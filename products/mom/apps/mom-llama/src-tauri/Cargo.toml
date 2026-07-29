@@ -1,0 +1,29 @@
+[package]
+name = "mom-llama-app"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+mom-llama-runtime = { path = "../../../crates/mom-llama-runtime" }
+llama-native-types = { path = "../../../crates/llama-native-types" }
+maud = "0.26"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rfd = { version = "=0.16.0", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+undocumented_unsafe_blocks = "deny"
