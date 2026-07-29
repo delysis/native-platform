@@ -1,0 +1,56 @@
+{
+  "schema": "llama_native_kit.implementation_receipt.v1",
+  "task_id": "adopted-standalone-baseline",
+  "status": "passed",
+  "date": "2026-07-29",
+  "source_inventory_sha256": "f27104ac3b9ec51beed0b1891f4853407af5ecc88ca3d6433a09ee170362cc58",
+  "binding": {
+    "llama_cpp_2": "0.1.153",
+    "llama_cpp_sys_2": "0.1.153",
+    "exactly_pinned": true
+  },
+  "verification": [
+    {
+      "command": "cargo check --workspace --exclude mom-llama-app",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo test --workspace --exclude mom-llama-app",
+      "outcome": "passed",
+      "passed": 32,
+      "ignored_real_model": 4
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --exclude mom-llama-app -- -D warnings",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo check -p mom-llama-app",
+      "outcome": "passed"
+    },
+    {
+      "command": "node --check apps/mom-llama/ui/coop-hx.js",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo fmt --all --check",
+      "outcome": "passed"
+    }
+  ],
+  "repairs": [
+    "Renamed adopted crates to standalone product-neutral identities.",
+    "Pinned both the safe binding and sys layer exactly.",
+    "Boxed current readiness receipts to eliminate a large enum variant.",
+    "Grouped multimodal sequence tracking rather than suppressing a Clippy design warning.",
+    "Corrected the Tauri icon to lossless RGBA encoding."
+  ],
+  "not_proven": [
+    "Real GGUF generation from this repository",
+    "Gemma 4 compatibility",
+    "Four-seat real consult",
+    "Persistent cache restore equivalence",
+    "Upstream visual parity",
+    "Signed-development native bundle",
+    "User acceptance"
+  ]
+}
