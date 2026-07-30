@@ -1,0 +1,66 @@
+# Free Token Energy — contributor guidance
+
+## Product direction
+
+Build a high-performance, local-first Rust gateway that makes multiple
+provider free tiers usable through one predictable API. Favor reusable
+provider, routing, streaming, and persistence components.
+
+## Non-negotiable principles
+
+- Privacy first: no telemetry; keys and operational metadata remain local.
+- No fake data: never seed or display invented usage, benchmarks, latency,
+  health, or quotas. Use measured observations, documented limits, or an
+  explicit unknown state.
+- One source of truth: model IDs, capabilities, policies, and quota limits live
+  in the model catalog.
+- Compatibility without ambiguity: preserve public model aliases while
+  translating provider-specific requests, streams, responses, and errors.
+- Safe local service: bind the proxy only to loopback, bound inputs and error
+  bodies, and avoid panics on recoverable runtime failures.
+
+## Current architecture
+
+- Tauri 2 desktop shell with a vanilla HTML/CSS/JavaScript webview
+- Rust router and provider adapters under `src-tauri/src/`
+- SQLite persistence in `db.rs`
+- Restart-safe sliding-window quota tracking in `rate_limiter.rs`
+- Model and provider metadata in `catalog.rs`
+- Provider transforms and stream parsers under `providers/`
+- OpenAI, Anthropic, and Gemini-compatible HTTP surfaces in `api_server.rs`
+
+Implemented providers are OpenRouter, Groq, Anthropic, Google Gemini, Mistral,
+NVIDIA NIM, and Cerebras.
+
+## Routing
+
+Routes are filtered by requested model, configured credentials, declared
+capabilities, and locally tracked quota. Ranking weights are:
+
+```text
+0.35 headroom + 0.30 evaluation + 0.20 capability + 0.15 latency
+```
+
+Only documented quota limits and measured evaluation/latency values may affect
+their respective score. Missing observations use a neutral value.
+
+## Required verification
+
+Before committing:
+
+```sh
+npm test
+cargo check --all-targets --all-features --manifest-path src-tauri/Cargo.toml
+```
+
+When changing provider transforms or streams, add fixture-style regression
+tests. When changing SQLite schema or migrations, add a reopen/migration test.
+Never commit the cloned repositories beneath `research/provider-gateways/`.
+
+## Remaining roadmap
+
+1. Live-provider end-to-end tests with user-owned credentials
+2. Real evaluation-result ingestion and display
+3. Usage visualizations sourced from request logs
+4. OS keychain-backed credential encryption
+5. Additional native transports such as Ollama and Bedrock

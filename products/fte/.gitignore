@@ -1,0 +1,29 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+/target
+dist
+dist-ssr
+*.local
+
+# Provider implementations are local research checkouts, not vendored source.
+# Keep the curated notes and policy file in the parent directory tracked.
+/research/provider-gateways/*/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

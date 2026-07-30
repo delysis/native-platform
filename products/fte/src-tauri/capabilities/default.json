@@ -1,0 +1,21 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://openrouter.ai/keys" },
+        { "url": "https://console.groq.com/keys" },
+        { "url": "https://aistudio.google.com/app/apikey" },
+        { "url": "https://console.mistral.ai/api-keys/" },
+        { "url": "https://cloud.cerebras.ai/" },
+        { "url": "https://build.nvidia.com/" },
+        { "url": "https://console.anthropic.com/" }
+      ]
+    }
+  ]
+}

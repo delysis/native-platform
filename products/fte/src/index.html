@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
+    <title>Free Token Energy</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <aside class="sidebar" aria-label="Primary navigation">
+      <div class="logo"><span aria-hidden="true">⚡</span> Free Token Energy</div>
+      <nav class="nav-section">
+        <button class="nav-item active" data-view="dashboard" type="button">
+          <span aria-hidden="true">▦</span> Dashboard
+        </button>
+        <button class="nav-item" data-view="setup" type="button">
+          <span aria-hidden="true">✦</span> Setup
+        </button>
+        <button class="nav-item" data-view="chat" type="button">
+          <span aria-hidden="true">◌</span> Playground
+        </button>
+        <button class="nav-item" data-view="logs" type="button">
+          <span aria-hidden="true">≡</span> Activity
+        </button>
+        <button class="nav-item" data-view="settings" type="button">
+          <span aria-hidden="true">⚙</span> Settings
+        </button>
+      </nav>
+      <p class="local-note">Keys and request metadata stay on this device.</p>
+    </aside>
+
+    <main class="main-content" id="view-container">
+      <section id="view-dashboard" class="view-section">
+        <header>
+          <p class="eyebrow">Local routing overview</p>
+          <h1>Gateway health</h1>
+          <p class="subtitle">Measured activity and locally tracked documented limits—no synthetic usage.</p>
+        </header>
+
+        <div class="metric-grid">
+          <article class="card metric-card">
+            <span class="metric-label">DOCUMENTED-LIMIT HEADROOM</span>
+            <strong class="metric-value" id="stat-headroom">—</strong>
+          </article>
+          <article class="card metric-card">
+            <span class="metric-label">AVERAGE LATENCY</span>
+            <strong class="metric-value" id="stat-latency">—</strong>
+          </article>
+          <article class="card metric-card">
+            <span class="metric-label">TOKENS ROUTED</span>
+            <strong class="metric-value" id="stat-tokens">0</strong>
+          </article>
+          <article class="card metric-card">
+            <span class="metric-label">REQUESTS</span>
+            <strong class="metric-value" id="stat-requests">0</strong>
+          </article>
+        </div>
+
+        <article class="card section-card">
+          <div class="section-heading">
+            <div>
+              <h2>Provider health</h2>
+              <p>Configuration, observed outcomes, and locally tracked published limits.</p>
+            </div>
+            <button class="btn-secondary compact" id="refresh-dashboard" type="button">Refresh</button>
+          </div>
+          <div id="live-health-list" class="health-list" aria-live="polite">
+            <p class="empty-state">Loading providers…</p>
+          </div>
+        </article>
+      </section>
+
+      <section id="view-setup" class="view-section" hidden>
+        <header>
+          <p class="eyebrow">Provider enrollment</p>
+          <h1>Connect your free tiers</h1>
+          <p class="subtitle">Open a provider console, then save its key locally.</p>
+        </header>
+
+        <article class="card master-profile">
+          <div class="section-heading">
+            <div>
+              <h2>Reusable signup profile</h2>
+              <p>Save non-secret details for faster registration. Never store a password here.</p>
+            </div>
+          </div>
+          <div class="master-grid">
+            <label>
+              <span>Common email</span>
+              <input type="email" id="profile-email" class="input-field" autocomplete="email" placeholder="you@example.com" maxlength="320">
+            </label>
+            <label>
+              <span>Full name</span>
+              <input type="text" id="profile-name" class="input-field" autocomplete="name" placeholder="Your name" maxlength="200">
+            </label>
+            <label>
+              <span>Password hint</span>
+              <input type="text" id="profile-password-hint" class="input-field" autocomplete="off" placeholder="A non-secret reminder only" maxlength="200">
+            </label>
+          </div>
+        </article>
+
+        <div class="provider-grid" id="onboarding-grid" aria-live="polite">
+          <p class="empty-state">Loading supported providers…</p>
+        </div>
+      </section>
+
+      <section id="view-chat" class="view-section" hidden>
+        <header>
+          <p class="eyebrow">Routing testbed</p>
+          <h1>Chat playground</h1>
+          <p class="subtitle">Try automatic routing or pin a public model alias.</p>
+        </header>
+
+        <article class="card chat-card">
+          <div class="chat-toolbar">
+            <label for="chat-model">Model</label>
+            <select id="chat-model" class="select-field">
+              <option value="auto">Automatic best route</option>
+            </select>
+          </div>
+          <div id="chat-history" class="chat-history" aria-live="polite">
+            <p class="empty-state" id="chat-placeholder">Your conversation will appear here.</p>
+          </div>
+          <form id="chat-form" class="chat-composer">
+            <label class="sr-only" for="chat-input">Message</label>
+            <textarea id="chat-input" class="input-field" rows="2" maxlength="100000" placeholder="Ask anything…" required></textarea>
+            <button class="btn-primary send-button" id="chat-send" type="submit">Send</button>
+          </form>
+        </article>
+      </section>
+
+      <section id="view-logs" class="view-section" hidden>
+        <header>
+          <p class="eyebrow">Local request metadata</p>
+          <h1>Activity</h1>
+          <p class="subtitle">The newest 50 requests. Prompts, responses, and keys are never logged.</p>
+        </header>
+        <article class="card table-card">
+          <div class="section-heading">
+            <h2>Recent requests</h2>
+            <button class="btn-secondary compact" id="refresh-logs" type="button">Refresh</button>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Time</th>
+                  <th scope="col">Provider</th>
+                  <th scope="col">Model</th>
+                  <th scope="col">Tokens</th>
+                  <th scope="col">Latency</th>
+                  <th scope="col">Status</th>
+                </tr>
+              </thead>
+              <tbody id="logs-body"></tbody>
+            </table>
+            <p class="empty-state" id="logs-empty">No requests recorded yet.</p>
+          </div>
+        </article>
+      </section>
+
+      <section id="view-settings" class="view-section" hidden>
+        <header>
+          <p class="eyebrow">Local service</p>
+          <h1>Settings</h1>
+          <p class="subtitle">Control the loopback-only OpenAI-compatible endpoint.</p>
+        </header>
+        <article class="card settings-card">
+          <div class="section-heading">
+            <div>
+              <h2>API proxy</h2>
+              <p id="proxy-status">Checking proxy status…</p>
+            </div>
+            <span class="status-pill status-muted" id="proxy-status-pill">Checking</span>
+          </div>
+          <form id="proxy-form" class="settings-form">
+            <label for="setting-port">Port</label>
+            <input type="number" id="setting-port" class="input-field" value="1337" min="1024" max="65535" required>
+            <button class="btn-primary" id="restart-proxy" type="submit">Apply and restart</button>
+          </form>
+          <p class="privacy-copy">The proxy binds only to <code>127.0.0.1</code>. Provider credentials never leave this app except in authenticated requests to the selected provider.</p>
+        </article>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>
