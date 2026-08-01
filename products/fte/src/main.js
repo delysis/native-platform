@@ -16,11 +16,11 @@ const PROVIDER_DETAILS = {
     url: 'https://aistudio.google.com/app/apikey',
   },
   mistral: {
-    description: 'Mistral-hosted chat and tool-capable models.',
+    description: 'Mistral chat models plus native Codestral fill-in-the-middle completion.',
     url: 'https://console.mistral.ai/api-keys/',
   },
   cerebras: {
-    description: 'Fast inference through the Cerebras cloud API.',
+    description: 'Fast chat and native raw text continuation through the Cerebras cloud API.',
     url: 'https://cloud.cerebras.ai/',
   },
   nvidia: {
@@ -40,7 +40,15 @@ const PROFILE_FIELDS = {
 };
 
 const chatMessages = [];
+let availableModels = [];
 let toastTimer;
+
+const PROMPT_SEMANTICS = {
+  direct_continuation: 'direct continuation',
+  fill_in_middle: 'FIM continuation',
+  provider_native_unverified: 'provider-native; template behavior unverified',
+  legacy_prompt_protocol: 'legacy prompt protocol',
+};
 
 function errorMessage(error) {
   if (typeof error === 'string') return error;
@@ -137,7 +145,10 @@ async function refreshDashboard() {
         provider.headroom == null
           ? 'quota varies by account'
           : `${Math.max(0, Math.min(100, Number(provider.headroom) * 100)).toFixed(0)}% local headroom`;
-      detail.textContent = `${provider.model_count} models · ${headroom} · ${formatNumber(provider.request_count)} requests`;
+      const autocomplete = provider.text_completion_model_count
+        ? ` · ${provider.text_completion_model_count} autocomplete`
+        : '';
+      detail.textContent = `${provider.model_count} models${autocomplete} · ${headroom} · ${formatNumber(provider.request_count)} requests`;
       summary.append(name, detail);
 
       row.append(summary, makeStatusPill(provider.status));
@@ -385,13 +396,13 @@ function contentToText(content) {
   return content == null ? '(empty response)' : JSON.stringify(content, null, 2);
 }
 
-function appendMessage(role, text) {
+function appendMessage(role, text, labelOverride = null) {
   document.getElementById('chat-placeholder')?.remove();
   const history = document.getElementById('chat-history');
   const message = document.createElement('article');
   message.className = `chat-message chat-${role}`;
   const label = document.createElement('strong');
-  label.textContent = role === 'assistant' ? 'Assistant' : role === 'error' ? 'Error' : 'You';
+  label.textContent = labelOverride || (role === 'assistant' ? 'Assistant' : role === 'error' ? 'Error' : 'You');
   const content = document.createElement('p');
   content.textContent = text;
   message.append(label, content);
@@ -402,28 +413,50 @@ function appendMessage(role, text) {
 async function sendMessage() {
   const input = document.getElementById('chat-input');
   const sendButton = document.getElementById('chat-send');
-  const message = input.value.trim();
+  const mode = document.getElementById('playground-mode').value;
+  const rawInput = input.value;
+  const message = mode === 'completion' ? rawInput : rawInput.trim();
   if (!message) return;
 
-  chatMessages.push({ role: 'user', content: message });
-  appendMessage('user', message);
+  if (mode === 'chat') {
+    chatMessages.push({ role: 'user', content: message });
+    appendMessage('user', message);
+  } else {
+    appendMessage('user', message, 'Raw prompt');
+  }
   input.value = '';
   input.disabled = true;
   sendButton.disabled = true;
   sendButton.textContent = 'Routing…';
 
   try {
-    const response = await invoke('chat_request', {
-      req: {
-        model: document.getElementById('chat-model').value,
-        messages: chatMessages,
-        stream: false,
-      },
-    });
-    const responseMessage = response.choices?.[0]?.message;
-    const content = contentToText(responseMessage?.content);
-    chatMessages.push(responseMessage || { role: 'assistant', content });
-    appendMessage('assistant', content);
+    if (mode === 'completion') {
+      const response = await invoke('completion_request', {
+        req: {
+          model: document.getElementById('chat-model').value,
+          prompt: message,
+          max_tokens: 256,
+          stream: false,
+        },
+      });
+      const choices = response.choices || [];
+      const content = choices.length > 1
+        ? choices.map((choice) => `[${choice.index}] ${choice.text || ''}`).join('\n\n')
+        : choices[0]?.text || '(empty completion)';
+      appendMessage('assistant', content, 'Continuation');
+    } else {
+      const response = await invoke('chat_request', {
+        req: {
+          model: document.getElementById('chat-model').value,
+          messages: chatMessages,
+          stream: false,
+        },
+      });
+      const responseMessage = response.choices?.[0]?.message;
+      const content = contentToText(responseMessage?.content);
+      chatMessages.push(responseMessage || { role: 'assistant', content });
+      appendMessage('assistant', content);
+    }
     await refreshDashboard();
   } catch (error) {
     appendMessage('error', errorMessage(error));
@@ -437,18 +470,55 @@ async function sendMessage() {
 
 async function loadModels() {
   try {
-    const models = await invoke('get_models');
-    const select = document.getElementById('chat-model');
-    select.replaceChildren();
-    for (const model of models) {
-      const option = document.createElement('option');
-      option.value = model.id;
-      option.textContent = model.display_name;
-      select.append(option);
-    }
+    availableModels = await invoke('get_models');
+    renderPlaygroundModels();
   } catch (error) {
     showToast(`Could not load models: ${errorMessage(error)}`, 'error');
   }
+}
+
+function renderPlaygroundModels() {
+  const mode = document.getElementById('playground-mode').value;
+  const select = document.getElementById('chat-model');
+  const previous = select.value;
+  const models = availableModels.filter((model) => (
+    mode === 'completion' ? model.supports_text_completions : model.supports_chat_completions
+  ));
+  select.replaceChildren();
+  for (const model of models) {
+    const option = document.createElement('option');
+    option.value = model.id;
+    const semantics = mode === 'completion'
+      ? model.prompt_semantics.map((item) => PROMPT_SEMANTICS[item] || item).join(', ')
+      : '';
+    option.textContent = semantics ? `${model.display_name} — ${semantics}` : model.display_name;
+    select.append(option);
+  }
+  if ([...select.options].some((option) => option.value === previous)) {
+    select.value = previous;
+  }
+}
+
+function resetPlaygroundForMode() {
+  const mode = document.getElementById('playground-mode').value;
+  chatMessages.length = 0;
+  const history = document.getElementById('chat-history');
+  history.replaceChildren();
+  const placeholder = document.createElement('p');
+  placeholder.className = 'empty-state';
+  placeholder.id = 'chat-placeholder';
+  placeholder.textContent = mode === 'completion'
+    ? 'The exact prompt and its continuation will appear here.'
+    : 'Your conversation will appear here.';
+  history.append(placeholder);
+  const input = document.getElementById('chat-input');
+  input.placeholder = mode === 'completion'
+    ? 'Paste the exact text to continue. Whitespace is preserved…'
+    : 'Ask anything…';
+  document.getElementById('playground-subtitle').textContent = mode === 'completion'
+    ? 'Sends prompt, never messages. Provider semantics are shown beside each model.'
+    : 'Try automatic chat routing or pin a public model alias.';
+  renderPlaygroundModels();
 }
 
 function renderProxyStatus(status) {
@@ -523,6 +593,7 @@ function bindEvents() {
     event.preventDefault();
     sendMessage();
   });
+  document.getElementById('playground-mode').addEventListener('change', resetPlaygroundForMode);
   document.getElementById('chat-input').addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();

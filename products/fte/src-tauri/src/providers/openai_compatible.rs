@@ -6,14 +6,19 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::providers::{
+    completions::{completion_chunks_from_response, CompletionEndpoint, CompletionProtocol},
     spec::{ParameterPolicy, ProviderSpec, RequestMode},
     streaming,
 };
-use crate::providers::{Capability, ChatChunk, ChatRequest, ChatResponse, Provider};
+use crate::providers::{
+    Capability, ChatChunk, ChatRequest, ChatResponse, CompletionChunk, CompletionRequest,
+    CompletionResponse, Provider,
+};
 
 pub struct OpenAiCompatibleProvider {
     spec: ProviderSpec,
     client: Client,
+    completion_endpoint: Option<CompletionEndpoint>,
 }
 
 #[derive(Debug)]
@@ -67,7 +72,20 @@ impl OpenAiCompatibleProvider {
                 warn!("Could not build the hardened HTTP client: {error}");
                 Client::new()
             });
-        Self { spec, client }
+        Self {
+            spec,
+            client,
+            completion_endpoint: None,
+        }
+    }
+
+    pub fn with_completion_endpoint(
+        mut self,
+        endpoint: &'static str,
+        protocol: CompletionProtocol,
+    ) -> Self {
+        self.completion_endpoint = Some(CompletionEndpoint::new(endpoint, protocol));
+        self
     }
 }
 
@@ -135,6 +153,61 @@ impl Provider for OpenAiCompatibleProvider {
             response,
             self.spec.stream_parser(),
         ))
+    }
+
+    fn supports_completions(&self) -> bool {
+        self.completion_endpoint.is_some()
+    }
+
+    async fn complete(
+        &self,
+        req: &CompletionRequest,
+        api_key: &str,
+    ) -> anyhow::Result<CompletionResponse> {
+        let endpoint = self.completion_endpoint.ok_or_else(|| {
+            anyhow::anyhow!("{} does not support native text completions", self.name())
+        })?;
+        let body = endpoint.request_body(req, false)?;
+        let response = self
+            .client
+            .post(endpoint.url)
+            .headers(self.spec.headers(api_key)?)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(upstream_error(response, self.name(), false).await);
+        }
+
+        endpoint.response(response.json::<serde_json::Value>().await?)
+    }
+
+    async fn complete_stream(
+        &self,
+        req: &CompletionRequest,
+        api_key: &str,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CompletionChunk>>> {
+        let endpoint = self.completion_endpoint.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} does not support native text completion streaming",
+                self.name()
+            )
+        })?;
+        let body = endpoint.request_body(req, true)?;
+        let response = self
+            .client
+            .post(endpoint.url)
+            .headers(self.spec.headers(api_key)?)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(upstream_error(response, self.name(), true).await);
+        }
+
+        Ok(completion_chunks_from_response(response, endpoint.protocol))
     }
 }
 

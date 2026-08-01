@@ -1,4 +1,4 @@
-use crate::providers::{ChatChunk, ChatRequest};
+use crate::providers::{ChatChunk, ChatRequest, CompletionChunk, CompletionRequest};
 use crate::router::Router as TokenRouter;
 use axum::{
     body::Body,
@@ -162,6 +162,15 @@ pub struct ModelResponse {
     object: &'static str,
     created: u64,
     owned_by: String,
+    #[serde(rename = "x_free_token_energy")]
+    surfaces: ModelSurfaceResponse,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelSurfaceResponse {
+    chat_completions: bool,
+    text_completions: bool,
+    prompt_semantics: Vec<crate::catalog::PromptSemantics>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,23 +232,10 @@ async fn chat_completions(
 
 async fn completions(
     State(router): State<Arc<TokenRouter>>,
-    Json(body): Json<Value>,
+    Json(req): Json<CompletionRequest>,
 ) -> Response<Body> {
-    let req = match chat_request_from_completion(&body) {
-        Ok(req) => req,
-        Err(error) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                &error.to_string(),
-                None,
-                "invalid_request_error",
-            )
-            .into_response();
-        }
-    };
-
     if req.stream {
-        return match router.chat_stream(&req, "default").await {
+        return match router.complete_stream(&req, "default").await {
             Ok(stream) => completion_sse_response(stream),
             Err(error) => api_error(
                 status_for_error(&error),
@@ -251,8 +247,8 @@ async fn completions(
         };
     }
 
-    match router.chat(&req, "default").await {
-        Ok(res) => Json(completion_response_from_chat(&body, res)).into_response(),
+    match router.complete(&req, "default").await {
+        Ok(res) => Json(res).into_response(),
         Err(error) => api_error(
             status_for_error(&error),
             &error.to_string(),
@@ -392,6 +388,11 @@ fn models_response(router: &TokenRouter) -> ModelsResponse {
             object: "model",
             created: 0,
             owned_by: model.providers.join(","),
+            surfaces: ModelSurfaceResponse {
+                chat_completions: model.supports_chat_completions,
+                text_completions: model.supports_text_completions,
+                prompt_semantics: model.prompt_semantics,
+            },
         })
         .collect();
 
@@ -415,6 +416,15 @@ fn status_for_error(error: &anyhow::Error) -> StatusCode {
         || normalized.contains("model is required")
         || normalized.contains("messages must contain")
         || normalized.contains("streaming responses")
+        || normalized.contains("stream_options")
+        || normalized.contains("prompt must")
+        || normalized.contains("prompt exceeds")
+        || normalized.contains("temperature must")
+        || normalized.contains("max_tokens must")
+        || normalized.contains("must be a positive integer")
+        || normalized.contains("stop must")
+        || normalized.contains("native text completion")
+        || normalized.contains("does not support chat completions")
         || normalized.contains("requested capability")
         || normalized.contains("supports every requested capability")
     {
@@ -511,7 +521,7 @@ fn chat_chunk_sse_event(chunk: &ChatChunk) -> anyhow::Result<Bytes> {
 }
 
 fn completion_sse_response(
-    stream: futures::stream::BoxStream<'static, anyhow::Result<ChatChunk>>,
+    stream: futures::stream::BoxStream<'static, anyhow::Result<CompletionChunk>>,
 ) -> Response<Body> {
     let body_stream = stream
         .map(|chunk_result| match chunk_result {
@@ -635,24 +645,8 @@ where
     response
 }
 
-fn completion_chunk_sse_event(chunk: &ChatChunk) -> anyhow::Result<Bytes> {
-    let text = chunk
-        .choices
-        .first()
-        .and_then(|choice| choice.delta.content.clone())
-        .unwrap_or_default();
-    let json = serde_json::to_string(&json!({
-        "id": chunk.id,
-        "object": "text_completion",
-        "created": chunk.created.unwrap_or_default(),
-        "model": chunk.model.clone().unwrap_or_else(|| "auto".to_string()),
-        "choices": [{
-            "text": text,
-            "index": 0,
-            "finish_reason": chunk.choices.first().and_then(|choice| choice.finish_reason.clone())
-        }],
-        "usage": chunk.usage
-    }))?;
+fn completion_chunk_sse_event(chunk: &CompletionChunk) -> anyhow::Result<Bytes> {
+    let json = serde_json::to_string(chunk)?;
     Ok(Bytes::from(format!("data: {json}\n\n")))
 }
 
@@ -737,57 +731,6 @@ fn gemini_chunk_sse_event(chunk: &ChatChunk) -> anyhow::Result<Bytes> {
         }))
     }))?;
     Ok(Bytes::from(format!("data: {json}\n\n")))
-}
-
-fn chat_request_from_completion(body: &Value) -> anyhow::Result<ChatRequest> {
-    let model = required_string(body, "model")?;
-    let prompt = body.get("prompt").map(value_to_text).unwrap_or_default();
-    let max_tokens = optional_u32(body.get("max_tokens"), "max_tokens")?;
-    let mut extra = Map::new();
-    copy_value(body, &mut extra, "stop", "stop");
-    copy_value(body, &mut extra, "top_p", "top_p");
-    copy_value(
-        body,
-        &mut extra,
-        "max_completion_tokens",
-        "max_completion_tokens",
-    );
-
-    Ok(ChatRequest {
-        model,
-        messages: vec![crate::providers::ChatMessage::text("user", &prompt)],
-        stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
-        stream_options: None,
-        temperature: body
-            .get("temperature")
-            .and_then(Value::as_f64)
-            .map(|value| value as f32),
-        max_tokens,
-        extra,
-    })
-}
-
-fn completion_response_from_chat(
-    request: &Value,
-    response: crate::providers::ChatResponse,
-) -> Value {
-    let content = response
-        .choices
-        .first()
-        .map(|choice| choice.message.content_text())
-        .unwrap_or_default();
-    json!({
-        "id": response.id,
-        "object": "text_completion",
-        "created": response.created.unwrap_or_default(),
-        "model": request.get("model").cloned().or(response.model.map(Value::String)).unwrap_or(Value::String("auto".to_string())),
-        "choices": [{
-            "text": content,
-            "index": 0,
-            "finish_reason": response.choices.first().and_then(|choice| choice.finish_reason.clone())
-        }],
-        "usage": response.usage
-    })
 }
 
 fn chat_request_from_response_create(body: &Value) -> anyhow::Result<ChatRequest> {
@@ -1283,6 +1226,26 @@ mod tests {
             .unwrap()
             .iter()
             .any(|item| { item["object"] == "model" && item["id"] == "llama-3.1-70b-instruct" }));
+
+        let cerebras = json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "gpt-oss-120b")
+            .unwrap();
+        assert_eq!(cerebras["x_free_token_energy"]["text_completions"], true);
+        assert_eq!(
+            cerebras["x_free_token_energy"]["prompt_semantics"],
+            json!(["direct_continuation"])
+        );
+
+        let openrouter = json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "openrouter-free")
+            .unwrap();
+        assert_eq!(openrouter["x_free_token_energy"]["text_completions"], false);
     }
 
     #[test]
@@ -1320,17 +1283,25 @@ mod tests {
             status_for_error(&anyhow::anyhow!("upstream timed out")),
             StatusCode::GATEWAY_TIMEOUT
         );
+        assert_eq!(
+            status_for_error(&anyhow::anyhow!("n must be a positive integer")),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_for_error(&anyhow::anyhow!("max_tokens must be greater than zero")),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
     fn numeric_request_fields_reject_overflow_and_negative_values() {
-        assert!(chat_request_from_completion(&json!({
+        assert!(serde_json::from_value::<CompletionRequest>(json!({
             "model": "auto",
             "prompt": "hello",
             "max_tokens": u64::MAX
         }))
         .is_err());
-        assert!(chat_request_from_completion(&json!({
+        assert!(serde_json::from_value::<CompletionRequest>(json!({
             "model": "auto",
             "prompt": "hello",
             "max_tokens": -1
@@ -1362,6 +1333,37 @@ mod tests {
         assert!(text.starts_with("data: {"));
         assert!(text.contains("\"object\":\"chat.completion.chunk\""));
         assert!(text.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn completion_stream_chunks_keep_choices_and_logprobs() {
+        let chunk: CompletionChunk = serde_json::from_value(json!({
+            "id": "cmpl-test",
+            "object": "text_completion",
+            "created": 1,
+            "model": "gpt-oss-120b",
+            "choices": [
+                {
+                    "text": "first",
+                    "index": 0,
+                    "logprobs": {"tokens": ["first"]},
+                    "finish_reason": null
+                },
+                {
+                    "text": "second",
+                    "index": 1,
+                    "logprobs": null,
+                    "finish_reason": "stop"
+                }
+            ]
+        }))
+        .unwrap();
+
+        let bytes = completion_chunk_sse_event(&chunk).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("\"index\":1"));
+        assert!(text.contains("\"tokens\":[\"first\"]"));
+        assert!(!text.contains("delta"));
     }
 
     #[test]

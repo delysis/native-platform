@@ -508,8 +508,17 @@ textarea.input-field {
   border-bottom: 1px solid var(--border);
 }
 
+.toolbar-field {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.toolbar-model-field {
+  flex: 1;
+}
+
 .chat-toolbar .select-field {
-  width: min(420px, 100%);
+  width: 100%;
 }
 
 .chat-history {

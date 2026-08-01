@@ -10,6 +10,7 @@ pub mod router;
 use crate::db::Database;
 use crate::eval_store::EvalStore;
 use crate::providers::anthropic;
+use crate::providers::completions::CompletionProtocol;
 use crate::providers::gemini;
 use crate::providers::groq;
 use crate::providers::openai_compatible::OpenAiCompatibleProvider;
@@ -44,24 +45,36 @@ pub fn run() {
             router.add_provider(Box::new(groq::provider()));
             router.add_provider(Box::new(anthropic::provider()));
             router.add_provider(Box::new(gemini::provider()));
-            router.add_provider(Box::new(OpenAiCompatibleProvider::new(
-                "mistral",
-                "Mistral AI",
-                "https://api.mistral.ai/v1/chat/completions",
-                vec![Capability::Streaming, Capability::Tools],
-            )));
+            router.add_provider(Box::new(
+                OpenAiCompatibleProvider::new(
+                    "mistral",
+                    "Mistral AI",
+                    "https://api.mistral.ai/v1/chat/completions",
+                    vec![Capability::Streaming, Capability::Tools],
+                )
+                .with_completion_endpoint(
+                    "https://api.mistral.ai/v1/fim/completions",
+                    CompletionProtocol::MistralFim,
+                ),
+            ));
             router.add_provider(Box::new(OpenAiCompatibleProvider::new(
                 "nvidia",
                 "NVIDIA NIM",
                 "https://integrate.api.nvidia.com/v1/chat/completions",
                 vec![Capability::Streaming, Capability::Tools],
             )));
-            router.add_provider(Box::new(OpenAiCompatibleProvider::new(
-                "cerebras",
-                "Cerebras",
-                "https://api.cerebras.ai/v1/chat/completions",
-                vec![Capability::Streaming, Capability::Tools],
-            )));
+            router.add_provider(Box::new(
+                OpenAiCompatibleProvider::new(
+                    "cerebras",
+                    "Cerebras",
+                    "https://api.cerebras.ai/v1/chat/completions",
+                    vec![Capability::Streaming, Capability::Tools],
+                )
+                .with_completion_endpoint(
+                    "https://api.cerebras.ai/v1/completions",
+                    CompletionProtocol::OpenAi,
+                ),
+            ));
 
             let router = Arc::new(router);
             let proxy = crate::api_server::ProxyManager::new(router.clone());
@@ -85,6 +98,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::chat_request,
+            commands::completion_request,
             commands::save_key,
             commands::delete_key,
             commands::get_providers,

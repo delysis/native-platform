@@ -109,16 +109,25 @@
       <section id="view-chat" class="view-section" hidden>
         <header>
           <p class="eyebrow">Routing testbed</p>
-          <h1>Chat playground</h1>
-          <p class="subtitle">Try automatic routing or pin a public model alias.</p>
+          <h1 id="playground-title">Generation playground</h1>
+          <p class="subtitle" id="playground-subtitle">Try chat routing or send an unwrapped prompt to a native text-completion endpoint.</p>
         </header>
 
         <article class="card chat-card">
           <div class="chat-toolbar">
-            <label for="chat-model">Model</label>
-            <select id="chat-model" class="select-field">
-              <option value="auto">Automatic best route</option>
-            </select>
+            <div class="toolbar-field">
+              <label for="playground-mode">Mode</label>
+              <select id="playground-mode" class="select-field">
+                <option value="chat">Chat</option>
+                <option value="completion">Raw autocomplete</option>
+              </select>
+            </div>
+            <div class="toolbar-field toolbar-model-field">
+              <label for="chat-model">Model</label>
+              <select id="chat-model" class="select-field">
+                <option value="auto">Automatic best route</option>
+              </select>
+            </div>
           </div>
           <div id="chat-history" class="chat-history" aria-live="polite">
             <p class="empty-state" id="chat-placeholder">Your conversation will appear here.</p>

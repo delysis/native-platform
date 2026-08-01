@@ -1,6 +1,6 @@
 use crate::api_server::{ProxyManager, ProxyStatus};
 use crate::db::Database;
-use crate::providers::{ChatRequest, ChatResponse};
+use crate::providers::{ChatRequest, ChatResponse, CompletionRequest, CompletionResponse};
 use crate::router::Router;
 use std::sync::Arc;
 use tauri::State;
@@ -13,6 +13,19 @@ pub async fn chat_request(
 ) -> Result<ChatResponse, String> {
     let hint = task_hint.unwrap_or_else(|| "general".to_string());
     router.chat(&req, &hint).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn completion_request(
+    router: State<'_, Arc<Router>>,
+    req: CompletionRequest,
+    task_hint: Option<String>,
+) -> Result<CompletionResponse, String> {
+    let hint = task_hint.unwrap_or_else(|| "general".to_string());
+    router
+        .complete(&req, &hint)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

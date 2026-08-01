@@ -10,7 +10,8 @@ for each request.
 - OpenRouter, Groq, Anthropic, Google Gemini, Mistral, NVIDIA NIM, and Cerebras
 - Native request and stream normalization for Anthropic Messages and Gemini
   `generateContent`
-- OpenAI-compatible chat, completions, responses, model listing, and SSE
+- OpenAI-compatible chat, native legacy text completions, responses, model
+  listing, and SSE
 - Atomic sliding-window request reservations that survive application restarts
 - Measured local request totals, token usage, latency, and provider outcomes
 - A desktop dashboard, provider setup, chat playground, activity log, and
@@ -47,6 +48,33 @@ Settings without restarting the desktop application.
 
 Use `model: "auto"` to let the router choose among configured, capable models,
 or use a public model ID returned by `/v1/models`.
+
+### Legacy text completions
+
+`POST /v1/completions` is a first-class prompt-based path. It preserves string,
+string-array, token-array, and token-batch prompts and never converts them into
+chat messages. Routing is restricted to catalog entries with a native text
+completion transport and rejects unsupported prompt types or parameters instead
+of silently dropping them.
+
+Current native transports are:
+
+- Cerebras `/v1/completions` for documented direct continuation with
+  `gpt-oss-120b`
+- OpenRouter `/api/v1/completions` is implemented in the provider adapter, but
+  the dynamic `openrouter/free` catalog alias is deliberately excluded from raw
+  routing because it cannot guarantee stable model or template semantics
+- Anthropic's legacy `/v1/complete` transport is implemented and fixture-tested,
+  but current Claude catalog models are deliberately excluded because Anthropic
+  now directs integrations to Messages and does not document those models for
+  the legacy endpoint
+- Mistral `/v1/fim/completions` with `codestral-latest`, marked as FIM
+  continuation
+
+Groq, Gemini, hosted NVIDIA NIM, and `mistral-small-latest` are chat-only in the
+catalog. They are never used as fallbacks for `/v1/completions`. Model objects
+include an `x_free_token_energy` extension describing their supported surfaces
+and prompt semantics.
 
 ## Routing
 

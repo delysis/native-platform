@@ -4,11 +4,12 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::catalog::{default_model_catalog, ModelCatalogEntry};
+use crate::catalog::{default_model_catalog, ModelCatalogEntry, PromptSemantics};
 use crate::db::{Database, ProviderLogSummary};
 use crate::eval_store::EvalStore;
 use crate::providers::{
-    spec::ParameterPolicy, Capability, ChatChunk, ChatRequest, ChatResponse, Provider,
+    spec::ParameterPolicy, Capability, ChatChunk, ChatRequest, ChatResponse, CompletionChunk,
+    CompletionRequest, CompletionResponse, Provider,
 };
 use crate::rate_limiter::QuotaTracker;
 use async_stream::try_stream;
@@ -37,6 +38,18 @@ pub struct PublicModel {
     pub id: String,
     pub display_name: String,
     pub providers: Vec<String>,
+    pub supports_chat_completions: bool,
+    pub supports_text_completions: bool,
+    pub prompt_semantics: Vec<PromptSemantics>,
+}
+
+#[derive(Default)]
+struct PublicModelAccumulator {
+    display_name: String,
+    providers: BTreeSet<String>,
+    supports_chat_completions: bool,
+    supports_text_completions: bool,
+    prompt_semantics: BTreeSet<PromptSemantics>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,6 +58,9 @@ pub struct ProviderModelStatus {
     pub provider_model_id: String,
     pub display_name: String,
     pub headroom: Option<f64>,
+    pub supports_chat_completions: bool,
+    pub supports_text_completions: bool,
+    pub prompt_semantics: Option<PromptSemantics>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +70,7 @@ pub struct ProviderStatus {
     pub configured: bool,
     pub status: String,
     pub model_count: usize,
+    pub text_completion_model_count: usize,
     pub headroom: Option<f64>,
     pub total_tokens: u64,
     pub avg_latency_ms: u64,
@@ -132,21 +149,32 @@ impl Router {
     }
 
     pub fn public_models(&self) -> Vec<PublicModel> {
-        let mut models: BTreeMap<String, (String, BTreeSet<String>)> = BTreeMap::new();
+        let mut models: BTreeMap<String, PublicModelAccumulator> = BTreeMap::new();
 
         for entry in &self.model_catalog {
             let model = models
                 .entry(entry.public_model_id.clone())
-                .or_insert_with(|| (entry.display_name.clone(), BTreeSet::new()));
-            model.1.insert(entry.provider_name.clone());
+                .or_insert_with(|| PublicModelAccumulator {
+                    display_name: entry.display_name.clone(),
+                    ..PublicModelAccumulator::default()
+                });
+            model.providers.insert(entry.provider_name.clone());
+            model.supports_chat_completions |= entry.chat_completions;
+            if let Some(completion) = &entry.text_completions {
+                model.supports_text_completions = true;
+                model.prompt_semantics.insert(completion.prompt_semantics);
+            }
         }
 
         let mut public_models: Vec<PublicModel> = models
             .into_iter()
-            .map(|(id, (display_name, providers))| PublicModel {
+            .map(|(id, model)| PublicModel {
                 id,
-                display_name,
-                providers: providers.into_iter().collect(),
+                display_name: model.display_name,
+                providers: model.providers.into_iter().collect(),
+                supports_chat_completions: model.supports_chat_completions,
+                supports_text_completions: model.supports_text_completions,
+                prompt_semantics: model.prompt_semantics.into_iter().collect(),
             })
             .collect();
 
@@ -163,6 +191,26 @@ impl Router {
                 id: "auto".to_string(),
                 display_name: "Automatic best available route".to_string(),
                 providers: all_providers,
+                supports_chat_completions: self
+                    .model_catalog
+                    .iter()
+                    .any(|entry| entry.chat_completions),
+                supports_text_completions: self
+                    .model_catalog
+                    .iter()
+                    .any(|entry| entry.text_completions.is_some()),
+                prompt_semantics: self
+                    .model_catalog
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .text_completions
+                            .as_ref()
+                            .map(|support| support.prompt_semantics)
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
             },
         );
 
@@ -196,6 +244,12 @@ impl Router {
                         self.quota_tracker
                             .headroom(&entry.provider_id, &entry.provider_model_id)
                     }),
+                    supports_chat_completions: entry.chat_completions,
+                    supports_text_completions: entry.text_completions.is_some(),
+                    prompt_semantics: entry
+                        .text_completions
+                        .as_ref()
+                        .map(|support| support.prompt_semantics),
                 })
                 .collect();
 
@@ -211,6 +265,10 @@ impl Router {
                 configured,
                 status,
                 model_count: models.len(),
+                text_completion_model_count: models
+                    .iter()
+                    .filter(|model| model.supports_text_completions)
+                    .count(),
                 headroom: headroom.map(|value| (value * 100.0).round() / 100.0),
                 total_tokens: summary.total_tokens,
                 avg_latency_ms: summary.avg_latency_ms,
@@ -253,6 +311,7 @@ impl Router {
         let mut best_route: Option<RouteResult> = None;
         let mut max_score = -1.0;
         let mut saw_model_candidate = false;
+        let mut saw_chat_candidate = false;
         let mut saw_configured_candidate = false;
         let mut saw_capable_candidate = false;
         let required_capabilities = required_capabilities(req);
@@ -263,6 +322,11 @@ impl Router {
                 continue;
             }
             saw_model_candidate = true;
+
+            if !entry.chat_completions {
+                continue;
+            }
+            saw_chat_candidate = true;
 
             let Some(provider) = self.providers.get(&entry.provider_id) else {
                 continue;
@@ -331,6 +395,8 @@ impl Router {
                     "Unknown model '{}'. Use /v1/models or model 'auto'.",
                     req.model
                 )
+            } else if !saw_chat_candidate {
+                anyhow::anyhow!("Model '{}' does not support chat completions.", req.model)
             } else if !saw_capable_candidate {
                 anyhow::anyhow!(
                     "No provider for '{}' supports every requested capability.",
@@ -344,6 +410,131 @@ impl Router {
             } else {
                 anyhow::anyhow!(
                     "All configured providers for '{}' are out of quota or unavailable.",
+                    req.model
+                )
+            }
+        })
+    }
+
+    pub async fn route_completion(
+        &self,
+        req: &CompletionRequest,
+        task_hint: &str,
+    ) -> anyhow::Result<RouteResult> {
+        validate_completion_request(req)?;
+
+        let mut best_route: Option<RouteResult> = None;
+        let mut max_score = -1.0;
+        let mut saw_model_candidate = false;
+        let mut saw_completion_candidate = false;
+        let mut saw_compatible_candidate = false;
+        let mut saw_configured_candidate = false;
+        let mut incompatible = BTreeSet::new();
+        let provider_summaries = self.db.get_provider_log_summaries()?;
+
+        for entry in &self.model_catalog {
+            if !entry.matches_requested_model(&req.model) {
+                continue;
+            }
+            saw_model_candidate = true;
+
+            let Some(completion_support) = &entry.text_completions else {
+                continue;
+            };
+            let Some(provider) = self.providers.get(&entry.provider_id) else {
+                continue;
+            };
+            if !provider.supports_completions() {
+                continue;
+            }
+            saw_completion_candidate = true;
+
+            if !completion_support.supports(req) {
+                incompatible.extend(completion_support.incompatibilities(req));
+                continue;
+            }
+            if req.stream
+                && (!provider.capabilities().contains(&Capability::Streaming)
+                    || !entry.capabilities.contains(&Capability::Streaming))
+            {
+                incompatible.insert("stream".to_string());
+                continue;
+            }
+            saw_compatible_candidate = true;
+
+            if !self.db.has_api_key(&entry.provider_id)? {
+                continue;
+            }
+            saw_configured_candidate = true;
+
+            let headroom = self
+                .quota_tracker
+                .headroom(&entry.provider_id, &entry.provider_model_id);
+            if headroom <= 0.0 {
+                continue;
+            }
+
+            let eval_scores = self.eval_store.get_score(&entry.public_model_id);
+            let quality_score = match task_hint {
+                "coding" => eval_scores.coding,
+                "reasoning" => eval_scores.reasoning,
+                "creative" => eval_scores.creative,
+                _ => eval_scores.general,
+            };
+            let capability_score = entry.capabilities.len() as f64 / Capability::ALL.len() as f64;
+            let latency_score = observed_latency_score(provider_summaries.get(&entry.provider_id));
+            let headroom_score = if entry.quota.has_documented_limit() {
+                headroom
+            } else {
+                0.5
+            };
+            let score = (0.35 * headroom_score)
+                + (0.30 * quality_score)
+                + (0.20 * capability_score)
+                + (0.15 * latency_score);
+
+            info!(
+                "Scored native completion route {}/{} as {}: {}",
+                entry.provider_id, entry.provider_model_id, entry.public_model_id, score
+            );
+
+            if score > max_score {
+                max_score = score;
+                best_route = Some(RouteResult {
+                    provider_id: entry.provider_id.clone(),
+                    public_model_id: entry.public_model_id.clone(),
+                    provider_model_id: entry.provider_model_id.clone(),
+                    parameter_policy: entry.parameter_policy.clone(),
+                    score,
+                });
+            }
+        }
+
+        best_route.ok_or_else(|| {
+            if !saw_model_candidate {
+                anyhow::anyhow!(
+                    "Unknown model '{}'. Use /v1/models or model 'auto'.",
+                    req.model
+                )
+            } else if !saw_completion_candidate {
+                anyhow::anyhow!(
+                    "Model '{}' does not support native text completions.",
+                    req.model
+                )
+            } else if !saw_compatible_candidate {
+                anyhow::anyhow!(
+                    "No native text completion route for '{}' accepts: {}.",
+                    req.model,
+                    incompatible.into_iter().collect::<Vec<_>>().join(", ")
+                )
+            } else if !saw_configured_candidate {
+                anyhow::anyhow!(
+                    "No API key is saved for a native text completion provider that can serve '{}'.",
+                    req.model
+                )
+            } else {
+                anyhow::anyhow!(
+                    "All configured native text completion providers for '{}' are out of quota or unavailable.",
                     req.model
                 )
             }
@@ -413,6 +604,57 @@ impl Router {
         }
     }
 
+    pub async fn complete(
+        &self,
+        req: &CompletionRequest,
+        task_hint: &str,
+    ) -> anyhow::Result<CompletionResponse> {
+        let route = self.route_completion(req, task_hint).await?;
+        self.reserve_request(&route)?;
+        let provider = self
+            .providers
+            .get(&route.provider_id)
+            .ok_or_else(|| anyhow::anyhow!("Provider disappeared during routing"))?;
+        let api_key = self.db.get_api_key(&route.provider_id)?.ok_or_else(|| {
+            anyhow::anyhow!("No API key found for provider {}", route.provider_id)
+        })?;
+
+        let mut provider_req = req.clone();
+        provider_req.model = route.provider_model_id.clone();
+        provider_req.stream = false;
+        provider_req.stream_options = None;
+
+        let start = std::time::Instant::now();
+        let result = provider.complete(&provider_req, &api_key).await;
+        let latency = elapsed_millis(start);
+
+        match result {
+            Ok(mut response) => {
+                let total_tokens = response.total_tokens().unwrap_or_default();
+                self.record_tokens(&route, total_tokens);
+                self.log_request(
+                    &route.provider_id,
+                    &route.public_model_id,
+                    total_tokens,
+                    latency,
+                    200,
+                );
+                response.normalize(&route.public_model_id, current_unix_timestamp());
+                Ok(response)
+            }
+            Err(error) => {
+                self.log_request(
+                    &route.provider_id,
+                    &route.public_model_id,
+                    0,
+                    latency,
+                    request_error_status(&error),
+                );
+                Err(error)
+            }
+        }
+    }
+
     pub async fn chat_stream(
         &self,
         req: &ChatRequest,
@@ -438,6 +680,75 @@ impl Router {
             .chat_stream(&provider_req, &api_key, &route.parameter_policy)
             .await
         {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.log_request(
+                    &route.provider_id,
+                    &route.public_model_id,
+                    0,
+                    elapsed_millis(start),
+                    request_error_status(&error),
+                );
+                return Err(error);
+            }
+        };
+        let quota_tracker = self.quota_tracker.clone();
+        let db = self.db.clone();
+        let route_for_stream = route.clone();
+        let created = current_unix_timestamp();
+
+        let stream = try_stream! {
+            let mut upstream = upstream;
+            let mut audit = StreamAudit::new(
+                quota_tracker,
+                db,
+                route_for_stream.clone(),
+                start,
+            );
+
+            while let Some(next_chunk) = upstream.next().await {
+                match next_chunk {
+                    Ok(mut chunk) => {
+                        if let Some(chunk_total) = chunk.total_tokens() {
+                            audit.total_tokens = chunk_total;
+                        }
+                        chunk.normalize(&route_for_stream.public_model_id, created);
+                        yield chunk;
+                    }
+                    Err(error) => {
+                        audit.finish(502);
+                        Err(error)?;
+                    }
+                }
+            }
+
+            audit.finish(200);
+        };
+
+        Ok(Box::pin(stream))
+    }
+
+    pub async fn complete_stream(
+        &self,
+        req: &CompletionRequest,
+        task_hint: &str,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CompletionChunk>>> {
+        let route = self.route_completion(req, task_hint).await?;
+        self.reserve_request(&route)?;
+        let provider = self
+            .providers
+            .get(&route.provider_id)
+            .ok_or_else(|| anyhow::anyhow!("Provider disappeared during routing"))?;
+        let api_key = self.db.get_api_key(&route.provider_id)?.ok_or_else(|| {
+            anyhow::anyhow!("No API key found for provider {}", route.provider_id)
+        })?;
+
+        let mut provider_req = req.clone();
+        provider_req.model = route.provider_model_id.clone();
+        provider_req.stream = true;
+
+        let start = std::time::Instant::now();
+        let upstream = match provider.complete_stream(&provider_req, &api_key).await {
             Ok(stream) => stream,
             Err(error) => {
                 self.log_request(
@@ -683,6 +994,43 @@ fn validate_chat_request(req: &ChatRequest) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_completion_request(req: &CompletionRequest) -> anyhow::Result<()> {
+    if req.model.trim().is_empty() {
+        return Err(anyhow::anyhow!("model is required"));
+    }
+    let prompt_count = req.prompt.item_count();
+    if prompt_count == 0 {
+        return Err(anyhow::anyhow!("prompt must contain at least one item"));
+    }
+    if prompt_count > 2_048 {
+        return Err(anyhow::anyhow!("prompt exceeds the limit of 2048 items"));
+    }
+    if let Some(temperature) = req.temperature {
+        if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+            return Err(anyhow::anyhow!("temperature must be between 0 and 2"));
+        }
+    }
+    if req.max_tokens == Some(0) {
+        return Err(anyhow::anyhow!("max_tokens must be greater than zero"));
+    }
+    if req.stream_options.is_some() && !req.stream {
+        return Err(anyhow::anyhow!(
+            "stream_options may only be set when stream is true"
+        ));
+    }
+    for parameter in ["n", "best_of"] {
+        if let Some(value) = req.extra.get(parameter).filter(|value| !value.is_null()) {
+            let number = value
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("{parameter} must be a positive integer"))?;
+            if number == 0 {
+                return Err(anyhow::anyhow!("{parameter} must be a positive integer"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn required_capabilities(req: &ChatRequest) -> Vec<Capability> {
     let mut required = Vec::new();
     if req.stream {
@@ -740,8 +1088,11 @@ mod tests {
     use futures::{stream::BoxStream, StreamExt};
     use std::sync::Mutex;
 
-    use crate::catalog::QuotaSpec;
-    use crate::providers::{ChatChoice, ChatChunk, ChatMessage, ChatUsage};
+    use crate::catalog::{PromptSemantics, QuotaSpec, TextCompletionSupport};
+    use crate::providers::{
+        ChatChoice, ChatChunk, ChatMessage, ChatUsage, CompletionChoice, CompletionPrompt,
+        CompletionPromptKind, CompletionUsage,
+    };
 
     #[tokio::test]
     async fn route_selects_configured_catalog_provider() {
@@ -860,6 +1211,118 @@ mod tests {
         assert_eq!(logs[0].model_id, "public-model");
         assert_eq!(logs[0].tokens_used, 7);
         assert_eq!(logs[0].status_code, 200);
+    }
+
+    #[tokio::test]
+    async fn completion_route_excludes_chat_only_models() {
+        let chat_only = test_catalog_entry("chat", "shared-model", "chat-model", 0.8);
+        let completion_entry =
+            test_completion_catalog_entry("completion", "shared-model", "completion-model");
+        let (db, _quota, mut router) = test_router(vec![chat_only, completion_entry]);
+        router.add_provider(Box::new(MockProvider::new("chat")));
+        router.add_provider(Box::new(MockCompletionProvider::new(
+            "completion",
+            Arc::new(Mutex::new(Vec::new())),
+            Vec::new(),
+        )));
+        db.save_api_key("chat", "test-key").unwrap();
+        db.save_api_key("completion", "test-key").unwrap();
+
+        let route = router
+            .route_completion(&completion_request("shared-model"), "general")
+            .await
+            .unwrap();
+
+        assert_eq!(route.provider_id, "completion");
+        assert_eq!(route.provider_model_id, "completion-model");
+    }
+
+    #[tokio::test]
+    async fn completion_preserves_token_batches_and_all_choices() {
+        let sent_requests = Arc::new(Mutex::new(Vec::new()));
+        let (db, _quota, mut router) = test_router(vec![test_completion_catalog_entry(
+            "completion",
+            "public-model",
+            "provider-model",
+        )]);
+        router.add_provider(Box::new(MockCompletionProvider::new(
+            "completion",
+            sent_requests.clone(),
+            Vec::new(),
+        )));
+        db.save_api_key("completion", "test-key").unwrap();
+        let mut request = completion_request("public-model");
+        request.prompt = CompletionPrompt::TokenBatches(vec![vec![1, 2], vec![3, 4]]);
+
+        let response = router.complete(&request, "general").await.unwrap();
+
+        let sent = sent_requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].model, "provider-model");
+        assert_eq!(sent[0].prompt, request.prompt);
+        assert_eq!(response.model.as_deref(), Some("public-model"));
+        assert_eq!(response.object.as_deref(), Some("text_completion"));
+        assert_eq!(response.choices.len(), 2);
+        assert!(response.choices[0].logprobs.is_some());
+    }
+
+    #[tokio::test]
+    async fn completion_route_rejects_unsupported_parameters() {
+        let mut entry =
+            test_completion_catalog_entry("completion", "public-model", "provider-model");
+        entry
+            .text_completions
+            .as_mut()
+            .unwrap()
+            .supported_parameters = vec!["max_tokens".to_string()];
+        let (db, _quota, mut router) = test_router(vec![entry]);
+        router.add_provider(Box::new(MockCompletionProvider::new(
+            "completion",
+            Arc::new(Mutex::new(Vec::new())),
+            Vec::new(),
+        )));
+        db.save_api_key("completion", "test-key").unwrap();
+        let mut request = completion_request("public-model");
+        request.extra.insert("n".to_string(), serde_json::json!(2));
+
+        let error = router
+            .route_completion(&request, "general")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("accepts: n"));
+    }
+
+    #[tokio::test]
+    async fn completion_stream_normalizes_chunks_and_records_usage() {
+        let sent_requests = Arc::new(Mutex::new(Vec::new()));
+        let (db, _quota, mut router) = test_router(vec![test_completion_catalog_entry(
+            "completion",
+            "public-model",
+            "provider-model",
+        )]);
+        router.add_provider(Box::new(MockCompletionProvider::new(
+            "completion",
+            sent_requests.clone(),
+            vec![completion_response("stream-1")],
+        )));
+        db.save_api_key("completion", "test-key").unwrap();
+        let mut request = completion_request("public-model");
+        request.stream = true;
+
+        let chunks: Vec<CompletionChunk> = router
+            .complete_stream(&request, "general")
+            .await
+            .unwrap()
+            .map(|result| result.unwrap())
+            .collect()
+            .await;
+
+        assert_eq!(sent_requests.lock().unwrap()[0].model, "provider-model");
+        assert_eq!(chunks[0].model.as_deref(), Some("public-model"));
+        assert_eq!(chunks[0].object.as_deref(), Some("text_completion"));
+        assert_eq!(db.get_recent_logs(10).unwrap()[0].tokens_used, 5);
     }
 
     #[tokio::test]
@@ -1000,6 +1463,8 @@ mod tests {
             provider_model_id: provider_model_id.to_string(),
             display_name: public_model_id.to_string(),
             capabilities: vec![Capability::Tools],
+            chat_completions: true,
+            text_completions: None,
             parameter_policy: ParameterPolicy::openai_compatible(),
             quota: QuotaSpec {
                 rpm: 10,
@@ -1011,6 +1476,33 @@ mod tests {
         }
     }
 
+    fn test_completion_catalog_entry(
+        provider_id: &str,
+        public_model_id: &str,
+        provider_model_id: &str,
+    ) -> ModelCatalogEntry {
+        ModelCatalogEntry {
+            capabilities: vec![Capability::Streaming],
+            chat_completions: false,
+            text_completions: Some(TextCompletionSupport {
+                prompt_semantics: PromptSemantics::DirectContinuation,
+                prompt_types: vec![
+                    CompletionPromptKind::Text,
+                    CompletionPromptKind::Texts,
+                    CompletionPromptKind::Tokens,
+                    CompletionPromptKind::TokenBatches,
+                ],
+                supported_parameters: vec![
+                    "stream".to_string(),
+                    "temperature".to_string(),
+                    "max_tokens".to_string(),
+                    "n".to_string(),
+                ],
+            }),
+            ..test_catalog_entry(provider_id, public_model_id, provider_model_id, 0.8)
+        }
+    }
+
     fn chat_request(model: &str) -> ChatRequest {
         ChatRequest {
             model: model.to_string(),
@@ -1019,6 +1511,50 @@ mod tests {
             stream_options: None,
             temperature: None,
             max_tokens: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn completion_request(model: &str) -> CompletionRequest {
+        CompletionRequest {
+            model: model.to_string(),
+            prompt: CompletionPrompt::Text("Once upon a time".to_string()),
+            stream: false,
+            stream_options: None,
+            temperature: None,
+            max_tokens: Some(32),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn completion_response(id: &str) -> CompletionResponse {
+        CompletionResponse {
+            id: id.to_string(),
+            object: None,
+            created: None,
+            model: None,
+            choices: vec![
+                CompletionChoice {
+                    text: " continued".to_string(),
+                    index: 0,
+                    logprobs: Some(serde_json::json!({"tokens": [" continued"]})),
+                    finish_reason: Some("stop".to_string()),
+                    extra: serde_json::Map::new(),
+                },
+                CompletionChoice {
+                    text: " alternative".to_string(),
+                    index: 1,
+                    logprobs: None,
+                    finish_reason: Some("length".to_string()),
+                    extra: serde_json::Map::new(),
+                },
+            ],
+            usage: Some(CompletionUsage {
+                prompt_tokens: 2,
+                completion_tokens: 3,
+                total_tokens: 5,
+                extra: serde_json::Map::new(),
+            }),
             extra: serde_json::Map::new(),
         }
     }
@@ -1104,6 +1640,83 @@ mod tests {
             _policy: &ParameterPolicy,
         ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ChatChunk>>> {
             self.sent_models.lock().unwrap().push(req.model.clone());
+            Ok(Box::pin(futures::stream::iter(
+                self.stream_chunks.clone().into_iter().map(Ok),
+            )))
+        }
+    }
+
+    struct MockCompletionProvider {
+        id: &'static str,
+        sent_requests: Arc<Mutex<Vec<CompletionRequest>>>,
+        stream_chunks: Vec<CompletionChunk>,
+    }
+
+    impl MockCompletionProvider {
+        fn new(
+            id: &'static str,
+            sent_requests: Arc<Mutex<Vec<CompletionRequest>>>,
+            stream_chunks: Vec<CompletionChunk>,
+        ) -> Self {
+            Self {
+                id,
+                sent_requests,
+                stream_chunks,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for MockCompletionProvider {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn name(&self) -> &str {
+            self.id
+        }
+
+        fn capabilities(&self) -> &[Capability] {
+            &[Capability::Streaming]
+        }
+
+        async fn chat(
+            &self,
+            _req: &ChatRequest,
+            _api_key: &str,
+            _policy: &ParameterPolicy,
+        ) -> anyhow::Result<ChatResponse> {
+            Err(anyhow::anyhow!("chat is not supported by this fixture"))
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: &ChatRequest,
+            _api_key: &str,
+            _policy: &ParameterPolicy,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ChatChunk>>> {
+            Err(anyhow::anyhow!("chat is not supported by this fixture"))
+        }
+
+        fn supports_completions(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            req: &CompletionRequest,
+            _api_key: &str,
+        ) -> anyhow::Result<CompletionResponse> {
+            self.sent_requests.lock().unwrap().push(req.clone());
+            Ok(completion_response("cmpl-test"))
+        }
+
+        async fn complete_stream(
+            &self,
+            req: &CompletionRequest,
+            _api_key: &str,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CompletionChunk>>> {
+            self.sent_requests.lock().unwrap().push(req.clone());
             Ok(Box::pin(futures::stream::iter(
                 self.stream_chunks.clone().into_iter().map(Ok),
             )))

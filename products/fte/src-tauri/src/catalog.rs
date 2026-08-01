@@ -1,6 +1,8 @@
 use serde::Serialize;
 
-use crate::providers::{spec::ParameterPolicy, Capability};
+use crate::providers::{
+    spec::ParameterPolicy, Capability, CompletionPromptKind, CompletionRequest,
+};
 use crate::rate_limiter::QuotaWindows;
 
 #[derive(Debug, Clone, Serialize)]
@@ -30,8 +32,58 @@ pub struct ModelCatalogEntry {
     pub provider_model_id: String,
     pub display_name: String,
     pub capabilities: Vec<Capability>,
+    pub chat_completions: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_completions: Option<TextCompletionSupport>,
     pub parameter_policy: ParameterPolicy,
     pub quota: QuotaSpec,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TextCompletionSupport {
+    pub prompt_semantics: PromptSemantics,
+    pub prompt_types: Vec<CompletionPromptKind>,
+    pub supported_parameters: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSemantics {
+    DirectContinuation,
+    FillInMiddle,
+    ProviderNativeUnverified,
+    LegacyPromptProtocol,
+}
+
+impl TextCompletionSupport {
+    pub fn supports(&self, request: &CompletionRequest) -> bool {
+        self.prompt_types.contains(&request.prompt.kind())
+            && request.requested_parameters().iter().all(|parameter| {
+                self.supported_parameters
+                    .iter()
+                    .any(|item| item == parameter)
+            })
+    }
+
+    pub fn incompatibilities(&self, request: &CompletionRequest) -> Vec<String> {
+        let mut incompatible = Vec::new();
+        if !self.prompt_types.contains(&request.prompt.kind()) {
+            incompatible.push(format!("prompt type {:?}", request.prompt.kind()));
+        }
+        incompatible.extend(
+            request
+                .requested_parameters()
+                .into_iter()
+                .filter(|parameter| {
+                    !self
+                        .supported_parameters
+                        .iter()
+                        .any(|supported| supported == parameter)
+                })
+                .map(ToString::to_string),
+        );
+        incompatible
+    }
 }
 
 impl ModelCatalogEntry {
@@ -139,6 +191,18 @@ pub fn default_model_catalog() -> Vec<ModelCatalogEntry> {
             vec![Capability::Streaming, Capability::Tools],
             unknown_quota(),
         ),
+        completion_only_model(
+            model(
+                "mistral",
+                "Mistral AI",
+                "codestral-latest",
+                "codestral-latest",
+                "Codestral",
+                vec![Capability::Streaming],
+                unknown_quota(),
+            ),
+            TextCompletionSupport::mistral_fim(),
+        ),
         model(
             "nvidia",
             "NVIDIA NIM",
@@ -206,8 +270,85 @@ fn model(
         display_name: display_name.to_string(),
         capabilities,
         parameter_policy: parameter_policy_for_provider(provider_id),
+        chat_completions: true,
+        text_completions: text_completion_support(provider_id, provider_model_id),
         quota,
     }
+}
+
+fn completion_only_model(
+    mut entry: ModelCatalogEntry,
+    text_completions: TextCompletionSupport,
+) -> ModelCatalogEntry {
+    entry.chat_completions = false;
+    entry.text_completions = Some(text_completions);
+    entry
+}
+
+fn text_completion_support(
+    provider_id: &str,
+    _provider_model_id: &str,
+) -> Option<TextCompletionSupport> {
+    match provider_id {
+        "cerebras" => Some(TextCompletionSupport::cerebras()),
+        _ => None,
+    }
+}
+
+impl TextCompletionSupport {
+    fn mistral_fim() -> Self {
+        Self {
+            prompt_semantics: PromptSemantics::FillInMiddle,
+            prompt_types: vec![CompletionPromptKind::Text],
+            supported_parameters: parameters(&[
+                "stream",
+                "temperature",
+                "max_tokens",
+                "metadata",
+                "min_tokens",
+                "prompt_cache_key",
+                "seed",
+                "stop",
+                "suffix",
+                "top_p",
+            ]),
+        }
+    }
+
+    fn cerebras() -> Self {
+        Self {
+            prompt_semantics: PromptSemantics::DirectContinuation,
+            prompt_types: all_prompt_types(),
+            supported_parameters: parameters(&[
+                "stream",
+                "temperature",
+                "max_tokens",
+                "echo",
+                "grammar_root",
+                "logprobs",
+                "min_tokens",
+                "prompt_cache_key",
+                "return_raw_tokens",
+                "seed",
+                "stop",
+                "top_p",
+                "user",
+            ]),
+        }
+    }
+}
+
+fn all_prompt_types() -> Vec<CompletionPromptKind> {
+    vec![
+        CompletionPromptKind::Text,
+        CompletionPromptKind::Texts,
+        CompletionPromptKind::Tokens,
+        CompletionPromptKind::TokenBatches,
+    ]
+}
+
+fn parameters(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| value.to_string()).collect()
 }
 
 fn parameter_policy_for_provider(provider_id: &str) -> ParameterPolicy {
@@ -217,5 +358,58 @@ fn parameter_policy_for_provider(provider_id: &str) -> ParameterPolicy {
         "mistral" => ParameterPolicy::mistral(),
         "nvidia" | "cerebras" => ParameterPolicy::max_completion_tokens_to_max_tokens(),
         _ => ParameterPolicy::openai_compatible(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_completion_matrix_is_explicit_in_the_catalog() {
+        let catalog = default_model_catalog();
+        let find = |provider: &str, model: &str| {
+            catalog
+                .iter()
+                .find(|entry| entry.provider_id == provider && entry.provider_model_id == model)
+                .unwrap()
+        };
+
+        assert!(find("openrouter", "openrouter/free")
+            .text_completions
+            .is_none());
+        assert!(find("groq", "llama-3.3-70b-versatile")
+            .text_completions
+            .is_none());
+        assert!(find("gemini", "gemini-2.5-flash")
+            .text_completions
+            .is_none());
+        assert!(find("mistral", "mistral-small-latest")
+            .text_completions
+            .is_none());
+        assert!(find("nvidia", "meta/llama-3.1-70b-instruct")
+            .text_completions
+            .is_none());
+
+        assert!(find("anthropic", "claude-sonnet-5")
+            .text_completions
+            .is_none());
+        assert_eq!(
+            find("mistral", "codestral-latest")
+                .text_completions
+                .as_ref()
+                .unwrap()
+                .prompt_semantics,
+            PromptSemantics::FillInMiddle
+        );
+        assert!(!find("mistral", "codestral-latest").chat_completions);
+        assert_eq!(
+            find("cerebras", "gpt-oss-120b")
+                .text_completions
+                .as_ref()
+                .unwrap()
+                .prompt_semantics,
+            PromptSemantics::DirectContinuation
+        );
     }
 }

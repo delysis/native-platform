@@ -325,7 +325,7 @@ impl ProviderSpec {
         self.response_transform.transform_chat_response(body)
     }
 
-    fn headers(&self, api_key: &str) -> anyhow::Result<HeaderMap> {
+    pub(crate) fn headers(&self, api_key: &str) -> anyhow::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         self.auth.apply(&mut headers, api_key)?;
 
