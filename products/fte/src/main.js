@@ -1,6 +1,12 @@
 const tauri = window.__TAURI__;
-const { invoke } = tauri.core;
-const openUrl = tauri.opener?.openUrl;
+const isDesktopRuntime = typeof tauri?.core?.invoke === 'function';
+const RUNTIME_UNAVAILABLE_MESSAGE = 'Open this interface from the Free Token Energy desktop application.';
+const invoke = isDesktopRuntime
+  ? (...args) => tauri.core.invoke(...args)
+  : async () => {
+    throw new Error(RUNTIME_UNAVAILABLE_MESSAGE);
+  };
+const openUrl = tauri?.opener?.openUrl;
 
 const PROVIDER_DETAILS = {
   openrouter: {
@@ -75,6 +81,70 @@ function setText(id, value) {
   document.getElementById(id).textContent = value;
 }
 
+function makeEmptyState(title, detail, className = '') {
+  const state = document.createElement('div');
+  state.className = `empty-state ${className}`.trim();
+  const heading = document.createElement('strong');
+  heading.textContent = title;
+  const copy = document.createElement('span');
+  copy.textContent = detail;
+  state.append(heading, copy);
+  return state;
+}
+
+function setButtonPending(button, pending, pendingLabel, defaultLabel) {
+  if (!button) return;
+  button.disabled = pending;
+  button.setAttribute('aria-busy', String(pending));
+  button.textContent = pending ? pendingLabel : defaultLabel;
+}
+
+function renderRuntimeState() {
+  const banner = document.getElementById('runtime-banner');
+  const status = document.getElementById('runtime-shell-status');
+  banner.hidden = isDesktopRuntime;
+  status.className = `runtime-status status-pill ${isDesktopRuntime ? 'status-ready' : 'status-warn'}`;
+  status.textContent = isDesktopRuntime ? 'Desktop connected' : 'Preview only';
+}
+
+function renderPreviewState() {
+  document.body.classList.add('preview-mode');
+  setText('stat-headroom', '—');
+  setText('stat-latency', '—');
+  setText('stat-tokens', '—');
+  setText('stat-requests', '—');
+
+  document.getElementById('live-health-list').replaceChildren(
+    makeEmptyState('Desktop connection required', 'Provider health is available when the desktop application is running.'),
+  );
+  document.getElementById('onboarding-grid').replaceChildren(
+    makeEmptyState('Desktop connection required', 'Launch the application to add provider credentials and inspect available routes.'),
+  );
+
+  const modelSelect = document.getElementById('chat-model');
+  modelSelect.replaceChildren();
+  const option = document.createElement('option');
+  option.textContent = 'Desktop application required';
+  option.disabled = true;
+  option.selected = true;
+  modelSelect.append(option);
+  setText('playground-model-note', 'Model routes are loaded from the local gateway catalog.');
+
+  setText('proxy-status', 'Unavailable in interface preview.');
+  setText('proxy-binding', '127.0.0.1:—');
+  const proxyPill = document.getElementById('proxy-status-pill');
+  proxyPill.className = 'status-pill status-muted';
+  proxyPill.textContent = 'Offline';
+
+  const logsEmpty = document.getElementById('logs-empty');
+  logsEmpty.textContent = 'Activity is available when the desktop application is running.';
+  logsEmpty.hidden = false;
+
+  for (const control of document.querySelectorAll('main button, main input, main select, main textarea')) {
+    control.disabled = true;
+  }
+}
+
 function formatNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number.toLocaleString() : '0';
@@ -109,6 +179,8 @@ function makeStatusPill(status) {
 
 async function refreshDashboard() {
   const healthList = document.getElementById('live-health-list');
+  const refreshButton = document.getElementById('refresh-dashboard');
+  setButtonPending(refreshButton, true, 'Refreshing…', 'Refresh');
   try {
     const [stats, providers] = await Promise.all([
       invoke('get_dashboard_stats'),
@@ -125,10 +197,9 @@ async function refreshDashboard() {
 
     healthList.replaceChildren();
     if (providers.length === 0) {
-      const empty = document.createElement('p');
-      empty.className = 'empty-state';
-      empty.textContent = 'No provider adapters are registered.';
-      healthList.append(empty);
+      healthList.append(
+        makeEmptyState('No providers registered', 'The local gateway did not report any provider adapters.'),
+      );
       return;
     }
 
@@ -146,20 +217,25 @@ async function refreshDashboard() {
           ? 'quota varies by account'
           : `${Math.max(0, Math.min(100, Number(provider.headroom) * 100)).toFixed(0)}% local headroom`;
       const autocomplete = provider.text_completion_model_count
-        ? ` · ${provider.text_completion_model_count} autocomplete`
+        ? ` · ${provider.text_completion_model_count} raw completion${provider.text_completion_model_count === 1 ? '' : 's'}`
         : '';
-      detail.textContent = `${provider.model_count} models${autocomplete} · ${headroom} · ${formatNumber(provider.request_count)} requests`;
+      detail.textContent = `${provider.model_count} model${provider.model_count === 1 ? '' : 's'}${autocomplete} · ${headroom} · ${formatNumber(provider.request_count)} requests`;
       summary.append(name, detail);
 
       row.append(summary, makeStatusPill(provider.status));
       healthList.append(row);
     }
   } catch (error) {
+    setText('stat-headroom', '—');
+    setText('stat-latency', '—');
+    setText('stat-tokens', '—');
+    setText('stat-requests', '—');
     healthList.replaceChildren();
-    const message = document.createElement('p');
-    message.className = 'empty-state error-copy';
-    message.textContent = `Could not load gateway health: ${errorMessage(error)}`;
-    healthList.append(message);
+    healthList.append(
+      makeEmptyState('Could not load provider status', errorMessage(error), 'error-copy'),
+    );
+  } finally {
+    setButtonPending(refreshButton, false, 'Refreshing…', 'Refresh');
   }
 }
 
@@ -173,7 +249,11 @@ function parseSqliteTimestamp(value) {
 async function refreshLogs() {
   const body = document.getElementById('logs-body');
   const empty = document.getElementById('logs-empty');
+  const refreshButton = document.getElementById('refresh-logs');
+  setButtonPending(refreshButton, true, 'Refreshing…', 'Refresh');
   body.replaceChildren();
+  empty.classList.remove('error-copy');
+  empty.textContent = 'No requests recorded yet.';
   empty.hidden = true;
 
   try {
@@ -211,6 +291,8 @@ async function refreshLogs() {
     empty.textContent = `Could not load activity: ${errorMessage(error)}`;
     empty.classList.add('error-copy');
     empty.hidden = false;
+  } finally {
+    setButtonPending(refreshButton, false, 'Refreshing…', 'Refresh');
   }
 }
 
@@ -277,16 +359,30 @@ function providerCard(provider, profile) {
   name.textContent = provider.name;
   const badge = document.createElement('span');
   badge.className = `badge ${provider.configured ? 'badge-free' : 'badge-muted'}`;
-  badge.textContent = provider.configured ? 'Connected' : 'Supported';
+  badge.textContent = provider.configured ? 'Connected' : 'Not configured';
   heading.append(name, badge);
 
   const description = document.createElement('p');
   description.className = 'description';
   description.textContent = details.description;
 
+  const providerMeta = document.createElement('div');
+  providerMeta.className = 'provider-meta';
+  const modelCount = document.createElement('span');
+  modelCount.className = 'provider-meta-item';
+  modelCount.textContent = `${formatNumber(provider.model_count)} model${provider.model_count === 1 ? '' : 's'}`;
+  providerMeta.append(modelCount);
+  if (provider.text_completion_model_count) {
+    const completionCount = document.createElement('span');
+    completionCount.className = 'provider-meta-item';
+    completionCount.textContent = `${formatNumber(provider.text_completion_model_count)} raw completion${provider.text_completion_model_count === 1 ? '' : 's'}`;
+    providerMeta.append(completionCount);
+  }
+
   const helperRow = document.createElement('div');
   helperRow.className = 'helper-row';
   for (const [label, value] of [['Email', profile.email], ['Name', profile.name]]) {
+    if (!value) continue;
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'btn-helper';
@@ -298,7 +394,7 @@ function providerCard(provider, profile) {
   const consoleButton = document.createElement('button');
   consoleButton.type = 'button';
   consoleButton.className = 'provider-link';
-  consoleButton.textContent = 'Open provider console ↗';
+  consoleButton.textContent = 'Open provider console';
   consoleButton.addEventListener('click', () => openProviderConsole(provider.id));
 
   const keyLabel = document.createElement('label');
@@ -363,26 +459,34 @@ function providerCard(provider, profile) {
     actionRow.append(removeButton);
   }
 
-  card.append(heading, description, helperRow, consoleButton, keyLabel, actionRow);
+  card.append(heading, description, providerMeta);
+  if (helperRow.childElementCount > 0) card.append(helperRow);
+  card.append(consoleButton, keyLabel, actionRow);
   return card;
 }
 
 async function renderProviderGrid() {
   const grid = document.getElementById('onboarding-grid');
-  grid.replaceChildren();
+  grid.replaceChildren(
+    makeEmptyState('Loading providers', 'Reading the local model catalog and saved configuration.'),
+  );
   try {
     const [profile, providers] = await Promise.all([
       loadProfile(),
       invoke('get_providers'),
     ]);
+    grid.replaceChildren();
+    if (providers.length === 0) {
+      grid.append(makeEmptyState('No providers registered', 'The local gateway did not report any provider adapters.'));
+      return;
+    }
     for (const provider of providers) {
       grid.append(providerCard(provider, profile));
     }
   } catch (error) {
-    const message = document.createElement('p');
-    message.className = 'empty-state error-copy';
-    message.textContent = `Could not load setup: ${errorMessage(error)}`;
-    grid.append(message);
+    grid.replaceChildren(
+      makeEmptyState('Could not load providers', errorMessage(error), 'error-copy'),
+    );
   }
 }
 
@@ -463,7 +567,7 @@ async function sendMessage() {
   } finally {
     input.disabled = false;
     sendButton.disabled = false;
-    sendButton.textContent = 'Send';
+    sendButton.textContent = 'Send request';
     input.focus();
   }
 }
@@ -473,6 +577,8 @@ async function loadModels() {
     availableModels = await invoke('get_models');
     renderPlaygroundModels();
   } catch (error) {
+    availableModels = [];
+    renderPlaygroundModels();
     showToast(`Could not load models: ${errorMessage(error)}`, 'error');
   }
 }
@@ -485,11 +591,21 @@ function renderPlaygroundModels() {
     mode === 'completion' ? model.supports_text_completions : model.supports_chat_completions
   ));
   select.replaceChildren();
+  select.disabled = models.length === 0;
+  if (models.length === 0) {
+    const option = document.createElement('option');
+    option.textContent = 'No compatible model routes';
+    option.disabled = true;
+    option.selected = true;
+    select.append(option);
+    updatePlaygroundModelNote();
+    return;
+  }
   for (const model of models) {
     const option = document.createElement('option');
     option.value = model.id;
     const semantics = mode === 'completion'
-      ? model.prompt_semantics.map((item) => PROMPT_SEMANTICS[item] || item).join(', ')
+      ? (model.prompt_semantics || []).map((item) => PROMPT_SEMANTICS[item] || item).join(', ')
       : '';
     option.textContent = semantics ? `${model.display_name} — ${semantics}` : model.display_name;
     select.append(option);
@@ -497,27 +613,52 @@ function renderPlaygroundModels() {
   if ([...select.options].some((option) => option.value === previous)) {
     select.value = previous;
   }
+  updatePlaygroundModelNote();
+}
+
+function updatePlaygroundModelNote() {
+  const mode = document.getElementById('playground-mode').value;
+  const selectedId = document.getElementById('chat-model').value;
+  const model = availableModels.find((item) => item.id === selectedId);
+  if (!model) {
+    setText('playground-model-note', 'No compatible model route is available for this request type.');
+    return;
+  }
+
+  const providerCount = Array.isArray(model.providers) ? model.providers.length : 0;
+  const providerSummary = providerCount === 0
+    ? 'Provider availability is unknown'
+    : `${providerCount} provider route${providerCount === 1 ? '' : 's'}`;
+  if (mode === 'completion') {
+    const semantics = (model.prompt_semantics || [])
+      .map((item) => PROMPT_SEMANTICS[item] || item)
+      .join(', ');
+    setText('playground-model-note', `${providerSummary} · ${semantics || 'native prompt semantics'}`);
+  } else {
+    setText('playground-model-note', `${providerSummary} · OpenAI-compatible chat request`);
+  }
 }
 
 function resetPlaygroundForMode() {
   const mode = document.getElementById('playground-mode').value;
   chatMessages.length = 0;
   const history = document.getElementById('chat-history');
-  history.replaceChildren();
-  const placeholder = document.createElement('p');
-  placeholder.className = 'empty-state';
+  const placeholder = makeEmptyState(
+    'No requests yet',
+    mode === 'completion'
+      ? 'The exact prompt and native continuation will appear here.'
+      : 'Responses from the selected route will appear here.',
+    'chat-empty',
+  );
   placeholder.id = 'chat-placeholder';
-  placeholder.textContent = mode === 'completion'
-    ? 'The exact prompt and its continuation will appear here.'
-    : 'Your conversation will appear here.';
-  history.append(placeholder);
+  history.replaceChildren(placeholder);
   const input = document.getElementById('chat-input');
   input.placeholder = mode === 'completion'
-    ? 'Paste the exact text to continue. Whitespace is preserved…'
-    : 'Ask anything…';
+    ? 'Enter the exact text to continue. Whitespace is preserved…'
+    : 'Enter a message…';
   document.getElementById('playground-subtitle').textContent = mode === 'completion'
-    ? 'Sends prompt, never messages. Provider semantics are shown beside each model.'
-    : 'Try automatic chat routing or pin a public model alias.';
+    ? 'Send an unwrapped prompt to a native text-completion route.'
+    : 'Test automatic chat routing or pin a public model.';
   renderPlaygroundModels();
 }
 
@@ -529,8 +670,10 @@ function renderProxyStatus(status) {
   if (status.port) {
     portInput.value = status.port;
     setText('proxy-status', `Listening on http://127.0.0.1:${status.port}`);
+    setText('proxy-binding', `127.0.0.1:${status.port}`);
   } else {
     setText('proxy-status', 'The local API proxy is not running.');
+    setText('proxy-binding', '127.0.0.1:—');
   }
 }
 
@@ -538,6 +681,11 @@ async function refreshProxyStatus() {
   try {
     renderProxyStatus(await invoke('get_proxy_status'));
   } catch (error) {
+    const pill = document.getElementById('proxy-status-pill');
+    pill.className = 'status-pill status-error';
+    pill.textContent = 'Unavailable';
+    setText('proxy-status', errorMessage(error));
+    setText('proxy-binding', '127.0.0.1:—');
     showToast(`Could not read proxy status: ${errorMessage(error)}`, 'error');
   }
 }
@@ -562,7 +710,7 @@ async function restartProxy() {
     await refreshProxyStatus();
   } finally {
     button.disabled = false;
-    button.textContent = 'Apply and restart';
+    button.textContent = 'Apply changes';
   }
 }
 
@@ -573,6 +721,9 @@ function showView(viewName) {
   for (const item of document.querySelectorAll('.nav-item')) {
     item.classList.toggle('active', item.dataset.view === viewName);
   }
+  const activeItem = document.querySelector(`.nav-item[data-view="${viewName}"]`);
+  setText('workspace-context', activeItem?.dataset.label || 'Workspace');
+  if (!isDesktopRuntime) return;
   if (viewName === 'dashboard') refreshDashboard();
   if (viewName === 'setup') renderProviderGrid();
   if (viewName === 'logs') refreshLogs();
@@ -594,6 +745,7 @@ function bindEvents() {
     sendMessage();
   });
   document.getElementById('playground-mode').addEventListener('change', resetPlaygroundForMode);
+  document.getElementById('chat-model').addEventListener('change', updatePlaygroundModelNote);
   document.getElementById('chat-input').addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
@@ -608,6 +760,11 @@ function bindEvents() {
 
 async function bootstrap() {
   bindEvents();
+  renderRuntimeState();
+  if (!isDesktopRuntime) {
+    renderPreviewState();
+    return;
+  }
   await Promise.all([refreshDashboard(), loadModels(), refreshProxyStatus()]);
 }
 

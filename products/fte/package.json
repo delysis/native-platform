@@ -10,9 +10,10 @@
     "check:rust": "cargo check --all-features --manifest-path src-tauri/Cargo.toml",
     "format:check": "cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check",
     "lint:rust": "cargo clippy --all-targets --all-features --manifest-path src-tauri/Cargo.toml -- -D warnings",
+    "test:frontend": "node --test tests/frontend-preview.test.mjs",
     "test:rust": "cargo test --all-features --manifest-path src-tauri/Cargo.toml",
     "check": "npm run check:frontend && npm run format:check && npm run lint:rust",
-    "test": "npm run check && npm run test:rust",
+    "test": "npm run check && npm run test:frontend && npm run test:rust",
     "audit:dependencies": "npm audit --audit-level=moderate",
     "tauri": "tauri"
   },
