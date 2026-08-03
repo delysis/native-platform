@@ -22,6 +22,16 @@ impl QuotaSpec {
     pub fn has_documented_limit(&self) -> bool {
         self.documented
     }
+
+    /// Whether dispatch must reserve a finite local quota window.
+    /// Unknown and inherently unmetered backends use neutral routing headroom without invented
+    /// limits, while request activity remains available through the ordinary request log.
+    pub fn has_enforced_limit(&self) -> bool {
+        self.documented
+            && [self.rpm, self.rpd, self.tpm, self.tpd]
+                .into_iter()
+                .any(|limit| limit < u32::MAX)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -364,6 +374,20 @@ fn parameter_policy_for_provider(provider_id: &str) -> ParameterPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_enforcement_requires_a_documented_finite_limit() {
+        assert!(!unknown_quota().has_enforced_limit());
+        assert!(documented_quota(10, u32::MAX, u32::MAX, u32::MAX).has_enforced_limit());
+        assert!(!QuotaSpec {
+            rpm: 10,
+            rpd: u32::MAX,
+            tpm: u32::MAX,
+            tpd: u32::MAX,
+            documented: false,
+        }
+        .has_enforced_limit());
+    }
 
     #[test]
     fn provider_completion_matrix_is_explicit_in_the_catalog() {

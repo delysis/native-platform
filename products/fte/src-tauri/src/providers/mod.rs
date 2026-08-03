@@ -1,5 +1,3 @@
-use async_trait::async_trait;
-use futures::stream::BoxStream;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
@@ -366,49 +364,4 @@ impl Capability {
         Self::LongContext,
         Self::Streaming,
     ];
-}
-
-#[async_trait]
-pub trait Provider: Send + Sync {
-    fn id(&self) -> &str;
-    fn name(&self) -> &str;
-    fn capabilities(&self) -> &[Capability];
-    async fn chat(
-        &self,
-        req: &ChatRequest,
-        api_key: &str,
-        policy: &spec::ParameterPolicy,
-    ) -> anyhow::Result<ChatResponse>;
-    async fn chat_stream(
-        &self,
-        req: &ChatRequest,
-        api_key: &str,
-        policy: &spec::ParameterPolicy,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ChatChunk>>>;
-
-    fn supports_completions(&self) -> bool {
-        false
-    }
-
-    async fn complete(
-        &self,
-        _req: &CompletionRequest,
-        _api_key: &str,
-    ) -> anyhow::Result<CompletionResponse> {
-        Err(anyhow::anyhow!(
-            "{} does not support native text completions",
-            self.name()
-        ))
-    }
-
-    async fn complete_stream(
-        &self,
-        _req: &CompletionRequest,
-        _api_key: &str,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CompletionChunk>>> {
-        Err(anyhow::anyhow!(
-            "{} does not support native text completion streaming",
-            self.name()
-        ))
-    }
 }

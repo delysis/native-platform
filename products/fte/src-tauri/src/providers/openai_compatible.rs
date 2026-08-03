@@ -5,6 +5,7 @@ use std::fmt;
 use std::time::Duration;
 use tracing::warn;
 
+use crate::backend::{BackendCredentials, InferenceBackend};
 use crate::providers::{
     completions::{completion_chunks_from_response, CompletionEndpoint, CompletionProtocol},
     spec::{ParameterPolicy, ProviderSpec, RequestMode},
@@ -12,7 +13,7 @@ use crate::providers::{
 };
 use crate::providers::{
     Capability, ChatChunk, ChatRequest, ChatResponse, CompletionChunk, CompletionRequest,
-    CompletionResponse, Provider,
+    CompletionResponse,
 };
 
 pub struct OpenAiCompatibleProvider {
@@ -90,7 +91,7 @@ impl OpenAiCompatibleProvider {
 }
 
 #[async_trait]
-impl Provider for OpenAiCompatibleProvider {
+impl InferenceBackend for OpenAiCompatibleProvider {
     fn id(&self) -> &str {
         self.spec.id()
     }
@@ -106,9 +107,10 @@ impl Provider for OpenAiCompatibleProvider {
     async fn chat(
         &self,
         req: &ChatRequest,
-        api_key: &str,
+        credentials: BackendCredentials<'_>,
         policy: &ParameterPolicy,
     ) -> anyhow::Result<ChatResponse> {
+        let api_key = credentials.require_api_key(self.name())?;
         let prepared = self
             .spec
             .prepare_chat(req, RequestMode::NonStreaming, policy, api_key)?;
@@ -131,9 +133,10 @@ impl Provider for OpenAiCompatibleProvider {
     async fn chat_stream(
         &self,
         req: &ChatRequest,
-        api_key: &str,
+        credentials: BackendCredentials<'_>,
         policy: &ParameterPolicy,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ChatChunk>>> {
+        let api_key = credentials.require_api_key(self.name())?;
         let prepared = self
             .spec
             .prepare_chat(req, RequestMode::Streaming, policy, api_key)?;
@@ -162,8 +165,9 @@ impl Provider for OpenAiCompatibleProvider {
     async fn complete(
         &self,
         req: &CompletionRequest,
-        api_key: &str,
+        credentials: BackendCredentials<'_>,
     ) -> anyhow::Result<CompletionResponse> {
+        let api_key = credentials.require_api_key(self.name())?;
         let endpoint = self.completion_endpoint.ok_or_else(|| {
             anyhow::anyhow!("{} does not support native text completions", self.name())
         })?;
@@ -186,8 +190,9 @@ impl Provider for OpenAiCompatibleProvider {
     async fn complete_stream(
         &self,
         req: &CompletionRequest,
-        api_key: &str,
+        credentials: BackendCredentials<'_>,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CompletionChunk>>> {
+        let api_key = credentials.require_api_key(self.name())?;
         let endpoint = self.completion_endpoint.ok_or_else(|| {
             anyhow::anyhow!(
                 "{} does not support native text completion streaming",

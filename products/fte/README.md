@@ -16,6 +16,8 @@ for each request.
 - Measured local request totals, token usage, latency, and provider outcomes
 - A desktop dashboard, provider setup, chat playground, activity log, and
   persistent proxy-port settings
+- A transport-neutral backend boundary that distinguishes authenticated remote
+  APIs from credentialless embedded or companion-process inference runtimes
 
 The model catalog uses current provider model IDs. Published free-tier limits
 are tracked locally where a provider documents them; account-specific or
@@ -91,6 +93,20 @@ capabilities, and have local quota remaining. They are ranked with:
 Unknown quota, evaluation, and latency inputs are neutral rather than
 fabricated. Request counts are reserved atomically before dispatch; token usage
 is recorded when it becomes available.
+
+Only finite documented quota windows are reserved and persisted. Local or
+otherwise unmetered backends still contribute measured request, token, and
+latency observations without being assigned invented quota limits.
+
+## Native llama.cpp integration
+
+The gateway is prepared to accept a credentialless local backend and
+runtime-discovered model routes without treating the runtime as a fake cloud
+provider. The native adapter itself remains pending the corresponding raw
+completion and reusable-host boundary in `llama-native-kit`.
+
+See [the llama-native-kit maintainer handoff](docs/LLAMA_NATIVE_KIT_HANDOFF.md)
+for the exact cross-repository contract and acceptance tests.
 
 ## Privacy and security
 

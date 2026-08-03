@@ -1,15 +1,19 @@
 use chrono::{TimeZone, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::backend::{
+    BackendCredentials, BackendKind, BackendReadiness, BackendRegistry, CredentialRequirement,
+    InferenceBackend,
+};
 use crate::catalog::{default_model_catalog, ModelCatalogEntry, PromptSemantics};
 use crate::db::{Database, ProviderLogSummary};
 use crate::eval_store::EvalStore;
 use crate::providers::{
     spec::ParameterPolicy, Capability, ChatChunk, ChatRequest, ChatResponse, CompletionChunk,
-    CompletionRequest, CompletionResponse, Provider,
+    CompletionRequest, CompletionResponse,
 };
 use crate::rate_limiter::QuotaTracker;
 use async_stream::try_stream;
@@ -17,7 +21,7 @@ use futures::{stream::BoxStream, StreamExt};
 use tracing::{info, warn};
 
 pub struct Router {
-    providers: HashMap<String, Box<dyn Provider>>,
+    backends: BackendRegistry,
     quota_tracker: Arc<QuotaTracker>,
     eval_store: Arc<EvalStore>,
     db: Arc<Database>,
@@ -30,6 +34,7 @@ pub struct RouteResult {
     pub public_model_id: String,
     pub provider_model_id: String,
     pub parameter_policy: ParameterPolicy,
+    pub quota_tracked: bool,
     pub score: f64,
 }
 
@@ -67,6 +72,8 @@ pub struct ProviderModelStatus {
 pub struct ProviderStatus {
     pub id: String,
     pub name: String,
+    pub backend_kind: BackendKind,
+    pub credential_required: bool,
     pub configured: bool,
     pub status: String,
     pub model_count: usize,
@@ -104,7 +111,7 @@ impl Router {
         }
 
         let router = Self {
-            providers: HashMap::new(),
+            backends: BackendRegistry::default(),
             quota_tracker,
             eval_store,
             db,
@@ -136,16 +143,80 @@ impl Router {
         }
     }
 
-    pub fn add_provider(&mut self, provider: Box<dyn Provider>) {
-        self.providers.insert(provider.id().to_string(), provider);
+    pub fn add_backend(&mut self, backend: Box<dyn InferenceBackend>) -> anyhow::Result<()> {
+        for entry in self
+            .model_catalog
+            .iter()
+            .filter(|entry| entry.provider_id == backend.id())
+        {
+            validate_model_route(backend.as_ref(), entry)?;
+        }
+        self.backends.register(backend)
+    }
+
+    /// Adds runtime-discovered model routes for an already registered backend.
+    ///
+    /// This is primarily intended for explicitly selected local GGUF models. It remains a
+    /// startup-time operation so route selection can use an immutable catalog snapshot.
+    pub fn add_model_routes(
+        &mut self,
+        backend_id: &str,
+        entries: Vec<ModelCatalogEntry>,
+    ) -> anyhow::Result<()> {
+        let backend = self.backends.get(backend_id).ok_or_else(|| {
+            anyhow::anyhow!("Cannot add model routes for unregistered backend '{backend_id}'.")
+        })?;
+
+        let mut route_keys = self
+            .model_catalog
+            .iter()
+            .map(|entry| {
+                (
+                    entry.provider_id.clone(),
+                    entry.public_model_id.clone(),
+                    entry.provider_model_id.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        for entry in &entries {
+            validate_model_route(backend, entry)?;
+            let key = (
+                entry.provider_id.clone(),
+                entry.public_model_id.clone(),
+                entry.provider_model_id.clone(),
+            );
+            if !route_keys.insert(key) {
+                return Err(anyhow::anyhow!(
+                    "Model route '{}/{}' is already registered.",
+                    entry.provider_id,
+                    entry.provider_model_id
+                ));
+            }
+        }
+
+        for entry in &entries {
+            self.quota_tracker.register_model(
+                entry.provider_id.clone(),
+                entry.provider_model_id.clone(),
+                entry.quota.windows(),
+            );
+        }
+        self.model_catalog.extend(entries);
+        Ok(())
     }
 
     pub fn supports_provider(&self, provider_id: &str) -> bool {
-        self.providers.contains_key(provider_id)
+        self.backends.contains(provider_id)
             && self
                 .model_catalog
                 .iter()
                 .any(|entry| entry.provider_id == provider_id)
+    }
+
+    pub fn credential_requirement(&self, backend_id: &str) -> Option<CredentialRequirement> {
+        self.backends
+            .get(backend_id)
+            .map(InferenceBackend::credential_requirement)
     }
 
     pub fn public_models(&self) -> Vec<PublicModel> {
@@ -231,7 +302,9 @@ impl Router {
 
         let mut statuses = Vec::new();
         for (provider_id, (provider_name, entries)) in by_provider {
-            let configured = self.db.has_api_key(&provider_id)?;
+            let backend = self.backends.get(&provider_id);
+            let readiness = self.backend_readiness(backend)?;
+            let configured = backend.is_some() && readiness.configuration_satisfied();
             let summary = summaries.get(&provider_id).cloned().unwrap_or_default();
 
             let models: Vec<ProviderModelStatus> = entries
@@ -257,11 +330,15 @@ impl Router {
                 .iter()
                 .filter_map(|model| model.headroom)
                 .reduce(f64::max);
-            let status = provider_status(configured, headroom, &summary);
+            let status = provider_status(readiness, headroom, &summary);
 
             statuses.push(ProviderStatus {
                 id: provider_id,
                 name: provider_name,
+                backend_kind: backend.map_or(BackendKind::Unknown, InferenceBackend::kind),
+                credential_required: backend.is_some_and(|backend| {
+                    backend.credential_requirement() == CredentialRequirement::ApiKey
+                }),
                 configured,
                 status,
                 model_count: models.len(),
@@ -286,8 +363,9 @@ impl Router {
         let mut headrooms = Vec::new();
 
         for entry in &self.model_catalog {
-            if self.providers.contains_key(&entry.provider_id)
-                && self.db.has_api_key(&entry.provider_id)?
+            if self
+                .backend_readiness(self.backends.get(&entry.provider_id))?
+                .is_ready()
                 && entry.quota.has_documented_limit()
             {
                 headrooms.push(
@@ -312,7 +390,9 @@ impl Router {
         let mut max_score = -1.0;
         let mut saw_model_candidate = false;
         let mut saw_chat_candidate = false;
-        let mut saw_configured_candidate = false;
+        let mut saw_missing_credential = false;
+        let mut saw_unready_candidate = false;
+        let mut saw_ready_candidate = false;
         let mut saw_capable_candidate = false;
         let required_capabilities = required_capabilities(req);
         let provider_summaries = self.db.get_provider_log_summaries()?;
@@ -328,22 +408,32 @@ impl Router {
             }
             saw_chat_candidate = true;
 
-            let Some(provider) = self.providers.get(&entry.provider_id) else {
+            let Some(backend) = self.backends.get(&entry.provider_id) else {
+                saw_unready_candidate = true;
                 continue;
             };
 
             if required_capabilities.iter().any(|capability| {
-                !provider.capabilities().contains(capability)
+                !backend.capabilities().contains(capability)
                     || !entry.capabilities.contains(capability)
             }) {
                 continue;
             }
             saw_capable_candidate = true;
 
-            if !self.db.has_api_key(&entry.provider_id)? {
-                continue;
+            match self.backend_readiness(Some(backend))? {
+                BackendReadiness::Ready => saw_ready_candidate = true,
+                BackendReadiness::MissingCredential => {
+                    saw_missing_credential = true;
+                    continue;
+                }
+                BackendReadiness::NotConfigured
+                | BackendReadiness::Loading
+                | BackendReadiness::Unavailable => {
+                    saw_unready_candidate = true;
+                    continue;
+                }
             }
-            saw_configured_candidate = true;
 
             let headroom = self
                 .quota_tracker
@@ -352,25 +442,12 @@ impl Router {
                 continue;
             }
 
-            let eval_scores = self.eval_store.get_score(&entry.public_model_id);
-            let quality_score = match task_hint {
-                "coding" => eval_scores.coding,
-                "reasoning" => eval_scores.reasoning,
-                "creative" => eval_scores.creative,
-                _ => eval_scores.general,
-            };
-            let capability_score = entry.capabilities.len() as f64 / Capability::ALL.len() as f64;
-            let latency_score = observed_latency_score(provider_summaries.get(&entry.provider_id));
-
-            let headroom_score = if entry.quota.has_documented_limit() {
-                headroom
-            } else {
-                0.5
-            };
-            let score = (0.35 * headroom_score)
-                + (0.30 * quality_score)
-                + (0.20 * capability_score)
-                + (0.15 * latency_score);
+            let score = self.route_score(
+                entry,
+                task_hint,
+                headroom,
+                provider_summaries.get(&entry.provider_id),
+            );
 
             info!(
                 "Scored {}/{} as {}: {}",
@@ -384,6 +461,7 @@ impl Router {
                     public_model_id: entry.public_model_id.clone(),
                     provider_model_id: entry.provider_model_id.clone(),
                     parameter_policy: entry.parameter_policy.clone(),
+                    quota_tracked: entry.quota.has_enforced_limit(),
                     score,
                 });
             }
@@ -402,9 +480,14 @@ impl Router {
                     "No provider for '{}' supports every requested capability.",
                     req.model
                 )
-            } else if !saw_configured_candidate {
+            } else if saw_missing_credential && !saw_ready_candidate && !saw_unready_candidate {
                 anyhow::anyhow!(
                     "No API key is saved for a provider that can serve '{}'.",
+                    req.model
+                )
+            } else if !saw_ready_candidate {
+                anyhow::anyhow!(
+                    "No configured inference backend for '{}' is ready.",
                     req.model
                 )
             } else {
@@ -428,7 +511,9 @@ impl Router {
         let mut saw_model_candidate = false;
         let mut saw_completion_candidate = false;
         let mut saw_compatible_candidate = false;
-        let mut saw_configured_candidate = false;
+        let mut saw_missing_credential = false;
+        let mut saw_unready_candidate = false;
+        let mut saw_ready_candidate = false;
         let mut incompatible = BTreeSet::new();
         let provider_summaries = self.db.get_provider_log_summaries()?;
 
@@ -441,10 +526,11 @@ impl Router {
             let Some(completion_support) = &entry.text_completions else {
                 continue;
             };
-            let Some(provider) = self.providers.get(&entry.provider_id) else {
+            let Some(backend) = self.backends.get(&entry.provider_id) else {
+                saw_unready_candidate = true;
                 continue;
             };
-            if !provider.supports_completions() {
+            if !backend.supports_completions() {
                 continue;
             }
             saw_completion_candidate = true;
@@ -454,7 +540,7 @@ impl Router {
                 continue;
             }
             if req.stream
-                && (!provider.capabilities().contains(&Capability::Streaming)
+                && (!backend.capabilities().contains(&Capability::Streaming)
                     || !entry.capabilities.contains(&Capability::Streaming))
             {
                 incompatible.insert("stream".to_string());
@@ -462,10 +548,19 @@ impl Router {
             }
             saw_compatible_candidate = true;
 
-            if !self.db.has_api_key(&entry.provider_id)? {
-                continue;
+            match self.backend_readiness(Some(backend))? {
+                BackendReadiness::Ready => saw_ready_candidate = true,
+                BackendReadiness::MissingCredential => {
+                    saw_missing_credential = true;
+                    continue;
+                }
+                BackendReadiness::NotConfigured
+                | BackendReadiness::Loading
+                | BackendReadiness::Unavailable => {
+                    saw_unready_candidate = true;
+                    continue;
+                }
             }
-            saw_configured_candidate = true;
 
             let headroom = self
                 .quota_tracker
@@ -474,24 +569,12 @@ impl Router {
                 continue;
             }
 
-            let eval_scores = self.eval_store.get_score(&entry.public_model_id);
-            let quality_score = match task_hint {
-                "coding" => eval_scores.coding,
-                "reasoning" => eval_scores.reasoning,
-                "creative" => eval_scores.creative,
-                _ => eval_scores.general,
-            };
-            let capability_score = entry.capabilities.len() as f64 / Capability::ALL.len() as f64;
-            let latency_score = observed_latency_score(provider_summaries.get(&entry.provider_id));
-            let headroom_score = if entry.quota.has_documented_limit() {
-                headroom
-            } else {
-                0.5
-            };
-            let score = (0.35 * headroom_score)
-                + (0.30 * quality_score)
-                + (0.20 * capability_score)
-                + (0.15 * latency_score);
+            let score = self.route_score(
+                entry,
+                task_hint,
+                headroom,
+                provider_summaries.get(&entry.provider_id),
+            );
 
             info!(
                 "Scored native completion route {}/{} as {}: {}",
@@ -505,6 +588,7 @@ impl Router {
                     public_model_id: entry.public_model_id.clone(),
                     provider_model_id: entry.provider_model_id.clone(),
                     parameter_policy: entry.parameter_policy.clone(),
+                    quota_tracked: entry.quota.has_enforced_limit(),
                     score,
                 });
             }
@@ -527,9 +611,14 @@ impl Router {
                     req.model,
                     incompatible.into_iter().collect::<Vec<_>>().join(", ")
                 )
-            } else if !saw_configured_candidate {
+            } else if saw_missing_credential && !saw_ready_candidate && !saw_unready_candidate {
                 anyhow::anyhow!(
                     "No API key is saved for a native text completion provider that can serve '{}'.",
+                    req.model
+                )
+            } else if !saw_ready_candidate {
+                anyhow::anyhow!(
+                    "No configured native text completion backend for '{}' is ready.",
                     req.model
                 )
             } else {
@@ -544,14 +633,11 @@ impl Router {
     pub async fn chat(&self, req: &ChatRequest, task_hint: &str) -> anyhow::Result<ChatResponse> {
         let route = self.route(req, task_hint).await?;
         self.reserve_request(&route)?;
-        let provider = self
-            .providers
+        let backend = self
+            .backends
             .get(&route.provider_id)
-            .ok_or_else(|| anyhow::anyhow!("Provider disappeared during routing"))?;
-
-        let api_key = self.db.get_api_key(&route.provider_id)?.ok_or_else(|| {
-            anyhow::anyhow!("No API key found for provider {}", route.provider_id)
-        })?;
+            .ok_or_else(|| anyhow::anyhow!("Inference backend disappeared during routing"))?;
+        let credential = self.backend_credentials(backend)?;
 
         let mut provider_req = req.clone();
         provider_req.model = route.provider_model_id.clone();
@@ -559,8 +645,12 @@ impl Router {
         provider_req.stream_options = None;
 
         let start = std::time::Instant::now();
-        let result = provider
-            .chat(&provider_req, &api_key, &route.parameter_policy)
+        let result = backend
+            .chat(
+                &provider_req,
+                credential.as_credentials(),
+                &route.parameter_policy,
+            )
             .await;
         let latency = elapsed_millis(start);
 
@@ -611,13 +701,11 @@ impl Router {
     ) -> anyhow::Result<CompletionResponse> {
         let route = self.route_completion(req, task_hint).await?;
         self.reserve_request(&route)?;
-        let provider = self
-            .providers
+        let backend = self
+            .backends
             .get(&route.provider_id)
-            .ok_or_else(|| anyhow::anyhow!("Provider disappeared during routing"))?;
-        let api_key = self.db.get_api_key(&route.provider_id)?.ok_or_else(|| {
-            anyhow::anyhow!("No API key found for provider {}", route.provider_id)
-        })?;
+            .ok_or_else(|| anyhow::anyhow!("Inference backend disappeared during routing"))?;
+        let credential = self.backend_credentials(backend)?;
 
         let mut provider_req = req.clone();
         provider_req.model = route.provider_model_id.clone();
@@ -625,7 +713,9 @@ impl Router {
         provider_req.stream_options = None;
 
         let start = std::time::Instant::now();
-        let result = provider.complete(&provider_req, &api_key).await;
+        let result = backend
+            .complete(&provider_req, credential.as_credentials())
+            .await;
         let latency = elapsed_millis(start);
 
         match result {
@@ -662,22 +752,23 @@ impl Router {
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ChatChunk>>> {
         let route = self.route(req, task_hint).await?;
         self.reserve_request(&route)?;
-        let provider = self
-            .providers
+        let backend = self
+            .backends
             .get(&route.provider_id)
-            .ok_or_else(|| anyhow::anyhow!("Provider disappeared during routing"))?;
-
-        let api_key = self.db.get_api_key(&route.provider_id)?.ok_or_else(|| {
-            anyhow::anyhow!("No API key found for provider {}", route.provider_id)
-        })?;
+            .ok_or_else(|| anyhow::anyhow!("Inference backend disappeared during routing"))?;
+        let credential = self.backend_credentials(backend)?;
 
         let mut provider_req = req.clone();
         provider_req.model = route.provider_model_id.clone();
         provider_req.stream = true;
 
         let start = std::time::Instant::now();
-        let upstream = match provider
-            .chat_stream(&provider_req, &api_key, &route.parameter_policy)
+        let upstream = match backend
+            .chat_stream(
+                &provider_req,
+                credential.as_credentials(),
+                &route.parameter_policy,
+            )
             .await
         {
             Ok(stream) => stream,
@@ -735,20 +826,21 @@ impl Router {
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CompletionChunk>>> {
         let route = self.route_completion(req, task_hint).await?;
         self.reserve_request(&route)?;
-        let provider = self
-            .providers
+        let backend = self
+            .backends
             .get(&route.provider_id)
-            .ok_or_else(|| anyhow::anyhow!("Provider disappeared during routing"))?;
-        let api_key = self.db.get_api_key(&route.provider_id)?.ok_or_else(|| {
-            anyhow::anyhow!("No API key found for provider {}", route.provider_id)
-        })?;
+            .ok_or_else(|| anyhow::anyhow!("Inference backend disappeared during routing"))?;
+        let credential = self.backend_credentials(backend)?;
 
         let mut provider_req = req.clone();
         provider_req.model = route.provider_model_id.clone();
         provider_req.stream = true;
 
         let start = std::time::Instant::now();
-        let upstream = match provider.complete_stream(&provider_req, &api_key).await {
+        let upstream = match backend
+            .complete_stream(&provider_req, credential.as_credentials())
+            .await
+        {
             Ok(stream) => stream,
             Err(error) => {
                 self.log_request(
@@ -797,7 +889,73 @@ impl Router {
         Ok(Box::pin(stream))
     }
 
+    fn backend_readiness(
+        &self,
+        backend: Option<&dyn InferenceBackend>,
+    ) -> anyhow::Result<BackendReadiness> {
+        let Some(backend) = backend else {
+            return Ok(BackendReadiness::Unavailable);
+        };
+        let runtime = backend.runtime_readiness();
+        if !runtime.is_ready() {
+            return Ok(runtime);
+        }
+        if backend.credential_requirement() == CredentialRequirement::ApiKey
+            && !self.db.has_api_key(backend.id())?
+        {
+            return Ok(BackendReadiness::MissingCredential);
+        }
+        Ok(BackendReadiness::Ready)
+    }
+
+    fn backend_credentials(
+        &self,
+        backend: &dyn InferenceBackend,
+    ) -> anyhow::Result<ResolvedBackendCredentials> {
+        match backend.credential_requirement() {
+            CredentialRequirement::NotRequired => Ok(ResolvedBackendCredentials::None),
+            CredentialRequirement::ApiKey => self
+                .db
+                .get_api_key(backend.id())?
+                .map(ResolvedBackendCredentials::ApiKey)
+                .ok_or_else(|| anyhow::anyhow!("No API key found for backend {}", backend.id())),
+        }
+    }
+
+    fn route_score(
+        &self,
+        entry: &ModelCatalogEntry,
+        task_hint: &str,
+        headroom: f64,
+        provider_summary: Option<&ProviderLogSummary>,
+    ) -> f64 {
+        let eval_scores = self.eval_store.get_score(&entry.public_model_id);
+        let quality_score = match task_hint {
+            "coding" => eval_scores.coding,
+            "reasoning" => eval_scores.reasoning,
+            "creative" => eval_scores.creative,
+            _ => eval_scores.general,
+        };
+        let declared_capabilities = entry.capabilities.len()
+            + usize::from(entry.chat_completions)
+            + usize::from(entry.text_completions.is_some());
+        let capability_score = declared_capabilities as f64 / (Capability::ALL.len() + 2) as f64;
+        let latency_score = observed_latency_score(provider_summary);
+        let headroom_score = if entry.quota.has_documented_limit() {
+            headroom
+        } else {
+            0.5
+        };
+        (0.35 * headroom_score)
+            + (0.30 * quality_score)
+            + (0.20 * capability_score)
+            + (0.15 * latency_score)
+    }
+
     fn reserve_request(&self, route: &RouteResult) -> anyhow::Result<()> {
+        if !route.quota_tracked {
+            return Ok(());
+        }
         let now = Utc::now();
         if !self
             .quota_tracker
@@ -838,6 +996,20 @@ impl Router {
                 .log_request(provider_id, public_model_id, tokens, latency_ms, status)
         {
             warn!("Could not persist request log: {error}");
+        }
+    }
+}
+
+enum ResolvedBackendCredentials {
+    None,
+    ApiKey(String),
+}
+
+impl ResolvedBackendCredentials {
+    fn as_credentials(&self) -> BackendCredentials<'_> {
+        match self {
+            Self::None => BackendCredentials::None,
+            Self::ApiKey(value) => BackendCredentials::ApiKey(value),
         }
     }
 }
@@ -902,7 +1074,7 @@ impl Drop for StreamAudit {
 }
 
 fn record_tokens(quota_tracker: &QuotaTracker, db: &Database, route: &RouteResult, tokens: u32) {
-    if tokens == 0 {
+    if tokens == 0 || !route.quota_tracked {
         return;
     }
     let now = Utc::now();
@@ -930,13 +1102,74 @@ fn request_error_status(error: &anyhow::Error) -> i32 {
         })
 }
 
+fn validate_model_route(
+    backend: &dyn InferenceBackend,
+    entry: &ModelCatalogEntry,
+) -> anyhow::Result<()> {
+    if entry.provider_id != backend.id() {
+        return Err(anyhow::anyhow!(
+            "Model route '{}' belongs to backend '{}', not '{}'.",
+            entry.provider_model_id,
+            entry.provider_id,
+            backend.id()
+        ));
+    }
+    for (field, value) in [
+        ("public_model_id", entry.public_model_id.as_str()),
+        ("provider_model_id", entry.provider_model_id.as_str()),
+        ("display_name", entry.display_name.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Model route for backend '{}' has an empty {field}.",
+                backend.id()
+            ));
+        }
+    }
+    if !entry.chat_completions && entry.text_completions.is_none() {
+        return Err(anyhow::anyhow!(
+            "Model route '{}/{}' declares no generation surface.",
+            entry.provider_id,
+            entry.provider_model_id
+        ));
+    }
+    if entry
+        .capabilities
+        .iter()
+        .any(|capability| !backend.capabilities().contains(capability))
+    {
+        return Err(anyhow::anyhow!(
+            "Model route '{}/{}' declares a capability its backend does not support.",
+            entry.provider_id,
+            entry.provider_model_id
+        ));
+    }
+    if let Some(completion) = &entry.text_completions {
+        if !backend.supports_completions() {
+            return Err(anyhow::anyhow!(
+                "Model route '{}/{}' declares text completions but its backend does not support them.",
+                entry.provider_id,
+                entry.provider_model_id
+            ));
+        }
+        if completion.prompt_types.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Model route '{}/{}' declares text completions without a supported prompt type.",
+                entry.provider_id,
+                entry.provider_model_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn provider_status(
-    configured: bool,
+    readiness: BackendReadiness,
     headroom: Option<f64>,
     summary: &ProviderLogSummary,
 ) -> String {
-    if !configured {
-        "needs_key".to_string()
+    if !readiness.is_ready() {
+        readiness.status().to_string()
     } else if headroom.is_some_and(|value| value <= 0.0) || summary.last_status_code == Some(429) {
         "quota_exhausted".to_string()
     } else if summary
@@ -1100,8 +1333,12 @@ mod tests {
             test_catalog_entry("unkeyed", "test-model", "provider-a-model", 0.5),
             test_catalog_entry("keyed", "test-model", "provider-b-model", 0.9),
         ]);
-        router.add_provider(Box::new(MockProvider::new("unkeyed")));
-        router.add_provider(Box::new(MockProvider::new("keyed")));
+        router
+            .add_backend(Box::new(MockProvider::new("unkeyed")))
+            .unwrap();
+        router
+            .add_backend(Box::new(MockProvider::new("keyed")))
+            .unwrap();
         router.db.save_api_key("keyed", "test-key").unwrap();
 
         let route = router
@@ -1115,11 +1352,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credentialless_local_backend_registers_models_and_serves_raw_completions() {
+        let seen_credentials = Arc::new(Mutex::new(Vec::new()));
+        let (db, _quota, mut router) = test_router(Vec::new());
+        router
+            .add_backend(Box::new(MockLocalCompletionBackend {
+                readiness: BackendReadiness::Ready,
+                seen_credentials: seen_credentials.clone(),
+            }))
+            .unwrap();
+        router
+            .add_model_routes(
+                "llama-native",
+                vec![local_completion_catalog_entry("local/test-model")],
+            )
+            .unwrap();
+
+        let response = router
+            .complete(&completion_request("local/test-model"), "general")
+            .await
+            .unwrap();
+
+        assert_eq!(response.model.as_deref(), Some("local/test-model"));
+        assert_eq!(seen_credentials.lock().unwrap().as_slice(), ["none"]);
+        let status = router.provider_statuses().unwrap().remove(0);
+        assert_eq!(status.backend_kind, BackendKind::LocalEmbedded);
+        assert!(!status.credential_required);
+        assert!(status.configured);
+        assert_eq!(status.status, "ready");
+        assert!(db.get_quota_events_since(0).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_backend_runtime_readiness_is_independent_of_credentials() {
+        let (_db, _quota, mut router) = test_router(Vec::new());
+        router
+            .add_backend(Box::new(MockLocalCompletionBackend {
+                readiness: BackendReadiness::Loading,
+                seen_credentials: Arc::new(Mutex::new(Vec::new())),
+            }))
+            .unwrap();
+        router
+            .add_model_routes(
+                "llama-native",
+                vec![local_completion_catalog_entry("local/test-model")],
+            )
+            .unwrap();
+
+        let error = router
+            .route_completion(&completion_request("local/test-model"), "general")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("backend") && error.contains("ready"));
+        let status = router.provider_statuses().unwrap().remove(0);
+        assert_eq!(status.status, "loading");
+        assert!(status.configured);
+    }
+
+    #[test]
+    fn runtime_model_routes_must_match_a_registered_backend() {
+        let (_db, _quota, mut router) = test_router(Vec::new());
+        let error = router
+            .add_model_routes(
+                "llama-native",
+                vec![local_completion_catalog_entry("local/test-model")],
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unregistered backend"));
+    }
+
+    #[tokio::test]
     async fn route_carries_catalog_parameter_policy() {
         let mut entry = test_catalog_entry("provider", "test-model", "provider-model", 0.9);
         entry.parameter_policy = ParameterPolicy::mistral();
         let (_db, _quota, mut router) = test_router(vec![entry]);
-        router.add_provider(Box::new(MockProvider::new("provider")));
+        router
+            .add_backend(Box::new(MockProvider::new("provider")))
+            .unwrap();
         router.db.save_api_key("provider", "test-key").unwrap();
 
         let route = router
@@ -1143,10 +1456,12 @@ mod tests {
             "provider-model",
             0.8,
         )]);
-        router.add_provider(Box::new(MockProvider::with_sent_models(
-            "provider",
-            sent_models.clone(),
-        )));
+        router
+            .add_backend(Box::new(MockProvider::with_sent_models(
+                "provider",
+                sent_models.clone(),
+            )))
+            .unwrap();
         db.save_api_key("provider", "test-key").unwrap();
 
         let response = router
@@ -1172,22 +1487,24 @@ mod tests {
             capabilities: vec![Capability::Streaming],
             ..test_catalog_entry("provider", "public-model", "provider-model", 0.8)
         }]);
-        router.add_provider(Box::new(MockProvider::with_stream(
-            "provider",
-            sent_models.clone(),
-            vec![ChatChunk {
-                id: "chunk-test".to_string(),
-                object: None,
-                created: None,
-                model: None,
-                choices: Vec::new(),
-                usage: Some(ChatUsage {
-                    prompt_tokens: 3,
-                    completion_tokens: 4,
-                    total_tokens: 7,
-                }),
-            }],
-        )));
+        router
+            .add_backend(Box::new(MockProvider::with_stream(
+                "provider",
+                sent_models.clone(),
+                vec![ChatChunk {
+                    id: "chunk-test".to_string(),
+                    object: None,
+                    created: None,
+                    model: None,
+                    choices: Vec::new(),
+                    usage: Some(ChatUsage {
+                        prompt_tokens: 3,
+                        completion_tokens: 4,
+                        total_tokens: 7,
+                    }),
+                }],
+            )))
+            .unwrap();
         db.save_api_key("provider", "test-key").unwrap();
 
         let mut request = chat_request("public-model");
@@ -1219,12 +1536,16 @@ mod tests {
         let completion_entry =
             test_completion_catalog_entry("completion", "shared-model", "completion-model");
         let (db, _quota, mut router) = test_router(vec![chat_only, completion_entry]);
-        router.add_provider(Box::new(MockProvider::new("chat")));
-        router.add_provider(Box::new(MockCompletionProvider::new(
-            "completion",
-            Arc::new(Mutex::new(Vec::new())),
-            Vec::new(),
-        )));
+        router
+            .add_backend(Box::new(MockProvider::new("chat")))
+            .unwrap();
+        router
+            .add_backend(Box::new(MockCompletionProvider::new(
+                "completion",
+                Arc::new(Mutex::new(Vec::new())),
+                Vec::new(),
+            )))
+            .unwrap();
         db.save_api_key("chat", "test-key").unwrap();
         db.save_api_key("completion", "test-key").unwrap();
 
@@ -1245,11 +1566,13 @@ mod tests {
             "public-model",
             "provider-model",
         )]);
-        router.add_provider(Box::new(MockCompletionProvider::new(
-            "completion",
-            sent_requests.clone(),
-            Vec::new(),
-        )));
+        router
+            .add_backend(Box::new(MockCompletionProvider::new(
+                "completion",
+                sent_requests.clone(),
+                Vec::new(),
+            )))
+            .unwrap();
         db.save_api_key("completion", "test-key").unwrap();
         let mut request = completion_request("public-model");
         request.prompt = CompletionPrompt::TokenBatches(vec![vec![1, 2], vec![3, 4]]);
@@ -1276,11 +1599,13 @@ mod tests {
             .unwrap()
             .supported_parameters = vec!["max_tokens".to_string()];
         let (db, _quota, mut router) = test_router(vec![entry]);
-        router.add_provider(Box::new(MockCompletionProvider::new(
-            "completion",
-            Arc::new(Mutex::new(Vec::new())),
-            Vec::new(),
-        )));
+        router
+            .add_backend(Box::new(MockCompletionProvider::new(
+                "completion",
+                Arc::new(Mutex::new(Vec::new())),
+                Vec::new(),
+            )))
+            .unwrap();
         db.save_api_key("completion", "test-key").unwrap();
         let mut request = completion_request("public-model");
         request.extra.insert("n".to_string(), serde_json::json!(2));
@@ -1302,11 +1627,13 @@ mod tests {
             "public-model",
             "provider-model",
         )]);
-        router.add_provider(Box::new(MockCompletionProvider::new(
-            "completion",
-            sent_requests.clone(),
-            vec![completion_response("stream-1")],
-        )));
+        router
+            .add_backend(Box::new(MockCompletionProvider::new(
+                "completion",
+                sent_requests.clone(),
+                vec![completion_response("stream-1")],
+            )))
+            .unwrap();
         db.save_api_key("completion", "test-key").unwrap();
         let mut request = completion_request("public-model");
         request.stream = true;
@@ -1337,7 +1664,9 @@ mod tests {
             },
             ..test_catalog_entry("provider", "public-model", "provider-model", 0.8)
         }]);
-        router.add_provider(Box::new(MockProvider::new("provider")));
+        router
+            .add_backend(Box::new(MockProvider::new("provider")))
+            .unwrap();
         db.save_api_key("provider", "test-key").unwrap();
         assert!(quota.try_record_request("provider", "provider-model", Utc::now()));
 
@@ -1379,7 +1708,9 @@ mod tests {
             capabilities: vec![Capability::Streaming],
             ..test_catalog_entry("provider", "public-model", "provider-model", 0.8)
         }]);
-        router.add_provider(Box::new(MockProvider::new("provider")));
+        router
+            .add_backend(Box::new(MockProvider::new("provider")))
+            .unwrap();
         db.save_api_key("provider", "test-key").unwrap();
         let mut request = chat_request("public-model");
         request.extra.insert(
@@ -1402,18 +1733,20 @@ mod tests {
             capabilities: vec![Capability::Streaming],
             ..test_catalog_entry("provider", "public-model", "provider-model", 0.8)
         }]);
-        router.add_provider(Box::new(MockProvider::with_stream(
-            "provider",
-            Arc::new(Mutex::new(Vec::new())),
-            vec![ChatChunk {
-                id: "chunk-test".to_string(),
-                object: None,
-                created: None,
-                model: None,
-                choices: Vec::new(),
-                usage: None,
-            }],
-        )));
+        router
+            .add_backend(Box::new(MockProvider::with_stream(
+                "provider",
+                Arc::new(Mutex::new(Vec::new())),
+                vec![ChatChunk {
+                    id: "chunk-test".to_string(),
+                    object: None,
+                    created: None,
+                    model: None,
+                    choices: Vec::new(),
+                    usage: None,
+                }],
+            )))
+            .unwrap();
         db.save_api_key("provider", "test-key").unwrap();
         let mut request = chat_request("public-model");
         request.stream = true;
@@ -1500,6 +1833,31 @@ mod tests {
                 ],
             }),
             ..test_catalog_entry(provider_id, public_model_id, provider_model_id, 0.8)
+        }
+    }
+
+    fn local_completion_catalog_entry(public_model_id: &str) -> ModelCatalogEntry {
+        ModelCatalogEntry {
+            provider_id: "llama-native".to_string(),
+            provider_name: "Local llama.cpp".to_string(),
+            public_model_id: public_model_id.to_string(),
+            provider_model_id: "model-fingerprint".to_string(),
+            display_name: "Selected local GGUF".to_string(),
+            capabilities: Vec::new(),
+            chat_completions: false,
+            text_completions: Some(TextCompletionSupport {
+                prompt_semantics: PromptSemantics::DirectContinuation,
+                prompt_types: vec![CompletionPromptKind::Text, CompletionPromptKind::Tokens],
+                supported_parameters: vec!["temperature".to_string(), "max_tokens".to_string()],
+            }),
+            parameter_policy: ParameterPolicy::openai_compatible(),
+            quota: QuotaSpec {
+                rpm: u32::MAX,
+                rpd: u32::MAX,
+                tpm: u32::MAX,
+                tpd: u32::MAX,
+                documented: false,
+            },
         }
     }
 
@@ -1596,7 +1954,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl InferenceBackend for MockProvider {
         fn id(&self) -> &str {
             self.id
         }
@@ -1612,7 +1970,7 @@ mod tests {
         async fn chat(
             &self,
             req: &ChatRequest,
-            _api_key: &str,
+            _credentials: BackendCredentials<'_>,
             _policy: &ParameterPolicy,
         ) -> anyhow::Result<ChatResponse> {
             self.sent_models.lock().unwrap().push(req.model.clone());
@@ -1636,7 +1994,7 @@ mod tests {
         async fn chat_stream(
             &self,
             req: &ChatRequest,
-            _api_key: &str,
+            _credentials: BackendCredentials<'_>,
             _policy: &ParameterPolicy,
         ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ChatChunk>>> {
             self.sent_models.lock().unwrap().push(req.model.clone());
@@ -1650,6 +2008,73 @@ mod tests {
         id: &'static str,
         sent_requests: Arc<Mutex<Vec<CompletionRequest>>>,
         stream_chunks: Vec<CompletionChunk>,
+    }
+
+    struct MockLocalCompletionBackend {
+        readiness: BackendReadiness,
+        seen_credentials: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl InferenceBackend for MockLocalCompletionBackend {
+        fn id(&self) -> &str {
+            "llama-native"
+        }
+
+        fn name(&self) -> &str {
+            "Local llama.cpp"
+        }
+
+        fn capabilities(&self) -> &[Capability] {
+            &[]
+        }
+
+        fn kind(&self) -> BackendKind {
+            BackendKind::LocalEmbedded
+        }
+
+        fn credential_requirement(&self) -> CredentialRequirement {
+            CredentialRequirement::NotRequired
+        }
+
+        fn runtime_readiness(&self) -> BackendReadiness {
+            self.readiness
+        }
+
+        async fn chat(
+            &self,
+            _req: &ChatRequest,
+            _credentials: BackendCredentials<'_>,
+            _policy: &ParameterPolicy,
+        ) -> anyhow::Result<ChatResponse> {
+            Err(anyhow::anyhow!("chat is not supported by this fixture"))
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: &ChatRequest,
+            _credentials: BackendCredentials<'_>,
+            _policy: &ParameterPolicy,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ChatChunk>>> {
+            Err(anyhow::anyhow!("chat is not supported by this fixture"))
+        }
+
+        fn supports_completions(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            _req: &CompletionRequest,
+            credentials: BackendCredentials<'_>,
+        ) -> anyhow::Result<CompletionResponse> {
+            let credential_kind = match credentials {
+                BackendCredentials::None => "none",
+                BackendCredentials::ApiKey(_) => "api_key",
+            };
+            self.seen_credentials.lock().unwrap().push(credential_kind);
+            Ok(completion_response("cmpl-local"))
+        }
     }
 
     impl MockCompletionProvider {
@@ -1667,7 +2092,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for MockCompletionProvider {
+    impl InferenceBackend for MockCompletionProvider {
         fn id(&self) -> &str {
             self.id
         }
@@ -1683,7 +2108,7 @@ mod tests {
         async fn chat(
             &self,
             _req: &ChatRequest,
-            _api_key: &str,
+            _credentials: BackendCredentials<'_>,
             _policy: &ParameterPolicy,
         ) -> anyhow::Result<ChatResponse> {
             Err(anyhow::anyhow!("chat is not supported by this fixture"))
@@ -1692,7 +2117,7 @@ mod tests {
         async fn chat_stream(
             &self,
             _req: &ChatRequest,
-            _api_key: &str,
+            _credentials: BackendCredentials<'_>,
             _policy: &ParameterPolicy,
         ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ChatChunk>>> {
             Err(anyhow::anyhow!("chat is not supported by this fixture"))
@@ -1705,7 +2130,7 @@ mod tests {
         async fn complete(
             &self,
             req: &CompletionRequest,
-            _api_key: &str,
+            _credentials: BackendCredentials<'_>,
         ) -> anyhow::Result<CompletionResponse> {
             self.sent_requests.lock().unwrap().push(req.clone());
             Ok(completion_response("cmpl-test"))
@@ -1714,7 +2139,7 @@ mod tests {
         async fn complete_stream(
             &self,
             req: &CompletionRequest,
-            _api_key: &str,
+            _credentials: BackendCredentials<'_>,
         ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CompletionChunk>>> {
             self.sent_requests.lock().unwrap().push(req.clone());
             Ok(Box::pin(futures::stream::iter(

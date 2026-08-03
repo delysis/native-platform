@@ -26,6 +26,7 @@ provider, routing, streaming, and persistence components.
 - SQLite persistence in `db.rs`
 - Restart-safe sliding-window quota tracking in `rate_limiter.rs`
 - Model and provider metadata in `catalog.rs`
+- Transport-neutral inference backend contracts and registration in `backend.rs`
 - Provider transforms and stream parsers under `providers/`
 - OpenAI, Anthropic, and Gemini-compatible HTTP surfaces in `api_server.rs`
 
@@ -34,8 +35,9 @@ NVIDIA NIM, and Cerebras.
 
 ## Routing
 
-Routes are filtered by requested model, configured credentials, declared
-capabilities, and locally tracked quota. Ranking weights are:
+Routes are filtered by requested model, backend readiness, any required
+credentials, declared capabilities, and locally tracked finite quota. Ranking
+weights are:
 
 ```text
 0.35 headroom + 0.30 evaluation + 0.20 capability + 0.15 latency
@@ -56,6 +58,11 @@ cargo check --all-targets --all-features --manifest-path src-tauri/Cargo.toml
 When changing provider transforms or streams, add fixture-style regression
 tests. When changing SQLite schema or migrations, add a reopen/migration test.
 Never commit the cloned repositories beneath `research/provider-gateways/`.
+
+Local inference backends must not require placeholder credentials, masquerade
+as chat for raw completion, or receive invented quota limits. Register only
+explicitly selected or inspected local models, and keep product-specific state
+outside the reusable backend adapter.
 
 ## Remaining roadmap
 

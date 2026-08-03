@@ -5,6 +5,8 @@
 - [x] SQLite storage for keys, settings, request logs, and restart-safe quota events
 - [x] Atomic sliding-window request and token tracking
 - [x] Model-aware capability gating and parameter policies
+- [x] Transport-neutral backend registry with credential-independent readiness
+- [x] Startup registration for inspected local model routes
 - [x] OpenRouter, Groq, Mistral, NVIDIA, and Cerebras adapters
 - [x] Native Anthropic and Gemini request/response/stream normalization
 - [x] OpenAI-compatible models, completions, chat completions, and responses
@@ -40,3 +42,5 @@
 - Add model-catalog refresh/versioning for fast-moving provider inventories
 - Add optional OS keychain-backed credential encryption
 - Add more native transports such as Ollama and AWS Bedrock
+- Integrate the versioned `llama-native-host` crate after its raw-completion
+  contract passes the handoff acceptance suite

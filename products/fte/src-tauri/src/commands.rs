@@ -1,4 +1,5 @@
 use crate::api_server::{ProxyManager, ProxyStatus};
+use crate::backend::CredentialRequirement;
 use crate::db::Database;
 use crate::providers::{ChatRequest, ChatResponse, CompletionRequest, CompletionResponse};
 use crate::router::Router;
@@ -39,6 +40,11 @@ pub async fn save_key(
     if !router.supports_provider(&provider_id) {
         return Err(format!("Unsupported provider '{provider_id}'."));
     }
+    if router.credential_requirement(&provider_id) != Some(CredentialRequirement::ApiKey) {
+        return Err(format!(
+            "Inference backend '{provider_id}' does not accept a provider API key."
+        ));
+    }
     let key_value = key_value.trim();
     if key_value.len() < 8 || key_value.len() > 16_384 {
         return Err("API key must be between 8 and 16384 characters.".to_string());
@@ -60,6 +66,11 @@ pub async fn delete_key(
     let provider_id = provider_id.trim().to_ascii_lowercase();
     if !router.supports_provider(&provider_id) {
         return Err(format!("Unsupported provider '{provider_id}'."));
+    }
+    if router.credential_requirement(&provider_id) != Some(CredentialRequirement::ApiKey) {
+        return Err(format!(
+            "Inference backend '{provider_id}' does not use a provider API key."
+        ));
     }
     db.delete_api_key(&provider_id).map_err(|e| e.to_string())
 }

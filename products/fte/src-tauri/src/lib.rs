@@ -1,4 +1,5 @@
 pub mod api_server;
+pub mod backend;
 pub mod catalog;
 pub mod commands;
 pub mod db;
@@ -41,40 +42,7 @@ pub fn run() {
 
             let mut router = Router::new(quota_tracker.clone(), eval_store.clone(), db.clone());
 
-            router.add_provider(Box::new(openrouter::provider()));
-            router.add_provider(Box::new(groq::provider()));
-            router.add_provider(Box::new(anthropic::provider()));
-            router.add_provider(Box::new(gemini::provider()));
-            router.add_provider(Box::new(
-                OpenAiCompatibleProvider::new(
-                    "mistral",
-                    "Mistral AI",
-                    "https://api.mistral.ai/v1/chat/completions",
-                    vec![Capability::Streaming, Capability::Tools],
-                )
-                .with_completion_endpoint(
-                    "https://api.mistral.ai/v1/fim/completions",
-                    CompletionProtocol::MistralFim,
-                ),
-            ));
-            router.add_provider(Box::new(OpenAiCompatibleProvider::new(
-                "nvidia",
-                "NVIDIA NIM",
-                "https://integrate.api.nvidia.com/v1/chat/completions",
-                vec![Capability::Streaming, Capability::Tools],
-            )));
-            router.add_provider(Box::new(
-                OpenAiCompatibleProvider::new(
-                    "cerebras",
-                    "Cerebras",
-                    "https://api.cerebras.ai/v1/chat/completions",
-                    vec![Capability::Streaming, Capability::Tools],
-                )
-                .with_completion_endpoint(
-                    "https://api.cerebras.ai/v1/completions",
-                    CompletionProtocol::OpenAi,
-                ),
-            ));
+            register_default_backends(&mut router)?;
 
             let router = Arc::new(router);
             let proxy = crate::api_server::ProxyManager::new(router.clone());
@@ -114,6 +82,44 @@ pub fn run() {
         .unwrap_or_else(|error| eprintln!("Free Token Energy could not start: {error}"));
 }
 
+fn register_default_backends(router: &mut Router) -> anyhow::Result<()> {
+    router.add_backend(Box::new(openrouter::provider()))?;
+    router.add_backend(Box::new(groq::provider()))?;
+    router.add_backend(Box::new(anthropic::provider()))?;
+    router.add_backend(Box::new(gemini::provider()))?;
+    router.add_backend(Box::new(
+        OpenAiCompatibleProvider::new(
+            "mistral",
+            "Mistral AI",
+            "https://api.mistral.ai/v1/chat/completions",
+            vec![Capability::Streaming, Capability::Tools],
+        )
+        .with_completion_endpoint(
+            "https://api.mistral.ai/v1/fim/completions",
+            CompletionProtocol::MistralFim,
+        ),
+    ))?;
+    router.add_backend(Box::new(OpenAiCompatibleProvider::new(
+        "nvidia",
+        "NVIDIA NIM",
+        "https://integrate.api.nvidia.com/v1/chat/completions",
+        vec![Capability::Streaming, Capability::Tools],
+    )))?;
+    router.add_backend(Box::new(
+        OpenAiCompatibleProvider::new(
+            "cerebras",
+            "Cerebras",
+            "https://api.cerebras.ai/v1/chat/completions",
+            vec![Capability::Streaming, Capability::Tools],
+        )
+        .with_completion_endpoint(
+            "https://api.cerebras.ai/v1/completions",
+            CompletionProtocol::OpenAi,
+        ),
+    ))?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn secure_app_data_directory(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -123,4 +129,41 @@ fn secure_app_data_directory(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn secure_app_data_directory(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_backends_conform_to_the_model_catalog() {
+        let path = std::env::temp_dir().join(format!(
+            "free-token-energy-backend-catalog-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Arc::new(Database::new(path).unwrap());
+        let mut router = Router::new(
+            Arc::new(QuotaTracker::new()),
+            Arc::new(EvalStore::new()),
+            db,
+        );
+
+        register_default_backends(&mut router).unwrap();
+
+        for id in [
+            "openrouter",
+            "groq",
+            "anthropic",
+            "gemini",
+            "mistral",
+            "nvidia",
+            "cerebras",
+        ] {
+            assert!(router.supports_provider(id), "missing backend {id}");
+        }
+    }
 }

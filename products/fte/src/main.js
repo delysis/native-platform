@@ -154,6 +154,9 @@ function statusLabel(status) {
   const labels = {
     ready: 'Ready',
     needs_key: 'Needs key',
+    not_configured: 'Not configured',
+    loading: 'Loading',
+    unavailable: 'Unavailable',
     quota_exhausted: 'Quota exhausted',
     upstream_error: 'Last call failed',
   };
@@ -164,6 +167,9 @@ function statusClass(status) {
   const classes = {
     ready: 'status-ready',
     needs_key: 'status-muted',
+    not_configured: 'status-muted',
+    loading: 'status-warn',
+    unavailable: 'status-error',
     quota_exhausted: 'status-warn',
     upstream_error: 'status-error',
   };
@@ -212,9 +218,11 @@ async function refreshDashboard() {
       name.textContent = provider.name;
       const detail = document.createElement('span');
       detail.className = 'muted';
+      const isLocal =
+        provider.backend_kind === 'local_embedded' || provider.backend_kind === 'local_service';
       const headroom =
         provider.headroom == null
-          ? 'quota varies by account'
+          ? (isLocal ? 'not quota-metered' : 'quota varies by account')
           : `${Math.max(0, Math.min(100, Number(provider.headroom) * 100)).toFixed(0)}% local headroom`;
       const autocomplete = provider.text_completion_model_count
         ? ` · ${provider.text_completion_model_count} raw completion${provider.text_completion_model_count === 1 ? '' : 's'}`
@@ -347,8 +355,12 @@ async function openProviderConsole(providerId) {
 }
 
 function providerCard(provider, profile) {
+  const requiresCredential = provider.credential_required !== false;
+  const isLocal = provider.backend_kind === 'local_embedded' || provider.backend_kind === 'local_service';
   const details = PROVIDER_DETAILS[provider.id] || {
-    description: 'Supported by the local gateway.',
+    description: isLocal
+      ? 'Runs through a local inference runtime without a provider API key.'
+      : 'Supported by the local gateway.',
   };
   const card = document.createElement('article');
   card.className = 'card provider-card';
@@ -358,8 +370,8 @@ function providerCard(provider, profile) {
   const name = document.createElement('h2');
   name.textContent = provider.name;
   const badge = document.createElement('span');
-  badge.className = `badge ${provider.configured ? 'badge-free' : 'badge-muted'}`;
-  badge.textContent = provider.configured ? 'Connected' : 'Not configured';
+  badge.className = `badge ${provider.status === 'ready' ? 'badge-free' : 'badge-muted'}`;
+  badge.textContent = statusLabel(provider.status);
   heading.append(name, badge);
 
   const description = document.createElement('p');
@@ -379,6 +391,9 @@ function providerCard(provider, profile) {
     providerMeta.append(completionCount);
   }
 
+  card.append(heading, description, providerMeta);
+  if (!requiresCredential) return card;
+
   const helperRow = document.createElement('div');
   helperRow.className = 'helper-row';
   for (const [label, value] of [['Email', profile.email], ['Name', profile.name]]) {
@@ -391,11 +406,13 @@ function providerCard(provider, profile) {
     helperRow.append(button);
   }
 
-  const consoleButton = document.createElement('button');
-  consoleButton.type = 'button';
-  consoleButton.className = 'provider-link';
-  consoleButton.textContent = 'Open provider console';
-  consoleButton.addEventListener('click', () => openProviderConsole(provider.id));
+  const consoleButton = details.url ? document.createElement('button') : null;
+  if (consoleButton) {
+    consoleButton.type = 'button';
+    consoleButton.className = 'provider-link';
+    consoleButton.textContent = 'Open provider console';
+    consoleButton.addEventListener('click', () => openProviderConsole(provider.id));
+  }
 
   const keyLabel = document.createElement('label');
   keyLabel.className = 'key-label';
@@ -459,9 +476,9 @@ function providerCard(provider, profile) {
     actionRow.append(removeButton);
   }
 
-  card.append(heading, description, providerMeta);
   if (helperRow.childElementCount > 0) card.append(helperRow);
-  card.append(consoleButton, keyLabel, actionRow);
+  if (consoleButton) card.append(consoleButton);
+  card.append(keyLabel, actionRow);
   return card;
 }
 
