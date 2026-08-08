@@ -35,23 +35,51 @@ fn json_output(output: &Output) -> Result<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn mcp_fixture_server(root: &Path) -> Result<PathBuf> {
-    let server = root.join("mcp-fixture");
+fn mcp_fixture_server(root: &Path) -> Result<(PathBuf, Vec<String>)> {
     let body = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo input","inputSchema":{"type":"object"}}],"content":[{"type":"text","text":"echo ok"}]}}"#;
-    std::fs::write(
-        &server,
-        format!(
-            "#!/bin/sh\nprintf 'Content-Length: {}\\r\\n\\r\\n{}'\n",
-            body.len(),
-            body
-        ),
-    )?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let server = root.join("mcp-fixture");
+        std::fs::write(
+            &server,
+            format!(
+                "#!/bin/sh\nprintf 'Content-Length: {}\\r\\n\\r\\n{}'\n",
+                body.len(),
+                body
+            ),
+        )?;
         std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o700))?;
+        Ok((server, Vec::new()))
     }
-    Ok(server)
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var_os("SystemRoot")
+            .ok_or_else(|| anyhow!("SystemRoot is not configured"))?;
+        let powershell = PathBuf::from(system_root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        let escaped_body = body
+            .replace('`', "``")
+            .replace('$', "`$")
+            .replace('"', "`\"");
+        let script = format!(
+            "[Console]::Out.Write(\"Content-Length: {}`r`n`r`n{}\")",
+            body.len(),
+            escaped_body
+        );
+        Ok((
+            powershell,
+            vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                script,
+            ],
+        ))
+    }
 }
 
 #[test]
@@ -399,22 +427,28 @@ fn attachment_and_mcp_are_exercisable_without_claiming_llama_inference() -> Resu
             "--json",
         ],
     )?)?;
-    let mcp = mcp_fixture_server(&root)?;
+    let (mcp, mcp_args) = mcp_fixture_server(&root)?;
     let mcp_path = mcp
         .to_str()
         .ok_or_else(|| anyhow!("invalid MCP fixture path"))?;
-    json_output(&cli(
-        &root,
-        &[
-            "mcp",
-            "configure",
-            "--name",
-            "fixture",
-            "--command",
-            mcp_path,
-            "--json",
-        ],
-    )?)?;
+    let mut configure_args = vec![
+        "mcp".to_string(),
+        "configure".to_string(),
+        "--name".to_string(),
+        "fixture".to_string(),
+        "--command".to_string(),
+        mcp_path.to_string(),
+    ];
+    for argument in mcp_args {
+        configure_args.push("--arg".to_string());
+        configure_args.push(argument);
+    }
+    configure_args.push("--json".to_string());
+    let configure_refs = configure_args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    json_output(&cli(&root, &configure_refs)?)?;
     let tools = json_output(&cli(
         &root,
         &["mcp", "list-tools", "--server", "fixture", "--json"],
