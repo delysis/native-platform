@@ -1515,7 +1515,7 @@ fn configure_mcp_fixture(session: &TestSession) -> Result<()> {
     std::fs::write(
         &executable,
         format!(
-            "#!/bin/sh\nprintf 'Content-Length: {}\\r\\n\\r\\n{}'\n",
+            "#!/bin/sh\ncat >/dev/null\nprintf 'Content-Length: {}\\r\\n\\r\\n{}'\n",
             body.len(),
             body.replace('\'', "'\\''")
         ),
