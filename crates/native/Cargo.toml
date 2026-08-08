@@ -6,18 +6,6 @@ members = [
     "crates/llama-native-engine",
     "crates/llama-native-cache",
     "crates/llama-native-host",
-    "crates/mom-llama-runtime",
-    "crates/mom-llama-cli",
-    "apps/mom-llama/src-tauri",
-]
-default-members = [
-    "crates/command-evidence",
-    "crates/llama-native-types",
-    "crates/llama-native-engine",
-    "crates/llama-native-cache",
-    "crates/llama-native-host",
-    "crates/mom-llama-runtime",
-    "crates/mom-llama-cli",
 ]
 
 [workspace.package]
@@ -28,18 +16,11 @@ repository = "https://github.com/delysis/llama-native-kit"
 rust-version = "1.85"
 
 [workspace.dependencies]
-anyhow = "1"
-chacha20poly1305 = "0.10.1"
-clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
-getrandom = "0.3"
-rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -52,12 +33,3 @@ undocumented_unsafe_blocks = "deny"
 
 [profile.dev.package.sha2]
 opt-level = 3
-
-# Free Token Energy pins the published native revision. When its adapter is
-# consumed from this source tree, keep the native types single-sourced so Rust
-# cannot construct duplicate, nominally incompatible host/type packages.
-[patch."https://github.com/delysis/llama-native-kit"]
-llama-native-cache = { path = "crates/llama-native-cache" }
-llama-native-engine = { path = "crates/llama-native-engine" }
-llama-native-host = { path = "crates/llama-native-host" }
-llama-native-types = { path = "crates/llama-native-types" }

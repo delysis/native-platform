@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Bounded resident-model host and lifecycle registry for llama-native-engine"
 
 [dependencies]
 llama-native-cache = { path = "../llama-native-cache" }

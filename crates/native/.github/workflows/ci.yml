@@ -20,18 +20,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Authorize pinned private gateway dependency
-        shell: bash
-        env:
-          FREE_TOKEN_ENERGY_DEPLOY_KEY: ${{ secrets.FREE_TOKEN_ENERGY_DEPLOY_KEY }}
-        run: |
-          test -n "$FREE_TOKEN_ENERGY_DEPLOY_KEY"
-          mkdir -p "$HOME/.ssh"
-          printf '%s\n' "$FREE_TOKEN_ENERGY_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
-          chmod 600 "$HOME/.ssh/id_ed25519"
-          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
-          git config --global url."git@github.com:".insteadOf "https://github.com/"
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
@@ -51,47 +39,11 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Test default workspace
-        run: cargo test --workspace --exclude mom-llama-app
+        run: cargo test --workspace
 
       - name: Lint default workspace
-        run: cargo clippy --workspace --all-targets --exclude mom-llama-app -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Check architecture and contracts
+      - name: Check architecture
         if: runner.os != 'Windows'
-        run: |
-          ./scripts/check-architecture.sh
-          ./scripts/check-contracts.sh
-
-  mom-llama-macos:
-    name: Mom Llama Tauri app (macOS)
-    runs-on: macos-latest
-    timeout-minutes: 60
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Authorize pinned private gateway dependency
-        shell: bash
-        env:
-          FREE_TOKEN_ENERGY_DEPLOY_KEY: ${{ secrets.FREE_TOKEN_ENERGY_DEPLOY_KEY }}
-        run: |
-          test -n "$FREE_TOKEN_ENERGY_DEPLOY_KEY"
-          mkdir -p "$HOME/.ssh"
-          printf '%s\n' "$FREE_TOKEN_ENERGY_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
-          chmod 600 "$HOME/.ssh/id_ed25519"
-          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
-          git config --global url."git@github.com:".insteadOf "https://github.com/"
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - run: cargo test -p mom-llama-app
-      - run: cargo clippy -p mom-llama-app --all-targets -- -D warnings
-      - run: node --check apps/mom-llama/ui/coop-hx.js
+        run: ./scripts/check-architecture.sh

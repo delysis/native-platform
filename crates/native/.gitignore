@@ -4,7 +4,3 @@
 .env
 *.log
 /artifacts/
-/receipts/local/
-/screenshots/local/
-/apps/mom-llama/src-tauri/gen/
-

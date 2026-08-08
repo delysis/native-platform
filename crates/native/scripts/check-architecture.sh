@@ -16,34 +16,22 @@ do
   fi
 done
 
-for task_file in crates/mom-llama-runtime/src/*.rs
-do
-  case "$task_file" in
-    */mcp.rs) continue ;;
-  esac
-  if rg -n 'std::net|tokio::net|std::process|Command::new|reqwest|ureq|TcpStream|127\.0\.0\.1|localhost|https?://' "$task_file"
-  then
-    echo "forbidden network or process authority in $task_file" >&2
-    exit 1
-  fi
-done
-
-if ! rg -q 'std::process' crates/mom-llama-runtime/src/mcp.rs
+if rg -n 'mom-llama|free-token-energy|fte-|tauri' Cargo.toml crates/*/Cargo.toml
 then
-  echo "the explicit MCP adapter no longer declares its process boundary" >&2
+  echo "product, gateway, or Tauri dependencies are forbidden in the native runtime" >&2
   exit 1
 fi
 
-if rg -n 'std::net|tokio::net|reqwest|ureq|TcpStream|127\.0\.0\.1|localhost|https?://' crates/mom-llama-runtime/src/mcp.rs
+if find . -maxdepth 3 -type d \( -name 'mom-llama*' -o -path './apps/*' \) | grep -q .
 then
-  echo "network authority is not allowed in the native-local MCP adapter" >&2
+  echo "product source is forbidden in the runtime repository" >&2
   exit 1
 fi
 
-if rg -n "(^|[\"' /])llama-(cli|server)([\"' /]|\$)" crates apps/mom-llama/src-tauri/src
+if rg -n "(^|[\"' /])llama-(cli|server)([\"' /]|\$)" crates
 then
-  echo "inference executable references are forbidden from product source" >&2
+  echo "inference executable references are forbidden from native source" >&2
   exit 1
 fi
 
-echo "architecture ok: inference is in-process; MCP is the sole bounded process adapter"
+echo "architecture ok: this repository contains only in-process native runtime crates"
