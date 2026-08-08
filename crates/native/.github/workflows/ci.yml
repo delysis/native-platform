@@ -40,7 +40,11 @@ jobs:
 
       - name: Install native build tools (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --yes clang cmake ninja-build
+        run: sudo apt-get update && sudo apt-get install --yes clang cmake ninja-build ripgrep
+
+      - name: Install architecture-check tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ripgrep
 
       - name: Check formatting
         if: runner.os == 'Linux'
