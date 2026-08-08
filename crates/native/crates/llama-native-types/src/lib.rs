@@ -261,7 +261,7 @@ pub enum PromptTokenPolicy {
     FillInMiddleModelTokens,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Ord, PartialOrd)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
     Image,
@@ -427,6 +427,11 @@ pub struct ModelCapabilities {
     pub prompt_forms: Vec<PromptForm>,
     pub chat_template_available: bool,
     pub multimodal: bool,
+    /// Exact input modalities reported by the loaded multimodal projector.
+    /// An empty list means no media is accepted, even when an mmproj path was
+    /// configured but could not establish a concrete capability.
+    #[serde(default)]
+    pub media_kinds: Vec<MediaKind>,
     pub streaming: bool,
     pub cancellation: bool,
     pub max_batch_inputs: u32,
@@ -543,6 +548,8 @@ pub enum NativeErrorCode {
     UnsupportedPromptForm,
     #[error("unsupported_parameter")]
     UnsupportedParameter,
+    #[error("unsupported_media")]
+    UnsupportedMedia,
     #[error("decode_failed")]
     DecodeFailed,
     #[error("cancelled")]
@@ -570,5 +577,22 @@ mod tests {
     fn native_error_is_machine_and_human_readable() {
         let error = NativeError::new(NativeErrorCode::ModelMissing, "Choose a model.");
         assert_eq!(error.to_string(), "model_missing: Choose a model.");
+    }
+
+    #[test]
+    fn legacy_capabilities_default_exact_media_kinds_to_empty() {
+        let capabilities: ModelCapabilities = serde_json::from_value(serde_json::json!({
+            "prompt_forms": ["chat"],
+            "chat_template_available": true,
+            "multimodal": true,
+            "streaming": true,
+            "cancellation": true,
+            "max_batch_inputs": 1,
+            "sampling_parameters": []
+        }))
+        .expect("legacy capabilities must remain readable");
+
+        assert!(capabilities.multimodal);
+        assert!(capabilities.media_kinds.is_empty());
     }
 }

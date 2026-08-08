@@ -16,11 +16,11 @@ use llama_cpp_2::token::LlamaToken;
 use llama_native_types::{
     BranchRequest, ChatMessage, ChatRole, ChatTemplateChoice, CompletionPrompt, GenerationEvent,
     GenerationEventKind, GenerationInput, GenerationMetrics, GenerationOutput, GenerationRequest,
-    GenerationState, MAX_PARALLEL_SEQUENCES, MediaInput, ModelCapabilities, ModelFingerprint,
-    ModelRuntimeState, NativeDevice, NativeError, NativeErrorCode, NativeModelConfig,
-    NativeModelDescriptor, NativeTransport, PreparedPrompt, PromptForm, PromptTokenPolicy,
-    ResidentModelStatus, SamplerKind, SamplingConfig, SamplingParameter, SequenceStateBlob,
-    SharedPrefixBatchRequest, SpecialTokenPolicy, TokenizedPrompt,
+    GenerationState, MAX_PARALLEL_SEQUENCES, MediaInput, MediaKind, ModelCapabilities,
+    ModelFingerprint, ModelRuntimeState, NativeDevice, NativeError, NativeErrorCode,
+    NativeModelConfig, NativeModelDescriptor, NativeTransport, PreparedPrompt, PromptForm,
+    PromptTokenPolicy, ResidentModelStatus, SamplerKind, SamplingConfig, SamplingParameter,
+    SequenceStateBlob, SharedPrefixBatchRequest, SpecialTokenPolicy, TokenizedPrompt,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -771,13 +771,11 @@ fn run_worker(
         }
     };
     if let Ok(mut current) = status.write() {
+        let media_kinds = multimodal
+            .as_ref()
+            .map_or_else(Vec::new, media_kinds_for_context);
         current.state = ModelRuntimeState::Ready;
-        current.descriptor = Some(describe_model(
-            &config,
-            &model,
-            &fingerprint,
-            multimodal.is_some(),
-        ));
+        current.descriptor = Some(describe_model(&config, &model, &fingerprint, media_kinds));
         current.fingerprint = Some(fingerprint);
     }
     let _ = ready_tx.send(Ok(()));
@@ -1530,10 +1528,11 @@ fn generate_multimodal(
     tracking.token_ids.clear();
     let started = Instant::now();
     let prompt = render_multimodal_prompt(model, request)?;
+    let supported_media_kinds = media_kinds_for_context(multimodal);
     let bitmaps = request
         .media
         .iter()
-        .map(|media| media_bitmap(multimodal, media))
+        .map(|media| media_bitmap(multimodal, &supported_media_kinds, media))
         .collect::<NativeResult<Vec<_>>>()?;
     let bitmap_refs = bitmaps.iter().collect::<Vec<_>>();
     let chunks = multimodal
@@ -1730,13 +1729,81 @@ struct SingleSequenceSupervision<'a> {
     reasoning_force: &'a Arc<AtomicBool>,
 }
 
-fn media_bitmap(context: &MtmdContext, media: &MediaInput) -> NativeResult<MtmdBitmap> {
+fn media_kinds_for_context(context: &MtmdContext) -> Vec<MediaKind> {
+    media_kinds_from_support(context.support_vision(), context.support_audio())
+}
+
+fn media_kinds_from_support(support_vision: bool, support_audio: bool) -> Vec<MediaKind> {
+    let mut media_kinds = Vec::with_capacity(2);
+    if support_vision {
+        media_kinds.push(MediaKind::Image);
+    }
+    if support_audio {
+        media_kinds.push(MediaKind::Audio);
+    }
+    media_kinds
+}
+
+fn validate_declared_media_kind(
+    media_id: &str,
+    declared_kind: MediaKind,
+    supported_media_kinds: &[MediaKind],
+) -> NativeResult<()> {
+    if supported_media_kinds.contains(&declared_kind) {
+        return Ok(());
+    }
+    Err(NativeError::new(
+        NativeErrorCode::UnsupportedMedia,
+        format!(
+            "media {media_id} declares {} input, which the loaded multimodal projector does not support",
+            media_kind_name(declared_kind)
+        ),
+    ))
+}
+
+fn validate_decoded_media_kind(
+    media_id: &str,
+    declared_kind: MediaKind,
+    decoded_is_audio: bool,
+) -> NativeResult<()> {
+    let decoded_kind = if decoded_is_audio {
+        MediaKind::Audio
+    } else {
+        MediaKind::Image
+    };
+    if decoded_kind == declared_kind {
+        return Ok(());
+    }
+    Err(NativeError::new(
+        NativeErrorCode::UnsupportedMedia,
+        format!(
+            "media {media_id} declares {} input but decoded as {}",
+            media_kind_name(declared_kind),
+            media_kind_name(decoded_kind)
+        ),
+    ))
+}
+
+fn media_kind_name(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Image => "image",
+        MediaKind::Audio => "audio",
+    }
+}
+
+fn media_bitmap(
+    context: &MtmdContext,
+    supported_media_kinds: &[MediaKind],
+    media: &MediaInput,
+) -> NativeResult<MtmdBitmap> {
+    validate_declared_media_kind(&media.id, media.kind, supported_media_kinds)?;
     let bitmap = MtmdBitmap::from_buffer(context, &media.bytes, false).map_err(|error| {
         NativeError::new(
             NativeErrorCode::ModelInvalid,
             format!("failed to decode media {}: {error}", media.id),
         )
     })?;
+    validate_decoded_media_kind(&media.id, media.kind, bitmap.is_audio())?;
     bitmap.set_id(&media.sha256).map_err(|error| {
         NativeError::new(
             NativeErrorCode::InvalidConfig,
@@ -2197,6 +2264,14 @@ fn validate_generation_request(
             "multimodal generation requires at least one media item",
         ));
     }
+    let supported_media_kinds = status
+        .descriptor
+        .as_ref()
+        .map(|descriptor| descriptor.capabilities.media_kinds.as_slice())
+        .unwrap_or_default();
+    for media in &request.media {
+        validate_declared_media_kind(&media.id, media.kind, supported_media_kinds)?;
+    }
     Ok(())
 }
 
@@ -2342,7 +2417,7 @@ fn describe_model(
     config: &NativeModelConfig,
     model: &LlamaModel,
     fingerprint: &ModelFingerprint,
-    multimodal: bool,
+    media_kinds: Vec<MediaKind>,
 ) -> NativeModelDescriptor {
     let display_name = model
         .meta_val_str("general.name")
@@ -2361,6 +2436,7 @@ fn describe_model(
     if chat_template_available {
         prompt_forms.insert(0, PromptForm::Chat);
     }
+    let multimodal = !media_kinds.is_empty();
     NativeModelDescriptor {
         stable_model_id: format!("sha256:{}", fingerprint.model_sha256),
         model_id: config.model_id.clone(),
@@ -2375,6 +2451,7 @@ fn describe_model(
             prompt_forms,
             chat_template_available,
             multimodal,
+            media_kinds,
             streaming: true,
             cancellation: true,
             max_batch_inputs: fingerprint.max_sequences,
@@ -2548,6 +2625,52 @@ mod tests {
             "llama-cpp-sys-2 = {{ version = \"={LLAMA_CPP_BINDING_VERSION}\""
         )));
     }
+
+    #[test]
+    fn reported_media_kinds_match_exact_mtmd_support() {
+        assert_eq!(
+            media_kinds_from_support(false, false),
+            Vec::<MediaKind>::new()
+        );
+        assert_eq!(
+            media_kinds_from_support(true, false),
+            vec![MediaKind::Image]
+        );
+        assert_eq!(
+            media_kinds_from_support(false, true),
+            vec![MediaKind::Audio]
+        );
+        assert_eq!(
+            media_kinds_from_support(true, true),
+            vec![MediaKind::Image, MediaKind::Audio]
+        );
+    }
+
+    #[test]
+    fn declared_media_kind_must_be_supported() {
+        assert!(
+            validate_declared_media_kind("image-1", MediaKind::Image, &[MediaKind::Image]).is_ok()
+        );
+        let error = validate_declared_media_kind("audio-1", MediaKind::Audio, &[MediaKind::Image])
+            .expect_err("unsupported declared media must fail before decoding");
+        assert_eq!(error.code, NativeErrorCode::UnsupportedMedia);
+        assert!(error.message.contains("audio-1"));
+    }
+
+    #[test]
+    fn decoded_media_kind_must_match_the_declaration() {
+        assert!(validate_decoded_media_kind("image-1", MediaKind::Image, false).is_ok());
+        assert!(validate_decoded_media_kind("audio-1", MediaKind::Audio, true).is_ok());
+
+        let image_error = validate_decoded_media_kind("image-2", MediaKind::Image, true)
+            .expect_err("audio decoded from declared image must fail");
+        assert_eq!(image_error.code, NativeErrorCode::UnsupportedMedia);
+
+        let audio_error = validate_decoded_media_kind("audio-2", MediaKind::Audio, false)
+            .expect_err("image decoded from declared audio must fail");
+        assert_eq!(audio_error.code, NativeErrorCode::UnsupportedMedia);
+    }
+
     use std::path::PathBuf;
 
     #[test]
