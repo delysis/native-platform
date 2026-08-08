@@ -72,13 +72,25 @@ pub fn hugging_face_hub_cache_dir() -> Option<PathBuf> {
     if let Some(path) = nonempty_env_path("XDG_CACHE_HOME") {
         return Some(path.join("huggingface").join("hub"));
     }
-    nonempty_env_path("HOME").map(|home| home.join(".cache").join("huggingface").join("hub"))
+    user_home_dir().map(|home| home.join(".cache").join("huggingface").join("hub"))
 }
 
 fn nonempty_env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    nonempty_env_path("HOME")
+        .or_else(|| nonempty_env_path("USERPROFILE"))
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
+            let path = std::env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
+            let mut home = drive;
+            home.push(path);
+            Some(PathBuf::from(home))
+        })
 }
 
 fn collect_cached_models(directory: &Path, depth: usize, models: &mut Vec<PathBuf>) {
@@ -183,8 +195,15 @@ mod tests {
             && std::env::var_os("HF_HOME").is_none()
             && std::env::var_os("XDG_CACHE_HOME").is_none()
         {
-            let cache = hugging_face_hub_cache_dir().expect("HOME should resolve a cache path");
-            assert!(cache.ends_with(".cache/huggingface/hub"));
+            let cache = hugging_face_hub_cache_dir()
+                .expect("the platform home directory should resolve a cache path");
+            assert!(
+                cache.ends_with(
+                    std::path::Path::new(".cache")
+                        .join("huggingface")
+                        .join("hub")
+                )
+            );
         }
     }
 }
