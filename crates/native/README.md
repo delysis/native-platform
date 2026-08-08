@@ -33,6 +33,13 @@ documents the product-neutral linking boundary, explicit chat/raw/token prompt
 semantics, model descriptors, cache identity, and the intentionally blocked FIM
 surface.
 
+The Mom Llama application pins the private Free Token Energy gateway by
+immutable Git revision. Free Token Energy pins the published native runtime in
+the same way; the workspace patch in the root manifest deliberately resolves
+that native dependency back to this checkout so the app has one `NativeHost`
+and one native type identity. CI uses repository-scoped read-only deploy keys,
+not a personal token or an unversioned sibling path.
+
 `docs/PERSONA_LIBRARY.md` documents the exact 14 built-in Persona templates.
 Groups are user-configured in Settings and invoked from the ordinary composer;
 there is no separate Consult dashboard and no application-seeded group pattern.

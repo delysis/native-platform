@@ -1175,6 +1175,7 @@ dependencies = [
 [[package]]
 name = "fte-backend-llama"
 version = "0.1.0"
+source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
 dependencies = [
  "async-trait",
  "fte-types",
@@ -1189,6 +1190,7 @@ dependencies = [
 [[package]]
 name = "fte-loopback"
 version = "0.1.0"
+source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
 dependencies = [
  "async-stream",
  "axum",
@@ -1209,6 +1211,7 @@ dependencies = [
 [[package]]
 name = "fte-protocols"
 version = "0.1.0"
+source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
 dependencies = [
  "fte-types",
  "serde",
@@ -1218,6 +1221,7 @@ dependencies = [
 [[package]]
 name = "fte-router"
 version = "0.1.0"
+source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
 dependencies = [
  "fte-types",
  "tokio",
@@ -1226,6 +1230,7 @@ dependencies = [
 [[package]]
 name = "fte-speech-gateway"
 version = "0.1.0"
+source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
 dependencies = [
  "fte-speech-router",
  "fte-speech-types",
@@ -1236,6 +1241,7 @@ dependencies = [
 [[package]]
 name = "fte-speech-router"
 version = "0.1.0"
+source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
 dependencies = [
  "fte-speech-types",
  "serde",
@@ -1245,6 +1251,7 @@ dependencies = [
 [[package]]
 name = "fte-speech-types"
 version = "0.1.0"
+source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
 dependencies = [
  "async-trait",
  "serde",
@@ -1257,6 +1264,7 @@ dependencies = [
 [[package]]
 name = "fte-store"
 version = "0.1.0"
+source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
 dependencies = [
  "fte-types",
  "rusqlite",
@@ -1266,6 +1274,7 @@ dependencies = [
 [[package]]
 name = "fte-types"
 version = "0.1.0"
+source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
 dependencies = [
  "async-trait",
  "futures",
@@ -4002,6 +4011,7 @@ dependencies = [
 [[package]]
 name = "tauri-plugin-free-token-energy"
 version = "0.1.0"
+source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
 dependencies = [
  "fte-loopback",
  "fte-router",

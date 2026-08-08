@@ -20,6 +20,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Authorize pinned private gateway dependency
+        shell: bash
+        env:
+          FREE_TOKEN_ENERGY_DEPLOY_KEY: ${{ secrets.FREE_TOKEN_ENERGY_DEPLOY_KEY }}
+        run: |
+          test -n "$FREE_TOKEN_ENERGY_DEPLOY_KEY"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$FREE_TOKEN_ENERGY_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
@@ -53,6 +65,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Authorize pinned private gateway dependency
+        shell: bash
+        env:
+          FREE_TOKEN_ENERGY_DEPLOY_KEY: ${{ secrets.FREE_TOKEN_ENERGY_DEPLOY_KEY }}
+        run: |
+          test -n "$FREE_TOKEN_ENERGY_DEPLOY_KEY"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$FREE_TOKEN_ENERGY_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
 
       - uses: dtolnay/rust-toolchain@stable
         with:

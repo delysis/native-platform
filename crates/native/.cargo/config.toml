@@ -3,3 +3,6 @@
 # default selected by generic Cargo/Tauri release builds. Keep the Rust bundle
 # metadata and native C/C++ objects on the same explicit deployment floor.
 MACOSX_DEPLOYMENT_TARGET = "13.0"
+
+[net]
+git-fetch-with-cli = true
