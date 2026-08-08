@@ -1150,6 +1150,7 @@ fn map_native_error(request_id: &RequestId, error: NativeError) -> GatewayError 
         | NativeErrorCode::ContextCreateFailed
         | NativeErrorCode::WorkerStopped => (ErrorClass::Unavailable, true, 503),
         NativeErrorCode::Cancelled => (ErrorClass::Cancelled, false, 499),
+        NativeErrorCode::UnsupportedMedia => (ErrorClass::Capability, false, 422),
         NativeErrorCode::CacheIncompatible => (ErrorClass::Capability, false, 409),
         NativeErrorCode::DecodeFailed | NativeErrorCode::Internal => {
             (ErrorClass::Internal, false, 500)
@@ -1227,6 +1228,18 @@ mod tests {
         assert_eq!(error.code, "native_memory_budget_exceeded");
         assert_eq!(error.class, ErrorClass::Unavailable);
         assert!(error.retryable);
+
+        let unsupported_media = map_native_error(
+            &RequestId::new(),
+            NativeError::new(
+                NativeErrorCode::UnsupportedMedia,
+                "the configured model does not accept audio input",
+            ),
+        );
+        assert_eq!(unsupported_media.code, "native_unsupported_media");
+        assert_eq!(unsupported_media.class, ErrorClass::Capability);
+        assert_eq!(unsupported_media.http_status, 422);
+        assert!(!unsupported_media.retryable);
     }
 
     #[test]
