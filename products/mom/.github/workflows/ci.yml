@@ -127,6 +127,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install native UX probe tools
+        run: brew install ripgrep
+
       - run: cargo test -p mom-llama-app
       - run: cargo clippy -p mom-llama-app --all-targets -- -D warnings
       - run: ./scripts/check-persona-product-ux.sh
