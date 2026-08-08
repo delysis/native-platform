@@ -25,4 +25,10 @@ store, load bounded resident models and submit `llama-native-types` requests.
 This repository never selects a database, key manager, network policy, hosted
 provider, application data directory or user interface.
 
+New products should use `GenerationBatchRequest` for branch families. Legacy
+`GenerationRequest` completion/chat calls remain wrappers over the same raw
+case path, while `SharedPrefixBatchRequest` remains available for existing
+chat-oriented consumers. Case IDs are causal and cancellation identities, not
+content hashes: identical output bytes never collapse two generation cases.
+
 `scripts/check-architecture.sh` enforces the negative half of this contract.

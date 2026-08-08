@@ -14,6 +14,21 @@ The runtime does not use `llama-server`, `llama-cli`, localhost, HTTP, TCP or
 SSE for inference. It owns only model loading, scheduling, tokenization,
 streaming, cancellation and cache-safe native state.
 
+## Raw generation families
+
+`GenerationBatchRequest` is the product-neutral batch boundary for local raw
+generation. Each ordered `GenerationCase` owns its exact `GenerationInput`,
+sampler/seed, cancellation identity and optional sequence state. Completion
+cases accept exact text or token IDs without a chat template; one case always
+produces one ordered output. The engine detects token-exact shared prefixes
+without changing prompt semantics.
+
+Outputs preserve sampled token IDs and per-case cache accounting. Rich token
+observations are optional and probability records carry an explicit
+`raw_model`, `post_constraint` or `post_sampler` stage. Backends leave
+unsupported observations absent. Exact inspected capabilities are published
+alongside the legacy summary fields for a compatibility window.
+
 ## Workspace
 
 - `llama-native-types`: stable public DTOs.

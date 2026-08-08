@@ -289,6 +289,32 @@ pub struct GenerationRequest {
     pub cached_prefix: Option<SequenceStateBlob>,
 }
 
+/// One independently sampled occurrence in a product-neutral generation batch.
+///
+/// A case is deliberately not a content identity: callers may submit identical
+/// inputs and seeds under different case IDs and receive distinct causal
+/// occurrences. Completion inputs must contain exactly one prompt so one case
+/// always maps to one ordered output and one cancellation key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GenerationCase {
+    pub case_id: String,
+    pub input: GenerationInput,
+    pub sampling: SamplingConfig,
+    #[serde(default)]
+    pub cached_prefix: Option<SequenceStateBlob>,
+}
+
+/// An ordered family of independently sampled generation cases.
+///
+/// The engine preserves `cases` order in outputs, detects token-exact prefixes
+/// across cases, and exposes each `case_id` as the branch cancellation key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GenerationBatchRequest {
+    pub request_id: String,
+    pub model_id: String,
+    pub cases: Vec<GenerationCase>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BranchRequest {
     pub branch_id: String,
@@ -348,10 +374,59 @@ pub struct GenerationEvent {
 pub struct GenerationMetrics {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
+    /// Compatibility total for callers predating `cache`.
+    ///
+    /// This is the number of prompt tokens whose KV work was reused either
+    /// from a supplied state or from token-exact sharing inside the batch.
     pub shared_prefix_tokens: usize,
     pub duration_ms: u128,
     pub first_token_ms: Option<u128>,
     pub tokens_per_second: f64,
+    #[serde(default)]
+    pub cache: GenerationCacheMetrics,
+}
+
+/// Per-case cache accounting. Values describe work actually accepted by the
+/// engine; an incompatible supplied state fails instead of being counted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenerationCacheMetrics {
+    /// Token count declared by a supplied sequence state.
+    pub supplied_prefix_tokens: usize,
+    /// Supplied prefix tokens restored into this case's sequence.
+    pub restored_prefix_tokens: usize,
+    /// Token-exact prefix tokens decoded once and copied within this batch.
+    pub batch_shared_prefix_tokens: usize,
+}
+
+/// The probability distribution to which an observation belongs.
+///
+/// These stages are not interchangeable. In particular, post-sampler values
+/// must never be presented as raw-model confidence.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbabilityStage {
+    RawModel,
+    PostConstraint,
+    PostSampler,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TokenProbabilityObservation {
+    pub stage: ProbabilityStage,
+    pub probability: f32,
+}
+
+/// Optional evidence about one generated token.
+///
+/// The current llama.cpp adapter always returns generated token IDs, but only
+/// populates this richer record when it can report the declared probability
+/// stage without approximation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TokenObservation {
+    pub generated_index: usize,
+    pub token_id: i32,
+    #[serde(default)]
+    pub probabilities: Vec<TokenProbabilityObservation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -363,6 +438,14 @@ pub struct GenerationOutput {
     pub input_index: usize,
     pub model_id: String,
     pub text: String,
+    /// Sampled token IDs in generation order. Stop-sequence tokens remain in
+    /// this evidence even when the compatibility `text` projection trims the
+    /// matching stop suffix.
+    #[serde(default)]
+    pub generated_token_ids: Vec<i32>,
+    /// Absent when the backend cannot provide typed observations honestly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_observations: Option<Vec<TokenObservation>>,
     pub state: GenerationState,
     pub finish_reason: String,
     pub metrics: GenerationMetrics,
@@ -422,10 +505,101 @@ pub enum SamplingParameter {
     Stop,
 }
 
+/// Whether the exact declaration was populated by an inspecting backend or
+/// defaulted while reading an older serialized descriptor.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityDeclarationStatus {
+    #[default]
+    Unreported,
+    Inspected,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptInputCapabilities {
+    pub chat: bool,
+    pub completion_text: bool,
+    pub completion_token_ids: bool,
+    /// Present only when the backend has a verified model-specific FIM token
+    /// contract. `None` is unsupported or unverified, never an approximation.
+    pub fill_in_middle: Option<FillInMiddleCapability>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FillInMiddleCapability {
+    pub contract_id: String,
+    pub prefix_token_id: i32,
+    pub suffix_token_id: i32,
+    pub middle_token_id: i32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenerationOutputCapabilities {
+    pub generated_token_ids: bool,
+    pub token_observations: bool,
+    /// Probability stages the backend can populate without inference or
+    /// relabeling. An empty list means probability records are unavailable.
+    #[serde(default)]
+    pub probability_stages: Vec<ProbabilityStage>,
+    /// Log-probability stages available as typed observations. Kept separate
+    /// because a probability and its logarithm are different public values.
+    #[serde(default)]
+    pub log_probability_stages: Vec<ProbabilityStage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenerationBatchCapabilities {
+    pub max_cases: u32,
+    pub ordered_outputs: bool,
+    pub per_case_sampling: bool,
+    pub per_case_cancellation: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CacheOperationCapabilities {
+    pub sequence_snapshot: bool,
+    pub sequence_restore: bool,
+    pub per_case_restore: bool,
+    pub token_exact_shared_prefix: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectorRequirement {
+    Required,
+}
+
+/// Exact media facts available from the loaded projector.
+///
+/// Optional limits and MIME lists remain absent when llama.cpp does not expose
+/// a trustworthy fixed contract; absence must not be interpreted as unlimited.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaInputCapability {
+    pub kind: MediaKind,
+    pub projector: ProjectorRequirement,
+    pub accepted_mime_types: Option<Vec<String>>,
+    pub max_objects_per_request: Option<u32>,
+    pub max_bytes_per_object: Option<u64>,
+    pub max_total_bytes_per_request: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExactModelCapabilities {
+    pub declaration: CapabilityDeclarationStatus,
+    pub prompts: PromptInputCapabilities,
+    pub outputs: GenerationOutputCapabilities,
+    pub batches: GenerationBatchCapabilities,
+    pub cache: CacheOperationCapabilities,
+    #[serde(default)]
+    pub media: Vec<MediaInputCapability>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelCapabilities {
     pub prompt_forms: Vec<PromptForm>,
     pub chat_template_available: bool,
+    /// Compatibility summary retained for one deprecation window. New callers
+    /// must use `exact.media` instead.
     pub multimodal: bool,
     /// Exact input modalities reported by the loaded multimodal projector.
     /// An empty list means no media is accepted, even when an mmproj path was
@@ -436,6 +610,10 @@ pub struct ModelCapabilities {
     pub cancellation: bool,
     pub max_batch_inputs: u32,
     pub sampling_parameters: Vec<SamplingParameter>,
+    /// Authoritative capability declarations for newly inspected models.
+    /// Older serialized descriptors deserialize as `Unreported`.
+    #[serde(default)]
+    pub exact: ExactModelCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -594,5 +772,105 @@ mod tests {
 
         assert!(capabilities.multimodal);
         assert!(capabilities.media_kinds.is_empty());
+        assert_eq!(
+            capabilities.exact.declaration,
+            CapabilityDeclarationStatus::Unreported
+        );
+    }
+
+    #[test]
+    fn probability_observations_preserve_distribution_semantics() {
+        let observation = TokenObservation {
+            generated_index: 0,
+            token_id: 42,
+            probabilities: vec![
+                TokenProbabilityObservation {
+                    stage: ProbabilityStage::RawModel,
+                    probability: 0.4,
+                },
+                TokenProbabilityObservation {
+                    stage: ProbabilityStage::PostSampler,
+                    probability: 0.7,
+                },
+            ],
+        };
+
+        let json = serde_json::to_value(&observation).expect("serialize token observation");
+        assert_eq!(json["probabilities"][0]["stage"], "raw_model");
+        assert_eq!(json["probabilities"][1]["stage"], "post_sampler");
+    }
+
+    #[test]
+    fn generation_batch_round_trip_preserves_case_order_and_exact_tokens() {
+        let request = GenerationBatchRequest {
+            request_id: "family".to_string(),
+            model_id: "model".to_string(),
+            cases: vec![
+                GenerationCase {
+                    case_id: "first".to_string(),
+                    input: GenerationInput::Completion {
+                        prompts: vec![CompletionPrompt::Tokens {
+                            token_ids: vec![1, 2, 3],
+                        }],
+                    },
+                    sampling: SamplingConfig {
+                        seed: 10,
+                        ..SamplingConfig::default()
+                    },
+                    cached_prefix: None,
+                },
+                GenerationCase {
+                    case_id: "second".to_string(),
+                    input: GenerationInput::Completion {
+                        prompts: vec![CompletionPrompt::Text {
+                            text: "Exact bytes".to_string(),
+                            special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+                        }],
+                    },
+                    sampling: SamplingConfig {
+                        seed: 11,
+                        ..SamplingConfig::default()
+                    },
+                    cached_prefix: None,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&request).expect("serialize batch request");
+        let decoded: GenerationBatchRequest =
+            serde_json::from_str(&json).expect("deserialize batch request");
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.cases[0].case_id, "first");
+        assert_eq!(decoded.cases[0].sampling.seed, 10);
+        assert_eq!(decoded.cases[1].case_id, "second");
+    }
+
+    #[test]
+    fn legacy_generation_output_defaults_new_evidence_fields_to_absent() {
+        let output: GenerationOutput = serde_json::from_value(serde_json::json!({
+            "request_id": "request",
+            "branch_id": "assistant",
+            "model_id": "model",
+            "text": "answer",
+            "state": "completed",
+            "finish_reason": "max_tokens",
+            "metrics": {
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+                "shared_prefix_tokens": 0,
+                "duration_ms": 10,
+                "first_token_ms": 5,
+                "tokens_per_second": 100.0
+            },
+            "real_engine_invoked": true,
+            "fake_fixture": false,
+            "transport": "in_process"
+        }))
+        .expect("legacy output must remain readable");
+
+        assert!(output.generated_token_ids.is_empty());
+        assert!(output.token_observations.is_none());
+        assert_eq!(output.metrics.cache, GenerationCacheMetrics::default());
+        assert_eq!(output.input_index, 0);
     }
 }

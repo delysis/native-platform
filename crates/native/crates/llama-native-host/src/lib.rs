@@ -9,8 +9,8 @@
 use llama_native_cache::{CacheFingerprint, MemoryPrefixCache, PrefixCacheValue};
 use llama_native_engine::{GenerationTicket, NativeModelHandle};
 use llama_native_types::{
-    GenerationRequest, NativeError, NativeErrorCode, NativeModelConfig, NativeModelDescriptor,
-    ResidentModelStatus, SharedPrefixBatchRequest,
+    GenerationBatchRequest, GenerationRequest, NativeError, NativeErrorCode, NativeModelConfig,
+    NativeModelDescriptor, ResidentModelStatus, SharedPrefixBatchRequest,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -285,6 +285,14 @@ impl NativeHost {
         request: GenerationRequest,
     ) -> Result<GenerationTicket, NativeError> {
         self.acquire(model)?.generate(request)
+    }
+
+    pub fn generate_batch(
+        &self,
+        model: NativeModelConfig,
+        request: GenerationBatchRequest,
+    ) -> Result<GenerationTicket, NativeError> {
+        self.acquire(model)?.generate_batch(request)
     }
 
     pub fn generate_shared_prefix(

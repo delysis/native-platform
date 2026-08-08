@@ -14,13 +14,17 @@ use llama_cpp_2::mtmd::{
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use llama_native_types::{
-    BranchRequest, ChatMessage, ChatRole, ChatTemplateChoice, CompletionPrompt, GenerationEvent,
-    GenerationEventKind, GenerationInput, GenerationMetrics, GenerationOutput, GenerationRequest,
-    GenerationState, MAX_PARALLEL_SEQUENCES, MediaInput, MediaKind, ModelCapabilities,
-    ModelFingerprint, ModelRuntimeState, NativeDevice, NativeError, NativeErrorCode,
-    NativeModelConfig, NativeModelDescriptor, NativeTransport, PreparedPrompt, PromptForm,
-    PromptTokenPolicy, ResidentModelStatus, SamplerKind, SamplingConfig, SamplingParameter,
-    SequenceStateBlob, SharedPrefixBatchRequest, SpecialTokenPolicy, TokenizedPrompt,
+    BranchRequest, CacheOperationCapabilities, CapabilityDeclarationStatus, ChatMessage, ChatRole,
+    ChatTemplateChoice, CompletionPrompt, ExactModelCapabilities, GenerationBatchCapabilities,
+    GenerationBatchRequest, GenerationCacheMetrics, GenerationCase, GenerationEvent,
+    GenerationEventKind, GenerationInput, GenerationMetrics, GenerationOutput,
+    GenerationOutputCapabilities, GenerationRequest, GenerationState, MAX_PARALLEL_SEQUENCES,
+    MediaInput, MediaInputCapability, MediaKind, ModelCapabilities, ModelFingerprint,
+    ModelRuntimeState, NativeDevice, NativeError, NativeErrorCode, NativeModelConfig,
+    NativeModelDescriptor, NativeTransport, PreparedPrompt, ProjectorRequirement, PromptForm,
+    PromptInputCapabilities, PromptTokenPolicy, ResidentModelStatus, SamplerKind, SamplingConfig,
+    SamplingParameter, SequenceStateBlob, SharedPrefixBatchRequest, SpecialTokenPolicy,
+    TokenizedPrompt,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -146,6 +150,13 @@ impl Drop for NativeModelInner {
 
 #[derive(Debug)]
 enum WorkerCommand {
+    GenerateBatch {
+        request: GenerationBatchRequest,
+        event_tx: Sender<GenerationEvent>,
+        result_tx: Sender<NativeResult<Vec<GenerationOutput>>>,
+        cancellations: Vec<Arc<AtomicBool>>,
+        reasoning_forces: Vec<Arc<AtomicBool>>,
+    },
     Generate {
         request: SharedPrefixBatchRequest,
         event_tx: Sender<GenerationEvent>,
@@ -159,13 +170,6 @@ enum WorkerCommand {
         result_tx: Sender<NativeResult<Vec<GenerationOutput>>>,
         cancellation: Arc<AtomicBool>,
         reasoning_force: Arc<AtomicBool>,
-    },
-    GenerateCompletion {
-        request: GenerationRequest,
-        event_tx: Sender<GenerationEvent>,
-        result_tx: Sender<NativeResult<Vec<GenerationOutput>>>,
-        cancellations: Vec<Arc<AtomicBool>>,
-        reasoning_forces: Vec<Arc<AtomicBool>>,
     },
     Snapshot {
         sequence_id: i32,
@@ -261,40 +265,72 @@ impl NativeModelHandle {
     }
 
     pub fn generate(&self, request: GenerationRequest) -> NativeResult<GenerationTicket> {
-        match &request.input {
-            GenerationInput::Chat { .. } if !request.media.is_empty() => {
-                self.generate_multimodal(request)
-            }
-            GenerationInput::Chat { messages, template } => {
-                let batch = SharedPrefixBatchRequest {
-                    request_id: request.request_id,
-                    model_id: request.model_id,
-                    common_messages: messages.clone(),
-                    chat_template: template.clone(),
-                    branches: vec![BranchRequest {
-                        branch_id: "assistant".to_string(),
-                        label: "Assistant".to_string(),
-                        instruction: String::new(),
-                        sampling: request.sampling,
-                        messages: Vec::new(),
-                        cached_prefix: None,
-                    }],
-                    cached_prefix: request.cached_prefix,
-                };
-                self.generate_shared_prefix(batch)
-            }
-            GenerationInput::Completion { .. } => self.generate_completion(request),
-            GenerationInput::FillInMiddle { .. } => Err(NativeError::new(
-                NativeErrorCode::UnsupportedPromptForm,
-                "fill-in-middle generation is unavailable because this model has no verified FIM token contract",
-            )),
+        if matches!(&request.input, GenerationInput::Chat { .. }) && !request.media.is_empty() {
+            return self.generate_multimodal(request);
         }
+        if !request.media.is_empty() {
+            return Err(NativeError::new(
+                NativeErrorCode::UnsupportedMedia,
+                "media inputs require a chat generation request",
+            ));
+        }
+        let GenerationRequest {
+            request_id,
+            model_id,
+            input,
+            sampling,
+            media: _,
+            cached_prefix,
+        } = request;
+        let cases = match input {
+            GenerationInput::Chat { messages, template } => vec![GenerationCase {
+                case_id: "assistant".to_string(),
+                input: GenerationInput::Chat { messages, template },
+                sampling,
+                cached_prefix,
+            }],
+            GenerationInput::Completion { prompts } => {
+                if cached_prefix.is_some() && prompts.len() != 1 {
+                    return Err(NativeError::new(
+                        NativeErrorCode::InvalidConfig,
+                        "a request-level cached prefix can only be used with one completion prompt",
+                    ));
+                }
+                prompts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, prompt)| GenerationCase {
+                        case_id: format!("completion-{index}"),
+                        input: GenerationInput::Completion {
+                            prompts: vec![prompt],
+                        },
+                        sampling: sampling.clone(),
+                        cached_prefix: cached_prefix.clone(),
+                    })
+                    .collect()
+            }
+            GenerationInput::FillInMiddle { .. } => {
+                return Err(NativeError::new(
+                    NativeErrorCode::UnsupportedPromptForm,
+                    "fill-in-middle generation is unavailable because this model has no verified FIM token contract",
+                ));
+            }
+        };
+        self.generate_batch(GenerationBatchRequest {
+            request_id,
+            model_id,
+            cases,
+        })
     }
 
-    fn generate_completion(&self, request: GenerationRequest) -> NativeResult<GenerationTicket> {
-        let prompt_count = validate_completion_request(&request, &self.status())?;
-        let mut cancellations = Vec::with_capacity(prompt_count);
-        let mut reasoning_forces = Vec::with_capacity(prompt_count);
+    /// Submit an ordered family of independently sampled raw generation cases.
+    pub fn generate_batch(
+        &self,
+        request: GenerationBatchRequest,
+    ) -> NativeResult<GenerationTicket> {
+        validate_generation_batch_request(&request, &self.status())?;
+        let mut cancellations = Vec::with_capacity(request.cases.len());
+        let mut reasoning_forces = Vec::with_capacity(request.cases.len());
         {
             let mut registry = self.inner.cancellations.lock().map_err(|_| {
                 NativeError::new(
@@ -305,16 +341,15 @@ impl NativeModelHandle {
             let mut reasoning_registry = self.inner.reasoning_forces.lock().map_err(|_| {
                 NativeError::new(NativeErrorCode::Internal, "reasoning registry is poisoned")
             })?;
-            for index in 0..prompt_count {
-                let branch_id = format!("completion-{index}");
+            for case in &request.cases {
                 let cancellation = Arc::new(AtomicBool::new(false));
                 let reasoning = Arc::new(AtomicBool::new(false));
                 registry.insert(
-                    (request.request_id.clone(), branch_id.clone()),
+                    (request.request_id.clone(), case.case_id.clone()),
                     Arc::clone(&cancellation),
                 );
                 reasoning_registry.insert(
-                    (request.request_id.clone(), branch_id),
+                    (request.request_id.clone(), case.case_id.clone()),
                     Arc::clone(&reasoning),
                 );
                 cancellations.push(cancellation);
@@ -324,22 +359,18 @@ impl NativeModelHandle {
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
         let (result_tx, result_rx) = bounded(1);
         let request_id = request.request_id.clone();
-        if let Err(error) = self
-            .inner
-            .command_tx
-            .send(WorkerCommand::GenerateCompletion {
-                request,
-                event_tx,
-                result_tx,
-                cancellations,
-                reasoning_forces,
-            })
-        {
+        if let Err(error) = self.inner.command_tx.send(WorkerCommand::GenerateBatch {
+            request,
+            event_tx,
+            result_tx,
+            cancellations,
+            reasoning_forces,
+        }) {
             cleanup_request_in_registry(&self.inner.cancellations, &request_id);
             cleanup_request_in_registry(&self.inner.reasoning_forces, &request_id);
             return Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
-                format!("native model worker is not accepting completion requests: {error}"),
+                format!("native model worker is not accepting batch requests: {error}"),
             ));
         }
         Ok(GenerationTicket {
@@ -783,6 +814,39 @@ fn run_worker(
     let mut sequence_token_ids = HashMap::<i32, Vec<i32>>::new();
     while let Ok(command) = command_rx.recv() {
         match command {
+            WorkerCommand::GenerateBatch {
+                request,
+                event_tx,
+                result_tx,
+                cancellations,
+                reasoning_forces,
+            } => {
+                set_status_state(&status, ModelRuntimeState::Ready, request.cases.len());
+                let result = prepare_generation_batch(&model, &request).and_then(
+                    |(normalized, token_sets)| {
+                        generate_batch(
+                            &model,
+                            &mut context,
+                            &normalized,
+                            Some(token_sets),
+                            BatchSupervision {
+                                event_tx: &event_tx,
+                                cancellations: &cancellations,
+                                reasoning_forces: &reasoning_forces,
+                            },
+                            SequenceTracking {
+                                token_counts: &mut sequence_token_counts,
+                                token_ids: &mut sequence_token_ids,
+                            },
+                        )
+                    },
+                );
+                if result.is_err() {
+                    emit_failed_case_events(&event_tx, &request);
+                }
+                set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = result_tx.send(result);
+            }
             WorkerCommand::Generate {
                 request,
                 event_tx,
@@ -806,6 +870,9 @@ fn run_worker(
                         token_ids: &mut sequence_token_ids,
                     },
                 );
+                if result.is_err() {
+                    emit_failed_branch_events(&event_tx, &request);
+                }
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
                 let _ = result_tx.send(result);
             }
@@ -832,38 +899,11 @@ fn run_worker(
                         token_ids: &mut sequence_token_ids,
                     },
                 );
+                if result.is_err() {
+                    emit_generation_state(&event_tx, &request, u64::MAX, GenerationState::Failed);
+                }
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
                 let _ = result_tx.send(result.map(|output| vec![output]));
-            }
-            WorkerCommand::GenerateCompletion {
-                request,
-                event_tx,
-                result_tx,
-                cancellations,
-                reasoning_forces,
-            } => {
-                let prompt_count = completion_prompt_count(&request);
-                set_status_state(&status, ModelRuntimeState::Ready, prompt_count);
-                let result =
-                    prepare_completion_batch(&model, request).and_then(|(batch, token_sets)| {
-                        generate_batch(
-                            &model,
-                            &mut context,
-                            &batch,
-                            Some(token_sets),
-                            BatchSupervision {
-                                event_tx: &event_tx,
-                                cancellations: &cancellations,
-                                reasoning_forces: &reasoning_forces,
-                            },
-                            SequenceTracking {
-                                token_counts: &mut sequence_token_counts,
-                                token_ids: &mut sequence_token_ids,
-                            },
-                        )
-                    });
-                set_status_state(&status, ModelRuntimeState::Ready, 0);
-                let _ = result_tx.send(result);
             }
             WorkerCommand::Snapshot {
                 sequence_id,
@@ -1130,6 +1170,7 @@ fn generate_batch(
                 sampler,
                 decoder: UTF_8.new_decoder(),
                 text: String::new(),
+                generated_token_ids: Vec::with_capacity(branch.sampling.max_tokens as usize),
                 generated: 0,
                 next_position: token_sets[index].len() as i32,
                 logit_index: index as i32,
@@ -1162,15 +1203,6 @@ fn generate_batch(
                 branch.state = GenerationState::Cancelled;
                 branch.finish_reason = "cancelled".to_string();
                 let _ = context.clear_kv_cache_seq(Some(index as u32), None, None);
-                emit_state(
-                    supervision.event_tx,
-                    request,
-                    branch.request,
-                    index,
-                    branch.event_index,
-                    GenerationState::Cancelled,
-                );
-                branch.event_index += 1;
                 continue;
             }
             if supervision.reasoning_forces[index].load(Ordering::Acquire)
@@ -1199,6 +1231,7 @@ fn generate_batch(
                 branch.finish_reason = "end_of_generation".to_string();
                 continue;
             }
+            branch.generated_token_ids.push(token.0);
             let bytes = model
                 .token_to_piece_bytes(token, 512, false, None)
                 .map_err(|error| {
@@ -1217,14 +1250,17 @@ fn generate_batch(
             branch.text.push_str(&piece);
             branch.generated += 1;
             if !piece.is_empty() {
-                let _ = supervision.event_tx.try_send(GenerationEvent {
-                    request_id: request.request_id.clone(),
-                    branch_id: branch.request.branch_id.clone(),
-                    sequence_id: branch.sequence_id,
-                    input_index: index,
-                    event_index: branch.event_index,
-                    event: GenerationEventKind::Delta { text: piece },
-                });
+                try_emit_nonterminal(
+                    supervision.event_tx,
+                    GenerationEvent {
+                        request_id: request.request_id.clone(),
+                        branch_id: branch.request.branch_id.clone(),
+                        sequence_id: branch.sequence_id,
+                        input_index: index,
+                        event_index: branch.event_index,
+                        event: GenerationEventKind::Delta { text: piece },
+                    },
+                );
                 branch.event_index += 1;
             }
             if let Some(stop) = branch
@@ -1270,14 +1306,17 @@ fn generate_batch(
             .map_err(|error| native_decode_error("failed to decode generation batch", error))?;
     }
     for branch in &mut branches {
-        if branch.state == GenerationState::Completed {
+        if matches!(
+            branch.state,
+            GenerationState::Completed | GenerationState::Cancelled
+        ) {
             emit_state(
                 supervision.event_tx,
                 request,
                 branch.request,
                 branch.sequence_id as usize,
                 branch.event_index,
-                GenerationState::Completed,
+                branch.state,
             );
             branch.event_index += 1;
         }
@@ -1298,6 +1337,8 @@ fn generate_batch(
                 input_index: branch.sequence_id as usize,
                 model_id: request.model_id.clone(),
                 text: branch.text,
+                generated_token_ids: branch.generated_token_ids,
+                token_observations: None,
                 state: branch.state,
                 finish_reason: branch.finish_reason,
                 metrics: GenerationMetrics {
@@ -1307,6 +1348,19 @@ fn generate_batch(
                     duration_ms,
                     first_token_ms: branch.first_token_ms,
                     tokens_per_second,
+                    cache: if let Some(state) = cached_states[branch.sequence_id as usize] {
+                        GenerationCacheMetrics {
+                            supplied_prefix_tokens: state.token_count,
+                            restored_prefix_tokens: state.token_count,
+                            batch_shared_prefix_tokens: 0,
+                        }
+                    } else {
+                        GenerationCacheMetrics {
+                            supplied_prefix_tokens: 0,
+                            restored_prefix_tokens: 0,
+                            batch_shared_prefix_tokens: shared_uncached_prefix,
+                        }
+                    },
                 },
                 real_engine_invoked: true,
                 fake_fixture: false,
@@ -1317,51 +1371,75 @@ fn generate_batch(
     Ok(outputs)
 }
 
-fn completion_prompt_count(request: &GenerationRequest) -> usize {
-    match &request.input {
-        GenerationInput::Completion { prompts } => prompts.len(),
-        _ => 0,
-    }
-}
-
-fn prepare_completion_batch(
+fn prepare_generation_batch(
     model: &LlamaModel,
-    request: GenerationRequest,
+    request: &GenerationBatchRequest,
 ) -> NativeResult<(SharedPrefixBatchRequest, Vec<Vec<LlamaToken>>)> {
-    let GenerationInput::Completion { prompts } = request.input else {
-        return Err(NativeError::new(
-            NativeErrorCode::UnsupportedPromptForm,
-            "the completion worker received a non-completion prompt",
-        ));
-    };
-    let token_sets = prompts
+    let token_sets = request
+        .cases
         .iter()
         .enumerate()
-        .map(|(index, prompt)| completion_prompt_tokens(model, prompt, index))
+        .map(|(index, case)| generation_case_tokens(model, case, index))
         .collect::<NativeResult<Vec<_>>>()?;
-    let branches = prompts
+    let branches = request
+        .cases
         .iter()
-        .enumerate()
-        .map(|(index, _)| BranchRequest {
-            branch_id: format!("completion-{index}"),
-            label: format!("Completion {index}"),
+        .map(|case| BranchRequest {
+            branch_id: case.case_id.clone(),
+            label: case.case_id.clone(),
             instruction: String::new(),
-            sampling: request.sampling.clone(),
+            sampling: case.sampling.clone(),
             messages: Vec::new(),
-            cached_prefix: None,
+            cached_prefix: case.cached_prefix.clone(),
         })
         .collect();
     Ok((
         SharedPrefixBatchRequest {
-            request_id: request.request_id,
-            model_id: request.model_id,
+            request_id: request.request_id.clone(),
+            model_id: request.model_id.clone(),
             common_messages: Vec::new(),
             chat_template: ChatTemplateChoice::ModelDefault,
             branches,
-            cached_prefix: request.cached_prefix,
+            cached_prefix: None,
         },
         token_sets,
     ))
+}
+
+fn generation_case_tokens(
+    model: &LlamaModel,
+    case: &GenerationCase,
+    case_index: usize,
+) -> NativeResult<Vec<LlamaToken>> {
+    match &case.input {
+        GenerationInput::Chat { messages, template } => {
+            let rendered =
+                render_messages_prompt_with_template(model, messages.clone(), true, template)?;
+            model
+                .str_to_token(&rendered, AddBos::Always)
+                .map_err(|error| {
+                    NativeError::new(
+                        NativeErrorCode::ModelInvalid,
+                        format!("failed to tokenize generation case {case_index}: {error}"),
+                    )
+                })
+        }
+        GenerationInput::Completion { prompts } => {
+            let Some(prompt) = prompts.first() else {
+                return Err(NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    format!("generation case {case_index} has no completion prompt"),
+                ));
+            };
+            completion_prompt_tokens(model, prompt, case_index)
+        }
+        GenerationInput::FillInMiddle { .. } => Err(NativeError::new(
+            NativeErrorCode::UnsupportedPromptForm,
+            format!(
+                "generation case {case_index} requested fill-in-middle without a verified model-specific token contract"
+            ),
+        )),
+    }
 }
 
 fn completion_prompt_tokens(
@@ -1584,6 +1662,7 @@ fn generate_multimodal(
     let mut sampler = build_sampler(model, &request.sampling);
     let mut decoder = UTF_8.new_decoder();
     let mut text = String::new();
+    let mut generated_token_ids = Vec::with_capacity(request.sampling.max_tokens as usize);
     let mut generated = 0_usize;
     let mut event_index = 2_u64;
     let mut first_token_ms = None;
@@ -1624,6 +1703,7 @@ fn generate_multimodal(
             break "end_of_generation".to_string();
         }
         sampler.accept(token);
+        generated_token_ids.push(token.0);
         let bytes = model
             .token_to_piece_bytes(token, 512, false, None)
             .map_err(|error| {
@@ -1640,14 +1720,17 @@ fn generate_multimodal(
         text.push_str(&piece);
         generated += 1;
         if !piece.is_empty() {
-            let _ = supervision.event_tx.try_send(GenerationEvent {
-                request_id: request.request_id.clone(),
-                branch_id: "assistant".to_string(),
-                sequence_id: 0,
-                input_index: 0,
-                event_index,
-                event: GenerationEventKind::Delta { text: piece },
-            });
+            try_emit_nonterminal(
+                supervision.event_tx,
+                GenerationEvent {
+                    request_id: request.request_id.clone(),
+                    branch_id: "assistant".to_string(),
+                    sequence_id: 0,
+                    input_index: 0,
+                    event_index,
+                    event: GenerationEventKind::Delta { text: piece },
+                },
+            );
             event_index += 1;
         }
         if let Some(stop) = request
@@ -1692,6 +1775,8 @@ fn generate_multimodal(
         input_index: 0,
         model_id: request.model_id.clone(),
         text,
+        generated_token_ids,
+        token_observations: None,
         state,
         finish_reason,
         metrics: GenerationMetrics {
@@ -1705,6 +1790,7 @@ fn generate_multimodal(
             } else {
                 generated as f64 / (duration_ms as f64 / 1000.0)
             },
+            cache: GenerationCacheMetrics::default(),
         },
         real_engine_invoked: true,
         fake_fixture: false,
@@ -1851,14 +1937,19 @@ fn emit_generation_state(
     event_index: u64,
     state: GenerationState,
 ) {
-    let _ = event_tx.try_send(GenerationEvent {
+    let event = GenerationEvent {
         request_id: request.request_id.clone(),
         branch_id: "assistant".to_string(),
         sequence_id: 0,
         input_index: 0,
         event_index,
         event: GenerationEventKind::State { state },
-    });
+    };
+    if is_terminal_state(state) {
+        try_emit_terminal(event_tx, event);
+    } else {
+        try_emit_nonterminal(event_tx, event);
+    }
 }
 
 struct ActiveBranch<'a> {
@@ -1867,6 +1958,7 @@ struct ActiveBranch<'a> {
     sampler: LlamaSampler,
     decoder: encoding_rs::Decoder,
     text: String,
+    generated_token_ids: Vec<i32>,
     generated: usize,
     next_position: i32,
     logit_index: i32,
@@ -2275,62 +2367,76 @@ fn validate_generation_request(
     Ok(())
 }
 
-fn validate_completion_request(
-    request: &GenerationRequest,
+fn validate_generation_batch_request(
+    request: &GenerationBatchRequest,
     status: &ResidentModelStatus,
-) -> NativeResult<usize> {
+) -> NativeResult<()> {
     if request.model_id != status.model_id {
         return Err(NativeError::new(
             NativeErrorCode::ModelNotLoaded,
             format!("model {} is not resident", request.model_id),
         ));
     }
-    if !request.media.is_empty() {
-        return Err(NativeError::new(
-            NativeErrorCode::UnsupportedPromptForm,
-            "raw completion prompts cannot include multimodal inputs",
-        ));
-    }
-    let GenerationInput::Completion { prompts } = &request.input else {
-        return Err(NativeError::new(
-            NativeErrorCode::UnsupportedPromptForm,
-            "completion validation received a non-completion input",
-        ));
-    };
-    if prompts.is_empty() || prompts.len() > status.max_sequences as usize {
+    if request.cases.is_empty() || request.cases.len() > status.max_sequences as usize {
         return Err(NativeError::new(
             NativeErrorCode::InvalidConfig,
             format!(
-                "completion generation requires 1 to {} prompts",
+                "batch generation requires 1 to {} cases",
                 status.max_sequences
             ),
         ));
     }
-    if request.sampling.max_tokens == 0 {
-        return Err(NativeError::new(
-            NativeErrorCode::InvalidConfig,
-            "completion max_tokens must be positive",
-        ));
-    }
-    if request.cached_prefix.is_some() && prompts.len() != 1 {
-        return Err(NativeError::new(
-            NativeErrorCode::InvalidConfig,
-            "a request-level cached prefix can only be used with one completion prompt",
-        ));
-    }
-    for (index, prompt) in prompts.iter().enumerate() {
-        let empty = match prompt {
-            CompletionPrompt::Text { text, .. } => text.is_empty(),
-            CompletionPrompt::Tokens { token_ids } => token_ids.is_empty(),
-        };
-        if empty {
+    let mut case_ids = std::collections::HashSet::with_capacity(request.cases.len());
+    for (index, case) in request.cases.iter().enumerate() {
+        if case.case_id.trim().is_empty() || !case_ids.insert(case.case_id.as_str()) {
             return Err(NativeError::new(
                 NativeErrorCode::InvalidConfig,
-                format!("completion prompt {index} is empty"),
+                "generation case IDs must be non-empty and unique",
             ));
         }
+        if case.sampling.max_tokens == 0 {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                format!("generation case {index} has a zero token limit"),
+            ));
+        }
+        match &case.input {
+            GenerationInput::Chat { messages, .. } if messages.is_empty() => {
+                return Err(NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    format!("generation case {index} has no chat messages"),
+                ));
+            }
+            GenerationInput::Completion { prompts } if prompts.len() != 1 => {
+                return Err(NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    format!("generation case {index} must contain exactly one completion prompt"),
+                ));
+            }
+            GenerationInput::Completion { prompts } => {
+                let empty = match &prompts[0] {
+                    CompletionPrompt::Text { text, .. } => text.is_empty(),
+                    CompletionPrompt::Tokens { token_ids } => token_ids.is_empty(),
+                };
+                if empty {
+                    return Err(NativeError::new(
+                        NativeErrorCode::InvalidConfig,
+                        format!("generation case {index} has an empty completion prompt"),
+                    ));
+                }
+            }
+            GenerationInput::FillInMiddle { .. } => {
+                return Err(NativeError::new(
+                    NativeErrorCode::UnsupportedPromptForm,
+                    format!(
+                        "generation case {index} requested fill-in-middle without a verified model-specific token contract"
+                    ),
+                ));
+            }
+            GenerationInput::Chat { .. } => {}
+        }
     }
-    Ok(prompts.len())
+    Ok(())
 }
 
 fn backend() -> NativeResult<&'static LlamaBackend> {
@@ -2437,6 +2543,11 @@ fn describe_model(
         prompt_forms.insert(0, PromptForm::Chat);
     }
     let multimodal = !media_kinds.is_empty();
+    let exact = inspected_capabilities(
+        chat_template_available,
+        fingerprint.max_sequences,
+        &media_kinds,
+    );
     NativeModelDescriptor {
         stable_model_id: format!("sha256:{}", fingerprint.model_sha256),
         model_id: config.model_id.clone(),
@@ -2472,7 +2583,54 @@ fn describe_model(
                 SamplingParameter::MaxTokens,
                 SamplingParameter::Stop,
             ],
+            exact,
         },
+    }
+}
+
+fn inspected_capabilities(
+    chat_template_available: bool,
+    max_sequences: u32,
+    media_kinds: &[MediaKind],
+) -> ExactModelCapabilities {
+    ExactModelCapabilities {
+        declaration: CapabilityDeclarationStatus::Inspected,
+        prompts: PromptInputCapabilities {
+            chat: chat_template_available,
+            completion_text: true,
+            completion_token_ids: true,
+            fill_in_middle: None,
+        },
+        outputs: GenerationOutputCapabilities {
+            generated_token_ids: true,
+            token_observations: false,
+            probability_stages: Vec::new(),
+            log_probability_stages: Vec::new(),
+        },
+        batches: GenerationBatchCapabilities {
+            max_cases: max_sequences,
+            ordered_outputs: true,
+            per_case_sampling: true,
+            per_case_cancellation: true,
+        },
+        cache: CacheOperationCapabilities {
+            sequence_snapshot: true,
+            sequence_restore: true,
+            per_case_restore: true,
+            token_exact_shared_prefix: true,
+        },
+        media: media_kinds
+            .iter()
+            .copied()
+            .map(|kind| MediaInputCapability {
+                kind,
+                projector: ProjectorRequirement::Required,
+                accepted_mime_types: None,
+                max_objects_per_request: None,
+                max_bytes_per_object: None,
+                max_total_bytes_per_request: None,
+            })
+            .collect(),
     }
 }
 
@@ -2536,14 +2694,79 @@ fn emit_state(
     event_index: u64,
     state: GenerationState,
 ) {
-    let _ = event_tx.try_send(GenerationEvent {
+    let event = GenerationEvent {
         request_id: request.request_id.clone(),
         branch_id: branch.branch_id.clone(),
         sequence_id: sequence_id as i32,
         input_index: sequence_id,
         event_index,
         event: GenerationEventKind::State { state },
-    });
+    };
+    if is_terminal_state(state) {
+        try_emit_terminal(event_tx, event);
+    } else {
+        try_emit_nonterminal(event_tx, event);
+    }
+}
+
+fn emit_failed_case_events(event_tx: &Sender<GenerationEvent>, request: &GenerationBatchRequest) {
+    for (index, case) in request.cases.iter().enumerate() {
+        try_emit_terminal(
+            event_tx,
+            GenerationEvent {
+                request_id: request.request_id.clone(),
+                branch_id: case.case_id.clone(),
+                sequence_id: index as i32,
+                input_index: index,
+                event_index: u64::MAX,
+                event: GenerationEventKind::State {
+                    state: GenerationState::Failed,
+                },
+            },
+        );
+    }
+}
+
+fn emit_failed_branch_events(
+    event_tx: &Sender<GenerationEvent>,
+    request: &SharedPrefixBatchRequest,
+) {
+    for (index, branch) in request.branches.iter().enumerate() {
+        try_emit_terminal(
+            event_tx,
+            GenerationEvent {
+                request_id: request.request_id.clone(),
+                branch_id: branch.branch_id.clone(),
+                sequence_id: index as i32,
+                input_index: index,
+                event_index: u64::MAX,
+                event: GenerationEventKind::State {
+                    state: GenerationState::Failed,
+                },
+            },
+        );
+    }
+}
+
+const fn is_terminal_state(state: GenerationState) -> bool {
+    matches!(
+        state,
+        GenerationState::Completed | GenerationState::Cancelled | GenerationState::Failed
+    )
+}
+
+fn try_emit_nonterminal(event_tx: &Sender<GenerationEvent>, event: GenerationEvent) {
+    let terminal_reserve = MAX_PARALLEL_SEQUENCES as usize;
+    if event_tx.len() < EVENT_CAPACITY.saturating_sub(terminal_reserve) {
+        let _ = event_tx.try_send(event);
+    }
+}
+
+fn try_emit_terminal(event_tx: &Sender<GenerationEvent>, event: GenerationEvent) {
+    // Non-terminal producers always preserve one slot for every possible
+    // sequence, so one owner-thread producer can publish every case terminal
+    // without turning this bounded stream into a generation deadlock.
+    let _ = event_tx.try_send(event);
 }
 
 fn set_status_state(
@@ -2728,6 +2951,138 @@ mod tests {
         assert_eq!(error.code, NativeErrorCode::InvalidConfig);
     }
 
+    fn test_status(max_sequences: u32) -> ResidentModelStatus {
+        ResidentModelStatus {
+            model_id: "model".to_string(),
+            state: ModelRuntimeState::Ready,
+            fingerprint: None,
+            descriptor: None,
+            active_sequences: 0,
+            max_sequences,
+        }
+    }
+
+    fn completion_case(case_id: &str, seed: u32) -> GenerationCase {
+        GenerationCase {
+            case_id: case_id.to_string(),
+            input: GenerationInput::Completion {
+                prompts: vec![CompletionPrompt::Tokens {
+                    token_ids: vec![1, 2, 3],
+                }],
+            },
+            sampling: SamplingConfig {
+                seed,
+                ..SamplingConfig::default()
+            },
+            cached_prefix: None,
+        }
+    }
+
+    #[test]
+    fn generation_cases_validate_independent_sampling_and_identity() {
+        let request = GenerationBatchRequest {
+            request_id: "request".to_string(),
+            model_id: "model".to_string(),
+            cases: vec![completion_case("first", 1), completion_case("second", 2)],
+        };
+        validate_generation_batch_request(&request, &test_status(2)).expect("valid ordered cases");
+        assert_eq!(request.cases[0].sampling.seed, 1);
+        assert_eq!(request.cases[1].sampling.seed, 2);
+
+        let mut duplicate = request;
+        duplicate.cases[1].case_id = "first".to_string();
+        let error = validate_generation_batch_request(&duplicate, &test_status(2))
+            .expect_err("duplicate case identities must fail");
+        assert_eq!(error.code, NativeErrorCode::InvalidConfig);
+    }
+
+    #[test]
+    fn one_case_cannot_hide_multiple_completion_occurrences() {
+        let mut case = completion_case("ambiguous", 1);
+        case.input = GenerationInput::Completion {
+            prompts: vec![
+                CompletionPrompt::Tokens { token_ids: vec![1] },
+                CompletionPrompt::Tokens { token_ids: vec![2] },
+            ],
+        };
+        let request = GenerationBatchRequest {
+            request_id: "request".to_string(),
+            model_id: "model".to_string(),
+            cases: vec![case],
+        };
+        let error = validate_generation_batch_request(&request, &test_status(1))
+            .expect_err("one case must map to one output");
+        assert_eq!(error.code, NativeErrorCode::InvalidConfig);
+        assert!(error.message.contains("exactly one completion prompt"));
+    }
+
+    #[test]
+    fn bounded_event_stream_reserves_one_terminal_for_every_case() {
+        let request = GenerationBatchRequest {
+            request_id: "request".to_string(),
+            model_id: "model".to_string(),
+            cases: (0..MAX_PARALLEL_SEQUENCES)
+                .map(|index| completion_case(&format!("case-{index}"), index))
+                .collect(),
+        };
+        let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
+        for index in 0..EVENT_CAPACITY * 2 {
+            try_emit_nonterminal(
+                &event_tx,
+                GenerationEvent {
+                    request_id: request.request_id.clone(),
+                    branch_id: "case-0".to_string(),
+                    sequence_id: 0,
+                    input_index: 0,
+                    event_index: index as u64,
+                    event: GenerationEventKind::Delta {
+                        text: "x".to_string(),
+                    },
+                },
+            );
+        }
+        emit_failed_case_events(&event_tx, &request);
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), EVENT_CAPACITY);
+        for case in &request.cases {
+            let terminals = events
+                .iter()
+                .filter(|event| {
+                    event.branch_id == case.case_id
+                        && matches!(
+                            event.event,
+                            GenerationEventKind::State {
+                                state: GenerationState::Failed
+                            }
+                        )
+                })
+                .count();
+            assert_eq!(terminals, 1, "{} must have one terminal", case.case_id);
+        }
+    }
+
+    #[test]
+    fn inspected_capabilities_do_not_invent_probabilities_or_media_limits() {
+        let capabilities = inspected_capabilities(true, 4, &[MediaKind::Image]);
+        assert_eq!(
+            capabilities.declaration,
+            CapabilityDeclarationStatus::Inspected
+        );
+        assert!(capabilities.prompts.chat);
+        assert!(capabilities.prompts.completion_token_ids);
+        assert!(capabilities.prompts.fill_in_middle.is_none());
+        assert!(capabilities.outputs.generated_token_ids);
+        assert!(!capabilities.outputs.token_observations);
+        assert!(capabilities.outputs.probability_stages.is_empty());
+        assert!(capabilities.outputs.log_probability_stages.is_empty());
+        assert!(capabilities.batches.per_case_sampling);
+        assert!(capabilities.batches.per_case_cancellation);
+        assert_eq!(capabilities.media.len(), 1);
+        assert!(capabilities.media[0].accepted_mime_types.is_none());
+        assert!(capabilities.media[0].max_bytes_per_object.is_none());
+    }
+
     #[test]
     fn longest_prefix_is_token_exact() {
         let first = vec![LlamaToken::new(1), LlamaToken::new(2), LlamaToken::new(3)];
@@ -2809,6 +3164,19 @@ mod tests {
                 .prompt_forms
                 .contains(&PromptForm::FillInMiddle)
         );
+        assert_eq!(
+            descriptor.capabilities.exact.declaration,
+            CapabilityDeclarationStatus::Inspected
+        );
+        assert!(descriptor.capabilities.exact.outputs.generated_token_ids);
+        assert!(
+            descriptor
+                .capabilities
+                .exact
+                .outputs
+                .probability_stages
+                .is_empty()
+        );
 
         let exact_text = "  Once upon a time\n".to_string();
         let prepared_text = handle.prepare_input(GenerationInput::Completion {
@@ -2843,7 +3211,7 @@ mod tests {
                         special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
                     },
                     CompletionPrompt::Tokens {
-                        token_ids: exact_tokens,
+                        token_ids: exact_tokens.clone(),
                     },
                 ],
             },
@@ -2864,6 +3232,10 @@ mod tests {
         assert_eq!(outputs[1].input_index, 1);
         assert_eq!(outputs[1].branch_id, "completion-1");
         assert!(outputs.iter().all(|output| output.real_engine_invoked));
+        assert!(outputs.iter().all(|output| {
+            output.generated_token_ids.len() == output.metrics.completion_tokens
+                && output.token_observations.is_none()
+        }));
         for input_index in 0..2 {
             let indexes = events
                 .iter()
@@ -2872,6 +3244,65 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(!indexes.is_empty());
             assert!(indexes.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+
+        let family_ticket = handle.generate_batch(GenerationBatchRequest {
+            request_id: "native-raw-family".to_string(),
+            model_id: descriptor.model_id.clone(),
+            cases: vec![
+                GenerationCase {
+                    case_id: "seed-41".to_string(),
+                    input: GenerationInput::Completion {
+                        prompts: vec![CompletionPrompt::Tokens {
+                            token_ids: exact_tokens.clone(),
+                        }],
+                    },
+                    sampling: SamplingConfig {
+                        seed: 41,
+                        max_tokens: 4,
+                        ..SamplingConfig::default()
+                    },
+                    cached_prefix: None,
+                },
+                GenerationCase {
+                    case_id: "seed-42".to_string(),
+                    input: GenerationInput::Completion {
+                        prompts: vec![CompletionPrompt::Tokens {
+                            token_ids: exact_tokens.clone(),
+                        }],
+                    },
+                    sampling: SamplingConfig {
+                        seed: 42,
+                        max_tokens: 4,
+                        ..SamplingConfig::default()
+                    },
+                    cached_prefix: None,
+                },
+            ],
+        })?;
+        let family_outputs = family_ticket.wait_timeout(Duration::from_secs(120))?;
+        let family_events = family_ticket.events.try_iter().collect::<Vec<_>>();
+        assert_eq!(family_outputs[0].branch_id, "seed-41");
+        assert_eq!(family_outputs[1].branch_id, "seed-42");
+        assert!(family_outputs.iter().all(|output| {
+            output.metrics.cache.batch_shared_prefix_tokens == exact_tokens.len() - 1
+        }));
+        for case_id in ["seed-41", "seed-42"] {
+            let terminals = family_events
+                .iter()
+                .filter(|event| {
+                    event.branch_id == case_id
+                        && matches!(
+                            event.event,
+                            GenerationEventKind::State {
+                                state: GenerationState::Completed
+                                    | GenerationState::Cancelled
+                                    | GenerationState::Failed
+                            }
+                        )
+                })
+                .count();
+            assert_eq!(terminals, 1);
         }
 
         let cancel_ticket = handle.generate(GenerationRequest {
