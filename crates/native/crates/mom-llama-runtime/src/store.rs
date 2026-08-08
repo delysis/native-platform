@@ -5,14 +5,17 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
+#[cfg(any(target_os = "macos", test))]
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", test))]
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 const DATABASE_FILE: &str = "runtime.sqlite3";
 const STORE_KEY_ENV: &str = "LLAMA_NATIVE_KIT_STORE_KEY_HEX";
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "com.delysis.llama-native-kit.mom-llama.store.v1";
 
 // RuntimeStore is intentionally cheap to reopen, but asking macOS Keychain for
@@ -20,8 +23,10 @@ const KEYCHAIN_SERVICE: &str = "com.delysis.llama-native-kit.mom-llama.store.v1"
 // authorization prompts for development-signed builds. Keep the key only in
 // process memory after the first successful OS lookup. The cache is indexed by
 // the hashed data-directory account, so isolated stores never share keys.
+#[cfg(target_os = "macos")]
 static INSTALLATION_KEYS: OnceLock<Mutex<HashMap<String, CachedInstallationKey>>> = OnceLock::new();
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone)]
 enum CachedInstallationKey {
     Available([u8; 32]),
@@ -425,6 +430,7 @@ fn configured_store_key(
     Ok(None)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn cached_installation_key(
     account: &str,
     cache: &OnceLock<Mutex<HashMap<String, CachedInstallationKey>>>,
@@ -476,6 +482,7 @@ fn load_or_create_macos_key(account: &str) -> Result<[u8; 32]> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn keychain_account(data_dir: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data_dir.to_string_lossy().as_bytes());
