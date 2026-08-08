@@ -995,11 +995,12 @@ fn fixture_readiness_never_claims_native_inference() -> Result<()> {
 }
 
 #[test]
-fn native_inference_architecture_rejects_network_and_process_authority() -> Result<()> {
+fn product_runtime_rejects_network_process_and_copied_native_authority() -> Result<()> {
     let runtime_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let crates_dir = runtime_manifest
+    let repo_root = runtime_manifest
         .parent()
-        .ok_or_else(|| anyhow!("runtime crate has no crates parent"))?;
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow!("runtime crate has no repository root"))?;
     let forbidden = [
         "std::net",
         "tokio::net",
@@ -1013,16 +1014,20 @@ fn native_inference_architecture_rejects_network_and_process_authority() -> Resu
         "std::process",
         "Command::new",
     ];
-    for crate_name in ["llama-native-types", "llama-native-engine"] {
-        assert_source_tree_excludes(&crates_dir.join(crate_name).join("src"), &forbidden)?;
-        let manifest = fs::read_to_string(crates_dir.join(crate_name).join("Cargo.toml"))?;
-        for dependency in ["reqwest", "ureq", "hyper", "tokio"] {
-            assert!(
-                !manifest.contains(dependency),
-                "{crate_name} must not depend on {dependency}"
-            );
-        }
+    for crate_name in [
+        "llama-native-types",
+        "llama-native-engine",
+        "llama-native-cache",
+        "llama-native-host",
+    ] {
+        assert!(
+            !repo_root.join("crates").join(crate_name).exists(),
+            "{crate_name} must remain an immutable external dependency"
+        );
     }
+    let workspace_manifest = fs::read_to_string(repo_root.join("Cargo.toml"))?;
+    assert!(workspace_manifest.contains("rev = \"a185a4be3c6ad6ea1935e01acef8946c7dfdc459\""));
+    assert!(!workspace_manifest.contains("[patch."));
 
     let runtime_src = runtime_manifest.join("src");
     for entry in fs::read_dir(&runtime_src)? {
@@ -1045,28 +1050,6 @@ fn native_inference_architecture_rejects_network_and_process_authority() -> Resu
     assert!(mcp.contains("std::process"));
     assert!(!mcp.contains("std::net"));
     assert!(!mcp.contains("127.0.0.1"));
-    Ok(())
-}
-
-fn assert_source_tree_excludes(root: &Path, forbidden: &[&str]) -> Result<()> {
-    for entry in fs::read_dir(root)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            assert_source_tree_excludes(&path, forbidden)?;
-            continue;
-        }
-        if path.extension().and_then(|value| value.to_str()) != Some("rs") {
-            continue;
-        }
-        let source = fs::read_to_string(&path)?;
-        for needle in forbidden {
-            assert!(
-                !source.contains(needle),
-                "{} contains forbidden native inference authority {needle}",
-                path.display()
-            );
-        }
-    }
     Ok(())
 }
 

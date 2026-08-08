@@ -1,5 +1,18 @@
 # Adopted source provenance
 
+## Standalone product extraction
+
+On 2026-08-08 the product-owned paths were history-preservingly filtered from
+`delysis/llama-native-kit` commit
+`d8696e323160c9dc6d5f286e68db7e671e7077e0` into this repository. The source
+commit is retained by tag `mom-llama-extraction-source-2026-08-08`; exact
+source-to-filtered commit mappings and the selected-tree inventory digest are
+recorded in [`provenance/extraction.json`](provenance/extraction.json).
+
+The split changes ownership, not data identity. Existing app-data directories,
+environment variables, the Tauri identifier and the Keychain service remain
+unchanged until an independently tested additive migration is available.
+
 The initial standalone workspace was assembled on 2026-07-29 from three local
 development branches. Adoption does not inherit their readiness claims.
 

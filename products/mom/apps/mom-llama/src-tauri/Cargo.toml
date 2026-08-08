@@ -3,7 +3,7 @@ name = "mom-llama-app"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/delysis/llama-native-kit"
+repository = "https://github.com/delysis/mom-llama"
 rust-version = "1.85"
 
 [build-dependencies]
@@ -12,16 +12,16 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 anyhow = "1"
 mom-llama-runtime = { path = "../../../crates/mom-llama-runtime" }
-llama-native-types = { path = "../../../crates/llama-native-types" }
-fte-backend-llama = { git = "https://github.com/delysis/free-token-energy", rev = "a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e" }
-fte-router = { git = "https://github.com/delysis/free-token-energy", rev = "a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e" }
-fte-store = { git = "https://github.com/delysis/free-token-energy", rev = "a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e" }
-fte-types = { git = "https://github.com/delysis/free-token-energy", rev = "a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e" }
+llama-native-types = { workspace = true }
+fte-backend-llama.workspace = true
+fte-router.workspace = true
+fte-store.workspace = true
+fte-types.workspace = true
 maud = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
-tauri-plugin-free-token-energy = { git = "https://github.com/delysis/free-token-energy", rev = "a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e" }
+tauri-plugin-free-token-energy.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rfd = { version = "=0.16.0", default-features = false }

@@ -1,59 +1,38 @@
-# Llama Native Kit
+# Mom Llama
 
-A reusable, local-first Rust integration for llama.cpp, with Mom Llama as its
-reference Tauri application.
+Mom Llama is the canonical native, local-first chat product. This repository
+owns its Rust product runtime, CLI, command/effect contracts, evidence receipts
+and Tauri/Maud interface.
 
-The runtime loads GGUF models directly in-process. It does not use
-`llama-server`, `llama-cli`, localhost, HTTP, TCP or SSE for inference. Safe
-Rust owns model scheduling, streaming, cancellation, encrypted persistence,
-cache policy, chat-native Personas, consult groups and readiness evidence.
+It does **not** contain a copied llama.cpp engine or a generic provider gateway:
+
+- [`delysis/llama-native-kit`](https://github.com/delysis/llama-native-kit)
+  owns the in-process GGUF runtime.
+- [`delysis/free-token-energy`](https://github.com/delysis/free-token-energy)
+  owns protocol routing, hosted providers, optional loopback compatibility and
+  the separate STT/TTS modules.
+- [`delysis/capability-system-compiler`](https://github.com/delysis/capability-system-compiler)
+  owns Loom compilation/specification and may test this CLI as a black box; it
+  does not own another Mom Llama implementation.
+
+See [`docs/MODULE_BOUNDARIES.md`](docs/MODULE_BOUNDARIES.md) for the complete
+dependency graph and the exact present status of speech.
 
 ## Workspace
 
-- `llama-native-types`: stable public DTOs.
-- `llama-native-engine`: a model-owning worker around the pinned llama.cpp
-  binding.
-- `llama-native-cache`: fingerprint-bound memory, disk and model-state cache
-  tiers.
-- `llama-native-host`: application-owned resident-model registry, memory/slot
-  budgeting, cancellation, lifecycle, and injected cache persistence.
-- `command-evidence`: source- and runtime-fingerprint-bound readiness receipts.
-- `mom-llama-runtime`: conversations, Skills, versioned Personas, `@mention`
-  routing, encrypted storage and cache policy.
-- `mom-llama-cli`: the complete machine-exercisable command surface.
-- `apps/mom-llama`: Maud/Tauri application with a thin native interaction
-  bridge.
+- `crates/mom-llama-runtime`: conversations, Skills, editable/versioned
+  Personas, `@mention` dispatch, storage, tools and product cache policy.
+- `crates/mom-llama-cli`: the complete machine-exercisable product boundary.
+- `apps/mom-llama`: the thin Maud/Tauri application.
+- `contracts`: visible command, effect, settings and upstream-parity ledgers.
+- `receipts`: preserved historical product evidence. A receipt counts as
+  current proof only when it is explicitly source-bound; older path/date-only
+  receipts remain informative.
 
-`docs/PRODUCT.md` and the contract ledgers distinguish implemented native
-behavior from web-specific or high-authority surfaces that are explicitly
-superseded, deferred, or rejected by constraint.
+Native-kit and Free Token Energy are exact Git-revision dependencies. Release
+manifests do not use sibling paths or patches.
 
-[`docs/FREE_TOKEN_ENERGY_INTEGRATION.md`](docs/FREE_TOKEN_ENERGY_INTEGRATION.md)
-documents the product-neutral linking boundary, explicit chat/raw/token prompt
-semantics, model descriptors, cache identity, and the intentionally blocked FIM
-surface.
-
-The Mom Llama application pins the private Free Token Energy gateway by
-immutable Git revision. Free Token Energy pins the published native runtime in
-the same way; the workspace patch in the root manifest deliberately resolves
-that native dependency back to this checkout so the app has one `NativeHost`
-and one native type identity. CI uses repository-scoped read-only deploy keys,
-not a personal token or an unversioned sibling path.
-
-`docs/PERSONA_LIBRARY.md` documents the exact 14 built-in Persona templates.
-Groups are user-configured in Settings and invoked from the ordinary composer;
-there is no separate Consult dashboard and no application-seeded group pattern.
-
-## Contracts and gates
-
-- `contracts/commands.json`: CLI/Tauri/view mappings for every visible command.
-- `contracts/effects.json`: filesystem, model, memory and bounded MCP authority.
-- `contracts/upstream-parity.json`: behavior ledger pinned to the inspected
-  llama.cpp UI revision. The current ledger has no `p0_required` rows: every
-  upstream family is implemented, superseded with native behavior, or
-  explicitly deferred/rejected with a reason.
-
-Run the required local gates:
+## Gates
 
 ```sh
 cargo fmt --all --check
@@ -64,54 +43,27 @@ cargo clippy -p mom-llama-app --all-targets -- -D warnings
 node --check apps/mom-llama/ui/coop-hx.js
 ./scripts/check-architecture.sh
 ./scripts/check-contracts.sh
+./scripts/check-persona-product-ux.sh
 ```
 
-With a real local model, exercise encrypted native-state save and a fresh-process
-restore:
+## Run the app
 
-```sh
-MOM_LLAMA_MODEL_PATH=/path/to/model.gguf ./scripts/prove-native-cache-restart.sh
-```
-
-Prompt caching has one runtime setting with three modes. New installations use
-`Automatic`: reusable Persona/Skill prefixes and per-conversation checkpoints
-are enabled. `Prefixes only` keeps reusable Persona/Skill prompt packs but does
-not persist conversation checkpoints. `Off` performs no cache lookup, creation,
-promotion, or restore; existing entries are retained until explicitly cleared,
-so turning caching back on is non-destructive. The CLI exposes the same choices
-as `--kv-cache-policy automatic|prefixes-only|off`.
-
-The operational mode is a runtime preference. Memory and disk ceilings,
-fingerprint requirements, corruption handling, and fallback behavior are
-compile-time safety policy. This gives normal users a small, safe control while
-keeping resource and compatibility invariants out of the UI.
-
-## Run Mom Llama Native Kit
-
-Configure a local GGUF with `MOM_LLAMA_MODEL_PATH`. Application data is kept
-under the standalone `llama-native-kit/mom-llama` data directory; override it
-with `LLAMA_NATIVE_KIT_DATA_DIR` for an isolated smoke. macOS uses the Keychain
-for the installation key and attempts resolution at most once during each app
-process, including when access is denied.
-See [`docs/SECURITY.md`](docs/SECURITY.md) for the exact threat model and cache
-boundaries. Non-Keychain test hosts must provide a 32-byte key as
-64 hexadecimal characters in `LLAMA_NATIVE_KIT_STORE_KEY_HEX`.
-
-Build a real macOS app bundle:
+Set `MOM_LLAMA_MODEL_PATH` to a GGUF or select one in Settings, then:
 
 ```sh
 cd apps/mom-llama/src-tauri
-MACOSX_DEPLOYMENT_TARGET=13.0 cargo tauri build --debug --bundles app
+cargo tauri dev
 ```
 
-Debug builds use the isolated `mom-llama-development` data directory and a
-predictable local development key. They never contact macOS Keychain. This is
-intentionally not secure storage; it preserves the production database shape
-while making rapid rebuilds prompt-free. Release builds continue to use the
-separate `mom-llama` directory and a Keychain-backed installation key. Set
-`LLAMA_NATIVE_KIT_SECURE_STORAGE=1` to exercise that secure path in a debug
-build.
+The extraction deliberately retains the existing Tauri identifier, data paths,
+environment variables and Keychain service. That preserves current local data
+and avoids new credential prompts. Renaming those compatibility identifiers is
+a separate additive migration, not part of repository cleanup.
 
-The debug bundle is emitted at:
+Debug builds use the prompt-free development store unless
+`LLAMA_NATIVE_KIT_SECURE_STORAGE=1` is set. Release builds retain the existing
+Keychain-backed store.
 
-`target/debug/bundle/macos/Mom Llama Native Kit.app`
+Prompt caching remains a product runtime preference: `automatic` (conversation
+checkpoints plus stable Persona/Skill prefixes), `prefixes-only`, or `off`.
+Compatibility fingerprints and safety ceilings are enforced by native-kit.

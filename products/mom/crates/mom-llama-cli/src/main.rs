@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "mom-llama")]
-#[command(about = "Mom Llama Lab local llama.cpp CLI")]
+#[command(about = "Mom Llama local llama.cpp CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

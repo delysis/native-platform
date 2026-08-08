@@ -1078,7 +1078,7 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         key: "showBuildVersion",
         label: "Show build version information",
         kind: "checkbox",
-        help: "Display the Native Kit app version in the bottom-right corner.",
+        help: "Display the Mom Llama app version in the bottom-right corner.",
         options: EMPTY_OPTIONS,
         blocker: None,
     },
@@ -1509,7 +1509,7 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             (persona_freeze_modal())
             (tool_approval_modal())
             @if show_build_version {
-                small class="build-version" { "Native Kit " (env!("CARGO_PKG_VERSION")) }
+                small class="build-version" { "Mom Llama " (env!("CARGO_PKG_VERSION")) }
             }
             div id="command-status" class="command-status is-hidden" role="status" aria-live="polite" {}
             output id="command-output" class="sr-command-output" aria-hidden="true" tabindex="-1" {}

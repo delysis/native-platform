@@ -36,7 +36,7 @@
     {"key":"showRawModelNames","status":"implemented","evidence":"Selects raw GGUF filename or compact native model label."},
     {"key":"showModelQuantization","status":"implemented","evidence":"Displays quantization inferred from the selected GGUF filename."},
     {"key":"showModelTags","status":"implemented","evidence":"Displays locally derived local, reasoning, and capability-neutral multimodal tags without assuming whether an arbitrary projector is vision-only, audio-only, or combined."},
-    {"key":"showBuildVersion","status":"implemented","evidence":"Displays the compiled Native Kit app version."},
+    {"key":"showBuildVersion","status":"implemented","evidence":"Displays the compiled Mom Llama app version."},
     {"key":"showSystemMessage","status":"implemented","evidence":"Controls system-message projection without removing Rust-owned context."},
     {"key":"renderThinkingAsMarkdown","status":"implemented","evidence":"Selects escaped Maud Markdown or plain reasoning text."},
     {"key":"temperature","status":"implemented","evidence":"Mapped to the in-process sampler DTO."},

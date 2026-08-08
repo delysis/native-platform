@@ -4,13 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Rust-owned product state, personas, conversations, tools and cache policy for Mom Llama"
 
 [dependencies]
 anyhow.workspace = true
-llama-native-engine = { path = "../llama-native-engine" }
-llama-native-cache = { path = "../llama-native-cache" }
-llama-native-host = { path = "../llama-native-host" }
-llama-native-types = { path = "../llama-native-types" }
+llama-native-engine.workspace = true
+llama-native-cache.workspace = true
+llama-native-host.workspace = true
+llama-native-types.workspace = true
 crossbeam-channel.workspace = true
 chacha20poly1305.workspace = true
 getrandom.workspace = true

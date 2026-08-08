@@ -32,9 +32,9 @@ dependencies = [
 
 [[package]]
 name = "aho-corasick"
-version = "1.1.4"
+version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301"
+checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
 dependencies = [
  "memchr",
 ]
@@ -56,9 +56,9 @@ dependencies = [
 
 [[package]]
 name = "android_system_properties"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
+checksum = "ae221649c9976a6f6c56ae1facf410f3ddb33cc661c4b7b61020a912d4237fbc"
 dependencies = [
  "libc",
 ]
@@ -143,9 +143,9 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.91"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae36dc4177970ef04fde5178d3e2429882def40e57a451f919c098f72baa6cec"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -430,7 +430,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -445,9 +445,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.4.0"
+version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5add81bb678e6cb321aff7fa0dc7689ad82b112dbc032cea19f91d6b8e3582b9"
+checksum = "5d262e149917187838d5b42777c8253bcb64500067342904e7d429499a6f277e"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -557,9 +557,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.4"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91e0c145792ef73a6ad36d27c75ac09f1832222a3c209689d90f534685ee5b7"
+checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -567,9 +567,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.2"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09628afdcc538b57f3c6341e9c8e9970f18e4a481690a64974d7023bd33548b"
+checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
 dependencies = [
  "anstream",
  "anstyle",
@@ -618,15 +618,6 @@ checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
  "memchr",
-]
-
-[[package]]
-name = "command-evidence"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -1101,9 +1092,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+checksum = "26b73573e6edcd2af0cdf47bd6cb58f0b3839491263c314eaad1ccf24430e1de"
 
 [[package]]
 name = "find_cuda_helper"
@@ -1175,7 +1166,7 @@ dependencies = [
 [[package]]
 name = "fte-backend-llama"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
+source = "git+https://github.com/delysis/free-token-energy?rev=40788e397e79c4c27df40cc702f07af500bb88eb#40788e397e79c4c27df40cc702f07af500bb88eb"
 dependencies = [
  "async-trait",
  "fte-types",
@@ -1190,7 +1181,7 @@ dependencies = [
 [[package]]
 name = "fte-loopback"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
+source = "git+https://github.com/delysis/free-token-energy?rev=40788e397e79c4c27df40cc702f07af500bb88eb#40788e397e79c4c27df40cc702f07af500bb88eb"
 dependencies = [
  "async-stream",
  "axum",
@@ -1211,7 +1202,7 @@ dependencies = [
 [[package]]
 name = "fte-protocols"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
+source = "git+https://github.com/delysis/free-token-energy?rev=40788e397e79c4c27df40cc702f07af500bb88eb#40788e397e79c4c27df40cc702f07af500bb88eb"
 dependencies = [
  "fte-types",
  "serde",
@@ -1221,50 +1212,16 @@ dependencies = [
 [[package]]
 name = "fte-router"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
+source = "git+https://github.com/delysis/free-token-energy?rev=40788e397e79c4c27df40cc702f07af500bb88eb#40788e397e79c4c27df40cc702f07af500bb88eb"
 dependencies = [
  "fte-types",
  "tokio",
 ]
 
 [[package]]
-name = "fte-speech-gateway"
-version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
-dependencies = [
- "fte-speech-router",
- "fte-speech-types",
- "serde",
- "thiserror 2.0.19",
-]
-
-[[package]]
-name = "fte-speech-router"
-version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
-dependencies = [
- "fte-speech-types",
- "serde",
- "thiserror 2.0.19",
-]
-
-[[package]]
-name = "fte-speech-types"
-version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
-dependencies = [
- "async-trait",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "fte-store"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
+source = "git+https://github.com/delysis/free-token-energy?rev=40788e397e79c4c27df40cc702f07af500bb88eb#40788e397e79c4c27df40cc702f07af500bb88eb"
 dependencies = [
  "fte-types",
  "rusqlite",
@@ -1274,13 +1231,13 @@ dependencies = [
 [[package]]
 name = "fte-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
+source = "git+https://github.com/delysis/free-token-energy?rev=40788e397e79c4c27df40cc702f07af500bb88eb#40788e397e79c4c27df40cc702f07af500bb88eb"
 dependencies = [
  "async-trait",
  "futures",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "uuid",
 ]
@@ -1997,9 +1954,9 @@ dependencies = [
 
 [[package]]
 name = "ipnet"
-version = "2.12.0"
+version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -2101,9 +2058,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.103"
+version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53b44bfcdb3f8d5837a46dae1ca9660a837176eee74a28b229bc626816589102"
+checksum = "0e0c1080212aad755ea003d18543e8768dd432c48819efd73a7bf1e39b7a5a3a"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -2204,9 +2161,9 @@ dependencies = [
 
 [[package]]
 name = "libredox"
-version = "0.1.18"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c943259e342f1e06ff2da7a83eabdfe7f92ce10262688dbf1895ff0b3e6e4652"
+checksum = "2026a5056764a10b2bf5d56488cba40da507f5493a6a429340e2004d9ed085fa"
 dependencies = [
  "libc",
 ]
@@ -2237,7 +2194,7 @@ dependencies = [
  "encoding_rs",
  "enumflags2",
  "llama-cpp-sys-2",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tracing",
  "tracing-core",
 ]
@@ -2259,6 +2216,7 @@ dependencies = [
 [[package]]
 name = "llama-native-cache"
 version = "0.1.0"
+source = "git+https://github.com/delysis/llama-native-kit?rev=a185a4be3c6ad6ea1935e01acef8946c7dfdc459#a185a4be3c6ad6ea1935e01acef8946c7dfdc459"
 dependencies = [
  "llama-native-types",
  "serde",
@@ -2268,6 +2226,7 @@ dependencies = [
 [[package]]
 name = "llama-native-engine"
 version = "0.1.0"
+source = "git+https://github.com/delysis/llama-native-kit?rev=a185a4be3c6ad6ea1935e01acef8946c7dfdc459#a185a4be3c6ad6ea1935e01acef8946c7dfdc459"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",
@@ -2280,6 +2239,7 @@ dependencies = [
 [[package]]
 name = "llama-native-host"
 version = "0.1.0"
+source = "git+https://github.com/delysis/llama-native-kit?rev=a185a4be3c6ad6ea1935e01acef8946c7dfdc459#a185a4be3c6ad6ea1935e01acef8946c7dfdc459"
 dependencies = [
  "llama-native-cache",
  "llama-native-engine",
@@ -2289,9 +2249,10 @@ dependencies = [
 [[package]]
 name = "llama-native-types"
 version = "0.1.0"
+source = "git+https://github.com/delysis/llama-native-kit?rev=a185a4be3c6ad6ea1935e01acef8946c7dfdc459#a185a4be3c6ad6ea1935e01acef8946c7dfdc459"
 dependencies = [
  "serde",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2467,7 +2428,7 @@ dependencies = [
  "once_cell",
  "png 0.18.1",
  "serde",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "windows-sys 0.61.2",
 ]
 
@@ -3129,7 +3090,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.17",
  "libredox",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3166,9 +3127,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.16"
+version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fcfdb36bda0c880c5931cdc7a2bcdc8ba4556847b9d912bca70bc94708711ad"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -3920,7 +3881,7 @@ dependencies = [
  "tauri-runtime",
  "tauri-runtime-wry",
  "tauri-utils",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tray-icon",
  "url",
@@ -3971,7 +3932,7 @@ dependencies = [
  "sha2",
  "syn 2.0.119",
  "tauri-utils",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
  "url",
  "uuid",
@@ -4011,13 +3972,10 @@ dependencies = [
 [[package]]
 name = "tauri-plugin-free-token-energy"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e#a63c215bb77e8d52a3eb79e87e1c4c7c1af9c71e"
+source = "git+https://github.com/delysis/free-token-energy?rev=40788e397e79c4c27df40cc702f07af500bb88eb#40788e397e79c4c27df40cc702f07af500bb88eb"
 dependencies = [
  "fte-loopback",
  "fte-router",
- "fte-speech-gateway",
- "fte-speech-router",
- "fte-speech-types",
  "fte-store",
  "fte-types",
  "serde",
@@ -4044,7 +4002,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tauri-utils",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "url",
  "webkit2gtk",
  "webview2-com",
@@ -4107,7 +4065,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "swift-rs",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",
  "url",
  "urlpattern",
@@ -4146,11 +4104,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.19"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
+checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
- "thiserror-impl 2.0.19",
+ "thiserror-impl 2.0.20",
 ]
 
 [[package]]
@@ -4166,9 +4124,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.19"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
+checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4177,9 +4135,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.54"
+version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e1d5e639ff6bab73cb6885cc7e7b1de96c3f32c68ec55f3952614bec1092244"
+checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
  "deranged",
  "num-conv",
@@ -4490,7 +4448,7 @@ dependencies = [
  "once_cell",
  "png 0.18.1",
  "serde",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "windows-sys 0.61.2",
 ]
 
@@ -4710,9 +4668,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.126"
+version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b067c0c11094aef6b7a801c1e34a26affafdf3d051dba08456b868789aaf9a4"
+checksum = "1b70935747edd64d89de3efa29d73789b806c15798f8e7dca4d8ac356b50ce70"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -4723,9 +4681,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.76"
+version = "0.4.77"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c62df1340f32221cb9c54d6a27b030e3dba64361d4a95bed55f9aacb44da291d"
+checksum = "6b7777d5cc23d0e91404e53ce2d5e8ec7acae3026b16233dba62cd3246457950"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -4733,9 +4691,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.126"
+version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "167ce5e579f6bcf889c4f7175a8a5a585de84e8ff93976ce393efa5f2837aab1"
+checksum = "77775f8f3f7217702089053b94958f8f54061a3f663417df76e19cbdcca29bc1"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -4743,9 +4701,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.126"
+version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3997c7839262f4ef12cf90b818d6340c18e80f263f1a94bf157d0ec4420380e"
+checksum = "e11d33f857dc2fb11b8bc75aee111aa9cbeb12cd9f25efd3d4c2a3dd4e235284"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -4756,9 +4714,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.126"
+version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
+checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
 ]
@@ -4778,9 +4736,9 @@ dependencies = [
 
 [[package]]
 name = "web-sys"
-version = "0.3.103"
+version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8622dcb61c0bcc9fffa6938bed81210af2da9a7e4a1a834b2e37a59b6dfb6141"
+checksum = "c435338968042f4f59a557f690a253676d47ce13ceb55d70100e7facf6620a30"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -4873,7 +4831,7 @@ version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "381336cfffd772377d291702245447a5251a2ffa5bad679c99e61bc48bacbf9c"
 dependencies = [
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "windows",
  "windows-core 0.61.2",
 ]
@@ -5382,7 +5340,7 @@ dependencies = [
  "sha2",
  "soup3",
  "tao-macros",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "url",
  "webkit2gtk",
  "webkit2gtk-sys",
@@ -5439,18 +5397,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.55"
+version = "0.8.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5a105cd7b140f6eeec8acff2ea38135d3cab283ada58540f629fe51e46696eb"
+checksum = "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.55"
+version = "0.8.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fe976fb70c78cd64cccfe3a6fc142244e8a77b70959b30faf9d0ac37ee228eb"
+checksum = "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1"
 dependencies = [
  "proc-macro2",
  "quote",

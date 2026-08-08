@@ -138,7 +138,7 @@ fn main() {
             }
         }),
         Err(error) => {
-            eprintln!("failed to build Mom Llama Native Kit: {error}");
+            eprintln!("failed to build Mom Llama: {error}");
             std::process::exit(1);
         }
     }

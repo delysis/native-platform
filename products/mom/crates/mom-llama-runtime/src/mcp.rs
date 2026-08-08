@@ -618,7 +618,7 @@ fn execute_mcp_request_supervised(
             .ok_or_else(|| anyhow::anyhow!("failed to open MCP stdin"))?;
         write_mcp_message(
             &mut stdin,
-            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"llama-native-kit-mom-llama","version":"0.1.0"}}}),
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mom-llama","version":"0.1.0"}}}),
         )?;
         write_mcp_message(
             &mut stdin,

@@ -6,7 +6,7 @@
     "commit": "876a4321163249c43ca4e986818fab5ab081f282",
     "path": "tools/ui",
     "inspected_at": "2026-07-31",
-    "inventory_source": "fresh sparse checkout of upstream master, independently reclassified for llama-native-kit"
+    "inventory_source": "fresh sparse checkout of upstream master, independently reclassified for Mom Llama"
   },
   "allowed_classifications": [
     "p0_implemented",

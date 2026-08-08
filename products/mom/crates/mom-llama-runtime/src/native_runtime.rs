@@ -363,7 +363,7 @@ fn native_error_blocker(error: NativeError) -> ValidationBlocker {
 fn native_blocker(code: &str, message: &str) -> ValidationBlocker {
     ValidationBlocker {
         readiness: "blocked_native_runtime".to_string(),
-        blocker: Blocker::new(code, message, vec!["Restart Mom Llama Lab.".to_string()]),
+        blocker: Blocker::new(code, message, vec!["Restart Mom Llama.".to_string()]),
     }
 }
 

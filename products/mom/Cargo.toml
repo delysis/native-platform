@@ -1,21 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/command-evidence",
-    "crates/llama-native-types",
-    "crates/llama-native-engine",
-    "crates/llama-native-cache",
-    "crates/llama-native-host",
     "crates/mom-llama-runtime",
     "crates/mom-llama-cli",
     "apps/mom-llama/src-tauri",
 ]
 default-members = [
-    "crates/command-evidence",
-    "crates/llama-native-types",
-    "crates/llama-native-engine",
-    "crates/llama-native-cache",
-    "crates/llama-native-host",
     "crates/mom-llama-runtime",
     "crates/mom-llama-cli",
 ]
@@ -24,7 +14,7 @@ default-members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/delysis/llama-native-kit"
+repository = "https://github.com/delysis/mom-llama"
 rust-version = "1.85"
 
 [workspace.dependencies]
@@ -40,6 +30,15 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "a185a4be3c6ad6ea1935e01acef8946c7dfdc459" }
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "a185a4be3c6ad6ea1935e01acef8946c7dfdc459" }
+llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "a185a4be3c6ad6ea1935e01acef8946c7dfdc459" }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "a185a4be3c6ad6ea1935e01acef8946c7dfdc459" }
+fte-backend-llama = { git = "https://github.com/delysis/free-token-energy", rev = "40788e397e79c4c27df40cc702f07af500bb88eb" }
+fte-router = { git = "https://github.com/delysis/free-token-energy", rev = "40788e397e79c4c27df40cc702f07af500bb88eb" }
+fte-store = { git = "https://github.com/delysis/free-token-energy", rev = "40788e397e79c4c27df40cc702f07af500bb88eb" }
+fte-types = { git = "https://github.com/delysis/free-token-energy", rev = "40788e397e79c4c27df40cc702f07af500bb88eb" }
+tauri-plugin-free-token-energy = { git = "https://github.com/delysis/free-token-energy", rev = "40788e397e79c4c27df40cc702f07af500bb88eb" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -52,12 +51,3 @@ undocumented_unsafe_blocks = "deny"
 
 [profile.dev.package.sha2]
 opt-level = 3
-
-# Free Token Energy pins the published native revision. When its adapter is
-# consumed from this source tree, keep the native types single-sourced so Rust
-# cannot construct duplicate, nominally incompatible host/type packages.
-[patch."https://github.com/delysis/llama-native-kit"]
-llama-native-cache = { path = "crates/llama-native-cache" }
-llama-native-engine = { path = "crates/llama-native-engine" }
-llama-native-host = { path = "crates/llama-native-host" }
-llama-native-types = { path = "crates/llama-native-types" }

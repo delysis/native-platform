@@ -1,0 +1,57 @@
+{
+  "schema": "mom_llama.repository_extraction.v1",
+  "extracted_at": "2026-08-08",
+  "source": {
+    "repository": "https://github.com/delysis/llama-native-kit",
+    "commit": "d8696e323160c9dc6d5f286e68db7e671e7077e0",
+    "tag": "mom-llama-extraction-source-2026-08-08",
+    "selected_paths": [
+      "apps/mom-llama",
+      "crates/mom-llama-runtime",
+      "crates/mom-llama-cli",
+      "contracts",
+      "docs",
+      "receipts",
+      "scripts"
+    ],
+    "selected_tree_inventory_digest": {
+      "algorithm": "sha256",
+      "canonical_input": "git ls-tree -r SOURCE -- SELECTED_PATHS",
+      "scope": "product_payload_only",
+      "value": "4bc2d1e9fe91d0557076b6464fb6f74ee7485a9e378968f3b3473eda058839dc"
+    },
+    "support_paths_retained_outside_payload_digest": [
+      ".cargo",
+      ".github",
+      ".gitignore",
+      "AGENTS.md",
+      "Cargo.lock",
+      "Cargo.toml",
+      "LICENSE-APACHE",
+      "LICENSE-MIT",
+      "README.md"
+    ]
+  },
+  "commit_map": [
+    {"source": "d0e0c135831dcb1ee79286d9403ac6d67017c348", "filtered": "50bf9b9254e24d68a339cecf2e95b1d43750f32d"},
+    {"source": "ed41f40cd0fd1e0608a1b055499dc58b2e03fa45", "filtered": "827317b32c108fcd33466a8bc7a6c54c963c053e"},
+    {"source": "488d046c04536af958ed429ba74501b09a254a3a", "filtered": "979c139e714681ef468aa88c66c54048ee057b72"},
+    {"source": "daba31e7efe578192263771e8fe55753ea3d7ad8", "filtered": "8ea7a86488f96cc538eea8c1d462ad586a0b922a"},
+    {"source": "d750c83ffab1a4aca8adb43de862a96ab149360b", "filtered": "d16cb34d80cc2af1233488d631f1a22211d3a1b7"},
+    {"source": "a5224e47c0531328e9b6ee76501822e6b0a2a5d9", "filtered": "afc4802827fd5a544f7717d020bf1661323c3041"},
+    {"source": "d8696e323160c9dc6d5f286e68db7e671e7077e0", "filtered": "c1387bcce6cff924e525b93c6f247e6b2af48893"}
+  ],
+  "dependency_boundaries": {
+    "llama_native_kit": "a185a4be3c6ad6ea1935e01acef8946c7dfdc459",
+    "free_token_energy": "40788e397e79c4c27df40cc702f07af500bb88eb"
+  },
+  "compatibility_identifiers_preserved": [
+    "LLAMA_NATIVE_KIT_DATA_DIR",
+    "LLAMA_NATIVE_KIT_STORE_KEY_HEX",
+    "LLAMA_NATIVE_KIT_SECURE_STORAGE",
+    "~/.local/share/llama-native-kit/mom-llama",
+    "~/.local/share/llama-native-kit/mom-llama-development",
+    "com.delysis.llama-native-kit.mom-llama.store.v1",
+    "com.delysis.llama-native-kit.mom-llama"
+  ]
+}
