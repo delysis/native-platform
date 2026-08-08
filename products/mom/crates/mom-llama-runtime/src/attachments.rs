@@ -1,5 +1,7 @@
 use crate::config::resolve_settings;
-use crate::conversation_store::{Message, MessageRole, load_db, save_db};
+use crate::conversation_store::{
+    Message, MessageRole, active_leaf_id, get_or_create_conversation, upsert_conversation,
+};
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
@@ -53,6 +55,13 @@ pub struct AttachmentImportOutput {
     pub attachment: AttachmentRecord,
     pub multimodal_ready: bool,
     pub multimodal_blocker: Option<Blocker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreview {
+    pub attachment: AttachmentRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
 }
 
 pub fn attachment_import(
@@ -110,30 +119,76 @@ pub fn attachment_import(
             ),
         ));
     }
-    let mut conversation_db = load_db()?;
-    let Some(conversation) = conversation_db
-        .conversations
-        .iter_mut()
-        .find(|conversation| conversation.id == conversation_id)
-    else {
-        return Ok(CommandResult::blocked(
-            "mom_llama.attachment_import",
-            "stub_blocked",
-            Blocker::new(
-                "conversation_not_found",
-                format!("Conversation {conversation_id} was not found."),
-                vec!["Create or select a conversation first.".to_string()],
-            ),
-        ));
-    };
-    let settings = resolve_settings()?;
-    let id = Uuid::new_v4().to_string();
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("attachment")
         .to_string();
-    let payload = fs::read(path)?;
+    store_attachment_payload(
+        conversation_id,
+        file_name,
+        path.display().to_string(),
+        kind,
+        mime,
+        fs::read(path)?,
+        "mom_llama.attachment_import",
+    )
+}
+
+pub fn attachment_import_pasted_text(
+    conversation_id: &str,
+    text: String,
+) -> Result<CommandResult<AttachmentImportOutput>> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Ok(CommandResult::blocked(
+            "mom_llama.attachment_import_paste",
+            "stub_blocked",
+            Blocker::new(
+                "pasted_text_empty",
+                "The pasted text is empty.",
+                vec!["Paste non-empty text.".to_string()],
+            ),
+        ));
+    }
+    if text.len() as u64 > MAX_TEXT_ATTACHMENT_BYTES {
+        return Ok(CommandResult::blocked(
+            "mom_llama.attachment_import_paste",
+            "stub_blocked",
+            Blocker::new(
+                "attachment_too_large",
+                format!(
+                    "Pasted text is {} bytes; the encrypted attachment limit is {} bytes.",
+                    text.len(),
+                    MAX_TEXT_ATTACHMENT_BYTES
+                ),
+                vec!["Paste a smaller text excerpt.".to_string()],
+            ),
+        ));
+    }
+    store_attachment_payload(
+        conversation_id,
+        format!("pasted-text-{}.txt", now_ms()),
+        "pasted-text".to_string(),
+        AttachmentKind::Text,
+        "text/plain",
+        text.into_bytes(),
+        "mom_llama.attachment_import_paste",
+    )
+}
+
+fn store_attachment_payload(
+    conversation_id: &str,
+    file_name: String,
+    source_path: String,
+    kind: AttachmentKind,
+    mime: &str,
+    payload: Vec<u8>,
+    command: &str,
+) -> Result<CommandResult<AttachmentImportOutput>> {
+    let (conversation_db, mut conversation) = get_or_create_conversation(conversation_id)?;
+    let settings = resolve_settings()?;
+    let id = Uuid::new_v4().to_string();
     let store = RuntimeStore::open(&settings.data_dir)?;
     let blob_namespace = format!("attachment.blob.{id}");
     store.put_bytes(&blob_namespace, &payload)?;
@@ -147,37 +202,40 @@ pub fn attachment_import(
         message_id: message_id.clone(),
         kind: kind.clone(),
         file_name: file_name.clone(),
-        source_path: path.display().to_string(),
+        source_path,
         stored_path: stored_path.clone(),
         mime: mime.to_string(),
-        bytes: metadata.len(),
+        bytes: payload.len() as u64,
         sha256,
         created_at: now.clone(),
     };
     let content = attachment_message_content(&record, &payload)?;
     conversation.messages.push(Message {
-        id: message_id,
+        id: message_id.clone(),
         conversation_id: conversation_id.to_string(),
         role: MessageRole::User,
         content,
         created_at: now.clone(),
-        parent_id: conversation
-            .messages
-            .last()
-            .map(|message| message.id.clone()),
+        parent_id: active_leaf_id(&conversation),
         model: None,
         receipt_id: None,
         prompt_tokens: None,
         completion_tokens: None,
+        reasoning_content: None,
+        reasoning_incomplete: false,
+        branch_index: None,
+        branch_count: None,
+        attribution: None,
     });
+    conversation.active_leaf_message_id = Some(message_id);
     conversation.updated_at = now;
-    let conversation_path = save_db(&conversation_db)?;
+    let conversation_path = upsert_conversation(conversation_db, conversation)?;
     let mut attachment_db = load_attachment_db()?;
     attachment_db.attachments.insert(0, record.clone());
     let attachment_db_path = save_attachment_db(&attachment_db)?;
     let (multimodal_ready, multimodal_blocker) = multimodal_readiness(&settings, &record);
     Ok(CommandResult::passed(
-        "mom_llama.attachment_import",
+        command,
         "contracted",
         AttachmentImportOutput {
             attachment: record,
@@ -212,6 +270,44 @@ pub fn attachment_list(
         "mom_llama.attachment_list",
         "contracted",
         attachments,
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    ))
+}
+
+pub fn attachment_preview(
+    attachment_id: &str,
+    include_payload: bool,
+) -> Result<CommandResult<AttachmentPreview>> {
+    let Some(attachment) = load_attachment_db()?
+        .attachments
+        .into_iter()
+        .find(|attachment| attachment.id == attachment_id)
+    else {
+        return Ok(CommandResult::blocked(
+            "mom_llama.attachment_preview",
+            "stub_blocked",
+            Blocker::new(
+                "attachment_not_found",
+                format!("Attachment {attachment_id} was not found."),
+                vec!["Refresh the conversation and try again.".to_string()],
+            ),
+        ));
+    };
+    let bytes = if include_payload {
+        Some(
+            attachment_bytes(attachment_id)?
+                .ok_or_else(|| anyhow::anyhow!("encrypted attachment payload is missing"))?,
+        )
+    } else {
+        None
+    };
+    Ok(CommandResult::passed(
+        "mom_llama.attachment_preview",
+        "contracted",
+        AttachmentPreview { attachment, bytes },
         Vec::new(),
         Vec::new(),
         false,

@@ -242,6 +242,24 @@ pub fn mcp_call_tool(
     tool_name: &str,
     arguments: Value,
 ) -> Result<CommandResult<McpCallToolOutput>> {
+    mcp_call_tool_impl(server_name, tool_name, arguments, None)
+}
+
+pub(crate) fn mcp_call_tool_supervised(
+    server_name: &str,
+    tool_name: &str,
+    arguments: Value,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<CommandResult<McpCallToolOutput>> {
+    mcp_call_tool_impl(server_name, tool_name, arguments, Some(should_cancel))
+}
+
+fn mcp_call_tool_impl(
+    server_name: &str,
+    tool_name: &str,
+    arguments: Value,
+    should_cancel: Option<&dyn Fn() -> bool>,
+) -> Result<CommandResult<McpCallToolOutput>> {
     let server = match enabled_server(server_name)? {
         Ok(server) => server,
         Err((readiness, blocker)) => {
@@ -263,13 +281,14 @@ pub fn mcp_call_tool(
             ),
         ));
     }
-    let response = execute_mcp_request(
+    let response = execute_mcp_request_supervised(
         &server,
         "tools/call",
         json!({
             "name": tool_name,
             "arguments": arguments,
         }),
+        should_cancel,
     )?;
     Ok(CommandResult::passed(
         "mom_llama.mcp_call_tool",
@@ -572,6 +591,15 @@ fn enabled_server(name: &str) -> Result<std::result::Result<McpServerConfig, (St
 }
 
 fn execute_mcp_request(server: &McpServerConfig, method: &str, params: Value) -> Result<Value> {
+    execute_mcp_request_supervised(server, method, params, None)
+}
+
+fn execute_mcp_request_supervised(
+    server: &McpServerConfig,
+    method: &str,
+    params: Value,
+    should_cancel: Option<&dyn Fn() -> bool>,
+) -> Result<Value> {
     let timeout_s = resolve_settings()
         .ok()
         .and_then(|settings| upstream_setting_i64(&settings, "mcpRequestTimeoutSeconds"))
@@ -590,7 +618,7 @@ fn execute_mcp_request(server: &McpServerConfig, method: &str, params: Value) ->
             .ok_or_else(|| anyhow::anyhow!("failed to open MCP stdin"))?;
         write_mcp_message(
             &mut stdin,
-            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mom-llama-lab","version":"0.1.0"}}}),
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"llama-native-kit-mom-llama","version":"0.1.0"}}}),
         )?;
         write_mcp_message(
             &mut stdin,
@@ -601,7 +629,7 @@ fn execute_mcp_request(server: &McpServerConfig, method: &str, params: Value) ->
             &json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}),
         )?;
     }
-    let output = command_output_with_timeout_from_child(child, timeout_s)?;
+    let output = command_output_with_timeout_from_child(child, timeout_s, should_cancel)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_mcp_response(&stdout).with_context(|| format!("failed to parse MCP response: {stdout}"))
 }
@@ -609,11 +637,17 @@ fn execute_mcp_request(server: &McpServerConfig, method: &str, params: Value) ->
 fn command_output_with_timeout_from_child(
     mut child: std::process::Child,
     timeout_s: f64,
+    should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<std::process::Output> {
     let pid = child.id();
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs_f64(timeout_s.max(0.001));
     loop {
+        if should_cancel.is_some_and(|should_cancel| should_cancel()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("MCP server pid {pid} was cancelled");
+        }
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();

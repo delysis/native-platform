@@ -3,7 +3,9 @@ use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::Result;
+use llama_native_types::SamplingConfig;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -21,6 +23,101 @@ pub enum MessageRole {
     System,
     User,
     Assistant,
+    Tool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationKind {
+    #[default]
+    Chat,
+    PersonaTemplate,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "template", rename_all = "snake_case")]
+pub enum ChatTemplatePolicy {
+    #[default]
+    ModelDefault,
+    FrozenSource(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolBinding {
+    pub server: String,
+    pub tool: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConversationExecutionProfile {
+    #[serde(default)]
+    pub mention_handle: String,
+    #[serde(default)]
+    pub model_path: Option<PathBuf>,
+    #[serde(default)]
+    pub mmproj_path: Option<PathBuf>,
+    #[serde(default)]
+    pub system_message: Option<String>,
+    #[serde(default)]
+    pub sampling: Option<SamplingConfig>,
+    #[serde(default)]
+    pub chat_template: ChatTemplatePolicy,
+    #[serde(default)]
+    pub tool_bindings: Vec<ToolBinding>,
+    #[serde(default = "default_source_history_tokens")]
+    pub source_history_tokens: u32,
+    #[serde(default = "default_host_context_tokens")]
+    pub host_context_tokens: u32,
+    #[serde(default = "default_profile_version")]
+    pub version: u64,
+}
+
+impl Default for ConversationExecutionProfile {
+    fn default() -> Self {
+        Self {
+            mention_handle: String::new(),
+            model_path: None,
+            mmproj_path: None,
+            system_message: None,
+            sampling: None,
+            chat_template: ChatTemplatePolicy::ModelDefault,
+            tool_bindings: Vec::new(),
+            source_history_tokens: default_source_history_tokens(),
+            host_context_tokens: default_host_context_tokens(),
+            version: default_profile_version(),
+        }
+    }
+}
+
+const fn default_source_history_tokens() -> u32 {
+    4096
+}
+
+const fn default_host_context_tokens() -> u32 {
+    2048
+}
+
+const fn default_profile_version() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSpeakerKind {
+    Persona,
+    LiveChat,
+    Synthesis,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageAttribution {
+    pub kind: MessageSpeakerKind,
+    pub source_id: String,
+    pub handle: String,
+    pub label: String,
+    pub version: u64,
+    pub invocation_id: String,
+    pub target_order: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -35,6 +132,16 @@ pub struct Message {
     pub receipt_id: Option<String>,
     pub prompt_tokens: Option<usize>,
     pub completion_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub reasoning_incomplete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<MessageAttribution>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -43,6 +150,10 @@ pub struct Conversation {
     pub title: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub kind: ConversationKind,
+    #[serde(default)]
+    pub execution_profile: ConversationExecutionProfile,
     pub selected_model_path: Option<PathBuf>,
     #[serde(default)]
     pub source_conversation_id: Option<String>,
@@ -50,6 +161,8 @@ pub struct Conversation {
     pub source_message_id: Option<String>,
     #[serde(default)]
     pub branch_root_message_id: Option<String>,
+    #[serde(default)]
+    pub active_leaf_message_id: Option<String>,
     #[serde(default)]
     pub current_skill_ids: Vec<String>,
     #[serde(default)]
@@ -102,6 +215,24 @@ pub struct ConversationBranchSibling {
     pub source_message_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageBranchSibling {
+    pub message_id: String,
+    pub parent_id: Option<String>,
+    pub role: MessageRole,
+    pub preview: String,
+    pub created_at: String,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageBranchSet {
+    pub conversation_id: String,
+    pub parent_id: Option<String>,
+    pub active_message_id: String,
+    pub siblings: Vec<MessageBranchSibling>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct DraftDb {
     #[serde(default)]
@@ -136,15 +267,27 @@ pub fn conversation_new(title: Option<String>) -> Result<CommandResult<Conversat
     let mut db = load_db()?;
     let now = now_ms().to_string();
     let settings = resolve_settings()?;
+    let id = Uuid::new_v4().to_string();
+    let title = title.unwrap_or_else(|| "New chat".to_string());
+    let mention_handle = new_chat_handle(&title, &id);
     let conversation = Conversation {
-        id: Uuid::new_v4().to_string(),
-        title: title.unwrap_or_else(|| "New chat".to_string()),
+        id,
+        title,
         created_at: now.clone(),
         updated_at: now,
+        kind: ConversationKind::Chat,
+        execution_profile: ConversationExecutionProfile {
+            mention_handle,
+            model_path: settings.model_path.clone(),
+            mmproj_path: settings.mmproj_path.clone(),
+            sampling: Some(settings.sampling_config()),
+            ..ConversationExecutionProfile::default()
+        },
         selected_model_path: settings.model_path,
         source_conversation_id: None,
         source_message_id: None,
         branch_root_message_id: None,
+        active_leaf_message_id: None,
         current_skill_ids: Vec::new(),
         messages: Vec::new(),
     };
@@ -160,6 +303,32 @@ pub fn conversation_new(title: Option<String>) -> Result<CommandResult<Conversat
         false,
         false,
     ))
+}
+
+fn new_chat_handle(title: &str, id: &str) -> String {
+    let mut base = title
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while base.contains("--") {
+        base = base.replace("--", "-");
+    }
+    let base = base.trim_matches('-');
+    let base = if base.len() < 2 { "chat" } else { base };
+    let suffix = id
+        .chars()
+        .filter(|character| *character != '-')
+        .take(6)
+        .collect::<String>();
+    let keep = 48usize.saturating_sub(suffix.len() + 1);
+    format!("{}-{suffix}", base.chars().take(keep).collect::<String>())
 }
 
 pub fn conversation_list() -> Result<CommandResult<Vec<Conversation>>> {
@@ -198,7 +367,7 @@ pub fn conversation_select(id: &str) -> Result<CommandResult<Conversation>> {
     Ok(CommandResult::passed(
         "mom_llama.conversation_select",
         "contracted",
-        conversation,
+        project_conversation(&conversation),
         vec![path.display().to_string()],
         Vec::new(),
         false,
@@ -266,6 +435,41 @@ pub fn conversation_rename(id: &str, title: String) -> Result<CommandResult<Conv
         result,
         vec![path.display().to_string()],
         Vec::new(),
+        false,
+        false,
+    ))
+}
+
+pub fn conversation_system_message_update(
+    id: &str,
+    system_message: Option<String>,
+) -> Result<CommandResult<Conversation>> {
+    let (db, mut conversation) = get_or_create_conversation(id)?;
+    let system_message = system_message
+        .map(|message| message.trim().to_string())
+        .filter(|message| !message.is_empty());
+    if conversation.execution_profile.system_message == system_message {
+        return Ok(CommandResult::passed(
+            "mom_llama.conversation_system_message_update",
+            "contracted",
+            project_conversation(&conversation),
+            Vec::new(),
+            vec!["conversation instructions unchanged".to_string()],
+            false,
+            false,
+        ));
+    }
+    conversation.execution_profile.system_message = system_message;
+    conversation.execution_profile.version =
+        conversation.execution_profile.version.saturating_add(1);
+    conversation.updated_at = now_ms().to_string();
+    let path = upsert_conversation(db, conversation.clone())?;
+    Ok(CommandResult::passed(
+        "mom_llama.conversation_system_message_update",
+        "contracted",
+        project_conversation(&conversation),
+        vec![path.display().to_string()],
+        vec!["conversation-scoped instructions; blank inherits the app default".to_string()],
         false,
         false,
     ))
@@ -398,19 +602,36 @@ pub fn message_edit(
     };
     let Some(message) = conversation
         .messages
-        .iter_mut()
+        .iter()
         .find(|message| message.id == message_id)
+        .cloned()
     else {
         return Ok(message_not_found("mom_llama.message_edit", message_id));
     };
-    message.content = content;
+    let mut edited = message;
+    edited.id = Uuid::new_v4().to_string();
+    edited.content = content;
+    edited.created_at = now_ms().to_string();
+    edited.receipt_id = None;
+    edited.branch_index = None;
+    edited.branch_count = None;
+    conversation.active_leaf_message_id = Some(edited.id.clone());
+    conversation.messages.push(edited.clone());
     conversation.updated_at = now_ms().to_string();
-    let result = message.clone();
+    if conversation.kind == ConversationKind::PersonaTemplate {
+        conversation.execution_profile.version =
+            conversation.execution_profile.version.saturating_add(1);
+    }
+    let persona_version =
+        (conversation.kind == ConversationKind::PersonaTemplate).then(|| conversation.clone());
     let path = save_db(&db)?;
+    if let Some(persona) = persona_version {
+        crate::personas::record_persona_version(&persona)?;
+    }
     Ok(CommandResult::passed(
         "mom_llama.message_edit",
         "contracted",
-        result,
+        edited,
         vec![path.display().to_string()],
         Vec::new(),
         false,
@@ -433,15 +654,35 @@ pub fn message_delete(
             conversation_id,
         ));
     };
+    let Some(parent_id) = conversation
+        .messages
+        .iter()
+        .find(|message| message.id == message_id)
+        .map(|message| message.parent_id.clone())
+    else {
+        return Ok(message_not_found("mom_llama.message_delete", message_id));
+    };
+    let removed = descendant_ids(conversation, message_id);
     let before = conversation.messages.len();
     conversation
         .messages
-        .retain(|message| message.id != message_id);
+        .retain(|message| !removed.contains(&message.id));
     let changed = before != conversation.messages.len();
     if !changed {
         return Ok(message_not_found("mom_llama.message_delete", message_id));
     }
+    if conversation
+        .active_leaf_message_id
+        .as_ref()
+        .is_some_and(|active| removed.contains(active))
+    {
+        conversation.active_leaf_message_id = parent_id;
+    }
     conversation.updated_at = now_ms().to_string();
+    if conversation.kind == ConversationKind::PersonaTemplate {
+        conversation.execution_profile.version =
+            conversation.execution_profile.version.saturating_add(1);
+    }
     let path = save_db(&db)?;
     Ok(CommandResult::passed(
         "mom_llama.message_delete",
@@ -525,10 +766,13 @@ pub fn conversation_fork(
         title: format!("{} fork", source.title),
         created_at: now.clone(),
         updated_at: now,
+        kind: ConversationKind::Chat,
+        execution_profile: source.execution_profile,
         selected_model_path: source.selected_model_path,
         source_conversation_id: Some(source.id.clone()),
         source_message_id: Some(message_id.to_string()),
         branch_root_message_id: Some(message_id.to_string()),
+        active_leaf_message_id: messages.last().map(|message| message.id.clone()),
         current_skill_ids: source.current_skill_ids,
         messages,
     };
@@ -539,6 +783,103 @@ pub fn conversation_fork(
         "mom_llama.conversation_fork",
         "contracted",
         fork,
+        vec![path.display().to_string()],
+        Vec::new(),
+        false,
+        false,
+    ))
+}
+
+pub fn message_branches(
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<CommandResult<MessageBranchSet>> {
+    let db = load_db()?;
+    let Some(conversation) = db
+        .conversations
+        .iter()
+        .find(|conversation| conversation.id == conversation_id)
+    else {
+        return Ok(conversation_not_found(
+            "mom_llama.message_branches",
+            conversation_id,
+        ));
+    };
+    let Some(selected) = conversation
+        .messages
+        .iter()
+        .find(|message| message.id == message_id)
+    else {
+        return Ok(message_not_found("mom_llama.message_branches", message_id));
+    };
+    let mut siblings = conversation
+        .messages
+        .iter()
+        .filter(|message| message.parent_id == selected.parent_id && message.role == selected.role)
+        .map(|message| MessageBranchSibling {
+            message_id: message.id.clone(),
+            parent_id: message.parent_id.clone(),
+            role: message.role.clone(),
+            preview: message.content.chars().take(120).collect(),
+            created_at: message.created_at.clone(),
+            selected: message.id == message_id,
+        })
+        .collect::<Vec<_>>();
+    siblings.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.message_id.cmp(&right.message_id))
+    });
+    Ok(CommandResult::passed(
+        "mom_llama.message_branches",
+        "contracted",
+        MessageBranchSet {
+            conversation_id: conversation_id.to_string(),
+            parent_id: selected.parent_id.clone(),
+            active_message_id: message_id.to_string(),
+            siblings,
+        },
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    ))
+}
+
+pub fn message_branch_select(
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<CommandResult<Conversation>> {
+    let mut db = load_db()?;
+    let Some(conversation) = db
+        .conversations
+        .iter_mut()
+        .find(|conversation| conversation.id == conversation_id)
+    else {
+        return Ok(conversation_not_found(
+            "mom_llama.message_branch_select",
+            conversation_id,
+        ));
+    };
+    if !conversation
+        .messages
+        .iter()
+        .any(|message| message.id == message_id)
+    {
+        return Ok(message_not_found(
+            "mom_llama.message_branch_select",
+            message_id,
+        ));
+    }
+    let leaf = preferred_leaf_from(conversation, message_id);
+    conversation.active_leaf_message_id = Some(leaf);
+    conversation.updated_at = now_ms().to_string();
+    let projected = project_conversation(conversation);
+    let path = save_db(&db)?;
+    Ok(CommandResult::passed(
+        "mom_llama.message_branch_select",
+        "contracted",
+        projected,
         vec![path.display().to_string()],
         Vec::new(),
         false,
@@ -764,14 +1105,16 @@ pub fn text_attachment_import(
         role: MessageRole::User,
         content: format!("Attached text file `{file_name}`:\n\n```text\n{text}\n```"),
         created_at: now.clone(),
-        parent_id: conversation
-            .messages
-            .last()
-            .map(|message| message.id.clone()),
+        parent_id: active_leaf_id(conversation),
         model: None,
         receipt_id: None,
         prompt_tokens: Some(text.split_whitespace().count()),
         completion_tokens: None,
+        reasoning_content: None,
+        reasoning_incomplete: false,
+        branch_index: None,
+        branch_count: None,
+        attribution: None,
     };
     let result = TextAttachmentImport {
         conversation_id: conversation_id.to_string(),
@@ -779,6 +1122,7 @@ pub fn text_attachment_import(
         file_name,
         bytes: metadata.len(),
     };
+    conversation.active_leaf_message_id = Some(message.id.clone());
     conversation.messages.push(message);
     conversation.updated_at = now;
     let path = save_db(&db)?;
@@ -793,12 +1137,218 @@ pub fn text_attachment_import(
     ))
 }
 
+pub fn active_path_messages(conversation: &Conversation) -> Vec<Message> {
+    let by_id = conversation
+        .messages
+        .iter()
+        .map(|message| (message.id.as_str(), message))
+        .collect::<HashMap<_, _>>();
+    let mut current = active_leaf_id(conversation);
+    let mut seen = HashSet::new();
+    let mut path = Vec::new();
+    while let Some(message_id) = current {
+        if !seen.insert(message_id.clone()) {
+            break;
+        }
+        let Some(message) = by_id.get(message_id.as_str()) else {
+            break;
+        };
+        path.push((*message).clone());
+        current = message.parent_id.clone();
+    }
+    path.reverse();
+    for message in &mut path {
+        let mut siblings = conversation
+            .messages
+            .iter()
+            .filter(|candidate| {
+                candidate.parent_id == message.parent_id && candidate.role == message.role
+            })
+            .collect::<Vec<_>>();
+        siblings.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        message.branch_count = Some(siblings.len());
+        message.branch_index = siblings
+            .iter()
+            .position(|candidate| candidate.id == message.id)
+            .map(|index| index + 1);
+    }
+    path
+}
+
+pub fn project_conversation(conversation: &Conversation) -> Conversation {
+    let mut projected = conversation.clone();
+    projected.messages = active_path_messages(conversation);
+    projected.active_leaf_message_id = projected.messages.last().map(|message| message.id.clone());
+    projected
+}
+
+pub(crate) fn strip_reserved_attribution_prefix(value: &str) -> String {
+    split_reserved_attribution_prefix(value)
+        .map_or_else(|| value.to_string(), |(_, content)| content.to_string())
+}
+
+fn split_reserved_attribution_prefix(value: &str) -> Option<(&str, &str)> {
+    const PREFIX: &str = "Response from @";
+    let trimmed = value.trim_start();
+    let candidate = trimmed.get(..PREFIX.len())?;
+    if !candidate.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let remainder = &trimmed[PREFIX.len()..];
+    let separator = remainder.find(':')?;
+    let handle = &remainder[..separator];
+    if handle.len() < 2
+        || handle.len() > 48
+        || !handle
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return None;
+    }
+    Some((handle, remainder[separator + 1..].trim_start()))
+}
+
+fn repair_inline_attribution_prefixes(db: &mut ConversationDb) -> bool {
+    let mut changed = false;
+    for conversation in &mut db.conversations {
+        let lineage = conversation
+            .messages
+            .iter()
+            .map(|message| {
+                (
+                    message.id.clone(),
+                    (
+                        message.parent_id.clone(),
+                        message
+                            .attribution
+                            .as_ref()
+                            .map(|attribution| attribution.handle.clone()),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for message in &mut conversation.messages {
+            if message.role != MessageRole::Assistant {
+                continue;
+            }
+            let Some((handle, content)) = split_reserved_attribution_prefix(&message.content)
+            else {
+                continue;
+            };
+            let handle = handle.to_string();
+            let content = content.to_string();
+            let matches_own_attribution = message
+                .attribution
+                .as_ref()
+                .is_some_and(|attribution| attribution.handle.eq_ignore_ascii_case(&handle));
+            let matches_attributed_ancestor = message.attribution.is_none()
+                && attributed_ancestor_matches(message.parent_id.as_deref(), &handle, &lineage);
+            if matches_own_attribution || matches_attributed_ancestor {
+                message.content = content;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn attributed_ancestor_matches(
+    parent_id: Option<&str>,
+    handle: &str,
+    lineage: &HashMap<String, (Option<String>, Option<String>)>,
+) -> bool {
+    let mut current = parent_id.map(str::to_string);
+    let mut seen = HashSet::new();
+    while let Some(message_id) = current {
+        if !seen.insert(message_id.clone()) {
+            return false;
+        }
+        let Some((parent, attribution)) = lineage.get(&message_id) else {
+            return false;
+        };
+        if attribution
+            .as_deref()
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(handle))
+        {
+            return true;
+        }
+        current = parent.clone();
+    }
+    false
+}
+
+pub fn active_leaf_id(conversation: &Conversation) -> Option<String> {
+    conversation
+        .active_leaf_message_id
+        .as_ref()
+        .filter(|id| {
+            conversation
+                .messages
+                .iter()
+                .any(|message| &message.id == *id)
+        })
+        .cloned()
+        .or_else(|| {
+            conversation
+                .messages
+                .last()
+                .map(|message| message.id.clone())
+        })
+}
+
+fn preferred_leaf_from(conversation: &Conversation, message_id: &str) -> String {
+    let mut current = message_id.to_string();
+    loop {
+        let next = conversation
+            .messages
+            .iter()
+            .filter(|message| message.parent_id.as_deref() == Some(current.as_str()))
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+            .map(|message| message.id.clone());
+        match next {
+            Some(next) => current = next,
+            None => return current,
+        }
+    }
+}
+
+fn descendant_ids(conversation: &Conversation, message_id: &str) -> HashSet<String> {
+    let mut removed = HashSet::from([message_id.to_string()]);
+    loop {
+        let before = removed.len();
+        for message in &conversation.messages {
+            if message
+                .parent_id
+                .as_ref()
+                .is_some_and(|parent| removed.contains(parent))
+            {
+                removed.insert(message.id.clone());
+            }
+        }
+        if removed.len() == before {
+            return removed;
+        }
+    }
+}
+
 pub fn load_db() -> Result<ConversationDb> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
     let legacy_path = settings.data_dir.join(CONVERSATIONS_FILE);
     store.import_json_once::<ConversationDb>(CONVERSATIONS_NAMESPACE, &legacy_path)?;
-    Ok(store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default())
+    let mut db = store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default();
+    if repair_inline_attribution_prefixes(&mut db) {
+        store.put(CONVERSATIONS_NAMESPACE, &db)?;
+    }
+    Ok(db)
 }
 
 pub fn save_db(db: &ConversationDb) -> Result<PathBuf> {
@@ -829,10 +1379,13 @@ pub fn get_or_create_conversation(id: &str) -> Result<(ConversationDb, Conversat
         },
         created_at: now.clone(),
         updated_at: now,
+        kind: ConversationKind::Chat,
+        execution_profile: ConversationExecutionProfile::default(),
         selected_model_path: settings.model_path,
         source_conversation_id: None,
         source_message_id: None,
         branch_root_message_id: None,
+        active_leaf_message_id: None,
         current_skill_ids: Vec::new(),
         messages: Vec::new(),
     };
@@ -866,7 +1419,10 @@ pub fn upsert_conversation(db: ConversationDb, conversation: Conversation) -> Re
                     }
                 }
                 existing.updated_at = conversation.updated_at.clone();
+                existing.kind = conversation.kind;
+                existing.execution_profile = conversation.execution_profile.clone();
                 existing.selected_model_path = conversation.selected_model_path.clone();
+                existing.active_leaf_message_id = conversation.active_leaf_message_id.clone();
                 if existing.title == "New chat"
                     || existing.title == "Default chat"
                     || existing.title == existing.id
@@ -942,4 +1498,103 @@ fn save_drafts(db: &DraftDb) -> Result<PathBuf> {
 
 fn draft_key(conversation_id: Option<&str>) -> String {
     conversation_id.unwrap_or(NEW_CHAT_DRAFT_KEY).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Conversation, ConversationDb, ConversationExecutionProfile, ConversationKind, Message,
+        MessageAttribution, MessageRole, MessageSpeakerKind, repair_inline_attribution_prefixes,
+        strip_reserved_attribution_prefix,
+    };
+
+    fn message(id: &str, parent_id: Option<&str>, role: MessageRole, content: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            conversation_id: "host".to_string(),
+            role,
+            content: content.to_string(),
+            created_at: id.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            model: None,
+            receipt_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            reasoning_content: None,
+            reasoning_incomplete: false,
+            branch_index: None,
+            branch_count: None,
+            attribution: None,
+        }
+    }
+
+    #[test]
+    fn reserved_attribution_prefix_is_not_assistant_content() {
+        assert_eq!(
+            strip_reserved_attribution_prefix(
+                "Response from @default-chat: The answer belongs to the host transcript."
+            ),
+            "The answer belongs to the host transcript."
+        );
+        assert_eq!(
+            strip_reserved_attribution_prefix("A normal response from @default-chat: remains."),
+            "A normal response from @default-chat: remains."
+        );
+    }
+
+    #[test]
+    fn legacy_copied_prefix_is_repaired_only_when_structural_attribution_supports_it() {
+        let mut attributed = message("a", None, MessageRole::Assistant, "First answer");
+        attributed.attribution = Some(MessageAttribution {
+            kind: MessageSpeakerKind::LiveChat,
+            source_id: "source".to_string(),
+            handle: "default-chat".to_string(),
+            label: "Default chat".to_string(),
+            version: 1,
+            invocation_id: "invocation".to_string(),
+            target_order: 0,
+        });
+        let user = message("u", Some("a"), MessageRole::User, "Follow up");
+        let copied = message(
+            "b",
+            Some("u"),
+            MessageRole::Assistant,
+            "Response from @default-chat: A direct host answer",
+        );
+        let unrelated = message(
+            "c",
+            None,
+            MessageRole::Assistant,
+            "Response from @unrelated-chat: Preserve this unverified literal",
+        );
+        let mut db = ConversationDb {
+            conversations: vec![Conversation {
+                id: "host".to_string(),
+                title: "Host".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "4".to_string(),
+                kind: ConversationKind::Chat,
+                execution_profile: ConversationExecutionProfile::default(),
+                selected_model_path: None,
+                source_conversation_id: None,
+                source_message_id: None,
+                branch_root_message_id: None,
+                active_leaf_message_id: Some("b".to_string()),
+                current_skill_ids: Vec::new(),
+                messages: vec![attributed, user, copied, unrelated],
+            }],
+            selected_conversation_id: Some("host".to_string()),
+        };
+
+        assert!(repair_inline_attribution_prefixes(&mut db));
+        assert_eq!(
+            db.conversations[0].messages[2].content,
+            "A direct host answer"
+        );
+        assert_eq!(
+            db.conversations[0].messages[3].content,
+            "Response from @unrelated-chat: Preserve this unverified literal"
+        );
+        assert!(!repair_inline_attribution_prefixes(&mut db));
+    }
 }

@@ -1,0 +1,5 @@
+[env]
+# llama.cpp uses C++17 filesystem APIs that are unavailable in the macOS 10.13
+# default selected by generic Cargo/Tauri release builds. Keep the Rust bundle
+# metadata and native C/C++ objects on the same explicit deployment floor.
+MACOSX_DEPLOYMENT_TARGET = "13.0"

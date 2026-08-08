@@ -1,0 +1,76 @@
+{
+  "schema": "llama_native_kit.implementation_receipt.v1",
+  "task_id": "real-structured-reasoning-and-native-skip",
+  "role": "standalone_integrator",
+  "status": "passed",
+  "date": "2026-07-30",
+  "repository": "/Users/george/Documents/llama-native-kit",
+  "upstream": {
+    "repo": "ggml-org/llama.cpp",
+    "commit": "32703b42d6d8a74336bf27613705cbc76e2363ee",
+    "skip_semantics": "force the active reasoning sampler to emit its end sequence, then continue answer generation"
+  },
+  "changed_paths": [
+    "apps/mom-llama/src-tauri/src/commands.rs",
+    "apps/mom-llama/src-tauri/src/main.rs",
+    "apps/mom-llama/src-tauri/src/view.rs",
+    "apps/mom-llama/ui/coop-hx.js",
+    "apps/mom-llama/ui/style.css",
+    "contracts/commands.json",
+    "contracts/effects.json",
+    "contracts/upstream-parity.json",
+    "crates/llama-native-engine/src/lib.rs",
+    "crates/mom-llama-cli/src/main.rs",
+    "crates/mom-llama-runtime/src/chat.rs",
+    "crates/mom-llama-runtime/src/conversation_store.rs",
+    "crates/mom-llama-runtime/src/native_runtime.rs",
+    "crates/mom-llama-runtime/tests/runtime.rs",
+    "receipts/007-real-structured-reasoning-skip.json"
+  ],
+  "tests_run": [
+    {
+      "command": "cargo test -p llama-native-engine",
+      "outcome": "passed",
+      "detail": "reasoning-force registry is independent from cancellation and branch scoped"
+    },
+    {
+      "command": "cargo test -p mom-llama-runtime",
+      "outcome": "passed",
+      "detail": "incremental parsing, persistence policy, context policy, and typed blockers passed"
+    },
+    {
+      "command": "MOM_LLAMA_REASONING_MODEL_PATH=<Qwen3-GGUF> cargo test -p mom-llama-runtime --test runtime real_native_reasoning_stream_can_be_forced_to_the_answer -- --ignored --exact",
+      "outcome": "passed",
+      "duration_seconds": 105.51
+    }
+  ],
+  "real_reasoning_evidence": {
+    "model_source": "bartowski/Qwen_Qwen3-0.6B-GGUF",
+    "model_file": "Qwen_Qwen3-0.6B-Q4_K_M.gguf",
+    "model_sha256": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14",
+    "native_device": "cpu",
+    "transport": "in_process",
+    "fake_fixture": false,
+    "real_engine_invoked": true,
+    "substantive_reasoning_delta_observed": true,
+    "skip_reasoning_accepted": true,
+    "skip_reasoning_scope": "request plus assistant branch",
+    "visible_answer_continued": true,
+    "raw_reasoning_end_marker_hidden_from_answer": true,
+    "reasoning_persisted_separately": true,
+    "reasoning_complete": true
+  },
+  "readiness_changes": [
+    {
+      "feature": "structured_reasoning",
+      "before": "p0_required pending real reasoning-capable GGUF evidence",
+      "after": "p0_implemented with real in-process reasoning, separation, persistence, and native Skip proof"
+    }
+  ],
+  "blockers": [],
+  "reuse_decisions": [
+    "Matched current upstream Skip semantics instead of mapping Skip to cancellation.",
+    "Kept reasoning force state independent from cancellation and scoped to one native branch.",
+    "Required substantive reasoning text before the real proof triggered Skip."
+  ]
+}

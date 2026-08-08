@@ -11,10 +11,15 @@ tauri-build = { version = "2", features = [] }
 anyhow = "1"
 mom-llama-runtime = { path = "../../../crates/mom-llama-runtime" }
 llama-native-types = { path = "../../../crates/llama-native-types" }
+fte-backend-llama = { path = "../../../../../free_token_energy/crates/fte-backend-llama" }
+fte-router = { path = "../../../../../free_token_energy/crates/fte-router" }
+fte-store = { path = "../../../../../free_token_energy/crates/fte-store" }
+fte-types = { path = "../../../../../free_token_energy/crates/fte-types" }
 maud = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
+tauri-plugin-free-token-energy = { path = "../../../../../free_token_energy/crates/tauri-plugin-free-token-energy" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rfd = { version = "=0.16.0", default-features = false }

@@ -1,32 +1,39 @@
 use llama_native_types::NativeDevice;
 use mom_llama_runtime::{
-    ChatSendInput, ChatSendOptions, ConsultStartInput, ConsultStartOptions,
+    ChatSendInput, ChatSendOptions, ConsultPersona, ConsultStartInput, ConsultStartOptions,
     ConversationExportFormat, EngineCheckOptions, KvCachePolicy, config::SettingsUpdate,
 };
 #[cfg(target_os = "macos")]
 use rfd::FileDialog;
+use serde::Deserialize;
 use serde_json::{Value, to_value};
 use std::path::PathBuf;
+use tauri::ipc::Response;
 use tauri::{Emitter, Window};
 
 #[tauri::command]
-pub fn mom_llama_render_app() -> Result<String, String> {
-    crate::view::render_app().map_err(to_error)
+pub fn mom_llama_render_app() -> Result<Response, String> {
+    markup_response(crate::view::render_app())
 }
 
 #[tauri::command]
-pub fn mom_llama_render_chat_fragment() -> Result<String, String> {
-    crate::view::render_chat_fragment().map_err(to_error)
+pub fn mom_llama_render_chat_fragment() -> Result<Response, String> {
+    markup_response(crate::view::render_chat_fragment())
 }
 
 #[tauri::command]
-pub fn mom_llama_render_sidebar_fragment() -> Result<String, String> {
-    crate::view::render_sidebar_fragment().map_err(to_error)
+pub fn mom_llama_render_sidebar_fragment() -> Result<Response, String> {
+    markup_response(crate::view::render_sidebar_fragment())
 }
 
 #[tauri::command]
-pub fn mom_llama_render_settings_fragment() -> Result<String, String> {
-    crate::view::render_settings_fragment().map_err(to_error)
+pub fn mom_llama_render_persona_picker_fragment() -> Result<Response, String> {
+    markup_response(crate::view::render_persona_picker_fragment())
+}
+
+#[tauri::command]
+pub fn mom_llama_render_settings_fragment() -> Result<Response, String> {
+    markup_response(crate::view::render_settings_fragment())
 }
 
 #[tauri::command]
@@ -34,7 +41,13 @@ pub fn mom_llama_render_settings_fragment() -> Result<String, String> {
 pub async fn mom_llama_pick_file(kind: String) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let dialog = match kind.as_str() {
-            "model" => FileDialog::new().add_filter("GGUF model", &["gguf"]),
+            "model" => {
+                let dialog = FileDialog::new().add_filter("GGUF model", &["gguf"]);
+                match mom_llama_runtime::hugging_face_hub_cache_dir() {
+                    Some(cache) if cache.is_dir() => dialog.set_directory(cache),
+                    _ => dialog,
+                }
+            }
             "mmproj" => FileDialog::new().add_filter("GGUF projector", &["gguf"]),
             "conversation" => FileDialog::new().add_filter("Conversation", &["json"]),
             "attachment" => FileDialog::new().add_filter(
@@ -60,10 +73,8 @@ pub async fn mom_llama_pick_file(_kind: String) -> Result<Option<String>, String
 }
 
 #[tauri::command]
-pub fn mom_llama_engine_check() -> Result<Value, String> {
-    command_value(mom_llama_runtime::engine_check(
-        EngineCheckOptions::default(),
-    ))
+pub async fn mom_llama_engine_check() -> Result<Value, String> {
+    blocking_command(move || mom_llama_runtime::engine_check(EngineCheckOptions::default())).await
 }
 
 #[tauri::command]
@@ -75,14 +86,16 @@ pub fn mom_llama_engine_configure(
     max_parallel_sequences: Option<u32>,
     memory_budget_mib: Option<u64>,
 ) -> Result<Value, String> {
-    command_value(mom_llama_runtime::configure_engine(
+    let value = command_value(mom_llama_runtime::configure_engine(
         PathBuf::from(model_path),
         device.as_deref().map(native_device_from_str),
         context_tokens,
         batch_tokens,
         max_parallel_sequences,
         memory_budget_mib.map(mib_to_bytes),
-    ))
+    ))?;
+    crate::refresh_gateway_native_model()?;
+    Ok(value)
 }
 
 #[tauri::command]
@@ -92,7 +105,9 @@ pub fn mom_llama_model_list() -> Result<Value, String> {
 
 #[tauri::command]
 pub fn mom_llama_model_select(model_path: String) -> Result<Value, String> {
-    command_value(mom_llama_runtime::model_select(PathBuf::from(model_path)))
+    let value = command_value(mom_llama_runtime::model_select(PathBuf::from(model_path)))?;
+    crate::refresh_gateway_native_model()?;
+    Ok(value)
 }
 
 #[tauri::command]
@@ -121,8 +136,179 @@ pub async fn mom_llama_chat_send(
 }
 
 #[tauri::command]
+pub async fn mom_llama_chat_dispatch(
+    window: Window,
+    conversation: String,
+    message: String,
+) -> Result<Value, String> {
+    let events = window.clone();
+    blocking_command(move || {
+        mom_llama_runtime::chat_dispatch_stream(
+            mom_llama_runtime::MentionDispatchInput {
+                conversation_id: conversation,
+                message,
+            },
+            ChatSendOptions::default(),
+            Some(move |event| {
+                events
+                    .emit("mom_llama_chat_dispatch_stream", &event)
+                    .map_err(anyhow::Error::new)?;
+                Ok(())
+            }),
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_mention_dispatch(
+    window: Window,
+    conversation: String,
+    message: String,
+) -> Result<Value, String> {
+    let events = window.clone();
+    blocking_command(move || {
+        let mut result = mom_llama_runtime::chat_dispatch_stream(
+            mom_llama_runtime::MentionDispatchInput {
+                conversation_id: conversation,
+                message,
+            },
+            ChatSendOptions::default(),
+            Some(move |event| {
+                events
+                    .emit("mom_llama_chat_dispatch_stream", &event)
+                    .map_err(anyhow::Error::new)?;
+                Ok(())
+            }),
+        )?;
+        result.command = "mom_llama.mention_dispatch".to_string();
+        result.receipt.command = "mom_llama.mention_dispatch".to_string();
+        Ok(result)
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn mom_llama_mention_candidates(
+    query: String,
+    conversation: Option<String>,
+) -> Result<Value, String> {
+    command_value(mom_llama_runtime::mention_candidates(
+        &query,
+        conversation.as_deref(),
+    ))
+}
+
+#[tauri::command]
+pub fn mom_llama_mention_cancel(
+    invocation: String,
+    target: Option<String>,
+) -> Result<Value, String> {
+    command_value(mom_llama_runtime::mention_cancel(
+        &invocation,
+        target.as_deref(),
+    ))
+}
+
+#[tauri::command]
+pub async fn mom_llama_mention_synthesize(invocation: String) -> Result<Value, String> {
+    blocking_command(move || mom_llama_runtime::mention_synthesize(&invocation)).await
+}
+
+#[tauri::command]
+pub fn mom_llama_persona_freeze(
+    conversation: String,
+    message: String,
+    name: String,
+    handle: String,
+    history: String,
+) -> Result<Value, String> {
+    command_value(mom_llama_runtime::persona_freeze(
+        mom_llama_runtime::PersonaFreezeInput {
+            conversation_id: conversation,
+            message_id: message,
+            name,
+            mention_handle: handle,
+            history_mode: match history.as_str() {
+                "system_only" => mom_llama_runtime::PersonaHistoryMode::SystemOnly,
+                "empty" => mom_llama_runtime::PersonaHistoryMode::Empty,
+                _ => mom_llama_runtime::PersonaHistoryMode::Full,
+            },
+        },
+    ))
+}
+
+#[tauri::command]
+pub fn mom_llama_persona_list() -> Result<Value, String> {
+    command_value(mom_llama_runtime::persona_list())
+}
+
+#[tauri::command]
+pub fn mom_llama_persona_get(persona: String) -> Result<Value, String> {
+    command_value(mom_llama_runtime::persona_get(&persona))
+}
+
+#[tauri::command]
+pub fn mom_llama_persona_update(
+    profile: mom_llama_runtime::PersonaUpdateInput,
+) -> Result<Value, String> {
+    command_value(mom_llama_runtime::persona_update(profile))
+}
+
+#[tauri::command]
+pub fn mom_llama_persona_delete(persona: String) -> Result<Value, String> {
+    command_value(mom_llama_runtime::persona_delete(&persona))
+}
+
+#[tauri::command]
+pub fn mom_llama_persona_instantiate(
+    persona: String,
+    title: Option<String>,
+) -> Result<Value, String> {
+    command_value(mom_llama_runtime::persona_instantiate(&persona, title))
+}
+
+#[tauri::command]
+pub fn mom_llama_persona_group_list() -> Result<Value, String> {
+    command_value(mom_llama_runtime::persona_group_list())
+}
+
+#[tauri::command]
+pub fn mom_llama_persona_group_create(
+    name: String,
+    handle: String,
+    personas: Vec<String>,
+) -> Result<Value, String> {
+    command_value(mom_llama_runtime::persona_group_create(
+        name, handle, personas,
+    ))
+}
+
+#[tauri::command]
+pub fn mom_llama_persona_group_update(
+    group: String,
+    name: String,
+    handle: String,
+    personas: Vec<String>,
+) -> Result<Value, String> {
+    command_value(mom_llama_runtime::persona_group_update(
+        group, name, handle, personas,
+    ))
+}
+
+#[tauri::command]
+pub fn mom_llama_persona_group_delete(group: String) -> Result<Value, String> {
+    command_value(mom_llama_runtime::persona_group_delete(&group))
+}
+
+#[tauri::command]
 pub fn mom_llama_chat_cancel(conversation: String) -> Result<Value, String> {
     command_value(mom_llama_runtime::chat_cancel(&conversation))
+}
+
+#[tauri::command]
+pub fn mom_llama_chat_skip_reasoning(conversation: String) -> Result<Value, String> {
+    command_value(mom_llama_runtime::chat_skip_reasoning(&conversation))
 }
 
 #[tauri::command]
@@ -144,6 +330,14 @@ pub async fn mom_llama_chat_continue(conversation: String) -> Result<Value, Stri
 #[tauri::command]
 pub fn mom_llama_consult_panel_list() -> Result<Value, String> {
     command_value(mom_llama_runtime::consult_panel_list())
+}
+
+#[tauri::command]
+pub fn mom_llama_consult_panel_create(
+    name: String,
+    personas: Vec<ConsultPersona>,
+) -> Result<Value, String> {
+    command_value(mom_llama_runtime::consult_panel_create(name, personas))
 }
 
 #[tauri::command]
@@ -214,6 +408,17 @@ pub fn mom_llama_conversation_search(query: String) -> Result<Value, String> {
 #[tauri::command]
 pub fn mom_llama_conversation_rename(conversation: String, title: String) -> Result<Value, String> {
     command_value(mom_llama_runtime::conversation_rename(&conversation, title))
+}
+
+#[tauri::command]
+pub fn mom_llama_conversation_system_message_update(
+    conversation: String,
+    system_message: Option<String>,
+) -> Result<Value, String> {
+    command_value(mom_llama_runtime::conversation_system_message_update(
+        &conversation,
+        system_message,
+    ))
 }
 
 #[tauri::command]
@@ -303,6 +508,22 @@ pub fn mom_llama_message_copy(conversation: String, message: String) -> Result<V
 }
 
 #[tauri::command]
+pub fn mom_llama_message_branches(conversation: String, message: String) -> Result<Value, String> {
+    command_value(mom_llama_runtime::message_branches(&conversation, &message))
+}
+
+#[tauri::command]
+pub fn mom_llama_message_branch_select(
+    conversation: String,
+    message: String,
+) -> Result<Value, String> {
+    command_value(mom_llama_runtime::message_branch_select(
+        &conversation,
+        &message,
+    ))
+}
+
+#[tauri::command]
 pub fn mom_llama_attachment_import_text(
     conversation: String,
     path: String,
@@ -310,6 +531,17 @@ pub fn mom_llama_attachment_import_text(
     command_value(mom_llama_runtime::text_attachment_import(
         &conversation,
         &PathBuf::from(path),
+    ))
+}
+
+#[tauri::command]
+pub fn mom_llama_attachment_import_paste(
+    conversation: String,
+    text: String,
+) -> Result<Value, String> {
+    command_value(mom_llama_runtime::attachment_import_pasted_text(
+        &conversation,
+        text,
     ))
 }
 
@@ -327,17 +559,45 @@ pub fn mom_llama_attachment_list(conversation: Option<String>) -> Result<Value, 
 }
 
 #[tauri::command]
+pub fn mom_llama_attachment_preview(attachment: String) -> Result<Value, String> {
+    command_value(mom_llama_runtime::attachment_preview(&attachment, true))
+}
+
+#[tauri::command]
 pub fn mom_llama_settings_get() -> Result<Value, String> {
     command_value(mom_llama_runtime::settings_get())
 }
 
 #[tauri::command]
 pub fn mom_llama_settings_reset() -> Result<Value, String> {
-    command_value(mom_llama_runtime::settings_reset())
+    let value = command_value(mom_llama_runtime::settings_reset())?;
+    crate::refresh_gateway_native_model()?;
+    Ok(value)
 }
 
 #[tauri::command]
-pub fn mom_llama_settings_update(
+pub fn mom_llama_settings_update(input: SettingsUpdateInput) -> Result<Value, String> {
+    let value = command_value(mom_llama_runtime::settings_update(SettingsUpdate {
+        model_path: input.model_path.map(PathBuf::from),
+        mmproj_path: input.mmproj_path.map(PathBuf::from),
+        native_device: input.device.as_deref().map(native_device_from_str),
+        context_tokens: input.context_tokens,
+        batch_tokens: input.batch_tokens,
+        max_parallel_sequences: input.max_parallel_sequences,
+        resident_memory_budget_bytes: input.memory_budget_mib.map(mib_to_bytes),
+        temperature: input.temperature,
+        top_p: input.top_p,
+        max_tokens: input.max_tokens,
+        kv_cache_policy: input.kv_cache_policy.as_deref().map(kv_policy_from_str),
+        upstream_settings: input.upstream_settings.and_then(value_to_settings_map),
+    }))?;
+    crate::refresh_gateway_native_model()?;
+    Ok(value)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsUpdateInput {
     model_path: Option<String>,
     mmproj_path: Option<String>,
     device: Option<String>,
@@ -350,22 +610,6 @@ pub fn mom_llama_settings_update(
     max_tokens: Option<u32>,
     kv_cache_policy: Option<String>,
     upstream_settings: Option<Value>,
-) -> Result<Value, String> {
-    command_value(mom_llama_runtime::settings_update(SettingsUpdate {
-        model_path: model_path.map(PathBuf::from),
-        mmproj_path: mmproj_path.map(PathBuf::from),
-        native_device: device.as_deref().map(native_device_from_str),
-        context_tokens,
-        batch_tokens,
-        max_parallel_sequences,
-        resident_memory_budget_bytes: memory_budget_mib.map(mib_to_bytes),
-        temperature,
-        top_p,
-        max_tokens,
-        kv_cache_policy: kv_cache_policy.as_deref().map(kv_policy_from_str),
-        upstream_settings: upstream_settings.and_then(value_to_settings_map),
-        ..SettingsUpdate::default()
-    }))
 }
 
 #[tauri::command]
@@ -509,7 +753,7 @@ pub fn mom_llama_mcp_get_prompt(
 }
 
 #[tauri::command]
-pub fn mom_llama_tool_loop_run(
+pub fn mom_llama_tool_loop_prepare(
     conversation: String,
     prompt: String,
     server: String,
@@ -517,14 +761,88 @@ pub fn mom_llama_tool_loop_run(
     arguments: Value,
     max_turns: Option<u32>,
 ) -> Result<Value, String> {
-    command_value(mom_llama_runtime::tool_loop_run(
+    command_value(mom_llama_runtime::tool_loop_prepare(
         &conversation,
         prompt,
         server,
         tool,
         arguments,
-        max_turns.unwrap_or(1),
+        max_turns.unwrap_or(4),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolLoopCommandInput {
+    conversation: String,
+    prompt: String,
+    server: String,
+    tool: String,
+    arguments: Value,
+    max_turns: Option<u32>,
+    approval_id: Option<String>,
+}
+
+#[tauri::command]
+pub async fn mom_llama_tool_loop_run(
+    window: Window,
+    input: ToolLoopCommandInput,
+) -> Result<Value, String> {
+    let events = window.clone();
+    blocking_command(move || {
+        mom_llama_runtime::tool_loop_run_stream(
+            mom_llama_runtime::ToolLoopRunInput {
+                conversation_id: input.conversation,
+                prompt: input.prompt,
+                server: input.server,
+                tool: input.tool,
+                arguments: input.arguments,
+                max_turns: input.max_turns.unwrap_or(4),
+                approval_id: input.approval_id,
+            },
+            move |event| {
+                events
+                    .emit("mom_llama_tool_loop_stream", &event)
+                    .map_err(anyhow::Error::new)?;
+                Ok(())
+            },
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn mom_llama_tool_loop_cancel(conversation: String) -> Result<Value, String> {
+    command_value(mom_llama_runtime::tool_loop_cancel(&conversation))
+}
+
+#[tauri::command]
+pub fn mom_llama_tool_loop_status(conversation: Option<String>) -> Result<Value, String> {
+    command_value(mom_llama_runtime::tool_loop_status(conversation.as_deref()))
+}
+
+#[tauri::command]
+pub fn mom_llama_tool_permission_list() -> Result<Value, String> {
+    command_value(mom_llama_runtime::tool_permission_list())
+}
+
+#[tauri::command]
+pub fn mom_llama_tool_permission_set(
+    server: String,
+    tool: String,
+    policy: String,
+) -> Result<Value, String> {
+    let policy = match policy.as_str() {
+        "always_allow" => mom_llama_runtime::ToolPermissionPolicy::AlwaysAllow,
+        "deny" => mom_llama_runtime::ToolPermissionPolicy::Deny,
+        _ => mom_llama_runtime::ToolPermissionPolicy::Ask,
+    };
+    command_value(mom_llama_runtime::tool_permission_set(server, tool, policy))
+}
+
+#[tauri::command]
+pub fn mom_llama_tool_permission_revoke(server: String, tool: String) -> Result<Value, String> {
+    command_value(mom_llama_runtime::tool_permission_revoke(&server, &tool))
 }
 
 #[tauri::command]
@@ -590,6 +908,12 @@ fn native_device_from_str(value: &str) -> NativeDevice {
 
 fn mib_to_bytes(value: u64) -> u64 {
     value.saturating_mul(1024 * 1024)
+}
+
+fn markup_response(result: anyhow::Result<String>) -> Result<Response, String> {
+    result
+        .map(|markup| Response::new(markup.into_bytes()))
+        .map_err(to_error)
 }
 
 fn command_value<T: serde::Serialize>(result: anyhow::Result<T>) -> Result<Value, String> {

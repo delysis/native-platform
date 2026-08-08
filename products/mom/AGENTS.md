@@ -48,3 +48,26 @@ node --check apps/mom-llama/ui/coop-hx.js
 
 Real-model and Tauri bundle checks are separate opt-in acceptance gates.
 
+## Native UI visual discipline
+
+- Keep the ordinary chat surface calm. Conversation configuration belongs in
+  Settings or a transient contextual surface, never in a permanent dashboard,
+  card rail, or instructional banner.
+- Every visible button must use an established component class from
+  `apps/mom-llama/ui/style.css`. Do not ship an unstyled platform-default
+  button, a one-off class without CSS, or a new visual treatment for an
+  existing action hierarchy.
+- Use `primary-button` only for the single principal action in a local task.
+  Use `secondary-button` or `small-button` for ordinary actions,
+  `icon-button` for compact icon-only actions with an accessible label, and
+  `danger` only for destructive actions.
+- Settings autosave. Do not add a persistent Save button. Use a small Lucide
+  progress glyph while saving, show success only as a brief neutral check that
+  disappears, and reserve persistent text plus an explicit Retry action for a
+  failure that needs attention. Never discard the user's edits.
+- Prefer existing Lucide/upstream llama.cpp icons and design tokens. New icons,
+  colors, radii, shadows, or button variants require a demonstrated semantic
+  need and a rendered desktop/compact regression check.
+- The deterministic view test must reject buttons that do not use an approved
+  component class. Visual review is required after changing navigation,
+  settings, composer, dialogs, or message presentation.

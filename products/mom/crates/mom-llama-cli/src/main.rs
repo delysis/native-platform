@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use llama_native_types::NativeDevice;
 use mom_llama_runtime::{
-    ChatSendInput, ChatSendOptions, ConsultStartInput, ConsultStartOptions,
+    ChatSendInput, ChatSendOptions, ConsultPersona, ConsultStartInput, ConsultStartOptions,
     ConversationExportFormat, EngineCheckOptions, KvCachePolicy, config::SettingsUpdate,
 };
 use serde::Serialize;
@@ -34,6 +34,18 @@ enum Command {
     Consult {
         #[command(subcommand)]
         command: ConsultCommand,
+    },
+    Persona {
+        #[command(subcommand)]
+        command: PersonaCommand,
+    },
+    PersonaGroup {
+        #[command(subcommand)]
+        command: PersonaGroupCommand,
+    },
+    Mention {
+        #[command(subcommand)]
+        command: MentionCommand,
     },
     Message {
         #[command(subcommand)]
@@ -144,7 +156,25 @@ enum ChatCommand {
         #[arg(long)]
         json: bool,
     },
+    Dispatch {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long = "timeout-s")]
+        timeout_s: Option<f64>,
+        #[arg(long = "stream-jsonl")]
+        stream_jsonl: bool,
+        #[arg(long)]
+        json: bool,
+    },
     Cancel {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        json: bool,
+    },
+    SkipReasoning {
         #[arg(long)]
         conversation: String,
         #[arg(long)]
@@ -169,8 +199,141 @@ enum ChatCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum PersonaCommand {
+    Freeze {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        handle: String,
+        #[arg(long, value_enum, default_value = "full")]
+        history: PersonaHistoryArg,
+        #[arg(long)]
+        json: bool,
+    },
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Get {
+        #[arg(long)]
+        persona: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Update {
+        #[arg(long, value_parser = parse_json_value)]
+        profile: Value,
+        #[arg(long)]
+        json: bool,
+    },
+    Delete {
+        #[arg(long)]
+        persona: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Instantiate {
+        #[arg(long)]
+        persona: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PersonaHistoryArg {
+    Full,
+    SystemOnly,
+    Empty,
+}
+
+#[derive(Debug, Subcommand)]
+enum PersonaGroupCommand {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        handle: String,
+        #[arg(long = "persona", required = true)]
+        persona_ids: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Update {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        handle: String,
+        #[arg(long = "persona", required = true)]
+        persona_ids: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Delete {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MentionCommand {
+    Dispatch {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Candidates {
+        #[arg(long, default_value = "")]
+        query: String,
+        #[arg(long)]
+        conversation: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Cancel {
+        #[arg(long)]
+        invocation: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Synthesize {
+        #[arg(long)]
+        invocation: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ConsultCommand {
     PanelList {
+        #[arg(long)]
+        json: bool,
+    },
+    PanelCreate {
+        #[arg(long, default_value = "My Dream Team")]
+        name: String,
+        #[arg(long = "persona", value_parser = parse_json_value, required = true)]
+        personas: Vec<Value>,
         #[arg(long)]
         json: bool,
     },
@@ -241,6 +404,14 @@ enum ConversationCommand {
         conversation: String,
         #[arg(long)]
         title: String,
+        #[arg(long)]
+        json: bool,
+    },
+    SystemMessage {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long, default_value = "")]
+        message: String,
         #[arg(long)]
         json: bool,
     },
@@ -332,6 +503,22 @@ enum MessageCommand {
         #[arg(long)]
         json: bool,
     },
+    Branches {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        json: bool,
+    },
+    BranchSelect {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -352,9 +539,23 @@ enum AttachmentCommand {
         #[arg(long)]
         json: bool,
     },
+    ImportPaste {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        json: bool,
+    },
     List {
         #[arg(long)]
         conversation: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Preview {
+        #[arg(long)]
+        attachment: String,
         #[arg(long)]
         json: bool,
     },
@@ -522,6 +723,22 @@ enum McpCommand {
 
 #[derive(Debug, Subcommand)]
 enum ToolLoopCommand {
+    Prepare {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        tool: String,
+        #[arg(long, value_parser = parse_json_value, default_value = "{}")]
+        arguments: Value,
+        #[arg(long, default_value_t = 4)]
+        max_turns: u32,
+        #[arg(long)]
+        json: bool,
+    },
     Run {
         #[arg(long)]
         conversation: String,
@@ -533,18 +750,76 @@ enum ToolLoopCommand {
         tool: String,
         #[arg(long, value_parser = parse_json_value, default_value = "{}")]
         arguments: Value,
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 4)]
         max_turns: u32,
+        #[arg(long)]
+        approval_id: String,
+        #[arg(long)]
+        stream_jsonl: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Cancel {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Status {
+        #[arg(long)]
+        conversation: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    PermissionList {
+        #[arg(long)]
+        json: bool,
+    },
+    PermissionSet {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        tool: String,
+        #[arg(long, value_enum)]
+        policy: ToolPermissionPolicyArg,
+        #[arg(long)]
+        json: bool,
+    },
+    PermissionRevoke {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        tool: String,
         #[arg(long)]
         json: bool,
     },
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ToolPermissionPolicyArg {
+    Ask,
+    AlwaysAllow,
+    Deny,
+}
+
+impl From<ToolPermissionPolicyArg> for mom_llama_runtime::ToolPermissionPolicy {
+    fn from(value: ToolPermissionPolicyArg) -> Self {
+        match value {
+            ToolPermissionPolicyArg::Ask => Self::Ask,
+            ToolPermissionPolicyArg::AlwaysAllow => Self::AlwaysAllow,
+            ToolPermissionPolicyArg::Deny => Self::Deny,
+        }
+    }
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 enum KvCachePolicyArg {
-    None,
-    PromptPrefix,
-    KvCacheCandidate,
+    #[value(alias = "kv-cache-candidate")]
+    Automatic,
+    #[value(alias = "prompt-prefix")]
+    PrefixesOnly,
+    #[value(alias = "none")]
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -565,7 +840,7 @@ enum SkillCommand {
         prompt_template: String,
         #[arg(long, default_value = "Use this prompt before the next answer.")]
         usage_hint: String,
-        #[arg(long, value_enum, default_value = "none")]
+        #[arg(long, value_enum, default_value = "off")]
         cache_policy: KvCachePolicyArg,
         #[arg(long)]
         json: bool,
@@ -585,7 +860,7 @@ enum SkillCommand {
         prompt_template: String,
         #[arg(long, default_value = "Use this prompt before the next answer.")]
         usage_hint: String,
-        #[arg(long, value_enum, default_value = "none")]
+        #[arg(long, value_enum, default_value = "off")]
         cache_policy: KvCachePolicyArg,
         #[arg(long)]
         json: bool,
@@ -713,8 +988,40 @@ fn run() -> Result<()> {
                     )
                 }
             }
+            ChatCommand::Dispatch {
+                conversation,
+                message,
+                timeout_s,
+                stream_jsonl,
+                json,
+            } => {
+                let input = mom_llama_runtime::MentionDispatchInput {
+                    conversation_id: conversation,
+                    message,
+                };
+                let options = ChatSendOptions {
+                    timeout_s: timeout_s.unwrap_or_else(|| ChatSendOptions::default().timeout_s),
+                    fake_fixture: false,
+                };
+                if stream_jsonl {
+                    let result = mom_llama_runtime::chat_dispatch_stream(
+                        input,
+                        options,
+                        Some(|event| {
+                            println!("{}", serde_json::to_string(&event)?);
+                            Ok(())
+                        }),
+                    )?;
+                    print_json_line_result(result)
+                } else {
+                    print_result(mom_llama_runtime::chat_dispatch(input, options)?, json)
+                }
+            }
             ChatCommand::Cancel { conversation, json } => {
                 print_result(mom_llama_runtime::chat_cancel(&conversation)?, json)
+            }
+            ChatCommand::SkipReasoning { conversation, json } => {
+                print_result(mom_llama_runtime::chat_skip_reasoning(&conversation)?, json)
             }
             ChatCommand::Regenerate {
                 conversation,
@@ -747,9 +1054,129 @@ fn run() -> Result<()> {
                 json,
             ),
         },
+        Command::Persona { command } => match command {
+            PersonaCommand::Freeze {
+                conversation,
+                message,
+                name,
+                handle,
+                history,
+                json,
+            } => print_result(
+                mom_llama_runtime::persona_freeze(mom_llama_runtime::PersonaFreezeInput {
+                    conversation_id: conversation,
+                    message_id: message,
+                    name,
+                    mention_handle: handle,
+                    history_mode: match history {
+                        PersonaHistoryArg::Full => mom_llama_runtime::PersonaHistoryMode::Full,
+                        PersonaHistoryArg::SystemOnly => {
+                            mom_llama_runtime::PersonaHistoryMode::SystemOnly
+                        }
+                        PersonaHistoryArg::Empty => mom_llama_runtime::PersonaHistoryMode::Empty,
+                    },
+                })?,
+                json,
+            ),
+            PersonaCommand::List { json } => print_result(mom_llama_runtime::persona_list()?, json),
+            PersonaCommand::Get { persona, json } => {
+                print_result(mom_llama_runtime::persona_get(&persona)?, json)
+            }
+            PersonaCommand::Update { profile, json } => print_result(
+                mom_llama_runtime::persona_update(serde_json::from_value(profile)?)?,
+                json,
+            ),
+            PersonaCommand::Delete { persona, json } => {
+                print_result(mom_llama_runtime::persona_delete(&persona)?, json)
+            }
+            PersonaCommand::Instantiate {
+                persona,
+                title,
+                json,
+            } => print_result(
+                mom_llama_runtime::persona_instantiate(&persona, title)?,
+                json,
+            ),
+        },
+        Command::PersonaGroup { command } => match command {
+            PersonaGroupCommand::List { json } => {
+                print_result(mom_llama_runtime::persona_group_list()?, json)
+            }
+            PersonaGroupCommand::Create {
+                name,
+                handle,
+                persona_ids,
+                json,
+            } => print_result(
+                mom_llama_runtime::persona_group_create(name, handle, persona_ids)?,
+                json,
+            ),
+            PersonaGroupCommand::Update {
+                group,
+                name,
+                handle,
+                persona_ids,
+                json,
+            } => print_result(
+                mom_llama_runtime::persona_group_update(group, name, handle, persona_ids)?,
+                json,
+            ),
+            PersonaGroupCommand::Delete { group, json } => {
+                print_result(mom_llama_runtime::persona_group_delete(&group)?, json)
+            }
+        },
+        Command::Mention { command } => match command {
+            MentionCommand::Dispatch {
+                conversation,
+                message,
+                json,
+            } => print_result(
+                mom_llama_runtime::mention_dispatch(
+                    mom_llama_runtime::MentionDispatchInput {
+                        conversation_id: conversation,
+                        message,
+                    },
+                    ChatSendOptions::default(),
+                )?,
+                json,
+            ),
+            MentionCommand::Candidates {
+                query,
+                conversation,
+                json,
+            } => print_result(
+                mom_llama_runtime::mention_candidates(&query, conversation.as_deref())?,
+                json,
+            ),
+            MentionCommand::Cancel {
+                invocation,
+                target,
+                json,
+            } => print_result(
+                mom_llama_runtime::mention_cancel(&invocation, target.as_deref())?,
+                json,
+            ),
+            MentionCommand::Synthesize { invocation, json } => {
+                print_result(mom_llama_runtime::mention_synthesize(&invocation)?, json)
+            }
+        },
         Command::Consult { command } => match command {
             ConsultCommand::PanelList { json } => {
                 print_result(mom_llama_runtime::consult_panel_list()?, json)
+            }
+            ConsultCommand::PanelCreate {
+                name,
+                personas,
+                json,
+            } => {
+                let personas = personas
+                    .into_iter()
+                    .map(serde_json::from_value::<ConsultPersona>)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                print_result(
+                    mom_llama_runtime::consult_panel_create(name, personas)?,
+                    json,
+                )
             }
             ConsultCommand::Start {
                 conversation,
@@ -820,6 +1247,22 @@ fn run() -> Result<()> {
                 mom_llama_runtime::message_delete(&conversation, &message)?,
                 json,
             ),
+            MessageCommand::Branches {
+                conversation,
+                message,
+                json,
+            } => print_result(
+                mom_llama_runtime::message_branches(&conversation, &message)?,
+                json,
+            ),
+            MessageCommand::BranchSelect {
+                conversation,
+                message,
+                json,
+            } => print_result(
+                mom_llama_runtime::message_branch_select(&conversation, &message)?,
+                json,
+            ),
         },
         Command::Attachment { command } => match command {
             AttachmentCommand::Import {
@@ -838,8 +1281,20 @@ fn run() -> Result<()> {
                 mom_llama_runtime::text_attachment_import(&conversation, &path)?,
                 json,
             ),
+            AttachmentCommand::ImportPaste {
+                conversation,
+                text,
+                json,
+            } => print_result(
+                mom_llama_runtime::attachment_import_pasted_text(&conversation, text)?,
+                json,
+            ),
             AttachmentCommand::List { conversation, json } => print_result(
                 mom_llama_runtime::attachment_list(conversation.as_deref())?,
+                json,
+            ),
+            AttachmentCommand::Preview { attachment, json } => print_result(
+                mom_llama_runtime::attachment_preview(&attachment, false)?,
                 json,
             ),
         },
@@ -893,6 +1348,17 @@ fn run() -> Result<()> {
                 json,
             } => print_result(
                 mom_llama_runtime::conversation_rename(&conversation, title)?,
+                json,
+            ),
+            ConversationCommand::SystemMessage {
+                conversation,
+                message,
+                json,
+            } => print_result(
+                mom_llama_runtime::conversation_system_message_update(
+                    &conversation,
+                    (!message.trim().is_empty()).then_some(message),
+                )?,
                 json,
             ),
             ConversationCommand::Delete { conversation, json } => {
@@ -1037,7 +1503,7 @@ fn run() -> Result<()> {
             ),
         },
         Command::ToolLoop { command } => match command {
-            ToolLoopCommand::Run {
+            ToolLoopCommand::Prepare {
                 conversation,
                 prompt,
                 server,
@@ -1046,7 +1512,7 @@ fn run() -> Result<()> {
                 max_turns,
                 json,
             } => print_result(
-                mom_llama_runtime::tool_loop_run(
+                mom_llama_runtime::tool_loop_prepare(
                     &conversation,
                     prompt,
                     server,
@@ -1054,6 +1520,72 @@ fn run() -> Result<()> {
                     arguments,
                     max_turns,
                 )?,
+                json,
+            ),
+            ToolLoopCommand::Run {
+                conversation,
+                prompt,
+                server,
+                tool,
+                arguments,
+                max_turns,
+                approval_id,
+                stream_jsonl,
+                json,
+            } => {
+                if stream_jsonl {
+                    let result = mom_llama_runtime::tool_loop_run_stream(
+                        mom_llama_runtime::ToolLoopRunInput {
+                            conversation_id: conversation,
+                            prompt,
+                            server,
+                            tool,
+                            arguments,
+                            max_turns,
+                            approval_id: Some(approval_id),
+                        },
+                        |event| {
+                            println!("{}", serde_json::to_string(&event)?);
+                            Ok(())
+                        },
+                    )?;
+                    print_json_line_result(result)
+                } else {
+                    print_result(
+                        mom_llama_runtime::tool_loop_run(
+                            &conversation,
+                            prompt,
+                            server,
+                            tool,
+                            arguments,
+                            max_turns,
+                            Some(approval_id),
+                        )?,
+                        json,
+                    )
+                }
+            }
+            ToolLoopCommand::Cancel { conversation, json } => {
+                print_result(mom_llama_runtime::tool_loop_cancel(&conversation)?, json)
+            }
+            ToolLoopCommand::Status { conversation, json } => print_result(
+                mom_llama_runtime::tool_loop_status(conversation.as_deref())?,
+                json,
+            ),
+            ToolLoopCommand::PermissionList { json } => {
+                print_result(mom_llama_runtime::tool_permission_list()?, json)
+            }
+            ToolLoopCommand::PermissionSet {
+                server,
+                tool,
+                policy,
+                json,
+            } => print_result(
+                mom_llama_runtime::tool_permission_set(server, tool, policy.into())?,
+                json,
+            ),
+            ToolLoopCommand::PermissionRevoke { server, tool, json } => print_result(
+                mom_llama_runtime::tool_permission_revoke(&server, &tool)?,
                 json,
             ),
         },
@@ -1125,9 +1657,9 @@ fn run() -> Result<()> {
 
 fn map_cache_policy(arg: KvCachePolicyArg) -> KvCachePolicy {
     match arg {
-        KvCachePolicyArg::None => KvCachePolicy::None,
-        KvCachePolicyArg::PromptPrefix => KvCachePolicy::PromptPrefix,
-        KvCachePolicyArg::KvCacheCandidate => KvCachePolicy::KvCacheCandidate,
+        KvCachePolicyArg::Automatic => KvCachePolicy::KvCacheCandidate,
+        KvCachePolicyArg::PrefixesOnly => KvCachePolicy::PromptPrefix,
+        KvCachePolicyArg::Off => KvCachePolicy::None,
     }
 }
 

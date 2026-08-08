@@ -1,0 +1,130 @@
+{
+  "schema": "llama_native_kit.implementation_receipt.v1",
+  "task_id": "full-upstream-parity-bundle-launch",
+  "role": "standalone_integrator",
+  "status": "passed",
+  "date": "2026-07-31",
+  "repository": "/Users/george/Documents/llama-native-kit",
+  "upstream": {
+    "repository": "ggml-org/llama.cpp",
+    "branch": "master",
+    "commit": "876a4321163249c43ca4e986818fab5ab081f282",
+    "path": "tools/ui"
+  },
+  "changed_paths": [
+    "README.md",
+    "apps/mom-llama/src-tauri/src/view.rs",
+    "apps/mom-llama/src-tauri/tauri.conf.json",
+    "apps/mom-llama/ui/coop-hx.js",
+    "contracts/upstream-parity.json",
+    "receipts/010-real-native-multimodal.json",
+    "receipts/011-full-parity-bundle-launch.json",
+    "receipts/assets/010-image-preview.png",
+    "receipts/assets/011-compact.png",
+    "receipts/assets/011-empty-desktop.png",
+    "receipts/assets/011-real-multimodal-tauri.png",
+    "receipts/assets/011-settings-desktop.png",
+    "receipts/assets/011-sidebar-desktop.png"
+  ],
+  "tests_run": [
+    {
+      "command": "cargo fmt --all --check",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo test --workspace --exclude mom-llama-app",
+      "outcome": "passed",
+      "detail": "All deterministic workspace tests passed; eight explicitly env-gated real-model tests remained ignored in this ordinary suite and are covered by their dedicated receipts."
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --exclude mom-llama-app -- -D warnings",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo test -p mom-llama-app",
+      "outcome": "passed",
+      "detail": "Four native-view tests passed, including the command metadata, local media CSP, object-URL lifecycle, structured reasoning, and structured tool-result probes."
+    },
+    {
+      "command": "cargo clippy -p mom-llama-app --all-targets -- -D warnings",
+      "outcome": "passed"
+    },
+    {
+      "command": "node --check apps/mom-llama/ui/coop-hx.js",
+      "outcome": "passed"
+    },
+    {
+      "command": "./scripts/check-architecture.sh",
+      "outcome": "passed",
+      "detail": "Inference is in-process and MCP is the sole bounded process adapter."
+    },
+    {
+      "command": "./scripts/check-contracts.sh",
+      "outcome": "passed",
+      "detail": "67 commands, 76 affordances, 25 effects, 36 parity rows, 58 upstream settings, and zero blockers."
+    },
+    {
+      "command": "MACOSX_DEPLOYMENT_TARGET=13.0 cargo tauri build --debug --bundles app",
+      "outcome": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "outcome": "passed"
+    }
+  ],
+  "bundle": {
+    "path": "target/debug/bundle/macos/Mom Llama Native Kit.app",
+    "bundle_id": "com.delysis.llama-native-kit.mom-llama",
+    "executable_size_bytes": 44188832,
+    "executable_sha256": "6a66161b5a779737b6b740d4d7e3e2f4e15651d804421740a3f3e04482946eb9",
+    "running_process_id_at_receipt": 58252
+  },
+  "real_native_tauri_evidence": {
+    "data_dir": "/tmp/llama-native-kit-visual-smoke-2",
+    "model_file": "gemma-4-E4B-it-Q8_0.gguf",
+    "projector_file": "mmproj-gemma-4-E4B-it-bf16.gguf",
+    "native_device": "metal",
+    "transport": "in_process",
+    "fake_fixture": false,
+    "real_engine_invoked": true,
+    "attachment": {
+      "file": "icon.png",
+      "mime": "image/png",
+      "bytes": 6229,
+      "encrypted_at_rest": true,
+      "native_picker": true,
+      "decrypted_blob_preview_rendered": true
+    },
+    "prompt": "What does the attached image show? Answer in one short sentence.",
+    "assistant_response": "The image displays the orange logo for C++.",
+    "prompt_tokens": 302,
+    "completion_tokens": 9,
+    "receipt_id": "mom_llama.chat_send:7416c515-9777-4a7c-8fc6-25296d39ee76"
+  },
+  "visual_evidence": [
+    "receipts/assets/011-empty-desktop.png",
+    "receipts/assets/011-sidebar-desktop.png",
+    "receipts/assets/011-settings-desktop.png",
+    "receipts/assets/011-compact.png",
+    "receipts/assets/010-image-preview.png",
+    "receipts/assets/011-real-multimodal-tauri.png"
+  ],
+  "parity": {
+    "p0_implemented": 18,
+    "p0_required": 0,
+    "p1_deferred": 8,
+    "p2_deferred": 2,
+    "superseded_by_native_rust": 3,
+    "rejected_for_constraint_violation": 5,
+    "blocking_feature_ids": [],
+    "achieved": true
+  },
+  "repairs": [
+    "Permitted only local data/blob image and media sources in the packaged CSP so encrypted image/audio previews render without adding network authority.",
+    "Kept preview object URLs alive for the lifetime of their rendered fragment and revoked them during fragment replacement or window shutdown.",
+    "Removed scaffold readiness jargon from successful user-facing actions while retaining typed human blocker messages.",
+    "Renamed the mmproj field to Multimodal projector so the UI does not falsely describe an image-and-audio projector as vision-only."
+  ],
+  "blockers": [],
+  "next_actions": []
+}

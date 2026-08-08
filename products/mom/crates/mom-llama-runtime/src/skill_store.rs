@@ -5,6 +5,7 @@ use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -29,6 +30,13 @@ pub struct Skill {
 pub struct SkillDb {
     #[serde(default)]
     pub skills: Vec<Skill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedSkillPrompt {
+    pub prompt: String,
+    pub cache_owner_id: Option<String>,
+    pub cache_label: String,
 }
 
 pub fn skill_create(
@@ -216,13 +224,49 @@ pub fn save_skill_db(db: &SkillDb) -> Result<PathBuf> {
     Ok(store.path().to_path_buf())
 }
 
-pub fn skill_prompt_prefix(skill_ids: &[String]) -> Result<String> {
+pub fn applied_skill_prompt(skill_ids: &[String]) -> Result<AppliedSkillPrompt> {
     let db = load_skill_db()?;
-    let prompts = skill_ids
+    let skills = skill_ids
         .iter()
         .filter_map(|id| db.skills.iter().find(|skill| &skill.id == id))
+        .collect::<Vec<_>>();
+    let prompt = skills
+        .iter()
         .map(|skill| skill.prompt_template.trim())
         .filter(|prompt| !prompt.is_empty())
-        .collect::<Vec<_>>();
-    Ok(prompts.join("\n\n"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let cacheable = !skills.is_empty()
+        && skills
+            .iter()
+            .all(|skill| skill.cache_policy.allows_prefix_reuse());
+    let cache_owner_id = cacheable.then(|| {
+        let mut hash = Sha256::new();
+        for skill in &skills {
+            hash.update(skill.id.as_bytes());
+            hash.update([0]);
+            hash.update(skill.updated_at.as_bytes());
+            hash.update([0]);
+            hash.update(skill.prompt_template.as_bytes());
+            hash.update([0]);
+        }
+        format!("skills:{:x}", hash.finalize())
+    });
+    let cache_label = if skills.is_empty() {
+        "Applied Skills".to_string()
+    } else {
+        format!(
+            "Applied Skills: {}",
+            skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Ok(AppliedSkillPrompt {
+        prompt,
+        cache_owner_id,
+        cache_label,
+    })
 }

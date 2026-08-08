@@ -1,5 +1,5 @@
 use crate::config::{Settings, resolve_settings};
-use crate::native_runtime::resident_model;
+use crate::native_runtime::{resident_model, resident_status};
 use crate::receipts::{Blocker, CommandResult};
 use anyhow::Result;
 use llama_native_engine::LLAMA_CPP_BINDING_VERSION;
@@ -20,6 +20,47 @@ pub struct EngineCheckOutput {
     pub transport: String,
     pub binding_version: String,
     pub backend: String,
+}
+
+pub fn engine_status() -> Result<CommandResult<EngineCheckOutput>> {
+    let settings = resolve_settings()?;
+    if let Err(blocked) = validate_engine_and_model(&settings) {
+        return Ok(CommandResult::blocked(
+            "mom_llama.engine_check",
+            &blocked.readiness,
+            blocked.blocker,
+        ));
+    }
+    let model_path = settings.model_path.as_ref().cloned().unwrap_or_default();
+    let resident = resident_status().filter(|status| {
+        status.fingerprint.as_ref().is_some_and(|fingerprint| {
+            fingerprint.model_path == model_path
+                && fingerprint.context_tokens == settings.context_tokens
+                && fingerprint.batch_tokens == settings.batch_tokens
+                && fingerprint.max_sequences == settings.max_parallel_sequences.clamp(1, 4)
+        })
+    });
+    let (readiness, backend) = resident.and_then(|status| status.fingerprint).map_or_else(
+        || ("configured", "not_loaded".to_string()),
+        |fingerprint| ("host_integrated", fingerprint.backend),
+    );
+    Ok(CommandResult::passed(
+        "mom_llama.engine_check",
+        readiness,
+        EngineCheckOutput {
+            runtime: "in_process_llama_cpp".to_string(),
+            model_path: model_path.display().to_string(),
+            help_check: "not_applicable".to_string(),
+            prompt_smoke: "not_run".to_string(),
+            transport: "in_process".to_string(),
+            binding_version: LLAMA_CPP_BINDING_VERSION.to_string(),
+            backend,
+        },
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    ))
 }
 
 pub fn engine_check(options: EngineCheckOptions) -> Result<CommandResult<EngineCheckOutput>> {

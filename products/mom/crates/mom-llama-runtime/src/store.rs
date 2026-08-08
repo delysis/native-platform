@@ -5,18 +5,56 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 const DATABASE_FILE: &str = "runtime.sqlite3";
-const STORE_KEY_ENV: &str = "MOM_LLAMA_STORE_KEY_HEX";
-const KEYCHAIN_SERVICE: &str = "coop.mom-llama-lab.store.v1";
+const STORE_KEY_ENV: &str = "LLAMA_NATIVE_KIT_STORE_KEY_HEX";
+const KEYCHAIN_SERVICE: &str = "com.delysis.llama-native-kit.mom-llama.store.v1";
+
+// RuntimeStore is intentionally cheap to reopen, but asking macOS Keychain for
+// the same installation key on every repository operation can produce repeated
+// authorization prompts for development-signed builds. Keep the key only in
+// process memory after the first successful OS lookup. The cache is indexed by
+// the hashed data-directory account, so isolated stores never share keys.
+static INSTALLATION_KEYS: OnceLock<Mutex<HashMap<String, CachedInstallationKey>>> = OnceLock::new();
+
+#[derive(Clone)]
+enum CachedInstallationKey {
+    Available([u8; 32]),
+    Unavailable(String),
+}
 
 #[derive(Clone)]
 pub(crate) struct RuntimeStore {
     path: PathBuf,
     key: [u8; 32],
+}
+
+pub(crate) struct DocumentMutations<'a> {
+    store: &'a RuntimeStore,
+    writes: Vec<(String, Vec<u8>, Vec<u8>)>,
+    deletes: Vec<String>,
+}
+
+impl DocumentMutations<'_> {
+    pub(crate) fn put_bytes(&mut self, namespace: &str, value: &[u8]) -> Result<()> {
+        let (nonce, ciphertext) = self.store.encrypt_bytes(namespace, value)?;
+        self.writes.push((namespace.to_string(), nonce, ciphertext));
+        self.deletes.retain(|candidate| candidate != namespace);
+        Ok(())
+    }
+
+    pub(crate) fn delete(&mut self, namespace: &str) {
+        self.writes
+            .retain(|(candidate, _, _)| candidate != namespace);
+        if !self.deletes.iter().any(|candidate| candidate == namespace) {
+            self.deletes.push(namespace.to_string());
+        }
+    }
 }
 
 impl RuntimeStore {
@@ -167,6 +205,71 @@ impl RuntimeStore {
         Ok(result)
     }
 
+    pub(crate) fn mutate_documents<T, R>(
+        &self,
+        namespace: &str,
+        default: impl FnOnce() -> T,
+        mutation: impl FnOnce(&mut T, &mut DocumentMutations<'_>) -> Result<R>,
+    ) -> Result<R>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let encrypted = transaction
+            .query_row(
+                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
+                [namespace],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let mut value = match encrypted {
+            Some((nonce, ciphertext)) => self.decrypt_json(namespace, &nonce, &ciphertext)?,
+            None => default(),
+        };
+        let mut documents = DocumentMutations {
+            store: self,
+            writes: Vec::new(),
+            deletes: Vec::new(),
+        };
+        let result = mutation(&mut value, &mut documents)?;
+        let (nonce, ciphertext) = self.encrypt_json(namespace, &value)?;
+
+        for deleted in documents.deletes {
+            transaction.execute(
+                "DELETE FROM encrypted_documents WHERE namespace = ?1",
+                [deleted],
+            )?;
+        }
+        for (document_namespace, document_nonce, document_ciphertext) in documents.writes {
+            transaction.execute(
+                "INSERT INTO encrypted_documents(namespace, nonce, ciphertext, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(namespace) DO UPDATE SET
+                   nonce = excluded.nonce,
+                   ciphertext = excluded.ciphertext,
+                   updated_at = excluded.updated_at",
+                params![
+                    document_namespace,
+                    document_nonce,
+                    document_ciphertext,
+                    timestamp_i64()
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO encrypted_documents(namespace, nonce, ciphertext, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(namespace) DO UPDATE SET
+               nonce = excluded.nonce,
+               ciphertext = excluded.ciphertext,
+               updated_at = excluded.updated_at",
+            params![namespace, nonce, ciphertext, timestamp_i64()],
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     pub(crate) fn import_json_once<T>(&self, namespace: &str, legacy_path: &Path) -> Result<bool>
     where
         T: Serialize + DeserializeOwned,
@@ -270,43 +373,106 @@ fn timestamp_i64() -> i64 {
 }
 
 fn resolve_store_key(data_dir: &Path) -> Result<[u8; 32]> {
-    if crate::config::data_dir_override_is_set() {
-        let mut hasher = Sha256::new();
-        hasher.update(b"mom-llama-test-store-key-v1");
-        hasher.update(data_dir.to_string_lossy().as_bytes());
-        return Ok(hasher.finalize().into());
-    }
-    if let Ok(value) = std::env::var(STORE_KEY_ENV) {
-        return decode_hex_key(&value);
+    if let Some(key) = configured_store_key(
+        data_dir,
+        std::env::var(STORE_KEY_ENV).ok().as_deref(),
+        crate::config::data_dir_override_is_set(),
+        crate::config::insecure_development_store_enabled(),
+    )? {
+        return Ok(key);
     }
     #[cfg(target_os = "macos")]
     {
-        const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
         let account = keychain_account(data_dir);
-        match security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, &account) {
-            Ok(key) => key
-                .try_into()
-                .map_err(|_| anyhow!("Keychain key is not 32 bytes")),
-            Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => {
-                let mut key = [0_u8; 32];
-                getrandom::fill(&mut key)
-                    .map_err(|error| anyhow!("store key generation failed: {error}"))?;
-                security_framework::passwords::set_generic_password(
-                    KEYCHAIN_SERVICE,
-                    &account,
-                    &key,
-                )?;
-                Ok(key)
-            }
-            Err(error) => Err(error.into()),
-        }
+        cached_installation_key(&account, &INSTALLATION_KEYS, || {
+            load_or_create_macos_key(&account)
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = data_dir;
         Err(anyhow!(
-            "Set MOM_LLAMA_STORE_KEY_HEX on platforms without a supported OS credential store"
+            "Set LLAMA_NATIVE_KIT_STORE_KEY_HEX on platforms without a supported OS credential store"
         ))
+    }
+}
+
+fn configured_store_key(
+    data_dir: &Path,
+    environment_key: Option<&str>,
+    deterministic_test_override: bool,
+    insecure_development_store: bool,
+) -> Result<Option<[u8; 32]>> {
+    if let Some(value) = environment_key {
+        return decode_hex_key(value).map(Some);
+    }
+    if deterministic_test_override {
+        let mut hasher = Sha256::new();
+        hasher.update(b"mom-llama-test-store-key-v1");
+        hasher.update(data_dir.to_string_lossy().as_bytes());
+        return Ok(Some(hasher.finalize().into()));
+    }
+    if insecure_development_store {
+        // Debug bundles intentionally trade confidentiality for iteration speed.
+        // The predictable key keeps the on-disk schema identical to production
+        // without invoking Keychain, and the separate development data directory
+        // prevents this store from ever being mistaken for the secure release store.
+        let mut hasher = Sha256::new();
+        hasher.update(b"mom-llama-insecure-development-store-key-v1");
+        hasher.update(data_dir.to_string_lossy().as_bytes());
+        return Ok(Some(hasher.finalize().into()));
+    }
+    Ok(None)
+}
+
+fn cached_installation_key(
+    account: &str,
+    cache: &OnceLock<Mutex<HashMap<String, CachedInstallationKey>>>,
+    load: impl FnOnce() -> Result<[u8; 32]>,
+) -> Result<[u8; 32]> {
+    let cache = cache.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut keys = cache
+        .lock()
+        .map_err(|_| anyhow!("installation-key memory cache is poisoned"))?;
+    if let Some(cached) = keys.get(account) {
+        return match cached {
+            CachedInstallationKey::Available(key) => Ok(*key),
+            CachedInstallationKey::Unavailable(message) => Err(anyhow!(message.clone())),
+        };
+    }
+    // Hold the lock across the first lookup so concurrent startup commands
+    // cannot independently trigger the same Keychain authorization request.
+    match load() {
+        Ok(key) => {
+            keys.insert(account.to_string(), CachedInstallationKey::Available(key));
+            Ok(key)
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            keys.insert(
+                account.to_string(),
+                CachedInstallationKey::Unavailable(message.clone()),
+            );
+            Err(anyhow!(message))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn load_or_create_macos_key(account: &str) -> Result<[u8; 32]> {
+    const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+    match security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, account) {
+        Ok(key) => key
+            .try_into()
+            .map_err(|_| anyhow!("Keychain key is not 32 bytes")),
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => {
+            let mut key = [0_u8; 32];
+            getrandom::fill(&mut key)
+                .map_err(|error| anyhow!("store key generation failed: {error}"))?;
+            security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, account, &key)?;
+            Ok(key)
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -319,14 +485,14 @@ fn keychain_account(data_dir: &Path) -> String {
 fn decode_hex_key(input: &str) -> Result<[u8; 32]> {
     if input.len() != 64 {
         return Err(anyhow!(
-            "MOM_LLAMA_STORE_KEY_HEX must contain 64 hex digits"
+            "LLAMA_NATIVE_KIT_STORE_KEY_HEX must contain 64 hex digits"
         ));
     }
     let mut key = [0_u8; 32];
     for (index, chunk) in input.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(chunk)?;
         key[index] = u8::from_str_radix(text, 16)
-            .with_context(|| "MOM_LLAMA_STORE_KEY_HEX contains non-hex data")?;
+            .with_context(|| "LLAMA_NATIVE_KIT_STORE_KEY_HEX contains non-hex data")?;
     }
     Ok(key)
 }
@@ -399,6 +565,40 @@ mod tests {
     }
 
     #[test]
+    fn metadata_and_blob_mutations_commit_or_roll_back_together() -> Result<()> {
+        let data_dir = test_dir("multi-document");
+        let store = RuntimeStore::open_with_key(&data_dir, [10_u8; 32])?;
+        store.put(
+            "metadata",
+            &SecretDocument {
+                values: vec!["old".to_string()],
+            },
+        )?;
+        store.put_bytes("blob.old", b"old bytes")?;
+
+        let failed: Result<()> = store.mutate_documents(
+            "metadata",
+            SecretDocument::default,
+            |metadata, documents| {
+                metadata.values = vec!["new".to_string()];
+                documents.delete("blob.old");
+                documents.put_bytes("blob.new", b"new bytes")?;
+                Err(anyhow!("force rollback"))
+            },
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            store.get::<SecretDocument>("metadata")?,
+            Some(SecretDocument {
+                values: vec!["old".to_string()]
+            })
+        );
+        assert_eq!(store.get_bytes("blob.old")?, Some(b"old bytes".to_vec()));
+        assert_eq!(store.get_bytes("blob.new")?, None);
+        Ok(())
+    }
+
+    #[test]
     fn wrong_key_and_tampering_fail_closed() -> Result<()> {
         let data_dir = test_dir("tamper");
         let store = RuntimeStore::open_with_key(&data_dir, [1_u8; 32])?;
@@ -417,5 +617,63 @@ mod tests {
         )?;
         assert!(store.get::<SecretDocument>("secret").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn explicit_key_has_priority_over_the_deterministic_test_override() -> Result<()> {
+        let configured = "11".repeat(32);
+        let key = configured_store_key(Path::new("/isolated/test"), Some(&configured), true, true)?
+            .ok_or_else(|| anyhow!("configured key missing"))?;
+        assert_eq!(key, [0x11; 32]);
+        Ok(())
+    }
+
+    #[test]
+    fn development_store_uses_a_prompt_free_predictable_key_only_when_enabled() -> Result<()> {
+        let data_dir = Path::new("/isolated/development");
+        let first = configured_store_key(data_dir, None, false, true)?
+            .ok_or_else(|| anyhow!("development key missing"))?;
+        let second = configured_store_key(data_dir, None, false, true)?
+            .ok_or_else(|| anyhow!("development key missing"))?;
+        assert_eq!(first, second);
+        assert!(configured_store_key(data_dir, None, false, false)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn installation_key_provider_runs_once_per_process_and_account() -> Result<()> {
+        use std::cell::Cell;
+
+        let cache = OnceLock::new();
+        let calls = Cell::new(0_u32);
+        let first = cached_installation_key("account-a", &cache, || {
+            calls.set(calls.get() + 1);
+            Ok([3_u8; 32])
+        })?;
+        let second = cached_installation_key("account-a", &cache, || {
+            calls.set(calls.get() + 1);
+            Ok([4_u8; 32])
+        })?;
+        assert_eq!(first, [3_u8; 32]);
+        assert_eq!(second, first);
+        assert_eq!(calls.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn denied_installation_key_is_not_retried_until_relaunch() {
+        use std::cell::Cell;
+
+        let cache = OnceLock::new();
+        let calls = Cell::new(0_u32);
+        for _ in 0..2 {
+            let error = cached_installation_key("denied-account", &cache, || {
+                calls.set(calls.get() + 1);
+                Err(anyhow!("user denied Keychain access"))
+            })
+            .expect_err("denied key must stay unavailable");
+            assert!(error.to_string().contains("denied Keychain access"));
+        }
+        assert_eq!(calls.get(), 1);
     }
 }
