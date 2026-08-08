@@ -48,7 +48,8 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             libwebkit2gtk-4.1-dev \
-            patchelf
+            patchelf \
+            ripgrep
 
       - run: npm ci
       - run: npm run audit:dependencies
