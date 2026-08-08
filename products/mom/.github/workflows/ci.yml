@@ -80,7 +80,6 @@ jobs:
         run: |
           ./scripts/check-architecture.sh
           ./scripts/check-contracts.sh
-          ./scripts/check-persona-product-ux.sh
 
   native-app:
     name: Mom Llama app (macOS)
@@ -130,4 +129,5 @@ jobs:
 
       - run: cargo test -p mom-llama-app
       - run: cargo clippy -p mom-llama-app --all-targets -- -D warnings
+      - run: ./scripts/check-persona-product-ux.sh
       - run: node --check apps/mom-llama/ui/coop-hx.js
