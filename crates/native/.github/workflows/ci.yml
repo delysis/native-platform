@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native-runtime:
+    name: Native runtime (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install native build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes clang cmake ninja-build ripgrep
+
+      - name: Install architecture-check tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ripgrep
+
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+
+      - name: Test default workspace
+        run: cargo test --workspace
+
+      - name: Lint default workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check architecture
+        if: runner.os != 'Windows'
+        run: ./scripts/check-architecture.sh

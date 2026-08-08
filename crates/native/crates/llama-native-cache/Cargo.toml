@@ -1,20 +1,15 @@
 [package]
-name = "mom-llama-cli"
+name = "llama-native-cache"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Tiered, fingerprint-bound prefix cache contracts for native llama.cpp"
 
 [dependencies]
-anyhow.workspace = true
-clap.workspace = true
-mom-llama-runtime = { path = "../mom-llama-runtime" }
 llama-native-types = { path = "../llama-native-types" }
 serde.workspace = true
-serde_json.workspace = true
-
-[dev-dependencies]
-uuid.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true
