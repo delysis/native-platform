@@ -831,8 +831,7 @@ fn load_or_create_token(path: &FilePath) -> Result<String, GatewayError> {
         ));
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(loopback_error)?;
-        secure_private_directory(parent)?;
+        ensure_private_directory(parent)?;
     }
     let token = random_token();
     write_token_atomic(path, &token)?;
@@ -843,8 +842,7 @@ fn write_token_atomic(path: &FilePath, token: &str) -> Result<(), GatewayError> 
     let parent = path
         .parent()
         .ok_or_else(|| loopback_error("the loopback token path has no private parent directory"))?;
-    fs::create_dir_all(parent).map_err(loopback_error)?;
-    secure_private_directory(parent)?;
+    ensure_private_directory(parent)?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -872,19 +870,29 @@ fn write_token_atomic(path: &FilePath, token: &str) -> Result<(), GatewayError> 
 }
 
 #[cfg(unix)]
-fn secure_private_directory(path: &FilePath) -> Result<(), GatewayError> {
+fn ensure_private_directory(path: &FilePath) -> Result<(), GatewayError> {
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path).map_err(loopback_error)?.permissions();
-    if permissions.mode() & 0o077 != 0 {
-        permissions.set_mode(0o700);
-        fs::set_permissions(path, permissions).map_err(loopback_error)?;
+    if !path.exists() {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path).map_err(loopback_error)?;
+    }
+    let mode = fs::metadata(path)
+        .map_err(loopback_error)?
+        .permissions()
+        .mode();
+    if mode & 0o022 != 0 {
+        return Err(loopback_error(
+            "the loopback token directory is writable by another user",
+        ));
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn secure_private_directory(_path: &FilePath) -> Result<(), GatewayError> {
-    Ok(())
+fn ensure_private_directory(path: &FilePath) -> Result<(), GatewayError> {
+    fs::create_dir_all(path).map_err(loopback_error)
 }
 
 #[cfg(unix)]
@@ -1222,6 +1230,35 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove token directory");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn token_creation_rejects_a_shared_parent_without_changing_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("fte-loopback-shared-{}", random::<u64>()));
+        fs::create_dir(&directory).expect("create shared directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777))
+            .expect("make fixture directory shared");
+        let before = fs::metadata(&directory)
+            .expect("shared directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        let error = write_token_atomic(&directory.join("token"), &random_token())
+            .expect_err("shared token parent must be rejected");
+        assert!(error.safe_detail.contains("writable by another user"));
+        let after = fs::metadata(&directory)
+            .expect("shared directory metadata after rejection")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(after, before, "token creation must not chmod its parent");
+        assert!(!directory.join("token").exists());
+        fs::remove_dir_all(directory).expect("remove shared directory");
+    }
+
     #[tokio::test]
     async fn real_loopback_socket_enforces_security_stream_state_and_storage() {
         let gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
@@ -1229,8 +1266,9 @@ mod tests {
             .register_backend(Arc::new(StreamingTestBackend))
             .expect("register backend");
         let store = Arc::new(SqliteStore::in_memory().expect("in-memory store"));
-        let token_path =
-            std::env::temp_dir().join(format!("fte-loopback-test-{}.token", random::<u64>()));
+        let token_directory =
+            std::env::temp_dir().join(format!("fte-loopback-test-{}", random::<u64>()));
+        let token_path = token_directory.join("token");
         let mut config = LoopbackConfig::app_private(token_path.clone());
         config.max_concurrent_requests = 1;
         let server = LoopbackServer::start(gateway, store.clone(), config.clone())
@@ -1404,6 +1442,6 @@ mod tests {
         assert_eq!(continuation["previous_response_id"], "resp_socket_test");
 
         restarted.shutdown().await;
-        let _ = fs::remove_file(token_path);
+        let _ = fs::remove_dir_all(token_directory);
     }
 }
