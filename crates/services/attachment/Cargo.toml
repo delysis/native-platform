@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+exclude = ["fuzz"]
+members = [
+    "crates/attachment-native-types",
+    "crates/attachment-native-inspect",
+    "crates/attachment-native-document",
+    "crates/attachment-native-plan",
+    "crates/attachment-native-host",
+    "crates/attachment-native-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/delysis/attachment-native-kit"
+rust-version = "1.88"
+
+[workspace.dependencies]
+attachment-native-types = { version = "0.1.0", path = "crates/attachment-native-types" }
+attachment-native-inspect = { version = "0.1.0", path = "crates/attachment-native-inspect" }
+attachment-native-document = { version = "0.1.0", path = "crates/attachment-native-document" }
+attachment-native-plan = { version = "0.1.0", path = "crates/attachment-native-plan" }
+attachment-native-host = { version = "0.1.0", path = "crates/attachment-native-host" }
+base64 = "0.22.1"
+clap = { version = "4.5.45", features = ["derive"] }
+crabz2 = { version = "0.2.0", default-features = false }
+csv = "1.4.0"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+hex = "0.4.3"
+html-to-markdown-rs = { version = "3.10.6", default-features = false }
+imagesize = { version = "0.15.0", default-features = false, features = ["bmp", "gif", "heif", "jpeg", "png", "tiff", "webp"] }
+infer = { version = "0.22.0", default-features = false, features = ["std"] }
+lopdf = { version = "0.44.0", default-features = false }
+lzma-rust2 = { version = "0.18.1", default-features = false, features = ["std", "xz"] }
+libarchive_oxide = { version = "=0.2.0", default-features = false, features = ["sevenz"] }
+mail-parser = { version = "0.11.5", default-features = false }
+quick-xml = { version = "0.41.0", default-features = false }
+ruzstd = { version = "0.9.0", default-features = false, features = ["hash", "std"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+sha2 = "0.10.9"
+tar = { version = "0.4.46", default-features = false }
+thiserror = "2.0.16"
+uuid = { version = "1.18.0", features = ["v4", "serde"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2", "deflate64"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+undocumented_unsafe_blocks = "deny"
+panic = "deny"
