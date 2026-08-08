@@ -1,0 +1,20 @@
+[package]
+name = "fte-speech-parakeet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+fte-speech-types = { path = "../fte-speech-types" }
+hound.workspace = true
+parakeet-rs.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+fte-speech-gateway = { path = "../fte-speech-gateway" }
+
+[lints]
+workspace = true

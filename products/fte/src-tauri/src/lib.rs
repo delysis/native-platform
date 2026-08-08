@@ -4,38 +4,73 @@ pub mod catalog;
 pub mod commands;
 pub mod db;
 pub mod eval_store;
+pub mod gateway_v2;
 pub mod providers;
 pub mod rate_limiter;
 pub mod router;
+#[cfg(target_os = "macos")]
+mod speech_smoke;
 
 use crate::db::Database;
 use crate::eval_store::EvalStore;
+use crate::providers::Capability;
 use crate::providers::anthropic;
 use crate::providers::completions::CompletionProtocol;
 use crate::providers::gemini;
 use crate::providers::groq;
 use crate::providers::openai_compatible::OpenAiCompatibleProvider;
 use crate::providers::openrouter;
-use crate::providers::Capability;
 use crate::rate_limiter::QuotaTracker;
 use crate::router::Router;
+use fte_speech_gateway::SpeechGateway;
 use std::sync::Arc;
 use tauri::Manager;
-use tracing::warn;
-
-const DEFAULT_PROXY_PORT: u16 = 1337;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let gateway_v2 = gateway_v2::GatewayV2::new()
+        .unwrap_or_else(|error| panic!("Free Token Energy gateway setup failed: {error}"));
+    let plugin_gateway = gateway_v2.gateway();
+    let plugin_secrets = gateway_v2.secrets();
+    let speech_gateway = Arc::new(SpeechGateway::default());
+    let parakeet_gateway = Arc::clone(&speech_gateway);
+    #[cfg(target_os = "macos")]
+    match tauri::async_runtime::block_on(
+        fte_speech_platform::apple_backend::AppleSpeechBackend::discover(),
+    ) {
+        Ok(backend) => {
+            if let Err(error) = speech_gateway.register_backend(Arc::new(backend)) {
+                eprintln!("Apple speech backend registration failed: {error}");
+            }
+        }
+        Err(error) => eprintln!("Apple speech backend discovery failed: {error}"),
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
+        .plugin(
+            tauri_plugin_free_token_energy::Builder::new()
+                .with_gateway(plugin_gateway)
+                .with_speech_gateway(speech_gateway)
+                .with_default_loopback()
+                .build(),
+        )
+        .setup(move |app| {
+            tauri::async_runtime::spawn(async move {
+                let backend = fte_speech_parakeet::ParakeetSpeechBackend::discover(
+                    fte_speech_parakeet::ParakeetBackendConfig::default(),
+                )
+                .await;
+                if let Err(error) = parakeet_gateway.register_backend(Arc::new(backend)) {
+                    eprintln!("Parakeet speech backend registration failed: {error}");
+                }
+            });
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
             secure_app_data_directory(&app_data_dir)?;
 
             let db_path = app_data_dir.join("gateway.db");
             let db = Arc::new(Database::new(db_path)?);
+            plugin_secrets.bind(Arc::clone(&db))?;
 
             let quota_tracker = Arc::new(QuotaTracker::new());
             let eval_store = Arc::new(EvalStore::new());
@@ -45,22 +80,11 @@ pub fn run() {
             register_default_backends(&mut router)?;
 
             let router = Arc::new(router);
-            let proxy = crate::api_server::ProxyManager::new(router.clone());
-            let saved_port = db
-                .get_setting("proxy_port")?
-                .and_then(|value| value.parse::<u16>().ok())
-                .filter(|port| *port >= 1024)
-                .unwrap_or(DEFAULT_PROXY_PORT);
-            let proxy_to_start = proxy.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(error) = proxy_to_start.restart(saved_port).await {
-                    warn!("Could not start local API proxy: {error}");
-                }
-            });
-
             app.manage(db);
             app.manage(router);
-            app.manage(proxy);
+
+            #[cfg(target_os = "macos")]
+            speech_smoke::start_if_requested(app.handle().clone());
 
             Ok(())
         })
@@ -75,8 +99,6 @@ pub fn run() {
             commands::get_master_profile,
             commands::get_dashboard_stats,
             commands::get_recent_logs,
-            commands::get_proxy_status,
-            commands::restart_proxy,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| eprintln!("Free Token Energy could not start: {error}"));

@@ -1,0 +1,20 @@
+[package]
+name = "fte-speech-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+fte-speech-router = { path = "../fte-speech-router" }
+fte-speech-types = { path = "../fte-speech-types" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

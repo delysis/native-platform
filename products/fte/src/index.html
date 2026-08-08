@@ -223,7 +223,7 @@
           <header class="page-header">
             <p class="eyebrow">Local service</p>
             <h1>Settings</h1>
-            <p class="subtitle">Configure the loopback-only OpenAI-compatible endpoint.</p>
+            <p class="subtitle">Expose authenticated OpenAI and Anthropic APIs to local desktop tools.</p>
           </header>
           <article class="card settings-card">
             <div class="section-heading">
@@ -241,6 +241,10 @@
             <div class="endpoint-note">
               <span>Binding</span>
               <code id="proxy-binding">127.0.0.1:1337</code>
+            </div>
+            <div class="endpoint-note">
+              <span>Local token file</span>
+              <code id="proxy-token-path">Created when the service starts</code>
             </div>
             <p class="privacy-copy">Provider credentials leave this application only in authenticated requests to the route you select.</p>
           </article>

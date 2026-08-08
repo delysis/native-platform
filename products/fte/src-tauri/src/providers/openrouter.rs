@@ -1,7 +1,7 @@
+use crate::providers::Capability;
 use crate::providers::completions::CompletionProtocol;
 use crate::providers::openai_compatible::OpenAiCompatibleProvider;
 use crate::providers::spec::ProviderSpec;
-use crate::providers::Capability;
 
 const OPENROUTER_CHAT_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_COMPLETIONS_ENDPOINT: &str = "https://openrouter.ai/api/v1/completions";

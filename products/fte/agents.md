@@ -21,6 +21,14 @@ provider, routing, streaming, and persistence components.
 
 ## Current architecture
 
+- Reusable gateway workspace under `crates/`; canonical contracts live only in
+  `fte-types`, while public protocol translation stays in `fte-protocols`
+- `fte-router` owns privacy/capability gates, affinity, admission, and routing;
+  providers and native adapters never reroute themselves
+- `fte-backend-llama` is the sole native-kit bridge and may contain no network,
+  process, shell, or executable-discovery authority
+- `tauri-plugin-free-token-energy` is Rust-only; the webview receives typed IPC
+  and never owns credentials, routing state, or model state
 - Tauri 2 desktop shell with a vanilla HTML/CSS/JavaScript webview
 - Rust router and provider adapters under `src-tauri/src/`
 - SQLite persistence in `db.rs`
@@ -52,8 +60,14 @@ Before committing:
 
 ```sh
 npm test
-cargo check --all-targets --all-features --manifest-path src-tauri/Cargo.toml
+cargo fmt --all --check
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
+
+For native cache or adapter changes, also run the ignored real-GGUF proof with
+`MOM_LLAMA_MODEL_PATH`. A cache metadata round-trip is not sufficient: the
+proof must show a cold checkpoint, a later hit, and real in-process inference.
 
 When changing provider transforms or streams, add fixture-style regression
 tests. When changing SQLite schema or migrations, add a reopen/migration test.

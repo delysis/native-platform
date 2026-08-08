@@ -682,12 +682,18 @@ function resetPlaygroundForMode() {
 function renderProxyStatus(status) {
   const pill = document.getElementById('proxy-status-pill');
   const portInput = document.getElementById('setting-port');
-  pill.className = `status-pill ${status.running ? 'status-ready' : 'status-error'}`;
-  pill.textContent = status.running ? 'Running' : 'Stopped';
-  if (status.port) {
-    portInput.value = status.port;
-    setText('proxy-status', `Listening on http://127.0.0.1:${status.port}`);
-    setText('proxy-binding', `127.0.0.1:${status.port}`);
+  const running = Boolean(status.enabled);
+  const address = status.addresses?.find((value) => value.startsWith('127.0.0.1:'))
+    ?? status.addresses?.[0]
+    ?? null;
+  const port = address ? Number(address.slice(address.lastIndexOf(':') + 1)) : null;
+  setText('proxy-token-path', status.token_path ?? 'Created when the service starts');
+  pill.className = `status-pill ${running ? 'status-ready' : 'status-error'}`;
+  pill.textContent = running ? 'Running' : 'Stopped';
+  if (port) {
+    portInput.value = port;
+    setText('proxy-status', `Listening on http://127.0.0.1:${port}`);
+    setText('proxy-binding', `127.0.0.1:${port}`);
   } else {
     setText('proxy-status', 'The local API proxy is not running.');
     setText('proxy-binding', '127.0.0.1:—');
@@ -696,7 +702,7 @@ function renderProxyStatus(status) {
 
 async function refreshProxyStatus() {
   try {
-    renderProxyStatus(await invoke('get_proxy_status'));
+    renderProxyStatus(await invoke('plugin:free-token-energy|loopback_status'));
   } catch (error) {
     const pill = document.getElementById('proxy-status-pill');
     pill.className = 'status-pill status-error';
@@ -719,7 +725,7 @@ async function restartProxy() {
   button.disabled = true;
   button.textContent = 'Applying…';
   try {
-    const status = await invoke('restart_proxy', { port });
+    const status = await invoke('plugin:free-token-energy|loopback_start', { port });
     renderProxyStatus(status);
     showToast(`Proxy is listening on port ${port}.`);
   } catch (error) {

@@ -1,6 +1,6 @@
 use async_stream::try_stream;
-use futures::{stream::BoxStream, StreamExt};
-use serde_json::{json, Map, Value};
+use futures::{StreamExt, stream::BoxStream};
+use serde_json::{Map, Value, json};
 
 use crate::providers::{ChatChunk, ChatChunkChoice, ChatDelta, ChatUsage};
 
@@ -536,7 +536,7 @@ impl SseParser {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_anthropic_sse_chat_event, parse_gemini_sse_chat_event, SseParser};
+    use super::{SseParser, parse_anthropic_sse_chat_event, parse_gemini_sse_chat_event};
 
     #[test]
     fn parses_split_sse_data_events() {

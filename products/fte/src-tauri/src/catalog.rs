@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::providers::{
-    spec::ParameterPolicy, Capability, CompletionPromptKind, CompletionRequest,
+    Capability, CompletionPromptKind, CompletionRequest, spec::ParameterPolicy,
 };
 use crate::rate_limiter::QuotaWindows;
 
@@ -379,14 +379,16 @@ mod tests {
     fn quota_enforcement_requires_a_documented_finite_limit() {
         assert!(!unknown_quota().has_enforced_limit());
         assert!(documented_quota(10, u32::MAX, u32::MAX, u32::MAX).has_enforced_limit());
-        assert!(!QuotaSpec {
-            rpm: 10,
-            rpd: u32::MAX,
-            tpm: u32::MAX,
-            tpd: u32::MAX,
-            documented: false,
-        }
-        .has_enforced_limit());
+        assert!(
+            !QuotaSpec {
+                rpm: 10,
+                rpd: u32::MAX,
+                tpm: u32::MAX,
+                tpd: u32::MAX,
+                documented: false,
+            }
+            .has_enforced_limit()
+        );
     }
 
     #[test]
@@ -399,25 +401,37 @@ mod tests {
                 .unwrap()
         };
 
-        assert!(find("openrouter", "openrouter/free")
-            .text_completions
-            .is_none());
-        assert!(find("groq", "llama-3.3-70b-versatile")
-            .text_completions
-            .is_none());
-        assert!(find("gemini", "gemini-2.5-flash")
-            .text_completions
-            .is_none());
-        assert!(find("mistral", "mistral-small-latest")
-            .text_completions
-            .is_none());
-        assert!(find("nvidia", "meta/llama-3.1-70b-instruct")
-            .text_completions
-            .is_none());
+        assert!(
+            find("openrouter", "openrouter/free")
+                .text_completions
+                .is_none()
+        );
+        assert!(
+            find("groq", "llama-3.3-70b-versatile")
+                .text_completions
+                .is_none()
+        );
+        assert!(
+            find("gemini", "gemini-2.5-flash")
+                .text_completions
+                .is_none()
+        );
+        assert!(
+            find("mistral", "mistral-small-latest")
+                .text_completions
+                .is_none()
+        );
+        assert!(
+            find("nvidia", "meta/llama-3.1-70b-instruct")
+                .text_completions
+                .is_none()
+        );
 
-        assert!(find("anthropic", "claude-sonnet-5")
-            .text_completions
-            .is_none());
+        assert!(
+            find("anthropic", "claude-sonnet-5")
+                .text_completions
+                .is_none()
+        );
         assert_eq!(
             find("mistral", "codestral-latest")
                 .text_completions

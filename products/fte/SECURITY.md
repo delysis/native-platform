@@ -17,13 +17,19 @@ Free Token Energy is local-first, but local-first is not the same as encrypted.
   Startup removes the reusable-password field written by older builds.
 - The application does not include telemetry.
 
-## Local proxy
+## Local interfaces
 
-The API proxy binds only to IPv4 loopback (`127.0.0.1`) and does not expose
-cross-origin browser access. It intentionally has no separate proxy
-authentication, so any process running as the same operating-system user can
-send requests through configured provider accounts. Do not run untrusted local
-software under that user.
+The reusable `fte-loopback` server is disabled until explicitly started. It
+binds only loopback addresses, validates `Host` and configured origins, applies
+bounded request/stream limits, and requires a random app-private bearer token.
+Hosted provider credentials never cross that interface.
+
+The older desktop router and its IPv4-only proxy remain a migration surface.
+That proxy does not have the reusable gateway's bearer-token boundary, so any
+process running as the same operating-system user can send requests through
+configured provider accounts while it is enabled. Do not enable that legacy
+surface while running untrusted local software. Removing it after transactional
+database and credential migration is the next breaking pre-1.0 step.
 
 ## Provider traffic
 

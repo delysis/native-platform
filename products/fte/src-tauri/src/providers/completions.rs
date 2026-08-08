@@ -1,6 +1,6 @@
 use async_stream::try_stream;
-use futures::{stream::BoxStream, StreamExt};
-use serde_json::{json, Map, Value};
+use futures::{StreamExt, stream::BoxStream};
+use serde_json::{Map, Value, json};
 
 use crate::providers::streaming::SseParser;
 use crate::providers::{
@@ -106,7 +106,7 @@ fn anthropic_request_body(request: &CompletionRequest, streaming: bool) -> anyho
             _ => {
                 return Err(anyhow::anyhow!(
                     "stop must be a string or an array of strings"
-                ))
+                ));
             }
         };
         body.insert("stop_sequences".to_string(), stop_sequences);

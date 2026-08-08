@@ -12,6 +12,7 @@ node_modules
 dist
 dist-ssr
 *.local
+/.cargo/local-native-kit.toml
 
 # Provider implementations are local research checkouts, not vendored source.
 # Keep the curated notes and policy file in the parent directory tracked.

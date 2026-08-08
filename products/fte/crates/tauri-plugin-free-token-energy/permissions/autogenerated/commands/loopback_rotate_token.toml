@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-loopback-rotate-token"
+description = "Enables the loopback_rotate_token command without any pre-configured scope."
+commands.allow = ["loopback_rotate_token"]
+
+[[permission]]
+identifier = "deny-loopback-rotate-token"
+description = "Denies the loopback_rotate_token command without any pre-configured scope."
+commands.deny = ["loopback_rotate_token"]

@@ -1,21 +1,21 @@
 use crate::providers::{ChatChunk, ChatRequest, CompletionChunk, CompletionRequest};
 use crate::router::Router as TokenRouter;
 use axum::{
+    Json, Router as AxumRouter,
     body::Body,
     extract::{DefaultBodyLimit, Path, State},
-    http::{header, HeaderName, HeaderValue, Request, Response, StatusCode},
+    http::{HeaderName, HeaderValue, Request, Response, StatusCode, header},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router as AxumRouter,
 };
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Weak};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 use tracing::{info, warn};
 
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -1221,11 +1221,11 @@ mod tests {
         let json = serde_json::to_value(response).unwrap();
 
         assert_eq!(json["object"], "list");
-        assert!(json["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| { item["object"] == "model" && item["id"] == "llama-3.1-70b-instruct" }));
+        assert!(
+            json["data"].as_array().unwrap().iter().any(|item| {
+                item["object"] == "model" && item["id"] == "llama-3.1-70b-instruct"
+            })
+        );
 
         let cerebras = json["data"]
             .as_array()
@@ -1295,18 +1295,22 @@ mod tests {
 
     #[test]
     fn numeric_request_fields_reject_overflow_and_negative_values() {
-        assert!(serde_json::from_value::<CompletionRequest>(json!({
-            "model": "auto",
-            "prompt": "hello",
-            "max_tokens": u64::MAX
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<CompletionRequest>(json!({
-            "model": "auto",
-            "prompt": "hello",
-            "max_tokens": -1
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<CompletionRequest>(json!({
+                "model": "auto",
+                "prompt": "hello",
+                "max_tokens": u64::MAX
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CompletionRequest>(json!({
+                "model": "auto",
+                "prompt": "hello",
+                "max_tokens": -1
+            }))
+            .is_err()
+        );
     }
 
     #[test]

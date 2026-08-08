@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures::{stream::BoxStream, StreamExt};
+use futures::{StreamExt, stream::BoxStream};
 use reqwest::Client;
 use std::fmt;
 use std::time::Duration;
@@ -7,13 +7,13 @@ use tracing::warn;
 
 use crate::backend::{BackendCredentials, InferenceBackend};
 use crate::providers::{
-    completions::{completion_chunks_from_response, CompletionEndpoint, CompletionProtocol},
-    spec::{ParameterPolicy, ProviderSpec, RequestMode},
-    streaming,
-};
-use crate::providers::{
     Capability, ChatChunk, ChatRequest, ChatResponse, CompletionChunk, CompletionRequest,
     CompletionResponse,
+};
+use crate::providers::{
+    completions::{CompletionEndpoint, CompletionProtocol, completion_chunks_from_response},
+    spec::{ParameterPolicy, ProviderSpec, RequestMode},
+    streaming,
 };
 
 pub struct OpenAiCompatibleProvider {

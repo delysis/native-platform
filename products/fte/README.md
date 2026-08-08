@@ -5,6 +5,17 @@ SQLite, and a dependency-light webview. It presents several provider accounts
 through one OpenAI-compatible loopback API and can select an available route
 for each request.
 
+The repository also contains a reusable Rust gateway and a Rust-only Tauri 2
+plugin. The reusable module is protocol-neutral internally, supports native
+OpenAI Responses Items/events and Anthropic Messages blocks, and can route to
+an in-process llama.cpp host or hosted providers without changing caller
+shape. See [Gateway Module](docs/GATEWAY_MODULE.md).
+
+The reusable gateway is substantially ahead of the historical desktop UI
+runtime. [Robustness and unification audit](docs/ROBUSTNESS_AUDIT.md) states
+the verified boundary and the remaining breaking migration work; the two paths
+are not represented as unified until that migration is complete.
+
 ## What works
 
 - OpenRouter, Groq, Anthropic, Google Gemini, Mistral, NVIDIA NIM, and Cerebras
@@ -18,6 +29,8 @@ for each request.
   persistent proxy-port settings
 - A transport-neutral backend boundary that distinguishes authenticated remote
   APIs from credentialless embedded or companion-process inference runtimes
+- A protocol-neutral speech gateway with Apple system TTS and resident
+  Parakeet STT loaded directly from the standard Hugging Face cache
 
 The model catalog uses current provider model IDs. Published free-tier limits
 are tracked locally where a provider documents them; account-specific or
@@ -44,7 +57,11 @@ Settings without restarting the desktop application.
 - `POST /v1/completions`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
+- `GET /v1/responses/{id}`
+- `DELETE /v1/responses/{id}`
+- `POST /v1/responses/{id}/cancel`
 - `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
 - `POST /v1beta/models/{model}:generateContent`
 - `POST /v1beta/models/{model}:streamGenerateContent`
 
@@ -100,20 +117,42 @@ latency observations without being assigned invented quota limits.
 
 ## Native llama.cpp integration
 
-The gateway is prepared to accept a credentialless local backend and
-runtime-discovered model routes without treating the runtime as a fake cloud
-provider. The native adapter itself remains pending the corresponding raw
-completion and reusable-host boundary in `llama-native-kit`.
+`fte-backend-llama` is a real credentialless local backend over the reusable
+llama-native host. Chat, raw text Completion, exact token Completion,
+streaming, cancellation, resident-model reuse, and fingerprinted prefix caches
+run in process. There is no `llama-cli`, `llama-server`, subprocess, or
+loopback hop between the router and local inference.
 
-See [the llama-native-kit maintainer handoff](docs/LLAMA_NATIVE_KIT_HANDOFF.md)
-for the exact cross-repository contract and acceptance tests.
+The real-GGUF integration test distinguishes actual in-process evidence from
+fixtures and proves both cold checkpoint creation and a second-request stable
+prefix hit. Release manifests pin the native kit by immutable Git revision.
+For coordinated local development, copy
+`.cargo/local-native-kit.toml.example` to `.cargo/local-native-kit.toml` and
+pass `--config .cargo/local-native-kit.toml` to Cargo; that override is ignored
+by Git.
+
+## Native speech integration
+
+The reusable speech stack is separate from text generation and uses typed STT
+and TTS requests, bounded event streams, request-scoped cancellation, and
+capability/privacy routing. On macOS, installed Apple voices are the preferred
+on-device TTS path. `fte-speech-parakeet` is the first embedded STT backend: it
+loads Parakeet Realtime EOU 120M once through ONNX Runtime, creates independent
+decoder state per request, accepts WAV or PCM, and performs no network or
+subprocess calls during transcription.
+
+Weights remain in the shared Hugging Face cache under
+`altunenes/parakeet-rs`; they are not copied into application storage. See
+[Speech Gateway](docs/SPEECH_GATEWAY.md) for routing, streaming IPC, platform
+fallback, evidence, and the retained `parakeet.cpp` backend lane.
 
 ## Privacy and security
 
-Keys and request metadata stay in the local app database, there is no
-telemetry, and the proxy listens only on IPv4 loopback. API keys are protected
-by app-directory and file permissions on Unix but are not encrypted at rest.
-Read [SECURITY.md](SECURITY.md) before using valuable provider credentials.
+There is no telemetry. The reusable loopback edge is disabled until explicitly
+started, binds only loopback, validates Host/Origin, and requires an app-private
+256-bit token. Hosted keys never cross that interface and are loaded through an
+injected secret resolver. The older desktop proxy remains a separate migration
+surface; read [SECURITY.md](SECURITY.md) before using valuable credentials.
 
 ## Development
 

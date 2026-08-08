@@ -8,16 +8,16 @@ use crate::backend::{
     BackendCredentials, BackendKind, BackendReadiness, BackendRegistry, CredentialRequirement,
     InferenceBackend,
 };
-use crate::catalog::{default_model_catalog, ModelCatalogEntry, PromptSemantics};
+use crate::catalog::{ModelCatalogEntry, PromptSemantics, default_model_catalog};
 use crate::db::{Database, ProviderLogSummary};
 use crate::eval_store::EvalStore;
 use crate::providers::{
-    spec::ParameterPolicy, Capability, ChatChunk, ChatRequest, ChatResponse, CompletionChunk,
-    CompletionRequest, CompletionResponse,
+    Capability, ChatChunk, ChatRequest, ChatResponse, CompletionChunk, CompletionRequest,
+    CompletionResponse, spec::ParameterPolicy,
 };
 use crate::rate_limiter::QuotaTracker;
 use async_stream::try_stream;
-use futures::{stream::BoxStream, StreamExt};
+use futures::{StreamExt, stream::BoxStream};
 use tracing::{info, warn};
 
 pub struct Router {
@@ -1318,8 +1318,11 @@ fn current_unix_timestamp() -> u64 {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use futures::{stream::BoxStream, StreamExt};
+    use futures::{StreamExt, stream::BoxStream};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
     use crate::catalog::{PromptSemantics, QuotaSpec, TextCompletionSupport};
     use crate::providers::{
@@ -1440,11 +1443,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(route
-            .parameter_policy
-            .rename_parameters
-            .iter()
-            .any(|rename| rename.from == "seed" && rename.to == "random_seed"));
+        assert!(
+            route
+                .parameter_policy
+                .rename_parameters
+                .iter()
+                .any(|rename| rename.from == "seed" && rename.to == "random_seed")
+        );
     }
 
     #[tokio::test]
@@ -1681,14 +1686,7 @@ mod tests {
 
     #[test]
     fn persisted_quota_events_are_restored_on_startup() {
-        let path = std::env::temp_dir().join(format!(
-            "free-token-energy-quota-restore-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = test_database_path("quota-restore");
         let db = Arc::new(Database::new(path).unwrap());
         let entry = test_catalog_entry("provider", "public-model", "provider-model", 0.8);
         db.record_quota_event("provider", "provider-model", Utc::now().timestamp(), 1, 0)
@@ -1761,15 +1759,7 @@ mod tests {
     }
 
     fn test_router(catalog: Vec<ModelCatalogEntry>) -> (Arc<Database>, Arc<QuotaTracker>, Router) {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "free-token-energy-router-test-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = test_database_path("router");
         let _ = std::fs::remove_file(&path);
 
         let db = Arc::new(Database::new(path).unwrap());
@@ -1781,6 +1771,18 @@ mod tests {
             catalog,
         );
         (db, quota, router)
+    }
+
+    fn test_database_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "free-token-energy-{label}-test-{}-{}-{}.sqlite",
+            std::process::id(),
+            TEST_DATABASE_ID.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     fn test_catalog_entry(
