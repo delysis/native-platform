@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-loopback-stop"
+description = "Enables the loopback_stop command without any pre-configured scope."
+commands.allow = ["loopback_stop"]
+
+[[permission]]
+identifier = "deny-loopback-stop"
+description = "Denies the loopback_stop command without any pre-configured scope."
+commands.deny = ["loopback_stop"]

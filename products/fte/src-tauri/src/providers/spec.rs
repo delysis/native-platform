@@ -1,10 +1,10 @@
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::providers::streaming::StreamParserKind;
 use crate::providers::{
-    text_from_value, Capability, ChatChoice, ChatMessage, ChatRequest, ChatResponse, ChatUsage,
+    Capability, ChatChoice, ChatMessage, ChatRequest, ChatResponse, ChatUsage, text_from_value,
 };
 
 #[derive(Debug, Clone)]
@@ -325,7 +325,7 @@ impl ProviderSpec {
         self.response_transform.transform_chat_response(body)
     }
 
-    fn headers(&self, api_key: &str) -> anyhow::Result<HeaderMap> {
+    pub(crate) fn headers(&self, api_key: &str) -> anyhow::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         self.auth.apply(&mut headers, api_key)?;
 

@@ -1,19 +1,25 @@
 use async_trait::async_trait;
-use futures::{stream::BoxStream, StreamExt};
+use futures::{StreamExt, stream::BoxStream};
 use reqwest::Client;
 use std::fmt;
 use std::time::Duration;
 use tracing::warn;
 
+use crate::backend::{BackendCredentials, InferenceBackend};
 use crate::providers::{
+    Capability, ChatChunk, ChatRequest, ChatResponse, CompletionChunk, CompletionRequest,
+    CompletionResponse,
+};
+use crate::providers::{
+    completions::{CompletionEndpoint, CompletionProtocol, completion_chunks_from_response},
     spec::{ParameterPolicy, ProviderSpec, RequestMode},
     streaming,
 };
-use crate::providers::{Capability, ChatChunk, ChatRequest, ChatResponse, Provider};
 
 pub struct OpenAiCompatibleProvider {
     spec: ProviderSpec,
     client: Client,
+    completion_endpoint: Option<CompletionEndpoint>,
 }
 
 #[derive(Debug)]
@@ -67,12 +73,25 @@ impl OpenAiCompatibleProvider {
                 warn!("Could not build the hardened HTTP client: {error}");
                 Client::new()
             });
-        Self { spec, client }
+        Self {
+            spec,
+            client,
+            completion_endpoint: None,
+        }
+    }
+
+    pub fn with_completion_endpoint(
+        mut self,
+        endpoint: &'static str,
+        protocol: CompletionProtocol,
+    ) -> Self {
+        self.completion_endpoint = Some(CompletionEndpoint::new(endpoint, protocol));
+        self
     }
 }
 
 #[async_trait]
-impl Provider for OpenAiCompatibleProvider {
+impl InferenceBackend for OpenAiCompatibleProvider {
     fn id(&self) -> &str {
         self.spec.id()
     }
@@ -88,9 +107,10 @@ impl Provider for OpenAiCompatibleProvider {
     async fn chat(
         &self,
         req: &ChatRequest,
-        api_key: &str,
+        credentials: BackendCredentials<'_>,
         policy: &ParameterPolicy,
     ) -> anyhow::Result<ChatResponse> {
+        let api_key = credentials.require_api_key(self.name())?;
         let prepared = self
             .spec
             .prepare_chat(req, RequestMode::NonStreaming, policy, api_key)?;
@@ -113,9 +133,10 @@ impl Provider for OpenAiCompatibleProvider {
     async fn chat_stream(
         &self,
         req: &ChatRequest,
-        api_key: &str,
+        credentials: BackendCredentials<'_>,
         policy: &ParameterPolicy,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ChatChunk>>> {
+        let api_key = credentials.require_api_key(self.name())?;
         let prepared = self
             .spec
             .prepare_chat(req, RequestMode::Streaming, policy, api_key)?;
@@ -135,6 +156,63 @@ impl Provider for OpenAiCompatibleProvider {
             response,
             self.spec.stream_parser(),
         ))
+    }
+
+    fn supports_completions(&self) -> bool {
+        self.completion_endpoint.is_some()
+    }
+
+    async fn complete(
+        &self,
+        req: &CompletionRequest,
+        credentials: BackendCredentials<'_>,
+    ) -> anyhow::Result<CompletionResponse> {
+        let api_key = credentials.require_api_key(self.name())?;
+        let endpoint = self.completion_endpoint.ok_or_else(|| {
+            anyhow::anyhow!("{} does not support native text completions", self.name())
+        })?;
+        let body = endpoint.request_body(req, false)?;
+        let response = self
+            .client
+            .post(endpoint.url)
+            .headers(self.spec.headers(api_key)?)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(upstream_error(response, self.name(), false).await);
+        }
+
+        endpoint.response(response.json::<serde_json::Value>().await?)
+    }
+
+    async fn complete_stream(
+        &self,
+        req: &CompletionRequest,
+        credentials: BackendCredentials<'_>,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<CompletionChunk>>> {
+        let api_key = credentials.require_api_key(self.name())?;
+        let endpoint = self.completion_endpoint.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} does not support native text completion streaming",
+                self.name()
+            )
+        })?;
+        let body = endpoint.request_body(req, true)?;
+        let response = self
+            .client
+            .post(endpoint.url)
+            .headers(self.spec.headers(api_key)?)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(upstream_error(response, self.name(), true).await);
+        }
+
+        Ok(completion_chunks_from_response(response, endpoint.protocol))
     }
 }
 

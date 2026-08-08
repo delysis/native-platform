@@ -7,13 +7,28 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Authorize pinned private native dependency
+        shell: bash
+        env:
+          LLAMA_NATIVE_KIT_DEPLOY_KEY: ${{ secrets.LLAMA_NATIVE_KIT_DEPLOY_KEY }}
+        run: |
+          test -n "$LLAMA_NATIVE_KIT_DEPLOY_KEY"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$LLAMA_NATIVE_KIT_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
 
       - uses: actions/setup-node@v4
         with:
@@ -25,8 +40,6 @@ jobs:
           components: clippy,rustfmt
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
 
       - name: Install Tauri system dependencies
         run: |
@@ -35,8 +48,14 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             libwebkit2gtk-4.1-dev \
-            patchelf
+            patchelf \
+            ripgrep
 
       - run: npm ci
       - run: npm run audit:dependencies
       - run: npm test
+      - run: npm run build
+      - run: cargo fmt --all --check
+      - run: ./scripts/check-module-boundaries.sh
+      - run: cargo test --workspace --all-features
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings

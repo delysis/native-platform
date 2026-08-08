@@ -5,6 +5,10 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "free-token-energy:default",
+    "free-token-energy-speech:default",
+    "free-token-energy:allow-loopback-start",
+    "free-token-energy:allow-loopback-stop",
     {
       "identifier": "opener:allow-open-url",
       "allow": [

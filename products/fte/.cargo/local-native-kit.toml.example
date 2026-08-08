@@ -1,0 +1,5 @@
+[patch."https://github.com/delysis/llama-native-kit"]
+llama-native-cache = { path = "../../Documents/llama-native-kit/crates/llama-native-cache" }
+llama-native-engine = { path = "../../Documents/llama-native-kit/crates/llama-native-engine" }
+llama-native-host = { path = "../../Documents/llama-native-kit/crates/llama-native-host" }
+llama-native-types = { path = "../../Documents/llama-native-kit/crates/llama-native-types" }

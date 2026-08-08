@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use anyhow::{Context, Result, anyhow};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -449,6 +449,9 @@ fn harden_file_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn log_summaries_report_latest_status_and_real_aggregates() {
@@ -499,8 +502,9 @@ mod tests {
 
     fn test_database_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "free-token-energy-db-{label}-{}-{}.sqlite",
+            "free-token-energy-db-{label}-{}-{}-{}.sqlite",
             std::process::id(),
+            TEST_DATABASE_ID.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

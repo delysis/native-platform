@@ -1,6 +1,6 @@
 use async_stream::try_stream;
-use futures::{stream::BoxStream, StreamExt};
-use serde_json::{json, Map, Value};
+use futures::{StreamExt, stream::BoxStream};
+use serde_json::{Map, Value, json};
 
 use crate::providers::{ChatChunk, ChatChunkChoice, ChatDelta, ChatUsage};
 
@@ -459,22 +459,22 @@ fn map_gemini_finish_reason(reason: &str) -> String {
 }
 
 #[derive(Default)]
-struct SseParser {
+pub(crate) struct SseParser {
     buffered_line: Vec<u8>,
     event_data_lines: Vec<String>,
 }
 
 impl SseParser {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    fn push_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    pub(crate) fn push_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<Vec<String>> {
         self.buffered_line.extend_from_slice(bytes);
         self.drain_complete_lines()
     }
 
-    fn finish(&mut self) -> anyhow::Result<Vec<String>> {
+    pub(crate) fn finish(&mut self) -> anyhow::Result<Vec<String>> {
         if !self.buffered_line.is_empty() {
             let mut line = std::mem::take(&mut self.buffered_line);
             if line.ends_with(b"\r") {
@@ -536,7 +536,7 @@ impl SseParser {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_anthropic_sse_chat_event, parse_gemini_sse_chat_event, SseParser};
+    use super::{SseParser, parse_anthropic_sse_chat_event, parse_gemini_sse_chat_event};
 
     #[test]
     fn parses_split_sse_data_events() {

@@ -1,9 +1,8 @@
-use async_trait::async_trait;
-use futures::stream::BoxStream;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 pub mod anthropic;
+pub mod completions;
 pub mod gemini;
 pub mod groq;
 pub mod openai_compatible;
@@ -54,6 +53,173 @@ pub struct ChatRequest {
 pub struct StreamOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum CompletionPrompt {
+    Text(String),
+    Texts(Vec<String>),
+    Tokens(Vec<u32>),
+    TokenBatches(Vec<Vec<u32>>),
+}
+
+impl Default for CompletionPrompt {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+impl CompletionPrompt {
+    pub fn kind(&self) -> CompletionPromptKind {
+        match self {
+            Self::Text(_) => CompletionPromptKind::Text,
+            Self::Texts(_) => CompletionPromptKind::Texts,
+            Self::Tokens(_) => CompletionPromptKind::Tokens,
+            Self::TokenBatches(_) => CompletionPromptKind::TokenBatches,
+        }
+    }
+
+    pub fn as_text(&self) -> anyhow::Result<&str> {
+        match self {
+            Self::Text(prompt) => Ok(prompt),
+            _ => Err(anyhow::anyhow!(
+                "this provider requires prompt to be a single string"
+            )),
+        }
+    }
+
+    pub fn item_count(&self) -> usize {
+        match self {
+            Self::Text(_) | Self::Tokens(_) => 1,
+            Self::Texts(prompts) => prompts.len(),
+            Self::TokenBatches(prompts) => prompts.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionPromptKind {
+    Text,
+    Texts,
+    Tokens,
+    TokenBatches,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionRequest {
+    pub model: String,
+    #[serde(default, deserialize_with = "deserialize_completion_prompt")]
+    pub prompt: CompletionPrompt,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(flatten, default)]
+    pub extra: Map<String, Value>,
+}
+
+impl CompletionRequest {
+    pub fn requested_parameters(&self) -> Vec<&str> {
+        let mut parameters = Vec::new();
+        if self.stream {
+            parameters.push("stream");
+        }
+        if self.stream_options.is_some() {
+            parameters.push("stream_options");
+        }
+        if self.temperature.is_some() {
+            parameters.push("temperature");
+        }
+        if self.max_tokens.is_some() {
+            parameters.push("max_tokens");
+        }
+        parameters.extend(
+            self.extra
+                .iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, _)| key.as_str()),
+        );
+        parameters
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionResponse {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub choices: Vec<CompletionChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<CompletionUsage>,
+    #[serde(flatten, default)]
+    pub extra: Map<String, Value>,
+}
+
+impl CompletionResponse {
+    pub fn total_tokens(&self) -> Option<u32> {
+        self.usage.as_ref().map(|usage| usage.total_tokens)
+    }
+
+    pub fn normalize(&mut self, model: &str, created: u64) {
+        self.model = Some(model.to_string());
+        self.object = Some("text_completion".to_string());
+        if self.created.is_none() {
+            self.created = Some(created);
+        }
+    }
+}
+
+pub type CompletionChunk = CompletionResponse;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionChoice {
+    #[serde(default, deserialize_with = "deserialize_completion_text")]
+    pub text: String,
+    #[serde(default)]
+    pub index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionUsage {
+    #[serde(default)]
+    pub prompt_tokens: u32,
+    #[serde(default)]
+    pub completion_tokens: u32,
+    #[serde(default)]
+    pub total_tokens: u32,
+    #[serde(flatten, default)]
+    pub extra: Map<String, Value>,
+}
+
+fn deserialize_completion_prompt<'de, D>(deserializer: D) -> Result<CompletionPrompt, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<CompletionPrompt>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_completion_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,23 +364,4 @@ impl Capability {
         Self::LongContext,
         Self::Streaming,
     ];
-}
-
-#[async_trait]
-pub trait Provider: Send + Sync {
-    fn id(&self) -> &str;
-    fn name(&self) -> &str;
-    fn capabilities(&self) -> &[Capability];
-    async fn chat(
-        &self,
-        req: &ChatRequest,
-        api_key: &str,
-        policy: &spec::ParameterPolicy,
-    ) -> anyhow::Result<ChatResponse>;
-    async fn chat_stream(
-        &self,
-        req: &ChatRequest,
-        api_key: &str,
-        policy: &spec::ParameterPolicy,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ChatChunk>>>;
 }

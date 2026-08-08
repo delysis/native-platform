@@ -1,0 +1,36 @@
+[package]
+name = "tauri-plugin-free-token-energy"
+links = "tauri-plugin-free-token-energy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+hosted-providers = ["dep:fte-providers"]
+native-llama = [
+    "dep:fte-backend-llama",
+    "dep:llama-native-host",
+    "dep:llama-native-types",
+]
+
+[dependencies]
+fte-backend-llama = { path = "../fte-backend-llama", optional = true }
+fte-loopback = { path = "../fte-loopback" }
+fte-providers = { path = "../fte-providers", optional = true }
+fte-router = { path = "../fte-router" }
+fte-store = { path = "../fte-store" }
+fte-types = { path = "../fte-types" }
+llama-native-host = { workspace = true, optional = true }
+llama-native-types = { workspace = true, optional = true }
+serde.workspace = true
+tauri = { version = "2", default-features = false }
+tokio.workspace = true
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+[lints]
+workspace = true
