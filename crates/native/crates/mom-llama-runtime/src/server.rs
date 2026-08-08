@@ -45,6 +45,7 @@ pub struct ModelSlot {
     pub slot_id: usize,
     pub model_path: Option<String>,
     pub model_bytes: u64,
+    pub reserved_bytes: u64,
     pub active_sequences: usize,
     pub max_sequences: u32,
     pub state: String,
@@ -91,7 +92,7 @@ pub fn server_status() -> Result<CommandResult<ServerStatus>> {
     let settings = resolve_settings()?;
     let slots = resident_slots();
     let active_sequences = slots.iter().map(|slot| slot.status.active_sequences).sum();
-    let resident_model_bytes = slots.iter().map(|slot| slot.model_bytes).sum();
+    let resident_model_bytes = slots.iter().map(|slot| slot.reserved_bytes).sum();
     Ok(CommandResult::passed(
         "mom_llama.server_status",
         if slots.is_empty() {
@@ -141,7 +142,10 @@ pub fn server_start() -> Result<CommandResult<ServerStatus>> {
             transport: "in_process".to_string(),
             resident_models: resident_slots().len(),
             active_sequences: status.active_sequences,
-            resident_model_bytes: resident_slots().iter().map(|slot| slot.model_bytes).sum(),
+            resident_model_bytes: resident_slots()
+                .iter()
+                .map(|slot| slot.reserved_bytes)
+                .sum(),
             memory_budget_bytes: settings.resident_memory_budget_bytes,
             health: Some(json!({
                 "state": status.state,
@@ -190,6 +194,7 @@ pub fn model_slot_list() -> Result<CommandResult<Vec<ModelSlot>>> {
             slot_id: slot.slot_id,
             model_path: Some(slot.model_path.display().to_string()),
             model_bytes: slot.model_bytes,
+            reserved_bytes: slot.reserved_bytes,
             active_sequences: slot.status.active_sequences,
             max_sequences: slot.status.max_sequences,
             state: format!("{:?}", slot.status.state).to_lowercase(),
@@ -242,6 +247,11 @@ pub fn model_slot_load(slot_id: usize, model_path: PathBuf) -> Result<CommandRes
     let model_bytes = std::fs::metadata(&model_path)
         .map(|metadata| metadata.len())
         .unwrap_or_default();
+    let reserved_bytes = resident_slots()
+        .into_iter()
+        .find(|slot| slot.slot_id == slot_id)
+        .map(|slot| slot.reserved_bytes)
+        .unwrap_or(model_bytes);
     Ok(CommandResult::passed(
         "mom_llama.model_slot_load",
         "host_integrated",
@@ -249,6 +259,7 @@ pub fn model_slot_load(slot_id: usize, model_path: PathBuf) -> Result<CommandRes
             slot_id,
             model_path: Some(model_path.display().to_string()),
             model_bytes,
+            reserved_bytes,
             active_sequences: status.active_sequences,
             max_sequences: status.max_sequences,
             state: format!("{:?}", status.state).to_lowercase(),
@@ -270,6 +281,7 @@ pub fn model_slot_unload(slot_id: usize) -> Result<CommandResult<ModelSlot>> {
             slot_id,
             model_path: None,
             model_bytes: 0,
+            reserved_bytes: 0,
             active_sequences: 0,
             max_sequences: 0,
             state: "unloaded".to_string(),

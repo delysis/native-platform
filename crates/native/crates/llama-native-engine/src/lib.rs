@@ -7,21 +7,23 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::mtmd::{
     MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText, mtmd_default_marker,
 };
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use llama_native_types::{
-    BranchRequest, ChatMessage, ChatRole, GenerationEvent, GenerationEventKind, GenerationMetrics,
-    GenerationOutput, GenerationRequest, GenerationState, MAX_PARALLEL_SEQUENCES, MediaInput,
-    ModelFingerprint, ModelRuntimeState, NativeDevice, NativeError, NativeErrorCode,
-    NativeModelConfig, NativeTransport, ResidentModelStatus, SamplerKind, SamplingConfig,
-    SequenceStateBlob, SharedPrefixBatchRequest,
+    BranchRequest, ChatMessage, ChatRole, ChatTemplateChoice, CompletionPrompt, GenerationEvent,
+    GenerationEventKind, GenerationInput, GenerationMetrics, GenerationOutput, GenerationRequest,
+    GenerationState, MAX_PARALLEL_SEQUENCES, MediaInput, ModelCapabilities, ModelFingerprint,
+    ModelRuntimeState, NativeDevice, NativeError, NativeErrorCode, NativeModelConfig,
+    NativeModelDescriptor, NativeTransport, PreparedPrompt, PromptForm, PromptTokenPolicy,
+    ResidentModelStatus, SamplerKind, SamplingConfig, SamplingParameter, SequenceStateBlob,
+    SharedPrefixBatchRequest, SpecialTokenPolicy, TokenizedPrompt,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::num::NonZeroU32;
@@ -30,7 +32,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-pub const LLAMA_CPP_BINDING_VERSION: &str = "0.1.150";
+pub const LLAMA_CPP_BINDING_VERSION: &str = "0.1.153";
 const COMMAND_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 256;
 
@@ -39,6 +41,7 @@ static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
 type NativeResult<T> = Result<T, NativeError>;
 type CancelKey = (String, String);
 type CancelRegistry = Arc<Mutex<HashMap<CancelKey, Arc<AtomicBool>>>>;
+type ReasoningForceRegistry = Arc<Mutex<HashMap<CancelKey, Arc<AtomicBool>>>>;
 
 #[derive(Debug)]
 pub struct GenerationTicket {
@@ -46,6 +49,7 @@ pub struct GenerationTicket {
     pub events: Receiver<GenerationEvent>,
     result: Receiver<NativeResult<Vec<GenerationOutput>>>,
     cancellations: CancelRegistry,
+    reasoning_forces: ReasoningForceRegistry,
 }
 
 impl GenerationTicket {
@@ -65,6 +69,7 @@ impl GenerationTicket {
             )
         })?;
         cleanup_request_in_registry(&self.cancellations, &self.request_id);
+        cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
         result
     }
 
@@ -76,7 +81,23 @@ impl GenerationTicket {
             )
         })?;
         cleanup_request_in_registry(&self.cancellations, &self.request_id);
+        cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
         result
+    }
+
+    pub fn try_wait(&self) -> NativeResult<Option<Vec<GenerationOutput>>> {
+        match self.result.try_recv() {
+            Ok(result) => {
+                cleanup_request_in_registry(&self.cancellations, &self.request_id);
+                cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
+                result.map(Some)
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                "native worker stopped before returning a result",
+            )),
+        }
     }
 }
 
@@ -97,6 +118,7 @@ impl Clone for NativeModelHandle {
 struct NativeModelInner {
     command_tx: Sender<WorkerCommand>,
     cancellations: CancelRegistry,
+    reasoning_forces: ReasoningForceRegistry,
     status: Arc<RwLock<ResidentModelStatus>>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -104,6 +126,11 @@ struct NativeModelInner {
 impl Drop for NativeModelInner {
     fn drop(&mut self) {
         if let Ok(registry) = self.cancellations.lock() {
+            for flag in registry.values() {
+                flag.store(true, Ordering::Release);
+            }
+        }
+        if let Ok(registry) = self.reasoning_forces.lock() {
             for flag in registry.values() {
                 flag.store(true, Ordering::Release);
             }
@@ -124,12 +151,21 @@ enum WorkerCommand {
         event_tx: Sender<GenerationEvent>,
         result_tx: Sender<NativeResult<Vec<GenerationOutput>>>,
         cancellations: Vec<Arc<AtomicBool>>,
+        reasoning_forces: Vec<Arc<AtomicBool>>,
     },
     GenerateMultimodal {
         request: GenerationRequest,
         event_tx: Sender<GenerationEvent>,
         result_tx: Sender<NativeResult<Vec<GenerationOutput>>>,
         cancellation: Arc<AtomicBool>,
+        reasoning_force: Arc<AtomicBool>,
+    },
+    GenerateCompletion {
+        request: GenerationRequest,
+        event_tx: Sender<GenerationEvent>,
+        result_tx: Sender<NativeResult<Vec<GenerationOutput>>>,
+        cancellations: Vec<Arc<AtomicBool>>,
+        reasoning_forces: Vec<Arc<AtomicBool>>,
     },
     Snapshot {
         sequence_id: i32,
@@ -144,6 +180,15 @@ enum WorkerCommand {
         request: SharedPrefixBatchRequest,
         response: Sender<NativeResult<SequenceStateBlob>>,
     },
+    Tokenize {
+        messages: Vec<ChatMessage>,
+        chat_template: ChatTemplateChoice,
+        response: Sender<NativeResult<TokenizedPrompt>>,
+    },
+    PrepareInput {
+        input: GenerationInput,
+        response: Sender<NativeResult<Vec<PreparedPrompt>>>,
+    },
     Shutdown,
 }
 
@@ -153,10 +198,12 @@ impl NativeModelHandle {
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = bounded(1);
         let cancellations = Arc::new(Mutex::new(HashMap::new()));
+        let reasoning_forces = Arc::new(Mutex::new(HashMap::new()));
         let status = Arc::new(RwLock::new(ResidentModelStatus {
             model_id: config.model_id.clone(),
             state: ModelRuntimeState::Loading,
             fingerprint: None,
+            descriptor: None,
             active_sequences: 0,
             max_sequences: config.max_sequences,
         }));
@@ -182,6 +229,7 @@ impl NativeModelHandle {
             inner: Arc::new(NativeModelInner {
                 command_tx,
                 cancellations,
+                reasoning_forces,
                 status,
                 join: Mutex::new(Some(worker)),
             }),
@@ -197,33 +245,116 @@ impl NativeModelHandle {
                 model_id: "unknown".to_string(),
                 state: ModelRuntimeState::Failed,
                 fingerprint: None,
+                descriptor: None,
                 active_sequences: 0,
                 max_sequences: 0,
             })
     }
 
+    /// Returns true when both handles address the same resident owner-thread worker.
+    ///
+    /// This is intentionally narrower than comparing model IDs: two separately loaded
+    /// workers may legitimately expose the same model fingerprint, while repeated
+    /// requests for one resident profile must reuse the same worker allocation.
+    pub fn is_same_worker(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn generate(&self, request: GenerationRequest) -> NativeResult<GenerationTicket> {
-        if !request.media.is_empty() {
-            return self.generate_multimodal(request);
+        match &request.input {
+            GenerationInput::Chat { .. } if !request.media.is_empty() => {
+                self.generate_multimodal(request)
+            }
+            GenerationInput::Chat { messages, template } => {
+                let batch = SharedPrefixBatchRequest {
+                    request_id: request.request_id,
+                    model_id: request.model_id,
+                    common_messages: messages.clone(),
+                    chat_template: template.clone(),
+                    branches: vec![BranchRequest {
+                        branch_id: "assistant".to_string(),
+                        label: "Assistant".to_string(),
+                        instruction: String::new(),
+                        sampling: request.sampling,
+                        messages: Vec::new(),
+                        cached_prefix: None,
+                    }],
+                    cached_prefix: request.cached_prefix,
+                };
+                self.generate_shared_prefix(batch)
+            }
+            GenerationInput::Completion { .. } => self.generate_completion(request),
+            GenerationInput::FillInMiddle { .. } => Err(NativeError::new(
+                NativeErrorCode::UnsupportedPromptForm,
+                "fill-in-middle generation is unavailable because this model has no verified FIM token contract",
+            )),
         }
-        let batch = SharedPrefixBatchRequest {
-            request_id: request.request_id,
-            model_id: request.model_id,
-            common_messages: request.messages,
-            branches: vec![BranchRequest {
-                branch_id: "assistant".to_string(),
-                label: "Assistant".to_string(),
-                instruction: String::new(),
-                sampling: request.sampling,
-            }],
-            cached_prefix: request.cached_prefix,
-        };
-        self.generate_shared_prefix(batch)
+    }
+
+    fn generate_completion(&self, request: GenerationRequest) -> NativeResult<GenerationTicket> {
+        let prompt_count = validate_completion_request(&request, &self.status())?;
+        let mut cancellations = Vec::with_capacity(prompt_count);
+        let mut reasoning_forces = Vec::with_capacity(prompt_count);
+        {
+            let mut registry = self.inner.cancellations.lock().map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "cancellation registry is poisoned",
+                )
+            })?;
+            let mut reasoning_registry = self.inner.reasoning_forces.lock().map_err(|_| {
+                NativeError::new(NativeErrorCode::Internal, "reasoning registry is poisoned")
+            })?;
+            for index in 0..prompt_count {
+                let branch_id = format!("completion-{index}");
+                let cancellation = Arc::new(AtomicBool::new(false));
+                let reasoning = Arc::new(AtomicBool::new(false));
+                registry.insert(
+                    (request.request_id.clone(), branch_id.clone()),
+                    Arc::clone(&cancellation),
+                );
+                reasoning_registry.insert(
+                    (request.request_id.clone(), branch_id),
+                    Arc::clone(&reasoning),
+                );
+                cancellations.push(cancellation);
+                reasoning_forces.push(reasoning);
+            }
+        }
+        let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
+        let (result_tx, result_rx) = bounded(1);
+        let request_id = request.request_id.clone();
+        if let Err(error) = self
+            .inner
+            .command_tx
+            .send(WorkerCommand::GenerateCompletion {
+                request,
+                event_tx,
+                result_tx,
+                cancellations,
+                reasoning_forces,
+            })
+        {
+            cleanup_request_in_registry(&self.inner.cancellations, &request_id);
+            cleanup_request_in_registry(&self.inner.reasoning_forces, &request_id);
+            return Err(NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("native model worker is not accepting completion requests: {error}"),
+            ));
+        }
+        Ok(GenerationTicket {
+            request_id,
+            events: event_rx,
+            result: result_rx,
+            cancellations: Arc::clone(&self.inner.cancellations),
+            reasoning_forces: Arc::clone(&self.inner.reasoning_forces),
+        })
     }
 
     fn generate_multimodal(&self, request: GenerationRequest) -> NativeResult<GenerationTicket> {
         validate_generation_request(&request, &self.status())?;
         let cancellation = Arc::new(AtomicBool::new(false));
+        let reasoning_force = Arc::new(AtomicBool::new(false));
         {
             let mut registry = self.inner.cancellations.lock().map_err(|_| {
                 NativeError::new(
@@ -234,6 +365,18 @@ impl NativeModelHandle {
             registry.insert(
                 (request.request_id.clone(), "assistant".to_string()),
                 Arc::clone(&cancellation),
+            );
+        }
+        {
+            let mut registry = self.inner.reasoning_forces.lock().map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "reasoning force registry is poisoned",
+                )
+            })?;
+            registry.insert(
+                (request.request_id.clone(), "assistant".to_string()),
+                Arc::clone(&reasoning_force),
             );
         }
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
@@ -247,9 +390,11 @@ impl NativeModelHandle {
                 event_tx,
                 result_tx,
                 cancellation,
+                reasoning_force,
             })
         {
             cleanup_request_in_registry(&self.inner.cancellations, &request_id);
+            cleanup_request_in_registry(&self.inner.reasoning_forces, &request_id);
             return Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
                 format!("native model worker is not accepting requests: {error}"),
@@ -260,6 +405,7 @@ impl NativeModelHandle {
             events: event_rx,
             result: result_rx,
             cancellations: Arc::clone(&self.inner.cancellations),
+            reasoning_forces: Arc::clone(&self.inner.reasoning_forces),
         })
     }
 
@@ -269,6 +415,7 @@ impl NativeModelHandle {
     ) -> NativeResult<GenerationTicket> {
         validate_batch_request(&request, &self.status())?;
         let mut flags = Vec::with_capacity(request.branches.len());
+        let mut reasoning_flags = Vec::with_capacity(request.branches.len());
         {
             let mut registry = self.inner.cancellations.lock().map_err(|_| {
                 NativeError::new(
@@ -285,6 +432,22 @@ impl NativeModelHandle {
                 flags.push(flag);
             }
         }
+        {
+            let mut registry = self.inner.reasoning_forces.lock().map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "reasoning force registry is poisoned",
+                )
+            })?;
+            for branch in &request.branches {
+                let flag = Arc::new(AtomicBool::new(false));
+                registry.insert(
+                    (request.request_id.clone(), branch.branch_id.clone()),
+                    Arc::clone(&flag),
+                );
+                reasoning_flags.push(flag);
+            }
+        }
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
         let (result_tx, result_rx) = bounded(1);
         let request_id = request.request_id.clone();
@@ -293,8 +456,10 @@ impl NativeModelHandle {
             event_tx,
             result_tx,
             cancellations: flags,
+            reasoning_forces: reasoning_flags,
         }) {
             cancel_request_in_registry(&self.inner.cancellations, &request_id);
+            cleanup_request_in_registry(&self.inner.reasoning_forces, &request_id);
             return Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
                 format!("native model worker is not accepting requests: {error}"),
@@ -305,6 +470,7 @@ impl NativeModelHandle {
             events: event_rx,
             result: result_rx,
             cancellations: Arc::clone(&self.inner.cancellations),
+            reasoning_forces: Arc::clone(&self.inner.reasoning_forces),
         })
     }
 
@@ -316,6 +482,17 @@ impl NativeModelHandle {
                 branch_id,
             )),
             None => cancel_request_in_registry(&self.inner.cancellations, request_id),
+        }
+    }
+
+    pub fn skip_reasoning(&self, request_id: &str, branch_id: Option<&str>) -> usize {
+        match branch_id {
+            Some(branch_id) => usize::from(set_flag_in_registry(
+                &self.inner.reasoning_forces,
+                request_id,
+                branch_id,
+            )),
+            None => set_request_flags_in_registry(&self.inner.reasoning_forces, request_id),
         }
     }
 
@@ -399,6 +576,59 @@ impl NativeModelHandle {
             )
         })?
     }
+
+    pub fn tokenize_messages(&self, messages: Vec<ChatMessage>) -> NativeResult<TokenizedPrompt> {
+        self.tokenize_messages_with_template(messages, ChatTemplateChoice::ModelDefault)
+    }
+
+    pub fn tokenize_messages_with_template(
+        &self,
+        messages: Vec<ChatMessage>,
+        chat_template: ChatTemplateChoice,
+    ) -> NativeResult<TokenizedPrompt> {
+        let (response_tx, response_rx) = bounded(1);
+        self.inner
+            .command_tx
+            .send(WorkerCommand::Tokenize {
+                messages,
+                chat_template,
+                response: response_tx,
+            })
+            .map_err(|error| {
+                NativeError::new(
+                    NativeErrorCode::WorkerStopped,
+                    format!("native model worker is not accepting tokenization: {error}"),
+                )
+            })?;
+        response_rx.recv().map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("native model worker stopped during tokenization: {error}"),
+            )
+        })?
+    }
+
+    pub fn prepare_input(&self, input: GenerationInput) -> NativeResult<Vec<PreparedPrompt>> {
+        let (response_tx, response_rx) = bounded(1);
+        self.inner
+            .command_tx
+            .send(WorkerCommand::PrepareInput {
+                input,
+                response: response_tx,
+            })
+            .map_err(|error| {
+                NativeError::new(
+                    NativeErrorCode::WorkerStopped,
+                    format!("native model worker is not accepting prompt preparation: {error}"),
+                )
+            })?;
+        response_rx.recv().map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("native model worker stopped during prompt preparation: {error}"),
+            )
+        })?
+    }
 }
 
 fn run_worker(
@@ -436,7 +666,28 @@ fn run_worker(
         }
         NativeDevice::Auto => 0,
     };
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+    let execution_backend = if gpu_layers == 0 {
+        "cpu"
+    } else if backend.supports_gpu_offload() {
+        "metal"
+    } else {
+        "cpu"
+    };
+    let mut model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+    if config.device == NativeDevice::Cpu {
+        model_params = match model_params.with_devices(&[]) {
+            Ok(model_params) => model_params,
+            Err(error) => {
+                let error = NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    format!("failed to configure the CPU-only native backend: {error}"),
+                );
+                set_status_state(&status, ModelRuntimeState::Failed, 0);
+                let _ = ready_tx.send(Err(error));
+                return;
+            }
+        };
+    }
     let model = match LlamaModel::load_from_file(backend, &config.model_path, &model_params) {
         Ok(model) => model,
         Err(error) => {
@@ -460,7 +711,12 @@ fn run_worker(
                 let _ = ready_tx.send(Err(error));
                 return;
             };
-            match MtmdContext::init_from_file(path, &model, &MtmdContextParams::default()) {
+            let params = MtmdContextParams {
+                use_gpu: config.device != NativeDevice::Cpu,
+                n_threads: native_thread_count(),
+                ..MtmdContextParams::default()
+            };
+            match MtmdContext::init_from_file(path, &model, &params) {
                 Ok(context) => Some(context),
                 Err(error) => {
                     let error = NativeError::new(
@@ -481,8 +737,11 @@ fn run_worker(
         .with_n_batch(config.batch_tokens)
         .with_n_ubatch(config.batch_tokens.min(512))
         .with_n_seq_max(config.max_sequences)
+        .with_n_threads(native_thread_count())
+        .with_n_threads_batch(native_thread_count())
         .with_kv_unified(true)
         .with_no_perf(false);
+    let (rope_config_sha256, kv_layout_sha256) = context_fingerprints(&context_params);
     let mut context = match model.new_context(backend, context_params) {
         Ok(context) => context,
         Err(error) => {
@@ -495,7 +754,15 @@ fn run_worker(
             return;
         }
     };
-    let fingerprint = match fingerprint_model(&config, backend, &model) {
+    let fingerprint = match fingerprint_model(
+        &config,
+        backend,
+        &model,
+        execution_backend,
+        context_tokens,
+        rope_config_sha256,
+        kv_layout_sha256,
+    ) {
         Ok(fingerprint) => fingerprint,
         Err(error) => {
             set_status_state(&status, ModelRuntimeState::Failed, 0);
@@ -505,6 +772,12 @@ fn run_worker(
     };
     if let Ok(mut current) = status.write() {
         current.state = ModelRuntimeState::Ready;
+        current.descriptor = Some(describe_model(
+            &config,
+            &model,
+            &fingerprint,
+            multimodal.is_some(),
+        ));
         current.fingerprint = Some(fingerprint);
     }
     let _ = ready_tx.send(Ok(()));
@@ -517,16 +790,23 @@ fn run_worker(
                 event_tx,
                 result_tx,
                 cancellations,
+                reasoning_forces,
             } => {
                 set_status_state(&status, ModelRuntimeState::Ready, request.branches.len());
                 let result = generate_batch(
                     &model,
                     &mut context,
                     &request,
-                    &event_tx,
-                    &cancellations,
-                    &mut sequence_token_counts,
-                    &mut sequence_token_ids,
+                    None,
+                    BatchSupervision {
+                        event_tx: &event_tx,
+                        cancellations: &cancellations,
+                        reasoning_forces: &reasoning_forces,
+                    },
+                    SequenceTracking {
+                        token_counts: &mut sequence_token_counts,
+                        token_ids: &mut sequence_token_ids,
+                    },
                 );
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
                 let _ = result_tx.send(result);
@@ -536,6 +816,7 @@ fn run_worker(
                 event_tx,
                 result_tx,
                 cancellation,
+                reasoning_force,
             } => {
                 set_status_state(&status, ModelRuntimeState::Ready, 1);
                 let result = generate_multimodal(
@@ -543,15 +824,48 @@ fn run_worker(
                     &mut context,
                     multimodal.as_ref(),
                     &request,
-                    &event_tx,
-                    &cancellation,
-                    MultimodalSequenceTracking {
+                    SingleSequenceSupervision {
+                        event_tx: &event_tx,
+                        cancellation: &cancellation,
+                        reasoning_force: &reasoning_force,
+                    },
+                    SequenceTracking {
                         token_counts: &mut sequence_token_counts,
                         token_ids: &mut sequence_token_ids,
                     },
                 );
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
                 let _ = result_tx.send(result.map(|output| vec![output]));
+            }
+            WorkerCommand::GenerateCompletion {
+                request,
+                event_tx,
+                result_tx,
+                cancellations,
+                reasoning_forces,
+            } => {
+                let prompt_count = completion_prompt_count(&request);
+                set_status_state(&status, ModelRuntimeState::Ready, prompt_count);
+                let result =
+                    prepare_completion_batch(&model, request).and_then(|(batch, token_sets)| {
+                        generate_batch(
+                            &model,
+                            &mut context,
+                            &batch,
+                            Some(token_sets),
+                            BatchSupervision {
+                                event_tx: &event_tx,
+                                cancellations: &cancellations,
+                                reasoning_forces: &reasoning_forces,
+                            },
+                            SequenceTracking {
+                                token_counts: &mut sequence_token_counts,
+                                token_ids: &mut sequence_token_ids,
+                            },
+                        )
+                    });
+                set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = result_tx.send(result);
             }
             WorkerCommand::Snapshot {
                 sequence_id,
@@ -595,6 +909,16 @@ fn run_worker(
                 );
                 let _ = response.send(result);
             }
+            WorkerCommand::Tokenize {
+                messages,
+                chat_template,
+                response,
+            } => {
+                let _ = response.send(tokenize_messages(&model, messages, &chat_template));
+            }
+            WorkerCommand::PrepareInput { input, response } => {
+                let _ = response.send(prepare_input(&model, input));
+            }
             WorkerCommand::Shutdown => break,
         }
     }
@@ -605,41 +929,77 @@ fn generate_batch(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
     request: &SharedPrefixBatchRequest,
-    event_tx: &Sender<GenerationEvent>,
-    cancellations: &[Arc<AtomicBool>],
-    sequence_token_counts: &mut HashMap<i32, usize>,
-    sequence_token_ids: &mut HashMap<i32, Vec<i32>>,
+    prepared_token_sets: Option<Vec<Vec<LlamaToken>>>,
+    supervision: BatchSupervision<'_>,
+    tracking: SequenceTracking<'_>,
 ) -> NativeResult<Vec<GenerationOutput>> {
     context.clear_kv_cache();
-    sequence_token_counts.clear();
-    sequence_token_ids.clear();
+    tracking.token_counts.clear();
+    tracking.token_ids.clear();
     let started = Instant::now();
-    let prompts = render_branch_prompts(model, request)?;
-    let token_sets = prompts
-        .iter()
-        .map(|prompt| {
-            model.str_to_token(prompt, AddBos::Always).map_err(|error| {
-                NativeError::new(
-                    NativeErrorCode::ModelInvalid,
-                    format!("failed to tokenize prompt: {error}"),
-                )
+    let token_sets = if let Some(token_sets) = prepared_token_sets {
+        token_sets
+    } else {
+        let prompts = render_branch_prompts(model, request)?;
+        prompts
+            .iter()
+            .map(|prompt| {
+                model.str_to_token(prompt, AddBos::Always).map_err(|error| {
+                    NativeError::new(
+                        NativeErrorCode::ModelInvalid,
+                        format!("failed to tokenize prompt: {error}"),
+                    )
+                })
             })
-        })
-        .collect::<NativeResult<Vec<_>>>()?;
+            .collect::<NativeResult<Vec<_>>>()?
+    };
     let minimum_tokens = token_sets.iter().map(Vec::len).min().unwrap_or_default();
     if minimum_tokens == 0 {
         return Err(NativeError::new(
             NativeErrorCode::ModelInvalid,
-            "the model chat template produced an empty prompt",
+            "generation input produced an empty token sequence",
         ));
     }
-    let mut restored_prefix = false;
-    let shared_prefix = if let Some(state) = request.cached_prefix.as_ref() {
-        if request.branches.len() != 1
-            || state.token_count == 0
+    if request.cached_prefix.is_some()
+        && request
+            .branches
+            .iter()
+            .any(|branch| branch.cached_prefix.is_some())
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "a request-level cache and branch-level caches cannot be combined",
+        ));
+    }
+    let cached_states = request
+        .branches
+        .iter()
+        .enumerate()
+        .map(|(index, branch)| {
+            if index == 0 && request.branches.len() == 1 {
+                request
+                    .cached_prefix
+                    .as_ref()
+                    .or(branch.cached_prefix.as_ref())
+            } else {
+                branch.cached_prefix.as_ref()
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut prefix_lengths = vec![0_usize; request.branches.len()];
+    let uncached_indices = cached_states
+        .iter()
+        .enumerate()
+        .filter_map(|(index, state)| state.is_none().then_some(index))
+        .collect::<Vec<_>>();
+    for (index, state) in cached_states.iter().enumerate() {
+        let Some(state) = state else {
+            continue;
+        };
+        if state.token_count == 0
             || state.token_count != state.token_ids.len()
-            || state.token_count >= token_sets[0].len()
-            || !token_sets[0]
+            || state.token_count >= token_sets[index].len()
+            || !token_sets[index]
                 .iter()
                 .take(state.token_count)
                 .map(|token| token.0)
@@ -647,23 +1007,43 @@ fn generate_batch(
         {
             return Err(NativeError::new(
                 NativeErrorCode::CacheIncompatible,
-                "saved KV prefix does not match the rendered native prompt",
+                format!(
+                    "saved KV prefix does not match rendered branch `{}`",
+                    request.branches[index].branch_id
+                ),
             ));
         }
-        state_buffer::import_sequence(context, state, 0)?;
-        restored_prefix = true;
-        state.token_count
-    } else if request.branches.len() > 1 {
-        longest_common_prefix(&token_sets).min(minimum_tokens.saturating_sub(1))
+        state_buffer::import_sequence(context, state, index as i32)?;
+        prefix_lengths[index] = state.token_count;
+    }
+    let uncached_token_sets = uncached_indices
+        .iter()
+        .map(|index| token_sets[*index].clone())
+        .collect::<Vec<_>>();
+    let shared_uncached_prefix = if uncached_token_sets.len() > 1 {
+        let uncached_minimum = uncached_token_sets
+            .iter()
+            .map(Vec::len)
+            .min()
+            .unwrap_or_default();
+        longest_common_prefix(&uncached_token_sets).min(uncached_minimum.saturating_sub(1))
     } else {
         0
     };
-    let required_tokens = shared_prefix
+    for index in &uncached_indices {
+        prefix_lengths[*index] = shared_uncached_prefix;
+    }
+    let cached_cells = cached_states
+        .iter()
+        .filter_map(|state| state.map(|state| state.token_count))
+        .sum::<usize>();
+    let required_tokens = cached_cells
+        + shared_uncached_prefix
         + token_sets
             .iter()
             .enumerate()
             .map(|(index, tokens)| {
-                tokens.len().saturating_sub(shared_prefix)
+                tokens.len().saturating_sub(prefix_lengths[index])
                     + request.branches[index].sampling.max_tokens as usize
             })
             .sum::<usize>();
@@ -678,7 +1058,7 @@ fn generate_batch(
     }
     for (index, branch) in request.branches.iter().enumerate() {
         emit_state(
-            event_tx,
+            supervision.event_tx,
             request,
             branch,
             index,
@@ -686,11 +1066,23 @@ fn generate_batch(
             GenerationState::Prefilling,
         );
     }
-    if shared_prefix > 0 && !restored_prefix {
-        decode_tokens_chunked(context, &token_sets[0][..shared_prefix], 0, 0, false)?;
-        for sequence_id in 1..request.branches.len() {
+    if shared_uncached_prefix > 0 {
+        let source = uncached_indices[0];
+        decode_tokens_chunked(
+            context,
+            &token_sets[source][..shared_uncached_prefix],
+            source as i32,
+            0,
+            false,
+        )?;
+        for destination in uncached_indices.iter().copied().skip(1) {
             context
-                .copy_kv_cache_seq(0, sequence_id as i32, Some(0), Some(shared_prefix as u32))
+                .copy_kv_cache_seq(
+                    source as i32,
+                    destination as i32,
+                    Some(0),
+                    Some(shared_uncached_prefix as u32),
+                )
                 .map_err(|error| {
                     NativeError::new(
                         NativeErrorCode::DecodeFailed,
@@ -700,15 +1092,10 @@ fn generate_batch(
         }
     }
     for (sequence_id, tokens) in token_sets.iter().enumerate() {
-        let suffix = &tokens[shared_prefix..tokens.len() - 1];
+        let prefix = prefix_lengths[sequence_id];
+        let suffix = &tokens[prefix..tokens.len() - 1];
         if !suffix.is_empty() {
-            decode_tokens_chunked(
-                context,
-                suffix,
-                sequence_id as i32,
-                shared_prefix as i32,
-                false,
-            )?;
+            decode_tokens_chunked(context, suffix, sequence_id as i32, prefix as i32, false)?;
         }
     }
     let mut final_prompt_batch = LlamaBatch::new(request.branches.len(), 1);
@@ -721,8 +1108,10 @@ fn generate_batch(
                 true,
             )
             .map_err(|error| native_decode_error("failed to build final prompt batch", error))?;
-        sequence_token_counts.insert(sequence_id as i32, tokens.len());
-        sequence_token_ids.insert(
+        tracking
+            .token_counts
+            .insert(sequence_id as i32, tokens.len());
+        tracking.token_ids.insert(
             sequence_id as i32,
             tokens.iter().map(|token| token.0).collect(),
         );
@@ -750,12 +1139,13 @@ fn generate_batch(
                 finish_reason: String::new(),
                 event_index: 1,
                 first_token_ms: None,
+                forced_tokens: VecDeque::new(),
             }
         })
         .collect::<Vec<_>>();
     for branch in &mut branches {
         emit_state(
-            event_tx,
+            supervision.event_tx,
             request,
             branch.request,
             branch.sequence_id as usize,
@@ -770,12 +1160,12 @@ fn generate_batch(
             if branch.state != GenerationState::Generating {
                 continue;
             }
-            if cancellations[index].load(Ordering::Acquire) {
+            if supervision.cancellations[index].load(Ordering::Acquire) {
                 branch.state = GenerationState::Cancelled;
                 branch.finish_reason = "cancelled".to_string();
                 let _ = context.clear_kv_cache_seq(Some(index as u32), None, None);
                 emit_state(
-                    event_tx,
+                    supervision.event_tx,
                     request,
                     branch.request,
                     index,
@@ -785,7 +1175,27 @@ fn generate_batch(
                 branch.event_index += 1;
                 continue;
             }
-            let token = branch.sampler.sample(context, branch.logit_index);
+            if supervision.reasoning_forces[index].load(Ordering::Acquire)
+                && branch.forced_tokens.is_empty()
+                && let Some(end_marker) = active_reasoning_end_marker(&branch.text)
+            {
+                let tokens = model
+                    .str_to_token(end_marker, AddBos::Never)
+                    .map_err(|error| {
+                        NativeError::new(
+                            NativeErrorCode::ModelInvalid,
+                            format!("failed to tokenize the reasoning end marker: {error}"),
+                        )
+                    })?;
+                branch.forced_tokens.extend(tokens);
+                supervision.reasoning_forces[index].store(false, Ordering::Release);
+            }
+            let token = if let Some(token) = branch.forced_tokens.pop_front() {
+                branch.sampler.accept(token);
+                token
+            } else {
+                branch.sampler.sample(context, branch.logit_index)
+            };
             if model.is_eog_token(token) {
                 branch.state = GenerationState::Completed;
                 branch.finish_reason = "end_of_generation".to_string();
@@ -809,10 +1219,11 @@ fn generate_batch(
             branch.text.push_str(&piece);
             branch.generated += 1;
             if !piece.is_empty() {
-                let _ = event_tx.try_send(GenerationEvent {
+                let _ = supervision.event_tx.try_send(GenerationEvent {
                     request_id: request.request_id.clone(),
                     branch_id: branch.request.branch_id.clone(),
                     sequence_id: branch.sequence_id,
+                    input_index: index,
                     event_index: branch.event_index,
                     event: GenerationEventKind::Delta { text: piece },
                 });
@@ -847,8 +1258,11 @@ fn generate_batch(
                 .map_err(|error| native_decode_error("failed to build generation batch", error))?;
             branch.logit_index = logit_index as i32;
             branch.next_position += 1;
-            sequence_token_counts.insert(branch.sequence_id, branch.next_position as usize);
-            sequence_token_ids
+            tracking
+                .token_counts
+                .insert(branch.sequence_id, branch.next_position as usize);
+            tracking
+                .token_ids
                 .entry(branch.sequence_id)
                 .or_default()
                 .push(token.0);
@@ -860,7 +1274,7 @@ fn generate_batch(
     for branch in &mut branches {
         if branch.state == GenerationState::Completed {
             emit_state(
-                event_tx,
+                supervision.event_tx,
                 request,
                 branch.request,
                 branch.sequence_id as usize,
@@ -883,6 +1297,7 @@ fn generate_batch(
             GenerationOutput {
                 request_id: request.request_id.clone(),
                 branch_id: branch.request.branch_id.clone(),
+                input_index: branch.sequence_id as usize,
                 model_id: request.model_id.clone(),
                 text: branch.text,
                 state: branch.state,
@@ -890,7 +1305,7 @@ fn generate_batch(
                 metrics: GenerationMetrics {
                     prompt_tokens: token_sets[branch.sequence_id as usize].len(),
                     completion_tokens,
-                    shared_prefix_tokens: shared_prefix,
+                    shared_prefix_tokens: prefix_lengths[branch.sequence_id as usize],
                     duration_ms,
                     first_token_ms: branch.first_token_ms,
                     tokens_per_second,
@@ -904,6 +1319,161 @@ fn generate_batch(
     Ok(outputs)
 }
 
+fn completion_prompt_count(request: &GenerationRequest) -> usize {
+    match &request.input {
+        GenerationInput::Completion { prompts } => prompts.len(),
+        _ => 0,
+    }
+}
+
+fn prepare_completion_batch(
+    model: &LlamaModel,
+    request: GenerationRequest,
+) -> NativeResult<(SharedPrefixBatchRequest, Vec<Vec<LlamaToken>>)> {
+    let GenerationInput::Completion { prompts } = request.input else {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedPromptForm,
+            "the completion worker received a non-completion prompt",
+        ));
+    };
+    let token_sets = prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| completion_prompt_tokens(model, prompt, index))
+        .collect::<NativeResult<Vec<_>>>()?;
+    let branches = prompts
+        .iter()
+        .enumerate()
+        .map(|(index, _)| BranchRequest {
+            branch_id: format!("completion-{index}"),
+            label: format!("Completion {index}"),
+            instruction: String::new(),
+            sampling: request.sampling.clone(),
+            messages: Vec::new(),
+            cached_prefix: None,
+        })
+        .collect();
+    Ok((
+        SharedPrefixBatchRequest {
+            request_id: request.request_id,
+            model_id: request.model_id,
+            common_messages: Vec::new(),
+            chat_template: ChatTemplateChoice::ModelDefault,
+            branches,
+            cached_prefix: request.cached_prefix,
+        },
+        token_sets,
+    ))
+}
+
+fn completion_prompt_tokens(
+    model: &LlamaModel,
+    prompt: &CompletionPrompt,
+    index: usize,
+) -> NativeResult<Vec<LlamaToken>> {
+    match prompt {
+        CompletionPrompt::Text {
+            text,
+            special_tokens,
+        } => model
+            .str_to_token(
+                text,
+                match special_tokens {
+                    SpecialTokenPolicy::NoBosParseSpecial => AddBos::Never,
+                    SpecialTokenPolicy::AddBosParseSpecial => AddBos::Always,
+                },
+            )
+            .map_err(|error| {
+                NativeError::new(
+                    NativeErrorCode::ModelInvalid,
+                    format!("failed to tokenize completion prompt {index}: {error}"),
+                )
+            }),
+        CompletionPrompt::Tokens { token_ids } => {
+            let vocabulary_size = model.n_vocab();
+            if let Some(invalid) = token_ids
+                .iter()
+                .find(|token| **token < 0 || **token >= vocabulary_size)
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    format!(
+                        "completion prompt {index} contains token ID {invalid} outside vocabulary 0..{vocabulary_size}"
+                    ),
+                ));
+            }
+            Ok(token_ids.iter().copied().map(LlamaToken::new).collect())
+        }
+    }
+}
+
+fn prepare_input(model: &LlamaModel, input: GenerationInput) -> NativeResult<Vec<PreparedPrompt>> {
+    match input {
+        GenerationInput::Chat { messages, template } => {
+            let rendered = render_messages_prompt_with_template(model, messages, true, &template)?;
+            let tokens = model
+                .str_to_token(&rendered, AddBos::Always)
+                .map_err(|error| {
+                    NativeError::new(
+                        NativeErrorCode::ModelInvalid,
+                        format!("failed to tokenize rendered chat prompt: {error}"),
+                    )
+                })?;
+            Ok(vec![PreparedPrompt {
+                input_index: 0,
+                prompt_form: PromptForm::Chat,
+                token_policy: PromptTokenPolicy::ChatTemplate,
+                source_sha256: format!("{:x}", Sha256::digest(rendered.as_bytes())),
+                token_ids: tokens.into_iter().map(|token| token.0).collect(),
+            }])
+        }
+        GenerationInput::Completion { prompts } => prompts
+            .iter()
+            .enumerate()
+            .map(|(index, prompt)| {
+                let tokens = completion_prompt_tokens(model, prompt, index)?;
+                let (token_policy, source_sha256) = match prompt {
+                    CompletionPrompt::Text {
+                        text,
+                        special_tokens,
+                    } => (
+                        match special_tokens {
+                            SpecialTokenPolicy::NoBosParseSpecial => {
+                                PromptTokenPolicy::NoBosParseSpecial
+                            }
+                            SpecialTokenPolicy::AddBosParseSpecial => {
+                                PromptTokenPolicy::AddBosParseSpecial
+                            }
+                        },
+                        format!("{:x}", Sha256::digest(text.as_bytes())),
+                    ),
+                    CompletionPrompt::Tokens { token_ids } => {
+                        let mut hasher = Sha256::new();
+                        for token in token_ids {
+                            hasher.update(token.to_le_bytes());
+                        }
+                        (
+                            PromptTokenPolicy::ExactTokenIds,
+                            format!("{:x}", hasher.finalize()),
+                        )
+                    }
+                };
+                Ok(PreparedPrompt {
+                    input_index: index,
+                    prompt_form: PromptForm::Completion,
+                    token_policy,
+                    source_sha256,
+                    token_ids: tokens.into_iter().map(|token| token.0).collect(),
+                })
+            })
+            .collect(),
+        GenerationInput::FillInMiddle { .. } => Err(NativeError::new(
+            NativeErrorCode::UnsupportedPromptForm,
+            "fill-in-middle prompt preparation requires a verified model-specific FIM token contract",
+        )),
+    }
+}
+
 fn prefill_shared_prefix(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
@@ -914,34 +1484,31 @@ fn prefill_shared_prefix(
     context.clear_kv_cache();
     sequence_token_counts.clear();
     sequence_token_ids.clear();
-    let prompts = render_branch_prompts(model, request)?;
-    let token_sets = prompts
-        .iter()
-        .map(|prompt| {
-            model.str_to_token(prompt, AddBos::Always).map_err(|error| {
-                NativeError::new(
-                    NativeErrorCode::ModelInvalid,
-                    format!("failed to tokenize cache probe: {error}"),
-                )
-            })
-        })
-        .collect::<NativeResult<Vec<_>>>()?;
-    let minimum = token_sets.iter().map(Vec::len).min().unwrap_or_default();
-    let prefix_tokens = longest_common_prefix(&token_sets).min(minimum.saturating_sub(1));
-    if prefix_tokens == 0 {
+    let prompt = render_messages_prompt_with_template(
+        model,
+        request.common_messages.clone(),
+        false,
+        &request.chat_template,
+    )?;
+    let tokens = model
+        .str_to_token(&prompt, AddBos::Always)
+        .map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!("failed to tokenize the common cache prefix: {error}"),
+            )
+        })?;
+    if tokens.is_empty() {
         return Err(NativeError::new(
             NativeErrorCode::CacheIncompatible,
-            "cache probes produced no reusable rendered prompt prefix",
+            "the common messages produced no reusable rendered prompt prefix",
         ));
     }
-    decode_tokens_chunked(context, &token_sets[0][..prefix_tokens], 0, 0, false)?;
-    let token_ids = token_sets[0][..prefix_tokens]
-        .iter()
-        .map(|token| token.0)
-        .collect::<Vec<_>>();
-    sequence_token_counts.insert(0, prefix_tokens);
+    decode_tokens_chunked(context, &tokens, 0, 0, false)?;
+    let token_ids = tokens.iter().map(|token| token.0).collect::<Vec<_>>();
+    sequence_token_counts.insert(0, tokens.len());
     sequence_token_ids.insert(0, token_ids.clone());
-    state_buffer::export_sequence(context, 0, prefix_tokens, token_ids)
+    state_buffer::export_sequence(context, 0, tokens.len(), token_ids)
 }
 
 fn generate_multimodal(
@@ -949,9 +1516,8 @@ fn generate_multimodal(
     context: &mut LlamaContext<'_>,
     multimodal: Option<&MtmdContext>,
     request: &GenerationRequest,
-    event_tx: &Sender<GenerationEvent>,
-    cancellation: &Arc<AtomicBool>,
-    tracking: MultimodalSequenceTracking<'_>,
+    supervision: SingleSequenceSupervision<'_>,
+    tracking: SequenceTracking<'_>,
 ) -> NativeResult<GenerationOutput> {
     let Some(multimodal) = multimodal else {
         return Err(NativeError::new(
@@ -993,7 +1559,12 @@ fn generate_multimodal(
             "multimodal prompt and completion exceed the native context",
         ));
     }
-    emit_generation_state(event_tx, request, 0, GenerationState::Prefilling);
+    emit_generation_state(
+        supervision.event_tx,
+        request,
+        0,
+        GenerationState::Prefilling,
+    );
     let mut next_position = chunks
         .eval_chunks(multimodal, context, 0, 0, context.n_batch() as i32, true)
         .map_err(|error| {
@@ -1005,20 +1576,51 @@ fn generate_multimodal(
     tracking
         .token_counts
         .insert(0, next_position.max(0) as usize);
-    emit_generation_state(event_tx, request, 1, GenerationState::Generating);
+    emit_generation_state(
+        supervision.event_tx,
+        request,
+        1,
+        GenerationState::Generating,
+    );
     let mut sampler = build_sampler(model, &request.sampling);
     let mut decoder = UTF_8.new_decoder();
     let mut text = String::new();
     let mut generated = 0_usize;
     let mut event_index = 2_u64;
     let mut first_token_ms = None;
+    let mut forced_tokens = VecDeque::new();
     let finish_reason = loop {
-        if cancellation.load(Ordering::Acquire) {
+        if supervision.cancellation.load(Ordering::Acquire) {
             let _ = context.clear_kv_cache_seq(Some(0), None, None);
-            emit_generation_state(event_tx, request, event_index, GenerationState::Cancelled);
+            emit_generation_state(
+                supervision.event_tx,
+                request,
+                event_index,
+                GenerationState::Cancelled,
+            );
             break "cancelled".to_string();
         }
-        let token = sampler.sample(context, -1);
+        if supervision.reasoning_force.load(Ordering::Acquire)
+            && forced_tokens.is_empty()
+            && let Some(end_marker) = active_reasoning_end_marker(&text)
+        {
+            let tokens = model
+                .str_to_token(end_marker, AddBos::Never)
+                .map_err(|error| {
+                    NativeError::new(
+                        NativeErrorCode::ModelInvalid,
+                        format!("failed to tokenize the reasoning end marker: {error}"),
+                    )
+                })?;
+            forced_tokens.extend(tokens);
+            supervision.reasoning_force.store(false, Ordering::Release);
+        }
+        let token = if let Some(token) = forced_tokens.pop_front() {
+            sampler.accept(token);
+            token
+        } else {
+            sampler.sample(context, -1)
+        };
         if model.is_eog_token(token) {
             break "end_of_generation".to_string();
         }
@@ -1039,10 +1641,11 @@ fn generate_multimodal(
         text.push_str(&piece);
         generated += 1;
         if !piece.is_empty() {
-            let _ = event_tx.try_send(GenerationEvent {
+            let _ = supervision.event_tx.try_send(GenerationEvent {
                 request_id: request.request_id.clone(),
                 branch_id: "assistant".to_string(),
                 sequence_id: 0,
+                input_index: 0,
                 event_index,
                 event: GenerationEventKind::Delta { text: piece },
             });
@@ -1075,13 +1678,19 @@ fn generate_multimodal(
     let state = if finish_reason == "cancelled" {
         GenerationState::Cancelled
     } else {
-        emit_generation_state(event_tx, request, event_index, GenerationState::Completed);
+        emit_generation_state(
+            supervision.event_tx,
+            request,
+            event_index,
+            GenerationState::Completed,
+        );
         GenerationState::Completed
     };
     let duration_ms = started.elapsed().as_millis();
     Ok(GenerationOutput {
         request_id: request.request_id.clone(),
         branch_id: "assistant".to_string(),
+        input_index: 0,
         model_id: request.model_id.clone(),
         text,
         state,
@@ -1104,9 +1713,21 @@ fn generate_multimodal(
     })
 }
 
-struct MultimodalSequenceTracking<'a> {
+struct SequenceTracking<'a> {
     token_counts: &'a mut HashMap<i32, usize>,
     token_ids: &'a mut HashMap<i32, Vec<i32>>,
+}
+
+struct BatchSupervision<'a> {
+    event_tx: &'a Sender<GenerationEvent>,
+    cancellations: &'a [Arc<AtomicBool>],
+    reasoning_forces: &'a [Arc<AtomicBool>],
+}
+
+struct SingleSequenceSupervision<'a> {
+    event_tx: &'a Sender<GenerationEvent>,
+    cancellation: &'a Arc<AtomicBool>,
+    reasoning_force: &'a Arc<AtomicBool>,
 }
 
 fn media_bitmap(context: &MtmdContext, media: &MediaInput) -> NativeResult<MtmdBitmap> {
@@ -1129,7 +1750,13 @@ fn render_multimodal_prompt(
     model: &LlamaModel,
     request: &GenerationRequest,
 ) -> NativeResult<String> {
-    let mut messages = request.messages.clone();
+    let GenerationInput::Chat { messages, template } = &request.input else {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedPromptForm,
+            "multimodal generation requires chat input",
+        ));
+    };
+    let mut messages = messages.clone();
     let markers = request
         .media
         .iter()
@@ -1148,7 +1775,7 @@ fn render_multimodal_prompt(
             content: markers,
         });
     }
-    render_messages_prompt(model, messages)
+    render_messages_prompt_with_template(model, messages, true, template)
 }
 
 fn emit_generation_state(
@@ -1161,6 +1788,7 @@ fn emit_generation_state(
         request_id: request.request_id.clone(),
         branch_id: "assistant".to_string(),
         sequence_id: 0,
+        input_index: 0,
         event_index,
         event: GenerationEventKind::State { state },
     });
@@ -1179,6 +1807,24 @@ struct ActiveBranch<'a> {
     finish_reason: String,
     event_index: u64,
     first_token_ms: Option<u128>,
+    forced_tokens: VecDeque<LlamaToken>,
+}
+
+fn active_reasoning_end_marker(text: &str) -> Option<&'static str> {
+    [
+        ("<think>", "</think>"),
+        (
+            "<<<reasoning_content_start>>>",
+            "<<<reasoning_content_end>>>",
+        ),
+        ("[Start thinking]", "[End thinking]"),
+    ]
+    .into_iter()
+    .find_map(|(start, end)| {
+        let latest_start = text.rfind(start)?;
+        let latest_end = text.rfind(end);
+        (latest_end.is_none_or(|end_index| latest_start > end_index)).then_some(end)
+    })
 }
 
 fn decode_tokens_chunked(
@@ -1213,17 +1859,15 @@ fn render_branch_prompts(
     model: &LlamaModel,
     request: &SharedPrefixBatchRequest,
 ) -> NativeResult<Vec<String>> {
-    let template = model.chat_template(None).map_err(|error| {
-        NativeError::new(
-            NativeErrorCode::ModelInvalid,
-            format!("model has no usable chat template: {error}"),
-        )
-    })?;
     request
         .branches
         .iter()
         .map(|branch| {
-            let mut messages = request.common_messages.clone();
+            let mut messages = if branch.messages.is_empty() {
+                request.common_messages.clone()
+            } else {
+                branch.messages.clone()
+            };
             if !branch.instruction.trim().is_empty() {
                 messages.push(ChatMessage {
                     role: ChatRole::User,
@@ -1233,35 +1877,114 @@ fn render_branch_prompts(
                     ),
                 });
             }
-            let native_messages = native_chat_messages(messages)?;
-            model
-                .apply_chat_template(&template, &native_messages, true)
-                .map_err(|error| {
-                    NativeError::new(
-                        NativeErrorCode::ModelInvalid,
-                        format!("failed to apply model chat template: {error}"),
-                    )
-                })
+            apply_model_chat_template(model, messages, true, &request.chat_template)
         })
         .collect()
 }
 
-fn render_messages_prompt(model: &LlamaModel, messages: Vec<ChatMessage>) -> NativeResult<String> {
-    let template = model.chat_template(None).map_err(|error| {
-        NativeError::new(
-            NativeErrorCode::ModelInvalid,
-            format!("model has no usable chat template: {error}"),
-        )
-    })?;
+fn render_messages_prompt_with_template(
+    model: &LlamaModel,
+    messages: Vec<ChatMessage>,
+    add_assistant: bool,
+    choice: &ChatTemplateChoice,
+) -> NativeResult<String> {
+    apply_model_chat_template(model, messages, add_assistant, choice)
+}
+
+fn apply_model_chat_template(
+    model: &LlamaModel,
+    messages: Vec<ChatMessage>,
+    add_assistant: bool,
+    choice: &ChatTemplateChoice,
+) -> NativeResult<String> {
+    let template = match choice {
+        ChatTemplateChoice::ModelDefault => model.chat_template(None).map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!("model has no usable chat template: {error}"),
+            )
+        })?,
+        ChatTemplateChoice::Override(template) => {
+            LlamaChatTemplate::new(template).map_err(|error| {
+                NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    format!("invalid frozen chat template: {error}"),
+                )
+            })?
+        }
+    };
     let native_messages = native_chat_messages(messages)?;
-    model
-        .apply_chat_template(&template, &native_messages, true)
+    match model.apply_chat_template(&template, &native_messages, add_assistant) {
+        Ok(rendered) => Ok(rendered),
+        Err(primary_error) => {
+            if matches!(choice, ChatTemplateChoice::Override(_)) {
+                return Err(NativeError::new(
+                    NativeErrorCode::ModelInvalid,
+                    format!("failed to apply frozen chat template: {primary_error}"),
+                ));
+            }
+            let embedded_template = template.to_str().unwrap_or_default();
+            let architecture = model
+                .meta_val_str("general.architecture")
+                .unwrap_or_default();
+            let Some(fallback_name) = fallback_chat_template_name(&architecture, embedded_template)
+            else {
+                return Err(NativeError::new(
+                    NativeErrorCode::ModelInvalid,
+                    format!("failed to apply model chat template: {primary_error}"),
+                ));
+            };
+            let fallback = LlamaChatTemplate::new(fallback_name).map_err(|error| {
+                NativeError::new(
+                    NativeErrorCode::ModelInvalid,
+                    format!(
+                        "failed to construct `{fallback_name}` chat-template fallback: {error}"
+                    ),
+                )
+            })?;
+            model
+                .apply_chat_template(&fallback, &native_messages, add_assistant)
+                .map_err(|fallback_error| {
+                    NativeError::new(
+                        NativeErrorCode::ModelInvalid,
+                        format!(
+                            "failed to apply embedded chat template ({primary_error}) and model-compatible `{fallback_name}` fallback ({fallback_error})"
+                        ),
+                    )
+                })
+        }
+    }
+}
+
+fn fallback_chat_template_name<'a>(
+    architecture: &str,
+    embedded_template: &'a str,
+) -> Option<&'a str> {
+    if architecture.starts_with("gemma") || embedded_template.contains("<start_of_turn>") {
+        Some("gemma")
+    } else {
+        None
+    }
+}
+
+fn tokenize_messages(
+    model: &LlamaModel,
+    messages: Vec<ChatMessage>,
+    chat_template: &ChatTemplateChoice,
+) -> NativeResult<TokenizedPrompt> {
+    let rendered = render_messages_prompt_with_template(model, messages, true, chat_template)?;
+    let tokens = model
+        .str_to_token(&rendered, AddBos::Always)
         .map_err(|error| {
             NativeError::new(
                 NativeErrorCode::ModelInvalid,
-                format!("failed to apply model chat template: {error}"),
+                format!("failed to tokenize rendered chat prompt: {error}"),
             )
-        })
+        })?;
+    Ok(TokenizedPrompt {
+        rendered_sha256: format!("{:x}", Sha256::digest(rendered.as_bytes())),
+        token_ids: tokens.into_iter().map(|token| token.0).collect(),
+    })
 }
 
 fn native_chat_messages(messages: Vec<ChatMessage>) -> NativeResult<Vec<LlamaChatMessage>> {
@@ -1419,10 +2142,15 @@ fn validate_batch_request(
             format!("generation requires 1 to {} branches", status.max_sequences),
         ));
     }
-    if request.common_messages.is_empty() {
+    if request.common_messages.is_empty()
+        && request
+            .branches
+            .iter()
+            .any(|branch| branch.messages.is_empty())
+    {
         return Err(NativeError::new(
             NativeErrorCode::InvalidConfig,
-            "generation requires at least one chat message",
+            "generation requires common messages or complete per-branch messages",
         ));
     }
     let mut ids = std::collections::HashSet::new();
@@ -1453,7 +2181,11 @@ fn validate_generation_request(
             format!("model {} is not resident", request.model_id),
         ));
     }
-    if request.messages.is_empty() || request.sampling.max_tokens == 0 {
+    let message_count = match &request.input {
+        GenerationInput::Chat { messages, .. } => messages.len(),
+        _ => 0,
+    };
+    if message_count == 0 || request.sampling.max_tokens == 0 {
         return Err(NativeError::new(
             NativeErrorCode::InvalidConfig,
             "multimodal generation requires messages and a positive token limit",
@@ -1468,6 +2200,64 @@ fn validate_generation_request(
     Ok(())
 }
 
+fn validate_completion_request(
+    request: &GenerationRequest,
+    status: &ResidentModelStatus,
+) -> NativeResult<usize> {
+    if request.model_id != status.model_id {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelNotLoaded,
+            format!("model {} is not resident", request.model_id),
+        ));
+    }
+    if !request.media.is_empty() {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedPromptForm,
+            "raw completion prompts cannot include multimodal inputs",
+        ));
+    }
+    let GenerationInput::Completion { prompts } = &request.input else {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedPromptForm,
+            "completion validation received a non-completion input",
+        ));
+    };
+    if prompts.is_empty() || prompts.len() > status.max_sequences as usize {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            format!(
+                "completion generation requires 1 to {} prompts",
+                status.max_sequences
+            ),
+        ));
+    }
+    if request.sampling.max_tokens == 0 {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "completion max_tokens must be positive",
+        ));
+    }
+    if request.cached_prefix.is_some() && prompts.len() != 1 {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "a request-level cached prefix can only be used with one completion prompt",
+        ));
+    }
+    for (index, prompt) in prompts.iter().enumerate() {
+        let empty = match prompt {
+            CompletionPrompt::Text { text, .. } => text.is_empty(),
+            CompletionPrompt::Tokens { token_ids } => token_ids.is_empty(),
+        };
+        if empty {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                format!("completion prompt {index} is empty"),
+            ));
+        }
+    }
+    Ok(prompts.len())
+}
+
 fn backend() -> NativeResult<&'static LlamaBackend> {
     match BACKEND.get_or_init(|| LlamaBackend::init().map_err(|error| error.to_string())) {
         Ok(backend) => Ok(backend),
@@ -1478,10 +2268,20 @@ fn backend() -> NativeResult<&'static LlamaBackend> {
     }
 }
 
+fn native_thread_count() -> i32 {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(16) as i32)
+        .unwrap_or(4)
+}
+
 fn fingerprint_model(
     config: &NativeModelConfig,
-    backend: &LlamaBackend,
+    _backend: &LlamaBackend,
     model: &LlamaModel,
+    execution_backend: &str,
+    context_tokens: u32,
+    rope_config_sha256: String,
+    kv_layout_sha256: String,
 ) -> NativeResult<ModelFingerprint> {
     let mut file = File::open(&config.model_path).map_err(|error| {
         NativeError::new(
@@ -1517,11 +2317,6 @@ fn fingerprint_model(
         .unwrap_or_default();
     let chat_template_sha256 = format!("{:x}", Sha256::digest(chat_template.as_bytes()));
     let multimodal_projector_sha256 = config.mmproj_path.as_deref().map(hash_file).transpose()?;
-    let backend_name = if backend.supports_gpu_offload() {
-        "metal"
-    } else {
-        "cpu"
-    };
     Ok(ModelFingerprint {
         model_id: config.model_id.clone(),
         model_path: config.model_path.clone(),
@@ -1533,9 +2328,100 @@ fn fingerprint_model(
         chat_template_sha256,
         multimodal_projector_sha256,
         binding_version: LLAMA_CPP_BINDING_VERSION.to_string(),
-        build_id: format!("llama-cpp-2-{LLAMA_CPP_BINDING_VERSION}-{backend_name}"),
-        backend: backend_name.to_string(),
+        build_id: format!("llama-cpp-2-{LLAMA_CPP_BINDING_VERSION}-{execution_backend}"),
+        backend: execution_backend.to_string(),
+        context_tokens,
+        batch_tokens: config.batch_tokens,
+        max_sequences: config.max_sequences,
+        rope_config_sha256,
+        kv_layout_sha256,
     })
+}
+
+fn describe_model(
+    config: &NativeModelConfig,
+    model: &LlamaModel,
+    fingerprint: &ModelFingerprint,
+    multimodal: bool,
+) -> NativeModelDescriptor {
+    let display_name = model
+        .meta_val_str("general.name")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| config.model_id.clone());
+    let architecture = model
+        .meta_val_str("general.architecture")
+        .unwrap_or_else(|_| "unknown".to_string());
+    let chat_template_available = model
+        .chat_template(None)
+        .ok()
+        .and_then(|template| template.to_string().ok())
+        .is_some_and(|template| !template.trim().is_empty());
+    let mut prompt_forms = vec![PromptForm::Completion];
+    if chat_template_available {
+        prompt_forms.insert(0, PromptForm::Chat);
+    }
+    NativeModelDescriptor {
+        stable_model_id: format!("sha256:{}", fingerprint.model_sha256),
+        model_id: config.model_id.clone(),
+        display_name,
+        architecture,
+        parameter_count: model.n_params(),
+        model_size: fingerprint.model_size,
+        context_tokens: fingerprint.context_tokens,
+        max_sequences: fingerprint.max_sequences,
+        backend: fingerprint.backend.clone(),
+        capabilities: ModelCapabilities {
+            prompt_forms,
+            chat_template_available,
+            multimodal,
+            streaming: true,
+            cancellation: true,
+            max_batch_inputs: fingerprint.max_sequences,
+            sampling_parameters: vec![
+                SamplingParameter::Seed,
+                SamplingParameter::Temperature,
+                SamplingParameter::DynamicTemperature,
+                SamplingParameter::TopK,
+                SamplingParameter::TopP,
+                SamplingParameter::MinP,
+                SamplingParameter::TypicalP,
+                SamplingParameter::Xtc,
+                SamplingParameter::RepeatPenalty,
+                SamplingParameter::FrequencyPenalty,
+                SamplingParameter::PresencePenalty,
+                SamplingParameter::Dry,
+                SamplingParameter::SamplerOrder,
+                SamplingParameter::MaxTokens,
+                SamplingParameter::Stop,
+            ],
+        },
+    }
+}
+
+fn context_fingerprints(params: &LlamaContextParams) -> (String, String) {
+    let rope = format!(
+        "scaling={:?};base={:08x};scale={:08x}",
+        params.rope_scaling_type(),
+        params.rope_freq_base().to_bits(),
+        params.rope_freq_scale().to_bits(),
+    );
+    let kv = format!(
+        "ctx={};batch={};ubatch={};seq={};type_k={:?};type_v={:?};flash={:?};swa_full={};unified={}",
+        params.n_ctx().map_or(0, NonZeroU32::get),
+        params.n_batch(),
+        params.n_ubatch(),
+        params.n_seq_max(),
+        params.type_k(),
+        params.type_v(),
+        params.flash_attention_policy(),
+        params.swa_full(),
+        params.kv_unified(),
+    );
+    (
+        format!("{:x}", Sha256::digest(rope.as_bytes())),
+        format!("{:x}", Sha256::digest(kv.as_bytes())),
+    )
 }
 
 fn hash_file(path: &std::path::Path) -> NativeResult<String> {
@@ -1577,6 +2463,7 @@ fn emit_state(
         request_id: request.request_id.clone(),
         branch_id: branch.branch_id.clone(),
         sequence_id: sequence_id as i32,
+        input_index: sequence_id,
         event_index,
         event: GenerationEventKind::State { state },
     });
@@ -1625,6 +2512,18 @@ fn cancel_request_in_registry(registry: &CancelRegistry, request_id: &str) -> us
         .unwrap_or_default()
 }
 
+fn set_flag_in_registry(
+    registry: &ReasoningForceRegistry,
+    request_id: &str,
+    branch_id: &str,
+) -> bool {
+    cancel_in_registry(registry, request_id, branch_id)
+}
+
+fn set_request_flags_in_registry(registry: &ReasoningForceRegistry, request_id: &str) -> usize {
+    cancel_request_in_registry(registry, request_id)
+}
+
 fn cleanup_request_in_registry(registry: &CancelRegistry, request_id: &str) {
     if let Ok(mut entries) = registry.lock() {
         entries.retain(|(candidate, _), _| candidate != request_id);
@@ -1638,6 +2537,17 @@ fn native_decode_error(context: &str, error: impl std::fmt::Display) -> NativeEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reported_binding_version_matches_the_exact_manifest_pin() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(manifest.contains(&format!(
+            "llama-cpp-2 = {{ version = \"={LLAMA_CPP_BINDING_VERSION}\""
+        )));
+        assert!(manifest.contains(&format!(
+            "llama-cpp-sys-2 = {{ version = \"={LLAMA_CPP_BINDING_VERSION}\""
+        )));
+    }
     use std::path::PathBuf;
 
     #[test]
@@ -1647,6 +2557,44 @@ mod tests {
         )))
         .expect_err("missing models must fail");
         assert_eq!(error.code, NativeErrorCode::ModelMissing);
+    }
+
+    #[test]
+    fn reasoning_force_only_targets_an_unclosed_reasoning_block() {
+        assert_eq!(active_reasoning_end_marker("plain answer"), None);
+        assert_eq!(
+            active_reasoning_end_marker("<think>working"),
+            Some("</think>")
+        );
+        assert_eq!(
+            active_reasoning_end_marker("<think>done</think>answer"),
+            None
+        );
+        assert_eq!(
+            active_reasoning_end_marker(
+                "<<<reasoning_content_start>>>working<<<reasoning_content_end>>>answer \
+                 <<<reasoning_content_start>>>more"
+            ),
+            Some("<<<reasoning_content_end>>>")
+        );
+    }
+
+    #[test]
+    fn reasoning_force_registry_is_separate_and_branch_scoped() {
+        let registry: ReasoningForceRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+        registry.lock().expect("lock registry").insert(
+            ("request".to_string(), "first".to_string()),
+            Arc::clone(&first),
+        );
+        registry.lock().expect("lock registry").insert(
+            ("request".to_string(), "second".to_string()),
+            Arc::clone(&second),
+        );
+        assert!(set_flag_in_registry(&registry, "request", "first"));
+        assert!(first.load(Ordering::Acquire));
+        assert!(!second.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1665,6 +2613,16 @@ mod tests {
     }
 
     #[test]
+    fn gemma_family_uses_the_supported_named_template_when_embedded_jinja_is_too_new() {
+        assert_eq!(fallback_chat_template_name("gemma4", ""), Some("gemma"));
+        assert_eq!(
+            fallback_chat_template_name("unknown", "{{ '<start_of_turn>' }}"),
+            Some("gemma")
+        );
+        assert_eq!(fallback_chat_template_name("qwen2", "chatml"), None);
+    }
+
+    #[test]
     #[ignore = "requires MOM_LLAMA_MODEL_PATH and a real local GGUF"]
     fn real_in_process_prompt_smoke() -> Result<(), Box<dyn std::error::Error>> {
         let model_path = std::env::var("MOM_LLAMA_MODEL_PATH")?;
@@ -1676,10 +2634,13 @@ mod tests {
         let ticket = handle.generate(GenerationRequest {
             request_id: "native-real-smoke".to_string(),
             model_id,
-            messages: vec![ChatMessage {
-                role: ChatRole::User,
-                content: "Reply with the single word ready.".to_string(),
-            }],
+            input: GenerationInput::Chat {
+                messages: vec![ChatMessage {
+                    role: ChatRole::User,
+                    content: "Reply with the single word ready.".to_string(),
+                }],
+                template: ChatTemplateChoice::ModelDefault,
+            },
             sampling: SamplingConfig {
                 seed: 1,
                 temperature: 0.0,
@@ -1695,6 +2656,144 @@ mod tests {
         assert!(!output[0].fake_fixture);
         assert_eq!(output[0].transport, NativeTransport::InProcess);
         assert!(!output[0].text.trim().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires MOM_LLAMA_MODEL_PATH and a real local GGUF"]
+    fn real_completion_text_tokens_batch_and_capabilities() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let model_path = std::env::var("MOM_LLAMA_MODEL_PATH")?;
+        let mut config = NativeModelConfig::local(PathBuf::from(model_path));
+        config.device = NativeDevice::Cpu;
+        config.max_sequences = 2;
+        let handle = NativeModelHandle::load(config)?;
+        let status = handle.status();
+        let descriptor = status
+            .descriptor
+            .as_ref()
+            .expect("loaded models expose an inspected descriptor");
+        assert!(descriptor.stable_model_id.starts_with("sha256:"));
+        assert!(
+            descriptor
+                .capabilities
+                .prompt_forms
+                .contains(&PromptForm::Completion)
+        );
+        assert!(
+            !descriptor
+                .capabilities
+                .prompt_forms
+                .contains(&PromptForm::FillInMiddle)
+        );
+
+        let exact_text = "  Once upon a time\n".to_string();
+        let prepared_text = handle.prepare_input(GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Text {
+                text: exact_text.clone(),
+                special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+            }],
+        })?;
+        assert_eq!(
+            prepared_text[0].source_sha256,
+            format!("{:x}", Sha256::digest(exact_text.as_bytes()))
+        );
+        let exact_tokens = prepared_text[0].token_ids.clone();
+        let prepared_tokens = handle.prepare_input(GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Tokens {
+                token_ids: exact_tokens.clone(),
+            }],
+        })?;
+        assert_eq!(prepared_tokens[0].token_ids, exact_tokens);
+        assert_eq!(
+            prepared_tokens[0].token_policy,
+            PromptTokenPolicy::ExactTokenIds
+        );
+
+        let ticket = handle.generate(GenerationRequest {
+            request_id: "native-completion-batch".to_string(),
+            model_id: status.model_id,
+            input: GenerationInput::Completion {
+                prompts: vec![
+                    CompletionPrompt::Text {
+                        text: exact_text,
+                        special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+                    },
+                    CompletionPrompt::Tokens {
+                        token_ids: exact_tokens,
+                    },
+                ],
+            },
+            sampling: SamplingConfig {
+                seed: 7,
+                temperature: 0.0,
+                max_tokens: 4,
+                ..SamplingConfig::default()
+            },
+            media: Vec::new(),
+            cached_prefix: None,
+        })?;
+        let outputs = ticket.wait_timeout(Duration::from_secs(120))?;
+        let events = ticket.events.try_iter().collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].input_index, 0);
+        assert_eq!(outputs[0].branch_id, "completion-0");
+        assert_eq!(outputs[1].input_index, 1);
+        assert_eq!(outputs[1].branch_id, "completion-1");
+        assert!(outputs.iter().all(|output| output.real_engine_invoked));
+        for input_index in 0..2 {
+            let indexes = events
+                .iter()
+                .filter(|event| event.input_index == input_index)
+                .map(|event| event.event_index)
+                .collect::<Vec<_>>();
+            assert!(!indexes.is_empty());
+            assert!(indexes.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+
+        let cancel_ticket = handle.generate(GenerationRequest {
+            request_id: "native-completion-cancel".to_string(),
+            model_id: descriptor.model_id.clone(),
+            input: GenerationInput::Completion {
+                prompts: vec![
+                    CompletionPrompt::Text {
+                        text: "Continue this sentence: The first result".to_string(),
+                        special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+                    },
+                    CompletionPrompt::Text {
+                        text: "Continue this sentence: The cancelled result".to_string(),
+                        special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+                    },
+                ],
+            },
+            sampling: SamplingConfig {
+                seed: 9,
+                temperature: 0.0,
+                max_tokens: 8,
+                ..SamplingConfig::default()
+            },
+            media: Vec::new(),
+            cached_prefix: None,
+        })?;
+        assert!(cancel_ticket.cancel_branch("completion-1"));
+        let cancelled_outputs = cancel_ticket.wait_timeout(Duration::from_secs(120))?;
+        assert_eq!(cancelled_outputs[0].state, GenerationState::Completed);
+        assert_eq!(cancelled_outputs[1].state, GenerationState::Cancelled);
+
+        let error = handle
+            .generate(GenerationRequest {
+                request_id: "native-fim-blocker".to_string(),
+                model_id: descriptor.model_id.clone(),
+                input: GenerationInput::FillInMiddle {
+                    prefix: "fn main() {".to_string(),
+                    suffix: "}".to_string(),
+                },
+                sampling: SamplingConfig::default(),
+                media: Vec::new(),
+                cached_prefix: None,
+            })
+            .expect_err("unverified FIM must fail closed");
+        assert_eq!(error.code, NativeErrorCode::UnsupportedPromptForm);
         Ok(())
     }
 }

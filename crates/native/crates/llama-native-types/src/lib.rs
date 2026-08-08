@@ -179,6 +179,88 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "template", rename_all = "snake_case")]
+pub enum ChatTemplateChoice {
+    #[default]
+    ModelDefault,
+    Override(String),
+}
+
+/// The exact prompt semantics for one native generation request.
+///
+/// Callers must choose a mode. In particular, completion prompts are never
+/// passed through a chat template and token prompts are consumed without
+/// decoding and re-tokenizing them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GenerationInput {
+    Chat {
+        messages: Vec<ChatMessage>,
+        #[serde(default)]
+        template: ChatTemplateChoice,
+    },
+    Completion {
+        prompts: Vec<CompletionPrompt>,
+    },
+    FillInMiddle {
+        prefix: String,
+        suffix: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompletionPrompt {
+    Text {
+        text: String,
+        #[serde(default)]
+        special_tokens: SpecialTokenPolicy,
+    },
+    Tokens {
+        token_ids: Vec<i32>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpecialTokenPolicy {
+    #[default]
+    NoBosParseSpecial,
+    AddBosParseSpecial,
+}
+
+impl GenerationInput {
+    #[must_use]
+    pub const fn kind(&self) -> PromptForm {
+        match self {
+            Self::Chat { .. } => PromptForm::Chat,
+            Self::Completion { .. } => PromptForm::Completion,
+            Self::FillInMiddle { .. } => PromptForm::FillInMiddle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptForm {
+    #[default]
+    Chat,
+    Completion,
+    FillInMiddle,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptTokenPolicy {
+    #[default]
+    ChatTemplate,
+    NoBosParseSpecial,
+    AddBosParseSpecial,
+    ExactTokenIds,
+    FillInMiddleModelTokens,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
@@ -199,7 +281,7 @@ pub struct MediaInput {
 pub struct GenerationRequest {
     pub request_id: String,
     pub model_id: String,
-    pub messages: Vec<ChatMessage>,
+    pub input: GenerationInput,
     pub sampling: SamplingConfig,
     #[serde(default)]
     pub media: Vec<MediaInput>,
@@ -213,6 +295,10 @@ pub struct BranchRequest {
     pub label: String,
     pub instruction: String,
     pub sampling: SamplingConfig,
+    #[serde(default)]
+    pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub cached_prefix: Option<SequenceStateBlob>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -220,6 +306,8 @@ pub struct SharedPrefixBatchRequest {
     pub request_id: String,
     pub model_id: String,
     pub common_messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub chat_template: ChatTemplateChoice,
     pub branches: Vec<BranchRequest>,
     #[serde(default)]
     pub cached_prefix: Option<SequenceStateBlob>,
@@ -249,6 +337,9 @@ pub struct GenerationEvent {
     pub request_id: String,
     pub branch_id: String,
     pub sequence_id: i32,
+    /// Stable zero-based index of this input in the submitted batch.
+    #[serde(default)]
+    pub input_index: usize,
     pub event_index: u64,
     pub event: GenerationEventKind,
 }
@@ -267,6 +358,9 @@ pub struct GenerationMetrics {
 pub struct GenerationOutput {
     pub request_id: String,
     pub branch_id: String,
+    /// Stable zero-based index of this output in the submitted batch.
+    #[serde(default)]
+    pub input_index: usize,
     pub model_id: String,
     pub text: String,
     pub state: GenerationState,
@@ -296,6 +390,63 @@ pub struct ModelFingerprint {
     pub binding_version: String,
     pub build_id: String,
     pub backend: String,
+    #[serde(default)]
+    pub context_tokens: u32,
+    #[serde(default)]
+    pub batch_tokens: u32,
+    #[serde(default)]
+    pub max_sequences: u32,
+    #[serde(default)]
+    pub rope_config_sha256: String,
+    #[serde(default)]
+    pub kv_layout_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplingParameter {
+    Seed,
+    Temperature,
+    DynamicTemperature,
+    TopK,
+    TopP,
+    MinP,
+    TypicalP,
+    Xtc,
+    RepeatPenalty,
+    FrequencyPenalty,
+    PresencePenalty,
+    Dry,
+    SamplerOrder,
+    MaxTokens,
+    Stop,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    pub prompt_forms: Vec<PromptForm>,
+    pub chat_template_available: bool,
+    pub multimodal: bool,
+    pub streaming: bool,
+    pub cancellation: bool,
+    pub max_batch_inputs: u32,
+    pub sampling_parameters: Vec<SamplingParameter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeModelDescriptor {
+    /// Path-independent content identity suitable for router/cache keys.
+    pub stable_model_id: String,
+    /// Caller-selected local alias. It is not part of the stable identity.
+    pub model_id: String,
+    pub display_name: String,
+    pub architecture: String,
+    pub parameter_count: u64,
+    pub model_size: u64,
+    pub context_tokens: u32,
+    pub max_sequences: u32,
+    pub backend: String,
+    pub capabilities: ModelCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -303,6 +454,8 @@ pub struct ResidentModelStatus {
     pub model_id: String,
     pub state: ModelRuntimeState,
     pub fingerprint: Option<ModelFingerprint>,
+    #[serde(default)]
+    pub descriptor: Option<NativeModelDescriptor>,
     pub active_sequences: usize,
     pub max_sequences: u32,
 }
@@ -323,6 +476,22 @@ pub struct SequenceStateBlob {
     pub token_count: usize,
     pub bytes: Vec<u8>,
     #[serde(default)]
+    pub token_ids: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenizedPrompt {
+    pub rendered_sha256: String,
+    pub token_ids: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreparedPrompt {
+    pub input_index: usize,
+    pub prompt_form: PromptForm,
+    pub token_policy: PromptTokenPolicy,
+    /// Hash of the exact submitted text bytes or little-endian token IDs.
+    pub source_sha256: String,
     pub token_ids: Vec<i32>,
 }
 
@@ -362,10 +531,18 @@ pub enum NativeErrorCode {
     ModelLoadFailed,
     #[error("model_not_loaded")]
     ModelNotLoaded,
+    #[error("model_slots_full")]
+    ModelSlotsFull,
+    #[error("memory_budget_exceeded")]
+    MemoryBudgetExceeded,
     #[error("context_create_failed")]
     ContextCreateFailed,
     #[error("prompt_too_large")]
     PromptTooLarge,
+    #[error("unsupported_prompt_form")]
+    UnsupportedPromptForm,
+    #[error("unsupported_parameter")]
+    UnsupportedParameter,
     #[error("decode_failed")]
     DecodeFailed,
     #[error("cancelled")]

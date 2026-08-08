@@ -17,8 +17,8 @@ fn data_dir(name: &str) -> Result<PathBuf> {
 fn cli(root: &Path, args: &[&str]) -> Result<Output> {
     Ok(Command::new(env!("CARGO_BIN_EXE_mom-llama-cli"))
         .args(args)
-        .env("MOM_LLAMA_DATA_DIR", root)
-        .env("MOM_LLAMA_STORE_KEY_HEX", TEST_STORE_KEY)
+        .env("LLAMA_NATIVE_KIT_DATA_DIR", root)
+        .env("LLAMA_NATIVE_KIT_STORE_KEY_HEX", TEST_STORE_KEY)
         .env_remove("MOM_LLAMA_MODEL_PATH")
         .env_remove("MOM_LLAMA_ENGINE_PATH")
         .output()?)
@@ -176,6 +176,175 @@ fn settings_skills_and_search_persist_in_encrypted_sqlite() -> Result<()> {
     let raw = String::from_utf8_lossy(&database);
     assert!(!raw.contains("Friendly clinical explainer"));
     assert!(!raw.contains("Garden planning"));
+    Ok(())
+}
+
+#[test]
+fn cache_policy_cli_uses_plain_names_and_preserves_legacy_aliases() -> Result<()> {
+    let root = data_dir("cache-policy-cli")?;
+    for (argument, expected, preencode) in [
+        ("automatic", "kv_cache_candidate", true),
+        ("prefixes-only", "prompt_prefix", false),
+        ("off", "none", false),
+        ("prompt-prefix", "prompt_prefix", false),
+        ("kv-cache-candidate", "kv_cache_candidate", true),
+    ] {
+        let value = json_output(&cli(
+            &root,
+            &[
+                "settings",
+                "update",
+                "--kv-cache-policy",
+                argument,
+                "--json",
+            ],
+        )?)?;
+        assert_eq!(
+            value
+                .pointer("/result/kv_cache_policy")
+                .and_then(Value::as_str),
+            Some(expected),
+            "unexpected policy for {argument}"
+        );
+        assert_eq!(
+            value.pointer("/result/upstream_settings/preEncodeConversation"),
+            Some(&Value::Bool(preencode)),
+            "unexpected checkpoint setting for {argument}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_imports_long_paste_directly_into_encrypted_storage() -> Result<()> {
+    let root = data_dir("paste-attachment")?;
+    let marker = "private-cli-paste-4271 ".repeat(120);
+    let value = json_output(&cli(
+        &root,
+        &[
+            "attachment",
+            "import-paste",
+            "--conversation",
+            "default",
+            "--text",
+            &marker,
+            "--json",
+        ],
+    )?)?;
+    assert_eq!(
+        value.get("readiness").and_then(Value::as_str),
+        Some("contracted")
+    );
+    assert_eq!(
+        value
+            .pointer("/result/attachment/source_path")
+            .and_then(Value::as_str),
+        Some("pasted-text")
+    );
+    let database = std::fs::read(root.join("runtime.sqlite3"))?;
+    assert!(
+        !database
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_attachment_preview_returns_metadata_without_decrypted_payload() -> Result<()> {
+    let root = data_dir("attachment-preview")?;
+    let image = root.join("preview.png");
+    let private_payload = b"private-preview-payload-7331";
+    std::fs::write(&image, private_payload)?;
+    let imported = json_output(&cli(
+        &root,
+        &[
+            "attachment",
+            "import",
+            "--conversation",
+            "default",
+            "--path",
+            image.to_str().ok_or_else(|| anyhow!("invalid test path"))?,
+            "--json",
+        ],
+    )?)?;
+    let attachment_id = imported
+        .pointer("/result/attachment/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing attachment id"))?;
+    let preview = json_output(&cli(
+        &root,
+        &[
+            "attachment",
+            "preview",
+            "--attachment",
+            attachment_id,
+            "--json",
+        ],
+    )?)?;
+    assert_eq!(
+        preview
+            .pointer("/result/attachment/id")
+            .and_then(Value::as_str),
+        Some(attachment_id)
+    );
+    assert!(preview.pointer("/result/bytes").is_none());
+    let database = std::fs::read(root.join("runtime.sqlite3"))?;
+    assert!(
+        !database
+            .windows(private_payload.len())
+            .any(|window| window == private_payload)
+    );
+    Ok(())
+}
+
+#[test]
+fn dream_team_create_and_list_are_cli_exercisable_and_encrypted() -> Result<()> {
+    let root = data_dir("dream-team")?;
+    let persona = serde_json::json!({
+        "id": "",
+        "label": "Favorite author lens",
+        "description": "Offers a calm public-work-inspired reflection.",
+        "perspective_prompt": "Name uncertainty and offer gentle reversible next steps.",
+        "public_figure": "Private Example Author 9753",
+        "expertise": "Compassionate public writing",
+        "model_slot": null
+    })
+    .to_string();
+    let created = json_output(&cli(
+        &root,
+        &[
+            "consult",
+            "panel-create",
+            "--name",
+            "Mom's Dream Team",
+            "--persona",
+            &persona,
+            "--json",
+        ],
+    )?)?;
+    let panel_id = created
+        .pointer("/result/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing Dream Team id"))?;
+    assert_eq!(
+        created
+            .pointer("/result/personas/0/public_figure")
+            .and_then(Value::as_str),
+        Some("Private Example Author 9753")
+    );
+
+    let listed = json_output(&cli(&root, &["consult", "panel-list", "--json"])?)?;
+    assert!(
+        listed
+            .pointer("/result")
+            .and_then(Value::as_array)
+            .is_some_and(|panels| panels
+                .iter()
+                .any(|panel| { panel.get("id").and_then(Value::as_str) == Some(panel_id) }))
+    );
+    let database = std::fs::read(root.join("runtime.sqlite3"))?;
+    assert!(!String::from_utf8_lossy(&database).contains("Private Example Author 9753"));
     Ok(())
 }
 
@@ -352,6 +521,86 @@ fn chat_and_consult_block_honestly_without_a_model() -> Result<()> {
 }
 
 #[test]
+fn tool_loop_status_and_cancel_are_typed_without_an_active_run() -> Result<()> {
+    let root = data_dir("tool-loop-supervision")?;
+    let status = json_output(&cli(
+        &root,
+        &[
+            "tool-loop",
+            "status",
+            "--conversation",
+            "not-running",
+            "--json",
+        ],
+    )?)?;
+    assert!(
+        status
+            .pointer("/result")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    );
+    assert_eq!(
+        status
+            .pointer("/receipt/real_engine_invoked")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let cancelled = json_output(&cli(
+        &root,
+        &[
+            "tool-loop",
+            "cancel",
+            "--conversation",
+            "not-running",
+            "--json",
+        ],
+    )?)?;
+    assert_eq!(
+        cancelled.get("status").and_then(Value::as_str),
+        Some("blocked")
+    );
+    assert_eq!(
+        cancelled.pointer("/blocker/code").and_then(Value::as_str),
+        Some("no_active_tool_loop")
+    );
+    assert_eq!(
+        cancelled
+            .pointer("/receipt/real_engine_invoked")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    Ok(())
+}
+
+#[test]
+fn skip_reasoning_is_typed_without_an_active_generation() -> Result<()> {
+    let root = data_dir("skip-reasoning")?;
+    let value = json_output(&cli(
+        &root,
+        &[
+            "chat",
+            "skip-reasoning",
+            "--conversation",
+            "not-running",
+            "--json",
+        ],
+    )?)?;
+    assert_eq!(value.get("status").and_then(Value::as_str), Some("blocked"));
+    assert_eq!(
+        value.pointer("/blocker/code").and_then(Value::as_str),
+        Some("no_active_reasoning_request")
+    );
+    assert_eq!(
+        value
+            .pointer("/receipt/real_engine_invoked")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_native_cli_stream_uses_no_llama_executable() -> Result<()> {
     let Some(model) = std::env::var_os("MOM_LLAMA_MODEL_PATH").map(PathBuf::from) else {
@@ -375,8 +624,8 @@ fn real_native_cli_stream_uses_no_llama_executable() -> Result<()> {
             "--stream-jsonl",
             "--json",
         ])
-        .env("MOM_LLAMA_DATA_DIR", &root)
-        .env("MOM_LLAMA_STORE_KEY_HEX", TEST_STORE_KEY)
+        .env("LLAMA_NATIVE_KIT_DATA_DIR", &root)
+        .env("LLAMA_NATIVE_KIT_STORE_KEY_HEX", TEST_STORE_KEY)
         .env("MOM_LLAMA_MODEL_PATH", model_path)
         .env_remove("MOM_LLAMA_ENGINE_PATH")
         .output()?;

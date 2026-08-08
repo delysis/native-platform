@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native-runtime:
+    name: Native runtime (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install native build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes clang cmake ninja-build
+
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+
+      - name: Test default workspace
+        run: cargo test --workspace --exclude mom-llama-app
+
+      - name: Lint default workspace
+        run: cargo clippy --workspace --all-targets --exclude mom-llama-app -- -D warnings
+
+      - name: Check architecture and contracts
+        if: runner.os != 'Windows'
+        run: |
+          ./scripts/check-architecture.sh
+          ./scripts/check-contracts.sh
+
+  mom-llama-macos:
+    name: Mom Llama Tauri app (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: cargo test -p mom-llama-app
+      - run: cargo clippy -p mom-llama-app --all-targets -- -D warnings
+      - run: node --check apps/mom-llama/ui/coop-hx.js

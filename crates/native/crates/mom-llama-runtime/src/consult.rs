@@ -1,17 +1,21 @@
 use crate::config::resolve_settings;
 use crate::conversation_store::{MessageRole, get_or_create_conversation};
+use crate::kv_cache::ensure_persona_prefix;
 use crate::native_runtime::{cancel_native_request, resident_model, resident_model_for_slot};
 use crate::now_ms;
+use crate::persona_library::builtin_panels;
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::{Result, anyhow};
 use llama_native_types::{
-    BranchRequest, ChatMessage, ChatRole, GenerationEventKind, GenerationMetrics,
-    GenerationRequest, GenerationState, SamplingConfig, SharedPrefixBatchRequest,
+    BranchRequest, ChatMessage, ChatRole, ChatTemplateChoice, GenerationEventKind, GenerationInput,
+    GenerationMetrics, GenerationOutput, GenerationRequest, GenerationState, NativeTransport,
+    SamplingConfig, SharedPrefixBatchRequest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -25,6 +29,10 @@ pub struct ConsultPersona {
     pub label: String,
     pub description: String,
     pub perspective_prompt: String,
+    #[serde(default)]
+    pub public_figure: Option<String>,
+    #[serde(default)]
+    pub expertise: Option<String>,
     #[serde(default)]
     pub model_slot: Option<usize>,
 }
@@ -54,6 +62,12 @@ pub struct ConsultSeatResult {
     pub receipt_id: String,
     pub content_sha256: String,
     pub metrics: GenerationMetrics,
+    #[serde(default)]
+    pub real_engine_invoked: bool,
+    #[serde(default)]
+    pub fake_fixture: bool,
+    #[serde(default)]
+    pub transport: Option<NativeTransport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,7 +155,12 @@ pub struct ConsultCancelOutput {
 }
 
 pub fn consult_panel_list() -> Result<CommandResult<Vec<ConsultPanel>>> {
-    let panels = load_panels()?.panels;
+    let mut panels = builtin_panels();
+    for panel in load_panels()?.panels {
+        if panel.id != "balanced-four" && !panels.iter().any(|built_in| built_in.id == panel.id) {
+            panels.push(panel);
+        }
+    }
     Ok(CommandResult::passed(
         "mom_llama.consult_panel_list",
         "contracted",
@@ -168,11 +187,21 @@ pub fn consult_panel_create(
             ),
         ));
     }
+    let personas = match normalize_personas(personas) {
+        Ok(personas) => personas,
+        Err(blocker) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.consult_panel_create",
+                "stub_blocked",
+                blocker,
+            ));
+        }
+    };
     let now = now_ms().to_string();
     let panel = ConsultPanel {
         id: Uuid::new_v4().to_string(),
         name: if name.trim().is_empty() {
-            "Consult group".to_string()
+            "My Dream Team".to_string()
         } else {
             name.trim().to_string()
         },
@@ -194,6 +223,54 @@ pub fn consult_panel_create(
         false,
         false,
     ))
+}
+
+fn normalize_personas(personas: Vec<ConsultPersona>) -> Result<Vec<ConsultPersona>, Blocker> {
+    let mut ids = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(personas.len());
+    for (index, persona) in personas.into_iter().enumerate() {
+        let label = persona.label.trim().to_string();
+        let description = persona.description.trim().to_string();
+        let perspective_prompt = persona.perspective_prompt.trim().to_string();
+        if label.is_empty() || description.is_empty() || perspective_prompt.is_empty() {
+            return Err(Blocker::new(
+                "consult_persona_incomplete",
+                format!(
+                    "Dream Team perspective {} needs a name, a short description, and perspective guidance.",
+                    index + 1
+                ),
+                vec!["Complete the required perspective fields.".to_string()],
+            ));
+        }
+        let id = if persona.id.trim().is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            persona.id.trim().to_string()
+        };
+        if !ids.insert(id.clone()) {
+            return Err(Blocker::new(
+                "consult_persona_id_duplicate",
+                "Each Dream Team perspective needs a distinct identity.",
+                vec!["Remove the duplicate perspective and try again.".to_string()],
+            ));
+        }
+        normalized.push(ConsultPersona {
+            id,
+            label,
+            description,
+            perspective_prompt,
+            public_figure: persona
+                .public_figure
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            expertise: persona
+                .expertise
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            model_slot: persona.model_slot,
+        });
+    }
+    Ok(normalized)
 }
 
 pub fn consult_start(
@@ -259,6 +336,8 @@ where
             seat.state = GenerationState::Completed;
             seat.text = format!("Fixture response from {}.", seat.label);
             seat.content_sha256 = sha256(&seat.text);
+            seat.fake_fixture = true;
+            seat.transport = Some(NativeTransport::FakeFixture);
             emit(
                 &mut on_event,
                 consult_event(
@@ -276,7 +355,7 @@ where
             &settings,
             &panel,
             &run_id,
-            common_messages(&conversation.messages, &input.prompt),
+            dynamic_messages(&conversation.messages, &input.prompt),
             options,
             &mut on_event,
         ) {
@@ -293,7 +372,7 @@ where
             }
             Err(ConsultExecutionError::Runtime(error)) => return Err(error),
         };
-        run.real_engine_invoked = true;
+        run.real_engine_invoked = outputs.iter().any(is_real_completed_output);
         let model_ids = outputs
             .iter()
             .map(|output| output.model_id.clone())
@@ -317,11 +396,33 @@ where
             seat.content_sha256 = sha256(&seat.text);
             seat.metrics = output.metrics.clone();
             seat.model_id = output.model_id.clone();
+            seat.real_engine_invoked = output.real_engine_invoked;
+            seat.fake_fixture = output.fake_fixture;
+            seat.transport = Some(output.transport);
+            if seat.state == GenerationState::Completed && !seat_is_real_completed(seat) {
+                seat.state = GenerationState::Failed;
+            }
         }
     }
     run.state = terminal_run_state(&run.seats);
     run.updated_at = now_ms().to_string();
     save_run(&run)?;
+    if !options.fake_fixture && !run.seats.iter().any(seat_is_real_completed) {
+        return Ok(CommandResult::blocked_with_evidence(
+            "mom_llama.consult_start",
+            "blocked_native_runtime",
+            Blocker::new(
+                "consult_no_real_completed_seats",
+                "No consult perspective completed with real in-process assistant text.",
+                vec!["Retry the consult or check the selected model.".to_string()],
+            ),
+            vec![RuntimeStore::current()?.path().display().to_string()],
+            Vec::new(),
+            run.real_engine_invoked,
+            false,
+        ));
+    }
+    let real_engine_invoked = run.real_engine_invoked;
     Ok(CommandResult::passed(
         "mom_llama.consult_start",
         if options.fake_fixture {
@@ -332,7 +433,7 @@ where
         run,
         vec![RuntimeStore::current()?.path().display().to_string()],
         Vec::new(),
-        !options.fake_fixture,
+        real_engine_invoked,
         options.fake_fixture,
     ))
 }
@@ -395,7 +496,7 @@ pub fn consult_synthesize(
         .seats
         .iter()
         .filter(|seat| {
-            seat.state == GenerationState::Completed
+            seat_is_real_completed(seat)
                 && (selected_seat_ids.is_empty() || selected_seat_ids.contains(&seat.seat_id))
         })
         .collect::<Vec<_>>();
@@ -430,16 +531,19 @@ pub fn consult_synthesize(
         .generate(GenerationRequest {
             request_id: format!("{run_id}:synthesis"),
             model_id: handle.status().model_id,
-            messages: vec![
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: "Synthesize the supplied reasoning perspectives. Preserve disagreements, distinguish evidence from uncertainty, and do not imply that any perspective is a clinician or medical authority.".to_string(),
-                },
-                ChatMessage {
-                    role: ChatRole::User,
-                    content: format!("Question:\n{}\n\nPerspectives:\n{sources}", run.prompt),
-                },
-            ],
+            input: GenerationInput::Chat {
+                messages: vec![
+                    ChatMessage {
+                        role: ChatRole::System,
+                        content: "Synthesize the supplied reasoning perspectives. Preserve disagreements, distinguish evidence from uncertainty, and do not imply that any perspective is a clinician or medical authority.".to_string(),
+                    },
+                    ChatMessage {
+                        role: ChatRole::User,
+                        content: format!("Question:\n{}\n\nPerspectives:\n{sources}", run.prompt),
+                    },
+                ],
+                template: ChatTemplateChoice::ModelDefault,
+            },
             sampling: sampling_config(&settings),
             media: Vec::new(),
             cached_prefix: None,
@@ -451,6 +555,21 @@ pub fn consult_synthesize(
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("native synthesis returned no output"))?;
+    if !is_real_completed_output(&output) {
+        return Ok(CommandResult::blocked_with_evidence(
+            "mom_llama.consult_synthesize",
+            "blocked_native_runtime",
+            Blocker::new(
+                "consult_synthesis_not_real_completed",
+                "The synthesis did not complete with real in-process assistant text.",
+                vec!["Retry synthesis or check the selected model.".to_string()],
+            ),
+            vec![RuntimeStore::current()?.path().display().to_string()],
+            Vec::new(),
+            output.real_engine_invoked,
+            output.fake_fixture,
+        ));
+    }
     let synthesis = ConsultSynthesis {
         text: output.text.clone(),
         receipt_id: format!("mom_llama.consult_synthesize:{run_id}"),
@@ -482,20 +601,16 @@ pub fn consult_synthesize(
 
 fn load_panels() -> Result<ConsultPanelDb> {
     let store = RuntimeStore::current()?;
-    let mut db = store
+    let db = store
         .get::<ConsultPanelDb>(PANELS_NAMESPACE)?
         .unwrap_or_default();
-    if db.panels.is_empty() {
-        db.panels.push(default_panel());
-        store.put(PANELS_NAMESPACE, &db)?;
-    }
     Ok(db)
 }
 
 fn selected_panel(id: Option<&str>) -> Result<ConsultPanel> {
-    let db = load_panels()?;
-    id.and_then(|id| db.panels.iter().find(|panel| panel.id == id).cloned())
-        .or_else(|| db.panels.first().cloned())
+    let panels = consult_panel_list()?.result.unwrap_or_default();
+    id.and_then(|id| panels.iter().find(|panel| panel.id == id).cloned())
+        .or_else(|| panels.first().cloned())
         .ok_or_else(|| anyhow!("no consult panel is configured"))
 }
 
@@ -537,30 +652,63 @@ fn pending_seat(
         receipt_id: format!("mom_llama.consult.member:{run_id}:{}", persona.id),
         content_sha256: String::new(),
         metrics: GenerationMetrics::default(),
+        real_engine_invoked: false,
+        fake_fixture: false,
+        transport: None,
     }
 }
 
-fn common_messages(
+fn dynamic_messages(
     messages: &[crate::conversation_store::Message],
     prompt: &str,
 ) -> Vec<ChatMessage> {
-    let mut common = vec![ChatMessage {
-        role: ChatRole::System,
-        content: "You are one reasoning perspective in a private local consult group. You are not a clinician and must not claim medical authority. Be clear about uncertainty and suggest professional review when appropriate.".to_string(),
-    }];
-    common.extend(messages.iter().map(|message| ChatMessage {
-        role: match message.role {
-            MessageRole::System => ChatRole::System,
-            MessageRole::User => ChatRole::User,
-            MessageRole::Assistant => ChatRole::Assistant,
-        },
-        content: message.content.clone(),
-    }));
-    common.push(ChatMessage {
+    let mut dynamic = messages
+        .iter()
+        .map(|message| ChatMessage {
+            role: match message.role {
+                MessageRole::System => ChatRole::System,
+                MessageRole::User => ChatRole::User,
+                MessageRole::Assistant => ChatRole::Assistant,
+                MessageRole::Tool => ChatRole::Tool,
+            },
+            content: message.content.clone(),
+        })
+        .collect::<Vec<_>>();
+    dynamic.push(ChatMessage {
         role: ChatRole::User,
         content: prompt.to_string(),
     });
-    common
+    dynamic
+}
+
+fn persona_prefix_messages(persona: &ConsultPersona) -> Vec<ChatMessage> {
+    let identity = persona.public_figure.as_deref().map_or_else(
+        || {
+            format!(
+                "You are the AI-generated `{}` reasoning perspective in a private local consult group.",
+                persona.label
+            )
+        },
+        |public_figure| {
+            format!(
+                "Offer a clearly labeled AI-generated perspective inspired by the publicly expressed work of {public_figure}. You are not {public_figure}; never claim to be them, imply their participation, or imply their endorsement."
+            )
+        },
+    );
+    let expertise = persona
+        .expertise
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("\nArea valued in this perspective: {value}."))
+        .unwrap_or_default();
+    vec![ChatMessage {
+        role: ChatRole::System,
+        content: format!(
+            "{identity}{expertise}\n\nDescription: {}\nPerspective guidance: {}\n\nAssume the primary reader is a licensed mental-health professional seeking private case consultation. Use appropriate clinical shorthand and be specific. Structure the response as: (1) formulation through this lens; (2) assessment questions or missing data that would discriminate among hypotheses; (3) sequencing, targets, and concrete interventions for the clinician to evaluate; (4) contraindications, monitoring, and what would change the plan; and (5) this lens's principal blind spot. Discuss differential diagnoses as hypotheses rather than declaring a diagnosis from limited information. Do not repeat generic disclaimers or soften every recommendation with boilerplate. Reserve urgent safety language for facts that actually indicate current danger, abuse, suicidality, self-harm, severe withdrawal, psychosis, or medical instability. Never claim to be the attributed person or imply their participation or endorsement. The clinician retains responsibility for assessment, consent, scope, and care.",
+            persona.description.trim(),
+            persona.perspective_prompt.trim(),
+        ),
+    }]
 }
 
 fn sampling_config(settings: &crate::config::Settings) -> SamplingConfig {
@@ -587,6 +735,22 @@ fn terminal_run_state(seats: &[ConsultSeatResult]) -> ConsultRunState {
     }
 }
 
+fn is_real_completed_output(output: &GenerationOutput) -> bool {
+    output.state == GenerationState::Completed
+        && !output.text.trim().is_empty()
+        && output.real_engine_invoked
+        && !output.fake_fixture
+        && output.transport == NativeTransport::InProcess
+}
+
+fn seat_is_real_completed(seat: &ConsultSeatResult) -> bool {
+    seat.state == GenerationState::Completed
+        && !seat.text.trim().is_empty()
+        && seat.real_engine_invoked
+        && !seat.fake_fixture
+        && seat.transport == Some(NativeTransport::InProcess)
+}
+
 fn emit<F>(callback: &mut Option<F>, event: ConsultStreamEvent) -> Result<()>
 where
     F: FnMut(ConsultStreamEvent) -> Result<()>,
@@ -606,7 +770,7 @@ fn run_native_consult<F>(
     settings: &crate::config::Settings,
     panel: &ConsultPanel,
     run_id: &str,
-    common_messages: Vec<ChatMessage>,
+    dynamic_messages: Vec<ChatMessage>,
     options: ConsultStartOptions,
     on_event: &mut Option<F>,
 ) -> std::result::Result<Vec<llama_native_types::GenerationOutput>, ConsultExecutionError>
@@ -629,19 +793,37 @@ where
         }
         .map_err(ConsultExecutionError::Blocked)?;
         let status = handle.status();
+        let branches = personas
+            .into_iter()
+            .map(|persona| {
+                let stable_messages = persona_prefix_messages(persona);
+                let mut messages = stable_messages.clone();
+                messages.extend(dynamic_messages.clone());
+                let cached_prefix = ensure_persona_prefix(
+                    &handle,
+                    &format!("consult-persona:{}:{}", panel.id, persona.id),
+                    &format!("Consult perspective: {}", persona.label),
+                    &stable_messages,
+                    &messages,
+                )
+                .map_err(ConsultExecutionError::Runtime)?
+                .map(|cache| cache.sequence);
+                Ok(BranchRequest {
+                    branch_id: persona.id.clone(),
+                    label: persona.label.clone(),
+                    instruction: String::new(),
+                    sampling: sampling_config(settings),
+                    messages,
+                    cached_prefix,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, ConsultExecutionError>>()?;
         let request = SharedPrefixBatchRequest {
             request_id: run_id.to_string(),
             model_id: status.model_id,
-            common_messages: common_messages.clone(),
-            branches: personas
-                .into_iter()
-                .map(|persona| BranchRequest {
-                    branch_id: persona.id.clone(),
-                    label: persona.label.clone(),
-                    instruction: persona.perspective_prompt.clone(),
-                    sampling: sampling_config(settings),
-                })
-                .collect(),
+            common_messages: Vec::new(),
+            chat_template: ChatTemplateChoice::ModelDefault,
+            branches,
             cached_prefix: None,
         };
         let ticket = handle
@@ -743,58 +925,18 @@ fn sha256(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
-fn default_panel() -> ConsultPanel {
-    let now = now_ms().to_string();
-    ConsultPanel {
-        id: "balanced-four".to_string(),
-        name: "Balanced consult group".to_string(),
-        personas: vec![
-            ConsultPersona {
-                id: "evidence".to_string(),
-                label: "Evidence lens".to_string(),
-                description: "Separates observations, evidence, and uncertainty.".to_string(),
-                perspective_prompt: "Answer the preceding question by identifying the strongest evidence, missing facts, uncertainty, and what would change the conclusion.".to_string(),
-                model_slot: None,
-            },
-            ConsultPersona {
-                id: "whole-person".to_string(),
-                label: "Whole-person lens".to_string(),
-                description: "Considers goals, context, preferences, and tradeoffs.".to_string(),
-                perspective_prompt: "Answer the preceding question by considering the person's goals, context, preferences, burdens, and tradeoffs. Do not claim clinical authority.".to_string(),
-                model_slot: None,
-            },
-            ConsultPersona {
-                id: "practical".to_string(),
-                label: "Practical lens".to_string(),
-                description: "Turns reasoning into safe, concrete next steps.".to_string(),
-                perspective_prompt: "Answer the preceding question with a small sequence of practical, reversible next steps and clear escalation conditions.".to_string(),
-                model_slot: None,
-            },
-            ConsultPersona {
-                id: "skeptical".to_string(),
-                label: "Skeptical lens".to_string(),
-                description: "Challenges assumptions and searches for failure modes.".to_string(),
-                perspective_prompt: "Answer the preceding question by challenging assumptions, identifying risks and failure modes, and presenting the strongest reasonable alternative interpretation.".to_string(),
-                model_slot: None,
-            },
-        ],
-        created_at: now.clone(),
-        updated_at: now,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn default_panel_is_bounded_and_disclaims_authority() {
-        let panel = default_panel();
-        assert_eq!(panel.personas.len(), MAX_SEATS);
+    fn built_in_panels_are_bounded_and_disclaim_authority() {
+        let panels = builtin_panels();
+        assert!(panels.iter().all(|panel| panel.personas.len() <= MAX_SEATS));
         assert!(
-            panel
-                .personas
+            panels
                 .iter()
+                .flat_map(|panel| panel.personas.iter())
                 .all(|persona| !persona.label.contains("Doctor"))
         );
     }
@@ -802,7 +944,7 @@ mod tests {
     #[test]
     fn terminal_state_preserves_independent_cancellation() {
         let settings = crate::config::Settings::defaults_for_data_dir(std::env::temp_dir());
-        let panel = default_panel();
+        let panel = builtin_panels().remove(0);
         let mut seats = panel
             .personas
             .iter()
@@ -816,5 +958,58 @@ mod tests {
             terminal_run_state(&seats),
             ConsultRunState::PartiallyCancelled
         );
+    }
+
+    #[test]
+    fn dream_team_personas_are_normalized_and_require_complete_guidance() {
+        let normalized = normalize_personas(vec![ConsultPersona {
+            id: String::new(),
+            label: "  Gentle perspective  ".to_string(),
+            description: "  Warmly reflects what was heard.  ".to_string(),
+            perspective_prompt: "  Emphasize compassion and practical choices.  ".to_string(),
+            public_figure: Some("  Example Author  ".to_string()),
+            expertise: Some("  Published work on compassion  ".to_string()),
+            model_slot: None,
+        }])
+        .expect("complete perspective should normalize");
+        assert_eq!(normalized[0].label, "Gentle perspective");
+        assert_eq!(
+            normalized[0].public_figure.as_deref(),
+            Some("Example Author")
+        );
+        assert!(!normalized[0].id.is_empty());
+
+        let blocked = normalize_personas(vec![ConsultPersona {
+            id: String::new(),
+            label: "Incomplete".to_string(),
+            description: String::new(),
+            perspective_prompt: String::new(),
+            public_figure: None,
+            expertise: None,
+            model_slot: None,
+        }])
+        .expect_err("incomplete perspective must fail closed");
+        assert_eq!(blocked.code, "consult_persona_incomplete");
+    }
+
+    #[test]
+    fn public_figure_prompt_is_explicitly_non_impersonating() {
+        let messages = persona_prefix_messages(&ConsultPersona {
+            id: "author".to_string(),
+            label: "Favorite author".to_string(),
+            description: "A view grounded in published writing.".to_string(),
+            perspective_prompt: "Offer a careful reflection.".to_string(),
+            public_figure: Some("Example Author".to_string()),
+            expertise: None,
+            model_slot: None,
+        });
+        let prompt = &messages[0].content;
+        assert!(prompt.contains("AI-generated perspective"));
+        assert!(prompt.contains("You are not Example Author"));
+        assert!(prompt.contains("never claim to be them"));
+        assert!(prompt.contains("never claim to be them") && prompt.contains("endorsement"));
+        assert!(prompt.contains("licensed mental-health professional"));
+        assert!(prompt.contains("sequencing, targets, and concrete interventions"));
+        assert!(prompt.contains("Do not repeat generic disclaimers"));
     }
 }

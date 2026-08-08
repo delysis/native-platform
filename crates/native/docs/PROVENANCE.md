@@ -16,3 +16,20 @@ The combined adopted Rust source inventory had SHA-256:
 All code is reverified in this repository. Historical receipts that are not
 bound to this repository's source hash are informative only.
 
+## Subsequent read-only uplifts
+
+On 2026-07-29 the active `capability-system-compiler` Mom Llama worktree was
+re-inspected as a read-only reference. The standalone runtime adopted its
+bounded native-model/MCP tool-loop correction: advertised-tool and input-schema
+validation, encrypted tool-message lineage, result hashing, iterative
+same-tool turns, and fail-closed real-engine evidence. The standalone
+implementation remains independently tested and does not inherit readiness
+from that worktree.
+
+On 2026-08-01 the official llama.cpp UI logo was also reused from that
+read-only worktree. Its recorded upstream source is
+`ggml-org/llama.cpp/tools/ui/src/lib/assets/logo.svg` at revision
+`3018a11e79e489b657dbb77c95694889ccff92df`; the verbatim SVG SHA-256 is
+`0a4955422e6affde4811e0c0915f506305d46d084283484970e337bb1282429a`.
+The macOS PNG asset SHA-256 is
+`4a208ee44cd2aed50dedc1958f45db5ec650059d02724fc9896f5a535c65413e`.
