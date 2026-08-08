@@ -5,11 +5,17 @@ SQLite, and a dependency-light webview. It presents several provider accounts
 through one OpenAI-compatible loopback API and can select an available route
 for each request.
 
-The repository also contains a reusable Rust gateway and a Rust-only Tauri 2
-plugin. The reusable module is protocol-neutral internally, supports native
-OpenAI Responses Items/events and Anthropic Messages blocks, and can route to
+The repository also contains reusable Rust services and two independently
+installable Rust-only Tauri 2 plugins. The model gateway is protocol-neutral
+internally, supports native OpenAI Responses Items/events and Anthropic
+Messages blocks, and can route to
 an in-process llama.cpp host or hosted providers without changing caller
 shape. See [Gateway Module](docs/GATEWAY_MODULE.md).
+
+Speech is a sibling service with its own contracts, router, registry, backends,
+Tauri plugin, permission namespace, and lifecycle. The two services are mapped
+in [Module and Repository Map](docs/MODULE_MAP.md); applications install only
+the plugins they actually use.
 
 The reusable gateway is substantially ahead of the historical desktop UI
 runtime. [Robustness and unification audit](docs/ROBUSTNESS_AUDIT.md) states
@@ -144,7 +150,9 @@ subprocess calls during transcription.
 Weights remain in the shared Hugging Face cache under
 `altunenes/parakeet-rs`; they are not copied into application storage. See
 [Speech Gateway](docs/SPEECH_GATEWAY.md) for routing, streaming IPC, platform
-fallback, evidence, and the retained `parakeet.cpp` backend lane.
+fallback, evidence, and the retained `parakeet.cpp` backend lane. Tauri
+consumers opt in through `tauri-plugin-free-token-energy-speech`; the core
+`tauri-plugin-free-token-energy` neither links nor authorizes speech.
 
 ## Privacy and security
 

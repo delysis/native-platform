@@ -4,20 +4,12 @@ use fte_loopback::{LoopbackConfig, LoopbackServer};
 #[cfg(feature = "hosted-providers")]
 use fte_providers::{HostedProviderBackend, HostedProviderConfig};
 use fte_router::{Gateway, GatewayDefaults};
-use fte_speech_gateway::{SpeechGateway, SpeechGatewayError, SpeechGatewayStatus};
-use fte_speech_router::SpeechRoutePlan;
-use fte_speech_types::{
-    AudioChunk, SpeechBackend, SpeechError, SpeechRequestId, SynthesisEvent, SynthesisRequest,
-    SynthesisResponse, TranscriptionAudioSink, TranscriptionEvent, TranscriptionRequest,
-    TranscriptionResponse,
-};
 use fte_store::{ResponseStore, SecretResolver, SqliteStore};
 use fte_types::{
     CancelTarget, GatewayBackend, GatewayError, GatewayEvent, GatewayRequest, GatewayResponse,
     GatewayStatus, LoopbackStatus, ModelDescriptor, RequestId,
 };
 use serde::Serialize;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -25,7 +17,6 @@ use tauri::{Manager, Runtime, State};
 
 pub struct Builder {
     gateway: Arc<Gateway>,
-    speech: Arc<SpeechGateway>,
     store: Option<Arc<dyn ResponseStore>>,
     secret_resolver: Option<Arc<dyn SecretResolver>>,
     loopback: Option<LoopbackConfig>,
@@ -45,7 +36,6 @@ impl Builder {
     pub fn new() -> Self {
         Self {
             gateway: Arc::new(Gateway::new(GatewayDefaults::default())),
-            speech: Arc::new(SpeechGateway::default()),
             store: None,
             secret_resolver: None,
             loopback: None,
@@ -65,20 +55,6 @@ impl Builder {
     pub fn with_gateway(mut self, gateway: Arc<Gateway>) -> Self {
         self.gateway = gateway;
         self
-    }
-
-    #[must_use]
-    pub fn with_speech_gateway(mut self, speech: Arc<SpeechGateway>) -> Self {
-        self.speech = speech;
-        self
-    }
-
-    pub fn register_speech_backend(
-        self,
-        backend: Arc<dyn SpeechBackend>,
-    ) -> Result<Self, SpeechGatewayError> {
-        self.speech.register_backend(backend)?;
-        Ok(self)
     }
 
     #[must_use]
@@ -163,7 +139,6 @@ impl Builder {
 
     pub fn build<R: Runtime>(self) -> TauriPlugin<R> {
         let gateway = self.gateway;
-        let speech = self.speech;
         let store = self.store;
         let loopback_config = self.loopback;
         let default_loopback = self.default_loopback;
@@ -174,16 +149,6 @@ impl Builder {
                 gateway_generate,
                 gateway_stream,
                 gateway_cancel,
-                speech_status,
-                speech_plan_transcription,
-                speech_plan_synthesis,
-                speech_synthesize,
-                speech_synthesize_stream,
-                speech_transcribe,
-                speech_transcribe_stream,
-                speech_transcription_audio_push,
-                speech_transcription_audio_finish,
-                speech_cancel,
                 loopback_status,
                 loopback_start,
                 loopback_stop,
@@ -202,8 +167,6 @@ impl Builder {
                 });
                 app.manage(PluginState {
                     gateway,
-                    speech,
-                    speech_inputs: Mutex::new(HashMap::new()),
                     store,
                     loopback_config,
                     loopback: Mutex::new(None),
@@ -218,13 +181,11 @@ impl Builder {
                     .ok()
                     .and_then(|mut loopback| loopback.take());
                 let gateway = Arc::clone(&state.gateway);
-                let speech = Arc::clone(&state.speech);
                 tauri::async_runtime::block_on(async move {
                     if let Some(server) = server {
                         server.shutdown().await;
                     }
                     let _ = gateway.shutdown().await;
-                    let _ = speech.shutdown().await;
                 });
             })
             .build()
@@ -233,8 +194,6 @@ impl Builder {
 
 pub struct PluginState {
     gateway: Arc<Gateway>,
-    speech: Arc<SpeechGateway>,
-    speech_inputs: Mutex<HashMap<SpeechRequestId, Arc<dyn TranscriptionAudioSink>>>,
     store: Arc<dyn ResponseStore>,
     loopback_config: Option<LoopbackConfig>,
     loopback: Mutex<Option<LoopbackServer>>,
@@ -242,16 +201,11 @@ pub struct PluginState {
 
 pub trait FreeTokenEnergyExt<R: Runtime> {
     fn free_token_energy(&self) -> Arc<Gateway>;
-    fn free_token_energy_speech(&self) -> Arc<SpeechGateway>;
 }
 
 impl<R: Runtime, T: Manager<R>> FreeTokenEnergyExt<R> for T {
     fn free_token_energy(&self) -> Arc<Gateway> {
         Arc::clone(&self.state::<PluginState>().gateway)
-    }
-
-    fn free_token_energy_speech(&self) -> Arc<SpeechGateway> {
-        Arc::clone(&self.state::<PluginState>().speech)
     }
 }
 
@@ -319,150 +273,6 @@ fn gateway_cancel(
     let target = output_index.map_or(CancelTarget::Request, CancelTarget::Output);
     CancelResult {
         cancelled: state.gateway.cancel(&RequestId(request_id), target),
-    }
-}
-
-#[tauri::command]
-fn speech_status(state: State<'_, PluginState>) -> Result<SpeechGatewayStatus, SpeechGatewayError> {
-    state.speech.status()
-}
-
-#[tauri::command]
-fn speech_plan_transcription(
-    request: TranscriptionRequest,
-    state: State<'_, PluginState>,
-) -> Result<SpeechRoutePlan, SpeechGatewayError> {
-    state.speech.plan_transcription(&request)
-}
-
-#[tauri::command]
-fn speech_plan_synthesis(
-    request: SynthesisRequest,
-    state: State<'_, PluginState>,
-) -> Result<SpeechRoutePlan, SpeechGatewayError> {
-    state.speech.plan_synthesis(&request)
-}
-
-#[tauri::command]
-async fn speech_synthesize(
-    request: SynthesisRequest,
-    state: State<'_, PluginState>,
-) -> Result<SynthesisResponse, SpeechGatewayError> {
-    let mut ticket = state.speech.synthesize(request).await?;
-    while let Some(event) = ticket.events.recv().await {
-        if event.is_terminal() {
-            break;
-        }
-    }
-    ticket.final_response().await.map_err(Into::into)
-}
-
-#[tauri::command]
-async fn speech_synthesize_stream(
-    request: SynthesisRequest,
-    on_event: Channel<SynthesisEvent>,
-    state: State<'_, PluginState>,
-) -> Result<SynthesisResponse, SpeechGatewayError> {
-    let request_id = request.context.request_id.clone();
-    let mut ticket = state.speech.synthesize(request).await?;
-    while let Some(event) = ticket.events.recv().await {
-        let terminal = event.is_terminal();
-        on_event
-            .send(event)
-            .map_err(|_| speech_channel_closed(&request_id))?;
-        if terminal {
-            break;
-        }
-    }
-    ticket.final_response().await.map_err(Into::into)
-}
-
-#[tauri::command]
-async fn speech_transcribe(
-    request: TranscriptionRequest,
-    state: State<'_, PluginState>,
-) -> Result<TranscriptionResponse, SpeechGatewayError> {
-    let mut ticket = state.speech.transcribe(request).await?;
-    while let Some(event) = ticket.events.recv().await {
-        if event.is_terminal() {
-            break;
-        }
-    }
-    ticket.final_response().await.map_err(Into::into)
-}
-
-#[tauri::command]
-async fn speech_transcribe_stream(
-    request: TranscriptionRequest,
-    on_event: Channel<TranscriptionEvent>,
-    state: State<'_, PluginState>,
-) -> Result<TranscriptionResponse, SpeechGatewayError> {
-    let request_id = request.context.request_id.clone();
-    let mut ticket = state.speech.transcribe(request).await?;
-    if let Some(sink) = ticket.audio_sink.clone() {
-        state
-            .speech_inputs
-            .lock()
-            .map_err(|_| speech_input_state_unavailable(&request_id))?
-            .insert(request_id.clone(), sink);
-    }
-    let mut channel_error = None;
-    while let Some(event) = ticket.events.recv().await {
-        let terminal = event.is_terminal();
-        if on_event.send(event).is_err() {
-            channel_error = Some(speech_channel_closed(&request_id));
-            break;
-        }
-        if terminal {
-            break;
-        }
-    }
-    if let Ok(mut inputs) = state.speech_inputs.lock() {
-        inputs.remove(&request_id);
-    }
-    if let Some(error) = channel_error {
-        return Err(error);
-    }
-    ticket.final_response().await.map_err(Into::into)
-}
-
-#[tauri::command]
-async fn speech_transcription_audio_push(
-    request_id: String,
-    chunk: AudioChunk,
-    state: State<'_, PluginState>,
-) -> Result<(), SpeechGatewayError> {
-    let request_id = SpeechRequestId(request_id);
-    let sink = state
-        .speech_inputs
-        .lock()
-        .map_err(|_| speech_input_state_unavailable(&request_id))?
-        .get(&request_id)
-        .cloned()
-        .ok_or_else(|| speech_input_missing(&request_id))?;
-    sink.push(chunk).await.map_err(Into::into)
-}
-
-#[tauri::command]
-async fn speech_transcription_audio_finish(
-    request_id: String,
-    state: State<'_, PluginState>,
-) -> Result<(), SpeechGatewayError> {
-    let request_id = SpeechRequestId(request_id);
-    let sink = state
-        .speech_inputs
-        .lock()
-        .map_err(|_| speech_input_state_unavailable(&request_id))?
-        .get(&request_id)
-        .cloned()
-        .ok_or_else(|| speech_input_missing(&request_id))?;
-    sink.finish().await.map_err(Into::into)
-}
-
-#[tauri::command]
-fn speech_cancel(request_id: String, state: State<'_, PluginState>) -> CancelResult {
-    CancelResult {
-        cancelled: state.speech.cancel(&SpeechRequestId(request_id)),
     }
 }
 
@@ -577,31 +387,4 @@ fn plugin_lock_error<T>(_error: std::sync::PoisonError<T>) -> GatewayError {
         "plugin_state_unavailable",
         "Free Token Energy plugin state is unavailable",
     )
-}
-
-fn speech_channel_closed(request_id: &SpeechRequestId) -> SpeechGatewayError {
-    SpeechError::unavailable(
-        request_id,
-        "tauri_speech_event_consumer_closed",
-        "the Tauri speech event consumer closed before the request completed",
-    )
-    .into()
-}
-
-fn speech_input_state_unavailable(request_id: &SpeechRequestId) -> SpeechGatewayError {
-    SpeechError::unavailable(
-        request_id,
-        "tauri_speech_input_state_unavailable",
-        "the Tauri streaming speech-input registry is unavailable",
-    )
-    .into()
-}
-
-fn speech_input_missing(request_id: &SpeechRequestId) -> SpeechGatewayError {
-    SpeechError::unavailable(
-        request_id,
-        "tauri_speech_input_missing",
-        "no active streaming transcription accepts audio for this request",
-    )
-    .into()
 }

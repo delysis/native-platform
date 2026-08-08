@@ -48,19 +48,35 @@ it would be dishonest to claim live audio streaming or pre-emptive native
 cancellation. Those capabilities remain false until a truly asynchronous
 bridge is implemented and tested.
 
-The reusable speech crates have no Tauri dependency. The Rust-only
-`tauri-plugin-free-token-energy` now owns an injected `SpeechGateway` and
-exposes scoped status, route-plan, synthesize, transcribe, stream, and cancel
-commands plus the `FreeTokenEnergyExt::free_token_energy_speech` Rust extension
-method. The desktop app contains an environment-gated launch smoke solely to
-prove the AppKit lifecycle. Ordinary Rust consumers use the same service and
-backend traits without Tauri.
+The reusable speech crates have no Tauri dependency. The Rust-only,
+speech-specific `tauri-plugin-free-token-energy-speech` owns an injected
+`SpeechGateway` and exposes scoped status, route-plan, synthesize, transcribe,
+stream, and cancel commands plus the
+`FreeTokenEnergySpeechExt::free_token_energy_speech` Rust extension method.
+The text/model `tauri-plugin-free-token-energy` contains no speech state,
+dependency, command, permission, or shutdown path. The desktop app contains an
+environment-gated launch smoke solely to prove the AppKit lifecycle. Ordinary
+Rust consumers use the same service and backend traits without Tauri.
 
 Live Tauri transcription has an explicit input half as well as an output event
 half. `speech_transcribe_stream` opens the bounded request, while
 `speech_transcription_audio_push` and `speech_transcription_audio_finish` feed
 ordered PCM chunks through the ticket's typed audio sink. Closing the event
 channel or ticket cancels only that request.
+
+### Tauri migration
+
+The speech request and event types are unchanged. Applications moving from the
+former combined plugin must:
+
+1. install `tauri-plugin-free-token-energy-speech` separately;
+2. grant `free-token-energy-speech:default` instead of receiving speech through
+   `free-token-energy:default`;
+3. invoke `plugin:free-token-energy-speech|speech_*` commands; and
+4. import `FreeTokenEnergySpeechExt` for Rust-side access.
+
+Applications that do not use speech need no speech crate, plugin, permission,
+backend registration, or shutdown path.
 
 ## Default Selection Policy
 

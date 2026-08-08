@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -52,5 +55,6 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: cargo fmt --all --check
+      - run: ./scripts/check-module-boundaries.sh
       - run: cargo test --workspace --all-features
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings

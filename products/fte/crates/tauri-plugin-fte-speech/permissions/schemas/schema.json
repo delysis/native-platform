@@ -295,118 +295,130 @@
       "type": "string",
       "oneOf": [
         {
-          "description": "Enables the gateway_cancel command without any pre-configured scope.",
+          "description": "Enables the speech_cancel command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-gateway-cancel",
-          "markdownDescription": "Enables the gateway_cancel command without any pre-configured scope."
+          "const": "allow-speech-cancel",
+          "markdownDescription": "Enables the speech_cancel command without any pre-configured scope."
         },
         {
-          "description": "Denies the gateway_cancel command without any pre-configured scope.",
+          "description": "Denies the speech_cancel command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-gateway-cancel",
-          "markdownDescription": "Denies the gateway_cancel command without any pre-configured scope."
+          "const": "deny-speech-cancel",
+          "markdownDescription": "Denies the speech_cancel command without any pre-configured scope."
         },
         {
-          "description": "Enables the gateway_generate command without any pre-configured scope.",
+          "description": "Enables the speech_plan_synthesis command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-gateway-generate",
-          "markdownDescription": "Enables the gateway_generate command without any pre-configured scope."
+          "const": "allow-speech-plan-synthesis",
+          "markdownDescription": "Enables the speech_plan_synthesis command without any pre-configured scope."
         },
         {
-          "description": "Denies the gateway_generate command without any pre-configured scope.",
+          "description": "Denies the speech_plan_synthesis command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-gateway-generate",
-          "markdownDescription": "Denies the gateway_generate command without any pre-configured scope."
+          "const": "deny-speech-plan-synthesis",
+          "markdownDescription": "Denies the speech_plan_synthesis command without any pre-configured scope."
         },
         {
-          "description": "Enables the gateway_models command without any pre-configured scope.",
+          "description": "Enables the speech_plan_transcription command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-gateway-models",
-          "markdownDescription": "Enables the gateway_models command without any pre-configured scope."
+          "const": "allow-speech-plan-transcription",
+          "markdownDescription": "Enables the speech_plan_transcription command without any pre-configured scope."
         },
         {
-          "description": "Denies the gateway_models command without any pre-configured scope.",
+          "description": "Denies the speech_plan_transcription command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-gateway-models",
-          "markdownDescription": "Denies the gateway_models command without any pre-configured scope."
+          "const": "deny-speech-plan-transcription",
+          "markdownDescription": "Denies the speech_plan_transcription command without any pre-configured scope."
         },
         {
-          "description": "Enables the gateway_status command without any pre-configured scope.",
+          "description": "Enables the speech_status command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-gateway-status",
-          "markdownDescription": "Enables the gateway_status command without any pre-configured scope."
+          "const": "allow-speech-status",
+          "markdownDescription": "Enables the speech_status command without any pre-configured scope."
         },
         {
-          "description": "Denies the gateway_status command without any pre-configured scope.",
+          "description": "Denies the speech_status command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-gateway-status",
-          "markdownDescription": "Denies the gateway_status command without any pre-configured scope."
+          "const": "deny-speech-status",
+          "markdownDescription": "Denies the speech_status command without any pre-configured scope."
         },
         {
-          "description": "Enables the gateway_stream command without any pre-configured scope.",
+          "description": "Enables the speech_synthesize command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-gateway-stream",
-          "markdownDescription": "Enables the gateway_stream command without any pre-configured scope."
+          "const": "allow-speech-synthesize",
+          "markdownDescription": "Enables the speech_synthesize command without any pre-configured scope."
         },
         {
-          "description": "Denies the gateway_stream command without any pre-configured scope.",
+          "description": "Denies the speech_synthesize command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-gateway-stream",
-          "markdownDescription": "Denies the gateway_stream command without any pre-configured scope."
+          "const": "deny-speech-synthesize",
+          "markdownDescription": "Denies the speech_synthesize command without any pre-configured scope."
         },
         {
-          "description": "Enables the loopback_rotate_token command without any pre-configured scope.",
+          "description": "Enables the speech_synthesize_stream command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-loopback-rotate-token",
-          "markdownDescription": "Enables the loopback_rotate_token command without any pre-configured scope."
+          "const": "allow-speech-synthesize-stream",
+          "markdownDescription": "Enables the speech_synthesize_stream command without any pre-configured scope."
         },
         {
-          "description": "Denies the loopback_rotate_token command without any pre-configured scope.",
+          "description": "Denies the speech_synthesize_stream command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-loopback-rotate-token",
-          "markdownDescription": "Denies the loopback_rotate_token command without any pre-configured scope."
+          "const": "deny-speech-synthesize-stream",
+          "markdownDescription": "Denies the speech_synthesize_stream command without any pre-configured scope."
         },
         {
-          "description": "Enables the loopback_start command without any pre-configured scope.",
+          "description": "Enables the speech_transcribe command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-loopback-start",
-          "markdownDescription": "Enables the loopback_start command without any pre-configured scope."
+          "const": "allow-speech-transcribe",
+          "markdownDescription": "Enables the speech_transcribe command without any pre-configured scope."
         },
         {
-          "description": "Denies the loopback_start command without any pre-configured scope.",
+          "description": "Denies the speech_transcribe command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-loopback-start",
-          "markdownDescription": "Denies the loopback_start command without any pre-configured scope."
+          "const": "deny-speech-transcribe",
+          "markdownDescription": "Denies the speech_transcribe command without any pre-configured scope."
         },
         {
-          "description": "Enables the loopback_status command without any pre-configured scope.",
+          "description": "Enables the speech_transcribe_stream command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-loopback-status",
-          "markdownDescription": "Enables the loopback_status command without any pre-configured scope."
+          "const": "allow-speech-transcribe-stream",
+          "markdownDescription": "Enables the speech_transcribe_stream command without any pre-configured scope."
         },
         {
-          "description": "Denies the loopback_status command without any pre-configured scope.",
+          "description": "Denies the speech_transcribe_stream command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-loopback-status",
-          "markdownDescription": "Denies the loopback_status command without any pre-configured scope."
+          "const": "deny-speech-transcribe-stream",
+          "markdownDescription": "Denies the speech_transcribe_stream command without any pre-configured scope."
         },
         {
-          "description": "Enables the loopback_stop command without any pre-configured scope.",
+          "description": "Enables the speech_transcription_audio_finish command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-loopback-stop",
-          "markdownDescription": "Enables the loopback_stop command without any pre-configured scope."
+          "const": "allow-speech-transcription-audio-finish",
+          "markdownDescription": "Enables the speech_transcription_audio_finish command without any pre-configured scope."
         },
         {
-          "description": "Denies the loopback_stop command without any pre-configured scope.",
+          "description": "Denies the speech_transcription_audio_finish command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-loopback-stop",
-          "markdownDescription": "Denies the loopback_stop command without any pre-configured scope."
+          "const": "deny-speech-transcription-audio-finish",
+          "markdownDescription": "Denies the speech_transcription_audio_finish command without any pre-configured scope."
         },
         {
-          "description": "Read gateway state and use configured generation routes. Loopback listener control requires separate permissions.\n#### This default permission set includes:\n\n- `allow-gateway-status`\n- `allow-gateway-models`\n- `allow-gateway-generate`\n- `allow-gateway-stream`\n- `allow-gateway-cancel`\n- `allow-loopback-status`",
+          "description": "Enables the speech_transcription_audio_push command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-speech-transcription-audio-push",
+          "markdownDescription": "Enables the speech_transcription_audio_push command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the speech_transcription_audio_push command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-speech-transcription-audio-push",
+          "markdownDescription": "Denies the speech_transcription_audio_push command without any pre-configured scope."
+        },
+        {
+          "description": "Inspect configured speech routes and perform explicitly requested transcription or synthesis.\n#### This default permission set includes:\n\n- `allow-speech-status`\n- `allow-speech-plan-transcription`\n- `allow-speech-plan-synthesis`\n- `allow-speech-synthesize`\n- `allow-speech-synthesize-stream`\n- `allow-speech-transcribe`\n- `allow-speech-transcribe-stream`\n- `allow-speech-transcription-audio-push`\n- `allow-speech-transcription-audio-finish`\n- `allow-speech-cancel`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Read gateway state and use configured generation routes. Loopback listener control requires separate permissions.\n#### This default permission set includes:\n\n- `allow-gateway-status`\n- `allow-gateway-models`\n- `allow-gateway-generate`\n- `allow-gateway-stream`\n- `allow-gateway-cancel`\n- `allow-loopback-status`"
+          "markdownDescription": "Inspect configured speech routes and perform explicitly requested transcription or synthesis.\n#### This default permission set includes:\n\n- `allow-speech-status`\n- `allow-speech-plan-transcription`\n- `allow-speech-plan-synthesis`\n- `allow-speech-synthesize`\n- `allow-speech-synthesize-stream`\n- `allow-speech-transcribe`\n- `allow-speech-transcribe-stream`\n- `allow-speech-transcription-audio-push`\n- `allow-speech-transcription-audio-finish`\n- `allow-speech-cancel`"
         }
       ]
     }

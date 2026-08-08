@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tauri_plugin_free_token_energy::FreeTokenEnergyExt;
+use tauri_plugin_fte_speech::FreeTokenEnergySpeechExt;
 
 const RECEIPT_ENV: &str = "FTE_APPLE_TTS_SMOKE_RECEIPT";
 const STT_RECEIPT_ENV: &str = "FTE_PARAKEET_STT_SMOKE_RECEIPT";

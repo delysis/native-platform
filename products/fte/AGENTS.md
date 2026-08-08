@@ -27,8 +27,12 @@ provider, routing, streaming, and persistence components.
   providers and native adapters never reroute themselves
 - `fte-backend-llama` is the sole native-kit bridge and may contain no network,
   process, shell, or executable-discovery authority
-- `tauri-plugin-free-token-energy` is Rust-only; the webview receives typed IPC
-  and never owns credentials, routing state, or model state
+- `tauri-plugin-free-token-energy` is Rust-only and text/model-only; the
+  webview receives typed IPC and never owns credentials, routing state, or
+  model state
+- STT/TTS is a sibling service family. `tauri-plugin-free-token-energy-speech`
+  owns its independent IPC state, lifecycle, and permission namespace; the core
+  plugin must not depend on or authorize speech
 - Tauri 2 desktop shell with a vanilla HTML/CSS/JavaScript webview
 - Rust router and provider adapters under `src-tauri/src/`
 - SQLite persistence in `db.rs`
@@ -63,6 +67,7 @@ npm test
 cargo fmt --all --check
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+./scripts/check-module-boundaries.sh
 ```
 
 For native cache or adapter changes, also run the ignored real-GGUF proof with

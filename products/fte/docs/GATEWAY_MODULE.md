@@ -20,8 +20,12 @@ service through an authenticated loopback listener.
 - `fte-backend-llama`: the only bridge between the gateway and the versioned
   llama-native host. Local execution is in-process and credentialless.
 - `fte-loopback`: authenticated Axum REST/SSE edge, disabled until started.
-- `tauri-plugin-free-token-energy`: Rust-only Tauri 2 commands, lifecycle, and
-  managed state.
+- `tauri-plugin-free-token-energy`: Rust-only text/model gateway commands,
+  loopback lifecycle, and managed state. It contains no speech dependency or
+  permission.
+
+Speech is a separately installable service and Tauri plugin; see
+[Module and Repository Map](MODULE_MAP.md) and [Speech Gateway](SPEECH_GATEWAY.md).
 
 The native kit does not depend on Free Token Energy. Product state remains in
 the embedding application.

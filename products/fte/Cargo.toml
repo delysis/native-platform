@@ -14,6 +14,7 @@ members = [
     "crates/fte-backend-llama",
     "crates/fte-loopback",
     "crates/tauri-plugin-free-token-energy",
+    "crates/tauri-plugin-fte-speech",
     "src-tauri",
 ]
 
@@ -48,10 +49,10 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["limit", "timeout"] }
 tracing = "0.1.44"
 uuid = { version = "1", features = ["v4", "serde"] }
-llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "ed41f40cd0fd1e0608a1b055499dc58b2e03fa45" }
-llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "ed41f40cd0fd1e0608a1b055499dc58b2e03fa45" }
-llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "ed41f40cd0fd1e0608a1b055499dc58b2e03fa45" }
-llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "ed41f40cd0fd1e0608a1b055499dc58b2e03fa45" }
+llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "a185a4be3c6ad6ea1935e01acef8946c7dfdc459" }
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "a185a4be3c6ad6ea1935e01acef8946c7dfdc459" }
+llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "a185a4be3c6ad6ea1935e01acef8946c7dfdc459" }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "a185a4be3c6ad6ea1935e01acef8946c7dfdc459" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

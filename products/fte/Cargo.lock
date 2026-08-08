@@ -1486,6 +1486,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-free-token-energy",
+ "tauri-plugin-free-token-energy-speech",
  "tauri-plugin-opener",
  "tokio",
  "tracing",
@@ -2755,7 +2756,7 @@ dependencies = [
 [[package]]
 name = "llama-native-cache"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=ed41f40cd0fd1e0608a1b055499dc58b2e03fa45#ed41f40cd0fd1e0608a1b055499dc58b2e03fa45"
+source = "git+https://github.com/delysis/llama-native-kit?rev=a185a4be3c6ad6ea1935e01acef8946c7dfdc459#a185a4be3c6ad6ea1935e01acef8946c7dfdc459"
 dependencies = [
  "llama-native-types",
  "serde",
@@ -2765,7 +2766,7 @@ dependencies = [
 [[package]]
 name = "llama-native-engine"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=ed41f40cd0fd1e0608a1b055499dc58b2e03fa45#ed41f40cd0fd1e0608a1b055499dc58b2e03fa45"
+source = "git+https://github.com/delysis/llama-native-kit?rev=a185a4be3c6ad6ea1935e01acef8946c7dfdc459#a185a4be3c6ad6ea1935e01acef8946c7dfdc459"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",
@@ -2778,7 +2779,7 @@ dependencies = [
 [[package]]
 name = "llama-native-host"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=ed41f40cd0fd1e0608a1b055499dc58b2e03fa45#ed41f40cd0fd1e0608a1b055499dc58b2e03fa45"
+source = "git+https://github.com/delysis/llama-native-kit?rev=a185a4be3c6ad6ea1935e01acef8946c7dfdc459#a185a4be3c6ad6ea1935e01acef8946c7dfdc459"
 dependencies = [
  "llama-native-cache",
  "llama-native-engine",
@@ -2788,7 +2789,7 @@ dependencies = [
 [[package]]
 name = "llama-native-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=ed41f40cd0fd1e0608a1b055499dc58b2e03fa45#ed41f40cd0fd1e0608a1b055499dc58b2e03fa45"
+source = "git+https://github.com/delysis/llama-native-kit?rev=a185a4be3c6ad6ea1935e01acef8946c7dfdc459#a185a4be3c6ad6ea1935e01acef8946c7dfdc459"
 dependencies = [
  "serde",
  "thiserror 2.0.19",
@@ -5074,9 +5075,6 @@ dependencies = [
  "fte-loopback",
  "fte-providers",
  "fte-router",
- "fte-speech-gateway",
- "fte-speech-router",
- "fte-speech-types",
  "fte-store",
  "fte-types",
  "llama-native-host",
@@ -5085,6 +5083,18 @@ dependencies = [
  "tauri",
  "tauri-plugin",
  "tokio",
+]
+
+[[package]]
+name = "tauri-plugin-free-token-energy-speech"
+version = "0.1.0"
+dependencies = [
+ "fte-speech-gateway",
+ "fte-speech-router",
+ "fte-speech-types",
+ "serde",
+ "tauri",
+ "tauri-plugin",
 ]
 
 [[package]]

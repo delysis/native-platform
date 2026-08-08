@@ -50,8 +50,12 @@ pub fn run() {
         .plugin(
             tauri_plugin_free_token_energy::Builder::new()
                 .with_gateway(plugin_gateway)
-                .with_speech_gateway(speech_gateway)
                 .with_default_loopback()
+                .build(),
+        )
+        .plugin(
+            tauri_plugin_fte_speech::Builder::new()
+                .with_speech_gateway(speech_gateway)
                 .build(),
         )
         .setup(move |app| {

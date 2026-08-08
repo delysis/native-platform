@@ -307,7 +307,7 @@ pub(crate) fn lock_apple_runtime() -> MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use crate::PlatformCapabilityProbe;
-    use fte_speech_router::SpeechRouter;
+    use fte_speech_router::{SpeechRouteError, SpeechRouter};
     use fte_speech_types::{
         AlignmentGranularity, AudioOutputFormat, SpeechDeadlinePolicy, SpeechRequestContext,
         SpeechRequestId, SpeechRouteSelector, SpeechRoutingPolicy, SynthesisInput,
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_probe_produces_an_honest_local_tts_route() {
+    async fn real_probe_produces_an_honest_local_tts_route_or_blocker() {
         let mut probe = PlatformCapabilityProbe::current()
             .with_source_timeout(std::time::Duration::from_secs(10));
         probe
@@ -381,10 +381,23 @@ mod tests {
             stream: false,
         };
 
-        let plan = SpeechRouter
-            .plan_synthesis(&request, &snapshot)
-            .expect("the installed Apple voice backend should be routable");
-        assert_eq!(plan.selected.route.backend_id, "apple.av-speech");
-        assert_eq!(plan.selected.route.network, NetworkBehavior::Never);
+        let apple_synthesis_ready = snapshot
+            .source_reports
+            .iter()
+            .flat_map(|report| &report.backends)
+            .find(|backend| backend.id == "apple.av-speech")
+            .is_some_and(|backend| backend.readiness.is_ready());
+        let plan = SpeechRouter.plan_synthesis(&request, &snapshot);
+
+        if apple_synthesis_ready {
+            let plan = plan.expect("a ready Apple voice backend must be routable");
+            assert_eq!(plan.selected.route.backend_id, "apple.av-speech");
+            assert_eq!(plan.selected.route.network, NetworkBehavior::Never);
+        } else {
+            assert!(
+                matches!(plan, Err(SpeechRouteError::NoEligibleRoute { .. })),
+                "an unavailable or timed-out OS voice inventory must fail closed"
+            );
+        }
     }
 }
