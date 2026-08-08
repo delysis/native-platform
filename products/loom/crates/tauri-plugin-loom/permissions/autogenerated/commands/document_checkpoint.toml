@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-document-checkpoint"
+description = "Enables the document_checkpoint command without any pre-configured scope."
+commands.allow = ["document_checkpoint"]
+
+[[permission]]
+identifier = "deny-document-checkpoint"
+description = "Denies the document_checkpoint command without any pre-configured scope."
+commands.deny = ["document_checkpoint"]

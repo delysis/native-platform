@@ -1,0 +1,28 @@
+[package]
+name = "tauri-plugin-loom"
+links = "tauri-plugin-loom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+loom-document = { path = "../loom-document" }
+loom-backend-llama = { path = "../loom-backend-llama" }
+loom-host = { path = "../loom-host" }
+loom-store = { path = "../loom-store" }
+loom-types = { path = "../loom-types" }
+serde.workspace = true
+tauri = { version = "2.11.5", default-features = false }
+tauri-plugin-dialog = "2.7.2"
+
+[build-dependencies]
+tauri-plugin = { version = "2.5.4", features = ["build"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "loom-backend-llama"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Direct in-process llama.cpp adapter for Loom"
+
+[dependencies]
+crossbeam-channel = "0.5.15"
+llama-native-engine = { path = "../../../../Documents/llama-native-kit/crates/llama-native-engine" }
+llama-native-host = { path = "../../../../Documents/llama-native-kit/crates/llama-native-host" }
+llama-native-types = { path = "../../../../Documents/llama-native-kit/crates/llama-native-types" }
+loom-types = { path = "../loom-types" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "loom-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+atomic-write-file.workspace = true
+loom-document = { path = "../loom-document" }
+loom-types = { path = "../loom-types" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-document-draft-upsert"
+description = "Enables the document_draft_upsert command without any pre-configured scope."
+commands.allow = ["document_draft_upsert"]
+
+[[permission]]
+identifier = "deny-document-draft-upsert"
+description = "Denies the document_draft_upsert command without any pre-configured scope."
+commands.deny = ["document_draft_upsert"]

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-document-reconciliation-preview"
+description = "Enables the document_reconciliation_preview command without any pre-configured scope."
+commands.allow = ["document_reconciliation_preview"]
+
+[[permission]]
+identifier = "deny-document-reconciliation-preview"
+description = "Denies the document_reconciliation_preview command without any pre-configured scope."
+commands.deny = ["document_reconciliation_preview"]

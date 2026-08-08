@@ -1,0 +1,24 @@
+[package]
+name = "loom-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "loom"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+loom-document = { path = "../loom-document" }
+loom-store = { path = "../loom-store" }
+loom-types = { path = "../loom-types" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
