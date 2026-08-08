@@ -2,11 +2,6 @@
 resolver = "2"
 members = [
     "crates/fte-types",
-    "crates/fte-speech-types",
-    "crates/fte-speech-platform",
-    "crates/fte-speech-router",
-    "crates/fte-speech-gateway",
-    "crates/fte-speech-parakeet",
     "crates/fte-protocols",
     "crates/fte-router",
     "crates/fte-providers",
@@ -14,7 +9,6 @@ members = [
     "crates/fte-backend-llama",
     "crates/fte-loopback",
     "crates/tauri-plugin-free-token-energy",
-    "crates/tauri-plugin-fte-speech",
     "src-tauri",
 ]
 
@@ -31,11 +25,9 @@ async-stream = "0.3.6"
 axum = "0.8.9"
 bytes = "1.11.1"
 futures = "0.3.32"
-hound = "3.5.1"
 http = "1"
 http-body-util = "0.1"
 rand = "0.9"
-parakeet-rs = "0.3.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

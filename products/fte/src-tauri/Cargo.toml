@@ -40,12 +40,7 @@ fte-types = { path = "../crates/fte-types" }
 fte-router = { path = "../crates/fte-router" }
 fte-store = { path = "../crates/fte-store" }
 fte-providers = { path = "../crates/fte-providers" }
-fte-speech-gateway = { path = "../crates/fte-speech-gateway" }
-fte-speech-platform = { path = "../crates/fte-speech-platform" }
-fte-speech-parakeet = { path = "../crates/fte-speech-parakeet" }
-fte-speech-types = { path = "../crates/fte-speech-types" }
 tauri-plugin-free-token-energy = { path = "../crates/tauri-plugin-free-token-energy" }
-tauri-plugin-fte-speech = { package = "tauri-plugin-free-token-energy-speech", path = "../crates/tauri-plugin-fte-speech" }
 
 [features]
 default = ["axum"]

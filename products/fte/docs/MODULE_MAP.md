@@ -1,8 +1,8 @@
 # Module and Repository Map
 
-Free Token Energy contains two independent service families and one desktop
-consumer. They may be composed in one application, but they do not share a
-request model, registry, Tauri state, permissions, or lifecycle.
+Free Token Energy owns the text/model provider gateway and its desktop
+consumer. Local speech is an independently versioned sibling, not a workspace
+member or implicit desktop capability.
 
 ## Text and model gateway
 
@@ -17,57 +17,30 @@ request model, registry, Tauri state, permissions, or lifecycle.
 | `fte-loopback` | Authenticated OpenAI/Anthropic-compatible REST and SSE edge. |
 | `tauri-plugin-free-token-energy` | Text/model gateway IPC, loopback control, and their lifecycle only. |
 
-## Speech gateway
+## Speech sibling
 
-| Crate | Owner boundary |
-|---|---|
-| `fte-speech-types` | Independent STT/TTS requests, events, tickets, descriptors, and backend trait. |
-| `fte-speech-router` | Speech capability, privacy, model, and voice route planning. |
-| `fte-speech-gateway` | Speech backend registry, dispatch, cancellation, and shutdown. |
-| `fte-speech-platform` | Runtime platform discovery and the proven macOS Apple TTS backend. |
-| `fte-speech-parakeet` | Resident, in-process Parakeet STT over Hugging Face-managed weights. |
-| `tauri-plugin-free-token-energy-speech` | Speech-only IPC, live audio-input sinks, and speech lifecycle. |
+[`delysis/speech-native-kit`](https://github.com/delysis/speech-native-kit)
+owns STT/TTS contracts, routing, resident local backends, cancellation,
+lifecycle, and its optional Tauri plugin. Its default Tauri permission is
+status-only; synthesis, file transcription, and live transcription are
+separate explicit grants.
 
-The speech crates do not depend on the text gateway crates. The text Tauri
-plugin does not depend on or authorize speech. An embedding application must
-install `tauri-plugin-free-token-energy-speech` and grant
-`free-token-energy-speech:default` explicitly before a webview can invoke
-speech commands.
-
-Apple TTS and Parakeet STT are executable. Windows, Linux, Android, Apple STT,
-Kokoro, `parakeet.cpp`, sherpa-onnx, and resident Gemma audio transcription are
-candidate or deferred lanes unless their individual runtime evidence says
-otherwise. No current speech module captures a microphone; capture is a
-permissioned product/UI responsibility that supplies ordered audio to the
-gateway's typed input sink.
-
-## Desktop composition
-
-The `free-token-energy` desktop package under `src-tauri/` installs both Tauri
-plugins because it exercises both services. This composition does not merge
-their state:
-
-```text
-Free Token Energy desktop
-├── tauri-plugin-free-token-energy
-│   └── model gateway + optional authenticated loopback
-└── tauri-plugin-free-token-energy-speech
-    └── Apple TTS + Parakeet STT
-```
-
-Other applications install only what they use. In particular, a local chat
-application does not acquire speech commands merely because it embeds the text
-gateway.
+The FTE desktop does not install that plugin. This keeps ONNX, platform speech
+frameworks, live-audio IPC, and microphone-adjacent authority out of a desktop
+that has no speech UI.
 
 ## External repository direction
 
 - `llama-native-kit` owns the in-process llama.cpp runtime. It must not own
   general STT/TTS routing or platform speech adapters.
-- Free Token Energy owns provider and protocol composition. Its generic speech
-  crate family is deliberately dependency-independent and can be extracted to
-  a separately versioned `speech-native-kit` without changing its architecture.
+- Free Token Energy owns hosted-provider policy and public protocol edges. A
+  future optional bridge may implement hosted speech backends and
+  OpenAI-compatible `/v1/audio/*` endpoints by depending on
+  `speech-native-kit`.
 - Product applications own conversation state, microphone permissions,
   playback UX, and the decision to install either plugin.
 
-`scripts/check-module-boundaries.sh` enforces the two Tauri-plugin dependency
-and permission boundaries in CI.
+`scripts/check-module-boundaries.sh` enforces that speech does not drift back
+into the FTE core plugin or desktop capability surface.
+
+The downstream adapter contract is specified in [Optional speech bridge](SPEECH_BRIDGE.md).

@@ -5,17 +5,18 @@ SQLite, and a dependency-light webview. It presents several provider accounts
 through one OpenAI-compatible loopback API and can select an available route
 for each request.
 
-The repository also contains reusable Rust services and two independently
-installable Rust-only Tauri 2 plugins. The model gateway is protocol-neutral
+The repository also contains reusable Rust services and a Rust-only Tauri 2
+plugin. The model gateway is protocol-neutral
 internally, supports native OpenAI Responses Items/events and Anthropic
 Messages blocks, and can route to
 an in-process llama.cpp host or hosted providers without changing caller
 shape. See [Gateway Module](docs/GATEWAY_MODULE.md).
 
-Speech is a sibling service with its own contracts, router, registry, backends,
-Tauri plugin, permission namespace, and lifecycle. The two services are mapped
-in [Module and Repository Map](docs/MODULE_MAP.md); applications install only
-the plugins they actually use.
+Local STT/TTS lives in the independent
+[`delysis/speech-native-kit`](https://github.com/delysis/speech-native-kit)
+repository. FTE may consume it through optional provider/protocol bridges, but
+does not compile, install, or authorize speech by default. See
+[Module and Repository Map](docs/MODULE_MAP.md).
 
 The reusable gateway is substantially ahead of the historical desktop UI
 runtime. [Robustness and unification audit](docs/ROBUSTNESS_AUDIT.md) states
@@ -35,8 +36,6 @@ are not represented as unified until that migration is complete.
   persistent proxy-port settings
 - A transport-neutral backend boundary that distinguishes authenticated remote
   APIs from credentialless embedded or companion-process inference runtimes
-- A protocol-neutral speech gateway with Apple system TTS and resident
-  Parakeet STT loaded directly from the standard Hugging Face cache
 
 The model catalog uses current provider model IDs. Published free-tier limits
 are tracked locally where a provider documents them; account-specific or
@@ -137,22 +136,14 @@ For coordinated local development, copy
 pass `--config .cargo/local-native-kit.toml` to Cargo; that override is ignored
 by Git.
 
-## Native speech integration
+## Speech composition
 
-The reusable speech stack is separate from text generation and uses typed STT
-and TTS requests, bounded event streams, request-scoped cancellation, and
-capability/privacy routing. On macOS, installed Apple voices are the preferred
-on-device TTS path. `fte-speech-parakeet` is the first embedded STT backend: it
-loads Parakeet Realtime EOU 120M once through ONNX Runtime, creates independent
-decoder state per request, accepts WAV or PCM, and performs no network or
-subprocess calls during transcription.
-
-Weights remain in the shared Hugging Face cache under
-`altunenes/parakeet-rs`; they are not copied into application storage. See
-[Speech Gateway](docs/SPEECH_GATEWAY.md) for routing, streaming IPC, platform
-fallback, evidence, and the retained `parakeet.cpp` backend lane. Tauri
-consumers opt in through `tauri-plugin-free-token-energy-speech`; the core
-`tauri-plugin-free-token-energy` neither links nor authorizes speech.
+Local speech execution is owned by
+[`speech-native-kit`](https://github.com/delysis/speech-native-kit). A product
+may embed that Tauri plugin directly without importing FTE's hosted providers
+or loopback server. Future OpenAI-compatible `/v1/audio/*` codecs and hosted
+speech adapters belong in a thin optional FTE bridge that depends on speech
+contracts; neither core owns the other.
 
 ## Privacy and security
 

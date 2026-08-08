@@ -24,8 +24,9 @@ service through an authenticated loopback listener.
   loopback lifecycle, and managed state. It contains no speech dependency or
   permission.
 
-Speech is a separately installable service and Tauri plugin; see
-[Module and Repository Map](MODULE_MAP.md) and [Speech Gateway](SPEECH_GATEWAY.md).
+Speech is an independently versioned service in
+[`delysis/speech-native-kit`](https://github.com/delysis/speech-native-kit).
+See [Module and Repository Map](MODULE_MAP.md).
 
 The native kit does not depend on Free Token Energy. Product state remains in
 the embedding application.

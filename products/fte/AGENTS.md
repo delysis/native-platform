@@ -30,9 +30,9 @@ provider, routing, streaming, and persistence components.
 - `tauri-plugin-free-token-energy` is Rust-only and text/model-only; the
   webview receives typed IPC and never owns credentials, routing state, or
   model state
-- STT/TTS is a sibling service family. `tauri-plugin-free-token-energy-speech`
-  owns its independent IPC state, lifecycle, and permission namespace; the core
-  plugin must not depend on or authorize speech
+- STT/TTS is owned by the independently versioned `speech-native-kit`. FTE may
+  add an optional hosted-provider or `/v1/audio/*` bridge, but the core plugin
+  and desktop must not compile, install, or authorize local speech by default
 - Tauri 2 desktop shell with a vanilla HTML/CSS/JavaScript webview
 - Rust router and provider adapters under `src-tauri/src/`
 - SQLite persistence in `db.rs`

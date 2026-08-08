@@ -22,7 +22,6 @@ evidence.
   one terminal event.
 - The native prefix cache binds exact token and runtime fingerprints. A mismatch
   is a normal miss; required caching fails closed.
-- Speech shutdown attempts every registered backend and aggregates failures.
 
 ## Still a breaking migration, not release evidence
 
@@ -43,8 +42,8 @@ evidence.
   authoritative and IPv6 is best effort.
 - The proposed `fte-core-2026-08` compatibility manifest and SDK conformance
   suite are not yet published as a versioned machine-readable profile.
-- Speech request-size/duration limits and worker-join semantics need a separate
-  platform-backend hardening slice.
+- Local STT/TTS hardening and real-audio acceptance are tracked independently
+  in `delysis/speech-native-kit`; they do not gate text/provider releases.
 
 ## Next safe slice
 
