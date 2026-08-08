@@ -9,7 +9,7 @@ then
   exit 1
 fi
 
-if rg -n 'fte-speech-|tauri-plugin-(fte-speech|free-token-energy-speech)' --glob 'Cargo.toml' .
+if rg -n '(fte-speech-|speech-native-|tauri-plugin-(fte-speech|free-token-energy-speech|speech-native))' --glob 'Cargo.toml' .
 then
   echo "speech dependencies require deliberate product UX and a separate permission review" >&2
   exit 1
@@ -55,7 +55,7 @@ then
   exit 1
 fi
 
-if rg -n '^name = "(fte-speech-|tauri-plugin-free-token-energy-speech)' Cargo.lock
+if rg -n '^name = "(fte-speech-|speech-native-|tauri-plugin-(free-token-energy-speech|speech-native))' Cargo.lock
 then
   echo "Mom Llama must not resolve speech packages without deliberate speech UX" >&2
   exit 1

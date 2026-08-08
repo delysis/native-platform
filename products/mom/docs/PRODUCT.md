@@ -30,11 +30,12 @@ and no consult group is seeded on the user's behalf.
 Mom Llama consumes exact immutable Git revisions of:
 
 - `llama-native-kit` for in-process model execution and cache-safe native state;
-- Free Token Energy for protocol-neutral routing and the optional text gateway.
+- Free Token Energy for protocol-neutral routing and the optional text gateway;
+- `speech-native-kit` for local STT/TTS only after a deliberate, human-reviewed
+  microphone/read-aloud product surface exists.
 
-It does not copy either implementation. It currently installs only the FTE text
-plugin. Speech backends remain in FTE until Mom Llama has a deliberate,
-human-reviewed microphone/read-aloud product surface.
+It does not copy these implementations. It currently installs only the FTE text
+plugin and no speech plugin.
 
 ## Frontend boundary
 

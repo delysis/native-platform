@@ -9,8 +9,9 @@ It does **not** contain a copied llama.cpp engine or a generic provider gateway:
 - [`delysis/llama-native-kit`](https://github.com/delysis/llama-native-kit)
   owns the in-process GGUF runtime.
 - [`delysis/free-token-energy`](https://github.com/delysis/free-token-energy)
-  owns protocol routing, hosted providers, optional loopback compatibility and
-  the separate STT/TTS modules.
+  owns protocol routing, hosted providers and optional loopback compatibility.
+- [`delysis/speech-native-kit`](https://github.com/delysis/speech-native-kit)
+  owns local STT/TTS contracts, routing, backends and optional Tauri IPC.
 - [`delysis/capability-system-compiler`](https://github.com/delysis/capability-system-compiler)
   owns Loom compilation/specification and may test this CLI as a black box; it
   does not own another Mom Llama implementation.

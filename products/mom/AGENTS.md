@@ -1,8 +1,9 @@
 # Mom Llama product contract
 
 This repository owns one product: Mom Llama. Reusable llama.cpp internals live
-in `delysis/llama-native-kit`; routing/protocol/provider/speech modules live in
-`delysis/free-token-energy`.
+in `delysis/llama-native-kit`; routing/protocol/provider modules live in
+`delysis/free-token-energy`; local STT/TTS lives in
+`delysis/speech-native-kit`.
 
 ## Product hierarchy
 
