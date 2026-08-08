@@ -42,6 +42,14 @@ pub trait PrefixCacheStore: Send + Sync {
     fn load(&self, namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError>;
     fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError>;
     fn delete(&self, namespace: &str, id: &str) -> Result<(), NativeError>;
+
+    fn clear(&self, namespace: &str) -> Result<usize, NativeError> {
+        let values = self.load(namespace)?;
+        for value in &values {
+            self.delete(namespace, &value.metadata.id)?;
+        }
+        Ok(values.len())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +58,24 @@ pub struct NativeHostConfig {
     pub max_slots: usize,
     pub memory_cache_bytes: usize,
     pub cache_namespace: String,
+    pub cache_policy: HostCachePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCachePolicy {
+    Disabled,
+    MemoryOnly,
+    MemoryAndPersistent,
+}
+
+impl HostCachePolicy {
+    const fn allows_memory(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    const fn allows_persistent(self) -> bool {
+        matches!(self, Self::MemoryAndPersistent)
+    }
 }
 
 impl Default for NativeHostConfig {
@@ -59,6 +85,7 @@ impl Default for NativeHostConfig {
             max_slots: 4,
             memory_cache_bytes: 256 * 1024 * 1024,
             cache_namespace: "llama-native-host".to_string(),
+            cache_policy: HostCachePolicy::MemoryAndPersistent,
         }
     }
 }
@@ -89,6 +116,7 @@ struct HostState {
 pub struct NativeHost {
     config: NativeHostConfig,
     state: Mutex<HostState>,
+    load_gate: Mutex<()>,
     clock: Arc<dyn HostClock>,
     persistent_cache: Option<Arc<dyn PrefixCacheStore>>,
 }
@@ -120,6 +148,7 @@ impl NativeHost {
                 slots: BTreeMap::new(),
                 cache: MemoryPrefixCache::new(config.memory_cache_bytes),
             }),
+            load_gate: Mutex::new(()),
             config,
             clock,
             persistent_cache,
@@ -127,32 +156,37 @@ impl NativeHost {
     }
 
     pub fn acquire(&self, model: NativeModelConfig) -> Result<NativeModelHandle, NativeError> {
-        if let Some(existing) = self
-            .state
-            .lock()
-            .map_err(host_poisoned)?
-            .slots
-            .values()
-            .find(|entry| entry.config == model)
-            .map(|entry| entry.handle.clone())
-        {
+        if let Some(existing) = self.resident_handle(&model)? {
             return Ok(existing);
         }
-        let slot_id = {
-            let state = self.state.lock().map_err(host_poisoned)?;
-            (0..self.config.max_slots)
-                .find(|slot| !state.slots.contains_key(slot))
-                .ok_or_else(|| {
-                    NativeError::new(
-                        NativeErrorCode::ModelSlotsFull,
-                        "all configured resident model slots are occupied",
-                    )
-                })?
-        };
-        self.load_into_slot(slot_id, model)
+        self.with_load_gate(|| {
+            if let Some(existing) = self.resident_handle(&model)? {
+                return Ok(existing);
+            }
+            let slot_id = {
+                let state = self.state.lock().map_err(host_poisoned)?;
+                (0..self.config.max_slots)
+                    .find(|slot| !state.slots.contains_key(slot))
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ModelSlotsFull,
+                            "all configured resident model slots are occupied",
+                        )
+                    })?
+            };
+            self.load_into_slot_inner(slot_id, model)
+        })
     }
 
     pub fn load_into_slot(
+        &self,
+        slot_id: usize,
+        model: NativeModelConfig,
+    ) -> Result<NativeModelHandle, NativeError> {
+        self.with_load_gate(|| self.load_into_slot_inner(slot_id, model))
+    }
+
+    fn load_into_slot_inner(
         &self,
         slot_id: usize,
         model: NativeModelConfig,
@@ -221,6 +255,28 @@ impl NativeHost {
             },
         );
         Ok(handle)
+    }
+
+    fn resident_handle(
+        &self,
+        model: &NativeModelConfig,
+    ) -> Result<Option<NativeModelHandle>, NativeError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(host_poisoned)?
+            .slots
+            .values()
+            .find(|entry| &entry.config == model)
+            .map(|entry| entry.handle.clone()))
+    }
+
+    fn with_load_gate<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, NativeError>,
+    ) -> Result<T, NativeError> {
+        let _guard = self.load_gate.lock().map_err(host_poisoned)?;
+        operation()
     }
 
     pub fn generate(
@@ -329,6 +385,9 @@ impl NativeHost {
         fingerprint: &CacheFingerprint,
         prompt_token_ids: &[i32],
     ) -> Option<PrefixCacheValue> {
+        if !self.config.cache_policy.allows_memory() {
+            return None;
+        }
         let now = self.clock.now_ms();
         self.state
             .lock()
@@ -343,6 +402,9 @@ impl NativeHost {
         prompt_token_ids: &[i32],
         owner_id: &str,
     ) -> Option<PrefixCacheValue> {
+        if !self.config.cache_policy.allows_memory() {
+            return None;
+        }
         let now = self.clock.now_ms();
         let mut state = self.state.lock().ok()?;
         let matched = state
@@ -352,19 +414,27 @@ impl NativeHost {
     }
 
     pub fn cache_insert(&self, value: PrefixCacheValue) -> Result<Vec<String>, NativeError> {
+        if !self.config.cache_policy.allows_memory() {
+            return Ok(Vec::new());
+        }
         let evicted = self
             .state
             .lock()
             .map_err(host_poisoned)?
             .cache
             .insert(value.clone());
-        if let Some(store) = &self.persistent_cache {
+        if self.config.cache_policy.allows_persistent()
+            && let Some(store) = &self.persistent_cache
+        {
             store.save(&self.config.cache_namespace, &value)?;
         }
         Ok(evicted)
     }
 
     pub fn restore_persistent_cache(&self) -> Result<usize, NativeError> {
+        if !self.config.cache_policy.allows_persistent() {
+            return Ok(0);
+        }
         let Some(store) = &self.persistent_cache else {
             return Ok(0);
         };
@@ -378,6 +448,25 @@ impl NativeHost {
             }
         }
         Ok(restored)
+    }
+
+    /// Clears both host-owned prefix tiers for this namespace.
+    ///
+    /// Persistent deletion is attempted even when lookup is currently disabled,
+    /// so a runtime policy change cannot strand reusable state behind an "off"
+    /// switch.
+    pub fn clear_cache(&self) -> Result<usize, NativeError> {
+        let memory_entries = {
+            let mut state = self.state.lock().map_err(host_poisoned)?;
+            let entries = state.cache.len();
+            state.cache.clear();
+            entries
+        };
+        let Some(store) = &self.persistent_cache else {
+            return Ok(memory_entries);
+        };
+        let persistent_entries = store.clear(&self.config.cache_namespace)?;
+        Ok(memory_entries.saturating_add(persistent_entries))
     }
 }
 
@@ -403,6 +492,10 @@ mod tests {
     use super::*;
     use llama_native_cache::{CacheFingerprint, CacheTier, PrefixCacheMetadata};
     use llama_native_types::{PromptForm, PromptTokenPolicy, SequenceStateBlob};
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     #[derive(Debug, Default)]
     struct TestPrefixStore {
@@ -509,6 +602,127 @@ mod tests {
                 .expect("persistent load")
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn load_gate_serializes_first_load_critical_sections() {
+        let host = Arc::new(NativeHost::new(NativeHostConfig::default()));
+        let start = Arc::new(Barrier::new(9));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let workers = (0..8)
+            .map(|_| {
+                let host = Arc::clone(&host);
+                let start = Arc::clone(&start);
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                thread::spawn(move || {
+                    start.wait();
+                    host.with_load_gate(|| {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(current, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(5));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .expect("load gate");
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for worker in workers {
+            worker.join().expect("load worker");
+        }
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn disabled_cache_neither_reads_writes_nor_restores_but_clear_still_deletes() {
+        let store = Arc::new(TestPrefixStore::default());
+        let host = NativeHost::with_dependencies(
+            NativeHostConfig {
+                cache_policy: HostCachePolicy::Disabled,
+                ..NativeHostConfig::default()
+            },
+            Arc::new(SystemClock),
+            Some(store.clone()),
+        );
+        let value = cache_value("disabled", 1);
+        assert!(
+            host.cache_insert(value.clone())
+                .expect("disabled insert")
+                .is_empty()
+        );
+        assert!(
+            host.cache_lookup(&value.metadata.fingerprint, &[1, 2])
+                .is_none()
+        );
+        assert!(
+            store
+                .load("llama-native-host")
+                .expect("store read")
+                .is_empty()
+        );
+
+        store
+            .save("llama-native-host", &value)
+            .expect("seed prior persistent value");
+        assert_eq!(
+            host.restore_persistent_cache().expect("disabled restore"),
+            0
+        );
+        assert_eq!(host.clear_cache().expect("disabled clear"), 1);
+        assert!(
+            store
+                .load("llama-native-host")
+                .expect("store read")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn memory_only_cache_never_writes_or_restores_persistent_values() {
+        let store = Arc::new(TestPrefixStore::default());
+        let host = NativeHost::with_dependencies(
+            NativeHostConfig {
+                cache_policy: HostCachePolicy::MemoryOnly,
+                ..NativeHostConfig::default()
+            },
+            Arc::new(SystemClock),
+            Some(store.clone()),
+        );
+        let value = cache_value("memory", 1);
+        host.cache_insert(value.clone()).expect("memory insert");
+        assert!(
+            host.cache_lookup(&value.metadata.fingerprint, &[1, 2])
+                .is_some()
+        );
+        assert!(
+            store
+                .load("llama-native-host")
+                .expect("store read")
+                .is_empty()
+        );
+
+        store
+            .save("llama-native-host", &cache_value("persistent", 2))
+            .expect("seed persistent value");
+        assert_eq!(
+            host.restore_persistent_cache()
+                .expect("memory-only restore"),
+            0
+        );
+        assert_eq!(host.clear_cache().expect("memory-only clear"), 2);
+        assert!(
+            host.cache_lookup(&value.metadata.fingerprint, &[1, 2])
+                .is_none()
+        );
+        assert!(
+            store
+                .load("llama-native-host")
+                .expect("store read")
+                .is_empty()
         );
     }
 }
