@@ -44,7 +44,7 @@ fn mcp_fixture_server(root: &Path) -> Result<(PathBuf, Vec<String>)> {
         std::fs::write(
             &server,
             format!(
-                "#!/bin/sh\nprintf 'Content-Length: {}\\r\\n\\r\\n{}'\n",
+                "#!/bin/sh\ncat >/dev/null\nprintf 'Content-Length: {}\\r\\n\\r\\n{}'\n",
                 body.len(),
                 body
             ),
@@ -66,7 +66,7 @@ fn mcp_fixture_server(root: &Path) -> Result<(PathBuf, Vec<String>)> {
             .replace('$', "`$")
             .replace('"', "`\"");
         let script = format!(
-            "[Console]::Out.Write(\"Content-Length: {}`r`n`r`n{}\")",
+            "[Console]::In.ReadToEnd() | Out-Null; [Console]::Out.Write(\"Content-Length: {}`r`n`r`n{}\")",
             body.len(),
             escaped_body
         );
