@@ -36,6 +36,8 @@ fn json_output(output: &Output) -> Result<Value> {
 }
 
 fn mcp_fixture_server(root: &Path) -> Result<(PathBuf, Vec<String>)> {
+    #[cfg(windows)]
+    let _ = root;
     let body = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo input","inputSchema":{"type":"object"}}],"content":[{"type":"text","text":"echo ok"}]}}"#;
     #[cfg(unix)]
     {
@@ -440,8 +442,7 @@ fn attachment_and_mcp_are_exercisable_without_claiming_llama_inference() -> Resu
         mcp_path.to_string(),
     ];
     for argument in mcp_args {
-        configure_args.push("--arg".to_string());
-        configure_args.push(argument);
+        configure_args.push(format!("--arg={argument}"));
     }
     configure_args.push("--json".to_string());
     let configure_refs = configure_args
