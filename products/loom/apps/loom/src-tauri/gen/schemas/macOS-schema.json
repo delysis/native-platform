@@ -2259,16 +2259,16 @@
           "markdownDescription": "Denies the save command without any pre-configured scope."
         },
         {
-          "description": "Open and edit a user-selected Loom project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`",
+          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`",
           "type": "string",
           "const": "loom:default",
-          "markdownDescription": "Open and edit a user-selected Loom project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`"
+          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`"
         },
         {
-          "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-focus-mode-set`",
+          "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
           "type": "string",
           "const": "loom:local-generation",
-          "markdownDescription": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-focus-mode-set`"
+          "markdownDescription": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`"
         },
         {
           "description": "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command.\n#### This permission set includes:\n\n- `allow-candidate-promote`",
@@ -2439,10 +2439,22 @@
           "markdownDescription": "Enables the project_current command without any pre-configured scope."
         },
         {
+          "description": "Enables the project_open_default command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-project-open-default",
+          "markdownDescription": "Enables the project_open_default command without any pre-configured scope."
+        },
+        {
           "description": "Enables the project_recover command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-project-recover",
           "markdownDescription": "Enables the project_recover command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the suggestions_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-suggestions-set",
+          "markdownDescription": "Enables the suggestions_set command without any pre-configured scope."
         },
         {
           "description": "Enables the weave_start command without any pre-configured scope.",
@@ -2613,10 +2625,22 @@
           "markdownDescription": "Denies the project_current command without any pre-configured scope."
         },
         {
+          "description": "Denies the project_open_default command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-project-open-default",
+          "markdownDescription": "Denies the project_open_default command without any pre-configured scope."
+        },
+        {
           "description": "Denies the project_recover command without any pre-configured scope.",
           "type": "string",
           "const": "loom:deny-project-recover",
           "markdownDescription": "Denies the project_recover command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the suggestions_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-suggestions-set",
+          "markdownDescription": "Denies the suggestions_set command without any pre-configured scope."
         },
         {
           "description": "Denies the weave_start command without any pre-configured scope.",
