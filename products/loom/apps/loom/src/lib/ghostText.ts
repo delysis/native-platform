@@ -1,5 +1,5 @@
 import { Plugin, PluginKey, Selection, type EditorState, type Transaction } from 'prosemirror-state';
-import { Decoration, DecorationSet, type EditorView } from 'prosemirror-view';
+import type { EditorView } from 'prosemirror-view';
 
 export interface GhostTextPresentation {
   active: boolean;
@@ -18,6 +18,18 @@ export interface GhostTextPlan {
 export interface GhostTextHandlers {
   accept: (candidateId: string, presentationKey: string) => void;
   dismiss: (candidateId: string, presentationKey: string) => void;
+}
+
+export interface GhostOverlayGeometry {
+  left: number;
+  top: number;
+  maxWidth: number;
+}
+
+export interface GhostOverlayBounds {
+  caret: { left: number; top: number; bottom: number };
+  shell: { left: number; top: number };
+  text: { left: number; right: number };
 }
 
 type GhostTextMeta =
@@ -58,47 +70,39 @@ export function planGhostText(
 }
 
 export function renderedGhostPresentationKey(state: EditorState): string {
-  const presentation = ghostTextPluginKey.getState(state) ?? null;
-  return planGhostText(state, presentation)?.presentationKey ?? '';
+  return currentGhostTextPlan(state)?.presentationKey ?? '';
 }
 
-export function createGhostTextElement(
-  ownerDocument: Document,
-  text: string
-): HTMLElement {
-  const element = ownerDocument.createElement('span');
-  element.className = 'loom-ghost-text';
-  // Keep proposal bytes out of the contenteditable text tree. WebKit includes
-  // hidden widget text in the AX value even with aria-hidden, which makes a
-  // screen reader report a private suggestion as accepted manuscript text.
-  element.textContent = '';
-  element.contentEditable = 'false';
-  element.setAttribute('aria-hidden', 'true');
-  element.setAttribute('data-loom-ghost-text', text);
-  element.setAttribute('draggable', 'false');
-  element.setAttribute('spellcheck', 'false');
-  return element;
+export function currentGhostTextPlan(state: EditorState): GhostTextPlan | null {
+  return planGhostText(state, ghostTextPluginKey.getState(state) ?? null);
 }
 
-export function createGhostTextDecorations(
-  state: EditorState,
-  presentation: GhostTextPresentation | null
-): DecorationSet {
-  const plan = planGhostText(state, presentation);
-  if (!plan) return DecorationSet.empty;
+/** Position a visual-only sibling overlay without entering the textbox tree. */
+export function planGhostOverlayGeometry(bounds: GhostOverlayBounds): GhostOverlayGeometry | null {
+  const values = [
+    bounds.caret.left,
+    bounds.caret.top,
+    bounds.caret.bottom,
+    bounds.shell.left,
+    bounds.shell.top,
+    bounds.text.left,
+    bounds.text.right
+  ];
+  if (!values.every(Number.isFinite) || bounds.text.right <= bounds.text.left) return null;
 
-  return DecorationSet.create(state.doc, [
-    Decoration.widget(
-      plan.position,
-      (view) => createGhostTextElement(view.dom.ownerDocument, plan.text),
-      {
-        ignoreSelection: true,
-        key: `loom-ghost:${plan.presentationKey}`,
-        marks: [],
-        side: 1
-      }
-    )
-  ]);
+  const sameLineWidth = bounds.text.right - bounds.caret.left;
+  if (sameLineWidth >= 72) {
+    return {
+      left: Math.max(0, bounds.caret.left - bounds.shell.left),
+      top: Math.max(0, bounds.caret.top - bounds.shell.top),
+      maxWidth: sameLineWidth
+    };
+  }
+  return {
+    left: Math.max(0, bounds.text.left - bounds.shell.left),
+    top: Math.max(0, bounds.caret.bottom - bounds.shell.top),
+    maxWidth: bounds.text.right - bounds.text.left
+  };
 }
 
 function clearTransaction(view: EditorView): Transaction {
@@ -145,9 +149,6 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
       }
     },
     props: {
-      decorations(state) {
-        return createGhostTextDecorations(state, ghostTextPluginKey.getState(state) ?? null);
-      },
       handleKeyDown(view, event) {
         const plan = planGhostText(view.state, ghostTextPluginKey.getState(view.state) ?? null);
         if (!plan || event.isComposing || event.keyCode === 229) return false;

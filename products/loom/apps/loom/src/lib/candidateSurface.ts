@@ -1,6 +1,6 @@
 export type CandidateSurfaceDecision =
   | { surface: true }
-  | { surface: false; reason: 'artifact' | 'empty' | 'invisible' | 'numeric' | 'repetition' };
+  | { surface: false; reason: 'artifact' | 'empty' | 'invisible' | 'numeric' | 'repetition' | 'too_short' };
 
 const wordPattern = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu;
 const letterPattern = /\p{L}/u;
@@ -43,6 +43,11 @@ export function candidateSurfaceDecision(text: string): CandidateSurfaceDecision
   if (generatedMediaMarkerPattern.test(text.slice(0, maxScannedCodeUnits))) {
     return { surface: false, reason: 'artifact' };
   }
+  const compactAscii = text.trim();
+  if (
+    /^[\x00-\x7f]*$/u.test(compactAscii) &&
+    Array.from(compactAscii).filter((scalar) => /\S/u.test(scalar)).length < 4
+  ) return { surface: false, reason: 'too_short' };
   if (hasDegenerateUnbrokenPeriod(text)) {
     return { surface: false, reason: 'repetition' };
   }

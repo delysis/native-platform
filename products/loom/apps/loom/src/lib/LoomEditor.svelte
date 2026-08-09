@@ -10,7 +10,8 @@
   import {
     clearGhostText,
     createGhostTextPlugin,
-    renderedGhostPresentationKey,
+    currentGhostTextPlan,
+    planGhostOverlayGeometry,
     setGhostText
   } from './ghostText';
 
@@ -29,6 +30,7 @@
   export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
   export let onSelectionChange: (atDocumentEnd: boolean) => void = () => {};
 
+  let shell: HTMLDivElement;
   let mount: HTMLDivElement;
   let view: EditorView | undefined;
   let lastEmitted = value;
@@ -37,9 +39,53 @@
   let composing = false;
   let suppressedGhostKey = '';
   let reportedGhostPresentationKey = '';
+  let ghostOverlay: {
+    presentationKey: string;
+    text: string;
+    left: number;
+    top: number;
+    maxWidth: number;
+  } | null = null;
+
+  function syncGhostOverlay(): string {
+    const plan = view ? currentGhostTextPlan(view.state) : null;
+    if (!view || !plan || !shell) {
+      ghostOverlay = null;
+      return '';
+    }
+    try {
+      const caret = view.coordsAtPos(plan.position, 1);
+      const shellBounds = shell.getBoundingClientRect();
+      const editorBounds = view.dom.getBoundingClientRect();
+      const editorStyle = window.getComputedStyle(view.dom);
+      const paddingLeft = Number.parseFloat(editorStyle.paddingLeft) || 0;
+      const paddingRight = Number.parseFloat(editorStyle.paddingRight) || 0;
+      const geometry = planGhostOverlayGeometry({
+        caret,
+        shell: shellBounds,
+        text: {
+          left: editorBounds.left + paddingLeft,
+          right: editorBounds.right - paddingRight
+        }
+      });
+      if (!geometry) {
+        ghostOverlay = null;
+        return '';
+      }
+      ghostOverlay = {
+        presentationKey: plan.presentationKey,
+        text: plan.text,
+        ...geometry
+      };
+      return plan.presentationKey;
+    } catch {
+      ghostOverlay = null;
+      return '';
+    }
+  }
 
   function reportGhostVisibility(): void {
-    const presentationKey = view ? renderedGhostPresentationKey(view.state) : '';
+    const presentationKey = syncGhostOverlay();
     if (reportedGhostPresentationKey === presentationKey) return;
     reportedGhostPresentationKey = presentationKey;
     onGhostVisibilityChange(presentationKey);
@@ -162,6 +208,7 @@
     });
     reportSelection(view.state);
     reportGhostVisibility();
+    window.addEventListener('resize', reportGhostVisibility);
     if (autofocus) view.focus();
   });
 
@@ -190,8 +237,18 @@
     if (composing) onCompositionChange(false);
     onSelectionChange(false);
     if (reportedGhostPresentationKey) onGhostVisibilityChange('');
+    window.removeEventListener('resize', reportGhostVisibility);
     view?.destroy();
   });
 </script>
 
-<div class="editor-mount" bind:this={mount}></div>
+<div class="loom-editor-shell" bind:this={shell}>
+  <div class="editor-mount" bind:this={mount}></div>
+  {#if ghostOverlay}
+    <span
+      class="loom-visual-ghost"
+      aria-hidden="true"
+      style={`left:${ghostOverlay.left}px;top:${ghostOverlay.top}px;max-width:${ghostOverlay.maxWidth}px`}
+    >{ghostOverlay.text}</span>
+  {/if}
+</div>

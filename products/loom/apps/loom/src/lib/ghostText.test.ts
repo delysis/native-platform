@@ -3,11 +3,10 @@ import { EditorState, Selection, TextSelection } from 'prosemirror-state';
 import type { EditorView } from 'prosemirror-view';
 import { describe, expect, it } from 'vitest';
 import {
-  createGhostTextDecorations,
-  createGhostTextElement,
   createGhostTextPlugin,
   ghostTextPluginKey,
   planGhostText,
+  planGhostOverlayGeometry,
   renderedGhostPresentationKey,
   setGhostText,
   type GhostTextPresentation
@@ -56,41 +55,39 @@ describe('planGhostText', () => {
   });
 });
 
-describe('createGhostTextDecorations', () => {
-  it('adds one widget without changing the ProseMirror document or Markdown projection', () => {
-    const state = stateAtEnd();
-    const before = defaultMarkdownSerializer.serialize(state.doc);
-    const decorations = createGhostTextDecorations(state, suggestion);
-    expect(decorations.find()).toHaveLength(1);
-    expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(before);
+describe('visual ghost overlay', () => {
+  it('keeps generated text out of ProseMirror DOM decorations', () => {
+    const plugin = createGhostTextPlugin({ accept() {}, dismiss() {} });
+    expect(plugin.props.decorations).toBeUndefined();
   });
 
-  it('creates inert, screen-reader-hidden text while preserving exact whitespace', () => {
-    const attributes = new Map<string, string>();
-    const element = {
-      className: '',
-      contentEditable: 'inherit',
-      setAttribute(name: string, value: string) {
-        attributes.set(name, value);
-      },
-      textContent: null as string | null
-    };
-    const fakeDocument = {
-      createElement(tag: string) {
-        expect(tag).toBe('span');
-        return element;
-      }
-    } as unknown as Document;
+  it('continues on the caret line when space remains', () => {
+    expect(planGhostOverlayGeometry({
+      caret: { left: 220, top: 80, bottom: 110 },
+      shell: { left: 100, top: 20 },
+      text: { left: 150, right: 600 }
+    })).toEqual({ left: 120, top: 60, maxWidth: 380 });
+  });
 
-    const created = createGhostTextElement(fakeDocument, suggestion.text);
-    expect(created).toBe(element);
-    expect(element.className).toBe('loom-ghost-text');
-    expect(element.textContent).toBe('');
-    expect(element.contentEditable).toBe('false');
-    expect(attributes.get('aria-hidden')).toBe('true');
-    expect(attributes.get('data-loom-ghost-text')).toBe(suggestion.text);
-    expect(attributes.get('draggable')).toBe('false');
-    expect(attributes.get('spellcheck')).toBe('false');
+  it('starts a new visual line near the writing measure edge', () => {
+    expect(planGhostOverlayGeometry({
+      caret: { left: 570, top: 80, bottom: 110 },
+      shell: { left: 100, top: 20 },
+      text: { left: 150, right: 600 }
+    })).toEqual({ left: 50, top: 90, maxWidth: 450 });
+  });
+
+  it('refuses non-finite or inverted layout evidence', () => {
+    expect(planGhostOverlayGeometry({
+      caret: { left: Number.NaN, top: 0, bottom: 1 },
+      shell: { left: 0, top: 0 },
+      text: { left: 0, right: 1 }
+    })).toBeNull();
+    expect(planGhostOverlayGeometry({
+      caret: { left: 1, top: 0, bottom: 1 },
+      shell: { left: 0, top: 0 },
+      text: { left: 2, right: 1 }
+    })).toBeNull();
   });
 });
 

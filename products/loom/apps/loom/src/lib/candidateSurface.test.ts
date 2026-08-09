@@ -19,6 +19,18 @@ describe('candidateSurfaceDecision', () => {
     });
   });
 
+  it('holds trivial ASCII fragments without rejecting compact Unicode writing', () => {
+    for (const text of ['.', 'S', 'Hi', '...']) {
+      expect(candidateSurfaceDecision(text)).toEqual({
+        surface: false,
+        reason: 'too_short'
+      });
+    }
+    expect(candidateTextIsSurfaceable('wait')).toBe(true);
+    expect(candidateTextIsSurfaceable('…')).toBe(true);
+    expect(candidateTextIsSurfaceable('雨')).toBe(true);
+  });
+
   it('suppresses control-only invisible Unicode without rejecting visible Unicode', () => {
     for (const text of ['\u200b', '\u2067', '\u2060', '\0', '\u200b\u2067\0']) {
       expect(candidateSurfaceDecision(text)).toEqual({

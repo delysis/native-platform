@@ -133,13 +133,13 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .source-editor-shell.verse .source-ghost-mirror { white-space: pre; }
 .loom-source-ghost-text { color: var(--ghost-ink); -webkit-text-fill-color: var(--ghost-ink); }
 .source-ghost-sentinel { color: transparent; -webkit-text-fill-color: transparent; }
-.editor-mount { min-height: 100%; }
+.loom-editor-shell, .editor-mount { min-height: 100%; }
+.loom-editor-shell { position: relative; }
 .loom-prosemirror { --writing-gutter: clamp(24px, 5vw, 72px); width: min(100%, calc(82ch + var(--writing-gutter) + var(--writing-gutter))); min-height: 100%; margin: 0; padding: clamp(24px, 4vh, 42px) var(--writing-gutter) 25vh; outline: 0; color: var(--ink); font: 19px/1.72 Iowan Old Style, Palatino, Georgia, serif; caret-color: var(--clay); }
 .loom-prosemirror p { margin: 0 0 1.05em; }
 .loom-prosemirror h1, .loom-prosemirror h2, .loom-prosemirror h3 { font-family: inherit; font-weight: 600; line-height: 1.25; }
 .loom-prosemirror blockquote { margin-left: 0; padding-left: 1.2em; border-left: 2px solid var(--line); color: #5d5d57; }
-.loom-ghost-text { color: var(--ghost-ink); overflow-wrap: anywhere; pointer-events: none; user-select: none; -webkit-user-select: none; white-space: break-spaces; }
-.loom-ghost-text::before { content: attr(data-loom-ghost-text); }
+.loom-visual-ghost { position: absolute; z-index: 1; display: block; color: var(--ghost-ink); font: 19px/1.72 Iowan Old Style, Palatino, Georgia, serif; overflow-wrap: anywhere; pointer-events: none; user-select: none; -webkit-user-select: none; white-space: break-spaces; }
 .loom-prosemirror ::selection, .source-pane textarea::selection { color: var(--selection-ink); background: var(--selection-bg); }
 .source-pane textarea::selection { -webkit-text-fill-color: var(--selection-ink); }
 .verse-notice { margin: 32px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); font-size: 13px; }
