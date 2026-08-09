@@ -6923,6 +6923,109 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires MOM_LLAMA_MODEL_PATH, MOM_LLAMA_MODEL_SHA256, and a real local GGUF"]
+    fn real_strict_batch_retains_a_pre_cancelled_case_under_exact_model_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let model_path = std::env::var("MOM_LLAMA_MODEL_PATH")?;
+        let model_sha256 = std::env::var("MOM_LLAMA_MODEL_SHA256")?;
+        let mut config = NativeModelConfig::local(PathBuf::from(model_path));
+        config.expected_model_sha256 = Some(model_sha256.clone());
+        config.device = NativeDevice::Cpu;
+        config.context_tokens = 512;
+        config.batch_tokens = 64;
+        config.max_sequences = 2;
+        let handle = NativeModelHandle::load(config)?;
+        let status = handle.status();
+        let fingerprint = status
+            .fingerprint
+            .as_ref()
+            .expect("real resident exposes a fingerprint");
+        assert_eq!(fingerprint.model_sha256, model_sha256);
+
+        let prepared = handle.prepare_input(GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Text {
+                text: "The rain stopped before Mara reached the house.".to_string(),
+                special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+            }],
+        })?;
+        let prompt_tokens = prepared
+            .first()
+            .expect("one prepared completion")
+            .token_ids
+            .clone();
+        assert!(!prompt_tokens.is_empty());
+
+        let request = GenerationBatchRequest {
+            request_id: "native-real-strict-mixed-cancel".to_string(),
+            model_id: status.model_id,
+            cases: vec![
+                GenerationCase {
+                    case_id: "completed".to_string(),
+                    input: GenerationInput::Completion {
+                        prompts: vec![CompletionPrompt::Tokens {
+                            token_ids: prompt_tokens.clone(),
+                        }],
+                    },
+                    sampling: SamplingConfig {
+                        seed: 101,
+                        temperature: 0.0,
+                        max_tokens: 8,
+                        ..SamplingConfig::default()
+                    },
+                    cached_prefix: None,
+                },
+                GenerationCase {
+                    case_id: "cancelled".to_string(),
+                    input: GenerationInput::Completion {
+                        prompts: vec![CompletionPrompt::Tokens {
+                            token_ids: prompt_tokens,
+                        }],
+                    },
+                    sampling: SamplingConfig {
+                        seed: 102,
+                        temperature: 0.0,
+                        max_tokens: 128,
+                        ..SamplingConfig::default()
+                    },
+                    cached_prefix: None,
+                },
+            ],
+        };
+        let budget = exact_token_batch_cell_budget(&request)?;
+        assert!(budget.fits(512));
+        let ticket = handle.generate_batch(request.clone())?;
+        assert!(ticket.cancel_branch("cancelled"));
+        let verified = ticket.wait_verified_timeout(Duration::from_secs(120))?;
+
+        assert_eq!(verified.request(), &request);
+        assert_eq!(verified.outputs().len(), 2);
+        assert_eq!(verified.outputs()[0].state, GenerationState::Completed);
+        assert_eq!(verified.outputs()[1].state, GenerationState::Cancelled);
+        assert_eq!(verified.outputs()[1].finish_reason, "cancelled");
+        assert!(verified.terminal_sampled_token_ids()[1].is_none());
+        for (index, output) in verified.outputs().iter().enumerate() {
+            let terminal_count = verified
+                .events()
+                .iter()
+                .filter(|event| {
+                    event.input_index == index
+                        && matches!(
+                            event.event,
+                            GenerationEventKind::State {
+                                state: GenerationState::Completed | GenerationState::Cancelled
+                            }
+                        )
+                })
+                .count();
+            assert_eq!(terminal_count, 1);
+            assert!(output.real_engine_invoked);
+            assert!(!output.fake_fixture);
+            assert_eq!(output.transport, NativeTransport::InProcess);
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires MOM_LLAMA_MODEL_PATH and a real local GGUF"]
     fn real_per_token_embeddings_preserve_generation_context()
     -> Result<(), Box<dyn std::error::Error>> {
