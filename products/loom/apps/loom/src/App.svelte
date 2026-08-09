@@ -32,7 +32,6 @@
     promoteCandidate,
     recoverProject,
     requestApplicationClose,
-    setFocusMode,
     setSuggestions as setSuggestionsPolicy,
     startWeave,
     startModelDownload,
@@ -123,7 +122,6 @@
   let errorMessage = '';
   let lastFailure: LoomFailure | null = null;
   let opening = false;
-  let focusMode = false;
   let search = '';
   let outlineOpen = false;
   let outlineToggle: HTMLButtonElement | undefined;
@@ -223,7 +221,11 @@
   let componentMounted = false;
   let workspaceRestoreSerial = 0;
   let modelRefreshSerial = 0;
+  let modelRefreshInFlightCount = 0;
   let modelLoadSerial = 0;
+  let preferredWriterPending: WorkspaceRestoreCapture | null = null;
+  let preferredWriterEnsureInFlight: Promise<boolean> | null = null;
+  let preferredWriterWakeQueued = false;
   let allowWindowClose = false;
   let unlistenWindowClose: (() => void) | undefined;
   let unlistenWindowFocus: (() => void) | undefined;
@@ -412,7 +414,6 @@
       currentModel &&
       suggestionsEnabled &&
       !uncertainWeave &&
-      !focusMode &&
       !compositionActive &&
       !visualMutationPending &&
       !sourceDirty &&
@@ -458,6 +459,7 @@
       workspaceRestoreSerial += 1;
       modelRefreshSerial += 1;
       modelLoadSerial += 1;
+      clearPreferredWriterRequest();
       window.removeEventListener('keydown', handleGlobalKeydown);
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
       if (saveTimer !== undefined) window.clearTimeout(saveTimer);
@@ -908,7 +910,7 @@
       ...handledModelDownloadCompletions,
       snapshot.command_id
     ];
-    await refreshModels();
+    await refreshCurrentModelsAndEnsureWriter();
     const downloaded = models.find((model) => model.model_path === snapshot.target_path);
     if (downloaded) {
       selectedModelPath = downloaded.model_path;
@@ -923,7 +925,7 @@
     snapshot: ModelDownloadSnapshot
   ): Promise<void> {
     modelDownloadError = '';
-    await refreshModels();
+    await refreshCurrentModelsAndEnsureWriter();
     const discovered = models.find((model) => model.model_path === snapshot.target_path);
     if (!discovered) {
       modelDownloadError = 'The verified file is installed, but model discovery did not return it.';
@@ -1665,8 +1667,116 @@
     );
   }
 
+  function workspaceCapturesMatch(
+    left: WorkspaceRestoreCapture | null,
+    right: WorkspaceRestoreCapture | null
+  ): boolean {
+    return Boolean(
+      left &&
+      right &&
+      left.restoreSerial === right.restoreSerial &&
+      left.projectId === right.projectId &&
+      left.sessionId === right.sessionId
+    );
+  }
+
+  function currentWorkspaceCapture(): WorkspaceRestoreCapture | null {
+    if (!project) return null;
+    return {
+      restoreSerial: workspaceRestoreSerial,
+      projectId: project.project_id,
+      sessionId: project.session_id
+    };
+  }
+
+  function clearPreferredWriterRequest(captured?: WorkspaceRestoreCapture): void {
+    if (!captured || workspaceCapturesMatch(preferredWriterPending, captured)) {
+      preferredWriterPending = null;
+    }
+  }
+
+  function queuePreferredWriterRequest(captured: WorkspaceRestoreCapture): void {
+    if (!suggestionsEnabled || !workspaceRestoreIsCurrent(captured)) return;
+    preferredWriterPending = { ...captured };
+  }
+
+  function wakePreferredWriterEnsure(): void {
+    if (preferredWriterWakeQueued || !preferredWriterPending) return;
+    preferredWriterWakeQueued = true;
+    queueMicrotask(() => {
+      preferredWriterWakeQueued = false;
+      void drainPreferredWriterEnsure();
+    });
+  }
+
+  function requestPreferredWriterEnsure(captured: WorkspaceRestoreCapture): void {
+    queuePreferredWriterRequest(captured);
+    wakePreferredWriterEnsure();
+  }
+
+  function requestPreferredWriterForCurrentWorkspace(): void {
+    const captured = currentWorkspaceCapture();
+    if (!captured || !suggestionsEnabled || currentModel) return;
+    requestPreferredWriterEnsure(captured);
+  }
+
+  function drainPreferredWriterEnsure(): Promise<boolean> {
+    if (preferredWriterEnsureInFlight) return preferredWriterEnsureInFlight;
+    const captured = preferredWriterPending;
+    if (!captured) return Promise.resolve(Boolean(currentModel));
+    if (!suggestionsEnabled || !workspaceRestoreIsCurrent(captured)) {
+      clearPreferredWriterRequest(captured);
+      return Promise.resolve(false);
+    }
+    if (
+      modelLoading ||
+      modelUnloading ||
+      modelRefreshInFlightCount > 0 ||
+      transition !== 'idle' ||
+      !document
+    ) return Promise.resolve(false);
+
+    preferredWriterPending = null;
+    const task = ensurePreferredWriterOnce(captured).catch(() => false);
+    preferredWriterEnsureInFlight = task;
+    void task.finally(() => {
+      if (preferredWriterEnsureInFlight !== task) return;
+      preferredWriterEnsureInFlight = null;
+      wakePreferredWriterEnsure();
+    });
+    return task;
+  }
+
+  async function ensurePreferredWriterOnce(
+    captured: WorkspaceRestoreCapture
+  ): Promise<boolean> {
+    if (!suggestionsEnabled || !workspaceRestoreIsCurrent(captured)) return false;
+    if (currentModel) {
+      if (document) scheduleAutomaticSuggestions(editVersion);
+      return true;
+    }
+
+    const refreshed = await refreshModels(captured);
+    if (!suggestionsEnabled || !workspaceRestoreIsCurrent(captured)) return false;
+    if (!refreshed && modelRefreshInFlightCount > 0) {
+      queuePreferredWriterRequest(captured);
+      return false;
+    }
+    await tick();
+    if (currentModel) {
+      if (document) scheduleAutomaticSuggestions(editVersion);
+      return true;
+    }
+    if (modelLoading || modelUnloading || transition !== 'idle' || !document) {
+      queuePreferredWriterRequest(captured);
+      return false;
+    }
+    return loadPreferredSuggestionModel(captured);
+  }
+
   async function refreshModels(expectedWorkspace?: WorkspaceRestoreCapture): Promise<boolean> {
     const refreshSerial = ++modelRefreshSerial;
+    modelRefreshInFlightCount += 1;
     try {
       const discovered = await listModels();
       if (
@@ -1696,7 +1806,19 @@
       models = [];
       selectedModelPath = '';
       return false;
+    } finally {
+      modelRefreshInFlightCount = Math.max(0, modelRefreshInFlightCount - 1);
+      if (modelRefreshInFlightCount === 0) wakePreferredWriterEnsure();
     }
+  }
+
+  async function refreshCurrentModelsAndEnsureWriter(): Promise<boolean> {
+    const captured = currentWorkspaceCapture();
+    const refreshed = await refreshModels(captured ?? undefined);
+    if (captured && workspaceRestoreIsCurrent(captured)) {
+      requestPreferredWriterForCurrentWorkspace();
+    }
+    return refreshed;
   }
 
   function closeProjectMenu(): void {
@@ -1716,7 +1838,7 @@
     modelManagerOpen = true;
     modelDownloadError = '';
     void recoverModelDownloads();
-    void refreshModels();
+    void refreshCurrentModelsAndEnsureWriter();
     void tick().then(() => modelManagerPanel?.focus());
   }
 
@@ -1785,6 +1907,7 @@
         }
       }
       if (!enabled) {
+        clearPreferredWriterRequest();
         cancelSuggestionTimer();
         dismissedCandidateIds = currentReadyBranches
           .map((branch) => branch.candidate_id)
@@ -1798,21 +1921,20 @@
           projectId: boundProject.project_id,
           sessionId: boundProject.session_id
         };
-        if (await refreshModels(captured)) {
-          writerReady = await loadPreferredSuggestionModel(captured);
-        }
-        if (!workspaceRestoreIsCurrent(captured)) return;
+        requestPreferredWriterEnsure(captured);
+        writerReady = Boolean(currentModel);
       }
       announce(enabled
         ? writerReady
           ? 'Suggestions on; Loom will quietly prepare private strands when typing pauses'
-          : 'Suggestions on; no tested local writer is available yet'
+          : 'Suggestions on; Loom is preparing a tested local writer'
         : 'Suggestions off');
       if (enabled && writerReady && document) {
         scheduleAutomaticSuggestions(editVersion);
       }
     } catch (error) {
       suggestionsEnabled = false;
+      clearPreferredWriterRequest();
       cancelSuggestionTimer();
       if (!enabled && activeBranchCount > 0) void cancelActiveBranches();
       recordFailure(error);
@@ -1825,8 +1947,8 @@
   function trapModelManagerFocus(event: KeyboardEvent): void {
     if (event.key !== 'Tab' || !modelManagerPanel) return;
     const focusable = Array.from(modelManagerPanel.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
-    )).filter((element) => !element.hasAttribute('hidden'));
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [href], [tabindex]:not([tabindex="-1"])'
+    )).filter((element) => !element.hasAttribute('hidden') && element.getClientRects().length > 0);
     if (focusable.length === 0) {
       event.preventDefault();
       modelManagerPanel.focus();
@@ -1900,7 +2022,10 @@
       await refreshModels();
       return false;
     } finally {
-      if (loadSerial === modelLoadSerial) modelLoading = false;
+      if (loadSerial === modelLoadSerial) {
+        modelLoading = false;
+        wakePreferredWriterEnsure();
+      }
     }
   }
 
@@ -1935,7 +2060,10 @@
         ) return false;
         await refreshModels(expectedWorkspace);
       } finally {
-        if (loadSerial === modelLoadSerial) modelLoading = false;
+        if (loadSerial === modelLoadSerial) {
+          modelLoading = false;
+          wakePreferredWriterEnsure();
+        }
       }
     }
     return false;
@@ -1954,6 +2082,7 @@
       }
       models = [selected, ...models.filter((model) => model.model_path !== selected.model_path)];
       selectedModelPath = selected.model_path;
+      requestPreferredWriterForCurrentWorkspace();
       announce(`${selected.display_name} added; load it to inspect exact capabilities`);
     } catch (error) {
       recordFailure(error);
@@ -1980,6 +2109,7 @@
       await refreshModels();
     } finally {
       modelUnloading = false;
+      wakePreferredWriterEnsure();
     }
   }
 
@@ -2028,6 +2158,7 @@
       if (!componentMounted) return false;
       project = current;
       if (!(await finishOpeningProject(current, restoreSerial))) return false;
+      wakePreferredWriterEnsure();
       announce(`Reattached ${current.title}`);
       return true;
     } catch {
@@ -2113,10 +2244,7 @@
         await recoverModelDownloads();
         if (!workspaceRestoreIsCurrent(captured)) return;
         if (!shouldDiscoverModelsOnStartup(suggestionsEnabled)) return;
-        if (!(await refreshModels(captured)) || !workspaceRestoreIsCurrent(captured)) return;
-        if (suggestionsEnabled && !currentModel) {
-          await loadPreferredSuggestionModel(captured);
-        }
+        requestPreferredWriterEnsure(captured);
       }
     });
   }
@@ -2131,6 +2259,7 @@
       if (!componentMounted || restoreSerial !== workspaceRestoreSerial) return;
       project = opened;
       if (await finishOpeningProject(opened, restoreSerial)) {
+        wakePreferredWriterEnsure();
         announce(`Opened ${opened.title}`);
       }
     } catch (error) {
@@ -2151,6 +2280,7 @@
     };
     if (!workspaceRestoreIsCurrent(captured)) return false;
     outlineOpen = false;
+    clearPreferredWriterRequest();
     cancelSuggestionTimer();
     const storedSuggestionsPreference = loadSuggestionPreference(captured.projectId);
     suggestionsEnabled = false;
@@ -2223,7 +2353,7 @@
       saveMessage = 'Project is ready';
     }
     if (storedSuggestionsPreference && suggestionsEnabled && !currentModel) {
-      void loadPreferredSuggestionModel(captured);
+      queuePreferredWriterRequest(captured);
     }
     return true;
   }
@@ -2395,7 +2525,10 @@
       if (
         requestSerial === navigationSerial &&
         projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source)
-      ) transition = 'idle';
+      ) {
+        transition = 'idle';
+        wakePreferredWriterEnsure();
+      }
     }
   }
 
@@ -2531,7 +2664,6 @@
       !currentModel ||
       !project ||
       !document ||
-      focusMode ||
       document.summary.kind === 'hybrid'
     ) return;
     suggestionTargetEditVersion = targetEditVersion;
@@ -2549,7 +2681,6 @@
       !currentModel ||
       !project ||
       !document ||
-      focusMode ||
       compositionActive ||
       transition !== 'idle'
     ) {
@@ -2927,27 +3058,6 @@
     return false;
   }
 
-  async function toggleFocusMode(): Promise<void> {
-    if (!project) return;
-    const enabling = !focusMode;
-    if (enabling) cancelSuggestionTimer();
-    focusMode = enabling;
-    if (desktop) {
-      try {
-        await setFocusMode(project.project_id, project.session_id, focusMode);
-      } catch (error) {
-        focusMode = !focusMode;
-        recordFailure(error);
-      }
-    }
-    if (focusMode) {
-      scheduleActiveBranchPoll();
-    } else if (suggestionsEnabled && currentModel && document) {
-      scheduleAutomaticSuggestions(editVersion);
-    }
-    announce(focusMode ? 'Focus mode on' : 'Focus mode off');
-  }
-
   function suggestionMatchesCurrentCaret(
     branch: BranchCard,
     visualAtEnd: boolean,
@@ -2977,7 +3087,6 @@
     if (
       mode !== 'visual' ||
       !suggestionsEnabled ||
-      focusMode ||
       visualMutationPending
     ) return null;
     for (const branch of currentReadyBranches) {
@@ -3005,7 +3114,6 @@
     if (
       mode !== 'source' ||
       !suggestionsEnabled ||
-      focusMode ||
       sourceDirty ||
       compositionActive
     ) return null;
@@ -3104,10 +3212,6 @@
       flushEditors();
       void saveNow();
     }
-    if (modifier && event.shiftKey && event.key.toLocaleLowerCase() === 'l') {
-      event.preventDefault();
-      void toggleFocusMode();
-    }
   }
 
   function handleGlobalPointerdown(event: PointerEvent): void {
@@ -3181,8 +3285,7 @@
       documentEpoch === captured.epoch &&
       editVersion === captured.editVersion &&
       suggestionIntentEpoch === captured.intentEpoch &&
-      suggestionsEnabled &&
-      !focusMode
+      suggestionsEnabled
     );
   }
 
@@ -4223,9 +4326,9 @@
     resetLiveGenerationView();
     saveState = 'clean';
     saveMessage = 'No project open';
-    focusMode = false;
     outlineOpen = false;
     suggestionsEnabled = false;
+    clearPreferredWriterRequest();
     cancelSuggestionTimer();
     dismissedCandidateIds = [];
     pendingCloseCommandId = null;
@@ -4292,7 +4395,7 @@
   <meta name="description" content="Loom — a local-first writing environment for prose and poetry" />
 </svelte:head>
 
-<div class:focus-mode={focusMode} class="app-shell">
+<div class="app-shell">
   <a class="skip-link" href="#manuscript">Skip to manuscript</a>
 
   {#if project}
@@ -4334,11 +4437,23 @@
             </button>
             <div class="project-menu-separator"></div>
           {/if}
-          <button type="button" on:click={(event) => openModelManager(projectMenuTrigger ?? event.currentTarget)}>
-            <span>Writing assistance…</span>
+          <button
+            class:active={suggestionsEnabled}
+            type="button"
+            aria-pressed={suggestionsEnabled}
+            disabled={suggestionsChanging}
+            on:click={() => {
+              closeProjectMenu();
+              void setSuggestionsEnabled(!suggestionsEnabled);
+            }}
+          >
+            <span>Suggestions</span>
+            <span class:ready={suggestionsEnabled} class="menu-state">
+              {suggestionsChanging ? '…' : suggestionsEnabled ? 'On' : 'Off'}
+            </span>
           </button>
-          <button class:active={focusMode} type="button" aria-pressed={focusMode} disabled={editorReadonly} on:click={() => { closeProjectMenu(); void toggleFocusMode(); }}>
-            <span>Focus mode</span><span aria-hidden="true">{focusMode ? '✓' : ''}</span>
+          <button type="button" on:click={(event) => openModelManager(projectMenuTrigger ?? event.currentTarget)}>
+            <span>Advanced model settings…</span>
           </button>
           {#if activeGhostSuggestion}
             <div class="project-menu-separator"></div>
@@ -4676,15 +4791,12 @@
         on:keydown={trapModelManagerFocus}
       >
         <header class="model-manager-header">
-          <div>
-            <h2 id="model-manager-title">Writing suggestions</h2>
-            <p>Optional, private continuations made on this computer.</p>
-          </div>
+          <h2 id="model-manager-title">Suggestions</h2>
           <button class="icon-button" type="button" on:click={closeModelManager} aria-label="Close model manager">×</button>
         </header>
 
         <div class="model-manager-body">
-          <section class="model-library" aria-labelledby="model-library-title">
+          <section class="model-manager-summary" aria-label="Suggestion settings">
             <label class="suggestions-setting">
               <input
                 type="checkbox"
@@ -4693,18 +4805,35 @@
                 on:change={(event) => void setSuggestionsEnabled(event.currentTarget.checked)}
               />
               <span>
-                <strong>Suggest while I pause</strong>
-                <small>{project ? currentModel ? 'Tab accepts a suggestion; ignoring it changes nothing.' : 'Choose a local writer below.' : 'Open a note first.'}</small>
+                <strong>Suggestions</strong>
               </span>
             </label>
+
+            <div class="model-readiness" role="status" aria-live="polite">
+              <span
+                class:ready={Boolean(currentModel) && !modelLoading && !modelUnloading}
+                class:preparing={modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0}
+                class="status-dot"
+              ></span>
+              <strong>
+                {modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0
+                  ? 'Preparing'
+                  : currentModel
+                    ? 'Ready'
+                    : 'Needs setup'}
+              </strong>
+            </div>
+          </section>
+
+          <details class="model-advanced-panel">
+            <summary>Advanced</summary>
+            <div class="model-advanced-content">
+              <section class="model-library" aria-labelledby="model-library-title">
             <div class="section-heading">
-              <div>
-                <h3 id="model-library-title">Local writer</h3>
-                <p>No manuscript text leaves your computer.</p>
-              </div>
+              <h3 id="model-library-title">Model</h3>
               <div class="model-library-actions">
                 <button class="bare-button compact" type="button" on:click={() => void chooseExistingModel()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>{modelChoosing ? 'Choosing…' : 'Choose model file…'}</button>
-                <button class="bare-button compact" type="button" on:click={() => void refreshModels()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>Refresh</button>
+                <button class="bare-button compact" type="button" on:click={() => void refreshCurrentModelsAndEnsureWriter()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>Refresh</button>
               </div>
             </div>
 
@@ -4721,26 +4850,16 @@
               </label>
             {:else}
               <div class="model-empty-state">
-                <strong>No local writer is set up yet.</strong>
-                <span>Keep writing as usual, or choose a GGUF model file when you want suggestions.</span>
+                <strong>No model found.</strong>
               </div>
             {/if}
 
             {#if selectedModel}
               <article class="model-facts">
-                <header>
-                  <div>
-                    <strong>{selectedModel.display_name}</strong>
-                    <span>{selectedModel.loaded ? 'Native inspection complete' : 'GGUF header verified · load for exact capabilities'}</span>
-                  </div>
-                  <span class:verified={selectedModel.header_verified} class="fact-chip">{selectedModel.header_verified ? 'GGUF verified' : 'Unavailable'}</span>
-                </header>
-                {#if selectedModel.tested_profile}
-                  <p class="tested-profile"><span aria-hidden="true">✓</span> Tested for local continuation</p>
-                {/if}
                 <details class="model-technical">
                   <summary>Technical details</summary>
                   <dl>
+                    <div><dt>Compatibility</dt><dd>{selectedModel.tested_profile ? 'Tested for Loom' : selectedModel.header_verified ? 'File inspected' : 'Unavailable'}</dd></div>
                     <div><dt>Prompt mode</dt><dd>{modelCapabilityMode(selectedModel)}</dd></div>
                     <div><dt>Architecture</dt><dd>{selectedModel.architecture ?? 'Inspect on load'}</dd></div>
                     <div><dt>Context</dt><dd>{selectedModel.context_tokens === null ? 'Inspect on load' : `${selectedModel.context_tokens.toLocaleString()} tokens`}</dd></div>
@@ -4768,15 +4887,10 @@
                 </div>
               </article>
             {/if}
+              </section>
 
-            <div class="model-language-note">
-              <strong>Why a base model?</strong>
-              It continues the writing already on the page. Loom does not turn your manuscript into a chat or add hidden instructions.
-            </div>
-          </section>
-
-          <details class="model-download-panel">
-            <summary>Advanced · add a model from a verified URL</summary>
+              <details class="model-download-panel">
+            <summary>Add a model from a verified URL</summary>
             <div class="model-download-content">
             <div class="section-heading">
               <div>
@@ -4901,6 +5015,8 @@
                 {/each}
               </div>
             {/if}
+            </div>
+              </details>
             </div>
           </details>
         </div>
