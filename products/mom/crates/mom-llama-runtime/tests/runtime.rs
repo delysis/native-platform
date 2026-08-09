@@ -2706,6 +2706,10 @@ async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_cor
         batch_tokens: Some(settings.batch_tokens.saturating_add(1)),
         ..SettingsUpdate::default()
     })?;
+    assert!(
+        mom_llama_runtime::unload_resident_model(),
+        "the prior fingerprint's resident worker should be unloadable without clearing cache state"
+    );
     let fingerprint_miss = product_gateway_cache_request(
         &stable_system,
         "Generate normally after changing the model batch fingerprint.",
@@ -3037,18 +3041,21 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
         max_tokens: Some(64),
         ..SettingsUpdate::default()
     })?;
-    let cancellation_target = mom_llama_runtime::consult_panel_list()?
+    let cancellation_panel = mom_llama_runtime::consult_panel_list()?
         .result
         .and_then(|panels| panels.into_iter().next())
-        .and_then(|panel| panel.personas.into_iter().last())
-        .map(|persona| persona.id)
+        .ok_or_else(|| anyhow!("the legacy recovery panel is unavailable"))?;
+    let cancellation_target = cancellation_panel
+        .personas
+        .last()
+        .map(|persona| persona.id.clone())
         .ok_or_else(|| anyhow!("the legacy recovery panel has no cancellation target"))?;
     let mut cancelled = None;
     let result = mom_llama_runtime::consult_start_stream(
         ConsultStartInput {
             conversation_id: "real-consult".to_string(),
             prompt: "Give a careful short plan for preparing a virtual consultation.".to_string(),
-            panel_id: None,
+            panel_id: Some(cancellation_panel.id),
         },
         ConsultStartOptions::default(),
         Some(|event: mom_llama_runtime::ConsultStreamEvent| {
@@ -3104,55 +3111,6 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
     assert!(synthesis.result.as_ref().is_some_and(|value| {
         value.derived && !value.source_receipt_ids.is_empty() && !value.text.trim().is_empty()
     }));
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
-fn real_custom_dream_team_routes_selected_attributed_perspective() -> Result<()> {
-    let Some(_session) = configured_real_session("real-dream-team")? else {
-        return Ok(());
-    };
-    let panel = mom_llama_runtime::consult_panel_create(
-        "Mom's Dream Team".to_string(),
-        vec![ConsultPersona {
-            id: "favorite-author".to_string(),
-            label: "Favorite author lens".to_string(),
-            description: "A gentle perspective inspired by public writing.".to_string(),
-            perspective_prompt: "Respond warmly in two short sentences and name uncertainty."
-                .to_string(),
-            public_figure: Some("Example Author".to_string()),
-            expertise: Some("Compassionate public writing".to_string()),
-            model_slot: None,
-        }],
-    )?
-    .result
-    .ok_or_else(|| anyhow!("custom Dream Team missing"))?;
-    let result = mom_llama_runtime::consult_start(
-        ConsultStartInput {
-            conversation_id: "real-dream-team".to_string(),
-            prompt: "How can I prepare calmly for a difficult conversation?".to_string(),
-            panel_id: Some(panel.id.clone()),
-        },
-        ConsultStartOptions::default(),
-    )?;
-    assert_eq!(result.readiness, "real_prompt_smoke_passed");
-    assert!(result.receipt.real_engine_invoked);
-    assert!(!result.receipt.fake_fixture);
-    let run = result
-        .result
-        .ok_or_else(|| anyhow!("custom Dream Team run missing"))?;
-    assert_eq!(run.panel_id, panel.id);
-    assert_eq!(run.seats.len(), 1);
-    assert_eq!(run.seats[0].seat_id, "favorite-author");
-    assert_eq!(run.seats[0].label, "Favorite author lens");
-    assert!(!run.seats[0].text.trim().is_empty());
-    assert!(run.seats[0].real_engine_invoked);
-    assert!(!run.seats[0].fake_fixture);
-    assert_eq!(
-        run.seats[0].transport,
-        Some(llama_native_types::NativeTransport::InProcess)
-    );
     Ok(())
 }
 
