@@ -190,7 +190,10 @@
   let verseCodec: VerseEditorCodec | null = null;
   let compositionActive = false;
   let sourceComposing = false;
-  let visualEditor: { flushPending: () => boolean } | null = null;
+  let visualEditor: {
+    flushPending: () => boolean;
+    focusAtDocumentEnd: () => boolean;
+  } | null = null;
   let componentMounted = false;
   let workspaceRestoreSerial = 0;
   let modelRefreshSerial = 0;
@@ -1986,8 +1989,14 @@
       restore: () => openInitialProject(restoreSerial),
       present: async () => {
         await tick();
-        if (mode === 'source') sourceTextarea?.focus({ preventScroll: true });
         await waitForWritingSurfacePaint();
+        if (mode === 'source' && sourceTextarea) {
+          sourceTextarea.focus({ preventScroll: true });
+          const end = sourceTextarea.value.length;
+          sourceTextarea.setSelectionRange(end, end);
+        } else {
+          visualEditor?.focusAtDocumentEnd();
+        }
       },
       isCurrent: workspaceRestoreIsCurrent,
       background: async (captured) => {

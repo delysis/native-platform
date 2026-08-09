@@ -45,6 +45,16 @@
     return true;
   }
 
+  export function focusAtDocumentEnd(): boolean {
+    if (!view || readonly) return false;
+    const end = Selection.atEnd(view.state.doc);
+    if (!view.state.selection.eq(end)) {
+      view.dispatch(view.state.tr.setSelection(end));
+    }
+    view.focus();
+    return view.hasFocus();
+  }
+
   function parse(markdown: string): ProseMirrorNode {
     return defaultMarkdownParser.parse(markdown);
   }
