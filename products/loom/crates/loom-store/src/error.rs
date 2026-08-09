@@ -22,6 +22,8 @@ pub enum StoreError {
     ResearchAssembly(#[from] loom_research_types::AssemblyError),
     #[error("research admission failed: {0}")]
     ResearchAdmission(String),
+    #[error("could not obtain entropy for a project-store session: {0}")]
+    SessionEntropy(String),
     #[error("project path is not valid UTF-8: {0:?}")]
     NonUtf8Path(PathBuf),
     #[error("unsafe project-relative path `{0}`")]

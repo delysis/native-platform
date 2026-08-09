@@ -1,6 +1,8 @@
 -- Research evidence is append-only and deliberately separate from the legacy
--- one-run/one-candidate shelf.  A row in a component table is only diagnostic
--- evidence until a matching row exists in research_admissions.
+-- one-run/one-candidate shelf. Every persisted row, including a matching row
+-- in research_admission_records, is audit evidence only. Strict runtime
+-- authority exists solely in an unpersisted, session-bound opaque capability;
+-- no combination of these rows, hashes, or record blobs can recreate it.
 
 CREATE TABLE research_model_calls (
     call_id TEXT PRIMARY KEY,
@@ -26,14 +28,14 @@ CREATE TABLE research_model_calls (
         'mock',
         'historical_receipt'
     )),
-    verification_replay_fingerprint TEXT CHECK (
-        verification_replay_fingerprint IS NULL
-        OR length(verification_replay_fingerprint) = 64
+    verification_audit_fingerprint TEXT CHECK (
+        verification_audit_fingerprint IS NULL
+        OR length(verification_audit_fingerprint) = 64
     ),
     call_record_blob_id TEXT NOT NULL REFERENCES blobs(blob_id) ON DELETE RESTRICT,
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
     CHECK (
-        verification_replay_fingerprint IS NULL
+        verification_audit_fingerprint IS NULL
         OR evidence_class IN (
             'live_base_writer_claim',
             'live_instruct_editor_claim',
@@ -112,7 +114,7 @@ WHEN NOT EXISTS (
         AND EXISTS (
             SELECT 1 FROM research_model_calls call
             WHERE call.call_id = NEW.call_id
-              AND call.verification_replay_fingerprint IS NOT NULL
+              AND call.verification_audit_fingerprint IS NOT NULL
         )
     )
     OR (
@@ -179,8 +181,8 @@ CREATE TABLE research_generated_span_occurrences (
         'historical_receipt'
     )),
     extraction_receipt_fingerprint TEXT NOT NULL CHECK (length(extraction_receipt_fingerprint) = 64),
-    verification_replay_fingerprint TEXT CHECK (
-        verification_replay_fingerprint IS NULL OR length(verification_replay_fingerprint) = 64
+    verification_audit_fingerprint TEXT CHECK (
+        verification_audit_fingerprint IS NULL OR length(verification_audit_fingerprint) = 64
     ),
     span_record_blob_id TEXT NOT NULL REFERENCES blobs(blob_id) ON DELETE RESTRICT,
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
@@ -202,9 +204,9 @@ WHEN NOT EXISTS (
       AND terminal.raw_output_blob_id = NEW.raw_output_blob_id
       AND call.evidence_class = NEW.evidence_class
       AND (
-          (NEW.verification_replay_fingerprint IS NULL)
+          (NEW.verification_audit_fingerprint IS NULL)
           OR (
-              call.verification_replay_fingerprint = NEW.verification_replay_fingerprint
+              call.verification_audit_fingerprint = NEW.verification_audit_fingerprint
               AND NEW.evidence_class = 'live_base_writer_claim'
           )
       )
@@ -481,16 +483,19 @@ BEGIN
     SELECT RAISE(ABORT, 'mixed-authorship assembly must retain ineligible operations');
 END;
 
-CREATE TABLE research_admissions (
-    admission_id TEXT PRIMARY KEY,
+-- These rows are append-only audit records. They are not authority tokens:
+-- live callers must retain an opaque runtime admission lease and a future
+-- reopen must reverify from fresh native evidence.
+CREATE TABLE research_admission_records (
+    admission_record_id TEXT PRIMARY KEY,
     subject_kind TEXT NOT NULL CHECK (subject_kind IN ('candidate_assembly', 'candidate_projection', 'mixed_authorship')),
     subject_id TEXT NOT NULL,
     admitted_at_ms INTEGER NOT NULL CHECK (admitted_at_ms > 0),
     UNIQUE (subject_kind, subject_id)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TRIGGER research_admissions_validate_insert
-BEFORE INSERT ON research_admissions
+CREATE TRIGGER research_admission_records_validate_insert
+BEFORE INSERT ON research_admission_records
 WHEN (
         NEW.subject_kind = 'candidate_assembly'
         AND NOT EXISTS (
@@ -507,7 +512,7 @@ WHEN (
                      ON span.occurrence_id = part.occurrence_id
                    WHERE part.assembly_id = assembly.assembly_id
                      AND span.evidence_class = 'live_base_writer_claim'
-                     AND span.verification_replay_fingerprint IS NOT NULL) = assembly.part_count
+                     AND span.verification_audit_fingerprint IS NOT NULL) = assembly.part_count
               AND (SELECT COUNT(*) FROM research_pipeline_operations operation
                    WHERE operation.graph_fingerprint = graph.graph_fingerprint) = graph.node_count
               AND graph.node_count = assembly.part_count * 2 + 1
@@ -580,7 +585,7 @@ WHEN (
               ON assembly.assembly_id = projection.assembly_id
             JOIN research_operation_graphs assembly_graph
               ON assembly_graph.graph_fingerprint = assembly.graph_fingerprint
-            JOIN research_admissions assembly_admission
+            JOIN research_admission_records assembly_admission
              ON assembly_admission.subject_kind = 'candidate_assembly'
              AND assembly_admission.subject_id = projection.assembly_id
             WHERE projection.projection_id = NEW.subject_id
@@ -665,9 +670,82 @@ BEGIN
     SELECT RAISE(ABORT, 'research admission subject is absent or ineligible');
 END;
 
+CREATE TABLE research_promotion_command_requests (
+    command_id TEXT PRIMARY KEY,
+    command_request_fingerprint TEXT NOT NULL CHECK (length(command_request_fingerprint) = 64),
+    canonical_request_blob_id TEXT NOT NULL UNIQUE REFERENCES blobs(blob_id) ON DELETE RESTRICT,
+    canonical_request_byte_len INTEGER NOT NULL
+        CHECK (canonical_request_byte_len BETWEEN 1 AND 1024),
+    project_id TEXT NOT NULL CHECK (length(project_id) = 26),
+    source_revision_id TEXT NOT NULL REFERENCES revisions(revision_id) ON DELETE RESTRICT,
+    source_blob_id TEXT NOT NULL REFERENCES blobs(blob_id) ON DELETE RESTRICT,
+    subject_kind TEXT NOT NULL CHECK (subject_kind IN ('candidate_projection', 'mixed_authorship')),
+    subject_id TEXT NOT NULL,
+    admission_record_id TEXT NOT NULL
+        REFERENCES research_admission_records(admission_record_id) ON DELETE RESTRICT,
+    intended_result_blob_id TEXT NOT NULL REFERENCES blobs(blob_id) ON DELETE RESTRICT,
+    intended_result_byte_len INTEGER NOT NULL CHECK (intended_result_byte_len > 0),
+    requested_at_ms INTEGER NOT NULL CHECK (requested_at_ms > 0),
+    recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= requested_at_ms)
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER research_promotion_command_requests_validate_insert
+BEFORE INSERT ON research_promotion_command_requests
+WHEN EXISTS (
+        SELECT 1 FROM command_receipts receipt WHERE receipt.command_id = NEW.command_id
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM blobs canonical_request
+        WHERE canonical_request.blob_id = NEW.canonical_request_blob_id
+          AND canonical_request.blob_id = NEW.command_request_fingerprint
+          AND canonical_request.byte_len = NEW.canonical_request_byte_len
+          AND canonical_request.byte_len > 0
+    )
+    OR NOT EXISTS (
+        SELECT 1
+        FROM revisions revision
+        JOIN artifacts artifact ON artifact.artifact_id = revision.artifact_id
+        WHERE revision.revision_id = NEW.source_revision_id
+          AND artifact.blob_id = NEW.source_blob_id
+    )
+    OR NOT EXISTS (
+        SELECT 1
+        FROM research_admission_records admission
+        WHERE admission.admission_record_id = NEW.admission_record_id
+          AND admission.subject_kind = NEW.subject_kind
+          AND admission.subject_id = NEW.subject_id
+    )
+    OR (
+        NEW.subject_kind = 'candidate_projection'
+        AND NOT EXISTS (
+            SELECT 1
+            FROM research_candidate_projections projection
+            WHERE projection.projection_id = NEW.subject_id
+              AND projection.source_revision_id = NEW.source_revision_id
+              AND projection.source_blob_id = NEW.source_blob_id
+              AND projection.resulting_blob_id = NEW.intended_result_blob_id
+              AND projection.resulting_byte_len = NEW.intended_result_byte_len
+        )
+    )
+    OR (
+        NEW.subject_kind = 'mixed_authorship'
+        AND NOT EXISTS (
+            SELECT 1
+            FROM research_mixed_authorship_assemblies mixed
+            WHERE mixed.mixed_assembly_id = NEW.subject_id
+              AND mixed.output_blob_id = NEW.intended_result_blob_id
+              AND mixed.output_byte_len = NEW.intended_result_byte_len
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'promotion command request does not match exact admitted intent');
+END;
+
 CREATE TABLE research_user_presence_events (
     event_receipt_blob_id TEXT PRIMARY KEY REFERENCES blobs(blob_id) ON DELETE RESTRICT,
-    command_id TEXT NOT NULL UNIQUE REFERENCES command_receipts(command_id) ON DELETE RESTRICT,
+    command_id TEXT NOT NULL UNIQUE,
+    command_request_fingerprint TEXT NOT NULL CHECK (length(command_request_fingerprint) = 64),
+    actor TEXT NOT NULL CHECK (length(CAST(actor AS BLOB)) BETWEEN 1 AND 128),
     user_presence_kind TEXT NOT NULL CHECK (user_presence_kind IN (
         'editor_gesture', 'cli_interactive_confirmation',
         'native_dialog_confirmation', 'human_review_submission'
@@ -681,25 +759,42 @@ CREATE TABLE research_user_presence_events (
 
 CREATE TRIGGER research_user_presence_events_validate_insert
 BEFORE INSERT ON research_user_presence_events
-WHEN NOT EXISTS (
+WHEN EXISTS (
+        SELECT 1 FROM command_receipts receipt WHERE receipt.command_id = NEW.command_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM research_user_presence_events prior
+        WHERE prior.session_fingerprint = NEW.session_fingerprint
+          AND prior.monotonic_event_index >= NEW.monotonic_event_index
+    )
+    OR NOT EXISTS (
     SELECT 1
-    FROM command_receipts receipt
-    JOIN command_requests request ON request.command_id = receipt.command_id
-    WHERE receipt.command_id = NEW.command_id
-      AND receipt.command_kind = 'promote_candidate'
-      AND request.command_kind = 'promote_candidate'
-      AND request.created_at_ms <= NEW.occurred_at_ms
-      AND NEW.occurred_at_ms <= receipt.completed_at_ms
+    FROM blobs receipt
+    JOIN research_promotion_command_requests request
+      ON request.command_id = NEW.command_id
+    WHERE receipt.blob_id = NEW.event_receipt_blob_id
+      AND receipt.byte_len > 0
+      AND request.command_request_fingerprint = NEW.command_request_fingerprint
+      AND request.recorded_at_ms <= NEW.occurred_at_ms
 )
+    OR NEW.created_at_ms < NEW.occurred_at_ms
 BEGIN
-    SELECT RAISE(ABORT, 'user-presence event is not bound to one promotion command lifetime');
+    SELECT RAISE(ABORT, 'user-presence event lacks exact pre-mutation evidence');
 END;
 
 CREATE TABLE research_promotion_authorities (
-    command_id TEXT PRIMARY KEY REFERENCES command_receipts(command_id) ON DELETE RESTRICT,
+    command_id TEXT PRIMARY KEY,
+    command_request_fingerprint TEXT NOT NULL CHECK (length(command_request_fingerprint) = 64),
     actor TEXT NOT NULL CHECK (length(CAST(actor AS BLOB)) BETWEEN 1 AND 128),
+    project_id TEXT NOT NULL CHECK (length(project_id) = 26),
     source_revision_id TEXT NOT NULL REFERENCES revisions(revision_id) ON DELETE RESTRICT,
     source_blob_id TEXT NOT NULL REFERENCES blobs(blob_id) ON DELETE RESTRICT,
+    subject_kind TEXT NOT NULL CHECK (subject_kind IN ('candidate_projection', 'mixed_authorship')),
+    subject_id TEXT NOT NULL,
+    admission_record_id TEXT NOT NULL
+        REFERENCES research_admission_records(admission_record_id) ON DELETE RESTRICT,
+    intended_result_blob_id TEXT NOT NULL REFERENCES blobs(blob_id) ON DELETE RESTRICT,
+    intended_result_byte_len INTEGER NOT NULL CHECK (intended_result_byte_len > 0),
     user_presence_kind TEXT NOT NULL CHECK (user_presence_kind IN (
         'editor_gesture', 'cli_interactive_confirmation',
         'native_dialog_confirmation', 'human_review_submission'
@@ -708,13 +803,16 @@ CREATE TABLE research_promotion_authorities (
     event_receipt_blob_id TEXT NOT NULL UNIQUE REFERENCES research_user_presence_events(event_receipt_blob_id) ON DELETE RESTRICT,
     monotonic_event_index INTEGER NOT NULL CHECK (monotonic_event_index > 0),
     occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms > 0),
-    authority_record_blob_id TEXT NOT NULL REFERENCES blobs(blob_id) ON DELETE RESTRICT,
-    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0)
+    authority_record_blob_id TEXT NOT NULL UNIQUE REFERENCES blobs(blob_id) ON DELETE RESTRICT,
+    intent_recorded_at_ms INTEGER NOT NULL CHECK (intent_recorded_at_ms > 0)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TRIGGER research_promotion_authorities_validate_insert
 BEFORE INSERT ON research_promotion_authorities
-WHEN NOT EXISTS (
+WHEN EXISTS (
+        SELECT 1 FROM command_receipts receipt WHERE receipt.command_id = NEW.command_id
+    )
+    OR NOT EXISTS (
     SELECT 1
     FROM revisions revision
     JOIN artifacts artifact ON artifact.artifact_id = revision.artifact_id
@@ -729,22 +827,64 @@ WHEN NOT EXISTS (
     OR NOT EXISTS (
         SELECT 1
         FROM research_user_presence_events event
-        JOIN command_receipts receipt ON receipt.command_id = event.command_id
-        JOIN command_requests request ON request.command_id = receipt.command_id
+        JOIN research_promotion_command_requests request
+          ON request.command_id = event.command_id
         WHERE event.event_receipt_blob_id = NEW.event_receipt_blob_id
           AND event.command_id = NEW.command_id
+          AND event.command_request_fingerprint = NEW.command_request_fingerprint
+          AND event.actor = NEW.actor
           AND event.user_presence_kind = NEW.user_presence_kind
           AND event.session_fingerprint = NEW.session_fingerprint
           AND event.monotonic_event_index = NEW.monotonic_event_index
           AND event.occurred_at_ms = NEW.occurred_at_ms
-          AND receipt.command_kind = 'promote_candidate'
-          AND request.command_kind = 'promote_candidate'
-          AND request.created_at_ms <= event.occurred_at_ms
-          AND event.occurred_at_ms <= receipt.completed_at_ms
+          AND request.project_id = NEW.project_id
+          AND request.source_revision_id = NEW.source_revision_id
+          AND request.source_blob_id = NEW.source_blob_id
+          AND request.subject_kind = NEW.subject_kind
+          AND request.subject_id = NEW.subject_id
+          AND request.admission_record_id = NEW.admission_record_id
+          AND request.intended_result_blob_id = NEW.intended_result_blob_id
+          AND request.intended_result_byte_len = NEW.intended_result_byte_len
+          AND request.requested_at_ms <= event.occurred_at_ms
+          AND request.recorded_at_ms <= event.occurred_at_ms
+          AND event.created_at_ms <= NEW.intent_recorded_at_ms
+    )
+    OR NOT EXISTS (
+        SELECT 1
+        FROM research_admission_records admission
+        WHERE admission.admission_record_id = NEW.admission_record_id
+          AND admission.subject_kind = NEW.subject_kind
+          AND admission.subject_id = NEW.subject_id
+    )
+    OR (
+        NEW.subject_kind = 'candidate_projection'
+        AND NOT EXISTS (
+            SELECT 1
+            FROM research_candidate_projections projection
+            WHERE projection.projection_id = NEW.subject_id
+              AND projection.source_revision_id = NEW.source_revision_id
+              AND projection.source_blob_id = NEW.source_blob_id
+              AND projection.resulting_blob_id = NEW.intended_result_blob_id
+              AND projection.resulting_byte_len = NEW.intended_result_byte_len
+        )
+    )
+    OR (
+        NEW.subject_kind = 'mixed_authorship'
+        AND NOT EXISTS (
+            SELECT 1
+            FROM research_mixed_authorship_assemblies mixed
+            WHERE mixed.mixed_assembly_id = NEW.subject_id
+              AND mixed.output_blob_id = NEW.intended_result_blob_id
+              AND mixed.output_byte_len = NEW.intended_result_byte_len
+        )
     )
 BEGIN
-    SELECT RAISE(ABORT, 'promotion authority is not pinned to its source revision');
+    SELECT RAISE(ABORT, 'promotion authority is not an exact pre-mutation intent');
 END;
+
+-- Applying a promotion remains deliberately unsupported. A future migration
+-- may add a terminal record only together with an atomic active-source check,
+-- visible-byte mutation, and exact canonical request/receipt verification.
 
 -- Existing candidates are evidence, not silently grandfathered research
 -- claims.  Rust revalidation may append one terminal review event per row.
@@ -823,8 +963,10 @@ CREATE TRIGGER research_candidate_projections_immutable_update BEFORE UPDATE ON 
 CREATE TRIGGER research_candidate_projections_immutable_delete BEFORE DELETE ON research_candidate_projections BEGIN SELECT RAISE(ABORT, 'research candidate projections are immutable'); END;
 CREATE TRIGGER research_mixed_assemblies_immutable_update BEFORE UPDATE ON research_mixed_authorship_assemblies BEGIN SELECT RAISE(ABORT, 'research mixed assemblies are immutable'); END;
 CREATE TRIGGER research_mixed_assemblies_immutable_delete BEFORE DELETE ON research_mixed_authorship_assemblies BEGIN SELECT RAISE(ABORT, 'research mixed assemblies are immutable'); END;
-CREATE TRIGGER research_admissions_immutable_update BEFORE UPDATE ON research_admissions BEGIN SELECT RAISE(ABORT, 'research admissions are immutable'); END;
-CREATE TRIGGER research_admissions_immutable_delete BEFORE DELETE ON research_admissions BEGIN SELECT RAISE(ABORT, 'research admissions are immutable'); END;
+CREATE TRIGGER research_admission_records_immutable_update BEFORE UPDATE ON research_admission_records BEGIN SELECT RAISE(ABORT, 'research admission records are immutable'); END;
+CREATE TRIGGER research_admission_records_immutable_delete BEFORE DELETE ON research_admission_records BEGIN SELECT RAISE(ABORT, 'research admission records are immutable'); END;
+CREATE TRIGGER research_promotion_command_requests_immutable_update BEFORE UPDATE ON research_promotion_command_requests BEGIN SELECT RAISE(ABORT, 'research promotion command requests are immutable'); END;
+CREATE TRIGGER research_promotion_command_requests_immutable_delete BEFORE DELETE ON research_promotion_command_requests BEGIN SELECT RAISE(ABORT, 'research promotion command requests are immutable'); END;
 CREATE TRIGGER research_user_presence_events_immutable_update BEFORE UPDATE ON research_user_presence_events BEGIN SELECT RAISE(ABORT, 'research user-presence events are immutable'); END;
 CREATE TRIGGER research_user_presence_events_immutable_delete BEFORE DELETE ON research_user_presence_events BEGIN SELECT RAISE(ABORT, 'research user-presence events are immutable'); END;
 CREATE TRIGGER research_promotion_authorities_immutable_update BEFORE UPDATE ON research_promotion_authorities BEGIN SELECT RAISE(ABORT, 'research promotion authorities are immutable'); END;

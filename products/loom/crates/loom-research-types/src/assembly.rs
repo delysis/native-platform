@@ -4,15 +4,15 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use loom_types::{BlobId, CommandId, RevisionId};
+use loom_types::{BlobId, CommandId, ProjectId, RevisionId};
 
 use crate::{
     BoundError, BoundedText, ByteRange, CallError, CandidateAssemblyId, CandidateProjectionId,
     ExactCallEvidence, GeneratedSpanOccurrenceId, GeneratedSpanOccurrenceRecord,
     MAX_ASSEMBLY_BYTES, MAX_ASSEMBLY_EVIDENCE_BYTES, MAX_ASSEMBLY_EVIDENCE_TOKENS,
-    MAX_ASSEMBLY_PARTS, MixedAuthorshipAssemblyId, NonEmptyBoundedVec, OperationGraph,
-    OperationGraphError, PipelineEligibility, PipelineIneligibility, PipelineOperationKind,
-    RangeError,
+    MAX_ASSEMBLY_PARTS, MAX_SOURCE_BYTES, MixedAuthorshipAssemblyId, NonEmptyBoundedVec,
+    OperationGraph, OperationGraphError, PipelineEligibility, PipelineIneligibility,
+    PipelineOperationKind, RangeError,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -662,6 +662,39 @@ impl<'de> Deserialize<'de> for MixedAuthorshipAssemblyRecord {
 
 pub type PromotionActor = BoundedText<128>;
 
+const MAX_CANONICAL_PROMOTION_REQUEST_BYTES: usize = 1_024;
+
+/// Exact admitted artifact named by a promotion intent.
+///
+/// Typed variants prevent a projection ULID from being reinterpreted as a
+/// mixed-authorship assembly (or vice versa) after authority is recorded.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PromotionSubject {
+    CandidateProjection {
+        projection_id: CandidateProjectionId,
+    },
+    MixedAuthorship {
+        mixed_assembly_id: MixedAuthorshipAssemblyId,
+    },
+}
+
+impl PromotionSubject {
+    pub const fn kind_name(self) -> &'static str {
+        match self {
+            Self::CandidateProjection { .. } => "candidate_projection",
+            Self::MixedAuthorship { .. } => "mixed_authorship",
+        }
+    }
+
+    pub fn id_string(self) -> String {
+        match self {
+            Self::CandidateProjection { projection_id } => projection_id.to_string(),
+            Self::MixedAuthorship { mixed_assembly_id } => mixed_assembly_id.to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserPresenceKind {
@@ -750,38 +783,74 @@ impl<'de> Deserialize<'de> for UserPresenceEvidence {
     }
 }
 
-/// Structural promotion-authority record. There is no caller-set
-/// `human_confirmed` boolean: actor, pinned source, command occurrence and
-/// user-presence receipt must all be present. The store still verifies that
-/// receipt before promotion.
+/// Exact command request that must be durable before user-presence authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct PromotionAuthority {
-    actor: PromotionActor,
+pub struct PromotionCommandRequest {
+    project_id: ProjectId,
     source_revision_id: RevisionId,
     source_blob_id: BlobId,
+    subject: PromotionSubject,
+    admission_record_id: BlobId,
+    intended_result_blob_id: BlobId,
+    intended_result_byte_len: u64,
     command_id: CommandId,
-    user_presence: UserPresenceEvidence,
+    command_request_fingerprint: BlobId,
+    canonical_request_bytes: NonEmptyBoundedVec<u8, MAX_CANONICAL_PROMOTION_REQUEST_BYTES>,
+    command_requested_at_ms: i64,
 }
 
-impl PromotionAuthority {
-    pub const fn new(
-        actor: PromotionActor,
+impl PromotionCommandRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        project_id: ProjectId,
         source_revision_id: RevisionId,
         source_blob_id: BlobId,
+        subject: PromotionSubject,
+        admission_record_id: BlobId,
+        intended_result_blob_id: BlobId,
+        intended_result_byte_len: u64,
         command_id: CommandId,
-        user_presence: UserPresenceEvidence,
-    ) -> Self {
-        Self {
-            actor,
+        command_requested_at_ms: i64,
+    ) -> Result<Self, AssemblyError> {
+        let maximum_result_bytes = MAX_SOURCE_BYTES as u64 + MAX_ASSEMBLY_BYTES as u64;
+        if intended_result_byte_len == 0 || intended_result_byte_len > maximum_result_bytes {
+            return Err(AssemblyError::InvalidPromotionResultLength {
+                actual: intended_result_byte_len,
+                maximum: maximum_result_bytes,
+            });
+        }
+        if command_requested_at_ms <= 0 {
+            return Err(AssemblyError::InvalidPromotionTimeline);
+        }
+        let canonical_request_bytes = canonical_promotion_request_bytes(
+            project_id,
             source_revision_id,
             source_blob_id,
+            subject,
+            admission_record_id,
+            intended_result_blob_id,
+            intended_result_byte_len,
             command_id,
-            user_presence,
-        }
+            command_requested_at_ms,
+        );
+        let command_request_fingerprint = BlobId::digest(&canonical_request_bytes);
+        Ok(Self {
+            project_id,
+            source_revision_id,
+            source_blob_id,
+            subject,
+            admission_record_id,
+            intended_result_blob_id,
+            intended_result_byte_len,
+            command_id,
+            command_request_fingerprint,
+            canonical_request_bytes: NonEmptyBoundedVec::new(canonical_request_bytes)?,
+            command_requested_at_ms,
+        })
     }
 
-    pub const fn actor(&self) -> &PromotionActor {
-        &self.actor
+    pub const fn project_id(&self) -> ProjectId {
+        self.project_id
     }
 
     pub const fn source_revision_id(&self) -> RevisionId {
@@ -792,8 +861,232 @@ impl PromotionAuthority {
         self.source_blob_id
     }
 
+    pub const fn subject(&self) -> PromotionSubject {
+        self.subject
+    }
+
+    pub const fn admission_record_id(&self) -> BlobId {
+        self.admission_record_id
+    }
+
+    pub const fn intended_result_blob_id(&self) -> BlobId {
+        self.intended_result_blob_id
+    }
+
+    pub const fn intended_result_byte_len(&self) -> u64 {
+        self.intended_result_byte_len
+    }
+
     pub const fn command_id(&self) -> CommandId {
         self.command_id
+    }
+
+    pub const fn command_request_fingerprint(&self) -> BlobId {
+        self.command_request_fingerprint
+    }
+
+    pub fn canonical_request_bytes(&self) -> &[u8] {
+        &self.canonical_request_bytes
+    }
+
+    pub const fn command_requested_at_ms(&self) -> i64 {
+        self.command_requested_at_ms
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromotionCommandRequestWire {
+    #[serde(deserialize_with = "crate::bounded::deserialize_project_id")]
+    project_id: ProjectId,
+    #[serde(deserialize_with = "crate::bounded::deserialize_revision_id")]
+    source_revision_id: RevisionId,
+    #[serde(deserialize_with = "crate::bounded::deserialize_blob_id")]
+    source_blob_id: BlobId,
+    subject: PromotionSubject,
+    #[serde(deserialize_with = "crate::bounded::deserialize_blob_id")]
+    admission_record_id: BlobId,
+    #[serde(deserialize_with = "crate::bounded::deserialize_blob_id")]
+    intended_result_blob_id: BlobId,
+    intended_result_byte_len: u64,
+    #[serde(deserialize_with = "crate::bounded::deserialize_command_id")]
+    command_id: CommandId,
+    #[serde(deserialize_with = "crate::bounded::deserialize_blob_id")]
+    command_request_fingerprint: BlobId,
+    canonical_request_bytes: NonEmptyBoundedVec<u8, MAX_CANONICAL_PROMOTION_REQUEST_BYTES>,
+    command_requested_at_ms: i64,
+}
+
+impl<'de> Deserialize<'de> for PromotionCommandRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PromotionCommandRequestWire::deserialize(deserializer)?;
+        Self::new(
+            wire.project_id,
+            wire.source_revision_id,
+            wire.source_blob_id,
+            wire.subject,
+            wire.admission_record_id,
+            wire.intended_result_blob_id,
+            wire.intended_result_byte_len,
+            wire.command_id,
+            wire.command_requested_at_ms,
+        )
+        .and_then(|request| {
+            if request.command_request_fingerprint != wire.command_request_fingerprint
+                || request.canonical_request_bytes != wire.canonical_request_bytes
+            {
+                return Err(AssemblyError::PromotionRequestFingerprintMismatch);
+            }
+            Ok(request)
+        })
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_promotion_request_bytes(
+    project_id: ProjectId,
+    source_revision_id: RevisionId,
+    source_blob_id: BlobId,
+    subject: PromotionSubject,
+    admission_record_id: BlobId,
+    intended_result_blob_id: BlobId,
+    intended_result_byte_len: u64,
+    command_id: CommandId,
+    command_requested_at_ms: i64,
+) -> Vec<u8> {
+    let (subject_kind, subject_id) = match subject {
+        PromotionSubject::CandidateProjection { projection_id } => (
+            b"candidate_projection".as_slice(),
+            projection_id.as_ulid().to_bytes(),
+        ),
+        PromotionSubject::MixedAuthorship { mixed_assembly_id } => (
+            b"mixed_authorship".as_slice(),
+            mixed_assembly_id.as_ulid().to_bytes(),
+        ),
+    };
+    let mut bytes = Vec::with_capacity(384);
+    bytes.extend_from_slice(b"loom/promotion-command-request/v1\0");
+    append_canonical_field(&mut bytes, b"project_id", &project_id.as_ulid().to_bytes());
+    append_canonical_field(
+        &mut bytes,
+        b"source_revision_id",
+        &source_revision_id.as_ulid().to_bytes(),
+    );
+    append_canonical_field(&mut bytes, b"source_blob_id", source_blob_id.as_bytes());
+    append_canonical_field(&mut bytes, b"subject_kind", subject_kind);
+    append_canonical_field(&mut bytes, b"subject_id", &subject_id);
+    append_canonical_field(
+        &mut bytes,
+        b"admission_record_id",
+        admission_record_id.as_bytes(),
+    );
+    append_canonical_field(
+        &mut bytes,
+        b"intended_result_blob_id",
+        intended_result_blob_id.as_bytes(),
+    );
+    append_canonical_field(
+        &mut bytes,
+        b"intended_result_byte_len",
+        &intended_result_byte_len.to_be_bytes(),
+    );
+    append_canonical_field(&mut bytes, b"command_id", &command_id.as_ulid().to_bytes());
+    append_canonical_field(
+        &mut bytes,
+        b"command_requested_at_ms",
+        &command_requested_at_ms.to_be_bytes(),
+    );
+    bytes
+}
+
+fn append_canonical_field(output: &mut Vec<u8>, label: &[u8], value: &[u8]) {
+    output.extend_from_slice(&(label.len() as u64).to_be_bytes());
+    output.extend_from_slice(label);
+    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    output.extend_from_slice(value);
+}
+
+/// Durable, pre-mutation promotion authority.
+///
+/// There is no caller-set `human_confirmed` boolean. The nested request pins
+/// the project and source, one exact admission record and typed subject, and
+/// the only bytes the command may install. The store must first persist that
+/// request, then match this authority to an opaque runtime admission lease and
+/// host-owned presence lease. Applying this authority is deliberately not yet
+/// implemented; serialized intent is never mutation authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PromotionAuthority {
+    actor: PromotionActor,
+    request: PromotionCommandRequest,
+    user_presence: UserPresenceEvidence,
+}
+
+impl PromotionAuthority {
+    pub fn new(
+        actor: PromotionActor,
+        request: PromotionCommandRequest,
+        user_presence: UserPresenceEvidence,
+    ) -> Result<Self, AssemblyError> {
+        if request.command_requested_at_ms() > user_presence.occurred_at_ms() {
+            return Err(AssemblyError::InvalidPromotionTimeline);
+        }
+        Ok(Self {
+            actor,
+            request,
+            user_presence,
+        })
+    }
+
+    pub const fn actor(&self) -> &PromotionActor {
+        &self.actor
+    }
+
+    pub const fn request(&self) -> &PromotionCommandRequest {
+        &self.request
+    }
+
+    pub const fn project_id(&self) -> ProjectId {
+        self.request.project_id()
+    }
+
+    pub const fn source_revision_id(&self) -> RevisionId {
+        self.request.source_revision_id()
+    }
+
+    pub const fn source_blob_id(&self) -> BlobId {
+        self.request.source_blob_id()
+    }
+
+    pub const fn subject(&self) -> PromotionSubject {
+        self.request.subject()
+    }
+
+    pub const fn admission_record_id(&self) -> BlobId {
+        self.request.admission_record_id()
+    }
+
+    pub const fn intended_result_blob_id(&self) -> BlobId {
+        self.request.intended_result_blob_id()
+    }
+
+    pub const fn intended_result_byte_len(&self) -> u64 {
+        self.request.intended_result_byte_len()
+    }
+
+    pub const fn command_id(&self) -> CommandId {
+        self.request.command_id()
+    }
+
+    pub const fn command_request_fingerprint(&self) -> BlobId {
+        self.request.command_request_fingerprint()
+    }
+
+    pub const fn command_requested_at_ms(&self) -> i64 {
+        self.request.command_requested_at_ms()
     }
 
     pub const fn user_presence(&self) -> &UserPresenceEvidence {
@@ -805,12 +1098,7 @@ impl PromotionAuthority {
 #[serde(deny_unknown_fields)]
 struct PromotionAuthorityWire {
     actor: PromotionActor,
-    #[serde(deserialize_with = "crate::bounded::deserialize_revision_id")]
-    source_revision_id: RevisionId,
-    #[serde(deserialize_with = "crate::bounded::deserialize_blob_id")]
-    source_blob_id: BlobId,
-    #[serde(deserialize_with = "crate::bounded::deserialize_command_id")]
-    command_id: CommandId,
+    request: PromotionCommandRequest,
     user_presence: UserPresenceEvidence,
 }
 
@@ -820,13 +1108,7 @@ impl<'de> Deserialize<'de> for PromotionAuthority {
         D: Deserializer<'de>,
     {
         let wire = PromotionAuthorityWire::deserialize(deserializer)?;
-        Ok(Self::new(
-            wire.actor,
-            wire.source_revision_id,
-            wire.source_blob_id,
-            wire.command_id,
-            wire.user_presence,
-        ))
+        Self::new(wire.actor, wire.request, wire.user_presence).map_err(serde::de::Error::custom)
     }
 }
 
@@ -876,6 +1158,12 @@ pub enum AssemblyError {
     MixedOutputRequiresCallEvidence,
     #[error("user-presence evidence requires a positive event index and timestamp")]
     InvalidUserPresence,
+    #[error("promotion result length {actual} is outside 1..={maximum} bytes")]
+    InvalidPromotionResultLength { actual: u64, maximum: u64 },
+    #[error("promotion command request must precede its user-presence event")]
+    InvalidPromotionTimeline,
+    #[error("promotion command request bytes or digest do not match its exact fields")]
+    PromotionRequestFingerprintMismatch,
 }
 
 fn validate_parts(

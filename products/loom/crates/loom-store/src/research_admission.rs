@@ -4,14 +4,15 @@ use loom_research_types::{
     CallEvidenceClass, CandidateAssemblyRecord, CandidateProjectionRecord, ExactCallEvidence,
     GeneratedSpanOccurrenceRecord, JoinBefore, MixedAuthorshipAssemblyRecord, ModelCall,
     OperationGraph, PipelineEligibility, PipelineOperationKind, PromotionAuthority,
-    UserPresenceKind,
+    PromotionCommandRequest, PromotionSubject, UserPresenceKind,
 };
-use loom_types::{BlobId, CommandId, CommandKind, now_unix_ms};
-use rusqlite::{Transaction, TransactionBehavior, params};
+use loom_types::{BlobId, CommandId, now_unix_ms};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 #[cfg(test)]
 use serde::Deserialize;
 
 use crate::provenance::insert_blob_row;
+use crate::store::StoreSessionNonce;
 use crate::{ProjectStore, Result, StoreError};
 
 #[cfg(test)]
@@ -23,12 +24,15 @@ const MAX_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(test)]
 const MAX_EVENT_COUNT: usize = 1_048_578;
 
-/// Content-addressed identity of one completed store admission occurrence.
+/// Deterministic identifier for one persisted admission audit row.
+///
+/// This is neither a content hash nor runtime authority. Only opaque,
+/// session-bound admission leases authorize downstream operations.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ResearchAdmissionId(BlobId);
+pub struct ResearchAdmissionRecordId(BlobId);
 
-impl ResearchAdmissionId {
-    pub const fn fingerprint(self) -> BlobId {
+impl ResearchAdmissionRecordId {
+    pub const fn as_blob_id(self) -> BlobId {
         self.0
     }
 }
@@ -39,6 +43,7 @@ impl ResearchAdmissionId {
 /// or a caller-supplied evidence enum cannot recreate this lease.
 #[derive(Debug)]
 pub struct AdmittedModelCall {
+    session_nonce: StoreSessionNonce,
     call: ModelCall,
     raw_output: Vec<u8>,
     token_ids: Vec<u32>,
@@ -56,6 +61,7 @@ impl AdmittedModelCall {
 /// call and, when present, exact token-to-byte boundaries.
 #[derive(Debug)]
 pub struct AdmittedGeneratedSpan {
+    session_nonce: StoreSessionNonce,
     record: GeneratedSpanOccurrenceRecord,
     call: ModelCall,
     raw_output: Vec<u8>,
@@ -72,14 +78,15 @@ impl AdmittedGeneratedSpan {
 /// and the exact bytes, graph, and witness were replayed by the store.
 #[derive(Debug)]
 pub struct AdmittedCandidateAssembly {
-    admission_id: ResearchAdmissionId,
+    session_nonce: StoreSessionNonce,
+    admission_record_id: ResearchAdmissionRecordId,
     record: CandidateAssemblyRecord,
     exact_calls: Vec<OwnedExactCall>,
 }
 
 impl AdmittedCandidateAssembly {
-    pub const fn admission_id(&self) -> ResearchAdmissionId {
-        self.admission_id
+    pub const fn admission_record_id(&self) -> ResearchAdmissionRecordId {
+        self.admission_record_id
     }
 
     pub const fn assembly_id(&self) -> loom_research_types::CandidateAssemblyId {
@@ -90,13 +97,14 @@ impl AdmittedCandidateAssembly {
 /// Non-serializable proof for a projection pinned to exact source bytes.
 #[derive(Debug)]
 pub struct AdmittedCandidateProjection {
-    admission_id: ResearchAdmissionId,
+    session_nonce: StoreSessionNonce,
+    admission_record_id: ResearchAdmissionRecordId,
     record: CandidateProjectionRecord,
 }
 
 impl AdmittedCandidateProjection {
-    pub const fn admission_id(&self) -> ResearchAdmissionId {
-        self.admission_id
+    pub const fn admission_record_id(&self) -> ResearchAdmissionRecordId {
+        self.admission_record_id
     }
 
     pub const fn projection_id(&self) -> loom_research_types::CandidateProjectionId {
@@ -107,7 +115,8 @@ impl AdmittedCandidateProjection {
 /// Explicitly ineligible but inspectable mixed-authorship persistence result.
 #[derive(Debug)]
 pub struct MixedAuthorshipAdmission {
-    admission_id: ResearchAdmissionId,
+    session_nonce: StoreSessionNonce,
+    admission_record_id: ResearchAdmissionRecordId,
     record: MixedAuthorshipAssemblyRecord,
 }
 
@@ -118,34 +127,84 @@ pub struct MixedAuthorshipAdmission {
 /// `UserPresenceEvidence` cannot manufacture it.
 #[derive(Debug)]
 pub struct VerifiedUserPresence {
+    session_nonce: StoreSessionNonce,
     command_id: CommandId,
+    command_request_fingerprint: BlobId,
     kind: UserPresenceKind,
     session_fingerprint: BlobId,
     event_receipt_blob_id: BlobId,
     event_receipt_bytes: Vec<u8>,
     monotonic_event_index: u64,
     occurred_at_ms: i64,
+    actor: loom_research_types::PromotionActor,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Opaque proof that the exact promotion command request was durably recorded
+/// in this process before user-presence authority.
+#[derive(Debug)]
+pub struct RecordedPromotionRequest {
+    session_nonce: StoreSessionNonce,
+    command_id: CommandId,
+    request_fingerprint: BlobId,
+    recorded_at_ms: i64,
+}
+
+/// Exact runtime admission lease selected for promotion. Persisted admission
+/// rows cannot construct either variant.
+#[derive(Debug)]
+pub enum PromotionSubjectLease<'a> {
+    CandidateProjection(&'a AdmittedCandidateProjection),
+    MixedAuthorship(&'a MixedAuthorshipAdmission),
+}
+
+/// Opaque pre-mutation authority. It is intentionally neither `Clone` nor
+/// serializable and has no constructor or SQL reload path.
+#[derive(Debug)]
 pub struct RecordedPromotionAuthority {
+    session_nonce: StoreSessionNonce,
     command_id: CommandId,
     record_blob_id: BlobId,
+    source_revision_id: loom_types::RevisionId,
+    source_blob_id: BlobId,
+    intended_result_blob_id: BlobId,
+    intended_result_byte_len: u64,
 }
 
 impl RecordedPromotionAuthority {
-    pub const fn command_id(self) -> CommandId {
+    /// Returns true only for the exact still-open store session that minted
+    /// this capability. This does not recreate or consume authority.
+    pub fn belongs_to(&self, store: &ProjectStore) -> bool {
+        self.session_nonce == store.session_nonce
+    }
+
+    pub const fn command_id(&self) -> CommandId {
         self.command_id
     }
 
-    pub const fn record_blob_id(self) -> BlobId {
+    pub const fn record_blob_id(&self) -> BlobId {
         self.record_blob_id
+    }
+
+    pub const fn source_revision_id(&self) -> loom_types::RevisionId {
+        self.source_revision_id
+    }
+
+    pub const fn source_blob_id(&self) -> BlobId {
+        self.source_blob_id
+    }
+
+    pub const fn intended_result_blob_id(&self) -> BlobId {
+        self.intended_result_blob_id
+    }
+
+    pub const fn intended_result_byte_len(&self) -> u64 {
+        self.intended_result_byte_len
     }
 }
 
 impl MixedAuthorshipAdmission {
-    pub const fn admission_id(&self) -> ResearchAdmissionId {
-        self.admission_id
+    pub const fn admission_record_id(&self) -> ResearchAdmissionRecordId {
+        self.admission_record_id
     }
 
     pub const fn record(&self) -> &MixedAuthorshipAssemblyRecord {
@@ -214,6 +273,15 @@ enum NativeCallEventKind {
 }
 
 impl ProjectStore {
+    fn require_research_session(&self, nonce: StoreSessionNonce) -> Result<()> {
+        if nonce != self.session_nonce {
+            return Err(admission_error(
+                "opaque research capability belongs to another project-store session",
+            ));
+        }
+        Ok(())
+    }
+
     /// Temporary internal replay plumbing for the verifier integration tests.
     ///
     /// This is deliberately crate-private: coherent caller-authored JSON is
@@ -264,7 +332,7 @@ impl ProjectStore {
                 call_id, campaign_id, stage_id, stage_attempt_id, trial_case_id,
                 seed_decimal, model_fingerprint, tokenizer_fingerprint, prompt_fingerprint,
                 sampler_fingerprint, control_program_fingerprint, evidence_class,
-                verification_replay_fingerprint, call_record_blob_id, created_at_ms
+                verification_audit_fingerprint, call_record_blob_id, created_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                        'live_base_writer_claim', ?12, ?13, ?14)",
             params![
@@ -309,6 +377,7 @@ impl ProjectStore {
         transaction.commit()?;
 
         Ok(AdmittedModelCall {
+            session_nonce: self.session_nonce,
             call,
             raw_output,
             token_ids,
@@ -324,6 +393,7 @@ impl ProjectStore {
         admitted_call: &AdmittedModelCall,
         record: GeneratedSpanOccurrenceRecord,
     ) -> Result<AdmittedGeneratedSpan> {
+        self.require_research_session(admitted_call.session_nonce)?;
         if record.call_id() != admitted_call.call.id() || !record.has_live_base_writer_claim() {
             return Err(admission_error(
                 "span is not a live base-writer claim for the admitted call",
@@ -379,7 +449,7 @@ impl ProjectStore {
                 occurrence_id, call_id, raw_output_blob_id,
                 output_start_byte, output_end_byte, token_start, token_end,
                 evidence_class, extraction_receipt_fingerprint,
-                verification_replay_fingerprint, span_record_blob_id, created_at_ms
+                verification_audit_fingerprint, span_record_blob_id, created_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                        'live_base_writer_claim', ?8, ?9, ?10, ?11)",
             params![
@@ -399,6 +469,7 @@ impl ProjectStore {
         transaction.commit()?;
 
         Ok(AdmittedGeneratedSpan {
+            session_nonce: self.session_nonce,
             record,
             call: admitted_call.call.clone(),
             raw_output: admitted_call.raw_output.clone(),
@@ -414,6 +485,14 @@ impl ProjectStore {
         record: CandidateAssemblyRecord,
         admitted_spans: &[&AdmittedGeneratedSpan],
     ) -> Result<AdmittedCandidateAssembly> {
+        if admitted_spans
+            .iter()
+            .any(|span| span.session_nonce != self.session_nonce)
+        {
+            return Err(admission_error(
+                "assembly contains a span lease from another project-store session",
+            ));
+        }
         if record.declared_pipeline_eligibility() != PipelineEligibility::DeclaredBaseWriterOnly {
             return Err(admission_error(
                 "assembly graph contains non-base-writer text",
@@ -446,7 +525,8 @@ impl ProjectStore {
         }
         let exact = exact_evidence(&exact_calls);
         let assembled_bytes = record.reconstruct(&exact)?;
-        let admission_id = admission_id("candidate_assembly", &record.id().to_string());
+        let admission_record_id =
+            admission_record_id("candidate_assembly", &record.id().to_string());
 
         let record_bytes = serde_json::to_vec(&record)?;
         let record_blob_id = self.put_blob(&record_bytes)?;
@@ -501,11 +581,11 @@ impl ProjectStore {
             )?;
         }
         transaction.execute(
-            "INSERT INTO research_admissions(
-                admission_id, subject_kind, subject_id, admitted_at_ms
+            "INSERT INTO research_admission_records(
+                admission_record_id, subject_kind, subject_id, admitted_at_ms
              ) VALUES (?1, 'candidate_assembly', ?2, ?3)",
             params![
-                admission_id.fingerprint().to_string(),
+                admission_record_id.as_blob_id().to_string(),
                 record.id().to_string(),
                 created_at_ms,
             ],
@@ -513,7 +593,8 @@ impl ProjectStore {
         transaction.commit()?;
 
         Ok(AdmittedCandidateAssembly {
-            admission_id,
+            session_nonce: self.session_nonce,
+            admission_record_id,
             record,
             exact_calls,
         })
@@ -526,13 +607,15 @@ impl ProjectStore {
         admitted_assembly: &AdmittedCandidateAssembly,
         record: CandidateProjectionRecord,
     ) -> Result<AdmittedCandidateProjection> {
+        self.require_research_session(admitted_assembly.session_nonce)?;
         if record.assembly_id() != admitted_assembly.record.id() {
             return Err(admission_error("projection names a different assembly"));
         }
         let source_bytes = self.read_blob(record.source_blob_id())?;
         let exact = exact_evidence(&admitted_assembly.exact_calls);
         let resulting = record.apply(&admitted_assembly.record, &source_bytes, &exact)?;
-        let admission_id = admission_id("candidate_projection", &record.id().to_string());
+        let admission_record_id =
+            admission_record_id("candidate_projection", &record.id().to_string());
 
         let record_bytes = serde_json::to_vec(&record)?;
         let record_blob_id = self.put_blob(&record_bytes)?;
@@ -580,18 +663,19 @@ impl ProjectStore {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO research_admissions(
-                admission_id, subject_kind, subject_id, admitted_at_ms
+            "INSERT INTO research_admission_records(
+                admission_record_id, subject_kind, subject_id, admitted_at_ms
              ) VALUES (?1, 'candidate_projection', ?2, ?3)",
             params![
-                admission_id.fingerprint().to_string(),
+                admission_record_id.as_blob_id().to_string(),
                 record.id().to_string(),
                 created_at_ms,
             ],
         )?;
         transaction.commit()?;
         Ok(AdmittedCandidateProjection {
-            admission_id,
+            session_nonce: self.session_nonce,
+            admission_record_id,
             record,
         })
     }
@@ -609,7 +693,7 @@ impl ProjectStore {
                 "mixed-authorship record has no text-affecting mixed operation",
             ));
         }
-        let admission_id = admission_id("mixed_authorship", &record.id().to_string());
+        let admission_record_id = admission_record_id("mixed_authorship", &record.id().to_string());
         let record_bytes = serde_json::to_vec(&record)?;
         let record_blob_id = self.put_blob(&record_bytes)?;
         let output_blob_id = self.put_blob(exact_output)?;
@@ -647,125 +731,220 @@ impl ProjectStore {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO research_admissions(
-                admission_id, subject_kind, subject_id, admitted_at_ms
+            "INSERT INTO research_admission_records(
+                admission_record_id, subject_kind, subject_id, admitted_at_ms
              ) VALUES (?1, 'mixed_authorship', ?2, ?3)",
             params![
-                admission_id.fingerprint().to_string(),
+                admission_record_id.as_blob_id().to_string(),
                 record.id().to_string(),
                 created_at_ms,
             ],
         )?;
         transaction.commit()?;
         Ok(MixedAuthorshipAdmission {
-            admission_id,
+            session_nonce: self.session_nonce,
+            admission_record_id,
             record,
         })
     }
 
-    /// Persists authority only when a non-serializable host lease agrees with
-    /// the exact command, source, presence receipt, and command lifetime.
+    /// Persists the exact promotion command request before user confirmation.
+    ///
+    /// The returned marker is process-local and cannot be reconstructed from
+    /// the row. The row is durable audit/recovery evidence only.
+    pub fn record_promotion_command_request(
+        &mut self,
+        subject_lease: PromotionSubjectLease<'_>,
+        request: &PromotionCommandRequest,
+    ) -> Result<RecordedPromotionRequest> {
+        if request.project_id() != self.manifest.project_id
+            || !promotion_subject_lease_matches(self.session_nonce, subject_lease, request)
+        {
+            return Err(admission_error(
+                "promotion request differs from its exact runtime admission lease",
+            ));
+        }
+        let subject = request.subject();
+        let recorded_at_ms = now_unix_ms().max(request.command_requested_at_ms());
+        let canonical_request_blob_id = self.put_blob(request.canonical_request_bytes())?;
+        if canonical_request_blob_id != request.command_request_fingerprint() {
+            return Err(admission_error(
+                "promotion request digest differs from its canonical bytes",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_blob_row(
+            &transaction,
+            canonical_request_blob_id,
+            request.canonical_request_bytes().len(),
+            recorded_at_ms,
+        )?;
+        let inserted = transaction.execute(
+            "INSERT INTO research_promotion_command_requests(
+                command_id, command_request_fingerprint,
+                canonical_request_blob_id, canonical_request_byte_len, project_id,
+                source_revision_id, source_blob_id,
+                subject_kind, subject_id, admission_record_id,
+                intended_result_blob_id, intended_result_byte_len,
+                requested_at_ms, recorded_at_ms
+             ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM command_receipts receipt WHERE receipt.command_id = ?1
+               )",
+            params![
+                request.command_id().to_string(),
+                request.command_request_fingerprint().to_string(),
+                canonical_request_blob_id.to_string(),
+                checked_sql_usize(
+                    request.canonical_request_bytes().len(),
+                    "canonical promotion request length",
+                )?,
+                request.project_id().to_string(),
+                request.source_revision_id().to_string(),
+                request.source_blob_id().to_string(),
+                subject.kind_name(),
+                subject.id_string(),
+                request.admission_record_id().to_string(),
+                request.intended_result_blob_id().to_string(),
+                checked_sql_u64(
+                    request.intended_result_byte_len(),
+                    "intended promotion result length",
+                )?,
+                request.command_requested_at_ms(),
+                recorded_at_ms,
+            ],
+        )?;
+        if inserted != 1 {
+            return Err(admission_error(
+                "promotion request command already has a terminal receipt",
+            ));
+        }
+        transaction.commit()?;
+        Ok(RecordedPromotionRequest {
+            session_nonce: self.session_nonce,
+            command_id: request.command_id(),
+            request_fingerprint: request.command_request_fingerprint(),
+            recorded_at_ms,
+        })
+    }
+
+    /// Durably records promotion intent before any manuscript mutation.
+    ///
+    /// A completed command receipt must not exist yet. The non-serializable
+    /// host lease binds the exact command-request fingerprint to one foreground
+    /// presence event; the authority additionally pins this project, source,
+    /// admission record, typed subject, and intended result bytes. Applying
+    /// this authority remains deliberately unsupported.
+    // Passing these opaque tokens by value is intentional: one host presence
+    // gesture and one recorded request may authorize at most one attempt.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn record_promotion_authority(
         &mut self,
-        lease: &VerifiedUserPresence,
+        recorded_request: RecordedPromotionRequest,
+        subject_lease: PromotionSubjectLease<'_>,
+        lease: VerifiedUserPresence,
         authority: &PromotionAuthority,
     ) -> Result<RecordedPromotionAuthority> {
         let presence = authority.user_presence();
-        if authority.command_id() != lease.command_id
+        if recorded_request.session_nonce != self.session_nonce
+            || lease.session_nonce != self.session_nonce
+            || authority.project_id() != self.manifest.project_id
+            || authority.command_id() != recorded_request.command_id
+            || authority.command_request_fingerprint() != recorded_request.request_fingerprint
+            || authority.command_id() != lease.command_id
+            || authority.command_request_fingerprint() != lease.command_request_fingerprint
             || presence.kind() != lease.kind
             || presence.session_fingerprint() != lease.session_fingerprint
             || presence.event_receipt_blob_id() != lease.event_receipt_blob_id
             || presence.monotonic_event_index() != lease.monotonic_event_index
             || presence.occurred_at_ms() != lease.occurred_at_ms
+            || authority.actor() != &lease.actor
             || BlobId::digest(&lease.event_receipt_bytes) != lease.event_receipt_blob_id
         {
             return Err(admission_error(
                 "promotion authority differs from its host-owned presence lease",
             ));
         }
-        let receipt = self
-            .load_receipt(authority.command_id())?
-            .ok_or_else(|| admission_error("promotion command has no durable receipt"))?;
-        if receipt.command != CommandKind::PromoteCandidate
-            || receipt.command_id != authority.command_id()
-            || receipt.project_id != self.manifest.project_id
-            || receipt.source_revision_id != Some(authority.source_revision_id())
-            || lease.occurred_at_ms < receipt.started_at_ms
-            || lease.occurred_at_ms > receipt.completed_at_ms
+        if !promotion_subject_lease_matches(self.session_nonce, subject_lease, authority.request())
         {
             return Err(admission_error(
-                "presence lease is not within the exact promotion command receipt",
+                "promotion authority lacks the exact runtime admission lease",
             ));
         }
-        let request: (String, i64) = self.connection.query_row(
-            "SELECT command_kind, created_at_ms
-             FROM command_requests WHERE command_id = ?1",
-            [authority.command_id().to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if request.0 != CommandKind::PromoteCandidate.as_str()
-            || request.1 > lease.occurred_at_ms
-            || receipt.started_at_ms != request.1
-        {
+        if recorded_request.recorded_at_ms > lease.occurred_at_ms {
             return Err(admission_error(
-                "promotion request, receipt, and presence lifetime disagree",
+                "promotion presence occurred before its durable command request",
             ));
         }
 
+        self.persist_promotion_authority(&recorded_request, &lease, authority)
+    }
+
+    fn persist_promotion_authority(
+        &mut self,
+        recorded_request: &RecordedPromotionRequest,
+        lease: &VerifiedUserPresence,
+        authority: &PromotionAuthority,
+    ) -> Result<RecordedPromotionAuthority> {
         let authority_bytes = serde_json::to_vec(authority)?;
         let authority_record_blob_id = self.put_blob(&authority_bytes)?;
         let event_receipt_blob_id = self.put_blob(&lease.event_receipt_bytes)?;
-        let created_at_ms = receipt.completed_at_ms.max(1);
+        let intent_recorded_at_ms = now_unix_ms().max(lease.occurred_at_ms);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_terminal_receipt: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM command_receipts WHERE command_id = ?1)",
+            [authority.command_id().to_string()],
+            |row| row.get(0),
+        )?;
+        if has_terminal_receipt {
+            return Err(admission_error(
+                "promotion authority must be recorded before command completion",
+            ));
+        }
+        if !durable_promotion_request_matches(&transaction, recorded_request, authority)? {
+            return Err(admission_error(
+                "promotion authority does not match its durable command request",
+            ));
+        }
+        if !persisted_promotion_subject_matches(&transaction, authority)? {
+            return Err(admission_error(
+                "promotion intent does not match its exact source, admission record, subject, and result",
+            ));
+        }
         for (blob_id, byte_len) in [
             (event_receipt_blob_id, lease.event_receipt_bytes.len()),
             (authority_record_blob_id, authority_bytes.len()),
         ] {
-            insert_blob_row(&transaction, blob_id, byte_len, created_at_ms)?;
+            insert_blob_row(&transaction, blob_id, byte_len, intent_recorded_at_ms)?;
         }
-        transaction.execute(
-            "INSERT INTO research_user_presence_events(
-                event_receipt_blob_id, command_id, user_presence_kind,
-                session_fingerprint, monotonic_event_index,
-                occurred_at_ms, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                event_receipt_blob_id.to_string(),
-                authority.command_id().to_string(),
-                user_presence_kind_name(lease.kind),
-                lease.session_fingerprint.to_string(),
-                checked_sql_u64(lease.monotonic_event_index, "presence event index")?,
-                lease.occurred_at_ms,
-                created_at_ms,
-            ],
+        insert_promotion_presence(
+            &transaction,
+            lease,
+            authority,
+            event_receipt_blob_id,
+            intent_recorded_at_ms,
         )?;
-        transaction.execute(
-            "INSERT INTO research_promotion_authorities(
-                command_id, actor, source_revision_id, source_blob_id,
-                user_presence_kind, session_fingerprint, event_receipt_blob_id,
-                monotonic_event_index, occurred_at_ms,
-                authority_record_blob_id, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                authority.command_id().to_string(),
-                authority.actor().as_str(),
-                authority.source_revision_id().to_string(),
-                authority.source_blob_id().to_string(),
-                user_presence_kind_name(lease.kind),
-                lease.session_fingerprint.to_string(),
-                event_receipt_blob_id.to_string(),
-                checked_sql_u64(lease.monotonic_event_index, "presence event index")?,
-                lease.occurred_at_ms,
-                authority_record_blob_id.to_string(),
-                created_at_ms,
-            ],
+        insert_promotion_authority_record(
+            &transaction,
+            lease,
+            authority,
+            event_receipt_blob_id,
+            authority_record_blob_id,
+            intent_recorded_at_ms,
         )?;
         transaction.commit()?;
         Ok(RecordedPromotionAuthority {
+            session_nonce: self.session_nonce,
             command_id: authority.command_id(),
             record_blob_id: authority_record_blob_id,
+            source_revision_id: authority.source_revision_id(),
+            source_blob_id: authority.source_blob_id(),
+            intended_result_blob_id: authority.intended_result_blob_id(),
+            intended_result_byte_len: authority.intended_result_byte_len(),
         })
     }
 
@@ -1216,6 +1395,239 @@ const fn user_presence_kind_name(kind: UserPresenceKind) -> &'static str {
     }
 }
 
+fn insert_promotion_presence(
+    transaction: &Transaction<'_>,
+    lease: &VerifiedUserPresence,
+    authority: &PromotionAuthority,
+    event_receipt_blob_id: BlobId,
+    intent_recorded_at_ms: i64,
+) -> Result<()> {
+    let inserted = transaction.execute(
+        "INSERT INTO research_user_presence_events(
+            event_receipt_blob_id, command_id, command_request_fingerprint,
+            actor, user_presence_kind, session_fingerprint,
+            monotonic_event_index, occurred_at_ms, created_at_ms
+         ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+           WHERE NOT EXISTS (
+               SELECT 1 FROM command_receipts receipt WHERE receipt.command_id = ?2
+           )",
+        params![
+            event_receipt_blob_id.to_string(),
+            authority.command_id().to_string(),
+            authority.command_request_fingerprint().to_string(),
+            lease.actor.as_str(),
+            user_presence_kind_name(lease.kind),
+            lease.session_fingerprint.to_string(),
+            checked_sql_u64(lease.monotonic_event_index, "presence event index")?,
+            lease.occurred_at_ms,
+            intent_recorded_at_ms,
+        ],
+    )?;
+    if inserted != 1 {
+        return Err(admission_error(
+            "promotion command became terminal before presence admission",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_promotion_authority_record(
+    transaction: &Transaction<'_>,
+    lease: &VerifiedUserPresence,
+    authority: &PromotionAuthority,
+    event_receipt_blob_id: BlobId,
+    authority_record_blob_id: BlobId,
+    intent_recorded_at_ms: i64,
+) -> Result<()> {
+    let subject = authority.subject();
+    let inserted = transaction.execute(
+        "INSERT INTO research_promotion_authorities(
+            command_id, command_request_fingerprint, actor, project_id,
+            source_revision_id, source_blob_id, subject_kind, subject_id,
+            admission_record_id, intended_result_blob_id, intended_result_byte_len,
+            user_presence_kind, session_fingerprint, event_receipt_blob_id,
+            monotonic_event_index, occurred_at_ms,
+            authority_record_blob_id, intent_recorded_at_ms
+         ) SELECT
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+            ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+           WHERE NOT EXISTS (
+               SELECT 1 FROM command_receipts receipt WHERE receipt.command_id = ?1
+           )",
+        params![
+            authority.command_id().to_string(),
+            authority.command_request_fingerprint().to_string(),
+            authority.actor().as_str(),
+            authority.project_id().to_string(),
+            authority.source_revision_id().to_string(),
+            authority.source_blob_id().to_string(),
+            subject.kind_name(),
+            subject.id_string(),
+            authority.admission_record_id().to_string(),
+            authority.intended_result_blob_id().to_string(),
+            checked_sql_u64(
+                authority.intended_result_byte_len(),
+                "intended promotion result length",
+            )?,
+            user_presence_kind_name(lease.kind),
+            lease.session_fingerprint.to_string(),
+            event_receipt_blob_id.to_string(),
+            checked_sql_u64(lease.monotonic_event_index, "presence event index")?,
+            lease.occurred_at_ms,
+            authority_record_blob_id.to_string(),
+            intent_recorded_at_ms,
+        ],
+    )?;
+    if inserted != 1 {
+        return Err(admission_error(
+            "promotion command became terminal before authority admission",
+        ));
+    }
+    Ok(())
+}
+
+fn durable_promotion_request_matches(
+    connection: &Connection,
+    recorded: &RecordedPromotionRequest,
+    authority: &PromotionAuthority,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM research_promotion_command_requests
+                WHERE command_id = ?1
+                  AND command_request_fingerprint = ?2
+                  AND canonical_request_blob_id = ?2
+                  AND canonical_request_byte_len = ?3
+                  AND project_id = ?4
+                  AND source_revision_id = ?5
+                  AND source_blob_id = ?6
+                  AND subject_kind = ?7
+                  AND subject_id = ?8
+                  AND admission_record_id = ?9
+                  AND intended_result_blob_id = ?10
+                  AND intended_result_byte_len = ?11
+                  AND requested_at_ms = ?12
+                  AND recorded_at_ms = ?13
+             )",
+            params![
+                authority.command_id().to_string(),
+                authority.command_request_fingerprint().to_string(),
+                checked_sql_usize(
+                    authority.request().canonical_request_bytes().len(),
+                    "canonical promotion request length",
+                )?,
+                authority.project_id().to_string(),
+                authority.source_revision_id().to_string(),
+                authority.source_blob_id().to_string(),
+                authority.subject().kind_name(),
+                authority.subject().id_string(),
+                authority.admission_record_id().to_string(),
+                authority.intended_result_blob_id().to_string(),
+                checked_sql_u64(
+                    authority.intended_result_byte_len(),
+                    "intended promotion result length",
+                )?,
+                authority.command_requested_at_ms(),
+                recorded.recorded_at_ms,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
+fn persisted_promotion_subject_matches(
+    connection: &Connection,
+    authority: &PromotionAuthority,
+) -> Result<bool> {
+    let subject_id = authority.subject().id_string();
+    let query = match authority.subject() {
+        PromotionSubject::CandidateProjection { .. } => {
+            "SELECT EXISTS(
+                SELECT 1
+                FROM research_admission_records admission
+                JOIN research_candidate_projections projection
+                  ON projection.projection_id = admission.subject_id
+                WHERE admission.admission_record_id = ?1
+                  AND admission.subject_kind = 'candidate_projection'
+                  AND admission.subject_id = ?2
+                  AND projection.source_revision_id = ?3
+                  AND projection.source_blob_id = ?4
+                  AND projection.resulting_blob_id = ?5
+                  AND projection.resulting_byte_len = ?6
+             )"
+        }
+        PromotionSubject::MixedAuthorship { .. } => {
+            "SELECT EXISTS(
+                SELECT 1
+                FROM research_admission_records admission
+                JOIN research_mixed_authorship_assemblies mixed
+                  ON mixed.mixed_assembly_id = admission.subject_id
+                JOIN revisions source_revision ON source_revision.revision_id = ?3
+                JOIN artifacts source_artifact
+                  ON source_artifact.artifact_id = source_revision.artifact_id
+                WHERE admission.admission_record_id = ?1
+                  AND admission.subject_kind = 'mixed_authorship'
+                  AND admission.subject_id = ?2
+                  AND source_artifact.blob_id = ?4
+                  AND mixed.output_blob_id = ?5
+                  AND mixed.output_byte_len = ?6
+             )"
+        }
+    };
+    connection
+        .query_row(
+            query,
+            params![
+                authority.admission_record_id().to_string(),
+                subject_id,
+                authority.source_revision_id().to_string(),
+                authority.source_blob_id().to_string(),
+                authority.intended_result_blob_id().to_string(),
+                checked_sql_u64(
+                    authority.intended_result_byte_len(),
+                    "intended promotion result length",
+                )?,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
+fn promotion_subject_lease_matches(
+    expected_session: StoreSessionNonce,
+    lease: PromotionSubjectLease<'_>,
+    request: &PromotionCommandRequest,
+) -> bool {
+    match (lease, request.subject()) {
+        (
+            PromotionSubjectLease::CandidateProjection(admitted),
+            PromotionSubject::CandidateProjection { projection_id },
+        ) => {
+            admitted.session_nonce == expected_session
+                && admitted.admission_record_id.as_blob_id() == request.admission_record_id()
+                && admitted.record.id() == projection_id
+                && admitted.record.source_revision_id() == request.source_revision_id()
+                && admitted.record.source_blob_id() == request.source_blob_id()
+                && admitted.record.witness().resulting_blob_id()
+                    == request.intended_result_blob_id()
+                && admitted.record.witness().resulting_byte_len()
+                    == request.intended_result_byte_len()
+        }
+        (
+            PromotionSubjectLease::MixedAuthorship(admitted),
+            PromotionSubject::MixedAuthorship { mixed_assembly_id },
+        ) => {
+            admitted.session_nonce == expected_session
+                && admitted.admission_record_id.as_blob_id() == request.admission_record_id()
+                && admitted.record.id() == mixed_assembly_id
+                && admitted.record.output_blob_id() == request.intended_result_blob_id()
+                && admitted.record.output_byte_len() == request.intended_result_byte_len()
+        }
+        _ => false,
+    }
+}
+
 fn exact_evidence(calls: &[OwnedExactCall]) -> Vec<ExactCallEvidence<'_>> {
     calls
         .iter()
@@ -1232,13 +1644,13 @@ fn encode_token_ids(token_ids: &[u32]) -> Vec<u8> {
     bytes
 }
 
-fn admission_id(kind: &str, subject: &str) -> ResearchAdmissionId {
+fn admission_record_id(kind: &str, subject: &str) -> ResearchAdmissionRecordId {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"loom/research-admission/v1\0");
     bytes.extend_from_slice(kind.as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(subject.as_bytes());
-    ResearchAdmissionId(BlobId::digest(&bytes))
+    ResearchAdmissionRecordId(BlobId::digest(&bytes))
 }
 
 fn checked_sql_u64(value: u64, field: &'static str) -> Result<i64> {
@@ -1258,13 +1670,153 @@ fn admission_error(message: impl Into<String>) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
+
     use loom_document::DocumentContent;
     use loom_research_types::{
         AssemblyPartRecord, CallIdentity, CallScope, CallTerminal, CampaignId, CandidateAssemblyId,
-        CandidateProjectionId, CompletedCall, GeneratedSpanOccurrenceId, ModelCallId,
-        OutputProjection, StageAttemptId, StageId, TokenEvidence, TrialCaseId,
+        CandidateProjectionId, CompletedCall, GeneratedSpanOccurrenceId, MixedAuthorshipAssemblyId,
+        ModelCallId, OutputProjection, PipelineOperation, PipelineOperationId, PromotionActor,
+        StageAttemptId, StageId, TokenEvidence, TrialCaseId, UserPresenceEvidence,
     };
+    use loom_types::RevisionId;
     use tempfile::tempdir;
+
+    struct MixedPromotionFixture {
+        admission: MixedAuthorshipAdmission,
+        source_revision_id: RevisionId,
+        source_blob_id: BlobId,
+    }
+
+    #[derive(Clone, Copy)]
+    struct PresenceSpec<'a> {
+        authority_actor: &'a str,
+        host_actor: &'a str,
+        session_fingerprint: BlobId,
+        monotonic_event_index: u64,
+        event_receipt_bytes: &'a [u8],
+    }
+
+    fn mixed_promotion_fixture(store: &mut ProjectStore) -> MixedPromotionFixture {
+        store
+            .save_document(
+                "manuscript/source.md",
+                DocumentContent::Prose("Pinned source manuscript.".into()),
+                "promotion source",
+            )
+            .expect("save promotion source");
+        let source = store
+            .read_document("manuscript/source.md")
+            .expect("read promotion source");
+        let exact_output = b"Human-authored continuation.";
+        let output_operation_id = PipelineOperationId::new();
+        let operation_graph = OperationGraph::new(
+            vec![
+                PipelineOperation::new(
+                    output_operation_id,
+                    PipelineOperationKind::LiteralText {
+                        content_blob_id: BlobId::digest(exact_output),
+                    },
+                    Vec::new(),
+                )
+                .expect("literal output operation"),
+            ],
+            output_operation_id,
+        )
+        .expect("mixed operation graph");
+        let record = MixedAuthorshipAssemblyRecord::new(
+            MixedAuthorshipAssemblyId::new(),
+            exact_output,
+            operation_graph,
+        )
+        .expect("mixed-authorship record");
+        let admission = store
+            .record_mixed_authorship_assembly(record, exact_output)
+            .expect("mixed-authorship admission");
+        MixedPromotionFixture {
+            admission,
+            source_revision_id: source.revision_id,
+            source_blob_id: source.blob_id,
+        }
+    }
+
+    fn promotion_request(
+        store: &ProjectStore,
+        fixture: &MixedPromotionFixture,
+        command_id: CommandId,
+    ) -> PromotionCommandRequest {
+        PromotionCommandRequest::new(
+            store.manifest().project_id,
+            fixture.source_revision_id,
+            fixture.source_blob_id,
+            PromotionSubject::MixedAuthorship {
+                mixed_assembly_id: fixture.admission.record().id(),
+            },
+            fixture.admission.admission_record_id().as_blob_id(),
+            fixture.admission.record().output_blob_id(),
+            fixture.admission.record().output_byte_len(),
+            command_id,
+            now_unix_ms().max(1),
+        )
+        .expect("promotion request")
+    }
+
+    fn authority_and_presence(
+        store: &ProjectStore,
+        recorded_request: &RecordedPromotionRequest,
+        request: &PromotionCommandRequest,
+        spec: PresenceSpec<'_>,
+    ) -> (PromotionAuthority, VerifiedUserPresence) {
+        let occurred_at_ms = recorded_request.recorded_at_ms + 1;
+        let event_receipt_blob_id = BlobId::digest(spec.event_receipt_bytes);
+        let user_presence = UserPresenceEvidence::new(
+            UserPresenceKind::EditorGesture,
+            spec.session_fingerprint,
+            event_receipt_blob_id,
+            spec.monotonic_event_index,
+            occurred_at_ms,
+        )
+        .expect("user-presence claim");
+        let authority = PromotionAuthority::new(
+            PromotionActor::new(spec.authority_actor).expect("authority actor"),
+            request.clone(),
+            user_presence,
+        )
+        .expect("promotion authority");
+        let lease = VerifiedUserPresence {
+            session_nonce: store.session_nonce,
+            command_id: request.command_id(),
+            command_request_fingerprint: request.command_request_fingerprint(),
+            kind: UserPresenceKind::EditorGesture,
+            session_fingerprint: spec.session_fingerprint,
+            event_receipt_blob_id,
+            event_receipt_bytes: spec.event_receipt_bytes.to_vec(),
+            monotonic_event_index: spec.monotonic_event_index,
+            occurred_at_ms,
+            actor: PromotionActor::new(spec.host_actor).expect("host actor"),
+        };
+        (authority, lease)
+    }
+
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).expect("create copied project directory");
+        for entry in fs::read_dir(source).expect("read source project") {
+            let entry = entry.expect("source project entry");
+            let file_type = entry.file_type().expect("source entry type");
+            assert!(
+                !file_type.is_symlink(),
+                "test project must not contain symlinks"
+            );
+            let target = destination.join(entry.file_name());
+            if file_type.is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                assert!(file_type.is_file(), "test project entries must be files");
+                fs::copy(entry.path(), target).expect("copy project file");
+            }
+        }
+    }
 
     #[test]
     fn token_encoding_is_unambiguous_big_endian() {
@@ -1279,11 +1831,393 @@ mod tests {
     }
 
     #[test]
-    fn admission_ids_are_domain_separated() {
+    fn admission_record_ids_are_domain_separated() {
         assert_ne!(
-            admission_id("candidate_assembly", "same"),
-            admission_id("candidate_projection", "same")
+            admission_record_id("candidate_assembly", "same"),
+            admission_record_id("candidate_projection", "same")
         );
+    }
+
+    #[test]
+    fn promotion_capabilities_expire_when_the_project_store_reopens() {
+        let directory = tempdir().expect("temporary project");
+        let root = directory.path().join("Novel");
+        let (mut store, _) = ProjectStore::initialize(&root, "Novel").expect("initialize");
+        let fixture = mixed_promotion_fixture(&mut store);
+        let request = promotion_request(&store, &fixture, CommandId::new());
+        let recorded_request = store
+            .record_promotion_command_request(
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                &request,
+            )
+            .expect("record promotion request");
+        let (authority, presence) = authority_and_presence(
+            &store,
+            &recorded_request,
+            &request,
+            PresenceSpec {
+                authority_actor: "foreground reviewer",
+                host_actor: "foreground reviewer",
+                session_fingerprint: BlobId::digest(b"reopen host session"),
+                monotonic_event_index: 1,
+                event_receipt_bytes: b"reopen foreground gesture",
+            },
+        );
+        drop(store);
+
+        let mut reopened = ProjectStore::open(&root).expect("reopen project");
+        assert!(
+            reopened
+                .record_promotion_authority(
+                    recorded_request,
+                    PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                    presence,
+                    &authority,
+                )
+                .is_err(),
+            "a prior-open request, admission, and presence must all be stale"
+        );
+        let authority_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM research_promotion_authorities",
+                [],
+                |row| row.get(0),
+            )
+            .expect("authority count");
+        assert_eq!(authority_count, 0);
+    }
+
+    #[test]
+    fn admission_capabilities_do_not_cross_projects_or_copied_stores() {
+        let directory = tempdir().expect("temporary project");
+        let source_root = directory.path().join("Source");
+        let other_root = directory.path().join("Other");
+        let copied_root = directory.path().join("Copied");
+        let (mut source_store, _) =
+            ProjectStore::initialize(&source_root, "Source").expect("initialize source");
+        let fixture = mixed_promotion_fixture(&mut source_store);
+        let request = promotion_request(&source_store, &fixture, CommandId::new());
+
+        let (mut other_store, _) =
+            ProjectStore::initialize(&other_root, "Other").expect("initialize other");
+        assert!(
+            other_store
+                .record_promotion_command_request(
+                    PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                    &request,
+                )
+                .is_err(),
+            "a capability from another project must fail"
+        );
+        drop(other_store);
+        drop(source_store);
+
+        copy_tree(&source_root, &copied_root);
+        let mut copied_store = ProjectStore::open(&copied_root).expect("open copied project");
+        assert!(
+            copied_store
+                .record_promotion_command_request(
+                    PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                    &request,
+                )
+                .is_err(),
+            "copied audit rows must not recreate runtime admission authority"
+        );
+    }
+
+    #[test]
+    fn request_fingerprint_and_host_actor_substitution_fail_closed() {
+        let directory = tempdir().expect("temporary project");
+        let root = directory.path().join("Novel");
+        let (mut store, _) = ProjectStore::initialize(&root, "Novel").expect("initialize");
+        let fixture = mixed_promotion_fixture(&mut store);
+
+        let fingerprint_request = promotion_request(&store, &fixture, CommandId::new());
+        let mut recorded_request = store
+            .record_promotion_command_request(
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                &fingerprint_request,
+            )
+            .expect("record fingerprint request");
+        let (fingerprint_authority, fingerprint_presence) = authority_and_presence(
+            &store,
+            &recorded_request,
+            &fingerprint_request,
+            PresenceSpec {
+                authority_actor: "foreground reviewer",
+                host_actor: "foreground reviewer",
+                session_fingerprint: BlobId::digest(b"fingerprint session"),
+                monotonic_event_index: 1,
+                event_receipt_bytes: b"fingerprint gesture",
+            },
+        );
+        recorded_request.request_fingerprint = BlobId::digest(b"substituted request fingerprint");
+        assert!(
+            store
+                .record_promotion_authority(
+                    recorded_request,
+                    PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                    fingerprint_presence,
+                    &fingerprint_authority,
+                )
+                .is_err(),
+            "a substituted recorded-request fingerprint must fail"
+        );
+
+        let actor_request = promotion_request(&store, &fixture, CommandId::new());
+        let actor_recorded = store
+            .record_promotion_command_request(
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                &actor_request,
+            )
+            .expect("record actor request");
+        let (actor_authority, actor_presence) = authority_and_presence(
+            &store,
+            &actor_recorded,
+            &actor_request,
+            PresenceSpec {
+                authority_actor: "caller-supplied actor",
+                host_actor: "host-derived actor",
+                session_fingerprint: BlobId::digest(b"actor session"),
+                monotonic_event_index: 1,
+                event_receipt_bytes: b"actor gesture",
+            },
+        );
+        assert!(
+            store
+                .record_promotion_authority(
+                    actor_recorded,
+                    PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                    actor_presence,
+                    &actor_authority,
+                )
+                .is_err(),
+            "the serialized authority actor must equal the host-owned lease actor"
+        );
+        let authority_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM research_promotion_authorities",
+                [],
+                |row| row.get(0),
+            )
+            .expect("authority count");
+        assert_eq!(authority_count, 0);
+    }
+
+    #[test]
+    fn retrospective_terminal_receipt_blocks_presence_and_authority_atomically() {
+        let directory = tempdir().expect("temporary project");
+        let root = directory.path().join("Novel");
+        let (mut store, _) = ProjectStore::initialize(&root, "Novel").expect("initialize");
+        let fixture = mixed_promotion_fixture(&mut store);
+        let request = promotion_request(&store, &fixture, CommandId::new());
+        let recorded_request = store
+            .record_promotion_command_request(
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                &request,
+            )
+            .expect("record promotion request");
+        let (authority, presence) = authority_and_presence(
+            &store,
+            &recorded_request,
+            &request,
+            PresenceSpec {
+                authority_actor: "foreground reviewer",
+                host_actor: "foreground reviewer",
+                session_fingerprint: BlobId::digest(b"receipt-race session"),
+                monotonic_event_index: 1,
+                event_receipt_bytes: b"receipt-race gesture",
+            },
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO command_receipts(
+                    command_id, command_kind, receipt_json, completed_at_ms
+                 ) VALUES (?1, 'promotion-test-terminal', '{}', ?2)",
+                params![request.command_id().to_string(), presence.occurred_at_ms],
+            )
+            .expect("insert retrospective terminal receipt");
+
+        assert!(
+            store
+                .record_promotion_authority(
+                    recorded_request,
+                    PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                    presence,
+                    &authority,
+                )
+                .is_err(),
+            "a terminal receipt inserted after request recording must close admission"
+        );
+        let counts: (i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM research_user_presence_events),
+                    (SELECT COUNT(*) FROM research_promotion_authorities)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("promotion intent counts");
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[test]
+    fn promotion_request_and_presence_capabilities_are_single_use() {
+        let directory = tempdir().expect("temporary project");
+        let root = directory.path().join("Novel");
+        let (mut store, _) = ProjectStore::initialize(&root, "Novel").expect("initialize");
+        let fixture = mixed_promotion_fixture(&mut store);
+        let request = promotion_request(&store, &fixture, CommandId::new());
+        let recorded_request = store
+            .record_promotion_command_request(
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                &request,
+            )
+            .expect("record promotion request");
+        let duplicate_request = RecordedPromotionRequest {
+            session_nonce: recorded_request.session_nonce,
+            command_id: recorded_request.command_id,
+            request_fingerprint: recorded_request.request_fingerprint,
+            recorded_at_ms: recorded_request.recorded_at_ms,
+        };
+        let (authority, presence) = authority_and_presence(
+            &store,
+            &recorded_request,
+            &request,
+            PresenceSpec {
+                authority_actor: "foreground reviewer",
+                host_actor: "foreground reviewer",
+                session_fingerprint: BlobId::digest(b"single-use session"),
+                monotonic_event_index: 1,
+                event_receipt_bytes: b"single-use gesture",
+            },
+        );
+        let duplicate_presence = VerifiedUserPresence {
+            session_nonce: presence.session_nonce,
+            command_id: presence.command_id,
+            command_request_fingerprint: presence.command_request_fingerprint,
+            kind: presence.kind,
+            session_fingerprint: presence.session_fingerprint,
+            event_receipt_blob_id: presence.event_receipt_blob_id,
+            event_receipt_bytes: presence.event_receipt_bytes.clone(),
+            monotonic_event_index: presence.monotonic_event_index,
+            occurred_at_ms: presence.occurred_at_ms,
+            actor: presence.actor.clone(),
+        };
+
+        store
+            .record_promotion_authority(
+                recorded_request,
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                presence,
+                &authority,
+            )
+            .expect("first authority admission");
+        assert!(
+            store
+                .record_promotion_authority(
+                    duplicate_request,
+                    PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                    duplicate_presence,
+                    &authority,
+                )
+                .is_err(),
+            "even an internal duplicate of consumed tokens must not double-spend"
+        );
+        let counts: (i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM research_user_presence_events),
+                    (SELECT COUNT(*) FROM research_promotion_authorities)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("promotion intent counts");
+        assert_eq!(counts, (1, 1));
+    }
+
+    #[test]
+    fn presence_event_indexes_are_strictly_monotonic_per_host_session() {
+        let directory = tempdir().expect("temporary project");
+        let root = directory.path().join("Novel");
+        let (mut store, _) = ProjectStore::initialize(&root, "Novel").expect("initialize");
+        let fixture = mixed_promotion_fixture(&mut store);
+        let session_fingerprint = BlobId::digest(b"monotonic host session");
+
+        let first_request = promotion_request(&store, &fixture, CommandId::new());
+        let first_recorded = store
+            .record_promotion_command_request(
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                &first_request,
+            )
+            .expect("record first request");
+        let (first_authority, first_presence) = authority_and_presence(
+            &store,
+            &first_recorded,
+            &first_request,
+            PresenceSpec {
+                authority_actor: "foreground reviewer",
+                host_actor: "foreground reviewer",
+                session_fingerprint,
+                monotonic_event_index: 2,
+                event_receipt_bytes: b"monotonic gesture two",
+            },
+        );
+        store
+            .record_promotion_authority(
+                first_recorded,
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                first_presence,
+                &first_authority,
+            )
+            .expect("record index two");
+
+        let second_request = promotion_request(&store, &fixture, CommandId::new());
+        let second_recorded = store
+            .record_promotion_command_request(
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                &second_request,
+            )
+            .expect("record second request");
+        let (second_authority, second_presence) = authority_and_presence(
+            &store,
+            &second_recorded,
+            &second_request,
+            PresenceSpec {
+                authority_actor: "foreground reviewer",
+                host_actor: "foreground reviewer",
+                session_fingerprint,
+                monotonic_event_index: 1,
+                event_receipt_bytes: b"monotonic gesture one",
+            },
+        );
+        assert!(
+            store
+                .record_promotion_authority(
+                    second_recorded,
+                    PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                    second_presence,
+                    &second_authority,
+                )
+                .is_err(),
+            "a lower index in the same host session must never be accepted later"
+        );
+        let counts: (i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM research_user_presence_events),
+                    (SELECT COUNT(*) FROM research_promotion_authorities)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("promotion intent counts");
+        assert_eq!(counts, (1, 1));
     }
 
     #[test]
@@ -1457,8 +2391,83 @@ mod tests {
             .verify_and_record_candidate_projection(&admitted_assembly, projection_record)
             .expect("admit exact projection topology");
         assert_ne!(
-            admitted_assembly.admission_id(),
-            admitted_projection.admission_id()
+            admitted_assembly.admission_record_id(),
+            admitted_projection.admission_record_id()
+        );
+
+        let command_id = CommandId::new();
+        let requested_at_ms = now_unix_ms();
+        let promotion_request = PromotionCommandRequest::new(
+            store.manifest.project_id,
+            admitted_projection.record.source_revision_id(),
+            admitted_projection.record.source_blob_id(),
+            PromotionSubject::CandidateProjection {
+                projection_id: admitted_projection.record.id(),
+            },
+            admitted_projection.admission_record_id().as_blob_id(),
+            admitted_projection.record.witness().resulting_blob_id(),
+            admitted_projection.record.witness().resulting_byte_len(),
+            command_id,
+            requested_at_ms,
+        )
+        .expect("promotion request");
+        let request_fingerprint = promotion_request.command_request_fingerprint();
+        let recorded_request = store
+            .record_promotion_command_request(
+                PromotionSubjectLease::CandidateProjection(&admitted_projection),
+                &promotion_request,
+            )
+            .expect("durably record request before presence");
+        let occurred_at_ms = recorded_request.recorded_at_ms + 1;
+        let event_receipt_bytes = b"host-owned foreground gesture".to_vec();
+        let event_receipt_blob_id = BlobId::digest(&event_receipt_bytes);
+        let session_fingerprint = BlobId::digest(b"host session");
+        let presence = loom_research_types::UserPresenceEvidence::new(
+            UserPresenceKind::EditorGesture,
+            session_fingerprint,
+            event_receipt_blob_id,
+            1,
+            occurred_at_ms,
+        )
+        .expect("presence claim");
+        let authority = PromotionAuthority::new(
+            loom_research_types::PromotionActor::new("foreground reviewer").expect("bounded actor"),
+            promotion_request,
+            presence,
+        )
+        .expect("authority intent");
+        let presence_lease = VerifiedUserPresence {
+            session_nonce: store.session_nonce,
+            command_id,
+            command_request_fingerprint: request_fingerprint,
+            kind: UserPresenceKind::EditorGesture,
+            session_fingerprint,
+            event_receipt_blob_id,
+            event_receipt_bytes,
+            monotonic_event_index: 1,
+            occurred_at_ms,
+            actor: loom_research_types::PromotionActor::new("foreground reviewer")
+                .expect("bounded host actor"),
+        };
+        let recorded_authority = store
+            .record_promotion_authority(
+                recorded_request,
+                PromotionSubjectLease::CandidateProjection(&admitted_projection),
+                presence_lease,
+                &authority,
+            )
+            .expect("record authority before mutation");
+        assert_eq!(recorded_authority.command_id(), command_id);
+        assert_eq!(
+            recorded_authority.intended_result_blob_id(),
+            admitted_projection.record.witness().resulting_blob_id()
+        );
+        assert!(
+            store
+                .load_receipt(command_id)
+                .expect("receipt lookup")
+                .is_none(),
+            "authority must not depend on a completed command receipt"
         );
     }
 }

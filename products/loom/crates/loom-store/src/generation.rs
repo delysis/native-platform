@@ -1,28 +1,33 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+#[cfg(test)]
 use std::path::Path;
 use std::str::FromStr;
 
+#[cfg(test)]
 use loom_document::DocumentContent;
 use loom_types::{
-    ArtifactId, ArtifactKind, AuthorityPolicy, AuthorshipAttestation, BlobId, BranchCandidate,
-    BranchId, ByteRange, CancelGenerationCommand, CandidateId, CommandId, CommandKind,
-    CommandReceipt, ContextRecipe, ContributionKind, DocumentId, DocumentKind, GeneratedSpan,
-    GenerationEvent, GenerationEventId, GenerationEventKind, GenerationRunId, GenerationStart,
-    GenerationTerminalEvent, GenerationTerminalStatus, KeepAlternativeCommand, ModelEnvironment,
-    ModelEnvironmentId, ModelRole, OperationId, PromoteCandidateCommand, PromptRecipe, RevisionId,
-    SelectionDecision, SelectionEvent, SelectionId, TokenTrace, now_unix_ms,
+    ArtifactId, ArtifactKind, AuthorityPolicy, BlobId, BranchCandidate, BranchId, ByteRange,
+    CancelGenerationCommand, CandidateId, CommandId, CommandKind, CommandReceipt, ContextRecipe,
+    DocumentId, DocumentKind, GeneratedSpan, GenerationEvent, GenerationEventId,
+    GenerationEventKind, GenerationRunId, GenerationStart, GenerationTerminalEvent,
+    GenerationTerminalStatus, KeepAlternativeCommand, ModelEnvironment, ModelEnvironmentId,
+    ModelRole, OperationId, PromoteCandidateCommand, PromptRecipe, RevisionId, SelectionDecision,
+    SelectionEvent, SelectionId, TokenTrace, now_unix_ms,
 };
+#[cfg(test)]
+use loom_types::{AuthorshipAttestation, ContributionKind};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+#[cfg(test)]
 use crate::provenance::{
-    StoredSegment, document_media_type, insert_blob_row, insert_revision_segments,
-    merge_adjacent_segments, slice_segments, validate_active_in_transaction,
-    validate_expected_source,
+    StoredSegment, document_media_type, insert_revision_segments, merge_adjacent_segments,
+    slice_segments, validate_expected_source,
 };
+use crate::provenance::{insert_blob_row, validate_active_in_transaction};
 use crate::store::{
     ActiveRevision, ProjectStore, SaveOutcome, VisibleProjectionState, persist_receipt_in,
 };
@@ -1211,10 +1216,11 @@ impl ProjectStore {
         self.promote_candidate_with_command_inner(command_id, command, before_projection_boundary)
     }
 
-    #[allow(clippy::too_many_lines)]
     // Retained only to validate one-time legacy migrations and adversarial
-    // tests. No production entry point can reach this implementation.
-    #[allow(dead_code)]
+    // tests. The caller-controlled `human_confirmed` record below must not be
+    // present in a production promotion path.
+    #[cfg(test)]
+    #[allow(clippy::too_many_lines)]
     fn promote_candidate_with_command_inner<F>(
         &mut self,
         command_id: CommandId,

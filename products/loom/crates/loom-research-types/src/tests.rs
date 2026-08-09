@@ -1,4 +1,4 @@
-use loom_types::{BlobId, CommandId, RevisionId};
+use loom_types::{BlobId, CommandId, ProjectId, RevisionId};
 use serde_json::{Value, json};
 
 use crate::*;
@@ -10,6 +10,36 @@ const TOKENS_TWO: &[u32] = &[20, 21];
 
 fn blob(label: &str) -> BlobId {
     BlobId::digest(label.as_bytes())
+}
+
+#[derive(Clone, Copy)]
+struct PromotionFingerprintFields {
+    project_id: ProjectId,
+    source_revision_id: RevisionId,
+    source_blob_id: BlobId,
+    subject: PromotionSubject,
+    admission_record_id: BlobId,
+    intended_result_blob_id: BlobId,
+    intended_result_byte_len: u64,
+    command_id: CommandId,
+    requested_at_ms: i64,
+}
+
+impl PromotionFingerprintFields {
+    fn request(self) -> PromotionCommandRequest {
+        PromotionCommandRequest::new(
+            self.project_id,
+            self.source_revision_id,
+            self.source_blob_id,
+            self.subject,
+            self.admission_record_id,
+            self.intended_result_blob_id,
+            self.intended_result_byte_len,
+            self.command_id,
+            self.requested_at_ms,
+        )
+        .unwrap()
+    }
 }
 
 fn identity(prefix: &str) -> CallIdentity {
@@ -660,11 +690,23 @@ fn wire_ids_and_hashes_require_their_canonical_encoding() {
     noncanonical_hash["identity"]["model_fingerprint"] = Value::String("A".repeat(64));
     assert!(serde_json::from_value::<ModelCall>(noncanonical_hash).is_err());
 
-    let authority = PromotionAuthority::new(
-        PromotionActor::new("reviewer").unwrap(),
+    let request = PromotionCommandRequest::new(
+        ProjectId::new(),
         RevisionId::new(),
         blob("source"),
+        PromotionSubject::CandidateProjection {
+            projection_id: CandidateProjectionId::new(),
+        },
+        blob("admission"),
+        blob("result"),
+        7,
         CommandId::new(),
+        1,
+    )
+    .unwrap();
+    let authority = PromotionAuthority::new(
+        PromotionActor::new("reviewer").unwrap(),
+        request,
         UserPresenceEvidence::new(
             UserPresenceKind::EditorGesture,
             blob("session"),
@@ -673,21 +715,22 @@ fn wire_ids_and_hashes_require_their_canonical_encoding() {
             1,
         )
         .unwrap(),
-    );
+    )
+    .unwrap();
     let mut noncanonical_revision = serde_json::to_value(&authority).unwrap();
-    let revision = noncanonical_revision["source_revision_id"]
+    let revision = noncanonical_revision["request"]["source_revision_id"]
         .as_str()
         .unwrap()
         .to_ascii_lowercase();
-    noncanonical_revision["source_revision_id"] = Value::String(revision);
+    noncanonical_revision["request"]["source_revision_id"] = Value::String(revision);
     assert!(serde_json::from_value::<PromotionAuthority>(noncanonical_revision).is_err());
 
     let mut noncanonical_command = serde_json::to_value(authority).unwrap();
-    let command = noncanonical_command["command_id"]
+    let command = noncanonical_command["request"]["command_id"]
         .as_str()
         .unwrap()
         .to_ascii_lowercase();
-    noncanonical_command["command_id"] = Value::String(command);
+    noncanonical_command["request"]["command_id"] = Value::String(command);
     assert!(serde_json::from_value::<PromotionAuthority>(noncanonical_command).is_err());
 }
 
@@ -967,6 +1010,10 @@ fn promotion_authority_requires_concrete_user_presence() {
     );
     let source_revision = RevisionId::new();
     let source_blob = blob("source");
+    let project = ProjectId::new();
+    let projection = CandidateProjectionId::new();
+    let admission = blob("admission");
+    let result = blob("result");
     let command = CommandId::new();
     let presence = UserPresenceEvidence::new(
         UserPresenceKind::CliInteractiveConfirmation,
@@ -976,17 +1023,155 @@ fn promotion_authority_requires_concrete_user_presence() {
         1_900_000_000_000,
     )
     .unwrap();
-    let authority = PromotionAuthority::new(
-        PromotionActor::new("george").unwrap(),
+    let promotion_request = PromotionCommandRequest::new(
+        project,
         source_revision,
         source_blob,
+        PromotionSubject::CandidateProjection {
+            projection_id: projection,
+        },
+        admission,
+        result,
+        42,
         command,
+        1_899_999_999_999,
+    )
+    .unwrap();
+    let authority = PromotionAuthority::new(
+        PromotionActor::new("george").unwrap(),
+        promotion_request,
         presence,
-    );
+    )
+    .unwrap();
+    assert_eq!(authority.project_id(), project);
     assert_eq!(authority.source_revision_id(), source_revision);
     assert_eq!(authority.source_blob_id(), source_blob);
+    assert_eq!(
+        authority.subject(),
+        PromotionSubject::CandidateProjection {
+            projection_id: projection
+        }
+    );
+    assert_eq!(authority.admission_record_id(), admission);
+    assert_eq!(authority.intended_result_blob_id(), result);
+    assert_eq!(authority.intended_result_byte_len(), 42);
     assert_eq!(authority.command_id(), command);
+    assert_eq!(
+        authority.command_request_fingerprint(),
+        BlobId::digest(authority.request().canonical_request_bytes())
+    );
+    assert_eq!(authority.command_requested_at_ms(), 1_899_999_999_999);
     assert_eq!(authority.actor().as_str(), "george");
+
+    assert!(
+        PromotionCommandRequest::new(
+            project,
+            source_revision,
+            source_blob,
+            PromotionSubject::CandidateProjection {
+                projection_id: projection,
+            },
+            admission,
+            result,
+            0,
+            command,
+            1,
+        )
+        .is_err()
+    );
+
+    let mut substituted = serde_json::to_value(&authority).unwrap();
+    substituted["request"]["command_request_fingerprint"] =
+        Value::String(blob("substituted request fingerprint").to_string());
+    assert!(serde_json::from_value::<PromotionAuthority>(substituted).is_err());
+
+    let mut changed_field = serde_json::to_value(&authority).unwrap();
+    changed_field["request"]["intended_result_byte_len"] = Value::from(43_u64);
+    assert!(serde_json::from_value::<PromotionAuthority>(changed_field).is_err());
+}
+
+#[test]
+fn promotion_request_fingerprint_changes_with_every_request_field() {
+    let fields = PromotionFingerprintFields {
+        project_id: ProjectId::new(),
+        source_revision_id: RevisionId::new(),
+        source_blob_id: blob("fingerprint source"),
+        subject: PromotionSubject::CandidateProjection {
+            projection_id: CandidateProjectionId::new(),
+        },
+        admission_record_id: blob("fingerprint admission"),
+        intended_result_blob_id: blob("fingerprint result"),
+        intended_result_byte_len: 42,
+        command_id: CommandId::new(),
+        requested_at_ms: 1_900_000_000_000,
+    };
+    let base = fields.request();
+    let variants = [
+        PromotionFingerprintFields {
+            project_id: ProjectId::new(),
+            ..fields
+        }
+        .request(),
+        PromotionFingerprintFields {
+            source_revision_id: RevisionId::new(),
+            ..fields
+        }
+        .request(),
+        PromotionFingerprintFields {
+            source_blob_id: blob("changed source"),
+            ..fields
+        }
+        .request(),
+        PromotionFingerprintFields {
+            subject: PromotionSubject::CandidateProjection {
+                projection_id: CandidateProjectionId::new(),
+            },
+            ..fields
+        }
+        .request(),
+        PromotionFingerprintFields {
+            subject: PromotionSubject::MixedAuthorship {
+                mixed_assembly_id: MixedAuthorshipAssemblyId::new(),
+            },
+            ..fields
+        }
+        .request(),
+        PromotionFingerprintFields {
+            admission_record_id: blob("changed admission"),
+            ..fields
+        }
+        .request(),
+        PromotionFingerprintFields {
+            intended_result_blob_id: blob("changed result"),
+            ..fields
+        }
+        .request(),
+        PromotionFingerprintFields {
+            intended_result_byte_len: 43,
+            ..fields
+        }
+        .request(),
+        PromotionFingerprintFields {
+            command_id: CommandId::new(),
+            ..fields
+        }
+        .request(),
+        PromotionFingerprintFields {
+            requested_at_ms: fields.requested_at_ms + 1,
+            ..fields
+        }
+        .request(),
+    ];
+    for variant in variants {
+        assert_ne!(
+            variant.command_request_fingerprint(),
+            base.command_request_fingerprint()
+        );
+        assert_ne!(
+            variant.canonical_request_bytes(),
+            base.canonical_request_bytes()
+        );
+    }
 }
 
 #[test]

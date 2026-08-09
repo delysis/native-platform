@@ -26,6 +26,7 @@ repository = "https://github.com/delysis/loom-native"
 atomic-write-file = "0.3.0"
 clap = { version = "4.6.6", features = ["derive"] }
 fs4 = "1.1.0"
+getrandom = "0.3.4"
 hex = "0.4.3"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rusqlite = { version = "0.39.0", features = ["bundled"] }

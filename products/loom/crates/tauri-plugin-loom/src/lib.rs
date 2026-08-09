@@ -232,6 +232,7 @@ impl IpcFailure {
             StoreError::ResearchCall(_) => "research_call_invalid",
             StoreError::ResearchAssembly(_) => "research_assembly_invalid",
             StoreError::ResearchAdmission(_) => "research_admission_rejected",
+            StoreError::SessionEntropy(_) => "session_entropy_unavailable",
             StoreError::NonUtf8Path(_) => "non_utf8_path",
             StoreError::UnsafeRelativePath(_) => "unsafe_relative_path",
             StoreError::SymbolicLink(_) => "symbolic_link_refused",
@@ -297,7 +298,10 @@ impl IpcFailure {
                 "transient_draft_identity_mismatch"
             }
         };
-        let retryable = matches!(error, StoreError::ProjectAlreadyOpen(_));
+        let retryable = matches!(
+            error,
+            StoreError::ProjectAlreadyOpen(_) | StoreError::SessionEntropy(_)
+        );
         Self::new(code, error.to_string(), retryable)
     }
 

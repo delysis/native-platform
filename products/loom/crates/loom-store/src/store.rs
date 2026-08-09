@@ -40,9 +40,31 @@ pub struct ProjectStore {
     pub(crate) root: PathBuf,
     pub(crate) manifest: ProjectManifest,
     pub(crate) connection: Connection,
+    pub(crate) session_nonce: StoreSessionNonce,
     // Holding this descriptor is the project ownership lease. The operating
     // system releases it on normal close, panic, or process termination.
     _lease: ProjectLease,
+}
+
+/// Unpersisted, per-open capability domain. Copying a database or reopening a
+/// project necessarily creates a different value, invalidating every opaque
+/// lease minted by the prior `ProjectStore`.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct StoreSessionNonce([u8; 32]);
+
+impl StoreSessionNonce {
+    fn generate() -> Result<Self> {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes)
+            .map_err(|error| StoreError::SessionEntropy(error.to_string()))?;
+        Ok(Self(bytes))
+    }
+}
+
+impl fmt::Debug for StoreSessionNonce {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StoreSessionNonce(REDACTED)")
+    }
 }
 
 struct ProjectLease {
@@ -187,6 +209,7 @@ impl ProjectStore {
             root,
             manifest,
             connection,
+            session_nonce: StoreSessionNonce::generate()?,
             _lease: lease,
         };
         store.quarantine_pending_legacy_candidates()?;
@@ -199,10 +222,6 @@ impl ProjectStore {
 
     pub const fn manifest(&self) -> &ProjectManifest {
         &self.manifest
-    }
-
-    pub fn database_path(&self) -> PathBuf {
-        self.root.join(".loom").join(DATABASE_FILE)
     }
 
     pub fn record_open(&mut self) -> Result<CommandReceipt> {

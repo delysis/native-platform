@@ -1,6 +1,6 @@
 use std::{fmt, marker::PhantomData, ops::Deref, str::FromStr};
 
-use loom_types::{BlobId, CommandId, RevisionId};
+use loom_types::{BlobId, CommandId, ProjectId, RevisionId};
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{self, SeqAccess, Visitor},
@@ -281,6 +281,13 @@ where
     D: Deserializer<'de>,
 {
     deserializer.deserialize_str(FixedParseVisitor::<CommandId>::new("command ULID", 26))
+}
+
+pub(crate) fn deserialize_project_id<'de, D>(deserializer: D) -> Result<ProjectId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_str(FixedParseVisitor::<ProjectId>::new("project ULID", 26))
 }
 
 struct OptionalBlobIdVisitor;

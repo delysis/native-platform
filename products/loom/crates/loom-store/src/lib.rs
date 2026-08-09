@@ -29,8 +29,8 @@ pub use provenance::{
 pub use reconciliation::{ExternalReconciliationOutcome, ExternalReconciliationRequest};
 pub use research_admission::{
     AdmittedCandidateAssembly, AdmittedCandidateProjection, AdmittedGeneratedSpan,
-    AdmittedModelCall, MixedAuthorshipAdmission, RecordedPromotionAuthority, ResearchAdmissionId,
-    VerifiedUserPresence,
+    AdmittedModelCall, MixedAuthorshipAdmission, PromotionSubjectLease, RecordedPromotionAuthority,
+    RecordedPromotionRequest, ResearchAdmissionRecordId, VerifiedUserPresence,
 };
 pub use schema::{CURRENT_SCHEMA_VERSION, CURRENT_STORE_SCHEMA_VERSION};
 pub use store::{

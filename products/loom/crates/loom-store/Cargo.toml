@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 atomic-write-file.workspace = true
 fs4.workspace = true
+getrandom.workspace = true
 loom-document = { path = "../loom-document" }
 loom-research-types = { path = "../loom-research-types" }
 loom-types = { path = "../loom-types" }

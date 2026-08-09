@@ -305,7 +305,8 @@ mod tests {
             "research_candidate_assembly_parts",
             "research_candidate_projections",
             "research_mixed_authorship_assemblies",
-            "research_admissions",
+            "research_admission_records",
+            "research_promotion_command_requests",
             "research_user_presence_events",
             "research_promotion_authorities",
             "research_legacy_candidates",
@@ -378,9 +379,14 @@ mod tests {
                 "research_mixed_assemblies_immutable_delete",
             ),
             (
-                "research_admissions",
-                "research_admissions_immutable_update",
-                "research_admissions_immutable_delete",
+                "research_admission_records",
+                "research_admission_records_immutable_update",
+                "research_admission_records_immutable_delete",
+            ),
+            (
+                "research_promotion_command_requests",
+                "research_promotion_command_requests_immutable_update",
+                "research_promotion_command_requests_immutable_delete",
             ),
             (
                 "research_user_presence_events",
@@ -454,7 +460,7 @@ mod tests {
                     call_id, campaign_id, stage_id, stage_attempt_id, trial_case_id,
                     seed_decimal, model_fingerprint, tokenizer_fingerprint, prompt_fingerprint,
                     sampler_fingerprint, control_program_fingerprint, evidence_class,
-                    verification_replay_fingerprint, call_record_blob_id, created_at_ms
+                    verification_audit_fingerprint, call_record_blob_id, created_at_ms
                  ) VALUES ('call-live', 'campaign', 'stage', 'attempt', 'case', '7',
                            ?1, ?1, ?1, ?1, ?1,
                            'live_base_writer_claim', ?2, ?3, 1)",
@@ -495,7 +501,7 @@ mod tests {
                     occurrence_id, call_id, raw_output_blob_id,
                     output_start_byte, output_end_byte, token_start, token_end,
                     evidence_class, extraction_receipt_fingerprint,
-                    verification_replay_fingerprint, span_record_blob_id, created_at_ms
+                    verification_audit_fingerprint, span_record_blob_id, created_at_ms
                  ) VALUES ('span-live', 'call-live', ?1, 0, 5, NULL, NULL,
                            'live_base_writer_claim', ?2, ?3, ?4, 1)",
                 rusqlite::params![output_blob, fingerprint, verification, span_record],
@@ -533,7 +539,7 @@ mod tests {
                     call_id, campaign_id, stage_id, stage_attempt_id, trial_case_id,
                     seed_decimal, model_fingerprint, tokenizer_fingerprint, prompt_fingerprint,
                     sampler_fingerprint, control_program_fingerprint, evidence_class,
-                    verification_replay_fingerprint, call_record_blob_id, created_at_ms
+                    verification_audit_fingerprint, call_record_blob_id, created_at_ms
                  ) VALUES ('call-fixture', 'campaign', 'stage', 'attempt', 'case', '7',
                            ?1, ?1, ?1, ?1, ?1,
                            'fixture', NULL, ?2, 1)",
@@ -569,7 +575,7 @@ mod tests {
                         occurrence_id, call_id, raw_output_blob_id,
                         output_start_byte, output_end_byte, token_start, token_end,
                         evidence_class, extraction_receipt_fingerprint,
-                        verification_replay_fingerprint, span_record_blob_id, created_at_ms
+                        verification_audit_fingerprint, span_record_blob_id, created_at_ms
                      ) VALUES ('span-fixture', 'call-fixture', ?1, 0, 5, NULL, NULL,
                                'fixture', ?2, ?3, ?4, 1)",
                     rusqlite::params![output_blob, fingerprint, verification, span_record],
@@ -648,8 +654,8 @@ mod tests {
         assert!(
             connection
                 .execute(
-                    "INSERT INTO research_admissions(
-                        admission_id, subject_kind, subject_id, admitted_at_ms
+                    "INSERT INTO research_admission_records(
+                        admission_record_id, subject_kind, subject_id, admitted_at_ms
                      ) VALUES ('forged', 'candidate_assembly', 'assembly', 1)",
                     [],
                 )
@@ -675,8 +681,8 @@ mod tests {
         assert!(
             connection
                 .execute(
-                    "INSERT INTO research_admissions(
-                        admission_id, subject_kind, subject_id, admitted_at_ms
+                    "INSERT INTO research_admission_records(
+                        admission_record_id, subject_kind, subject_id, admitted_at_ms
                      ) VALUES ('permuted', 'candidate_assembly', 'assembly', 1)",
                     [],
                 )
@@ -688,10 +694,15 @@ mod tests {
         let source_artifact = "source-artifact";
         let authority_record = hash('8');
         let presence_blob = hash('9');
+        let mixed_graph_record = hash('g');
+        let mixed_graph_fingerprint = hash('k');
+        let mixed_record = hash('h');
         for (blob_id, byte_len) in [
             (&source_blob, 5_i64),
             (&authority_record, 2),
             (&presence_blob, 2),
+            (&mixed_graph_record, 2),
+            (&mixed_record, 2),
         ] {
             connection
                 .execute(
@@ -708,55 +719,94 @@ mod tests {
                  INSERT INTO documents(document_id, relative_path, document_kind, created_at_ms)
                  VALUES ('source-document', 'manuscript/source.md', 'prose', 1);
                  INSERT INTO revisions(revision_id, document_id, parent_revision_id, artifact_id, reason, created_at_ms)
-                 VALUES ('source-revision', 'source-document', NULL, '{source_artifact}', 'source', 1);"
+                 VALUES ('source-revision', 'source-document', NULL, '{source_artifact}', 'source', 1);
+                 INSERT INTO research_operation_graphs(
+                    graph_fingerprint, graph_record_blob_id, output_operation_id,
+                    node_count, created_at_ms
+                 ) VALUES ('{mixed_graph_fingerprint}', '{mixed_graph_record}', 'mixed-op', 1, 1);
+                 INSERT INTO research_pipeline_operations(
+                    graph_fingerprint, position, operation_id, operation_kind,
+                    reference_id, evidence_class
+                 ) VALUES ('{mixed_graph_fingerprint}', 0, 'mixed-op', 'literal_text', '{source_blob}', NULL);
+                 INSERT INTO research_mixed_authorship_assemblies(
+                    mixed_assembly_id, output_blob_id, output_byte_len,
+                    graph_fingerprint, mixed_record_blob_id, created_at_ms
+                 ) VALUES ('mixed-subject', '{source_blob}', 5, '{mixed_graph_fingerprint}', '{mixed_record}', 1);
+                 INSERT INTO research_admission_records(
+                    admission_record_id, subject_kind, subject_id, admitted_at_ms
+                 ) VALUES ('mixed-admission', 'mixed_authorship', 'mixed-subject', 1);"
             ))
-            .expect("seed source revision");
-        for command_id in ["promotion-one", "promotion-two"] {
-            connection
-                .execute(
-                    "INSERT INTO command_receipts(command_id, command_kind, receipt_json, completed_at_ms)
-                     VALUES (?1, 'promote_candidate', '{}', 20)",
-                    [command_id],
-                )
-                .expect("promotion receipt");
-            connection
-                .execute(
-                    "INSERT INTO command_requests(command_id, request_fingerprint, command_kind, created_at_ms)
-                     VALUES (?1, ?2, 'promote_candidate', 10)",
-                    rusqlite::params![command_id, fingerprint],
-                )
-                .expect("promotion request");
-        }
+            .expect("seed promotion subject");
+        connection
+            .execute(
+                "INSERT INTO blobs(blob_id, byte_len, media_type, created_at_ms)
+                 VALUES (?1, 2, 'application/octet-stream', 1)",
+                [&fingerprint],
+            )
+            .expect("canonical promotion request blob");
+        connection
+            .execute(
+                "INSERT INTO research_promotion_command_requests(
+                    command_id, command_request_fingerprint,
+                    canonical_request_blob_id, canonical_request_byte_len, project_id,
+                    source_revision_id, source_blob_id, subject_kind, subject_id,
+                    admission_record_id, intended_result_blob_id,
+                    intended_result_byte_len, requested_at_ms, recorded_at_ms
+                 ) VALUES (
+                    'promotion-one', ?1, ?1, 2, 'PPPPPPPPPPPPPPPPPPPPPPPPPP',
+                    'source-revision', ?2, 'mixed_authorship', 'mixed-subject',
+                    'mixed-admission', ?2, 5, 10, 12
+                 )",
+                rusqlite::params![fingerprint, source_blob],
+            )
+            .expect("pre-mutation promotion request");
         connection
             .execute(
                 "INSERT INTO research_user_presence_events(
-                    event_receipt_blob_id, command_id, user_presence_kind,
+                    event_receipt_blob_id, command_id, command_request_fingerprint,
+                    actor, user_presence_kind,
                     session_fingerprint, monotonic_event_index,
                     occurred_at_ms, created_at_ms
-                 ) VALUES (?1, 'promotion-one', 'editor_gesture', ?2, 1, 15, 15)",
+                 ) VALUES (?1, 'promotion-one', ?2, 'human', 'editor_gesture', ?2, 1, 15, 15)",
                 rusqlite::params![presence_blob, fingerprint],
             )
             .expect("first command presence");
         connection
             .execute(
                 "INSERT INTO research_promotion_authorities(
-                    command_id, actor, source_revision_id, source_blob_id,
+                    command_id, command_request_fingerprint, actor, project_id,
+                    source_revision_id, source_blob_id,
+                    subject_kind, subject_id, admission_record_id,
+                    intended_result_blob_id, intended_result_byte_len,
                     user_presence_kind, session_fingerprint, event_receipt_blob_id,
                     monotonic_event_index, occurred_at_ms,
-                    authority_record_blob_id, created_at_ms
-                 ) VALUES ('promotion-one', 'human', 'source-revision', ?1,
-                           'editor_gesture', ?2, ?3, 1, 15, ?4, 20)",
-                rusqlite::params![source_blob, fingerprint, presence_blob, authority_record],
+                    authority_record_blob_id, intent_recorded_at_ms
+                 ) VALUES (
+                    'promotion-one', ?1, 'human', 'PPPPPPPPPPPPPPPPPPPPPPPPPP',
+                    'source-revision', ?2, 'mixed_authorship', 'mixed-subject',
+                    'mixed-admission', ?2, 5, 'editor_gesture', ?1, ?3,
+                    1, 15, ?4, 16
+                 )",
+                rusqlite::params![fingerprint, source_blob, presence_blob, authority_record],
             )
-            .expect("first authority");
+            .expect("authority before mutation or receipt");
+        let receipt_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM command_receipts WHERE command_id = 'promotion-one'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("receipt count");
+        assert_eq!(receipt_count, 0, "intent must precede its terminal receipt");
         assert!(
             connection
                 .execute(
                     "INSERT INTO research_user_presence_events(
-                        event_receipt_blob_id, command_id, user_presence_kind,
+                        event_receipt_blob_id, command_id, command_request_fingerprint,
+                        actor, user_presence_kind,
                         session_fingerprint, monotonic_event_index,
                         occurred_at_ms, created_at_ms
-                     ) VALUES (?1, 'promotion-two', 'editor_gesture', ?2, 2, 15, 15)",
+                     ) VALUES (?1, 'promotion-two', ?2, 'human', 'editor_gesture', ?2, 2, 15, 15)",
                     rusqlite::params![presence_blob, fingerprint],
                 )
                 .is_err(),
@@ -770,6 +820,19 @@ mod tests {
                     [&presence_blob],
                 )
                 .is_err()
+        );
+
+        let settlement_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'research_promotion_settlements'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("settlement table count");
+        assert_eq!(
+            settlement_table_count, 0,
+            "promotion application stays disabled"
         );
         assert!(
             connection

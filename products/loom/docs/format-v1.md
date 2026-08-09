@@ -101,11 +101,11 @@ Migration `7` adds the clean-port research admission foundation:
 
 - model-call declarations and exactly one append-only terminal;
 - exact output partitions, non-empty generated-span occurrences, flat assemblies, pinned projections, mixed-authorship records, and normalized operation graphs;
-- schema and adoption groundwork for a final admission row; downstream span, assembly, and projection methods require an opaque admitted-call token before they can insert one;
-- append-only, single-use user-presence events bound to one promotion command lifetime;
+- schema and adoption groundwork for audit-only admission records; downstream span, assembly, and projection methods require an opaque admitted-call token bound to the current `ProjectStore` open session before they can insert one;
+- canonical, internally fingerprinted promotion requests and append-only, actor-bound, single-use user-presence events tied to one command and strictly increasing host-session index;
 - immutable legacy review events. Pre-migration candidates and every new diagnostic legacy candidate receive a terminal quarantine record rather than implicit research eligibility.
 
-`LiveBaseWriterClaim` and related values are declarations, not credentials. The raw receipt/event-stream replay mint is test-only, and no production constructor for `AdmittedModelCall` exists at this checkpoint. Strict live admission intentionally remains unavailable until `loom-inference` alone can consume the native backend's opaque generation seal and mint a `VerifiedInferenceEnvelope`. `loom-store` may adopt and persist that envelope and derive its private downstream tokens; it must never recreate authority from receipt fields, JSON, hashes, or record replay. Persisted fixture, mock, critic, historical, literal, or caller-declared live records cannot become strict assemblies.
+`LiveBaseWriterClaim` and related values are declarations, not credentials. The raw receipt/event-stream replay mint is test-only, and no production constructor for `AdmittedModelCall` exists at this checkpoint. Strict live admission intentionally remains unavailable until `loom-inference` alone can consume the native backend's opaque generation seal and mint a `VerifiedInferenceEnvelope`. `loom-store` may adopt and persist that envelope and derive private downstream tokens for the current random store-session nonce; reopening or copying the project invalidates them. It must never recreate authority from receipt fields, JSON, hashes, record replay, or an admission row. Persisted fixture, mock, critic, historical, literal, or caller-declared live records cannot become strict assemblies. Promotion settlement and manuscript mutation remain absent until one transaction can consume opaque authority, revalidate the active visible source, and bind the exact resulting receipt and revision.
 
 ## SQLite guarantees
 
