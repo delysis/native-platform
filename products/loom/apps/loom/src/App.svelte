@@ -4121,20 +4121,26 @@
 <div class:focus-mode={focusMode} class="app-shell">
   <a class="skip-link" href="#manuscript">Skip to manuscript</a>
 
-  <header class="topbar">
-    <div class="brand" aria-label="Loom">
-      <span class="brand-mark" aria-hidden="true">∿</span>
-      <span>Loom</span>
-    </div>
-    {#if project}
+  {#if project}
+    <header class="topbar" aria-label="Writing controls">
+      <h1 class="context-title" title={document?.summary.title ?? project.title}>
+        {document?.summary.title ?? project.title}
+      </h1>
+      <div class="topbar-spacer"></div>
+      {#if document && saveState !== 'clean' && saveState !== 'saved'}
+        <div class="save-status state-{saveState}" role="status" aria-live="polite">
+          <span class="status-dot"></span>{saveMessage}
+        </div>
+      {/if}
       <details class="project-menu" bind:this={projectMenu}>
-        <summary class="project-switcher" bind:this={projectMenuTrigger}>
-          <span>{project.title}</span>
-          <span class="muted" aria-hidden="true">⌄</span>
+        <summary class="more-button" bind:this={projectMenuTrigger} title="Writing options">
+          <span aria-hidden="true">•••</span>
+          <span class="sr-only">Writing options for {project.title}</span>
         </summary>
         <div class="project-menu-popover" aria-label="Project and editor options">
+          <div class="project-menu-title">{project.title}</div>
           {#if document}
-            <div class="project-menu-label">View</div>
+            <div class="project-menu-label">Editor</div>
             <button class:active={mode === 'visual'} type="button" aria-pressed={mode === 'visual'} disabled={!canUseVisual || editorReadonly} on:click={() => { closeProjectMenu(); void setMode('visual'); }}>
               <span>Visual editor</span><span aria-hidden="true">{mode === 'visual' ? '✓' : ''}</span>
             </button>
@@ -4144,28 +4150,19 @@
             <div class="project-menu-separator"></div>
           {/if}
           <button type="button" on:click={(event) => openModelManager(projectMenuTrigger ?? event.currentTarget)}>
-            <span>Suggestions &amp; models…</span>
-            <span class:ready={suggestionsEnabled && currentModel} class="menu-state">
-              {suggestionsEnabled ? currentModel ? 'On' : 'Needs model' : 'Off'}
-            </span>
+            <span>Writing assistance…</span>
           </button>
           <button class:active={focusMode} type="button" aria-pressed={focusMode} disabled={editorReadonly} on:click={() => { closeProjectMenu(); void toggleFocusMode(); }}>
             <span>Focus mode</span><span aria-hidden="true">{focusMode ? '✓' : ''}</span>
           </button>
           <div class="project-menu-separator"></div>
-          <button class="danger-menu-item" type="button" disabled={reconciliationResolutionLocked || (editorReadonly && transition !== 'closing' && !(reconciliation && !document))} on:click={() => { closeProjectMenu(); void closeProject(); }}>
+          <button type="button" disabled={reconciliationResolutionLocked || (editorReadonly && transition !== 'closing' && !(reconciliation && !document))} on:click={() => { closeProjectMenu(); void closeProject(); }}>
             {transition === 'closing' ? 'Retry closing project' : 'Close project'}
           </button>
         </div>
       </details>
-    {/if}
-    <div class="topbar-spacer"></div>
-    {#if document && saveState !== 'clean' && saveState !== 'saved'}
-      <div class="save-status state-{saveState}" role="status" aria-live="polite">
-        <span class="status-dot"></span>{saveMessage}
-      </div>
-    {/if}
-  </header>
+    </header>
+  {/if}
 
   {#if project}
     <div class:single-document={project.documents.length === 1} class="workspace-grid">
@@ -4282,10 +4279,6 @@
             </footer>
           </section>
         {:else if document}
-          <header class="document-header">
-            <h1>{document.summary.title}</h1>
-          </header>
-
           {#if staleDraft}
             <div class="runtime-note" role="alert">
               A crash-safe draft from revision {staleDraft.source_revision_id} is preserved separately. Editing is locked until you explicitly restore or discard it; Loom will not overwrite either version.
@@ -4316,6 +4309,7 @@
                     <LoomEditor
                       bind:this={visualEditor}
                       value={documentText}
+                      label={`${document.summary.title}, manuscript editor`}
                       onChange={updateText}
                       onCompositionChange={setVisualComposition}
                       onSelectionChange={updateVisualSelection}
@@ -4362,7 +4356,6 @@
             <div class="inline-suggestion" role="group" aria-label="Private writing suggestion">
               <span class="sr-only" aria-live="polite">A private writing suggestion is ready. Press Tab to accept or Escape to dismiss.</span>
               <button class="inline-suggestion-copy" type="button" on:click={() => void acceptInlineSuggestion(inlineSuggestion)} title="Accept this private strand">
-                <span aria-hidden="true">∿</span>
                 <span>{inlineSuggestion.text || 'A private strand is ready'}</span>
                 <kbd>Tab</kbd>
               </button>
@@ -4433,7 +4426,6 @@
           {/if}
         {:else}
           <section class="empty-project">
-            <span class="empty-mark" aria-hidden="true">∿</span>
             {#if uncertainPromotion}
               <h1>Promotion needs confirmation.</h1>
               <p>The active editor was detached so stale bytes cannot overwrite a promotion that may already be durable.</p>
@@ -4450,7 +4442,6 @@
   {:else}
     <main class="welcome" id="manuscript">
       <section class="welcome-note" aria-labelledby="welcome-title">
-        <div class="large-mark" aria-hidden="true">∿</div>
         <h1 id="welcome-title">Open a Loom.</h1>
         {#if !desktop}
           <div class="runtime-note" role="note">Open the desktop app to write.</div>
