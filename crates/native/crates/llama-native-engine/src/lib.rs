@@ -2841,15 +2841,39 @@ fn native_decode_error(context: &str, error: impl std::fmt::Display) -> NativeEr
 mod tests {
     use super::*;
 
+    const LLAMA_CPP_BINDING_REV: &str = "a74dbb79f96e0ebad8b0737ee1d3c9c1deb185af";
+
     #[test]
-    fn reported_binding_version_matches_the_exact_manifest_pin() {
+    fn reported_binding_identity_matches_the_exact_manifest_and_lock_pin() {
         let manifest = include_str!("../Cargo.toml");
-        assert!(manifest.contains(&format!(
-            "llama-cpp-2 = {{ version = \"={LLAMA_CPP_BINDING_VERSION}\""
-        )));
-        assert!(manifest.contains(&format!(
-            "llama-cpp-sys-2 = {{ version = \"={LLAMA_CPP_BINDING_VERSION}\""
-        )));
+        let pinned_manifest_lines = |package: &str| {
+            let prefix = format!("{package} = {{ version = \"={LLAMA_CPP_BINDING_VERSION}\"");
+            manifest
+                .lines()
+                .filter(|line| line.starts_with(&prefix))
+                .filter(|line| line.contains("git = "))
+                .filter(|line| line.contains(&format!("rev = \"{LLAMA_CPP_BINDING_REV}\"")))
+                .count()
+        };
+        assert_eq!(pinned_manifest_lines("llama-cpp-2"), 2);
+        assert_eq!(pinned_manifest_lines("llama-cpp-sys-2"), 1);
+
+        let lock = include_str!("../../../Cargo.lock");
+        let locked_source_suffix =
+            format!("?rev={LLAMA_CPP_BINDING_REV}#{LLAMA_CPP_BINDING_REV}\"");
+        assert_eq!(lock.matches(&locked_source_suffix).count(), 2);
+        for package in ["llama-cpp-2", "llama-cpp-sys-2"] {
+            let package_name = format!("\nname = \"{package}\"\n");
+            let mut matching_blocks = lock
+                .split("[[package]]")
+                .filter(|block| block.contains(&package_name));
+            let block = matching_blocks
+                .next()
+                .expect("binding package must be locked");
+            assert!(matching_blocks.next().is_none());
+            assert!(block.contains("source = \"git+"));
+            assert!(block.contains(&locked_source_suffix));
+        }
     }
 
     #[test]
