@@ -30,9 +30,8 @@ use loom_store::{
 use loom_types::{
     AuthorityPolicy, BlobId, BranchId, ByteRange, CancelGenerationCommand, CandidateId, CommandId,
     CommandReceipt, ContextRecipe, DocumentId, DocumentKind, GenerationEventKind, GenerationRunId,
-    GenerationStart, GenerationTerminalStatus, LoomEvent, ModelEnvironment, ProjectId,
-    PromoteCandidateCommand, PromptMode, PromptRecipe, RevisionId, SelectionDecision,
-    derive_weave_case_ids, now_unix_ms,
+    GenerationStart, GenerationTerminalStatus, LoomEvent, ModelEnvironment, ProjectId, PromptMode,
+    PromptRecipe, RevisionId, SelectionDecision, derive_weave_case_ids, now_unix_ms,
 };
 use serde::{Deserialize, Serialize};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -230,6 +229,9 @@ impl IpcFailure {
             StoreError::Sqlite(_) => "database_error",
             StoreError::Json(_) => "manifest_json_error",
             StoreError::Document(_) => "document_projection_error",
+            StoreError::ResearchCall(_) => "research_call_invalid",
+            StoreError::ResearchAssembly(_) => "research_assembly_invalid",
+            StoreError::ResearchAdmission(_) => "research_admission_rejected",
             StoreError::NonUtf8Path(_) => "non_utf8_path",
             StoreError::UnsafeRelativePath(_) => "unsafe_relative_path",
             StoreError::SymbolicLink(_) => "symbolic_link_refused",
@@ -272,6 +274,7 @@ impl IpcFailure {
             StoreError::DuplicateGenerationBranch(_) => "duplicate_generation_branch",
             StoreError::GenerationFamilySourceMismatch => "generation_family_source_mismatch",
             StoreError::CandidateNotFound(_) => "candidate_not_found",
+            StoreError::LegacyCandidateNotAdmitted => "legacy_candidate_not_admitted",
             StoreError::GenerationAlreadyTerminal(_) => "generation_already_terminal",
             StoreError::CompletedGenerationRequiresCandidate => {
                 "generation_terminal_candidate_required"
@@ -3555,7 +3558,7 @@ fn persist_generation_result<R: Runtime>(
             match candidate.terminal.status {
                 GenerationTerminalStatus::Completed => {
                     let outcome = store
-                        .finish_generation_candidate(
+                        .finish_unverified_generation_candidate_for_diagnostics(
                             candidate.generation.run_id,
                             TerminalCandidateInput {
                                 output_bytes: candidate.output_text.into_bytes(),
@@ -3823,9 +3826,9 @@ async fn candidate_promote(
     expected_visible_blob_id: String,
     state: State<'_, PluginState>,
 ) -> Result<Receipt, IpcFailure> {
-    let command_id = parse_command_id(&command_id)?;
-    let candidate_id = parse_candidate_id(&candidate_id)?;
-    let expected_source_revision_id =
+    let _command_id = parse_command_id(&command_id)?;
+    let _candidate_id = parse_candidate_id(&candidate_id)?;
+    let _expected_source_revision_id =
         expected_source_revision_id
             .parse::<RevisionId>()
             .map_err(|_| {
@@ -3835,7 +3838,7 @@ async fn candidate_promote(
                     false,
                 )
             })?;
-    let expected_visible_blob_id = expected_visible_blob_id.parse::<BlobId>().map_err(|_| {
+    let _expected_visible_blob_id = expected_visible_blob_id.parse::<BlobId>().map_err(|_| {
         IpcFailure::new(
             "invalid_blob_id",
             "visible blob ID is not a valid SHA-256 digest",
@@ -3843,27 +3846,12 @@ async fn candidate_promote(
         )
     })?;
     let mut session = lock_session(&state)?;
-    let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    let outcome = store
-        .promote_candidate_with_command(
-            command_id,
-            PromoteCandidateCommand {
-                candidate_id,
-                expected_source_revision_id,
-                expected_visible_blob_id,
-            },
-        )
-        .map_err(IpcFailure::store)?;
-    let request_fingerprint = outcome.request_fingerprint.to_string();
-    let replayed = outcome.replayed;
-    let visible_projection = outcome.visible_projection;
-    let mut receipt = Receipt::from(outcome.save.receipt);
-    receipt.result_revision_id = Some(outcome.save.revision_id.to_string());
-    receipt.result_blob_id = Some(outcome.save.blob_id.to_string());
-    receipt.request_fingerprint = Some(request_fingerprint);
-    receipt.replayed = replayed;
-    receipt.visible_projection = Some(visible_projection);
-    Ok(receipt)
+    let _store = require_bound_store(&mut session, &project_id, &session_id)?;
+    Err(IpcFailure::new(
+        "strict_promotion_unavailable",
+        "legacy candidates are diagnostic-only; promotion requires an admitted assembly projection and verified foreground user-presence authority",
+        false,
+    ))
 }
 
 fn parse_command_id(value: &str) -> Result<CommandId, IpcFailure> {

@@ -968,7 +968,12 @@ impl ProjectStore {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub fn finish_generation_candidate(
+    /// Records an old one-run/one-candidate result as diagnostic evidence.
+    ///
+    /// The returned candidate is never a strict research admission and cannot
+    /// be promoted. New inference paths must use the assembly-first research
+    /// admission APIs.
+    pub fn finish_unverified_generation_candidate_for_diagnostics(
         &mut self,
         run_id: GenerationRunId,
         input: TerminalCandidateInput,
@@ -1089,6 +1094,27 @@ impl ProjectStore {
                 created_at_ms,
             ],
         )?;
+        transaction.execute(
+            "INSERT INTO research_legacy_candidates(candidate_id, discovered_at_ms)
+             VALUES (?1, ?2)",
+            params![candidate_id.to_string(), created_at_ms.max(1)],
+        )?;
+        transaction.execute(
+            "INSERT INTO research_legacy_candidate_review_events(
+                candidate_id, sequence, disposition, assembly_id, reason, created_at_ms
+             ) VALUES (?1, 0, 'pending', NULL, NULL, ?2)",
+            params![candidate_id.to_string(), created_at_ms.max(1)],
+        )?;
+        transaction.execute(
+            "INSERT INTO research_legacy_candidate_review_events(
+                candidate_id, sequence, disposition, assembly_id, reason, created_at_ms
+             ) VALUES (?1, 1, 'quarantined', NULL, ?2, ?3)",
+            params![
+                candidate_id.to_string(),
+                "diagnostic finalization has no verifier-owned exact replay lease",
+                created_at_ms.max(1),
+            ],
+        )?;
         let ready_event = GenerationEvent {
             event_id: GenerationEventId::new(),
             run_id,
@@ -1141,13 +1167,30 @@ impl ProjectStore {
 
     pub fn promote_candidate(
         &mut self,
-        command: PromoteCandidateCommand,
+        _command: PromoteCandidateCommand,
     ) -> Result<PromotionOutcome> {
-        self.promote_candidate_with_command(CommandId::new(), command)
+        Err(StoreError::LegacyCandidateNotAdmitted)
     }
 
     #[allow(clippy::too_many_lines)]
     pub fn promote_candidate_with_command(
+        &mut self,
+        _command_id: CommandId,
+        _command: PromoteCandidateCommand,
+    ) -> Result<PromotionOutcome> {
+        Err(StoreError::LegacyCandidateNotAdmitted)
+    }
+
+    #[cfg(test)]
+    fn promote_legacy_candidate_for_test(
+        &mut self,
+        command: PromoteCandidateCommand,
+    ) -> Result<PromotionOutcome> {
+        self.promote_candidate_with_command_inner(CommandId::new(), command, |_| Ok(()))
+    }
+
+    #[cfg(test)]
+    fn promote_legacy_candidate_with_command_for_test(
         &mut self,
         command_id: CommandId,
         command: PromoteCandidateCommand,
@@ -1169,6 +1212,9 @@ impl ProjectStore {
     }
 
     #[allow(clippy::too_many_lines)]
+    // Retained only to validate one-time legacy migrations and adversarial
+    // tests. No production entry point can reach this implementation.
+    #[allow(dead_code)]
     fn promote_candidate_with_command_inner<F>(
         &mut self,
         command_id: CommandId,
@@ -2308,6 +2354,7 @@ impl ProjectStore {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(dead_code)]
     fn replay_promote_candidate(
         &mut self,
         command_id: CommandId,
@@ -2922,6 +2969,7 @@ fn keep_alternative_fingerprint(command: KeepAlternativeCommand) -> Result<BlobI
     )
 }
 
+#[allow(dead_code)]
 fn promote_candidate_fingerprint(command: PromoteCandidateCommand) -> Result<BlobId> {
     request_fingerprint(
         "loom.promote-candidate.v1",
@@ -3391,6 +3439,7 @@ struct RunIdentity {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct CandidateContext {
     candidate_id: CandidateId,
     generated_span_artifact_id: ArtifactId,
@@ -3702,7 +3751,7 @@ mod tests {
                 .store_provenance_blob(b"recorded event stream")
                 .expect("store event stream");
             self.store
-                .finish_generation_candidate(
+                .finish_unverified_generation_candidate_for_diagnostics(
                     run_id,
                     TerminalCandidateInput {
                         output_bytes: output.as_bytes().to_vec(),
@@ -3765,7 +3814,7 @@ mod tests {
 
         fixture
             .store
-            .promote_candidate(PromoteCandidateCommand {
+            .promote_legacy_candidate_for_test(PromoteCandidateCommand {
                 candidate_id: terminal.candidate.candidate_id,
                 expected_source_revision_id: fixture.loaded.revision_id,
                 expected_visible_blob_id: fixture.loaded.blob_id,
@@ -3778,6 +3827,44 @@ mod tests {
                 .expect("read promoted document")
                 .text,
             "Once upon a time"
+        );
+    }
+
+    #[test]
+    fn caller_declared_live_inference_cannot_promote_legacy_prose() {
+        let mut fixture = Fixture::new();
+        let start = fixture.start(fixture.writer_environment);
+        let terminal = fixture.finish(start.generation.run_id, "unverified prose");
+        let command = PromoteCandidateCommand {
+            candidate_id: terminal.candidate.candidate_id,
+            expected_source_revision_id: fixture.loaded.revision_id,
+            expected_visible_blob_id: fixture.loaded.blob_id,
+        };
+
+        assert!(matches!(
+            fixture.store.promote_candidate(command),
+            Err(StoreError::LegacyCandidateNotAdmitted)
+        ));
+        let disposition: String = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT disposition
+                 FROM research_legacy_candidate_review_events
+                 WHERE candidate_id = ?1
+                 ORDER BY sequence DESC LIMIT 1",
+                [terminal.candidate.candidate_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("legacy quarantine disposition");
+        assert_eq!(disposition, "quarantined");
+        assert_eq!(
+            fixture
+                .store
+                .read_document("manuscript/001.md")
+                .expect("active manuscript")
+                .text,
+            "Once "
         );
     }
 
@@ -4271,11 +4358,11 @@ mod tests {
         };
         let promoted = fixture
             .store
-            .promote_candidate_with_command(command_id, command)
+            .promote_legacy_candidate_with_command_for_test(command_id, command)
             .expect("promote candidate");
         let replay = fixture
             .store
-            .promote_candidate_with_command(command_id, command)
+            .promote_legacy_candidate_with_command_for_test(command_id, command)
             .expect("replay promotion after active revision changed");
         assert!(!promoted.replayed);
         assert!(replay.replayed);
@@ -4289,7 +4376,7 @@ mod tests {
         assert_eq!(replay.visible_projection, VisibleProjectionState::Applied);
 
         assert!(matches!(
-            fixture.store.promote_candidate_with_command(
+            fixture.store.promote_legacy_candidate_with_command_for_test(
                 command_id,
                 PromoteCandidateCommand {
                     candidate_id: second.candidate.candidate_id,
@@ -4349,7 +4436,7 @@ mod tests {
         .expect("restore acknowledged source bytes");
         let replay = fixture
             .store
-            .promote_candidate_with_command(command_id, command)
+            .promote_legacy_candidate_with_command_for_test(command_id, command)
             .expect("settle committed promotion");
         assert!(replay.replayed);
         assert_eq!(replay.save, committed.save);
@@ -4389,7 +4476,7 @@ mod tests {
 
         let replay = fixture
             .store
-            .promote_candidate_with_command(command_id, command)
+            .promote_legacy_candidate_with_command_for_test(command_id, command)
             .expect("retry committed projection");
         assert!(replay.replayed);
         assert_eq!(replay.save, committed.save);
@@ -4700,11 +4787,13 @@ mod tests {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.critic_environment);
         let terminal = fixture.finish(start.generation.run_id, "critic prose");
-        let result = fixture.store.promote_candidate(PromoteCandidateCommand {
-            candidate_id: terminal.candidate.candidate_id,
-            expected_source_revision_id: fixture.loaded.revision_id,
-            expected_visible_blob_id: fixture.loaded.blob_id,
-        });
+        let result = fixture
+            .store
+            .promote_legacy_candidate_for_test(PromoteCandidateCommand {
+                candidate_id: terminal.candidate.candidate_id,
+                expected_source_revision_id: fixture.loaded.revision_id,
+                expected_visible_blob_id: fixture.loaded.blob_id,
+            });
         assert!(matches!(result, Err(StoreError::CriticCannotPromote)));
         assert_eq!(
             fixture
@@ -4926,7 +5015,7 @@ mod tests {
         let terminal = fixture.finish(start.generation.run_id, "upon a time");
         let promoted = fixture
             .store
-            .promote_candidate(PromoteCandidateCommand {
+            .promote_legacy_candidate_for_test(PromoteCandidateCommand {
                 candidate_id: terminal.candidate.candidate_id,
                 expected_source_revision_id: fixture.loaded.revision_id,
                 expected_visible_blob_id: fixture.loaded.blob_id,
@@ -4979,7 +5068,7 @@ mod tests {
         let terminal = fixture.finish(start.generation.run_id, "MODEL");
         let promoted = fixture
             .store
-            .promote_candidate(PromoteCandidateCommand {
+            .promote_legacy_candidate_for_test(PromoteCandidateCommand {
                 candidate_id: terminal.candidate.candidate_id,
                 expected_source_revision_id: fixture.loaded.revision_id,
                 expected_visible_blob_id: fixture.loaded.blob_id,

@@ -1,6 +1,6 @@
 # Loom project format v1
 
-Status: initial versioned foundation. Project manifest schema version `1` is the stable on-disk compatibility boundary. The SQLite store currently reaches additive migration `3`; database migration numbers do not change the manifest version when they preserve the v1 contract.
+Status: initial versioned foundation. Project manifest schema version `1` is the stable on-disk compatibility boundary. The current branch reaches additive SQLite migration `7`; database migration numbers do not change the manifest version when they preserve the v1 contract.
 
 ## Authority split
 
@@ -91,11 +91,21 @@ Migration `2` adds immutable model environments, prompt/context recipes, authori
 - Raw event streams and optional backend/cache receipts are immutable references. `InferenceEvidenceKind` distinguishes live inference from fixtures, mocks, and historical receipts.
 - Events have a per-run sequence. SQLite admits at most one terminal event and rejects later events. Completed terminals require one candidate; failed terminals require an error; cancelled, pruned, and rejected terminals cannot name a candidate.
 - Generated spans refer to immutable output bytes and token traces. Editing a promoted span changes revision projection, never its original output or trace.
-- Automation, generation completion, and `KeepAlternative` do not mutate the active manuscript. Only explicit `PromoteCandidate` composition creates the promoted revision/outbox.
+- Automation, generation completion, and `KeepAlternative` do not mutate the active manuscript. Migration `7` seals the legacy raw-candidate promotion path; those candidates are diagnostic-only and `PromoteCandidate` now fails closed until assembly-first promotion supplies a verified projection and explicit authority.
 - Authority policies assign each environment exactly one writer or critic role. Critics may generate evidence for inspection but promotion is rejected unless the candidate's environment is a designated writer.
 - Promotion records an immutable `SelectionEvent` and `AuthorshipAttestation` tied to the human command receipt.
 
 The checked-in `generation-protocol-v1.json` golden fixture fixes the serialized model, recipe, command, trace, terminal, and promotion DTO shapes. It is protocol evidence only, never a claimed live inference receipt.
+
+Migration `7` adds the clean-port research admission foundation:
+
+- model-call declarations and exactly one append-only terminal;
+- exact output partitions, non-empty generated-span occurrences, flat assemblies, pinned projections, mixed-authorship records, and normalized operation graphs;
+- schema and adoption groundwork for a final admission row; downstream span, assembly, and projection methods require an opaque admitted-call token before they can insert one;
+- append-only, single-use user-presence events bound to one promotion command lifetime;
+- immutable legacy review events. Pre-migration candidates and every new diagnostic legacy candidate receive a terminal quarantine record rather than implicit research eligibility.
+
+`LiveBaseWriterClaim` and related values are declarations, not credentials. The raw receipt/event-stream replay mint is test-only, and no production constructor for `AdmittedModelCall` exists at this checkpoint. Strict live admission intentionally remains unavailable until `loom-inference` alone can consume the native backend's opaque generation seal and mint a `VerifiedInferenceEnvelope`. `loom-store` may adopt and persist that envelope and derive its private downstream tokens; it must never recreate authority from receipt fields, JSON, hashes, or record replay. Persisted fixture, mock, critic, historical, literal, or caller-declared live records cannot become strict assemblies.
 
 ## SQLite guarantees
 

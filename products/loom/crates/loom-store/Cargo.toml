@@ -9,6 +9,7 @@ license.workspace = true
 atomic-write-file.workspace = true
 fs4.workspace = true
 loom-document = { path = "../loom-document" }
+loom-research-types = { path = "../loom-research-types" }
 loom-types = { path = "../loom-types" }
 rusqlite.workspace = true
 serde.workspace = true

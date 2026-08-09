@@ -183,12 +183,14 @@ impl ProjectStore {
         let mut connection = Connection::open(&database_path)?;
         configure(&connection)?;
         migrate(&mut connection)?;
-        Ok(Self {
+        let mut store = Self {
             root,
             manifest,
             connection,
             _lease: lease,
-        })
+        };
+        store.quarantine_pending_legacy_candidates()?;
+        Ok(store)
     }
 
     pub fn root(&self) -> &Path {

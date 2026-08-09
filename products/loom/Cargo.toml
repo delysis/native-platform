@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/loom-types",
+    "crates/loom-research-types",
     "crates/loom-document",
     "crates/loom-store",
     "crates/loom-context",

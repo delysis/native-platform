@@ -7,6 +7,7 @@ mod generation;
 mod paths;
 mod provenance;
 mod reconciliation;
+mod research_admission;
 mod schema;
 mod store;
 
@@ -26,6 +27,11 @@ pub use provenance::{
     MAX_EDIT_DIFF_WORK, MAX_REVISION_SEGMENTS, ProvenanceSegment, RevisionProvenance,
 };
 pub use reconciliation::{ExternalReconciliationOutcome, ExternalReconciliationRequest};
+pub use research_admission::{
+    AdmittedCandidateAssembly, AdmittedCandidateProjection, AdmittedGeneratedSpan,
+    AdmittedModelCall, MixedAuthorshipAdmission, RecordedPromotionAuthority, ResearchAdmissionId,
+    VerifiedUserPresence,
+};
 pub use schema::{CURRENT_SCHEMA_VERSION, CURRENT_STORE_SCHEMA_VERSION};
 pub use store::{
     DocumentReconciliationSnapshot, DocumentSummary, LoadedDocument, MAX_DOCUMENT_BYTES,

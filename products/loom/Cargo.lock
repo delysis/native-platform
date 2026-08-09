@@ -2230,6 +2230,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-research-types"
+version = "0.1.0"
+dependencies = [
+ "loom-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "ulid",
+]
+
+[[package]]
 name = "loom-search"
 version = "0.1.0"
 dependencies = [
@@ -2247,6 +2259,7 @@ dependencies = [
  "fs4",
  "libc",
  "loom-document",
+ "loom-research-types",
  "loom-types",
  "rusqlite",
  "serde",

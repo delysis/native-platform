@@ -16,6 +16,12 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("document projection failed: {0}")]
     Document(#[from] loom_document::DocumentError),
+    #[error("research call evidence failed validation: {0}")]
+    ResearchCall(#[from] loom_research_types::CallError),
+    #[error("research assembly evidence failed validation: {0}")]
+    ResearchAssembly(#[from] loom_research_types::AssemblyError),
+    #[error("research admission failed: {0}")]
+    ResearchAdmission(String),
     #[error("project path is not valid UTF-8: {0:?}")]
     NonUtf8Path(PathBuf),
     #[error("unsafe project-relative path `{0}`")]
@@ -118,6 +124,10 @@ pub enum StoreError {
     GenerationFamilySourceMismatch,
     #[error("candidate {0} does not exist")]
     CandidateNotFound(CandidateId),
+    #[error(
+        "legacy generation candidates are diagnostic evidence and cannot be promoted; promote an admitted projection with explicit user-presence authority"
+    )]
+    LegacyCandidateNotAdmitted,
     #[error("generation run {0} already has a terminal event")]
     GenerationAlreadyTerminal(GenerationRunId),
     #[error("completed generation requires a terminal candidate")]
