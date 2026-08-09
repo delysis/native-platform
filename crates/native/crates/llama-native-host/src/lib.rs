@@ -160,6 +160,33 @@ impl JoinedNativeHost {
     }
 }
 
+/// Terminal process-exit fact for one exact host after all owners present at
+/// the drain boundary were synchronously joined.
+///
+/// Unlike [`JoinedNativeHost`], this recovery-mode fact is intentionally
+/// replayable: calling the idempotent process-exit drain again returns a new
+/// fact with a zero per-drain worker count. It must not be used as linear
+/// graceful-shutdown authority.
+#[derive(Debug)]
+pub struct ProcessExitJoinedNativeHost {
+    host_identity: Arc<HostIdentity>,
+    joined_worker_count: usize,
+}
+
+impl ProcessExitJoinedNativeHost {
+    /// Number of resident worker owners consumed by this drain invocation.
+    #[must_use]
+    pub const fn joined_worker_count(&self) -> usize {
+        self.joined_worker_count
+    }
+
+    /// Returns true only for the exact host instance that minted this fact.
+    #[must_use]
+    pub fn belongs_to(&self, host: &NativeHost) -> bool {
+        Arc::ptr_eq(&self.host_identity, &host.identity)
+    }
+}
+
 impl std::fmt::Debug for HostSlotStatus {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -741,6 +768,52 @@ impl NativeHost {
         })
     }
 
+    /// Permanently closes model admission and synchronously joins every owned
+    /// worker before returning a process-exit fact.
+    ///
+    /// Unlike [`Self::shutdown_joined`], this terminal drain recovers poisoned
+    /// lifecycle mutexes and treats a worker panic as joined: `JoinHandle::join`
+    /// has already waited for that worker to return before reporting the panic.
+    /// It deliberately has no failure return. A caller may block behind an
+    /// in-flight model load or native call, but it cannot continue process
+    /// teardown while a host-owned worker remains live.
+    #[must_use = "process teardown must retain the joined native-host drain fact"]
+    pub fn shutdown_for_process_exit(&self) -> ProcessExitJoinedNativeHost {
+        let _load_guard = self
+            .load_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slots = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.phase = HostPhase::Quiescing;
+            std::mem::take(&mut state.slots)
+        };
+
+        for entry in slots.values() {
+            entry.owner.begin_shutdown();
+        }
+        let joined_now = slots.len();
+        for (_, entry) in slots {
+            // `shutdown_joined` consumes the sole JoinHandle and waits for the
+            // thread even when it reports that the joined thread panicked.
+            let _ = entry.owner.shutdown_joined();
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(state.slots.is_empty());
+        state.phase = HostPhase::Stopped;
+        ProcessExitJoinedNativeHost {
+            host_identity: Arc::clone(&self.identity),
+            joined_worker_count: joined_now,
+        }
+    }
+
     pub fn cache_lookup(
         &self,
         fingerprint: &CacheFingerprint,
@@ -1073,6 +1146,79 @@ mod tests {
     }
 
     #[test]
+    fn process_exit_shutdown_recovers_poison_and_is_idempotent() {
+        let host = NativeHost::new(NativeHostConfig::default());
+        let other = NativeHost::new(NativeHostConfig::default());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = host.load_gate.lock().expect("load gate");
+            panic!("poison the load gate");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = host.state.lock().expect("host state");
+            panic!("poison the host state");
+        }));
+
+        let joined = host.shutdown_for_process_exit();
+        assert_eq!(joined.joined_worker_count(), 0);
+        assert!(joined.belongs_to(&host));
+        assert!(!joined.belongs_to(&other));
+        {
+            let state = host
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.phase, HostPhase::Stopped);
+            assert!(state.slots.is_empty());
+        }
+
+        let joined_again = host.shutdown_for_process_exit();
+        assert_eq!(joined_again.joined_worker_count(), 0);
+        assert!(joined_again.belongs_to(&host));
+    }
+
+    #[test]
+    fn process_exit_shutdown_waits_behind_load_gate_then_closes_admission() {
+        let host = Arc::new(NativeHost::new(NativeHostConfig::default()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let loader_host = Arc::clone(&host);
+        let loader = thread::spawn(move || {
+            loader_host
+                .with_load_gate(|| {
+                    entered_tx.send(()).expect("report held load gate");
+                    release_rx.recv().expect("release held load gate");
+                    Ok(())
+                })
+                .expect("simulated load critical section");
+        });
+        entered_rx.recv().expect("loader entered gate");
+
+        let (drain_started_tx, drain_started_rx) = std::sync::mpsc::channel();
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let drain_host = Arc::clone(&host);
+        let drain = thread::spawn(move || {
+            drain_started_tx.send(()).expect("report drain start");
+            let joined = drain_host.shutdown_for_process_exit();
+            drained_tx.send(joined).expect("report drain proof");
+        });
+        drain_started_rx.recv().expect("drain started");
+        assert!(matches!(
+            drained_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_tx.send(()).expect("release loader");
+        loader.join().expect("loader thread");
+        let joined = drained_rx.recv().expect("drain proof");
+        drain.join().expect("drain thread");
+        assert_eq!(joined.joined_worker_count(), 0);
+        assert!(joined.belongs_to(&host));
+        let state = host.state.lock().expect("unpoisoned host state");
+        assert_eq!(state.phase, HostPhase::Stopped);
+        assert!(state.slots.is_empty());
+    }
+
+    #[test]
     fn digest_assertions_validate_without_participating_in_resident_identity() {
         const CORRECT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
         const WRONG: &str = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -1191,6 +1337,56 @@ mod tests {
                 .code,
             NativeErrorCode::WorkerStopped
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires MOM_LLAMA_MODEL_PATH, MOM_LLAMA_MODEL_SHA256, and a real local GGUF"]
+    fn real_process_exit_shutdown_revokes_live_clients_then_joins_and_stops_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let model_path = PathBuf::from(std::env::var("MOM_LLAMA_MODEL_PATH")?);
+        let mut config = NativeModelConfig::local(model_path);
+        config.expected_model_sha256 = Some(std::env::var("MOM_LLAMA_MODEL_SHA256")?);
+        config.device = NativeDevice::Cpu;
+        config.context_tokens = 512;
+        config.batch_tokens = 64;
+        config.max_sequences = 1;
+        config.gpu_layers = 0;
+        let host = NativeHost::new(NativeHostConfig {
+            memory_budget_bytes: u64::MAX,
+            max_slots: 1,
+            memory_cache_bytes: 0,
+            cache_namespace: "process-exit-shutdown-real-test".to_string(),
+            cache_policy: HostCachePolicy::Disabled,
+        });
+        let handle = host.acquire(config.clone())?;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = host.load_gate.lock().expect("load gate");
+            panic!("poison the live host load gate");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = host.state.lock().expect("host state");
+            panic!("poison the live host state");
+        }));
+
+        let joined = host.shutdown_for_process_exit();
+        assert_eq!(joined.joined_worker_count(), 1);
+        assert!(joined.belongs_to(&host));
+        assert!(host.slots().is_empty());
+        assert_eq!(
+            handle
+                .snapshot_sequence(0)
+                .expect_err("a revoked client cannot submit work")
+                .code,
+            NativeErrorCode::WorkerStopped
+        );
+        assert!(host.acquire(config).is_err());
+        let state = host
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.phase, HostPhase::Stopped);
+        assert!(state.slots.is_empty());
         Ok(())
     }
 
