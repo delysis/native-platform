@@ -30,7 +30,7 @@ use loom_store::{
 use loom_types::{
     AuthorityPolicy, BlobId, BranchId, ByteRange, CancelGenerationCommand, CandidateId, CommandId,
     CommandReceipt, ContextRecipe, DocumentId, DocumentKind, GenerationEventKind, GenerationRunId,
-    GenerationStart, GenerationTerminalStatus, LoomEvent, ModelEnvironment,
+    GenerationStart, GenerationTerminalStatus, LoomEvent, ModelEnvironment, ProjectId,
     PromoteCandidateCommand, PromptMode, PromptRecipe, RevisionId, SelectionDecision,
     derive_weave_case_ids, now_unix_ms,
 };
@@ -968,51 +968,12 @@ fn close_project_with_wait(
         (typed_project_id, typed_session_id)
     };
 
-    state
-        .generations
-        .cancel_session(typed_project_id, typed_session_id)
-        .map_err(|error| IpcFailure::generation_registry(&error))?;
-    let mut generation_idle = state
-        .generations
-        .wait_for_session_idle(typed_project_id, typed_session_id, generation_wait)
-        .map_err(|error| IpcFailure::generation_registry(&error))?;
-    if !generation_idle {
-        let failures = state
-            .generations
-            .terminal_persistence_failures(typed_project_id, typed_session_id)
-            .map_err(|error| IpcFailure::generation_registry(&error))?;
-        for failure in failures {
-            terminalize_open_runs(state, &failure.identity, &failure.runs, &failure.error)
-                .and_then(|_| {
-                    release_family_after_terminal_persistence(
-                        state,
-                        &failure.identity,
-                        &failure.runs,
-                    )
-                })
-                .map_err(|error| {
-                    IpcFailure::new(
-                        "generation_terminal_persistence_failed",
-                        format!(
-                            "Loom could not preserve a terminal record before closing: {}",
-                            error.message
-                        ),
-                        true,
-                    )
-                })?;
-        }
-        generation_idle = state
-            .generations
-            .wait_for_session_idle(typed_project_id, typed_session_id, Duration::ZERO)
-            .map_err(|error| IpcFailure::generation_registry(&error))?;
-    }
-    if !generation_idle {
-        return Err(IpcFailure::new(
-            "generation_cancellation_in_progress",
-            "Loom requested cancellation and is still preserving terminal generation evidence; retry the same close command shortly",
-            true,
-        ));
-    }
+    cancel_and_drain_generation_session(
+        state,
+        typed_project_id,
+        typed_session_id,
+        generation_wait,
+    )?;
 
     let mut session = lock_session(state)?;
     if session.phase == SessionPhase::Closed {
@@ -1054,6 +1015,60 @@ fn close_project_with_wait(
     session.phase = SessionPhase::Closed;
     session.last_close = Some(receipt.clone());
     Ok(receipt)
+}
+
+fn cancel_and_drain_generation_session(
+    state: &PluginState,
+    project_id: ProjectId,
+    session_id: CommandId,
+    wait: Duration,
+) -> Result<(), IpcFailure> {
+    state
+        .generations
+        .cancel_session(project_id, session_id)
+        .map_err(|error| IpcFailure::generation_registry(&error))?;
+    let mut generation_idle = state
+        .generations
+        .wait_for_session_idle(project_id, session_id, wait)
+        .map_err(|error| IpcFailure::generation_registry(&error))?;
+    if !generation_idle {
+        let failures = state
+            .generations
+            .terminal_persistence_failures(project_id, session_id)
+            .map_err(|error| IpcFailure::generation_registry(&error))?;
+        for failure in failures {
+            terminalize_open_runs(state, &failure.identity, &failure.runs, &failure.error)
+                .and_then(|_| {
+                    release_family_after_terminal_persistence(
+                        state,
+                        &failure.identity,
+                        &failure.runs,
+                    )
+                })
+                .map_err(|error| {
+                    IpcFailure::new(
+                        "generation_terminal_persistence_failed",
+                        format!(
+                            "Loom could not preserve a terminal record before closing: {}",
+                            error.message
+                        ),
+                        true,
+                    )
+                })?;
+        }
+        generation_idle = state
+            .generations
+            .wait_for_session_idle(project_id, session_id, Duration::ZERO)
+            .map_err(|error| IpcFailure::generation_registry(&error))?;
+    }
+    if !generation_idle {
+        return Err(IpcFailure::new(
+            "generation_cancellation_in_progress",
+            "Loom requested cancellation and is still preserving terminal generation evidence; retry the same close command shortly",
+            true,
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
