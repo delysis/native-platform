@@ -4,7 +4,7 @@ mod state_buffer;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use encoding_rs::UTF_8;
 use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -16,16 +16,20 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use llama_native_types::{
     BranchRequest, CacheOperationCapabilities, CapabilityDeclarationStatus, ChatMessage, ChatRole,
-    ChatTemplateChoice, CompletionPrompt, ExactModelCapabilities, GenerationBatchCapabilities,
+    ChatTemplateChoice, CompletionPrompt, EmbeddingBatchOutput, EmbeddingBatchRequest,
+    EmbeddingCapabilities, EmbeddingNormalization, EmbeddingNormalizationSupport,
+    EmbeddingOutputConfig, EmbeddingPooling, EmbeddingPoolingSupport, EmbeddingTransportEvidence,
+    EmbeddingVectorOutput, ExactModelCapabilities, GenerationBatchCapabilities,
     GenerationBatchRequest, GenerationCacheMetrics, GenerationCase, GenerationEvent,
     GenerationEventKind, GenerationInput, GenerationMetrics, GenerationOutput,
-    GenerationOutputCapabilities, GenerationRequest, GenerationState, MAX_PARALLEL_SEQUENCES,
-    MediaInput, MediaInputCapability, MediaKind, ModelCapabilities, ModelFingerprint,
-    ModelRuntimeState, NativeDevice, NativeError, NativeErrorCode, NativeEvidenceCapabilities,
-    NativeModelConfig, NativeModelDescriptor, NativeTransport, PreparedPrompt,
-    ProjectorRequirement, PromptForm, PromptInputCapabilities, PromptTokenPolicy,
-    ResidentModelStatus, SamplerKind, SamplingConfig, SamplingParameter, SequenceStateBlob,
-    SharedPrefixBatchRequest, SpecialTokenPolicy, TokenizedPrompt,
+    GenerationOutputCapabilities, GenerationRequest, GenerationState, MAX_EMBEDDING_BATCH_INPUTS,
+    MAX_EMBEDDING_BATCH_VALUES, MAX_EMBEDDING_DIMENSIONS, MAX_EMBEDDING_INPUT_TOKENS,
+    MAX_EMBEDDING_VALUES_PER_OUTPUT, MAX_PARALLEL_SEQUENCES, MediaInput, MediaInputCapability,
+    MediaKind, ModelCapabilities, ModelFingerprint, ModelRuntimeState, NativeDevice, NativeError,
+    NativeErrorCode, NativeEvidenceCapabilities, NativeModelConfig, NativeModelDescriptor,
+    NativeTransport, PreparedPrompt, ProjectorRequirement, PromptForm, PromptInputCapabilities,
+    PromptTokenPolicy, ResidentModelStatus, SamplerKind, SamplingConfig, SamplingParameter,
+    SequenceStateBlob, SharedPrefixBatchRequest, SpecialTokenPolicy, TokenizedPrompt,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -106,6 +110,51 @@ impl GenerationTicket {
     }
 }
 
+/// One cancellable owner-worker embedding request.
+#[derive(Debug)]
+pub struct EmbeddingTicket {
+    pub request_id: String,
+    result: Receiver<NativeResult<EmbeddingBatchOutput>>,
+    cancellation: Arc<AtomicBool>,
+}
+
+impl EmbeddingTicket {
+    /// Request cooperative cancellation. A decode already inside llama.cpp is
+    /// allowed to finish, but its values are discarded before publication.
+    pub fn cancel(&self) {
+        self.cancellation.store(true, Ordering::Release);
+    }
+
+    pub fn wait(self) -> NativeResult<EmbeddingBatchOutput> {
+        self.result.recv().map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("native worker stopped before returning embeddings: {error}"),
+            )
+        })?
+    }
+
+    pub fn wait_timeout(&self, timeout: Duration) -> NativeResult<EmbeddingBatchOutput> {
+        self.result.recv_timeout(timeout).map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("native embeddings did not finish before the timeout: {error}"),
+            )
+        })?
+    }
+
+    pub fn try_wait(&self) -> NativeResult<Option<EmbeddingBatchOutput>> {
+        match self.result.try_recv() {
+            Ok(result) => result.map(Some),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                "native worker stopped before returning embeddings",
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct NativeModelHandle {
     inner: Arc<NativeModelInner>,
@@ -151,6 +200,11 @@ impl Drop for NativeModelInner {
 
 #[derive(Debug)]
 enum WorkerCommand {
+    EmbedBatch {
+        request: EmbeddingBatchRequest,
+        result: Sender<NativeResult<EmbeddingBatchOutput>>,
+        cancellation: Arc<AtomicBool>,
+    },
     GenerateBatch {
         request: GenerationBatchRequest,
         event_tx: Sender<GenerationEvent>,
@@ -263,6 +317,33 @@ impl NativeModelHandle {
     /// requests for one resident profile must reuse the same worker allocation.
     pub fn is_same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Submit exact token IDs for in-process embedding on this model's owner
+    /// worker. No text tokenization or generation-context mutation occurs.
+    pub fn embed_batch(&self, request: EmbeddingBatchRequest) -> NativeResult<EmbeddingTicket> {
+        validate_embedding_batch_request(&request, &self.status())?;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (result_tx, result_rx) = bounded(1);
+        let request_id = request.request_id().to_string();
+        self.inner
+            .command_tx
+            .send(WorkerCommand::EmbedBatch {
+                request,
+                result: result_tx,
+                cancellation: Arc::clone(&cancellation),
+            })
+            .map_err(|error| {
+                NativeError::new(
+                    NativeErrorCode::WorkerStopped,
+                    format!("native model worker is not accepting embeddings: {error}"),
+                )
+            })?;
+        Ok(EmbeddingTicket {
+            request_id,
+            result: result_rx,
+            cancellation,
+        })
     }
 
     pub fn generate(&self, request: GenerationRequest) -> NativeResult<GenerationTicket> {
@@ -764,15 +845,7 @@ fn run_worker(
         None => None,
     };
     let context_tokens = config.context_tokens.min(model.n_ctx_train()).max(512);
-    let context_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(context_tokens))
-        .with_n_batch(config.batch_tokens)
-        .with_n_ubatch(config.batch_tokens.min(512))
-        .with_n_seq_max(config.max_sequences)
-        .with_n_threads(native_thread_count())
-        .with_n_threads_batch(native_thread_count())
-        .with_kv_unified(true)
-        .with_no_perf(false);
+    let context_params = generation_context_params(&config, context_tokens);
     let (rope_config_sha256, kv_layout_sha256) = context_fingerprints(&context_params);
     let mut context = match model.new_context(backend, context_params) {
         Ok(context) => context,
@@ -808,13 +881,34 @@ fn run_worker(
             .map_or_else(Vec::new, media_kinds_for_context);
         current.state = ModelRuntimeState::Ready;
         current.descriptor = Some(describe_model(&config, &model, &fingerprint, media_kinds));
-        current.fingerprint = Some(fingerprint);
+        current.fingerprint = Some(fingerprint.clone());
     }
     let _ = ready_tx.send(Ok(()));
     let mut sequence_token_counts = HashMap::<i32, usize>::new();
     let mut sequence_token_ids = HashMap::<i32, Vec<i32>>::new();
     while let Ok(command) = command_rx.recv() {
         match command {
+            WorkerCommand::EmbedBatch {
+                request,
+                result,
+                cancellation,
+            } => {
+                set_status_state(&status, ModelRuntimeState::Ready, 1);
+                let embedding_result = execute_embedding_batch(
+                    &config,
+                    backend,
+                    &model,
+                    &fingerprint,
+                    context_tokens,
+                    &request,
+                    &cancellation,
+                );
+                if let Ok(output) = &embedding_result {
+                    record_embedding_capability(&status, output, context_tokens);
+                }
+                set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = result.send(embedding_result);
+            }
             WorkerCommand::GenerateBatch {
                 request,
                 event_tx,
@@ -962,6 +1056,511 @@ fn run_worker(
         }
     }
     set_status_state(&status, ModelRuntimeState::Stopped, 0);
+}
+
+fn generation_context_params(
+    config: &NativeModelConfig,
+    context_tokens: u32,
+) -> LlamaContextParams {
+    LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(context_tokens))
+        .with_n_batch(config.batch_tokens)
+        .with_n_ubatch(config.batch_tokens.min(512))
+        .with_n_seq_max(config.max_sequences)
+        .with_n_threads(native_thread_count())
+        .with_n_threads_batch(native_thread_count())
+        .with_kv_unified(true)
+        .with_no_perf(false)
+}
+
+fn embedding_context_params(
+    config: &NativeModelConfig,
+    context_tokens: u32,
+    maximum_input_tokens: u32,
+    pooling: EmbeddingPooling,
+) -> LlamaContextParams {
+    let physical_batch = maximum_input_tokens.min(config.batch_tokens).clamp(1, 512);
+    LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(context_tokens))
+        .with_n_batch(maximum_input_tokens.max(1))
+        .with_n_ubatch(physical_batch)
+        .with_n_seq_max(1)
+        .with_n_threads(native_thread_count())
+        .with_n_threads_batch(native_thread_count())
+        .with_kv_unified(true)
+        .with_no_perf(false)
+        .with_embeddings(true)
+        .with_pooling_type(llama_pooling(pooling))
+}
+
+const fn llama_pooling(pooling: EmbeddingPooling) -> LlamaPoolingType {
+    match pooling {
+        EmbeddingPooling::None => LlamaPoolingType::None,
+        EmbeddingPooling::Mean => LlamaPoolingType::Mean,
+        EmbeddingPooling::Cls => LlamaPoolingType::Cls,
+        EmbeddingPooling::Last => LlamaPoolingType::Last,
+        EmbeddingPooling::Rank => LlamaPoolingType::Rank,
+    }
+}
+
+fn resolved_embedding_pooling(pooling: LlamaPoolingType) -> NativeResult<EmbeddingPooling> {
+    match pooling {
+        LlamaPoolingType::None => Ok(EmbeddingPooling::None),
+        LlamaPoolingType::Mean => Ok(EmbeddingPooling::Mean),
+        LlamaPoolingType::Cls => Ok(EmbeddingPooling::Cls),
+        LlamaPoolingType::Last => Ok(EmbeddingPooling::Last),
+        LlamaPoolingType::Rank => Ok(EmbeddingPooling::Rank),
+        LlamaPoolingType::Unspecified => Err(NativeError::new(
+            NativeErrorCode::UnsupportedParameter,
+            "llama.cpp did not resolve a concrete embedding pooling mode",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_embedding_batch(
+    config: &NativeModelConfig,
+    backend: &LlamaBackend,
+    model: &LlamaModel,
+    fingerprint: &ModelFingerprint,
+    context_tokens: u32,
+    request: &EmbeddingBatchRequest,
+    cancellation: &AtomicBool,
+) -> NativeResult<EmbeddingBatchOutput> {
+    check_embedding_cancellation(cancellation)?;
+    let maximum_input_tokens = request
+        .inputs()
+        .iter()
+        .map(|input| input.token_ids().len())
+        .max()
+        .unwrap_or_default();
+    if maximum_input_tokens > context_tokens as usize {
+        return Err(NativeError::new(
+            NativeErrorCode::PromptTooLarge,
+            format!(
+                "embedding input requires {maximum_input_tokens} context cells but the model context has {context_tokens}"
+            ),
+        ));
+    }
+    let maximum_input_tokens = u32::try_from(maximum_input_tokens).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "embedding input token count does not fit the native context contract",
+        )
+    })?;
+    validate_embedding_token_ids(model, request)?;
+    let expected_width = embedding_output_width(model, request.pooling())?;
+    validate_embedding_output_budget(
+        request.inputs().iter().map(|input| input.token_ids().len()),
+        request.pooling(),
+        expected_width,
+    )?;
+    let params = embedding_context_params(
+        config,
+        context_tokens,
+        maximum_input_tokens,
+        request.pooling(),
+    );
+    let execution_fingerprint = embedding_execution_fingerprint(fingerprint, &params);
+    let mut context = model.new_context(backend, params).map_err(|error| {
+        NativeError::new(
+            NativeErrorCode::ContextCreateFailed,
+            format!("failed to create the temporary embedding context: {error}"),
+        )
+    })?;
+    let live_pooling = resolved_embedding_pooling(context.pooling_type())?;
+    if live_pooling != request.pooling() {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedParameter,
+            format!(
+                "requested {:?} embedding pooling but llama.cpp resolved {:?}",
+                request.pooling(),
+                live_pooling
+            ),
+        ));
+    }
+
+    let mut dimensions = None;
+    let mut total_values = 0usize;
+    let mut outputs = Vec::with_capacity(request.inputs().len());
+    for (input_index, input) in request.inputs().iter().enumerate() {
+        check_embedding_cancellation(cancellation)?;
+        context.clear_kv_cache();
+        let tokens = input
+            .token_ids()
+            .iter()
+            .copied()
+            .map(LlamaToken::new)
+            .collect::<Vec<_>>();
+        let mut batch = LlamaBatch::new(tokens.len(), 1);
+        batch
+            .add_sequence(&tokens, 0, live_pooling == EmbeddingPooling::None)
+            .map_err(|error| native_decode_error("failed to build embedding batch", error))?;
+        context
+            .decode(&mut batch)
+            .map_err(|error| native_decode_error("failed to decode embedding batch", error))?;
+        check_embedding_cancellation(cancellation)?;
+        let (row_count, width, mut values) =
+            read_embedding_values(&context, live_pooling, tokens.len())?;
+        if width != expected_width {
+            return Err(NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!("model returned embedding width {width} after reporting {expected_width}"),
+            ));
+        }
+        if dimensions.is_some_and(|known| known != width) {
+            return Err(NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                "model changed embedding width inside one request",
+            ));
+        }
+        dimensions = Some(width);
+        apply_embedding_normalization(&mut values, row_count, width, request.normalization())?;
+        total_values = total_values.checked_add(values.len()).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "embedding batch value count overflow",
+            )
+        })?;
+        if total_values > MAX_EMBEDDING_BATCH_VALUES {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                format!(
+                    "embedding batch cannot materialize more than {MAX_EMBEDDING_BATCH_VALUES} values"
+                ),
+            ));
+        }
+        outputs.push(EmbeddingVectorOutput::new(
+            input.input_id().to_string(),
+            input_index,
+            input.token_ids().to_vec(),
+            u32::try_from(row_count).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    "embedding row count does not fit the public output contract",
+                )
+            })?,
+            values,
+        )?);
+    }
+    let dimensions = u32::try_from(dimensions.unwrap_or_default()).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            "embedding width does not fit the public output contract",
+        )
+    })?;
+    let output_config =
+        EmbeddingOutputConfig::new(live_pooling, request.normalization(), dimensions)?;
+    EmbeddingBatchOutput::new(
+        request.request_id().to_string(),
+        request.model_id().to_string(),
+        output_config,
+        outputs,
+        execution_fingerprint,
+        EmbeddingTransportEvidence::new(NativeTransport::InProcess, true, false)?,
+    )
+}
+
+fn embedding_output_width(model: &LlamaModel, pooling: EmbeddingPooling) -> NativeResult<usize> {
+    let width = if pooling == EmbeddingPooling::Rank {
+        usize::try_from(model.n_cls_out()).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                "model classification width does not fit this host",
+            )
+        })?
+    } else {
+        usize::try_from(model.n_embd_out()).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                "model embedding width is negative or does not fit this host",
+            )
+        })?
+    };
+    if width == 0 || width > MAX_EMBEDDING_DIMENSIONS as usize {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            format!(
+                "model reports embedding width {width}; expected 1..={MAX_EMBEDDING_DIMENSIONS}"
+            ),
+        ));
+    }
+    Ok(width)
+}
+
+fn validate_embedding_output_budget(
+    input_token_counts: impl IntoIterator<Item = usize>,
+    pooling: EmbeddingPooling,
+    width: usize,
+) -> NativeResult<()> {
+    if width == 0 || width > MAX_EMBEDDING_DIMENSIONS as usize {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            format!(
+                "model reports embedding width {width}; expected 1..={MAX_EMBEDDING_DIMENSIONS}"
+            ),
+        ));
+    }
+    let mut total_values = 0usize;
+    for token_count in input_token_counts {
+        let row_count = if pooling == EmbeddingPooling::None {
+            token_count
+        } else {
+            1
+        };
+        let value_count = row_count.checked_mul(width).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "embedding output shape overflows this host",
+            )
+        })?;
+        if value_count > MAX_EMBEDDING_VALUES_PER_OUTPUT {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                format!(
+                    "one embedding output would exceed {MAX_EMBEDDING_VALUES_PER_OUTPUT} values"
+                ),
+            ));
+        }
+        total_values = total_values.checked_add(value_count).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "embedding batch value count overflows this host",
+            )
+        })?;
+        if total_values > MAX_EMBEDDING_BATCH_VALUES {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                format!("embedding batch would exceed {MAX_EMBEDDING_BATCH_VALUES} total values"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn embedding_execution_fingerprint(
+    resident_fingerprint: &ModelFingerprint,
+    params: &LlamaContextParams,
+) -> ModelFingerprint {
+    let (rope_config_sha256, base_kv_layout_sha256) = context_fingerprints(params);
+    let embedding_layout = format!(
+        "base={base_kv_layout_sha256};embeddings={};pooling={:?}",
+        params.embeddings(),
+        params.pooling_type(),
+    );
+    let mut fingerprint = resident_fingerprint.clone();
+    fingerprint.context_tokens = params.n_ctx().map_or(0, NonZeroU32::get);
+    fingerprint.batch_tokens = params.n_batch();
+    fingerprint.max_sequences = params.n_seq_max();
+    fingerprint.rope_config_sha256 = rope_config_sha256;
+    fingerprint.kv_layout_sha256 = format!("{:x}", Sha256::digest(embedding_layout.as_bytes()));
+    fingerprint
+}
+
+fn validate_embedding_token_ids(
+    model: &LlamaModel,
+    request: &EmbeddingBatchRequest,
+) -> NativeResult<()> {
+    validate_embedding_token_ids_in_vocab(model.n_vocab(), request)
+}
+
+fn validate_embedding_token_ids_in_vocab(
+    vocabulary_size: i32,
+    request: &EmbeddingBatchRequest,
+) -> NativeResult<()> {
+    if vocabulary_size <= 0 {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            "embedding model reported an empty vocabulary",
+        ));
+    }
+    for input in request.inputs() {
+        if let Some(invalid) = input
+            .token_ids()
+            .iter()
+            .find(|token_id| **token_id < 0 || **token_id >= vocabulary_size)
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                format!(
+                    "embedding input {} contains token ID {invalid} outside vocabulary 0..{vocabulary_size}",
+                    input.input_id()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_embedding_values(
+    context: &LlamaContext<'_>,
+    pooling: EmbeddingPooling,
+    token_count: usize,
+) -> NativeResult<(usize, usize, Vec<f32>)> {
+    if pooling == EmbeddingPooling::None {
+        let first = context
+            .embeddings_ith(0)
+            .map_err(|error| embedding_read_error(pooling, error))?;
+        let width = first.len();
+        let value_count = token_count.checked_mul(width).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "per-token embedding value count overflow",
+            )
+        })?;
+        if value_count > MAX_EMBEDDING_VALUES_PER_OUTPUT {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                format!(
+                    "one unpooled embedding cannot materialize more than {MAX_EMBEDDING_VALUES_PER_OUTPUT} values"
+                ),
+            ));
+        }
+        let mut values = Vec::with_capacity(value_count);
+        values.extend_from_slice(first);
+        for row_index in 1..token_count {
+            let row_index = i32::try_from(row_index).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    "embedding token index does not fit llama.cpp",
+                )
+            })?;
+            let row = context
+                .embeddings_ith(row_index)
+                .map_err(|error| embedding_read_error(pooling, error))?;
+            if row.len() != width {
+                return Err(NativeError::new(
+                    NativeErrorCode::ModelInvalid,
+                    "model changed per-token embedding width inside one input",
+                ));
+            }
+            values.extend_from_slice(row);
+        }
+        Ok((token_count, width, values))
+    } else {
+        let embedding = context
+            .embeddings_seq_ith(0)
+            .map_err(|error| embedding_read_error(pooling, error))?;
+        if embedding.len() > MAX_EMBEDDING_VALUES_PER_OUTPUT {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                format!(
+                    "one pooled embedding cannot materialize more than {MAX_EMBEDDING_VALUES_PER_OUTPUT} values"
+                ),
+            ));
+        }
+        Ok((1, embedding.len(), embedding.to_vec()))
+    }
+}
+
+fn embedding_read_error(pooling: EmbeddingPooling, error: impl std::fmt::Display) -> NativeError {
+    NativeError::new(
+        NativeErrorCode::UnsupportedParameter,
+        format!("model cannot return {pooling:?} embeddings: {error}"),
+    )
+}
+
+fn apply_embedding_normalization(
+    values: &mut [f32],
+    row_count: usize,
+    width: usize,
+    normalization: EmbeddingNormalization,
+) -> NativeResult<()> {
+    let expected = row_count.checked_mul(width).ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "embedding output shape overflow",
+        )
+    })?;
+    if width == 0 || values.len() != expected || values.iter().any(|value| !value.is_finite()) {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            "embedding rows must have a positive stable width and finite values",
+        ));
+    }
+    if normalization == EmbeddingNormalization::None {
+        return Ok(());
+    }
+    for row in values.chunks_exact_mut(width) {
+        let norm = row
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if norm == 0.0 || !norm.is_finite() {
+            return Err(NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                "cannot L2-normalize a zero-norm or non-finite embedding row",
+            ));
+        }
+        for value in row {
+            *value = (f64::from(*value) / norm) as f32;
+        }
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            "embedding normalization produced a non-finite value",
+        ));
+    }
+    Ok(())
+}
+
+fn check_embedding_cancellation(cancellation: &AtomicBool) -> NativeResult<()> {
+    if cancellation.load(Ordering::Acquire) {
+        Err(NativeError::new(
+            NativeErrorCode::Cancelled,
+            "embedding request was cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn record_embedding_capability(
+    status: &Arc<RwLock<ResidentModelStatus>>,
+    output: &EmbeddingBatchOutput,
+    context_tokens: u32,
+) {
+    let Ok(mut status) = status.write() else {
+        return;
+    };
+    let Some(descriptor) = status.descriptor.as_mut() else {
+        return;
+    };
+    let previous = descriptor.capabilities.exact.evidence.embeddings;
+    let mut pooling = if previous.declaration() == CapabilityDeclarationStatus::Inspected {
+        previous.pooling()
+    } else {
+        EmbeddingPoolingSupport::default()
+    };
+    match output.config().pooling() {
+        EmbeddingPooling::None => pooling.none = true,
+        EmbeddingPooling::Mean => pooling.mean = true,
+        EmbeddingPooling::Cls => pooling.cls = true,
+        EmbeddingPooling::Last => pooling.last = true,
+        EmbeddingPooling::Rank => pooling.rank = true,
+    }
+    let dimensions = if previous.declaration() == CapabilityDeclarationStatus::Inspected
+        && previous.dimensions() != Some(output.config().dimensions())
+    {
+        None
+    } else {
+        Some(output.config().dimensions())
+    };
+    if let Ok(capabilities) = EmbeddingCapabilities::new(
+        CapabilityDeclarationStatus::Inspected,
+        pooling,
+        EmbeddingNormalizationSupport {
+            none: true,
+            l2: true,
+        },
+        u16::try_from(MAX_EMBEDDING_BATCH_INPUTS).ok(),
+        Some(context_tokens.min(MAX_EMBEDDING_INPUT_TOKENS as u32)),
+        dimensions,
+    ) {
+        descriptor.capabilities.exact.evidence.embeddings = capabilities;
+    }
 }
 
 fn generate_batch(
@@ -2441,6 +3040,25 @@ fn validate_generation_batch_request(
     Ok(())
 }
 
+fn validate_embedding_batch_request(
+    request: &EmbeddingBatchRequest,
+    status: &ResidentModelStatus,
+) -> NativeResult<()> {
+    if status.state != ModelRuntimeState::Ready || status.fingerprint.is_none() {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelNotLoaded,
+            format!("model {} is not ready for embeddings", status.model_id),
+        ));
+    }
+    if request.model_id() != status.model_id {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelNotLoaded,
+            format!("model {} is not resident", request.model_id()),
+        ));
+    }
+    Ok(())
+}
+
 fn backend() -> NativeResult<&'static LlamaBackend> {
     match BACKEND.get_or_init(|| LlamaBackend::init().map_err(|error| error.to_string())) {
         Ok(backend) => Ok(backend),
@@ -2840,8 +3458,40 @@ fn native_decode_error(context: &str, error: impl std::fmt::Display) -> NativeEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llama_native_types::EmbeddingInput;
 
     const LLAMA_CPP_BINDING_REV: &str = "a74dbb79f96e0ebad8b0737ee1d3c9c1deb185af";
+
+    fn test_model_fingerprint(model_id: &str) -> ModelFingerprint {
+        ModelFingerprint {
+            model_id: model_id.to_string(),
+            model_path: PathBuf::from("model.gguf"),
+            model_size: 1,
+            model_sha256: "a".repeat(64),
+            tokenizer_sha256: "b".repeat(64),
+            chat_template_sha256: "c".repeat(64),
+            multimodal_projector_sha256: None,
+            binding_version: LLAMA_CPP_BINDING_VERSION.to_string(),
+            build_id: "test-build".to_string(),
+            backend: "cpu".to_string(),
+            context_tokens: 2_048,
+            batch_tokens: 64,
+            max_sequences: 4,
+            rope_config_sha256: "d".repeat(64),
+            kv_layout_sha256: "e".repeat(64),
+        }
+    }
+
+    fn embedding_request(model_id: &str, token_ids: Vec<i32>) -> EmbeddingBatchRequest {
+        EmbeddingBatchRequest::new(
+            "embedding-request".to_string(),
+            model_id.to_string(),
+            vec![EmbeddingInput::new("input-0".to_string(), token_ids).expect("valid input")],
+            EmbeddingPooling::None,
+            EmbeddingNormalization::None,
+        )
+        .expect("valid embedding request")
+    }
 
     #[test]
     fn reported_binding_identity_matches_the_exact_manifest_and_lock_pin() {
@@ -2874,6 +3524,196 @@ mod tests {
             assert!(block.contains("source = \"git+"));
             assert!(block.contains(&locked_source_suffix));
         }
+    }
+
+    fn reviewed_embedding_binding_surface(context: &LlamaContext<'_>) {
+        let _ = context.pooling_type();
+        let _ = context.embeddings_ith(0);
+        let _ = context.embeddings_seq_ith(0);
+    }
+
+    #[test]
+    fn reviewed_embedding_surface_resolves_through_the_single_pinned_wrapper() {
+        let _surface: fn(&LlamaContext<'_>) = reviewed_embedding_binding_surface;
+        assert_eq!(
+            llama_pooling(EmbeddingPooling::None),
+            LlamaPoolingType::None
+        );
+        assert_eq!(
+            llama_pooling(EmbeddingPooling::Mean),
+            LlamaPoolingType::Mean
+        );
+        assert_eq!(llama_pooling(EmbeddingPooling::Cls), LlamaPoolingType::Cls);
+        assert_eq!(
+            llama_pooling(EmbeddingPooling::Last),
+            LlamaPoolingType::Last
+        );
+        assert_eq!(
+            llama_pooling(EmbeddingPooling::Rank),
+            LlamaPoolingType::Rank
+        );
+        assert_eq!(
+            resolved_embedding_pooling(LlamaPoolingType::Unspecified)
+                .expect_err("unresolved pooling must fail closed")
+                .code,
+            NativeErrorCode::UnsupportedParameter
+        );
+    }
+
+    #[test]
+    fn embedding_context_is_temporary_and_has_its_own_exact_fingerprint() {
+        let mut config = NativeModelConfig::local(PathBuf::from("model.gguf"));
+        config.batch_tokens = 64;
+        config.max_sequences = 4;
+        let generation_before = generation_context_params(&config, 2_048);
+        let generation_before_fingerprints = context_fingerprints(&generation_before);
+        assert!(!generation_before.embeddings());
+        assert_eq!(
+            generation_before.pooling_type(),
+            LlamaPoolingType::Unspecified
+        );
+
+        let embedding = embedding_context_params(&config, 2_048, 7, EmbeddingPooling::Mean);
+        assert!(embedding.embeddings());
+        assert_eq!(embedding.pooling_type(), LlamaPoolingType::Mean);
+        assert_eq!(embedding.n_batch(), 7);
+        assert_eq!(embedding.n_seq_max(), 1);
+        let execution =
+            embedding_execution_fingerprint(&test_model_fingerprint("model"), &embedding);
+        assert_eq!(execution.context_tokens, 2_048);
+        assert_eq!(execution.batch_tokens, 7);
+        assert_eq!(execution.max_sequences, 1);
+        assert_ne!(execution.kv_layout_sha256, "e".repeat(64));
+
+        let generation_after = generation_context_params(&config, 2_048);
+        assert!(!generation_after.embeddings());
+        assert_eq!(
+            generation_after.pooling_type(),
+            LlamaPoolingType::Unspecified
+        );
+        assert_eq!(
+            context_fingerprints(&generation_after),
+            generation_before_fingerprints
+        );
+    }
+
+    #[test]
+    fn embedding_normalization_is_row_local_and_fail_closed() {
+        let mut values = vec![3.0, 4.0, 0.0, 0.0, 5.0, 12.0];
+        apply_embedding_normalization(&mut values, 2, 3, EmbeddingNormalization::L2)
+            .expect("nonzero finite rows normalize");
+        assert!((values[0] - 0.6).abs() < 1.0e-6);
+        assert!((values[1] - 0.8).abs() < 1.0e-6);
+        assert!((values[4] - (5.0 / 13.0)).abs() < 1.0e-6);
+        assert!((values[5] - (12.0 / 13.0)).abs() < 1.0e-6);
+        for row in values.chunks_exact(3) {
+            let norm = row.iter().map(|value| value * value).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1.0e-6);
+        }
+
+        let mut unchanged = vec![1.0, 2.0];
+        apply_embedding_normalization(&mut unchanged, 1, 2, EmbeddingNormalization::None)
+            .expect("finite unnormalized rows remain valid");
+        assert_eq!(unchanged, vec![1.0, 2.0]);
+
+        let mut zero = vec![0.0, 0.0];
+        let zero_error = apply_embedding_normalization(&mut zero, 1, 2, EmbeddingNormalization::L2)
+            .expect_err("zero-norm rows must fail");
+        assert_eq!(zero_error.code, NativeErrorCode::ModelInvalid);
+
+        let mut non_finite = vec![f32::NAN];
+        let finite_error =
+            apply_embedding_normalization(&mut non_finite, 1, 1, EmbeddingNormalization::None)
+                .expect_err("non-finite model outputs must fail");
+        assert_eq!(finite_error.code, NativeErrorCode::ModelInvalid);
+    }
+
+    #[test]
+    fn embedding_cancellation_is_typed_and_ticket_scoped() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        check_embedding_cancellation(&cancellation).expect("unset cancellation permits work");
+        let (_result_tx, result_rx) = bounded::<NativeResult<EmbeddingBatchOutput>>(1);
+        let ticket = EmbeddingTicket {
+            request_id: "embedding-request".to_string(),
+            result: result_rx,
+            cancellation: Arc::clone(&cancellation),
+        };
+        ticket.cancel();
+        assert!(cancellation.load(Ordering::Acquire));
+        assert_eq!(
+            check_embedding_cancellation(&cancellation)
+                .expect_err("set cancellation must stop work")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+    }
+
+    #[test]
+    fn embedding_request_requires_the_ready_matching_resident_model() {
+        let request = embedding_request("other-model", vec![1]);
+        let ready = ResidentModelStatus {
+            model_id: "model".to_string(),
+            state: ModelRuntimeState::Ready,
+            fingerprint: Some(test_model_fingerprint("model")),
+            descriptor: None,
+            active_sequences: 0,
+            max_sequences: 1,
+        };
+        let mismatch = validate_embedding_batch_request(&request, &ready)
+            .expect_err("a different model ID must fail admission");
+        assert_eq!(mismatch.code, NativeErrorCode::ModelNotLoaded);
+
+        let mut not_ready = ready;
+        not_ready.state = ModelRuntimeState::Stopped;
+        let request = embedding_request("model", vec![1]);
+        let state_error = validate_embedding_batch_request(&request, &not_ready)
+            .expect_err("a stopped model must fail admission");
+        assert_eq!(state_error.code, NativeErrorCode::ModelNotLoaded);
+    }
+
+    #[test]
+    fn embedding_token_ids_must_fit_the_live_vocabulary() {
+        let request = embedding_request("model", vec![0, 9]);
+        validate_embedding_token_ids_in_vocab(10, &request)
+            .expect("upper-exclusive vocabulary range accepts its last token");
+
+        let request = embedding_request("model", vec![10]);
+        let range_error = validate_embedding_token_ids_in_vocab(10, &request)
+            .expect_err("a token equal to vocabulary size must fail");
+        assert_eq!(range_error.code, NativeErrorCode::InvalidConfig);
+        assert!(range_error.message.contains("token ID 10"));
+
+        let empty_vocab_error = validate_embedding_token_ids_in_vocab(0, &request)
+            .expect_err("an empty reported vocabulary must fail");
+        assert_eq!(empty_vocab_error.code, NativeErrorCode::ModelInvalid);
+    }
+
+    #[test]
+    fn embedding_value_budget_fails_before_context_creation_or_decode() {
+        validate_embedding_output_budget([2, 3], EmbeddingPooling::None, 8)
+            .expect("small unpooled outputs fit");
+        validate_embedding_output_budget([usize::MAX], EmbeddingPooling::Mean, 8)
+            .expect("pooled output size does not scale with token count");
+
+        let oversized_rows = MAX_EMBEDDING_VALUES_PER_OUTPUT / 8 + 1;
+        let output_error =
+            validate_embedding_output_budget([oversized_rows], EmbeddingPooling::None, 8)
+                .expect_err("an oversized per-token output must fail preflight");
+        assert_eq!(output_error.code, NativeErrorCode::InvalidConfig);
+
+        let rows_per_input = MAX_EMBEDDING_VALUES_PER_OUTPUT / 8;
+        let batch_error =
+            validate_embedding_output_budget([rows_per_input; 5], EmbeddingPooling::None, 8)
+                .expect_err("an oversized aggregate batch must fail preflight");
+        assert_eq!(batch_error.code, NativeErrorCode::InvalidConfig);
+
+        let width_error = validate_embedding_output_budget(
+            [1],
+            EmbeddingPooling::Mean,
+            MAX_EMBEDDING_DIMENSIONS as usize + 1,
+        )
+        .expect_err("an impossible model width must fail preflight");
+        assert_eq!(width_error.code, NativeErrorCode::ModelInvalid);
     }
 
     #[test]
@@ -3375,6 +4215,155 @@ mod tests {
             })
             .expect_err("unverified FIM must fail closed");
         assert_eq!(error.code, NativeErrorCode::UnsupportedPromptForm);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires MOM_LLAMA_MODEL_PATH and a real local GGUF"]
+    fn real_per_token_embeddings_preserve_generation_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let model_path = std::env::var("MOM_LLAMA_MODEL_PATH")?;
+        let mut config = NativeModelConfig::local(PathBuf::from(model_path));
+        config.device = NativeDevice::Cpu;
+        config.context_tokens = 512;
+        config.batch_tokens = 64;
+        config.max_sequences = 1;
+        let handle = NativeModelHandle::load(config)?;
+        let status_before = handle.status();
+        let resident_fingerprint = status_before
+            .fingerprint
+            .clone()
+            .expect("loaded model has a resident fingerprint");
+        let model_id = status_before.model_id;
+
+        let prepared = handle.prepare_input(GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Text {
+                text: "Once upon a time, the locked garden opened at midnight.".to_string(),
+                special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+            }],
+        })?;
+        let mut exact_tokens = prepared[0].token_ids.clone();
+        exact_tokens.truncate(8);
+        assert!(
+            exact_tokens.len() >= 2,
+            "the real tokenizer must produce at least two test tokens"
+        );
+
+        let generation_request = |request_id: &str| GenerationRequest {
+            request_id: request_id.to_string(),
+            model_id: model_id.clone(),
+            input: GenerationInput::Completion {
+                prompts: vec![CompletionPrompt::Tokens {
+                    token_ids: exact_tokens.clone(),
+                }],
+            },
+            sampling: SamplingConfig {
+                seed: 91,
+                temperature: 0.0,
+                max_tokens: 2,
+                ..SamplingConfig::default()
+            },
+            media: Vec::new(),
+            cached_prefix: None,
+        };
+        let before = handle
+            .generate(generation_request("embedding-baseline-before"))?
+            .wait_timeout(Duration::from_secs(120))?;
+
+        let input_tokens = [exact_tokens.clone(), exact_tokens[..2].to_vec()];
+        let embedding = handle
+            .embed_batch(EmbeddingBatchRequest::new(
+                "real-per-token-embedding".to_string(),
+                model_id.clone(),
+                vec![
+                    EmbeddingInput::new("full".to_string(), input_tokens[0].clone())?,
+                    EmbeddingInput::new("prefix".to_string(), input_tokens[1].clone())?,
+                ],
+                EmbeddingPooling::None,
+                EmbeddingNormalization::None,
+            )?)?
+            .wait_timeout(Duration::from_secs(120))?;
+
+        assert_eq!(embedding.request_id(), "real-per-token-embedding");
+        assert_eq!(embedding.model_id(), model_id);
+        assert_eq!(embedding.config().pooling(), EmbeddingPooling::None);
+        assert!(embedding.config().dimensions() > 0);
+        assert_eq!(embedding.outputs().len(), input_tokens.len());
+        for (index, (output, expected_tokens)) in embedding
+            .outputs()
+            .iter()
+            .zip(input_tokens.iter())
+            .enumerate()
+        {
+            assert_eq!(output.input_index(), index);
+            assert_eq!(output.token_ids(), expected_tokens);
+            assert_eq!(output.row_count() as usize, expected_tokens.len());
+            assert_eq!(
+                output.values().len(),
+                expected_tokens.len() * embedding.config().dimensions() as usize
+            );
+            assert!(output.values().iter().all(|value| value.is_finite()));
+            assert_eq!(
+                output
+                    .values()
+                    .chunks_exact(embedding.config().dimensions() as usize)
+                    .count(),
+                expected_tokens.len()
+            );
+        }
+        assert_eq!(embedding.evidence().transport(), NativeTransport::InProcess);
+        assert!(embedding.evidence().real_engine_invoked());
+        assert!(!embedding.evidence().fake_fixture());
+        assert_eq!(
+            embedding.model_fingerprint().model_sha256,
+            resident_fingerprint.model_sha256
+        );
+        assert_eq!(
+            embedding.model_fingerprint().tokenizer_sha256,
+            resident_fingerprint.tokenizer_sha256
+        );
+        assert_eq!(
+            embedding.model_fingerprint().batch_tokens,
+            exact_tokens.len() as u32
+        );
+        assert_eq!(embedding.model_fingerprint().max_sequences, 1);
+        assert_ne!(
+            embedding.model_fingerprint().kv_layout_sha256,
+            resident_fingerprint.kv_layout_sha256
+        );
+
+        let status_after_embedding = handle.status();
+        assert_eq!(
+            status_after_embedding.fingerprint.as_ref(),
+            Some(&resident_fingerprint),
+            "a temporary embedding context must not replace resident generation identity"
+        );
+        let embedding_capabilities = status_after_embedding
+            .descriptor
+            .as_ref()
+            .expect("loaded model descriptor remains present")
+            .capabilities
+            .exact
+            .evidence
+            .embeddings;
+        assert_eq!(
+            embedding_capabilities.declaration(),
+            CapabilityDeclarationStatus::Inspected
+        );
+        assert!(embedding_capabilities.pooling().none);
+        assert_eq!(
+            embedding_capabilities.dimensions(),
+            Some(embedding.config().dimensions())
+        );
+
+        let after = handle
+            .generate(generation_request("embedding-baseline-after"))?
+            .wait_timeout(Duration::from_secs(120))?;
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 1);
+        assert_eq!(before[0].generated_token_ids, after[0].generated_token_ids);
+        assert_eq!(before[0].text, after[0].text);
+        assert_eq!(before[0].state, after[0].state);
         Ok(())
     }
 }
