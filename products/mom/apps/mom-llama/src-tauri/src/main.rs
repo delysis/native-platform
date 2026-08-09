@@ -65,12 +65,6 @@ fn main() {
             commands::mom_llama_persona_group_create,
             commands::mom_llama_persona_group_update,
             commands::mom_llama_persona_group_delete,
-            commands::mom_llama_consult_panel_list,
-            commands::mom_llama_consult_panel_create,
-            commands::mom_llama_consult_start,
-            commands::mom_llama_consult_status,
-            commands::mom_llama_consult_cancel,
-            commands::mom_llama_consult_synthesize,
             commands::mom_llama_conversation_new,
             commands::mom_llama_conversation_list,
             commands::mom_llama_conversation_select,
@@ -95,6 +89,7 @@ fn main() {
             commands::mom_llama_attachment_import,
             commands::mom_llama_attachment_list,
             commands::mom_llama_attachment_preview,
+            commands::mom_llama_attachment_preview_bytes,
             commands::mom_llama_settings_get,
             commands::mom_llama_settings_reset,
             commands::mom_llama_settings_update,
@@ -122,10 +117,6 @@ fn main() {
             commands::mom_llama_tool_permission_list,
             commands::mom_llama_tool_permission_set,
             commands::mom_llama_tool_permission_revoke,
-            commands::mom_llama_server_configure,
-            commands::mom_llama_server_status,
-            commands::mom_llama_server_start,
-            commands::mom_llama_server_stop,
             commands::mom_llama_model_slot_list,
             commands::mom_llama_model_slot_load,
             commands::mom_llama_model_slot_unload,
@@ -223,14 +214,25 @@ fn gateway_store_error(error: impl std::fmt::Display) -> GatewayError {
 
 fn smoke() -> Result<()> {
     let app_html = view::render_app()?;
-    let smoke = json!({
-        "schema": "mom_llama.tauri_app_smoke.v1",
+    let smoke = smoke_receipt(app_html.len());
+    println!("{}", serde_json::to_string_pretty(&smoke)?);
+    Ok(())
+}
+
+fn smoke_receipt(rendered_html_bytes: usize) -> serde_json::Value {
+    let distinct_contract_command_count = view::CONTROL_SPECS
+        .iter()
+        .map(|control| control.command)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    json!({
+        "schema": "mom_llama.tauri_app_smoke.v2",
         "status": "passed",
+        "scope": "render-and-control-registry",
         "runtime": "tauri-maud-htmx",
-        "rendered_html_bytes": app_html.len(),
-        "visible_command_count": view::CONTROL_SPECS.len(),
-        "forbidden_frontend_frameworks": false,
-        "localhost_core_route_shim": false,
+        "rendered_html_bytes": rendered_html_bytes,
+        "registered_affordance_count": view::CONTROL_SPECS.len(),
+        "distinct_contract_command_count": distinct_contract_command_count,
         "commands": view::CONTROL_SPECS.iter().map(|control| {
             json!({
                 "affordance": control.affordance,
@@ -240,7 +242,27 @@ fn smoke() -> Result<()> {
                 "effect": control.effect,
             })
         }).collect::<Vec<_>>(),
-    });
-    println!("{}", serde_json::to_string_pretty(&smoke)?);
-    Ok(())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::smoke_receipt;
+
+    #[test]
+    fn smoke_receipt_reports_only_derived_registry_evidence() {
+        let receipt = smoke_receipt(123);
+        assert_eq!(receipt["schema"], "mom_llama.tauri_app_smoke.v2");
+        assert_eq!(receipt["scope"], "render-and-control-registry");
+        assert_eq!(receipt["rendered_html_bytes"], 123);
+        assert!(receipt["registered_affordance_count"].as_u64().is_some());
+        assert!(
+            receipt["distinct_contract_command_count"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(receipt.get("visible_command_count").is_none());
+        assert!(receipt.get("forbidden_frontend_frameworks").is_none());
+        assert!(receipt.get("localhost_core_route_shim").is_none());
+    }
 }

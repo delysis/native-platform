@@ -1,15 +1,17 @@
 use llama_native_types::NativeDevice;
 use mom_llama_runtime::{
-    ChatSendInput, ChatSendOptions, ConsultPersona, ConsultStartInput, ConsultStartOptions,
-    ConversationExportFormat, EngineCheckOptions, KvCachePolicy, config::SettingsUpdate,
+    ChatSendInput, ChatSendOptions, ConversationExportFormat, EngineCheckOptions, KvCachePolicy,
+    PathSelection, PathSelectionKind, config::SettingsUpdate,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use rfd::FileDialog;
 use serde::Deserialize;
 use serde_json::{Value, to_value};
 use std::path::PathBuf;
 use tauri::ipc::Response;
 use tauri::{Emitter, Window};
+
+const MAX_ATTACHMENT_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
 
 #[tauri::command]
 pub fn mom_llama_render_app() -> Result<Response, String> {
@@ -37,9 +39,15 @@ pub fn mom_llama_render_settings_fragment() -> Result<Response, String> {
 }
 
 #[tauri::command]
-#[cfg(target_os = "macos")]
-pub async fn mom_llama_pick_file(kind: String) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+pub async fn mom_llama_pick_file(kind: String) -> Result<Value, String> {
+    let Some(path_kind) = PathSelectionKind::parse(&kind) else {
+        return picker_blocked(
+            "path_selection_kind_invalid",
+            format!("Unsupported native file picker kind: {kind}"),
+        );
+    };
+    let path = tauri::async_runtime::spawn_blocking(move || {
         let dialog = match kind.as_str() {
             "model" => {
                 let dialog = FileDialog::new().add_filter("GGUF model", &["gguf"]);
@@ -51,25 +59,51 @@ pub async fn mom_llama_pick_file(kind: String) -> Result<Option<String>, String>
             "mmproj" => FileDialog::new().add_filter("GGUF projector", &["gguf"]),
             "conversation" => FileDialog::new().add_filter("Conversation", &["json"]),
             "attachment" => FileDialog::new().add_filter(
-                "Supported attachment",
+                "Documents and media",
                 &[
-                    "txt", "md", "csv", "json", "png", "jpg", "jpeg", "webp", "wav", "mp3", "flac",
-                    "pdf",
+                    "txt", "md", "markdown", "rst", "rtf", "tex", "csv", "tsv", "json", "jsonl",
+                    "yaml", "yml", "toml", "ini", "cfg", "xml", "html", "htm", "css", "svg", "vtt",
+                    "srt", "ipynb", "log", "sql", "c", "h", "cpp", "hpp", "rs", "py", "js", "jsx",
+                    "ts", "tsx", "java", "go", "swift", "sh", "pdf", "doc", "docx", "xls", "xlsx",
+                    "ppt", "pptx", "odt", "ods", "odp", "pages", "numbers", "key", "epub", "eml",
+                    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "avif", "wav",
+                    "mp3", "flac", "ogg", "opus", "m4a", "aac", "aif", "aiff", "caf", "mp4", "m4v",
+                    "mov", "webm", "mkv", "avi", "zip", "tar", "gz", "tgz", "bz2", "tbz2", "xz",
+                    "txz", "zst", "7z",
                 ],
             ),
             "mcp" => FileDialog::new(),
-            other => return Err(format!("unsupported native file picker kind: {other}")),
+            _ => unreachable!("validated path selection kind"),
         };
-        Ok(dialog.pick_file().map(|path| path.display().to_string()))
+        dialog.pick_file()
     })
     .await
-    .map_err(|error| format!("native file picker task failed: {error}"))?
+    .map_err(|error| format!("native file picker task failed: {error}"))?;
+    command_value(mom_llama_runtime::path_select(path_kind, path))
 }
 
 #[tauri::command]
-#[cfg(not(target_os = "macos"))]
-pub async fn mom_llama_pick_file(_kind: String) -> Result<Option<String>, String> {
-    Err("The native file picker is currently available in the macOS release target.".to_string())
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+pub async fn mom_llama_pick_file(_kind: String) -> Result<Value, String> {
+    picker_blocked(
+        "native_file_picker_unsupported",
+        "The native file picker is unavailable on this build. Enter or paste an absolute path instead."
+            .to_string(),
+    )
+}
+
+fn picker_blocked(code: &str, message: String) -> Result<Value, String> {
+    command_value(Ok(
+        mom_llama_runtime::CommandResult::<PathSelection>::blocked(
+            "mom_llama.path_select",
+            "stub_blocked",
+            mom_llama_runtime::Blocker::new(
+                code,
+                message,
+                vec!["Enter or paste an absolute path instead.".to_string()],
+            ),
+        ),
+    ))
 }
 
 #[tauri::command]
@@ -328,64 +362,6 @@ pub async fn mom_llama_chat_continue(conversation: String) -> Result<Value, Stri
 }
 
 #[tauri::command]
-pub fn mom_llama_consult_panel_list() -> Result<Value, String> {
-    command_value(mom_llama_runtime::consult_panel_list())
-}
-
-#[tauri::command]
-pub fn mom_llama_consult_panel_create(
-    name: String,
-    personas: Vec<ConsultPersona>,
-) -> Result<Value, String> {
-    command_value(mom_llama_runtime::consult_panel_create(name, personas))
-}
-
-#[tauri::command]
-pub async fn mom_llama_consult_start(
-    window: Window,
-    conversation: String,
-    prompt: String,
-    panel: Option<String>,
-) -> Result<Value, String> {
-    let events = window.clone();
-    blocking_command(move || {
-        mom_llama_runtime::consult_start_stream(
-            ConsultStartInput {
-                conversation_id: conversation,
-                prompt,
-                panel_id: panel,
-            },
-            ConsultStartOptions::default(),
-            Some(move |event| {
-                events
-                    .emit("mom_llama_consult_stream", &event)
-                    .map_err(anyhow::Error::new)?;
-                Ok(())
-            }),
-        )
-    })
-    .await
-}
-
-#[tauri::command]
-pub fn mom_llama_consult_status(run: String) -> Result<Value, String> {
-    command_value(mom_llama_runtime::consult_status(&run))
-}
-
-#[tauri::command]
-pub fn mom_llama_consult_cancel(run: String, seat: Option<String>) -> Result<Value, String> {
-    command_value(mom_llama_runtime::consult_cancel(&run, seat.as_deref()))
-}
-
-#[tauri::command]
-pub async fn mom_llama_consult_synthesize(
-    run: String,
-    seats: Vec<String>,
-) -> Result<Value, String> {
-    blocking_command(move || mom_llama_runtime::consult_synthesize(&run, seats)).await
-}
-
-#[tauri::command]
 pub fn mom_llama_conversation_new(title: Option<String>) -> Result<Value, String> {
     command_value(mom_llama_runtime::conversation_new(title))
 }
@@ -560,7 +536,40 @@ pub fn mom_llama_attachment_list(conversation: Option<String>) -> Result<Value, 
 
 #[tauri::command]
 pub fn mom_llama_attachment_preview(attachment: String) -> Result<Value, String> {
-    command_value(mom_llama_runtime::attachment_preview(&attachment, true))
+    command_value(mom_llama_runtime::attachment_preview(&attachment, false))
+}
+
+#[tauri::command]
+pub fn mom_llama_attachment_preview_bytes(attachment: String) -> Result<Response, String> {
+    let preview = mom_llama_runtime::attachment_preview(&attachment, false).map_err(to_error)?;
+    let metadata = preview.result.ok_or_else(|| {
+        preview
+            .blocker
+            .map(|blocker| format!("{}: {}", blocker.code, blocker.message))
+            .unwrap_or_else(|| {
+                "attachment_preview_unavailable: Preview metadata is unavailable.".to_string()
+            })
+    })?;
+    ensure_attachment_preview_size(&metadata.attachment.file_name, metadata.attachment.bytes)?;
+
+    let bytes = mom_llama_runtime::attachments::attachment_bytes(&attachment)
+        .map_err(to_error)?
+        .ok_or_else(|| {
+            "attachment_content_missing: The attachment metadata exists, but its content is unavailable."
+                .to_string()
+        })?;
+    let loaded_bytes = u64::try_from(bytes.len()).map_err(|_| {
+        "attachment_preview_too_large: Attachment size does not fit in u64.".to_string()
+    })?;
+    ensure_attachment_preview_size(&metadata.attachment.file_name, loaded_bytes)?;
+    if loaded_bytes != metadata.attachment.bytes {
+        return Err(format!(
+            "attachment_content_size_mismatch: Attachment `{}` declares {} bytes but loaded {} bytes.",
+            metadata.attachment.file_name, metadata.attachment.bytes, loaded_bytes
+        ));
+    }
+
+    Ok(Response::new(bytes))
 }
 
 #[tauri::command]
@@ -846,34 +855,6 @@ pub fn mom_llama_tool_permission_revoke(server: String, tool: String) -> Result<
 }
 
 #[tauri::command]
-pub fn mom_llama_server_configure(
-    model_path: Option<String>,
-    slots: Option<u32>,
-    memory_budget_mib: Option<u64>,
-) -> Result<Value, String> {
-    command_value(mom_llama_runtime::server_configure(
-        model_path.map(PathBuf::from),
-        slots,
-        memory_budget_mib.map(mib_to_bytes),
-    ))
-}
-
-#[tauri::command]
-pub fn mom_llama_server_status() -> Result<Value, String> {
-    command_value(mom_llama_runtime::server_status())
-}
-
-#[tauri::command]
-pub fn mom_llama_server_start() -> Result<Value, String> {
-    command_value(mom_llama_runtime::server_start())
-}
-
-#[tauri::command]
-pub fn mom_llama_server_stop() -> Result<Value, String> {
-    command_value(mom_llama_runtime::server_stop())
-}
-
-#[tauri::command]
 pub fn mom_llama_model_slot_list() -> Result<Value, String> {
     command_value(mom_llama_runtime::model_slot_list())
 }
@@ -910,6 +891,15 @@ fn mib_to_bytes(value: u64) -> u64 {
     value.saturating_mul(1024 * 1024)
 }
 
+fn ensure_attachment_preview_size(file_name: &str, bytes: u64) -> Result<(), String> {
+    if bytes <= MAX_ATTACHMENT_PREVIEW_BYTES {
+        return Ok(());
+    }
+    Err(format!(
+        "attachment_preview_too_large: Attachment `{file_name}` is {bytes} bytes; inline previews are limited to {MAX_ATTACHMENT_PREVIEW_BYTES} bytes."
+    ))
+}
+
 fn markup_response(result: anyhow::Result<String>) -> Result<Response, String> {
     result
         .map(|markup| Response::new(markup.into_bytes()))
@@ -941,5 +931,21 @@ fn kv_policy_from_str(value: &str) -> KvCachePolicy {
         "prompt_prefix" => KvCachePolicy::PromptPrefix,
         "kv_cache_candidate" => KvCachePolicy::KvCacheCandidate,
         _ => KvCachePolicy::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_ATTACHMENT_PREVIEW_BYTES, ensure_attachment_preview_size};
+
+    #[test]
+    fn attachment_preview_cap_is_checked_at_the_exact_boundary() {
+        assert!(ensure_attachment_preview_size("within.png", MAX_ATTACHMENT_PREVIEW_BYTES).is_ok());
+        let error = ensure_attachment_preview_size(
+            "too-large.png",
+            MAX_ATTACHMENT_PREVIEW_BYTES.saturating_add(1),
+        )
+        .expect_err("a preview over the hard byte ceiling must fail closed");
+        assert!(error.starts_with("attachment_preview_too_large:"));
     }
 }

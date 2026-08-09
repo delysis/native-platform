@@ -5,16 +5,14 @@ use crate::store::RuntimeStore;
 use anyhow::Result;
 use llama_native_types::SamplingConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const CONVERSATIONS_FILE: &str = "conversations.json";
 const DRAFTS_FILE: &str = "drafts.json";
-const CONVERSATIONS_NAMESPACE: &str = "conversations.v2";
-const DRAFTS_NAMESPACE: &str = "drafts.v2";
-const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
+pub(crate) const CONVERSATIONS_NAMESPACE: &str = "conversations.v2";
+pub(crate) const DRAFTS_NAMESPACE: &str = "drafts.v2";
 const NEW_CHAT_DRAFT_KEY: &str = "__new_chat__";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,6 +140,8 @@ pub struct Message {
     pub branch_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribution: Option<MessageAttribution>,
+    #[serde(default)]
+    pub attachment_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -258,6 +258,8 @@ pub struct MessageCopy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TextAttachmentImport {
     pub conversation_id: String,
+    #[serde(default)]
+    pub attachment_id: String,
     pub message_id: String,
     pub file_name: String,
     pub bytes: u64,
@@ -477,26 +479,46 @@ pub fn conversation_system_message_update(
 
 pub fn conversation_delete(id: &str) -> Result<CommandResult<ConversationMutation>> {
     let mut db = load_db()?;
-    let before = db.conversations.len();
-    db.conversations
-        .retain(|conversation| conversation.id != id);
-    let changed = before != db.conversations.len();
-    if !changed {
+    let Some(index) = db
+        .conversations
+        .iter()
+        .position(|conversation| conversation.id == id)
+    else {
         return Ok(conversation_not_found("mom_llama.conversation_delete", id));
-    }
+    };
+    let removed = db.conversations.remove(index);
+    let mut removed_attachment_ids = removed
+        .messages
+        .iter()
+        .flat_map(|message| message.attachment_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut drafts = load_drafts()?;
+    drafts.drafts.retain(|draft| {
+        if draft.conversation_id.as_deref() == Some(id) {
+            removed_attachment_ids.extend(draft.attachment_ids.iter().cloned());
+            false
+        } else {
+            true
+        }
+    });
     if db.selected_conversation_id.as_deref() == Some(id) {
         db.selected_conversation_id = db
             .conversations
             .first()
             .map(|conversation| conversation.id.clone());
     }
-    let path = save_db(&db)?;
+    let path = crate::attachments::persist_conversations_with_attachment_gc(
+        &db,
+        Some(&drafts),
+        &removed_attachment_ids,
+        &BTreeSet::from([id.to_string()]),
+    )?;
     Ok(CommandResult::passed(
         "mom_llama.conversation_delete",
         "contracted",
         ConversationMutation {
             conversation_id: id.to_string(),
-            changed,
+            changed: true,
         },
         vec![path.display().to_string()],
         Vec::new(),
@@ -508,6 +530,24 @@ pub fn conversation_delete(id: &str) -> Result<CommandResult<ConversationMutatio
 pub fn conversation_import_json(content: &str) -> Result<CommandResult<Conversation>> {
     let mut imported = serde_json::from_str::<Conversation>(content)?;
     let mut db = load_db()?;
+    let handle = match crate::personas::validate_imported_conversation_handle(
+        &db,
+        &imported.execution_profile.mention_handle,
+        &imported.title,
+    )? {
+        Ok(handle) => handle,
+        Err(blocker) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.conversation_import",
+                "stub_blocked",
+                blocker,
+            ));
+        }
+    };
+    imported.execution_profile.mention_handle = handle;
+    if imported.execution_profile.model_path.is_none() {
+        imported.execution_profile.model_path = imported.selected_model_path.clone();
+    }
     if imported.id.trim().is_empty()
         || db
             .conversations
@@ -515,9 +555,9 @@ pub fn conversation_import_json(content: &str) -> Result<CommandResult<Conversat
             .any(|conversation| conversation.id == imported.id)
     {
         imported.id = Uuid::new_v4().to_string();
-        for message in &mut imported.messages {
-            message.conversation_id = imported.id.clone();
-        }
+    }
+    for message in &mut imported.messages {
+        message.conversation_id = imported.id.clone();
     }
     imported.updated_at = now_ms().to_string();
     db.selected_conversation_id = Some(imported.id.clone());
@@ -608,6 +648,18 @@ pub fn message_edit(
     else {
         return Ok(message_not_found("mom_llama.message_edit", message_id));
     };
+    if matches!(&message.role, MessageRole::System | MessageRole::Tool) {
+        return Ok(CommandResult::blocked(
+            "mom_llama.message_edit",
+            "stub_blocked",
+            Blocker::new(
+                "message_role_not_editable",
+                format!("{:?} messages cannot be edited.", message.role),
+                vec!["Edit the conversation system message or rerun the tool instead.".to_string()],
+            ),
+        ));
+    }
+    let attribution = message.attribution.clone();
     let mut edited = message;
     edited.id = Uuid::new_v4().to_string();
     edited.content = content;
@@ -615,8 +667,15 @@ pub fn message_edit(
     edited.receipt_id = None;
     edited.branch_index = None;
     edited.branch_count = None;
-    conversation.active_leaf_message_id = Some(edited.id.clone());
     conversation.messages.push(edited.clone());
+    conversation.active_leaf_message_id = Some(
+        attribution
+            .as_ref()
+            .and_then(|attribution| {
+                clone_later_attributed_peers(conversation, message_id, &edited.id, attribution)
+            })
+            .unwrap_or_else(|| edited.id.clone()),
+    );
     conversation.updated_at = now_ms().to_string();
     if conversation.kind == ConversationKind::PersonaTemplate {
         conversation.execution_profile.version =
@@ -654,15 +713,38 @@ pub fn message_delete(
             conversation_id,
         ));
     };
-    let Some(parent_id) = conversation
+    let Some(target) = conversation
         .messages
         .iter()
         .find(|message| message.id == message_id)
-        .map(|message| message.parent_id.clone())
+        .cloned()
     else {
         return Ok(message_not_found("mom_llama.message_delete", message_id));
     };
-    let removed = descendant_ids(conversation, message_id);
+    let parent_id = target.parent_id.clone();
+    let removed = if target.attribution.is_some() {
+        // Mention results are independent responses that happen to be linked as a
+        // chain so the ordinary single-leaf projection can display all of them.
+        // Splice a deleted result out of that display chain rather than treating
+        // every later peer (and the user's subsequent conversation) as its
+        // semantic descendants.
+        for child in conversation
+            .messages
+            .iter_mut()
+            .filter(|message| message.parent_id.as_deref() == Some(message_id))
+        {
+            child.parent_id.clone_from(&parent_id);
+        }
+        HashSet::from([message_id.to_string()])
+    } else {
+        descendant_ids(conversation, message_id)
+    };
+    let removed_attachment_ids = conversation
+        .messages
+        .iter()
+        .filter(|message| removed.contains(&message.id))
+        .flat_map(|message| message.attachment_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
     let before = conversation.messages.len();
     conversation
         .messages
@@ -683,7 +765,12 @@ pub fn message_delete(
         conversation.execution_profile.version =
             conversation.execution_profile.version.saturating_add(1);
     }
-    let path = save_db(&db)?;
+    let path = crate::attachments::persist_conversations_with_attachment_gc(
+        &db,
+        None,
+        &removed_attachment_ids,
+        &BTreeSet::new(),
+    )?;
     Ok(CommandResult::passed(
         "mom_llama.message_delete",
         "contracted",
@@ -748,19 +835,17 @@ pub fn conversation_fork(
             conversation_id,
         ));
     };
-    let Some(index) = source
-        .messages
-        .iter()
-        .position(|message| message.id == message_id)
-    else {
+    let active = active_path_messages(&source);
+    let Some(index) = active.iter().position(|message| message.id == message_id) else {
         return Ok(message_not_found("mom_llama.conversation_fork", message_id));
     };
     let now = now_ms().to_string();
     let fork_id = Uuid::new_v4().to_string();
-    let mut messages = source.messages[..=index].to_vec();
+    let mut messages = active[..=index].to_vec();
     for message in &mut messages {
         message.conversation_id = fork_id.clone();
     }
+    crate::attachments::snapshot_message_attachments(&fork_id, &mut messages)?;
     let fork = Conversation {
         id: fork_id.clone(),
         title: format!("{} fork", source.title),
@@ -970,6 +1055,18 @@ pub fn draft_update(
 ) -> Result<CommandResult<DraftMessage>> {
     let mut db = load_drafts()?;
     let key = draft_key(conversation_id);
+    let previous_attachment_ids = db
+        .drafts
+        .iter()
+        .find(|draft| draft_key(draft.conversation_id.as_deref()) == key)
+        .map(|draft| {
+            draft
+                .attachment_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     let draft = DraftMessage {
         conversation_id: conversation_id.map(str::to_string),
         message,
@@ -988,7 +1085,16 @@ pub fn draft_update(
     } else {
         db.drafts.push(draft.clone());
     }
-    let path = save_drafts(&db)?;
+    let retained_attachment_ids = draft
+        .attachment_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let removed_attachment_ids = previous_attachment_ids
+        .difference(&retained_attachment_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let path = crate::attachments::persist_drafts_with_attachment_gc(&db, &removed_attachment_ids)?;
     Ok(CommandResult::passed(
         "mom_llama.draft_update",
         "contracted",
@@ -1004,9 +1110,16 @@ pub fn draft_clear(conversation_id: Option<&str>) -> Result<CommandResult<Conver
     let mut db = load_drafts()?;
     let key = draft_key(conversation_id);
     let before = db.drafts.len();
-    db.drafts
-        .retain(|draft| draft_key(draft.conversation_id.as_deref()) != key);
-    let path = save_drafts(&db)?;
+    let mut removed_attachment_ids = BTreeSet::new();
+    db.drafts.retain(|draft| {
+        if draft_key(draft.conversation_id.as_deref()) == key {
+            removed_attachment_ids.extend(draft.attachment_ids.iter().cloned());
+            false
+        } else {
+            true
+        }
+    });
+    let path = crate::attachments::persist_drafts_with_attachment_gc(&db, &removed_attachment_ids)?;
     Ok(CommandResult::passed(
         "mom_llama.draft_clear",
         "contracted",
@@ -1025,113 +1138,36 @@ pub fn text_attachment_import(
     conversation_id: &str,
     path: &Path,
 ) -> Result<CommandResult<TextAttachmentImport>> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            return Ok(CommandResult::blocked(
-                "mom_llama.attachment_import_text",
-                "stub_blocked",
+    let imported = crate::attachments::attachment_import(conversation_id, path)?;
+    if imported.status == "blocked" {
+        return Ok(CommandResult::blocked(
+            "mom_llama.attachment_import_text",
+            &imported.readiness,
+            imported.blocker.unwrap_or_else(|| {
                 Blocker::new(
-                    "attachment_not_found",
-                    format!("Text attachment {} was not found.", path.display()),
-                    vec!["Choose an existing local text file.".to_string()],
-                ),
-            ));
-        }
-    };
-    if !metadata.is_file() {
-        return Ok(CommandResult::blocked(
-            "mom_llama.attachment_import_text",
-            "stub_blocked",
-            Blocker::new(
-                "attachment_not_file",
-                format!("Text attachment {} is not a file.", path.display()),
-                vec!["Choose a local text file.".to_string()],
-            ),
+                    "attachment_import_blocked",
+                    "The attachment could not be staged.",
+                    vec!["Choose another file.".to_string()],
+                )
+            }),
         ));
     }
-    if metadata.len() > MAX_TEXT_ATTACHMENT_BYTES {
-        return Ok(CommandResult::blocked(
-            "mom_llama.attachment_import_text",
-            "stub_blocked",
-            Blocker::new(
-                "attachment_too_large",
-                format!(
-                    "Text attachment is {} bytes; P0 limit is {} bytes.",
-                    metadata.len(),
-                    MAX_TEXT_ATTACHMENT_BYTES
-                ),
-                vec!["Use a smaller text excerpt.".to_string()],
-            ),
-        ));
-    }
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_lowercase();
-    if !matches!(extension.as_str(), "txt" | "md" | "csv" | "json") {
-        return Ok(CommandResult::blocked(
-            "mom_llama.attachment_import_text",
-            "stub_blocked",
-            Blocker::new(
-                "attachment_type_unsupported",
-                "P0 only imports .txt, .md, .csv, and .json text attachments.",
-                vec!["Convert the file to a plain text format.".to_string()],
-            ),
-        ));
-    }
-    let text = fs::read_to_string(path)?;
-    let mut db = load_db()?;
-    let Some(conversation) = db
-        .conversations
-        .iter_mut()
-        .find(|conversation| conversation.id == conversation_id)
-    else {
-        return Ok(conversation_not_found(
-            "mom_llama.attachment_import_text",
-            conversation_id,
-        ));
-    };
-    let now = now_ms().to_string();
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("attachment.txt")
-        .to_string();
-    let message = Message {
-        id: Uuid::new_v4().to_string(),
-        conversation_id: conversation_id.to_string(),
-        role: MessageRole::User,
-        content: format!("Attached text file `{file_name}`:\n\n```text\n{text}\n```"),
-        created_at: now.clone(),
-        parent_id: active_leaf_id(conversation),
-        model: None,
-        receipt_id: None,
-        prompt_tokens: Some(text.split_whitespace().count()),
-        completion_tokens: None,
-        reasoning_content: None,
-        reasoning_incomplete: false,
-        branch_index: None,
-        branch_count: None,
-        attribution: None,
-    };
-    let result = TextAttachmentImport {
-        conversation_id: conversation_id.to_string(),
-        message_id: message.id.clone(),
-        file_name,
-        bytes: metadata.len(),
-    };
-    conversation.active_leaf_message_id = Some(message.id.clone());
-    conversation.messages.push(message);
-    conversation.updated_at = now;
-    let path = save_db(&db)?;
+    let attachment = imported
+        .result
+        .map(|output| output.attachment)
+        .ok_or_else(|| anyhow::anyhow!("passed attachment import had no result"))?;
     Ok(CommandResult::passed(
         "mom_llama.attachment_import_text",
         "contracted",
-        result,
-        vec![path.display().to_string()],
-        Vec::new(),
+        TextAttachmentImport {
+            conversation_id: conversation_id.to_string(),
+            attachment_id: attachment.id,
+            message_id: String::new(),
+            file_name: attachment.file_name,
+            bytes: attachment.bytes,
+        },
+        imported.receipt.changed_paths,
+        imported.receipt.artifacts_produced,
         false,
         false,
     ))
@@ -1320,6 +1356,71 @@ fn preferred_leaf_from(conversation: &Conversation, message_id: &str) -> String 
     }
 }
 
+fn clone_later_attributed_peers(
+    conversation: &mut Conversation,
+    source_message_id: &str,
+    edited_message_id: &str,
+    attribution: &MessageAttribution,
+) -> Option<String> {
+    if attribution.kind == MessageSpeakerKind::Synthesis {
+        return None;
+    }
+
+    let mut source_parent = source_message_id.to_string();
+    let mut cloned_parent = edited_message_id.to_string();
+    let mut target_order = attribution.target_order;
+    let mut cloned_any = false;
+
+    loop {
+        let next = conversation
+            .messages
+            .iter()
+            .filter(|message| {
+                message.parent_id.as_deref() == Some(source_parent.as_str())
+                    && message.role == MessageRole::Assistant
+                    && message.attribution.as_ref().is_some_and(|candidate| {
+                        candidate.invocation_id == attribution.invocation_id
+                            && candidate.kind != MessageSpeakerKind::Synthesis
+                            && candidate.target_order > target_order
+                    })
+            })
+            .min_by(|left, right| {
+                let left_order = left
+                    .attribution
+                    .as_ref()
+                    .map_or(usize::MAX, |item| item.target_order);
+                let right_order = right
+                    .attribution
+                    .as_ref()
+                    .map_or(usize::MAX, |item| item.target_order);
+                left_order
+                    .cmp(&right_order)
+                    .then_with(|| left.created_at.cmp(&right.created_at))
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+            .cloned();
+        let Some(mut next) = next else {
+            break;
+        };
+        let original_id = next.id.clone();
+        target_order = next
+            .attribution
+            .as_ref()
+            .map_or(target_order, |item| item.target_order);
+        next.id = Uuid::new_v4().to_string();
+        next.parent_id = Some(cloned_parent);
+        next.created_at = now_ms().to_string();
+        next.branch_index = None;
+        next.branch_count = None;
+        source_parent = original_id;
+        cloned_parent = next.id.clone();
+        conversation.messages.push(next);
+        cloned_any = true;
+    }
+
+    cloned_any.then_some(cloned_parent)
+}
+
 fn descendant_ids(conversation: &Conversation, message_id: &str) -> HashSet<String> {
     let mut removed = HashSet::from([message_id.to_string()]);
     loop {
@@ -1482,18 +1583,11 @@ fn snippet(content: &str, query: &str) -> String {
     collapsed.chars().skip(start).take(120).collect()
 }
 
-fn load_drafts() -> Result<DraftDb> {
+pub(crate) fn load_drafts() -> Result<DraftDb> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
     store.import_json_once::<DraftDb>(DRAFTS_NAMESPACE, &settings.data_dir.join(DRAFTS_FILE))?;
     Ok(store.get(DRAFTS_NAMESPACE)?.unwrap_or_default())
-}
-
-fn save_drafts(db: &DraftDb) -> Result<PathBuf> {
-    let settings = resolve_settings()?;
-    let store = RuntimeStore::open(&settings.data_dir)?;
-    store.put(DRAFTS_NAMESPACE, db)?;
-    Ok(store.path().to_path_buf())
 }
 
 fn draft_key(conversation_id: Option<&str>) -> String {
@@ -1525,7 +1619,26 @@ mod tests {
             branch_index: None,
             branch_count: None,
             attribution: None,
+            attachment_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn pre_attachment_messages_deserialize_with_an_empty_attachment_set() {
+        let mut encoded = serde_json::to_value(message(
+            "legacy",
+            None,
+            MessageRole::User,
+            "before attachment linkage",
+        ))
+        .expect("encode legacy message fixture");
+        encoded
+            .as_object_mut()
+            .expect("message fixture must be an object")
+            .remove("attachment_ids");
+        let decoded: Message =
+            serde_json::from_value(encoded).expect("legacy message must remain readable");
+        assert!(decoded.attachment_ids.is_empty());
     }
 
     #[test]

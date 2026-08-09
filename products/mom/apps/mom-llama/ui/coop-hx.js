@@ -33,6 +33,8 @@
   const consult = () => document.getElementById("consult-view");
   const selectedConversation = () =>
     (chat() && chat().dataset.currentConversation) || "default";
+  const selectedConversationKind = () =>
+    (chat() && chat().dataset.conversationKind) || "chat";
   const settingEnabled = (key, fallback = false) => {
     const field = document.querySelector(`[data-setting-key="${key}"]`);
     return field ? Boolean(field.checked) : fallback;
@@ -110,18 +112,77 @@
     return template.content.firstElementChild;
   };
 
-  const attachmentObjectUrls = new WeakMap();
+  const ATTACHMENT_PREVIEW_CONCURRENCY = 2;
+  const ATTACHMENT_PREVIEW_LIVE_LIMIT = 4;
+  const attachmentObjectUrls = new Map();
+  const attachmentPreviewMedia = new WeakMap();
+  const attachmentPreviewFallbacks = new WeakMap();
+  const attachmentPreviewQueue = [];
+  let attachmentPreviewLoads = 0;
+  let attachmentPreviewObserver = null;
+
+  const attachmentPreviewsWithin = (root) => {
+    if (!root) return [];
+    const previews = root.matches?.("[data-attachment-preview]") ? [root] : [];
+    previews.push(...(root.querySelectorAll?.("[data-attachment-preview]") || []));
+    return previews;
+  };
+
+  const rememberAttachmentPreviewFallback = (preview) => {
+    if (attachmentPreviewFallbacks.has(preview)) return;
+    const body = preview.querySelector(".attachment-preview-body");
+    if (!body) return;
+    attachmentPreviewFallbacks.set(
+      preview,
+      [...body.childNodes].map((node) => node.cloneNode(true)),
+    );
+  };
+
+  const restoreAttachmentPreviewFallback = (preview) => {
+    const body = preview.querySelector(".attachment-preview-body");
+    const fallback = attachmentPreviewFallbacks.get(preview);
+    if (!body || !fallback) return;
+    body.replaceChildren(...fallback.map((node) => node.cloneNode(true)));
+  };
+
+  const touchAttachmentPreview = (media) => {
+    const entry = attachmentObjectUrls.get(media);
+    if (!entry) return;
+    attachmentObjectUrls.delete(media);
+    attachmentObjectUrls.set(media, entry);
+  };
+
+  const releaseAttachmentPreview = (preview, restoreFallback = false) => {
+    const media = attachmentPreviewMedia.get(preview);
+    const entry = media && attachmentObjectUrls.get(media);
+    if (entry) URL.revokeObjectURL(entry.url);
+    if (media) attachmentObjectUrls.delete(media);
+    attachmentPreviewMedia.delete(preview);
+    if (restoreFallback) restoreAttachmentPreviewFallback(preview);
+  };
+
+  const enforceAttachmentPreviewLimit = () => {
+    while (attachmentObjectUrls.size > ATTACHMENT_PREVIEW_LIVE_LIMIT) {
+      const oldest = attachmentObjectUrls.entries().next().value;
+      if (!oldest) return;
+      const [, entry] = oldest;
+      releaseAttachmentPreview(entry.preview, true);
+      entry.preview.dataset.previewHydrated = "evicted";
+    }
+  };
 
   const releaseAttachmentObjectUrls = (root) => {
-    if (!root) return;
-    const media = root.matches?.(".attachment-preview-body img, .attachment-preview-body audio")
-      ? [root]
-      : [...root.querySelectorAll?.(".attachment-preview-body img, .attachment-preview-body audio") || []];
-    media.forEach((element) => {
-      const url = attachmentObjectUrls.get(element);
-      if (url) URL.revokeObjectURL(url);
-      attachmentObjectUrls.delete(element);
+    const previews = attachmentPreviewsWithin(root);
+    previews.forEach((preview) => {
+      preview.dataset.previewReleased = "true";
+      attachmentPreviewObserver?.unobserve(preview);
+      releaseAttachmentPreview(preview);
     });
+    for (let index = attachmentPreviewQueue.length - 1; index >= 0; index -= 1) {
+      if (previews.includes(attachmentPreviewQueue[index])) {
+        attachmentPreviewQueue.splice(index, 1);
+      }
+    }
   };
 
   const swap = async (selector, command) => {
@@ -134,40 +195,111 @@
     return replacement;
   };
 
-  const hydrateAttachmentPreviews = async (root = document) => {
-    const previews = [...root.querySelectorAll("[data-attachment-preview]:not([data-preview-hydrated])")];
-    await Promise.all(previews.map(async (preview) => {
-      try {
-        const kind = preview.dataset.attachmentKind;
-        if (!["image", "audio"].includes(kind)) {
-          preview.dataset.previewHydrated = "metadata";
-          return;
-        }
-        const result = await invoke("mom_llama_attachment_preview", {
-          attachment: preview.dataset.attachmentPreview,
-        });
-        const bytes = result?.result?.bytes;
-        const mime = result?.result?.attachment?.mime || preview.dataset.attachmentMime;
-        if (!Array.isArray(bytes) || !mime) return;
-        const url = URL.createObjectURL(new Blob([Uint8Array.from(bytes)], { type: mime }));
-        const media = document.createElement(kind === "image" ? "img" : "audio");
-        media.src = url;
-        attachmentObjectUrls.set(media, url);
-        if (kind === "image") {
-          media.alt = result?.result?.attachment?.file_name || "Local attachment";
-        } else {
-          media.controls = true;
-        }
-        preview.querySelector(".attachment-preview-body")?.replaceChildren(media);
-        preview.dataset.previewHydrated = "true";
-      } catch (error) {
-        preview.dataset.previewHydrated = "blocked";
-        preview.title = errorMessage(error);
-      }
-    }));
+  const rawAttachmentBytes = (response) => {
+    if (response instanceof ArrayBuffer) return new Uint8Array(response);
+    if (ArrayBuffer.isView(response)) {
+      return new Uint8Array(response.buffer, response.byteOffset, response.byteLength);
+    }
+    throw new Error("Attachment preview returned serialized JSON instead of raw IPC bytes.");
   };
 
-  window.addEventListener("beforeunload", () => releaseAttachmentObjectUrls(document));
+  const loadAttachmentPreview = async (preview) => {
+    if (!preview.isConnected || preview.dataset.previewReleased === "true") return;
+    const kind = preview.dataset.attachmentKind;
+    const mime = preview.dataset.attachmentMime;
+    const body = preview.querySelector(".attachment-preview-body");
+    if (!["image", "audio"].includes(kind) || !mime || !body) return;
+    preview.dataset.previewHydrated = "loading";
+    try {
+      const response = await invoke("mom_llama_attachment_preview_bytes", {
+        attachment: preview.dataset.attachmentPreview,
+      });
+      if (!preview.isConnected || preview.dataset.previewReleased === "true") return;
+      const bytes = rawAttachmentBytes(response);
+      const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+      const media = kind === "image"
+        ? document.createElement("img")
+        : createCommandElement("audio", DYNAMIC_CONTROL_SPECS.attachmentPreview);
+      media.src = url;
+      if (kind === "image") {
+        media.alt = preview.querySelector("figcaption strong")?.textContent || "Local attachment";
+      } else {
+        media.controls = true;
+      }
+      body.replaceChildren(media);
+      attachmentPreviewMedia.set(preview, media);
+      attachmentObjectUrls.set(media, { preview, url });
+      preview.dataset.previewHydrated = "true";
+      enforceAttachmentPreviewLimit();
+    } catch (error) {
+      if (!preview.isConnected || preview.dataset.previewReleased === "true") return;
+      preview.dataset.previewHydrated = "blocked";
+      preview.title = errorMessage(error);
+      attachmentPreviewObserver?.unobserve(preview);
+    }
+  };
+
+  const drainAttachmentPreviewQueue = () => {
+    while (
+      attachmentPreviewLoads < ATTACHMENT_PREVIEW_CONCURRENCY
+      && attachmentPreviewQueue.length
+    ) {
+      const preview = attachmentPreviewQueue.shift();
+      if (!preview?.isConnected || preview.dataset.previewReleased === "true") continue;
+      attachmentPreviewLoads += 1;
+      loadAttachmentPreview(preview)
+        .catch(reportError)
+        .finally(() => {
+          attachmentPreviewLoads -= 1;
+          drainAttachmentPreviewQueue();
+        });
+    }
+  };
+
+  const queueAttachmentPreview = (preview) => {
+    const state = preview.dataset.previewHydrated;
+    if (["queued", "loading", "true", "blocked", "metadata"].includes(state)) return;
+    preview.dataset.previewHydrated = "queued";
+    attachmentPreviewQueue.push(preview);
+    drainAttachmentPreviewQueue();
+  };
+
+  if ("IntersectionObserver" in window) {
+    attachmentPreviewObserver = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        const preview = entry.target;
+        const media = attachmentPreviewMedia.get(preview);
+        if (media && attachmentObjectUrls.has(media)) {
+          touchAttachmentPreview(media);
+          return;
+        }
+        queueAttachmentPreview(preview);
+      });
+    }, { rootMargin: "320px 0px" });
+  }
+
+  const hydrateAttachmentPreviews = async (root = document) => {
+    attachmentPreviewsWithin(root).forEach((preview) => {
+      delete preview.dataset.previewReleased;
+      const kind = preview.dataset.attachmentKind;
+      if (!["image", "audio"].includes(kind)) {
+        preview.dataset.previewHydrated = "metadata";
+        return;
+      }
+      rememberAttachmentPreviewFallback(preview);
+      if (attachmentPreviewObserver) {
+        attachmentPreviewObserver.observe(preview);
+      } else {
+        queueAttachmentPreview(preview);
+      }
+    });
+  };
+
+  window.addEventListener("beforeunload", () => {
+    attachmentPreviewObserver?.disconnect();
+    releaseAttachmentObjectUrls(document);
+  });
 
   const captureChatViewport = () => {
     const currentChat = chat();
@@ -210,6 +342,7 @@
     const viewport = captureChatViewport();
     const replacement = await swap("#chat", "mom_llama_render_chat_fragment");
     if (replacement) await hydrateAttachmentPreviews(replacement);
+    renderChatBusyState();
     restoreChatViewport(viewport, replacement);
     return replacement;
   };
@@ -218,6 +351,7 @@
   const refreshSettings = async (section = "general") => {
     const wasOpen = !document.getElementById("settings-modal")?.hidden;
     const modal = await swap("#settings-modal", "mom_llama_render_settings_fragment");
+    refreshAutosaveStatus();
     if (wasOpen && modal) {
       modal.hidden = false;
       modal.classList.remove("is-hidden");
@@ -243,7 +377,14 @@
     try { return JSON.parse(raw); }
     catch { throw new Error(`${name.replaceAll("_", " ")} must be valid JSON.`); }
   };
-  const pickFile = (kind) => invoke("mom_llama_pick_file", { kind });
+  const pickFile = async (kind) => {
+    const result = await invoke("mom_llama_pick_file", { kind });
+    if (result?.status === "blocked") {
+      report(result);
+      return "";
+    }
+    return result?.result?.path || "";
+  };
 
   const collectUpstreamSettings = (form) => {
     const values = {};
@@ -261,10 +402,8 @@
   const autosaveQueues = new Map();
   let autosaveStatusRevision = 0;
   let autosaveSettleTimer = null;
-  let lastFailedAutosave = null;
 
-  const setAutosaveStatus = (state, message, revision = autosaveStatusRevision) => {
-    if (revision !== autosaveStatusRevision) return;
+  const setAutosaveStatus = (state, message) => {
     window.clearTimeout(autosaveSettleTimer);
     const autosave = document.querySelector(".settings-autosave");
     const status = document.getElementById("settings-save-status");
@@ -273,9 +412,26 @@
     if (status) status.textContent = message;
     retry?.classList.toggle("is-hidden", state !== "error");
     if (state === "saved") {
+      const revision = autosaveStatusRevision;
       autosaveSettleTimer = window.setTimeout(() => {
         if (revision === autosaveStatusRevision && autosave) autosave.dataset.state = "idle";
       }, 1400);
+    }
+  };
+
+  const refreshAutosaveStatus = () => {
+    autosaveStatusRevision += 1;
+    const queues = [...autosaveQueues.values()];
+    if (queues.some((queue) => queue.failure)) {
+      setAutosaveStatus("error", "Couldn’t save changes");
+      return;
+    }
+    if (queues.some((queue) => queue.running || queue.pending)) {
+      setAutosaveStatus("saving", "Saving…");
+      return;
+    }
+    if (queues.some((queue) => queue.latestRevision > 0)) {
+      setAutosaveStatus("saved", "Saved");
     }
   };
 
@@ -285,36 +441,42 @@
     queue.running = true;
     const job = queue.pending;
     queue.pending = null;
+    refreshAutosaveStatus();
     try {
       const result = await job.run();
       if (result?.status === "blocked") {
         throw new Error(result?.blocker?.message || "That change could not be saved.");
       }
       job.after?.(result);
-      if (job.revision === autosaveStatusRevision) {
-        lastFailedAutosave = null;
-        setAutosaveStatus("saved", "Saved", job.revision);
+      if (job.revision === queue.latestRevision) {
+        queue.failure = null;
       }
     } catch (error) {
-      if (job.revision === autosaveStatusRevision) {
-        lastFailedAutosave = { key, job };
-        setAutosaveStatus("error", "Couldn’t save changes", job.revision);
+      if (job.revision === queue.latestRevision) {
+        queue.failure = { key, job };
         reportError(error);
       }
     } finally {
       queue.running = false;
-      if (queue.pending) runAutosaveQueue(key);
+      refreshAutosaveStatus();
+      if (queue.pending) void runAutosaveQueue(key);
     }
   };
 
   const queueAutosave = (key, job, delay = 650) => {
-    const queue = autosaveQueues.get(key) || { timer: null, running: false, pending: null };
+    const queue = autosaveQueues.get(key) || {
+      timer: null,
+      running: false,
+      pending: null,
+      latestRevision: 0,
+      failure: null,
+    };
     autosaveQueues.set(key, queue);
     window.clearTimeout(queue.timer);
-    const revision = ++autosaveStatusRevision;
+    const revision = ++queue.latestRevision;
     queue.pending = { ...job, revision };
-    setAutosaveStatus("saving", "Saving…", revision);
-    queue.timer = window.setTimeout(() => runAutosaveQueue(key), delay);
+    refreshAutosaveStatus();
+    queue.timer = window.setTimeout(() => void runAutosaveQueue(key), delay);
   };
 
   const settingsUpdatePayload = (form) => ({
@@ -421,6 +583,25 @@
     formField(editor, "persona_chat_template").value = frozen || "";
     editor.querySelector(".persona-template-source")?.classList.toggle("is-hidden", frozen == null);
     editor.scrollIntoView({ block: "nearest" });
+  };
+
+  const openPersonaProfile = async (personaId) => {
+    const result = await invoke("mom_llama_persona_get", { persona: personaId });
+    report(result);
+    if (result?.status === "blocked" || !result?.result) return false;
+    closePersonas();
+    openSettings("personas");
+    setPersonaEditor(result.result);
+    return true;
+  };
+
+  const instantiatePersona = async (personaId) => {
+    const result = await invoke("mom_llama_persona_instantiate", {
+      persona: personaId,
+      title: null,
+    });
+    report(result);
+    return result;
   };
 
   const personaProfileFromEditor = () => {
@@ -538,6 +719,69 @@
     element.dataset.effect = spec.effect;
   };
 
+  const DYNAMIC_CONTROL_SPECS = Object.freeze({
+    attachmentPreview: Object.freeze({
+      affordance: "attachment.preview",
+      command: "mom_llama.attachment_preview",
+      tauri: "mom_llama_attachment_preview",
+      cli: "mom-llama attachment preview --attachment <id> --json",
+      effect: "mom_llama.effects.attachment_preview.v1",
+    }),
+    conversationSelect: Object.freeze({
+      affordance: "conversation.select",
+      command: "mom_llama.conversation_select",
+      tauri: "mom_llama_conversation_select",
+      cli: "mom-llama conversation select --conversation <id> --json",
+      effect: "mom_llama.effects.conversation_store.v1",
+    }),
+    mentionCancel: Object.freeze({
+      affordance: "mention.cancel",
+      command: "mom_llama.mention_cancel",
+      tauri: "mom_llama_mention_cancel",
+      cli: "mom-llama mention cancel --invocation <id> --target <id> --json",
+      effect: "mom_llama.effects.chat_cancel.v1",
+    }),
+    mentionCandidates: Object.freeze({
+      affordance: "mention.candidates",
+      command: "mom_llama.mention_candidates",
+      tauri: "mom_llama_mention_candidates",
+      cli: "mom-llama mention candidates --query <text> --json",
+      effect: "mom_llama.effects.conversation_store.v1",
+    }),
+    personaGroupList: Object.freeze({
+      affordance: "persona_group.list",
+      command: "mom_llama.persona_group_list",
+      tauri: "mom_llama_persona_group_list",
+      cli: "mom-llama persona-group list --json",
+      effect: "mom_llama.effects.consult_read.v1",
+    }),
+    messageEdit: Object.freeze({
+      affordance: "message.edit",
+      command: "mom_llama.message_edit",
+      tauri: "mom_llama_message_edit",
+      cli: "mom-llama message edit --conversation <id> --message <id> --content <text> --json",
+      effect: "mom_llama.effects.conversation_store.v1",
+    }),
+  });
+
+  const createCommandElement = (tag, spec) => {
+    const element = document.createElement(tag);
+    commandMetadata(element, spec);
+    return element;
+  };
+
+  const setButtonStateLabel = (button, label) => {
+    if (!button) return;
+    const explicitLabel = button.querySelector(":scope > [data-button-label], :scope > .button-label");
+    const fallbackLabel = [...button.children].find((child) => (
+      child.tagName === "SPAN" && child.getAttribute("aria-hidden") !== "true"
+    ));
+    const labelNode = explicitLabel || fallbackLabel;
+    if (labelNode) labelNode.textContent = label;
+    button.setAttribute("aria-label", label);
+    if (button.hasAttribute("title")) button.setAttribute("title", label);
+  };
+
   const renderSearchResults = (response) => {
     const list = document.getElementById("conversation-search-results");
     if (!list) return;
@@ -552,18 +796,11 @@
     }
     hits.forEach((hit) => {
       const item = document.createElement("li");
-      const button = document.createElement("button");
+      const button = createCommandElement("button", DYNAMIC_CONTROL_SPECS.conversationSelect);
       button.type = "button";
       button.className = "conversation-item search-hit";
       button.dataset.action = "conversation-select";
       button.dataset.conversation = hit.conversation_id;
-      commandMetadata(button, {
-        affordance: "conversation.select",
-        command: "mom_llama.conversation_select",
-        tauri: "mom_llama_conversation_select",
-        cli: "mom-llama conversation select --conversation <id> --json",
-        effect: "mom_llama.effects.conversation_store.v1",
-      });
       const title = document.createElement("span");
       title.textContent = hit.title || hit.conversation_id;
       const detail = document.createElement("small");
@@ -584,14 +821,35 @@
   };
 
   let draftTimer = null;
+  const draftAttachmentIds = (form = document.getElementById("chat-form")) =>
+    [...(form?.querySelectorAll("[data-staged-attachment-id]") || [])]
+      .map((attachment) => attachment.dataset.stagedAttachmentId)
+      .filter(Boolean);
+
+  const persistDraftNow = async (
+    message,
+    attachmentIds = draftAttachmentIds(),
+    conversation = selectedConversation(),
+  ) => {
+    window.clearTimeout(draftTimer);
+    draftTimer = null;
+    return invoke("mom_llama_draft_update", {
+      conversation,
+      message,
+      attachmentIds: [...attachmentIds],
+    });
+  };
+
   const scheduleDraft = (message) => {
     window.clearTimeout(draftTimer);
     const conversation = selectedConversation();
+    const attachmentIds = draftAttachmentIds();
     draftTimer = window.setTimeout(() => {
+      draftTimer = null;
       invoke("mom_llama_draft_update", {
         conversation,
         message,
-        attachmentIds: [],
+        attachmentIds,
       }).catch(reportError);
     }, 300);
   };
@@ -621,14 +879,14 @@
     const card = document.createElement("div");
     card.className = "message-card";
     if (role === "assistant") {
-      const reasoning = document.createElement("details");
+      const reasoning = document.createElement("section");
       reasoning.className = "message-reasoning live-reasoning is-hidden";
-      reasoning.open = settingEnabled("showThoughtInProgress");
-      const summary = document.createElement("summary");
-      summary.textContent = "Reasoning in progress";
+      const label = document.createElement("p");
+      label.className = "message-reasoning-label";
+      label.textContent = "Reasoning in progress";
       const reasoningContent = document.createElement("div");
       reasoningContent.className = "reasoning-content";
-      reasoning.append(summary, reasoningContent);
+      reasoning.append(label, reasoningContent);
       card.appendChild(reasoning);
     }
     const visibleContent = document.createElement("div");
@@ -651,12 +909,22 @@
     stream.scrollTop = stream.scrollHeight;
   };
 
-  const setChatBusy = (busy) => {
+  const chatBusyLeases = new Set();
+  let chatBusyLeaseSerial = 0;
+
+  const renderChatBusyState = () => {
+    const busy = chatBusyLeases.size > 0;
     const form = document.getElementById("chat-form");
     if (!form) return;
     const send = form.querySelector("button[type='submit']");
     const stop = form.querySelector(".stop-button");
     const skipReasoning = form.querySelector(".skip-reasoning-button");
+    const message = formField(form, "message");
+    const attachmentImport = form.querySelector("[data-action='attachment-import']");
+    const attachmentRemovers = form.querySelectorAll("[data-action='draft-attachment-remove']");
+    if (message) message.readOnly = busy;
+    if (attachmentImport) attachmentImport.disabled = busy;
+    attachmentRemovers.forEach((button) => { button.disabled = busy; });
     if (send) {
       send.disabled = busy;
       send.classList.toggle("is-hidden", busy);
@@ -672,10 +940,43 @@
     form.dataset.busy = busy ? "true" : "false";
   };
 
+  const acquireChatBusy = (scope) => {
+    const lease = `${scope}:${++chatBusyLeaseSerial}`;
+    chatBusyLeases.add(lease);
+    renderChatBusyState();
+    return lease;
+  };
+
+  const acquireStableChatBusy = (lease) => {
+    if (!lease) return null;
+    chatBusyLeases.add(lease);
+    renderChatBusyState();
+    return lease;
+  };
+
+  const releaseChatBusy = (lease) => {
+    if (!lease) return;
+    chatBusyLeases.delete(lease);
+    renderChatBusyState();
+  };
+
+  const releaseMentionInvocationBusy = (invocation) => {
+    if (!invocation) return;
+    const prefix = `mention-request:${invocation}:`;
+    [...chatBusyLeases]
+      .filter((lease) => lease.startsWith(prefix))
+      .forEach((lease) => chatBusyLeases.delete(lease));
+    renderChatBusyState();
+  };
+
+  const chatRequestLease = (payload) => payload.request_id
+    ? `chat-request:${payload.request_id}`
+    : null;
+
   const onChatEvent = (event) => {
     const payload = event.payload || event;
     if (payload.event === "started") {
-      setChatBusy(true);
+      acquireStableChatBusy(chatRequestLease(payload));
       appendLiveMessage("assistant", "", `live-assistant-${payload.request_id}`);
     }
     if (payload.event === "delta") {
@@ -688,7 +989,7 @@
     if (payload.event === "reasoning_delta") {
       const reasoning = document.querySelector(`#live-assistant-${CSS.escape(payload.request_id)} .live-reasoning`);
       const content = reasoning?.querySelector(".reasoning-content");
-      reasoning?.classList.remove("is-hidden");
+      if (settingEnabled("showThoughtInProgress")) reasoning?.classList.remove("is-hidden");
       if (content) {
         content.textContent += payload.delta || "";
         keepLiveTailVisible(content);
@@ -699,8 +1000,8 @@
         skipReasoning.classList.remove("is-hidden");
       }
     }
-    if (["completed", "cancelled", "warning"].includes(payload.event)) {
-      if (payload.event !== "warning") setChatBusy(false);
+    if (["completed", "cancelled", "failed"].includes(payload.event)) {
+      releaseChatBusy(chatRequestLease(payload));
     }
   };
 
@@ -715,20 +1016,13 @@
     name.textContent = payload.label || payload.handle;
     const handle = document.createElement("span");
     handle.textContent = `@${payload.handle}`;
-    const stop = document.createElement("button");
+    const stop = createCommandElement("button", DYNAMIC_CONTROL_SPECS.mentionCancel);
     stop.type = "button";
     stop.className = "mention-stop";
     stop.textContent = "Stop";
     stop.dataset.action = "mention-cancel";
     stop.dataset.invocation = payload.invocation_id;
     stop.dataset.target = payload.target_id;
-    commandMetadata(stop, {
-      affordance: "mention.cancel",
-      command: "mom_llama.mention_cancel",
-      tauri: "mom_llama_mention_cancel",
-      cli: "mom-llama mention cancel --invocation <id> --target <id> --json",
-      effect: "mom_llama.effects.chat_cancel.v1",
-    });
     byline.append(name, handle, stop);
     card.prepend(byline);
     return card;
@@ -741,7 +1035,13 @@
       return;
     }
     const payload = envelope.event || envelope;
-    if (payload.event === "started") appendMentionMessage(payload);
+    const lease = payload.invocation_id && payload.target_id
+      ? `mention-request:${payload.invocation_id}:${payload.target_id}`
+      : null;
+    if (payload.event === "started") {
+      acquireStableChatBusy(lease);
+      appendMentionMessage(payload);
+    }
     const row = document.getElementById(mentionLiveId(payload));
     if (payload.event === "delta") {
       const content = row?.querySelector(".live-content");
@@ -752,6 +1052,7 @@
     }
     const terminal = payload.state && ["completed", "cancelled", "failed"].includes(payload.state);
     if (["completed", "cancelled", "failed"].includes(payload.event) || terminal) {
+      releaseChatBusy(lease);
       row?.querySelector(".mention-stop")?.remove();
       row?.setAttribute("data-state", payload.state || payload.event);
     }
@@ -767,6 +1068,7 @@
   };
 
   const closeMentions = () => {
+    mentionSearchSerial += 1;
     const list = document.getElementById("mention-candidates");
     list?.classList.add("is-hidden");
     list?.replaceChildren();
@@ -785,17 +1087,27 @@
   const updateMentionCandidates = async (textarea) => {
     const token = mentionTokenAtCursor(textarea);
     if (!token) { closeMentions(); return; }
+    const conversation = selectedConversation();
     const serial = ++mentionSearchSerial;
     const response = await invoke("mom_llama_mention_candidates", {
       query: token.query,
-      conversation: selectedConversation(),
+      conversation,
     });
     if (serial !== mentionSearchSerial) return;
+    const currentToken = mentionTokenAtCursor(textarea);
+    const tokenIsCurrent = currentToken
+      && currentToken.query === token.query
+      && currentToken.start === token.start
+      && currentToken.end === token.end;
+    if (!textarea.isConnected || selectedConversation() !== conversation || !tokenIsCurrent) {
+      closeMentions();
+      return;
+    }
     const list = document.getElementById("mention-candidates");
     const candidates = response?.result || [];
     if (!list || !candidates.length) { closeMentions(); return; }
     list.replaceChildren(...candidates.map((candidate, index) => {
-      const button = document.createElement("button");
+      const button = createCommandElement("button", DYNAMIC_CONTROL_SPECS.mentionCandidates);
       button.type = "button";
       button.className = `mention-candidate${index === 0 ? " active" : ""}`;
       button.setAttribute("role", "option");
@@ -819,9 +1131,59 @@
     list.classList.remove("is-hidden");
   };
 
-  const openConsult = () => {
+  const renderStoreBlocker = (blocker, fallback) => {
+    const message = document.createElement("p");
+    message.className = "store-blocker";
+    message.setAttribute("role", "status");
+    message.dataset.blockerCode = blocker?.code || "local_store_unavailable";
+    message.textContent = blocker?.message || fallback;
+    return message;
+  };
+
+  const renderConsultGroups = (response) => {
+    const options = consult()?.querySelector(".consult-group-options");
+    if (!options) return;
+    options.replaceChildren();
+    if (response?.status === "blocked" || response?.blocker) {
+      options.append(renderStoreBlocker(
+        response?.blocker,
+        "Consult groups could not be loaded from local storage.",
+      ));
+      return;
+    }
+    const groups = response?.result || [];
+    if (!groups.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty-line";
+      empty.textContent = "No groups yet. Create one in Settings.";
+      options.append(empty);
+      return;
+    }
+    groups.forEach((group) => {
+      const button = createCommandElement("button", DYNAMIC_CONTROL_SPECS.personaGroupList);
+      button.type = "button";
+      button.className = "consult-group-option";
+      button.dataset.action = "consult-group-insert";
+      button.dataset.handle = group.mention_handle || "";
+      const handle = document.createElement("span");
+      handle.textContent = `@${group.mention_handle || ""}`;
+      const detail = document.createElement("small");
+      detail.textContent = `${group.name || "Consult group"} · ${(group.persona_ids || []).length} members`;
+      button.append(handle, detail);
+      options.append(button);
+    });
+  };
+
+  const refreshConsult = async () => {
+    const response = await invoke("mom_llama_persona_group_list");
+    renderConsultGroups(response);
+    if (response?.status === "blocked") report(response);
+    return consult();
+  };
+
+  const openConsult = async () => {
     shell()?.classList.remove("sidebar-open");
-    const view = consult();
+    const view = await refreshConsult();
     if (view) {
       view.classList.remove("is-hidden");
       view.querySelector(".consult-group-option")?.focus();
@@ -906,8 +1268,8 @@
     formField(form, "description").value = skill?.description || "";
     formField(form, "prompt_template").value = skill?.prompt || "";
     formField(form, "cache_policy").value = skill?.cache || "none";
-    const submit = form.querySelector('[data-action="skill-create"] span');
-    if (submit) submit.textContent = skill ? "Save changes" : "Save Skill";
+    const submit = form.querySelector('[data-action="skill-create"]');
+    setButtonStateLabel(submit, skill ? "Save changes" : "Save Skill");
     form.querySelector('[data-action="skill-edit-cancel"]')?.classList.toggle("is-hidden", !skill);
     if (skill) formField(form, "name")?.focus();
   };
@@ -915,10 +1277,10 @@
   const armDestructiveAction = (button) => {
     if (button.dataset.confirmArmed === "true") return true;
     button.dataset.confirmArmed = "true";
-    button.textContent = "Delete?";
+    setButtonStateLabel(button, "Delete?");
     window.setTimeout(() => {
       button.dataset.confirmArmed = "false";
-      button.textContent = "Delete";
+      setButtonStateLabel(button, "Delete");
     }, 3500);
     return false;
   };
@@ -927,35 +1289,21 @@
     const row = button.closest(".message-row");
     const card = row?.querySelector(".message-card");
     if (!card || card.querySelector("textarea")) return;
-    const textarea = document.createElement("textarea");
+    const textarea = createCommandElement("textarea", DYNAMIC_CONTROL_SPECS.messageEdit);
     textarea.value = button.dataset.messageContent || card.textContent;
     textarea.rows = 5;
     textarea.className = "inline-message-editor";
-    const save = document.createElement("button");
+    const save = createCommandElement("button", DYNAMIC_CONTROL_SPECS.messageEdit);
     save.type = "button";
     save.className = "small-button";
     save.textContent = "Save";
     save.dataset.action = "message-edit-save";
     save.dataset.message = button.dataset.message;
-    commandMetadata(save, {
-      affordance: "message.edit",
-      command: "mom_llama.message_edit",
-      tauri: "mom_llama_message_edit",
-      cli: "mom-llama message edit --conversation <id> --message <id> --content <text> --json",
-      effect: "mom_llama.effects.conversation_store.v1",
-    });
-    const cancel = document.createElement("button");
+    const cancel = createCommandElement("button", DYNAMIC_CONTROL_SPECS.conversationSelect);
     cancel.type = "button";
     cancel.className = "small-button";
     cancel.textContent = "Cancel";
     cancel.dataset.action = "message-edit-cancel";
-    commandMetadata(cancel, {
-      affordance: "conversation.select",
-      command: "mom_llama.conversation_select",
-      tauri: "mom_llama_conversation_select",
-      cli: "mom-llama conversation select --conversation <id> --json",
-      effect: "mom_llama.effects.conversation_store.v1",
-    });
     const actions = document.createElement("div");
     actions.className = "inline-message-actions";
     actions.append(save, cancel);
@@ -979,7 +1327,7 @@
       closePersonas();
       openSettings("personas");
     },
-    "consult-open": async () => { await invoke("mom_llama_persona_group_list"); openConsult(); },
+    "consult-open": async () => openConsult(),
     "consult-close": async () => { await invoke("mom_llama_conversation_list"); closeConsult(); },
     "consult-settings-open": async () => {
       await invoke("mom_llama_settings_get");
@@ -989,28 +1337,67 @@
     "consult-group-insert": async (button) => {
       const textarea = document.querySelector("#chat-form textarea[name='message']");
       if (!textarea) return;
+      const handle = button.dataset.handle || "";
+      const response = await invoke("mom_llama_persona_group_list");
+      const current = (response?.result || []).some((group) => (
+        String(group.mention_handle || "").toLowerCase() === handle.toLowerCase()
+      ));
+      if (response?.status === "blocked" || !current) {
+        report(response?.status === "blocked" ? response : {
+          status: "blocked",
+          blocker: {
+            code: "persona_group_not_found",
+            message: "That consult group is no longer available.",
+          },
+        });
+        await refreshConsult();
+        return;
+      }
       const prefix = textarea.value && !textarea.value.endsWith(" ") ? " " : "";
-      textarea.value += `${prefix}@${button.dataset.handle} `;
+      textarea.value += `${prefix}@${handle} `;
       textarea.dispatchEvent(new Event("input", { bubbles: true }));
       closeConsult();
       textarea.focus();
     },
     "mention-insert": async (button) => {
       const textarea = document.querySelector("#chat-form textarea[name='message']");
-      if (textarea) insertMention(textarea, button.dataset.handle || "");
+      if (!textarea) return;
+      const handle = button.dataset.handle || "";
+      const response = await invoke("mom_llama_mention_candidates", {
+        query: handle,
+        conversation: selectedConversation(),
+      });
+      const current = (response?.result || []).some((candidate) => (
+        String(candidate.handle || "").toLowerCase() === handle.toLowerCase()
+      ));
+      if (response?.status === "blocked" || !current) {
+        report(response?.status === "blocked" ? response : {
+          status: "blocked",
+          blocker: {
+            code: "mention_target_not_found",
+            message: "That mention target is no longer available.",
+          },
+        });
+        closeMentions();
+        return;
+      }
+      insertMention(textarea, handle);
     },
     "mention-cancel": async (button) => report(await invoke("mom_llama_mention_cancel", {
       invocation: button.dataset.invocation,
       target: button.dataset.target || null,
     })),
     "mention-synthesize": async (button) => {
-      setChatBusy(true);
-      const result = await invoke("mom_llama_mention_synthesize", {
-        invocation: button.dataset.invocation,
-      });
-      report(result);
-      setChatBusy(false);
-      await refreshConversationProjection();
+      const lease = acquireChatBusy("mention-synthesis");
+      try {
+        const result = await invoke("mom_llama_mention_synthesize", {
+          invocation: button.dataset.invocation,
+        });
+        report(result);
+        await refreshConversationProjection();
+      } finally {
+        releaseChatBusy(lease);
+      }
     },
     "conversation-new": async () => {
       const result = await invoke("mom_llama_conversation_new", { title: "New chat" });
@@ -1022,6 +1409,17 @@
     "conversation-select": async (button) => {
       const result = await invoke("mom_llama_conversation_select", { conversation: button.dataset.conversation });
       report(result); await refreshConversationProjection();
+    },
+    "persona-open": async (button) => {
+      const result = await invoke("mom_llama_conversation_select", {
+        conversation: button.dataset.conversation,
+      });
+      report(result);
+      if (result?.status !== "blocked") {
+        closeSettings();
+        closePersonas();
+        await refreshConversationProjection();
+      }
     },
     "chat-cancel": async () => report(await invoke("mom_llama_chat_cancel", { conversation: selectedConversation() })),
     "chat-skip-reasoning": async (button) => {
@@ -1052,7 +1450,25 @@
       const showRaw = raw?.classList.contains("is-hidden") === true;
       formatted?.classList.toggle("is-hidden", showRaw);
       raw?.classList.toggle("is-hidden", !showRaw);
-      button.textContent = showRaw ? "Formatted" : "Raw";
+      setButtonStateLabel(button, showRaw ? "Formatted" : "Raw");
+      button.setAttribute("aria-pressed", showRaw ? "true" : "false");
+      report(result);
+    },
+    "tool-details-toggle": async (button) => {
+      const result = await invoke("mom_llama_message_copy", {
+        conversation: selectedConversation(),
+        message: button.dataset.message,
+      });
+      if (result?.status === "blocked") {
+        report(result);
+        return;
+      }
+      const card = button.closest(".tool-result-card");
+      const details = card?.querySelectorAll(":scope > .tool-result-details") || [];
+      const show = [...details].some((detail) => detail.classList.contains("is-hidden"));
+      details.forEach((detail) => detail.classList.toggle("is-hidden", !show));
+      setButtonStateLabel(button, show ? "Hide details" : "Details");
+      button.setAttribute("aria-expanded", show ? "true" : "false");
       report(result);
     },
     "message-edit": async (button) => inlineEdit(button),
@@ -1074,12 +1490,10 @@
         await Promise.all([refreshSettings("personas"), refreshPersonas()]);
       }
     },
-    "persona-edit": async (button) => {
-      setPersonaEditor(JSON.parse(button.dataset.personaJson || "{}"));
-    },
+    "persona-edit": async (button) => openPersonaProfile(button.dataset.persona),
+    "persona-profile-open": async (button) => openPersonaProfile(button.dataset.persona),
     "persona-instantiate": async (button) => {
-      const result = await invoke("mom_llama_persona_instantiate", { persona: button.dataset.persona, title: null });
-      report(result);
+      const result = await instantiatePersona(button.dataset.persona);
       if (result?.status !== "blocked") {
         closeSettings();
         closePersonas();
@@ -1089,13 +1503,26 @@
     "persona-update": async () => {
       const result = await invoke("mom_llama_persona_update", { profile: personaProfileFromEditor() });
       report(result);
-      if (result?.status !== "blocked") await refreshSettings("personas");
+      if (result?.status !== "blocked") {
+        await Promise.all([
+          refreshSettings("personas"),
+          refreshPersonas(),
+          refreshConversationProjection(),
+        ]);
+      }
     },
     "persona-delete": async (button) => {
       if (!armDestructiveAction(button)) return;
       const persona = formValue(document.getElementById("persona-editor"), "persona_id");
-      report(await invoke("mom_llama_persona_delete", { persona }));
-      await refreshSettings("personas");
+      const result = await invoke("mom_llama_persona_delete", { persona });
+      report(result);
+      if (result?.status !== "blocked") {
+        await Promise.all([
+          refreshSettings("personas"),
+          refreshPersonas(),
+          refreshConversationProjection(),
+        ]);
+      }
     },
     "persona-group-new": async () => setPersonaGroupEditor(),
     "persona-group-edit": async (button) => setPersonaGroupEditor(JSON.parse(button.dataset.groupJson || "{}")),
@@ -1112,12 +1539,14 @@
         ? await invoke("mom_llama_persona_group_update", { group, ...payload })
         : await invoke("mom_llama_persona_group_create", payload);
       report(result);
-      if (result?.status !== "blocked") await refreshSettings("consult");
+      if (result?.status !== "blocked") {
+        await Promise.all([refreshSettings("consult"), refreshConsult()]);
+      }
     },
     "persona-group-delete": async (button) => {
       if (!armDestructiveAction(button)) return;
       report(await invoke("mom_llama_persona_group_delete", { group: button.dataset.group }));
-      await refreshSettings("consult");
+      await Promise.all([refreshSettings("consult"), refreshConsult()]);
     },
     "message-edit-save": async (button) => {
       const content = button.closest(".message-card")?.querySelector("textarea")?.value || "";
@@ -1171,17 +1600,52 @@
       await refreshConversationProjection();
     },
     "attachment-import": async () => {
+      const form = document.getElementById("chat-form");
+      const message = formField(form, "message")?.value || "";
       const path = await pickFile("attachment");
       if (!path) return;
-      report(await invoke("mom_llama_attachment_import", { conversation: selectedConversation(), path }));
-      await refreshConversationProjection();
+      const sourceConversation = selectedConversation();
+      let conversation = sourceConversation;
+      if (selectedConversationKind() === "persona_template") {
+        const instantiated = await instantiatePersona(sourceConversation);
+        if (instantiated?.status === "blocked" || !instantiated?.result?.id) return;
+        conversation = instantiated.result.id;
+        chat().dataset.currentConversation = conversation;
+        chat().dataset.conversationKind = "chat";
+        await invoke("mom_llama_draft_update", {
+          conversation: sourceConversation,
+          message: "",
+          attachmentIds: [],
+        });
+      }
+      await persistDraftNow(message, [], conversation);
+      const result = await invoke("mom_llama_attachment_import", { conversation, path });
+      report(result);
+      if (result?.status !== "blocked") await refreshConversationProjection();
+    },
+    "draft-attachment-remove": async (button) => {
+      const form = document.getElementById("chat-form");
+      const attachmentIds = draftAttachmentIds(form)
+        .filter((attachment) => attachment !== button.dataset.attachment);
+      const result = await persistDraftNow(
+        formField(form, "message")?.value || "",
+        attachmentIds,
+      );
+      report(result);
+      await refreshChat();
     },
     "settings-get": async () => report(await invoke("mom_llama_settings_get")),
     "settings-reset": async () => { report(await invoke("mom_llama_settings_reset")); await refreshSettings("general"); },
     "settings-retry": async () => {
-      if (!lastFailedAutosave) return;
-      const { key, job } = lastFailedAutosave;
-      queueAutosave(key, job, 0);
+      const failures = [...autosaveQueues.entries()]
+        .filter(([, queue]) => (
+          queue.failure
+          && !queue.running
+          && !queue.pending
+          && queue.failure.job.revision === queue.latestRevision
+        ))
+        .map(([key, queue]) => ({ key, failure: queue.failure }));
+      failures.forEach(({ key, failure }) => queueAutosave(key, failure.job, 0));
     },
     "engine-check": async () => { report(await invoke("mom_llama_engine_check")); await refreshSettings("general"); },
     "model-list": async () => report(await invoke("mom_llama_model_list")),
@@ -1406,33 +1870,63 @@
       if (form.id === "chat-form") {
         if (form.dataset.busy === "true") return;
         const message = formValue(form, "message");
-        if (!message) return;
-        const conversation = selectedConversation();
+        const attachmentIds = draftAttachmentIds(form);
+        if (!message && !attachmentIds.length) return;
+        // Acquire the UI-side dispatch gate before the first await. Without
+        // this, rapid Enter presses can race persona instantiation or draft
+        // persistence and dispatch the same turn more than once.
+        const dispatchLease = acquireChatBusy("chat-dispatch");
+        const sourceConversation = selectedConversation();
+        let conversation = sourceConversation;
         const textarea = formField(form, "message");
-        window.clearTimeout(draftTimer);
-        draftTimer = null;
-        if (textarea) textarea.value = "";
-        appendLiveMessage("user", message, `live-user-${Date.now()}`);
-        setChatBusy(true);
-        closeMentions();
-        const draftClear = invoke("mom_llama_draft_clear", { conversation }).catch(reportError);
-        let result;
         try {
-          result = await invoke("mom_llama_chat_dispatch", { conversation, message });
-        } catch (error) {
-          if (textarea && !textarea.value) textarea.value = message;
-          scheduleDraft(message);
-          throw error;
+          if (selectedConversationKind() === "persona_template") {
+            if (attachmentIds.length) {
+              report({
+                status: "blocked",
+                blocker: {
+                  code: "persona_template_staged_attachments",
+                  message: "Start a chat before adding attachments to a Persona.",
+                },
+              });
+              return;
+            }
+            const instantiated = await instantiatePersona(sourceConversation);
+            if (instantiated?.status === "blocked" || !instantiated?.result?.id) return;
+            conversation = instantiated.result.id;
+            chat().dataset.currentConversation = conversation;
+            chat().dataset.conversationKind = "chat";
+          }
+          await persistDraftNow(textarea?.value || message, attachmentIds, conversation);
+          if (conversation !== sourceConversation) {
+            await invoke("mom_llama_draft_update", {
+              conversation: sourceConversation,
+              message: "",
+              attachmentIds: [],
+            });
+          }
+          if (textarea) textarea.value = "";
+          if (message) appendLiveMessage("user", message, `live-user-${Date.now()}`);
+          closeMentions();
+          let result;
+          try {
+            result = await invoke("mom_llama_chat_dispatch", { conversation, message });
+          } catch (error) {
+            if (textarea && !textarea.value) textarea.value = message;
+            await persistDraftNow(message, attachmentIds).catch(reportError);
+            await refreshChat().catch(reportError);
+            throw error;
+          }
+          report(result);
+          releaseMentionInvocationBusy(result?.result?.invocation?.id);
+          if (result?.status === "blocked" && textarea && !textarea.value) {
+            textarea.value = message;
+            await persistDraftNow(message, attachmentIds);
+          }
+          await refreshConversationProjection();
         } finally {
-          setChatBusy(false);
+          releaseChatBusy(dispatchLease);
         }
-        report(result);
-        await draftClear;
-        if (result?.status === "blocked" && textarea && !textarea.value) {
-          textarea.value = message;
-          scheduleDraft(message);
-        }
-        await refreshConversationProjection();
       }
       if (form.id === "settings-form") {
         scheduleSettingsAutosave(0);
@@ -1454,7 +1948,7 @@
         await refreshSettings("general");
       }
       if (form.id === "conversation-search-form") await search();
-    } catch (error) { reportError(error); setChatBusy(false); }
+    } catch (error) { reportError(error); }
   });
 
   document.addEventListener("input", (event) => {
@@ -1493,6 +1987,7 @@
     if (threshold === 0 || text.length < threshold) return;
     event.preventDefault();
     try {
+      await persistDraftNow(event.target.value, draftAttachmentIds(event.target.form));
       const result = await invoke("mom_llama_attachment_import_paste", {
         conversation: selectedConversation(),
         text,

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/delysis/mom-llama"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -23,8 +23,11 @@ serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-free-token-energy.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 rfd = { version = "=0.16.0", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "=0.16.0", default-features = false, features = ["tokio", "xdg-portal"] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -329,6 +329,59 @@ fn cli_attachment_preview_returns_metadata_without_decrypted_payload() -> Result
 }
 
 #[test]
+fn path_selection_is_cli_exercisable_and_typed() -> Result<()> {
+    let root = data_dir("path-selection")?;
+    let model = root.join("tiny.gguf");
+    std::fs::write(&model, b"GGUF")?;
+    let selected = json_output(&cli(
+        &root,
+        &[
+            "path",
+            "select",
+            "--kind",
+            "model",
+            "--path",
+            model.to_str().ok_or_else(|| anyhow!("invalid test path"))?,
+            "--json",
+        ],
+    )?)?;
+    assert_eq!(selected["command"], "mom_llama.path_select");
+    assert_eq!(selected["status"], "contracted");
+    assert_eq!(selected["readiness"], "contracted");
+    assert_eq!(selected["result"]["kind"], "model");
+    assert_eq!(
+        selected["result"]["path"],
+        model.canonicalize()?.display().to_string()
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_consult_cli_is_hidden_but_remains_available_for_recovery() -> Result<()> {
+    let root = data_dir("legacy-consult-recovery")?;
+    let help = cli(&root, &["--help"])?;
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout)?;
+    assert!(
+        !help
+            .lines()
+            .any(|line| line.trim_start().starts_with("consult")),
+        "legacy Consult commands must not be advertised in the product CLI"
+    );
+
+    let recovered = json_output(&cli(&root, &["consult", "panel-list", "--json"])?)?;
+    assert_eq!(
+        recovered.get("command").and_then(Value::as_str),
+        Some("mom_llama.consult_panel_list")
+    );
+    assert_eq!(
+        recovered.get("readiness").and_then(Value::as_str),
+        Some("contracted")
+    );
+    Ok(())
+}
+
+#[test]
 fn dream_team_create_and_list_are_cli_exercisable_and_encrypted() -> Result<()> {
     let root = data_dir("dream-team")?;
     let persona = serde_json::json!({
@@ -382,7 +435,7 @@ fn dream_team_create_and_list_are_cli_exercisable_and_encrypted() -> Result<()> 
 fn attachment_and_mcp_are_exercisable_without_claiming_llama_inference() -> Result<()> {
     let root = data_dir("adapters")?;
     let image = root.join("photo.png");
-    std::fs::write(&image, b"fixture image bytes")?;
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x02\0\0\0\x03")?;
     let conversation = json_output(&cli(
         &root,
         &["conversation", "new", "--title", "Pictures", "--json"],

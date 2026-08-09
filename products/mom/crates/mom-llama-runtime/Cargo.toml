@@ -8,6 +8,8 @@ description = "Rust-owned product state, personas, conversations, tools and cach
 
 [dependencies]
 anyhow.workspace = true
+attachment-native-host.workspace = true
+attachment-native-types.workspace = true
 llama-native-engine.workspace = true
 llama-native-cache.workspace = true
 llama-native-host.workspace = true
@@ -24,6 +26,12 @@ uuid.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
+
+[dev-dependencies]
+fte-backend-llama.workspace = true
+fte-router.workspace = true
+fte-types.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

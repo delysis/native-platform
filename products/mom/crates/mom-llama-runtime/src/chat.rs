@@ -1,8 +1,10 @@
-use crate::attachments::media_inputs_for_conversation;
+use crate::attachments::{
+    ChatAttachmentContext, commit_generated_exchange, prepare_chat_attachments,
+};
 use crate::config::{resolve_settings, upstream_setting_string};
 use crate::conversation_store::{
     ChatTemplatePolicy, Message, MessageRole, active_leaf_id, active_path_messages,
-    get_or_create_conversation, load_db, strip_reserved_attribution_prefix, upsert_conversation,
+    get_or_create_conversation, load_db, strip_reserved_attribution_prefix,
 };
 use crate::kv_cache::{
     compatible_cached_prefix, ensure_persona_prefix, invalidate_cache, persist_session_checkpoint,
@@ -373,19 +375,9 @@ fn chat_send_supervised<F>(
 where
     F: FnMut(ChatStreamEvent) -> Result<()>,
 {
-    if input.message.trim().is_empty() {
-        return Ok(CommandResult::blocked(
-            "mom_llama.chat_send",
-            "stub_blocked",
-            Blocker::new(
-                "message_empty",
-                "Message text is empty.",
-                vec!["Type a message before sending.".to_string()],
-            ),
-        ));
-    }
     let mut settings = resolve_settings()?;
     let (db, mut conversation) = get_or_create_conversation(&input.conversation_id)?;
+    let expected_active_leaf = conversation.active_leaf_message_id.clone();
     settings.model_path = conversation
         .execution_profile
         .model_path
@@ -397,7 +389,33 @@ where
         .mmproj_path
         .clone()
         .or(settings.mmproj_path);
-    let media = media_inputs_for_conversation(&input.conversation_id)?;
+    let active_messages = active_path_messages(&conversation);
+    let attachment_context = match prepare_chat_attachments(
+        &input.conversation_id,
+        &active_messages,
+        regenerate_user_id.as_deref(),
+    )? {
+        Ok(context) => context,
+        Err(blocked) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.chat_send",
+                &blocked.readiness,
+                blocked.blocker,
+            ));
+        }
+    };
+    if user_turn_is_empty(&input.message, &attachment_context) {
+        return Ok(CommandResult::blocked(
+            "mom_llama.chat_send",
+            "stub_blocked",
+            Blocker::new(
+                "message_empty",
+                "The message has no text or model-ready attachment content.",
+                vec!["Type a message or attach a supported file before sending.".to_string()],
+            ),
+        ));
+    }
+    let media = attachment_context.media.clone();
     if !media.is_empty()
         && !settings
             .mmproj_path
@@ -423,7 +441,6 @@ where
     let parse_reasoning = !upstream_setting_bool(&settings, "disableReasoningParsing");
     let exclude_reasoning_from_context =
         upstream_setting_bool(&settings, "excludeReasoningFromContext");
-    let active_messages = active_path_messages(&conversation);
     let context_messages = if let Some(user_id) = regenerate_user_id.as_deref() {
         let Some(index) = active_messages
             .iter()
@@ -449,6 +466,8 @@ where
         context_messages,
         &input.message,
         exclude_reasoning_from_context,
+        &attachment_context.text_by_message_id,
+        &attachment_context.current_text,
     );
     let request_id = Uuid::new_v4().to_string();
     let cancel_path = format!("native://request/{request_id}");
@@ -690,11 +709,13 @@ where
                 branch_index: None,
                 branch_count: None,
                 attribution: None,
+                attachment_ids: attachment_context.staged_ids.clone(),
             })
         },
         |_| None,
     );
     let user_message_id = regenerate_user_id
+        .clone()
         .or_else(|| user_message.as_ref().map(|message| message.id.clone()))
         .expect("a new or existing user message must back assistant generation");
     let assistant_message = Message {
@@ -713,6 +734,7 @@ where
         branch_index: None,
         branch_count: None,
         attribution: None,
+        attachment_ids: Vec::new(),
     };
     let assistant_message_id = assistant_message.id.clone();
     if let Some(user_message) = user_message {
@@ -729,7 +751,14 @@ where
     conversation.selected_model_path = settings.model_path.clone();
     conversation.execution_profile.model_path = settings.model_path.clone();
     conversation.execution_profile.mmproj_path = settings.mmproj_path.clone();
-    let path = upsert_conversation(db, conversation.clone())?;
+    let path = commit_generated_exchange(
+        db,
+        conversation.clone(),
+        expected_active_leaf.as_deref(),
+        &attachment_context.staged_ids,
+        &user_message_id,
+        regenerate_user_id.is_none(),
+    )?;
     mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Completed)?;
     let result = ChatSendOutput {
         request_id: request_id.clone(),
@@ -774,6 +803,12 @@ where
         !options.fake_fixture,
         options.fake_fixture,
     ))
+}
+
+fn user_turn_is_empty(message: &str, attachments: &ChatAttachmentContext) -> bool {
+    message.trim().is_empty()
+        && attachments.current_text.trim().is_empty()
+        && attachments.media.is_empty()
 }
 
 pub fn chat_cancel(conversation_id: &str) -> Result<CommandResult<ChatCancelOutput>> {
@@ -897,6 +932,8 @@ fn build_native_messages(
     messages: &[Message],
     next_message: &str,
     exclude_reasoning_from_context: bool,
+    attachment_text_by_message_id: &std::collections::HashMap<String, String>,
+    current_attachment_text: &str,
 ) -> Vec<ChatMessage> {
     let mut result = Vec::new();
     let combined_system = [system_message.trim(), skill_prefix.trim()]
@@ -911,16 +948,30 @@ fn build_native_messages(
         });
     }
     for message in messages {
+        let mut message = message.clone();
+        if let Some(attachment_text) = attachment_text_by_message_id.get(&message.id) {
+            message.content = append_attachment_context(&message.content, attachment_text);
+        }
         result.extend(native_context_messages(
-            message,
+            &message,
             exclude_reasoning_from_context,
         ));
     }
     result.push(ChatMessage {
         role: ChatRole::User,
-        content: next_message.to_string(),
+        content: append_attachment_context(next_message, current_attachment_text),
     });
     result
+}
+
+fn append_attachment_context(message: &str, attachment_text: &str) -> String {
+    if attachment_text.is_empty() {
+        message.to_string()
+    } else if message.is_empty() {
+        attachment_text.to_string()
+    } else {
+        format!("{message}\n\n{attachment_text}")
+    }
 }
 
 pub(crate) fn native_context_messages(
@@ -1193,8 +1244,8 @@ fn mutate_active_requests(data_dir: &Path, mutation: impl FnOnce(&mut ActiveChat
 #[cfg(test)]
 mod tests {
     use super::{
-        Message, MessageRole, ReasoningStreamParser, ReasoningTarget, build_native_messages,
-        native_context_messages, parse_reasoning_output,
+        ChatAttachmentContext, Message, MessageRole, ReasoningStreamParser, ReasoningTarget,
+        build_native_messages, native_context_messages, parse_reasoning_output, user_turn_is_empty,
     };
     use crate::conversation_store::{MessageAttribution, MessageSpeakerKind};
 
@@ -1215,6 +1266,7 @@ mod tests {
             branch_index: None,
             branch_count: None,
             attribution: None,
+            attachment_ids: Vec::new(),
         }
     }
 
@@ -1262,9 +1314,18 @@ mod tests {
     #[test]
     fn reasoning_context_policy_is_explicit() {
         let message = assistant_message(Some("private"), "answer");
-        let included = build_native_messages("", "", std::slice::from_ref(&message), "next", false);
+        let included = build_native_messages(
+            "",
+            "",
+            std::slice::from_ref(&message),
+            "next",
+            false,
+            &Default::default(),
+            "",
+        );
         assert_eq!(included[0].content, "<think>private</think>answer");
-        let excluded = build_native_messages("", "", &[message], "next", true);
+        let excluded =
+            build_native_messages("", "", &[message], "next", true, &Default::default(), "");
         assert_eq!(excluded[0].content, "answer");
     }
 
@@ -1291,5 +1352,34 @@ mod tests {
         assert!(!context[0].content.contains("Response from @"));
         assert_eq!(context[1].role, llama_native_types::ChatRole::Assistant);
         assert_eq!(context[1].content, "Structurally attributed answer");
+    }
+
+    #[test]
+    fn attachment_only_turns_are_valid_but_empty_turns_are_not() {
+        let empty = ChatAttachmentContext {
+            staged_ids: Vec::new(),
+            text_by_message_id: Default::default(),
+            current_text: String::new(),
+            media: Vec::new(),
+        };
+        assert!(user_turn_is_empty("   ", &empty));
+
+        let text_attachment = ChatAttachmentContext {
+            current_text: "[BEGIN UNTRUSTED ATTACHMENT DATA]".to_string(),
+            ..empty.clone()
+        };
+        assert!(!user_turn_is_empty("", &text_attachment));
+
+        let media_attachment = ChatAttachmentContext {
+            media: vec![llama_native_types::MediaInput {
+                id: "image".to_string(),
+                kind: llama_native_types::MediaKind::Image,
+                mime: "image/png".to_string(),
+                sha256: "fixture".to_string(),
+                bytes: vec![1],
+            }],
+            ..empty
+        };
+        assert!(!user_turn_is_empty("", &media_attachment));
     }
 }

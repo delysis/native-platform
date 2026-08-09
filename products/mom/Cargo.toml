@@ -15,7 +15,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/delysis/mom-llama"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -30,15 +30,17 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "a185a4be3c6ad6ea1935e01acef8946c7dfdc459" }
-llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "a185a4be3c6ad6ea1935e01acef8946c7dfdc459" }
-llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "a185a4be3c6ad6ea1935e01acef8946c7dfdc459" }
-llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "a185a4be3c6ad6ea1935e01acef8946c7dfdc459" }
-fte-backend-llama = { git = "https://github.com/delysis/free-token-energy", rev = "40788e397e79c4c27df40cc702f07af500bb88eb" }
-fte-router = { git = "https://github.com/delysis/free-token-energy", rev = "40788e397e79c4c27df40cc702f07af500bb88eb" }
-fte-store = { git = "https://github.com/delysis/free-token-energy", rev = "40788e397e79c4c27df40cc702f07af500bb88eb" }
-fte-types = { git = "https://github.com/delysis/free-token-energy", rev = "40788e397e79c4c27df40cc702f07af500bb88eb" }
-tauri-plugin-free-token-energy = { git = "https://github.com/delysis/free-token-energy", rev = "40788e397e79c4c27df40cc702f07af500bb88eb" }
+attachment-native-host = { git = "https://github.com/delysis/attachment-native-kit", rev = "a7702f423102716d9fa21b64c51c331d4044a31d" }
+attachment-native-types = { git = "https://github.com/delysis/attachment-native-kit", rev = "a7702f423102716d9fa21b64c51c331d4044a31d" }
+llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "c61692d48b0768bb242bcecb7a80c3318fc476b4" }
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "c61692d48b0768bb242bcecb7a80c3318fc476b4" }
+llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "c61692d48b0768bb242bcecb7a80c3318fc476b4" }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "c61692d48b0768bb242bcecb7a80c3318fc476b4" }
+fte-backend-llama = { git = "https://github.com/delysis/free-token-energy", rev = "9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe" }
+fte-router = { git = "https://github.com/delysis/free-token-energy", rev = "9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe" }
+fte-store = { git = "https://github.com/delysis/free-token-energy", rev = "9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe" }
+fte-types = { git = "https://github.com/delysis/free-token-energy", rev = "9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe" }
+tauri-plugin-free-token-energy = { git = "https://github.com/delysis/free-token-energy", rev = "9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

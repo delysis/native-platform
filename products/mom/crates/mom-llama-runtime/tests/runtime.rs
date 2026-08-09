@@ -1,22 +1,58 @@
 use anyhow::{Result, anyhow};
+use fte_backend_llama::{BACKEND_ID, LlamaNativeBackend};
+use fte_router::{Gateway, GatewayDefaults};
+use fte_types::{
+    CacheMode, CacheOutcome, CachePolicy, ContentBlock, DeadlinePolicy, GatewayRequest,
+    GatewayResponse, GenerationInput, InputItem, MessageRole as GatewayMessageRole, ModelSelector,
+    RequestId, ResponseFormat, RoutingPolicy, SamplingOptions, StoragePolicy, StreamPolicy,
+    TerminalStatus, ToolPolicy,
+};
 use mom_llama_runtime::config::{SettingsUpdate, set_data_dir_override_for_tests};
 use mom_llama_runtime::{
     ChatDispatchOutput, ChatSendInput, ChatSendOptions, ConsultPersona, ConsultStartInput,
-    ConsultStartOptions, EngineCheckOptions, KvCachePolicy, MentionDispatchInput,
-    PersonaFreezeInput, PersonaHistoryMode,
+    ConsultStartOptions, Conversation, ConversationExecutionProfile, ConversationKind,
+    EngineCheckOptions, KvCachePolicy, MentionDispatchInput, Message, MessageAttribution,
+    MessageRole, MessageSpeakerKind, PersonaFreezeInput, PersonaHistoryMode,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
 
+const VALID_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\
+    \x00\x00\x00\x0dIHDR\x00\x00\x00\x02\x00\x00\x00\x04\x08\x02\x00\x00\x00\x2b\x8d\x79\x6e\
+    \x00\x00\x00\x09pHYs\x00\x00\x00\x01\x00\x00\x00\x01\x00\x4f\x25\xc4\xd6\
+    \x00\x00\x00\x10IDAT\x78\x9c\x63\xfc\xc3\x00\x02\x2c\x0c\x58\x28\x00\x1b\x74\x01\x0a\x5f\x82\xdc\x5d\
+    \x00\x00\x00\x00IEND\xae\x42\x60\x82";
+
+type EncryptedDocumentSnapshot = BTreeMap<String, (Vec<u8>, Vec<u8>, i64)>;
+
 fn test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn encrypted_document_snapshot(data_dir: &Path) -> Result<EncryptedDocumentSnapshot> {
+    let connection = rusqlite::Connection::open(data_dir.join("runtime.sqlite3"))?;
+    let mut statement = connection.prepare(
+        "SELECT namespace, nonce, ciphertext, updated_at
+         FROM encrypted_documents ORDER BY namespace",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            (
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+            ),
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<BTreeMap<_, _>, _>>()?)
 }
 
 struct TestSession {
@@ -52,6 +88,85 @@ impl Drop for TestSession {
     fn drop(&mut self) {
         mom_llama_runtime::unload_resident_model();
         set_data_dir_override_for_tests(None);
+    }
+}
+
+fn attributed_history_fixture(id: &str) -> Conversation {
+    let message = |message_id: &str,
+                   parent_id: Option<&str>,
+                   role: MessageRole,
+                   content: &str,
+                   attribution: Option<MessageAttribution>| Message {
+        id: message_id.to_string(),
+        conversation_id: id.to_string(),
+        role,
+        content: content.to_string(),
+        created_at: message_id.to_string(),
+        parent_id: parent_id.map(str::to_string),
+        model: None,
+        receipt_id: None,
+        prompt_tokens: None,
+        completion_tokens: None,
+        reasoning_content: None,
+        reasoning_incomplete: false,
+        branch_index: None,
+        branch_count: None,
+        attribution,
+        attachment_ids: Vec::new(),
+    };
+    let attribution = |source: &str, handle: &str, order: usize| MessageAttribution {
+        kind: MessageSpeakerKind::Persona,
+        source_id: source.to_string(),
+        handle: handle.to_string(),
+        label: handle.to_string(),
+        version: 1,
+        invocation_id: "shared-invocation".to_string(),
+        target_order: order,
+    };
+    Conversation {
+        id: id.to_string(),
+        title: "Attributed response history".to_string(),
+        created_at: "0".to_string(),
+        updated_at: "5".to_string(),
+        kind: ConversationKind::Chat,
+        execution_profile: ConversationExecutionProfile::default(),
+        selected_model_path: None,
+        source_conversation_id: None,
+        source_message_id: None,
+        branch_root_message_id: None,
+        active_leaf_message_id: Some("5-host-answer".to_string()),
+        current_skill_ids: Vec::new(),
+        messages: vec![
+            message("1-user", None, MessageRole::User, "Ask both", None),
+            message(
+                "2-first-peer",
+                Some("1-user"),
+                MessageRole::Assistant,
+                "First perspective",
+                Some(attribution("first", "first", 0)),
+            ),
+            message(
+                "3-second-peer",
+                Some("2-first-peer"),
+                MessageRole::Assistant,
+                "Second perspective",
+                Some(attribution("second", "second", 1)),
+            ),
+            message(
+                "4-follow-up",
+                Some("3-second-peer"),
+                MessageRole::User,
+                "Follow up after both",
+                None,
+            ),
+            message(
+                "5-host-answer",
+                Some("4-follow-up"),
+                MessageRole::Assistant,
+                "Host answer after both",
+                None,
+            ),
+        ],
     }
 }
 
@@ -283,7 +398,7 @@ fn dream_team_creation_is_encrypted_persistent_and_non_impersonating() -> Result
 
 #[test]
 fn legacy_consult_migration_to_personas_and_groups_is_idempotent() -> Result<()> {
-    let _session = TestSession::new("consult-persona-migration")?;
+    let session = TestSession::new("consult-persona-migration")?;
     mom_llama_runtime::consult_panel_create(
         "Migration team".to_string(),
         vec![ConsultPersona {
@@ -302,12 +417,19 @@ fn legacy_consult_migration_to_personas_and_groups_is_idempotent() -> Result<()>
     let first_groups = mom_llama_runtime::persona_group_list()?
         .result
         .expect("first migrated group list missing");
+    let documents_after_migration = encrypted_document_snapshot(session.path())?;
     let second_personas = mom_llama_runtime::persona_list()?
         .result
         .expect("second migrated Persona list missing");
     let second_groups = mom_llama_runtime::persona_group_list()?
         .result
         .expect("second migrated group list missing");
+    mom_llama_runtime::mention_candidates("", None)?;
+    assert_eq!(
+        encrypted_document_snapshot(session.path())?,
+        documents_after_migration,
+        "subsequent Persona, group, and handle reads must not rewrite legacy migration state"
+    );
     assert_eq!(first_personas, second_personas);
     assert_eq!(first_groups, second_groups);
     assert_eq!(
@@ -760,6 +882,108 @@ fn duplicate_persona_handles_and_oversized_groups_fail_closed() -> Result<()> {
 }
 
 #[test]
+fn conversation_import_validates_or_safely_assigns_mention_handles() -> Result<()> {
+    let _session = TestSession::new("conversation-import-handle-validation")?;
+    let source = mom_llama_runtime::conversation_new(Some("Existing handle owner".to_string()))?
+        .result
+        .ok_or_else(|| anyhow!("source conversation missing"))?;
+
+    let mut duplicate = source.clone();
+    duplicate.id = "imported-duplicate".to_string();
+    duplicate.title = "Imported duplicate".to_string();
+    duplicate.messages.clear();
+    duplicate.active_leaf_message_id = None;
+    let blocked = mom_llama_runtime::conversation_import_json(&serde_json::to_string(&duplicate)?)?;
+    assert_eq!(blocked.status, "blocked");
+    assert_eq!(
+        blocked
+            .blocker
+            .as_ref()
+            .map(|blocker| blocker.code.as_str()),
+        Some("mention_handle_taken")
+    );
+
+    let mut invalid = duplicate.clone();
+    invalid.id = "imported-invalid".to_string();
+    invalid.execution_profile.mention_handle = "bad handle!".to_string();
+    let blocked = mom_llama_runtime::conversation_import_json(&serde_json::to_string(&invalid)?)?;
+    assert_eq!(blocked.status, "blocked");
+    assert_eq!(
+        blocked
+            .blocker
+            .as_ref()
+            .map(|blocker| blocker.code.as_str()),
+        Some("mention_handle_invalid")
+    );
+
+    let mut legacy = duplicate;
+    legacy.id = "imported-legacy".to_string();
+    legacy.title = "Imported Legacy Chat".to_string();
+    legacy.execution_profile.mention_handle.clear();
+    let imported = mom_llama_runtime::conversation_import_json(&serde_json::to_string(&legacy)?)?
+        .result
+        .ok_or_else(|| anyhow!("legacy import missing"))?;
+    assert_eq!(
+        imported.execution_profile.mention_handle,
+        "imported-legacy-chat"
+    );
+    Ok(())
+}
+
+#[test]
+fn persisted_legacy_handle_collisions_migrate_without_losing_conversation_data() -> Result<()> {
+    let session = TestSession::new("persisted-legacy-handle-collisions")?;
+    let mut older = attributed_history_fixture("legacy-older");
+    older.title = "Older saved chat".to_string();
+    older.created_at = "1".to_string();
+    older.updated_at = "1".to_string();
+    older.execution_profile.mention_handle = "Shared-Lens".to_string();
+    let older_messages = older.messages.clone();
+
+    let mut newer = attributed_history_fixture("legacy-newer");
+    newer.title = "Newer saved chat".to_string();
+    newer.created_at = "2".to_string();
+    newer.updated_at = "2".to_string();
+    newer.execution_profile.mention_handle = "shared-lens".to_string();
+    let newer_messages = newer.messages.clone();
+
+    let legacy = mom_llama_runtime::conversation_store::ConversationDb {
+        conversations: vec![newer, older],
+        selected_conversation_id: Some("legacy-newer".to_string()),
+    };
+    fs::write(
+        session.path().join("conversations.json"),
+        serde_json::to_vec_pretty(&legacy)?,
+    )?;
+
+    mom_llama_runtime::persona_list()?;
+    let conversations = mom_llama_runtime::conversation_list()?
+        .result
+        .ok_or_else(|| anyhow!("migrated conversations missing"))?;
+    let migrated_older = conversations
+        .iter()
+        .find(|conversation| conversation.id == "legacy-older")
+        .ok_or_else(|| anyhow!("older legacy conversation missing"))?;
+    let migrated_newer = conversations
+        .iter()
+        .find(|conversation| conversation.id == "legacy-newer")
+        .ok_or_else(|| anyhow!("newer legacy conversation missing"))?;
+    assert_eq!(
+        migrated_older.execution_profile.mention_handle,
+        "shared-lens"
+    );
+    assert_eq!(
+        migrated_newer.execution_profile.mention_handle,
+        "shared-lens-2"
+    );
+    assert_eq!(migrated_older.messages, older_messages);
+    assert_eq!(migrated_newer.messages, newer_messages);
+    assert_eq!(migrated_older.title, "Older saved chat");
+    assert_eq!(migrated_newer.title, "Newer saved chat");
+    Ok(())
+}
+
+#[test]
 fn blocked_chat_stream_never_claims_native_engine_invocation() -> Result<()> {
     let _session = TestSession::new("blocked-stream-evidence")?;
     let mut events = Vec::new();
@@ -1019,6 +1243,11 @@ fn product_runtime_rejects_network_process_and_copied_native_authority() -> Resu
         "llama-native-engine",
         "llama-native-cache",
         "llama-native-host",
+        "attachment-native-types",
+        "attachment-native-inspect",
+        "attachment-native-document",
+        "attachment-native-plan",
+        "attachment-native-host",
     ] {
         assert!(
             !repo_root.join("crates").join(crate_name).exists(),
@@ -1026,8 +1255,12 @@ fn product_runtime_rejects_network_process_and_copied_native_authority() -> Resu
         );
     }
     let workspace_manifest = fs::read_to_string(repo_root.join("Cargo.toml"))?;
-    assert!(workspace_manifest.contains("rev = \"a185a4be3c6ad6ea1935e01acef8946c7dfdc459\""));
+    assert!(workspace_manifest.contains("rev = \"c61692d48b0768bb242bcecb7a80c3318fc476b4\""));
+    assert!(workspace_manifest.contains("rev = \"9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe\""));
+    assert!(workspace_manifest.contains("rev = \"a7702f423102716d9fa21b64c51c331d4044a31d\""));
     assert!(!workspace_manifest.contains("[patch."));
+    assert!(!workspace_manifest.contains("attachment-native-host = { path ="));
+    assert!(!workspace_manifest.contains("attachment-native-types = { path ="));
 
     let runtime_src = runtime_manifest.join("src");
     for entry in fs::read_dir(&runtime_src)? {
@@ -1275,6 +1508,241 @@ fn user_and_assistant_edits_preserve_original_message_branches() -> Result<()> {
 }
 
 #[test]
+fn editing_one_mention_result_preserves_later_peers_on_the_edited_branch() -> Result<()> {
+    let _session = TestSession::new("mention-result-edit-branches")?;
+    let fixture = attributed_history_fixture("mention-result-edit-branches");
+    mom_llama_runtime::conversation_import_json(&serde_json::to_string(&fixture)?)?;
+
+    let edited = mom_llama_runtime::message_edit(
+        &fixture.id,
+        "2-first-peer",
+        "Revised first perspective".to_string(),
+    )?
+    .result
+    .ok_or_else(|| anyhow!("edited mention result missing"))?;
+    let edited_branch = mom_llama_runtime::conversation_select(&fixture.id)?
+        .result
+        .ok_or_else(|| anyhow!("edited mention branch missing"))?;
+    assert_eq!(
+        edited_branch
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "Ask both",
+            "Revised first perspective",
+            "Second perspective"
+        ]
+    );
+    assert_eq!(edited_branch.messages[1].id, edited.id);
+    let cloned_peer = &edited_branch.messages[2];
+    assert_ne!(cloned_peer.id, "3-second-peer");
+    assert_eq!(cloned_peer.parent_id.as_deref(), Some(edited.id.as_str()));
+    assert_eq!(
+        cloned_peer
+            .attribution
+            .as_ref()
+            .map(|attribution| (attribution.invocation_id.as_str(), attribution.target_order)),
+        Some(("shared-invocation", 1))
+    );
+
+    let branches = mom_llama_runtime::message_branches(&fixture.id, &edited.id)?
+        .result
+        .ok_or_else(|| anyhow!("edited mention branches missing"))?;
+    assert_eq!(branches.siblings.len(), 2);
+    let original_branch = mom_llama_runtime::message_branch_select(&fixture.id, "2-first-peer")?
+        .result
+        .ok_or_else(|| anyhow!("original mention branch missing"))?;
+    assert_eq!(
+        original_branch
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "Ask both",
+            "First perspective",
+            "Second perspective",
+            "Follow up after both",
+            "Host answer after both"
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn deleting_one_mention_result_splices_later_peers_and_host_history() -> Result<()> {
+    let _session = TestSession::new("mention-result-delete-splice")?;
+    let fixture = attributed_history_fixture("mention-result-delete-splice");
+    mom_llama_runtime::conversation_import_json(&serde_json::to_string(&fixture)?)?;
+
+    let deleted = mom_llama_runtime::message_delete(&fixture.id, "2-first-peer")?;
+    assert_eq!(deleted.readiness, "contracted");
+    let projected = mom_llama_runtime::conversation_select(&fixture.id)?
+        .result
+        .ok_or_else(|| anyhow!("mention history missing after delete"))?;
+    assert_eq!(
+        projected
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "Ask both",
+            "Second perspective",
+            "Follow up after both",
+            "Host answer after both"
+        ]
+    );
+    assert_eq!(projected.messages[1].parent_id.as_deref(), Some("1-user"));
+    assert_eq!(
+        projected.active_leaf_message_id.as_deref(),
+        Some("5-host-answer")
+    );
+    assert!(
+        projected
+            .messages
+            .iter()
+            .all(|message| message.id != "2-first-peer")
+    );
+    Ok(())
+}
+
+#[test]
+fn system_and_tool_messages_reject_edits_without_mutating_the_conversation() -> Result<()> {
+    let _session = TestSession::new("message-edit-role-guards")?;
+    let system = Message {
+        id: "system-message".to_string(),
+        conversation_id: "message-edit-role-guards".to_string(),
+        role: MessageRole::System,
+        content: "Stable system policy".to_string(),
+        created_at: "1".to_string(),
+        parent_id: None,
+        model: None,
+        receipt_id: None,
+        prompt_tokens: None,
+        completion_tokens: None,
+        reasoning_content: None,
+        reasoning_incomplete: false,
+        branch_index: None,
+        branch_count: None,
+        attribution: None,
+        attachment_ids: Vec::new(),
+    };
+    let tool = Message {
+        id: "tool-message".to_string(),
+        conversation_id: "message-edit-role-guards".to_string(),
+        role: MessageRole::Tool,
+        content: "Stable tool result".to_string(),
+        created_at: "2".to_string(),
+        parent_id: Some(system.id.clone()),
+        ..system.clone()
+    };
+    let fixture = Conversation {
+        id: "message-edit-role-guards".to_string(),
+        title: "Role guards".to_string(),
+        created_at: "1".to_string(),
+        updated_at: "2".to_string(),
+        kind: ConversationKind::Chat,
+        execution_profile: ConversationExecutionProfile::default(),
+        selected_model_path: None,
+        source_conversation_id: None,
+        source_message_id: None,
+        branch_root_message_id: None,
+        active_leaf_message_id: Some(tool.id.clone()),
+        current_skill_ids: Vec::new(),
+        messages: vec![system.clone(), tool.clone()],
+    };
+    mom_llama_runtime::conversation_import_json(&serde_json::to_string(&fixture)?)?;
+    let before = mom_llama_runtime::conversation_select(&fixture.id)?
+        .result
+        .ok_or_else(|| anyhow!("role-guard fixture missing before edits"))?;
+
+    for message in [&system, &tool] {
+        let blocked = mom_llama_runtime::message_edit(
+            &fixture.id,
+            &message.id,
+            "Attempted rewrite".to_string(),
+        )?;
+        assert_eq!(blocked.status, "blocked");
+        assert_eq!(blocked.readiness, "stub_blocked");
+        assert_eq!(
+            blocked
+                .blocker
+                .as_ref()
+                .map(|blocker| blocker.code.as_str()),
+            Some("message_role_not_editable")
+        );
+        assert!(blocked.result.is_none());
+        assert!(blocked.receipt.changed_paths.is_empty());
+    }
+
+    let stored = mom_llama_runtime::conversation_select(&fixture.id)?
+        .result
+        .ok_or_else(|| anyhow!("role-guard fixture missing"))?;
+    assert_eq!(stored, before);
+    Ok(())
+}
+
+#[test]
+fn chat_dispatch_ignores_email_embedded_and_code_at_tokens_but_blocks_explicit_unknowns()
+-> Result<()> {
+    let _session = TestSession::new("mention-token-boundaries")?;
+    let conversation = mom_llama_runtime::conversation_new(Some("Mention boundaries".to_string()))?
+        .result
+        .ok_or_else(|| anyhow!("mention-boundary conversation missing"))?;
+    let literal_message = "Email george@example.com; keep prefix@embedded, `@inline-code`, and:\n```text\n@fenced-code\n```\n    @indented-code";
+    let direct = mom_llama_runtime::chat_dispatch(
+        MentionDispatchInput {
+            conversation_id: conversation.id.clone(),
+            message: literal_message.to_string(),
+        },
+        ChatSendOptions {
+            fake_fixture: true,
+            ..ChatSendOptions::default()
+        },
+    )?;
+    assert!(matches!(
+        direct.result,
+        Some(ChatDispatchOutput::Direct { .. })
+    ));
+    let before_unknown = mom_llama_runtime::conversation_select(&conversation.id)?
+        .result
+        .ok_or_else(|| anyhow!("mention-boundary transcript missing"))?;
+
+    for message in [
+        "@missing-person please answer",
+        "Ask @missing-person please",
+    ] {
+        let blocked = mom_llama_runtime::chat_dispatch(
+            MentionDispatchInput {
+                conversation_id: conversation.id.clone(),
+                message: message.to_string(),
+            },
+            ChatSendOptions {
+                fake_fixture: true,
+                ..ChatSendOptions::default()
+            },
+        )?;
+        assert_eq!(blocked.status, "blocked");
+        assert_eq!(
+            blocked
+                .blocker
+                .as_ref()
+                .map(|blocker| blocker.code.as_str()),
+            Some("mention_target_not_found")
+        );
+    }
+    assert_eq!(
+        mom_llama_runtime::conversation_select(&conversation.id)?.result,
+        Some(before_unknown),
+        "an unresolved explicit mention must not append a host message"
+    );
+    Ok(())
+}
+
+#[test]
 fn conversations_search_skills_and_settings_survive_restart() -> Result<()> {
     let session = TestSession::new("persistence")?;
     let conversation = mom_llama_runtime::conversation_new(Some("Garden planning".to_string()))?
@@ -1352,13 +1820,18 @@ fn attachment_payload_is_encrypted_and_multimodal_is_honestly_blocked() -> Resul
         .result
         .ok_or_else(|| anyhow!("conversation was not created"))?;
     let image = session.path().join("garden.png");
-    let payload = b"not-a-real-png-private-attachment-5831";
+    let payload = VALID_PNG;
     std::fs::write(&image, payload)?;
     let imported = mom_llama_runtime::attachment_import(&conversation.id, &image)?;
     let output = imported
         .result
         .as_ref()
         .ok_or_else(|| anyhow!("attachment result missing"))?;
+    assert_eq!(
+        output.attachment.state,
+        mom_llama_runtime::AttachmentState::Staged
+    );
+    assert!(output.attachment.message_id.is_empty());
     assert!(output.attachment.stored_path.starts_with("encrypted://"));
     assert!(!output.multimodal_ready);
     assert_eq!(
@@ -1382,10 +1855,10 @@ fn attachment_payload_is_encrypted_and_multimodal_is_honestly_blocked() -> Resul
     let hydrated = mom_llama_runtime::attachment_preview(&output.attachment.id, true)?
         .result
         .ok_or_else(|| anyhow!("attachment payload preview missing"))?;
-    assert_eq!(hydrated.bytes.as_deref(), Some(payload.as_slice()));
+    assert_eq!(hydrated.bytes.as_deref(), Some(payload));
     let chat = mom_llama_runtime::chat_send(
         ChatSendInput {
-            conversation_id: conversation.id,
+            conversation_id: conversation.id.clone(),
             message: "Describe the image.".to_string(),
         },
         ChatSendOptions {
@@ -1394,14 +1867,26 @@ fn attachment_payload_is_encrypted_and_multimodal_is_honestly_blocked() -> Resul
         },
     )?;
     assert_eq!(chat.readiness, "blocked_missing_mmproj");
+    let draft = mom_llama_runtime::draft_get(Some(&conversation.id))?
+        .result
+        .ok_or_else(|| anyhow!("attachment draft missing"))?;
+    assert_eq!(draft.attachment_ids, vec![output.attachment.id.clone()]);
+    let conversation = mom_llama_runtime::conversation_select(&conversation.id)?
+        .result
+        .ok_or_else(|| anyhow!("conversation missing after blocked send"))?;
+    assert!(conversation.messages.is_empty());
     Ok(())
 }
 
 #[test]
 fn long_paste_becomes_an_encrypted_text_attachment_without_a_plaintext_file() -> Result<()> {
     let session = TestSession::new("pasted-text-attachment")?;
+    let conversation = mom_llama_runtime::conversation_new(Some("Pasted notes".to_string()))?
+        .result
+        .ok_or_else(|| anyhow!("pasted-notes conversation missing"))?;
     let marker = "private-long-paste-9137 ".repeat(160);
-    let imported = mom_llama_runtime::attachment_import_pasted_text("default", marker.clone())?;
+    let imported =
+        mom_llama_runtime::attachment_import_pasted_text(&conversation.id, marker.clone())?;
     assert_eq!(imported.readiness, "contracted");
     let output = imported
         .result
@@ -1412,21 +1897,166 @@ fn long_paste_becomes_an_encrypted_text_attachment_without_a_plaintext_file() ->
     assert!(output.attachment.stored_path.starts_with("encrypted://"));
     assert!(!session.path().join(&output.attachment.file_name).exists());
 
-    let conversation = mom_llama_runtime::conversation_select("default")?
+    let conversation = mom_llama_runtime::conversation_select(&conversation.id)?
         .result
         .ok_or_else(|| anyhow!("default conversation missing"))?;
-    assert!(
-        conversation
-            .messages
-            .iter()
-            .any(|message| message.content.contains("private-long-paste-9137"))
+    assert!(conversation.messages.is_empty());
+    let draft = mom_llama_runtime::draft_get(Some(&conversation.id))?
+        .result
+        .ok_or_else(|| anyhow!("pasted attachment draft missing"))?;
+    assert_eq!(draft.attachment_ids, vec![output.attachment.id.clone()]);
+    let sent = mom_llama_runtime::chat_send(
+        ChatSendInput {
+            conversation_id: conversation.id.clone(),
+            message: "Summarize this attachment.".to_string(),
+        },
+        ChatSendOptions {
+            timeout_s: 1.0,
+            fake_fixture: true,
+        },
+    )?;
+    assert_eq!(sent.readiness, "fake_fixture_exercised");
+    let conversation = mom_llama_runtime::conversation_select(&conversation.id)?
+        .result
+        .ok_or_else(|| anyhow!("default conversation missing after send"))?;
+    let attached_user = conversation
+        .messages
+        .iter()
+        .find(|message| message.role == mom_llama_runtime::MessageRole::User)
+        .ok_or_else(|| anyhow!("attached user message missing"))?;
+    assert_eq!(
+        attached_user.attachment_ids,
+        vec![output.attachment.id.clone()]
     );
+    assert_eq!(attached_user.content, "Summarize this attachment.");
+    assert!(
+        mom_llama_runtime::draft_get(Some(&conversation.id))?
+            .result
+            .is_some_and(|draft| draft.attachment_ids.is_empty())
+    );
+    let committed = mom_llama_runtime::attachment_list(Some(&conversation.id))?
+        .result
+        .and_then(|records| {
+            records
+                .into_iter()
+                .find(|record| record.id == output.attachment.id)
+        })
+        .ok_or_else(|| anyhow!("committed attachment record missing"))?;
+    assert_eq!(
+        committed.state,
+        mom_llama_runtime::AttachmentState::Committed
+    );
+    assert_eq!(committed.message_id, attached_user.id);
     let sqlite = std::fs::read(session.path().join("runtime.sqlite3"))?;
     assert!(
         !sqlite
             .windows(marker.len())
             .any(|window| window == marker.as_bytes())
     );
+    Ok(())
+}
+
+#[test]
+fn fixture_mention_commits_staged_attachments_and_clears_the_draft_without_real_readiness()
+-> Result<()> {
+    let _session = TestSession::new("fixture-mention-attachment-lifecycle")?;
+    let source = mom_llama_runtime::conversation_new(Some("Fixture persona source".to_string()))?
+        .result
+        .ok_or_else(|| anyhow!("fixture persona source missing"))?;
+    mom_llama_runtime::chat_send(
+        ChatSendInput {
+            conversation_id: source.id.clone(),
+            message: "Stable fixture source context".to_string(),
+        },
+        ChatSendOptions {
+            fake_fixture: true,
+            ..ChatSendOptions::default()
+        },
+    )?;
+    let source = mom_llama_runtime::conversation_select(&source.id)?
+        .result
+        .ok_or_else(|| anyhow!("fixture persona source reload missing"))?;
+    let persona = mom_llama_runtime::persona_freeze(PersonaFreezeInput {
+        conversation_id: source.id.clone(),
+        message_id: source
+            .active_leaf_message_id
+            .clone()
+            .ok_or_else(|| anyhow!("fixture persona source leaf missing"))?,
+        name: "Attachment reviewer".to_string(),
+        mention_handle: "attachment-reviewer".to_string(),
+        history_mode: PersonaHistoryMode::Full,
+    })?
+    .result
+    .ok_or_else(|| anyhow!("fixture attachment persona missing"))?;
+    let host = mom_llama_runtime::conversation_new(Some("Attachment host".to_string()))?
+        .result
+        .ok_or_else(|| anyhow!("fixture attachment host missing"))?;
+    let imported = mom_llama_runtime::attachment_import_pasted_text(
+        &host.id,
+        "private fixture attachment payload 4182".to_string(),
+    )?
+    .result
+    .ok_or_else(|| anyhow!("fixture mention attachment import missing"))?;
+    let addressed = format!(
+        "@{} review the attached note",
+        persona.execution_profile.mention_handle
+    );
+    mom_llama_runtime::draft_update(
+        Some(&host.id),
+        addressed.clone(),
+        vec![imported.attachment.id.clone()],
+    )?;
+
+    let dispatched = mom_llama_runtime::chat_dispatch(
+        MentionDispatchInput {
+            conversation_id: host.id.clone(),
+            message: addressed,
+        },
+        ChatSendOptions {
+            fake_fixture: true,
+            ..ChatSendOptions::default()
+        },
+    )?;
+    assert_eq!(dispatched.readiness, "fake_fixture_exercised");
+    assert!(dispatched.receipt.fake_fixture);
+    assert!(!dispatched.receipt.real_engine_invoked);
+    let ChatDispatchOutput::Mention { invocation, .. } = dispatched
+        .result
+        .ok_or_else(|| anyhow!("fixture mention dispatch output missing"))?
+    else {
+        return Err(anyhow!("fixture attachment dispatch was not a mention"));
+    };
+    assert!(invocation.results.iter().all(|result| {
+        result.fake_fixture && !result.real_engine_invoked && result.model_id == "fake_fixture"
+    }));
+
+    let stored = mom_llama_runtime::conversation_select(&host.id)?
+        .result
+        .ok_or_else(|| anyhow!("fixture attachment host reload missing"))?;
+    let user_message = stored
+        .messages
+        .iter()
+        .find(|message| message.id == invocation.user_message_id)
+        .ok_or_else(|| anyhow!("fixture mention user message missing"))?;
+    assert_eq!(
+        user_message.attachment_ids,
+        vec![imported.attachment.id.clone()]
+    );
+    let draft = mom_llama_runtime::draft_get(Some(&host.id))?
+        .result
+        .ok_or_else(|| anyhow!("fixture mention draft result missing"))?;
+    assert!(draft.message.is_empty());
+    assert!(draft.attachment_ids.is_empty());
+    let record = mom_llama_runtime::attachment_list(Some(&host.id))?
+        .result
+        .and_then(|records| {
+            records
+                .into_iter()
+                .find(|record| record.id == imported.attachment.id)
+        })
+        .ok_or_else(|| anyhow!("fixture mention committed attachment missing"))?;
+    assert_eq!(record.state, mom_llama_runtime::AttachmentState::Committed);
+    assert_eq!(record.message_id, user_message.id);
     Ok(())
 }
 
@@ -1548,6 +2178,257 @@ fn configured_real_session(name: &str) -> Result<Option<TestSession>> {
         ..SettingsUpdate::default()
     })?;
     Ok(Some(session))
+}
+
+async fn product_gateway_cache_request(
+    stable_system: &str,
+    user_message: &str,
+    cache_mode: CacheMode,
+    owner_version: &str,
+) -> Result<GatewayResponse> {
+    let (host, model) = mom_llama_runtime::gateway_native_host_and_model()?;
+    let model_id = model.model_id.clone();
+    let backend = Arc::new(LlamaNativeBackend::new(host));
+    backend.configure_model(model)?;
+    let gateway = Gateway::new(GatewayDefaults {
+        catalog_version: "mom-llama-real-cache-proof-v1".to_string(),
+    });
+    gateway.register_backend(backend)?;
+    let request = GatewayRequest {
+        request_id: RequestId::new(),
+        client_id: "mom-llama-real-cache-proof".to_string(),
+        model: ModelSelector::ExactRoute {
+            backend_id: BACKEND_ID.to_string(),
+            model_id,
+        },
+        input: GenerationInput::Chat {
+            items: vec![
+                InputItem::Message {
+                    id: None,
+                    role: GatewayMessageRole::System,
+                    content: vec![ContentBlock::Text {
+                        text: stable_system.to_string(),
+                    }],
+                },
+                InputItem::Message {
+                    id: None,
+                    role: GatewayMessageRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: user_message.to_string(),
+                    }],
+                },
+            ],
+        },
+        sampling: SamplingOptions {
+            max_output_tokens: Some(8),
+            temperature: Some(0.0),
+            seed: Some(7),
+            ..SamplingOptions::default()
+        },
+        response_format: ResponseFormat::default(),
+        tools: Vec::new(),
+        tool_policy: ToolPolicy::default(),
+        cache: CachePolicy {
+            mode: cache_mode,
+            stable_prefix_items: Some(1),
+            owner_namespace: Some("mom-llama-integrated-cache-proof".to_string()),
+            owner_version: Some(owner_version.to_string()),
+            ..CachePolicy::default()
+        },
+        routing: RoutingPolicy::default(),
+        storage: StoragePolicy::default(),
+        deadline: DeadlinePolicy {
+            total_ms: Some(180_000),
+            ..DeadlinePolicy::default()
+        },
+        stream: StreamPolicy::default(),
+        provider_extensions: BTreeMap::new(),
+    };
+    Ok(gateway.execute(request).await?.final_response().await?)
+}
+
+fn assert_gateway_cache_outcome(response: &GatewayResponse, expected: CacheOutcome) -> Result<()> {
+    assert_eq!(response.status, TerminalStatus::Completed);
+    assert!(response.usage.real_local_inference);
+    assert!(!response.output.is_empty());
+    assert_eq!(
+        response
+            .usage
+            .cache
+            .as_ref()
+            .ok_or_else(|| anyhow!("gateway cache receipt missing"))?
+            .outcome,
+        expected
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
+async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_corruption()
+-> Result<()> {
+    let Some(session) = configured_real_session("real-product-gateway-cache")? else {
+        return Ok(());
+    };
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        max_tokens: Some(8),
+        kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
+        ..SettingsUpdate::default()
+    })?;
+    let stable_system = format!(
+        "This is an immutable local persona prefix used only for cache verification. {}",
+        "Keep the complete prior statement in context and answer the next user briefly. "
+            .repeat(32)
+    );
+
+    let cold = product_gateway_cache_request(
+        &stable_system,
+        "Return the word cold.",
+        CacheMode::Persistent,
+        "v1",
+    )
+    .await?;
+    assert_gateway_cache_outcome(&cold, CacheOutcome::Miss)?;
+    let warm = product_gateway_cache_request(
+        &stable_system,
+        "Return the word warm.",
+        CacheMode::Persistent,
+        "v1",
+    )
+    .await?;
+    assert_gateway_cache_outcome(&warm, CacheOutcome::Hit)?;
+
+    let cleared = mom_llama_runtime::kv_cache_clear()?;
+    assert_eq!(cleared.readiness, "contracted");
+    assert!(cleared.blocker.is_none());
+    let after_clear = product_gateway_cache_request(
+        &stable_system,
+        "Return the words after clear.",
+        CacheMode::Persistent,
+        "v1",
+    )
+    .await?;
+    assert_gateway_cache_outcome(&after_clear, CacheOutcome::Miss)?;
+
+    let settings = mom_llama_runtime::settings_get()?
+        .result
+        .ok_or_else(|| anyhow!("cache proof settings missing"))?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        resident_memory_budget_bytes: Some(
+            settings
+                .resident_memory_budget_bytes
+                .saturating_add(1024 * 1024),
+        ),
+        ..SettingsUpdate::default()
+    })?;
+    let restored = product_gateway_cache_request(
+        &stable_system,
+        "Return the words after persistent restore.",
+        CacheMode::Persistent,
+        "v1",
+    )
+    .await?;
+    assert_gateway_cache_outcome(&restored, CacheOutcome::Hit)?;
+
+    mom_llama_runtime::kv_cache_clear()?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        kv_cache_policy: Some(KvCachePolicy::None),
+        ..SettingsUpdate::default()
+    })?;
+    let off_first = product_gateway_cache_request(
+        &stable_system,
+        "Caching is off, first request.",
+        CacheMode::Persistent,
+        "v1",
+    )
+    .await?;
+    let off_second = product_gateway_cache_request(
+        &stable_system,
+        "Caching is off, second request.",
+        CacheMode::Persistent,
+        "v1",
+    )
+    .await?;
+    assert_gateway_cache_outcome(&off_first, CacheOutcome::Miss)?;
+    assert_gateway_cache_outcome(&off_second, CacheOutcome::Miss)?;
+    assert!(
+        !encrypted_document_snapshot(session.path())?
+            .contains_key("native-host-prefix-cache.mom-llama"),
+        "the Off policy must not write the shared FTE/native prefix document"
+    );
+
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
+        ..SettingsUpdate::default()
+    })?;
+    let before_corruption = product_gateway_cache_request(
+        &stable_system,
+        "Checkpoint a prefix before corruption.",
+        CacheMode::Persistent,
+        "v1",
+    )
+    .await?;
+    assert_gateway_cache_outcome(&before_corruption, CacheOutcome::Miss)?;
+    let connection = rusqlite::Connection::open(session.path().join("runtime.sqlite3"))?;
+    assert_eq!(
+        connection.execute(
+            "UPDATE encrypted_documents SET ciphertext = X'00'
+             WHERE namespace = 'native-host-prefix-cache.mom-llama'",
+            [],
+        )?,
+        1
+    );
+    let settings = mom_llama_runtime::settings_get()?
+        .result
+        .ok_or_else(|| anyhow!("cache proof settings missing after re-enable"))?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        resident_memory_budget_bytes: Some(
+            settings
+                .resident_memory_budget_bytes
+                .saturating_add(1024 * 1024),
+        ),
+        ..SettingsUpdate::default()
+    })?;
+    let corruption_fallback = product_gateway_cache_request(
+        &stable_system,
+        "Generate normally after quarantining corrupt cache bytes.",
+        CacheMode::Persistent,
+        "v1",
+    )
+    .await?;
+    assert_gateway_cache_outcome(&corruption_fallback, CacheOutcome::Miss)?;
+    let documents = encrypted_document_snapshot(session.path())?;
+    assert!(
+        documents
+            .keys()
+            .any(|namespace| namespace.starts_with("quarantine.disposable-cache."))
+    );
+    assert!(documents.contains_key("native-host-prefix-cache.mom-llama"));
+
+    let warm_after_quarantine = product_gateway_cache_request(
+        &stable_system,
+        "Verify the replacement cache is warm.",
+        CacheMode::Persistent,
+        "v1",
+    )
+    .await?;
+    assert_gateway_cache_outcome(&warm_after_quarantine, CacheOutcome::Hit)?;
+    let settings = mom_llama_runtime::settings_get()?
+        .result
+        .ok_or_else(|| anyhow!("cache proof settings missing before fingerprint change"))?;
+    mom_llama_runtime::settings_update(SettingsUpdate {
+        context_tokens: Some(settings.context_tokens.saturating_add(128)),
+        ..SettingsUpdate::default()
+    })?;
+    let fingerprint_miss = product_gateway_cache_request(
+        &stable_system,
+        "Generate normally after changing the model context fingerprint.",
+        CacheMode::Persistent,
+        "v1",
+    )
+    .await?;
+    assert_gateway_cache_outcome(&fingerprint_miss, CacheOutcome::Miss)?;
+    Ok(())
 }
 
 fn one_second_tone_wav() -> Vec<u8> {
@@ -1868,28 +2749,29 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
         max_tokens: Some(192),
         ..SettingsUpdate::default()
     })?;
-    let (started_tx, started_rx) = mpsc::sync_channel(1);
-    let handle = std::thread::spawn(move || {
-        mom_llama_runtime::consult_start_stream(
-            ConsultStartInput {
-                conversation_id: "real-consult".to_string(),
-                prompt: "Give a careful short plan for preparing a virtual consultation."
-                    .to_string(),
-                panel_id: None,
-            },
-            ConsultStartOptions::default(),
-            Some(|event: mom_llama_runtime::ConsultStreamEvent| {
-                if event.event == "delta" {
-                    let _ = started_tx.try_send(event.run_id);
-                }
-                Ok(())
-            }),
-        )
-    });
-    let run_id = started_rx
-        .recv_timeout(Duration::from_secs(120))
-        .map_err(|error| anyhow!("consult did not start streaming: {error}"))?;
-    let cancelled = mom_llama_runtime::consult_cancel(&run_id, Some("skeptical"))?;
+    let mut cancelled = None;
+    let result = mom_llama_runtime::consult_start_stream(
+        ConsultStartInput {
+            conversation_id: "real-consult".to_string(),
+            prompt: "Give a careful short plan for preparing a virtual consultation.".to_string(),
+            panel_id: None,
+        },
+        ConsultStartOptions::default(),
+        Some(|event: mom_llama_runtime::ConsultStreamEvent| {
+            if cancelled.is_none()
+                && event.seat_id == "skeptical"
+                && event.event == "state"
+                && event.state == Some(llama_native_types::GenerationState::Generating)
+            {
+                cancelled = Some(mom_llama_runtime::consult_cancel(
+                    &event.run_id,
+                    Some("skeptical"),
+                )?);
+            }
+            Ok(())
+        }),
+    )?;
+    let cancelled = cancelled.ok_or_else(|| anyhow!("skeptical seat never became cancellable"))?;
     assert_eq!(
         cancelled
             .result
@@ -1897,9 +2779,6 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
             .map(|result| result.cancelled_sequences),
         Some(1)
     );
-    let result = handle
-        .join()
-        .map_err(|_| anyhow!("consult worker panicked"))??;
     let run = result
         .result
         .ok_or_else(|| anyhow!("consult result missing"))?;

@@ -119,6 +119,54 @@ impl RuntimeStore {
             .transpose()
     }
 
+    /// Read a disposable encrypted cache document, quarantining corrupt bytes.
+    ///
+    /// This is deliberately separate from [`Self::get`]. Product records such
+    /// as conversations, settings, and personas must continue to fail closed
+    /// when authentication or decoding fails. A native prefix cache is only a
+    /// performance hint: preserving its raw authenticated bytes for diagnosis,
+    /// removing it from the live namespace, and returning a cache miss is both
+    /// safe and availability-preserving.
+    pub(crate) fn get_disposable_cache<T>(&self, namespace: &str) -> Result<Option<T>>
+    where
+        T: DeserializeOwned,
+    {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let encrypted = transaction
+            .query_row(
+                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
+                [namespace],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let Some((nonce, ciphertext)) = encrypted else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        match self.decrypt_json(namespace, &nonce, &ciphertext) {
+            Ok(value) => {
+                transaction.commit()?;
+                Ok(Some(value))
+            }
+            Err(_) => {
+                let quarantine_namespace =
+                    disposable_cache_quarantine_namespace(namespace, &nonce, &ciphertext);
+                transaction.execute(
+                    "INSERT INTO encrypted_documents(namespace, nonce, ciphertext, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![quarantine_namespace, nonce, ciphertext, timestamp_i64()],
+                )?;
+                transaction.execute(
+                    "DELETE FROM encrypted_documents WHERE namespace = ?1",
+                    [namespace],
+                )?;
+                transaction.commit()?;
+                Ok(None)
+            }
+        }
+    }
+
     pub(crate) fn put<T>(&self, namespace: &str, value: &T) -> Result<()>
     where
         T: Serialize,
@@ -163,6 +211,42 @@ impl RuntimeStore {
                updated_at = excluded.updated_at",
             params![namespace, nonce, ciphertext, timestamp_i64()],
         )?;
+        Ok(())
+    }
+
+    /// Replace several encrypted documents in one SQLite transaction.
+    ///
+    /// Callers use this when a product operation spans independently versioned
+    /// documents (for example a conversation, its draft, and attachment
+    /// metadata). Either every encrypted value becomes visible, or none do.
+    pub(crate) fn put_documents_atomically<I, N, V>(&self, documents: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: Into<String>,
+        V: AsRef<[u8]>,
+    {
+        let encrypted = documents
+            .into_iter()
+            .map(|(namespace, value)| {
+                let namespace = namespace.into();
+                let (nonce, ciphertext) = self.encrypt_bytes(&namespace, value.as_ref())?;
+                Ok((namespace, nonce, ciphertext))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (namespace, nonce, ciphertext) in encrypted {
+            transaction.execute(
+                "INSERT INTO encrypted_documents(namespace, nonce, ciphertext, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(namespace) DO UPDATE SET
+                   nonce = excluded.nonce,
+                   ciphertext = excluded.ciphertext,
+                   updated_at = excluded.updated_at",
+                params![namespace, nonce, ciphertext, timestamp_i64()],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -375,6 +459,23 @@ impl RuntimeStore {
 
 fn timestamp_i64() -> i64 {
     i64::try_from(crate::now_ms()).unwrap_or(i64::MAX)
+}
+
+fn disposable_cache_quarantine_namespace(
+    namespace: &str,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update(nonce);
+    hasher.update(ciphertext);
+    let digest = format!("{:x}", hasher.finalize());
+    format!(
+        "quarantine.disposable-cache.{}.{}",
+        timestamp_i64(),
+        &digest[..16]
+    )
 }
 
 fn resolve_store_key(data_dir: &Path) -> Result<[u8; 32]> {
@@ -623,6 +724,63 @@ mod tests {
             [],
         )?;
         assert!(store.get::<SecretDocument>("secret").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn disposable_cache_corruption_is_quarantined_but_product_corruption_is_not_masked()
+    -> Result<()> {
+        let data_dir = test_dir("cache-quarantine");
+        let store = RuntimeStore::open_with_key(&data_dir, [17_u8; 32])?;
+        store.put(
+            "native-host-prefix-cache.mom-llama",
+            &SecretDocument {
+                values: vec!["disposable".to_string()],
+            },
+        )?;
+        store.put(
+            "conversations",
+            &SecretDocument {
+                values: vec!["must fail closed".to_string()],
+            },
+        )?;
+        let connection = Connection::open(store.path())?;
+        connection.execute(
+            "UPDATE encrypted_documents SET ciphertext = X'00'
+             WHERE namespace IN ('native-host-prefix-cache.mom-llama', 'conversations')",
+            [],
+        )?;
+
+        assert_eq!(
+            store.get_disposable_cache::<SecretDocument>("native-host-prefix-cache.mom-llama")?,
+            None,
+            "corrupt prefix state must become an ordinary cache miss"
+        );
+        assert!(
+            store.get::<SecretDocument>("conversations").is_err(),
+            "ordinary encrypted product data must remain fail-closed"
+        );
+
+        let live_cache_rows: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM encrypted_documents
+             WHERE namespace = 'native-host-prefix-cache.mom-llama'",
+            [],
+            |row| row.get(0),
+        )?;
+        let quarantine_rows: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM encrypted_documents
+             WHERE namespace LIKE 'quarantine.disposable-cache.%'",
+            [],
+            |row| row.get(0),
+        )?;
+        let product_rows: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM encrypted_documents WHERE namespace = 'conversations'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(live_cache_rows, 0);
+        assert_eq!(quarantine_rows, 1);
+        assert_eq!(product_rows, 1);
         Ok(())
     }
 

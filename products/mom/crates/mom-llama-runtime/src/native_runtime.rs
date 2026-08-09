@@ -1,9 +1,11 @@
-use crate::config::Settings;
+use crate::config::{KvCachePolicy, Settings};
 use crate::engine::{ValidationBlocker, validate_model_path};
 use crate::receipts::Blocker;
 use llama_native_cache::PrefixCacheValue;
 use llama_native_engine::NativeModelHandle;
-use llama_native_host::{NativeHost, NativeHostConfig, PrefixCacheStore, SystemClock};
+use llama_native_host::{
+    HostCachePolicy, NativeHost, NativeHostConfig, PrefixCacheStore, SystemClock,
+};
 use llama_native_types::{NativeError, NativeErrorCode, NativeModelConfig, ResidentModelStatus};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -26,6 +28,7 @@ struct ProductHostKey {
     memory_budget_bytes: u64,
     max_slots: usize,
     data_dir: PathBuf,
+    cache_policy: KvCachePolicy,
 }
 
 #[derive(Debug)]
@@ -45,6 +48,7 @@ fn host_key(settings: &Settings) -> ProductHostKey {
         memory_budget_bytes: settings.resident_memory_budget_bytes,
         max_slots: settings.max_parallel_sequences.clamp(1, 4) as usize,
         data_dir: settings.data_dir.clone(),
+        cache_policy: settings.kv_cache_policy,
     }
 }
 
@@ -61,7 +65,7 @@ impl ProductPrefixCacheStore {
 impl PrefixCacheStore for ProductPrefixCacheStore {
     fn load(&self, namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
         self.store
-            .get(&Self::document(namespace))
+            .get_disposable_cache(&Self::document(namespace))
             .map(|values| values.unwrap_or_default())
             .map_err(prefix_store_error)
     }
@@ -96,6 +100,17 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
             })
             .map_err(prefix_store_error)
     }
+
+    fn clear(&self, namespace: &str) -> Result<usize, NativeError> {
+        let document = Self::document(namespace);
+        let entries = self
+            .store
+            .get_disposable_cache::<Vec<PrefixCacheValue>>(&document)
+            .map_err(prefix_store_error)?
+            .map_or(0, |values| values.len());
+        self.store.delete(&document).map_err(prefix_store_error)?;
+        Ok(entries)
+    }
 }
 
 fn prefix_store_error(error: anyhow::Error) -> NativeError {
@@ -113,6 +128,7 @@ fn create_product_host(key: &ProductHostKey) -> Result<Arc<NativeHost>, NativeEr
             memory_budget_bytes: key.memory_budget_bytes,
             max_slots: key.max_slots,
             cache_namespace: "mom-llama".to_string(),
+            cache_policy: host_cache_policy(key.cache_policy),
             ..NativeHostConfig::default()
         },
         Arc::new(SystemClock),
@@ -122,6 +138,24 @@ fn create_product_host(key: &ProductHostKey) -> Result<Arc<NativeHost>, NativeEr
     );
     host.restore_persistent_cache()?;
     Ok(Arc::new(host))
+}
+
+const fn host_cache_policy(policy: KvCachePolicy) -> HostCachePolicy {
+    match policy {
+        KvCachePolicy::None => HostCachePolicy::Disabled,
+        KvCachePolicy::PromptPrefix | KvCachePolicy::KvCacheCandidate => {
+            HostCachePolicy::MemoryAndPersistent
+        }
+    }
+}
+
+/// Clears every product-owned prefix tier used by direct native generation and
+/// by the embedded gateway. This deliberately works while caching is disabled,
+/// so switching the runtime policy off cannot strand an older encrypted
+/// checkpoint on disk.
+pub fn clear_native_prefix_cache(settings: &Settings) -> anyhow::Result<usize> {
+    with_host(settings, NativeHost::clear_cache)
+        .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))
 }
 
 fn with_host<T>(
@@ -340,6 +374,13 @@ pub fn skip_native_reasoning(request_id: &str, branch_id: Option<&str>) -> usize
 }
 
 fn native_error_blocker(error: NativeError) -> ValidationBlocker {
+    let blocker_code = match error.code {
+        NativeErrorCode::MemoryBudgetExceeded => {
+            "resident_model_memory_budget_exceeded".to_string()
+        }
+        NativeErrorCode::ModelSlotsFull => "resident_model_slots_full".to_string(),
+        _ => error.code.to_string(),
+    };
     ValidationBlocker {
         readiness: match error.code {
             NativeErrorCode::ModelMissing => "blocked_missing_model",
@@ -353,7 +394,7 @@ fn native_error_blocker(error: NativeError) -> ValidationBlocker {
         }
         .to_string(),
         blocker: Blocker::new(
-            error.code.to_string(),
+            blocker_code,
             error.message,
             vec!["Check the selected model and native runtime settings.".to_string()],
         ),
@@ -369,7 +410,11 @@ fn native_blocker(code: &str, message: &str) -> ValidationBlocker {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrefixCacheStore, ProductPrefixCacheStore};
+    use super::{
+        HostCachePolicy, PrefixCacheStore, ProductHostKey, ProductPrefixCacheStore,
+        create_product_host, host_cache_policy,
+    };
+    use crate::config::KvCachePolicy;
     use llama_native_cache::{CacheFingerprint, CacheTier, PrefixCacheMetadata, PrefixCacheValue};
     use llama_native_host::memory_reservation;
     use llama_native_types::{PromptForm, PromptTokenPolicy, SequenceStateBlob};
@@ -436,6 +481,121 @@ mod tests {
             .delete("test", "persistent-test")
             .expect("delete prefix");
         assert!(cache.load("test").expect("load after delete").is_empty());
+        std::fs::remove_dir_all(data_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn product_cache_policy_controls_every_native_host_cache_tier() {
+        assert_eq!(
+            host_cache_policy(KvCachePolicy::None),
+            HostCachePolicy::Disabled
+        );
+        assert_eq!(
+            host_cache_policy(KvCachePolicy::PromptPrefix),
+            HostCachePolicy::MemoryAndPersistent
+        );
+        assert_eq!(
+            host_cache_policy(KvCachePolicy::KvCacheCandidate),
+            HostCachePolicy::MemoryAndPersistent
+        );
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "mom-llama-disabled-host-cache-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let key = ProductHostKey {
+            memory_budget_bytes: 1024 * 1024 * 1024,
+            max_slots: 1,
+            data_dir: data_dir.clone(),
+            cache_policy: KvCachePolicy::None,
+        };
+        let host = create_product_host(&key).expect("disabled product host");
+        let value = cache_value();
+        host.cache_insert(value.clone())
+            .expect("disabled insert is a no-op");
+        assert!(
+            host.cache_lookup(&value.metadata.fingerprint, &value.sequence.token_ids)
+                .is_none(),
+            "the Off policy must not read from the native host memory tier"
+        );
+        let store = crate::store::RuntimeStore::open(&data_dir).expect("test encrypted store");
+        let persistent = ProductPrefixCacheStore { store };
+        assert!(
+            persistent
+                .load("mom-llama")
+                .expect("load disabled persistent tier")
+                .is_empty(),
+            "the Off policy must not write the native host persistent tier"
+        );
+        std::fs::remove_dir_all(data_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn product_prefix_cache_clear_removes_the_encrypted_document() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "mom-llama-prefix-cache-clear-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = crate::store::RuntimeStore::open_with_key(&data_dir, [23_u8; 32])
+            .expect("test encrypted store");
+        let cache = ProductPrefixCacheStore { store };
+        cache
+            .save("mom-llama", &cache_value())
+            .expect("save prefix");
+        assert_eq!(cache.clear("mom-llama").expect("clear prefixes"), 1);
+        assert!(
+            cache
+                .load("mom-llama")
+                .expect("load cleared prefixes")
+                .is_empty()
+        );
+        std::fs::remove_dir_all(data_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn product_prefix_cache_quarantines_corruption_and_recovers_as_a_cold_cache() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "mom-llama-prefix-cache-corruption-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = crate::store::RuntimeStore::open_with_key(&data_dir, [29_u8; 32])
+            .expect("test encrypted store");
+        let store_path = store.path().to_path_buf();
+        let cache = ProductPrefixCacheStore { store };
+        let value = cache_value();
+        cache.save("mom-llama", &value).expect("save prefix");
+        rusqlite::Connection::open(&store_path)
+            .expect("open encrypted store")
+            .execute(
+                "UPDATE encrypted_documents SET ciphertext = X'00'
+                 WHERE namespace = 'native-host-prefix-cache.mom-llama'",
+                [],
+            )
+            .expect("corrupt disposable prefix row");
+
+        assert!(
+            cache
+                .load("mom-llama")
+                .expect("corrupt disposable cache must be a miss")
+                .is_empty()
+        );
+        cache
+            .save("mom-llama", &value)
+            .expect("cold cache must accept a replacement");
+        assert_eq!(
+            cache.load("mom-llama").expect("load replacement"),
+            vec![value]
+        );
+        let quarantine_count: i64 = rusqlite::Connection::open(&store_path)
+            .expect("open encrypted store")
+            .query_row(
+                "SELECT COUNT(*) FROM encrypted_documents
+                 WHERE namespace LIKE 'quarantine.disposable-cache.%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count quarantined cache rows");
+        assert_eq!(quarantine_count, 1);
         std::fs::remove_dir_all(data_dir).expect("remove test directory");
     }
 }

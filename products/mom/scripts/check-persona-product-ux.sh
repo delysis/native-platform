@@ -50,6 +50,8 @@ jq -e '
 cargo run -q -p mom-llama-app -- --dump-html > "$acceptance_dir/app.html"
 rg -q 'data-action="personas-open"' "$acceptance_dir/app.html"
 rg -q 'Start a private conversation with a saved Persona.' "$acceptance_dir/app.html"
+rg -q 'data-action="persona-open" data-conversation="persona-judith_herman"' \
+  "$acceptance_dir/app.html"
 rg -q 'data-action="persona-instantiate" data-persona="persona-judith_herman"' \
   "$acceptance_dir/app.html"
 if rg -q 'data-action="skills-open"|Body &amp; trauma lens|Safety &amp; recovery stages lens' \
@@ -57,7 +59,7 @@ if rg -q 'data-action="skills-open"|Body &amp; trauma lens|Safety &amp; recovery
   echo "obsolete primary navigation or abstract Persona seeds remain" >&2
   exit 1
 fi
-if rg -q 'data-action="persona-open"|Edits version this template|class="persona-template-banner"' \
+if rg -q 'Edits version this template|class="persona-template-banner"' \
   "$acceptance_dir/app.html"; then
   echo "internal Persona-template state leaked into the normal chat surface" >&2
   exit 1
@@ -69,5 +71,6 @@ rg -q 'stream.dataset.followTail' apps/mom-llama/ui/coop-hx.js
 composer_clear_line=$(rg -n -F 'if (textarea) textarea.value = "";' apps/mom-llama/ui/coop-hx.js | head -n 1 | cut -d: -f1)
 dispatch_line=$(rg -n -F 'result = await invoke("mom_llama_chat_dispatch"' apps/mom-llama/ui/coop-hx.js | head -n 1 | cut -d: -f1)
 test "$composer_clear_line" -lt "$dispatch_line"
+rg -q -F 'if (!message && !attachmentIds.length) return;' apps/mom-llama/ui/coop-hx.js
 
-echo "persona product UX ok: exact 14-person catalog, zero seeded groups, visible start flow, immediate composer clear, stable transcript viewport"
+echo "persona product UX ok: exact 14-person catalog, zero seeded groups, editable template flow, explicit start flow, attachment-only dispatch, immediate composer clear, stable transcript viewport"

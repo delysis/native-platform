@@ -42,8 +42,9 @@
     {"source": "d8696e323160c9dc6d5f286e68db7e671e7077e0", "filtered": "c1387bcce6cff924e525b93c6f247e6b2af48893"}
   ],
   "dependency_boundaries": {
-    "llama_native_kit": "a185a4be3c6ad6ea1935e01acef8946c7dfdc459",
-    "free_token_energy": "40788e397e79c4c27df40cc702f07af500bb88eb"
+    "llama_native_kit": "c61692d48b0768bb242bcecb7a80c3318fc476b4",
+    "free_token_energy": "9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe",
+    "attachment_native_kit": "a7702f423102716d9fa21b64c51c331d4044a31d"
   },
   "compatibility_identifiers_preserved": [
     "LLAMA_NATIVE_KIT_DATA_DIR",

@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use llama_native_types::NativeDevice;
 use mom_llama_runtime::{
     ChatSendInput, ChatSendOptions, ConsultPersona, ConsultStartInput, ConsultStartOptions,
-    ConversationExportFormat, EngineCheckOptions, KvCachePolicy, config::SettingsUpdate,
+    ConversationExportFormat, EngineCheckOptions, KvCachePolicy, PathSelectionKind,
+    config::SettingsUpdate,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -31,6 +32,8 @@ enum Command {
         #[command(subcommand)]
         command: ChatCommand,
     },
+    /// Hidden compatibility surface for verified migration and recovery only.
+    #[command(hide = true)]
     Consult {
         #[command(subcommand)]
         command: ConsultCommand,
@@ -54,6 +57,10 @@ enum Command {
     Attachment {
         #[command(subcommand)]
         command: AttachmentCommand,
+    },
+    Path {
+        #[command(subcommand)]
+        command: PathCommand,
     },
     #[command(hide = true)]
     Server {
@@ -108,6 +115,39 @@ enum EngineCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum PathCommand {
+    Select {
+        #[arg(long, value_enum)]
+        kind: PathKindArg,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PathKindArg {
+    Model,
+    Mmproj,
+    Conversation,
+    Attachment,
+    Mcp,
+}
+
+impl From<PathKindArg> for PathSelectionKind {
+    fn from(value: PathKindArg) -> Self {
+        match value {
+            PathKindArg::Model => Self::Model,
+            PathKindArg::Mmproj => Self::MultimodalProjector,
+            PathKindArg::Conversation => Self::Conversation,
+            PathKindArg::Attachment => Self::Attachment,
+            PathKindArg::Mcp => Self::McpExecutable,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1295,6 +1335,12 @@ fn run() -> Result<()> {
             ),
             AttachmentCommand::Preview { attachment, json } => print_result(
                 mom_llama_runtime::attachment_preview(&attachment, false)?,
+                json,
+            ),
+        },
+        Command::Path { command } => match command {
+            PathCommand::Select { kind, path, json } => print_result(
+                mom_llama_runtime::path_select(kind.into(), Some(path))?,
                 json,
             ),
         },

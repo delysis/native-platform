@@ -3,7 +3,8 @@
 This repository owns one product: Mom Llama. Reusable llama.cpp internals live
 in `delysis/llama-native-kit`; routing/protocol/provider modules live in
 `delysis/free-token-energy`; local STT/TTS lives in
-`delysis/speech-native-kit`.
+`delysis/speech-native-kit`; content-first attachment inspection and planning
+lives in `delysis/attachment-native-kit`.
 
 ## Product hierarchy
 
@@ -26,8 +27,9 @@ in `delysis/llama-native-kit`; routing/protocol/provider modules live in
 - Cache mismatch is an ordinary miss followed by generation.
 - Only the explicit MCP adapter may spawn a process; normal product/runtime
   code has no network or process authority.
-- Do not add native engine crates, provider implementations, speech backends or
-  loopback servers here. Consume their typed public boundaries.
+- Do not add native engine crates, attachment parsers, provider implementations,
+  speech backends or loopback servers here. Consume their typed public
+  boundaries.
 - Preserve current data/Keychain/Tauri identifiers until a tested additive
   migration verifies read-back and rollback.
 

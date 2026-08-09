@@ -9,21 +9,27 @@ then
   exit 1
 fi
 
+if find crates -mindepth 1 -maxdepth 1 -type d -name 'attachment-native-*' | grep -q .
+then
+  echo "copied attachment-native crates are forbidden; use the pinned attachment dependency" >&2
+  exit 1
+fi
+
 if rg -n '(fte-speech-|speech-native-|tauri-plugin-(fte-speech|free-token-energy-speech|speech-native))' --glob 'Cargo.toml' .
 then
   echo "speech dependencies require deliberate product UX and a separate permission review" >&2
   exit 1
 fi
 
-if rg -n '^\[patch\.|llama-native-[a-z-]+\s*=\s*\{\s*path\s*=' --glob 'Cargo.toml' .
+if rg -n '^\[patch\.|(llama|attachment)-native-[a-z-]+\s*=\s*\{\s*path\s*=' --glob 'Cargo.toml' .
 then
-  echo "release manifests must use one immutable native-kit Git revision" >&2
+  echo "release manifests must use immutable native and attachment Git revisions" >&2
   exit 1
 fi
 
-if rg -n 'llama-native-[a-z-]+\s*=\s*\{\s*path\s*=\s*"\.\.' --glob 'Cargo.toml' .
+if rg -n '(llama|attachment)-native-[a-z-]+\s*=\s*\{\s*path\s*=\s*"\.\.' --glob 'Cargo.toml' .
 then
-  echo "sibling native-kit paths are forbidden" >&2
+  echo "sibling native or attachment paths are forbidden" >&2
   exit 1
 fi
 
@@ -36,7 +42,7 @@ then
   exit 1
 fi
 
-if ! rg -q 'source = "git\+https://github\.com/delysis/llama-native-kit\?rev=a185a4be3c6ad6ea1935e01acef8946c7dfdc459#' Cargo.lock
+if ! rg -q 'source = "git\+https://github\.com/delysis/llama-native-kit\?rev=c61692d48b0768bb242bcecb7a80c3318fc476b4#' Cargo.lock
 then
   echo "the locked native-kit source does not match the reviewed boundary" >&2
   exit 1
@@ -49,9 +55,22 @@ then
   exit 1
 fi
 
-if ! rg -q 'source = "git\+https://github\.com/delysis/free-token-energy\?rev=40788e397e79c4c27df40cc702f07af500bb88eb#' Cargo.lock
+if ! rg -q 'source = "git\+https://github\.com/delysis/free-token-energy\?rev=9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe#' Cargo.lock
 then
   echo "the locked Free Token Energy source does not match the reviewed boundary" >&2
+  exit 1
+fi
+
+attachment_sources=$(rg -o 'source = "git\+https://github\.com/delysis/attachment-native-kit[^"]+"' Cargo.lock | sort -u | wc -l | tr -d ' ')
+if [ "$attachment_sources" -ne 1 ]
+then
+  echo "the locked graph must contain exactly one attachment-native-kit source" >&2
+  exit 1
+fi
+
+if ! rg -q 'source = "git\+https://github\.com/delysis/attachment-native-kit\?rev=a7702f423102716d9fa21b64c51c331d4044a31d#' Cargo.lock
+then
+  echo "the locked attachment-native-kit source does not match the reviewed boundary" >&2
   exit 1
 fi
 
@@ -104,4 +123,4 @@ then
   exit 1
 fi
 
-echo "architecture ok: Mom Llama owns product code; native-kit and FTE are pinned boundaries"
+echo "architecture ok: Mom Llama owns product code; native-kit, attachment-native-kit, and FTE are pinned boundaries"

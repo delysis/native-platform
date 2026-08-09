@@ -1614,6 +1614,7 @@ fn append_message(
         branch_index: None,
         branch_count: None,
         attribution: None,
+        attachment_ids: Vec::new(),
     });
     conversation.active_leaf_message_id = Some(message_id.clone());
     conversation.updated_at = now_ms().to_string();

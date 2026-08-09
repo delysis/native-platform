@@ -9,6 +9,7 @@ pub mod mcp;
 pub mod mentions;
 pub mod models;
 pub mod native_runtime;
+pub mod path_selection;
 mod persona_library;
 pub mod personas;
 pub mod receipts;
@@ -19,8 +20,8 @@ pub mod tool_loop;
 pub mod upstream_status;
 
 pub use attachments::{
-    AttachmentImportOutput, AttachmentKind, AttachmentPreview, AttachmentRecord, attachment_import,
-    attachment_import_pasted_text, attachment_list, attachment_preview,
+    AttachmentImportOutput, AttachmentKind, AttachmentPreview, AttachmentRecord, AttachmentState,
+    attachment_import, attachment_import_pasted_text, attachment_list, attachment_preview,
 };
 pub use chat::{
     ChatCancelOutput, ChatRequestState, ChatSendInput, ChatSendOptions, ChatSendOutput,
@@ -68,6 +69,7 @@ pub use native_runtime::{
     gateway_native_configuration, gateway_native_host_and_model, resident_model_for_profile,
     resident_status, unload_resident_model,
 };
+pub use path_selection::{PathSelection, PathSelectionKind, path_select};
 pub use personas::{
     PersonaFreezeInput, PersonaGroup, PersonaHistoryMode, PersonaUpdateInput, PersonaVersion,
     persona_delete, persona_freeze, persona_get, persona_group_create, persona_group_delete,

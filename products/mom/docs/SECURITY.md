@@ -3,11 +3,23 @@
 Mom Llama encrypts conversations, Skills, attachments, receipts, settings, and
 persistent llama.cpp sequence state with XChaCha20-Poly1305 before SQLite sees
 them. Each record has a fresh random nonce and binds its namespace as
-authenticated associated data. This prevents ordinary database inspection,
-file-only backup exposure, and undetected record substitution from revealing or
-silently changing private content.
+authenticated associated data. The confidentiality boundary depends on how the
+encryption key is provisioned.
 
-On macOS, the random 32-byte installation key is stored in the user's Keychain.
+Secure and release builds use a random 32-byte installation key stored in the
+user's macOS Keychain. In that mode, copied database files and file-only backups
+are unreadable without the installation key, and authenticated encryption
+detects record substitution.
+
+Debug builds default to a separate `mom-llama-development` data directory and a
+predictable path-derived key so rapid iteration does not trigger Keychain
+authorization prompts. This preserves the production record format and detects
+accidental corruption, but it is **not a confidentiality boundary**: anyone who
+has the source and knows the data path can derive the development key. Set
+`LLAMA_NATIVE_KIT_SECURE_STORAGE=1` to exercise Keychain-backed storage in a
+debug build.
+
+In secure mode, the installation key is stored in the user's Keychain.
 The runtime attempts to resolve it at most once per data directory during a
 process launch and keeps either the key or the denial/error only in memory. This
 avoids repeated Keychain access dialogs when a development-signed app opens the
@@ -18,18 +30,21 @@ distribution boundary for that behavior.
 
 Automated tests and isolated CLI proofs can set
 `LLAMA_NATIVE_KIT_STORE_KEY_HEX`. That explicit key always takes precedence.
-The deterministic path-derived key exists only behind the in-process test data
-directory override and is never selected by the normal app or by merely setting
-`LLAMA_NATIVE_KIT_DATA_DIR`.
+The in-process test data-directory override also selects a deterministic test
+key. `LLAMA_NATIVE_KIT_DATA_DIR` changes the storage location but does not, by
+itself, select the test-only key; a debug build still uses its documented
+development-key policy unless secure storage is explicitly enabled.
 
 ## What this does not claim
 
-This encryption does not protect content from someone who controls the running
-app, the unlocked macOS account, or the model output itself. It is not a HIPAA
-compliance claim and it is not a substitute for full-disk encryption, account
-security, signed distribution, or careful exports. Its narrow purpose is to
-keep app-owned private records and model-state caches authenticated and
-unreadable when the SQLite files are copied or inspected without the key.
+Secure-mode encryption does not protect content from someone who controls the
+running app, the unlocked macOS account, or the model output itself. Debug-mode
+encryption additionally does not protect copied files from someone who can
+derive the development key. Neither mode is a HIPAA compliance claim or a
+substitute for full-disk encryption, account security, signed distribution, or
+careful exports. Secure mode's narrow purpose is to keep app-owned private
+records and model-state caches authenticated and unreadable when SQLite files
+are copied or inspected without the installation key.
 
 ## Native prefix-cache boundary
 

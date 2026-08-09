@@ -12,6 +12,9 @@ It does **not** contain a copied llama.cpp engine or a generic provider gateway:
   owns protocol routing, hosted providers and optional loopback compatibility.
 - [`delysis/speech-native-kit`](https://github.com/delysis/speech-native-kit)
   owns local STT/TTS contracts, routing, backends and optional Tauri IPC.
+- [`delysis/attachment-native-kit`](https://github.com/delysis/attachment-native-kit)
+  owns content-first recursive inspection, canonical attachment artifacts,
+  provenance and capability-aware media/transform planning.
 - [`delysis/capability-system-compiler`](https://github.com/delysis/capability-system-compiler)
   owns Loom compilation/specification and may test this CLI as a black box; it
   does not own another Mom Llama implementation.
@@ -22,7 +25,8 @@ dependency graph and the exact present status of speech.
 ## Workspace
 
 - `crates/mom-llama-runtime`: conversations, Skills, editable/versioned
-  Personas, `@mention` dispatch, storage, tools and product cache policy.
+  Personas, `@mention` dispatch, attachment lifecycle, storage, tools and
+  product cache policy.
 - `crates/mom-llama-cli`: the complete machine-exercisable product boundary.
 - `apps/mom-llama`: the thin Maud/Tauri application.
 - `contracts`: visible command, effect, settings and upstream-parity ledgers.
@@ -30,8 +34,8 @@ dependency graph and the exact present status of speech.
   current proof only when it is explicitly source-bound; older path/date-only
   receipts remain informative.
 
-Native-kit and Free Token Energy are exact Git-revision dependencies. Release
-manifests do not use sibling paths or patches.
+Native-kit, attachment-native-kit and Free Token Energy are exact Git-revision
+dependencies. Release manifests do not use sibling paths or patches.
 
 ## Gates
 

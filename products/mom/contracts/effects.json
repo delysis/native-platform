@@ -55,6 +55,19 @@
       "destructive": "reversible"
     },
     {
+      "effect_id": "mom_llama.effects.path_select.v1",
+      "reads": ["selected_path_metadata"],
+      "writes": ["command_receipt"],
+      "network": [],
+      "process": [],
+      "secrets": [],
+      "model_calls": [],
+      "persistence": ["encrypted_receipts"],
+      "memory": [],
+      "external_apps": ["native_file_dialog"],
+      "destructive": "none"
+    },
+    {
       "effect_id": "mom_llama.effects.chat_send.v1",
       "reads": ["selected_model", "conversation", "skills", "settings", "compatible_prefix_cache"],
       "writes": ["conversation", "encrypted_receipt", "optional_session_cache"],

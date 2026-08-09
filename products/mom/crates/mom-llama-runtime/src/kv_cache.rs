@@ -1,5 +1,5 @@
 use crate::config::{KvCachePolicy, Settings, resolve_settings, upstream_setting_string};
-use crate::native_runtime::resident_model;
+use crate::native_runtime::{clear_native_prefix_cache, resident_model};
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
 use crate::skill_store::load_skill_db;
@@ -294,6 +294,7 @@ pub fn kv_cache_restore(cache_id: Option<String>) -> Result<CommandResult<KvCach
 
 pub fn kv_cache_clear() -> Result<CommandResult<KvCacheStatus>> {
     let settings = resolve_settings()?;
+    clear_native_prefix_cache(&settings)?;
     let store = RuntimeStore::open(&settings.data_dir)?;
     store.mutate_documents(
         KV_CACHE_NAMESPACE,

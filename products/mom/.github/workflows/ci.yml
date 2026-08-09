@@ -28,13 +28,16 @@ jobs:
         env:
           LLAMA_NATIVE_KIT_DEPLOY_KEY: ${{ secrets.LLAMA_NATIVE_KIT_DEPLOY_KEY }}
           FREE_TOKEN_ENERGY_DEPLOY_KEY: ${{ secrets.FREE_TOKEN_ENERGY_DEPLOY_KEY }}
+          ATTACHMENT_NATIVE_KIT_DEPLOY_KEY: ${{ secrets.ATTACHMENT_NATIVE_KIT_DEPLOY_KEY }}
         run: |
           test -n "$LLAMA_NATIVE_KIT_DEPLOY_KEY"
           test -n "$FREE_TOKEN_ENERGY_DEPLOY_KEY"
+          test -n "$ATTACHMENT_NATIVE_KIT_DEPLOY_KEY"
           mkdir -p "$HOME/.ssh"
           printf '%s\n' "$LLAMA_NATIVE_KIT_DEPLOY_KEY" > "$HOME/.ssh/llama_native_kit"
           printf '%s\n' "$FREE_TOKEN_ENERGY_DEPLOY_KEY" > "$HOME/.ssh/free_token_energy"
-          chmod 600 "$HOME/.ssh/llama_native_kit" "$HOME/.ssh/free_token_energy"
+          printf '%s\n' "$ATTACHMENT_NATIVE_KIT_DEPLOY_KEY" > "$HOME/.ssh/attachment_native_kit"
+          chmod 600 "$HOME/.ssh/llama_native_kit" "$HOME/.ssh/free_token_energy" "$HOME/.ssh/attachment_native_kit"
           ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
           cat >> "$HOME/.ssh/config" <<'EOF'
           Host github-native-kit
@@ -47,9 +50,15 @@ jobs:
             User git
             IdentityFile ~/.ssh/free_token_energy
             IdentitiesOnly yes
+          Host github-attachment-kit
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/attachment_native_kit
+            IdentitiesOnly yes
           EOF
           git config --global url."git@github-native-kit:delysis/llama-native-kit".insteadOf "https://github.com/delysis/llama-native-kit"
           git config --global url."git@github-fte:delysis/free-token-energy".insteadOf "https://github.com/delysis/free-token-energy"
+          git config --global url."git@github-attachment-kit:delysis/attachment-native-kit".insteadOf "https://github.com/delysis/attachment-native-kit"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -94,13 +103,16 @@ jobs:
         env:
           LLAMA_NATIVE_KIT_DEPLOY_KEY: ${{ secrets.LLAMA_NATIVE_KIT_DEPLOY_KEY }}
           FREE_TOKEN_ENERGY_DEPLOY_KEY: ${{ secrets.FREE_TOKEN_ENERGY_DEPLOY_KEY }}
+          ATTACHMENT_NATIVE_KIT_DEPLOY_KEY: ${{ secrets.ATTACHMENT_NATIVE_KIT_DEPLOY_KEY }}
         run: |
           test -n "$LLAMA_NATIVE_KIT_DEPLOY_KEY"
           test -n "$FREE_TOKEN_ENERGY_DEPLOY_KEY"
+          test -n "$ATTACHMENT_NATIVE_KIT_DEPLOY_KEY"
           mkdir -p "$HOME/.ssh"
           printf '%s\n' "$LLAMA_NATIVE_KIT_DEPLOY_KEY" > "$HOME/.ssh/llama_native_kit"
           printf '%s\n' "$FREE_TOKEN_ENERGY_DEPLOY_KEY" > "$HOME/.ssh/free_token_energy"
-          chmod 600 "$HOME/.ssh/llama_native_kit" "$HOME/.ssh/free_token_energy"
+          printf '%s\n' "$ATTACHMENT_NATIVE_KIT_DEPLOY_KEY" > "$HOME/.ssh/attachment_native_kit"
+          chmod 600 "$HOME/.ssh/llama_native_kit" "$HOME/.ssh/free_token_energy" "$HOME/.ssh/attachment_native_kit"
           ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
           cat >> "$HOME/.ssh/config" <<'EOF'
           Host github-native-kit
@@ -113,9 +125,15 @@ jobs:
             User git
             IdentityFile ~/.ssh/free_token_energy
             IdentitiesOnly yes
+          Host github-attachment-kit
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/attachment_native_kit
+            IdentitiesOnly yes
           EOF
           git config --global url."git@github-native-kit:delysis/llama-native-kit".insteadOf "https://github.com/delysis/llama-native-kit"
           git config --global url."git@github-fte:delysis/free-token-energy".insteadOf "https://github.com/delysis/free-token-energy"
+          git config --global url."git@github-attachment-kit:delysis/attachment-native-kit".insteadOf "https://github.com/delysis/attachment-native-kit"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
