@@ -1,5 +1,5 @@
 use crate::config::{resolve_settings, upstream_setting_string};
-use crate::consult::{ConsultPersona, consult_panel_list};
+use crate::consult::{ConsultPanel, ConsultPersona, stored_legacy_panels};
 use crate::conversation_store::{
     ChatTemplatePolicy, Conversation, ConversationDb, ConversationExecutionProfile,
     ConversationKind, Message, MessageRole, ToolBinding, active_path_messages, load_db,
@@ -7,7 +7,7 @@ use crate::conversation_store::{
 };
 use crate::native_runtime::resident_model_for_profile;
 use crate::now_ms;
-use crate::persona_library::{LIBRARY_REVISION, builtin_personas};
+use crate::persona_library::{LIBRARY_REVISION, builtin_panels, builtin_personas};
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::Result;
@@ -20,7 +20,7 @@ use uuid::Uuid;
 const GROUPS_NAMESPACE: &str = "persona-groups.v1";
 const PERSONA_VERSIONS_NAMESPACE: &str = "persona-versions.v1";
 const MAX_GROUP_MEMBERS: usize = 4;
-const PERSONA_STATE_MIGRATION_VERSION: u32 = 2;
+const PERSONA_STATE_MIGRATION_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +75,14 @@ struct PersonaGroupDb {
     catalog_revision: Option<String>,
     #[serde(default)]
     builtin_persona_provenance: Vec<BuiltinPersonaProvenance>,
+}
+
+impl PersonaGroupDb {
+    fn legacy_consult_migration_is_current(&self) -> bool {
+        self.legacy_consult_migrated
+            && self.migration_version >= PERSONA_STATE_MIGRATION_VERSION
+            && self.catalog_revision.as_deref() == Some(LIBRARY_REVISION)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -695,10 +703,7 @@ fn write_group(
 
 fn migrate_legacy_consult() -> Result<()> {
     let mut groups = load_group_db()?;
-    if groups.legacy_consult_migrated
-        && groups.migration_version >= PERSONA_STATE_MIGRATION_VERSION
-        && groups.catalog_revision.as_deref() == Some(LIBRARY_REVISION)
-    {
+    if groups.legacy_consult_migration_is_current() {
         return Ok(());
     }
 
@@ -716,20 +721,29 @@ fn migrate_legacy_consult() -> Result<()> {
         settings.mmproj_path.clone(),
     )?;
 
-    // Default panel patterns are no longer product state. Consult groups are
-    // explicitly configured in Settings. Preserve only user-created legacy
-    // panels and remap their references onto the canonical Persona IDs.
-    groups
-        .groups
-        .retain(|group| !group.id.starts_with("group-builtin-"));
-    let panels = consult_panel_list()?.result.unwrap_or_default();
-    for panel in panels
-        .into_iter()
-        .filter(|panel| !panel.id.starts_with("builtin-"))
-    {
+    // Migration reads the persisted legacy document directly. The display
+    // list intentionally overlays current built-ins and cannot be a lossless
+    // recovery source when a stored user panel collides with a built-in ID.
+    let current_builtin_panels = builtin_panels();
+    let mut migrated_legacy_persona_ids = BTreeSet::new();
+    for panel in stored_legacy_panels()? {
+        if current_builtin_panels
+            .iter()
+            .any(|built_in| built_in == &panel)
+        {
+            continue;
+        }
+        validate_legacy_panel(&panel)?;
         let mut persona_ids = Vec::new();
-        for legacy in panel.personas {
-            let id = format!("persona-{}", legacy.id);
+        let mut distinct_persona_ids = BTreeSet::new();
+        for (index, legacy) in panel.personas.iter().enumerate() {
+            let id = resolve_legacy_persona_id(&conversations, &panel, index, legacy)?;
+            if !distinct_persona_ids.insert(id.clone()) {
+                anyhow::bail!(
+                    "legacy Consult panel `{}` contains duplicate Persona content",
+                    panel.id
+                );
+            }
             if !conversations
                 .conversations
                 .iter()
@@ -747,7 +761,7 @@ fn migrate_legacy_consult() -> Result<()> {
                         mention_handle: handle,
                         model_path: settings.model_path.clone(),
                         mmproj_path: settings.mmproj_path.clone(),
-                        system_message: Some(legacy.perspective_prompt),
+                        system_message: Some(legacy.perspective_prompt.clone()),
                         ..ConversationExecutionProfile::default()
                     },
                     selected_model_path: settings.model_path.clone(),
@@ -759,15 +773,21 @@ fn migrate_legacy_consult() -> Result<()> {
                     messages: Vec::new(),
                 });
             }
+            migrated_legacy_persona_ids.insert(id.clone());
             persona_ids.push(id);
         }
-        let group_id = format!("group-{}", panel.id);
+        let group_id = resolve_legacy_group_id(
+            &groups.groups,
+            &panel,
+            &persona_ids,
+            &current_builtin_panels,
+        )?;
         if !groups.groups.iter().any(|group| group.id == group_id) {
             let now = now_ms().to_string();
             let handle = unique_handle(&conversations, &groups.groups, &panel.name);
             groups.groups.push(PersonaGroup {
                 id: group_id,
-                name: panel.name,
+                name: panel.name.clone(),
                 mention_handle: handle,
                 persona_ids,
                 created_at: now.clone(),
@@ -780,11 +800,125 @@ fn migrate_legacy_consult() -> Result<()> {
     groups.migration_version = PERSONA_STATE_MIGRATION_VERSION;
     groups.catalog_revision = Some(LIBRARY_REVISION.to_string());
     save_db(&conversations)?;
-    for persona in catalog_versions {
+    let legacy_versions = conversations
+        .conversations
+        .iter()
+        .filter(|persona| migrated_legacy_persona_ids.contains(&persona.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut recorded_version_ids = BTreeSet::new();
+    for persona in catalog_versions.into_iter().chain(legacy_versions) {
+        if !recorded_version_ids.insert(persona.id.clone()) {
+            continue;
+        }
         record_persona_version(&persona)?;
     }
     RuntimeStore::current()?.put(GROUPS_NAMESPACE, &groups)?;
     Ok(())
+}
+
+fn validate_legacy_panel(panel: &ConsultPanel) -> Result<()> {
+    if panel.name.trim().is_empty() {
+        anyhow::bail!("legacy Consult panel `{}` has an empty name", panel.id);
+    }
+    if panel.personas.is_empty() || panel.personas.len() > MAX_GROUP_MEMBERS {
+        anyhow::bail!(
+            "legacy Consult panel `{}` must contain one to four Personas",
+            panel.id
+        );
+    }
+    if panel.personas.iter().any(|persona| {
+        persona.label.trim().is_empty() || persona.perspective_prompt.trim().is_empty()
+    }) {
+        anyhow::bail!(
+            "legacy Consult panel `{}` contains an incomplete Persona",
+            panel.id
+        );
+    }
+    Ok(())
+}
+
+fn resolve_legacy_persona_id(
+    conversations: &ConversationDb,
+    panel: &ConsultPanel,
+    index: usize,
+    legacy: &ConsultPersona,
+) -> Result<String> {
+    let legacy_id = legacy.id.trim();
+    if !legacy_id.is_empty() {
+        let candidate = format!("persona-{legacy_id}");
+        match conversations
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == candidate)
+        {
+            None => return Ok(candidate),
+            Some(conversation) if legacy_persona_matches(conversation, legacy) => {
+                return Ok(candidate);
+            }
+            Some(_) => {}
+        }
+    }
+
+    let digest = sha256_json(&(panel.id.as_str(), index, legacy))?;
+    let candidate = format!("persona-legacy-{digest}");
+    match conversations
+        .conversations
+        .iter()
+        .find(|conversation| conversation.id == candidate)
+    {
+        None => Ok(candidate),
+        Some(conversation) if legacy_persona_matches(conversation, legacy) => Ok(candidate),
+        Some(_) => anyhow::bail!(
+            "legacy Persona identity collision for panel `{}` seat {}",
+            panel.id,
+            index + 1
+        ),
+    }
+}
+
+fn legacy_persona_matches(conversation: &Conversation, legacy: &ConsultPersona) -> bool {
+    conversation.kind == ConversationKind::PersonaTemplate
+        && conversation.title == legacy.label
+        && conversation.execution_profile.system_message.as_deref()
+            == Some(legacy.perspective_prompt.as_str())
+}
+
+fn resolve_legacy_group_id(
+    groups: &[PersonaGroup],
+    panel: &ConsultPanel,
+    persona_ids: &[String],
+    current_builtin_panels: &[ConsultPanel],
+) -> Result<String> {
+    let panel_id = panel.id.trim();
+    let reserved_builtin_id = panel_id.starts_with("builtin-")
+        || current_builtin_panels
+            .iter()
+            .any(|built_in| built_in.id == panel_id);
+    if !panel_id.is_empty() && !reserved_builtin_id {
+        let candidate = format!("group-{panel_id}");
+        match groups.iter().find(|group| group.id == candidate) {
+            None => return Ok(candidate),
+            Some(group) if legacy_group_matches(group, panel, persona_ids) => return Ok(candidate),
+            Some(_) => {}
+        }
+    }
+
+    let digest = sha256_json(panel)?;
+    let candidate = format!("group-legacy-{digest}");
+    match groups.iter().find(|group| group.id == candidate) {
+        None => Ok(candidate),
+        Some(group) if legacy_group_matches(group, panel, persona_ids) => Ok(candidate),
+        Some(_) => anyhow::bail!("legacy Consult group identity collision for `{}`", panel.id),
+    }
+}
+
+fn legacy_group_matches(
+    group: &PersonaGroup,
+    panel: &ConsultPanel,
+    persona_ids: &[String],
+) -> bool {
+    group.name == panel.name && group.persona_ids == persona_ids
 }
 
 fn reconcile_builtin_personas(

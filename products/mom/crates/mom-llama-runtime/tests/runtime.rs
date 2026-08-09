@@ -1,4 +1,6 @@
 use anyhow::{Result, anyhow};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use fte_backend_llama::{BACKEND_ID, LlamaNativeBackend};
 use fte_router::{Gateway, GatewayDefaults};
 use fte_types::{
@@ -9,12 +11,13 @@ use fte_types::{
 };
 use mom_llama_runtime::config::{SettingsUpdate, set_data_dir_override_for_tests};
 use mom_llama_runtime::{
-    ChatDispatchOutput, ChatSendInput, ChatSendOptions, ConsultPersona, ConsultStartInput,
-    ConsultStartOptions, Conversation, ConversationExecutionProfile, ConversationKind,
-    EngineCheckOptions, KvCachePolicy, MentionDispatchInput, Message, MessageAttribution,
-    MessageRole, MessageSpeakerKind, PersonaFreezeInput, PersonaHistoryMode,
+    ChatDispatchOutput, ChatSendInput, ChatSendOptions, ConsultPanel, ConsultPersona,
+    ConsultStartInput, ConsultStartOptions, Conversation, ConversationExecutionProfile,
+    ConversationKind, EngineCheckOptions, KvCachePolicy, MentionDispatchInput, Message,
+    MessageAttribution, MessageRole, MessageSpeakerKind, PersonaFreezeInput, PersonaHistoryMode,
 };
-use serde_json::json;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,6 +56,35 @@ fn encrypted_document_snapshot(data_dir: &Path) -> Result<EncryptedDocumentSnaps
         ))
     })?;
     Ok(rows.collect::<std::result::Result<BTreeMap<_, _>, _>>()?)
+}
+
+fn seed_legacy_consult_panels(data_dir: &Path, panels: Vec<Value>) -> Result<()> {
+    const NAMESPACE: &str = "consult-panels.v1";
+    let mut key_hasher = Sha256::new();
+    key_hasher.update(b"mom-llama-test-store-key-v1");
+    key_hasher.update(data_dir.to_string_lossy().as_bytes());
+    let key: [u8; 32] = key_hasher.finalize().into();
+    let nonce = [0xA5_u8; 24];
+    let plaintext = serde_json::to_vec(&json!({ "panels": panels }))?;
+    let ciphertext = XChaCha20Poly1305::new(Key::from_slice(&key))
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: NAMESPACE.as_bytes(),
+            },
+        )
+        .map_err(|_| anyhow!("failed to encrypt legacy Consult fixture"))?;
+    rusqlite::Connection::open(data_dir.join("runtime.sqlite3"))?.execute(
+        "INSERT INTO encrypted_documents(namespace, nonce, ciphertext, updated_at)
+         VALUES (?1, ?2, ?3, 0)
+         ON CONFLICT(namespace) DO UPDATE SET
+           nonce = excluded.nonce,
+           ciphertext = excluded.ciphertext,
+           updated_at = excluded.updated_at",
+        rusqlite::params![NAMESPACE, nonce.as_slice(), ciphertext],
+    )?;
+    Ok(())
 }
 
 struct TestSession {
@@ -350,9 +382,9 @@ fn conversation_system_message_is_scoped_persistent_and_clearable() -> Result<()
 }
 
 #[test]
-fn dream_team_creation_is_encrypted_persistent_and_non_impersonating() -> Result<()> {
+fn legacy_panel_creation_is_read_only_even_before_migration() -> Result<()> {
     let session = TestSession::new("dream-team-create")?;
-    let created = mom_llama_runtime::consult_panel_create(
+    let rejected = mom_llama_runtime::consult_panel_create(
         "Mom's favorites".to_string(),
         vec![ConsultPersona {
             id: String::new(),
@@ -364,34 +396,18 @@ fn dream_team_creation_is_encrypted_persistent_and_non_impersonating() -> Result
             model_slot: None,
         }],
     )?;
-    assert_eq!(created.readiness, "contracted");
-    assert!(created.blocker.is_none());
-    let panel = created
-        .result
-        .ok_or_else(|| anyhow!("Dream Team was not created"))?;
-    assert_eq!(panel.personas.len(), 1);
-    assert!(!panel.personas[0].id.is_empty());
-
-    let listed = mom_llama_runtime::consult_panel_list()?
-        .result
-        .ok_or_else(|| anyhow!("Dream Team list missing"))?;
-    assert!(listed.iter().any(|candidate| candidate.id == panel.id));
-    assert!(
-        listed
-            .iter()
-            .any(|candidate| candidate.id == "builtin-trauma-balanced")
+    assert_eq!(rejected.readiness, "stub_blocked");
+    assert!(rejected.result.is_none());
+    assert_eq!(
+        rejected
+            .blocker
+            .as_ref()
+            .map(|blocker| blocker.code.as_str()),
+        Some("legacy_consult_panel_write_retired")
     );
     assert!(
-        listed
-            .iter()
-            .any(|candidate| candidate.id == "builtin-emdr-formulation")
-    );
-
-    let sqlite = std::fs::read(session.path().join("runtime.sqlite3"))?;
-    assert!(
-        !sqlite
-            .windows(b"Private Example Author 8642".len())
-            .any(|window| window == b"Private Example Author 8642")
+        !session.path().join("runtime.sqlite3").exists(),
+        "retired runtime writes must not initialize product storage"
     );
     Ok(())
 }
@@ -399,17 +415,24 @@ fn dream_team_creation_is_encrypted_persistent_and_non_impersonating() -> Result
 #[test]
 fn legacy_consult_migration_to_personas_and_groups_is_idempotent() -> Result<()> {
     let session = TestSession::new("consult-persona-migration")?;
-    mom_llama_runtime::consult_panel_create(
-        "Migration team".to_string(),
-        vec![ConsultPersona {
-            id: String::new(),
-            label: "Migration lens".to_string(),
-            description: "A durable migration test lens.".to_string(),
-            perspective_prompt: "Keep the migration exact.".to_string(),
-            public_figure: None,
-            expertise: Some("Migration".to_string()),
-            model_slot: None,
-        }],
+    mom_llama_runtime::consult_panel_list()?;
+    seed_legacy_consult_panels(
+        session.path(),
+        vec![json!({
+            "id": "migration-team",
+            "name": "Migration team",
+            "personas": [{
+                "id": "migration-lens",
+                "label": "Migration lens",
+                "description": "A durable migration test lens.",
+                "perspective_prompt": "Keep the migration exact.",
+                "public_figure": null,
+                "expertise": "Migration",
+                "model_slot": null
+            }],
+            "created_at": "1",
+            "updated_at": "1"
+        })],
     )?;
     let first_personas = mom_llama_runtime::persona_list()?
         .result
@@ -429,6 +452,32 @@ fn legacy_consult_migration_to_personas_and_groups_is_idempotent() -> Result<()>
         encrypted_document_snapshot(session.path())?,
         documents_after_migration,
         "subsequent Persona, group, and handle reads must not rewrite legacy migration state"
+    );
+    let retired_write = mom_llama_runtime::consult_panel_create(
+        "Too late legacy team".to_string(),
+        vec![ConsultPersona {
+            id: "post-migration-lens".to_string(),
+            label: "Post-migration lens".to_string(),
+            description: "This legacy panel must never be stranded.".to_string(),
+            perspective_prompt: "Fail closed instead of writing legacy state.".to_string(),
+            public_figure: None,
+            expertise: Some("Migration integrity".to_string()),
+            model_slot: None,
+        }],
+    )?;
+    assert_eq!(retired_write.readiness, "stub_blocked");
+    assert!(retired_write.result.is_none());
+    assert_eq!(
+        retired_write
+            .blocker
+            .as_ref()
+            .map(|blocker| blocker.code.as_str()),
+        Some("legacy_consult_panel_write_retired")
+    );
+    assert_eq!(
+        encrypted_document_snapshot(session.path())?,
+        documents_after_migration,
+        "a retired legacy write must not mutate any encrypted product document"
     );
     assert_eq!(first_personas, second_personas);
     assert_eq!(first_groups, second_groups);
@@ -459,6 +508,226 @@ fn legacy_consult_migration_to_personas_and_groups_is_idempotent() -> Result<()>
             .iter()
             .any(|group| group.name == "Migration team")
     );
+    Ok(())
+}
+
+#[test]
+fn raw_legacy_migration_preserves_builtin_and_persona_id_collisions() -> Result<()> {
+    let session = TestSession::new("consult-raw-collisions")?;
+    let builtins = mom_llama_runtime::consult_panel_list()?
+        .result
+        .ok_or_else(|| anyhow!("legacy built-in panel list missing"))?;
+    let exact_builtin = builtins
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("legacy built-in panel missing"))?;
+    let persona = |id: &str, label: &str, prompt: &str| ConsultPersona {
+        id: id.to_string(),
+        label: label.to_string(),
+        description: format!("{label} description"),
+        perspective_prompt: prompt.to_string(),
+        public_figure: None,
+        expertise: Some("Migration integrity".to_string()),
+        model_slot: None,
+    };
+    let panel = |id: &str, name: &str, personas: Vec<ConsultPersona>| ConsultPanel {
+        id: id.to_string(),
+        name: name.to_string(),
+        personas,
+        created_at: "1".to_string(),
+        updated_at: "1".to_string(),
+    };
+
+    let mut builtin_id_collision = panel(
+        &exact_builtin.id,
+        "Customized built-in ID",
+        vec![persona(
+            "shared-id",
+            "Customized collision lens",
+            "Preserve the customized built-in-ID panel.",
+        )],
+    );
+    builtin_id_collision.updated_at = "customized".to_string();
+    let prefixed_user_panel = panel(
+        "builtin-custom-user",
+        "User-owned builtin prefix",
+        vec![persona(
+            "prefix-lens",
+            "Prefix lens",
+            "Preserve user data even when its ID uses an old reserved prefix.",
+        )],
+    );
+    let first_shared_id = panel(
+        "first-team",
+        "First shared-ID team",
+        vec![persona(
+            "shared-id",
+            "First shared-ID lens",
+            "Keep the first prompt exact.",
+        )],
+    );
+    let second_shared_id = panel(
+        "second-team",
+        "Second shared-ID team",
+        vec![persona(
+            "shared-id",
+            "Second shared-ID lens",
+            "Keep the second prompt exact.",
+        )],
+    );
+    seed_legacy_consult_panels(
+        session.path(),
+        vec![
+            serde_json::to_value(exact_builtin.clone())?,
+            serde_json::to_value(builtin_id_collision)?,
+            serde_json::to_value(prefixed_user_panel)?,
+            serde_json::to_value(first_shared_id)?,
+            serde_json::to_value(second_shared_id)?,
+        ],
+    )?;
+
+    let personas = mom_llama_runtime::persona_list()?
+        .result
+        .ok_or_else(|| anyhow!("migrated Persona list missing"))?;
+    let groups = mom_llama_runtime::persona_group_list()?
+        .result
+        .ok_or_else(|| anyhow!("migrated group list missing"))?;
+    assert!(
+        !groups.iter().any(|group| group.name == exact_builtin.name),
+        "an exact application-owned built-in must not become a user group"
+    );
+    for recovered_name in [
+        "Customized built-in ID",
+        "User-owned builtin prefix",
+        "First shared-ID team",
+        "Second shared-ID team",
+    ] {
+        assert!(
+            groups.iter().any(|group| group.name == recovered_name),
+            "raw stored panel `{recovered_name}` was not recovered"
+        );
+    }
+    for recovered_name in ["Customized built-in ID", "User-owned builtin prefix"] {
+        assert!(
+            groups
+                .iter()
+                .find(|group| group.name == recovered_name)
+                .is_some_and(|group| group.id.starts_with("group-legacy-")),
+            "reserved built-in IDs must migrate to deterministic user-owned IDs"
+        );
+    }
+    let first_group = groups
+        .iter()
+        .find(|group| group.name == "First shared-ID team")
+        .ok_or_else(|| anyhow!("first shared-ID group missing"))?;
+    let second_group = groups
+        .iter()
+        .find(|group| group.name == "Second shared-ID team")
+        .ok_or_else(|| anyhow!("second shared-ID group missing"))?;
+    assert_ne!(first_group.persona_ids, second_group.persona_ids);
+    for (group, expected_prompt) in [
+        (first_group, "Keep the first prompt exact."),
+        (second_group, "Keep the second prompt exact."),
+    ] {
+        let persona = personas
+            .iter()
+            .find(|persona| group.persona_ids.first() == Some(&persona.id))
+            .ok_or_else(|| anyhow!("migrated shared-ID Persona missing"))?;
+        assert_eq!(
+            persona.execution_profile.system_message.as_deref(),
+            Some(expected_prompt)
+        );
+    }
+
+    let migrated = encrypted_document_snapshot(session.path())?;
+    mom_llama_runtime::persona_list()?;
+    mom_llama_runtime::persona_group_list()?;
+    assert_eq!(encrypted_document_snapshot(session.path())?, migrated);
+    Ok(())
+}
+
+#[test]
+fn malformed_legacy_panel_blocks_without_advancing_migration() -> Result<()> {
+    let session = TestSession::new("consult-malformed-collision")?;
+    mom_llama_runtime::consult_panel_list()?;
+    let duplicate = json!({
+        "id": "duplicate-team",
+        "name": "Duplicate team",
+        "personas": [{
+            "id": "duplicate-lens",
+            "label": "Duplicate lens",
+            "description": "Duplicate fixture",
+            "perspective_prompt": "Keep one exact copy.",
+            "public_figure": null,
+            "expertise": null,
+            "model_slot": null
+        }, {
+            "id": "duplicate-lens",
+            "label": "Duplicate lens",
+            "description": "Duplicate fixture",
+            "perspective_prompt": "Keep one exact copy.",
+            "public_figure": null,
+            "expertise": null,
+            "model_slot": null
+        }],
+        "created_at": "1",
+        "updated_at": "1"
+    });
+    seed_legacy_consult_panels(session.path(), vec![duplicate.clone()])?;
+    let before = encrypted_document_snapshot(session.path())?;
+    let error = mom_llama_runtime::persona_list()
+        .expect_err("duplicate legacy Persona content must fail closed");
+    assert!(error.to_string().contains("duplicate Persona content"));
+    assert_eq!(
+        encrypted_document_snapshot(session.path())?,
+        before,
+        "failed recovery must not persist Personas, groups, versions, or a migration marker"
+    );
+
+    let mut repaired = duplicate;
+    repaired["personas"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("invalid duplicate fixture"))?
+        .pop();
+    seed_legacy_consult_panels(session.path(), vec![repaired])?;
+    let recovered = mom_llama_runtime::persona_list()?
+        .result
+        .ok_or_else(|| anyhow!("repaired legacy Persona list missing"))?;
+    assert!(
+        recovered
+            .iter()
+            .any(|persona| persona.title == "Duplicate lens"),
+        "the failed attempt must not advance the migration marker"
+    );
+    Ok(())
+}
+
+#[test]
+fn gateway_document_adapter_is_confined_to_fte_response_namespaces() -> Result<()> {
+    let session = TestSession::new("gateway-document-namespace")?;
+    for namespace in [
+        "consult-panels.v1",
+        "persona-groups.v1",
+        "fte.response.v1:",
+        "fte.response.v1:../consult-panels.v1",
+    ] {
+        assert!(mom_llama_runtime::gateway_document_get(namespace).is_err());
+        assert!(mom_llama_runtime::gateway_document_put(namespace, b"blocked").is_err());
+        assert!(mom_llama_runtime::gateway_document_delete(namespace).is_err());
+    }
+    assert!(
+        !session.path().join("runtime.sqlite3").exists(),
+        "invalid gateway namespaces must be rejected before product storage opens"
+    );
+
+    let namespace = "fte.response.v1:request_01.test";
+    mom_llama_runtime::gateway_document_put(namespace, b"response")?;
+    assert_eq!(
+        mom_llama_runtime::gateway_document_get(namespace)?,
+        Some(b"response".to_vec())
+    );
+    assert!(mom_llama_runtime::gateway_document_delete(namespace)?);
+    assert_eq!(mom_llama_runtime::gateway_document_get(namespace)?, None);
     Ok(())
 }
 
@@ -2247,7 +2516,11 @@ async fn product_gateway_cache_request(
     Ok(gateway.execute(request).await?.final_response().await?)
 }
 
-fn assert_gateway_cache_outcome(response: &GatewayResponse, expected: CacheOutcome) -> Result<()> {
+fn assert_gateway_cache_outcome(
+    stage: &str,
+    response: &GatewayResponse,
+    expected: CacheOutcome,
+) -> Result<()> {
     assert_eq!(response.status, TerminalStatus::Completed);
     assert!(response.usage.real_local_inference);
     assert!(!response.output.is_empty());
@@ -2258,7 +2531,8 @@ fn assert_gateway_cache_outcome(response: &GatewayResponse, expected: CacheOutco
             .as_ref()
             .ok_or_else(|| anyhow!("gateway cache receipt missing"))?
             .outcome,
-        expected
+        expected,
+        "unexpected cache outcome at `{stage}`"
     );
     Ok(())
 }
@@ -2288,7 +2562,7 @@ async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_cor
         "v1",
     )
     .await?;
-    assert_gateway_cache_outcome(&cold, CacheOutcome::Miss)?;
+    assert_gateway_cache_outcome("cold", &cold, CacheOutcome::Miss)?;
     let warm = product_gateway_cache_request(
         &stable_system,
         "Return the word warm.",
@@ -2296,7 +2570,7 @@ async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_cor
         "v1",
     )
     .await?;
-    assert_gateway_cache_outcome(&warm, CacheOutcome::Hit)?;
+    assert_gateway_cache_outcome("warm", &warm, CacheOutcome::Hit)?;
 
     let cleared = mom_llama_runtime::kv_cache_clear()?;
     assert_eq!(cleared.readiness, "contracted");
@@ -2308,7 +2582,7 @@ async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_cor
         "v1",
     )
     .await?;
-    assert_gateway_cache_outcome(&after_clear, CacheOutcome::Miss)?;
+    assert_gateway_cache_outcome("after_clear", &after_clear, CacheOutcome::Miss)?;
 
     let settings = mom_llama_runtime::settings_get()?
         .result
@@ -2328,7 +2602,7 @@ async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_cor
         "v1",
     )
     .await?;
-    assert_gateway_cache_outcome(&restored, CacheOutcome::Hit)?;
+    assert_gateway_cache_outcome("restored", &restored, CacheOutcome::Hit)?;
 
     mom_llama_runtime::kv_cache_clear()?;
     mom_llama_runtime::settings_update(SettingsUpdate {
@@ -2349,8 +2623,8 @@ async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_cor
         "v1",
     )
     .await?;
-    assert_gateway_cache_outcome(&off_first, CacheOutcome::Miss)?;
-    assert_gateway_cache_outcome(&off_second, CacheOutcome::Miss)?;
+    assert_gateway_cache_outcome("off_first", &off_first, CacheOutcome::Miss)?;
+    assert_gateway_cache_outcome("off_second", &off_second, CacheOutcome::Miss)?;
     assert!(
         !encrypted_document_snapshot(session.path())?
             .contains_key("native-host-prefix-cache.mom-llama"),
@@ -2368,7 +2642,7 @@ async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_cor
         "v1",
     )
     .await?;
-    assert_gateway_cache_outcome(&before_corruption, CacheOutcome::Miss)?;
+    assert_gateway_cache_outcome("before_corruption", &before_corruption, CacheOutcome::Miss)?;
     let connection = rusqlite::Connection::open(session.path().join("runtime.sqlite3"))?;
     assert_eq!(
         connection.execute(
@@ -2396,7 +2670,11 @@ async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_cor
         "v1",
     )
     .await?;
-    assert_gateway_cache_outcome(&corruption_fallback, CacheOutcome::Miss)?;
+    assert_gateway_cache_outcome(
+        "corruption_fallback",
+        &corruption_fallback,
+        CacheOutcome::Miss,
+    )?;
     let documents = encrypted_document_snapshot(session.path())?;
     assert!(
         documents
@@ -2412,22 +2690,30 @@ async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_cor
         "v1",
     )
     .await?;
-    assert_gateway_cache_outcome(&warm_after_quarantine, CacheOutcome::Hit)?;
+    assert_gateway_cache_outcome(
+        "warm_after_quarantine",
+        &warm_after_quarantine,
+        CacheOutcome::Hit,
+    )?;
     let settings = mom_llama_runtime::settings_get()?
         .result
         .ok_or_else(|| anyhow!("cache proof settings missing before fingerprint change"))?;
     mom_llama_runtime::settings_update(SettingsUpdate {
-        context_tokens: Some(settings.context_tokens.saturating_add(128)),
+        // Use a configuration field whose effective value is not capped by a
+        // small model's advertised context window. SmolLM2 clamps an oversized
+        // context request back to 8K, which correctly preserves the fingerprint
+        // and would make this a false invalidation test.
+        batch_tokens: Some(settings.batch_tokens.saturating_add(1)),
         ..SettingsUpdate::default()
     })?;
     let fingerprint_miss = product_gateway_cache_request(
         &stable_system,
-        "Generate normally after changing the model context fingerprint.",
+        "Generate normally after changing the model batch fingerprint.",
         CacheMode::Persistent,
         "v1",
     )
     .await?;
-    assert_gateway_cache_outcome(&fingerprint_miss, CacheOutcome::Miss)?;
+    assert_gateway_cache_outcome("fingerprint_miss", &fingerprint_miss, CacheOutcome::Miss)?;
     Ok(())
 }
 
@@ -2746,9 +3032,17 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
         return Ok(());
     };
     mom_llama_runtime::settings_update(SettingsUpdate {
-        max_tokens: Some(192),
+        // This proof needs observable concurrent work and a non-empty
+        // synthesis, not long prose from every seat.
+        max_tokens: Some(64),
         ..SettingsUpdate::default()
     })?;
+    let cancellation_target = mom_llama_runtime::consult_panel_list()?
+        .result
+        .and_then(|panels| panels.into_iter().next())
+        .and_then(|panel| panel.personas.into_iter().last())
+        .map(|persona| persona.id)
+        .ok_or_else(|| anyhow!("the legacy recovery panel has no cancellation target"))?;
     let mut cancelled = None;
     let result = mom_llama_runtime::consult_start_stream(
         ConsultStartInput {
@@ -2759,19 +3053,31 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
         ConsultStartOptions::default(),
         Some(|event: mom_llama_runtime::ConsultStreamEvent| {
             if cancelled.is_none()
-                && event.seat_id == "skeptical"
-                && event.event == "state"
-                && event.state == Some(llama_native_types::GenerationState::Generating)
+                && event.seat_id == cancellation_target
+                && (matches!(
+                    event.state,
+                    Some(
+                        llama_native_types::GenerationState::Prefilling
+                            | llama_native_types::GenerationState::Generating
+                    )
+                ) || event.event == "delta")
             {
-                cancelled = Some(mom_llama_runtime::consult_cancel(
-                    &event.run_id,
-                    Some("skeptical"),
-                )?);
+                let attempt =
+                    mom_llama_runtime::consult_cancel(&event.run_id, Some(&cancellation_target))?;
+                if attempt
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result.cancelled_sequences == 1)
+                {
+                    cancelled = Some(attempt);
+                }
             }
             Ok(())
         }),
     )?;
-    let cancelled = cancelled.ok_or_else(|| anyhow!("skeptical seat never became cancellable"))?;
+    let cancelled = cancelled.ok_or_else(|| {
+        anyhow!("legacy consult seat `{cancellation_target}` never became cancellable")
+    })?;
     assert_eq!(
         cancelled
             .result
@@ -2784,7 +3090,8 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
         .ok_or_else(|| anyhow!("consult result missing"))?;
     assert_eq!(run.seats.len(), 4);
     assert!(run.seats.iter().any(|seat| {
-        seat.seat_id == "skeptical" && seat.state == llama_native_types::GenerationState::Cancelled
+        seat.seat_id == cancellation_target
+            && seat.state == llama_native_types::GenerationState::Cancelled
     }));
     assert!(
         run.seats

@@ -500,33 +500,34 @@ pub fn mom_llama_message_branch_select(
 }
 
 #[tauri::command]
-pub fn mom_llama_attachment_import_text(
+pub async fn mom_llama_attachment_import_text(
     conversation: String,
     path: String,
 ) -> Result<Value, String> {
-    command_value(mom_llama_runtime::text_attachment_import(
-        &conversation,
-        &PathBuf::from(path),
-    ))
+    blocking_command(move || {
+        mom_llama_runtime::text_attachment_import(&conversation, &PathBuf::from(path))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn mom_llama_attachment_import_paste(
+pub async fn mom_llama_attachment_import_paste(
     conversation: String,
     text: String,
 ) -> Result<Value, String> {
-    command_value(mom_llama_runtime::attachment_import_pasted_text(
-        &conversation,
-        text,
-    ))
+    blocking_command(move || mom_llama_runtime::attachment_import_pasted_text(&conversation, text))
+        .await
 }
 
 #[tauri::command]
-pub fn mom_llama_attachment_import(conversation: String, path: String) -> Result<Value, String> {
-    command_value(mom_llama_runtime::attachment_import(
-        &conversation,
-        &PathBuf::from(path),
-    ))
+pub async fn mom_llama_attachment_import(
+    conversation: String,
+    path: String,
+) -> Result<Value, String> {
+    blocking_command(move || {
+        mom_llama_runtime::attachment_import(&conversation, &PathBuf::from(path))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -535,13 +536,17 @@ pub fn mom_llama_attachment_list(conversation: Option<String>) -> Result<Value, 
 }
 
 #[tauri::command]
-pub fn mom_llama_attachment_preview(attachment: String) -> Result<Value, String> {
-    command_value(mom_llama_runtime::attachment_preview(&attachment, false))
+pub async fn mom_llama_attachment_preview(attachment: String) -> Result<Value, String> {
+    blocking_command(move || mom_llama_runtime::attachment_preview(&attachment, false)).await
 }
 
 #[tauri::command]
-pub fn mom_llama_attachment_preview_bytes(attachment: String) -> Result<Response, String> {
-    let preview = mom_llama_runtime::attachment_preview(&attachment, false).map_err(to_error)?;
+pub async fn mom_llama_attachment_preview_bytes(attachment: String) -> Result<Response, String> {
+    blocking_response(move || attachment_preview_response(&attachment)).await
+}
+
+fn attachment_preview_response(attachment: &str) -> Result<Response, String> {
+    let preview = mom_llama_runtime::attachment_preview(attachment, false).map_err(to_error)?;
     let metadata = preview.result.ok_or_else(|| {
         preview
             .blocker
@@ -552,7 +557,7 @@ pub fn mom_llama_attachment_preview_bytes(attachment: String) -> Result<Response
     })?;
     ensure_attachment_preview_size(&metadata.attachment.file_name, metadata.attachment.bytes)?;
 
-    let bytes = mom_llama_runtime::attachments::attachment_bytes(&attachment)
+    let bytes = mom_llama_runtime::attachments::attachment_bytes(attachment)
         .map_err(to_error)?
         .ok_or_else(|| {
             "attachment_content_missing: The attachment metadata exists, but its content is unavailable."
@@ -682,18 +687,18 @@ pub fn mom_llama_kv_cache_status() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub fn mom_llama_kv_cache_save(skill: Option<String>) -> Result<Value, String> {
-    command_value(mom_llama_runtime::kv_cache_save(skill))
+pub async fn mom_llama_kv_cache_save(skill: Option<String>) -> Result<Value, String> {
+    blocking_command(move || mom_llama_runtime::kv_cache_save(skill)).await
 }
 
 #[tauri::command]
-pub fn mom_llama_kv_cache_restore(cache: Option<String>) -> Result<Value, String> {
-    command_value(mom_llama_runtime::kv_cache_restore(cache))
+pub async fn mom_llama_kv_cache_restore(cache: Option<String>) -> Result<Value, String> {
+    blocking_command(move || mom_llama_runtime::kv_cache_restore(cache)).await
 }
 
 #[tauri::command]
-pub fn mom_llama_kv_cache_clear() -> Result<Value, String> {
-    command_value(mom_llama_runtime::kv_cache_clear())
+pub async fn mom_llama_kv_cache_clear() -> Result<Value, String> {
+    blocking_command(mom_llama_runtime::kv_cache_clear).await
 }
 
 #[tauri::command]
@@ -722,43 +727,41 @@ pub fn mom_llama_mcp_list_servers() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub fn mom_llama_mcp_list_tools(server: String) -> Result<Value, String> {
-    command_value(mom_llama_runtime::mcp_list_tools(&server))
+pub async fn mom_llama_mcp_list_tools(server: String) -> Result<Value, String> {
+    blocking_command(move || mom_llama_runtime::mcp_list_tools(&server)).await
 }
 
 #[tauri::command]
-pub fn mom_llama_mcp_call_tool(
+pub async fn mom_llama_mcp_call_tool(
     server: String,
     tool: String,
     arguments: Value,
 ) -> Result<Value, String> {
-    command_value(mom_llama_runtime::mcp_call_tool(&server, &tool, arguments))
+    blocking_command(move || mom_llama_runtime::mcp_call_tool(&server, &tool, arguments)).await
 }
 
 #[tauri::command]
-pub fn mom_llama_mcp_list_resources(server: String) -> Result<Value, String> {
-    command_value(mom_llama_runtime::mcp_list_resources(&server))
+pub async fn mom_llama_mcp_list_resources(server: String) -> Result<Value, String> {
+    blocking_command(move || mom_llama_runtime::mcp_list_resources(&server)).await
 }
 
 #[tauri::command]
-pub fn mom_llama_mcp_read_resource(server: String, uri: String) -> Result<Value, String> {
-    command_value(mom_llama_runtime::mcp_read_resource(&server, &uri))
+pub async fn mom_llama_mcp_read_resource(server: String, uri: String) -> Result<Value, String> {
+    blocking_command(move || mom_llama_runtime::mcp_read_resource(&server, &uri)).await
 }
 
 #[tauri::command]
-pub fn mom_llama_mcp_list_prompts(server: String) -> Result<Value, String> {
-    command_value(mom_llama_runtime::mcp_list_prompts(&server))
+pub async fn mom_llama_mcp_list_prompts(server: String) -> Result<Value, String> {
+    blocking_command(move || mom_llama_runtime::mcp_list_prompts(&server)).await
 }
 
 #[tauri::command]
-pub fn mom_llama_mcp_get_prompt(
+pub async fn mom_llama_mcp_get_prompt(
     server: String,
     prompt: String,
     arguments: Value,
 ) -> Result<Value, String> {
-    command_value(mom_llama_runtime::mcp_get_prompt(
-        &server, &prompt, arguments,
-    ))
+    blocking_command(move || mom_llama_runtime::mcp_get_prompt(&server, &prompt, arguments)).await
 }
 
 #[tauri::command]
@@ -860,16 +863,14 @@ pub fn mom_llama_model_slot_list() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub fn mom_llama_model_slot_load(slot: usize, model_path: String) -> Result<Value, String> {
-    command_value(mom_llama_runtime::model_slot_load(
-        slot,
-        PathBuf::from(model_path),
-    ))
+pub async fn mom_llama_model_slot_load(slot: usize, model_path: String) -> Result<Value, String> {
+    blocking_command(move || mom_llama_runtime::model_slot_load(slot, PathBuf::from(model_path)))
+        .await
 }
 
 #[tauri::command]
-pub fn mom_llama_model_slot_unload(slot: usize) -> Result<Value, String> {
-    command_value(mom_llama_runtime::model_slot_unload(slot))
+pub async fn mom_llama_model_slot_unload(slot: usize) -> Result<Value, String> {
+    blocking_command(move || mom_llama_runtime::model_slot_unload(slot)).await
 }
 
 fn value_to_settings_map(value: Value) -> Option<std::collections::BTreeMap<String, Value>> {
@@ -922,6 +923,15 @@ where
         .map_err(to_error)?
 }
 
+async fn blocking_response<F>(operation: F) -> Result<Response, String>
+where
+    F: FnOnce() -> Result<Response, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(to_error)?
+}
+
 fn to_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
@@ -938,6 +948,16 @@ fn kv_policy_from_str(value: &str) -> KvCachePolicy {
 mod tests {
     use super::{MAX_ATTACHMENT_PREVIEW_BYTES, ensure_attachment_preview_size};
 
+    fn command_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let declaration = format!("pub async fn {name}");
+        let Some(start) = source.find(&declaration) else {
+            panic!("missing async Tauri command {name}");
+        };
+        let rest = &source[start..];
+        let end = rest.find("\n#[tauri::command]").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
     #[test]
     fn attachment_preview_cap_is_checked_at_the_exact_boundary() {
         assert!(ensure_attachment_preview_size("within.png", MAX_ATTACHMENT_PREVIEW_BYTES).is_ok());
@@ -947,5 +967,37 @@ mod tests {
         )
         .expect_err("a preview over the hard byte ceiling must fail closed");
         assert!(error.starts_with("attachment_preview_too_large:"));
+    }
+
+    #[test]
+    fn multi_second_tauri_commands_stay_off_the_async_dispatch_thread() {
+        let source = include_str!("commands.rs");
+        for name in [
+            "mom_llama_attachment_import_text",
+            "mom_llama_attachment_import_paste",
+            "mom_llama_attachment_import",
+            "mom_llama_attachment_preview",
+            "mom_llama_kv_cache_save",
+            "mom_llama_kv_cache_restore",
+            "mom_llama_kv_cache_clear",
+            "mom_llama_mcp_list_tools",
+            "mom_llama_mcp_call_tool",
+            "mom_llama_mcp_list_resources",
+            "mom_llama_mcp_read_resource",
+            "mom_llama_mcp_list_prompts",
+            "mom_llama_mcp_get_prompt",
+            "mom_llama_model_slot_load",
+            "mom_llama_model_slot_unload",
+        ] {
+            assert!(
+                command_body(source, name).contains("blocking_command("),
+                "{name} must use the shared blocking command boundary"
+            );
+        }
+        assert!(
+            command_body(source, "mom_llama_attachment_preview_bytes")
+                .contains("blocking_response("),
+            "raw attachment previews must read and decrypt outside the async dispatch thread"
+        );
     }
 }

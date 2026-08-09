@@ -4188,6 +4188,23 @@ mod tests {
     }
 
     #[test]
+    fn compact_layout_is_reachable_at_the_native_window_minimum() -> Result<()> {
+        let config: Value = serde_json::from_str(include_str!("../tauri.conf.json"))?;
+        assert_eq!(
+            config
+                .pointer("/app/windows/0/minWidth")
+                .and_then(Value::as_u64),
+            Some(760),
+            "the native minimum width must enter the 900px compact layout"
+        );
+        assert!(
+            include_str!("../../ui/style.css").contains("@media (max-width: 900px)"),
+            "the compact breakpoint must remain paired with the native window minimum"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn selected_persona_projects_its_normal_editable_transcript() {
         let persona_message =
             test_message("persona-answer", MessageRole::Assistant, "Template reply");

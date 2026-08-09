@@ -2,9 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use llama_native_types::NativeDevice;
 use mom_llama_runtime::{
-    ChatSendInput, ChatSendOptions, ConsultPersona, ConsultStartInput, ConsultStartOptions,
-    ConversationExportFormat, EngineCheckOptions, KvCachePolicy, PathSelectionKind,
-    config::SettingsUpdate,
+    ChatSendInput, ChatSendOptions, ConversationExportFormat, EngineCheckOptions, KvCachePolicy,
+    PathSelectionKind, config::SettingsUpdate,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -369,47 +368,9 @@ enum ConsultCommand {
         #[arg(long)]
         json: bool,
     },
-    PanelCreate {
-        #[arg(long, default_value = "My Dream Team")]
-        name: String,
-        #[arg(long = "persona", value_parser = parse_json_value, required = true)]
-        personas: Vec<Value>,
-        #[arg(long)]
-        json: bool,
-    },
-    Start {
-        #[arg(long)]
-        conversation: String,
-        #[arg(long)]
-        prompt: String,
-        #[arg(long)]
-        panel: Option<String>,
-        #[arg(long = "timeout-s")]
-        timeout_s: Option<f64>,
-        #[arg(long = "stream-jsonl")]
-        stream_jsonl: bool,
-        #[arg(long)]
-        json: bool,
-    },
     Status {
         #[arg(long)]
         run: String,
-        #[arg(long)]
-        json: bool,
-    },
-    Cancel {
-        #[arg(long)]
-        run: String,
-        #[arg(long)]
-        seat: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    Synthesize {
-        #[arg(long)]
-        run: String,
-        #[arg(long = "seat")]
-        seats: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -1204,61 +1165,8 @@ fn run() -> Result<()> {
             ConsultCommand::PanelList { json } => {
                 print_result(mom_llama_runtime::consult_panel_list()?, json)
             }
-            ConsultCommand::PanelCreate {
-                name,
-                personas,
-                json,
-            } => {
-                let personas = personas
-                    .into_iter()
-                    .map(serde_json::from_value::<ConsultPersona>)
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                print_result(
-                    mom_llama_runtime::consult_panel_create(name, personas)?,
-                    json,
-                )
-            }
-            ConsultCommand::Start {
-                conversation,
-                prompt,
-                panel,
-                timeout_s,
-                stream_jsonl,
-                json,
-            } => {
-                let input = ConsultStartInput {
-                    conversation_id: conversation,
-                    prompt,
-                    panel_id: panel,
-                };
-                let options = ConsultStartOptions {
-                    timeout_s: timeout_s
-                        .unwrap_or_else(|| ConsultStartOptions::default().timeout_s),
-                    fake_fixture: false,
-                };
-                if stream_jsonl {
-                    let result = mom_llama_runtime::consult_start_stream(
-                        input,
-                        options,
-                        Some(|event| {
-                            println!("{}", serde_json::to_string(&event)?);
-                            Ok(())
-                        }),
-                    )?;
-                    print_json_line_result(result)
-                } else {
-                    print_result(mom_llama_runtime::consult_start(input, options)?, json)
-                }
-            }
             ConsultCommand::Status { run, json } => {
                 print_result(mom_llama_runtime::consult_status(&run)?, json)
-            }
-            ConsultCommand::Cancel { run, seat, json } => print_result(
-                mom_llama_runtime::consult_cancel(&run, seat.as_deref())?,
-                json,
-            ),
-            ConsultCommand::Synthesize { run, seats, json } => {
-                print_result(mom_llama_runtime::consult_synthesize(&run, seats)?, json)
             }
         },
         Command::Message { command } => match command {

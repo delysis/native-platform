@@ -15,13 +15,11 @@ use llama_native_types::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const PANELS_NAMESPACE: &str = "consult-panels.v1";
 const RUNS_NAMESPACE: &str = "consult-runs.v1";
-const MAX_SEATS: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConsultPersona {
@@ -173,104 +171,18 @@ pub fn consult_panel_list() -> Result<CommandResult<Vec<ConsultPanel>>> {
 }
 
 pub fn consult_panel_create(
-    name: String,
-    personas: Vec<ConsultPersona>,
+    _name: String,
+    _personas: Vec<ConsultPersona>,
 ) -> Result<CommandResult<ConsultPanel>> {
-    if personas.is_empty() || personas.len() > MAX_SEATS {
-        return Ok(CommandResult::blocked(
-            "mom_llama.consult_panel_create",
-            "stub_blocked",
-            Blocker::new(
-                "consult_seat_count_invalid",
-                "A consult panel must contain between one and four reasoning perspectives.",
-                vec!["Choose one to four perspectives.".to_string()],
-            ),
-        ));
-    }
-    let personas = match normalize_personas(personas) {
-        Ok(personas) => personas,
-        Err(blocker) => {
-            return Ok(CommandResult::blocked(
-                "mom_llama.consult_panel_create",
-                "stub_blocked",
-                blocker,
-            ));
-        }
-    };
-    let now = now_ms().to_string();
-    let panel = ConsultPanel {
-        id: Uuid::new_v4().to_string(),
-        name: if name.trim().is_empty() {
-            "My Dream Team".to_string()
-        } else {
-            name.trim().to_string()
-        },
-        personas,
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    let store = RuntimeStore::current()?;
-    store.mutate(PANELS_NAMESPACE, ConsultPanelDb::default, |db| {
-        db.panels.insert(0, panel.clone());
-        Ok(())
-    })?;
-    Ok(CommandResult::passed(
+    Ok(CommandResult::blocked(
         "mom_llama.consult_panel_create",
-        "contracted",
-        panel,
-        vec![store.path().display().to_string()],
-        Vec::new(),
-        false,
-        false,
+        "stub_blocked",
+        Blocker::new(
+            "legacy_consult_panel_write_retired",
+            "Legacy Consult panels are read-only after the Persona migration.",
+            vec!["Create Personas and Consult groups instead.".to_string()],
+        ),
     ))
-}
-
-fn normalize_personas(personas: Vec<ConsultPersona>) -> Result<Vec<ConsultPersona>, Blocker> {
-    let mut ids = BTreeSet::new();
-    let mut normalized = Vec::with_capacity(personas.len());
-    for (index, persona) in personas.into_iter().enumerate() {
-        let label = persona.label.trim().to_string();
-        let description = persona.description.trim().to_string();
-        let perspective_prompt = persona.perspective_prompt.trim().to_string();
-        if label.is_empty() || description.is_empty() || perspective_prompt.is_empty() {
-            return Err(Blocker::new(
-                "consult_persona_incomplete",
-                format!(
-                    "Dream Team perspective {} needs a name, a short description, and perspective guidance.",
-                    index + 1
-                ),
-                vec!["Complete the required perspective fields.".to_string()],
-            ));
-        }
-        let id = if persona.id.trim().is_empty() {
-            Uuid::new_v4().to_string()
-        } else {
-            persona.id.trim().to_string()
-        };
-        if !ids.insert(id.clone()) {
-            return Err(Blocker::new(
-                "consult_persona_id_duplicate",
-                "Each Dream Team perspective needs a distinct identity.",
-                vec!["Remove the duplicate perspective and try again.".to_string()],
-            ));
-        }
-        normalized.push(ConsultPersona {
-            id,
-            label,
-            description,
-            perspective_prompt,
-            public_figure: persona
-                .public_figure
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-            expertise: persona
-                .expertise
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-            model_slot: persona.model_slot,
-        });
-    }
-    Ok(normalized)
 }
 
 pub fn consult_start(
@@ -607,6 +519,10 @@ fn load_panels() -> Result<ConsultPanelDb> {
     Ok(db)
 }
 
+pub(crate) fn stored_legacy_panels() -> Result<Vec<ConsultPanel>> {
+    Ok(load_panels()?.panels)
+}
+
 fn selected_panel(id: Option<&str>) -> Result<ConsultPanel> {
     let panels = consult_panel_list()?.result.unwrap_or_default();
     id.and_then(|id| panels.iter().find(|panel| panel.id == id).cloned())
@@ -932,7 +848,7 @@ mod tests {
     #[test]
     fn built_in_panels_are_bounded_and_disclaim_authority() {
         let panels = builtin_panels();
-        assert!(panels.iter().all(|panel| panel.personas.len() <= MAX_SEATS));
+        assert!(panels.iter().all(|panel| panel.personas.len() <= 4));
         assert!(
             panels
                 .iter()
@@ -958,38 +874,6 @@ mod tests {
             terminal_run_state(&seats),
             ConsultRunState::PartiallyCancelled
         );
-    }
-
-    #[test]
-    fn dream_team_personas_are_normalized_and_require_complete_guidance() {
-        let normalized = normalize_personas(vec![ConsultPersona {
-            id: String::new(),
-            label: "  Gentle perspective  ".to_string(),
-            description: "  Warmly reflects what was heard.  ".to_string(),
-            perspective_prompt: "  Emphasize compassion and practical choices.  ".to_string(),
-            public_figure: Some("  Example Author  ".to_string()),
-            expertise: Some("  Published work on compassion  ".to_string()),
-            model_slot: None,
-        }])
-        .expect("complete perspective should normalize");
-        assert_eq!(normalized[0].label, "Gentle perspective");
-        assert_eq!(
-            normalized[0].public_figure.as_deref(),
-            Some("Example Author")
-        );
-        assert!(!normalized[0].id.is_empty());
-
-        let blocked = normalize_personas(vec![ConsultPersona {
-            id: String::new(),
-            label: "Incomplete".to_string(),
-            description: String::new(),
-            perspective_prompt: String::new(),
-            public_figure: None,
-            expertise: None,
-            model_slot: None,
-        }])
-        .expect_err("incomplete perspective must fail closed");
-        assert_eq!(blocked.code, "consult_persona_incomplete");
     }
 
     #[test]

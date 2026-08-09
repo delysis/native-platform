@@ -382,52 +382,40 @@ fn legacy_consult_cli_is_hidden_but_remains_available_for_recovery() -> Result<(
 }
 
 #[test]
-fn dream_team_create_and_list_are_cli_exercisable_and_encrypted() -> Result<()> {
-    let root = data_dir("dream-team")?;
-    let persona = serde_json::json!({
-        "id": "",
-        "label": "Favorite author lens",
-        "description": "Offers a calm public-work-inspired reflection.",
-        "perspective_prompt": "Name uncertainty and offer gentle reversible next steps.",
-        "public_figure": "Private Example Author 9753",
-        "expertise": "Compassionate public writing",
-        "model_slot": null
-    })
-    .to_string();
-    let created = json_output(&cli(
-        &root,
-        &[
-            "consult",
-            "panel-create",
-            "--name",
-            "Mom's Dream Team",
-            "--persona",
-            &persona,
-            "--json",
-        ],
-    )?)?;
-    let panel_id = created
-        .pointer("/result/id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("missing Dream Team id"))?;
-    assert_eq!(
-        created
-            .pointer("/result/personas/0/public_figure")
-            .and_then(Value::as_str),
-        Some("Private Example Author 9753")
-    );
+fn legacy_consult_cli_rejects_every_mutating_subcommand() -> Result<()> {
+    let root = data_dir("legacy-consult-read-only")?;
+    let help = cli(&root, &["consult", "--help"])?;
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout)?;
+    for retired in ["panel-create", "start", "cancel", "synthesize"] {
+        assert!(
+            !help.lines().any(|line| line.contains(retired)),
+            "retired mutating subcommand `{retired}` must not be parseable"
+        );
+    }
 
-    let listed = json_output(&cli(&root, &["consult", "panel-list", "--json"])?)?;
+    for args in [
+        &["consult", "panel-create"][..],
+        &["consult", "start"][..],
+        &["consult", "cancel"][..],
+        &["consult", "synthesize"][..],
+    ] {
+        let rejected = cli(&root, args)?;
+        assert!(
+            !rejected.status.success(),
+            "retired mutating command `{}` unexpectedly succeeded",
+            args.join(" ")
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("unrecognized subcommand"),
+            "retired command `{}` did not fail during parsing",
+            args.join(" ")
+        );
+    }
     assert!(
-        listed
-            .pointer("/result")
-            .and_then(Value::as_array)
-            .is_some_and(|panels| panels
-                .iter()
-                .any(|panel| { panel.get("id").and_then(Value::as_str) == Some(panel_id) }))
+        !root.join("runtime.sqlite3").exists(),
+        "rejected legacy writes must not initialize product storage"
     );
-    let database = std::fs::read(root.join("runtime.sqlite3"))?;
-    assert!(!String::from_utf8_lossy(&database).contains("Private Example Author 9753"));
     Ok(())
 }
 
@@ -554,7 +542,7 @@ fn deprecated_server_alias_is_hidden_and_never_opens_a_server() -> Result<()> {
 }
 
 #[test]
-fn chat_and_consult_block_honestly_without_a_model() -> Result<()> {
+fn chat_blocks_honestly_without_a_model() -> Result<()> {
     let root = data_dir("generation-blockers")?;
     let conversation = json_output(&cli(
         &root,
@@ -581,29 +569,6 @@ fn chat_and_consult_block_honestly_without_a_model() -> Result<()> {
     assert_eq!(
         chat.pointer("/blocker/code").and_then(Value::as_str),
         Some("model_path_missing")
-    );
-
-    let consult = json_output(&cli(
-        &root,
-        &[
-            "consult",
-            "start",
-            "--conversation",
-            conversation_id,
-            "--prompt",
-            "Review this case",
-            "--json",
-        ],
-    )?)?;
-    assert_eq!(
-        consult.get("status").and_then(Value::as_str),
-        Some("blocked")
-    );
-    assert_eq!(
-        consult
-            .pointer("/receipt/real_engine_invoked")
-            .and_then(Value::as_bool),
-        Some(false)
     );
     Ok(())
 }
