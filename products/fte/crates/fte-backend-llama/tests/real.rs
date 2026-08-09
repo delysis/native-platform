@@ -55,7 +55,7 @@ async fn real_chat_completion_and_stable_prefix_hit_are_in_process() {
         return;
     };
     let host = Arc::new(NativeHost::new(NativeHostConfig::default()));
-    let backend = LlamaNativeBackend::new(host);
+    let backend = LlamaNativeBackend::new_borrowed(Arc::clone(&host));
     let mut config = NativeModelConfig::local(model_path);
     config.device = NativeDevice::Cpu;
     config.context_tokens = 4096;
@@ -143,4 +143,22 @@ async fn real_chat_completion_and_stable_prefix_hit_are_in_process() {
         .await
         .expect("complete exact completion");
     assert!(completion.usage.real_local_inference);
+
+    assert_eq!(
+        host.slots().len(),
+        1,
+        "chat, warm-prefix chat, and Completion must reuse one resident model"
+    );
+    backend
+        .shutdown()
+        .await
+        .expect("the FTE adapter must drain its requests");
+    assert_eq!(
+        host.slots().len(),
+        1,
+        "adapter shutdown must not unload its borrowed native host"
+    );
+    let joined = host.shutdown_for_process_exit();
+    assert_eq!(joined.joined_worker_count(), 1);
+    assert!(joined.belongs_to(&host));
 }

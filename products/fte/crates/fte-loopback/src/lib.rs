@@ -35,6 +35,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+const LISTENER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone)]
 pub struct LoopbackConfig {
     pub port: u16,
@@ -186,9 +188,24 @@ impl LoopbackServer {
     }
 
     pub async fn shutdown(self) {
+        self.shutdown_with_grace(LISTENER_SHUTDOWN_GRACE).await;
+    }
+
+    async fn shutdown_with_grace(self, grace: Duration) {
         let _ = self.shutdown.send(true);
-        for task in self.tasks {
-            let _ = task.await;
+        let deadline = Instant::now() + grace;
+        for mut task in self.tasks {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if tokio::time::timeout(remaining, &mut task).await.is_err() {
+                // Axum graceful shutdown intentionally waits for live
+                // connections. A client that stops reading an SSE response
+                // can otherwise hold process exit forever. After the bounded
+                // grace period, drop that listener and every connection it
+                // owns, then await the aborted task so no listener work is
+                // left detached.
+                task.abort();
+                let _ = task.await;
+            }
         }
     }
 }
@@ -1015,6 +1032,8 @@ mod tests {
 
     struct StreamingTestBackend;
 
+    struct FloodingTestBackend;
+
     #[async_trait]
     impl GatewayBackend for StreamingTestBackend {
         fn descriptor(&self) -> BackendDescriptor {
@@ -1141,6 +1160,109 @@ mod tests {
         ) -> Result<GatewayUsage, GatewayError> {
             Ok(GatewayUsage {
                 input_tokens: Some(7),
+                provenance: UsageProvenance::Exact,
+                selected_route: Some(request.route),
+                ..GatewayUsage::default()
+            })
+        }
+
+        fn cancel(&self, _request_id: &RequestId, _target: CancelTarget) -> usize {
+            0
+        }
+    }
+
+    #[async_trait]
+    impl GatewayBackend for FloodingTestBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            StreamingTestBackend.descriptor()
+        }
+
+        fn readiness(&self) -> BackendReadiness {
+            BackendReadiness::Ready
+        }
+
+        async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
+            let request_id = request.request.request_id.clone();
+            let route = request.route;
+            let response_id = "resp_stalled_client".to_string();
+            let item = OutputItem::Message {
+                id: "msg_stalled_client".to_string(),
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "x".repeat(8 * 1024 * 1024),
+                }],
+            };
+            let response = GatewayResponse {
+                id: response_id.clone(),
+                request_id: request_id.clone(),
+                model: route.model_id.clone(),
+                route: route.clone(),
+                output: vec![item.clone()],
+                usage: GatewayUsage {
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    provenance: UsageProvenance::Exact,
+                    selected_route: Some(route.clone()),
+                    ..GatewayUsage::default()
+                },
+                status: TerminalStatus::Completed,
+                previous_response_id: None,
+            };
+            let (event_tx, event_rx) = mpsc::channel(8);
+            let (final_tx, final_rx) = oneshot::channel();
+            let terminal = Arc::new(AtomicBool::new(false));
+            let terminal_for_task = Arc::clone(&terminal);
+            let ticket_request_id = request_id.clone();
+            tokio::spawn(async move {
+                for event in [
+                    GatewayEvent::ResponseCreated {
+                        request_id: request_id.clone(),
+                        response_id,
+                        route,
+                    },
+                    GatewayEvent::OutputItemAdded {
+                        request_id: request_id.clone(),
+                        output_index: 0,
+                        item: item.clone(),
+                    },
+                    GatewayEvent::TextDelta {
+                        request_id: request_id.clone(),
+                        output_index: 0,
+                        content_index: 0,
+                        delta: "x".repeat(8 * 1024 * 1024),
+                    },
+                    GatewayEvent::OutputItemCompleted {
+                        request_id: request_id.clone(),
+                        output_index: 0,
+                        item,
+                    },
+                    GatewayEvent::Completed {
+                        request_id,
+                        response: Box::new(response.clone()),
+                    },
+                ] {
+                    if event_tx.send(event).await.is_err() {
+                        return;
+                    }
+                }
+                terminal_for_task.store(true, Ordering::Release);
+                let _ = final_tx.send(Ok(response));
+            });
+            Ok(GatewayTicket::new(
+                ticket_request_id,
+                event_rx,
+                final_rx,
+                Arc::new(NoopCancellation),
+                terminal,
+            ))
+        }
+
+        async fn count_tokens(
+            &self,
+            request: BackendRequest,
+        ) -> Result<GatewayUsage, GatewayError> {
+            Ok(GatewayUsage {
+                input_tokens: Some(1),
                 provenance: UsageProvenance::Exact,
                 selected_route: Some(request.route),
                 ..GatewayUsage::default()
@@ -1442,6 +1564,54 @@ mod tests {
         assert_eq!(continuation["previous_response_id"], "resp_socket_test");
 
         restarted.shutdown().await;
+        let _ = fs::remove_dir_all(token_directory);
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_a_listener_after_a_non_reading_sse_client_exhausts_grace() {
+        let gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
+        gateway
+            .register_backend(Arc::new(FloodingTestBackend))
+            .expect("register flooding backend");
+        let store = Arc::new(SqliteStore::in_memory().expect("in-memory store"));
+        let token_directory =
+            std::env::temp_dir().join(format!("fte-loopback-stall-{}", random::<u64>()));
+        let token_path = token_directory.join("token");
+        let server = LoopbackServer::start(
+            gateway,
+            store,
+            LoopbackConfig::app_private(token_path.clone()),
+        )
+        .await
+        .expect("start loopback");
+        let address = server
+            .addresses()
+            .iter()
+            .find(|address| address.is_ipv4())
+            .copied()
+            .expect("IPv4 listener");
+        let token = fs::read_to_string(&token_path).expect("read token");
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/responses"))
+            .bearer_auth(token)
+            .json(&json!({
+                "model":"test-model",
+                "input":"produce a deliberately oversized stream",
+                "stream":true
+            }))
+            .send()
+            .await
+            .expect("open Responses stream");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            server.shutdown_with_grace(Duration::from_millis(25)),
+        )
+        .await
+        .expect("listener shutdown must be bounded even when the client never reads SSE data");
+
+        drop(response);
         let _ = fs::remove_dir_all(token_directory);
     }
 }

@@ -20,6 +20,17 @@ evidence.
 - Gateway routing enforces privacy/capability/readiness gates, bounded
   admission, route affinity, pre-output-only retry, deadlines, cancellation and
   one terminal event.
+- Gateway and provider shutdown is explicitly quiescing: new registration and
+  admission close atomically, active request IDs are cancelled, authoritative
+  backend results and blocking bridges drain, and repeated shutdown is
+  idempotent with an observable retained error.
+- The Tauri plugin coordinates `RunEvent::Exit`, dynamic plugin removal, and
+  concurrent loopback start/stop/rotation without nested-runtime panics or
+  listener ownership races. Loopback graceful shutdown has a bounded abort
+  fallback for stalled clients.
+- The llama adapter borrows its injected `NativeHost`; its shutdown drains FTE
+  operations but deliberately leaves the resident host for the embedding
+  application to close with joined process-exit authority.
 - The native prefix cache binds exact token and runtime fingerprints. A mismatch
   is a normal miss; required caching fails closed.
 
@@ -36,8 +47,6 @@ evidence.
 - The desktop does not yet discover and register local GGUF descriptors. The
   `fte-backend-llama` adapter is real and is consumed by Mom Llama, but the FTE
   desktop currently registers hosted routes only.
-- Plugin `on_drop` still performs blocking async shutdown. A dedicated,
-  idempotent application-exit shutdown coordinator remains necessary.
 - IPv6 listener failure does not yet have a structured status field. IPv4 is
   authoritative and IPv6 is best effort.
 - The proposed `fte-core-2026-08` compatibility manifest and SDK conformance

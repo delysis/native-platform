@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -180,7 +180,117 @@ pub struct HostedProviderBackend {
     client: reqwest::Client,
     secrets: Arc<dyn SecretResolver>,
     credential: Mutex<Option<String>>,
-    active: Arc<Mutex<HashMap<RequestId, CancellationToken>>>,
+    activity: Arc<HostedActivity>,
+}
+
+struct HostedActivityState {
+    accepting: bool,
+    active: HashMap<RequestId, CancellationToken>,
+}
+
+impl Default for HostedActivityState {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            active: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct HostedActivity {
+    state: Mutex<HostedActivityState>,
+    changed: Notify,
+}
+
+impl HostedActivity {
+    fn register(self: &Arc<Self>, request_id: &RequestId) -> Result<HostedOperation, GatewayError> {
+        let mut state = self.lock_state();
+        if !state.accepting {
+            return Err(GatewayError::unavailable(
+                request_id,
+                "provider_quiescing",
+                "the hosted provider is draining and no longer accepts requests",
+            ));
+        }
+        if state.active.contains_key(request_id) {
+            return Err(GatewayError::invalid_request(
+                request_id,
+                "provider_request_id_active",
+                "that request ID is already active on the hosted provider",
+            ));
+        }
+        let cancellation = CancellationToken::new();
+        state
+            .active
+            .insert(request_id.clone(), cancellation.clone());
+        Ok(HostedOperation {
+            activity: Arc::clone(self),
+            request_id: request_id.clone(),
+            cancellation,
+        })
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.lock_state().accepting
+    }
+
+    fn cancel(&self, request_id: &RequestId) -> usize {
+        self.lock_state()
+            .active
+            .get(request_id)
+            .cloned()
+            .map(|token| {
+                token.cancel();
+                1
+            })
+            .unwrap_or_default()
+    }
+
+    async fn shutdown(&self) -> Result<(), GatewayError> {
+        let tokens = {
+            let mut state = self.lock_state();
+            state.accepting = false;
+            state.active.values().cloned().collect::<Vec<_>>()
+        };
+        for token in tokens {
+            token.cancel();
+        }
+        loop {
+            let changed = self.changed.notified();
+            let drained = self.lock_state().active.is_empty();
+            if drained {
+                return Ok(());
+            }
+            changed.await;
+        }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, HostedActivityState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+struct HostedOperation {
+    activity: Arc<HostedActivity>,
+    request_id: RequestId,
+    cancellation: CancellationToken,
+}
+
+impl HostedOperation {
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+impl Drop for HostedOperation {
+    fn drop(&mut self) {
+        let mut state = self.activity.lock_state();
+        state.active.remove(&self.request_id);
+        self.activity.changed.notify_waiters();
+    }
 }
 
 impl std::fmt::Debug for HostedProviderBackend {
@@ -209,7 +319,7 @@ impl HostedProviderBackend {
             client,
             secrets,
             credential: Mutex::new(None),
-            active: Arc::new(Mutex::new(HashMap::new())),
+            activity: Arc::new(HostedActivity::default()),
         })
     }
 
@@ -299,6 +409,11 @@ impl GatewayBackend for HostedProviderBackend {
     }
 
     fn readiness(&self) -> BackendReadiness {
+        if !self.activity.is_accepting() {
+            return BackendReadiness::Unavailable {
+                reason: "the hosted provider is draining".to_string(),
+            };
+        }
         match self.credential(&RequestId::new()) {
             Ok(_) => BackendReadiness::Ready,
             Err(error) => BackendReadiness::NotConfigured {
@@ -311,16 +426,10 @@ impl GatewayBackend for HostedProviderBackend {
         let request_id = request.request.request_id.clone();
         let secret = self.credential(&request_id)?;
         let prepared = self.prepare(&request)?;
-        let token = CancellationToken::new();
-        self.active
-            .lock()
-            .map_err(|error| {
-                provider_internal(&self.config.id, "provider_state_unavailable", error)
-            })?
-            .insert(request_id.clone(), token.clone());
+        let operation = self.activity.register(&request_id)?;
+        let token = operation.cancellation();
         let response = tokio::select! {
             () = token.cancelled() => {
-                self.active.lock().ok().map(|mut active| active.remove(&request_id));
                 return Err(cancelled_error(&request_id, &self.config.id));
             }
             response = self.client
@@ -330,11 +439,10 @@ impl GatewayBackend for HostedProviderBackend {
                 .send() => response.map_err(|error| map_transport_error(&request_id, &self.config.id, error))?,
         };
         if !response.status().is_success() {
-            self.active
-                .lock()
-                .ok()
-                .map(|mut active| active.remove(&request_id));
-            return Err(map_http_error(&request_id, &self.config.id, response).await);
+            return Err(tokio::select! {
+                () = token.cancelled() => cancelled_error(&request_id, &self.config.id),
+                error = map_http_error(&request_id, &self.config.id, response) => error,
+            });
         }
 
         let capacity = request
@@ -360,17 +468,25 @@ impl GatewayBackend for HostedProviderBackend {
                     "the event consumer closed before the hosted request started",
                 )
             })?;
+        let terminal_permit = event_tx.clone().reserve_owned().await.map_err(|_| {
+            GatewayError::unavailable(
+                &request_id,
+                "gateway_event_channel_closed",
+                "the event consumer closed before terminal capacity was reserved",
+            )
+        })?;
 
         let cancellation: Arc<dyn TicketCancellation> = Arc::new(HostedCancellation {
             token: token.clone(),
         });
-        let active = Arc::clone(&self.active);
         let protocol = prepared.protocol;
         let request_id_for_task = request_id.clone();
         let route = request.route;
+        let backend_id_for_task = route.backend_id.clone();
         let previous_response_id = request.request.storage.previous_response_id;
         let terminal_for_task = Arc::clone(&terminal);
         tokio::spawn(async move {
+            let _operation = operation;
             let result = if prepared.streaming {
                 consume_provider_stream(
                     response,
@@ -381,29 +497,32 @@ impl GatewayBackend for HostedProviderBackend {
                         route,
                         previous_response_id,
                         events: event_tx.clone(),
-                        cancellation: token,
+                        cancellation: token.clone(),
                     },
                 )
                 .await
             } else {
-                consume_provider_json(
-                    response,
-                    protocol,
-                    &request_id_for_task,
-                    &response_id,
-                    route,
-                    previous_response_id,
-                    &event_tx,
-                )
-                .await
+                tokio::select! {
+                    () = token.cancelled() => {
+                        Err(cancelled_error(&request_id_for_task, &backend_id_for_task))
+                    }
+                    result = consume_provider_json(
+                        response,
+                        ProviderJsonRequest {
+                            protocol,
+                            request_id: request_id_for_task.clone(),
+                            response_id,
+                            route,
+                            previous_response_id,
+                            events: event_tx.clone(),
+                            cancellation: token.clone(),
+                        },
+                    ) => result,
+                }
             };
             let terminal_event = terminal_event(&request_id_for_task, &result);
-            terminal_for_task.store(true, Ordering::Release);
-            let _ = event_tx.send(terminal_event).await;
+            enqueue_reserved_terminal(terminal_permit, terminal_event, &terminal_for_task);
             let _ = final_tx.send(result);
-            if let Ok(mut active) = active.lock() {
-                active.remove(&request_id_for_task);
-            }
         });
 
         Ok(GatewayTicket::new(
@@ -429,6 +548,8 @@ impl GatewayBackend for HostedProviderBackend {
         }
         let request_id = request.request.request_id.clone();
         let secret = self.credential(&request_id)?;
+        let operation = self.activity.register(&request_id)?;
+        let cancellation = operation.cancellation();
         let (url, body) = match self.config.protocol {
             HostedProtocol::Anthropic => (
                 required_endpoint(
@@ -456,21 +577,30 @@ impl GatewayBackend for HostedProviderBackend {
                 ));
             }
         };
-        let response = self
-            .client
-            .post(url)
-            .headers(self.headers(&secret, &request_id)?)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| map_transport_error(&request_id, &self.config.id, error))?;
+        let response = tokio::select! {
+            () = cancellation.cancelled() => {
+                return Err(cancelled_error(&request_id, &self.config.id));
+            }
+            response = self
+                .client
+                .post(url)
+                .headers(self.headers(&secret, &request_id)?)
+                .json(&body)
+                .send() => response.map_err(|error| map_transport_error(&request_id, &self.config.id, error))?,
+        };
         if !response.status().is_success() {
-            return Err(map_http_error(&request_id, &self.config.id, response).await);
+            return Err(tokio::select! {
+                () = cancellation.cancelled() => cancelled_error(&request_id, &self.config.id),
+                error = map_http_error(&request_id, &self.config.id, response) => error,
+            });
         }
-        let value = response
-            .json::<Value>()
-            .await
-            .map_err(|error| map_transport_error(&request_id, &self.config.id, error))?;
+        let value = tokio::select! {
+            () = cancellation.cancelled() => {
+                return Err(cancelled_error(&request_id, &self.config.id));
+            }
+            value = response.json::<Value>() => value
+                .map_err(|error| map_transport_error(&request_id, &self.config.id, error))?,
+        };
         Ok(GatewayUsage {
             input_tokens: value
                 .get("input_tokens")
@@ -483,31 +613,11 @@ impl GatewayBackend for HostedProviderBackend {
     }
 
     fn cancel(&self, request_id: &RequestId, _target: CancelTarget) -> usize {
-        self.active
-            .lock()
-            .ok()
-            .and_then(|active| active.get(request_id).cloned())
-            .map(|token| {
-                token.cancel();
-                1
-            })
-            .unwrap_or_default()
+        self.activity.cancel(request_id)
     }
 
     async fn shutdown(&self) -> Result<(), GatewayError> {
-        let tokens = self
-            .active
-            .lock()
-            .map_err(|error| {
-                provider_internal(&self.config.id, "provider_state_unavailable", error)
-            })?
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for token in tokens {
-            token.cancel();
-        }
-        Ok(())
+        self.activity.shutdown().await
     }
 }
 
@@ -532,6 +642,33 @@ fn terminal_event(
             request_id: request_id.clone(),
             error: error.clone(),
         },
+    }
+}
+
+fn enqueue_reserved_terminal(
+    permit: mpsc::OwnedPermit<GatewayEvent>,
+    event: GatewayEvent,
+    terminal_observed: &AtomicBool,
+) {
+    permit.send(event);
+    terminal_observed.store(true, Ordering::Release);
+}
+
+async fn send_provider_event(
+    events: &mpsc::Sender<GatewayEvent>,
+    cancellation: &CancellationToken,
+    request_id: &RequestId,
+    provider: &str,
+    event: GatewayEvent,
+) -> Result<(), GatewayError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(cancelled_error(request_id, provider)),
+        result = events.send(event) => result.map_err(|_| GatewayError::unavailable(
+            request_id,
+            "gateway_event_channel_closed",
+            "the hosted event consumer closed before the request completed",
+        )),
     }
 }
 
@@ -1825,28 +1962,49 @@ fn content_text(content: &[fte_types::ContentBlock]) -> String {
         .join("\n")
 }
 
-async fn consume_provider_json(
-    response: reqwest::Response,
+struct ProviderJsonRequest {
     protocol: WireProtocol,
-    request_id: &RequestId,
-    response_id: &str,
+    request_id: RequestId,
+    response_id: String,
     route: ResolvedRoute,
     previous_response_id: Option<String>,
-    events: &mpsc::Sender<GatewayEvent>,
+    events: mpsc::Sender<GatewayEvent>,
+    cancellation: CancellationToken,
+}
+
+async fn consume_provider_json(
+    response: reqwest::Response,
+    request: ProviderJsonRequest,
 ) -> Result<GatewayResponse, GatewayError> {
-    let value = response
-        .json::<Value>()
-        .await
-        .map_err(|error| map_transport_error(request_id, &route.backend_id, error))?;
-    let response = parse_provider_response(
+    let ProviderJsonRequest {
         protocol,
-        &value,
         request_id,
         response_id,
         route,
         previous_response_id,
+        events,
+        cancellation,
+    } = request;
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| map_transport_error(&request_id, &route.backend_id, error))?;
+    let response = parse_provider_response(
+        protocol,
+        &value,
+        &request_id,
+        &response_id,
+        route,
+        previous_response_id,
     )?;
-    emit_completed_lifecycle(events, request_id, &response).await;
+    emit_completed_lifecycle(
+        &events,
+        &cancellation,
+        &request_id,
+        &response.route.backend_id,
+        &response,
+    )
+    .await?;
     Ok(response)
 }
 
@@ -1881,6 +2039,7 @@ async fn consume_provider_stream(
         response_id,
         route,
         previous_response_id,
+        cancellation.clone(),
     );
     let started_at = tokio::time::Instant::now();
     loop {
@@ -2008,6 +2167,7 @@ struct ProviderStreamState {
     gemini_function_outputs: HashMap<(usize, usize), usize>,
     usage: GatewayUsage,
     provider_terminal: Option<GatewayResponse>,
+    cancellation: CancellationToken,
 }
 
 impl ProviderStreamState {
@@ -2017,6 +2177,7 @@ impl ProviderStreamState {
         response_id: String,
         route: ResolvedRoute,
         previous_response_id: Option<String>,
+        cancellation: CancellationToken,
     ) -> Self {
         Self {
             protocol,
@@ -2034,7 +2195,23 @@ impl ProviderStreamState {
             gemini_function_outputs: HashMap::new(),
             usage: GatewayUsage::default(),
             provider_terminal: None,
+            cancellation,
         }
+    }
+
+    async fn emit(
+        &self,
+        events: &mpsc::Sender<GatewayEvent>,
+        event: GatewayEvent,
+    ) -> Result<(), GatewayError> {
+        send_provider_event(
+            events,
+            &self.cancellation,
+            &self.request_id,
+            &self.route.backend_id,
+            event,
+        )
+        .await
     }
 
     async fn consume_frame(
@@ -2079,13 +2256,15 @@ impl ProviderStreamState {
                 {
                     let item = parse_openai_output_item(item)?;
                     ensure_output(&mut self.outputs, index, item.clone());
-                    let _ = events
-                        .send(GatewayEvent::OutputItemAdded {
+                    self.emit(
+                        events,
+                        GatewayEvent::OutputItemAdded {
                             request_id: self.request_id.clone(),
                             output_index: index,
                             item,
-                        })
-                        .await;
+                        },
+                    )
+                    .await?;
                 }
             }
             "response.content_part.added" => {
@@ -2094,14 +2273,16 @@ impl ProviderStreamState {
                     usize_field(&value, "content_index"),
                     value.get("part").and_then(parse_openai_content),
                 ) {
-                    let _ = events
-                        .send(GatewayEvent::ContentPartAdded {
+                    self.emit(
+                        events,
+                        GatewayEvent::ContentPartAdded {
                             request_id: self.request_id.clone(),
                             output_index,
                             content_index,
                             part,
-                        })
-                        .await;
+                        },
+                    )
+                    .await?;
                 }
             }
             "response.output_text.delta" => {
@@ -2111,14 +2292,16 @@ impl ProviderStreamState {
                     value.get("delta").and_then(Value::as_str),
                 ) {
                     self.text.entry(output_index).or_default().push_str(delta);
-                    let _ = events
-                        .send(GatewayEvent::TextDelta {
+                    self.emit(
+                        events,
+                        GatewayEvent::TextDelta {
                             request_id: self.request_id.clone(),
                             output_index,
                             content_index,
                             delta: delta.to_string(),
-                        })
-                        .await;
+                        },
+                    )
+                    .await?;
                 }
             }
             "response.reasoning_summary_text.delta" => {
@@ -2127,14 +2310,16 @@ impl ProviderStreamState {
                     usize_field(&value, "summary_index"),
                     value.get("delta").and_then(Value::as_str),
                 ) {
-                    let _ = events
-                        .send(GatewayEvent::ReasoningSummaryDelta {
+                    self.emit(
+                        events,
+                        GatewayEvent::ReasoningSummaryDelta {
                             request_id: self.request_id.clone(),
                             output_index,
                             summary_index,
                             delta: delta.to_string(),
-                        })
-                        .await;
+                        },
+                    )
+                    .await?;
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -2146,13 +2331,15 @@ impl ProviderStreamState {
                         .entry(output_index)
                         .or_default()
                         .push_str(delta);
-                    let _ = events
-                        .send(GatewayEvent::FunctionArgumentsDelta {
+                    self.emit(
+                        events,
+                        GatewayEvent::FunctionArgumentsDelta {
                             request_id: self.request_id.clone(),
                             output_index,
                             delta: delta.to_string(),
-                        })
-                        .await;
+                        },
+                    )
+                    .await?;
                 }
             }
             "response.content_part.done" => {
@@ -2161,14 +2348,16 @@ impl ProviderStreamState {
                     usize_field(&value, "content_index"),
                     value.get("part").and_then(parse_openai_content),
                 ) {
-                    let _ = events
-                        .send(GatewayEvent::ContentPartCompleted {
+                    self.emit(
+                        events,
+                        GatewayEvent::ContentPartCompleted {
                             request_id: self.request_id.clone(),
                             output_index,
                             content_index,
                             part,
-                        })
-                        .await;
+                        },
+                    )
+                    .await?;
                 }
             }
             "response.output_item.done" => {
@@ -2177,13 +2366,15 @@ impl ProviderStreamState {
                 {
                     let item = parse_openai_output_item(item)?;
                     ensure_output(&mut self.outputs, index, item.clone());
-                    let _ = events
-                        .send(GatewayEvent::OutputItemCompleted {
+                    self.emit(
+                        events,
+                        GatewayEvent::OutputItemCompleted {
                             request_id: self.request_id.clone(),
                             output_index: index,
                             item,
-                        })
-                        .await;
+                        },
+                    )
+                    .await?;
                 }
             }
             "response.completed" | "response.incomplete" => {
@@ -2233,14 +2424,16 @@ impl ProviderStreamState {
                 };
                 if let Some(delta) = delta {
                     self.text.entry(index).or_default().push_str(delta);
-                    let _ = events
-                        .send(GatewayEvent::TextDelta {
+                    self.emit(
+                        events,
+                        GatewayEvent::TextDelta {
                             request_id: self.request_id.clone(),
                             output_index: index,
                             content_index: 0,
                             delta: delta.to_string(),
-                        })
-                        .await;
+                        },
+                    )
+                    .await?;
                 }
             }
         }
@@ -2267,13 +2460,15 @@ impl ProviderStreamState {
                 if let Some(block) = value.get("content_block") {
                     let item = parse_anthropic_output_item(block, index)?;
                     ensure_output(&mut self.outputs, index, item.clone());
-                    let _ = events
-                        .send(GatewayEvent::OutputItemAdded {
+                    self.emit(
+                        events,
+                        GatewayEvent::OutputItemAdded {
                             request_id: self.request_id.clone(),
                             output_index: index,
                             item,
-                        })
-                        .await;
+                        },
+                    )
+                    .await?;
                 }
             }
             "content_block_delta" => {
@@ -2287,26 +2482,30 @@ impl ProviderStreamState {
                     "text_delta" => {
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
                             self.text.entry(index).or_default().push_str(text);
-                            let _ = events
-                                .send(GatewayEvent::TextDelta {
+                            self.emit(
+                                events,
+                                GatewayEvent::TextDelta {
                                     request_id: self.request_id.clone(),
                                     output_index: index,
                                     content_index: 0,
                                     delta: text.to_string(),
-                                })
-                                .await;
+                                },
+                            )
+                            .await?;
                         }
                     }
                     "thinking_delta" => {
                         if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
-                            let _ = events
-                                .send(GatewayEvent::ReasoningSummaryDelta {
+                            self.emit(
+                                events,
+                                GatewayEvent::ReasoningSummaryDelta {
                                     request_id: self.request_id.clone(),
                                     output_index: index,
                                     summary_index: 0,
                                     delta: text.to_string(),
-                                })
-                                .await;
+                                },
+                            )
+                            .await?;
                         }
                     }
                     "input_json_delta" => {
@@ -2315,13 +2514,15 @@ impl ProviderStreamState {
                                 .entry(index)
                                 .or_default()
                                 .push_str(partial);
-                            let _ = events
-                                .send(GatewayEvent::FunctionArgumentsDelta {
+                            self.emit(
+                                events,
+                                GatewayEvent::FunctionArgumentsDelta {
                                     request_id: self.request_id.clone(),
                                     output_index: index,
                                     delta: partial.to_string(),
-                                })
-                                .await;
+                                },
+                            )
+                            .await?;
                         }
                     }
                     _ => {}
@@ -2391,14 +2592,16 @@ impl ProviderStreamState {
                             self.gemini_signatures
                                 .insert(output_index, signature.clone());
                         }
-                        let _ = events
-                            .send(GatewayEvent::ReasoningSummaryDelta {
+                        self.emit(
+                            events,
+                            GatewayEvent::ReasoningSummaryDelta {
                                 request_id: self.request_id.clone(),
                                 output_index,
                                 summary_index: 0,
                                 delta: text.to_string(),
-                            })
-                            .await;
+                            },
+                        )
+                        .await?;
                     } else {
                         let output_index = *self
                             .gemini_text_outputs
@@ -2413,14 +2616,16 @@ impl ProviderStreamState {
                                 output_index
                             });
                         self.text.entry(output_index).or_default().push_str(text);
-                        let _ = events
-                            .send(GatewayEvent::TextDelta {
+                        self.emit(
+                            events,
+                            GatewayEvent::TextDelta {
                                 request_id: self.request_id.clone(),
                                 output_index,
                                 content_index: 0,
                                 delta: text.to_string(),
-                            })
-                            .await;
+                            },
+                        )
+                        .await?;
                     }
                 }
                 if let Some(call) = part.get("functionCall") {
@@ -2451,13 +2656,15 @@ impl ProviderStreamState {
                     {
                         *stored = arguments.clone();
                     }
-                    let _ = events
-                        .send(GatewayEvent::FunctionArgumentsDelta {
+                    self.emit(
+                        events,
+                        GatewayEvent::FunctionArgumentsDelta {
                             request_id: self.request_id.clone(),
                             output_index,
                             delta: arguments.to_string(),
-                        })
-                        .await;
+                        },
+                    )
+                    .await?;
                 }
             }
         }
@@ -2531,7 +2738,14 @@ impl ProviderStreamState {
             status: TerminalStatus::Completed,
             previous_response_id: self.previous_response_id,
         };
-        emit_completed_lifecycle(events, &self.request_id, &response).await;
+        emit_completed_lifecycle(
+            events,
+            &self.cancellation,
+            &self.request_id,
+            &response.route.backend_id,
+            &response,
+        )
+        .await?;
         Ok(response)
     }
 }
@@ -2981,51 +3195,78 @@ fn parse_anthropic_output_item(
 
 async fn emit_completed_lifecycle(
     events: &mpsc::Sender<GatewayEvent>,
+    cancellation: &CancellationToken,
     request_id: &RequestId,
+    provider: &str,
     response: &GatewayResponse,
-) {
+) -> Result<(), GatewayError> {
     for (output_index, item) in response.output.iter().enumerate() {
-        let _ = events
-            .send(GatewayEvent::OutputItemAdded {
+        send_provider_event(
+            events,
+            cancellation,
+            request_id,
+            provider,
+            GatewayEvent::OutputItemAdded {
                 request_id: request_id.clone(),
                 output_index,
                 item: item.clone(),
-            })
-            .await;
+            },
+        )
+        .await?;
         if let fte_types::OutputItem::Message { content, .. } = item {
             for (content_index, part) in content.iter().enumerate() {
-                let _ = events
-                    .send(GatewayEvent::ContentPartAdded {
+                send_provider_event(
+                    events,
+                    cancellation,
+                    request_id,
+                    provider,
+                    GatewayEvent::ContentPartAdded {
                         request_id: request_id.clone(),
                         output_index,
                         content_index,
                         part: part.clone(),
-                    })
-                    .await;
-                let _ = events
-                    .send(GatewayEvent::ContentPartCompleted {
+                    },
+                )
+                .await?;
+                send_provider_event(
+                    events,
+                    cancellation,
+                    request_id,
+                    provider,
+                    GatewayEvent::ContentPartCompleted {
                         request_id: request_id.clone(),
                         output_index,
                         content_index,
                         part: part.clone(),
-                    })
-                    .await;
+                    },
+                )
+                .await?;
             }
         }
-        let _ = events
-            .send(GatewayEvent::OutputItemCompleted {
+        send_provider_event(
+            events,
+            cancellation,
+            request_id,
+            provider,
+            GatewayEvent::OutputItemCompleted {
                 request_id: request_id.clone(),
                 output_index,
                 item: item.clone(),
-            })
-            .await;
+            },
+        )
+        .await?;
     }
-    let _ = events
-        .send(GatewayEvent::UsageUpdated {
+    send_provider_event(
+        events,
+        cancellation,
+        request_id,
+        provider,
+        GatewayEvent::UsageUpdated {
             request_id: request_id.clone(),
             usage: response.usage.clone(),
-        })
-        .await;
+        },
+    )
+    .await
 }
 
 fn ensure_output(
@@ -3333,6 +3574,121 @@ mod tests {
                 catalog_version: "test".to_string(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn hosted_shutdown_cancels_and_waits_for_registered_operations() {
+        let activity = Arc::new(HostedActivity::default());
+        let request_id = RequestId("active-request".to_string());
+        let operation = activity
+            .register(&request_id)
+            .expect("register hosted operation");
+        let cancellation = operation.cancellation();
+        let activity_for_shutdown = Arc::clone(&activity);
+        let shutdown = tokio::spawn(async move {
+            activity_for_shutdown
+                .shutdown()
+                .await
+                .expect("drain hosted operations");
+        });
+
+        tokio::task::yield_now().await;
+        assert!(cancellation.is_cancelled());
+        assert!(!shutdown.is_finished());
+        let error = match activity.register(&RequestId::new()) {
+            Ok(_) => panic!("quiescing providers must reject new work"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "provider_quiescing");
+
+        drop(operation);
+        shutdown.await.expect("shutdown task");
+        activity
+            .shutdown()
+            .await
+            .expect("shutdown is idempotent after drain");
+    }
+
+    #[tokio::test]
+    async fn hosted_shutdown_interrupts_an_undrained_event_send() {
+        let activity = Arc::new(HostedActivity::default());
+        let request_id = RequestId("blocked-event-send".to_string());
+        let operation = activity
+            .register(&request_id)
+            .expect("register hosted operation");
+        let cancellation = operation.cancellation();
+        let (events, _undrained) = mpsc::channel(1);
+        events
+            .send(GatewayEvent::Warning {
+                request_id: request_id.clone(),
+                code: "fill_channel".to_string(),
+                message: "fill the bounded channel".to_string(),
+            })
+            .await
+            .expect("fill event channel");
+
+        let request_for_send = request_id.clone();
+        let blocked_send = tokio::spawn(async move {
+            let _operation = operation;
+            send_provider_event(
+                &events,
+                &cancellation,
+                &request_for_send,
+                "provider",
+                GatewayEvent::Warning {
+                    request_id: request_for_send.clone(),
+                    code: "blocked".to_string(),
+                    message: "this send must be interrupted by shutdown".to_string(),
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!blocked_send.is_finished());
+
+        tokio::time::timeout(Duration::from_secs(1), activity.shutdown())
+            .await
+            .expect("shutdown must interrupt a full event channel")
+            .expect("shutdown hosted activity");
+        let error = blocked_send
+            .await
+            .expect("blocked send task")
+            .expect_err("shutdown cancellation must interrupt the send");
+        assert_eq!(error.code, "request_cancelled");
+    }
+
+    #[tokio::test]
+    async fn hosted_terminal_reservation_survives_a_full_event_channel() {
+        let request_id = RequestId("reserved-terminal".to_string());
+        let (events, mut receiver) = mpsc::channel(2);
+        let terminal_permit = events
+            .clone()
+            .reserve_owned()
+            .await
+            .expect("reserve terminal capacity");
+        events
+            .send(GatewayEvent::Warning {
+                request_id: request_id.clone(),
+                code: "fill_channel".to_string(),
+                message: "consume every ordinary permit".to_string(),
+            })
+            .await
+            .expect("fill ordinary event capacity");
+        let terminal_observed = AtomicBool::new(false);
+        let cancelled = Err(cancelled_error(&request_id, "provider"));
+        enqueue_reserved_terminal(
+            terminal_permit,
+            terminal_event(&request_id, &cancelled),
+            &terminal_observed,
+        );
+        drop(events);
+
+        let mut terminal_count = 0;
+        while let Some(event) = receiver.recv().await {
+            terminal_count += usize::from(event.is_terminal());
+        }
+        assert_eq!(terminal_count, 1);
+        assert!(terminal_observed.load(Ordering::Acquire));
     }
 
     #[test]

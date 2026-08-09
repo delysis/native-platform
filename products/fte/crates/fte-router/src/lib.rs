@@ -2,15 +2,15 @@
 
 use fte_types::{
     BackendDescriptor, BackendLocation, BackendRequest, CancelTarget, GatewayBackend, GatewayError,
-    GatewayRequest, GatewayStatus, GatewayTicket, GatewayUsage, ModelDescriptor, ModelSelector,
-    PrivacyPolicy, RequestId, ResolvedRoute, ResponseFormat, RouteProfile,
+    GatewayLifecycle, GatewayRequest, GatewayStatus, GatewayTicket, GatewayUsage, ModelDescriptor,
+    ModelSelector, PrivacyPolicy, RequestId, ResolvedRoute, ResponseFormat, RouteProfile,
 };
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 
 const DEFAULT_BACKEND_CONCURRENCY: usize = 4;
 const DEFAULT_QUEUE_MS: u64 = 30_000;
@@ -40,6 +40,7 @@ impl Default for GatewayDefaults {
 struct GatewayState {
     backends: BTreeMap<String, Arc<dyn GatewayBackend>>,
     backend_admission: BTreeMap<String, Arc<Semaphore>>,
+    all_admission: Vec<Arc<Semaphore>>,
     backend_circuits: BTreeMap<String, BackendCircuit>,
     response_affinity: BTreeMap<String, (String, String)>,
 }
@@ -68,10 +69,140 @@ impl BackendCircuit {
     }
 }
 
+#[derive(Default)]
+struct LifecycleState {
+    phase: GatewayLifecycle,
+    active_requests: BTreeMap<RequestId, usize>,
+    shutdown_error: Option<GatewayError>,
+}
+
+#[derive(Default)]
+struct LifecycleControl {
+    state: Mutex<LifecycleState>,
+    changed: Notify,
+}
+
+enum ShutdownDisposition {
+    Lead(Vec<RequestId>),
+    Wait,
+    Complete(Result<(), GatewayError>),
+}
+
+impl LifecycleControl {
+    fn ensure_running(&self, request_id: &RequestId) -> Result<(), GatewayError> {
+        let state = self.lock_state();
+        if state.phase == GatewayLifecycle::Running {
+            Ok(())
+        } else {
+            Err(gateway_closed_error(request_id, state.phase))
+        }
+    }
+
+    fn while_running<T>(
+        &self,
+        request_id: &RequestId,
+        operation: impl FnOnce() -> Result<T, GatewayError>,
+    ) -> Result<T, GatewayError> {
+        let state = self.lock_state();
+        if state.phase != GatewayLifecycle::Running {
+            return Err(gateway_closed_error(request_id, state.phase));
+        }
+        operation()
+    }
+
+    fn register_request(&self, request_id: &RequestId) -> Result<(), GatewayError> {
+        let mut state = self.lock_state();
+        if state.phase != GatewayLifecycle::Running {
+            return Err(gateway_closed_error(request_id, state.phase));
+        }
+        *state.active_requests.entry(request_id.clone()).or_default() += 1;
+        Ok(())
+    }
+
+    fn release_request(&self, request_id: &RequestId) {
+        let mut state = self.lock_state();
+        let remove = state
+            .active_requests
+            .get_mut(request_id)
+            .is_some_and(|count| {
+                *count = count.saturating_sub(1);
+                *count == 0
+            });
+        if remove {
+            state.active_requests.remove(request_id);
+        }
+        self.changed.notify_waiters();
+    }
+
+    fn begin_shutdown(&self) -> ShutdownDisposition {
+        let mut state = self.lock_state();
+        match state.phase {
+            GatewayLifecycle::Running => {
+                state.phase = GatewayLifecycle::Quiescing;
+                let active = state.active_requests.keys().cloned().collect();
+                self.changed.notify_waiters();
+                ShutdownDisposition::Lead(active)
+            }
+            GatewayLifecycle::Quiescing => ShutdownDisposition::Wait,
+            GatewayLifecycle::Closed => {
+                ShutdownDisposition::Complete(state.shutdown_error.clone().map_or(Ok(()), Err))
+            }
+        }
+    }
+
+    fn snapshot(&self) -> (GatewayLifecycle, usize, Option<GatewayError>) {
+        let state = self.lock_state();
+        (
+            state.phase,
+            state.active_requests.values().sum(),
+            state.shutdown_error.clone(),
+        )
+    }
+
+    async fn wait_until_drained(&self) {
+        loop {
+            let changed = self.changed.notified();
+            let drained = self.lock_state().active_requests.is_empty();
+            if drained {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    async fn wait_until_closed(&self) -> Result<(), GatewayError> {
+        loop {
+            let changed = self.changed.notified();
+            let result = {
+                let state = self.lock_state();
+                (state.phase == GatewayLifecycle::Closed)
+                    .then(|| state.shutdown_error.clone().map_or(Ok(()), Err))
+            };
+            if let Some(result) = result {
+                return result;
+            }
+            changed.await;
+        }
+    }
+
+    fn finish_shutdown(&self, result: &Result<(), GatewayError>) {
+        let mut state = self.lock_state();
+        state.phase = GatewayLifecycle::Closed;
+        state.shutdown_error = result.as_ref().err().cloned();
+        self.changed.notify_waiters();
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, LifecycleState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 pub struct Gateway {
     defaults: GatewayDefaults,
     state: RwLock<GatewayState>,
-    active_requests: Arc<AtomicUsize>,
+    lifecycle: Arc<LifecycleControl>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -89,7 +220,7 @@ impl Gateway {
         Self {
             defaults,
             state: RwLock::new(GatewayState::default()),
-            active_requests: Arc::new(AtomicUsize::new(0)),
+            lifecycle: Arc::new(LifecycleControl::default()),
         }
     }
 
@@ -113,29 +244,32 @@ impl Gateway {
                 "every model descriptor must name its owning backend",
             ));
         }
-        let mut state = self.state.write().map_err(|_| {
-            GatewayError::unavailable(
-                &RequestId::new(),
-                "gateway_state_poisoned",
-                "gateway state is unavailable",
-            )
-        })?;
-        if state.backends.contains_key(&descriptor.id) {
-            return Err(GatewayError::invalid_request(
-                &RequestId::new(),
-                "backend_duplicate",
-                "a backend with that ID is already registered",
-            ));
-        }
-        state.backend_admission.insert(
-            descriptor.id.clone(),
-            Arc::new(Semaphore::new(DEFAULT_BACKEND_CONCURRENCY)),
-        );
-        state
-            .backend_circuits
-            .insert(descriptor.id.clone(), BackendCircuit::default());
-        state.backends.insert(descriptor.id, backend);
-        Ok(())
+        self.lifecycle.while_running(&RequestId::new(), || {
+            let mut state = self.state.write().map_err(|_| {
+                GatewayError::unavailable(
+                    &RequestId::new(),
+                    "gateway_state_poisoned",
+                    "gateway state is unavailable",
+                )
+            })?;
+            if state.backends.contains_key(&descriptor.id) {
+                return Err(GatewayError::invalid_request(
+                    &RequestId::new(),
+                    "backend_duplicate",
+                    "a backend with that ID is already registered",
+                ));
+            }
+            let admission = Arc::new(Semaphore::new(DEFAULT_BACKEND_CONCURRENCY));
+            state
+                .backend_admission
+                .insert(descriptor.id.clone(), Arc::clone(&admission));
+            state.all_admission.push(admission);
+            state
+                .backend_circuits
+                .insert(descriptor.id.clone(), BackendCircuit::default());
+            state.backends.insert(descriptor.id, backend);
+            Ok(())
+        })
     }
 
     /// Replaces the admission semaphore used by future requests for one
@@ -153,30 +287,35 @@ impl Gateway {
                 "backend concurrency must be greater than zero",
             ));
         }
-        let mut state = self.state.write().map_err(|_| {
-            GatewayError::unavailable(
-                &RequestId::new(),
-                "gateway_state_poisoned",
-                "gateway state is unavailable",
-            )
-        })?;
-        if !state.backends.contains_key(backend_id) {
-            return Err(GatewayError::invalid_request(
-                &RequestId::new(),
-                "backend_not_registered",
-                "the backend must be registered before configuring admission",
-            ));
-        }
-        state
-            .backend_admission
-            .insert(backend_id.to_string(), Arc::new(Semaphore::new(limit)));
-        Ok(())
+        self.lifecycle.while_running(&RequestId::new(), || {
+            let mut state = self.state.write().map_err(|_| {
+                GatewayError::unavailable(
+                    &RequestId::new(),
+                    "gateway_state_poisoned",
+                    "gateway state is unavailable",
+                )
+            })?;
+            if !state.backends.contains_key(backend_id) {
+                return Err(GatewayError::invalid_request(
+                    &RequestId::new(),
+                    "backend_not_registered",
+                    "the backend must be registered before configuring admission",
+                ));
+            }
+            let admission = Arc::new(Semaphore::new(limit));
+            state
+                .backend_admission
+                .insert(backend_id.to_string(), Arc::clone(&admission));
+            state.all_admission.push(admission);
+            Ok(())
+        })
     }
 
     pub async fn execute(&self, request: GatewayRequest) -> Result<GatewayTicket, GatewayError> {
         let started_at = Instant::now();
         request.validate()?;
         let request_id = request.request_id.clone();
+        self.lifecycle.ensure_running(&request_id)?;
         let deadline = request.deadline.clone();
         let event_capacity = request
             .stream
@@ -228,9 +367,11 @@ impl Gateway {
             match result {
                 Ok(ticket) => {
                     self.record_backend_success(&backend_id)?;
-                    return Ok(ticket
-                        .with_deadlines(deadline, started_at.elapsed(), event_capacity)
-                        .with_admission_lease(Box::new(lease)));
+                    return Ok(ticket.with_admission_lease(Box::new(lease)).with_deadlines(
+                        deadline,
+                        started_at.elapsed(),
+                        event_capacity,
+                    ));
                 }
                 Err(error) if retryable_setup_failure(fallback_allowed, &error) => {
                     self.record_backend_failure(&backend_id)?;
@@ -260,6 +401,7 @@ impl Gateway {
     ) -> Result<GatewayUsage, GatewayError> {
         let started_at = Instant::now();
         request.validate()?;
+        self.lifecycle.ensure_running(&request.request_id)?;
         let (backend, route, admission) = self.resolve(&request)?;
         let _lease = self
             .admit(
@@ -309,24 +451,78 @@ impl Gateway {
     }
 
     pub async fn shutdown(&self) -> Result<(), GatewayError> {
-        let backends = self
-            .state
-            .read()
-            .map_err(|_| {
-                GatewayError::unavailable(
-                    &RequestId::new(),
-                    "gateway_state_poisoned",
-                    "gateway state is unavailable",
-                )
-            })?
-            .backends
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for backend in backends {
-            backend.shutdown().await?;
+        match self.lifecycle.begin_shutdown() {
+            ShutdownDisposition::Complete(result) => return result,
+            ShutdownDisposition::Wait => return self.lifecycle.wait_until_closed().await,
+            ShutdownDisposition::Lead(active_request_ids) => {
+                let (backends, admissions, state_error) = match self.state.read() {
+                    Ok(state) => (
+                        state.backends.values().cloned().collect::<Vec<_>>(),
+                        state.all_admission.clone(),
+                        None,
+                    ),
+                    Err(poisoned) => {
+                        // Poisoning does not make the resources behind the
+                        // lock disappear. Recover the guard so shutdown still
+                        // closes admission, cancels work, and joins every
+                        // backend before reporting the failure.
+                        let state = poisoned.into_inner();
+                        (
+                            state.backends.values().cloned().collect::<Vec<_>>(),
+                            state.all_admission.clone(),
+                            Some(GatewayError::unavailable(
+                                &RequestId::new(),
+                                "gateway_state_poisoned",
+                                "gateway state was poisoned; resources were drained before closure",
+                            )),
+                        )
+                    }
+                };
+                for admission in admissions {
+                    admission.close();
+                }
+                for request_id in active_request_ids {
+                    for backend in &backends {
+                        let _ = backend.cancel(&request_id, CancelTarget::Request);
+                    }
+                }
+
+                // The coordinator is intentionally detached: once quiescing
+                // begins, dropping one shutdown caller must not strand the
+                // gateway forever or leave backend tasks alive.
+                let lifecycle = Arc::clone(&self.lifecycle);
+                tokio::spawn(async move {
+                    let mut tasks = JoinSet::new();
+                    for backend in backends {
+                        tasks.spawn(async move { backend.shutdown().await });
+                    }
+                    let mut first_error = state_error;
+                    while let Some(result) = tasks.join_next().await {
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                first_error.get_or_insert(error);
+                            }
+                            Err(error) => {
+                                first_error.get_or_insert_with(|| GatewayError {
+                                    code: "backend_shutdown_task_failed".to_string(),
+                                    class: fte_types::ErrorClass::Internal,
+                                    retryable: false,
+                                    http_status: 500,
+                                    request_id: RequestId::new(),
+                                    provider: None,
+                                    safe_detail: format!("a backend shutdown task failed: {error}"),
+                                });
+                            }
+                        }
+                    }
+                    lifecycle.wait_until_drained().await;
+                    let result = first_error.map_or(Ok(()), Err);
+                    lifecycle.finish_shutdown(&result);
+                });
+            }
         }
-        Ok(())
+        self.lifecycle.wait_until_closed().await
     }
 
     #[must_use]
@@ -345,19 +541,35 @@ impl Gateway {
 
     #[must_use]
     pub fn status(&self) -> GatewayStatus {
-        self.state
-            .read()
-            .map(|state| GatewayStatus {
+        let (lifecycle, active_requests, shutdown_error) = self.lifecycle.snapshot();
+        match self.state.read() {
+            Ok(state) => GatewayStatus {
                 backend_count: state.backends.len(),
                 ready_backend_count: state
                     .backends
                     .values()
                     .filter(|backend| backend.readiness().is_ready())
                     .count(),
-                active_requests: self.active_requests.load(AtomicOrdering::Acquire),
+                active_requests,
+                lifecycle,
+                shutdown_error,
                 loopback: None,
-            })
-            .unwrap_or_default()
+            },
+            Err(_) => GatewayStatus {
+                backend_count: 0,
+                ready_backend_count: 0,
+                active_requests,
+                lifecycle,
+                shutdown_error: shutdown_error.or_else(|| {
+                    Some(GatewayError::unavailable(
+                        &RequestId::new(),
+                        "gateway_state_poisoned",
+                        "gateway state is unavailable",
+                    ))
+                }),
+                loopback: None,
+            },
+        }
     }
 
     pub fn record_response_affinity(
@@ -429,10 +641,11 @@ impl Gateway {
                     )
                 })?
         };
-        self.active_requests.fetch_add(1, AtomicOrdering::AcqRel);
+        self.lifecycle.register_request(request_id)?;
         Ok(AdmissionLease {
             _permit: permit,
-            active_requests: Arc::clone(&self.active_requests),
+            request_id: request_id.clone(),
+            lifecycle: Arc::clone(&self.lifecycle),
         })
     }
 
@@ -597,13 +810,32 @@ impl Gateway {
 
 struct AdmissionLease {
     _permit: OwnedSemaphorePermit,
-    active_requests: Arc<AtomicUsize>,
+    request_id: RequestId,
+    lifecycle: Arc<LifecycleControl>,
 }
 
 impl Drop for AdmissionLease {
     fn drop(&mut self) {
-        self.active_requests.fetch_sub(1, AtomicOrdering::AcqRel);
+        self.lifecycle.release_request(&self.request_id);
     }
+}
+
+fn gateway_closed_error(request_id: &RequestId, phase: GatewayLifecycle) -> GatewayError {
+    let (code, detail) = match phase {
+        GatewayLifecycle::Running => (
+            "gateway_admission_race",
+            "gateway admission changed while the request was being registered",
+        ),
+        GatewayLifecycle::Quiescing => (
+            "gateway_quiescing",
+            "the gateway is draining and no longer accepts requests",
+        ),
+        GatewayLifecycle::Closed => (
+            "gateway_closed",
+            "the gateway is closed and no longer accepts requests",
+        ),
+    };
+    GatewayError::unavailable(request_id, code, detail)
 }
 
 fn queue_timeout(request_id: &RequestId, detail: &str) -> GatewayError {
@@ -824,7 +1056,7 @@ mod tests {
         TicketCancellation, ToolPolicy,
     };
     use std::collections::BTreeMap;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use tokio::sync::{mpsc, oneshot};
 
     struct NeverExecuteBackend(BackendDescriptor);
@@ -1007,11 +1239,28 @@ mod tests {
         assert_eq!(route.backend_id, "measured");
     }
 
-    struct CountCancellation(Arc<AtomicUsize>);
+    struct CountCancellation {
+        count: Arc<AtomicUsize>,
+        completion:
+            Mutex<Option<oneshot::Sender<Result<fte_types::GatewayResponse, GatewayError>>>>,
+    }
 
     impl TicketCancellation for CountCancellation {
         fn cancel(&self, _target: CancelTarget) -> usize {
-            self.0.fetch_add(1, AtomicOrdering::AcqRel);
+            self.count.fetch_add(1, AtomicOrdering::AcqRel);
+            if let Ok(mut completion) = self.completion.lock()
+                && let Some(completion) = completion.take()
+            {
+                let _ = completion.send(Err(GatewayError {
+                    code: "fixture_cancelled".to_string(),
+                    class: fte_types::ErrorClass::Cancelled,
+                    retryable: false,
+                    http_status: 499,
+                    request_id: RequestId::new(),
+                    provider: None,
+                    safe_detail: "the fixture request was cancelled".to_string(),
+                }));
+            }
             1
         }
     }
@@ -1032,12 +1281,15 @@ mod tests {
 
         async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
             let (_event_tx, event_rx) = mpsc::channel(1);
-            let (_final_tx, final_rx) = oneshot::channel();
+            let (final_tx, final_rx) = oneshot::channel();
             Ok(GatewayTicket::new(
                 request.request.request_id,
                 event_rx,
                 final_rx,
-                Arc::new(CountCancellation(Arc::clone(&self.cancelled))),
+                Arc::new(CountCancellation {
+                    count: Arc::clone(&self.cancelled),
+                    completion: Mutex::new(Some(final_tx)),
+                }),
                 Arc::new(AtomicBool::new(false)),
             ))
         }
@@ -1045,6 +1297,334 @@ mod tests {
         fn cancel(&self, _request_id: &RequestId, _target: CancelTarget) -> usize {
             0
         }
+    }
+
+    struct NoopCancellation;
+
+    impl TicketCancellation for NoopCancellation {
+        fn cancel(&self, _target: CancelTarget) -> usize {
+            0
+        }
+    }
+
+    type FixtureFinalSender = oneshot::Sender<Result<fte_types::GatewayResponse, GatewayError>>;
+
+    struct DrainingBackend {
+        completion: Mutex<Option<FixtureFinalSender>>,
+        cancellations: Arc<AtomicUsize>,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    struct DelayedFinalBackend {
+        completion: Arc<Mutex<Option<FixtureFinalSender>>>,
+        cancellations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl GatewayBackend for DelayedFinalBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            descriptor("delayed-final", BackendLocation::LocalEmbedded)
+        }
+
+        fn readiness(&self) -> BackendReadiness {
+            BackendReadiness::Ready
+        }
+
+        async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
+            let (_event_tx, event_rx) = mpsc::channel(1);
+            let (final_tx, final_rx) = oneshot::channel();
+            *self.completion.lock().expect("completion state") = Some(final_tx);
+            Ok(GatewayTicket::new(
+                request.request.request_id,
+                event_rx,
+                final_rx,
+                Arc::new(NoopCancellation),
+                Arc::new(AtomicBool::new(false)),
+            ))
+        }
+
+        fn cancel(&self, _request_id: &RequestId, _target: CancelTarget) -> usize {
+            self.cancellations.fetch_add(1, AtomicOrdering::AcqRel);
+            1
+        }
+    }
+
+    #[async_trait]
+    impl GatewayBackend for DrainingBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            descriptor("draining", BackendLocation::LocalEmbedded)
+        }
+
+        fn readiness(&self) -> BackendReadiness {
+            BackendReadiness::Ready
+        }
+
+        async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
+            let (_event_tx, event_rx) = mpsc::channel(1);
+            let (final_tx, final_rx) = oneshot::channel();
+            *self.completion.lock().expect("completion state") = Some(final_tx);
+            Ok(GatewayTicket::new(
+                request.request.request_id,
+                event_rx,
+                final_rx,
+                Arc::new(NoopCancellation),
+                Arc::new(AtomicBool::new(false)),
+            ))
+        }
+
+        fn cancel(&self, request_id: &RequestId, _target: CancelTarget) -> usize {
+            self.cancellations.fetch_add(1, AtomicOrdering::AcqRel);
+            let Some(completion) = self.completion.lock().expect("completion state").take() else {
+                return 0;
+            };
+            let _ = completion.send(Err(GatewayError {
+                code: "fixture_cancelled".to_string(),
+                class: fte_types::ErrorClass::Cancelled,
+                retryable: false,
+                http_status: 499,
+                request_id: request_id.clone(),
+                provider: None,
+                safe_detail: "the fixture request was cancelled".to_string(),
+            }));
+            1
+        }
+
+        async fn shutdown(&self) -> Result<(), GatewayError> {
+            self.shutdowns.fetch_add(1, AtomicOrdering::AcqRel);
+            Ok(())
+        }
+    }
+
+    struct BlockingShutdownBackend {
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl GatewayBackend for BlockingShutdownBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            descriptor("blocking", BackendLocation::LocalEmbedded)
+        }
+
+        fn readiness(&self) -> BackendReadiness {
+            BackendReadiness::Ready
+        }
+
+        async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
+            Err(GatewayError::unavailable(
+                &request.request.request_id,
+                "fixture_not_executed",
+                "the lifecycle fixture does not execute requests",
+            ))
+        }
+
+        fn cancel(&self, _request_id: &RequestId, _target: CancelTarget) -> usize {
+            0
+        }
+
+        async fn shutdown(&self) -> Result<(), GatewayError> {
+            self.shutdowns.fetch_add(1, AtomicOrdering::AcqRel);
+            self.entered.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("release lifecycle fixture")
+                .forget();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_active_work_and_waits_for_authoritative_completion() {
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let gateway = Gateway::new(GatewayDefaults::default());
+        gateway
+            .register_backend(Arc::new(DrainingBackend {
+                completion: Mutex::new(None),
+                cancellations: Arc::clone(&cancellations),
+                shutdowns: Arc::clone(&shutdowns),
+            }))
+            .expect("register draining backend");
+        let mut request = request();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "draining".to_string(),
+            model_id: "draining-model".to_string(),
+        };
+        let ticket = gateway.execute(request).await.expect("start request");
+        assert_eq!(gateway.status().active_requests, 1);
+
+        tokio::time::timeout(Duration::from_secs(1), gateway.shutdown())
+            .await
+            .expect("gateway shutdown must not hang")
+            .expect("gateway shutdown");
+        assert_eq!(cancellations.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(shutdowns.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(gateway.status().active_requests, 0);
+        assert_eq!(gateway.status().lifecycle, GatewayLifecycle::Closed);
+        drop(ticket);
+    }
+
+    #[tokio::test]
+    async fn deadline_does_not_release_admission_before_the_backend_final() {
+        let completion = Arc::new(Mutex::new(None));
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+        gateway
+            .register_backend(Arc::new(DelayedFinalBackend {
+                completion: Arc::clone(&completion),
+                cancellations: Arc::clone(&cancellations),
+            }))
+            .expect("register delayed-final backend");
+        let mut request = request();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "delayed-final".to_string(),
+            model_id: "delayed-final-model".to_string(),
+        };
+        request.deadline.first_token_ms = Some(5);
+        let ticket = gateway
+            .execute(request)
+            .await
+            .expect("start delayed request");
+        let error = ticket
+            .final_response()
+            .await
+            .expect_err("consumer observes first-output deadline");
+        assert_eq!(error.code, "first_output_deadline_exceeded");
+        assert_eq!(gateway.status().active_requests, 1);
+
+        let shutdown_gateway = Arc::clone(&gateway);
+        let shutdown = tokio::spawn(async move { shutdown_gateway.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        assert!(cancellations.load(AtomicOrdering::Acquire) >= 1);
+
+        let final_tx = completion
+            .lock()
+            .expect("completion state")
+            .take()
+            .expect("pending backend final");
+        let _ = final_tx.send(Err(GatewayError::unavailable(
+            &RequestId::new(),
+            "fixture_backend_stopped",
+            "the delayed backend has now terminated",
+        )));
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown waits only until raw backend final")
+            .expect("shutdown task")
+            .expect("gateway shutdown");
+        assert_eq!(gateway.status().active_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_registration_atomically_and_is_idempotent() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+        gateway
+            .register_backend(Arc::new(BlockingShutdownBackend {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                shutdowns: Arc::clone(&shutdowns),
+            }))
+            .expect("register blocking backend");
+
+        let first_gateway = Arc::clone(&gateway);
+        let first = tokio::spawn(async move { first_gateway.shutdown().await });
+        entered
+            .acquire()
+            .await
+            .expect("backend shutdown entered")
+            .forget();
+        assert_eq!(gateway.status().lifecycle, GatewayLifecycle::Quiescing);
+
+        let register_error = gateway
+            .register_backend(Arc::new(NeverExecuteBackend(descriptor(
+                "late",
+                BackendLocation::LocalEmbedded,
+            ))))
+            .expect_err("registration after quiescing must fail");
+        assert_eq!(register_error.code, "gateway_quiescing");
+        let concurrency_error = gateway
+            .set_backend_concurrency("blocking", 2)
+            .expect_err("admission mutation after quiescing must fail");
+        assert_eq!(concurrency_error.code, "gateway_quiescing");
+
+        let second_gateway = Arc::clone(&gateway);
+        let second = tokio::spawn(async move { second_gateway.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+        release.add_permits(1);
+        first
+            .await
+            .expect("first shutdown task")
+            .expect("first shutdown");
+        second
+            .await
+            .expect("second shutdown task")
+            .expect("second shutdown");
+        gateway
+            .shutdown()
+            .await
+            .expect("closed shutdown is idempotent");
+        assert_eq!(shutdowns.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(gateway.status().lifecycle, GatewayLifecycle::Closed);
+
+        let error = gateway
+            .execute(request())
+            .await
+            .expect_err("closed gateways reject new requests");
+        assert_eq!(error.code, "gateway_closed");
+    }
+
+    #[tokio::test]
+    async fn poisoned_gateway_state_is_still_fully_drained_before_erroring() {
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+        gateway
+            .register_backend(Arc::new(DrainingBackend {
+                completion: Mutex::new(None),
+                cancellations: Arc::clone(&cancellations),
+                shutdowns: Arc::clone(&shutdowns),
+            }))
+            .expect("register draining backend");
+        let mut request = request();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "draining".to_string(),
+            model_id: "draining-model".to_string(),
+        };
+        let ticket = gateway.execute(request).await.expect("start request");
+
+        let gateway_for_poison = Arc::clone(&gateway);
+        let _ = std::thread::spawn(move || {
+            let _state = gateway_for_poison.state.write().expect("gateway state");
+            panic!("poison gateway state for deterministic shutdown coverage");
+        })
+        .join();
+        let status = gateway.status();
+        assert_eq!(status.lifecycle, GatewayLifecycle::Running);
+        assert_eq!(
+            status
+                .shutdown_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("gateway_state_poisoned")
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(1), gateway.shutdown())
+            .await
+            .expect("poisoned shutdown must not hang")
+            .expect_err("poison remains observable after resources drain");
+        assert_eq!(error.code, "gateway_state_poisoned");
+        assert_eq!(cancellations.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(shutdowns.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(gateway.status().active_requests, 0);
+        assert_eq!(gateway.status().lifecycle, GatewayLifecycle::Closed);
+        drop(ticket);
     }
 
     #[tokio::test]
@@ -1072,6 +1652,7 @@ mod tests {
         assert_eq!(error.code, "queue_deadline_exceeded");
 
         drop(first);
+        wait_for_no_active(&gateway).await;
         assert_eq!(cancelled.load(AtomicOrdering::Acquire), 1);
         assert_eq!(gateway.status().active_requests, 0);
     }
@@ -1236,6 +1817,7 @@ mod tests {
         assert_eq!(gateway.status().active_requests, 1);
 
         drop(first);
+        wait_for_no_active(&gateway).await;
         assert_eq!(cancelled.load(AtomicOrdering::Acquire), 1);
         assert_eq!(gateway.status().active_requests, 0);
     }
@@ -1299,5 +1881,15 @@ mod tests {
         assert_eq!(error.code, "request_total_deadline_exceeded");
         assert_eq!(error.class, fte_types::ErrorClass::Timeout);
         assert_eq!(gateway.status().active_requests, 0);
+    }
+
+    async fn wait_for_no_active(gateway: &Gateway) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gateway.status().active_requests != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture request must drain");
     }
 }

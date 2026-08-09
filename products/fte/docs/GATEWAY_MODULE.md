@@ -31,6 +31,14 @@ See [Module and Repository Map](MODULE_MAP.md).
 The native kit does not depend on Free Token Energy. Product state remains in
 the embedding application.
 
+The native host passed to the plugin is explicitly **borrowed**. Gateway
+shutdown closes FTE admission, cancels every FTE request, and waits for model
+acquisition, tokenization, cache, provider, bridge, and token-count work to
+finish. It never unloads or closes the application-owned host. On Tauri exit,
+the plugin drain runs before the embedding application's `App::run` callback;
+only that application callback may perform and retain the native host's final
+joined process-exit shutdown fact.
+
 ## Embedding
 
 ```rust,ignore
@@ -49,6 +57,12 @@ tauri::Builder::default().plugin(
 open a port. A caller must explicitly invoke `loopback_start`. Mom Llama
 registers only its product-owned native backend, so its route set remains
 local-only even when no model can load.
+
+Loopback start, stop, and token rotation participate in the same cleanup
+coordinator as generation. Exit first closes lifecycle admission, waits for
+any in-flight listener ownership transfer, quiesces the gateway and listener
+concurrently, then bounds Axum's graceful connection wait. A stalled client
+cannot retain a listener or native request indefinitely during process exit.
 
 ## Loopback
 
@@ -95,8 +109,10 @@ seconds, without weakening privacy or capability filtering.
 The llama adapter never shells out and never uses HTTP. Expensive model load,
 tokenization, and prefix state work runs on blocking workers while llama.cpp
 objects remain on their owner threads. Backend admission is bounded and held
-for the complete ticket/stream lifetime. Dropping a consumer cancels only that
-request.
+until the authoritative backend result resolves, even when a consumer drops or
+a deadline wrapper returns earlier. Dropping a consumer cancels only that
+request. A reserved event-channel permit guarantees one terminal event without
+allowing a full ordinary-event queue to pin cancellation or shutdown.
 
 Cache precedence is:
 
@@ -132,6 +148,10 @@ The deterministic workspace suite covers strict parsing, protocol event order,
 privacy gates, route affinity, storage, loopback security, bounded admission,
 consumer cancellation, queue/startup/first-output/idle/total deadlines,
 pre-output retry pinning, circuit breaking, bounded-channel backpressure, and
-cache-policy validation. An ignored real-GGUF adapter test proves cold prefix
-creation, second-request restoration, raw Completion input, and real
-in-process engine evidence using `MOM_LLAMA_MODEL_PATH`.
+cache-policy validation. It also covers concurrent/idempotent gateway cleanup,
+borrowed-host preservation, dropped blocking futures, configuration rebinds,
+full-channel terminal delivery, listener lifecycle races, and forced listener
+closure for a non-reading SSE client. An ignored real-GGUF adapter test proves
+cold prefix creation, second-request restoration, raw Completion input, one
+resident model across those requests, explicit adapter drain, and final joined
+host shutdown using `MOM_LLAMA_MODEL_PATH`.

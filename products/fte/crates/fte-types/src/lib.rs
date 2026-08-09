@@ -811,7 +811,6 @@ pub struct GatewayTicket {
     final_response: Option<oneshot::Receiver<Result<GatewayResponse, GatewayError>>>,
     cancellation: Arc<dyn TicketCancellation>,
     terminal_observed: Arc<AtomicBool>,
-    _admission_lease: Option<Box<dyn Send>>,
     cancel_on_drop: bool,
 }
 
@@ -839,16 +838,33 @@ impl GatewayTicket {
             final_response: Some(final_response),
             cancellation,
             terminal_observed,
-            _admission_lease: None,
             cancel_on_drop: true,
         }
     }
 
-    /// Keeps an opaque router admission guard alive for the complete ticket
-    /// lifetime, including a streaming response body.
+    /// Keeps an opaque router admission guard alive until the authoritative
+    /// backend result resolves. Dropping a consumer cancels the request, but
+    /// it does not falsely report the backend task as drained before that task
+    /// has actually terminated.
     #[must_use]
     pub fn with_admission_lease(mut self, lease: Box<dyn Send>) -> Self {
-        self._admission_lease = Some(lease);
+        let request_id = self.request_id.clone();
+        let Some(upstream_final) = self.final_response.take() else {
+            return self;
+        };
+        let (final_tx, final_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = upstream_final.await.unwrap_or_else(|_| {
+                Err(GatewayError::unavailable(
+                    &request_id,
+                    "backend_result_channel_closed",
+                    "the backend stopped before returning an authoritative result",
+                ))
+            });
+            drop(lease);
+            let _ = final_tx.send(result);
+        });
+        self.final_response = Some(final_rx);
         self
     }
 
@@ -880,7 +896,6 @@ impl GatewayTicket {
         drop(placeholder_tx);
         let mut upstream_events = std::mem::replace(&mut self.events, placeholder_rx);
         let cancellation = Arc::clone(&self.cancellation);
-        let admission_lease = self._admission_lease.take();
         self.cancel_on_drop = false;
 
         let capacity = event_capacity.clamp(32, 4096);
@@ -892,6 +907,11 @@ impl GatewayTicket {
         let cancellation_for_task = Arc::clone(&cancellation);
 
         tokio::spawn(async move {
+            let Ok(terminal_permit) = event_tx.clone().reserve_owned().await else {
+                let _ = cancellation_for_task.cancel(CancelTarget::Request);
+                return;
+            };
+            let mut terminal_permit = Some(terminal_permit);
             let now = tokio::time::Instant::now();
             let first_deadline = remaining_deadline(now, policy.first_token_ms, elapsed);
             let total_deadline = remaining_deadline(now, policy.total_ms, elapsed);
@@ -920,13 +940,46 @@ impl GatewayTicket {
                             idle_deadline = Some(tokio::time::Instant::now() + duration);
                         }
                         let is_terminal = event.is_terminal();
-                        if event_tx.send(event).await.is_err() {
-                            let _ = cancellation_for_task.cancel(CancelTarget::Request);
-                            return;
-                        }
                         if is_terminal {
-                            terminal_for_task.store(true, Ordering::Release);
+                            enqueue_reserved_terminal(
+                                &mut terminal_permit,
+                                event,
+                                &terminal_for_task,
+                            );
                             upstream_terminal_observed = true;
+                            continue;
+                        }
+                        let send_deadline = next_ticket_deadline(
+                            first_deadline.filter(|_| !first_output_observed),
+                            idle_deadline.filter(|_| !upstream_terminal_observed),
+                            total_deadline,
+                        );
+                        tokio::select! {
+                            result = event_tx.send(event) => {
+                                if result.is_err() {
+                                    let _ = cancellation_for_task.cancel(CancelTarget::Request);
+                                    return;
+                                }
+                            }
+                            () = sleep_until_optional(send_deadline), if send_deadline.is_some() => {
+                                let error = ticket_deadline_error(
+                                    &request_for_task,
+                                    first_output_observed,
+                                    first_deadline,
+                                    total_deadline,
+                                );
+                                let _ = cancellation_for_task.cancel(CancelTarget::Request);
+                                enqueue_reserved_terminal(
+                                    &mut terminal_permit,
+                                    GatewayEvent::Failed {
+                                        request_id: request_for_task.clone(),
+                                        error: error.clone(),
+                                    },
+                                    &terminal_for_task,
+                                );
+                                let _ = final_tx.send(Err(error));
+                                return;
+                            }
                         }
                     }
                     result = &mut upstream_final => {
@@ -939,42 +992,32 @@ impl GatewayTicket {
                         });
                         if !upstream_terminal_observed {
                             let terminal = terminal_event_from_result(&request_for_task, &result);
-                            terminal_for_task.store(true, Ordering::Release);
-                            let _ = event_tx.send(terminal).await;
+                            enqueue_reserved_terminal(
+                                &mut terminal_permit,
+                                terminal,
+                                &terminal_for_task,
+                            );
                         }
                         let _ = final_tx.send(result);
                         return;
                     }
                     () = sleep_until_optional(deadline), if deadline.is_some() => {
-                        let now = tokio::time::Instant::now();
-                        let (code, detail) = if total_deadline.is_some_and(|value| now >= value) {
-                            (
-                                "request_total_deadline_exceeded",
-                                "the request exceeded its total deadline",
-                            )
-                        } else if !first_output_observed
-                            && first_deadline.is_some_and(|value| now >= value)
-                        {
-                            (
-                                "first_output_deadline_exceeded",
-                                "the selected backend did not produce output before the first-output deadline",
-                            )
-                        } else {
-                            (
-                                "stream_idle_deadline_exceeded",
-                                "the selected backend stream was idle for too long",
-                            )
-                        };
-                        let error = ticket_timeout(&request_for_task, code, detail);
+                        let error = ticket_deadline_error(
+                            &request_for_task,
+                            first_output_observed,
+                            first_deadline,
+                            total_deadline,
+                        );
                         let _ = cancellation_for_task.cancel(CancelTarget::Request);
                         if !upstream_terminal_observed {
-                            terminal_for_task.store(true, Ordering::Release);
-                            let _ = event_tx
-                                .send(GatewayEvent::Failed {
+                            enqueue_reserved_terminal(
+                                &mut terminal_permit,
+                                GatewayEvent::Failed {
                                     request_id: request_for_task.clone(),
                                     error: error.clone(),
-                                })
-                                .await;
+                                },
+                                &terminal_for_task,
+                            );
                         }
                         let _ = final_tx.send(Err(error));
                         return;
@@ -989,7 +1032,6 @@ impl GatewayTicket {
             final_response: Some(final_rx),
             cancellation,
             terminal_observed,
-            _admission_lease: admission_lease,
             cancel_on_drop: true,
         }
     }
@@ -1069,6 +1111,43 @@ async fn sleep_until_optional(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+fn enqueue_reserved_terminal(
+    permit: &mut Option<mpsc::OwnedPermit<GatewayEvent>>,
+    event: GatewayEvent,
+    terminal_observed: &AtomicBool,
+) {
+    if let Some(permit) = permit.take() {
+        permit.send(event);
+        terminal_observed.store(true, Ordering::Release);
+    }
+}
+
+fn ticket_deadline_error(
+    request_id: &RequestId,
+    first_output_observed: bool,
+    first_deadline: Option<tokio::time::Instant>,
+    total_deadline: Option<tokio::time::Instant>,
+) -> GatewayError {
+    let now = tokio::time::Instant::now();
+    let (code, detail) = if total_deadline.is_some_and(|value| now >= value) {
+        (
+            "request_total_deadline_exceeded",
+            "the request exceeded its total deadline",
+        )
+    } else if !first_output_observed && first_deadline.is_some_and(|value| now >= value) {
+        (
+            "first_output_deadline_exceeded",
+            "the selected backend did not produce output before the first-output deadline",
+        )
+    } else {
+        (
+            "stream_idle_deadline_exceeded",
+            "the selected backend stream was idle for too long",
+        )
+    };
+    ticket_timeout(request_id, code, detail)
+}
+
 fn event_is_output_progress(event: &GatewayEvent) -> bool {
     matches!(
         event,
@@ -1136,9 +1215,25 @@ pub trait GatewayBackend: Send + Sync {
         })
     }
     fn cancel(&self, request_id: &RequestId, target: CancelTarget) -> usize;
+    /// Stops admission owned by this backend, cancels every backend request,
+    /// and does not return until all bridge/provider tasks have terminated.
+    ///
+    /// This is a request-drain boundary only. A backend borrowing an
+    /// application-owned native host must not destroy or permanently close
+    /// that host here; process-lifetime host ownership belongs to the embedding
+    /// application.
     async fn shutdown(&self) -> Result<(), GatewayError> {
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayLifecycle {
+    #[default]
+    Running,
+    Quiescing,
+    Closed,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -1146,6 +1241,10 @@ pub struct GatewayStatus {
     pub backend_count: usize,
     pub ready_backend_count: usize,
     pub active_requests: usize,
+    #[serde(default)]
+    pub lifecycle: GatewayLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_error: Option<GatewayError>,
     pub loopback: Option<LoopbackStatus>,
 }
 
@@ -1307,6 +1406,65 @@ mod tests {
         };
         assert_eq!(error.code, "first_output_deadline_exceeded");
         assert!(ticket.events.recv().await.is_none());
+        assert!(ticket.terminal_observed());
+        assert_eq!(cancellations.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn full_event_channel_preserves_exactly_one_timeout_terminal() {
+        let request_id = RequestId::new();
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (_final_tx, final_rx) = oneshot::channel();
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let request_for_events = request_id.clone();
+        tokio::spawn(async move {
+            for index in 0..64 {
+                if event_tx
+                    .send(GatewayEvent::Warning {
+                        request_id: request_for_events.clone(),
+                        code: format!("warning_{index}"),
+                        message: "fill the downstream event channel".to_string(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let mut ticket = GatewayTicket::new(
+            request_id,
+            event_rx,
+            final_rx,
+            Arc::new(CountingCancellation(Arc::clone(&cancellations))),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_deadlines(
+            DeadlinePolicy {
+                total_ms: Some(10),
+                ..DeadlinePolicy::default()
+            },
+            Duration::ZERO,
+            32,
+        );
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let events = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut events = Vec::new();
+            while let Some(event) = ticket.events.recv().await {
+                events.push(event);
+            }
+            events
+        })
+        .await
+        .expect("the timed-out wrapper must close its event stream");
+        let terminals = events.iter().filter(|event| event.is_terminal()).count();
+        assert_eq!(terminals, 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GatewayEvent::Failed { error, .. }
+                if error.code == "request_total_deadline_exceeded"
+        )));
         assert!(ticket.terminal_observed());
         assert_eq!(cancellations.load(Ordering::Acquire), 1);
     }
