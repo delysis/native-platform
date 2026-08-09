@@ -140,6 +140,7 @@
   let modelManagerReturnFocus: HTMLElement | null = null;
   let strandReviewDialog: HTMLDialogElement | undefined;
   let strandReviewTrigger: HTMLButtonElement | undefined;
+  let strandReviewOpen = false;
   let reviewCandidateId: string | null = null;
   let projectMenu: HTMLDetailsElement | undefined;
   let projectMenuTrigger: HTMLElement | undefined;
@@ -3218,18 +3219,24 @@
   }
 
   async function openStrandReview(): Promise<void> {
-    if (!strandReviewDialog || reviewableBranches.length === 0) return;
+    if (reviewableBranches.length === 0) return;
     reviewCandidateId = activeGhostSuggestion?.candidateId ??
       reviewableBranches[0].candidate_id;
     promotionArmedCandidateId = null;
+    strandReviewOpen = true;
     await tick();
+    if (!strandReviewDialog) return;
     if (!strandReviewDialog.open) strandReviewDialog.showModal();
     strandReviewDialog.querySelector<HTMLElement>('[data-review-close]')?.focus();
   }
 
   function closeStrandReview(): void {
     promotionArmedCandidateId = null;
-    if (strandReviewDialog?.open) strandReviewDialog.close();
+    if (strandReviewDialog?.open) {
+      strandReviewDialog.close();
+    } else {
+      strandReviewOpen = false;
+    }
   }
 
   function moveStrandReview(offset: number): void {
@@ -4667,22 +4674,25 @@
             {/if}
           </section>
 
-          <dialog
-            class="strand-review"
-            bind:this={strandReviewDialog}
-            aria-labelledby="strand-review-title"
-            on:click={(event) => {
-              if (event.target === strandReviewDialog) closeStrandReview();
-            }}
-            on:close={() => {
-              promotionArmedCandidateId = null;
-              strandReviewTrigger?.focus();
-            }}
-            on:cancel={() => {
-              promotionArmedCandidateId = null;
-            }}
-          >
-            <div class="strand-review-shell">
+          {#if strandReviewOpen}
+            <dialog
+              class="strand-review"
+              bind:this={strandReviewDialog}
+              aria-labelledby="strand-review-title"
+              on:click={(event) => {
+                if (event.target === strandReviewDialog) closeStrandReview();
+              }}
+              on:close={() => {
+                strandReviewOpen = false;
+                promotionArmedCandidateId = null;
+                strandReviewTrigger?.focus();
+              }}
+              on:cancel={() => {
+                strandReviewOpen = false;
+                promotionArmedCandidateId = null;
+              }}
+            >
+              <div class="strand-review-shell">
               <header class="strand-review-header">
                 <div>
                   <h2 id="strand-review-title">Alternatives</h2>
@@ -4746,8 +4756,9 @@
               {:else}
                 <p class="strand-review-empty">No suitable alternative remains at this caret.</p>
               {/if}
-            </div>
-          </dialog>
+              </div>
+            </dialog>
+          {/if}
 
           {#if uncertainPromotion}
             <div class="attention-action">
