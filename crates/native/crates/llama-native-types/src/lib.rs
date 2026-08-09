@@ -2,8 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 mod controlled_generation;
+mod exact_token_budget;
+mod sampling_fingerprint;
 
 pub use controlled_generation::*;
+pub use exact_token_budget::*;
+pub use sampling_fingerprint::{SAMPLING_CONFIG_FINGERPRINT_DOMAIN, SamplingConfigFingerprint};
 
 pub const MAX_PARALLEL_SEQUENCES: u32 = 4;
 pub const MAX_EMBEDDING_BATCH_INPUTS: usize = 64;
@@ -16,6 +20,12 @@ pub const MAX_CONSTRAINT_ARTIFACT_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_DISTRIBUTION_OBSERVATION_TOP_K: u16 = 256;
 pub const MAX_DISTRIBUTION_OBSERVATIONS_PER_TOKEN: usize = 12;
 pub const MAX_TOKEN_PIECE_BYTES: usize = 4_096;
+/// Maximum UTF-8 bytes retained for one generated output before stop trimming.
+///
+/// This fixed process-wide ceiling bounds both output strings and the retained
+/// strict-authority delta ledger. It is not caller-controlled; changing it
+/// changes the native source/build fingerprint.
+pub const MAX_GENERATED_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SPARSE_LOGIT_BIAS_ENTRIES: usize = 4_096;
 pub const MAX_EXTENDED_SAMPLERS: usize = 8;
 pub const MAX_ABS_LOGIT_BIAS: f32 = 100.0;
@@ -38,7 +48,18 @@ pub enum NativeDevice {
 pub struct NativeModelConfig {
     pub model_id: String,
     pub model_path: PathBuf,
+    /// Optional trusted digest supplied by the caller. When present, the held
+    /// file is hashed before the llama.cpp load attempt and a mismatch aborts
+    /// that attempt. On platforms with advisory file locking, later artifact
+    /// checks determine strict-authority eligibility; this field alone does not
+    /// claim that an uncooperative writer could not race the parser.
+    #[serde(default)]
+    pub expected_model_sha256: Option<String>,
     pub mmproj_path: Option<PathBuf>,
+    /// Optional trusted digest for the multimodal projector, with the same
+    /// advisory-lock limitations as `expected_model_sha256`.
+    #[serde(default)]
+    pub expected_mmproj_sha256: Option<String>,
     pub device: NativeDevice,
     pub context_tokens: u32,
     pub batch_tokens: u32,
@@ -56,7 +77,9 @@ impl NativeModelConfig {
         Self {
             model_id,
             model_path,
+            expected_model_sha256: None,
             mmproj_path: None,
+            expected_mmproj_sha256: None,
             device: NativeDevice::Auto,
             context_tokens: 8192,
             batch_tokens: 512,
@@ -1876,7 +1899,6 @@ pub enum NativeTransport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelFingerprint {
     pub model_id: String,
-    pub model_path: PathBuf,
     pub model_size: u64,
     pub model_sha256: String,
     pub tokenizer_sha256: String,
@@ -2614,15 +2636,34 @@ pub struct NativeModelDescriptor {
     pub capabilities: ModelCapabilities,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResidentModelStatus {
     pub model_id: String,
+    /// Operational location of this live resident. Paths are deliberately not
+    /// part of [`ModelFingerprint`] and are redacted from `Debug` output.
+    #[serde(default)]
+    pub model_path: PathBuf,
     pub state: ModelRuntimeState,
     pub fingerprint: Option<ModelFingerprint>,
     #[serde(default)]
     pub descriptor: Option<NativeModelDescriptor>,
     pub active_sequences: usize,
     pub max_sequences: u32,
+}
+
+impl std::fmt::Debug for ResidentModelStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResidentModelStatus")
+            .field("model_id", &self.model_id)
+            .field("model_path", &"<redacted>")
+            .field("state", &self.state)
+            .field("fingerprint", &self.fingerprint)
+            .field("descriptor", &self.descriptor)
+            .field("active_sequences", &self.active_sequences)
+            .field("max_sequences", &self.max_sequences)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2922,7 +2963,6 @@ mod tests {
     fn test_model_fingerprint() -> ModelFingerprint {
         ModelFingerprint {
             model_id: "model".to_string(),
-            model_path: PathBuf::from("model.gguf"),
             model_size: 1024,
             model_sha256: "a".repeat(64),
             tokenizer_sha256: "b".repeat(64),
@@ -2944,6 +2984,51 @@ mod tests {
         let config = NativeModelConfig::local(PathBuf::from("model.gguf"));
         assert_eq!(config.max_sequences, MAX_PARALLEL_SEQUENCES);
         assert_eq!(config.device, NativeDevice::Auto);
+        assert!(config.expected_model_sha256.is_none());
+        assert!(config.expected_mmproj_sha256.is_none());
+    }
+
+    #[test]
+    fn model_fingerprints_are_path_free_and_resident_debug_redacts_live_paths() {
+        let fingerprint = test_model_fingerprint();
+        let encoded = serde_json::to_value(&fingerprint).expect("serialize fingerprint");
+        assert!(encoded.get("model_path").is_none());
+
+        let status = ResidentModelStatus {
+            model_id: "model".to_string(),
+            model_path: PathBuf::from("/private/models/writer.gguf"),
+            state: ModelRuntimeState::Ready,
+            fingerprint: Some(fingerprint),
+            descriptor: None,
+            active_sequences: 0,
+            max_sequences: 1,
+        };
+        let debug = format!("{status:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("writer.gguf"));
+        assert_eq!(
+            serde_json::to_value(&status)
+                .expect("serialize live status")
+                .get("model_path"),
+            Some(&serde_json::json!("/private/models/writer.gguf"))
+        );
+    }
+
+    #[test]
+    fn legacy_model_config_defaults_trusted_artifact_hashes_to_absent() {
+        let config: NativeModelConfig = serde_json::from_value(serde_json::json!({
+            "model_id": "model",
+            "model_path": "model.gguf",
+            "mmproj_path": null,
+            "device": "cpu",
+            "context_tokens": 8192,
+            "batch_tokens": 512,
+            "max_sequences": 4,
+            "gpu_layers": 0
+        }))
+        .expect("legacy config remains readable");
+        assert!(config.expected_model_sha256.is_none());
+        assert!(config.expected_mmproj_sha256.is_none());
     }
 
     #[test]

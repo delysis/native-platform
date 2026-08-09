@@ -8,13 +8,15 @@ use super::{
     DistributionObservationPolicy, DistributionValueKind, ExtendedSampler, ExtendedSamplerKind,
     ExtendedSamplerProgram, GenerationCacheMetrics, GenerationMetrics, GenerationOutput,
     GenerationState, MAX_EXTENDED_SAMPLERS, ModelFingerprint, NativeError, NativeErrorCode,
-    NativeTransport, ProbabilityStage, SamplerKind, SamplingConfig, StructuredConstraint,
-    TokenDistributionObservation, TokenObservation, TokenProbabilityObservation,
+    NativeTransport, ProbabilityStage, SAMPLING_CONFIG_FINGERPRINT_DOMAIN, SamplerKind,
+    SamplingConfig, StructuredConstraint, TokenDistributionObservation, TokenObservation,
+    TokenProbabilityObservation,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::PathBuf;
+
+use crate::sampling_fingerprint::sampling_float_bits;
 
 pub const MAX_CONTROLLED_BATCH_CASES: usize = 4;
 pub const MAX_CONTROL_MODEL_PARTICIPANTS: usize = 8;
@@ -194,7 +196,6 @@ struct ControlledModelIdentityWire {
 #[serde(deny_unknown_fields)]
 struct StrictModelFingerprintWire {
     model_id: String,
-    model_path: PathBuf,
     model_size: u64,
     model_sha256: String,
     tokenizer_sha256: String,
@@ -214,7 +215,6 @@ impl From<StrictModelFingerprintWire> for ModelFingerprint {
     fn from(value: StrictModelFingerprintWire) -> Self {
         Self {
             model_id: value.model_id,
-            model_path: value.model_path,
             model_size: value.model_size,
             model_sha256: value.model_sha256,
             tokenizer_sha256: value.tokenizer_sha256,
@@ -315,11 +315,6 @@ fn validate_model_fingerprint(fingerprint: &ModelFingerprint) -> Result<(), Nati
     )?;
     validate_id("model fingerprint build_id", &fingerprint.build_id)?;
     validate_id("model fingerprint backend", &fingerprint.backend)?;
-    if fingerprint.model_path.as_os_str().is_empty() || fingerprint.model_path.to_str().is_none() {
-        return Err(invalid(
-            "controlled model fingerprint paths must be non-empty UTF-8",
-        ));
-    }
     if fingerprint.model_size == 0
         || fingerprint.context_tokens == 0
         || fingerprint.batch_tokens == 0
@@ -1411,7 +1406,9 @@ impl ControlledGenerationBatchRequest {
         let mut digest = StableDigest::new("controlled-generation-float-bits-v1");
         hash_control_float_bits(&mut digest, &self.control);
         for case in &self.cases {
-            hash_sampling_float_bits(&mut digest, &case.sampling);
+            for bits in sampling_float_bits(&case.sampling) {
+                digest.u32(bits);
+            }
         }
         digest.finish()
     }
@@ -2990,41 +2987,8 @@ fn hash_prompt(digest: &mut StableDigest, prompt: &ExactTokenPrompt) {
 }
 
 fn hash_sampling(digest: &mut StableDigest, sampling: &SamplingConfig) {
-    digest.u32(sampling.seed);
-    hash_sampling_float_bits(digest, sampling);
-    digest.i32(sampling.top_k);
-    digest.i32(sampling.repeat_last_n);
-    digest.i32(sampling.dry_allowed_length);
-    digest.i32(sampling.dry_penalty_last_n);
-    digest.usize(sampling.sampler_order.len());
-    for sampler in &sampling.sampler_order {
-        digest.u32(*sampler as u32);
-    }
-    digest.u32(sampling.max_tokens);
-    digest.usize(sampling.stop.len());
-    for stop in &sampling.stop {
-        digest.text(stop);
-    }
-}
-
-fn hash_sampling_float_bits(digest: &mut StableDigest, sampling: &SamplingConfig) {
-    for value in [
-        sampling.temperature,
-        sampling.dynamic_temperature_range,
-        sampling.dynamic_temperature_exponent,
-        sampling.top_p,
-        sampling.min_p,
-        sampling.typical_p,
-        sampling.xtc_probability,
-        sampling.xtc_threshold,
-        sampling.repeat_penalty,
-        sampling.frequency_penalty,
-        sampling.presence_penalty,
-        sampling.dry_multiplier,
-        sampling.dry_base,
-    ] {
-        digest.f32(value);
-    }
+    digest.text(SAMPLING_CONFIG_FINGERPRINT_DOMAIN);
+    digest.bytes(sampling.fingerprint().as_bytes());
 }
 
 fn hash_control_float_bits(digest: &mut StableDigest, control: &ControlProgram) {
@@ -3189,12 +3153,9 @@ mod tests {
         DistributionValueKindSet, GenerationCacheMetrics, GenerationMetrics, MirostatV2Config,
         ProbabilityStageSet, StageDistributionObservation,
     };
-    use std::path::PathBuf;
-
     fn fingerprint(model_id: &str, model_hash: char, tokenizer_hash: char) -> ModelFingerprint {
         ModelFingerprint {
             model_id: model_id.to_string(),
-            model_path: PathBuf::from(format!("{model_id}.gguf")),
             model_size: 1024,
             model_sha256: model_hash.to_string().repeat(64),
             tokenizer_sha256: tokenizer_hash.to_string().repeat(64),
@@ -3241,6 +3202,33 @@ mod tests {
             },
         )
         .expect("valid controlled case")
+    }
+
+    fn request_with_sampling(sampling: SamplingConfig) -> ControlledGenerationBatchRequest {
+        ControlledGenerationBatchRequest::new(
+            "sampling-fingerprint".to_string(),
+            vec![
+                ControlledGenerationCase::new(
+                    "case".to_string(),
+                    ExactTokenPrompt::new(vec![1]).expect("prompt"),
+                    None,
+                    sampling,
+                )
+                .expect("case"),
+            ],
+            ControlProgram::new(
+                model("writer", 'a'),
+                Vec::new(),
+                None,
+                Vec::new(),
+                ExtendedSamplerProgram::default(),
+                TerminalSelector::Distribution,
+                DistributionObservationPolicy::default(),
+                Vec::new(),
+            )
+            .expect("program"),
+        )
+        .expect("request")
     }
 
     fn cfg_program() -> ControlProgram {
@@ -3342,6 +3330,10 @@ mod tests {
         assert_eq!(request.cost().maximum_context_token_positions(), 9);
 
         let json = serde_json::to_string(&request).expect("serialize request");
+        assert!(
+            !json.contains("model_path"),
+            "semantic controlled-model identity must not serialize an operational path"
+        );
         let decoded: ControlledGenerationBatchRequest =
             serde_json::from_str(&json).expect("deserialize request");
         assert_eq!(decoded, request);
@@ -3372,6 +3364,13 @@ mod tests {
                 .is_err(),
             "controlled nested model identities must reject unknown claims"
         );
+        let mut leaked_path = serde_json::to_value(&request).expect("request JSON");
+        leaked_path["control"]["writer"]["fingerprint"]["model_path"] =
+            serde_json::json!("/private/models/writer.gguf");
+        assert!(
+            serde_json::from_value::<ControlledGenerationBatchRequest>(leaked_path).is_err(),
+            "strict semantic model identities must reject operational paths"
+        );
 
         assert!(
             ControlledGenerationBatchRequest::new(
@@ -3386,38 +3385,18 @@ mod tests {
 
     #[test]
     fn request_fingerprints_commit_exact_sampling_float_bits() {
-        let request_with_temperature = |temperature| {
-            ControlledGenerationBatchRequest::new(
-                "signed-zero".to_string(),
-                vec![
-                    ControlledGenerationCase::new(
-                        "case".to_string(),
-                        ExactTokenPrompt::new(vec![1]).expect("prompt"),
-                        None,
-                        SamplingConfig {
-                            temperature,
-                            max_tokens: 1,
-                            ..SamplingConfig::default()
-                        },
-                    )
-                    .expect("case"),
-                ],
-                ControlProgram::new(
-                    model("writer", 'a'),
-                    Vec::new(),
-                    None,
-                    Vec::new(),
-                    ExtendedSamplerProgram::default(),
-                    TerminalSelector::Distribution,
-                    DistributionObservationPolicy::default(),
-                    Vec::new(),
-                )
-                .expect("program"),
-            )
-            .expect("request")
-        };
-        let positive_zero = request_with_temperature(0.0);
-        let negative_zero = request_with_temperature(-0.0);
+        let positive_zero = request_with_sampling(SamplingConfig {
+            seed: 7,
+            temperature: 0.0,
+            max_tokens: 1,
+            ..SamplingConfig::default()
+        });
+        let negative_zero = request_with_sampling(SamplingConfig {
+            seed: 7,
+            temperature: -0.0,
+            max_tokens: 1,
+            ..SamplingConfig::default()
+        });
         assert_ne!(
             positive_zero.fingerprint_sha256(),
             negative_zero.fingerprint_sha256()
@@ -3426,6 +3405,83 @@ mod tests {
             positive_zero.exact_float_bits_sha256(),
             negative_zero.exact_float_bits_sha256()
         );
+    }
+
+    #[test]
+    fn exact_float_bits_receipt_ignores_non_floats_and_commits_every_float() {
+        let baseline_sampling = SamplingConfig {
+            seed: 7,
+            max_tokens: 1,
+            ..SamplingConfig::default()
+        };
+        let baseline = request_with_sampling(baseline_sampling.clone());
+        let baseline_float_bits = baseline.exact_float_bits_sha256();
+
+        let mut changed_seed = baseline_sampling.clone();
+        changed_seed.seed = 8;
+        let mut changed_top_k = baseline_sampling.clone();
+        changed_top_k.top_k = 41;
+        let mut changed_stop = baseline_sampling.clone();
+        changed_stop.stop = vec!["stop here".to_string()];
+        for changed in [changed_seed, changed_top_k, changed_stop] {
+            let request = request_with_sampling(changed);
+            assert_eq!(request.exact_float_bits_sha256(), baseline_float_bits);
+            assert_ne!(request.fingerprint_sha256(), baseline.fingerprint_sha256());
+        }
+
+        type SamplingMutation = (&'static str, fn(&mut SamplingConfig));
+        let mutations: [SamplingMutation; 13] = [
+            ("temperature", |value| {
+                value.temperature = f32::from_bits(value.temperature.to_bits() ^ 1);
+            }),
+            ("dynamic_temperature_range", |value| {
+                value.dynamic_temperature_range =
+                    f32::from_bits(value.dynamic_temperature_range.to_bits() ^ 1);
+            }),
+            ("dynamic_temperature_exponent", |value| {
+                value.dynamic_temperature_exponent =
+                    f32::from_bits(value.dynamic_temperature_exponent.to_bits() ^ 1);
+            }),
+            ("top_p", |value| {
+                value.top_p = f32::from_bits(value.top_p.to_bits() ^ 1);
+            }),
+            ("min_p", |value| {
+                value.min_p = f32::from_bits(value.min_p.to_bits() ^ 1);
+            }),
+            ("typical_p", |value| {
+                value.typical_p = f32::from_bits(value.typical_p.to_bits() - 1);
+            }),
+            ("xtc_probability", |value| {
+                value.xtc_probability = f32::from_bits(value.xtc_probability.to_bits() ^ 1);
+            }),
+            ("xtc_threshold", |value| {
+                value.xtc_threshold = f32::from_bits(value.xtc_threshold.to_bits() ^ 1);
+            }),
+            ("repeat_penalty", |value| {
+                value.repeat_penalty = f32::from_bits(value.repeat_penalty.to_bits() ^ 1);
+            }),
+            ("frequency_penalty", |value| {
+                value.frequency_penalty = f32::from_bits(value.frequency_penalty.to_bits() ^ 1);
+            }),
+            ("presence_penalty", |value| {
+                value.presence_penalty = f32::from_bits(value.presence_penalty.to_bits() ^ 1);
+            }),
+            ("dry_multiplier", |value| {
+                value.dry_multiplier = f32::from_bits(value.dry_multiplier.to_bits() ^ 1);
+            }),
+            ("dry_base", |value| {
+                value.dry_base = f32::from_bits(value.dry_base.to_bits() ^ 1);
+            }),
+        ];
+        for (field, mutate) in mutations {
+            let mut changed = baseline_sampling.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                request_with_sampling(changed).exact_float_bits_sha256(),
+                baseline_float_bits,
+                "float bit change was omitted for {field}"
+            );
+        }
     }
 
     #[test]

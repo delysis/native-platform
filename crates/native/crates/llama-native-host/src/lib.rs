@@ -90,13 +90,26 @@ impl Default for NativeHostConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HostSlotStatus {
     pub slot_id: usize,
     pub model_path: PathBuf,
     pub model_bytes: u64,
     pub reserved_bytes: u64,
     pub status: ResidentModelStatus,
+}
+
+impl std::fmt::Debug for HostSlotStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostSlotStatus")
+            .field("slot_id", &self.slot_id)
+            .field("model_path", &"<redacted>")
+            .field("model_bytes", &self.model_bytes)
+            .field("reserved_bytes", &self.reserved_bytes)
+            .field("status", &self.status)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -575,6 +588,31 @@ mod tests {
         assert!(right.slots().is_empty());
         assert_eq!(left.unload_all(), 0);
         assert_eq!(right.unload_all(), 0);
+    }
+
+    #[test]
+    fn host_slot_debug_redacts_both_operational_model_paths() {
+        let slot = HostSlotStatus {
+            slot_id: 3,
+            model_path: PathBuf::from("/private/HOST_PATH_SENTINEL.gguf"),
+            model_bytes: 17,
+            reserved_bytes: 23,
+            status: ResidentModelStatus {
+                model_id: "model".to_string(),
+                model_path: PathBuf::from("/private/RESIDENT_PATH_SENTINEL.gguf"),
+                state: llama_native_types::ModelRuntimeState::Ready,
+                fingerprint: None,
+                descriptor: None,
+                active_sequences: 0,
+                max_sequences: 1,
+            },
+        };
+
+        let debug = format!("{slot:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("slot_id: 3"));
+        assert!(!debug.contains("HOST_PATH_SENTINEL"));
+        assert!(!debug.contains("RESIDENT_PATH_SENTINEL"));
     }
 
     #[test]

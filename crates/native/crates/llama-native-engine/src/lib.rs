@@ -1,8 +1,11 @@
+#[cfg(test)]
+mod build_identity;
 pub mod control_math;
 mod state_buffer;
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use encoding_rs::UTF_8;
+use fs4::FileExt as Fs4FileExt;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -19,29 +22,39 @@ use llama_native_types::{
     ChatTemplateChoice, CompletionPrompt, EmbeddingBatchOutput, EmbeddingBatchRequest,
     EmbeddingCapabilities, EmbeddingNormalization, EmbeddingNormalizationSupport,
     EmbeddingOutputConfig, EmbeddingPooling, EmbeddingPoolingSupport, EmbeddingTransportEvidence,
-    EmbeddingVectorOutput, ExactModelCapabilities, GenerationBatchCapabilities,
-    GenerationBatchRequest, GenerationCacheMetrics, GenerationCase, GenerationEvent,
-    GenerationEventKind, GenerationInput, GenerationMetrics, GenerationOutput,
-    GenerationOutputCapabilities, GenerationRequest, GenerationState, MAX_EMBEDDING_BATCH_INPUTS,
-    MAX_EMBEDDING_BATCH_VALUES, MAX_EMBEDDING_DIMENSIONS, MAX_EMBEDDING_INPUT_TOKENS,
-    MAX_EMBEDDING_VALUES_PER_OUTPUT, MAX_PARALLEL_SEQUENCES, MediaInput, MediaInputCapability,
+    EmbeddingVectorOutput, ExactModelCapabilities, ExactTokenBatchBudgetError,
+    ExactTokenBatchCellBudget, GenerationBatchCapabilities, GenerationBatchRequest,
+    GenerationCacheMetrics, GenerationCase, GenerationEvent, GenerationEventKind, GenerationInput,
+    GenerationMetrics, GenerationOutput, GenerationOutputCapabilities, GenerationRequest,
+    GenerationState, MAX_EMBEDDING_BATCH_INPUTS, MAX_EMBEDDING_BATCH_VALUES,
+    MAX_EMBEDDING_DIMENSIONS, MAX_EMBEDDING_INPUT_TOKENS, MAX_EMBEDDING_VALUES_PER_OUTPUT,
+    MAX_GENERATED_OUTPUT_BYTES, MAX_PARALLEL_SEQUENCES, MediaInput, MediaInputCapability,
     MediaKind, ModelCapabilities, ModelFingerprint, ModelRuntimeState, NativeDevice, NativeError,
     NativeErrorCode, NativeEvidenceCapabilities, NativeModelConfig, NativeModelDescriptor,
     NativeTransport, PreparedPrompt, ProjectorRequirement, PromptForm, PromptInputCapabilities,
     PromptTokenPolicy, ResidentModelStatus, SamplerKind, SamplingConfig, SamplingParameter,
     SequenceStateBlob, SharedPrefixBatchRequest, SpecialTokenPolicy, TokenizedPrompt,
+    exact_token_batch_cell_budget,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::io::Read;
+use std::fs::{File, Metadata};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-pub const LLAMA_CPP_BINDING_VERSION: &str = "0.1.153";
+pub const LLAMA_CPP_BINDING_VERSION: &str = "0.1.154";
+pub const LLAMA_CPP_BINDING_REV: &str = "01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f";
+pub const LLAMA_CPP_REV: &str = "5f55650a78f92aff4d48d671423e888fac0469ff";
+/// SHA-256 of a private, domain-separated build-input accumulator. The raw
+/// inputs are deliberately neither compiled into this crate nor exposed.
+///
+/// ```compile_fail
+/// let _ = llama_native_engine::LLAMA_NATIVE_BUILD_MANIFEST;
+/// ```
+pub const LLAMA_NATIVE_BUILD_MANIFEST_SHA256: &str = env!("LLAMA_NATIVE_BUILD_MANIFEST_SHA256");
 const COMMAND_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 256;
 
@@ -52,11 +65,220 @@ type CancelKey = (String, String);
 type CancelRegistry = Arc<Mutex<HashMap<CancelKey, Arc<AtomicBool>>>>;
 type ReasoningForceRegistry = Arc<Mutex<HashMap<CancelKey, Arc<AtomicBool>>>>;
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactFileState {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactFileState {
+    length: u64,
+    created: u64,
+    modified: u64,
+    attributes: u32,
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactFileState {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    readonly: bool,
+}
+
+impl ArtifactFileState {
+    const fn length(&self) -> u64 {
+        self.length
+    }
+}
+
+#[derive(Debug)]
+struct ModelArtifactGuard {
+    label: &'static str,
+    original_path: std::path::PathBuf,
+    load_path: std::path::PathBuf,
+    file: File,
+    initial_state: ArtifactFileState,
+    expected_sha256: String,
+    #[cfg(test)]
+    payload_bytes_read: std::sync::atomic::AtomicU64,
+    strict_binding_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct ModelArtifactGuards {
+    model: ModelArtifactGuard,
+    projector: Option<ModelArtifactGuard>,
+}
+
+/// Owner-worker authority proving one exact-token generation batch completed
+/// through the live in-process engine.
+///
+/// The seal deliberately has no public constructor and implements neither
+/// `Clone`, `Default`, nor Serde traits. Callers may inspect its evidence but
+/// cannot reconstruct authority from caller-authored JSON or copied outputs.
+/// On supported Unix hosts, model artifacts are reopened through a pinned file
+/// descriptor, the held bytes are hashed once before the load attempt, and
+/// identity plus high-resolution mutation metadata is checked before and after
+/// strict generation. Unix file locks are advisory: the checks revoke authority
+/// after detected mutation, but do not claim that llama.cpp could never parse
+/// raced bytes. This is not a defense against an OS-compromised process or an
+/// exotic filesystem that can hide and restore mutation metadata entirely
+/// between checks. Strict artifact authority is currently unavailable on
+/// Windows and other hosts without a verified handle-derived reopen path.
+///
+/// ```compile_fail
+/// use llama_native_engine::VerifiedGenerationBatch;
+/// fn clone_authority(seal: &VerifiedGenerationBatch) -> VerifiedGenerationBatch {
+///     seal.clone()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use llama_native_engine::VerifiedGenerationBatch;
+/// fn require_default<T: Default>() {}
+/// require_default::<VerifiedGenerationBatch>();
+/// ```
+///
+/// ```compile_fail
+/// use llama_native_engine::VerifiedGenerationBatch;
+/// fn require_serialize<T: serde::Serialize>() {}
+/// require_serialize::<VerifiedGenerationBatch>();
+/// ```
+///
+/// ```compile_fail
+/// use llama_native_engine::VerifiedGenerationBatch;
+/// fn require_deserialize<T: for<'de> serde::Deserialize<'de>>() {}
+/// require_deserialize::<VerifiedGenerationBatch>();
+/// ```
+pub struct VerifiedGenerationBatch {
+    request: GenerationBatchRequest,
+    model_fingerprint: ModelFingerprint,
+    outputs: Vec<GenerationOutput>,
+    terminal_sampled_token_ids: Vec<Option<i32>>,
+    events: Vec<GenerationEvent>,
+}
+
+impl std::fmt::Debug for VerifiedGenerationBatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedGenerationBatch")
+            .field("request_id", &self.request.request_id)
+            .field("model_id", &self.model_fingerprint.model_id)
+            .field("model_sha256", &self.model_fingerprint.model_sha256)
+            .field("case_count", &self.request.cases.len())
+            .field("output_count", &self.outputs.len())
+            .field("terminal_count", &self.terminal_sampled_token_ids.len())
+            .field("event_count", &self.events.len())
+            .finish()
+    }
+}
+
+impl VerifiedGenerationBatch {
+    #[must_use]
+    pub const fn request(&self) -> &GenerationBatchRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub const fn model_fingerprint(&self) -> &ModelFingerprint {
+        &self.model_fingerprint
+    }
+
+    #[must_use]
+    pub fn outputs(&self) -> &[GenerationOutput] {
+        &self.outputs
+    }
+
+    /// The sampled terminal token for each ordered output. This is `Some` only
+    /// when the live model recognized an end-of-generation token; cancellation,
+    /// maximum-token, and stop-sequence terminals carry `None`.
+    #[must_use]
+    pub fn terminal_sampled_token_ids(&self) -> &[Option<i32>] {
+        &self.terminal_sampled_token_ids
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &[GenerationEvent] {
+        &self.events
+    }
+}
+
+#[derive(Debug)]
+struct VerifiedGenerationEvidence {
+    request: GenerationBatchRequest,
+    model_fingerprint: ModelFingerprint,
+    terminal_sampled_token_ids: Vec<Option<i32>>,
+    events: Vec<GenerationEvent>,
+}
+
+#[derive(Debug)]
+struct GenerationCompletion {
+    outputs: Vec<GenerationOutput>,
+    authority: NativeResult<Box<VerifiedGenerationEvidence>>,
+}
+
+#[derive(Debug)]
+struct GeneratedBatchExecution {
+    outputs: Vec<GenerationOutput>,
+    terminal_sampled_token_ids: Vec<Option<i32>>,
+}
+
+impl GenerationCompletion {
+    fn unverified(outputs: Vec<GenerationOutput>) -> Self {
+        Self::authority_rejected(
+            outputs,
+            NativeError::new(
+                NativeErrorCode::UnsupportedParameter,
+                "this generation path does not carry exact-token owner-worker authority",
+            ),
+        )
+    }
+
+    fn authority_rejected(outputs: Vec<GenerationOutput>, error: NativeError) -> Self {
+        Self {
+            outputs,
+            authority: Err(error),
+        }
+    }
+
+    fn verified(outputs: Vec<GenerationOutput>, evidence: VerifiedGenerationEvidence) -> Self {
+        Self {
+            outputs,
+            authority: Ok(Box::new(evidence)),
+        }
+    }
+
+    fn into_outputs(self) -> Vec<GenerationOutput> {
+        self.outputs
+    }
+
+    fn into_verified(self) -> NativeResult<VerifiedGenerationBatch> {
+        let Self { outputs, authority } = self;
+        let evidence = *authority?;
+        Ok(VerifiedGenerationBatch {
+            request: evidence.request,
+            model_fingerprint: evidence.model_fingerprint,
+            outputs,
+            terminal_sampled_token_ids: evidence.terminal_sampled_token_ids,
+            events: evidence.events,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct GenerationTicket {
     pub request_id: String,
     pub events: Receiver<GenerationEvent>,
-    result: Receiver<NativeResult<Vec<GenerationOutput>>>,
+    result: Receiver<NativeResult<GenerationCompletion>>,
     cancellations: CancelRegistry,
     reasoning_forces: ReasoningForceRegistry,
 }
@@ -79,7 +301,7 @@ impl GenerationTicket {
         })?;
         cleanup_request_in_registry(&self.cancellations, &self.request_id);
         cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
-        result
+        result.map(GenerationCompletion::into_outputs)
     }
 
     pub fn wait_timeout(&self, timeout: Duration) -> NativeResult<Vec<GenerationOutput>> {
@@ -91,7 +313,7 @@ impl GenerationTicket {
         })?;
         cleanup_request_in_registry(&self.cancellations, &self.request_id);
         cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
-        result
+        result.map(GenerationCompletion::into_outputs)
     }
 
     pub fn try_wait(&self) -> NativeResult<Option<Vec<GenerationOutput>>> {
@@ -99,12 +321,58 @@ impl GenerationTicket {
             Ok(result) => {
                 cleanup_request_in_registry(&self.cancellations, &self.request_id);
                 cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
-                result.map(Some)
+                result.map(|completion| Some(completion.into_outputs()))
             }
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
             Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
                 "native worker stopped before returning a result",
+            )),
+        }
+    }
+
+    /// Wait for an opaque owner-worker seal. This succeeds only for the exact
+    /// token `GenerateBatch` path while its platform artifact binding remains
+    /// valid; compatibility, shared-prefix, multimodal, and currently Windows
+    /// generation remain intentionally unverified.
+    pub fn wait_verified(self) -> NativeResult<VerifiedGenerationBatch> {
+        let result = self.result.recv().map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("native worker stopped before returning a verified result: {error}"),
+            )
+        })?;
+        cleanup_request_in_registry(&self.cancellations, &self.request_id);
+        cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
+        result?.into_verified()
+    }
+
+    pub fn wait_verified_timeout(
+        &self,
+        timeout: Duration,
+    ) -> NativeResult<VerifiedGenerationBatch> {
+        let result = self.result.recv_timeout(timeout).map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("native verified generation did not finish before the timeout: {error}"),
+            )
+        })?;
+        cleanup_request_in_registry(&self.cancellations, &self.request_id);
+        cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
+        result?.into_verified()
+    }
+
+    pub fn try_wait_verified(&self) -> NativeResult<Option<VerifiedGenerationBatch>> {
+        match self.result.try_recv() {
+            Ok(result) => {
+                cleanup_request_in_registry(&self.cancellations, &self.request_id);
+                cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
+                result?.into_verified().map(Some)
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                "native worker stopped before returning a verified result",
             )),
         }
     }
@@ -207,22 +475,24 @@ enum WorkerCommand {
     },
     GenerateBatch {
         request: GenerationBatchRequest,
+        exact_cell_budget: Option<ExactTokenBatchCellBudget>,
+        admission: GenerationBatchAdmission,
         event_tx: Sender<GenerationEvent>,
-        result_tx: Sender<NativeResult<Vec<GenerationOutput>>>,
+        result_tx: Sender<NativeResult<GenerationCompletion>>,
         cancellations: Vec<Arc<AtomicBool>>,
         reasoning_forces: Vec<Arc<AtomicBool>>,
     },
     Generate {
         request: SharedPrefixBatchRequest,
         event_tx: Sender<GenerationEvent>,
-        result_tx: Sender<NativeResult<Vec<GenerationOutput>>>,
+        result_tx: Sender<NativeResult<GenerationCompletion>>,
         cancellations: Vec<Arc<AtomicBool>>,
         reasoning_forces: Vec<Arc<AtomicBool>>,
     },
     GenerateMultimodal {
         request: GenerationRequest,
         event_tx: Sender<GenerationEvent>,
-        result_tx: Sender<NativeResult<Vec<GenerationOutput>>>,
+        result_tx: Sender<NativeResult<GenerationCompletion>>,
         cancellation: Arc<AtomicBool>,
         reasoning_force: Arc<AtomicBool>,
     },
@@ -251,6 +521,12 @@ enum WorkerCommand {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationBatchAdmission {
+    Compatibility,
+    ExactBatch,
+}
+
 impl NativeModelHandle {
     pub fn load(config: NativeModelConfig) -> NativeResult<Self> {
         validate_config(&config)?;
@@ -260,6 +536,7 @@ impl NativeModelHandle {
         let reasoning_forces = Arc::new(Mutex::new(HashMap::new()));
         let status = Arc::new(RwLock::new(ResidentModelStatus {
             model_id: config.model_id.clone(),
+            model_path: config.model_path.clone(),
             state: ModelRuntimeState::Loading,
             fingerprint: None,
             descriptor: None,
@@ -302,6 +579,7 @@ impl NativeModelHandle {
             .map(|status| status.clone())
             .unwrap_or_else(|_| ResidentModelStatus {
                 model_id: "unknown".to_string(),
+                model_path: std::path::PathBuf::new(),
                 state: ModelRuntimeState::Failed,
                 fingerprint: None,
                 descriptor: None,
@@ -398,11 +676,14 @@ impl NativeModelHandle {
                 ));
             }
         };
-        self.generate_batch(GenerationBatchRequest {
-            request_id,
-            model_id,
-            cases,
-        })
+        self.submit_generation_batch(
+            GenerationBatchRequest {
+                request_id,
+                model_id,
+                cases,
+            },
+            GenerationBatchAdmission::Compatibility,
+        )
     }
 
     /// Submit an ordered family of independently sampled raw generation cases.
@@ -410,7 +691,17 @@ impl NativeModelHandle {
         &self,
         request: GenerationBatchRequest,
     ) -> NativeResult<GenerationTicket> {
-        validate_generation_batch_request(&request, &self.status())?;
+        self.submit_generation_batch(request, GenerationBatchAdmission::ExactBatch)
+    }
+
+    fn submit_generation_batch(
+        &self,
+        request: GenerationBatchRequest,
+        admission: GenerationBatchAdmission,
+    ) -> NativeResult<GenerationTicket> {
+        let status = self.status();
+        validate_generation_batch_request(&request, &status)?;
+        let exact_cell_budget = exact_token_budget_for_submission(&request, &status)?;
         let mut cancellations = Vec::with_capacity(request.cases.len());
         let mut reasoning_forces = Vec::with_capacity(request.cases.len());
         {
@@ -443,6 +734,8 @@ impl NativeModelHandle {
         let request_id = request.request_id.clone();
         if let Err(error) = self.inner.command_tx.send(WorkerCommand::GenerateBatch {
             request,
+            exact_cell_budget,
+            admission,
             event_tx,
             result_tx,
             cancellations,
@@ -744,6 +1037,389 @@ impl NativeModelHandle {
     }
 }
 
+impl ModelArtifactGuard {
+    fn open(
+        path: &std::path::Path,
+        label: &'static str,
+        caller_expected_sha256: Option<&str>,
+    ) -> NativeResult<Self> {
+        let file = open_guarded_artifact(path).map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::ModelMissing,
+                format!("failed to open {label} {}: {error}", path.display()),
+            )
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!("failed to inspect {label} {}: {error}", path.display()),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!("{label} is not a regular file: {}", path.display()),
+            ));
+        }
+        let initial_state = artifact_file_state(&metadata);
+        let path_state = artifact_path_state(path, label)?;
+        if path_state != initial_state {
+            return Err(artifact_changed_error(
+                label,
+                path,
+                "path identity changed while opening the artifact",
+            ));
+        }
+
+        #[cfg(windows)]
+        let lock_error = {
+            // The deny-write/delete share mode is mandatory and stronger than
+            // an advisory range lock. Take the latter when available, but do
+            // not make strict authority depend on duplicate lock semantics.
+            let _ = Fs4FileExt::try_lock_shared(&file);
+            None
+        };
+        #[cfg(not(windows))]
+        let lock_error = Fs4FileExt::try_lock_shared(&file)
+            .err()
+            .map(|error| format!("cooperative shared lock unavailable: {error}"));
+        #[cfg(test)]
+        let payload_bytes_read = std::sync::atomic::AtomicU64::new(0);
+        #[cfg(test)]
+        let expected_sha256 = hash_open_artifact(&file, label, path, &payload_bytes_read)?;
+        #[cfg(not(test))]
+        let expected_sha256 = hash_open_artifact(&file, label, path)?;
+        let state_after_hash = file
+            .metadata()
+            .map(|value| artifact_file_state(&value))
+            .map_err(|error| {
+                NativeError::new(
+                    NativeErrorCode::ModelInvalid,
+                    format!("failed to re-inspect {label} {}: {error}", path.display()),
+                )
+            })?;
+        if state_after_hash != initial_state || artifact_path_state(path, label)? != initial_state {
+            return Err(artifact_changed_error(
+                label,
+                path,
+                "identity or metadata changed while computing the initial SHA-256",
+            ));
+        }
+        if let Some(expected) = caller_expected_sha256
+            && expected != expected_sha256
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!(
+                    "{label} {} has SHA-256 {expected_sha256}, expected {expected}",
+                    path.display()
+                ),
+            ));
+        }
+
+        let pinned_load_path = pinned_artifact_load_path(&file, &initial_state, path);
+        let mut strict_errors = Vec::with_capacity(2);
+        if let Some(error) = lock_error {
+            strict_errors.push(error);
+        }
+        if pinned_load_path.is_none() {
+            strict_errors.push(
+                "this platform cannot make llama.cpp reopen the held artifact handle".to_string(),
+            );
+        }
+        let strict_binding_error = (!strict_errors.is_empty()).then(|| strict_errors.join("; "));
+
+        Ok(Self {
+            label,
+            original_path: path.to_path_buf(),
+            load_path: pinned_load_path.unwrap_or_else(|| path.to_path_buf()),
+            file,
+            initial_state,
+            expected_sha256,
+            #[cfg(test)]
+            payload_bytes_read,
+            strict_binding_error,
+        })
+    }
+
+    fn verify_identity(&self) -> NativeResult<()> {
+        let held_state = self.file.metadata().map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!(
+                    "failed to re-inspect held {} {}: {error}",
+                    self.label,
+                    self.original_path.display()
+                ),
+            )
+        })?;
+        if artifact_file_state(&held_state) != self.initial_state {
+            return Err(artifact_changed_error(
+                self.label,
+                &self.original_path,
+                "held file identity or metadata changed",
+            ));
+        }
+        if artifact_path_state(&self.original_path, self.label)? != self.initial_state {
+            return Err(artifact_changed_error(
+                self.label,
+                &self.original_path,
+                "configured path no longer names the held file",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_strict_unchanged(&self) -> NativeResult<()> {
+        if let Some(error) = &self.strict_binding_error {
+            return Err(NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!(
+                    "{} {} cannot support strict generation authority: {error}",
+                    self.label,
+                    self.original_path.display()
+                ),
+            ));
+        }
+        self.verify_identity()
+    }
+
+    #[cfg(test)]
+    fn payload_bytes_read(&self) -> u64 {
+        self.payload_bytes_read.load(Ordering::Relaxed)
+    }
+}
+
+impl ModelArtifactGuards {
+    fn open(config: &NativeModelConfig) -> NativeResult<Self> {
+        let model = ModelArtifactGuard::open(
+            &config.model_path,
+            "model",
+            config.expected_model_sha256.as_deref(),
+        )?;
+        let projector = config
+            .mmproj_path
+            .as_deref()
+            .map(|path| {
+                ModelArtifactGuard::open(
+                    path,
+                    "multimodal projector",
+                    config.expected_mmproj_sha256.as_deref(),
+                )
+            })
+            .transpose()?;
+        Ok(Self { model, projector })
+    }
+
+    fn verify_loaded_identities(&self) -> NativeResult<()> {
+        self.model.verify_identity()?;
+        if let Some(projector) = &self.projector {
+            projector.verify_identity()?;
+        }
+        Ok(())
+    }
+
+    fn verify_strict_unchanged(&self, fingerprint: &ModelFingerprint) -> NativeResult<()> {
+        if fingerprint.model_sha256 != self.model.expected_sha256 {
+            return Err(generation_verification_error(
+                "resident fingerprint no longer matches the held model artifact",
+            ));
+        }
+        match (&self.projector, &fingerprint.multimodal_projector_sha256) {
+            (Some(projector), Some(fingerprint_sha256))
+                if fingerprint_sha256 == &projector.expected_sha256 => {}
+            (None, None) => {}
+            _ => {
+                return Err(generation_verification_error(
+                    "resident fingerprint no longer matches the held projector artifact",
+                ));
+            }
+        }
+        self.model.verify_strict_unchanged()?;
+        if let Some(projector) = &self.projector {
+            projector.verify_strict_unchanged()?;
+        }
+        // Recheck the first artifact after checking the second, narrowing the
+        // cross-artifact mutation window without pretending filesystem atomicity.
+        self.model.verify_identity()?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn artifact_file_state(metadata: &Metadata) -> ArtifactFileState {
+    use std::os::unix::fs::MetadataExt as _;
+    ArtifactFileState {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+#[cfg(windows)]
+fn artifact_file_state(metadata: &Metadata) -> ArtifactFileState {
+    use std::os::windows::fs::MetadataExt as _;
+    ArtifactFileState {
+        length: metadata.file_size(),
+        created: metadata.creation_time(),
+        modified: metadata.last_write_time(),
+        attributes: metadata.file_attributes(),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn artifact_file_state(metadata: &Metadata) -> ArtifactFileState {
+    ArtifactFileState {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+        readonly: metadata.permissions().readonly(),
+    }
+}
+
+fn artifact_path_state(path: &std::path::Path, label: &str) -> NativeResult<ArtifactFileState> {
+    std::fs::metadata(path)
+        .map(|metadata| artifact_file_state(&metadata))
+        .map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!("failed to inspect {label} path {}: {error}", path.display()),
+            )
+        })
+}
+
+#[cfg(windows)]
+fn open_guarded_artifact(path: &std::path::Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_guarded_artifact(path: &std::path::Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(unix)]
+fn pinned_artifact_load_path(
+    file: &File,
+    expected_state: &ArtifactFileState,
+    _original_path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    use std::os::fd::AsRawFd as _;
+    ["/dev/fd", "/proc/self/fd"].into_iter().find_map(|root| {
+        let candidate = std::path::PathBuf::from(root).join(file.as_raw_fd().to_string());
+        let probe = File::open(&candidate).ok()?;
+        (artifact_file_state(&probe.metadata().ok()?) == *expected_state).then_some(candidate)
+    })
+}
+
+#[cfg(windows)]
+fn pinned_artifact_load_path(
+    _file: &File,
+    _expected_state: &ArtifactFileState,
+    _original_path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    // Deny-write/delete sharing improves legacy load stability, but a caller
+    // path is not a handle-derived reopen path and the metadata above lacks a
+    // volume/file identity. Keep legacy loading available while refusing to
+    // mint strict authority until both properties are implemented and tested.
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pinned_artifact_load_path(
+    _file: &File,
+    _expected_state: &ArtifactFileState,
+    _original_path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn read_artifact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt as _;
+    file.read_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_artifact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt as _;
+    file.seek_read(buffer, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_artifact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut reader = file.try_clone()?;
+    reader.seek(SeekFrom::Start(offset))?;
+    reader.read(buffer)
+}
+
+#[cfg(not(test))]
+fn hash_open_artifact(file: &File, label: &str, path: &std::path::Path) -> NativeResult<String> {
+    hash_open_artifact_with_read_observer(file, label, path, |_| {})
+}
+
+#[cfg(test)]
+fn hash_open_artifact(
+    file: &File,
+    label: &str,
+    path: &std::path::Path,
+    payload_bytes_read: &std::sync::atomic::AtomicU64,
+) -> NativeResult<String> {
+    hash_open_artifact_with_read_observer(file, label, path, |read| {
+        payload_bytes_read.fetch_add(read as u64, Ordering::Relaxed);
+    })
+}
+
+fn hash_open_artifact_with_read_observer(
+    file: &File,
+    label: &str,
+    path: &std::path::Path,
+    mut observe_read: impl FnMut(usize),
+) -> NativeResult<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut offset = 0_u64;
+    loop {
+        let read = read_artifact_at(file, &mut buffer, offset).map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!("failed while hashing {label} {}: {error}", path.display()),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        observe_read(read);
+        hasher.update(&buffer[..read]);
+        offset = offset.checked_add(read as u64).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!("{label} {} is too large to hash safely", path.display()),
+            )
+        })?;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn artifact_changed_error(label: &str, path: &std::path::Path, detail: &str) -> NativeError {
+    NativeError::new(
+        NativeErrorCode::ModelInvalid,
+        format!(
+            "{label} {} changed across the trusted load/generation boundary: {detail}",
+            path.display()
+        ),
+    )
+}
+
 fn run_worker(
     config: NativeModelConfig,
     command_rx: Receiver<WorkerCommand>,
@@ -801,7 +1477,16 @@ fn run_worker(
             }
         };
     }
-    let model = match LlamaModel::load_from_file(backend, &config.model_path, &model_params) {
+    let artifacts = match ModelArtifactGuards::open(&config) {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            set_status_state(&status, ModelRuntimeState::Failed, 0);
+            let _ = ready_tx.send(Err(error));
+            return;
+        }
+    };
+    let model = match LlamaModel::load_from_file(backend, &artifacts.model.load_path, &model_params)
+    {
         Ok(model) => model,
         Err(error) => {
             let error = NativeError::new(
@@ -813,12 +1498,12 @@ fn run_worker(
             return;
         }
     };
-    let multimodal = match config.mmproj_path.as_ref() {
-        Some(path) => {
-            let Some(path) = path.to_str() else {
+    let multimodal = match artifacts.projector.as_ref() {
+        Some(artifact) => {
+            let Some(load_path) = artifact.load_path.to_str() else {
                 let error = NativeError::new(
                     NativeErrorCode::InvalidConfig,
-                    "multimodal projector path is not valid UTF-8",
+                    "pinned multimodal projector path is not valid UTF-8",
                 );
                 set_status_state(&status, ModelRuntimeState::Failed, 0);
                 let _ = ready_tx.send(Err(error));
@@ -829,12 +1514,15 @@ fn run_worker(
                 n_threads: native_thread_count(),
                 ..MtmdContextParams::default()
             };
-            match MtmdContext::init_from_file(path, &model, &params) {
+            match MtmdContext::init_from_file(load_path, &model, &params) {
                 Ok(context) => Some(context),
                 Err(error) => {
                     let error = NativeError::new(
                         NativeErrorCode::ModelLoadFailed,
-                        format!("failed to load multimodal projector {path}: {error}"),
+                        format!(
+                            "failed to load multimodal projector {}: {error}",
+                            artifact.original_path.display()
+                        ),
                     );
                     set_status_state(&status, ModelRuntimeState::Failed, 0);
                     let _ = ready_tx.send(Err(error));
@@ -844,6 +1532,11 @@ fn run_worker(
         }
         None => None,
     };
+    if let Err(error) = artifacts.verify_loaded_identities() {
+        set_status_state(&status, ModelRuntimeState::Failed, 0);
+        let _ = ready_tx.send(Err(error));
+        return;
+    }
     let context_tokens = config.context_tokens.min(model.n_ctx_train()).max(512);
     let context_params = generation_context_params(&config, context_tokens);
     let (rope_config_sha256, kv_layout_sha256) = context_fingerprints(&context_params);
@@ -861,8 +1554,8 @@ fn run_worker(
     };
     let fingerprint = match fingerprint_model(
         &config,
-        backend,
         &model,
+        &artifacts,
         execution_backend,
         context_tokens,
         rope_config_sha256,
@@ -911,21 +1604,41 @@ fn run_worker(
             }
             WorkerCommand::GenerateBatch {
                 request,
+                exact_cell_budget,
+                admission,
                 event_tx,
                 result_tx,
                 cancellations,
                 reasoning_forces,
             } => {
                 set_status_state(&status, ModelRuntimeState::Ready, request.cases.len());
-                let result = prepare_generation_batch(&model, &request).and_then(
+                let statically_sealable =
+                    is_statically_sealable_generation_batch(&request, admission);
+                let strict_precheck = if statically_sealable {
+                    artifacts.verify_strict_unchanged(&fingerprint)
+                } else {
+                    Ok(())
+                };
+                let retain_authority_evidence =
+                    should_retain_authority_evidence(statically_sealable, &strict_precheck);
+                let mut retained_events = retain_authority_evidence.then(Vec::new);
+                let mut unrecorded_control_used = false;
+                // Authority admission is deliberately orthogonal to legacy
+                // generation. A failed strict precheck must not suppress valid
+                // model output requested through `generate_batch(...).wait()`.
+                let generated = prepare_generation_batch(&model, &request).and_then(
                     |(normalized, token_sets)| {
                         generate_batch(
                             &model,
                             &mut context,
                             &normalized,
                             Some(token_sets),
+                            exact_cell_budget.as_ref(),
                             BatchSupervision {
                                 event_tx: &event_tx,
+                                retained_events: retained_events.as_mut(),
+                                unrecorded_control_used: retain_authority_evidence
+                                    .then_some(&mut unrecorded_control_used),
                                 cancellations: &cancellations,
                                 reasoning_forces: &reasoning_forces,
                             },
@@ -936,9 +1649,51 @@ fn run_worker(
                         )
                     },
                 );
-                if result.is_err() {
+                if generated.is_err() {
                     emit_failed_case_events(&event_tx, &request);
                 }
+                if retain_authority_evidence {
+                    unrecorded_control_used |= reasoning_forces
+                        .iter()
+                        .any(|flag| flag.load(Ordering::Acquire));
+                }
+                let sealable_batch = retain_authority_evidence
+                    && is_sealable_generation_batch(&request, admission, unrecorded_control_used);
+                let result = generated.map(|execution| {
+                    let GeneratedBatchExecution {
+                        outputs,
+                        terminal_sampled_token_ids,
+                    } = execution;
+                    let authority = strict_precheck.and_then(|()| {
+                        if !sealable_batch {
+                            return Err(NativeError::new(
+                                NativeErrorCode::UnsupportedParameter,
+                                "this generation path does not carry exact-token owner-worker authority",
+                            ));
+                        }
+                        let events = retained_events.take().ok_or_else(|| {
+                            generation_verification_error(
+                                "statically sealable generation did not retain its event ledger",
+                            )
+                        })?;
+                        // Validate while the outputs are borrowed, then move
+                        // them once into the completion envelope. Legacy waits
+                        // never pay for a defensive output clone.
+                        verify_generation_batch_authority(
+                            &model,
+                            request,
+                            fingerprint.clone(),
+                            &outputs,
+                            terminal_sampled_token_ids,
+                            events,
+                            &artifacts,
+                        )
+                    });
+                    match authority {
+                        Ok(evidence) => GenerationCompletion::verified(outputs, evidence),
+                        Err(error) => GenerationCompletion::authority_rejected(outputs, error),
+                    }
+                });
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
                 let _ = result_tx.send(result);
             }
@@ -955,8 +1710,11 @@ fn run_worker(
                     &mut context,
                     &request,
                     None,
+                    None,
                     BatchSupervision {
                         event_tx: &event_tx,
+                        retained_events: None,
+                        unrecorded_control_used: None,
                         cancellations: &cancellations,
                         reasoning_forces: &reasoning_forces,
                     },
@@ -969,7 +1727,9 @@ fn run_worker(
                     emit_failed_branch_events(&event_tx, &request);
                 }
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
-                let _ = result_tx.send(result);
+                let _ = result_tx.send(
+                    result.map(|execution| GenerationCompletion::unverified(execution.outputs)),
+                );
             }
             WorkerCommand::GenerateMultimodal {
                 request,
@@ -998,7 +1758,8 @@ fn run_worker(
                     emit_generation_state(&event_tx, &request, u64::MAX, GenerationState::Failed);
                 }
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
-                let _ = result_tx.send(result.map(|output| vec![output]));
+                let _ = result_tx
+                    .send(result.map(|output| GenerationCompletion::unverified(vec![output])));
             }
             WorkerCommand::Snapshot {
                 sequence_id,
@@ -1568,9 +2329,10 @@ fn generate_batch(
     context: &mut LlamaContext<'_>,
     request: &SharedPrefixBatchRequest,
     prepared_token_sets: Option<Vec<Vec<LlamaToken>>>,
-    supervision: BatchSupervision<'_>,
+    exact_cell_budget: Option<&ExactTokenBatchCellBudget>,
+    mut supervision: BatchSupervision<'_>,
     tracking: SequenceTracking<'_>,
-) -> NativeResult<Vec<GenerationOutput>> {
+) -> NativeResult<GeneratedBatchExecution> {
     context.clear_kv_cache();
     tracking.token_counts.clear();
     tracking.token_ids.clear();
@@ -1654,37 +2416,53 @@ fn generate_batch(
         state_buffer::import_sequence(context, state, index as i32)?;
         prefix_lengths[index] = state.token_count;
     }
-    let uncached_token_sets = uncached_indices
-        .iter()
-        .map(|index| token_sets[*index].clone())
-        .collect::<Vec<_>>();
-    let shared_uncached_prefix = if uncached_token_sets.len() > 1 {
-        let uncached_minimum = uncached_token_sets
-            .iter()
-            .map(Vec::len)
-            .min()
-            .unwrap_or_default();
-        longest_common_prefix(&uncached_token_sets).min(uncached_minimum.saturating_sub(1))
+    let (shared_uncached_prefix, required_tokens) = if let Some(budget) = exact_cell_budget {
+        exact_budget_execution_values(
+            budget,
+            request,
+            &token_sets,
+            &cached_states,
+            &mut prefix_lengths,
+        )?
     } else {
-        0
-    };
-    for index in &uncached_indices {
-        prefix_lengths[*index] = shared_uncached_prefix;
-    }
-    let cached_cells = cached_states
-        .iter()
-        .filter_map(|state| state.map(|state| state.token_count))
-        .sum::<usize>();
-    let required_tokens = cached_cells
-        + shared_uncached_prefix
-        + token_sets
+        let uncached_token_sets = uncached_indices
+            .iter()
+            .map(|index| token_sets[*index].clone())
+            .collect::<Vec<_>>();
+        let shared_uncached_prefix = if uncached_token_sets.len() > 1 {
+            let uncached_minimum = uncached_token_sets
+                .iter()
+                .map(Vec::len)
+                .min()
+                .unwrap_or_default();
+            longest_common_prefix(&uncached_token_sets).min(uncached_minimum.saturating_sub(1))
+        } else {
+            0
+        };
+        for index in &uncached_indices {
+            prefix_lengths[*index] = shared_uncached_prefix;
+        }
+        let cached_cells = cached_states
+            .iter()
+            .filter_map(|state| state.map(|state| state.token_count))
+            .try_fold(0_usize, |total, count| total.checked_add(count))
+            .ok_or_else(|| batch_cell_budget_error("cached-prefix cell count overflowed"))?;
+        let branch_cells = token_sets
             .iter()
             .enumerate()
-            .map(|(index, tokens)| {
-                tokens.len().saturating_sub(prefix_lengths[index])
-                    + request.branches[index].sampling.max_tokens as usize
+            .try_fold(0_usize, |total, (index, tokens)| {
+                let prompt_suffix = tokens.len().checked_sub(prefix_lengths[index])?;
+                let case_cells = prompt_suffix
+                    .checked_add(request.branches[index].sampling.max_tokens as usize)?;
+                total.checked_add(case_cells)
             })
-            .sum::<usize>();
+            .ok_or_else(|| batch_cell_budget_error("generation batch cell count overflowed"))?;
+        let required_tokens = cached_cells
+            .checked_add(shared_uncached_prefix)
+            .and_then(|total| total.checked_add(branch_cells))
+            .ok_or_else(|| batch_cell_budget_error("generation batch cell count overflowed"))?;
+        (shared_uncached_prefix, required_tokens)
+    };
     if required_tokens > context.n_ctx() as usize {
         return Err(NativeError::new(
             NativeErrorCode::PromptTooLarge,
@@ -1695,14 +2473,7 @@ fn generate_batch(
         ));
     }
     for (index, branch) in request.branches.iter().enumerate() {
-        emit_state(
-            supervision.event_tx,
-            request,
-            branch,
-            index,
-            0,
-            GenerationState::Prefilling,
-        );
+        supervision.emit_state(request, branch, index, 0, GenerationState::Prefilling);
     }
     if shared_uncached_prefix > 0 {
         let source = uncached_indices[0];
@@ -1771,6 +2542,7 @@ fn generate_batch(
                 decoder: UTF_8.new_decoder(),
                 text: String::new(),
                 generated_token_ids: Vec::with_capacity(branch.sampling.max_tokens as usize),
+                terminal_sampled_token_id: None,
                 generated: 0,
                 next_position: token_sets[index].len() as i32,
                 logit_index: index as i32,
@@ -1783,8 +2555,7 @@ fn generate_batch(
         })
         .collect::<Vec<_>>();
     for branch in &mut branches {
-        emit_state(
-            supervision.event_tx,
+        supervision.emit_state(
             request,
             branch.request,
             branch.sequence_id as usize,
@@ -1805,20 +2576,23 @@ fn generate_batch(
                 let _ = context.clear_kv_cache_seq(Some(index as u32), None, None);
                 continue;
             }
-            if supervision.reasoning_forces[index].load(Ordering::Acquire)
-                && branch.forced_tokens.is_empty()
-                && let Some(end_marker) = active_reasoning_end_marker(&branch.text)
-            {
-                let tokens = model
-                    .str_to_token(end_marker, AddBos::Never)
-                    .map_err(|error| {
-                        NativeError::new(
-                            NativeErrorCode::ModelInvalid,
-                            format!("failed to tokenize the reasoning end marker: {error}"),
-                        )
-                    })?;
-                branch.forced_tokens.extend(tokens);
-                supervision.reasoning_forces[index].store(false, Ordering::Release);
+            if supervision.reasoning_forces[index].load(Ordering::Acquire) {
+                supervision.mark_unrecorded_control();
+                if branch.forced_tokens.is_empty()
+                    && let Some(end_marker) = active_reasoning_end_marker(&branch.text)
+                {
+                    let tokens =
+                        model
+                            .str_to_token(end_marker, AddBos::Never)
+                            .map_err(|error| {
+                                NativeError::new(
+                                    NativeErrorCode::ModelInvalid,
+                                    format!("failed to tokenize the reasoning end marker: {error}"),
+                                )
+                            })?;
+                    branch.forced_tokens.extend(tokens);
+                    supervision.reasoning_forces[index].store(false, Ordering::Release);
+                }
             }
             let token = if let Some(token) = branch.forced_tokens.pop_front() {
                 branch.sampler.accept(token);
@@ -1829,6 +2603,7 @@ fn generate_batch(
             if model.is_eog_token(token) {
                 branch.state = GenerationState::Completed;
                 branch.finish_reason = "end_of_generation".to_string();
+                branch.terminal_sampled_token_id = Some(token.0);
                 continue;
             }
             branch.generated_token_ids.push(token.0);
@@ -1847,20 +2622,17 @@ fn generate_batch(
             if branch.first_token_ms.is_none() {
                 branch.first_token_ms = Some(started.elapsed().as_millis());
             }
-            branch.text.push_str(&piece);
+            append_generated_utf8_piece(&mut branch.text, &piece)?;
             branch.generated += 1;
             if !piece.is_empty() {
-                try_emit_nonterminal(
-                    supervision.event_tx,
-                    GenerationEvent {
-                        request_id: request.request_id.clone(),
-                        branch_id: branch.request.branch_id.clone(),
-                        sequence_id: branch.sequence_id,
-                        input_index: index,
-                        event_index: branch.event_index,
-                        event: GenerationEventKind::Delta { text: piece },
-                    },
-                );
+                supervision.emit(GenerationEvent {
+                    request_id: request.request_id.clone(),
+                    branch_id: branch.request.branch_id.clone(),
+                    sequence_id: branch.sequence_id,
+                    input_index: index,
+                    event_index: branch.event_index,
+                    event: GenerationEventKind::Delta { text: piece },
+                });
                 branch.event_index += 1;
             }
             if let Some(stop) = branch
@@ -1910,8 +2682,7 @@ fn generate_batch(
             branch.state,
             GenerationState::Completed | GenerationState::Cancelled
         ) {
-            emit_state(
-                supervision.event_tx,
+            supervision.emit_state(
                 request,
                 branch.request,
                 branch.sequence_id as usize,
@@ -1922,53 +2693,56 @@ fn generate_batch(
         }
     }
     let duration_ms = started.elapsed().as_millis();
-    let outputs = branches
-        .into_iter()
-        .map(|branch| {
-            let completion_tokens = branch.generated;
-            let tokens_per_second = if duration_ms == 0 {
-                0.0
-            } else {
-                completion_tokens as f64 / (duration_ms as f64 / 1000.0)
-            };
-            GenerationOutput {
-                request_id: request.request_id.clone(),
-                branch_id: branch.request.branch_id.clone(),
-                input_index: branch.sequence_id as usize,
-                model_id: request.model_id.clone(),
-                text: branch.text,
-                generated_token_ids: branch.generated_token_ids,
-                token_observations: None,
-                state: branch.state,
-                finish_reason: branch.finish_reason,
-                metrics: GenerationMetrics {
-                    prompt_tokens: token_sets[branch.sequence_id as usize].len(),
-                    completion_tokens,
-                    shared_prefix_tokens: prefix_lengths[branch.sequence_id as usize],
-                    duration_ms,
-                    first_token_ms: branch.first_token_ms,
-                    tokens_per_second,
-                    cache: if let Some(state) = cached_states[branch.sequence_id as usize] {
-                        GenerationCacheMetrics {
-                            supplied_prefix_tokens: state.token_count,
-                            restored_prefix_tokens: state.token_count,
-                            batch_shared_prefix_tokens: 0,
-                        }
-                    } else {
-                        GenerationCacheMetrics {
-                            supplied_prefix_tokens: 0,
-                            restored_prefix_tokens: 0,
-                            batch_shared_prefix_tokens: shared_uncached_prefix,
-                        }
-                    },
+    let mut outputs = Vec::with_capacity(branches.len());
+    let mut terminal_sampled_token_ids = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let completion_tokens = branch.generated;
+        let tokens_per_second = if duration_ms == 0 {
+            0.0
+        } else {
+            completion_tokens as f64 / (duration_ms as f64 / 1000.0)
+        };
+        terminal_sampled_token_ids.push(branch.terminal_sampled_token_id);
+        outputs.push(GenerationOutput {
+            request_id: request.request_id.clone(),
+            branch_id: branch.request.branch_id.clone(),
+            input_index: branch.sequence_id as usize,
+            model_id: request.model_id.clone(),
+            text: branch.text,
+            generated_token_ids: branch.generated_token_ids,
+            token_observations: None,
+            state: branch.state,
+            finish_reason: branch.finish_reason,
+            metrics: GenerationMetrics {
+                prompt_tokens: token_sets[branch.sequence_id as usize].len(),
+                completion_tokens,
+                shared_prefix_tokens: prefix_lengths[branch.sequence_id as usize],
+                duration_ms,
+                first_token_ms: branch.first_token_ms,
+                tokens_per_second,
+                cache: if let Some(state) = cached_states[branch.sequence_id as usize] {
+                    GenerationCacheMetrics {
+                        supplied_prefix_tokens: state.token_count,
+                        restored_prefix_tokens: state.token_count,
+                        batch_shared_prefix_tokens: 0,
+                    }
+                } else {
+                    GenerationCacheMetrics {
+                        supplied_prefix_tokens: 0,
+                        restored_prefix_tokens: 0,
+                        batch_shared_prefix_tokens: shared_uncached_prefix,
+                    }
                 },
-                real_engine_invoked: true,
-                fake_fixture: false,
-                transport: NativeTransport::InProcess,
-            }
-        })
-        .collect();
-    Ok(outputs)
+            },
+            real_engine_invoked: true,
+            fake_fixture: false,
+            transport: NativeTransport::InProcess,
+        });
+    }
+    Ok(GeneratedBatchExecution {
+        outputs,
+        terminal_sampled_token_ids,
+    })
 }
 
 fn prepare_generation_batch(
@@ -2004,6 +2778,354 @@ fn prepare_generation_batch(
         },
         token_sets,
     ))
+}
+
+fn exact_generation_case_token_ids(case: &GenerationCase) -> Option<&[i32]> {
+    match &case.input {
+        GenerationInput::Completion { prompts } => match prompts.as_slice() {
+            [CompletionPrompt::Tokens { token_ids }] if !token_ids.is_empty() => Some(token_ids),
+            _ => None,
+        },
+        GenerationInput::Chat { .. } | GenerationInput::FillInMiddle { .. } => None,
+    }
+}
+
+fn is_exact_token_generation_batch(request: &GenerationBatchRequest) -> bool {
+    !request.cases.is_empty()
+        && request
+            .cases
+            .iter()
+            .all(|case| exact_generation_case_token_ids(case).is_some())
+}
+
+fn exact_batch_shared_prefix_tokens(request: &GenerationBatchRequest) -> Option<usize> {
+    usize::try_from(
+        exact_token_batch_cell_budget(request)
+            .ok()?
+            .shared_uncached_prefix_tokens(),
+    )
+    .ok()
+}
+
+fn is_statically_sealable_generation_batch(
+    request: &GenerationBatchRequest,
+    admission: GenerationBatchAdmission,
+) -> bool {
+    admission == GenerationBatchAdmission::ExactBatch
+        && is_exact_token_generation_batch(request)
+        && request
+            .cases
+            .iter()
+            .all(|case| case.cached_prefix.is_none() && case.sampling.seed != u32::MAX)
+}
+
+fn is_sealable_generation_batch(
+    request: &GenerationBatchRequest,
+    admission: GenerationBatchAdmission,
+    unrecorded_control_used: bool,
+) -> bool {
+    is_statically_sealable_generation_batch(request, admission) && !unrecorded_control_used
+}
+
+fn should_retain_authority_evidence(
+    statically_sealable: bool,
+    strict_precheck: &NativeResult<()>,
+) -> bool {
+    statically_sealable && strict_precheck.is_ok()
+}
+
+fn verify_generation_batch_authority(
+    model: &LlamaModel,
+    request: GenerationBatchRequest,
+    model_fingerprint: ModelFingerprint,
+    outputs: &[GenerationOutput],
+    terminal_sampled_token_ids: Vec<Option<i32>>,
+    events: Vec<GenerationEvent>,
+    artifacts: &ModelArtifactGuards,
+) -> NativeResult<VerifiedGenerationEvidence> {
+    let decoded_token_text = outputs
+        .iter()
+        .map(|output| decode_verified_token_text(model, &output.generated_token_ids))
+        .collect::<NativeResult<Vec<_>>>()?;
+    validate_verified_generation_batch(
+        &request,
+        &model_fingerprint,
+        outputs,
+        &terminal_sampled_token_ids,
+        &events,
+        &decoded_token_text,
+        |token_id| model.is_eog_token(LlamaToken::new(token_id)),
+    )?;
+    // This is deliberately the last fallible check before producing the
+    // private evidence that `wait_verified` can turn into authority, after all
+    // tokenizer/EOG queries made during validation.
+    artifacts.verify_strict_unchanged(&model_fingerprint)?;
+    Ok(VerifiedGenerationEvidence {
+        request,
+        model_fingerprint,
+        terminal_sampled_token_ids,
+        events,
+    })
+}
+
+fn validate_verified_generation_batch<F>(
+    request: &GenerationBatchRequest,
+    model_fingerprint: &ModelFingerprint,
+    outputs: &[GenerationOutput],
+    terminal_sampled_token_ids: &[Option<i32>],
+    events: &[GenerationEvent],
+    decoded_token_text: &[String],
+    is_eog_token: F,
+) -> NativeResult<()>
+where
+    F: Fn(i32) -> bool,
+{
+    if !is_exact_token_generation_batch(request) {
+        return Err(generation_verification_error(
+            "only exact-token completion batches can receive owner-worker authority",
+        ));
+    }
+    if request
+        .cases
+        .iter()
+        .any(|case| case.cached_prefix.is_some())
+    {
+        return Err(generation_verification_error(
+            "caller-supplied cached state cannot receive owner-worker authority",
+        ));
+    }
+    if request
+        .cases
+        .iter()
+        .any(|case| case.sampling.seed == u32::MAX)
+    {
+        return Err(generation_verification_error(
+            "the random default-seed sentinel cannot receive owner-worker authority",
+        ));
+    }
+    if request.model_id != model_fingerprint.model_id {
+        return Err(generation_verification_error(
+            "request and live model fingerprint IDs disagree",
+        ));
+    }
+    if outputs.len() != request.cases.len()
+        || decoded_token_text.len() != outputs.len()
+        || terminal_sampled_token_ids.len() != outputs.len()
+    {
+        return Err(generation_verification_error(
+            "verified output count does not match the exact submitted batch",
+        ));
+    }
+    let expected_shared_prefix = exact_batch_shared_prefix_tokens(request).ok_or_else(|| {
+        generation_verification_error("failed to derive exact batch prefix metrics")
+    })?;
+
+    let mut next_event_indexes = vec![0_u64; request.cases.len()];
+    let mut terminal_states = vec![None; request.cases.len()];
+    let mut delta_text = vec![String::new(); request.cases.len()];
+    for event in events {
+        let Some(case) = request.cases.get(event.input_index) else {
+            return Err(generation_verification_error(
+                "retained event input index is outside the submitted batch",
+            ));
+        };
+        let expected_sequence_id = i32::try_from(event.input_index).map_err(|_| {
+            generation_verification_error("retained event input index does not fit sequence ID")
+        })?;
+        if event.request_id != request.request_id
+            || event.branch_id != case.case_id
+            || event.sequence_id != expected_sequence_id
+        {
+            return Err(generation_verification_error(
+                "retained event request, case, or sequence identity disagrees",
+            ));
+        }
+        let expected_event_index = next_event_indexes[event.input_index];
+        if event.event_index != expected_event_index {
+            return Err(generation_verification_error(
+                "retained event indexes are not contiguous per case",
+            ));
+        }
+        if terminal_states[event.input_index].is_some() {
+            return Err(generation_verification_error(
+                "retained ledger contains an event after a case terminal",
+            ));
+        }
+        match &event.event {
+            GenerationEventKind::State {
+                state: GenerationState::Prefilling,
+            } if event.event_index == 0 => {}
+            GenerationEventKind::State {
+                state: GenerationState::Generating,
+            } if event.event_index == 1 => {}
+            GenerationEventKind::State { state }
+                if event.event_index >= 2
+                    && matches!(
+                        state,
+                        GenerationState::Completed | GenerationState::Cancelled
+                    ) =>
+            {
+                terminal_states[event.input_index] = Some(*state);
+            }
+            GenerationEventKind::Delta { text } if event.event_index >= 2 && !text.is_empty() => {
+                delta_text[event.input_index].push_str(text);
+            }
+            _ => {
+                return Err(generation_verification_error(
+                    "retained ledger contains an impossible generation event transition",
+                ));
+            }
+        }
+        next_event_indexes[event.input_index] = expected_event_index
+            .checked_add(1)
+            .ok_or_else(|| generation_verification_error("retained event index overflowed"))?;
+    }
+
+    for (index, (case, output)) in request.cases.iter().zip(outputs).enumerate() {
+        let prompt_token_ids = exact_generation_case_token_ids(case).ok_or_else(|| {
+            generation_verification_error("verified case lost its exact token prompt")
+        })?;
+        if output.request_id != request.request_id
+            || output.model_id != request.model_id
+            || output.branch_id != case.case_id
+            || output.input_index != index
+        {
+            return Err(generation_verification_error(
+                "ordered output identity disagrees with the submitted request",
+            ));
+        }
+        if !output.real_engine_invoked
+            || output.fake_fixture
+            || output.transport != NativeTransport::InProcess
+        {
+            return Err(generation_verification_error(
+                "verified output lacks real in-process engine evidence",
+            ));
+        }
+        if output.generated_token_ids.len() != output.metrics.completion_tokens {
+            return Err(generation_verification_error(
+                "generated token evidence disagrees with completion metrics",
+            ));
+        }
+        if output.metrics.prompt_tokens != prompt_token_ids.len()
+            || output.generated_token_ids.len() > case.sampling.max_tokens as usize
+            || output.metrics.shared_prefix_tokens != expected_shared_prefix
+            || output.metrics.cache.supplied_prefix_tokens != 0
+            || output.metrics.cache.restored_prefix_tokens != 0
+            || output.metrics.cache.batch_shared_prefix_tokens != expected_shared_prefix
+        {
+            return Err(generation_verification_error(
+                "output prompt, generation, or uncached-prefix metrics disagree",
+            ));
+        }
+        if output
+            .generated_token_ids
+            .iter()
+            .copied()
+            .any(&is_eog_token)
+        {
+            return Err(generation_verification_error(
+                "generated prose token evidence contains an unseparated EOG token",
+            ));
+        }
+        if !matches!(
+            output.state,
+            GenerationState::Completed | GenerationState::Cancelled
+        ) || terminal_states[index] != Some(output.state)
+        {
+            return Err(generation_verification_error(
+                "output and retained terminal states disagree",
+            ));
+        }
+        if delta_text[index] != decoded_token_text[index] {
+            return Err(generation_verification_error(
+                "retained delta text disagrees with the exact generated token IDs",
+            ));
+        }
+        let terminal_sampled_token_id = terminal_sampled_token_ids[index];
+        match (output.state, output.finish_reason.as_str()) {
+            (GenerationState::Cancelled, "cancelled")
+                if terminal_sampled_token_id.is_none()
+                    && output.text == decoded_token_text[index] => {}
+            (GenerationState::Completed, "end_of_generation")
+                if terminal_sampled_token_id.is_some_and(&is_eog_token)
+                    && output.text == decoded_token_text[index] => {}
+            (GenerationState::Completed, "max_tokens")
+                if terminal_sampled_token_id.is_none()
+                    && output.text == decoded_token_text[index]
+                    && output.generated_token_ids.len() == case.sampling.max_tokens as usize => {}
+            (GenerationState::Completed, "stop_sequence")
+                if terminal_sampled_token_id.is_none()
+                    && case.sampling.stop.iter().any(|stop| {
+                        !stop.is_empty()
+                            && decoded_token_text[index] == format!("{}{stop}", output.text)
+                    }) => {}
+            _ => {
+                return Err(generation_verification_error(
+                    "output text, stop condition, state, and finish reason disagree",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_verified_token_text(model: &LlamaModel, token_ids: &[i32]) -> NativeResult<String> {
+    let mut pieces = Vec::with_capacity(token_ids.len());
+    for token_id in token_ids {
+        let bytes = model
+            .token_to_piece_bytes(LlamaToken::new(*token_id), 512, false, None)
+            .map_err(|error| {
+                generation_verification_error(format!(
+                    "failed to re-decode generated token evidence: {error}"
+                ))
+            })?;
+        pieces.push(bytes);
+    }
+    strict_verified_utf8(&pieces)
+}
+
+fn strict_verified_utf8(pieces: &[Vec<u8>]) -> NativeResult<String> {
+    let byte_count = pieces.iter().try_fold(0_usize, |total, piece| {
+        checked_generated_output_len(total, piece.len())
+    })?;
+    let mut bytes = Vec::with_capacity(byte_count);
+    for piece in pieces {
+        bytes.extend_from_slice(piece);
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        generation_verification_error(format!(
+            "generated token pieces are not complete canonical UTF-8: {error}"
+        ))
+    })
+}
+
+fn append_generated_utf8_piece(output: &mut String, piece: &str) -> NativeResult<()> {
+    let _ = checked_generated_output_len(output.len(), piece.len())?;
+    output.push_str(piece);
+    Ok(())
+}
+
+fn checked_generated_output_len(current: usize, additional: usize) -> NativeResult<usize> {
+    let next = current.checked_add(additional).ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::MemoryBudgetExceeded,
+            "generated UTF-8 output byte count overflowed",
+        )
+    })?;
+    if next > MAX_GENERATED_OUTPUT_BYTES {
+        return Err(NativeError::new(
+            NativeErrorCode::MemoryBudgetExceeded,
+            format!(
+                "generated UTF-8 output exceeds the {MAX_GENERATED_OUTPUT_BYTES}-byte per-case ceiling"
+            ),
+        ));
+    }
+    Ok(next)
+}
+
+fn generation_verification_error(message: impl Into<String>) -> NativeError {
+    NativeError::new(NativeErrorCode::Internal, message)
 }
 
 fn generation_case_tokens(
@@ -2318,7 +3440,7 @@ fn generate_multimodal(
         if first_token_ms.is_none() {
             first_token_ms = Some(started.elapsed().as_millis());
         }
-        text.push_str(&piece);
+        append_generated_utf8_piece(&mut text, &piece)?;
         generated += 1;
         if !piece.is_empty() {
             try_emit_nonterminal(
@@ -2406,8 +3528,50 @@ struct SequenceTracking<'a> {
 
 struct BatchSupervision<'a> {
     event_tx: &'a Sender<GenerationEvent>,
+    retained_events: Option<&'a mut Vec<GenerationEvent>>,
+    unrecorded_control_used: Option<&'a mut bool>,
     cancellations: &'a [Arc<AtomicBool>],
     reasoning_forces: &'a [Arc<AtomicBool>],
+}
+
+impl BatchSupervision<'_> {
+    fn mark_unrecorded_control(&mut self) {
+        if let Some(used) = self.unrecorded_control_used.as_deref_mut() {
+            *used = true;
+        }
+    }
+
+    fn emit(&mut self, event: GenerationEvent) {
+        if let Some(retained_events) = self.retained_events.as_deref_mut() {
+            retained_events.push(event.clone());
+        }
+        if matches!(
+            &event.event,
+            GenerationEventKind::State { state } if is_terminal_state(*state)
+        ) {
+            try_emit_terminal(self.event_tx, event);
+        } else {
+            try_emit_nonterminal(self.event_tx, event);
+        }
+    }
+
+    fn emit_state(
+        &mut self,
+        request: &SharedPrefixBatchRequest,
+        branch: &BranchRequest,
+        sequence_id: usize,
+        event_index: u64,
+        state: GenerationState,
+    ) {
+        self.emit(GenerationEvent {
+            request_id: request.request_id.clone(),
+            branch_id: branch.branch_id.clone(),
+            sequence_id: sequence_id as i32,
+            input_index: sequence_id,
+            event_index,
+            event: GenerationEventKind::State { state },
+        });
+    }
 }
 
 struct SingleSequenceSupervision<'a> {
@@ -2560,6 +3724,7 @@ struct ActiveBranch<'a> {
     decoder: encoding_rs::Decoder,
     text: String,
     generated_token_ids: Vec<i32>,
+    terminal_sampled_token_id: Option<i32>,
     generated: usize,
     next_position: i32,
     logit_index: i32,
@@ -2853,6 +4018,68 @@ fn longest_common_prefix(token_sets: &[Vec<LlamaToken>]) -> usize {
         .count()
 }
 
+fn exact_budget_execution_values(
+    budget: &ExactTokenBatchCellBudget,
+    request: &SharedPrefixBatchRequest,
+    token_sets: &[Vec<LlamaToken>],
+    cached_states: &[Option<&SequenceStateBlob>],
+    prefix_lengths: &mut [usize],
+) -> NativeResult<(usize, usize)> {
+    if budget.cases().len() != request.branches.len()
+        || token_sets.len() != request.branches.len()
+        || cached_states.len() != request.branches.len()
+        || prefix_lengths.len() != request.branches.len()
+    {
+        return Err(generation_verification_error(
+            "preflight exact-token cell budget lost batch cardinality",
+        ));
+    }
+    let shared_uncached_prefix = usize::try_from(budget.shared_uncached_prefix_tokens())
+        .map_err(|_| batch_cell_budget_error("shared prefix does not fit this host"))?;
+    let required_cells = usize::try_from(budget.required_cells())
+        .map_err(|_| batch_cell_budget_error("required cells do not fit this host"))?;
+
+    let mut observed_cached_prefix_tokens = 0_u64;
+    for (index, case_budget) in budget.cases().iter().enumerate() {
+        let actual_cached_prefix = cached_states[index].map_or(0, |state| state.token_count);
+        let actual_cached_prefix = u64::try_from(actual_cached_prefix)
+            .map_err(|_| batch_cell_budget_error("cached prefix does not fit u64"))?;
+        let expected_reused_prefix = if cached_states[index].is_some() {
+            actual_cached_prefix
+        } else {
+            budget.shared_uncached_prefix_tokens()
+        };
+        let actual_prompt_tokens = u64::try_from(token_sets[index].len())
+            .map_err(|_| batch_cell_budget_error("prompt length does not fit u64"))?;
+        if case_budget.input_index() != index
+            || case_budget.prompt_tokens() != actual_prompt_tokens
+            || case_budget.cached_prefix_tokens() != actual_cached_prefix
+            || case_budget.reused_prefix_tokens() != expected_reused_prefix
+            || case_budget.maximum_sampled_tokens()
+                != u64::from(request.branches[index].sampling.max_tokens)
+        {
+            return Err(generation_verification_error(
+                "preflight exact-token cell budget disagrees with prepared execution",
+            ));
+        }
+        observed_cached_prefix_tokens = observed_cached_prefix_tokens
+            .checked_add(actual_cached_prefix)
+            .ok_or_else(|| batch_cell_budget_error("cached-prefix cell count overflowed"))?;
+        prefix_lengths[index] = usize::try_from(case_budget.reused_prefix_tokens())
+            .map_err(|_| batch_cell_budget_error("reused prefix does not fit this host"))?;
+    }
+    if observed_cached_prefix_tokens != budget.cached_prefix_tokens() {
+        return Err(generation_verification_error(
+            "preflight exact-token cached-prefix total disagrees with execution",
+        ));
+    }
+    Ok((shared_uncached_prefix, required_cells))
+}
+
+fn batch_cell_budget_error(message: impl Into<String>) -> NativeError {
+    NativeError::new(NativeErrorCode::MemoryBudgetExceeded, message)
+}
+
 fn validate_config(config: &NativeModelConfig) -> NativeResult<()> {
     if config.max_sequences == 0 || config.max_sequences > MAX_PARALLEL_SEQUENCES {
         return Err(NativeError::new(
@@ -2881,6 +4108,35 @@ fn validate_config(config: &NativeModelConfig) -> NativeResult<()> {
         return Err(NativeError::new(
             NativeErrorCode::ModelInvalid,
             "native models must use the .gguf format",
+        ));
+    }
+    validate_expected_sha256(
+        "expected_model_sha256",
+        config.expected_model_sha256.as_deref(),
+    )?;
+    validate_expected_sha256(
+        "expected_mmproj_sha256",
+        config.expected_mmproj_sha256.as_deref(),
+    )?;
+    if config.expected_mmproj_sha256.is_some() && config.mmproj_path.is_none() {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "expected_mmproj_sha256 requires a multimodal projector path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_expected_sha256(field: &str, value: Option<&str>) -> NativeResult<()> {
+    if let Some(value) = value
+        && (value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            format!("{field} must be exactly 64 lowercase hexadecimal characters"),
         ));
     }
     Ok(())
@@ -3040,6 +4296,54 @@ fn validate_generation_batch_request(
     Ok(())
 }
 
+fn exact_token_budget_for_submission(
+    request: &GenerationBatchRequest,
+    status: &ResidentModelStatus,
+) -> NativeResult<Option<ExactTokenBatchCellBudget>> {
+    let budget = match exact_token_batch_cell_budget(request) {
+        Ok(budget) => budget,
+        Err(ExactTokenBatchBudgetError::NonExactTokenCase { .. }) => return Ok(None),
+        Err(ExactTokenBatchBudgetError::InvalidCachedPrefix { index }) => {
+            return Err(NativeError::new(
+                NativeErrorCode::CacheIncompatible,
+                format!("generation case {index} has an invalid exact-token cached prefix"),
+            ));
+        }
+        Err(
+            error @ (ExactTokenBatchBudgetError::EmptyBatch
+            | ExactTokenBatchBudgetError::EmptyPrompt { .. }
+            | ExactTokenBatchBudgetError::NegativeTokenId { .. }
+            | ExactTokenBatchBudgetError::ZeroCompletionBudget { .. }
+            | ExactTokenBatchBudgetError::ArithmeticOverflow),
+        ) => {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                error.to_string(),
+            ));
+        }
+    };
+    let context_tokens = status
+        .fingerprint
+        .as_ref()
+        .map(|fingerprint| fingerprint.context_tokens)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ModelNotLoaded,
+                "resident model has no exact context fingerprint",
+            )
+        })?;
+    if !budget.fits(u64::from(context_tokens)) {
+        return Err(NativeError::new(
+            NativeErrorCode::PromptTooLarge,
+            format!(
+                "exact-token batch requires {} KV cells but the resident context has {context_tokens}",
+                budget.required_cells()
+            ),
+        ));
+    }
+    Ok(Some(budget))
+}
+
 fn validate_embedding_batch_request(
     request: &EmbeddingBatchRequest,
     status: &ResidentModelStatus,
@@ -3077,51 +4381,32 @@ fn native_thread_count() -> i32 {
 
 fn fingerprint_model(
     config: &NativeModelConfig,
-    _backend: &LlamaBackend,
     model: &LlamaModel,
+    artifacts: &ModelArtifactGuards,
     execution_backend: &str,
     context_tokens: u32,
     rope_config_sha256: String,
     kv_layout_sha256: String,
 ) -> NativeResult<ModelFingerprint> {
-    let mut file = File::open(&config.model_path).map_err(|error| {
-        NativeError::new(
-            NativeErrorCode::ModelMissing,
-            format!("failed to open model for fingerprinting: {error}"),
-        )
-    })?;
-    let metadata = file.metadata().map_err(|error| {
-        NativeError::new(
-            NativeErrorCode::ModelInvalid,
-            format!("failed to inspect model: {error}"),
-        )
-    })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|error| {
-            NativeError::new(
-                NativeErrorCode::ModelInvalid,
-                format!("failed while hashing model: {error}"),
-            )
-        })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let model_sha256 = format!("{:x}", hasher.finalize());
+    artifacts.verify_loaded_identities()?;
+    let model_sha256 = artifacts.model.expected_sha256.clone();
     let chat_template = model
         .chat_template(None)
         .ok()
         .and_then(|template| template.to_string().ok())
         .unwrap_or_default();
     let chat_template_sha256 = format!("{:x}", Sha256::digest(chat_template.as_bytes()));
-    let multimodal_projector_sha256 = config.mmproj_path.as_deref().map(hash_file).transpose()?;
+    let multimodal_projector_sha256 = artifacts
+        .projector
+        .as_ref()
+        .map(|projector| projector.expected_sha256.clone());
+    // This binds the private compiler recipe, reviewed static dependency
+    // artifacts, and selected backend. It deliberately does not claim to hash
+    // a loaded process image or a pathname-resolved host executable.
+    let build_id = native_build_id(execution_backend);
     Ok(ModelFingerprint {
         model_id: config.model_id.clone(),
-        model_path: config.model_path.clone(),
-        model_size: metadata.len(),
+        model_size: artifacts.model.initial_state.length(),
         model_sha256: model_sha256.clone(),
         // The tokenizer is embedded in GGUF. Using the complete GGUF hash is
         // conservative: any tokenizer or model tensor change invalidates state.
@@ -3129,7 +4414,7 @@ fn fingerprint_model(
         chat_template_sha256,
         multimodal_projector_sha256,
         binding_version: LLAMA_CPP_BINDING_VERSION.to_string(),
-        build_id: format!("llama-cpp-2-{LLAMA_CPP_BINDING_VERSION}-{execution_backend}"),
+        build_id,
         backend: execution_backend.to_string(),
         context_tokens,
         batch_tokens: config.batch_tokens,
@@ -3137,6 +4422,23 @@ fn fingerprint_model(
         rope_config_sha256,
         kv_layout_sha256,
     })
+}
+
+fn native_build_id(execution_backend: &str) -> String {
+    native_build_id_from_private_digest(LLAMA_NATIVE_BUILD_MANIFEST_SHA256, execution_backend)
+}
+
+fn native_build_id_from_private_digest(
+    private_build_digest: &str,
+    execution_backend: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"llama-native-build-recipe-v3\0");
+    hasher.update((private_build_digest.len() as u64).to_le_bytes());
+    hasher.update(private_build_digest.as_bytes());
+    hasher.update((execution_backend.len() as u64).to_le_bytes());
+    hasher.update(execution_backend.as_bytes());
+    format!("llama-native-build-v3-{:x}", hasher.finalize())
 }
 
 fn describe_model(
@@ -3280,56 +4582,6 @@ fn context_fingerprints(params: &LlamaContextParams) -> (String, String) {
     )
 }
 
-fn hash_file(path: &std::path::Path) -> NativeResult<String> {
-    let mut file = File::open(path).map_err(|error| {
-        NativeError::new(
-            NativeErrorCode::ModelMissing,
-            format!(
-                "failed to open {} for fingerprinting: {error}",
-                path.display()
-            ),
-        )
-    })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|error| {
-            NativeError::new(
-                NativeErrorCode::ModelInvalid,
-                format!("failed while hashing {}: {error}", path.display()),
-            )
-        })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn emit_state(
-    event_tx: &Sender<GenerationEvent>,
-    request: &SharedPrefixBatchRequest,
-    branch: &BranchRequest,
-    sequence_id: usize,
-    event_index: u64,
-    state: GenerationState,
-) {
-    let event = GenerationEvent {
-        request_id: request.request_id.clone(),
-        branch_id: branch.branch_id.clone(),
-        sequence_id: sequence_id as i32,
-        input_index: sequence_id,
-        event_index,
-        event: GenerationEventKind::State { state },
-    };
-    if is_terminal_state(state) {
-        try_emit_terminal(event_tx, event);
-    } else {
-        try_emit_nonterminal(event_tx, event);
-    }
-}
-
 fn emit_failed_case_events(event_tx: &Sender<GenerationEvent>, request: &GenerationBatchRequest) {
     for (index, case) in request.cases.iter().enumerate() {
         try_emit_terminal(
@@ -3459,13 +4711,51 @@ fn native_decode_error(context: &str, error: impl std::fmt::Display) -> NativeEr
 mod tests {
     use super::*;
     use llama_native_types::EmbeddingInput;
+    use std::sync::atomic::AtomicU64;
 
-    const LLAMA_CPP_BINDING_REV: &str = "a74dbb79f96e0ebad8b0737ee1d3c9c1deb185af";
+    type TestSealFixture = (
+        GenerationBatchRequest,
+        ModelFingerprint,
+        Vec<GenerationOutput>,
+        Vec<Option<i32>>,
+        Vec<GenerationEvent>,
+        Vec<String>,
+    );
+
+    static TEST_ARTIFACT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestArtifactDirectory {
+        path: std::path::PathBuf,
+    }
+
+    impl TestArtifactDirectory {
+        fn new(label: &str) -> Self {
+            loop {
+                let sequence = TEST_ARTIFACT_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+                let path =
+                    std::env::temp_dir().join(format!("llama-native-engine-{label}-{sequence}"));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self { path },
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("unique artifact test directory is created: {error}"),
+                }
+            }
+        }
+
+        fn join(&self, name: &str) -> std::path::PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for TestArtifactDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn test_model_fingerprint(model_id: &str) -> ModelFingerprint {
         ModelFingerprint {
             model_id: model_id.to_string(),
-            model_path: PathBuf::from("model.gguf"),
             model_size: 1,
             model_sha256: "a".repeat(64),
             tokenizer_sha256: "b".repeat(64),
@@ -3493,8 +4783,191 @@ mod tests {
         .expect("valid embedding request")
     }
 
+    fn seal_fixture() -> TestSealFixture {
+        let cases = [
+            ("case-a", vec![1, 2, 3], 17, "alpha"),
+            ("case-b", vec![1, 2, 4], 18, "beta"),
+        ];
+        let request = GenerationBatchRequest {
+            request_id: "verified-request".to_string(),
+            model_id: "model".to_string(),
+            cases: cases
+                .iter()
+                .map(|(case_id, prompt_tokens, seed, _)| GenerationCase {
+                    case_id: (*case_id).to_string(),
+                    input: GenerationInput::Completion {
+                        prompts: vec![CompletionPrompt::Tokens {
+                            token_ids: prompt_tokens.clone(),
+                        }],
+                    },
+                    sampling: SamplingConfig {
+                        seed: *seed,
+                        max_tokens: 4,
+                        ..SamplingConfig::default()
+                    },
+                    cached_prefix: None,
+                })
+                .collect(),
+        };
+        let outputs = cases
+            .iter()
+            .enumerate()
+            .map(
+                |(index, (case_id, prompt_tokens, _, text))| GenerationOutput {
+                    request_id: request.request_id.clone(),
+                    branch_id: (*case_id).to_string(),
+                    input_index: index,
+                    model_id: request.model_id.clone(),
+                    text: (*text).to_string(),
+                    generated_token_ids: vec![100 + index as i32],
+                    token_observations: None,
+                    state: GenerationState::Completed,
+                    finish_reason: "end_of_generation".to_string(),
+                    metrics: GenerationMetrics {
+                        prompt_tokens: prompt_tokens.len(),
+                        completion_tokens: 1,
+                        shared_prefix_tokens: 2,
+                        duration_ms: 1,
+                        first_token_ms: Some(1),
+                        tokens_per_second: 1_000.0,
+                        cache: GenerationCacheMetrics {
+                            supplied_prefix_tokens: 0,
+                            restored_prefix_tokens: 0,
+                            batch_shared_prefix_tokens: 2,
+                        },
+                    },
+                    real_engine_invoked: true,
+                    fake_fixture: false,
+                    transport: NativeTransport::InProcess,
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for (index, (case_id, ..)) in cases.iter().enumerate() {
+            events.push(GenerationEvent {
+                request_id: request.request_id.clone(),
+                branch_id: (*case_id).to_string(),
+                sequence_id: index as i32,
+                input_index: index,
+                event_index: 0,
+                event: GenerationEventKind::State {
+                    state: GenerationState::Prefilling,
+                },
+            });
+        }
+        for (index, (case_id, ..)) in cases.iter().enumerate() {
+            events.push(GenerationEvent {
+                request_id: request.request_id.clone(),
+                branch_id: (*case_id).to_string(),
+                sequence_id: index as i32,
+                input_index: index,
+                event_index: 1,
+                event: GenerationEventKind::State {
+                    state: GenerationState::Generating,
+                },
+            });
+        }
+        for (index, (case_id, _, _, text)) in cases.iter().enumerate() {
+            events.push(GenerationEvent {
+                request_id: request.request_id.clone(),
+                branch_id: (*case_id).to_string(),
+                sequence_id: index as i32,
+                input_index: index,
+                event_index: 2,
+                event: GenerationEventKind::Delta {
+                    text: (*text).to_string(),
+                },
+            });
+        }
+        for (index, (case_id, ..)) in cases.iter().enumerate() {
+            events.push(GenerationEvent {
+                request_id: request.request_id.clone(),
+                branch_id: (*case_id).to_string(),
+                sequence_id: index as i32,
+                input_index: index,
+                event_index: 3,
+                event: GenerationEventKind::State {
+                    state: GenerationState::Completed,
+                },
+            });
+        }
+        (
+            request,
+            test_model_fingerprint("model"),
+            outputs,
+            vec![Some(900), Some(901)],
+            events,
+            vec!["alpha".to_string(), "beta".to_string()],
+        )
+    }
+
+    fn is_test_eog_token(token_id: i32) -> bool {
+        matches!(token_id, 900 | 901)
+    }
+
+    fn test_verified_generation() -> VerifiedGenerationBatch {
+        let (request, model_fingerprint, outputs, terminal_sampled_token_ids, events, decoded) =
+            seal_fixture();
+        validate_verified_generation_batch(
+            &request,
+            &model_fingerprint,
+            &outputs,
+            &terminal_sampled_token_ids,
+            &events,
+            &decoded,
+            is_test_eog_token,
+        )
+        .expect("test authority fixture must satisfy live invariants");
+        VerifiedGenerationBatch {
+            request,
+            model_fingerprint,
+            outputs,
+            terminal_sampled_token_ids,
+            events,
+        }
+    }
+
+    fn verified_completion(verified: VerifiedGenerationBatch) -> GenerationCompletion {
+        let VerifiedGenerationBatch {
+            request,
+            model_fingerprint,
+            outputs,
+            terminal_sampled_token_ids,
+            events,
+        } = verified;
+        GenerationCompletion::verified(
+            outputs,
+            VerifiedGenerationEvidence {
+                request,
+                model_fingerprint,
+                terminal_sampled_token_ids,
+                events,
+            },
+        )
+    }
+
+    fn completed_generation_ticket(completion: GenerationCompletion) -> GenerationTicket {
+        let (result_tx, result_rx) = bounded(1);
+        result_tx
+            .send(Ok(completion))
+            .expect("test result receiver remains live");
+        let (_event_tx, event_rx) = bounded(EVENT_CAPACITY);
+        GenerationTicket {
+            request_id: "verified-request".to_string(),
+            events: event_rx,
+            result: result_rx,
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
+            reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
     #[test]
-    fn reported_binding_identity_matches_the_exact_manifest_and_lock_pin() {
+    fn reported_binding_identity_matches_the_private_recipe_and_lock_pin() {
+        assert_eq!(
+            LLAMA_CPP_BINDING_REV,
+            "01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f"
+        );
+        assert_eq!(LLAMA_CPP_REV, "5f55650a78f92aff4d48d671423e888fac0469ff");
         let manifest = include_str!("../Cargo.toml");
         let pinned_manifest_lines = |package: &str| {
             let prefix = format!("{package} = {{ version = \"={LLAMA_CPP_BINDING_VERSION}\"");
@@ -3507,6 +4980,22 @@ mod tests {
         };
         assert_eq!(pinned_manifest_lines("llama-cpp-2"), 2);
         assert_eq!(pinned_manifest_lines("llama-cpp-sys-2"), 1);
+        assert_eq!(
+            manifest
+                .lines()
+                .filter(|line| line.starts_with("llama-cpp-2 = "))
+                .filter(|line| line.contains("features = [\"sampler\", \"mtmd\"]"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            manifest
+                .lines()
+                .filter(|line| line.starts_with("llama-cpp-2 = "))
+                .filter(|line| { line.contains("features = [\"sampler\", \"mtmd\", \"metal\"]") })
+                .count(),
+            1
+        );
 
         let lock = include_str!("../../../Cargo.lock");
         let locked_source_suffix =
@@ -3524,6 +5013,31 @@ mod tests {
             assert!(block.contains("source = \"git+"));
             assert!(block.contains(&locked_source_suffix));
         }
+
+        let private_build_digest = LLAMA_NATIVE_BUILD_MANIFEST_SHA256;
+        assert_eq!(private_build_digest.len(), 64);
+        assert!(
+            private_build_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+
+        let cpu_build = native_build_id_from_private_digest(private_build_digest, "cpu");
+        assert_eq!(
+            cpu_build,
+            native_build_id_from_private_digest(private_build_digest, "cpu")
+        );
+        assert_ne!(
+            cpu_build,
+            native_build_id_from_private_digest(private_build_digest, "metal")
+        );
+        assert_ne!(
+            cpu_build,
+            native_build_id_from_private_digest(&"c".repeat(64), "cpu")
+        );
+        assert!(cpu_build.starts_with("llama-native-build-v3-"));
+        assert_eq!(cpu_build.len(), "llama-native-build-v3-".len() + 64);
+        assert_eq!(native_build_id("cpu"), cpu_build);
     }
 
     fn reviewed_embedding_binding_surface(context: &LlamaContext<'_>) {
@@ -3558,6 +5072,767 @@ mod tests {
                 .code,
             NativeErrorCode::UnsupportedParameter
         );
+    }
+
+    #[test]
+    fn verified_batch_invariants_bind_request_model_outputs_tokens_text_and_events() {
+        let (request, fingerprint, outputs, terminal_ids, events, decoded) = seal_fixture();
+        validate_verified_generation_batch(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+            is_test_eog_token,
+        )
+        .expect("coherent owner-worker evidence verifies");
+
+        let expected_outputs = outputs.clone();
+        let verified = VerifiedGenerationBatch {
+            request,
+            model_fingerprint: fingerprint,
+            outputs,
+            terminal_sampled_token_ids: terminal_ids,
+            events,
+        };
+        assert_eq!(verified.request().request_id, "verified-request");
+        assert_eq!(verified.model_fingerprint().model_id, "model");
+        assert_eq!(verified.outputs(), expected_outputs);
+        assert_eq!(
+            verified.terminal_sampled_token_ids(),
+            [Some(900), Some(901)]
+        );
+        assert_eq!(verified.events().len(), 8);
+        assert_eq!(
+            verified_completion(verified).into_outputs(),
+            expected_outputs,
+            "legacy consumption must preserve the exact baseline outputs"
+        );
+    }
+
+    #[test]
+    fn verified_batch_debug_redacts_prompts_outputs_stops_tokens_and_events() {
+        let mut verified = test_verified_generation();
+        verified.request.request_id = "safe-request-id".to_string();
+        verified.request.cases[0].sampling.stop = vec!["PRIVATE_STOP_SENTINEL".to_string()];
+        verified.request.cases[0].input = GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Tokens {
+                token_ids: vec![2_147_483_001],
+            }],
+        };
+        verified.outputs[0].text = "PRIVATE_PROSE_SENTINEL".to_string();
+        verified.events[2].event = GenerationEventKind::Delta {
+            text: "PRIVATE_EVENT_SENTINEL".to_string(),
+        };
+
+        let debug = format!("{verified:?}");
+        assert!(debug.contains("safe-request-id"));
+        assert!(debug.contains("model_sha256"));
+        for secret in [
+            "PRIVATE_STOP_SENTINEL",
+            "2147483001",
+            "PRIVATE_PROSE_SENTINEL",
+            "PRIVATE_EVENT_SENTINEL",
+            "alpha",
+            "beta",
+        ] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn verified_batch_rejects_every_tampered_trust_dimension() {
+        let assert_rejected = |request: &GenerationBatchRequest,
+                               fingerprint: &ModelFingerprint,
+                               outputs: &[GenerationOutput],
+                               terminal_ids: &[Option<i32>],
+                               events: &[GenerationEvent],
+                               decoded: &[String]| {
+            let error = validate_verified_generation_batch(
+                request,
+                fingerprint,
+                outputs,
+                terminal_ids,
+                events,
+                decoded,
+                is_test_eog_token,
+            )
+            .expect_err("tampered evidence must not mint authority");
+            assert_eq!(error.code, NativeErrorCode::Internal);
+        };
+
+        let (request, mut fingerprint, outputs, terminal_ids, events, decoded) = seal_fixture();
+        fingerprint.model_id = "other-model".to_string();
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (mut request, fingerprint, outputs, terminal_ids, events, decoded) = seal_fixture();
+        request.cases[0].input = GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Text {
+                text: "caller text".to_string(),
+                special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+            }],
+        };
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, mut outputs, terminal_ids, events, decoded) = seal_fixture();
+        outputs.swap(0, 1);
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, mut outputs, terminal_ids, events, decoded) = seal_fixture();
+        outputs[0].real_engine_invoked = false;
+        outputs[0].fake_fixture = true;
+        outputs[0].transport = NativeTransport::FakeFixture;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, mut outputs, terminal_ids, events, decoded) = seal_fixture();
+        outputs[0].generated_token_ids.push(999);
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, outputs, terminal_ids, events, mut decoded) = seal_fixture();
+        decoded[0] = "tampered-token-decoding".to_string();
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, mut outputs, terminal_ids, events, decoded) = seal_fixture();
+        outputs[0].text = "different prose".to_string();
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, outputs, terminal_ids, mut events, decoded) = seal_fixture();
+        events[4].request_id = "wrong-request".to_string();
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, outputs, terminal_ids, mut events, decoded) = seal_fixture();
+        events[4].branch_id = "wrong-case".to_string();
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, outputs, terminal_ids, mut events, decoded) = seal_fixture();
+        events[4].sequence_id = 1;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, outputs, terminal_ids, mut events, decoded) = seal_fixture();
+        events[4].input_index = 99;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, outputs, terminal_ids, mut events, decoded) = seal_fixture();
+        events[4].event_index = 9;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, outputs, terminal_ids, mut events, decoded) = seal_fixture();
+        events.pop();
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, outputs, terminal_ids, mut events, decoded) = seal_fixture();
+        events.push(events[6].clone());
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, mut outputs, terminal_ids, mut events, decoded) = seal_fixture();
+        outputs[0].state = GenerationState::Failed;
+        events[6].event = GenerationEventKind::State {
+            state: GenerationState::Failed,
+        };
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, outputs, mut terminal_ids, events, decoded) = seal_fixture();
+        terminal_ids[0] = None;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, outputs, mut terminal_ids, events, decoded) = seal_fixture();
+        terminal_ids[0] = Some(123);
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, outputs, mut terminal_ids, events, decoded) = seal_fixture();
+        terminal_ids.pop();
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, mut outputs, terminal_ids, events, decoded) = seal_fixture();
+        outputs[0].generated_token_ids[0] = 900;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, mut outputs, terminal_ids, events, decoded) = seal_fixture();
+        outputs[0].metrics.prompt_tokens += 1;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, mut outputs, terminal_ids, events, decoded) = seal_fixture();
+        outputs[0].metrics.shared_prefix_tokens += 1;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, mut outputs, terminal_ids, events, decoded) = seal_fixture();
+        outputs[0].metrics.cache.restored_prefix_tokens = 1;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, mut outputs, terminal_ids, events, decoded) = seal_fixture();
+        outputs[0].metrics.cache.supplied_prefix_tokens = 1;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (request, fingerprint, mut outputs, terminal_ids, events, decoded) = seal_fixture();
+        outputs[0].metrics.cache.batch_shared_prefix_tokens += 1;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (mut request, fingerprint, outputs, terminal_ids, events, decoded) = seal_fixture();
+        request.cases[0].sampling.max_tokens = 0;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (mut request, fingerprint, outputs, terminal_ids, events, decoded) = seal_fixture();
+        request.cases[0].sampling.seed = u32::MAX;
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+
+        let (mut request, fingerprint, outputs, terminal_ids, events, decoded) = seal_fixture();
+        request.cases[0].cached_prefix = Some(SequenceStateBlob {
+            sequence_id: 0,
+            token_count: 1,
+            bytes: vec![1, 2, 3],
+            token_ids: vec![1],
+        });
+        assert_rejected(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+        );
+    }
+
+    #[test]
+    fn verified_batch_requires_exact_stop_suffix_and_published_projection() {
+        let (mut request, fingerprint, mut outputs, mut terminal_ids, mut events, mut decoded) =
+            seal_fixture();
+        request.cases[0].sampling.stop = vec!["<stop>".to_string()];
+        outputs[0].finish_reason = "stop_sequence".to_string();
+        terminal_ids[0] = None;
+        decoded[0] = "alpha<stop>".to_string();
+        events[4].event = GenerationEventKind::Delta {
+            text: decoded[0].clone(),
+        };
+        validate_verified_generation_batch(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+            is_test_eog_token,
+        )
+        .expect("an exact removed stop suffix is a coherent output projection");
+
+        request.cases[0].sampling.stop = vec!["different".to_string()];
+        let error = validate_verified_generation_batch(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+            is_test_eog_token,
+        )
+        .expect_err("a claimed stop projection without its configured suffix must fail");
+        assert_eq!(error.code, NativeErrorCode::Internal);
+    }
+
+    #[test]
+    fn verified_terminal_sample_evidence_matches_each_non_eog_terminal() {
+        let (mut request, fingerprint, mut outputs, mut terminal_ids, events, decoded) =
+            seal_fixture();
+        request.cases[0].sampling.max_tokens = 1;
+        outputs[0].finish_reason = "max_tokens".to_string();
+        terminal_ids[0] = None;
+        validate_verified_generation_batch(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+            is_test_eog_token,
+        )
+        .expect("max-token termination has no separately sampled EOG token");
+
+        let (request, fingerprint, mut outputs, mut terminal_ids, mut events, decoded) =
+            seal_fixture();
+        outputs[0].state = GenerationState::Cancelled;
+        outputs[0].finish_reason = "cancelled".to_string();
+        terminal_ids[0] = None;
+        events[6].event = GenerationEventKind::State {
+            state: GenerationState::Cancelled,
+        };
+        validate_verified_generation_batch(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+            is_test_eog_token,
+        )
+        .expect("cancelled termination has no separately sampled EOG token");
+    }
+
+    #[test]
+    fn strict_seal_utf8_accepts_split_codepoints_and_rejects_incomplete_or_malformed_bytes() {
+        let split_euro = vec![vec![0xe2], vec![0x82], vec![0xac]];
+        assert_eq!(
+            strict_verified_utf8(&split_euro).expect("split token pieces form canonical UTF-8"),
+            "€"
+        );
+
+        let incomplete = vec![vec![0xe2], vec![0x82]];
+        assert_eq!(
+            strict_verified_utf8(&incomplete)
+                .expect_err("an incomplete final codepoint cannot receive authority")
+                .code,
+            NativeErrorCode::Internal
+        );
+
+        let malformed = vec![vec![b'a'], vec![0xff], vec![b'b']];
+        assert_eq!(
+            strict_verified_utf8(&malformed)
+                .expect_err("malformed token bytes cannot receive authority")
+                .code,
+            NativeErrorCode::Internal
+        );
+    }
+
+    #[test]
+    fn generated_output_byte_accounting_accepts_the_ceiling_and_rejects_overflow() {
+        assert_eq!(
+            checked_generated_output_len(MAX_GENERATED_OUTPUT_BYTES - 3, 3)
+                .expect("exact byte ceiling is admissible"),
+            MAX_GENERATED_OUTPUT_BYTES
+        );
+        assert_eq!(
+            checked_generated_output_len(MAX_GENERATED_OUTPUT_BYTES, 1)
+                .expect_err("one byte over the ceiling must fail")
+                .code,
+            NativeErrorCode::MemoryBudgetExceeded
+        );
+        assert_eq!(
+            checked_generated_output_len(usize::MAX, 1)
+                .expect_err("host integer overflow must fail")
+                .code,
+            NativeErrorCode::MemoryBudgetExceeded
+        );
+    }
+
+    #[test]
+    fn only_exact_token_generate_batch_results_can_yield_a_seal() {
+        let (request, _, outputs, _, _, _) = seal_fixture();
+        assert!(is_exact_token_generation_batch(&request));
+        assert!(is_sealable_generation_batch(
+            &request,
+            GenerationBatchAdmission::ExactBatch,
+            false
+        ));
+        assert!(
+            !is_sealable_generation_batch(&request, GenerationBatchAdmission::ExactBatch, true),
+            "out-of-band reasoning intervention is not bound by the request and must remove authority"
+        );
+        assert!(
+            !is_sealable_generation_batch(&request, GenerationBatchAdmission::Compatibility, false),
+            "the compatibility wrapper must not mint exact batch authority"
+        );
+
+        let non_exact_inputs = [
+            GenerationInput::Chat {
+                messages: vec![ChatMessage {
+                    role: ChatRole::User,
+                    content: "not exact tokens".to_string(),
+                }],
+                template: ChatTemplateChoice::ModelDefault,
+            },
+            GenerationInput::Completion {
+                prompts: vec![CompletionPrompt::Text {
+                    text: "not exact tokens".to_string(),
+                    special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+                }],
+            },
+            GenerationInput::FillInMiddle {
+                prefix: "prefix".to_string(),
+                suffix: "suffix".to_string(),
+            },
+        ];
+        for input in non_exact_inputs {
+            let mut non_exact = request.clone();
+            non_exact.cases[0].input = input;
+            assert!(!is_exact_token_generation_batch(&non_exact));
+        }
+
+        let mut cached = request.clone();
+        cached.cases[0].cached_prefix = Some(SequenceStateBlob {
+            sequence_id: 77,
+            token_count: 1,
+            bytes: vec![0xde, 0xad, 0xbe, 0xef],
+            token_ids: vec![1],
+        });
+        assert!(is_exact_token_generation_batch(&cached));
+        assert!(
+            !is_statically_sealable_generation_batch(&cached, GenerationBatchAdmission::ExactBatch),
+            "publicly relabelable KV bytes must never enter strict authority"
+        );
+
+        let mut default_seed = request.clone();
+        default_seed.cases[0].sampling.seed = u32::MAX;
+        assert!(
+            !is_statically_sealable_generation_batch(
+                &default_seed,
+                GenerationBatchAdmission::ExactBatch
+            ),
+            "llama.cpp's randomized default-seed sentinel is not an exact treatment"
+        );
+
+        let error = GenerationCompletion::unverified(outputs.clone())
+            .into_verified()
+            .expect_err("compatibility, shared-prefix, and multimodal results stay unverified");
+        assert_eq!(error.code, NativeErrorCode::UnsupportedParameter);
+        assert_eq!(
+            GenerationCompletion::unverified(outputs.clone()).into_outputs(),
+            outputs,
+            "strict seal rejection must not change legacy cached-result delivery"
+        );
+    }
+
+    #[test]
+    fn statically_ineligible_legacy_batches_stream_without_internal_ledger_retention() {
+        let (request, _, _, _, events, _) = seal_fixture();
+        let statically_sealable = is_statically_sealable_generation_batch(
+            &request,
+            GenerationBatchAdmission::Compatibility,
+        );
+        assert!(!statically_sealable);
+        let mut retained_events = statically_sealable.then(Vec::new);
+        let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
+        let cancellations = [Arc::new(AtomicBool::new(false))];
+        let reasoning_forces = [Arc::new(AtomicBool::new(false))];
+        let mut unrecorded_control_used = false;
+        let expected = events[0].clone();
+        BatchSupervision {
+            event_tx: &event_tx,
+            retained_events: retained_events.as_mut(),
+            unrecorded_control_used: statically_sealable.then_some(&mut unrecorded_control_used),
+            cancellations: &cancellations,
+            reasoning_forces: &reasoning_forces,
+        }
+        .emit(expected.clone());
+
+        assert!(retained_events.is_none());
+        assert!(!unrecorded_control_used);
+        assert_eq!(
+            event_rx.try_recv().expect("legacy event remains visible"),
+            expected
+        );
+    }
+
+    #[test]
+    fn failed_strict_precheck_does_not_allocate_an_authority_ledger() {
+        let failure: NativeResult<()> = Err(NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            "strict artifact binding unavailable",
+        ));
+        assert!(should_retain_authority_evidence(true, &Ok(())));
+        assert!(!should_retain_authority_evidence(true, &failure));
+        assert!(!should_retain_authority_evidence(false, &Ok(())));
+        let retained_events =
+            should_retain_authority_evidence(true, &failure).then(Vec::<GenerationEvent>::new);
+        assert!(retained_events.is_none());
+    }
+
+    #[test]
+    fn verified_wait_variants_return_authority_while_legacy_wait_discards_it() {
+        let ticket = completed_generation_ticket(verified_completion(test_verified_generation()));
+        let verified = ticket
+            .wait_verified()
+            .expect("blocking verified wait returns the opaque seal");
+        assert_eq!(verified.request().request_id, "verified-request");
+
+        let ticket = completed_generation_ticket(verified_completion(test_verified_generation()));
+        let verified = ticket
+            .wait_verified_timeout(Duration::from_millis(1))
+            .expect("timed verified wait returns the opaque seal");
+        assert_eq!(verified.outputs().len(), 2);
+
+        let ticket = completed_generation_ticket(verified_completion(test_verified_generation()));
+        let verified = ticket
+            .try_wait_verified()
+            .expect("nonblocking verified wait is typed")
+            .expect("completed result is ready");
+        assert_eq!(verified.events().len(), 8);
+
+        let ticket = completed_generation_ticket(verified_completion(test_verified_generation()));
+        let outputs = ticket
+            .wait()
+            .expect("legacy wait preserves outputs while consuming authority");
+        assert_eq!(outputs.len(), 2);
+
+        let (_, _, outputs, _, _, _) = seal_fixture();
+        let ticket = completed_generation_ticket(GenerationCompletion::unverified(outputs));
+        let error = ticket
+            .wait_verified()
+            .expect_err("unverified paths cannot satisfy a verified wait");
+        assert_eq!(error.code, NativeErrorCode::UnsupportedParameter);
+    }
+
+    #[test]
+    fn strict_authority_failures_never_poison_legacy_output_delivery() {
+        let failures = [
+            (
+                NativeErrorCode::ModelInvalid,
+                "strict artifact precheck failed",
+            ),
+            (NativeErrorCode::Internal, "strict UTF-8 validation failed"),
+            (
+                NativeErrorCode::ModelInvalid,
+                "strict artifact postcheck failed",
+            ),
+            (
+                NativeErrorCode::Internal,
+                "strict authority mint validation failed",
+            ),
+        ];
+
+        for (code, message) in failures {
+            let (_, _, outputs, _, _, _) = seal_fixture();
+            let expected = outputs.clone();
+            let legacy = completed_generation_ticket(GenerationCompletion::authority_rejected(
+                outputs,
+                NativeError::new(code, message),
+            ));
+            assert_eq!(
+                legacy
+                    .wait()
+                    .expect("authority rejection must not poison legacy output"),
+                expected
+            );
+
+            let (_, _, outputs, _, _, _) = seal_fixture();
+            let strict = completed_generation_ticket(GenerationCompletion::authority_rejected(
+                outputs,
+                NativeError::new(code, message),
+            ));
+            let error = strict
+                .wait_verified()
+                .expect_err("verified wait must preserve the exact authority failure");
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn dropped_external_nonterminals_do_not_change_the_retained_seal_ledger() {
+        let (request, fingerprint, outputs, terminal_ids, expected_events, decoded) =
+            seal_fixture();
+        let (event_tx, event_rx) = bounded(1);
+        let cancellations = (0..request.cases.len())
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect::<Vec<_>>();
+        let reasoning_forces = (0..request.cases.len())
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect::<Vec<_>>();
+        let mut retained_events = Vec::new();
+        {
+            let mut supervision = BatchSupervision {
+                event_tx: &event_tx,
+                retained_events: Some(&mut retained_events),
+                unrecorded_control_used: None,
+                cancellations: &cancellations,
+                reasoning_forces: &reasoning_forces,
+            };
+            for event in expected_events.iter().cloned() {
+                supervision.emit(event);
+            }
+        }
+        assert_eq!(event_rx.try_iter().count(), 1);
+        assert_eq!(retained_events, expected_events);
+        validate_verified_generation_batch(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &retained_events,
+            &decoded,
+            is_test_eog_token,
+        )
+        .expect("external backpressure cannot weaken retained authority");
     }
 
     #[test]
@@ -3653,6 +5928,7 @@ mod tests {
         let request = embedding_request("other-model", vec![1]);
         let ready = ResidentModelStatus {
             model_id: "model".to_string(),
+            model_path: PathBuf::from("model.gguf"),
             state: ModelRuntimeState::Ready,
             fingerprint: Some(test_model_fingerprint("model")),
             descriptor: None,
@@ -3772,6 +6048,143 @@ mod tests {
         assert_eq!(error.code, NativeErrorCode::ModelMissing);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_preserves_legacy_load_but_refuses_strict_artifact_authority() {
+        let directory = TestArtifactDirectory::new("windows-legacy-only");
+        let configured_path = directory.join("model.gguf");
+        std::fs::write(&configured_path, b"model").expect("write model artifact");
+        let guard = ModelArtifactGuard::open(&configured_path, "model", None)
+            .expect("Windows deny-sharing still supports legacy model loading");
+        assert_eq!(guard.load_path, configured_path);
+        let error = guard
+            .verify_strict_unchanged()
+            .expect_err("Windows lacks a reviewed handle-derived reopen identity");
+        assert_eq!(error.code, NativeErrorCode::ModelInvalid);
+        assert!(
+            error
+                .message
+                .contains("cannot support strict generation authority")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_artifact_handle_defeats_path_rename_swap_and_invalidates_strict_authority() {
+        let directory = TestArtifactDirectory::new("path-swap");
+        let configured_path = directory.join("model.gguf");
+        let displaced_path = directory.join("original.gguf");
+        let replacement_path = directory.join("replacement.gguf");
+        std::fs::write(&configured_path, b"model-a").expect("write original artifact");
+        std::fs::write(&replacement_path, b"model-b").expect("write replacement artifact");
+
+        let guard = ModelArtifactGuard::open(&configured_path, "model", None)
+            .expect("regular local files support a pinned guarded open");
+        guard
+            .verify_strict_unchanged()
+            .expect("unchanged held artifact verifies");
+        assert_ne!(guard.load_path, configured_path);
+
+        std::fs::rename(&configured_path, &displaced_path).expect("rename held inode away");
+        std::fs::rename(&replacement_path, &configured_path).expect("replace configured path");
+
+        assert_eq!(
+            std::fs::read(&guard.load_path).expect("pinned descriptor path remains readable"),
+            b"model-a",
+            "llama.cpp's pinned reopen path must still name the originally opened inode"
+        );
+        let error = guard
+            .verify_strict_unchanged()
+            .expect_err("a configured-path identity swap must revoke strict authority");
+        assert_eq!(error.code, NativeErrorCode::ModelInvalid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_artifact_metadata_detects_same_inode_in_place_mutation() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        let directory = TestArtifactDirectory::new("in-place-change");
+        let configured_path = directory.join("model.gguf");
+        std::fs::write(&configured_path, b"alpha").expect("write original artifact");
+        let guard = ModelArtifactGuard::open(&configured_path, "model", None)
+            .expect("regular local files support a pinned guarded open");
+        let payload_bytes_read = guard.payload_bytes_read();
+
+        // Unix flock is intentionally advisory. This writer does not cooperate,
+        // demonstrating that immutable identity/mutation metadata, not the lock
+        // alone, closes the ordinary same-user mutation path.
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&configured_path)
+            .expect("an uncooperative same-user writer can ignore advisory flock");
+        writer
+            .seek(SeekFrom::Start(0))
+            .expect("seek mutable test file");
+        writer
+            .write_all(b"omega")
+            .expect("mutate bytes without changing file length");
+        writer.sync_all().expect("flush mutation");
+
+        let error = guard
+            .verify_strict_unchanged()
+            .expect_err("same-inode content mutation must revoke strict authority");
+        assert_eq!(error.code, NativeErrorCode::ModelInvalid);
+        assert_eq!(guard.payload_bytes_read(), payload_bytes_read);
+    }
+
+    #[test]
+    fn strict_pre_post_artifact_checks_read_no_payload_after_initial_hash() {
+        let directory = TestArtifactDirectory::new("metadata-only-verification");
+        let configured_path = directory.join("model.gguf");
+        std::fs::write(&configured_path, b"immutable model bytes").expect("write artifact");
+        let guard = ModelArtifactGuard::open(&configured_path, "model", None)
+            .expect("regular local files support guarded verification");
+        let after_initial_hash = guard.payload_bytes_read();
+        assert_eq!(after_initial_hash, 21);
+
+        guard
+            .verify_strict_unchanged()
+            .expect("strict precheck accepts unchanged metadata");
+        guard
+            .verify_strict_unchanged()
+            .expect("strict postcheck accepts unchanged metadata");
+        assert_eq!(
+            guard.payload_bytes_read(),
+            after_initial_hash,
+            "strict generation-bound checks must not reread model payload bytes"
+        );
+    }
+
+    #[test]
+    fn caller_expected_artifact_hash_fails_before_model_load() {
+        let directory = TestArtifactDirectory::new("expected-hash");
+        let configured_path = directory.join("model.gguf");
+        std::fs::write(&configured_path, b"artifact").expect("write artifact");
+        let wrong_sha256 = "0".repeat(64);
+        let error = ModelArtifactGuard::open(&configured_path, "model", Some(&wrong_sha256))
+            .expect_err("trusted expected digest must reject different bytes");
+        assert_eq!(error.code, NativeErrorCode::ModelInvalid);
+        assert!(error.message.contains("expected"));
+    }
+
+    #[test]
+    fn expected_artifact_hash_configuration_is_canonical_and_projector_scoped() {
+        let directory = TestArtifactDirectory::new("hash-config");
+        let configured_path = directory.join("model.gguf");
+        std::fs::write(&configured_path, b"artifact").expect("write artifact");
+        let mut config = NativeModelConfig::local(configured_path);
+        config.expected_model_sha256 = Some("A".repeat(64));
+        let error = validate_config(&config).expect_err("uppercase digest is noncanonical");
+        assert_eq!(error.code, NativeErrorCode::InvalidConfig);
+
+        config.expected_model_sha256 = Some("a".repeat(64));
+        config.expected_mmproj_sha256 = Some("b".repeat(64));
+        let error = validate_config(&config)
+            .expect_err("a projector digest without a projector path is ambiguous");
+        assert_eq!(error.code, NativeErrorCode::InvalidConfig);
+    }
+
     #[test]
     fn reasoning_force_only_targets_an_unclosed_reasoning_block() {
         assert_eq!(active_reasoning_end_marker("plain answer"), None);
@@ -3821,6 +6234,7 @@ mod tests {
     fn test_status(max_sequences: u32) -> ResidentModelStatus {
         ResidentModelStatus {
             model_id: "model".to_string(),
+            model_path: PathBuf::from("model.gguf"),
             state: ModelRuntimeState::Ready,
             fingerprint: None,
             descriptor: None,
@@ -3861,6 +6275,118 @@ mod tests {
         let error = validate_generation_batch_request(&duplicate, &test_status(2))
             .expect_err("duplicate case identities must fail");
         assert_eq!(error.code, NativeErrorCode::InvalidConfig);
+    }
+
+    #[test]
+    fn exact_token_preflight_accounts_for_the_whole_batch_at_the_context_boundary() {
+        let mut first = completion_case("first", 1);
+        first.sampling.max_tokens = 6;
+        let mut second = completion_case("second", 2);
+        second.sampling.max_tokens = 6;
+        let request = GenerationBatchRequest {
+            request_id: "request".to_string(),
+            model_id: "model".to_string(),
+            cases: vec![first, second],
+        };
+        let budget = exact_token_batch_cell_budget(&request).expect("exact-token budget");
+        assert_eq!(budget.required_cells(), 14);
+        for case in &request.cases {
+            let one_case = GenerationBatchRequest {
+                request_id: "single".to_string(),
+                model_id: request.model_id.clone(),
+                cases: vec![case.clone()],
+            };
+            assert_eq!(
+                exact_token_batch_cell_budget(&one_case)
+                    .expect("one-case budget")
+                    .required_cells(),
+                8
+            );
+        }
+
+        let mut fingerprint = test_model_fingerprint("model");
+        fingerprint.context_tokens = 13;
+        let mut status = test_status(2);
+        status.fingerprint = Some(fingerprint.clone());
+        let error = exact_token_budget_for_submission(&request, &status)
+            .expect_err("aggregate batch must not pass on per-case admission");
+        assert_eq!(error.code, NativeErrorCode::PromptTooLarge);
+        assert!(error.message.contains("requires 14 KV cells"));
+
+        fingerprint.context_tokens = 14;
+        status.fingerprint = Some(fingerprint);
+        assert_eq!(
+            exact_token_budget_for_submission(&request, &status)
+                .expect("exact boundary fits")
+                .expect("exact-token request")
+                .required_cells(),
+            14
+        );
+    }
+
+    #[test]
+    fn public_exact_token_budget_matches_execution_prefix_and_cell_values() {
+        let mut first = completion_case("first", 1);
+        first.sampling.max_tokens = 1;
+        let mut second = completion_case("second", 2);
+        second.input = GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Tokens {
+                token_ids: vec![1, 2, 4, 5],
+            }],
+        };
+        second.sampling.max_tokens = 3;
+        let request = GenerationBatchRequest {
+            request_id: "request".to_string(),
+            model_id: "model".to_string(),
+            cases: vec![first, second],
+        };
+        let budget = exact_token_batch_cell_budget(&request).expect("exact-token budget");
+        let normalized = SharedPrefixBatchRequest {
+            request_id: request.request_id.clone(),
+            model_id: request.model_id.clone(),
+            common_messages: Vec::new(),
+            chat_template: ChatTemplateChoice::ModelDefault,
+            branches: request
+                .cases
+                .iter()
+                .map(|case| BranchRequest {
+                    branch_id: case.case_id.clone(),
+                    label: case.case_id.clone(),
+                    instruction: String::new(),
+                    sampling: case.sampling.clone(),
+                    messages: Vec::new(),
+                    cached_prefix: None,
+                })
+                .collect(),
+            cached_prefix: None,
+        };
+        let token_sets = request
+            .cases
+            .iter()
+            .map(|case| {
+                exact_generation_case_token_ids(case)
+                    .expect("exact prompt")
+                    .iter()
+                    .copied()
+                    .map(LlamaToken::new)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let cached_states = vec![None, None];
+        let mut prefix_lengths = vec![0, 0];
+        let (shared_prefix, execution_cells) = exact_budget_execution_values(
+            &budget,
+            &normalized,
+            &token_sets,
+            &cached_states,
+            &mut prefix_lengths,
+        )
+        .expect("execution accepts the public preflight budget");
+
+        assert_eq!(shared_prefix, 2);
+        assert_eq!(prefix_lengths, vec![2, 2]);
+        assert_eq!(execution_cells as u64, budget.required_cells());
+        assert_eq!(execution_cells, 7);
     }
 
     #[test]
@@ -4113,7 +6639,7 @@ mod tests {
             assert!(indexes.windows(2).all(|pair| pair[0] < pair[1]));
         }
 
-        let family_ticket = handle.generate_batch(GenerationBatchRequest {
+        let family_request = GenerationBatchRequest {
             request_id: "native-raw-family".to_string(),
             model_id: descriptor.model_id.clone(),
             cases: vec![
@@ -4146,9 +6672,27 @@ mod tests {
                     cached_prefix: None,
                 },
             ],
-        })?;
-        let family_outputs = family_ticket.wait_timeout(Duration::from_secs(120))?;
+        };
+        let family_ticket = handle.generate_batch(family_request.clone())?;
+        let verified = family_ticket.wait_verified_timeout(Duration::from_secs(120))?;
         let family_events = family_ticket.events.try_iter().collect::<Vec<_>>();
+        let family_outputs = verified.outputs();
+        assert_eq!(verified.request(), &family_request);
+        assert_eq!(verified.model_fingerprint().model_id, descriptor.model_id);
+        assert!(verified.events().len() >= family_events.len());
+        assert_eq!(
+            verified.terminal_sampled_token_ids().len(),
+            family_outputs.len()
+        );
+        for (output, terminal_token_id) in family_outputs
+            .iter()
+            .zip(verified.terminal_sampled_token_ids())
+        {
+            assert_eq!(
+                terminal_token_id.is_some(),
+                output.finish_reason == "end_of_generation"
+            );
+        }
         assert_eq!(family_outputs[0].branch_id, "seed-41");
         assert_eq!(family_outputs[1].branch_id, "seed-42");
         assert!(family_outputs.iter().all(|output| {
@@ -4171,6 +6715,166 @@ mod tests {
                 .count();
             assert_eq!(terminals, 1);
         }
+        for case_id in ["seed-41", "seed-42"] {
+            let retained = verified
+                .events()
+                .iter()
+                .filter(|event| event.branch_id == case_id)
+                .collect::<Vec<_>>();
+            assert!(
+                retained
+                    .iter()
+                    .enumerate()
+                    .all(|(index, event)| event.event_index == index as u64)
+            );
+            assert_eq!(
+                retained
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event.event,
+                            GenerationEventKind::State {
+                                state: GenerationState::Completed | GenerationState::Cancelled
+                            }
+                        )
+                    })
+                    .count(),
+                1
+            );
+        }
+
+        let mut legacy_request = family_request;
+        legacy_request.request_id = "native-raw-family-legacy".to_string();
+        let legacy_outputs = handle
+            .generate_batch(legacy_request)?
+            .wait_timeout(Duration::from_secs(120))?;
+        for (sealed, legacy) in family_outputs.iter().zip(&legacy_outputs) {
+            assert_eq!(sealed.branch_id, legacy.branch_id);
+            assert_eq!(sealed.generated_token_ids, legacy.generated_token_ids);
+            assert_eq!(sealed.text, legacy.text);
+            assert_eq!(sealed.state, legacy.state);
+            assert_eq!(sealed.finish_reason, legacy.finish_reason);
+        }
+
+        let default_seed_request = GenerationBatchRequest {
+            request_id: "native-default-seed-strict".to_string(),
+            model_id: descriptor.model_id.clone(),
+            cases: vec![GenerationCase {
+                case_id: "default-seed".to_string(),
+                input: GenerationInput::Completion {
+                    prompts: vec![CompletionPrompt::Tokens {
+                        token_ids: exact_tokens.clone(),
+                    }],
+                },
+                sampling: SamplingConfig {
+                    max_tokens: 1,
+                    ..SamplingConfig::default()
+                },
+                cached_prefix: None,
+            }],
+        };
+        let default_seed_error = handle
+            .generate_batch(default_seed_request.clone())?
+            .wait_verified_timeout(Duration::from_secs(120))
+            .expect_err("llama.cpp's randomized seed sentinel must stay unverified");
+        assert_eq!(
+            default_seed_error.code,
+            NativeErrorCode::UnsupportedParameter
+        );
+        let mut legacy_default_seed_request = default_seed_request;
+        legacy_default_seed_request.request_id = "native-default-seed-legacy".to_string();
+        let legacy_default_seed_outputs = handle
+            .generate_batch(legacy_default_seed_request)?
+            .wait_timeout(Duration::from_secs(120))?;
+        assert_eq!(legacy_default_seed_outputs.len(), 1);
+        assert!(legacy_default_seed_outputs[0].real_engine_invoked);
+
+        assert!(exact_tokens.len() >= 2);
+        let alternate_tokens = handle.prepare_input(GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Text {
+                text: "Unrelated cache source".to_string(),
+                special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+            }],
+        })?[0]
+            .token_ids
+            .clone();
+        let source_token = alternate_tokens
+            .into_iter()
+            .find(|token_id| *token_id != exact_tokens[0])
+            .expect("alternate text must contain a token distinct from the target prefix");
+        let cache_source_request = GenerationBatchRequest {
+            request_id: "native-forged-cache-source".to_string(),
+            model_id: descriptor.model_id.clone(),
+            cases: vec![GenerationCase {
+                case_id: "source".to_string(),
+                input: GenerationInput::Completion {
+                    prompts: vec![CompletionPrompt::Tokens {
+                        token_ids: vec![source_token],
+                    }],
+                },
+                sampling: SamplingConfig {
+                    seed: 73,
+                    temperature: 0.0,
+                    max_tokens: 1,
+                    ..SamplingConfig::default()
+                },
+                cached_prefix: None,
+            }],
+        };
+        handle
+            .generate_batch(cache_source_request)?
+            .wait_timeout(Duration::from_secs(120))?;
+        let mut forged_cache = handle.snapshot_sequence(0)?;
+        assert_eq!(forged_cache.token_count, 1);
+        assert_eq!(forged_cache.token_ids, vec![source_token]);
+        forged_cache.token_ids = vec![exact_tokens[0]];
+
+        let forged_request = GenerationBatchRequest {
+            request_id: "native-forged-cache-strict".to_string(),
+            model_id: descriptor.model_id.clone(),
+            cases: vec![GenerationCase {
+                case_id: "forged".to_string(),
+                input: GenerationInput::Completion {
+                    prompts: vec![CompletionPrompt::Tokens {
+                        token_ids: exact_tokens.clone(),
+                    }],
+                },
+                sampling: SamplingConfig {
+                    seed: 79,
+                    temperature: 0.0,
+                    max_tokens: 2,
+                    ..SamplingConfig::default()
+                },
+                cached_prefix: Some(forged_cache.clone()),
+            }],
+        };
+        let forged_error = handle
+            .generate_batch(forged_request.clone())?
+            .wait_verified_timeout(Duration::from_secs(120))
+            .expect_err("relabelled public cache bytes must stay unverified");
+        assert_eq!(forged_error.code, NativeErrorCode::UnsupportedParameter);
+
+        let mut legacy_forged_request = forged_request;
+        legacy_forged_request.request_id = "native-forged-cache-legacy".to_string();
+        let legacy_forged_outputs = handle
+            .generate_batch(legacy_forged_request)?
+            .wait_timeout(Duration::from_secs(120))?;
+        assert_eq!(legacy_forged_outputs.len(), 1);
+        assert!(legacy_forged_outputs[0].real_engine_invoked);
+        assert_eq!(
+            legacy_forged_outputs[0]
+                .metrics
+                .cache
+                .supplied_prefix_tokens,
+            1
+        );
+        assert_eq!(
+            legacy_forged_outputs[0]
+                .metrics
+                .cache
+                .restored_prefix_tokens,
+            1
+        );
 
         let cancel_ticket = handle.generate(GenerationRequest {
             request_id: "native-completion-cancel".to_string(),
