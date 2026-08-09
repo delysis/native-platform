@@ -15,11 +15,12 @@ use std::time::{Duration, SystemTime};
 use loom_backend_llama::{
     ContinuationCase, DownloadCancellation, DownloadControl, DownloadError,
     ExactContinuationRequest, ExactContinuationResult, GgufDownloadRequest, GgufHeaderStatus,
-    JoinedLlamaRuntime, LlamaBackend, LlamaBackendError, LlamaGenerationHandle, LocalModelProfile,
-    MAX_MODEL_DOWNLOAD_BYTES, ModelDiscoveryOptions, ModelRelease, NativeHostRuntime,
-    ProcessExitJoinedLlamaRuntime, SamplingConfig, Sha256Digest, VerifiedModelDescriptor,
-    discover_gguf_models, download_gguf, model_environment_from_verified,
-    validate_candidate_receipt_binding, validate_gguf_download_request,
+    JoinedLlamaGeneration, JoinedLlamaRuntime, LlamaBackend, LlamaBackendError,
+    LlamaGenerationControl, LlamaGenerationHandle, LocalModelProfile, MAX_MODEL_DOWNLOAD_BYTES,
+    ModelDiscoveryOptions, ModelRelease, NativeHostRuntime, ProcessExitJoinedLlamaRuntime,
+    SamplingConfig, Sha256Digest, VerifiedModelDescriptor, discover_gguf_models, download_gguf,
+    model_environment_from_verified, validate_candidate_receipt_binding,
+    validate_gguf_download_request,
 };
 use loom_document::{DocumentContent, MergeError, MergeOutcome, three_way_merge};
 use loom_host::{
@@ -223,18 +224,40 @@ enum GenerationWorkerSlot {
     Reserved,
     Running {
         worker: JoinHandle<()>,
-        cancellation: Arc<dyn GenerationWorkerCancellation>,
+        owner: GenerationWorkerOwner,
     },
 }
 
-trait GenerationWorkerCancellation: std::fmt::Debug + Send + Sync {
+/// Product builds have exactly one owner kind. The test-only fixture variant
+/// exercises hostile cancellation and nested-worker schedules without adding
+/// an erasable production authority surface.
+#[derive(Debug)]
+enum GenerationWorkerOwner {
+    Llama(LlamaGenerationHandle),
+    #[cfg(test)]
+    Fixture(FixtureGenerationWorkerOwner),
+}
+
+#[cfg(test)]
+trait FixtureGenerationWorkerCancellation: std::fmt::Debug + Send + Sync {
     fn cancel_all(&self);
 }
 
-impl GenerationWorkerCancellation for LlamaGenerationHandle {
-    fn cancel_all(&self) {
-        let _ = LlamaGenerationHandle::cancel_all(self);
-    }
+#[cfg(test)]
+#[derive(Debug)]
+struct FixtureGenerationWorkerOwner {
+    cancellation: Arc<dyn FixtureGenerationWorkerCancellation>,
+    backend_worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+enum GenerationBackendWorkerJoined {
+    Llama(JoinedLlamaGeneration),
+    #[cfg(test)]
+    Fixture {
+        worker_was_present: bool,
+        worker_panicked: bool,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -286,7 +309,8 @@ struct ModelLoadsDrained {
 #[derive(Debug)]
 struct GenerationWorkersJoined {
     registry_identity: Arc<WorkerRegistryIdentity>,
-    count: usize,
+    family_count: usize,
+    backend_workers: Vec<GenerationBackendWorkerJoined>,
 }
 
 #[derive(Debug)]
@@ -342,6 +366,7 @@ struct GenerationWorkerReservation<'registry, 'admission> {
 struct GenerationWorkerAttachError {
     failure: IpcFailure,
     worker: JoinHandle<()>,
+    owner: GenerationWorkerOwner,
 }
 
 impl Default for ModelLoadRegistry {
@@ -467,6 +492,73 @@ impl ModelLoadsDrained {
     }
 }
 
+impl GenerationWorkerOwner {
+    fn cancel_all(&self) {
+        match self {
+            Self::Llama(owner) => {
+                let _ = owner.cancel_all();
+            }
+            #[cfg(test)]
+            Self::Fixture(owner) => owner.cancellation.cancel_all(),
+        }
+    }
+
+    /// Consumes the sole backend-worker owner and returns only after its exact
+    /// nested worker has been joined. Cancellation panics in hostile fixtures
+    /// are contained before the join; product owners use the infallible,
+    /// per-case-catch native path.
+    fn shutdown_joined(self) -> GenerationBackendWorkerJoined {
+        match self {
+            Self::Llama(owner) => GenerationBackendWorkerJoined::Llama(owner.shutdown_joined()),
+            #[cfg(test)]
+            Self::Fixture(mut owner) => {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    owner.cancellation.cancel_all();
+                }));
+                let backend_worker = owner.backend_worker.take();
+                GenerationBackendWorkerJoined::Fixture {
+                    worker_was_present: backend_worker.is_some(),
+                    worker_panicked: backend_worker
+                        .is_some_and(|backend_worker| backend_worker.join().is_err()),
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn fixture(
+        cancellation: Arc<dyn FixtureGenerationWorkerCancellation>,
+        backend_worker: JoinHandle<()>,
+    ) -> Self {
+        Self::Fixture(FixtureGenerationWorkerOwner {
+            cancellation,
+            backend_worker: Some(backend_worker),
+        })
+    }
+}
+
+impl GenerationBackendWorkerJoined {
+    const fn worker_panicked(&self) -> bool {
+        match self {
+            Self::Llama(joined) => joined.worker_panicked(),
+            #[cfg(test)]
+            Self::Fixture {
+                worker_panicked, ..
+            } => *worker_panicked,
+        }
+    }
+
+    const fn joined_worker_count(&self) -> usize {
+        match self {
+            Self::Llama(joined) => joined.joined_worker_count(),
+            #[cfg(test)]
+            Self::Fixture {
+                worker_was_present, ..
+            } => *worker_was_present as usize,
+        }
+    }
+}
+
 impl GenerationWorkerRegistry {
     fn reserve<'registry, 'admission>(
         &'registry self,
@@ -532,12 +624,12 @@ impl GenerationWorkerRegistry {
             finished_ids
                 .into_iter()
                 .filter_map(|request_id| match state.workers.remove(&request_id) {
-                    Some(GenerationWorkerSlot::Running { worker, .. }) => Some(worker),
+                    Some(GenerationWorkerSlot::Running { worker, owner }) => Some((worker, owner)),
                     Some(GenerationWorkerSlot::Reserved) | None => None,
                 })
                 .collect::<Vec<_>>()
         };
-        self.join_workers(finished)
+        self.join_workers(finished).map(|(count, _)| count)
     }
 
     fn join_all(&self) -> Result<GenerationWorkersJoined, IpcFailure> {
@@ -564,15 +656,16 @@ impl GenerationWorkerRegistry {
             std::mem::take(&mut state.workers)
                 .into_values()
                 .filter_map(|slot| match slot {
-                    GenerationWorkerSlot::Running { worker, .. } => Some(worker),
+                    GenerationWorkerSlot::Running { worker, owner } => Some((worker, owner)),
                     GenerationWorkerSlot::Reserved => None,
                 })
                 .collect::<Vec<_>>()
         };
-        let count = self.join_workers(workers)?;
+        let (family_count, backend_workers) = self.join_workers(workers)?;
         Ok(GenerationWorkersJoined {
             registry_identity: Arc::clone(&self.identity),
-            count,
+            family_count,
+            backend_workers,
         })
     }
 
@@ -589,37 +682,47 @@ impl GenerationWorkerRegistry {
             std::mem::take(&mut state.workers)
                 .into_values()
                 .filter_map(|slot| match slot {
-                    GenerationWorkerSlot::Running {
-                        worker,
-                        cancellation,
-                    } => Some((worker, cancellation)),
+                    GenerationWorkerSlot::Running { worker, owner } => Some((worker, owner)),
                     GenerationWorkerSlot::Reserved => None,
                 })
                 .collect::<Vec<_>>()
         };
-        let count = workers.len();
-        for (worker, cancellation) in workers {
+        let family_count = workers.len();
+        let mut backend_workers = Vec::with_capacity(family_count);
+        for (worker, owner) in workers {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                cancellation.cancel_all();
+                owner.cancel_all();
             }));
             let _ = worker.join();
+            backend_workers.push(owner.shutdown_joined());
         }
         GenerationWorkersJoined {
             registry_identity: Arc::clone(&self.identity),
-            count,
+            family_count,
+            backend_workers,
         }
     }
 
-    fn join_workers(&self, workers: Vec<JoinHandle<()>>) -> Result<usize, IpcFailure> {
-        let count = workers.len();
+    fn join_workers(
+        &self,
+        workers: Vec<(JoinHandle<()>, GenerationWorkerOwner)>,
+    ) -> Result<(usize, Vec<GenerationBackendWorkerJoined>), IpcFailure> {
+        let family_count = workers.len();
         let mut panicked = false;
-        for worker in workers {
+        let mut backend_workers = Vec::with_capacity(family_count);
+        for (worker, owner) in workers {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                owner.cancel_all();
+            }));
             panicked |= worker.join().is_err();
+            let backend_worker = owner.shutdown_joined();
+            panicked |= backend_worker.worker_panicked();
+            backend_workers.push(backend_worker);
         }
         if panicked {
             return Err(self.record_join_failure());
         }
-        Ok(count)
+        Ok((family_count, backend_workers))
     }
 
     fn record_join_failure(&self) -> IpcFailure {
@@ -662,8 +765,18 @@ impl GenerationWorkersJoined {
         Arc::ptr_eq(&self.registry_identity, &registry.identity)
     }
 
+    #[cfg(test)]
     const fn count(&self) -> usize {
-        self.count
+        self.family_count
+    }
+
+    fn joined_worker_count(&self) -> usize {
+        self.family_count.saturating_add(
+            self.backend_workers
+                .iter()
+                .map(GenerationBackendWorkerJoined::joined_worker_count)
+                .sum::<usize>(),
+        )
     }
 }
 
@@ -908,18 +1021,21 @@ impl GenerationWorkerReservation<'_, '_> {
     fn attach(
         mut self,
         worker: JoinHandle<()>,
-        cancellation: Arc<dyn GenerationWorkerCancellation>,
+        owner: GenerationWorkerOwner,
     ) -> Result<(), GenerationWorkerAttachError> {
         let mut state = match self.registry.lock() {
             Ok(state) => state,
-            Err(failure) => return Err(GenerationWorkerAttachError { failure, worker }),
+            Err(failure) => {
+                return Err(GenerationWorkerAttachError {
+                    failure,
+                    worker,
+                    owner,
+                });
+            }
         };
         match state.workers.get_mut(&self.request_id) {
             Some(slot @ GenerationWorkerSlot::Reserved) => {
-                *slot = GenerationWorkerSlot::Running {
-                    worker,
-                    cancellation,
-                };
+                *slot = GenerationWorkerSlot::Running { worker, owner };
                 self.attached = true;
                 Ok(())
             }
@@ -930,6 +1046,7 @@ impl GenerationWorkerReservation<'_, '_> {
                     false,
                 ),
                 worker,
+                owner,
             }),
         }
     }
@@ -1005,7 +1122,7 @@ struct PreparedModelDownload {
 
 #[derive(Debug)]
 struct LlamaCancellation {
-    handle: Arc<LlamaGenerationHandle>,
+    handle: Arc<LlamaGenerationControl>,
 }
 
 impl BranchCancellation for LlamaCancellation {
@@ -4879,8 +4996,8 @@ async fn weave_start<R: Runtime>(
         prompt_recipe,
         cases,
     };
-    let handle = match state.backend.start_exact_continuation(native_request) {
-        Ok(handle) => Arc::new(handle),
+    let generation_owner = match state.backend.start_exact_continuation(native_request) {
+        Ok(owner) => owner,
         Err(error) => {
             if let Err(persistence) =
                 fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
@@ -4893,6 +5010,7 @@ async fn weave_start<R: Runtime>(
             return Err(IpcFailure::backend(&error));
         }
     };
+    let handle = generation_owner.control();
     if let Err(error) = state.generations.attach_cancellation(
         &request_id,
         Arc::new(LlamaCancellation {
@@ -4968,14 +5086,16 @@ async fn weave_start<R: Runtime>(
             ));
         }
     };
-    let worker_cancellation: Arc<dyn GenerationWorkerCancellation> = handle.clone();
-    if let Err(GenerationWorkerAttachError { failure, worker }) =
-        worker_reservation.attach(worker, worker_cancellation)
+    if let Err(GenerationWorkerAttachError {
+        failure,
+        worker,
+        owner,
+    }) = worker_reservation.attach(worker, GenerationWorkerOwner::Llama(generation_owner))
     {
-        for (_, branch_id) in &runs {
-            let _ = handle.cancel_branch(*branch_id);
-        }
-        let failure = if worker.join().is_err() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.cancel_all()));
+        let desktop_panicked = worker.join().is_err();
+        let backend_joined = owner.shutdown_joined();
+        let failure = if desktop_panicked || backend_joined.worker_panicked() {
             state.generation_workers.record_join_failure()
         } else {
             failure
@@ -5045,7 +5165,7 @@ fn run_desktop_generation<R: Runtime>(
     identity: &GenerationFamilyIdentity,
     runs: &[(GenerationRunId, BranchId)],
     binding: &GenerationResultBinding,
-    handle: &Arc<LlamaGenerationHandle>,
+    handle: &Arc<LlamaGenerationControl>,
 ) {
     let result = loop {
         match handle.receive_event_timeout(Duration::from_millis(10)) {
@@ -5060,7 +5180,7 @@ fn run_desktop_generation<R: Runtime>(
             Ok(None) | Err(LlamaBackendError::ResultDisconnected) => {}
             Err(error) => break Err(error.to_string()),
         }
-        match handle.wait_timeout(Duration::ZERO) {
+        match handle.receive_result_timeout(Duration::ZERO) {
             Ok(result) => break Ok(result),
             Err(LlamaBackendError::ResultTimeout) => {}
             Err(error) => break Err(error.to_string()),
@@ -5102,7 +5222,7 @@ fn run_desktop_generation<R: Runtime>(
 fn drain_backend_events<R: Runtime>(
     app: &AppHandle<R>,
     identity: &GenerationFamilyIdentity,
-    handle: &LlamaGenerationHandle,
+    handle: &LlamaGenerationControl,
 ) -> Result<(), IpcFailure> {
     loop {
         match handle.receive_event_timeout(Duration::ZERO) {
@@ -5832,7 +5952,7 @@ impl DesktopWorkersJoined {
     fn joined_worker_count(&self) -> usize {
         self.model_loads
             .count()
-            .saturating_add(self.generation_workers.count())
+            .saturating_add(self.generation_workers.joined_worker_count())
             .saturating_add(self.download_workers.count())
     }
 }
@@ -6444,12 +6564,18 @@ mod tests {
     #[derive(Debug)]
     struct NoopGenerationWorkerCancellation;
 
-    impl GenerationWorkerCancellation for NoopGenerationWorkerCancellation {
+    impl FixtureGenerationWorkerCancellation for NoopGenerationWorkerCancellation {
         fn cancel_all(&self) {}
     }
 
-    fn noop_generation_worker_cancellation() -> Arc<dyn GenerationWorkerCancellation> {
-        Arc::new(NoopGenerationWorkerCancellation)
+    fn fixture_generation_worker_owner(
+        cancellation: Arc<dyn FixtureGenerationWorkerCancellation>,
+    ) -> GenerationWorkerOwner {
+        GenerationWorkerOwner::fixture(cancellation, std::thread::spawn(|| {}))
+    }
+
+    fn noop_generation_worker_owner() -> GenerationWorkerOwner {
+        fixture_generation_worker_owner(Arc::new(NoopGenerationWorkerCancellation))
     }
 
     #[derive(Debug)]
@@ -6457,7 +6583,7 @@ mod tests {
         cancelled: Arc<AtomicBool>,
     }
 
-    impl GenerationWorkerCancellation for FlagGenerationWorkerCancellation {
+    impl FixtureGenerationWorkerCancellation for FlagGenerationWorkerCancellation {
         fn cancel_all(&self) {
             self.cancelled.store(true, Ordering::Release);
         }
@@ -6466,7 +6592,7 @@ mod tests {
     #[derive(Debug)]
     struct PanickingGenerationWorkerCancellation;
 
-    impl GenerationWorkerCancellation for PanickingGenerationWorkerCancellation {
+    impl FixtureGenerationWorkerCancellation for PanickingGenerationWorkerCancellation {
         fn cancel_all(&self) {
             panic!("fixture cancellation panic");
         }
@@ -6619,10 +6745,7 @@ mod tests {
             "generation_worker_starting"
         );
         reservation
-            .attach(
-                std::thread::spawn(|| {}),
-                noop_generation_worker_cancellation(),
-            )
+            .attach(std::thread::spawn(|| {}), noop_generation_worker_owner())
             .map_err(|error| error.failure)
             .expect("attach worker");
         assert_eq!(workers.join_all().expect("join owned worker").count(), 1);
@@ -6639,7 +6762,7 @@ mod tests {
             .expect("reserve worker")
             .attach(
                 std::thread::spawn(|| panic!("fixture desktop panic")),
-                noop_generation_worker_cancellation(),
+                noop_generation_worker_owner(),
             )
             .map_err(|error| error.failure)
             .expect("attach worker");
@@ -6705,7 +6828,7 @@ mod tests {
                     std::thread::spawn(move || {
                         generation_signal.store(true, Ordering::Release);
                     }),
-                    noop_generation_worker_cancellation(),
+                    noop_generation_worker_owner(),
                 )
                 .map_err(|error| error.failure)
                 .expect("attach generation worker");
@@ -6738,46 +6861,60 @@ mod tests {
         let state = PluginState::default();
         let generation_cancelled = Arc::new(AtomicBool::new(false));
         let generation_finished = Arc::new(AtomicBool::new(false));
+        let backend_forwarder_finished = Arc::new(AtomicBool::new(false));
         let panicking_cancellation_worker_finished = Arc::new(AtomicBool::new(false));
+        let release_panicking_outer = Arc::new(AtomicBool::new(false));
         let download_finished = Arc::new(AtomicBool::new(false));
         let download_cancellation = DownloadCancellation::default();
 
         {
             let admission =
                 lock_application_admission(&state, "fixture workers").expect("admission");
-            let wait_cancelled = Arc::clone(&generation_cancelled);
-            let finished = Arc::clone(&generation_finished);
-            state
-                .generation_workers
-                .reserve("exit-generation", &admission)
-                .expect("reserve generation")
-                .attach(
-                    std::thread::spawn(move || {
-                        while !wait_cancelled.load(Ordering::Acquire) {
-                            std::thread::yield_now();
-                        }
-                        finished.store(true, Ordering::Release);
-                    }),
-                    Arc::new(FlagGenerationWorkerCancellation {
-                        cancelled: Arc::clone(&generation_cancelled),
-                    }),
-                )
-                .map_err(|error| error.failure)
-                .expect("attach generation");
-
             let finished = Arc::clone(&panicking_cancellation_worker_finished);
+            let release_outer = Arc::clone(&release_panicking_outer);
             state
                 .generation_workers
                 .reserve("exit-generation-panicking-cancellation", &admission)
                 .expect("reserve generation with panicking cancellation")
                 .attach(
                     std::thread::spawn(move || {
+                        while !release_outer.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
                         finished.store(true, Ordering::Release);
                     }),
-                    Arc::new(PanickingGenerationWorkerCancellation),
+                    fixture_generation_worker_owner(Arc::new(
+                        PanickingGenerationWorkerCancellation,
+                    )),
                 )
                 .map_err(|error| error.failure)
                 .expect("attach generation with panicking cancellation");
+
+            let finished = Arc::clone(&generation_finished);
+            let backend_wait_cancelled = Arc::clone(&generation_cancelled);
+            let backend_finished = Arc::clone(&backend_forwarder_finished);
+            state
+                .generation_workers
+                .reserve("exit-generation", &admission)
+                .expect("reserve generation")
+                .attach(
+                    std::thread::spawn(move || {
+                        finished.store(true, Ordering::Release);
+                    }),
+                    GenerationWorkerOwner::fixture(
+                        Arc::new(FlagGenerationWorkerCancellation {
+                            cancelled: Arc::clone(&generation_cancelled),
+                        }),
+                        std::thread::spawn(move || {
+                            while !backend_wait_cancelled.load(Ordering::Acquire) {
+                                std::thread::yield_now();
+                            }
+                            backend_finished.store(true, Ordering::Release);
+                        }),
+                    ),
+                )
+                .map_err(|error| error.failure)
+                .expect("attach generation");
 
             let wait_cancelled = download_cancellation.clone();
             let finished = Arc::clone(&download_finished);
@@ -6798,10 +6935,12 @@ mod tests {
                 .expect("attach download");
         }
 
+        release_panicking_outer.store(true, Ordering::Release);
         let joined = state.join_desktop_workers_for_exit();
-        assert_eq!(joined.joined_worker_count(), 3);
+        assert_eq!(joined.joined_worker_count(), 5);
         assert!(generation_cancelled.load(Ordering::Acquire));
         assert!(generation_finished.load(Ordering::Acquire));
+        assert!(backend_forwarder_finished.load(Ordering::Acquire));
         assert!(panicking_cancellation_worker_finished.load(Ordering::Acquire));
         assert!(download_finished.load(Ordering::Acquire));
     }

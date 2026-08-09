@@ -8,6 +8,10 @@ use loom_types::BuildModelPolicy;
 
 const POLICY_ENV: &str = "LOOM_BUILD_MODEL_POLICY";
 const WRITER_MODEL_PATH_ENV: &str = "LOOM_BUILD_WRITER_MODEL_PATH";
+const MACOS_DEPLOYMENT_TARGET_ENV: &str = "MACOSX_DEPLOYMENT_TARGET";
+const CMAKE_MACOS_DEPLOYMENT_TARGET_ENV: &str = "CMAKE_OSX_DEPLOYMENT_TARGET";
+const MINIMUM_MACOS_MAJOR: u32 = 10;
+const MINIMUM_MACOS_MINOR: u32 = 15;
 const DEFAULT_POLICY: &str = "writer-gemma4-base-v1";
 const ALLOWED_POLICIES: [(&str, &str); 2] = [
     ("none-v1", "none-v1.json"),
@@ -15,10 +19,43 @@ const ALLOWED_POLICIES: [(&str, &str); 2] = [
 ];
 
 fn main() {
+    if let Err(error) = enforce_native_platform_floor() {
+        panic!("invalid Loom native platform floor: {error}");
+    }
     if let Err(error) = embed_build_model_policy() {
         panic!("failed to embed Loom build-model policy: {error}");
     }
     tauri_build::build();
+}
+
+fn enforce_native_platform_floor() -> Result<(), String> {
+    println!("cargo:rerun-if-env-changed={MACOS_DEPLOYMENT_TARGET_ENV}");
+    println!("cargo:rerun-if-env-changed={CMAKE_MACOS_DEPLOYMENT_TARGET_ENV}");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return Ok(());
+    }
+    for variable in [
+        MACOS_DEPLOYMENT_TARGET_ENV,
+        CMAKE_MACOS_DEPLOYMENT_TARGET_ENV,
+    ] {
+        let value = env::var(variable)
+            .map_err(|_| format!("{variable} must explicitly declare macOS 10.15 or newer"))?;
+        let (major, minor) = parse_major_minor(&value)
+            .ok_or_else(|| format!("{variable} has invalid version `{value}`"))?;
+        if (major, minor) < (MINIMUM_MACOS_MAJOR, MINIMUM_MACOS_MINOR) {
+            return Err(format!(
+                "{variable}={value} is below the llama.cpp filesystem floor of macOS 10.15"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_major_minor(value: &str) -> Option<(u32, u32)> {
+    let mut parts = value.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor))
 }
 
 fn embed_build_model_policy() -> Result<(), String> {

@@ -34,7 +34,8 @@ pub use runtime::{
 
 pub use adapter::{
     CandidateProvenanceRecord, ContinuationCase, DEFAULT_EVENT_CAPACITY, ExactContinuationRequest,
-    ExactContinuationResult, LlamaBackend, LlamaBackendError, LlamaGenerationHandle,
-    MAX_EVENT_CAPACITY, model_environment_from_verified, validate_candidate_receipt_binding,
+    ExactContinuationResult, JoinedLlamaGeneration, LlamaBackend, LlamaBackendError,
+    LlamaGenerationControl, LlamaGenerationHandle, MAX_EVENT_CAPACITY,
+    model_environment_from_verified, validate_candidate_receipt_binding,
 };
 pub use llama_native_types::{SamplerKind, SamplingConfig};

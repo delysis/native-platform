@@ -292,30 +292,61 @@ impl LlamaBackend {
                 LlamaBackendError::WorkerSpawn(error)
             })?;
 
-        Ok(LlamaGenerationHandle {
+        let control = Arc::new(LlamaGenerationControl {
             request_id: request.request_id,
             identities,
             execution,
             events,
             event_rx,
             result_rx,
+        });
+
+        Ok(LlamaGenerationHandle {
+            control,
             worker: Mutex::new(Some(worker)),
         })
     }
 }
 
+/// Cloneable generation control deliberately excludes thread-join authority.
+/// Registries and event consumers may share this value without gaining the
+/// ability to certify that the backend worker has stopped.
 #[derive(Debug)]
-pub struct LlamaGenerationHandle {
+pub struct LlamaGenerationControl {
     request_id: String,
     identities: Vec<CaseIdentity>,
     execution: Arc<dyn BatchExecution>,
     events: Arc<EventStream>,
     event_rx: Receiver<LoomEvent>,
     result_rx: Receiver<Result<ExactContinuationResult, LlamaBackendError>>,
+}
+
+/// The sole owner of one Loom event-forwarder thread.
+///
+/// This type is intentionally neither `Clone` nor shareable through a trait
+/// object. Moving it transfers the only authority capable of returning a
+/// joined-worker proof.
+#[derive(Debug)]
+pub struct LlamaGenerationHandle {
+    control: Arc<LlamaGenerationControl>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl LlamaGenerationHandle {
+/// Affine evidence that the exact event-forwarder owned by a generation
+/// handle has been joined (or had already been joined by that same owner).
+#[derive(Debug)]
+pub struct JoinedLlamaGeneration {
+    worker_was_present: bool,
+    worker_panicked: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkerJoinOutcome {
+    worker_was_present: bool,
+    worker_panicked: bool,
+}
+
+impl LlamaGenerationControl {
     #[must_use]
     pub fn request_id(&self) -> &str {
         &self.request_id
@@ -374,8 +405,55 @@ impl LlamaGenerationHandle {
         }
     }
 
+    /// Receives the backend result without joining the worker. Only the
+    /// non-cloneable owner may perform that join.
+    pub fn receive_result_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<ExactContinuationResult, LlamaBackendError> {
+        match self.result_rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(LlamaBackendError::ResultTimeout),
+            Err(RecvTimeoutError::Disconnected) => Err(LlamaBackendError::ResultDisconnected),
+        }
+    }
+}
+
+impl LlamaGenerationHandle {
+    /// Returns cancellation/event/result control without duplicating the
+    /// event-forwarder `JoinHandle`.
+    #[must_use]
+    pub fn control(&self) -> Arc<LlamaGenerationControl> {
+        Arc::clone(&self.control)
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        self.control.request_id()
+    }
+
+    pub fn cancel_branch(&self, branch_id: BranchId) -> bool {
+        self.control.cancel_branch(branch_id)
+    }
+
+    pub fn cancel_run(&self, run_id: GenerationRunId) -> bool {
+        self.control.cancel_run(run_id)
+    }
+
+    pub fn cancel_all(&self) -> usize {
+        self.control.cancel_all()
+    }
+
+    pub fn receive_event_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<LoomEvent>, LlamaBackendError> {
+        self.control.receive_event_timeout(timeout)
+    }
+
     pub fn wait(self) -> Result<ExactContinuationResult, LlamaBackendError> {
         let result = self
+            .control
             .result_rx
             .recv()
             .map_err(|_| LlamaBackendError::ResultDisconnected);
@@ -387,28 +465,71 @@ impl LlamaGenerationHandle {
         &self,
         timeout: Duration,
     ) -> Result<ExactContinuationResult, LlamaBackendError> {
-        match self.result_rx.recv_timeout(timeout) {
+        match self.control.receive_result_timeout(timeout) {
             Ok(result) => {
                 self.join_worker()?;
-                result
+                Ok(result)
             }
-            Err(RecvTimeoutError::Timeout) => Err(LlamaBackendError::ResultTimeout),
-            Err(RecvTimeoutError::Disconnected) => {
+            Err(LlamaBackendError::ResultTimeout) => Err(LlamaBackendError::ResultTimeout),
+            Err(LlamaBackendError::ResultDisconnected) => {
                 self.join_worker()?;
                 Err(LlamaBackendError::ResultDisconnected)
+            }
+            Err(error) => {
+                self.join_worker()?;
+                Err(error)
             }
         }
     }
 
+    /// Consumes the only worker owner, requests cancellation for every case,
+    /// and returns only after the exact event-forwarder has been joined.
+    #[must_use]
+    pub fn shutdown_joined(self) -> JoinedLlamaGeneration {
+        let _ = self.control.cancel_all();
+        let outcome = self.join_worker_outcome();
+        JoinedLlamaGeneration {
+            worker_was_present: outcome.worker_was_present,
+            worker_panicked: outcome.worker_panicked,
+        }
+    }
+
     fn join_worker(&self) -> Result<(), LlamaBackendError> {
+        let outcome = self.join_worker_outcome();
+        if outcome.worker_panicked {
+            Err(LlamaBackendError::WorkerPanicked)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn join_worker_outcome(&self) -> WorkerJoinOutcome {
         let worker = self
             .worker
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        worker.map_or(Ok(()), |worker| {
-            worker.join().map_err(|_| LlamaBackendError::WorkerPanicked)
-        })
+        WorkerJoinOutcome {
+            worker_was_present: worker.is_some(),
+            worker_panicked: worker.is_some_and(|worker| worker.join().is_err()),
+        }
+    }
+}
+
+impl JoinedLlamaGeneration {
+    #[must_use]
+    pub const fn worker_was_present(&self) -> bool {
+        self.worker_was_present
+    }
+
+    #[must_use]
+    pub const fn worker_panicked(&self) -> bool {
+        self.worker_panicked
+    }
+
+    #[must_use]
+    pub const fn joined_worker_count(&self) -> usize {
+        self.worker_was_present as usize
     }
 }
 
@@ -420,11 +541,7 @@ impl Drop for LlamaGenerationHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
         if worker_is_live {
-            for identity in &self.identities {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.execution.cancel_case(&identity.case_id)
-                }));
-            }
+            let _ = self.control.cancel_all();
         }
         let _ = self.join_worker();
     }
@@ -1804,6 +1921,43 @@ mod tests {
         drop(handle);
 
         assert_eq!(runtime.execution.cancelled_cases(), expected_cases);
+    }
+
+    #[test]
+    fn affine_owner_joins_while_cloneable_control_remains_retained() {
+        let request = request_with_two_cases();
+        let expected_cases = request
+            .cases
+            .iter()
+            .map(|case| case.generation.branch_id.to_string())
+            .collect::<Vec<_>>();
+        let outputs = (0..request.cases.len())
+            .map(|index| native_output(&request, index, GenerationState::Cancelled, true))
+            .collect();
+        let runtime = fake_runtime(
+            &request,
+            outputs,
+            Vec::new(),
+            false,
+            RuntimeEvidenceClass::TestFixture,
+        );
+        runtime
+            .execution
+            .complete_on_cancel
+            .store(true, Ordering::Release);
+        let backend = LlamaBackend::with_runtime(runtime.clone(), 32).expect("backend");
+        let owner = backend
+            .start_exact_continuation(request)
+            .expect("start generation");
+        let retained_control = owner.control();
+
+        let joined = owner.shutdown_joined();
+
+        assert!(joined.worker_was_present());
+        assert!(!joined.worker_panicked());
+        assert_eq!(joined.joined_worker_count(), 1);
+        assert_eq!(runtime.execution.cancelled_cases(), expected_cases);
+        assert!(!retained_control.request_id().is_empty());
     }
 
     #[test]
