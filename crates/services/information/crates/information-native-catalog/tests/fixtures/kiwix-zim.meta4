@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metalink xmlns="urn:ietf:params:xml:ns:metalink">
+  <generator>MirrorBrain/2.19.0</generator>
+  <file name="wikipedia_bg_all_maxi_2026-07.zim">
+    <size>5121103348</size>
+    <hash type="md5">28600089e5854e16e2335b9f5e39d829</hash>
+    <hash type="sha-256">e033d74dbadca167a75c0c9415e283d40e28e1cc698221c32334a67206de9f9d</hash>
+    <pieces length="4194304" type="sha-1">
+      <hash>2b3ef08d52850cceb267dd618a478ab102aa6381</hash>
+    </pieces>
+    <url location="us" priority="2">https://wi.mirror.driftle.ss/kiwix/zim/wikipedia/wikipedia_bg_all_maxi_2026-07.zim</url>
+    <url location="us" priority="1">https://ny.mirror.driftle.ss/kiwix/zim/wikipedia/wikipedia_bg_all_maxi_2026-07.zim</url>
+  </file>
+</metalink>

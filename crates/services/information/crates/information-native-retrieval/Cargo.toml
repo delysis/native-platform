@@ -1,0 +1,16 @@
+[package]
+name = "information-native-retrieval"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+information-native-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,147 @@
+use crate::input::{load_rights, load_use_policy, validate_values};
+use crate::{
+    CliResult, ScriptureOccurrenceArgs, ScripturePassageArgs, ScriptureSearchArgs,
+    ScriptureSourceArgs, json_value,
+};
+use information_native_backend_scripture::{
+    OCCURRENCE_COLLECTION, PASSAGE_COLLECTION, ScriptureBackend, ScriptureBackendConfig,
+};
+use information_native_retrieval::{LookupRequest, ResourceBackend, RetrievalRouter};
+use information_native_types::{
+    InformationQuery, QUERY_SCHEMA, QueryBudget, QueryFilters, QueryId, ReleaseId,
+    RepresentationId, ResourceId, RetrievalTarget,
+};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+pub(crate) fn search(args: &ScriptureSearchArgs) -> CliResult<serde_json::Value> {
+    validate_values("document ids", &args.document_ids, 128, 8_192)?;
+    let mounted = mount(&args.source)?;
+    let query = InformationQuery {
+        schema: QUERY_SCHEMA.to_string(),
+        query_id: query_id(args.query_id.as_ref())?,
+        text: args.reference.clone(),
+        syntax: args.syntax.into(),
+        purpose: args.purpose.into(),
+        targets: vec![mounted.target()],
+        resources: vec![mounted.resource_id.clone()],
+        representations: vec![mounted.representation_id.clone()],
+        filters: QueryFilters {
+            languages: Vec::new(),
+            subjects: Vec::new(),
+            document_ids: args.document_ids.clone(),
+            spatial: None,
+            temporal_start: None,
+            temporal_end: None,
+            fields: BTreeMap::new(),
+        },
+        budget: QueryBudget {
+            max_hits: args.max_hits,
+            max_hits_per_backend: args.max_hits,
+            max_backends: 1,
+            max_context_chars: args.max_context_chars,
+            timeout_ms: args.timeout_ms,
+        },
+    };
+    json_value(&mounted.router.search(&query)?)
+}
+
+pub(crate) fn occurrence(args: &ScriptureOccurrenceArgs) -> CliResult<serde_json::Value> {
+    lookup(
+        &args.source,
+        OCCURRENCE_COLLECTION,
+        &args.occurrence_id,
+        args.purpose.into(),
+        args.max_context_chars,
+        args.timeout_ms,
+    )
+}
+
+pub(crate) fn passage(args: &ScripturePassageArgs) -> CliResult<serde_json::Value> {
+    lookup(
+        &args.source,
+        PASSAGE_COLLECTION,
+        &args.passage_id,
+        args.purpose.into(),
+        args.max_context_chars,
+        args.timeout_ms,
+    )
+}
+
+fn lookup(
+    source: &ScriptureSourceArgs,
+    collection: &str,
+    key: &str,
+    purpose: information_native_types::RetrievalPurpose,
+    max_context_chars: u32,
+    timeout_ms: u64,
+) -> CliResult<serde_json::Value> {
+    let mounted = mount(source)?;
+    let request = LookupRequest {
+        resource_id: mounted.resource_id,
+        release_id: mounted.release_id,
+        representation_id: mounted.representation_id,
+        purpose,
+        collection: Some(collection.to_string()),
+        key: key.to_string(),
+        max_context_chars,
+        timeout_ms,
+    };
+    json_value(&mounted.router.lookup(&request)?)
+}
+
+struct MountedScripture {
+    router: RetrievalRouter,
+    resource_id: ResourceId,
+    release_id: ReleaseId,
+    representation_id: RepresentationId,
+}
+
+impl MountedScripture {
+    fn target(&self) -> RetrievalTarget {
+        RetrievalTarget {
+            resource_id: self.resource_id.clone(),
+            release_id: self.release_id.clone(),
+            representation_id: self.representation_id.clone(),
+        }
+    }
+}
+
+fn mount(args: &ScriptureSourceArgs) -> CliResult<MountedScripture> {
+    let resource_id = ResourceId::parse(args.resource_id.clone())?;
+    let release_id = ReleaseId::parse(args.release_id.clone())?;
+    let representation_id = RepresentationId::parse(args.representation_id.clone())?;
+    let mut config = ScriptureBackendConfig::new(
+        args.backend_id.clone(),
+        args.label.clone(),
+        resource_id.clone(),
+        release_id.clone(),
+        representation_id.clone(),
+        &args.database,
+        args.access_mode.into(),
+        args.publisher.clone(),
+    );
+    config.verified_source_sha256 = args.verified_sha256.clone();
+    if args.rights_json.is_some() {
+        config.rights = load_rights(args.rights_json.as_deref())?;
+    }
+    if args.use_policy_json.is_some() {
+        config.use_policy = load_use_policy(args.use_policy_json.as_deref())?;
+    }
+    config.max_snippet_chars = args.max_snippet_chars;
+    let backend: Arc<dyn ResourceBackend> = Arc::new(ScriptureBackend::open(config)?);
+    let router = RetrievalRouter::from_backends([backend])?;
+    Ok(MountedScripture {
+        router,
+        resource_id,
+        release_id,
+        representation_id,
+    })
+}
+
+fn query_id(value: Option<&String>) -> CliResult<QueryId> {
+    match value {
+        Some(value) => Ok(QueryId::parse(value.clone())?),
+        None => Ok(QueryId::new()),
+    }
+}

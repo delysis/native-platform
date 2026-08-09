@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-information-plan-removal"
+description = "Enables the information_plan_removal command without any pre-configured scope."
+commands.allow = ["information_plan_removal"]
+
+[[permission]]
+identifier = "deny-information-plan-removal"
+description = "Denies the information_plan_removal command without any pre-configured scope."
+commands.deny = ["information_plan_removal"]

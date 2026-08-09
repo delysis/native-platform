@@ -1,0 +1,492 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PermissionFile",
+  "description": "Permission file that can define a default permission, a set of permissions or a list of inlined permissions.",
+  "type": "object",
+  "properties": {
+    "default": {
+      "description": "The default permission set for the plugin",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DefaultPermission"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "set": {
+      "description": "A list of permissions sets defined",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/PermissionSet"
+      }
+    },
+    "permission": {
+      "description": "A list of inlined permissions",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Permission"
+      }
+    }
+  },
+  "definitions": {
+    "DefaultPermission": {
+      "description": "The default permission set of the plugin.\n\nWorks similarly to a permission with the \"default\" identifier.",
+      "type": "object",
+      "required": [
+        "permissions"
+      ],
+      "properties": {
+        "version": {
+          "description": "The version of the permission.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1.0
+        },
+        "description": {
+          "description": "Human-readable description of what the permission does. Tauri convention is to use `<h4>` headings in markdown content for Tauri documentation generation purposes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissions": {
+          "description": "All permissions this set contains.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "PermissionSet": {
+      "description": "A set of direct permissions grouped together under a new name.",
+      "type": "object",
+      "required": [
+        "description",
+        "identifier",
+        "permissions"
+      ],
+      "properties": {
+        "identifier": {
+          "description": "A unique identifier for the permission.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Human-readable description of what the permission does.",
+          "type": "string"
+        },
+        "permissions": {
+          "description": "All permissions this set contains.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PermissionKind"
+          }
+        }
+      }
+    },
+    "Permission": {
+      "description": "Descriptions of explicit privileges of commands.\n\nIt can enable commands to be accessible in the frontend of the application.\n\nIf the scope is defined it can be used to fine grain control the access of individual or multiple commands.",
+      "type": "object",
+      "required": [
+        "identifier"
+      ],
+      "properties": {
+        "version": {
+          "description": "The version of the permission.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1.0
+        },
+        "identifier": {
+          "description": "A unique identifier for the permission.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Human-readable description of what the permission does. Tauri internal convention is to use `<h4>` headings in markdown content for Tauri documentation generation purposes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commands": {
+          "description": "Allowed or denied commands when using this permission.",
+          "default": {
+            "allow": [],
+            "deny": []
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/Commands"
+            }
+          ]
+        },
+        "scope": {
+          "description": "Allowed or denied scoped when using this permission.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Scopes"
+            }
+          ]
+        },
+        "platforms": {
+          "description": "Target platforms this permission applies. By default all platforms are affected by this permission.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/Target"
+          }
+        }
+      }
+    },
+    "Commands": {
+      "description": "Allowed and denied commands inside a permission.\n\nIf two commands clash inside of `allow` and `deny`, it should be denied by default.",
+      "type": "object",
+      "properties": {
+        "allow": {
+          "description": "Allowed command.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deny": {
+          "description": "Denied command, which takes priority.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "Scopes": {
+      "description": "An argument for fine grained behavior control of Tauri commands.\n\nIt can be of any serde serializable type and is used to allow or prevent certain actions inside a Tauri command. The configured scope is passed to the command and will be enforced by the command implementation.\n\n## Example\n\n```json { \"allow\": [{ \"path\": \"$HOME/**\" }], \"deny\": [{ \"path\": \"$HOME/secret.txt\" }] } ```",
+      "type": "object",
+      "properties": {
+        "allow": {
+          "description": "Data that defines what is allowed by the scope.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/Value"
+          }
+        },
+        "deny": {
+          "description": "Data that defines what is denied by the scope. This should be prioritized by validation logic.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/Value"
+          }
+        }
+      }
+    },
+    "Value": {
+      "description": "All supported ACL values.",
+      "anyOf": [
+        {
+          "description": "Represents a null JSON value.",
+          "type": "null"
+        },
+        {
+          "description": "Represents a [`bool`].",
+          "type": "boolean"
+        },
+        {
+          "description": "Represents a valid ACL [`Number`].",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Number"
+            }
+          ]
+        },
+        {
+          "description": "Represents a [`String`].",
+          "type": "string"
+        },
+        {
+          "description": "Represents a list of other [`Value`]s.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Value"
+          }
+        },
+        {
+          "description": "Represents a map of [`String`] keys to [`Value`]s.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/Value"
+          }
+        }
+      ]
+    },
+    "Number": {
+      "description": "A valid ACL number.",
+      "anyOf": [
+        {
+          "description": "Represents an [`i64`].",
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "description": "Represents a [`f64`].",
+          "type": "number",
+          "format": "double"
+        }
+      ]
+    },
+    "Target": {
+      "description": "Platform target.",
+      "oneOf": [
+        {
+          "description": "MacOS.",
+          "type": "string",
+          "enum": [
+            "macOS"
+          ]
+        },
+        {
+          "description": "Windows.",
+          "type": "string",
+          "enum": [
+            "windows"
+          ]
+        },
+        {
+          "description": "Linux.",
+          "type": "string",
+          "enum": [
+            "linux"
+          ]
+        },
+        {
+          "description": "Android.",
+          "type": "string",
+          "enum": [
+            "android"
+          ]
+        },
+        {
+          "description": "iOS.",
+          "type": "string",
+          "enum": [
+            "iOS"
+          ]
+        }
+      ]
+    },
+    "PermissionKind": {
+      "type": "string",
+      "oneOf": [
+        {
+          "description": "Resolve and execute exact acquisition plans, including configured network or file source access.\n#### This permission set includes:\n\n- `allow-information-status`\n- `allow-information-catalog-search`\n- `allow-information-installed`\n- `allow-information-resolve-install-plan`\n- `allow-information-install`",
+          "type": "string",
+          "const": "acquire",
+          "markdownDescription": "Resolve and execute exact acquisition plans, including configured network or file source access.\n#### This permission set includes:\n\n- `allow-information-status`\n- `allow-information-catalog-search`\n- `allow-information-installed`\n- `allow-information-resolve-install-plan`\n- `allow-information-install`"
+        },
+        {
+          "description": "Enables the information_catalog_search command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-information-catalog-search",
+          "markdownDescription": "Enables the information_catalog_search command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the information_catalog_search command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-information-catalog-search",
+          "markdownDescription": "Denies the information_catalog_search command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the information_install command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-information-install",
+          "markdownDescription": "Enables the information_install command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the information_install command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-information-install",
+          "markdownDescription": "Denies the information_install command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the information_installed command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-information-installed",
+          "markdownDescription": "Enables the information_installed command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the information_installed command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-information-installed",
+          "markdownDescription": "Denies the information_installed command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the information_lookup command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-information-lookup",
+          "markdownDescription": "Enables the information_lookup command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the information_lookup command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-information-lookup",
+          "markdownDescription": "Denies the information_lookup command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the information_mount_installation command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-information-mount-installation",
+          "markdownDescription": "Enables the information_mount_installation command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the information_mount_installation command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-information-mount-installation",
+          "markdownDescription": "Denies the information_mount_installation command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the information_plan_removal command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-information-plan-removal",
+          "markdownDescription": "Enables the information_plan_removal command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the information_plan_removal command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-information-plan-removal",
+          "markdownDescription": "Denies the information_plan_removal command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the information_query command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-information-query",
+          "markdownDescription": "Enables the information_query command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the information_query command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-information-query",
+          "markdownDescription": "Denies the information_query command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the information_read command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-information-read",
+          "markdownDescription": "Enables the information_read command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the information_read command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-information-read",
+          "markdownDescription": "Denies the information_read command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the information_register_external command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-information-register-external",
+          "markdownDescription": "Enables the information_register_external command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the information_register_external command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-information-register-external",
+          "markdownDescription": "Denies the information_register_external command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the information_resolve_install_plan command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-information-resolve-install-plan",
+          "markdownDescription": "Enables the information_resolve_install_plan command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the information_resolve_install_plan command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-information-resolve-install-plan",
+          "markdownDescription": "Denies the information_resolve_install_plan command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the information_search command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-information-search",
+          "markdownDescription": "Enables the information_search command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the information_search command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-information-search",
+          "markdownDescription": "Denies the information_search command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the information_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-information-status",
+          "markdownDescription": "Enables the information_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the information_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-information-status",
+          "markdownDescription": "Denies the information_status command without any pre-configured scope."
+        },
+        {
+          "description": "Search the configured catalogue, inspect ready installations, and resolve exact install plans without fetching bytes.\n#### This permission set includes:\n\n- `allow-information-status`\n- `allow-information-catalog-search`\n- `allow-information-installed`\n- `allow-information-resolve-install-plan`",
+          "type": "string",
+          "const": "catalog",
+          "markdownDescription": "Search the configured catalogue, inspect ready installations, and resolve exact install plans without fetching bytes.\n#### This permission set includes:\n\n- `allow-information-status`\n- `allow-information-catalog-search`\n- `allow-information-installed`\n- `allow-information-resolve-install-plan`"
+        },
+        {
+          "description": "Inspect information-native host readiness without granting catalogue, query, registration, acquisition, or removal authority.\n#### This default permission set includes:\n\n- `allow-information-status`",
+          "type": "string",
+          "const": "default",
+          "markdownDescription": "Inspect information-native host readiness without granting catalogue, query, registration, acquisition, or removal authority.\n#### This default permission set includes:\n\n- `allow-information-status`"
+        },
+        {
+          "description": "Exchange an opaque application-owned native picker grant for a read-only external registration; raw filesystem paths are never accepted over IPC.\n#### This permission set includes:\n\n- `allow-information-status`\n- `allow-information-installed`\n- `allow-information-register-external`",
+          "type": "string",
+          "const": "external-registration",
+          "markdownDescription": "Exchange an opaque application-owned native picker grant for a read-only external registration; raw filesystem paths are never accepted over IPC.\n#### This permission set includes:\n\n- `allow-information-status`\n- `allow-information-installed`\n- `allow-information-register-external`"
+        },
+        {
+          "description": "Search, read, and look up evidence for visible local-UI use. These commands force local_ui purpose and cannot request model context.\n#### This permission set includes:\n\n- `allow-information-status`\n- `allow-information-search`\n- `allow-information-read`\n- `allow-information-lookup`",
+          "type": "string",
+          "const": "local-ui-query",
+          "markdownDescription": "Search, read, and look up evidence for visible local-UI use. These commands force local_ui purpose and cannot request model context.\n#### This permission set includes:\n\n- `allow-information-status`\n- `allow-information-search`\n- `allow-information-read`\n- `allow-information-lookup`"
+        },
+        {
+          "description": "Execute typed model-facing information tool calls. The host forces model_context purpose and requires exact retrieval targets.\n#### This permission set includes:\n\n- `allow-information-status`\n- `allow-information-query`",
+          "type": "string",
+          "const": "model-query",
+          "markdownDescription": "Execute typed model-facing information tool calls. The host forces model_context purpose and requires exact retrieval targets.\n#### This permission set includes:\n\n- `allow-information-status`\n- `allow-information-query`"
+        },
+        {
+          "description": "Bind one previously installed or explicitly registered resource into the live retrieval router without granting registration, acquisition, or query authority.\n#### This permission set includes:\n\n- `allow-information-mount-installation`",
+          "type": "string",
+          "const": "mount",
+          "markdownDescription": "Bind one previously installed or explicitly registered resource into the live retrieval router without granting registration, acquisition, or query authority.\n#### This permission set includes:\n\n- `allow-information-mount-installation`"
+        },
+        {
+          "description": "Inspect the exact impact of removing a registration or managed package without deleting or unregistering anything.\n#### This permission set includes:\n\n- `allow-information-status`\n- `allow-information-installed`\n- `allow-information-plan-removal`",
+          "type": "string",
+          "const": "removal-planning",
+          "markdownDescription": "Inspect the exact impact of removing a registration or managed package without deleting or unregistering anything.\n#### This permission set includes:\n\n- `allow-information-status`\n- `allow-information-installed`\n- `allow-information-plan-removal`"
+        }
+      ]
+    }
+  }
+}

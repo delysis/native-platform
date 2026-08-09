@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/information-native-types",
+    "crates/information-native-catalog",
+    "crates/information-native-store",
+    "crates/information-native-acquire",
+    "crates/information-native-retrieval",
+    "crates/information-native-backend-sqlite",
+    "crates/information-native-backend-community",
+    "crates/information-native-backend-encyclopedia",
+    "crates/information-native-backend-scripture",
+    "crates/information-native-host",
+    "crates/information-native-cli",
+    "crates/tauri-plugin-information-native",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+description = "Local-first offline information resource components for native AI applications"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+rust-version = "1.92"
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+chrono = { version = "0.4.41", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5.45", features = ["derive"] }
+fs2 = "0.4.3"
+hex = "0.4.3"
+quick-xml = { version = "0.41.0", features = ["serialize"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "rustls-tls"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+sha2 = "0.10.9"
+tempfile = "3.20.0"
+thiserror = "2.0.16"
+url = { version = "2.5.7", features = ["serde"] }
+uuid = { version = "1.18.0", features = ["v4", "serde"] }
+
+information-native-types = { version = "0.1.0", path = "crates/information-native-types" }
+information-native-catalog = { version = "0.1.0", path = "crates/information-native-catalog" }
+information-native-store = { version = "0.1.0", path = "crates/information-native-store" }
+information-native-acquire = { version = "0.1.0", path = "crates/information-native-acquire" }
+information-native-retrieval = { version = "0.1.0", path = "crates/information-native-retrieval" }
+information-native-backend-sqlite = { version = "0.1.0", path = "crates/information-native-backend-sqlite" }
+information-native-backend-community = { version = "0.1.0", path = "crates/information-native-backend-community" }
+information-native-backend-encyclopedia = { version = "0.1.0", path = "crates/information-native-backend-encyclopedia" }
+information-native-backend-scripture = { version = "0.1.0", path = "crates/information-native-backend-scripture" }
+information-native-host = { version = "0.1.0", path = "crates/information-native-host" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+undocumented_unsafe_blocks = "deny"
+panic = "deny"
