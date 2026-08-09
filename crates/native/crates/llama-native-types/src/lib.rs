@@ -2930,6 +2930,8 @@ pub enum NativeErrorCode {
     ModelLoadFailed,
     #[error("model_not_loaded")]
     ModelNotLoaded,
+    #[error("model_in_use")]
+    ModelInUse,
     #[error("model_slots_full")]
     ModelSlotsFull,
     #[error("memory_budget_exceeded")]

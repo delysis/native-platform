@@ -39,7 +39,7 @@ use llama_native_types::{
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, Metadata};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
@@ -436,6 +436,105 @@ impl Clone for NativeModelHandle {
     }
 }
 
+/// Linear evidence that one native model owner thread returned and was joined.
+///
+/// This token has no public constructor and is deliberately neither cloneable
+/// nor serializable. Dropping a handle, observing an empty host slot, or seeing
+/// a `Stopped` status cannot manufacture it.
+#[derive(Debug)]
+pub struct JoinedNativeModel {
+    model_id: String,
+}
+
+impl JoinedNativeModel {
+    #[must_use]
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+}
+
+/// A consuming shutdown could not prove unique ownership of the model worker.
+///
+/// The attempted handle is retained so an owning host can restore it without
+/// detaching a still-live worker from its residency registry.
+#[derive(Debug)]
+pub struct NativeModelInUse {
+    handle: NativeModelHandle,
+    additional_handles: NonZeroUsize,
+}
+
+impl NativeModelInUse {
+    #[must_use]
+    pub const fn additional_handles(&self) -> NonZeroUsize {
+        self.additional_handles
+    }
+
+    #[must_use]
+    pub fn into_handle(self) -> NativeModelHandle {
+        self.handle
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "shutdown attempts must be matched so a live worker is never mistaken for a joined one"]
+pub enum NativeModelShutdown {
+    Joined(JoinedNativeModel),
+    InUse(NativeModelInUse),
+}
+
+#[derive(Debug)]
+struct WorkerBootstrapGuard {
+    command_tx: Option<Sender<WorkerCommand>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl WorkerBootstrapGuard {
+    fn new(command_tx: Sender<WorkerCommand>, join: JoinHandle<()>) -> Self {
+        Self {
+            command_tx: Some(command_tx),
+            join: Some(join),
+        }
+    }
+
+    fn into_parts(mut self) -> NativeResult<(Sender<WorkerCommand>, JoinHandle<()>)> {
+        let command_tx = self.command_tx.take().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "native model bootstrap lost its command sender",
+            )
+        })?;
+        let join = self.join.take().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "native model bootstrap lost its worker join handle",
+            )
+        })?;
+        Ok((command_tx, join))
+    }
+
+    fn shutdown_and_join(&mut self) -> NativeResult<()> {
+        if let Some(command_tx) = &self.command_tx {
+            let _ = command_tx.send(WorkerCommand::Shutdown);
+        }
+        self.command_tx.take();
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        join.join().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                "native model bootstrap worker panicked before it could be joined",
+            )
+        })
+    }
+}
+
+impl Drop for WorkerBootstrapGuard {
+    fn drop(&mut self) {
+        let _ = self.shutdown_and_join();
+    }
+}
+
 #[derive(Debug)]
 struct NativeModelInner {
     command_tx: Sender<WorkerCommand>,
@@ -447,6 +546,12 @@ struct NativeModelInner {
 
 impl Drop for NativeModelInner {
     fn drop(&mut self) {
+        let _ = self.shutdown_and_join();
+    }
+}
+
+impl NativeModelInner {
+    fn cancel_active_work(&self) {
         if let Ok(registry) = self.cancellations.lock() {
             for flag in registry.values() {
                 flag.store(true, Ordering::Release);
@@ -457,12 +562,28 @@ impl Drop for NativeModelInner {
                 flag.store(true, Ordering::Release);
             }
         }
-        let _ = self.command_tx.try_send(WorkerCommand::Shutdown);
-        if let Ok(join) = self.join.get_mut()
-            && let Some(handle) = join.take()
-        {
-            let _ = handle.join();
-        }
+    }
+
+    fn shutdown_and_join(&mut self) -> NativeResult<()> {
+        let join = self
+            .join
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(join) = join else {
+            return Ok(());
+        };
+        self.cancel_active_work();
+        // A blocking send is intentional. `try_send` can lose Shutdown when
+        // the bounded queue is full and then deadlock while joining a worker
+        // whose final sender is still alive.
+        let _ = self.command_tx.send(WorkerCommand::Shutdown);
+        join.join().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                "native model owner worker panicked before it could be joined",
+            )
+        })
     }
 }
 
@@ -553,14 +674,38 @@ impl NativeModelHandle {
                     format!("failed to start native model worker: {error}"),
                 )
             })?;
-        ready_rx
-            .recv_timeout(Duration::from_secs(300))
-            .map_err(|error| {
-                NativeError::new(
+        let mut bootstrap = WorkerBootstrapGuard::new(command_tx, worker);
+        let readiness = ready_rx.recv_timeout(Duration::from_secs(300));
+        match readiness {
+            Ok(Ok(())) => {}
+            Ok(Err(load_error)) => {
+                if let Err(join_error) = bootstrap.shutdown_and_join() {
+                    return Err(NativeError::new(
+                        NativeErrorCode::WorkerStopped,
+                        format!(
+                            "native model load failed ({load_error}); its bootstrap worker also failed to join ({join_error})"
+                        ),
+                    ));
+                }
+                return Err(load_error);
+            }
+            Err(readiness_error) => {
+                let load_error = NativeError::new(
                     NativeErrorCode::ModelLoadFailed,
-                    format!("native model worker did not become ready: {error}"),
-                )
-            })??;
+                    format!("native model worker did not become ready: {readiness_error}"),
+                );
+                if let Err(join_error) = bootstrap.shutdown_and_join() {
+                    return Err(NativeError::new(
+                        NativeErrorCode::WorkerStopped,
+                        format!(
+                            "{load_error}; its bootstrap worker also failed to join ({join_error})"
+                        ),
+                    ));
+                }
+                return Err(load_error);
+            }
+        }
+        let (command_tx, worker) = bootstrap.into_parts()?;
         Ok(Self {
             inner: Arc::new(NativeModelInner {
                 command_tx,
@@ -595,6 +740,36 @@ impl NativeModelHandle {
     /// requests for one resident profile must reuse the same worker allocation.
     pub fn is_same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Consumes the final handle, shuts down its worker, and joins the owner
+    /// thread before returning linear shutdown evidence.
+    ///
+    /// When another handle still exists, no shutdown is attempted. The
+    /// returned `NativeModelInUse` retains this handle so the owning registry
+    /// can restore it and retry after outstanding leases are dropped.
+    pub fn try_shutdown(self) -> NativeResult<NativeModelShutdown> {
+        let model_id = self.status().model_id;
+        match Arc::try_unwrap(self.inner) {
+            Ok(mut inner) => {
+                inner.shutdown_and_join()?;
+                Ok(NativeModelShutdown::Joined(JoinedNativeModel { model_id }))
+            }
+            Err(inner) => {
+                let additional_handles = Arc::strong_count(&inner).saturating_sub(1);
+                let additional_handles =
+                    NonZeroUsize::new(additional_handles).ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::Internal,
+                            "native model ownership changed while shutdown was being attempted",
+                        )
+                    })?;
+                Ok(NativeModelShutdown::InUse(NativeModelInUse {
+                    handle: Self { inner },
+                    additional_handles,
+                }))
+            }
+        }
     }
 
     /// Submit exact token IDs for in-process embedding on this model's owner
@@ -4724,6 +4899,110 @@ mod tests {
 
     static TEST_ARTIFACT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
     static REAL_MODEL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_worker_handle(model_id: &str, stopped: Arc<AtomicBool>) -> NativeModelHandle {
+        let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let join = std::thread::spawn(move || {
+            while let Ok(command) = command_rx.recv() {
+                if matches!(command, WorkerCommand::Shutdown) {
+                    break;
+                }
+            }
+            stopped.store(true, Ordering::Release);
+        });
+        NativeModelHandle {
+            inner: Arc::new(NativeModelInner {
+                command_tx,
+                cancellations: Arc::new(Mutex::new(HashMap::new())),
+                reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
+                status: Arc::new(RwLock::new(ResidentModelStatus {
+                    model_id: model_id.to_string(),
+                    model_path: std::path::PathBuf::new(),
+                    state: ModelRuntimeState::Ready,
+                    fingerprint: None,
+                    descriptor: None,
+                    active_sequences: 0,
+                    max_sequences: 1,
+                })),
+                join: Mutex::new(Some(join)),
+            }),
+        }
+    }
+
+    #[test]
+    fn joined_shutdown_requires_the_final_handle_and_observes_worker_return() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let handle = test_worker_handle("shutdown-test", Arc::clone(&stopped));
+        let outstanding = handle.clone();
+
+        let blocked = match handle.try_shutdown().expect("typed shutdown attempt") {
+            NativeModelShutdown::InUse(blocked) => blocked,
+            NativeModelShutdown::Joined(_) => panic!("a live clone must block shutdown authority"),
+        };
+        assert_eq!(blocked.additional_handles().get(), 1);
+        assert!(!stopped.load(Ordering::Acquire));
+
+        drop(outstanding);
+        let joined = match blocked
+            .into_handle()
+            .try_shutdown()
+            .expect("final handle joins")
+        {
+            NativeModelShutdown::Joined(joined) => joined,
+            NativeModelShutdown::InUse(_) => panic!("no additional handle remains"),
+        };
+        assert_eq!(joined.model_id(), "shutdown-test");
+        assert!(stopped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn bootstrap_guard_never_detaches_its_worker() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
+        let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let join = std::thread::spawn(move || {
+            while let Ok(command) = command_rx.recv() {
+                if matches!(command, WorkerCommand::Shutdown) {
+                    break;
+                }
+            }
+            worker_stopped.store(true, Ordering::Release);
+        });
+
+        drop(WorkerBootstrapGuard::new(command_tx, join));
+        assert!(stopped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn worker_panic_cannot_mint_joined_shutdown_authority() {
+        let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let join = std::thread::spawn(move || {
+            let _ = command_rx.recv();
+            panic!("intentional owner-worker panic");
+        });
+        let handle = NativeModelHandle {
+            inner: Arc::new(NativeModelInner {
+                command_tx,
+                cancellations: Arc::new(Mutex::new(HashMap::new())),
+                reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
+                status: Arc::new(RwLock::new(ResidentModelStatus {
+                    model_id: "panicking-worker".to_string(),
+                    model_path: std::path::PathBuf::new(),
+                    state: ModelRuntimeState::Ready,
+                    fingerprint: None,
+                    descriptor: None,
+                    active_sequences: 0,
+                    max_sequences: 1,
+                })),
+                join: Mutex::new(Some(join)),
+            }),
+        };
+
+        let error = handle
+            .try_shutdown()
+            .expect_err("a panicked worker must not yield joined evidence");
+        assert_eq!(error.code, NativeErrorCode::WorkerStopped);
+    }
 
     struct TestArtifactDirectory {
         path: std::path::PathBuf,
