@@ -130,6 +130,17 @@ export function sourceGhostTextForTextarea(
   return display;
 }
 
+/** The complete fail-closed presentation contract shared with the scheduler. */
+export function sourceGhostPresentationCompatible(
+  manuscriptText: string,
+  candidateText: string,
+  verseNewline: VerseNewlineKind | null
+): boolean {
+  return !sourceTextHasStrongRtl(manuscriptText) &&
+    !sourceTextHasStrongRtl(candidateText) &&
+    sourceGhostTextForTextarea(candidateText, verseNewline) !== null;
+}
+
 export function planSourceGhostText(input: SourceGhostPlanInput): SourceGhostPlan | null {
   const { presentation } = input;
   if (

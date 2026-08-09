@@ -54,7 +54,7 @@ export function candidateSurfaceDecision(text: string): CandidateSurfaceDecision
 
   const tokens = (text.slice(0, maxScannedCodeUnits).match(wordPattern) ?? [])
     .slice(0, 512)
-    .map((token) => token.toLocaleLowerCase());
+    .map((token) => token.toLowerCase());
   if (tokens.length === 0) return { surface: true };
 
   const numericTokens = tokens.filter((token) => digitPattern.test(token)).length;

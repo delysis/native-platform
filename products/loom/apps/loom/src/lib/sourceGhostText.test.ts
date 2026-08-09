@@ -4,6 +4,7 @@ import {
   planSourceGhostText,
   renderedSourceGhostPresentationKey,
   sourceGhostKeyAction,
+  sourceGhostPresentationCompatible,
   sourceTextHasStrongRtl,
   sourceGhostTextForTextarea,
   sourceMirrorDirectionIsSupported,
@@ -111,6 +112,13 @@ describe('sourceGhostTextForTextarea', () => {
   it('keeps exact Unicode and tabs while projecting only the declared newline encoding', () => {
     expect(sourceGhostTextForTextarea('\t東🧵\r\nnext', 'crlf')).toBe('\t東🧵\nnext');
     expect(sourceGhostTextForTextarea('\t東🧵\rnext', 'crlf')).toBeNull();
+  });
+
+  it('shares the complete newline and RTL presentation contract with scheduling', () => {
+    expect(sourceGhostPresentationCompatible('A waits', ' then light', null)).toBe(true);
+    expect(sourceGhostPresentationCompatible('עברית', ' then light', null)).toBe(false);
+    expect(sourceGhostPresentationCompatible('A waits', ' עברית', null)).toBe(false);
+    expect(sourceGhostPresentationCompatible('A waits', ' then\rbroken', null)).toBe(false);
   });
 });
 

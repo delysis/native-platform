@@ -15,7 +15,9 @@ import {
 function stateAtEnd(markdown = 'The sentence waits', withPlugin = false): EditorState {
   const initial = EditorState.create({
     doc: defaultMarkdownParser.parse(markdown),
-    plugins: withPlugin ? [createGhostTextPlugin({ accept() {}, dismiss() {} })] : []
+    plugins: withPlugin ? [createGhostTextPlugin({
+      accept: () => true, dismiss() {}, visible: () => true
+    })] : []
   });
   return initial.apply(initial.tr.setSelection(Selection.atEnd(initial.doc)));
 }
@@ -57,7 +59,9 @@ describe('planGhostText', () => {
 
 describe('visual ghost overlay', () => {
   it('keeps generated text out of ProseMirror DOM decorations', () => {
-    const plugin = createGhostTextPlugin({ accept() {}, dismiss() {} });
+    const plugin = createGhostTextPlugin({
+      accept: () => true, dismiss() {}, visible: () => true
+    });
     expect(plugin.props.decorations).toBeUndefined();
   });
 
@@ -87,6 +91,27 @@ describe('visual ghost overlay', () => {
       caret: { left: 1, top: 0, bottom: 1 },
       shell: { left: 0, top: 0 },
       text: { left: 2, right: 1 }
+    })).toBeNull();
+  });
+
+  it('refuses a caret clipped outside the scroll viewport', () => {
+    expect(planGhostOverlayGeometry({
+      caret: { left: 220, top: 680, bottom: 710 },
+      shell: { left: 100, top: 20 },
+      text: { left: 150, right: 600 },
+      clip: { left: 100, right: 700, top: 40, bottom: 640 }
+    })).toBeNull();
+    expect(planGhostOverlayGeometry({
+      caret: { left: 220, top: 80, bottom: 110 },
+      shell: { left: 100, top: 20 },
+      text: { left: 150, right: 600 },
+      clip: { left: 100, right: 700, top: 40, bottom: 640 }
+    })).toEqual({ left: 120, top: 60, maxWidth: 380 });
+    expect(planGhostOverlayGeometry({
+      caret: { left: 570, top: 610, bottom: 640 },
+      shell: { left: 100, top: 20 },
+      text: { left: 150, right: 600 },
+      clip: { left: 100, right: 700, top: 40, bottom: 640 }
     })).toBeNull();
   });
 });
@@ -127,9 +152,57 @@ describe('ghost-text plugin state', () => {
 
   it('accepts with unmodified Tab only while the exact ghost is rendered', () => {
     let accepted = '';
+    let wasInstalledWhenClaimed = false;
+    let visible = false;
     const plugin = createGhostTextPlugin({
-      accept: (candidateId) => { accepted = candidateId; },
-      dismiss() {}
+      accept: (candidateId) => {
+        accepted = candidateId;
+        wasInstalledWhenClaimed = ghostTextPluginKey.getState(state) !== null;
+        return true;
+      },
+      dismiss() {},
+      visible: () => visible
+    });
+    const doc = defaultMarkdownParser.parse('The sentence waits');
+    let state = EditorState.create({
+      doc,
+      selection: Selection.atEnd(doc),
+      plugins: [plugin]
+    });
+    const view = {
+      get state() { return state; },
+      dispatch(transaction: Parameters<EditorView['dispatch']>[0]) {
+        state = state.apply(transaction);
+      }
+    } as unknown as EditorView;
+    setGhostText(view, suggestion);
+
+    const tab = {
+      key: 'Tab',
+      keyCode: 9,
+      isComposing: false,
+      shiftKey: false,
+      metaKey: false,
+      ctrlKey: false,
+      altKey: false
+    } as KeyboardEvent;
+    expect(plugin.props.handleKeyDown?.call(plugin, view, tab)).toBe(false);
+    expect(accepted).toBe('');
+    expect(ghostTextPluginKey.getState(state)).not.toBeNull();
+
+    visible = true;
+    const handled = plugin.props.handleKeyDown?.call(plugin, view, tab);
+    expect(handled).toBe(true);
+    expect(accepted).toBe(suggestion.candidateId);
+    expect(wasInstalledWhenClaimed).toBe(true);
+    expect(ghostTextPluginKey.getState(state)).toBeNull();
+  });
+
+  it('clears a parent-rejected ghost without consuming ordinary Tab', () => {
+    const plugin = createGhostTextPlugin({
+      accept: () => false,
+      dismiss() {},
+      visible: () => true
     });
     const doc = defaultMarkdownParser.parse('The sentence waits');
     let state = EditorState.create({
@@ -154,8 +227,8 @@ describe('ghost-text plugin state', () => {
       ctrlKey: false,
       altKey: false
     } as KeyboardEvent);
-    expect(handled).toBe(true);
-    expect(accepted).toBe(suggestion.candidateId);
+
+    expect(handled).toBe(false);
     expect(ghostTextPluginKey.getState(state)).toBeNull();
   });
 
@@ -163,8 +236,12 @@ describe('ghost-text plugin state', () => {
     let dismissed = '';
     let accepted = '';
     const plugin = createGhostTextPlugin({
-      accept: (candidateId) => { accepted = candidateId; },
-      dismiss: (candidateId) => { dismissed = candidateId; }
+      accept: (candidateId) => {
+        accepted = candidateId;
+        return true;
+      },
+      dismiss: (candidateId) => { dismissed = candidateId; },
+      visible: () => true
     });
     const doc = defaultMarkdownParser.parse('The sentence waits');
     let state = EditorState.create({

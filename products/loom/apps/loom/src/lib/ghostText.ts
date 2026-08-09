@@ -16,8 +16,14 @@ export interface GhostTextPlan {
 }
 
 export interface GhostTextHandlers {
-  accept: (candidateId: string, presentationKey: string) => void;
+  /**
+   * Synchronously consume the exact visible presentation. A false result
+   * leaves Tab with its ordinary browser meaning after the stale ghost is
+   * cleared.
+   */
+  accept: (candidateId: string, presentationKey: string) => boolean;
   dismiss: (candidateId: string, presentationKey: string) => void;
+  visible: (presentationKey: string) => boolean;
 }
 
 export interface GhostOverlayGeometry {
@@ -30,6 +36,7 @@ export interface GhostOverlayBounds {
   caret: { left: number; top: number; bottom: number };
   shell: { left: number; top: number };
   text: { left: number; right: number };
+  clip?: { left: number; right: number; top: number; bottom: number };
 }
 
 type GhostTextMeta =
@@ -89,6 +96,19 @@ export function planGhostOverlayGeometry(bounds: GhostOverlayBounds): GhostOverl
     bounds.text.right
   ];
   if (!values.every(Number.isFinite) || bounds.text.right <= bounds.text.left) return null;
+  if (bounds.clip) {
+    const { clip, caret } = bounds;
+    const clipValues = [clip.left, clip.right, clip.top, clip.bottom];
+    if (
+      !clipValues.every(Number.isFinite) ||
+      clip.right <= clip.left ||
+      clip.bottom <= clip.top ||
+      caret.left < clip.left ||
+      caret.left >= clip.right ||
+      caret.bottom <= clip.top ||
+      caret.top >= clip.bottom
+    ) return null;
+  }
 
   const sameLineWidth = bounds.text.right - bounds.caret.left;
   if (sameLineWidth >= 72) {
@@ -98,6 +118,14 @@ export function planGhostOverlayGeometry(bounds: GhostOverlayBounds): GhostOverl
       maxWidth: sameLineWidth
     };
   }
+  if (
+    bounds.clip &&
+    (
+      bounds.caret.bottom >= bounds.clip.bottom ||
+      bounds.text.left >= bounds.clip.right ||
+      bounds.text.right <= bounds.clip.left
+    )
+  ) return null;
   return {
     left: Math.max(0, bounds.text.left - bounds.shell.left),
     top: Math.max(0, bounds.caret.bottom - bounds.shell.top),
@@ -164,9 +192,13 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           !event.ctrlKey &&
           !event.altKey
         ) {
+          if (!handlers.visible(plan.presentationKey)) return false;
+          // Claim parent authority while its exact visibility witness still
+          // exists. Dispatch synchronously reports the cleared overlay, so
+          // clearing first would make every legitimate acceptance fail.
+          const accepted = handlers.accept(plan.candidateId, plan.presentationKey);
           view.dispatch(clearTransaction(view));
-          handlers.accept(plan.candidateId, plan.presentationKey);
-          return true;
+          return accepted;
         }
         return false;
       }

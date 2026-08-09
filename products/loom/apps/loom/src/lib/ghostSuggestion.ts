@@ -1,5 +1,8 @@
 import type { BranchCard } from './types';
-import { candidateTextIsSurfaceable } from './candidateSurface';
+import {
+  candidateSurfaceDecision,
+  type CandidateSurfaceDecision
+} from './candidateSurface';
 
 export interface VerifiedGhostSuggestion {
   candidateId: string;
@@ -13,7 +16,26 @@ export interface GhostSuggestionSelection {
   hydratedBlobByRun: Readonly<Record<string, string>>;
   dismissedCandidateIds: readonly string[];
   targetByte: number | null;
+  presentationCompatible?: (text: string) => boolean;
 }
+
+export type AutocompleteExhaustionReason =
+  | Exclude<CandidateSurfaceDecision, { surface: true }>['reason']
+  | 'invalid'
+  | 'unpresentable';
+
+export type AutocompleteDisposition =
+  | { kind: 'inactive' }
+  | { kind: 'awaiting_candidates' }
+  | { kind: 'awaiting_hydration'; runIds: readonly string[] }
+  | { kind: 'available'; suggestion: VerifiedGhostSuggestion }
+  | {
+      kind: 'exhausted';
+      candidates: readonly {
+        candidateId: string;
+        reason: AutocompleteExhaustionReason;
+      }[];
+    };
 
 export interface GhostReviewAffordance {
   visible: boolean;
@@ -95,26 +117,75 @@ export function verifiedGhostSuggestion(
 export function selectVerifiedGhostSuggestion(
   selection: GhostSuggestionSelection
 ): VerifiedGhostSuggestion | null {
+  const disposition = autocompleteDisposition(selection);
+  return disposition.kind === 'available' ? disposition.suggestion : null;
+}
+
+/**
+ * Keep the absence of inline text typed. Inactive editing, generation still in
+ * flight, immutable-body hydration, and a fully rejected family are different
+ * states and must never collapse into one nullable "ready" flag.
+ */
+export function autocompleteDisposition(
+  selection: GhostSuggestionSelection
+): AutocompleteDisposition {
   if (
     !selection.active ||
     selection.targetByte === null ||
     !Number.isSafeInteger(selection.targetByte) ||
     selection.targetByte < 0
-  ) return null;
+  ) return { kind: 'inactive' };
 
   const dismissed = new Set(selection.dismissedCandidateIds);
-  for (const branch of selection.branches) {
+  const exactBranches = selection.branches.filter((branch) =>
+    Boolean(
+      branch.candidate_id &&
+      !dismissed.has(branch.candidate_id) &&
+      branch.target_start_byte === selection.targetByte &&
+      branch.target_end_byte === selection.targetByte
+    )
+  );
+  if (exactBranches.length === 0) return { kind: 'awaiting_candidates' };
+
+  const awaitingHydration: string[] = [];
+  const exhausted: Array<{
+    candidateId: string;
+    reason: AutocompleteExhaustionReason;
+  }> = [];
+  for (const branch of exactBranches) {
+    const candidateId = branch.candidate_id;
+    if (!candidateId) continue;
     if (
-      !branch.candidate_id ||
-      dismissed.has(branch.candidate_id) ||
-      branch.target_start_byte !== selection.targetByte ||
-      branch.target_end_byte !== selection.targetByte
-    ) continue;
+      !branch.output_blob_id ||
+      branch.output_byte_len === null ||
+      selection.hydratedBlobByRun[branch.run_id] !== branch.output_blob_id
+    ) {
+      awaitingHydration.push(branch.run_id);
+      continue;
+    }
     const verified = verifiedGhostSuggestion(
       branch,
       selection.hydratedBlobByRun[branch.run_id]
     );
-    if (verified && candidateTextIsSurfaceable(verified.text)) return verified;
+    if (!verified) {
+      exhausted.push({ candidateId, reason: 'invalid' });
+      continue;
+    }
+    const surface = candidateSurfaceDecision(verified.text);
+    if (surface.surface) {
+      if (
+        selection.presentationCompatible &&
+        !selection.presentationCompatible(verified.text)
+      ) {
+        exhausted.push({ candidateId, reason: 'unpresentable' });
+        continue;
+      }
+      return { kind: 'available', suggestion: verified };
+    }
+    exhausted.push({ candidateId, reason: surface.reason });
   }
-  return null;
+  if (awaitingHydration.length > 0) {
+    return { kind: 'awaiting_hydration', runIds: awaitingHydration };
+  }
+  return { kind: 'exhausted', candidates: exhausted };
 }

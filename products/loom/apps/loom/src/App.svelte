@@ -45,20 +45,27 @@
   import {
     decodeVerseForEditor,
     encodeVerseFromEditor,
-    type VerseEditorCodec
+    type VerseEditorCodec,
+    type VerseNewlineKind
   } from './lib/verseCodec';
   import { canRoundTripMarkdownExactly, canUseVisualMarkdown } from './lib/markdownSafety';
   import {
+    autocompleteDisposition,
     ghostReviewAffordance,
-    selectVerifiedGhostSuggestion,
     verifiedGhostSuggestion,
-    visibleVerifiedGhostSuggestion
+    visibleVerifiedGhostSuggestion,
+    type AutocompleteDisposition
   } from './lib/ghostSuggestion';
+  import {
+    emptyAutocompleteRetryLedger,
+    planAutocompleteRetry,
+    type AutocompleteRetryLedger
+  } from './lib/autocompleteRetry';
   import {
     candidateSurfaceReason,
     candidateTextIsSurfaceable
   } from './lib/candidateSurface';
-  import { sourceGhostTextForTextarea } from './lib/sourceGhostText';
+  import { sourceGhostPresentationCompatible } from './lib/sourceGhostText';
   import { branchIsActionableOnShelf } from './lib/branchShelf';
   import {
     appendUniquePage,
@@ -168,8 +175,9 @@
   let suggestionsEnabled = false;
   let suggestionsChanging = false;
   let suggestionsIdleTimer: number | undefined;
-  let suggestionTargetEditVersion: number | null = null;
+  let scheduledSuggestion: SuggestionSchedule | null = null;
   let suggestionIntentEpoch = 0;
+  let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
   let dismissedCandidateIds: string[] = [];
   let announcedGhostPresentationKey = '';
   let modelDownloadUrl = '';
@@ -198,10 +206,12 @@
   let branchFirstPageCursor: BranchPageCursor | null = null;
   let branchHasMore = false;
   let branchLoadingMore = false;
+  let branchLoadMoreOwner = 0;
   let branchLoadedPastFirstPage = false;
   let branchBodyBlobByRun: Record<string, string> = {};
   let branchBodyErrorByRun: Record<string, string> = {};
   let branchRefreshSerial = 0;
+  let branchRefreshInFlightCount = 0;
   let sourceTextarea: HTMLTextAreaElement | undefined;
   let weaveStarting = false;
   let uncertainWeave: WeaveCapture | null = null;
@@ -352,12 +362,34 @@
     sessionId: string;
     documentId: string;
     relativePath: string;
+    documentKind: DocumentKind;
     sourceRevisionId: string;
     visibleBlobId: string;
     cursorByte: number;
     editVersion: number;
     intentEpoch: number;
+    modelId: string;
   }
+
+  interface AutocompleteRetryTicket {
+    projectId: string;
+    sessionId: string;
+    documentId: string;
+    sourceRevisionId: string;
+    visibleBlobId: string;
+    documentEpoch: number;
+    editVersion: number;
+    intentEpoch: number;
+    mode: 'visual' | 'source';
+    targetByte: number;
+    modelId: string;
+    sourceNewline: VerseNewlineKind | null;
+    waitsRemaining: number;
+  }
+
+  type SuggestionSchedule =
+    | { kind: 'edit_pause'; editVersion: number }
+    | { kind: 'exhausted_retry'; ticket: AutocompleteRetryTicket };
 
   interface ModelDownloadCapture extends VerifiedDownloadForm {
     commandId: string;
@@ -427,6 +459,9 @@
   const modelDownloadPollBaseMs = 750;
   const modelDownloadPollMaxMs = 5_000;
   const suggestionsIdleDelayMs = 1_800;
+  const suggestionsRetryDelayMs = 350;
+  const maximumAutomaticSuggestionRetries = 1;
+  const maximumAutocompleteRetryWaits = 50;
 
   $: visibleDocuments = project?.documents.filter((candidate) => {
     const query = search.trim().toLocaleLowerCase();
@@ -446,7 +481,8 @@
     branch.status === 'ready' &&
     branch.selection !== 'promote' &&
     branch.selection !== 'reject' &&
-    branch.source_revision_id === document?.summary.revision_id
+    branch.source_revision_id === document?.summary.revision_id &&
+    branch.model_id === currentModel?.model_id
   );
   $: shelfBranches = branches.filter((branch) =>
     branchIsActionableOnShelf(branch, document?.summary.revision_id)
@@ -484,27 +520,32 @@
     documentText,
     verseCodec
   );
-  $: ghostSuggestion = selectVerifiedGhostSuggestion({
+  $: visualAutocompleteDisposition = autocompleteDisposition({
     active: mode === 'visual' && suggestionsEnabled && !visualMutationPending && branchPromotionReady,
     branches: currentReadyBranches,
     hydratedBlobByRun: branchBodyBlobByRun,
     dismissedCandidateIds,
     targetByte: visualGhostTargetByte
   });
-  $: sourceGhostCandidate = selectVerifiedGhostSuggestion({
+  $: ghostSuggestion = visualAutocompleteDisposition.kind === 'available'
+    ? visualAutocompleteDisposition.suggestion
+    : null;
+  $: sourceGhostNewline = document?.summary.kind === 'verse'
+    ? verseCodec?.newline ?? 'mixed'
+    : null;
+  $: sourceAutocompleteDisposition = autocompleteDisposition({
     active: mode === 'source' && suggestionsEnabled && !sourceDirty && !compositionActive && branchPromotionReady,
     branches: currentReadyBranches,
     hydratedBlobByRun: branchBodyBlobByRun,
     dismissedCandidateIds,
-    targetByte: sourceGhostTargetByte
+    targetByte: sourceGhostTargetByte,
+    presentationCompatible: (text) =>
+      sourceGhostPresentationCompatible(sourceDisplayText, text, sourceGhostNewline)
   });
-  $: sourceGhostNewline = document?.summary.kind === 'verse'
-    ? verseCodec?.newline ?? 'mixed'
+  $: sourceGhostCandidate = sourceAutocompleteDisposition.kind === 'available'
+    ? sourceAutocompleteDisposition.suggestion
     : null;
-  $: sourceGhostSuggestion = sourceGhostCandidate &&
-    sourceGhostTextForTextarea(sourceGhostCandidate.text, sourceGhostNewline) !== null
-      ? sourceGhostCandidate
-      : null;
+  $: sourceGhostSuggestion = sourceGhostCandidate;
   $: activeGhostSuggestion = mode === 'visual'
     ? visibleVerifiedGhostSuggestion(
       ghostSuggestion,
@@ -569,6 +610,8 @@
       document &&
       document.summary.kind !== 'hybrid' &&
       currentModel &&
+      !modelLoading &&
+      !modelUnloading &&
       suggestionsEnabled &&
       !uncertainWeave &&
       !compositionActive &&
@@ -587,6 +630,19 @@
       automaticBoundaryIsExact &&
       activeBranchCount === 0
   );
+  $: retryEvaluationSnapshot = {
+    enabled: desktop && branchPromotionReady && suggestionsEnabled && Boolean(currentModel) && activeBranchCount === 0,
+    branches,
+    hydrated: branchBodyBlobByRun,
+    dismissed: dismissedCandidateIds,
+    mode,
+    visualTarget: visualGhostTargetByte,
+    sourceTarget: sourceGhostTargetByte,
+    sourceNewline: sourceGhostNewline
+  };
+  $: if (retryEvaluationSnapshot.enabled) {
+    maybeRetryExhaustedAutocomplete();
+  }
   $: showVisual = mode === 'visual' || mode === 'split';
   $: showSource = mode === 'source' || mode === 'split';
   $: exactTextSurface = document?.summary.kind === 'verse';
@@ -705,6 +761,7 @@
     branchNextCursor = null;
     branchFirstPageCursor = null;
     branchHasMore = false;
+    branchLoadMoreOwner += 1;
     branchLoadingMore = false;
     branchLoadedPastFirstPage = false;
     branchBodyBlobByRun = {};
@@ -1362,7 +1419,7 @@
       }));
       cancellingRunIds = cancellingRunIds.filter((runId) => runId !== generation.run_id);
       scheduleBranchRefresh();
-      announce(status === 'ready' ? 'A private strand is ready' : `A private strand ${status}`);
+      if (status !== 'ready') announce(`A private strand ${status}`);
       return;
     }
 
@@ -1624,6 +1681,78 @@
     }
   }
 
+  function maybeRetryExhaustedAutocomplete(): void {
+    if (
+      !desktop ||
+      !project ||
+      !document ||
+      !currentModel ||
+      !suggestionsEnabled ||
+      !branchPromotionReady
+    ) return;
+    const sourceRevisionId = document.summary.revision_id;
+    if (!sourceRevisionId) return;
+    const retryMode = mode === 'visual' || mode === 'source' ? mode : null;
+    if (!retryMode) return;
+    const targetByte = retryMode === 'visual'
+      ? visualGhostTargetByte
+      : sourceGhostTargetByte;
+    if (targetByte === null) return;
+    const ready = branches.filter((branch) =>
+      branch.status === 'ready' &&
+      branch.selection !== 'promote' &&
+      branch.selection !== 'reject' &&
+      branch.source_revision_id === sourceRevisionId &&
+      branch.model_id === currentModel?.model_id
+    );
+    const disposition = autocompleteDisposition({
+      active: true,
+      branches: ready,
+      hydratedBlobByRun: branchBodyBlobByRun,
+      dismissedCandidateIds,
+      targetByte,
+      presentationCompatible: retryMode === 'source'
+        ? (text) => sourceGhostPresentationCompatible(
+          sourceDisplayText,
+          text,
+          sourceGhostNewline
+        )
+        : undefined
+    });
+    const budgetKey = [
+      project.project_id,
+      project.session_id,
+      document.summary.document_id,
+      sourceRevisionId,
+      editVersion
+    ].join(':');
+    const decision = planAutocompleteRetry(autocompleteRetryLedger, {
+      disposition,
+      budgetKey,
+      activeBranchCount: branches.filter(isBranchActive).length,
+      weaveStarting,
+      maximumRetries: maximumAutomaticSuggestionRetries
+    });
+    autocompleteRetryLedger = decision.ledger;
+    if (decision.kind === 'schedule') {
+      scheduleAutocompleteRetry({
+        projectId: project.project_id,
+        sessionId: project.session_id,
+        documentId: document.summary.document_id,
+        sourceRevisionId,
+        visibleBlobId: document.visible_blob_id,
+        documentEpoch,
+        editVersion,
+        intentEpoch: suggestionIntentEpoch,
+        mode: retryMode,
+        targetByte,
+        modelId: currentModel.model_id,
+        sourceNewline: retryMode === 'source' ? sourceGhostNewline : null,
+        waitsRemaining: maximumAutocompleteRetryWaits
+      });
+    }
+  }
+
   async function refreshBranchesFor(
     projectId: string,
     sessionId: string,
@@ -1632,6 +1761,7 @@
     expectedViewEpoch = branchPollEpoch
   ): Promise<boolean> {
     const refreshSerial = ++branchRefreshSerial;
+    branchRefreshInFlightCount += 1;
     try {
       const page = await getBranchPage(
         projectId,
@@ -1696,6 +1826,8 @@
         announce('Stored strands could not be refreshed');
       }
       return false;
+    } finally {
+      branchRefreshInFlightCount = Math.max(0, branchRefreshInFlightCount - 1);
     }
   }
 
@@ -1713,7 +1845,14 @@
   }
 
   async function loadMoreBranches(): Promise<void> {
-    if (!project || !document || !branchNextCursor || !branchHasMore || branchLoadingMore) return;
+    if (
+      !project ||
+      !document ||
+      !branchNextCursor ||
+      !branchHasMore ||
+      branchLoadingMore ||
+      branchRefreshInFlightCount > 0
+    ) return;
     const scope = {
       projectId: project.project_id,
       sessionId: project.session_id,
@@ -1722,6 +1861,7 @@
       cursor: branchNextCursor
     };
     const refreshSerial = ++branchRefreshSerial;
+    const loadOwner = ++branchLoadMoreOwner;
     branchLoadingMore = true;
     try {
       const page = await getBranchPage(
@@ -1778,7 +1918,7 @@
         announce('Older strands could not be loaded');
       }
     } finally {
-      branchLoadingMore = false;
+      if (branchLoadMoreOwner === loadOwner) branchLoadingMore = false;
     }
   }
 
@@ -2141,7 +2281,7 @@
   function cancelSuggestionTimer(): void {
     if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
     suggestionsIdleTimer = undefined;
-    suggestionTargetEditVersion = null;
+    scheduledSuggestion = null;
     suggestionIntentEpoch += 1;
   }
 
@@ -2152,9 +2292,17 @@
       suggestionsChanging
     ) return;
     const boundProject = project;
+    const previousEnabled = suggestionsEnabled;
+    const previousDismissedCandidateIds = dismissedCandidateIds;
     suggestionsChanging = true;
     suggestionIntentEpoch += 1;
-    if (!enabled) cancelSuggestionTimer();
+    if (!enabled) {
+      suggestionsEnabled = false;
+      cancelSuggestionTimer();
+      dismissedCandidateIds = currentReadyBranches
+        .map((branch) => branch.candidate_id)
+        .filter((candidateId): candidateId is string => Boolean(candidateId));
+    }
     try {
       await setSuggestionsPolicy(boundProject.project_id, boundProject.session_id, enabled);
       if (
@@ -2172,10 +2320,6 @@
       }
       if (!enabled) {
         clearPreferredWriterRequest();
-        cancelSuggestionTimer();
-        dismissedCandidateIds = currentReadyBranches
-          .map((branch) => branch.candidate_id)
-          .filter((candidateId): candidateId is string => Boolean(candidateId));
         scheduleActiveBranchPoll();
       }
       let writerReady = Boolean(currentModel);
@@ -2197,7 +2341,8 @@
         scheduleAutomaticSuggestions(editVersion);
       }
     } catch (error) {
-      suggestionsEnabled = false;
+      suggestionsEnabled = previousEnabled;
+      dismissedCandidateIds = previousDismissedCandidateIds;
       clearPreferredWriterRequest();
       cancelSuggestionTimer();
       if (!enabled && activeBranchCount > 0) void cancelActiveBranches();
@@ -2931,9 +3076,20 @@
     targetEditVersion: number,
     delay = suggestionsIdleDelayMs
   ): void {
+    armSuggestionSchedule({ kind: 'edit_pause', editVersion: targetEditVersion }, delay);
+  }
+
+  function scheduleAutocompleteRetry(ticket: AutocompleteRetryTicket): void {
+    armSuggestionSchedule(
+      { kind: 'exhausted_retry', ticket },
+      suggestionsRetryDelayMs
+    );
+  }
+
+  function armSuggestionSchedule(schedule: SuggestionSchedule, delay: number): void {
     if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
     suggestionsIdleTimer = undefined;
-    suggestionTargetEditVersion = null;
+    scheduledSuggestion = null;
     if (
       !desktop ||
       !suggestionsEnabled ||
@@ -2942,16 +3098,80 @@
       !document ||
       document.summary.kind === 'hybrid'
     ) return;
-    suggestionTargetEditVersion = targetEditVersion;
+    scheduledSuggestion = schedule;
     suggestionsIdleTimer = window.setTimeout(() => {
       suggestionsIdleTimer = undefined;
-      void tryStartAutomaticSuggestions(targetEditVersion);
+      void tryStartAutomaticSuggestions(schedule);
     }, delay);
   }
 
-  async function tryStartAutomaticSuggestions(targetEditVersion: number): Promise<void> {
+  function rearmBoundedSuggestionSchedule(
+    schedule: SuggestionSchedule,
+    delay: number
+  ): boolean {
+    if (schedule.kind === 'edit_pause') {
+      armSuggestionSchedule(schedule, delay);
+      return true;
+    }
+    if (schedule.ticket.waitsRemaining <= 0) {
+      scheduledSuggestion = null;
+      return false;
+    }
+    armSuggestionSchedule({
+      kind: 'exhausted_retry',
+      ticket: {
+        ...schedule.ticket,
+        waitsRemaining: schedule.ticket.waitsRemaining - 1
+      }
+    }, delay);
+    return true;
+  }
+
+  function retryTicketDisposition(
+    ticket: AutocompleteRetryTicket
+  ): AutocompleteDisposition | null {
     if (
-      suggestionTargetEditVersion !== targetEditVersion ||
+      !project ||
+      !document ||
+      !currentModel ||
+      !suggestionsEnabled ||
+      project.project_id !== ticket.projectId ||
+      project.session_id !== ticket.sessionId ||
+      document.summary.document_id !== ticket.documentId ||
+      document.summary.revision_id !== ticket.sourceRevisionId ||
+      document.visible_blob_id !== ticket.visibleBlobId ||
+      documentEpoch !== ticket.documentEpoch ||
+      editVersion !== ticket.editVersion ||
+      suggestionIntentEpoch !== ticket.intentEpoch ||
+      mode !== ticket.mode ||
+      currentModel.model_id !== ticket.modelId ||
+      sourceGhostNewline !== ticket.sourceNewline ||
+      !branchPromotionReady
+    ) return null;
+    const targetByte = mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte;
+    if (targetByte !== ticket.targetByte) return null;
+    return autocompleteDisposition({
+      active: true,
+      branches: currentReadyBranches,
+      hydratedBlobByRun: branchBodyBlobByRun,
+      dismissedCandidateIds,
+      targetByte,
+      presentationCompatible: mode === 'source'
+        ? (text) => sourceGhostPresentationCompatible(
+          sourceDisplayText,
+          text,
+          ticket.sourceNewline
+        )
+        : undefined
+    });
+  }
+
+  async function tryStartAutomaticSuggestions(schedule: SuggestionSchedule): Promise<void> {
+    const targetEditVersion = schedule.kind === 'edit_pause'
+      ? schedule.editVersion
+      : schedule.ticket.editVersion;
+    if (
+      scheduledSuggestion !== schedule ||
       targetEditVersion !== editVersion ||
       !suggestionsEnabled ||
       !currentModel ||
@@ -2960,11 +3180,29 @@
       compositionActive ||
       transition !== 'idle'
     ) {
-      suggestionTargetEditVersion = null;
+      scheduledSuggestion = null;
       return;
     }
+    if (schedule.kind === 'exhausted_retry') {
+      const disposition = retryTicketDisposition(schedule.ticket);
+      if (!disposition) {
+        scheduledSuggestion = null;
+        return;
+      }
+      if (disposition.kind === 'available' || disposition.kind === 'inactive') {
+        scheduledSuggestion = null;
+        return;
+      }
+      if (
+        disposition.kind === 'awaiting_candidates' ||
+        disposition.kind === 'awaiting_hydration'
+      ) {
+        rearmBoundedSuggestionSchedule(schedule, 200);
+        return;
+      }
+    }
     if (activeBranchCount > 0 || weaveStarting) {
-      scheduleAutomaticSuggestions(targetEditVersion, 450);
+      rearmBoundedSuggestionSchedule(schedule, 450);
       return;
     }
     if (!canStartAutomaticSuggestions) {
@@ -2973,11 +3211,11 @@
         saveInFlight ||
         saveState === 'dirty' ||
         saveState === 'saving'
-      ) scheduleAutomaticSuggestions(targetEditVersion, 350);
-      else suggestionTargetEditVersion = null;
+      ) rearmBoundedSuggestionSchedule(schedule, 350);
+      else scheduledSuggestion = null;
       return;
     }
-    suggestionTargetEditVersion = null;
+    scheduledSuggestion = null;
     await startAutomaticWeave();
   }
 
@@ -3386,15 +3624,22 @@
         : null;
   }
 
-  function acceptActiveGhost(candidateId: string, presentationKey: string): void {
+  function acceptActiveGhost(candidateId: string, presentationKey: string): boolean {
     const eligible = eligibleGhostForCurrentMode();
     const branch = branches.find((candidate) => candidate.candidate_id === candidateId);
+    const visiblePresentationKey = mode === 'visual'
+      ? visibleVisualGhostPresentationKey
+      : mode === 'source'
+        ? visibleSourceGhostPresentationKey
+        : '';
     if (
       !branch ||
       eligible?.candidateId !== candidateId ||
-      eligible.presentationKey !== presentationKey
-    ) return;
+      eligible.presentationKey !== presentationKey ||
+      visiblePresentationKey !== presentationKey
+    ) return false;
     void acceptInlineSuggestion(branch);
+    return true;
   }
 
   function dismissActiveGhost(candidateId: string, presentationKey: string): void {
@@ -3514,7 +3759,8 @@
     if (started.branches.some((branch) =>
       branch.source_revision_id !== captured.sourceRevisionId ||
       branch.target_start_byte !== captured.cursorByte ||
-      branch.target_end_byte !== captured.cursorByte
+      branch.target_end_byte !== captured.cursorByte ||
+      branch.model_id !== captured.modelId
     )) {
       throw new Error('The desktop returned a branch outside the requested manuscript boundary.');
     }
@@ -3524,6 +3770,9 @@
       ...started.branches.map((branch) => applyLiveBranchState(branch, false)),
       ...branches.filter((branch) => !runIds.has(branch.run_id))
     ];
+    // A lost-reply replay may already be terminal. Only the authoritative body
+    // endpoint can certify immutable blob identity for presentation.
+    scheduleBranchRefresh();
     scheduleActiveBranchPoll();
     return true;
   }
@@ -3533,11 +3782,13 @@
       project?.project_id === captured.projectId &&
       project.session_id === captured.sessionId &&
       document?.summary.document_id === captured.documentId &&
+      document.summary.kind === captured.documentKind &&
       document.summary.revision_id === captured.sourceRevisionId &&
       document.visible_blob_id === captured.visibleBlobId &&
       documentEpoch === captured.epoch &&
       editVersion === captured.editVersion &&
       suggestionIntentEpoch === captured.intentEpoch &&
+      currentModel?.model_id === captured.modelId &&
       suggestionsEnabled
     );
   }
@@ -3619,7 +3870,7 @@
   }
 
   async function startAutomaticWeave(): Promise<void> {
-    if (weaveStarting || !project || !document) return;
+    if (weaveStarting || !project || !document || !currentModel) return;
     const startingEditVersion = editVersion;
     if (compositionActive || !flushEditors() || editVersion !== startingEditVersion) return;
     if (!canStartAutomaticSuggestions || uncertainWeave) return;
@@ -3641,11 +3892,13 @@
       sessionId: project.session_id,
       documentId: document.summary.document_id,
       relativePath: document.summary.relative_path,
+      documentKind: document.summary.kind,
       sourceRevisionId,
       visibleBlobId: document.visible_blob_id,
       cursorByte,
       editVersion,
-      intentEpoch: suggestionIntentEpoch
+      intentEpoch: suggestionIntentEpoch,
+      modelId: currentModel.model_id
     };
     weaveStarting = true;
     clearFailure();
@@ -3659,10 +3912,7 @@
         sourceRevisionId: captured.sourceRevisionId,
         expectedVisibleBlobId: captured.visibleBlobId,
         cursorByte: captured.cursorByte,
-        branchCount: 3,
-        maxTokens: 128,
-        temperature: 0.8,
-        automatic: true
+        policy: { kind: 'automatic_v2' }
       });
       if (installWeaveSnapshot(started, captured)) {
         uncertainWeave = null;

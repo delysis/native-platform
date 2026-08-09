@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { BranchCard } from './types';
 import {
+  autocompleteDisposition,
   ghostReviewAffordance,
   selectVerifiedGhostSuggestion,
   verifiedGhostSuggestion,
@@ -172,5 +173,78 @@ describe('selectVerifiedGhostSuggestion', () => {
     });
     expect(loopBranch.text).toBe(loop);
     expect(loopBranch.output_blob_id).toBe('blob-1');
+  });
+
+  it('types a fully hydrated rejected family as exhausted instead of ready', () => {
+    const repeatedUpper = `\.\n\n${'The platform smelled of wet iron. '.repeat(18)}`.trimEnd();
+    const repeatedLower = `\.\n\n${'the platform smelled of wet iron.\n\n'.repeat(16)}`.trimEnd();
+    const cards = [
+      branch({
+        run_id: 'run-upper',
+        candidate_id: 'candidate-upper',
+        output_blob_id: 'blob-upper',
+        text: repeatedUpper,
+        output_byte_len: new TextEncoder().encode(repeatedUpper).byteLength
+      }),
+      branch({
+        run_id: 'run-lower',
+        candidate_id: 'candidate-lower',
+        output_blob_id: 'blob-lower',
+        text: repeatedLower,
+        output_byte_len: new TextEncoder().encode(repeatedLower).byteLength
+      }),
+      branch({
+        run_id: 'run-period',
+        candidate_id: 'candidate-period',
+        output_blob_id: 'blob-period',
+        text: '.',
+        output_byte_len: 1
+      })
+    ];
+    const disposition = autocompleteDisposition({
+      active: true,
+      branches: cards,
+      hydratedBlobByRun: {
+        'run-upper': 'blob-upper',
+        'run-lower': 'blob-lower',
+        'run-period': 'blob-period'
+      },
+      dismissedCandidateIds: [],
+      targetByte: 9
+    });
+    expect(disposition).toEqual({
+      kind: 'exhausted',
+      candidates: [
+        { candidateId: 'candidate-upper', reason: 'repetition' },
+        { candidateId: 'candidate-lower', reason: 'repetition' },
+        { candidateId: 'candidate-period', reason: 'too_short' }
+      ]
+    });
+  });
+
+  it('distinguishes immutable-body hydration from an exhausted family', () => {
+    expect(autocompleteDisposition({
+      active: true,
+      branches: [branch()],
+      hydratedBlobByRun: {},
+      dismissedCandidateIds: [],
+      targetByte: 9
+    })).toEqual({ kind: 'awaiting_hydration', runIds: ['run-1'] });
+  });
+
+  it('keeps presentation compatibility inside the typed disposition', () => {
+    const incompatible = branch({ text: ' rain\rbreak' });
+    incompatible.output_byte_len = new TextEncoder().encode(incompatible.text).byteLength;
+    expect(autocompleteDisposition({
+      active: true,
+      branches: [incompatible],
+      hydratedBlobByRun: { 'run-1': 'blob-1' },
+      dismissedCandidateIds: [],
+      targetByte: 9,
+      presentationCompatible: (text) => !text.includes('\r')
+    })).toEqual({
+      kind: 'exhausted',
+      candidates: [{ candidateId: 'candidate-1', reason: 'unpresentable' }]
+    });
   });
 });

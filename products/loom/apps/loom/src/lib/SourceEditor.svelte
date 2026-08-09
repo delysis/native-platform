@@ -26,7 +26,7 @@
   export let onSelectionChange: (textarea: HTMLTextAreaElement) => void = () => {};
   export let onCompositionStart: () => void = () => {};
   export let onCompositionEnd: (textarea: HTMLTextAreaElement) => void = () => {};
-  export let onGhostAccept: (candidateId: string, presentationKey: string) => void = () => {};
+  export let onGhostAccept: (candidateId: string, presentationKey: string) => boolean = () => false;
   export let onGhostDismiss: (candidateId: string, presentationKey: string) => void = () => {};
   export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
 
@@ -277,10 +277,14 @@
       onGhostDismiss(visible.candidateId, visible.presentationKey);
       return;
     }
+    // The parent must consume the exact visibility witness before this
+    // component clears it. Its boolean result is the authority to consume
+    // Tab; a rejected stale suggestion leaves keyboard navigation ordinary.
+    const accepted = onGhostAccept(visible.candidateId, visible.presentationKey);
+    suppressCurrentGhost();
+    if (!accepted) return;
     event.preventDefault();
     event.stopPropagation();
-    suppressCurrentGhost();
-    onGhostAccept(visible.candidateId, visible.presentationKey);
   }
 
   function handleDocumentSelectionChange(): void {

@@ -25,13 +25,14 @@
   export let onChange: (markdown: string) => void = () => {};
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onImmediateDocumentMutation: () => void = () => {};
-  export let onGhostAccept: (candidateId: string, presentationKey: string) => void = () => {};
+  export let onGhostAccept: (candidateId: string, presentationKey: string) => boolean = () => false;
   export let onGhostDismiss: (candidateId: string, presentationKey: string) => void = () => {};
   export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
   export let onSelectionChange: (atDocumentEnd: boolean) => void = () => {};
 
   let shell: HTMLDivElement;
   let mount: HTMLDivElement;
+  let scrollViewport: HTMLElement | null = null;
   let view: EditorView | undefined;
   let lastEmitted = value;
   let projectionTimer: number | undefined;
@@ -66,7 +67,8 @@
         text: {
           left: editorBounds.left + paddingLeft,
           right: editorBounds.right - paddingRight
-        }
+        },
+        clip: scrollViewport?.getBoundingClientRect()
       });
       if (!geometry) {
         ghostOverlay = null;
@@ -86,6 +88,9 @@
 
   function reportGhostVisibility(): void {
     const presentationKey = syncGhostOverlay();
+    // Keep a hidden plan installed so a later scroll/layout correction can
+    // restore it. Keyboard authority still follows the exact visible overlay
+    // key below, never the merely installed plugin state.
     if (reportedGhostPresentationKey === presentationKey) return;
     reportedGhostPresentationKey = presentationKey;
     onGhostVisibilityChange(presentationKey);
@@ -151,7 +156,10 @@
         keymap(baseKeymap),
         createGhostTextPlugin({
           accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
-          dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey)
+          dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
+          visible: (presentationKey) =>
+            reportedGhostPresentationKey === presentationKey &&
+            ghostOverlay?.presentationKey === presentationKey
         })
       ]
     });
@@ -207,8 +215,10 @@
       }
     });
     reportSelection(view.state);
+    scrollViewport = shell.closest<HTMLElement>('.editor-pane');
     reportGhostVisibility();
     window.addEventListener('resize', reportGhostVisibility);
+    scrollViewport?.addEventListener('scroll', reportGhostVisibility, { passive: true });
     if (autofocus) view.focus();
   });
 
@@ -238,6 +248,7 @@
     onSelectionChange(false);
     if (reportedGhostPresentationKey) onGhostVisibilityChange('');
     window.removeEventListener('resize', reportGhostVisibility);
+    scrollViewport?.removeEventListener('scroll', reportGhostVisibility);
     view?.destroy();
   });
 </script>

@@ -18,8 +18,8 @@ use loom_backend_llama::{
     JoinedLlamaGeneration, JoinedLlamaRuntime, LlamaBackend, LlamaBackendError,
     LlamaGenerationControl, LlamaGenerationHandle, LocalModelProfile, MAX_MODEL_DOWNLOAD_BYTES,
     ModelDiscoveryOptions, ModelRelease, NativeHostRuntime, ProcessExitJoinedLlamaRuntime,
-    SamplingConfig, Sha256Digest, VerifiedModelDescriptor, discover_gguf_models, download_gguf,
-    model_environment_from_verified, validate_candidate_receipt_binding,
+    SamplerKind, SamplingConfig, Sha256Digest, VerifiedModelDescriptor, discover_gguf_models,
+    download_gguf, model_environment_from_verified, validate_candidate_receipt_binding,
     validate_gguf_download_request,
 };
 use loom_document::{DocumentContent, MergeError, MergeOutcome, three_way_merge};
@@ -119,6 +119,114 @@ struct Session {
     last_close: Option<ProjectCloseReceipt>,
 }
 
+const AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2: u8 = 2;
+const MAX_TRACKED_AUTOMATIC_REVISION_BUDGETS_V2: usize = 16_384;
+const AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2: u32 = AUTOMATIC_WEAVE_BRANCH_COUNT_V2
+    * AUTOMATIC_WEAVE_MAX_TOKENS_V2
+    * AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2 as u32;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AutomaticBudgetScope {
+    project: ProjectId,
+    session: CommandId,
+    document: DocumentId,
+    source_revision: RevisionId,
+}
+
+#[derive(Debug, Default)]
+struct AutomaticBudgetLedger {
+    active_session: Option<(ProjectId, CommandId)>,
+    families_by_scope: BTreeMap<AutomaticBudgetScope, u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutomaticBudgetError {
+    Capacity,
+    Exhausted,
+    Poisoned,
+}
+
+#[derive(Debug, Default)]
+struct AutomaticBudgetAuthority {
+    ledger: Mutex<AutomaticBudgetLedger>,
+}
+
+#[derive(Debug)]
+struct AutomaticBudgetReservation<'authority> {
+    authority: &'authority AutomaticBudgetAuthority,
+    scope: AutomaticBudgetScope,
+    committed: bool,
+}
+
+impl AutomaticBudgetAuthority {
+    fn reserve(
+        &self,
+        scope: AutomaticBudgetScope,
+    ) -> Result<AutomaticBudgetReservation<'_>, AutomaticBudgetError> {
+        let mut ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| AutomaticBudgetError::Poisoned)?;
+        let session = (scope.project, scope.session);
+        if ledger.active_session != Some(session) {
+            ledger.active_session = Some(session);
+            ledger.families_by_scope.clear();
+        }
+        // Only the current immutable revision of each document can request
+        // automatic work. Dropping superseded revisions keeps the ledger
+        // bounded by the number of project documents, not edit count.
+        ledger.families_by_scope.retain(|candidate, _| {
+            candidate.document != scope.document
+                || candidate.source_revision == scope.source_revision
+        });
+        if !ledger.families_by_scope.contains_key(&scope)
+            && ledger.families_by_scope.len() >= MAX_TRACKED_AUTOMATIC_REVISION_BUDGETS_V2
+        {
+            return Err(AutomaticBudgetError::Capacity);
+        }
+        let spent = ledger.families_by_scope.entry(scope).or_default();
+        if *spent >= AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2 {
+            return Err(AutomaticBudgetError::Exhausted);
+        }
+        *spent += 1;
+        drop(ledger);
+        Ok(AutomaticBudgetReservation {
+            authority: self,
+            scope,
+            committed: false,
+        })
+    }
+
+    fn refund(&self, scope: AutomaticBudgetScope) {
+        let Ok(mut ledger) = self.ledger.lock() else {
+            // Poisoning fails closed: never mint replacement authority when
+            // the exact prior reservation state cannot be proven.
+            return;
+        };
+        let Some(spent) = ledger.families_by_scope.get_mut(&scope) else {
+            return;
+        };
+        *spent = spent.saturating_sub(1);
+        if *spent == 0 {
+            ledger.families_by_scope.remove(&scope);
+        }
+    }
+}
+
+impl AutomaticBudgetReservation<'_> {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AutomaticBudgetReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.authority.refund(self.scope);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PluginState {
     close_requested: AtomicBool,
@@ -130,6 +238,7 @@ pub struct PluginState {
     model: Mutex<ModelRegistry>,
     model_lifecycle: Mutex<()>,
     user_model_paths: Mutex<BTreeSet<PathBuf>>,
+    automatic_budget: AutomaticBudgetAuthority,
     generations: GenerationRegistry,
     generation_workers: GenerationWorkerRegistry,
     model_loads: Arc<ModelLoadRegistry>,
@@ -166,6 +275,7 @@ impl PluginState {
             model: Mutex::new(ModelRegistry::default()),
             model_lifecycle: Mutex::new(()),
             user_model_paths: Mutex::new(BTreeSet::new()),
+            automatic_budget: AutomaticBudgetAuthority::default(),
             generations: GenerationRegistry::default(),
             generation_workers: GenerationWorkerRegistry::default(),
             model_loads: Arc::new(ModelLoadRegistry::default()),
@@ -1647,6 +1757,46 @@ pub struct WeaveStarted {
     exact_prompt_blob_id: String,
     branches: Vec<BranchSnapshot>,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum WeavePolicySnapshot {
+    AutomaticV2 {},
+    ManualV2 {
+        branch_count: u32,
+        max_tokens: u32,
+        temperature: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WeavePreset {
+    AutomaticProseV2,
+    AutomaticVerseV2,
+    ManualV2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ResolvedWeavePolicy {
+    preset: WeavePreset,
+    branch_count: u32,
+    max_tokens: u32,
+    temperature: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ValidatedWeavePolicy {
+    AutomaticV2,
+    ManualV2 {
+        branch_count: u32,
+        max_tokens: u32,
+        temperature: f32,
+    },
+}
+
+const AUTOMATIC_WEAVE_BRANCH_COUNT_V2: u32 = 3;
+const AUTOMATIC_WEAVE_MAX_TOKENS_V2: u32 = 48;
+const AUTOMATIC_WEAVE_TEMPERATURE_V2: f32 = 0.8;
 
 #[derive(Clone, Debug, Serialize)]
 struct DesktopLoomEvent {
@@ -4468,9 +4618,7 @@ fn replay_weave_if_recorded(
     source_revision_id: RevisionId,
     expected_visible_blob_id: BlobId,
     cursor_byte: u64,
-    branch_count: u32,
-    max_tokens: u32,
-    temperature: f32,
+    policy: ValidatedWeavePolicy,
 ) -> Result<Option<WeaveStarted>, IpcFailure> {
     let replay = {
         let mut session = lock_session(state)?;
@@ -4481,13 +4629,17 @@ fn replay_weave_if_recorded(
         else {
             return Ok(None);
         };
-        let document_matches = store
+        let document_kind = store
             .list_documents()
             .map_err(IpcFailure::store)?
             .into_iter()
-            .any(|document| {
+            .find(|document| {
                 document.document_id == document_id && document.relative_path == relative_path
-            });
+            })
+            .map(|document| document.kind);
+        let resolved = document_kind
+            .map(|kind| policy.bind_document_kind(kind))
+            .transpose()?;
         let source_bytes = store
             .reconstruct_revision(source_revision_id)
             .map_err(IpcFailure::store)?;
@@ -4512,38 +4664,47 @@ fn replay_weave_if_recorded(
                 false,
             )
         })?;
-        let family_matches = family.generations.len() == branch_count as usize
-            && family.receipt.source_revision_id == Some(source_revision_id)
-            && document_matches
-            && BlobId::digest(&source_bytes) == expected_visible_blob_id
-            && cursor <= source_text.len()
-            && source_text.is_char_boundary(cursor)
-            && family
-                .generations
-                .iter()
-                .enumerate()
-                .all(|(index, started)| {
-                    let Ok(case_index) = u32::try_from(index) else {
-                        return false;
-                    };
-                    let (run_id, branch_id) = derive_weave_case_ids(command_id, case_index);
-                    let sampling = SamplingConfig {
-                        seed: generation_seed(command_id, case_index),
-                        temperature,
-                        max_tokens,
-                        ..SamplingConfig::default()
-                    };
-                    serde_json::to_value(sampling).is_ok_and(|sampling| {
-                        started.generation.run_id == run_id
-                            && started.generation.branch_id == branch_id
-                            && started.generation.document_id == document_id
-                            && started.generation.source_revision_id == source_revision_id
-                            && started.generation.target_range == expected_range
-                            && started.generation.seed
-                                == u64::from(generation_seed(command_id, case_index))
-                            && started.generation.sampling == sampling
+        let family_matches = resolved.is_some_and(|resolved| {
+            family.generations.len() == resolved.branch_count as usize
+                && family.receipt.source_revision_id == Some(source_revision_id)
+                && BlobId::digest(&source_bytes) == expected_visible_blob_id
+                && cursor <= source_text.len()
+                && source_text.is_char_boundary(cursor)
+                && family
+                    .generations
+                    .iter()
+                    .enumerate()
+                    .all(|(index, started)| {
+                        let Ok(case_index) = u32::try_from(index) else {
+                            return false;
+                        };
+                        let (run_id, branch_id) = derive_weave_case_ids(command_id, case_index);
+                        let sampling = sampling_for_weave_case(
+                            command_id,
+                            case_index,
+                            resolved.max_tokens,
+                            resolved.temperature,
+                            resolved.preset,
+                        );
+                        serde_json::from_value::<SamplingConfig>(
+                            started.generation.sampling.clone(),
+                        )
+                        .is_ok_and(|recorded_sampling| {
+                            started.generation.run_id == run_id
+                                && started.generation.branch_id == branch_id
+                                && started.generation.document_id == document_id
+                                && started.generation.source_revision_id == source_revision_id
+                                && started.generation.target_range == expected_range
+                                && started.generation.seed
+                                    == u64::from(generation_seed(
+                                        command_id,
+                                        case_index,
+                                        resolved.preset,
+                                    ))
+                                && recorded_sampling.fingerprint() == sampling.fingerprint()
+                        })
                     })
-                });
+        });
         if !family_matches {
             return Err(IpcFailure::new(
                 "idempotency_conflict",
@@ -4700,10 +4861,7 @@ async fn weave_start<R: Runtime>(
     source_revision_id: String,
     expected_visible_blob_id: String,
     cursor_byte: u64,
-    branch_count: u32,
-    max_tokens: u32,
-    temperature: f32,
-    automatic: bool,
+    policy: WeavePolicySnapshot,
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<WeaveStarted, IpcFailure> {
@@ -4730,28 +4888,17 @@ async fn weave_start<R: Runtime>(
             false,
         )
     })?;
-    if branch_count == 0 || branch_count > 4 {
-        return Err(IpcFailure::new(
-            "invalid_branch_count",
-            "a weave must request between one and four branches",
-            false,
-        ));
-    }
-    if max_tokens == 0 || max_tokens > 2_048 {
-        return Err(IpcFailure::new(
-            "invalid_generation_budget",
-            "a weave must request between one and 2,048 tokens per branch",
-            false,
-        ));
-    }
-    if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
-        return Err(IpcFailure::new(
-            "invalid_temperature",
-            "temperature must be a finite value from 0 through 2",
-            false,
-        ));
-    }
+    let policy = validate_weave_policy(policy)?;
+    let branch_count = policy.branch_count();
+    let agency = policy.agency();
 
+    // Serialize the loaded-model snapshot through native startup and family
+    // registration. A switch cannot observe zero active branches in the gap.
+    let application_admission = lock_application_admission(&state, "a writing suggestion")?;
+    // Replay is read-only recovery, so focus/automation policy does not hide
+    // durable private evidence. It is checked while holding the same admission
+    // boundary as new work: concurrent first calls cannot both miss the row,
+    // and an exact replay never consumes automatic budget or reaches native.
     if let Some(replay) = replay_weave_if_recorded(
         &state,
         &project_id,
@@ -4762,16 +4909,10 @@ async fn weave_start<R: Runtime>(
         source_revision_id,
         expected_visible_blob_id,
         cursor_byte,
-        branch_count,
-        max_tokens,
-        temperature,
+        policy,
     )? {
         return Ok(replay);
     }
-
-    // Serialize the loaded-model snapshot through native startup and family
-    // registration. A switch cannot observe zero active branches in the gap.
-    let application_admission = lock_application_admission(&state, "a writing suggestion")?;
     let _model_lifecycle = lock_model_lifecycle(&state)?;
     let loaded_model = loaded_model(&state)?;
     let max_cases = loaded_model
@@ -4792,10 +4933,9 @@ async fn weave_start<R: Runtime>(
     let request_id = format!("weave-{command_id}");
     let (identity, exact_prefix, prompt_recipe, cases, queued_branches, runs) = {
         let mut session = lock_session(&state)?;
-        let admission = if automatic {
-            session.agency.admit_automation()
-        } else {
-            session.agency.admit_manual_generation()
+        let admission = match agency {
+            WeaveAgency::Automatic => session.agency.admit_automation(),
+            WeaveAgency::Manual => session.agency.admit_manual_generation(),
         };
         admission
             .map_err(|error| IpcFailure::new("generation_blocked", error.to_string(), false))?;
@@ -4811,6 +4951,13 @@ async fn weave_start<R: Runtime>(
             .read_document(&relative_path)
             .map_err(IpcFailure::store)?;
         ensure_document_id(&loaded, &document_id.to_string())?;
+        let ResolvedWeavePolicy {
+            preset,
+            branch_count: resolved_branch_count,
+            max_tokens,
+            temperature,
+        } = policy.bind_document_kind(loaded.kind)?;
+        debug_assert_eq!(resolved_branch_count, branch_count);
         if loaded.revision_id != source_revision_id {
             return Err(IpcFailure::new(
                 "source_revision_conflict",
@@ -4846,6 +4993,38 @@ async fn weave_start<R: Runtime>(
                 false,
             ));
         }
+        let automatic_budget_reservation = match agency {
+            WeaveAgency::Automatic => Some(
+                state
+                    .automatic_budget
+                    .reserve(AutomaticBudgetScope {
+                        project: store.manifest().project_id,
+                        session: active_session_id,
+                        document: document_id,
+                        source_revision: source_revision_id,
+                    })
+                    .map_err(|error| match error {
+                        AutomaticBudgetError::Exhausted => IpcFailure::new(
+                            "automatic_revision_budget_exhausted",
+                            format!(
+                                "this immutable manuscript revision has already used its {AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2} automatic families ({AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2} generated-token ceiling)",
+                            ),
+                            false,
+                        ),
+                        AutomaticBudgetError::Capacity => IpcFailure::new(
+                            "automatic_budget_capacity",
+                            "the bounded automatic-budget ledger is full; close and reopen the project before requesting more automatic work",
+                            false,
+                        ),
+                        AutomaticBudgetError::Poisoned => IpcFailure::new(
+                            "automatic_budget_state_invalid",
+                            "automatic generation is unavailable because its budget authority cannot be proven",
+                            false,
+                        ),
+                    })?,
+            ),
+            WeaveAgency::Manual => None,
+        };
         let exact_prefix = loaded.text[..cursor].to_owned();
         let exact_prompt_blob_id = store
             .store_provenance_blob(exact_prefix.as_bytes())
@@ -4895,12 +5074,8 @@ async fn weave_start<R: Runtime>(
         let mut cases = Vec::with_capacity(branch_count as usize);
         for index in 0..branch_count {
             let (run_id, branch_id) = derive_weave_case_ids(command_id, index);
-            let sampling = SamplingConfig {
-                seed: generation_seed(command_id, index),
-                temperature,
-                max_tokens,
-                ..SamplingConfig::default()
-            };
+            let sampling =
+                sampling_for_weave_case(command_id, index, max_tokens, temperature, preset);
             let generation = GenerationStart {
                 run_id,
                 branch_id,
@@ -4948,6 +5123,9 @@ async fn weave_start<R: Runtime>(
                 return Err(IpcFailure::store(error));
             }
         };
+        if let Some(reservation) = automatic_budget_reservation {
+            reservation.commit();
+        }
         let queued_branches = family
             .generations
             .into_iter()
@@ -5123,14 +5301,168 @@ async fn weave_start<R: Runtime>(
     })
 }
 
-fn generation_seed(command_id: CommandId, index: u32) -> u32 {
+fn generation_seed(command_id: CommandId, index: u32, preset: WeavePreset) -> u32 {
     let material = format!("{command_id}:{index}");
     let digest = BlobId::digest(material.as_bytes());
-    u32::from_le_bytes(
+    let entropy = u32::from_le_bytes(
         digest.as_bytes()[..4]
             .try_into()
             .expect("a SHA-256 digest always contains four seed bytes"),
-    )
+    );
+    // The low two bits are a lossless policy-version tag. For one command and
+    // case index, no two current presets can ever share a seed, even if every
+    // other sampling field happens to match.
+    (entropy & !0b11) | preset.seed_tag()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WeaveAgency {
+    Automatic,
+    Manual,
+}
+
+impl WeavePreset {
+    const fn seed_tag(self) -> u32 {
+        match self {
+            Self::AutomaticProseV2 => 0,
+            Self::AutomaticVerseV2 => 1,
+            Self::ManualV2 => 2,
+        }
+    }
+}
+
+fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePolicy, IpcFailure> {
+    let validated = match policy {
+        WeavePolicySnapshot::AutomaticV2 {} => ValidatedWeavePolicy::AutomaticV2,
+        WeavePolicySnapshot::ManualV2 {
+            branch_count,
+            max_tokens,
+            temperature,
+        } => ValidatedWeavePolicy::ManualV2 {
+            branch_count,
+            max_tokens,
+            temperature,
+        },
+    };
+    if validated.branch_count() == 0 || validated.branch_count() > 4 {
+        return Err(IpcFailure::new(
+            "invalid_branch_count",
+            "a manual Weave must request between one and four branches",
+            false,
+        ));
+    }
+    if validated.max_tokens() == 0 || validated.max_tokens() > 2_048 {
+        return Err(IpcFailure::new(
+            "invalid_generation_budget",
+            "a manual Weave must request between one and 2,048 tokens per branch",
+            false,
+        ));
+    }
+    if !validated.temperature().is_finite() || !(0.0..=2.0).contains(&validated.temperature()) {
+        return Err(IpcFailure::new(
+            "invalid_temperature",
+            "manual Weave temperature must be a finite value from 0 through 2",
+            false,
+        ));
+    }
+    Ok(validated)
+}
+
+impl ValidatedWeavePolicy {
+    const fn agency(self) -> WeaveAgency {
+        match self {
+            Self::AutomaticV2 => WeaveAgency::Automatic,
+            Self::ManualV2 { .. } => WeaveAgency::Manual,
+        }
+    }
+
+    const fn branch_count(self) -> u32 {
+        match self {
+            Self::AutomaticV2 => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
+            Self::ManualV2 { branch_count, .. } => branch_count,
+        }
+    }
+
+    const fn max_tokens(self) -> u32 {
+        match self {
+            Self::AutomaticV2 => AUTOMATIC_WEAVE_MAX_TOKENS_V2,
+            Self::ManualV2 { max_tokens, .. } => max_tokens,
+        }
+    }
+
+    const fn temperature(self) -> f32 {
+        match self {
+            Self::AutomaticV2 => AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            Self::ManualV2 { temperature, .. } => temperature,
+        }
+    }
+
+    fn bind_document_kind(self, kind: DocumentKind) -> Result<ResolvedWeavePolicy, IpcFailure> {
+        let preset = match (self, kind) {
+            (Self::AutomaticV2, DocumentKind::Prose) => WeavePreset::AutomaticProseV2,
+            (Self::AutomaticV2, DocumentKind::Verse) => WeavePreset::AutomaticVerseV2,
+            (Self::AutomaticV2, DocumentKind::Hybrid) => {
+                return Err(IpcFailure::new(
+                    "automatic_hybrid_boundary_unresolved",
+                    "automatic suggestions require an authoritative prose or verse block boundary",
+                    false,
+                ));
+            }
+            (Self::ManualV2 { .. }, _) => WeavePreset::ManualV2,
+        };
+        Ok(ResolvedWeavePolicy {
+            preset,
+            branch_count: self.branch_count(),
+            max_tokens: self.max_tokens(),
+            temperature: self.temperature(),
+        })
+    }
+}
+
+fn sampling_for_weave_case(
+    command_id: CommandId,
+    index: u32,
+    max_tokens: u32,
+    temperature: f32,
+    preset: WeavePreset,
+) -> SamplingConfig {
+    let repetition_resistant_prose = preset == WeavePreset::AutomaticProseV2;
+    SamplingConfig {
+        seed: generation_seed(command_id, index, preset),
+        temperature,
+        dynamic_temperature_range: 0.0,
+        dynamic_temperature_exponent: 1.0,
+        top_k: 40,
+        top_p: 0.95,
+        min_p: 0.0,
+        typical_p: 1.0,
+        xtc_probability: 0.0,
+        xtc_threshold: 0.1,
+        repeat_last_n: 64,
+        repeat_penalty: if repetition_resistant_prose {
+            1.08
+        } else {
+            1.0
+        },
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
+        dry_multiplier: if repetition_resistant_prose { 0.8 } else { 0.0 },
+        dry_base: 1.75,
+        dry_allowed_length: if repetition_resistant_prose { 4 } else { 2 },
+        dry_penalty_last_n: if repetition_resistant_prose { 256 } else { -1 },
+        sampler_order: vec![
+            SamplerKind::Penalties,
+            SamplerKind::Dry,
+            SamplerKind::TopK,
+            SamplerKind::TypicalP,
+            SamplerKind::TopP,
+            SamplerKind::MinP,
+            SamplerKind::Xtc,
+            SamplerKind::Temperature,
+        ],
+        max_tokens,
+        stop: Vec::new(),
+    }
 }
 
 fn loaded_model(state: &State<'_, PluginState>) -> Result<LoadedModel, IpcFailure> {
@@ -7379,12 +7711,209 @@ mod tests {
     fn generation_seeds_are_deterministic_and_branch_specific() {
         let command_id = CommandId::new();
         assert_eq!(
-            generation_seed(command_id, 0),
-            generation_seed(command_id, 0)
+            generation_seed(command_id, 0, WeavePreset::AutomaticProseV2),
+            generation_seed(command_id, 0, WeavePreset::AutomaticProseV2)
         );
         assert_ne!(
-            generation_seed(command_id, 0),
-            generation_seed(command_id, 1)
+            generation_seed(command_id, 0, WeavePreset::AutomaticProseV2),
+            generation_seed(command_id, 1, WeavePreset::AutomaticProseV2)
+        );
+        assert_ne!(
+            generation_seed(command_id, 0, WeavePreset::AutomaticProseV2),
+            generation_seed(command_id, 0, WeavePreset::AutomaticVerseV2)
+        );
+        assert_ne!(
+            generation_seed(command_id, 0, WeavePreset::AutomaticVerseV2),
+            generation_seed(command_id, 0, WeavePreset::ManualV2)
+        );
+    }
+
+    #[test]
+    fn automatic_budget_reservations_are_affine_and_revision_bounded() {
+        let authority = AutomaticBudgetAuthority::default();
+        let scope = AutomaticBudgetScope {
+            project: ProjectId::new(),
+            session: CommandId::new(),
+            document: DocumentId::new(),
+            source_revision: RevisionId::new(),
+        };
+        authority.reserve(scope).expect("first family").commit();
+        authority
+            .reserve(scope)
+            .expect("replacement family")
+            .commit();
+        assert_eq!(
+            authority
+                .reserve(scope)
+                .expect_err("revision budget exhausted"),
+            AutomaticBudgetError::Exhausted
+        );
+        assert_eq!(AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2, 288);
+    }
+
+    #[test]
+    fn uncommitted_automatic_budget_reservation_refunds_on_drop() {
+        let authority = AutomaticBudgetAuthority::default();
+        let scope = AutomaticBudgetScope {
+            project: ProjectId::new(),
+            session: CommandId::new(),
+            document: DocumentId::new(),
+            source_revision: RevisionId::new(),
+        };
+        let abandoned = authority.reserve(scope).expect("pending family");
+        let committed = authority.reserve(scope).expect("second pending family");
+        assert_eq!(
+            authority.reserve(scope).expect_err("pending slots count"),
+            AutomaticBudgetError::Exhausted
+        );
+        drop(abandoned);
+        authority.reserve(scope).expect("refunded family").commit();
+        committed.commit();
+        assert_eq!(
+            authority
+                .reserve(scope)
+                .expect_err("committed work remains spent"),
+            AutomaticBudgetError::Exhausted
+        );
+    }
+
+    #[test]
+    fn automatic_budget_renews_only_for_new_authoritative_revision_or_session() {
+        let authority = AutomaticBudgetAuthority::default();
+        let project_id = ProjectId::new();
+        let session_id = CommandId::new();
+        let document_id = DocumentId::new();
+        let first = AutomaticBudgetScope {
+            project: project_id,
+            session: session_id,
+            document: document_id,
+            source_revision: RevisionId::new(),
+        };
+        authority.reserve(first).expect("first revision").commit();
+        authority
+            .reserve(first)
+            .expect("first replacement")
+            .commit();
+
+        let next_revision = AutomaticBudgetScope {
+            source_revision: RevisionId::new(),
+            ..first
+        };
+        authority
+            .reserve(next_revision)
+            .expect("new revision renews")
+            .commit();
+        let next_session = AutomaticBudgetScope {
+            session: CommandId::new(),
+            ..next_revision
+        };
+        authority
+            .reserve(next_session)
+            .expect("new project session renews")
+            .commit();
+    }
+
+    #[test]
+    fn automatic_sampling_is_typed_and_repetition_resistant() {
+        let command_id = CommandId::new();
+        let automatic =
+            sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::AutomaticProseV2);
+        let verse = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::AutomaticVerseV2);
+        let manual = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::ManualV2);
+
+        assert_ne!(automatic.seed, verse.seed);
+        assert_ne!(verse.seed, manual.seed);
+        assert_eq!(automatic.max_tokens, 48);
+        assert_eq!(automatic.temperature.to_bits(), 0.8_f32.to_bits());
+        assert_eq!(automatic.repeat_penalty.to_bits(), 1.08_f32.to_bits());
+        assert_eq!(automatic.dry_multiplier.to_bits(), 0.8_f32.to_bits());
+        assert_eq!(automatic.dry_allowed_length, 4);
+        assert_eq!(automatic.dry_penalty_last_n, 256);
+        assert_eq!(verse.repeat_penalty.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(verse.dry_multiplier.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(
+            manual.repeat_penalty.to_bits(),
+            SamplingConfig::default().repeat_penalty.to_bits()
+        );
+        assert_eq!(
+            manual.dry_multiplier.to_bits(),
+            SamplingConfig::default().dry_multiplier.to_bits()
+        );
+    }
+
+    #[test]
+    fn weave_v2_sampling_has_stable_exact_bit_fingerprints() {
+        let command_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            .parse::<CommandId>()
+            .expect("fixed command ID");
+        let prose = sampling_for_weave_case(
+            command_id,
+            0,
+            AUTOMATIC_WEAVE_MAX_TOKENS_V2,
+            AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            WeavePreset::AutomaticProseV2,
+        );
+        let verse = sampling_for_weave_case(
+            command_id,
+            0,
+            AUTOMATIC_WEAVE_MAX_TOKENS_V2,
+            AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            WeavePreset::AutomaticVerseV2,
+        );
+        let manual = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::ManualV2);
+        assert_eq!(
+            prose.fingerprint().sha256_hex(),
+            "8958697e23818dd62c364f46d14d12e977a10b2428be17d255954a25bd3d529c"
+        );
+        assert_eq!(
+            verse.fingerprint().sha256_hex(),
+            "60bf288ce682c665732d7975bca0722a8f9d8e71fdfa59e453e0c4c0734feef9"
+        );
+        assert_eq!(
+            manual.fingerprint().sha256_hex(),
+            "7db5d3b7e3450e90f85074910b816dbce5b102adff36ebf6d62beb4e800bf0bc"
+        );
+    }
+
+    #[test]
+    fn automatic_policy_has_no_runtime_budget_fields() {
+        let parsed: WeavePolicySnapshot =
+            serde_json::from_str(r#"{"kind":"automatic_v2"}"#).expect("automatic policy");
+        assert_eq!(
+            validate_weave_policy(parsed).expect("validate automatic"),
+            ValidatedWeavePolicy::AutomaticV2
+        );
+        assert!(
+            serde_json::from_str::<WeavePolicySnapshot>(
+                r#"{"kind":"automatic_v2","max_tokens":2048}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn automatic_policy_is_bound_by_rust_to_the_authoritative_document_kind() {
+        let policy = ValidatedWeavePolicy::AutomaticV2;
+        assert_eq!(
+            policy
+                .bind_document_kind(DocumentKind::Prose)
+                .expect("prose")
+                .preset,
+            WeavePreset::AutomaticProseV2
+        );
+        assert_eq!(
+            policy
+                .bind_document_kind(DocumentKind::Verse)
+                .expect("verse")
+                .preset,
+            WeavePreset::AutomaticVerseV2
+        );
+        assert_eq!(
+            policy
+                .bind_document_kind(DocumentKind::Hybrid)
+                .expect_err("hybrid has no authoritative caret block")
+                .code,
+            "automatic_hybrid_boundary_unresolved"
         );
     }
 

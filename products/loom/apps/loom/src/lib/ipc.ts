@@ -300,10 +300,14 @@ export interface WeaveStartArgs {
   sourceRevisionId: string;
   expectedVisibleBlobId: string;
   cursorByte: number;
-  branchCount: number;
-  maxTokens: number;
-  temperature: number;
-  automatic: boolean;
+  policy:
+    | { kind: 'automatic_v2' }
+    | {
+        kind: 'manual_v2';
+        branch_count: number;
+        max_tokens: number;
+        temperature: number;
+      };
 }
 
 export function startWeave(args: WeaveStartArgs): Promise<WeaveStarted> {
