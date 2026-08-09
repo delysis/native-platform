@@ -44,6 +44,7 @@
     type VerseEditorCodec
   } from './lib/verseCodec';
   import { canRoundTripMarkdownExactly, canUseVisualMarkdown } from './lib/markdownSafety';
+  import { verifiedGhostSuggestion } from './lib/ghostSuggestion';
   import {
     appendUniquePage,
     branchBodyDisposition,
@@ -125,6 +126,7 @@
   let suggestionTargetEditVersion: number | null = null;
   let suggestionIntentEpoch = 0;
   let dismissedCandidateIds: string[] = [];
+  let announcedGhostPresentationKey = '';
   let modelDownloadUrl = '';
   let modelDownloadFileName = '';
   let lastDerivedModelFileName = '';
@@ -187,6 +189,7 @@
   let sourceSelectionStart = 0;
   let sourceSelectionEnd = 0;
   let visualSelectionAtEnd = false;
+  let visualMutationPending = false;
   let verseCodec: VerseEditorCodec | null = null;
   let compositionActive = false;
   let sourceComposing = false;
@@ -353,6 +356,14 @@
       sourceSelectionEnd
     )
   );
+  $: ghostSuggestion = findVisualGhostSuggestion();
+  $: if (
+    ghostSuggestion &&
+    ghostSuggestion.presentationKey !== announcedGhostPresentationKey
+  ) {
+    announcedGhostPresentationKey = ghostSuggestion.presentationKey;
+    announce('Suggestion available. Tab accepts; Escape dismisses.');
+  }
   $: automaticBoundaryIsExact = mode === 'visual'
     ? visualSelectionAtEnd
     : mode === 'source' && Boolean(sourceTextarea) && sourceSelectionStart === sourceSelectionEnd;
@@ -370,6 +381,7 @@
       !uncertainWeave &&
       !focusMode &&
       !compositionActive &&
+      !visualMutationPending &&
       !sourceDirty &&
       !saveInFlight &&
       !weaveStarting &&
@@ -2302,10 +2314,12 @@
 
   function updateText(text: string): void {
     if (transition !== 'idle') return;
+    const mutationWasInvalidated = visualMutationPending;
+    visualMutationPending = false;
     if (text === documentText) return;
     documentText = text;
     editVersion += 1;
-    suggestionIntentEpoch += 1;
+    if (!mutationWasInvalidated) suggestionIntentEpoch += 1;
     uncertainWeave = null;
     saveState = 'dirty';
     saveMessage = saveInFlight ? 'Saving earlier changes…' : 'Unsaved changes';
@@ -2317,6 +2331,16 @@
     scheduleAutomaticSuggestions(editVersion);
   }
 
+  function invalidateVisualSuggestionImmediately(): void {
+    if (transition !== 'idle' || visualMutationPending) return;
+    visualMutationPending = true;
+    suggestionIntentEpoch += 1;
+    uncertainWeave = null;
+    promotionArmedCandidateId = null;
+    dismissedCandidateIds = [];
+    if (activeBranchCount > 0) void cancelActiveBranches();
+  }
+
   function setSourceDocument(text: string, kind: DocumentKind): void {
     if (sourceProjectionTimer !== undefined) {
       window.clearTimeout(sourceProjectionTimer);
@@ -2326,6 +2350,7 @@
     sourceSelectionStart = 0;
     sourceSelectionEnd = 0;
     visualSelectionAtEnd = false;
+    visualMutationPending = false;
     if (kind === 'verse') {
       const decoded = decodeVerseForEditor(text);
       verseCodec = decoded.codec;
@@ -2865,8 +2890,35 @@
     }
   }
 
-  function dismissInlineSuggestion(): void {
-    const candidateId = inlineSuggestion?.candidate_id;
+  function findVisualGhostSuggestion() {
+    if (
+      mode !== 'visual' ||
+      !suggestionsEnabled ||
+      focusMode ||
+      visualMutationPending
+    ) return null;
+    for (const branch of currentReadyBranches) {
+      if (
+        !branch.candidate_id ||
+        dismissedCandidateIds.includes(branch.candidate_id) ||
+        !suggestionMatchesCurrentCaret(
+          branch,
+          visualSelectionAtEnd,
+          sourceSelectionStart,
+          sourceSelectionEnd
+        ) ||
+        !canPromoteBranch(branch)
+      ) continue;
+      const verified = verifiedGhostSuggestion(
+        branch,
+        branchBodyBlobByRun[branch.run_id]
+      );
+      if (verified) return verified;
+    }
+    return null;
+  }
+
+  function dismissInlineSuggestion(candidateId = inlineSuggestion?.candidate_id): void {
     if (!candidateId || dismissedCandidateIds.includes(candidateId)) return;
     dismissedCandidateIds = [...dismissedCandidateIds, candidateId];
     announce('Suggestion dismissed; its private strand remains recoverable');
@@ -2876,6 +2928,17 @@
     if (!branch.candidate_id || !canPromoteBranch(branch)) return;
     promotionArmedCandidateId = branch.candidate_id;
     await confirmPromotion(branch);
+  }
+
+  function acceptVisualGhost(candidateId: string): void {
+    const branch = branches.find((candidate) => candidate.candidate_id === candidateId);
+    if (!branch || ghostSuggestion?.candidateId !== candidateId) return;
+    void acceptInlineSuggestion(branch);
+  }
+
+  function dismissVisualGhost(candidateId: string): void {
+    if (ghostSuggestion?.candidateId !== candidateId) return;
+    dismissInlineSuggestion(candidateId);
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
@@ -2895,6 +2958,7 @@
       inlineSuggestion &&
       inlineSuggestionAtCaret &&
       !compositionActive &&
+      mode === 'source' &&
       eventComesFromWritingSurface(event)
     ) {
       event.preventDefault();
@@ -2909,6 +2973,7 @@
       !event.altKey &&
       inlineSuggestion &&
       inlineSuggestionAtCaret &&
+      mode === 'source' &&
       eventComesFromWritingSurface(event) &&
       canPromoteBranch(inlineSuggestion)
     ) {
@@ -3309,6 +3374,7 @@
       editVersion === savedVersion &&
       (saveState === 'clean' || saveState === 'saved') &&
       !sourceDirty &&
+      !visualMutationPending &&
       !compositionActive &&
       !saveInFlight &&
       !weaveStarting &&
@@ -4155,6 +4221,16 @@
           <button class:active={focusMode} type="button" aria-pressed={focusMode} disabled={editorReadonly} on:click={() => { closeProjectMenu(); void toggleFocusMode(); }}>
             <span>Focus mode</span><span aria-hidden="true">{focusMode ? '✓' : ''}</span>
           </button>
+          {#if ghostSuggestion}
+            <div class="project-menu-separator"></div>
+            <div class="project-menu-label">Suggestion</div>
+            <button type="button" on:click={() => { closeProjectMenu(); acceptVisualGhost(ghostSuggestion.candidateId); }}>
+              <span>Accept suggestion</span><kbd>Tab</kbd>
+            </button>
+            <button type="button" on:click={() => { closeProjectMenu(); dismissVisualGhost(ghostSuggestion.candidateId); }}>
+              <span>Dismiss suggestion</span><kbd>Esc</kbd>
+            </button>
+          {/if}
           <div class="project-menu-separator"></div>
           <button type="button" disabled={reconciliationResolutionLocked || (editorReadonly && transition !== 'closing' && !(reconciliation && !document))} on:click={() => { closeProjectMenu(); void closeProject(); }}>
             {transition === 'closing' ? 'Retry closing project' : 'Close project'}
@@ -4310,8 +4386,14 @@
                       bind:this={visualEditor}
                       value={documentText}
                       label={`${document.summary.title}, manuscript editor`}
+                      ghostText={ghostSuggestion?.text ?? ''}
+                      ghostCandidateId={ghostSuggestion?.candidateId ?? ''}
+                      ghostPresentationKey={ghostSuggestion?.presentationKey ?? ''}
                       onChange={updateText}
                       onCompositionChange={setVisualComposition}
+                      onImmediateDocumentMutation={invalidateVisualSuggestionImmediately}
+                      onGhostAccept={acceptVisualGhost}
+                      onGhostDismiss={dismissVisualGhost}
                       onSelectionChange={updateVisualSelection}
                       readonly={editorReadonly}
                       autofocus={true}
@@ -4351,17 +4433,6 @@
               </div>
             {/if}
           </section>
-
-          {#if inlineSuggestion && inlineSuggestionAtCaret && canPromoteBranch(inlineSuggestion)}
-            <div class="inline-suggestion" role="group" aria-label="Private writing suggestion">
-              <span class="sr-only" aria-live="polite">A private writing suggestion is ready. Press Tab to accept or Escape to dismiss.</span>
-              <button class="inline-suggestion-copy" type="button" on:click={() => void acceptInlineSuggestion(inlineSuggestion)} title="Accept this private strand">
-                <span>{inlineSuggestion.text || 'A private strand is ready'}</span>
-                <kbd>Tab</kbd>
-              </button>
-              <button class="inline-suggestion-dismiss" type="button" on:click={dismissInlineSuggestion} aria-label="Dismiss suggestion (Escape)">×</button>
-            </div>
-          {/if}
 
           {#if branches.length > 0}
             <details class="branch-shelf">

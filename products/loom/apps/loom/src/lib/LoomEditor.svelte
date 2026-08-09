@@ -7,13 +7,24 @@
   import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
   import { onDestroy, onMount } from 'svelte';
+  import {
+    clearGhostText,
+    createGhostTextPlugin,
+    setGhostText
+  } from './ghostText';
 
   export let value = '';
   export let label = 'Manuscript editor';
   export let readonly = false;
   export let autofocus = false;
+  export let ghostText = '';
+  export let ghostCandidateId = '';
+  export let ghostPresentationKey = '';
   export let onChange: (markdown: string) => void = () => {};
   export let onCompositionChange: (active: boolean) => void = () => {};
+  export let onImmediateDocumentMutation: () => void = () => {};
+  export let onGhostAccept: (candidateId: string) => void = () => {};
+  export let onGhostDismiss: (candidateId: string) => void = () => {};
   export let onSelectionChange: (atDocumentEnd: boolean) => void = () => {};
 
   let mount: HTMLDivElement;
@@ -22,6 +33,7 @@
   let projectionTimer: number | undefined;
   let localDocumentChanged = false;
   let composing = false;
+  let suppressedGhostKey = '';
 
   function projectDocument(): void {
     if (!view || composing || !localDocumentChanged) return;
@@ -80,7 +92,11 @@
           'Mod-Alt-2': setBlockType(heading, { level: 2 }),
           'Mod->': wrapIn(blockquote)
         }),
-        keymap(baseKeymap)
+        keymap(baseKeymap),
+        createGhostTextPlugin({
+          accept: (candidateId) => onGhostAccept(candidateId),
+          dismiss: (candidateId) => onGhostDismiss(candidateId)
+        })
       ]
     });
   }
@@ -111,6 +127,8 @@
         view.updateState(next);
         reportSelection(next);
         if (transaction.docChanged) {
+          suppressedGhostKey = ghostPresentationKey;
+          onImmediateDocumentMutation();
           localDocumentChanged = true;
           if (!composing) scheduleProjection();
         }
@@ -118,6 +136,8 @@
       handleDOMEvents: {
         compositionstart() {
           composing = true;
+          suppressedGhostKey = ghostPresentationKey;
+          if (view) clearGhostText(view);
           onCompositionChange(true);
           return false;
         },
@@ -142,6 +162,13 @@
 
   $: if (view) {
     view.setProps({ editable: () => !readonly });
+    const presentation = ghostPresentationKey && ghostPresentationKey !== suppressedGhostKey ? {
+      active: !readonly && !composing,
+      candidateId: ghostCandidateId,
+      presentationKey: ghostPresentationKey,
+      text: ghostText
+    } : null;
+    setGhostText(view, presentation);
   }
 
   onDestroy(() => {
