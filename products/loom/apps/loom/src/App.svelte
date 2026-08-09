@@ -19,7 +19,6 @@
     getModelDownloadStatus,
     getWeaveStatus,
     isDesktopRuntime,
-    keepCandidate,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
     loadModel,
@@ -46,9 +45,14 @@
   } from './lib/verseCodec';
   import { canRoundTripMarkdownExactly, canUseVisualMarkdown } from './lib/markdownSafety';
   import {
+    selectVerifiedGhostSuggestion,
     verifiedGhostSuggestion,
     visibleVerifiedGhostSuggestion
   } from './lib/ghostSuggestion';
+  import {
+    candidateSurfaceReason,
+    candidateTextIsSurfaceable
+  } from './lib/candidateSurface';
   import { sourceGhostTextForTextarea } from './lib/sourceGhostText';
   import { branchIsActionableOnShelf } from './lib/branchShelf';
   import {
@@ -134,6 +138,9 @@
   let modelManagerOpen = false;
   let modelManagerPanel: HTMLElement | undefined;
   let modelManagerReturnFocus: HTMLElement | null = null;
+  let strandReviewDialog: HTMLDialogElement | undefined;
+  let strandReviewTrigger: HTMLButtonElement | undefined;
+  let reviewCandidateId: string | null = null;
   let projectMenu: HTMLDetailsElement | undefined;
   let projectMenuTrigger: HTMLElement | undefined;
   let suggestionsEnabled = false;
@@ -187,8 +194,6 @@
   let generationSequenceByRun: Record<string, number> = {};
   let cancellingRunIds: string[] = [];
   let cancellationCommandByRun: Record<string, string> = {};
-  let keepingCandidateIds: string[] = [];
-  let keepCommandByCandidate: Record<string, string> = {};
   let promotionArmedCandidateId: string | null = null;
   let promotionInFlight = false;
   let uncertainPromotion: PromotionCapture | null = null;
@@ -338,6 +343,12 @@
     quiet?: boolean;
   }
 
+  interface HydratedBranchBodies {
+    cards: BranchCard[];
+    bodyBlobByRun: Record<string, string>;
+    bodyErrorByRun: Record<string, string>;
+  }
+
   type PromotionReloadOutcome = 'unchanged' | 'promoted' | 'source_changed' | 'reconciliation';
 
   const saveDelayMs = 900;
@@ -373,14 +384,60 @@
   $: shelfBranches = branches.filter((branch) =>
     branchIsActionableOnShelf(branch, document?.summary.revision_id)
   );
-  $: shelfReadyCount = shelfBranches.filter((branch) => branch.status === 'ready').length;
-  $: shelfFailureCount = shelfBranches.length - shelfReadyCount;
-  $: branchShelfVisible = shelfBranches.length > 0;
-  $: branchShelfLabel = shelfReadyCount > 0
-    ? `${shelfReadyCount} ${shelfReadyCount === 1 ? 'strand' : 'strands'} ready${shelfFailureCount > 0 ? ` · ${shelfFailureCount} need attention` : ''}`
-    : `${shelfFailureCount} ${shelfFailureCount === 1 ? 'suggestion needs' : 'suggestions need'} attention`;
-  $: ghostSuggestion = findVisualGhostSuggestion();
-  $: sourceGhostSuggestion = findSourceGhostSuggestion();
+  $: branchPromotionReady = Boolean(
+    project &&
+    document &&
+    document.summary.kind !== 'hybrid' &&
+    document.summary.active_blob_id === document.visible_blob_id &&
+    transition === 'idle' &&
+    editVersion === savedVersion &&
+    (saveState === 'clean' || saveState === 'saved') &&
+    !sourceDirty &&
+    !visualMutationPending &&
+    !compositionActive &&
+    !saveInFlight &&
+    !weaveStarting &&
+    !staleDraft &&
+    !uncertainDraft &&
+    !uncertainSave &&
+    !reconciliation &&
+    !promotionInFlight &&
+    !uncertainPromotion
+  );
+  $: visualGhostTargetByte = mode === 'visual' && visualSelectionAtEnd
+    ? utf8ByteOffset(documentText, documentText.length)
+    : null;
+  $: sourceGhostTargetByte = sourceGhostTargetByteFor(
+    mode,
+    Boolean(sourceTextarea),
+    sourceSelectionStart,
+    sourceSelectionEnd,
+    sourceDisplayText,
+    document,
+    documentText,
+    verseCodec
+  );
+  $: ghostSuggestion = selectVerifiedGhostSuggestion({
+    active: mode === 'visual' && suggestionsEnabled && !visualMutationPending && branchPromotionReady,
+    branches: currentReadyBranches,
+    hydratedBlobByRun: branchBodyBlobByRun,
+    dismissedCandidateIds,
+    targetByte: visualGhostTargetByte
+  });
+  $: sourceGhostCandidate = selectVerifiedGhostSuggestion({
+    active: mode === 'source' && suggestionsEnabled && !sourceDirty && !compositionActive && branchPromotionReady,
+    branches: currentReadyBranches,
+    hydratedBlobByRun: branchBodyBlobByRun,
+    dismissedCandidateIds,
+    targetByte: sourceGhostTargetByte
+  });
+  $: sourceGhostNewline = document?.summary.kind === 'verse'
+    ? verseCodec?.newline ?? 'mixed'
+    : null;
+  $: sourceGhostSuggestion = sourceGhostCandidate &&
+    sourceGhostTextForTextarea(sourceGhostCandidate.text, sourceGhostNewline) !== null
+      ? sourceGhostCandidate
+      : null;
   $: activeGhostSuggestion = mode === 'visual'
     ? visibleVerifiedGhostSuggestion(
       ghostSuggestion,
@@ -392,6 +449,42 @@
         visibleSourceGhostPresentationKey
       )
       : null;
+  $: reviewTargetByte = mode === 'visual'
+    ? visualGhostTargetByte
+    : mode === 'source'
+      ? sourceGhostTargetByte
+      : null;
+  $: exactReviewBranches = suggestionsEnabled && branchPromotionReady && reviewTargetByte !== null
+    ? shelfBranches.filter((branch) =>
+      branch.status === 'ready' &&
+      branch.target_start_byte === reviewTargetByte &&
+      branch.target_end_byte === reviewTargetByte &&
+      Boolean(verifiedGhostSuggestion(branch, branchBodyBlobByRun[branch.run_id]))
+    )
+    : [];
+  $: reviewableBranches = exactReviewBranches.filter((branch) =>
+    candidateTextIsSurfaceable(branch.text)
+  );
+  $: suppressedReviewBranches = exactReviewBranches.filter((branch) =>
+    !candidateTextIsSurfaceable(branch.text)
+  );
+  $: if (
+    reviewableBranches.length > 0 &&
+    !reviewableBranches.some((branch) => branch.candidate_id === reviewCandidateId)
+  ) reviewCandidateId = reviewableBranches[0].candidate_id;
+  $: reviewBranch = reviewableBranches.find(
+    (branch) => branch.candidate_id === reviewCandidateId
+  ) ?? reviewableBranches[0] ?? null;
+  $: reviewBranchIndex = reviewBranch
+    ? reviewableBranches.findIndex((branch) => branch.run_id === reviewBranch.run_id)
+    : -1;
+  $: alternativeReviewCount = Math.max(
+    0,
+    reviewableBranches.length - (activeGhostSuggestion ? 1 : 0)
+  );
+  $: alternativeReviewVisible = reviewableBranches.length > 1 || (
+    reviewableBranches.length === 1 && !activeGhostSuggestion
+  );
   $: if (
     activeGhostSuggestion &&
     activeGhostSuggestion.presentationKey !== announcedGhostPresentationKey
@@ -525,8 +618,6 @@
     generationSequenceByRun = {};
     cancellingRunIds = [];
     cancellationCommandByRun = {};
-    keepingCandidateIds = [];
-    keepCommandByCandidate = {};
     uncertainWeave = null;
   }
 
@@ -552,6 +643,7 @@
       sourceProjectionTimer = undefined;
     }
     if (document) documentEpoch += 1;
+    closeStrandReview();
     document = null;
     documentText = '';
     sourceDisplayText = '';
@@ -1313,7 +1405,7 @@
     cards: BranchCard[],
     expectedViewEpoch: number,
     refreshSerial: number
-  ): Promise<BranchCard[]> {
+  ): Promise<HydratedBranchBodies | null> {
     const hydrated = [...cards];
     const bodyBlobByRun = { ...branchBodyBlobByRun };
     const bodyErrorByRun = { ...branchBodyErrorByRun };
@@ -1325,11 +1417,15 @@
         bodyBlobByRun[branch.run_id],
         branchShelfBodyMaxBytes
       );
-      if (disposition === 'absent' || disposition === 'cached') continue;
+      if (disposition === 'absent') continue;
       if (!outputBlobId) throw new Error('The desktop omitted the branch body identity.');
       if (branch.output_byte_len === null) {
         throw new Error('The desktop omitted the indexed branch body length.');
       }
+      if (
+        disposition === 'cached' &&
+        new TextEncoder().encode(branch.text).byteLength === branch.output_byte_len
+      ) continue;
       if (disposition === 'too_large') {
         hydrated[index] = { ...branch, text: '' };
         bodyBlobByRun[branch.run_id] = outputBlobId;
@@ -1349,7 +1445,7 @@
         documentId,
         expectedViewEpoch,
         refreshSerial
-      )) return hydrated;
+      )) return null;
       if (
         !body ||
         body.run_id !== branch.run_id ||
@@ -1363,17 +1459,14 @@
       bodyBlobByRun[branch.run_id] = outputBlobId;
       delete bodyErrorByRun[branch.run_id];
     }
-    if (branchScopeMatches(
+    if (!branchScopeMatches(
       projectId,
       sessionId,
       documentId,
       expectedViewEpoch,
       refreshSerial
-    )) {
-      branchBodyBlobByRun = bodyBlobByRun;
-      branchBodyErrorByRun = bodyErrorByRun;
-    }
-    return hydrated;
+    )) return null;
+    return { cards: hydrated, bodyBlobByRun, bodyErrorByRun };
   }
 
   function reconcileBranchActionState(): void {
@@ -1386,16 +1479,6 @@
       if (!activeRunIds.has(runId)) delete nextCancellationCommands[runId];
     }
     cancellationCommandByRun = nextCancellationCommands;
-    const selectableCandidateIds = new Set(
-      branches
-        .filter((branch) => branch.candidate_id && branch.selection === null)
-        .map((branch) => branch.candidate_id as string)
-    );
-    const nextKeepCommands = { ...keepCommandByCandidate };
-    for (const candidateId of Object.keys(nextKeepCommands)) {
-      if (!selectableCandidateIds.has(candidateId)) delete nextKeepCommands[candidateId];
-    }
-    keepCommandByCandidate = nextKeepCommands;
     if (
       promotionArmedCandidateId &&
       !branches.some((branch) => branch.candidate_id === promotionArmedCandidateId)
@@ -1443,7 +1526,7 @@
         branchLoadedPastFirstPage = false;
       }
       branchFirstPageCursor = page.next_cursor;
-      const hydrated = await hydrateBranchBodies(
+      const hydration = await hydrateBranchBodies(
         projectId,
         sessionId,
         documentId,
@@ -1451,14 +1534,16 @@
         expectedViewEpoch,
         refreshSerial
       );
-      if (!branchScopeMatches(
+      if (!hydration || !branchScopeMatches(
         projectId,
         sessionId,
         documentId,
         expectedViewEpoch,
         refreshSerial
       )) return false;
-      const hydratedByRun = new Map(hydrated.map((branch) => [branch.run_id, branch]));
+      const hydratedByRun = new Map(hydration.cards.map((branch) => [branch.run_id, branch]));
+      branchBodyBlobByRun = hydration.bodyBlobByRun;
+      branchBodyErrorByRun = hydration.bodyErrorByRun;
       branches = branches.map((branch) => hydratedByRun.get(branch.run_id) ?? branch);
       reconcileBranchActionState();
       if (branches.some(isBranchActive)) scheduleActiveBranchPoll();
@@ -1526,7 +1611,7 @@
       branchNextCursor = page.next_cursor;
       branchHasMore = page.has_more;
       branchLoadedPastFirstPage = true;
-      const hydrated = await hydrateBranchBodies(
+      const hydration = await hydrateBranchBodies(
         scope.projectId,
         scope.sessionId,
         scope.documentId,
@@ -1534,14 +1619,16 @@
         scope.viewEpoch,
         refreshSerial
       );
-      if (!branchScopeMatches(
+      if (!hydration || !branchScopeMatches(
         scope.projectId,
         scope.sessionId,
         scope.documentId,
         scope.viewEpoch,
         refreshSerial
       )) return;
-      const hydratedByRun = new Map(hydrated.map((branch) => [branch.run_id, branch]));
+      const hydratedByRun = new Map(hydration.cards.map((branch) => [branch.run_id, branch]));
+      branchBodyBlobByRun = hydration.bodyBlobByRun;
+      branchBodyErrorByRun = hydration.bodyErrorByRun;
       branches = branches.map((branch) => hydratedByRun.get(branch.run_id) ?? branch);
       reconcileBranchActionState();
     } catch (error) {
@@ -3058,90 +3145,36 @@
     return false;
   }
 
-  function suggestionMatchesCurrentCaret(
-    branch: BranchCard,
-    visualAtEnd: boolean,
-    sourceStart: number,
-    sourceEnd: number
-  ): boolean {
-    if (mode === 'visual') {
-      const endByte = utf8ByteOffset(documentText, documentText.length);
-      return visualAtEnd &&
-        branch.target_start_byte === endByte &&
-        branch.target_end_byte === endByte;
-    }
+  function sourceGhostTargetByteFor(
+    currentMode: EditorMode,
+    editorAvailable: boolean,
+    selectionStart: number,
+    selectionEnd: number,
+    displayText: string,
+    currentDocument: OpenDocument | null,
+    manuscriptText: string,
+    codec: VerseEditorCodec | null
+  ): number | null {
     if (
-      mode !== 'source' ||
-      !sourceTextarea ||
-      sourceStart !== sourceEnd
-    ) return false;
+      currentMode !== 'source' ||
+      !editorAvailable ||
+      selectionStart !== selectionEnd ||
+      !currentDocument
+    ) return null;
     try {
-      const cursorByte = captureWeaveCursorByte();
-      return branch.target_start_byte === cursorByte && branch.target_end_byte === cursorByte;
+      const displayPrefix = displayText.slice(0, selectionStart);
+      if (
+        currentDocument.summary.kind === 'verse' &&
+        (!codec || !codec.editable)
+      ) return null;
+      const manuscriptPrefix = currentDocument.summary.kind === 'verse' && codec
+        ? encodeVerseFromEditor(displayPrefix, codec)
+        : displayPrefix;
+      if (!manuscriptText.startsWith(manuscriptPrefix)) return null;
+      return utf8ByteOffset(manuscriptPrefix, manuscriptPrefix.length);
     } catch {
-      return false;
+      return null;
     }
-  }
-
-  function findVisualGhostSuggestion() {
-    if (
-      mode !== 'visual' ||
-      !suggestionsEnabled ||
-      visualMutationPending
-    ) return null;
-    for (const branch of currentReadyBranches) {
-      if (
-        !branch.candidate_id ||
-        dismissedCandidateIds.includes(branch.candidate_id) ||
-        !suggestionMatchesCurrentCaret(
-          branch,
-          visualSelectionAtEnd,
-          sourceSelectionStart,
-          sourceSelectionEnd
-        ) ||
-        !canPromoteBranch(branch)
-      ) continue;
-      const verified = verifiedGhostSuggestion(
-        branch,
-        branchBodyBlobByRun[branch.run_id]
-      );
-      if (verified) return verified;
-    }
-    return null;
-  }
-
-  function findSourceGhostSuggestion() {
-    if (
-      mode !== 'source' ||
-      !suggestionsEnabled ||
-      sourceDirty ||
-      compositionActive
-    ) return null;
-    const newline = document?.summary.kind === 'verse'
-      ? verseCodec?.newline ?? 'mixed'
-      : null;
-    for (const branch of currentReadyBranches) {
-      if (
-        !branch.candidate_id ||
-        dismissedCandidateIds.includes(branch.candidate_id) ||
-        !suggestionMatchesCurrentCaret(
-          branch,
-          visualSelectionAtEnd,
-          sourceSelectionStart,
-          sourceSelectionEnd
-        ) ||
-        !canPromoteBranch(branch)
-      ) continue;
-      const verified = verifiedGhostSuggestion(
-        branch,
-        branchBodyBlobByRun[branch.run_id]
-      );
-      if (
-        verified &&
-        sourceGhostTextForTextarea(verified.text, newline) !== null
-      ) return verified;
-    }
-    return null;
   }
 
   function dismissInlineSuggestion(candidateId: string | null | undefined): void {
@@ -3182,6 +3215,31 @@
       eligible.presentationKey !== presentationKey
     ) return;
     dismissInlineSuggestion(candidateId);
+  }
+
+  async function openStrandReview(): Promise<void> {
+    if (!strandReviewDialog || reviewableBranches.length === 0) return;
+    reviewCandidateId = activeGhostSuggestion?.candidateId ??
+      reviewableBranches[0].candidate_id;
+    promotionArmedCandidateId = null;
+    await tick();
+    if (!strandReviewDialog.open) strandReviewDialog.showModal();
+    strandReviewDialog.querySelector<HTMLElement>('[data-review-close]')?.focus();
+  }
+
+  function closeStrandReview(): void {
+    promotionArmedCandidateId = null;
+    if (strandReviewDialog?.open) strandReviewDialog.close();
+  }
+
+  function moveStrandReview(offset: number): void {
+    if (reviewableBranches.length < 2 || reviewBranchIndex < 0) return;
+    const nextIndex = (
+      reviewBranchIndex + offset + reviewableBranches.length
+    ) % reviewableBranches.length;
+    reviewCandidateId = reviewableBranches[nextIndex].candidate_id;
+    promotionArmedCandidateId = null;
+    announce(`Alternative ${nextIndex + 1} of ${reviewableBranches.length}`);
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
@@ -3517,83 +3575,15 @@
     await Promise.all(active.map((branch) => cancelBranch(branch)));
   }
 
-  async function keepBranch(branch: BranchCard): Promise<void> {
-    if (
-      !project ||
-      !document ||
-      branch.status !== 'ready' ||
-      !branch.candidate_id ||
-      branch.selection !== null ||
-      keepingCandidateIds.includes(branch.candidate_id)
-    ) return;
-    const candidateId = branch.candidate_id;
-    const captured = {
-      projectId: project.project_id,
-      sessionId: project.session_id,
-      documentId: document.summary.document_id,
-      commandId: keepCommandByCandidate[candidateId] ?? newUlid(),
-      candidateId
-    };
-    keepCommandByCandidate = {
-      ...keepCommandByCandidate,
-      [candidateId]: captured.commandId
-    };
-    keepingCandidateIds = [...keepingCandidateIds, candidateId];
-    try {
-      const receipt = await keepCandidate(
-        captured.projectId,
-        captured.sessionId,
-        captured.commandId,
-        captured.candidateId
-      );
-      if (
-        receipt.command_id !== captured.commandId ||
-        receipt.project_id !== captured.projectId
-      ) {
-        throw new Error('The desktop returned a keep receipt for another command.');
-      }
-      announce('Private strand kept as an alternative');
-    } catch (error) {
-      if (
-        project?.project_id === captured.projectId &&
-        project.session_id === captured.sessionId
-      ) recordFailure(error);
-    } finally {
-      keepingCandidateIds = keepingCandidateIds.filter((id) => id !== candidateId);
-      await refreshBranchesFor(
-        captured.projectId,
-        captured.sessionId,
-        captured.documentId,
-        false
-      );
-    }
-  }
-
   function canPromoteBranch(branch: BranchCard): boolean {
     return Boolean(
-      project &&
+      branchPromotionReady &&
       document &&
-      document.summary.kind !== 'hybrid' &&
       branch.status === 'ready' &&
       branch.candidate_id &&
       branch.selection !== 'promote' &&
       branch.selection !== 'reject' &&
-      branch.source_revision_id === document.summary.revision_id &&
-      document.summary.active_blob_id === document.visible_blob_id &&
-      transition === 'idle' &&
-      editVersion === savedVersion &&
-      (saveState === 'clean' || saveState === 'saved') &&
-      !sourceDirty &&
-      !visualMutationPending &&
-      !compositionActive &&
-      !saveInFlight &&
-      !weaveStarting &&
-      !staleDraft &&
-      !uncertainDraft &&
-      !uncertainSave &&
-      !reconciliation &&
-      !promotionInFlight &&
-      !uncertainPromotion
+      branch.source_revision_id === document.summary.revision_id
     );
   }
 
@@ -3662,6 +3652,7 @@
         throw new Error('The promoted revision was not visible in the project snapshot.');
       }
       uncertainPromotion = null;
+      closeStrandReview();
       announce(outcome === 'reconciliation'
         ? 'Promotion is durable; an external file change now needs review'
         : 'Strand promoted from authoritative manuscript bytes');
@@ -3673,12 +3664,15 @@
         clearFailure();
         switch (outcome) {
           case 'promoted':
+            closeStrandReview();
             announce('Promotion had committed; Loom reopened the authoritative manuscript');
             break;
           case 'source_changed':
+            closeStrandReview();
             announce('The manuscript changed independently; Loom reopened it without attributing the change to this strand');
             break;
           case 'reconciliation':
+            closeStrandReview();
             announce('An external manuscript change needs review before promotion can be attributed');
             break;
           case 'unchanged':
@@ -4313,6 +4307,7 @@
     modelRefreshSerial += 1;
     modelLoadSerial += 1;
     documentEpoch += 1;
+    closeStrandReview();
     project = null;
     document = null;
     documentText = '';
@@ -4352,28 +4347,6 @@
     if (kind === 'verse') return 'Poem';
     if (kind === 'hybrid') return 'Hybrid';
     return 'Prose';
-  }
-
-  function branchStatusLabel(branch: BranchCard): string {
-    if (branch.selection === 'promote') return 'Promoted';
-    if (branch.selection === 'keep_alternative') return 'Kept';
-    if (branch.selection === 'reject') return 'Rejected';
-    switch (branch.status) {
-      case 'queued': return 'Queued';
-      case 'generating': return cancellingRunIds.includes(branch.run_id) ? 'Cancelling' : 'Writing';
-      case 'ready': return 'Ready';
-      case 'failed': return 'Failed';
-      case 'cancelled': return 'Cancelled';
-      case 'pruned': return 'Pruned';
-      case 'rejected': return 'Rejected';
-      case 'interrupted': return 'Interrupted';
-    }
-  }
-
-  function branchBoundaryLabel(branch: BranchCard): string {
-    return branch.target_start_byte === branch.target_end_byte
-      ? `byte ${branch.target_start_byte.toLocaleString()}`
-      : `bytes ${branch.target_start_byte.toLocaleString()}–${branch.target_end_byte.toLocaleString()}`;
   }
 
   function promotionUnavailableReason(branch: BranchCard): string {
@@ -4419,6 +4392,19 @@
         <div class="save-status state-{saveState}" role="status" aria-live="polite">
           <span class="status-dot"></span>{saveMessage}
         </div>
+      {/if}
+      {#if document && alternativeReviewVisible}
+        <button
+          class="alternatives-button"
+          bind:this={strandReviewTrigger}
+          type="button"
+          aria-haspopup="dialog"
+          on:click={() => void openStrandReview()}
+        >
+          {activeGhostSuggestion
+            ? `${alternativeReviewCount} more`
+            : `${reviewableBranches.length} alternatives`}
+        </button>
       {/if}
       <details class="project-menu" bind:this={projectMenu}>
         <summary class="more-button" bind:this={projectMenuTrigger} title="Writing options">
@@ -4681,54 +4667,87 @@
             {/if}
           </section>
 
-          {#if branchShelfVisible}
-            <details class="branch-shelf">
-              <summary>
-                <span class:ready={shelfReadyCount > 0} class="status-dot"></span>
-                <span>{branchShelfLabel}</span>
-              </summary>
-              <div class="branch-shelf-body" aria-label="Private strands">
-                {#each shelfBranches as branch (branch.branch_id)}
-                  <article class="branch-card status-{branch.status}">
-                    <header>
-                      <span class="branch-status">{branchStatusLabel(branch)}</span>
-                      <span>{branchBoundaryLabel(branch)}</span>
-                    </header>
-                    {#if branch.text}
-                      <p>{branch.text}</p>
-                    {:else if branchBodyErrorByRun[branch.run_id]}
-                      <p class="branch-placeholder">{branchBodyErrorByRun[branch.run_id]}</p>
-                    {:else}
-                      <p class="branch-placeholder">{isBranchActive(branch) ? 'Waiting for local model text…' : 'No candidate text was produced.'}</p>
-                    {/if}
-                    {#if branch.error}
-                      <div class="branch-error" role={branch.status === 'failed' ? 'alert' : 'status'}>{branch.error}{branch.error_truncated ? '…' : ''}</div>
-                    {/if}
-                    <footer><span title={branch.model_id ?? 'Model identity is available in immutable provenance'}>{branch.model_id ?? 'Recorded model'}</span><span>{branch.seed ? `seed ${branch.seed}` : 'seed in provenance'}</span></footer>
-                    <div class="branch-actions">
-                      {#if isBranchActive(branch)}
-                        <button class="secondary-button compact" type="button" on:click={() => void cancelBranch(branch)} disabled={cancellingRunIds.includes(branch.run_id)}>
-                          {cancellingRunIds.includes(branch.run_id) ? 'Cancelling…' : 'Cancel'}
-                        </button>
-                      {:else if branch.status === 'ready' && branch.candidate_id && branch.selection !== 'promote' && branch.selection !== 'reject'}
-                        {#if branch.selection === null}
-                          <button class="secondary-button compact" type="button" on:click={() => void keepBranch(branch)} disabled={keepingCandidateIds.includes(branch.candidate_id)}>
-                            {keepingCandidateIds.includes(branch.candidate_id) ? 'Keeping…' : 'Keep'}
-                          </button>
-                        {/if}
-                        <button class="primary-button compact" type="button" on:click={() => promotionArmedCandidateId === branch.candidate_id ? void confirmPromotion(branch) : armPromotion(branch)} disabled={!canPromoteBranch(branch)} title={canPromoteBranch(branch) ? (promotionArmedCandidateId === branch.candidate_id ? 'Confirm promotion through the immutable store' : 'Promote through the immutable store') : promotionUnavailableReason(branch)}>
-                          {promotionArmedCandidateId === branch.candidate_id ? 'Confirm promotion' : 'Promote…'}
-                        </button>
-                        {#if promotionArmedCandidateId === branch.candidate_id}
-                          <button class="bare-button compact" type="button" on:click={cancelPromotion}>Cancel</button>
-                        {/if}
-                      {/if}
-                    </div>
-                  </article>
-                {/each}
-              </div>
-            </details>
-          {/if}
+          <dialog
+            class="strand-review"
+            bind:this={strandReviewDialog}
+            aria-labelledby="strand-review-title"
+            on:click={(event) => {
+              if (event.target === strandReviewDialog) closeStrandReview();
+            }}
+            on:close={() => {
+              promotionArmedCandidateId = null;
+              strandReviewTrigger?.focus();
+            }}
+            on:cancel={() => {
+              promotionArmedCandidateId = null;
+            }}
+          >
+            <div class="strand-review-shell">
+              <header class="strand-review-header">
+                <div>
+                  <h2 id="strand-review-title">Alternatives</h2>
+                  {#if reviewBranchIndex >= 0}
+                    <span>{reviewBranchIndex + 1} of {reviewableBranches.length}</span>
+                  {/if}
+                </div>
+                <button
+                  class="dialog-close"
+                  data-review-close
+                  type="button"
+                  aria-label="Close alternatives"
+                  on:click={closeStrandReview}
+                >×</button>
+              </header>
+
+              {#if reviewBranch}
+                <div class="strand-review-prose">{reviewBranch.text}</div>
+
+                {#if reviewableBranches.length > 1}
+                  <nav class="strand-review-navigation" aria-label="Alternative navigation">
+                    <button type="button" on:click={() => moveStrandReview(-1)}>Previous</button>
+                    <button type="button" on:click={() => moveStrandReview(1)}>Next</button>
+                  </nav>
+                {/if}
+
+                <details class="strand-evidence">
+                  <summary>Evidence</summary>
+                  <dl>
+                    <div><dt>Model</dt><dd>{reviewBranch.model_id ?? 'Recorded model'}</dd></div>
+                    <div><dt>Seed</dt><dd>{reviewBranch.seed ?? 'Recorded in provenance'}</dd></div>
+                    <div><dt>Boundary</dt><dd>{reviewBranch.target_start_byte}</dd></div>
+                    <div><dt>Output</dt><dd>{reviewBranch.output_blob_id ?? 'Pending immutable body'}</dd></div>
+                    <div><dt>Run</dt><dd>{reviewBranch.run_id}</dd></div>
+                  </dl>
+                  {#if suppressedReviewBranches.length > 0}
+                    <details class="suppressed-output">
+                      <summary>{suppressedReviewBranches.length} malformed {suppressedReviewBranches.length === 1 ? 'output' : 'outputs'} held back</summary>
+                      {#each suppressedReviewBranches as suppressed (suppressed.run_id)}
+                        <div>
+                          <strong>{candidateSurfaceReason(suppressed.text) ?? 'Held back'}</strong>
+                          <pre>{suppressed.text}</pre>
+                        </div>
+                      {/each}
+                    </details>
+                  {/if}
+                </details>
+
+                <footer class="strand-review-actions">
+                  {#if promotionArmedCandidateId === reviewBranch.candidate_id}
+                    <button class="secondary-button" type="button" on:click={cancelPromotion}>Cancel</button>
+                    <button class="primary-button" type="button" on:click={() => void confirmPromotion(reviewBranch)} disabled={!canPromoteBranch(reviewBranch)}>
+                      Confirm use
+                    </button>
+                  {:else}
+                    <button class="primary-button" type="button" on:click={() => armPromotion(reviewBranch)} disabled={!canPromoteBranch(reviewBranch)} title={promotionUnavailableReason(reviewBranch)}>
+                      Use this
+                    </button>
+                  {/if}
+                </footer>
+              {:else}
+                <p class="strand-review-empty">No suitable alternative remains at this caret.</p>
+              {/if}
+            </div>
+          </dialog>
 
           {#if uncertainPromotion}
             <div class="attention-action">

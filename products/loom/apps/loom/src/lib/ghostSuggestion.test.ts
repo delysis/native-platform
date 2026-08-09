@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { BranchCard } from './types';
 import {
+  selectVerifiedGhostSuggestion,
   verifiedGhostSuggestion,
   visibleVerifiedGhostSuggestion
 } from './ghostSuggestion';
@@ -60,5 +61,56 @@ describe('visibleVerifiedGhostSuggestion', () => {
     expect(visibleVerifiedGhostSuggestion(suggestion, '')).toBeNull();
     expect(visibleVerifiedGhostSuggestion(suggestion, 'candidate-1:another-blob')).toBeNull();
     expect(visibleVerifiedGhostSuggestion(suggestion, 'candidate-1:blob-1')).toBe(suggestion);
+  });
+});
+
+describe('selectVerifiedGhostSuggestion', () => {
+  it('reacts to an explicit immutable-body and caret snapshot', () => {
+    const waiting = {
+      active: true,
+      branches: [branch()],
+      hydratedBlobByRun: {},
+      dismissedCandidateIds: [],
+      targetByte: 9
+    };
+    expect(selectVerifiedGhostSuggestion(waiting)).toBeNull();
+    expect(selectVerifiedGhostSuggestion({
+      ...waiting,
+      hydratedBlobByRun: { 'run-1': 'blob-1' }
+    })).toEqual({
+      candidateId: 'candidate-1',
+      presentationKey: 'candidate-1:blob-1',
+      text: ' rain.\n\nThen light.'
+    });
+  });
+
+  it('fails closed away from the exact boundary or after dismissal', () => {
+    const selection = {
+      active: true,
+      branches: [branch()],
+      hydratedBlobByRun: { 'run-1': 'blob-1' },
+      dismissedCandidateIds: [] as string[],
+      targetByte: 9
+    };
+    expect(selectVerifiedGhostSuggestion({ ...selection, targetByte: 8 })).toBeNull();
+    expect(selectVerifiedGhostSuggestion({
+      ...selection,
+      dismissedCandidateIds: ['candidate-1']
+    })).toBeNull();
+    expect(selectVerifiedGhostSuggestion({ ...selection, active: false })).toBeNull();
+  });
+
+  it('keeps degenerate model loops in provenance without presenting them', () => {
+    const loop = ` She ${'her '.repeat(24)}`;
+    expect(selectVerifiedGhostSuggestion({
+      active: true,
+      branches: [branch({
+        text: loop,
+        output_byte_len: new TextEncoder().encode(loop).byteLength
+      })],
+      hydratedBlobByRun: { 'run-1': 'blob-1' },
+      dismissedCandidateIds: [],
+      targetByte: 9
+    })).toBeNull();
   });
 });

@@ -1,9 +1,18 @@
 import type { BranchCard } from './types';
+import { candidateTextIsSurfaceable } from './candidateSurface';
 
 export interface VerifiedGhostSuggestion {
   candidateId: string;
   presentationKey: string;
   text: string;
+}
+
+export interface GhostSuggestionSelection {
+  active: boolean;
+  branches: readonly BranchCard[];
+  hydratedBlobByRun: Readonly<Record<string, string>>;
+  dismissedCandidateIds: readonly string[];
+  targetByte: number | null;
 }
 
 export function visibleVerifiedGhostSuggestion(
@@ -37,4 +46,37 @@ export function verifiedGhostSuggestion(
     presentationKey: `${branch.candidate_id}:${branch.output_blob_id}`,
     text: branch.text
   };
+}
+
+/**
+ * Select the first displayable continuation from an explicit reactive snapshot.
+ *
+ * Keep every input explicit: Svelte's legacy reactivity cannot discover state
+ * read indirectly through a no-argument component helper.
+ */
+export function selectVerifiedGhostSuggestion(
+  selection: GhostSuggestionSelection
+): VerifiedGhostSuggestion | null {
+  if (
+    !selection.active ||
+    selection.targetByte === null ||
+    !Number.isSafeInteger(selection.targetByte) ||
+    selection.targetByte < 0
+  ) return null;
+
+  const dismissed = new Set(selection.dismissedCandidateIds);
+  for (const branch of selection.branches) {
+    if (
+      !branch.candidate_id ||
+      dismissed.has(branch.candidate_id) ||
+      branch.target_start_byte !== selection.targetByte ||
+      branch.target_end_byte !== selection.targetByte
+    ) continue;
+    const verified = verifiedGhostSuggestion(
+      branch,
+      selection.hydratedBlobByRun[branch.run_id]
+    );
+    if (verified && candidateTextIsSurfaceable(verified.text)) return verified;
+  }
+  return null;
 }
