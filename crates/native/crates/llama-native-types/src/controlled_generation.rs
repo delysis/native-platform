@@ -5,11 +5,12 @@
 //! completion-shaped, exact-token, fingerprint-bound, and self-describing.
 
 use super::{
-    DistributionObservationPolicy, DistributionValueKind, ExtendedSampler, ExtendedSamplerKind,
-    ExtendedSamplerProgram, GenerationCacheMetrics, GenerationMetrics, GenerationOutput,
-    GenerationState, MAX_EXTENDED_SAMPLERS, ModelFingerprint, NativeError, NativeErrorCode,
-    NativeTransport, ProbabilityStage, SAMPLING_CONFIG_FINGERPRINT_DOMAIN, SamplerKind,
-    SamplingConfig, StructuredConstraint, TokenDistributionObservation, TokenObservation,
+    DistributionObservationPolicy, DistributionTokenValue, DistributionValueKind, ExtendedSampler,
+    ExtendedSamplerKind, ExtendedSamplerProgram, GenerationCacheMetrics, GenerationMetrics,
+    GenerationOutput, GenerationState, MAX_EXTENDED_SAMPLERS, ModelFingerprint, NativeError,
+    NativeErrorCode, NativeTransport, ProbabilityStage, RankedDistributionCandidate,
+    SAMPLING_CONFIG_FINGERPRINT_DOMAIN, SamplerKind, SamplingConfig, StageDistributionObservation,
+    StructuredConstraint, TokenDistributionObservation, TokenObservation,
     TokenProbabilityObservation,
 };
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,46 @@ impl TryFrom<ExactF32Wire> for ExactF32 {
 
     fn try_from(value: ExactF32Wire) -> Result<Self, Self::Error> {
         Self::new(f32::from_bits(value.bits))
+    }
+}
+
+/// A finite output metric serialized by exact IEEE-754 bits.
+///
+/// This stays private because the public controlled-input contract currently
+/// needs only `ExactF32`. Controlled output serialization nevertheless must
+/// preserve every bit independently of a particular data-format parser.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "ExactF64Wire")]
+struct ExactF64 {
+    bits: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactF64Wire {
+    bits: u64,
+}
+
+impl ExactF64 {
+    fn new(value: f64) -> Result<Self, NativeError> {
+        if !value.is_finite() {
+            return Err(invalid("exact f64 value must be finite"));
+        }
+        Ok(Self {
+            bits: value.to_bits(),
+        })
+    }
+
+    const fn get(self) -> f64 {
+        f64::from_bits(self.bits)
+    }
+}
+
+impl TryFrom<ExactF64Wire> for ExactF64 {
+    type Error = NativeError;
+
+    fn try_from(value: ExactF64Wire) -> Result<Self, Self::Error> {
+        Self::new(f64::from_bits(value.bits))
     }
 }
 
@@ -939,6 +980,11 @@ impl ControlProgram {
                         return Err(invalid("control program contains duplicate same-model CFG"));
                     }
                     validate_exact_range("CFG scale", *scale, 0.0, MAX_ABS_CONTROL_SCALAR)?;
+                    if scale.get() == 1.0 {
+                        return Err(invalid(
+                            "CFG scale 1 is an identity transform and cannot be declared as applied control",
+                        ));
+                    }
                     if let Some(rescale) = rescale {
                         validate_exact_range("CFG rescale", *rescale, 0.0, 1.0)?;
                     }
@@ -1038,6 +1084,11 @@ impl ControlProgram {
                         f32::MIN_POSITIVE,
                         MAX_ABS_CONTROL_SCALAR,
                     )?;
+                    if exponent.get() == 1.0 {
+                        return Err(invalid(
+                            "power sampling exponent 1 is an identity transform and cannot be declared as applied control",
+                        ));
+                    }
                 }
             }
         }
@@ -1609,22 +1660,22 @@ fn sum_u64(mut values: impl Iterator<Item = u64>) -> Result<u64, NativeError> {
 /// Rich output for one controlled case. Distribution observations are kept
 /// separate from the compatibility `GenerationOutput` so no legacy field is
 /// relabeled.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ControlledGenerationCaseOutput {
     case_id: String,
     generation: GenerationOutput,
     distribution_observations: Vec<TokenDistributionObservation>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ControlledGenerationCaseOutputWire {
     case_id: String,
     generation: StrictGenerationOutputWire,
-    distribution_observations: Vec<TokenDistributionObservation>,
+    distribution_observations: Vec<StrictTokenDistributionObservationWire>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictGenerationOutputWire {
     request_id: String,
@@ -1643,7 +1694,7 @@ struct StrictGenerationOutputWire {
     transport: NativeTransport,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictTokenObservationWire {
     generated_index: usize,
@@ -1651,14 +1702,14 @@ struct StrictTokenObservationWire {
     probabilities: Vec<StrictTokenProbabilityObservationWire>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictTokenProbabilityObservationWire {
     stage: ProbabilityStage,
-    probability: f32,
+    probability: ExactF32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictGenerationMetricsWire {
     prompt_tokens: usize,
@@ -1666,16 +1717,50 @@ struct StrictGenerationMetricsWire {
     shared_prefix_tokens: usize,
     duration_ms: u128,
     first_token_ms: Option<u128>,
-    tokens_per_second: f64,
+    tokens_per_second: ExactF64,
     cache: StrictGenerationCacheMetricsWire,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictGenerationCacheMetricsWire {
     supplied_prefix_tokens: usize,
     restored_prefix_tokens: usize,
     batch_shared_prefix_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictDistributionTokenValueWire {
+    token_id: i32,
+    #[serde(default)]
+    token_bytes: Option<Vec<u8>>,
+    value: ExactF32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictRankedDistributionCandidateWire {
+    rank: u16,
+    token: StrictDistributionTokenValueWire,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictStageDistributionObservationWire {
+    stage: ProbabilityStage,
+    value_kind: DistributionValueKind,
+    selected: StrictDistributionTokenValueWire,
+    #[serde(default)]
+    ranked_candidates: Vec<StrictRankedDistributionCandidateWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictTokenDistributionObservationWire {
+    generated_index: usize,
+    token_id: i32,
+    observations: Vec<StrictStageDistributionObservationWire>,
 }
 
 impl From<StrictGenerationOutputWire> for GenerationOutput {
@@ -1698,7 +1783,7 @@ impl From<StrictGenerationOutputWire> for GenerationOutput {
                             .into_iter()
                             .map(|probability| TokenProbabilityObservation {
                                 stage: probability.stage,
-                                probability: probability.probability,
+                                probability: probability.probability.get(),
                             })
                             .collect(),
                     })
@@ -1712,7 +1797,7 @@ impl From<StrictGenerationOutputWire> for GenerationOutput {
                 shared_prefix_tokens: value.metrics.shared_prefix_tokens,
                 duration_ms: value.metrics.duration_ms,
                 first_token_ms: value.metrics.first_token_ms,
-                tokens_per_second: value.metrics.tokens_per_second,
+                tokens_per_second: value.metrics.tokens_per_second.get(),
                 cache: GenerationCacheMetrics {
                     supplied_prefix_tokens: value.metrics.cache.supplied_prefix_tokens,
                     restored_prefix_tokens: value.metrics.cache.restored_prefix_tokens,
@@ -1723,6 +1808,186 @@ impl From<StrictGenerationOutputWire> for GenerationOutput {
             fake_fixture: value.fake_fixture,
             transport: value.transport,
         }
+    }
+}
+
+impl TryFrom<&GenerationOutput> for StrictGenerationOutputWire {
+    type Error = NativeError;
+
+    fn try_from(value: &GenerationOutput) -> Result<Self, Self::Error> {
+        let token_observations = value
+            .token_observations
+            .as_ref()
+            .map(|observations| {
+                observations
+                    .iter()
+                    .map(|observation| {
+                        Ok(StrictTokenObservationWire {
+                            generated_index: observation.generated_index,
+                            token_id: observation.token_id,
+                            probabilities: observation
+                                .probabilities
+                                .iter()
+                                .map(|probability| {
+                                    Ok(StrictTokenProbabilityObservationWire {
+                                        stage: probability.stage,
+                                        probability: ExactF32::new(probability.probability)?,
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, NativeError>>()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, NativeError>>()
+            })
+            .transpose()?;
+        Ok(Self {
+            request_id: value.request_id.clone(),
+            branch_id: value.branch_id.clone(),
+            input_index: value.input_index,
+            model_id: value.model_id.clone(),
+            text: value.text.clone(),
+            generated_token_ids: value.generated_token_ids.clone(),
+            token_observations,
+            state: value.state,
+            finish_reason: value.finish_reason.clone(),
+            metrics: StrictGenerationMetricsWire {
+                prompt_tokens: value.metrics.prompt_tokens,
+                completion_tokens: value.metrics.completion_tokens,
+                shared_prefix_tokens: value.metrics.shared_prefix_tokens,
+                duration_ms: value.metrics.duration_ms,
+                first_token_ms: value.metrics.first_token_ms,
+                tokens_per_second: ExactF64::new(value.metrics.tokens_per_second)?,
+                cache: StrictGenerationCacheMetricsWire {
+                    supplied_prefix_tokens: value.metrics.cache.supplied_prefix_tokens,
+                    restored_prefix_tokens: value.metrics.cache.restored_prefix_tokens,
+                    batch_shared_prefix_tokens: value.metrics.cache.batch_shared_prefix_tokens,
+                },
+            },
+            real_engine_invoked: value.real_engine_invoked,
+            fake_fixture: value.fake_fixture,
+            transport: value.transport,
+        })
+    }
+}
+
+impl TryFrom<&DistributionTokenValue> for StrictDistributionTokenValueWire {
+    type Error = NativeError;
+
+    fn try_from(value: &DistributionTokenValue) -> Result<Self, Self::Error> {
+        Ok(Self {
+            token_id: value.token_id(),
+            token_bytes: value.token_bytes().map(ToOwned::to_owned),
+            value: ExactF32::new(value.value())?,
+        })
+    }
+}
+
+impl TryFrom<StrictDistributionTokenValueWire> for DistributionTokenValue {
+    type Error = NativeError;
+
+    fn try_from(value: StrictDistributionTokenValueWire) -> Result<Self, Self::Error> {
+        Self::new(value.token_id, value.token_bytes, value.value.get())
+    }
+}
+
+impl TryFrom<&RankedDistributionCandidate> for StrictRankedDistributionCandidateWire {
+    type Error = NativeError;
+
+    fn try_from(value: &RankedDistributionCandidate) -> Result<Self, Self::Error> {
+        Ok(Self {
+            rank: value.rank(),
+            token: StrictDistributionTokenValueWire::try_from(value.token())?,
+        })
+    }
+}
+
+impl TryFrom<StrictRankedDistributionCandidateWire> for RankedDistributionCandidate {
+    type Error = NativeError;
+
+    fn try_from(value: StrictRankedDistributionCandidateWire) -> Result<Self, Self::Error> {
+        Self::new(value.rank, value.token.try_into()?)
+    }
+}
+
+impl TryFrom<&StageDistributionObservation> for StrictStageDistributionObservationWire {
+    type Error = NativeError;
+
+    fn try_from(value: &StageDistributionObservation) -> Result<Self, Self::Error> {
+        Ok(Self {
+            stage: value.stage(),
+            value_kind: value.value_kind(),
+            selected: StrictDistributionTokenValueWire::try_from(value.selected())?,
+            ranked_candidates: value
+                .ranked_candidates()
+                .iter()
+                .map(StrictRankedDistributionCandidateWire::try_from)
+                .collect::<Result<Vec<_>, NativeError>>()?,
+        })
+    }
+}
+
+impl TryFrom<StrictStageDistributionObservationWire> for StageDistributionObservation {
+    type Error = NativeError;
+
+    fn try_from(value: StrictStageDistributionObservationWire) -> Result<Self, Self::Error> {
+        Self::new(
+            value.stage,
+            value.value_kind,
+            value.selected.try_into()?,
+            value
+                .ranked_candidates
+                .into_iter()
+                .map(RankedDistributionCandidate::try_from)
+                .collect::<Result<Vec<_>, NativeError>>()?,
+        )
+    }
+}
+
+impl TryFrom<&TokenDistributionObservation> for StrictTokenDistributionObservationWire {
+    type Error = NativeError;
+
+    fn try_from(value: &TokenDistributionObservation) -> Result<Self, Self::Error> {
+        Ok(Self {
+            generated_index: value.generated_index(),
+            token_id: value.token_id(),
+            observations: value
+                .observations()
+                .iter()
+                .map(StrictStageDistributionObservationWire::try_from)
+                .collect::<Result<Vec<_>, NativeError>>()?,
+        })
+    }
+}
+
+impl TryFrom<StrictTokenDistributionObservationWire> for TokenDistributionObservation {
+    type Error = NativeError;
+
+    fn try_from(value: StrictTokenDistributionObservationWire) -> Result<Self, Self::Error> {
+        Self::new(
+            value.generated_index,
+            value.token_id,
+            value
+                .observations
+                .into_iter()
+                .map(StageDistributionObservation::try_from)
+                .collect::<Result<Vec<_>, NativeError>>()?,
+        )
+    }
+}
+
+impl TryFrom<&ControlledGenerationCaseOutput> for ControlledGenerationCaseOutputWire {
+    type Error = NativeError;
+
+    fn try_from(value: &ControlledGenerationCaseOutput) -> Result<Self, Self::Error> {
+        Ok(Self {
+            case_id: value.case_id.clone(),
+            generation: StrictGenerationOutputWire::try_from(&value.generation)?,
+            distribution_observations: value
+                .distribution_observations
+                .iter()
+                .map(StrictTokenDistributionObservationWire::try_from)
+                .collect::<Result<Vec<_>, NativeError>>()?,
+        })
     }
 }
 
@@ -1761,6 +2026,17 @@ impl ControlledGenerationCaseOutput {
     }
 }
 
+impl Serialize for ControlledGenerationCaseOutput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        ControlledGenerationCaseOutputWire::try_from(self)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
 impl<'de> Deserialize<'de> for ControlledGenerationCaseOutput {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1770,7 +2046,11 @@ impl<'de> Deserialize<'de> for ControlledGenerationCaseOutput {
         Self::new(
             wire.case_id,
             wire.generation.into(),
-            wire.distribution_observations,
+            wire.distribution_observations
+                .into_iter()
+                .map(TokenDistributionObservation::try_from)
+                .collect::<Result<Vec<_>, NativeError>>()
+                .map_err(serde::de::Error::custom)?,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -2402,10 +2682,10 @@ fn validate_distribution_observations(
         if observation
             .observations()
             .iter()
-            .any(|stage| stage.ranked_candidates().len() != usize::from(policy.top_k()))
+            .any(|stage| stage.ranked_candidates().len() > usize::from(policy.top_k()))
         {
             return Err(invalid(
-                "distribution evidence top-k width does not match the request policy",
+                "distribution evidence exceeds the requested top-k bound",
             ));
         }
     }
@@ -3590,6 +3870,49 @@ mod tests {
     }
 
     #[test]
+    fn controlled_output_wire_preserves_exact_metric_float_bits() {
+        // This is one of serde_json's documented values that its default
+        // non-float_roundtrip parser can move by one ULP when encoded as a
+        // decimal JSON number. The controlled wire must not depend on that
+        // optional parser feature because its receipt commits exact bits.
+        let exact_throughput = 51.248178375505404_f64;
+        let request = ControlledGenerationBatchRequest::new(
+            "exact-output-float".to_string(),
+            vec![case("case", true)],
+            cfg_program(),
+        )
+        .expect("valid request");
+        let mut generation = fixture_generation("exact-output-float", "case");
+        generation.metrics.tokens_per_second = exact_throughput;
+        let output = ControlledGenerationBatchOutput::new(
+            request.clone(),
+            vec![
+                ControlledGenerationCaseOutput::new("case".to_string(), generation, Vec::new())
+                    .expect("valid output"),
+            ],
+            backend_declaration(&request),
+        )
+        .expect("controlled output");
+
+        let json = serde_json::to_value(&output).expect("serialize exact output");
+        assert_eq!(
+            json["cases"][0]["generation"]["metrics"]["tokens_per_second"]["bits"],
+            serde_json::json!(exact_throughput.to_bits())
+        );
+        let restored: ControlledGenerationBatchOutput =
+            serde_json::from_value(json).expect("restore exact output");
+        assert_eq!(
+            restored.cases()[0]
+                .generation()
+                .metrics
+                .tokens_per_second
+                .to_bits(),
+            exact_throughput.to_bits()
+        );
+        assert_eq!(restored, output);
+    }
+
+    #[test]
     fn requested_but_unreported_control_cannot_be_labeled_applied() {
         let request = ControlledGenerationBatchRequest::new(
             "request".to_string(),
@@ -3673,12 +3996,21 @@ mod tests {
             observations,
         )
         .expect("case output");
-        ControlledGenerationBatchOutput::new(
+        let controlled = ControlledGenerationBatchOutput::new(
             request.clone(),
             vec![output],
             backend_declaration(&request),
         )
         .expect("complete evidence must pass");
+        let json = serde_json::to_value(&controlled).expect("serialize exact observations");
+        assert_eq!(
+            json["cases"][0]["distribution_observations"][0]["observations"][0]["selected"]["value"]
+                ["bits"],
+            serde_json::json!(0.5_f32.to_bits())
+        );
+        let restored: ControlledGenerationBatchOutput =
+            serde_json::from_value(json).expect("restore exact observations");
+        assert_eq!(restored, controlled);
     }
 
     #[test]

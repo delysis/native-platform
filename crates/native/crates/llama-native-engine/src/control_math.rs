@@ -17,9 +17,11 @@ pub const MAX_FINGERPRINT_BYTES: usize = 256;
 pub const MAX_SPARSE_BIASES: usize = 4_096;
 
 const MAX_ABS_LOGIT: f32 = 1_000_000.0;
-const MAX_GUIDANCE_SCALE: f32 = 64.0;
-const MIN_POWER_OR_TEMPERATURE: f32 = 1.0 / 64.0;
-const MAX_POWER_OR_TEMPERATURE: f32 = 64.0;
+const MAX_GUIDANCE_SCALE: f32 = 100.0;
+const MIN_POWER: f32 = f32::MIN_POSITIVE;
+const MAX_POWER: f32 = 100.0;
+const MIN_TEMPERATURE: f32 = 0.01;
+const MAX_TEMPERATURE: f32 = 100.0;
 
 /// A caller-visible failure at the controlled-decoding math boundary.
 #[derive(Debug, Clone, PartialEq)]
@@ -457,21 +459,11 @@ pub fn power_temperature_transform(
 ) -> Result<Vec<f32>, ControlMathError> {
     let power = match transform {
         PowerTemperature::Power(power) => {
-            validate_parameter(
-                "power",
-                power,
-                MIN_POWER_OR_TEMPERATURE,
-                MAX_POWER_OR_TEMPERATURE,
-            )?;
+            validate_parameter("power", power, MIN_POWER, MAX_POWER)?;
             power
         }
         PowerTemperature::Temperature(temperature) => {
-            validate_parameter(
-                "temperature",
-                temperature,
-                MIN_POWER_OR_TEMPERATURE,
-                MAX_POWER_OR_TEMPERATURE,
-            )?;
+            validate_parameter("temperature", temperature, MIN_TEMPERATURE, MAX_TEMPERATURE)?;
             1.0 / temperature
         }
     };
@@ -1065,11 +1057,8 @@ mod tests {
             .expect("maximum bounded linear arithmetic must remain finite");
         assert!(linear.iter().all(|value| value.is_finite()));
 
-        let power = power_temperature_transform(
-            positive,
-            PowerTemperature::Power(MAX_POWER_OR_TEMPERATURE),
-        )
-        .expect("maximum bounded power must remain finite");
+        let power = power_temperature_transform(positive, PowerTemperature::Power(MAX_POWER))
+            .expect("maximum bounded power must remain finite");
         assert!(power.iter().all(|value| value.is_finite()));
 
         let biased = apply_sparse_logit_bias(positive, &[(0, MAX_ABS_LOGIT_BIAS)])

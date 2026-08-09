@@ -130,6 +130,16 @@ impl JoinedHostSlot {
     pub fn worker_belongs_to(&self, handle: &NativeModelHandle) -> bool {
         self.worker.belongs_to(handle)
     }
+
+    /// Exact joined worker authority retained by this host-slot receipt.
+    ///
+    /// This reference lets move-only inference seals prove that their owner
+    /// thread is the same worker this host actually consumed and joined. It
+    /// does not expose construction or cloning authority for the token.
+    #[must_use]
+    pub const fn joined_model(&self) -> &JoinedNativeModel {
+        &self.worker
+    }
 }
 
 #[derive(Debug)]

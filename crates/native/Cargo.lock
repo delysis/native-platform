@@ -337,6 +337,7 @@ dependencies = [
  "llama-cpp-sys-2",
  "llama-native-types",
  "serde",
+ "serde_json",
  "sha2",
 ]
 

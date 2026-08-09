@@ -1,7 +1,15 @@
 #[cfg(test)]
 mod build_identity;
 pub mod control_math;
+mod controlled_runtime;
+mod embedding_runtime;
 mod state_buffer;
+
+pub use controlled_runtime::{
+    ControlledGenerationSubmission, ControlledGenerationTicket, ControlledRuntimeCostEvidence,
+    VerifiedControlledGenerationBatch, VerifiedControlledGenerationTerminal,
+};
+pub use embedding_runtime::{VerifiedEmbeddingBatch, VerifiedEmbeddingTerminal};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use encoding_rs::UTF_8;
@@ -233,6 +241,18 @@ struct GeneratedBatchExecution {
     terminal_sampled_token_ids: Vec<Option<i32>>,
 }
 
+/// Private bounded trace emitted at the exact legacy sampler call site.
+///
+/// Controlled baseline authority may retain this trace, but callers cannot
+/// construct or inject it through any public request or receipt surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeSampleSelection {
+    case_index: usize,
+    generated_index: usize,
+    token_id: i32,
+    terminal: bool,
+}
+
 impl GenerationCompletion {
     fn unverified(outputs: Vec<GenerationOutput>) -> Self {
         Self::authority_rejected(
@@ -399,7 +419,7 @@ impl Drop for GenerationTicket {
 #[derive(Debug)]
 pub struct EmbeddingTicket {
     pub request_id: String,
-    result: Receiver<NativeResult<EmbeddingBatchOutput>>,
+    result: Receiver<embedding_runtime::EmbeddingCompletion>,
     cancellation: Arc<AtomicBool>,
     cancellations: EmbeddingCancelRegistry,
 }
@@ -412,30 +432,100 @@ impl EmbeddingTicket {
     }
 
     pub fn wait(self) -> NativeResult<EmbeddingBatchOutput> {
-        self.result.recv().map_err(|error| {
+        let completion = self.result.recv().map_err(|error| {
             NativeError::new(
                 NativeErrorCode::WorkerStopped,
                 format!("native worker stopped before returning embeddings: {error}"),
             )
-        })?
+        })?;
+        cleanup_owned_embedding_in_registry(
+            &self.cancellations,
+            &self.request_id,
+            &self.cancellation,
+        );
+        completion.into_output()
     }
 
     pub fn wait_timeout(&self, timeout: Duration) -> NativeResult<EmbeddingBatchOutput> {
-        self.result.recv_timeout(timeout).map_err(|error| {
+        let completion = self.result.recv_timeout(timeout).map_err(|error| {
             NativeError::new(
                 NativeErrorCode::WorkerStopped,
                 format!("native embeddings did not finish before the timeout: {error}"),
             )
-        })?
+        })?;
+        cleanup_owned_embedding_in_registry(
+            &self.cancellations,
+            &self.request_id,
+            &self.cancellation,
+        );
+        completion.into_output()
     }
 
     pub fn try_wait(&self) -> NativeResult<Option<EmbeddingBatchOutput>> {
         match self.result.try_recv() {
-            Ok(result) => result.map(Some),
+            Ok(completion) => {
+                cleanup_owned_embedding_in_registry(
+                    &self.cancellations,
+                    &self.request_id,
+                    &self.cancellation,
+                );
+                completion.into_output().map(Some)
+            }
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
             Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
                 "native worker stopped before returning embeddings",
+            )),
+        }
+    }
+
+    /// Consume this ticket into an opaque owner-worker embedding seal.
+    /// Serialized outputs, fixtures, cancelled work, replayed claims, and
+    /// artifact identity failures cannot satisfy this path.
+    pub fn wait_verified(self) -> NativeResult<VerifiedEmbeddingBatch> {
+        let completion = self.result.recv().map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("native worker stopped before returning verified embeddings: {error}"),
+            )
+        })?;
+        cleanup_owned_embedding_in_registry(
+            &self.cancellations,
+            &self.request_id,
+            &self.cancellation,
+        );
+        completion.into_verified()
+    }
+
+    pub fn wait_verified_timeout(&self, timeout: Duration) -> NativeResult<VerifiedEmbeddingBatch> {
+        let completion = self.result.recv_timeout(timeout).map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                format!("verified native embeddings did not finish before the timeout: {error}"),
+            )
+        })?;
+        cleanup_owned_embedding_in_registry(
+            &self.cancellations,
+            &self.request_id,
+            &self.cancellation,
+        );
+        completion.into_verified()
+    }
+
+    pub fn try_wait_verified(&self) -> NativeResult<Option<VerifiedEmbeddingBatch>> {
+        match self.result.try_recv() {
+            Ok(completion) => {
+                cleanup_owned_embedding_in_registry(
+                    &self.cancellations,
+                    &self.request_id,
+                    &self.cancellation,
+                );
+                completion.into_verified().map(Some)
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                "native worker stopped before returning verified embeddings",
             )),
         }
     }
@@ -444,7 +534,11 @@ impl EmbeddingTicket {
 impl Drop for EmbeddingTicket {
     fn drop(&mut self) {
         self.cancellation.store(true, Ordering::Release);
-        cleanup_embedding_in_registry(&self.cancellations, &self.request_id);
+        cleanup_owned_embedding_in_registry(
+            &self.cancellations,
+            &self.request_id,
+            &self.cancellation,
+        );
     }
 }
 
@@ -715,7 +809,8 @@ impl NativeModelInner {
 enum WorkerCommand {
     EmbedBatch {
         request: EmbeddingBatchRequest,
-        result: Sender<NativeResult<EmbeddingBatchOutput>>,
+        admitted_request_sha256: String,
+        result: Sender<embedding_runtime::EmbeddingCompletion>,
         cancellation: Arc<AtomicBool>,
     },
     GenerateBatch {
@@ -740,6 +835,17 @@ enum WorkerCommand {
         result_tx: Sender<NativeResult<GenerationCompletion>>,
         cancellation: Arc<AtomicBool>,
         reasoning_force: Arc<AtomicBool>,
+    },
+    ControlledGenerate {
+        submission: Box<ControlledGenerationSubmission>,
+        admitted_request_sha256: String,
+        event_tx: Sender<GenerationEvent>,
+        result_tx: Sender<NativeResult<controlled_runtime::ControlledGenerationCompletion>>,
+        cancellations: Vec<Arc<AtomicBool>>,
+    },
+    InspectControlledIdentity {
+        participant_id: String,
+        response: Sender<NativeResult<llama_native_types::ControlledModelIdentity>>,
     },
     Snapshot {
         sequence_id: i32,
@@ -791,10 +897,19 @@ impl NativeModelHandle {
             max_sequences: config.max_sequences,
         }));
         let worker_status = Arc::clone(&status);
+        let worker_identity = Arc::new(WorkerIdentity);
+        let owner_worker_identity = Arc::clone(&worker_identity);
         let worker = thread::Builder::new()
             .name(format!("llama-model-{}", config.model_id))
             .spawn(move || {
-                run_worker(config, command_rx, shutdown_rx, ready_tx, worker_status);
+                run_worker(
+                    config,
+                    command_rx,
+                    shutdown_rx,
+                    ready_tx,
+                    worker_status,
+                    owner_worker_identity,
+                );
             })
             .map_err(|error| {
                 NativeError::new(
@@ -836,7 +951,7 @@ impl NativeModelHandle {
         let (command_tx, shutdown_tx, worker) = bootstrap.into_parts()?;
         Ok((
             Arc::new(NativeModelInner {
-                worker_identity: Arc::new(WorkerIdentity),
+                worker_identity,
                 command_tx,
                 shutdown_tx,
                 closing: AtomicBool::new(false),
@@ -883,6 +998,7 @@ impl NativeModelHandle {
         let cancellation = Arc::new(AtomicBool::new(false));
         let (result_tx, result_rx) = bounded(1);
         let request_id = request.request_id().to_string();
+        let admitted_request_sha256 = embedding_runtime::embedding_request_sha256(&request);
         {
             let mut registry = self.inner.embedding_cancellations.lock().map_err(|_| {
                 NativeError::new(
@@ -901,12 +1017,17 @@ impl NativeModelHandle {
         if let Err(error) = self.inner.send_command(
             WorkerCommand::EmbedBatch {
                 request,
+                admitted_request_sha256,
                 result: result_tx,
                 cancellation: Arc::clone(&cancellation),
             },
             "submitting embeddings",
         ) {
-            cleanup_embedding_in_registry(&self.inner.embedding_cancellations, &request_id);
+            cleanup_owned_embedding_in_registry(
+                &self.inner.embedding_cancellations,
+                &request_id,
+                &cancellation,
+            );
             return Err(error);
         }
         Ok(EmbeddingTicket {
@@ -1758,6 +1879,7 @@ fn run_worker(
     shutdown_rx: Receiver<()>,
     ready_tx: Sender<NativeResult<()>>,
     status: Arc<RwLock<ResidentModelStatus>>,
+    worker_identity: Arc<WorkerIdentity>,
 ) {
     let backend = match backend() {
         Ok(backend) => backend,
@@ -1912,6 +2034,9 @@ fn run_worker(
     let _ = ready_tx.send(Ok(()));
     let mut sequence_token_counts = HashMap::<i32, usize>::new();
     let mut sequence_token_ids = HashMap::<i32, Vec<i32>>::new();
+    let mut controlled_token_contract = None;
+    let mut embedding_call_sequence = 0_u64;
+    let mut controlled_call_sequence = 0_u64;
     loop {
         let command = crossbeam_channel::select_biased! {
             recv(shutdown_rx) -> _ => {
@@ -1926,10 +2051,24 @@ fn run_worker(
         match command {
             WorkerCommand::EmbedBatch {
                 request,
+                admitted_request_sha256,
                 result,
                 cancellation,
             } => {
                 set_status_state(&status, ModelRuntimeState::Ready, 1);
+                let owner_call_sequence = embedding_call_sequence;
+                let Some(next_call_sequence) = embedding_call_sequence.checked_add(1) else {
+                    let _ = result.send(embedding_runtime::EmbeddingCompletion::failed(
+                        NativeError::new(
+                            NativeErrorCode::Internal,
+                            "native embedding owner call sequence overflowed",
+                        ),
+                    ));
+                    set_status_state(&status, ModelRuntimeState::Ready, 0);
+                    continue;
+                };
+                embedding_call_sequence = next_call_sequence;
+                let strict_precheck = artifacts.verify_strict_unchanged(&fingerprint);
                 let embedding_result = execute_embedding_batch(
                     &config,
                     backend,
@@ -1939,11 +2078,64 @@ fn run_worker(
                     &request,
                     &cancellation,
                 );
-                if let Ok(output) = &embedding_result {
-                    record_embedding_capability(&status, output, context_tokens);
-                }
+                let completion = match embedding_result {
+                    Ok(output) => {
+                        let captured_output_bits_sha256 =
+                            embedding_runtime::embedding_output_bits_sha256(&output);
+                        let authority = strict_precheck.and_then(|()| {
+                            let maximum_input_tokens = request
+                                .inputs()
+                                .iter()
+                                .map(|input| input.token_ids().len())
+                                .max()
+                                .unwrap_or_default();
+                            let maximum_input_tokens = u32::try_from(maximum_input_tokens)
+                                .map_err(|_| {
+                                    NativeError::new(
+                                        NativeErrorCode::Internal,
+                                        "verified embedding token count does not fit u32",
+                                    )
+                                })?;
+                            let params = embedding_context_params(
+                                &config,
+                                context_tokens,
+                                maximum_input_tokens,
+                                request.pooling(),
+                            );
+                            let expected_execution_fingerprint =
+                                embedding_execution_fingerprint(&fingerprint, &params);
+                            let expected_dimensions =
+                                u32::try_from(embedding_output_width(&model, request.pooling())?)
+                                    .map_err(|_| {
+                                    NativeError::new(
+                                        NativeErrorCode::ModelInvalid,
+                                        "verified embedding dimensions do not fit u32",
+                                    )
+                                })?;
+                            embedding_runtime::verify_embedding_batch_authority(
+                                request,
+                                &admitted_request_sha256,
+                                fingerprint.clone(),
+                                expected_execution_fingerprint,
+                                expected_dimensions,
+                                &output,
+                                &captured_output_bits_sha256,
+                                owner_call_sequence,
+                                &[embedding_runtime::EmbeddingCompletionTerminal::Completed],
+                                &cancellation,
+                                Arc::clone(&worker_identity),
+                                &artifacts,
+                            )
+                        });
+                        if authority.is_ok() {
+                            record_embedding_capability(&status, &output, context_tokens);
+                        }
+                        embedding_runtime::EmbeddingCompletion::completed(output, authority)
+                    }
+                    Err(error) => embedding_runtime::EmbeddingCompletion::failed(error),
+                };
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
-                let _ = result.send(embedding_result);
+                let _ = result.send(completion);
             }
             WorkerCommand::GenerateBatch {
                 request,
@@ -1982,6 +2174,7 @@ fn run_worker(
                                 retained_events: retained_events.as_mut(),
                                 unrecorded_control_used: retain_authority_evidence
                                     .then_some(&mut unrecorded_control_used),
+                                runtime_sample_trace: None,
                                 cancellations: &cancellations,
                                 reasoning_forces: &reasoning_forces,
                             },
@@ -2058,6 +2251,7 @@ fn run_worker(
                         event_tx: &event_tx,
                         retained_events: None,
                         unrecorded_control_used: None,
+                        runtime_sample_trace: None,
                         cancellations: &cancellations,
                         reasoning_forces: &reasoning_forces,
                     },
@@ -2103,6 +2297,101 @@ fn run_worker(
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
                 let _ = result_tx
                     .send(result.map(|output| GenerationCompletion::unverified(vec![output])));
+            }
+            WorkerCommand::ControlledGenerate {
+                submission,
+                admitted_request_sha256,
+                event_tx,
+                result_tx,
+                cancellations,
+            } => {
+                let owner_call_sequence = controlled_call_sequence;
+                let Some(next_call_sequence) = controlled_call_sequence.checked_add(1) else {
+                    let _ = result_tx.send(Err(NativeError::new(
+                        NativeErrorCode::Internal,
+                        "native controlled-generation owner call sequence overflowed",
+                    )));
+                    continue;
+                };
+                controlled_call_sequence = next_call_sequence;
+                set_status_state(
+                    &status,
+                    ModelRuntimeState::Ready,
+                    submission.request().cost().total_sequence_slots() as usize,
+                );
+                let strict_precheck = artifacts.verify_strict_unchanged(&fingerprint);
+                let mut retained_events = Vec::new();
+                let live_contract = ensure_controlled_token_contract(
+                    &mut controlled_token_contract,
+                    &model,
+                    &fingerprint,
+                );
+                let execution = live_contract
+                    .and_then(|contract| {
+                        controlled_runtime::validate_submission_identity(
+                            &submission,
+                            &fingerprint,
+                            contract,
+                        )
+                    })
+                    .and_then(|()| {
+                        controlled_runtime::execute_controlled_generation(
+                            &model,
+                            &mut context,
+                            &submission,
+                            &event_tx,
+                            &mut retained_events,
+                            &cancellations,
+                            SequenceTracking {
+                                token_counts: &mut sequence_token_counts,
+                                token_ids: &mut sequence_token_ids,
+                            },
+                        )
+                    });
+                if execution.is_err() {
+                    controlled_runtime::emit_missing_failed_terminals(
+                        &event_tx,
+                        submission.request(),
+                        &mut retained_events,
+                    );
+                }
+                let result = execution.and_then(|execution| {
+                    let contract = controlled_token_contract.as_ref().ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::Internal,
+                            "controlled token contract disappeared after execution",
+                        )
+                    })?;
+                    controlled_runtime::finalize_controlled_completion(
+                        &model,
+                        *submission,
+                        execution,
+                        retained_events,
+                        fingerprint.clone(),
+                        contract,
+                        &artifacts,
+                        strict_precheck,
+                        &admitted_request_sha256,
+                        owner_call_sequence,
+                        Arc::clone(&worker_identity),
+                    )
+                });
+                set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = result_tx.send(result);
+            }
+            WorkerCommand::InspectControlledIdentity {
+                participant_id,
+                response,
+            } => {
+                let result = ensure_controlled_token_contract(
+                    &mut controlled_token_contract,
+                    &model,
+                    &fingerprint,
+                )
+                .and_then(|contract| {
+                    controlled_runtime::controlled_identity(participant_id, &fingerprint, contract)
+                });
+                let _ = response.send(result);
             }
             WorkerCommand::Snapshot {
                 sequence_id,
@@ -2181,7 +2470,7 @@ fn reject_queued_command(command: WorkerCommand) {
             ..
         } => {
             cancellation.store(true, Ordering::Release);
-            let _ = result.send(Err(cancelled()));
+            let _ = result.send(embedding_runtime::EmbeddingCompletion::failed(cancelled()));
         }
         WorkerCommand::GenerateBatch {
             request,
@@ -2221,6 +2510,21 @@ fn reject_queued_command(command: WorkerCommand) {
             emit_generation_state(&event_tx, &request, u64::MAX, GenerationState::Cancelled);
             let _ = result_tx.send(Err(cancelled()));
         }
+        WorkerCommand::ControlledGenerate {
+            submission,
+            admitted_request_sha256: _,
+            event_tx,
+            result_tx,
+            cancellations,
+        } => controlled_runtime::reject_queued_controlled(
+            *submission,
+            event_tx,
+            result_tx,
+            cancellations,
+        ),
+        WorkerCommand::InspectControlledIdentity { response, .. } => {
+            let _ = response.send(Err(cancelled()));
+        }
         WorkerCommand::Snapshot { response, .. } => {
             let _ = response.send(Err(cancelled()));
         }
@@ -2237,6 +2541,25 @@ fn reject_queued_command(command: WorkerCommand) {
             let _ = response.send(Err(cancelled()));
         }
     }
+}
+
+fn ensure_controlled_token_contract<'a>(
+    slot: &'a mut Option<llama_native_types::TokenContractIdentity>,
+    model: &LlamaModel,
+    fingerprint: &ModelFingerprint,
+) -> NativeResult<&'a llama_native_types::TokenContractIdentity> {
+    if slot.is_none() {
+        *slot = Some(controlled_runtime::derive_live_token_contract(
+            model,
+            fingerprint,
+        )?);
+    }
+    slot.as_ref().ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::Internal,
+            "controlled token contract initialization returned no value",
+        )
+    })
 }
 
 fn generation_context_params(
@@ -2430,6 +2753,7 @@ fn execute_embedding_batch(
             "embedding width does not fit the public output contract",
         )
     })?;
+    check_embedding_cancellation(cancellation)?;
     let output_config =
         EmbeddingOutputConfig::new(live_pooling, request.normalization(), dimensions)?;
     EmbeddingBatchOutput::new(
@@ -3020,7 +3344,14 @@ fn generate_batch(
             } else {
                 branch.sampler.sample(context, branch.logit_index)
             };
-            if model.is_eog_token(token) {
+            let terminal = model.is_eog_token(token);
+            supervision.record_runtime_sample(
+                index,
+                branch.generated_token_ids.len(),
+                token.0,
+                terminal,
+            );
+            if terminal {
                 branch.state = GenerationState::Completed;
                 branch.finish_reason = "end_of_generation".to_string();
                 branch.terminal_sampled_token_id = Some(token.0);
@@ -3950,6 +4281,7 @@ struct BatchSupervision<'a> {
     event_tx: &'a Sender<GenerationEvent>,
     retained_events: Option<&'a mut Vec<GenerationEvent>>,
     unrecorded_control_used: Option<&'a mut bool>,
+    runtime_sample_trace: Option<&'a mut Vec<RuntimeSampleSelection>>,
     cancellations: &'a [Arc<AtomicBool>],
     reasoning_forces: &'a [Arc<AtomicBool>],
 }
@@ -3958,6 +4290,23 @@ impl BatchSupervision<'_> {
     fn mark_unrecorded_control(&mut self) {
         if let Some(used) = self.unrecorded_control_used.as_deref_mut() {
             *used = true;
+        }
+    }
+
+    fn record_runtime_sample(
+        &mut self,
+        case_index: usize,
+        generated_index: usize,
+        token_id: i32,
+        terminal: bool,
+    ) {
+        if let Some(trace) = self.runtime_sample_trace.as_deref_mut() {
+            trace.push(RuntimeSampleSelection {
+                case_index,
+                generated_index,
+                token_id,
+                terminal,
+            });
         }
     }
 
@@ -4935,6 +5284,42 @@ fn inspected_capabilities(
     max_sequences: u32,
     media_kinds: &[MediaKind],
 ) -> ExactModelCapabilities {
+    let structured_constraints = llama_native_types::StructuredConstraintCapabilities::new(
+        CapabilityDeclarationStatus::Inspected,
+        true,
+        true,
+        Some(llama_native_types::MAX_CONSTRAINT_ARTIFACT_BYTES),
+    )
+    .unwrap_or_else(|error| panic!("static structured capabilities are invalid: {error}"));
+    let distribution_observations = llama_native_types::DistributionObservationCapabilities::new(
+        CapabilityDeclarationStatus::Inspected,
+        llama_native_types::ProbabilityStageSupport {
+            raw_model: true,
+            post_constraint: true,
+            post_guidance: true,
+            post_sampler: true,
+        },
+        llama_native_types::DistributionValueKindSupport {
+            logits: true,
+            probabilities: true,
+            log_probabilities: true,
+        },
+        true,
+        Some(llama_native_types::MAX_DISTRIBUTION_OBSERVATION_TOP_K),
+    )
+    .unwrap_or_else(|error| panic!("static observation capabilities are invalid: {error}"));
+    let extended_sampling = llama_native_types::ExtendedSamplingCapabilities::new(
+        CapabilityDeclarationStatus::Inspected,
+        llama_native_types::ExtendedSamplerSupport {
+            mirostat_v1: true,
+            mirostat_v2: true,
+            eta_cutoff: true,
+            sparse_logit_bias: true,
+            top_n_sigma: true,
+        },
+        u16::try_from(llama_native_types::MAX_SPARSE_LOGIT_BIAS_ENTRIES).ok(),
+    )
+    .unwrap_or_else(|error| panic!("static sampler capabilities are invalid: {error}"));
     ExactModelCapabilities {
         declaration: CapabilityDeclarationStatus::Inspected,
         prompts: PromptInputCapabilities {
@@ -4961,7 +5346,12 @@ fn inspected_capabilities(
             per_case_restore: true,
             token_exact_shared_prefix: true,
         },
-        evidence: NativeEvidenceCapabilities::default(),
+        evidence: NativeEvidenceCapabilities {
+            embeddings: EmbeddingCapabilities::default(),
+            structured_constraints,
+            distribution_observations,
+            extended_sampling,
+        },
         media: media_kinds
             .iter()
             .copied()
@@ -5200,8 +5590,16 @@ fn cleanup_request_in_registry(registry: &CancelRegistry, request_id: &str) {
     }
 }
 
-fn cleanup_embedding_in_registry(registry: &EmbeddingCancelRegistry, request_id: &str) {
-    if let Ok(mut entries) = registry.lock() {
+fn cleanup_owned_embedding_in_registry(
+    registry: &EmbeddingCancelRegistry,
+    request_id: &str,
+    owned: &Arc<AtomicBool>,
+) {
+    if let Ok(mut entries) = registry.lock()
+        && entries
+            .get(request_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, owned))
+    {
         entries.remove(request_id);
     }
 }
@@ -5727,7 +6125,7 @@ mod tests {
             manifest
                 .lines()
                 .filter(|line| line.starts_with("llama-cpp-2 = "))
-                .filter(|line| line.contains("features = [\"sampler\", \"mtmd\"]"))
+                .filter(|line| line.contains("features = [\"common\", \"sampler\", \"mtmd\"]"))
                 .count(),
             1
         );
@@ -5735,7 +6133,9 @@ mod tests {
             manifest
                 .lines()
                 .filter(|line| line.starts_with("llama-cpp-2 = "))
-                .filter(|line| { line.contains("features = [\"sampler\", \"mtmd\", \"metal\"]") })
+                .filter(|line| {
+                    line.contains("features = [\"common\", \"sampler\", \"mtmd\", \"metal\"]")
+                })
                 .count(),
             1
         );
@@ -6433,6 +6833,7 @@ mod tests {
             event_tx: &event_tx,
             retained_events: retained_events.as_mut(),
             unrecorded_control_used: statically_sealable.then_some(&mut unrecorded_control_used),
+            runtime_sample_trace: None,
             cancellations: &cancellations,
             reasoning_forces: &reasoning_forces,
         }
@@ -6557,6 +6958,7 @@ mod tests {
                 event_tx: &event_tx,
                 retained_events: Some(&mut retained_events),
                 unrecorded_control_used: None,
+                runtime_sample_trace: None,
                 cancellations: &cancellations,
                 reasoning_forces: &reasoning_forces,
             };
@@ -6650,7 +7052,7 @@ mod tests {
     fn embedding_cancellation_is_typed_and_ticket_scoped() {
         let cancellation = Arc::new(AtomicBool::new(false));
         check_embedding_cancellation(&cancellation).expect("unset cancellation permits work");
-        let (_result_tx, result_rx) = bounded::<NativeResult<EmbeddingBatchOutput>>(1);
+        let (_result_tx, result_rx) = bounded::<embedding_runtime::EmbeddingCompletion>(1);
         let ticket = EmbeddingTicket {
             request_id: "embedding-request".to_string(),
             result: result_rx,
@@ -6665,6 +7067,103 @@ mod tests {
                 .code,
             NativeErrorCode::Cancelled
         );
+    }
+
+    #[test]
+    fn queued_embedding_shutdown_has_one_cancelled_completion() {
+        let request = embedding_request("model", vec![1, 2]);
+        let admitted_request_sha256 = embedding_runtime::embedding_request_sha256(&request);
+        let (result_tx, result_rx) = bounded(1);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        reject_queued_command(WorkerCommand::EmbedBatch {
+            request,
+            admitted_request_sha256,
+            result: result_tx,
+            cancellation: Arc::clone(&cancellation),
+        });
+        assert!(cancellation.load(Ordering::Acquire));
+        let completion = result_rx.recv().expect("one shutdown completion");
+        assert_eq!(
+            completion.terminal(),
+            embedding_runtime::EmbeddingCompletionTerminal::Cancelled
+        );
+        assert_eq!(
+            completion
+                .into_output()
+                .expect_err("queued shutdown cannot publish values")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        assert!(result_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn duplicate_embedding_request_id_fails_before_queue_admission() {
+        let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let (shutdown_tx, _shutdown_rx) = bounded(1);
+        let embedding_cancellations = Arc::new(Mutex::new(HashMap::new()));
+        embedding_cancellations.lock().expect("registry").insert(
+            "embedding-request".to_string(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let handle = NativeModelHandle {
+            inner: Arc::new(NativeModelInner {
+                worker_identity: Arc::new(WorkerIdentity),
+                command_tx,
+                shutdown_tx,
+                closing: AtomicBool::new(false),
+                admission: Mutex::new(()),
+                cancellations: Arc::new(Mutex::new(HashMap::new())),
+                embedding_cancellations,
+                reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
+                status: Arc::new(RwLock::new(ResidentModelStatus {
+                    model_id: "model".to_string(),
+                    model_path: PathBuf::new(),
+                    state: ModelRuntimeState::Ready,
+                    fingerprint: Some(test_model_fingerprint("model")),
+                    descriptor: None,
+                    active_sequences: 0,
+                    max_sequences: 4,
+                })),
+            }),
+        };
+        let error = handle
+            .embed_batch(embedding_request("model", vec![1]))
+            .expect_err("duplicate embedding IDs fail before queueing");
+        assert_eq!(error.code, NativeErrorCode::InvalidConfig);
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_embedding_ticket_cannot_remove_or_cancel_reused_identity() {
+        let registry = Arc::new(Mutex::new(HashMap::new()));
+        let old = Arc::new(AtomicBool::new(false));
+        registry
+            .lock()
+            .expect("registry")
+            .insert("embedding-request".to_string(), Arc::clone(&old));
+        let (_result_tx, result_rx) = bounded::<embedding_runtime::EmbeddingCompletion>(1);
+        let ticket = EmbeddingTicket {
+            request_id: "embedding-request".to_string(),
+            result: result_rx,
+            cancellation: old,
+            cancellations: Arc::clone(&registry),
+        };
+        let replacement = Arc::new(AtomicBool::new(false));
+        registry
+            .lock()
+            .expect("registry")
+            .insert("embedding-request".to_string(), Arc::clone(&replacement));
+        drop(ticket);
+        assert!(!replacement.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(
+            registry
+                .lock()
+                .expect("registry")
+                .get("embedding-request")
+                .expect("replacement remains"),
+            &replacement
+        ));
     }
 
     #[test]
@@ -7782,7 +8281,7 @@ mod tests {
         let _real_model_guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model test lock");
         let model_path = std::env::var("MOM_LLAMA_MODEL_PATH")?;
         let mut config = NativeModelConfig::local(PathBuf::from(model_path));
-        config.device = NativeDevice::Cpu;
+        config.device = NativeDevice::Auto;
         config.context_tokens = 512;
         config.batch_tokens = 64;
         config.max_sequences = 1;
@@ -7830,7 +8329,40 @@ mod tests {
             .wait_timeout(Duration::from_secs(120))?;
 
         let input_tokens = [exact_tokens.clone(), exact_tokens[..2].to_vec()];
-        let embedding = handle
+        let cancelled_ticket = handle.embed_batch(EmbeddingBatchRequest::new(
+            "real-cancelled-embedding".to_string(),
+            model_id.clone(),
+            vec![EmbeddingInput::new(
+                "cancelled".to_string(),
+                input_tokens[0].clone(),
+            )?],
+            EmbeddingPooling::None,
+            EmbeddingNormalization::None,
+        )?)?;
+        cancelled_ticket.cancel();
+        assert_eq!(
+            cancelled_ticket
+                .wait_verified_timeout(Duration::from_secs(120))
+                .expect_err("cancelled real embeddings cannot mint a seal")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        assert_eq!(
+            handle
+                .status()
+                .descriptor
+                .as_ref()
+                .expect("loaded model descriptor remains present")
+                .capabilities
+                .exact
+                .evidence
+                .embeddings
+                .declaration(),
+            CapabilityDeclarationStatus::Unreported,
+            "failed authority must not publish embedding capability status"
+        );
+
+        let verified_embedding = handle
             .embed_batch(EmbeddingBatchRequest::new(
                 "real-per-token-embedding".to_string(),
                 model_id.clone(),
@@ -7841,7 +8373,8 @@ mod tests {
                 EmbeddingPooling::None,
                 EmbeddingNormalization::None,
             )?)?
-            .wait_timeout(Duration::from_secs(120))?;
+            .wait_verified_timeout(Duration::from_secs(120))?;
+        let embedding = verified_embedding.output();
 
         assert_eq!(embedding.request_id(), "real-per-token-embedding");
         assert_eq!(embedding.model_id(), model_id);
@@ -7886,6 +8419,32 @@ mod tests {
             exact_tokens.len() as u32
         );
         assert_eq!(embedding.model_fingerprint().max_sequences, 1);
+        assert_eq!(
+            verified_embedding.execution_fingerprint(),
+            embedding.model_fingerprint()
+        );
+        assert_eq!(
+            verified_embedding.resident_model_fingerprint(),
+            &resident_fingerprint
+        );
+        assert_eq!(
+            verified_embedding.terminal(),
+            VerifiedEmbeddingTerminal::Completed
+        );
+        assert_eq!(
+            verified_embedding.requested_pooling(),
+            EmbeddingPooling::None
+        );
+        assert_eq!(
+            verified_embedding.requested_normalization(),
+            EmbeddingNormalization::None
+        );
+        assert_eq!(verified_embedding.resolved_config(), embedding.config());
+        assert_eq!(verified_embedding.transport(), NativeTransport::InProcess);
+        assert_eq!(verified_embedding.request_sha256().len(), 64);
+        assert_eq!(verified_embedding.output_bits_sha256().len(), 64);
+        assert_eq!(verified_embedding.ledger_sha256().len(), 64);
+        assert_eq!(verified_embedding.owner_call_sequence(), 1);
         assert_ne!(
             embedding.model_fingerprint().kv_layout_sha256,
             resident_fingerprint.kv_layout_sha256
@@ -7923,6 +8482,8 @@ mod tests {
         assert_eq!(before[0].generated_token_ids, after[0].generated_token_ids);
         assert_eq!(before[0].text, after[0].text);
         assert_eq!(before[0].state, after[0].state);
+        let joined = owner.shutdown_joined()?;
+        assert!(verified_embedding.belongs_to_joined_model(&joined));
         Ok(())
     }
 }

@@ -508,6 +508,16 @@ impl ExtendedSamplerProgram {
                     "sparse logit bias operation must contain at least one entry",
                 ));
             }
+            if let ExtendedSampler::SparseLogitBias { biases } = sampler {
+                if index != 0 {
+                    return Err(invalid_config(
+                        "sparse logit bias must be the first extended sampler so it cannot be hidden behind truncation",
+                    ));
+                }
+                if biases.as_slice().iter().any(|entry| entry.bias == 0.0) {
+                    return Err(invalid_config("sparse logit bias entries must be non-zero"));
+                }
+            }
         }
         Ok(Self(samplers))
     }
@@ -862,7 +872,8 @@ impl TryFrom<Vec<DistributionValueKind>> for DistributionValueKindSet {
 
 /// Bounded request for causal distribution evidence.
 ///
-/// `top_k` is the number of globally ranked candidates requested. A selected
+/// `top_k` is the maximum number of globally ranked finite-support candidates
+/// requested. A constrained distribution may honestly return fewer. A selected
 /// token observation is carried separately so sampling may choose a token
 /// outside that set. The default requests no evidence; absence must never be
 /// interpreted as backend support.
