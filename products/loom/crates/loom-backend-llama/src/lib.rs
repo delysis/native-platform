@@ -28,8 +28,8 @@ pub use model::{
     VerifiedMediaKind, VerifiedModelDescriptor, is_gguf_path, verify_model_inspection,
 };
 pub use runtime::{
-    BatchExecution, BatchRuntime, CompleteModelRelease, HostShutdownReceipt, ModelRelease,
-    NativeHostRuntime, RuntimeEvidenceClass,
+    BatchExecution, BatchRuntime, CompleteModelRelease, JoinedLlamaRuntime, ModelRelease,
+    NativeHostRuntime, ProcessExitJoinedLlamaRuntime, RuntimeEvidenceClass,
 };
 
 pub use adapter::{

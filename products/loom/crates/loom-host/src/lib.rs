@@ -386,6 +386,40 @@ impl GenerationRegistry {
             .collect())
     }
 
+    /// Requests cancellation for every process-local generation branch.
+    ///
+    /// This is reserved for application-wide teardown, where no project
+    /// session may remain authoritative. Routes stay registered until their
+    /// owning workers persist terminal state and call `complete_family`.
+    pub fn cancel_all(&self) -> Result<Vec<GenerationRunId>, GenerationRegistryError> {
+        let (pending, cancellations) = {
+            let mut state = self.lock()?;
+            let mut pending = Vec::new();
+            let mut cancellations = Vec::new();
+            for family in state.families.values_mut() {
+                for (run_id, branch_id) in &family.branches {
+                    if let Some(cancellation) = &family.cancellation {
+                        cancellations.push((*run_id, *branch_id, Arc::clone(cancellation)));
+                    } else {
+                        family.pending_cancellations.insert(*branch_id);
+                        pending.push(*run_id);
+                    }
+                }
+            }
+            (pending, cancellations)
+        };
+        Ok(pending
+            .into_iter()
+            .chain(
+                cancellations
+                    .into_iter()
+                    .filter_map(|(run_id, branch_id, cancellation)| {
+                        cancellation.cancel_branch(branch_id).then_some(run_id)
+                    }),
+            )
+            .collect())
+    }
+
     /// Waits for workers to persist terminal state and release every route for
     /// one session. The timeout is a hard upper bound; callers may retry the
     /// same idempotent command without guessing whether close committed.
@@ -762,6 +796,49 @@ mod tests {
         assert_eq!(completed.project_id, project_id);
         assert_eq!(registry.active_branch_count().expect("active count"), 0);
         assert!(registry.route_for_run(run_id).expect("route").is_none());
+    }
+
+    #[test]
+    fn application_teardown_cancels_every_registered_family() {
+        let registry = GenerationRegistry::new(4).expect("registry");
+        let first_run = GenerationRunId::new();
+        let first_branch = BranchId::new();
+        let second_run = GenerationRunId::new();
+        let second_branch = BranchId::new();
+        let first = Arc::new(FakeCancellation::default());
+        let second = Arc::new(FakeCancellation::default());
+        registry
+            .register(family(
+                "first",
+                ProjectId::new(),
+                CommandId::new(),
+                vec![(first_run, first_branch)],
+                first.clone(),
+            ))
+            .expect("first family");
+        registry
+            .register(family(
+                "second",
+                ProjectId::new(),
+                CommandId::new(),
+                vec![(second_run, second_branch)],
+                second.clone(),
+            ))
+            .expect("second family");
+
+        let mut cancelled = registry.cancel_all().expect("cancel every family");
+        cancelled.sort_unstable();
+        let mut expected = vec![first_run, second_run];
+        expected.sort_unstable();
+        assert_eq!(cancelled, expected);
+        assert_eq!(
+            *first.branches.lock().expect("first cancellation"),
+            vec![first_branch]
+        );
+        assert_eq!(
+            *second.branches.lock().expect("second cancellation"),
+            vec![second_branch]
+        );
     }
 
     #[test]

@@ -77,7 +77,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -88,7 +88,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -782,7 +782,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -976,7 +976,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2073,9 +2073,8 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "llama-cpp-2"
-version = "0.1.153"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a86ff114bb5ec602625776ec11d80d6ac8d113c74460e6a17bd44a6fedff15ef"
+version = "0.1.154"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f#01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2087,22 +2086,22 @@ dependencies = [
 
 [[package]]
 name = "llama-cpp-sys-2"
-version = "0.1.153"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f244dd304a9ef81b0875c6a7cc04bc84a022870623dd292736527d59645f9c55"
+version = "0.1.154"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f#01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f"
 dependencies = [
  "bindgen",
  "cc",
  "cmake",
  "find_cuda_helper",
  "glob",
+ "sha2",
  "walkdir",
 ]
 
 [[package]]
 name = "llama-native-cache"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=c61692d48b0768bb242bcecb7a80c3318fc476b4#c61692d48b0768bb242bcecb7a80c3318fc476b4"
+source = "git+https://github.com/delysis/llama-native-kit.git?rev=b71dfaa16c77b7069259bd15add740b80f895017#b71dfaa16c77b7069259bd15add740b80f895017"
 dependencies = [
  "llama-native-types",
  "serde",
@@ -2112,10 +2111,11 @@ dependencies = [
 [[package]]
 name = "llama-native-engine"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=c61692d48b0768bb242bcecb7a80c3318fc476b4#c61692d48b0768bb242bcecb7a80c3318fc476b4"
+source = "git+https://github.com/delysis/llama-native-kit.git?rev=b71dfaa16c77b7069259bd15add740b80f895017#b71dfaa16c77b7069259bd15add740b80f895017"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",
+ "fs4",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "llama-native-types",
@@ -2125,7 +2125,7 @@ dependencies = [
 [[package]]
 name = "llama-native-host"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=c61692d48b0768bb242bcecb7a80c3318fc476b4#c61692d48b0768bb242bcecb7a80c3318fc476b4"
+source = "git+https://github.com/delysis/llama-native-kit.git?rev=b71dfaa16c77b7069259bd15add740b80f895017#b71dfaa16c77b7069259bd15add740b80f895017"
 dependencies = [
  "llama-native-cache",
  "llama-native-engine",
@@ -2135,9 +2135,10 @@ dependencies = [
 [[package]]
 name = "llama-native-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=c61692d48b0768bb242bcecb7a80c3318fc476b4#c61692d48b0768bb242bcecb7a80c3318fc476b4"
+source = "git+https://github.com/delysis/llama-native-kit.git?rev=b71dfaa16c77b7069259bd15add740b80f895017#b71dfaa16c77b7069259bd15add740b80f895017"
 dependencies = [
  "serde",
+ "sha2",
  "thiserror 2.0.20",
 ]
 
@@ -2353,7 +2354,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.20",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2988,7 +2989,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3270,7 +3271,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3327,7 +3328,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3718,7 +3719,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4254,10 +4255,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4629,7 +4630,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.20",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5067,7 +5068,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

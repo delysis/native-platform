@@ -67,7 +67,9 @@ impl LocalModelProfile {
         NativeModelConfig {
             model_id: self.model_id.clone(),
             model_path: self.model_path.clone(),
+            expected_model_sha256: None,
             mmproj_path: self.projector_path.clone(),
+            expected_mmproj_sha256: None,
             device: self.device.into(),
             context_tokens: self.context_tokens,
             batch_tokens: self.batch_tokens,
@@ -82,6 +84,7 @@ impl LocalModelProfile {
 pub enum ProbabilitySemantics {
     RawModel,
     PostConstraint,
+    PostGuidance,
     PostSampler,
 }
 
@@ -90,6 +93,7 @@ impl From<ProbabilityStage> for ProbabilitySemantics {
         match value {
             ProbabilityStage::RawModel => Self::RawModel,
             ProbabilityStage::PostConstraint => Self::PostConstraint,
+            ProbabilityStage::PostGuidance => Self::PostGuidance,
             ProbabilityStage::PostSampler => Self::PostSampler,
         }
     }
@@ -230,8 +234,6 @@ pub enum ModelInspectionError {
         #[source]
         source: loom_types::HashIdParseError,
     },
-    #[error("model fingerprint path does not match the requested local model path")]
-    ModelPathMismatch,
     #[error("projector fingerprint presence does not match the requested projector path")]
     ProjectorMismatch,
     #[error("required raw-completion capability is unavailable: {0}")]
@@ -272,7 +274,7 @@ pub fn verify_model_inspection(
         model_environment_id,
         stable_model_id: descriptor.stable_model_id,
         local_model_id: profile.model_id.clone(),
-        model_path: fingerprint.model_path,
+        model_path: profile.model_path.clone(),
         display_name: descriptor.display_name,
         architecture,
         parameter_count,
@@ -320,9 +322,6 @@ fn validate_inspection_consistency(
     descriptor: &NativeModelDescriptor,
     fingerprint: &ModelFingerprint,
 ) -> Result<(), ModelInspectionError> {
-    if fingerprint.model_path != profile.model_path {
-        return Err(ModelInspectionError::ModelPathMismatch);
-    }
     if profile.projector_path.is_some() != fingerprint.multimodal_projector_sha256.is_some() {
         return Err(ModelInspectionError::ProjectorMismatch);
     }

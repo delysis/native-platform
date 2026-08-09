@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use crossbeam_channel::RecvTimeoutError;
 use llama_native_engine::GenerationTicket;
-use llama_native_host::{HostCachePolicy, NativeHost, NativeHostConfig};
+use llama_native_host::{
+    HostCachePolicy, HostSlotShutdown, JoinedHostSlot, JoinedNativeHost, NativeHost,
+    NativeHostConfig, ProcessExitJoinedNativeHost,
+};
 use llama_native_types::{
     GenerationBatchRequest, GenerationEvent, GenerationOutput, NativeError, NativeErrorCode,
 };
@@ -19,7 +22,7 @@ pub enum RuntimeEvidenceClass {
     TestFixture,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum ModelRelease {
     AlreadyAbsent,
     Released { proof: CompleteModelRelease },
@@ -30,51 +33,88 @@ pub enum ModelRelease {
 /// The count is stored once so a receipt cannot represent different matched
 /// and released counts. Construction remains inside this crate and additionally
 /// requires a post-release host snapshot with no matching survivors.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct CompleteModelRelease {
-    matched_and_released_slots: NonZeroUsize,
+    evidence: CompleteModelReleaseEvidence,
+}
+
+#[derive(Debug)]
+enum CompleteModelReleaseEvidence {
+    Native(Vec<JoinedHostSlot>),
+    #[cfg(test)]
+    Fixture(NonZeroUsize),
 }
 
 impl CompleteModelRelease {
+    #[cfg(test)]
     pub(crate) const fn from_complete_count(slots: NonZeroUsize) -> Self {
         Self {
-            matched_and_released_slots: slots,
+            evidence: CompleteModelReleaseEvidence::Fixture(slots),
         }
     }
 
     #[must_use]
-    pub const fn matched_slots(self) -> NonZeroUsize {
-        self.matched_and_released_slots
+    pub fn matched_slots(&self) -> NonZeroUsize {
+        self.released_slots()
     }
 
     #[must_use]
-    pub const fn released_slots(self) -> NonZeroUsize {
-        self.matched_and_released_slots
-    }
-}
-
-/// Proof that a runtime-owned host was observed empty after releasing every
-/// resident slot known to that runtime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HostShutdownReceipt {
-    matched_and_released_slots: usize,
-}
-
-impl HostShutdownReceipt {
-    const fn from_complete_count(slots: usize) -> Self {
-        Self {
-            matched_and_released_slots: slots,
+    pub fn released_slots(&self) -> NonZeroUsize {
+        match &self.evidence {
+            CompleteModelReleaseEvidence::Native(slots) => NonZeroUsize::new(slots.len())
+                .expect("native release evidence is constructed from a non-empty slot family"),
+            #[cfg(test)]
+            CompleteModelReleaseEvidence::Fixture(slots) => *slots,
         }
     }
+}
 
+/// Linear evidence that one exact native runtime permanently closed model
+/// admission and joined every resident worker.
+///
+/// The native proof is deliberately private and this type is neither `Clone`
+/// nor `Copy`. Code using an erased [`BatchRuntime`] therefore cannot construct
+/// or delegate shutdown authority. This proves native model workers only;
+/// application-owned event-forwarder and download workers require their own
+/// joined evidence.
+#[derive(Debug)]
+#[must_use = "joined native-runtime authority must be consumed by application shutdown"]
+pub struct JoinedLlamaRuntime {
+    native: JoinedNativeHost,
+}
+
+impl JoinedLlamaRuntime {
     #[must_use]
-    pub const fn matched_slots(self) -> usize {
-        self.matched_and_released_slots
+    pub const fn joined_worker_count(&self) -> usize {
+        self.native.joined_worker_count()
     }
 
+    /// Returns true only for the concrete runtime instance that joined.
     #[must_use]
-    pub const fn released_slots(self) -> usize {
-        self.matched_and_released_slots
+    pub fn belongs_to(&self, runtime: &NativeHostRuntime) -> bool {
+        self.native.belongs_to(&runtime.host)
+    }
+}
+
+/// Replayable terminal fact for an exact native runtime after its
+/// poison-recovering process-exit drain joined every resident worker.
+#[derive(Debug)]
+#[must_use = "process teardown must retain the joined native-runtime drain fact"]
+pub struct ProcessExitJoinedLlamaRuntime {
+    native: ProcessExitJoinedNativeHost,
+}
+
+impl ProcessExitJoinedLlamaRuntime {
+    /// Number of native owners consumed by this drain invocation.
+    #[must_use]
+    pub const fn joined_worker_count(&self) -> usize {
+        self.native.joined_worker_count()
+    }
+
+    /// Returns true only for the concrete runtime instance that drained.
+    #[must_use]
+    pub fn belongs_to(&self, runtime: &NativeHostRuntime) -> bool {
+        self.native.belongs_to(&runtime.host)
     }
 }
 
@@ -107,25 +147,15 @@ pub trait BatchRuntime: std::fmt::Debug + Send + Sync + 'static {
     fn release_model(&self, _profile: &LocalModelProfile) -> Result<ModelRelease, NativeError> {
         Ok(ModelRelease::AlreadyAbsent)
     }
-
-    /// Releases every runtime-owned native slot and proves the host empty.
-    ///
-    /// Runtimes without a typed ownership and verification boundary must fail
-    /// closed instead of returning an empty receipt.
-    fn shutdown_and_verify_empty(&self) -> Result<HostShutdownReceipt, NativeError> {
-        Err(NativeError::new(
-            NativeErrorCode::Internal,
-            "this batch runtime cannot prove that its native host is empty",
-        ))
-    }
 }
 
 #[derive(Debug, Default)]
 struct ResidencyLedger {
-    // c616 `slots()` and `unload()` erase host-lock poisoning into empty/false.
-    // Holding this mutex across every host acquire, snapshot, and release gives
-    // us an independent ownership fact and makes any in-runtime panic poison
-    // this boundary too. Do not add a residency-mutating host call outside it.
+    // The compatibility `slots()` and `unload()` APIs erase host-lock failures
+    // into empty/false. Holding this mutex across every host acquire, snapshot,
+    // release, and shutdown gives us an independent ownership fact and makes
+    // any in-runtime panic poison this boundary too. Do not add a
+    // residency-mutating host call outside it.
     model_paths: BTreeSet<PathBuf>,
 }
 
@@ -151,6 +181,52 @@ impl NativeHostRuntime {
                 "native host residency ownership is poisoned; refusing to infer teardown",
             )
         })
+    }
+
+    /// Permanently closes this exact host and returns only after every native
+    /// model worker owned by it has been joined.
+    pub fn shutdown_joined(&self) -> Result<JoinedLlamaRuntime, NativeError> {
+        let mut residency = self.lock_residency()?;
+        let slots = self.host.slots();
+        if slots.is_empty() && !residency.model_paths.is_empty() {
+            return Err(unobservable_residency_error(
+                "tracked models remained while the native host reported no slots",
+            ));
+        }
+        let observed_paths = slots
+            .iter()
+            .map(|slot| slot.model_path.clone())
+            .collect::<BTreeSet<_>>();
+        if !residency.model_paths.is_subset(&observed_paths) {
+            return Err(unobservable_residency_error(
+                "the native slot snapshot omitted tracked model ownership",
+            ));
+        }
+
+        let native = self.host.shutdown_joined()?;
+        if !native.belongs_to(&self.host) {
+            return Err(NativeError::new(
+                NativeErrorCode::Internal,
+                "native host returned shutdown authority for a different host instance",
+            ));
+        }
+        residency.model_paths.clear();
+        Ok(JoinedLlamaRuntime { native })
+    }
+
+    /// Final process-exit drain for the exact native host.
+    ///
+    /// This waits for any in-flight residency operation, recovers a poisoned
+    /// residency ledger, permanently closes host admission, and cannot return
+    /// before every host-owned model worker has been joined.
+    pub fn shutdown_for_process_exit(&self) -> ProcessExitJoinedLlamaRuntime {
+        let mut residency = self
+            .residency
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let native = self.host.shutdown_for_process_exit();
+        residency.model_paths.clear();
+        ProcessExitJoinedLlamaRuntime { native }
     }
 }
 
@@ -221,9 +297,20 @@ impl BatchRuntime for NativeHostRuntime {
 
         residency.model_paths.insert(profile.model_path.clone());
         let matched = slot_ids.len();
-        let mut released = 0usize;
+        let mut joined_slots = Vec::with_capacity(matched);
         for slot_id in &slot_ids {
-            released = released.saturating_add(usize::from(self.host.unload(*slot_id)));
+            match self.host.shutdown_slot_joined(*slot_id)? {
+                HostSlotShutdown::Joined(joined) if joined.belongs_to(&self.host) => {
+                    joined_slots.push(joined);
+                }
+                HostSlotShutdown::Joined(_) | HostSlotShutdown::Vacant => {
+                    return Err(incomplete_release_error(
+                        matched,
+                        joined_slots.len(),
+                        self.host.slots().len(),
+                    ));
+                }
+            }
         }
         let survivors = self
             .host
@@ -231,64 +318,34 @@ impl BatchRuntime for NativeHostRuntime {
             .into_iter()
             .filter(|slot| slot.model_path == profile.model_path)
             .count();
-        let proof = prove_complete_model_release(matched, released, survivors)?;
+        let proof = prove_complete_model_release(matched, joined_slots, survivors)?;
         residency.model_paths.remove(&profile.model_path);
         Ok(ModelRelease::Released { proof })
-    }
-
-    fn shutdown_and_verify_empty(&self) -> Result<HostShutdownReceipt, NativeError> {
-        let mut residency = self.lock_residency()?;
-        let slots = self.host.slots();
-        if slots.is_empty() && !residency.model_paths.is_empty() {
-            return Err(unobservable_residency_error(
-                "tracked models remained while the native host reported no slots",
-            ));
-        }
-        let observed_paths = slots
-            .iter()
-            .map(|slot| slot.model_path.clone())
-            .collect::<BTreeSet<_>>();
-        if !residency.model_paths.is_subset(&observed_paths) {
-            return Err(unobservable_residency_error(
-                "the native slot snapshot omitted tracked model ownership",
-            ));
-        }
-
-        let matched = slots.len();
-        let mut released = 0usize;
-        for slot in &slots {
-            released = released.saturating_add(usize::from(self.host.unload(slot.slot_id)));
-        }
-        let survivors = self.host.slots().len();
-        let receipt = prove_empty_host_shutdown(matched, released, survivors)?;
-        residency.model_paths.clear();
-        Ok(receipt)
     }
 }
 
 fn prove_complete_model_release(
     matched: usize,
-    released: usize,
+    joined_slots: Vec<JoinedHostSlot>,
     survivors: usize,
 ) -> Result<CompleteModelRelease, NativeError> {
-    let Some(matched) = NonZeroUsize::new(matched) else {
-        return Err(incomplete_release_error(matched, released, survivors));
+    let Some(matched_nonzero) = NonZeroUsize::new(matched) else {
+        return Err(incomplete_release_error(
+            matched,
+            joined_slots.len(),
+            survivors,
+        ));
     };
-    if released != matched.get() || survivors != 0 {
-        return Err(incomplete_release_error(matched.get(), released, survivors));
+    if joined_slots.len() != matched_nonzero.get() || survivors != 0 {
+        return Err(incomplete_release_error(
+            matched_nonzero.get(),
+            joined_slots.len(),
+            survivors,
+        ));
     }
-    Ok(CompleteModelRelease::from_complete_count(matched))
-}
-
-fn prove_empty_host_shutdown(
-    matched: usize,
-    released: usize,
-    survivors: usize,
-) -> Result<HostShutdownReceipt, NativeError> {
-    if released != matched || survivors != 0 {
-        return Err(incomplete_release_error(matched, released, survivors));
-    }
-    Ok(HostShutdownReceipt::from_complete_count(matched))
+    Ok(CompleteModelRelease {
+        evidence: CompleteModelReleaseEvidence::Native(joined_slots),
+    })
 }
 
 fn incomplete_release_error(matched: usize, released: usize, survivors: usize) -> NativeError {
@@ -339,38 +396,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn complete_release_proof_requires_every_match_and_no_survivors() {
-        let proof = prove_complete_model_release(2, 2, 0).expect("complete release");
+    fn fixture_release_proof_is_affine_and_has_one_canonical_count() {
+        let proof = CompleteModelRelease::from_complete_count(
+            NonZeroUsize::new(2).expect("non-zero fixture count"),
+        );
         assert_eq!(proof.matched_slots().get(), 2);
         assert_eq!(proof.released_slots().get(), 2);
-
-        assert!(prove_complete_model_release(2, 1, 1).is_err());
-        assert!(prove_complete_model_release(2, 2, 1).is_err());
-        assert!(prove_complete_model_release(0, 0, 0).is_err());
     }
 
     #[test]
-    fn host_shutdown_proof_accepts_empty_and_rejects_partial_release() {
-        let empty = prove_empty_host_shutdown(0, 0, 0).expect("already empty host");
-        assert_eq!(empty.matched_slots(), 0);
-        assert_eq!(empty.released_slots(), 0);
-
-        let released = prove_empty_host_shutdown(3, 3, 0).expect("complete host release");
-        assert_eq!(released.matched_slots(), 3);
-        assert_eq!(released.released_slots(), 3);
-
-        assert!(prove_empty_host_shutdown(3, 2, 1).is_err());
-        assert!(prove_empty_host_shutdown(3, 3, 1).is_err());
-    }
-
-    #[test]
-    fn empty_native_runtime_returns_a_zero_residency_receipt() {
+    fn empty_native_runtime_returns_exact_joined_authority() {
         let runtime = NativeHostRuntime::default();
-        let receipt = runtime
-            .shutdown_and_verify_empty()
-            .expect("fresh runtime is provably empty");
-        assert_eq!(receipt.matched_slots(), 0);
-        assert_eq!(receipt.released_slots(), 0);
+        let other_runtime = NativeHostRuntime::default();
+        let joined = runtime.shutdown_joined().expect("fresh runtime joins");
+        assert_eq!(joined.joined_worker_count(), 0);
+        assert!(joined.belongs_to(&runtime));
+        assert!(!joined.belongs_to(&other_runtime));
+        let _other_joined = other_runtime
+            .shutdown_joined()
+            .expect("other runtime joins");
+    }
+
+    #[test]
+    fn process_exit_runtime_recovers_poison_and_returns_exact_drain_fact() {
+        let runtime = NativeHostRuntime::default();
+        let other_runtime = NativeHostRuntime::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = runtime.residency.lock().expect("residency ledger");
+            panic!("poison residency ledger");
+        }));
+
+        let joined = runtime.shutdown_for_process_exit();
+        assert_eq!(joined.joined_worker_count(), 0);
+        assert!(joined.belongs_to(&runtime));
+        assert!(!joined.belongs_to(&other_runtime));
+        let joined_again = runtime.shutdown_for_process_exit();
+        assert_eq!(joined_again.joined_worker_count(), 0);
+        assert!(joined_again.belongs_to(&runtime));
     }
 
     #[test]
@@ -385,6 +447,6 @@ mod tests {
             .insert(profile.model_path.clone());
 
         assert!(runtime.release_model(&profile).is_err());
-        assert!(runtime.shutdown_and_verify_empty().is_err());
+        assert!(runtime.shutdown_joined().is_err());
     }
 }

@@ -23,12 +23,13 @@ use crate::model::{
     LocalModelProfile, ModelInspectionError, VerifiedModelDescriptor, verify_model_inspection,
 };
 use crate::runtime::{
-    BatchExecution, BatchRuntime, HostShutdownReceipt, ModelRelease, NativeHostRuntime,
+    BatchExecution, BatchRuntime, JoinedLlamaRuntime, ModelRelease, NativeHostRuntime,
     RuntimeEvidenceClass,
 };
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 256;
 pub const MAX_EVENT_CAPACITY: usize = 65_536;
+const _: () = assert!(DEFAULT_EVENT_CAPACITY > 0 && DEFAULT_EVENT_CAPACITY <= MAX_EVENT_CAPACITY);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContinuationCase {
@@ -108,45 +109,95 @@ pub enum LlamaBackendError {
     ResultDisconnected,
     #[error("generation did not finish before the requested timeout")]
     ResultTimeout,
+    #[error("this backend was constructed without concrete native shutdown authority")]
+    NativeShutdownAuthorityUnavailable,
+}
+
+#[derive(Debug)]
+enum RuntimeBinding {
+    Native(Arc<NativeHostRuntime>),
+    Custom(Arc<dyn BatchRuntime>),
+}
+
+impl RuntimeBinding {
+    fn as_batch_runtime(&self) -> &dyn BatchRuntime {
+        match self {
+            Self::Native(runtime) => runtime.as_ref(),
+            Self::Custom(runtime) => runtime.as_ref(),
+        }
+    }
+
+    fn native(&self) -> Option<&NativeHostRuntime> {
+        match self {
+            Self::Native(runtime) => Some(runtime.as_ref()),
+            Self::Custom(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct LlamaBackend {
-    runtime: Arc<dyn BatchRuntime>,
+    runtime: RuntimeBinding,
     event_capacity: usize,
 }
 
 impl Default for LlamaBackend {
     fn default() -> Self {
-        Self::with_runtime(
-            Arc::new(NativeHostRuntime::default()),
-            DEFAULT_EVENT_CAPACITY,
-        )
-        .expect("the built-in event capacity is valid")
+        Self::with_default_native_runtime(Arc::new(NativeHostRuntime::default()))
     }
 }
 
 impl LlamaBackend {
+    /// Builds an exact native backend with the compile-time product default
+    /// event capacity. Unlike the configurable constructor, this cannot fail.
+    #[must_use]
+    pub fn with_default_native_runtime(runtime: Arc<NativeHostRuntime>) -> Self {
+        Self {
+            runtime: RuntimeBinding::Native(runtime),
+            event_capacity: DEFAULT_EVENT_CAPACITY,
+        }
+    }
+
+    /// Builds a backend around a custom runtime without granting it authority
+    /// to certify native host shutdown.
     pub fn with_runtime(
         runtime: Arc<dyn BatchRuntime>,
         event_capacity: usize,
     ) -> Result<Self, LlamaBackendError> {
+        Self::validate_event_capacity(event_capacity)?;
+        Ok(Self {
+            runtime: RuntimeBinding::Custom(runtime),
+            event_capacity,
+        })
+    }
+
+    /// Builds a backend around one concrete native runtime. Only this typed
+    /// path retains the exact instance needed to return joined-host evidence.
+    pub fn with_native_runtime(
+        runtime: Arc<NativeHostRuntime>,
+        event_capacity: usize,
+    ) -> Result<Self, LlamaBackendError> {
+        Self::validate_event_capacity(event_capacity)?;
+        Ok(Self {
+            runtime: RuntimeBinding::Native(runtime),
+            event_capacity,
+        })
+    }
+
+    fn validate_event_capacity(event_capacity: usize) -> Result<(), LlamaBackendError> {
         if event_capacity == 0 || event_capacity > MAX_EVENT_CAPACITY {
             return Err(LlamaBackendError::InvalidRequest(format!(
                 "event capacity must be in 1..={MAX_EVENT_CAPACITY}"
             )));
         }
-        Ok(Self {
-            runtime,
-            event_capacity,
-        })
+        Ok(())
     }
 
     pub fn inspect_model(
         &self,
         profile: &LocalModelProfile,
     ) -> Result<VerifiedModelDescriptor, LlamaBackendError> {
-        let inspection = self.runtime.inspect_model(profile)?;
+        let inspection = self.runtime.as_batch_runtime().inspect_model(profile)?;
         verify_model_inspection(profile, inspection).map_err(Into::into)
     }
 
@@ -156,13 +207,29 @@ impl LlamaBackend {
         &self,
         profile: &LocalModelProfile,
     ) -> Result<ModelRelease, LlamaBackendError> {
-        self.runtime.release_model(profile).map_err(Into::into)
+        self.runtime
+            .as_batch_runtime()
+            .release_model(profile)
+            .map_err(Into::into)
     }
 
-    /// Releases every runtime-owned model and returns only after the native
-    /// host has proved that no resident slot remains.
-    pub fn shutdown_and_verify_empty(&self) -> Result<HostShutdownReceipt, LlamaBackendError> {
-        self.runtime.shutdown_and_verify_empty().map_err(Into::into)
+    /// Permanently closes the exact native runtime and returns only after all
+    /// of its resident native workers have been joined.
+    pub fn shutdown_joined(&self) -> Result<JoinedLlamaRuntime, LlamaBackendError> {
+        self.runtime
+            .native()
+            .ok_or(LlamaBackendError::NativeShutdownAuthorityUnavailable)?
+            .shutdown_joined()
+            .map_err(Into::into)
+    }
+
+    /// Checks that joined authority was minted by this backend's exact native
+    /// runtime rather than another same-typed backend instance.
+    #[must_use]
+    pub fn owns_joined_runtime(&self, joined: &JoinedLlamaRuntime) -> bool {
+        self.runtime
+            .native()
+            .is_some_and(|runtime| joined.belongs_to(runtime))
     }
 
     pub fn start_exact_continuation(
@@ -174,7 +241,10 @@ impl LlamaBackend {
         let exact_prompt_blob_id = BlobId::digest(request.exact_manuscript_prefix.as_bytes());
         let model_environment = model_environment_from_verified(&model)?;
         let native_request = build_native_request(&request);
-        let execution = self.runtime.start_batch(&request.model, native_request)?;
+        let execution = self
+            .runtime
+            .as_batch_runtime()
+            .start_batch(&request.model, native_request)?;
         let identities = request
             .cases
             .iter()
@@ -196,7 +266,7 @@ impl LlamaBackend {
         let worker_execution = Arc::clone(&execution);
         let worker_events = Arc::clone(&events);
         let worker_identities = identities.clone();
-        let runtime_evidence = self.runtime.evidence_class();
+        let runtime_evidence = self.runtime.as_batch_runtime().evidence_class();
         let worker_request = request.clone();
         let worker_model = model.clone();
         let worker_environment = model_environment.clone();
@@ -278,6 +348,21 @@ impl LlamaGenerationHandle {
         self.cancel_branch(identity.branch_id)
     }
 
+    /// Requests cancellation for every branch owned by this exact handle.
+    /// Returns the number of branches whose native cancellation route accepted
+    /// the request.
+    pub fn cancel_all(&self) -> usize {
+        self.identities
+            .iter()
+            .filter(|identity| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.cancel_branch(identity.branch_id)
+                }))
+                .unwrap_or(false)
+            })
+            .count()
+    }
+
     pub fn receive_event_timeout(
         &self,
         timeout: Duration,
@@ -336,7 +421,9 @@ impl Drop for LlamaGenerationHandle {
             .is_some();
         if worker_is_live {
             for identity in &self.identities {
-                let _ = self.execution.cancel_case(&identity.case_id);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.execution.cancel_case(&identity.case_id)
+                }));
             }
         }
         let _ = self.join_worker();
@@ -1102,8 +1189,9 @@ mod tests {
     use llama_native_types::{
         CacheOperationCapabilities, CapabilityDeclarationStatus, ExactModelCapabilities,
         GenerationBatchCapabilities, GenerationCacheMetrics, GenerationMetrics as NativeMetrics,
-        GenerationOutputCapabilities, ModelCapabilities, ModelFingerprint, NativeModelDescriptor,
-        PromptForm, PromptInputCapabilities, SamplingParameter,
+        GenerationOutputCapabilities, ModelCapabilities, ModelFingerprint,
+        NativeEvidenceCapabilities, NativeModelDescriptor, PromptForm, PromptInputCapabilities,
+        SamplingParameter,
     };
 
     use super::*;
@@ -1227,7 +1315,6 @@ mod tests {
         let tokenizer_sha256 = "22".repeat(32);
         let fingerprint = ModelFingerprint {
             model_id: profile.model_id.clone(),
-            model_path: profile.model_path.clone(),
             model_size: 1_000,
             model_sha256: model_sha256.clone(),
             tokenizer_sha256,
@@ -1268,6 +1355,7 @@ mod tests {
                 per_case_restore: true,
                 token_exact_shared_prefix: true,
             },
+            evidence: NativeEvidenceCapabilities::default(),
             media: Vec::new(),
         };
         RuntimeModelInspection {
@@ -1590,6 +1678,21 @@ mod tests {
     }
 
     #[test]
+    fn only_the_typed_native_constructor_retains_shutdown_authority() {
+        let runtime = Arc::new(NativeHostRuntime::default());
+        let backend = LlamaBackend::with_native_runtime(runtime.clone(), 1).expect("backend");
+        let other_backend =
+            LlamaBackend::with_native_runtime(Arc::new(NativeHostRuntime::default()), 1)
+                .expect("other backend");
+        let joined = backend.shutdown_joined().expect("joined native runtime");
+
+        assert_eq!(joined.joined_worker_count(), 0);
+        assert!(joined.belongs_to(runtime.as_ref()));
+        assert!(backend.owns_joined_runtime(&joined));
+        assert!(!other_backend.owns_joined_runtime(&joined));
+    }
+
+    #[test]
     fn exact_prefix_batch_is_completion_only_and_fixture_evidence_stays_fixture() {
         let request = request_with_two_cases();
         let outputs = (0..request.cases.len())
@@ -1622,20 +1725,23 @@ mod tests {
         assert_stream_contract(&loom_events, &request);
         drop(handle);
         assert!(runtime.execution.cancelled_cases().is_empty());
-        assert_eq!(
-            backend
-                .release_model(&request.model)
-                .expect("release fixture model"),
-            ModelRelease::Released {
-                proof: CompleteModelRelease::from_complete_count(std::num::NonZeroUsize::MIN,),
-            }
-        );
-        assert_eq!(
+        let ModelRelease::Released { proof } = backend
+            .release_model(&request.model)
+            .expect("release fixture model")
+        else {
+            panic!("fixture model was unexpectedly absent");
+        };
+        assert_eq!(proof.released_slots(), std::num::NonZeroUsize::MIN);
+        assert!(matches!(
             backend
                 .release_model(&request.model)
                 .expect("second release is idempotent"),
             ModelRelease::AlreadyAbsent
-        );
+        ));
+        assert!(matches!(
+            backend.shutdown_joined(),
+            Err(LlamaBackendError::NativeShutdownAuthorityUnavailable)
+        ));
     }
 
     #[test]
@@ -1868,9 +1974,8 @@ mod tests {
         };
         assert_eq!(proof.matched_slots(), proof.released_slots());
         assert_eq!(proof.released_slots().get(), 1);
-        let shutdown = backend.shutdown_and_verify_empty()?;
-        assert_eq!(shutdown.matched_slots(), 0);
-        assert_eq!(shutdown.released_slots(), 0);
+        let shutdown = backend.shutdown_joined()?;
+        assert_eq!(shutdown.joined_worker_count(), 1);
         Ok(())
     }
 

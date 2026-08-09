@@ -5,17 +5,19 @@ mod model_download;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, Metadata};
 use std::io::Read as _;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use loom_backend_llama::{
-    ContinuationCase, DownloadControl, DownloadError, ExactContinuationRequest,
-    ExactContinuationResult, GgufDownloadRequest, GgufHeaderStatus, LlamaBackend,
-    LlamaBackendError, LlamaGenerationHandle, LocalModelProfile, MAX_MODEL_DOWNLOAD_BYTES,
-    ModelDiscoveryOptions, ModelRelease, SamplingConfig, Sha256Digest, VerifiedModelDescriptor,
+    ContinuationCase, DownloadCancellation, DownloadControl, DownloadError,
+    ExactContinuationRequest, ExactContinuationResult, GgufDownloadRequest, GgufHeaderStatus,
+    JoinedLlamaRuntime, LlamaBackend, LlamaBackendError, LlamaGenerationHandle, LocalModelProfile,
+    MAX_MODEL_DOWNLOAD_BYTES, ModelDiscoveryOptions, ModelRelease, NativeHostRuntime,
+    ProcessExitJoinedLlamaRuntime, SamplingConfig, Sha256Digest, VerifiedModelDescriptor,
     discover_gguf_models, download_gguf, model_environment_from_verified,
     validate_candidate_receipt_binding, validate_gguf_download_request,
 };
@@ -56,6 +58,7 @@ const PROJECT_CLOSE_GENERATION_WAIT: Duration = Duration::from_secs(3);
 const MAX_MODEL_DOWNLOAD_URL_BYTES: usize = 16 * 1024;
 const POLICY_MODEL_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_TRACKED_GENERATION_WORKERS: usize = DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES;
+pub const APPLICATION_QUIT_MENU_ID: &str = "loom.application.quit";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ApplicationPhase {
@@ -67,10 +70,36 @@ enum ApplicationPhase {
 
 struct ApplicationCloseAttempt<'a> {
     state: &'a PluginState,
+    phase: MutexGuard<'a, ApplicationPhase>,
     authorized: bool,
 }
 
-struct ReadyToExit;
+#[derive(Debug)]
+struct ApplicationShutdownProof {
+    native_runtime: ApplicationNativeShutdown,
+    desktop_workers: DesktopWorkersJoined,
+}
+
+#[derive(Debug)]
+enum ApplicationNativeShutdown {
+    Graceful(JoinedLlamaRuntime),
+    ProcessExit(ProcessExitJoinedLlamaRuntime),
+}
+
+#[derive(Debug)]
+struct ReadyToExit {
+    proof: ApplicationShutdownProof,
+}
+
+#[derive(Debug)]
+struct WorkerRegistryIdentity;
+
+#[derive(Debug)]
+struct DesktopWorkersJoined {
+    model_loads: ModelLoadsDrained,
+    generation_workers: GenerationWorkersJoined,
+    download_workers: DownloadWorkersJoined,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum SessionPhase {
@@ -95,13 +124,16 @@ pub struct PluginState {
     exit_authorized: AtomicBool,
     application: Mutex<ApplicationPhase>,
     session: Mutex<Session>,
+    native_runtime: Arc<NativeHostRuntime>,
     backend: Arc<LlamaBackend>,
     model: Mutex<ModelRegistry>,
     model_lifecycle: Mutex<()>,
     user_model_paths: Mutex<BTreeSet<PathBuf>>,
     generations: GenerationRegistry,
     generation_workers: GenerationWorkerRegistry,
+    model_loads: Arc<ModelLoadRegistry>,
     downloads: Arc<ModelDownloadRegistry>,
+    download_workers: DownloadWorkerRegistry,
     model_library_root: Option<PathBuf>,
     build_model_policy: BuildModelPolicy,
     additional_policy_model_paths: Vec<PathBuf>,
@@ -119,22 +151,41 @@ impl PluginState {
         build_model_policy: BuildModelPolicy,
         additional_policy_model_paths: Vec<PathBuf>,
     ) -> Self {
+        let native_runtime = Arc::new(NativeHostRuntime::default());
+        let backend = Arc::new(LlamaBackend::with_default_native_runtime(Arc::clone(
+            &native_runtime,
+        )));
         Self {
             close_requested: AtomicBool::new(false),
             exit_authorized: AtomicBool::new(false),
             application: Mutex::new(ApplicationPhase::default()),
             session: Mutex::new(Session::default()),
-            backend: Arc::new(LlamaBackend::default()),
+            native_runtime,
+            backend,
             model: Mutex::new(ModelRegistry::default()),
             model_lifecycle: Mutex::new(()),
             user_model_paths: Mutex::new(BTreeSet::new()),
             generations: GenerationRegistry::default(),
             generation_workers: GenerationWorkerRegistry::default(),
+            model_loads: Arc::new(ModelLoadRegistry::default()),
             downloads: Arc::new(ModelDownloadRegistry::default()),
+            download_workers: DownloadWorkerRegistry::default(),
             model_library_root,
             build_model_policy,
             additional_policy_model_paths,
         }
+    }
+}
+
+impl Drop for PluginState {
+    fn drop(&mut self) {
+        self.close_requested.store(true, Ordering::Release);
+        self.exit_authorized.store(false, Ordering::Release);
+        if let Ok(phase) = self.application.get_mut() {
+            *phase = ApplicationPhase::Closing;
+        }
+        let _desktop_workers = self.join_desktop_workers_for_exit();
+        let _native_runtime = self.native_runtime.shutdown_for_process_exit();
     }
 }
 
@@ -170,7 +221,20 @@ enum ModelRegistry {
 #[derive(Debug)]
 enum GenerationWorkerSlot {
     Reserved,
-    Running(JoinHandle<()>),
+    Running {
+        worker: JoinHandle<()>,
+        cancellation: Arc<dyn GenerationWorkerCancellation>,
+    },
+}
+
+trait GenerationWorkerCancellation: std::fmt::Debug + Send + Sync {
+    fn cancel_all(&self);
+}
+
+impl GenerationWorkerCancellation for LlamaGenerationHandle {
+    fn cancel_all(&self) {
+        let _ = LlamaGenerationHandle::cancel_all(self);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -179,16 +243,99 @@ struct GenerationWorkerState {
     join_failure: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct GenerationWorkerRegistry {
+    identity: Arc<WorkerRegistryIdentity>,
     state: Mutex<GenerationWorkerState>,
 }
 
 #[derive(Debug)]
-struct GenerationWorkerReservation<'a> {
-    registry: &'a GenerationWorkerRegistry,
+struct ModelLoadRegistry {
+    identity: Arc<WorkerRegistryIdentity>,
+    state: Mutex<ModelLoadState>,
+    drained: Condvar,
+}
+
+#[derive(Debug)]
+struct ModelLoadState {
+    accepting: bool,
+    active: usize,
+}
+
+#[derive(Debug)]
+struct ModelLoadPermit {
+    lifetime: Arc<ModelLoadLifetime>,
+}
+
+#[derive(Debug)]
+struct ModelLoadWorkerGuard {
+    _lifetime: Arc<ModelLoadLifetime>,
+}
+
+#[derive(Debug)]
+struct ModelLoadLifetime {
+    registry: Arc<ModelLoadRegistry>,
+}
+
+#[derive(Debug)]
+struct ModelLoadsDrained {
+    registry_identity: Arc<WorkerRegistryIdentity>,
+    count: usize,
+}
+
+#[derive(Debug)]
+struct GenerationWorkersJoined {
+    registry_identity: Arc<WorkerRegistryIdentity>,
+    count: usize,
+}
+
+#[derive(Debug)]
+enum DownloadWorkerSlot {
+    Reserved,
+    Running {
+        worker: JoinHandle<()>,
+        cancellation: DownloadCancellation,
+    },
+}
+
+#[derive(Debug, Default)]
+struct DownloadWorkerState {
+    workers: BTreeMap<CommandId, DownloadWorkerSlot>,
+    join_failure: Option<String>,
+}
+
+#[derive(Debug)]
+struct DownloadWorkerRegistry {
+    identity: Arc<WorkerRegistryIdentity>,
+    state: Mutex<DownloadWorkerState>,
+}
+
+#[derive(Debug)]
+struct DownloadWorkerReservation<'registry, 'admission> {
+    registry: &'registry DownloadWorkerRegistry,
+    command_id: CommandId,
+    attached: bool,
+    _admission: PhantomData<&'admission ApplicationPhase>,
+}
+
+#[derive(Debug)]
+struct DownloadWorkerAttachError {
+    failure: IpcFailure,
+    worker: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct DownloadWorkersJoined {
+    registry_identity: Arc<WorkerRegistryIdentity>,
+    count: usize,
+}
+
+#[derive(Debug)]
+struct GenerationWorkerReservation<'registry, 'admission> {
+    registry: &'registry GenerationWorkerRegistry,
     request_id: String,
     attached: bool,
+    _admission: PhantomData<&'admission ApplicationPhase>,
 }
 
 #[derive(Debug)]
@@ -197,8 +344,135 @@ struct GenerationWorkerAttachError {
     worker: JoinHandle<()>,
 }
 
+impl Default for ModelLoadRegistry {
+    fn default() -> Self {
+        Self {
+            identity: Arc::new(WorkerRegistryIdentity),
+            state: Mutex::new(ModelLoadState {
+                accepting: true,
+                active: 0,
+            }),
+            drained: Condvar::new(),
+        }
+    }
+}
+
+impl ModelLoadRegistry {
+    fn reserve(
+        self: &Arc<Self>,
+        _admission: &MutexGuard<'_, ApplicationPhase>,
+    ) -> Result<ModelLoadPermit, IpcFailure> {
+        let mut state = self.state.lock().map_err(|_| {
+            IpcFailure::new(
+                "model_load_worker_state_poisoned",
+                "the local model loader entered an invalid state; restart Loom",
+                false,
+            )
+        })?;
+        if !state.accepting {
+            return Err(IpcFailure::new(
+                "application_quiescing",
+                "Loom will not start local model verification while the application is closing",
+                true,
+            ));
+        }
+        state.active = state.active.checked_add(1).ok_or_else(|| {
+            IpcFailure::new(
+                "model_load_worker_capacity",
+                "the local model loader count overflowed",
+                false,
+            )
+        })?;
+        Ok(ModelLoadPermit {
+            lifetime: Arc::new(ModelLoadLifetime {
+                registry: Arc::clone(self),
+            }),
+        })
+    }
+
+    /// Permanently closes model-load admission and waits until both every
+    /// admitted async command and its blocking worker have released their
+    /// shared lifetime, including registry commit or rollback.
+    fn close_and_drain(&self) -> ModelLoadsDrained {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.accepting = false;
+        let count = state.active;
+        while state.active != 0 {
+            state = self
+                .drained
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        ModelLoadsDrained {
+            registry_identity: Arc::clone(&self.identity),
+            count,
+        }
+    }
+
+    fn reopen_after_aborted_close(&self) -> Result<(), IpcFailure> {
+        let mut state = self.state.lock().map_err(|_| {
+            IpcFailure::new(
+                "model_load_worker_state_poisoned",
+                "the local model loader entered an invalid state; restart Loom",
+                false,
+            )
+        })?;
+        if state.active != 0 {
+            return Err(IpcFailure::new(
+                "model_load_worker_active",
+                "the local model loader cannot reopen while verification is active",
+                true,
+            ));
+        }
+        state.accepting = true;
+        Ok(())
+    }
+}
+
+impl ModelLoadPermit {
+    fn worker_guard(&self) -> ModelLoadWorkerGuard {
+        ModelLoadWorkerGuard {
+            _lifetime: Arc::clone(&self.lifetime),
+        }
+    }
+}
+
+impl Drop for ModelLoadLifetime {
+    fn drop(&mut self) {
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("a model-load permit can be released only once");
+        if state.active == 0 {
+            self.registry.drained.notify_all();
+        }
+    }
+}
+
+impl ModelLoadsDrained {
+    fn belongs_to(&self, registry: &ModelLoadRegistry) -> bool {
+        Arc::ptr_eq(&self.registry_identity, &registry.identity)
+    }
+
+    const fn count(&self) -> usize {
+        self.count
+    }
+}
+
 impl GenerationWorkerRegistry {
-    fn reserve(&self, request_id: &str) -> Result<GenerationWorkerReservation<'_>, IpcFailure> {
+    fn reserve<'registry, 'admission>(
+        &'registry self,
+        request_id: &str,
+        _admission: &'admission MutexGuard<'_, ApplicationPhase>,
+    ) -> Result<GenerationWorkerReservation<'registry, 'admission>, IpcFailure> {
         self.reap_finished()?;
         let mut state = self.lock()?;
         if let Some(failure) = &state.join_failure {
@@ -231,6 +505,7 @@ impl GenerationWorkerRegistry {
             registry: self,
             request_id: request_id.to_owned(),
             attached: false,
+            _admission: PhantomData,
         })
     }
 
@@ -248,16 +523,16 @@ impl GenerationWorkerRegistry {
                 .workers
                 .iter()
                 .filter_map(|(request_id, slot)| match slot {
-                    GenerationWorkerSlot::Running(worker) if worker.is_finished() => {
+                    GenerationWorkerSlot::Running { worker, .. } if worker.is_finished() => {
                         Some(request_id.clone())
                     }
-                    GenerationWorkerSlot::Reserved | GenerationWorkerSlot::Running(_) => None,
+                    GenerationWorkerSlot::Reserved | GenerationWorkerSlot::Running { .. } => None,
                 })
                 .collect::<Vec<_>>();
             finished_ids
                 .into_iter()
                 .filter_map(|request_id| match state.workers.remove(&request_id) {
-                    Some(GenerationWorkerSlot::Running(worker)) => Some(worker),
+                    Some(GenerationWorkerSlot::Running { worker, .. }) => Some(worker),
                     Some(GenerationWorkerSlot::Reserved) | None => None,
                 })
                 .collect::<Vec<_>>()
@@ -265,7 +540,7 @@ impl GenerationWorkerRegistry {
         self.join_workers(finished)
     }
 
-    fn join_all(&self) -> Result<usize, IpcFailure> {
+    fn join_all(&self) -> Result<GenerationWorkersJoined, IpcFailure> {
         let workers = {
             let mut state = self.lock()?;
             if let Some(failure) = &state.join_failure {
@@ -289,12 +564,50 @@ impl GenerationWorkerRegistry {
             std::mem::take(&mut state.workers)
                 .into_values()
                 .filter_map(|slot| match slot {
-                    GenerationWorkerSlot::Running(worker) => Some(worker),
+                    GenerationWorkerSlot::Running { worker, .. } => Some(worker),
                     GenerationWorkerSlot::Reserved => None,
                 })
                 .collect::<Vec<_>>()
         };
-        self.join_workers(workers)
+        let count = self.join_workers(workers)?;
+        Ok(GenerationWorkersJoined {
+            registry_identity: Arc::clone(&self.identity),
+            count,
+        })
+    }
+
+    /// Final event-loop fallback for an operating-system exit that can no
+    /// longer be prevented. Every reservation is statically tied to an
+    /// application-admission guard, so owning that phase mutex proves there
+    /// can be no unattached worker here.
+    fn join_all_for_exit(&self) -> GenerationWorkersJoined {
+        let workers = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut state.workers)
+                .into_values()
+                .filter_map(|slot| match slot {
+                    GenerationWorkerSlot::Running {
+                        worker,
+                        cancellation,
+                    } => Some((worker, cancellation)),
+                    GenerationWorkerSlot::Reserved => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let count = workers.len();
+        for (worker, cancellation) in workers {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cancellation.cancel_all();
+            }));
+            let _ = worker.join();
+        }
+        GenerationWorkersJoined {
+            registry_identity: Arc::clone(&self.identity),
+            count,
+        }
     }
 
     fn join_workers(&self, workers: Vec<JoinHandle<()>>) -> Result<usize, IpcFailure> {
@@ -335,19 +648,282 @@ impl GenerationWorkerRegistry {
     }
 }
 
-impl GenerationWorkerReservation<'_> {
-    fn attach(mut self, worker: JoinHandle<()>) -> Result<(), GenerationWorkerAttachError> {
+impl Default for GenerationWorkerRegistry {
+    fn default() -> Self {
+        Self {
+            identity: Arc::new(WorkerRegistryIdentity),
+            state: Mutex::new(GenerationWorkerState::default()),
+        }
+    }
+}
+
+impl GenerationWorkersJoined {
+    fn belongs_to(&self, registry: &GenerationWorkerRegistry) -> bool {
+        Arc::ptr_eq(&self.registry_identity, &registry.identity)
+    }
+
+    const fn count(&self) -> usize {
+        self.count
+    }
+}
+
+impl Default for DownloadWorkerRegistry {
+    fn default() -> Self {
+        Self {
+            identity: Arc::new(WorkerRegistryIdentity),
+            state: Mutex::new(DownloadWorkerState::default()),
+        }
+    }
+}
+
+impl DownloadWorkerRegistry {
+    fn reserve<'registry, 'admission>(
+        &'registry self,
+        command_id: CommandId,
+        _admission: &'admission MutexGuard<'_, ApplicationPhase>,
+    ) -> Result<DownloadWorkerReservation<'registry, 'admission>, IpcFailure> {
+        let mut state = self.lock()?;
+        if let Some(failure) = &state.join_failure {
+            return Err(IpcFailure::new(
+                "download_worker_join_failed",
+                failure.clone(),
+                false,
+            ));
+        }
+        if state.workers.contains_key(&command_id) {
+            return Err(IpcFailure::new(
+                "download_worker_duplicate",
+                "the model download already owns a desktop worker",
+                false,
+            ));
+        }
+        if state.workers.len() >= crate::model_download::MAX_RETAINED_MODEL_DOWNLOADS {
+            return Err(IpcFailure::new(
+                "download_worker_capacity",
+                "Loom must join completed model downloads before starting another",
+                true,
+            ));
+        }
+        state
+            .workers
+            .insert(command_id, DownloadWorkerSlot::Reserved);
+        Ok(DownloadWorkerReservation {
+            registry: self,
+            command_id,
+            attached: false,
+            _admission: PhantomData,
+        })
+    }
+
+    fn reap_finished(&self) -> Result<usize, IpcFailure> {
+        let workers = {
+            let mut state = self.lock()?;
+            if let Some(failure) = &state.join_failure {
+                return Err(IpcFailure::new(
+                    "download_worker_join_failed",
+                    failure.clone(),
+                    false,
+                ));
+            }
+            let finished = state
+                .workers
+                .iter()
+                .filter_map(|(command_id, slot)| match slot {
+                    DownloadWorkerSlot::Running { worker, .. } if worker.is_finished() => {
+                        Some(*command_id)
+                    }
+                    DownloadWorkerSlot::Reserved | DownloadWorkerSlot::Running { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            finished
+                .into_iter()
+                .filter_map(|command_id| match state.workers.remove(&command_id) {
+                    Some(DownloadWorkerSlot::Running { worker, .. }) => Some(worker),
+                    Some(DownloadWorkerSlot::Reserved) | None => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        self.join_workers(workers)
+    }
+
+    fn join_all(&self) -> Result<DownloadWorkersJoined, IpcFailure> {
+        let workers = {
+            let mut state = self.lock()?;
+            if let Some(failure) = &state.join_failure {
+                return Err(IpcFailure::new(
+                    "download_worker_join_failed",
+                    failure.clone(),
+                    false,
+                ));
+            }
+            if state
+                .workers
+                .values()
+                .any(|slot| matches!(slot, DownloadWorkerSlot::Reserved))
+            {
+                return Err(IpcFailure::new(
+                    "download_worker_starting",
+                    "a model download is still entering its owned lifecycle",
+                    true,
+                ));
+            }
+            std::mem::take(&mut state.workers)
+                .into_values()
+                .filter_map(|slot| match slot {
+                    DownloadWorkerSlot::Running { worker, .. } => Some(worker),
+                    DownloadWorkerSlot::Reserved => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let count = self.join_workers(workers)?;
+        Ok(DownloadWorkersJoined {
+            registry_identity: Arc::clone(&self.identity),
+            count,
+        })
+    }
+
+    fn join_all_for_exit(&self) -> DownloadWorkersJoined {
+        let workers = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut state.workers)
+                .into_values()
+                .filter_map(|slot| match slot {
+                    DownloadWorkerSlot::Running {
+                        worker,
+                        cancellation,
+                    } => Some((worker, cancellation)),
+                    DownloadWorkerSlot::Reserved => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let count = workers.len();
+        for (worker, cancellation) in workers {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cancellation.cancel();
+            }));
+            let _ = worker.join();
+        }
+        DownloadWorkersJoined {
+            registry_identity: Arc::clone(&self.identity),
+            count,
+        }
+    }
+
+    fn join_workers(&self, workers: Vec<JoinHandle<()>>) -> Result<usize, IpcFailure> {
+        let count = workers.len();
+        let mut first_failure = None;
+        for worker in workers {
+            if worker.join().is_err() {
+                first_failure.get_or_insert_with(|| "worker panicked".to_owned());
+            }
+        }
+        if let Some(error) = first_failure {
+            let message = format!(
+                "a desktop model download worker failed before it could be joined: {error}"
+            );
+            if let Ok(mut state) = self.state.lock() {
+                state.join_failure = Some(message.clone());
+            }
+            return Err(IpcFailure::new(
+                "download_worker_join_failed",
+                message,
+                false,
+            ));
+        }
+        Ok(count)
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, DownloadWorkerState>, IpcFailure> {
+        self.state.lock().map_err(|_| {
+            IpcFailure::new(
+                "download_worker_state_poisoned",
+                "the download worker registry entered an invalid state; restart Loom",
+                false,
+            )
+        })
+    }
+}
+
+impl DownloadWorkerReservation<'_, '_> {
+    fn attach(
+        mut self,
+        worker: JoinHandle<()>,
+        cancellation: DownloadCancellation,
+    ) -> Result<(), DownloadWorkerAttachError> {
+        let mut state = match self.registry.lock() {
+            Ok(state) => state,
+            Err(failure) => return Err(DownloadWorkerAttachError { failure, worker }),
+        };
+        match state.workers.get_mut(&self.command_id) {
+            Some(slot @ DownloadWorkerSlot::Reserved) => {
+                *slot = DownloadWorkerSlot::Running {
+                    worker,
+                    cancellation,
+                };
+                self.attached = true;
+                Ok(())
+            }
+            Some(DownloadWorkerSlot::Running { .. }) | None => Err(DownloadWorkerAttachError {
+                failure: IpcFailure::new(
+                    "download_worker_state_changed",
+                    "the model download worker reservation changed before attachment",
+                    false,
+                ),
+                worker,
+            }),
+        }
+    }
+}
+
+impl Drop for DownloadWorkerReservation<'_, '_> {
+    fn drop(&mut self) {
+        if self.attached {
+            return;
+        }
+        if let Ok(mut state) = self.registry.state.lock()
+            && matches!(
+                state.workers.get(&self.command_id),
+                Some(DownloadWorkerSlot::Reserved)
+            )
+        {
+            state.workers.remove(&self.command_id);
+        }
+    }
+}
+
+impl DownloadWorkersJoined {
+    fn belongs_to(&self, registry: &DownloadWorkerRegistry) -> bool {
+        Arc::ptr_eq(&self.registry_identity, &registry.identity)
+    }
+
+    const fn count(&self) -> usize {
+        self.count
+    }
+}
+
+impl GenerationWorkerReservation<'_, '_> {
+    fn attach(
+        mut self,
+        worker: JoinHandle<()>,
+        cancellation: Arc<dyn GenerationWorkerCancellation>,
+    ) -> Result<(), GenerationWorkerAttachError> {
         let mut state = match self.registry.lock() {
             Ok(state) => state,
             Err(failure) => return Err(GenerationWorkerAttachError { failure, worker }),
         };
         match state.workers.get_mut(&self.request_id) {
             Some(slot @ GenerationWorkerSlot::Reserved) => {
-                *slot = GenerationWorkerSlot::Running(worker);
+                *slot = GenerationWorkerSlot::Running {
+                    worker,
+                    cancellation,
+                };
                 self.attached = true;
                 Ok(())
             }
-            Some(GenerationWorkerSlot::Running(_)) | None => Err(GenerationWorkerAttachError {
+            Some(GenerationWorkerSlot::Running { .. }) | None => Err(GenerationWorkerAttachError {
                 failure: IpcFailure::new(
                     "generation_worker_state_changed",
                     "the desktop generation worker reservation changed before attachment",
@@ -359,7 +935,7 @@ impl GenerationWorkerReservation<'_> {
     }
 }
 
-impl Drop for GenerationWorkerReservation<'_> {
+impl Drop for GenerationWorkerReservation<'_, '_> {
     fn drop(&mut self) {
         if self.attached {
             return;
@@ -526,6 +1102,15 @@ impl Builder {
                 });
             })
             .on_event(|app, event| {
+                if let RunEvent::Exit = event {
+                    quiesce_unpreventable_runtime_exit(app);
+                }
+                if let RunEvent::MenuEvent(menu_event) = event
+                    && menu_event.id() == APPLICATION_QUIT_MENU_ID
+                {
+                    let _ = prepare_application_exit_request(app);
+                    emit_application_close_request(app);
+                }
                 if let RunEvent::ExitRequested { api, .. } = event
                     && !prepare_application_exit_request(app)
                 {
@@ -1496,7 +2081,7 @@ async fn document_open(
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 async fn document_checkpoint(
     project_id: String,
     session_id: String,
@@ -1606,7 +2191,7 @@ fn parse_checkpoint_draft_version(
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 async fn document_draft_upsert(
     project_id: String,
     session_id: String,
@@ -2209,39 +2794,62 @@ async fn model_choose<R: Runtime>(
 }
 
 #[tauri::command]
-async fn model_load(
+async fn model_load<R: Runtime>(
     model_path: String,
+    app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ModelCapabilitySummary, IpcFailure> {
-    ensure_application_running(&state, "local model verification")?;
-    let (canonical_path, profile) = match prepare_model_load(&model_path, &state)? {
+    let (model_load, plan) = {
+        let application_admission = lock_application_admission(&state, "local model verification")?;
+        let model_load = state.model_loads.reserve(&application_admission)?;
+        let plan = prepare_model_load(&model_path, &state)?;
+        (model_load, plan)
+    };
+    let (canonical_path, profile) = match plan {
         ModelLoadPlan::Ready(summary) => return Ok(summary),
         ModelLoadPlan::Inspect {
             canonical_path,
             profile,
         } => (canonical_path, profile),
     };
+    let worker_app = app.clone();
+    let worker_path = canonical_path.clone();
     let worker_profile = profile.clone();
+    let cleanup_profile = profile;
     let backend = Arc::clone(&state.backend);
-    let inspected =
-        tauri::async_runtime::spawn_blocking(move || backend.inspect_model(&worker_profile))
-            .await
-            .map_err(|error| {
-                IpcFailure::new(
-                    "model_worker_failed",
-                    format!("the local model verification worker stopped: {error}"),
-                    true,
-                )
-            });
-    let descriptor = resolve_model_inspection(&state, &canonical_path, &profile, inspected)?;
-    commit_model_load(
-        &state,
-        &canonical_path,
-        LoadedModel {
-            profile,
-            descriptor,
-        },
-    )
+    let worker_guard = model_load.worker_guard();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _worker_guard = worker_guard;
+        let worker_state = worker_app.state::<PluginState>();
+        let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let inspected = Ok(backend.inspect_model(&worker_profile));
+            let descriptor =
+                resolve_model_inspection(&worker_state, &worker_path, &worker_profile, inspected)?;
+            commit_model_load(
+                &worker_state,
+                &worker_path,
+                LoadedModel {
+                    profile: worker_profile,
+                    descriptor,
+                },
+            )
+        }));
+        match operation {
+            Ok(result) => result,
+            Err(panic) => {
+                let _ = release_staged_model(&worker_state, &worker_path, &cleanup_profile);
+                std::panic::resume_unwind(panic);
+            }
+        }
+    })
+    .await
+    .map_err(|error| {
+        IpcFailure::new(
+            "model_worker_failed",
+            format!("the local model verification worker stopped: {error}"),
+            true,
+        )
+    })?
 }
 
 /// Automatically loads only a writer named by the embedded build policy.
@@ -2253,55 +2861,80 @@ async fn model_load(
 /// `docs/model-policy-loading.md` for the remaining cross-process mutation
 /// limit of a path-based native loader.
 #[tauri::command]
-async fn model_load_policy_candidate(
+async fn model_load_policy_candidate<R: Runtime>(
     profile_id: String,
     model_path: String,
+    app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ModelCapabilitySummary, IpcFailure> {
-    ensure_application_running(&state, "local model verification")?;
-    let (canonical_path, profile, expectation) =
-        match prepare_policy_model_load(&profile_id, &model_path, &state)? {
-            PolicyModelLoadPlan::Ready(summary) => return Ok(summary),
-            PolicyModelLoadPlan::Inspect {
-                canonical_path,
-                profile,
-                expectation,
-            } => (canonical_path, profile, expectation),
-        };
+    let (model_load, plan) = {
+        let application_admission = lock_application_admission(&state, "local model verification")?;
+        let model_load = state.model_loads.reserve(&application_admission)?;
+        let plan = prepare_policy_model_load(&profile_id, &model_path, &state)?;
+        (model_load, plan)
+    };
+    let (canonical_path, profile, expectation) = match plan {
+        PolicyModelLoadPlan::Ready(summary) => return Ok(summary),
+        PolicyModelLoadPlan::Inspect {
+            canonical_path,
+            profile,
+            expectation,
+        } => (canonical_path, profile, expectation),
+    };
+    let worker_app = app.clone();
     let worker_path = canonical_path.clone();
     let worker_profile = profile.clone();
+    let cleanup_profile = profile;
     let worker_expectation = expectation.clone();
     let backend = Arc::clone(&state.backend);
-    let inspected = tauri::async_runtime::spawn_blocking(move || {
-        inspect_preverified_policy_file(&worker_path, &worker_expectation, || {
-            let descriptor = backend
-                .inspect_model(&worker_profile)
-                .map_err(|error| IpcFailure::backend(&error))?;
-            validate_policy_model_descriptor(&descriptor, &worker_path, &worker_expectation)?;
-            Ok(descriptor)
-        })
+    let worker_guard = model_load.worker_guard();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _worker_guard = worker_guard;
+        let worker_state = worker_app.state::<PluginState>();
+        let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let inspected =
+                inspect_preverified_policy_file(&worker_path, &worker_expectation, || {
+                    let descriptor = backend
+                        .inspect_model(&worker_profile)
+                        .map_err(|error| IpcFailure::backend(&error))?;
+                    validate_policy_model_descriptor(
+                        &descriptor,
+                        &worker_path,
+                        &worker_expectation,
+                    )?;
+                    Ok(descriptor)
+                });
+            let descriptor = resolve_policy_model_inspection(
+                &worker_state,
+                &worker_path,
+                &worker_profile,
+                inspected,
+            )?;
+            commit_model_load(
+                &worker_state,
+                &worker_path,
+                LoadedModel {
+                    profile: worker_profile,
+                    descriptor,
+                },
+            )
+        }));
+        match operation {
+            Ok(result) => result,
+            Err(panic) => {
+                let _ = release_staged_model(&worker_state, &worker_path, &cleanup_profile);
+                std::panic::resume_unwind(panic);
+            }
+        }
     })
     .await
-    .map_err(|error| PolicyInspectionFailure {
-        failure: IpcFailure::new(
+    .map_err(|error| {
+        IpcFailure::new(
             "model_worker_failed",
             format!("the policy model verification worker stopped: {error}"),
             true,
-        ),
-        // The worker may have crossed the native boundary before its join
-        // failed, so cleanup must conservatively attempt a native release.
-        native_inspection_started: true,
-    })
-    .and_then(|result| result);
-    let descriptor = resolve_policy_model_inspection(&state, &canonical_path, &profile, inspected)?;
-    commit_model_load(
-        &state,
-        &canonical_path,
-        LoadedModel {
-            profile,
-            descriptor,
-        },
-    )
+        )
+    })?
 }
 
 fn prepare_policy_model_load(
@@ -2330,7 +2963,6 @@ fn prepare_policy_model_load(
     }
 
     let _lifecycle = lock_model_lifecycle(state)?;
-    let _application_admission = lock_application_admission(state, "local model verification")?;
     let mut registry = lock_model_registry(state)?;
     match &*registry {
         ModelRegistry::Loaded(loaded) if loaded.profile.model_path == canonical_path => {
@@ -2669,7 +3301,6 @@ fn prepare_model_load(
     })?;
     let discovered = discover_loadable_model(state, &canonical)?;
     let _lifecycle = lock_model_lifecycle(state)?;
-    let _application_admission = lock_application_admission(state, "local model verification")?;
     let mut registry = lock_model_registry(state)?;
     match &*registry {
         ModelRegistry::Loaded(loaded) if loaded.profile.model_path == canonical => {
@@ -2855,9 +3486,8 @@ fn model_residency_unknown(reason: &str) -> IpcFailure {
 
 #[tauri::command]
 async fn model_unload(state: State<'_, PluginState>) -> Result<ModelUnloadOutcome, IpcFailure> {
-    ensure_application_running(&state, "local model teardown")?;
-    let _lifecycle = lock_model_lifecycle(&state)?;
     let _application_admission = lock_application_admission(&state, "local model teardown")?;
+    let _lifecycle = lock_model_lifecycle(&state)?;
     ensure_no_active_generations(&state, "unloading the local model")?;
     unload_registered_model(&state)
 }
@@ -2945,9 +3575,9 @@ fn unload_registered_model(state: &PluginState) -> Result<ModelUnloadOutcome, Ip
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 #[tauri::command]
-async fn model_download_start<R: Runtime>(
+fn model_download_start<R: Runtime>(
     command_id: String,
     url: String,
     file_name: String,
@@ -2958,6 +3588,7 @@ async fn model_download_start<R: Runtime>(
     state: State<'_, PluginState>,
 ) -> Result<ModelDownloadSnapshot, IpcFailure> {
     ensure_application_running(&state, "a model download")?;
+    state.download_workers.reap_finished()?;
     let PreparedModelDownload {
         command_id,
         request,
@@ -2971,16 +3602,29 @@ async fn model_download_start<R: Runtime>(
         expected_bytes,
         max_bytes,
     )?;
-    let (reservation, snapshot) = {
-        let _application_admission = lock_application_admission(&state, "a model download")?;
-        state
-            .downloads
-            .reserve(spec, now_unix_ms())
-            .map_err(|error| IpcFailure::model_download_registry(&error))?
-    };
-    if reservation == ReservationOutcome::Replayed {
-        return Ok(snapshot);
+    let application_admission = lock_application_admission(&state, "a model download")?;
+    let (reservation, snapshot) = state
+        .downloads
+        .reserve(spec, now_unix_ms())
+        .map_err(|error| IpcFailure::model_download_registry(&error))?;
+    match reservation {
+        ReservationOutcome::Replayed => {
+            drop(application_admission);
+            return Ok(snapshot);
+        }
+        ReservationOutcome::Started => {}
     }
+    let worker_reservation = state
+        .download_workers
+        .reserve(command_id, &application_admission)
+        .inspect_err(|failure| {
+            let _ = state.downloads.fail(
+                command_id,
+                failure.message.clone(),
+                failure.retryable,
+                now_unix_ms(),
+            );
+        })?;
     emit_model_download_snapshot(
         &app,
         &state.downloads,
@@ -2992,14 +3636,62 @@ async fn model_download_start<R: Runtime>(
         .downloads
         .cancellation(command_id)
         .map_err(|error| IpcFailure::model_download_registry(&error))?;
-    spawn_model_download(
+    start_model_download_worker(
         app,
-        Arc::clone(&state.downloads),
+        &state.downloads,
         command_id,
         request,
-        cancellation,
-    );
+        &cancellation,
+        worker_reservation,
+    )?;
+    drop(application_admission);
     Ok(snapshot)
+}
+
+fn start_model_download_worker<R: Runtime>(
+    app: AppHandle<R>,
+    downloads: &Arc<ModelDownloadRegistry>,
+    command_id: CommandId,
+    request: GgufDownloadRequest,
+    cancellation: &DownloadCancellation,
+    reservation: DownloadWorkerReservation<'_, '_>,
+) -> Result<(), IpcFailure> {
+    let worker = spawn_model_download(
+        app,
+        Arc::clone(downloads),
+        command_id,
+        request,
+        cancellation.clone(),
+    )
+    .map_err(|error| {
+        cancellation.cancel();
+        let failure = IpcFailure::new(
+            "download_worker_spawn_failed",
+            format!("the model download worker could not start: {error}"),
+            true,
+        );
+        let _ = downloads.fail(
+            command_id,
+            failure.message.clone(),
+            failure.retryable,
+            now_unix_ms(),
+        );
+        failure
+    })?;
+    if let Err(DownloadWorkerAttachError { failure, worker }) =
+        reservation.attach(worker, cancellation.clone())
+    {
+        cancellation.cancel();
+        let _ = worker.join();
+        let _ = downloads.fail(
+            command_id,
+            failure.message.clone(),
+            failure.retryable,
+            now_unix_ms(),
+        );
+        return Err(failure);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3076,56 +3768,61 @@ fn spawn_model_download<R: Runtime>(
     downloads: Arc<ModelDownloadRegistry>,
     command_id: CommandId,
     request: GgufDownloadRequest,
-    cancellation: loom_backend_llama::DownloadCancellation,
-) {
-    std::mem::drop(tauri::async_runtime::spawn(async move {
-        let progress_downloads = Arc::clone(&downloads);
-        let progress_app = app.clone();
-        let result = download_gguf(
-            &request,
-            &cancellation,
-            move |progress| match progress_downloads.record_progress(
-                command_id,
-                progress,
-                now_unix_ms(),
-            ) {
-                Ok(snapshot) => {
-                    emit_model_download_snapshot(
-                        &progress_app,
-                        &progress_downloads,
-                        "loom://model-download-progress",
+    cancellation: DownloadCancellation,
+) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("loom-model-download".to_owned())
+        .spawn(move || {
+            tauri::async_runtime::block_on(async move {
+                let progress_downloads = Arc::clone(&downloads);
+                let progress_app = app.clone();
+                let result =
+                    download_gguf(
+                        &request,
+                        &cancellation,
+                        move |progress| match progress_downloads.record_progress(
+                            command_id,
+                            progress,
+                            now_unix_ms(),
+                        ) {
+                            Ok(snapshot) => {
+                                emit_model_download_snapshot(
+                                    &progress_app,
+                                    &progress_downloads,
+                                    "loom://model-download-progress",
+                                    command_id,
+                                    &snapshot,
+                                );
+                                DownloadControl::Continue
+                            }
+                            Err(_) => DownloadControl::Cancel,
+                        },
+                    )
+                    .await;
+                let terminal = match result {
+                    Ok(result) => downloads.complete(command_id, &result, now_unix_ms()),
+                    Err(error) if error.is_cancelled() => {
+                        downloads.finish_cancelled(command_id, now_unix_ms())
+                    }
+                    Err(error) => downloads.fail(
+                        command_id,
+                        error.to_string(),
+                        error.is_retryable(),
+                        now_unix_ms(),
+                    ),
+                };
+                match terminal {
+                    Ok(snapshot) => emit_model_download_snapshot(
+                        &app,
+                        &downloads,
+                        "loom://model-download-terminal",
                         command_id,
                         &snapshot,
-                    );
-                    DownloadControl::Continue
+                    ),
+                    Err(error) => eprintln!("Loom model download terminal state failed: {error}"),
                 }
-                Err(_) => DownloadControl::Cancel,
-            },
-        )
-        .await;
-        let terminal = match result {
-            Ok(result) => downloads.complete(command_id, &result, now_unix_ms()),
-            Err(error) if error.is_cancelled() => {
-                downloads.finish_cancelled(command_id, now_unix_ms())
-            }
-            Err(error) => downloads.fail(
-                command_id,
-                error.to_string(),
-                error.is_retryable(),
-                now_unix_ms(),
-            ),
-        };
-        match terminal {
-            Ok(snapshot) => emit_model_download_snapshot(
-                &app,
-                &downloads,
-                "loom://model-download-terminal",
-                command_id,
-                &snapshot,
-            ),
-            Err(error) => eprintln!("Loom model download terminal state failed: {error}"),
-        }
-    }));
+            });
+        })
 }
 
 #[tauri::command]
@@ -3957,8 +4654,8 @@ async fn weave_start<R: Runtime>(
 
     // Serialize the loaded-model snapshot through native startup and family
     // registration. A switch cannot observe zero active branches in the gap.
+    let application_admission = lock_application_admission(&state, "a writing suggestion")?;
     let _model_lifecycle = lock_model_lifecycle(&state)?;
-    let _application_admission = lock_application_admission(&state, "a writing suggestion")?;
     let loaded_model = loaded_model(&state)?;
     let max_cases = loaded_model
         .descriptor
@@ -4215,7 +4912,10 @@ async fn weave_start<R: Runtime>(
         }
         return Err(IpcFailure::generation_registry(&error));
     }
-    let worker_reservation = match state.generation_workers.reserve(&request_id) {
+    let worker_reservation = match state
+        .generation_workers
+        .reserve(&request_id, &application_admission)
+    {
         Ok(reservation) => reservation,
         Err(error) => {
             for (_, branch_id) in &runs {
@@ -4268,7 +4968,9 @@ async fn weave_start<R: Runtime>(
             ));
         }
     };
-    if let Err(GenerationWorkerAttachError { failure, worker }) = worker_reservation.attach(worker)
+    let worker_cancellation: Arc<dyn GenerationWorkerCancellation> = handle.clone();
+    if let Err(GenerationWorkerAttachError { failure, worker }) =
+        worker_reservation.attach(worker, worker_cancellation)
     {
         for (_, branch_id) in &runs {
             let _ = handle.cancel_branch(*branch_id);
@@ -4942,6 +5644,50 @@ fn prepare_application_exit_request<R: Runtime>(app: &AppHandle<R>) -> bool {
     record_application_exit_request(&state)
 }
 
+/// `RunEvent::Exit` is the last synchronous boundary before Tauri calls
+/// `cleanup_before_exit`. On macOS, Dock Quit and `AppleEvent` Quit can reach
+/// this boundary without an interceptable `ExitRequested`, so this fallback
+/// owns the same admission barrier and performs all joins on the event-loop
+/// thread before AppKit/static teardown may continue.
+fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
+    let Some(state) = app.try_state::<PluginState>() else {
+        return;
+    };
+    if state.exit_authorized.load(Ordering::Acquire) {
+        return;
+    }
+    state.close_requested.store(true, Ordering::Release);
+    let mut phase = state
+        .application
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *phase == ApplicationPhase::ExitAuthorized || state.exit_authorized.load(Ordering::Acquire) {
+        return;
+    }
+    *phase = ApplicationPhase::Closing;
+
+    // Owning `phase` is an application-wide admission barrier. Worker
+    // reservations borrow an admission guard until their JoinHandle and
+    // cancellation authority are attached, making a detached start
+    // impossible at this point in safe code.
+    let desktop_workers = state.join_desktop_workers_for_exit();
+    let _model_lifecycle = state
+        .model_lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut model_registry = state
+        .model
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let native_runtime = state.native_runtime.shutdown_for_process_exit();
+    *model_registry = ModelRegistry::Empty;
+    let proof = ApplicationShutdownProof::from_process_exit(native_runtime, desktop_workers);
+    let joined = proof.joined_worker_count();
+    *phase = ApplicationPhase::ExitAuthorized;
+    state.exit_authorized.store(true, Ordering::Release);
+    eprintln!("Loom joined {joined} owned worker(s) before unpreventable runtime exit");
+}
+
 fn emit_application_close_request<R: Runtime>(app: &AppHandle<R>) {
     let _ = app.emit("loom://application-close-requested", ());
 }
@@ -4965,6 +5711,7 @@ fn begin_application_close(state: &PluginState) -> Result<ApplicationCloseAttemp
             *phase = ApplicationPhase::Closing;
             Ok(ApplicationCloseAttempt {
                 state,
+                phase,
                 authorized: false,
             })
         }
@@ -5024,19 +5771,12 @@ fn lock_application_phase(
 }
 
 impl ApplicationCloseAttempt<'_> {
-    fn authorize(mut self) -> Result<ReadyToExit, IpcFailure> {
-        let mut phase = lock_application_phase(self.state)?;
-        if *phase != ApplicationPhase::Closing {
-            return Err(IpcFailure::new(
-                "application_close_state_changed",
-                "the native application close authority changed during teardown",
-                false,
-            ));
-        }
-        *phase = ApplicationPhase::ExitAuthorized;
+    fn authorize(mut self, proof: ApplicationShutdownProof) -> ReadyToExit {
+        debug_assert_eq!(*self.phase, ApplicationPhase::Closing);
+        *self.phase = ApplicationPhase::ExitAuthorized;
         self.state.exit_authorized.store(true, Ordering::Release);
         self.authorized = true;
-        Ok(ReadyToExit)
+        ReadyToExit { proof }
     }
 }
 
@@ -5045,16 +5785,111 @@ impl Drop for ApplicationCloseAttempt<'_> {
         if self.authorized {
             return;
         }
-        if let Ok(mut phase) = self.state.application.lock()
-            && *phase == ApplicationPhase::Closing
-        {
-            *phase = ApplicationPhase::Running;
+        if *self.phase == ApplicationPhase::Closing {
+            *self.phase = ApplicationPhase::Running;
         }
     }
 }
 
-fn exit_application<R: Runtime>(app: &AppHandle<R>, _permit: ReadyToExit) {
+fn exit_application<R: Runtime>(app: &AppHandle<R>, permit: ReadyToExit) {
+    let ReadyToExit { proof } = permit;
+    let _joined_worker_count = proof.joined_worker_count();
     app.exit(0);
+}
+
+impl ApplicationShutdownProof {
+    fn joined_worker_count(&self) -> usize {
+        let native_workers = match &self.native_runtime {
+            ApplicationNativeShutdown::Graceful(proof) => proof.joined_worker_count(),
+            ApplicationNativeShutdown::ProcessExit(proof) => proof.joined_worker_count(),
+        };
+        native_workers.saturating_add(self.desktop_workers.joined_worker_count())
+    }
+
+    #[cfg(test)]
+    fn from_graceful(
+        native_runtime: JoinedLlamaRuntime,
+        desktop_workers: DesktopWorkersJoined,
+    ) -> Self {
+        Self {
+            native_runtime: ApplicationNativeShutdown::Graceful(native_runtime),
+            desktop_workers,
+        }
+    }
+
+    fn from_process_exit(
+        native_runtime: ProcessExitJoinedLlamaRuntime,
+        desktop_workers: DesktopWorkersJoined,
+    ) -> Self {
+        Self {
+            native_runtime: ApplicationNativeShutdown::ProcessExit(native_runtime),
+            desktop_workers,
+        }
+    }
+}
+
+impl DesktopWorkersJoined {
+    fn joined_worker_count(&self) -> usize {
+        self.model_loads
+            .count()
+            .saturating_add(self.generation_workers.count())
+            .saturating_add(self.download_workers.count())
+    }
+}
+
+impl PluginState {
+    fn join_desktop_workers(&self) -> Result<DesktopWorkersJoined, IpcFailure> {
+        let model_loads = self.model_loads.close_and_drain();
+        self.downloads
+            .cancel_all_active(now_unix_ms())
+            .map_err(|error| IpcFailure::model_download_registry(&error))?;
+        let download_workers = self.download_workers.join_all()?;
+        let active_downloads = self
+            .downloads
+            .active_count()
+            .map_err(|error| IpcFailure::model_download_registry(&error))?;
+        if active_downloads != 0 {
+            return Err(IpcFailure::new(
+                "model_download_terminal_missing",
+                format!(
+                    "{active_downloads} joined model download worker(s) failed to record terminal state"
+                ),
+                false,
+            ));
+        }
+        let generation_workers = self.generation_workers.join_all()?;
+        if !model_loads.belongs_to(&self.model_loads)
+            || !generation_workers.belongs_to(&self.generation_workers)
+            || !download_workers.belongs_to(&self.download_workers)
+        {
+            return Err(IpcFailure::new(
+                "desktop_worker_identity_mismatch",
+                "desktop worker shutdown authority came from a different registry instance",
+                false,
+            ));
+        }
+        Ok(DesktopWorkersJoined {
+            model_loads,
+            generation_workers,
+            download_workers,
+        })
+    }
+
+    /// Infallible final event-loop drain. Every worker owning a `JoinHandle` is
+    /// removed under a poison-recovering registry lock, cancelled, and joined
+    /// before the returned exact-registry facts are assembled.
+    fn join_desktop_workers_for_exit(&self) -> DesktopWorkersJoined {
+        let model_loads = self.model_loads.close_and_drain();
+        // Running worker slots retain the authoritative cancellation handles.
+        // Avoid fallible semantic registries at this unpreventable boundary.
+        let download_workers = self.download_workers.join_all_for_exit();
+        let generation_workers = self.generation_workers.join_all_for_exit();
+        DesktopWorkersJoined {
+            model_loads,
+            generation_workers,
+            download_workers,
+        }
+    }
 }
 
 #[tauri::command]
@@ -5076,43 +5911,54 @@ fn application_close<R: Runtime>(
             true,
         ));
     }
-    let session = lock_session(&state)?;
-    if session.phase != SessionPhase::Closed {
-        return Err(IpcFailure::new(
-            "project_must_close_first",
-            "Loom refuses to close the window while a project session is active",
-            false,
-        ));
+    {
+        let session = lock_session(&state)?;
+        if session.phase != SessionPhase::Closed {
+            return Err(IpcFailure::new(
+                "project_must_close_first",
+                "Loom refuses to close the window while a project session is active",
+                false,
+            ));
+        }
     }
-    drop(session);
-    let active_downloads = state
-        .downloads
-        .active_count()
-        .map_err(|error| IpcFailure::model_download_registry(&error))?;
-    if active_downloads != 0 {
-        state
-            .downloads
-            .cancel_all_active(now_unix_ms())
-            .map_err(|error| IpcFailure::model_download_registry(&error))?;
-        return Err(IpcFailure::new(
-            "model_download_active",
-            format!(
-                "Loom requested cancellation for {active_downloads} active model download(s); retry close after they reach a terminal state"
-            ),
-            true,
-        ));
-    }
-    state.generation_workers.join_all()?;
+    let desktop_workers = state.join_desktop_workers()?;
     let _model_lifecycle = lock_model_lifecycle(&state)?;
-    let _model_release = unload_registered_model(&state)?;
-    let _host_shutdown = state.backend.shutdown_and_verify_empty().map_err(|error| {
-        model_residency_unknown(&format!(
-            "the native runtime could not prove an empty host during application shutdown: {error}"
-        ))
-    })?;
-    let permit = close_attempt.authorize()?;
+    let mut model_registry = lock_model_registry(&state)?;
+    ensure_model_registry_ready_for_application_shutdown(&model_registry)?;
+    let native_runtime = match state.native_runtime.shutdown_joined() {
+        Ok(joined) => ApplicationNativeShutdown::Graceful(joined),
+        Err(error) => {
+            eprintln!("Loom graceful native shutdown required the process-exit drain: {error}");
+            ApplicationNativeShutdown::ProcessExit(state.native_runtime.shutdown_for_process_exit())
+        }
+    };
+    *model_registry = ModelRegistry::Empty;
+    let proof = ApplicationShutdownProof {
+        native_runtime,
+        desktop_workers,
+    };
+    let permit = close_attempt.authorize(proof);
     exit_application(&app, permit);
     Ok(())
+}
+
+fn ensure_model_registry_ready_for_application_shutdown(
+    registry: &ModelRegistry,
+) -> Result<(), IpcFailure> {
+    match registry {
+        ModelRegistry::Empty | ModelRegistry::Loaded(_) => Ok(()),
+        ModelRegistry::Loading { .. } => Err(IpcFailure::new(
+            "model_load_in_progress",
+            "wait for local model verification before closing Loom",
+            true,
+        )),
+        ModelRegistry::Unloading(_) => Err(IpcFailure::new(
+            "model_unload_in_progress",
+            "wait for local model teardown before closing Loom",
+            true,
+        )),
+        ModelRegistry::ResidencyUnknown { reason } => Err(model_residency_unknown(reason)),
+    }
 }
 
 #[tauri::command]
@@ -5135,9 +5981,26 @@ fn application_close_is_pending(state: &PluginState) -> Result<bool, IpcFailure>
 }
 
 fn abort_application_close(state: &PluginState) -> Result<(), IpcFailure> {
-    let phase = lock_application_phase(state)?;
+    let phase = match state.application.try_lock() {
+        Ok(phase) => phase,
+        Err(TryLockError::WouldBlock) => {
+            return Err(IpcFailure::new(
+                "application_close_in_progress",
+                "wait for the current native close proof before resuming Loom",
+                true,
+            ));
+        }
+        Err(TryLockError::Poisoned(_)) => {
+            return Err(IpcFailure::new(
+                "application_state_poisoned",
+                "the application lifecycle entered an invalid state; Loom will not infer safe exit",
+                false,
+            ));
+        }
+    };
     match *phase {
         ApplicationPhase::Running => {
+            state.model_loads.reopen_after_aborted_close()?;
             state.close_requested.store(false, Ordering::Release);
             Ok(())
         }
@@ -5578,6 +6441,63 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct NoopGenerationWorkerCancellation;
+
+    impl GenerationWorkerCancellation for NoopGenerationWorkerCancellation {
+        fn cancel_all(&self) {}
+    }
+
+    fn noop_generation_worker_cancellation() -> Arc<dyn GenerationWorkerCancellation> {
+        Arc::new(NoopGenerationWorkerCancellation)
+    }
+
+    #[derive(Debug)]
+    struct FlagGenerationWorkerCancellation {
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl GenerationWorkerCancellation for FlagGenerationWorkerCancellation {
+        fn cancel_all(&self) {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanickingGenerationWorkerCancellation;
+
+    impl GenerationWorkerCancellation for PanickingGenerationWorkerCancellation {
+        fn cancel_all(&self) {
+            panic!("fixture cancellation panic");
+        }
+    }
+
+    fn empty_application_shutdown_proof(state: &PluginState) -> ApplicationShutdownProof {
+        let desktop_workers = state
+            .join_desktop_workers()
+            .expect("join empty desktop runtime");
+        let native_runtime = state
+            .native_runtime
+            .shutdown_joined()
+            .expect("join empty native runtime");
+        ApplicationShutdownProof::from_graceful(native_runtime, desktop_workers)
+    }
+
+    #[test]
+    fn model_load_lifetime_outlives_a_cancelled_async_command_until_worker_return() {
+        let registry = Arc::new(ModelLoadRegistry::default());
+        let application = Mutex::new(ApplicationPhase::Running);
+        let admission = application.lock().expect("application admission");
+        let command = registry.reserve(&admission).expect("model load permit");
+        let worker = command.worker_guard();
+        drop(admission);
+        drop(command);
+
+        assert_eq!(registry.state.lock().expect("model load state").active, 1);
+        drop(worker);
+        assert_eq!(registry.state.lock().expect("model load state").active, 0);
+    }
+
     #[test]
     fn native_exit_request_quiesces_until_a_private_permit_authorizes_exit() {
         let state = PluginState::default();
@@ -5595,11 +6515,9 @@ mod tests {
         );
 
         let attempt = begin_application_close(&state).expect("begin close proof");
-        assert_eq!(
-            *state.application.lock().expect("application phase"),
-            ApplicationPhase::Closing
-        );
-        let _permit = attempt.authorize().expect("authorize proven close");
+        assert_eq!(*attempt.phase, ApplicationPhase::Closing);
+        let proof = empty_application_shutdown_proof(&state);
+        let _permit = attempt.authorize(proof);
         assert_eq!(
             *state.application.lock().expect("application phase"),
             ApplicationPhase::ExitAuthorized
@@ -5647,6 +6565,14 @@ mod tests {
     }
 
     #[test]
+    fn final_runtime_exit_path_is_not_optional_plugin_drop_cleanup() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("if let RunEvent::Exit = event"));
+        assert!(source.contains("quiesce_unpreventable_runtime_exit(app)"));
+        assert!(source.contains("cleanup_before_exit"));
+    }
+
+    #[test]
     fn native_exit_recording_never_blocks_on_an_owned_application_admission_boundary() {
         let state = Arc::new(PluginState::default());
         let admission =
@@ -5679,8 +6605,12 @@ mod tests {
 
     #[test]
     fn generation_worker_reservation_prevents_exit_race_and_join_is_owned() {
+        let application = Mutex::new(ApplicationPhase::Running);
+        let admission = application.lock().expect("application admission");
         let workers = GenerationWorkerRegistry::default();
-        let reservation = workers.reserve("request-one").expect("reserve worker");
+        let reservation = workers
+            .reserve("request-one", &admission)
+            .expect("reserve worker");
         assert_eq!(
             workers
                 .join_all()
@@ -5689,20 +6619,28 @@ mod tests {
             "generation_worker_starting"
         );
         reservation
-            .attach(std::thread::spawn(|| {}))
+            .attach(
+                std::thread::spawn(|| {}),
+                noop_generation_worker_cancellation(),
+            )
             .map_err(|error| error.failure)
             .expect("attach worker");
-        assert_eq!(workers.join_all().expect("join owned worker"), 1);
-        assert_eq!(workers.join_all().expect("join replay"), 0);
+        assert_eq!(workers.join_all().expect("join owned worker").count(), 1);
+        assert_eq!(workers.join_all().expect("join replay").count(), 0);
     }
 
     #[test]
     fn generation_worker_panic_latches_fail_closed_teardown() {
+        let application = Mutex::new(ApplicationPhase::Running);
+        let admission = application.lock().expect("application admission");
         let workers = GenerationWorkerRegistry::default();
         workers
-            .reserve("request-panic")
+            .reserve("request-panic", &admission)
             .expect("reserve worker")
-            .attach(std::thread::spawn(|| panic!("fixture desktop panic")))
+            .attach(
+                std::thread::spawn(|| panic!("fixture desktop panic")),
+                noop_generation_worker_cancellation(),
+            )
             .map_err(|error| error.failure)
             .expect("attach worker");
 
@@ -5715,11 +6653,157 @@ mod tests {
         );
         assert_eq!(
             workers
-                .reserve("request-after-panic")
+                .reserve("request-after-panic", &admission)
                 .expect_err("panic evidence remains latched")
                 .code,
             "generation_worker_join_failed"
         );
+    }
+
+    #[test]
+    fn download_worker_reservation_is_joined_and_bound_to_its_exact_registry() {
+        let application = Mutex::new(ApplicationPhase::Running);
+        let admission = application.lock().expect("application admission");
+        let workers = DownloadWorkerRegistry::default();
+        let other = DownloadWorkerRegistry::default();
+        let command_id = CommandId::new();
+        let reservation = workers
+            .reserve(command_id, &admission)
+            .expect("reserve download worker");
+        assert_eq!(
+            workers
+                .join_all()
+                .expect_err("reserved download must block teardown")
+                .code,
+            "download_worker_starting"
+        );
+        reservation
+            .attach(std::thread::spawn(|| {}), DownloadCancellation::default())
+            .map_err(|error| error.failure)
+            .expect("attach download worker");
+        let joined = workers.join_all().expect("join download worker");
+        assert_eq!(joined.count(), 1);
+        assert!(joined.belongs_to(&workers));
+        assert!(!joined.belongs_to(&other));
+    }
+
+    #[test]
+    fn plugin_drop_joins_every_owned_desktop_worker_before_state_destruction() {
+        let state = PluginState::default();
+        let generation_stopped = Arc::new(AtomicBool::new(false));
+        let download_stopped = Arc::new(AtomicBool::new(false));
+
+        let generation_signal = Arc::clone(&generation_stopped);
+        {
+            let admission =
+                lock_application_admission(&state, "fixture generation").expect("admission");
+            state
+                .generation_workers
+                .reserve("drop-generation", &admission)
+                .expect("reserve generation worker")
+                .attach(
+                    std::thread::spawn(move || {
+                        generation_signal.store(true, Ordering::Release);
+                    }),
+                    noop_generation_worker_cancellation(),
+                )
+                .map_err(|error| error.failure)
+                .expect("attach generation worker");
+        }
+        let download_signal = Arc::clone(&download_stopped);
+        {
+            let admission =
+                lock_application_admission(&state, "fixture download").expect("admission");
+            state
+                .download_workers
+                .reserve(CommandId::new(), &admission)
+                .expect("reserve download worker")
+                .attach(
+                    std::thread::spawn(move || {
+                        download_signal.store(true, Ordering::Release);
+                    }),
+                    DownloadCancellation::default(),
+                )
+                .map_err(|error| error.failure)
+                .expect("attach download worker");
+        }
+
+        drop(state);
+        assert!(generation_stopped.load(Ordering::Acquire));
+        assert!(download_stopped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn unpreventable_exit_retains_cancellation_and_joins_every_desktop_worker() {
+        let state = PluginState::default();
+        let generation_cancelled = Arc::new(AtomicBool::new(false));
+        let generation_finished = Arc::new(AtomicBool::new(false));
+        let panicking_cancellation_worker_finished = Arc::new(AtomicBool::new(false));
+        let download_finished = Arc::new(AtomicBool::new(false));
+        let download_cancellation = DownloadCancellation::default();
+
+        {
+            let admission =
+                lock_application_admission(&state, "fixture workers").expect("admission");
+            let wait_cancelled = Arc::clone(&generation_cancelled);
+            let finished = Arc::clone(&generation_finished);
+            state
+                .generation_workers
+                .reserve("exit-generation", &admission)
+                .expect("reserve generation")
+                .attach(
+                    std::thread::spawn(move || {
+                        while !wait_cancelled.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        finished.store(true, Ordering::Release);
+                    }),
+                    Arc::new(FlagGenerationWorkerCancellation {
+                        cancelled: Arc::clone(&generation_cancelled),
+                    }),
+                )
+                .map_err(|error| error.failure)
+                .expect("attach generation");
+
+            let finished = Arc::clone(&panicking_cancellation_worker_finished);
+            state
+                .generation_workers
+                .reserve("exit-generation-panicking-cancellation", &admission)
+                .expect("reserve generation with panicking cancellation")
+                .attach(
+                    std::thread::spawn(move || {
+                        finished.store(true, Ordering::Release);
+                    }),
+                    Arc::new(PanickingGenerationWorkerCancellation),
+                )
+                .map_err(|error| error.failure)
+                .expect("attach generation with panicking cancellation");
+
+            let wait_cancelled = download_cancellation.clone();
+            let finished = Arc::clone(&download_finished);
+            state
+                .download_workers
+                .reserve(CommandId::new(), &admission)
+                .expect("reserve download")
+                .attach(
+                    std::thread::spawn(move || {
+                        while !wait_cancelled.is_cancelled() {
+                            std::thread::yield_now();
+                        }
+                        finished.store(true, Ordering::Release);
+                    }),
+                    download_cancellation,
+                )
+                .map_err(|error| error.failure)
+                .expect("attach download");
+        }
+
+        let joined = state.join_desktop_workers_for_exit();
+        assert_eq!(joined.joined_worker_count(), 3);
+        assert!(generation_cancelled.load(Ordering::Acquire));
+        assert!(generation_finished.load(Ordering::Acquire));
+        assert!(panicking_cancellation_worker_finished.load(Ordering::Acquire));
+        assert!(download_finished.load(Ordering::Acquire));
     }
 
     fn test_policy_expectation(expected_bytes: &[u8]) -> PolicyWriterExpectation {
