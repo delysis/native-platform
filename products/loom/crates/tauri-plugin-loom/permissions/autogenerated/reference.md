@@ -1,6 +1,6 @@
 ## Default Permission
 
-Open and edit a user-selected Loom project. Generation and hosted-provider authority are separate permissions.
+Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.
 
 #### This default permission set includes the following:
 
