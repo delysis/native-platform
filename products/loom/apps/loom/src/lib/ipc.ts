@@ -5,6 +5,7 @@ import type {
   BranchPage,
   BranchPageCursor,
   BranchSummary,
+  BuildModelPolicySummary,
   CommandReceipt,
   DesktopGenerationEnvelope,
   DocumentKind,
@@ -21,6 +22,7 @@ import type {
   TransientDraftWriteReceipt,
   WeaveStarted
 } from './types';
+import { decodeBuildModelPolicy } from './buildModelPolicy';
 
 const PREFIX = 'plugin:loom|';
 
@@ -49,6 +51,11 @@ export function chooseAndOpenProject(): Promise<ProjectSnapshot> {
 
 export function currentProjectSession(): Promise<ProjectSnapshot> {
   return call('project_current');
+}
+
+export async function getBuildModelPolicy(): Promise<BuildModelPolicySummary> {
+  const value = await call<unknown>('build_model_policy_get');
+  return decodeBuildModelPolicy(value);
 }
 
 export function openDocument(

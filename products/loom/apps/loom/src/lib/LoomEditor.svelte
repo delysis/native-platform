@@ -10,9 +10,10 @@
   import {
     clearGhostText,
     createGhostTextPlugin,
-    currentGhostTextPlan,
-    planGhostOverlayGeometry,
-    setGhostText
+    exactMarkdownByteOffsetAtSelection,
+    setGhostText,
+    visibleGhostWidgetPresentationKey,
+    visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
 
   export let value = '';
@@ -22,15 +23,22 @@
   export let ghostText = '';
   export let ghostCandidateId = '';
   export let ghostPresentationKey = '';
+  export let ghostAnchorByteOffset: number | null = null;
+  export let surfaceKey = '';
   export let onChange: (markdown: string) => void = () => {};
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onImmediateDocumentMutation: () => void = () => {};
   export let onGhostAccept: (candidateId: string, presentationKey: string) => boolean = () => false;
   export let onGhostDismiss: (candidateId: string, presentationKey: string) => void = () => {};
+  export let onGhostPresentationRejected: (
+    candidateId: string,
+    presentationKey: string,
+    surfaceKey: string,
+    anchorByteOffset: number
+  ) => void;
   export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
-  export let onSelectionChange: (atDocumentEnd: boolean) => void = () => {};
+  export let onSelectionChange: (markdownByteOffset: number | null) => void = () => {};
 
-  let shell: HTMLDivElement;
   let mount: HTMLDivElement;
   let scrollViewport: HTMLElement | null = null;
   let view: EditorView | undefined;
@@ -40,60 +48,52 @@
   let composing = false;
   let suppressedGhostKey = '';
   let reportedGhostPresentationKey = '';
-  let ghostOverlay: {
-    presentationKey: string;
-    text: string;
-    left: number;
-    top: number;
-    maxWidth: number;
-  } | null = null;
+  let reportedRejectedPresentationIdentity = '';
+  let visibilityFrame: number | undefined;
+  let selectionReportTimer: number | undefined;
+  let boundaryCacheDocument: ProseMirrorNode | null = null;
+  let boundaryCacheCanonical = '';
+  let boundaryCacheFrom = -1;
+  let boundaryCacheTo = -1;
+  let boundaryCacheValue: number | null = null;
 
-  function syncGhostOverlay(): string {
-    const plan = view ? currentGhostTextPlan(view.state) : null;
-    if (!view || !plan || !shell) {
-      ghostOverlay = null;
-      return '';
-    }
-    try {
-      const caret = view.coordsAtPos(plan.position, 1);
-      const shellBounds = shell.getBoundingClientRect();
-      const editorBounds = view.dom.getBoundingClientRect();
-      const editorStyle = window.getComputedStyle(view.dom);
-      const paddingLeft = Number.parseFloat(editorStyle.paddingLeft) || 0;
-      const paddingRight = Number.parseFloat(editorStyle.paddingRight) || 0;
-      const geometry = planGhostOverlayGeometry({
-        caret,
-        shell: shellBounds,
-        text: {
-          left: editorBounds.left + paddingLeft,
-          right: editorBounds.right - paddingRight
-        },
-        clip: scrollViewport?.getBoundingClientRect()
-      });
-      if (!geometry) {
-        ghostOverlay = null;
-        return '';
-      }
-      ghostOverlay = {
-        presentationKey: plan.presentationKey,
-        text: plan.text,
-        ...geometry
-      };
-      return plan.presentationKey;
-    } catch {
-      ghostOverlay = null;
-      return '';
-    }
+  function clearBoundaryCache(): void {
+    boundaryCacheDocument = null;
+    boundaryCacheCanonical = '';
+    boundaryCacheFrom = -1;
+    boundaryCacheTo = -1;
+    boundaryCacheValue = null;
+  }
+
+  function selectionBoundary(state: EditorState): number | null {
+    if (
+      boundaryCacheDocument === state.doc &&
+      boundaryCacheCanonical === lastEmitted &&
+      boundaryCacheFrom === state.selection.from &&
+      boundaryCacheTo === state.selection.to
+    ) return boundaryCacheValue;
+    const boundary = exactMarkdownByteOffsetAtSelection(state, lastEmitted);
+    boundaryCacheDocument = state.doc;
+    boundaryCacheCanonical = lastEmitted;
+    boundaryCacheFrom = state.selection.from;
+    boundaryCacheTo = state.selection.to;
+    boundaryCacheValue = boundary;
+    return boundary;
   }
 
   function reportGhostVisibility(): void {
-    const presentationKey = syncGhostOverlay();
-    // Keep a hidden plan installed so a later scroll/layout correction can
-    // restore it. Keyboard authority still follows the exact visible overlay
-    // key below, never the merely installed plugin state.
+    const presentationKey = view ? visibleGhostWidgetPresentationKey(view) : '';
     if (reportedGhostPresentationKey === presentationKey) return;
     reportedGhostPresentationKey = presentationKey;
     onGhostVisibilityChange(presentationKey);
+  }
+
+  function scheduleGhostVisibilityReport(): void {
+    if (visibilityFrame !== undefined) window.cancelAnimationFrame(visibilityFrame);
+    visibilityFrame = window.requestAnimationFrame(() => {
+      visibilityFrame = undefined;
+      reportGhostVisibility();
+    });
   }
 
   function projectDocument(): void {
@@ -104,7 +104,9 @@
     }
     localDocumentChanged = false;
     lastEmitted = defaultMarkdownSerializer.serialize(view.state.doc);
+    clearBoundaryCache();
     onChange(lastEmitted);
+    reportSelection(view.state);
   }
 
   function scheduleProjection(delay = 240): void {
@@ -157,21 +159,28 @@
         createGhostTextPlugin({
           accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
-          visible: (presentationKey) =>
+          visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>
             reportedGhostPresentationKey === presentationKey &&
-            ghostOverlay?.presentationKey === presentationKey
+            Boolean(view) &&
+            expectedSurfaceKey === surfaceKey &&
+            anchorByteOffset === ghostAnchorByteOffset &&
+            selectionBoundary(view!.state) === anchorByteOffset &&
+            visibleGhostWidgetPresentationKey(view!) === presentationKey
         })
       ]
     });
   }
 
   function reportSelection(state: EditorState): void {
-    const documentEnd = Selection.atEnd(state.doc);
-    onSelectionChange(
-      state.selection.empty &&
-      state.selection.from === documentEnd.from &&
-      state.selection.to === documentEnd.to
-    );
+    onSelectionChange(selectionBoundary(state));
+  }
+
+  function scheduleSelectionReport(delay = 48): void {
+    if (selectionReportTimer !== undefined) window.clearTimeout(selectionReportTimer);
+    selectionReportTimer = window.setTimeout(() => {
+      selectionReportTimer = undefined;
+      if (view && !localDocumentChanged && !composing) reportSelection(view.state);
+    }, delay);
   }
 
   onMount(() => {
@@ -189,8 +198,22 @@
         if (!view) return;
         const next = view.state.apply(transaction);
         view.updateState(next);
-        reportSelection(next);
-        reportGhostVisibility();
+        if (transaction.docChanged) {
+          clearBoundaryCache();
+          if (selectionReportTimer !== undefined) {
+            window.clearTimeout(selectionReportTimer);
+            selectionReportTimer = undefined;
+          }
+          onSelectionChange(null);
+        } else if (transaction.selectionSet) {
+          onSelectionChange(null);
+          scheduleSelectionReport();
+        }
+        if (transaction.docChanged || transaction.selectionSet) {
+          reportGhostVisibility();
+        } else {
+          scheduleGhostVisibilityReport();
+        }
         if (transaction.docChanged) {
           suppressedGhostKey = ghostPresentationKey;
           onImmediateDocumentMutation();
@@ -199,6 +222,14 @@
         }
       },
       handleDOMEvents: {
+        focus() {
+          scheduleGhostVisibilityReport();
+          return false;
+        },
+        blur() {
+          scheduleGhostVisibilityReport();
+          return false;
+        },
         compositionstart() {
           composing = true;
           suppressedGhostKey = ghostPresentationKey;
@@ -208,6 +239,11 @@
         },
         compositionend() {
           composing = false;
+          // A cancelled/no-op IME session must not permanently hide an
+          // otherwise exact candidate. A real mutation already invalidated
+          // its parent identity, and the exact-boundary proof still gates any
+          // transient redisplay before that update arrives.
+          suppressedGhostKey = '';
           onCompositionChange(false);
           scheduleProjection(0);
           return false;
@@ -215,8 +251,8 @@
       }
     });
     reportSelection(view.state);
-    scrollViewport = shell.closest<HTMLElement>('.editor-pane');
-    reportGhostVisibility();
+    scrollViewport = mount.closest<HTMLElement>('.editor-pane');
+    scheduleGhostVisibilityReport();
     window.addEventListener('resize', reportGhostVisibility);
     scrollViewport?.addEventListener('scroll', reportGhostVisibility, { passive: true });
     if (autofocus) view.focus();
@@ -226,26 +262,64 @@
     lastEmitted = value;
     const next = stateFor(value);
     view.updateState(next);
+    clearBoundaryCache();
     reportSelection(next);
-    reportGhostVisibility();
+    scheduleGhostVisibilityReport();
   }
 
   $: if (view) {
     view.setProps({ editable: () => !readonly });
-    const presentation = ghostPresentationKey && ghostPresentationKey !== suppressedGhostKey ? {
+    const anchorByteOffset = ghostAnchorByteOffset;
+    const exactAnchor = anchorByteOffset !== null &&
+      selectionBoundary(view.state) === anchorByteOffset;
+    const faithful = exactAnchor && visualGhostTextIsFaithfulAtSelection(
+        view.state,
+        lastEmitted,
+        anchorByteOffset!,
+        ghostText
+      );
+    const rejectionIdentity = anchorByteOffset === null
+      ? ''
+      : `${ghostPresentationKey}\u0000${surfaceKey}\u0000${anchorByteOffset}`;
+    if (
+      !readonly &&
+      !composing &&
+      ghostCandidateId &&
+      ghostPresentationKey &&
+      surfaceKey &&
+      exactAnchor &&
+      !faithful &&
+      reportedRejectedPresentationIdentity !== rejectionIdentity
+    ) {
+      reportedRejectedPresentationIdentity = rejectionIdentity;
+      onGhostPresentationRejected(
+        ghostCandidateId,
+        ghostPresentationKey,
+        surfaceKey,
+        anchorByteOffset!
+      );
+    }
+    const presentation = ghostPresentationKey &&
+      surfaceKey &&
+      faithful &&
+      ghostPresentationKey !== suppressedGhostKey ? {
       active: !readonly && !composing,
       candidateId: ghostCandidateId,
       presentationKey: ghostPresentationKey,
+      surfaceKey,
+      anchorByteOffset,
       text: ghostText
     } : null;
     setGhostText(view, presentation);
-    reportGhostVisibility();
+    scheduleGhostVisibilityReport();
   }
 
   onDestroy(() => {
     if (projectionTimer !== undefined) window.clearTimeout(projectionTimer);
+    if (visibilityFrame !== undefined) window.cancelAnimationFrame(visibilityFrame);
+    if (selectionReportTimer !== undefined) window.clearTimeout(selectionReportTimer);
     if (composing) onCompositionChange(false);
-    onSelectionChange(false);
+    onSelectionChange(null);
     if (reportedGhostPresentationKey) onGhostVisibilityChange('');
     window.removeEventListener('resize', reportGhostVisibility);
     scrollViewport?.removeEventListener('scroll', reportGhostVisibility);
@@ -253,13 +327,6 @@
   });
 </script>
 
-<div class="loom-editor-shell" bind:this={shell}>
+<div class="loom-editor-shell">
   <div class="editor-mount" bind:this={mount}></div>
-  {#if ghostOverlay}
-    <span
-      class="loom-visual-ghost"
-      aria-hidden="true"
-      style={`left:${ghostOverlay.left}px;top:${ghostOverlay.top}px;max-width:${ghostOverlay.maxWidth}px`}
-    >{ghostOverlay.text}</span>
-  {/if}
 </div>

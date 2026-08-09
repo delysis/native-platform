@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use loom_types::BuildModelPolicy;
-use std::path::PathBuf;
 use tauri::menu::{
     AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID,
 };
@@ -11,10 +10,6 @@ const EMBEDDED_BUILD_MODEL_POLICY: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/loom-build-model-policy.json"));
 const EMBEDDED_BUILD_MODEL_POLICY_NAME: &str = env!("LOOM_BUILD_MODEL_POLICY_NAME");
 const EMBEDDED_BUILD_MODEL_POLICY_SHA256: &str = env!("LOOM_BUILD_MODEL_POLICY_SHA256");
-const EMBEDDED_BUILD_WRITER_MODEL_PATH: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/loom-build-writer-model-path.txt"
-));
 const APPLICATION_QUIT_ACCELERATOR: &str = "CmdOrCtrl+Q";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -23,15 +18,7 @@ pub fn run() {
         eprintln!("Loom's embedded model policy failed its integrity check");
         return;
     };
-    let Ok(build_writer_model_path) = embedded_build_writer_model_path() else {
-        eprintln!("Loom's embedded writer model path failed its integrity check");
-        return;
-    };
-    let mut loom_plugin =
-        tauri_plugin_loom::Builder::new().with_build_model_policy(build_model_policy);
-    if let Some(model_path) = build_writer_model_path {
-        loom_plugin = loom_plugin.with_additional_policy_model_path(model_path);
-    }
+    let loom_plugin = tauri_plugin_loom::Builder::new().with_build_model_policy(build_model_policy);
     tauri::Builder::default()
         // Tauri's stock macOS Quit item calls AppKit `terminate:` directly and
         // bypasses RunEvent::ExitRequested. Loom owns a regular Cmd+Q menu item
@@ -145,19 +132,6 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
     )
 }
 
-fn embedded_build_writer_model_path() -> Result<Option<PathBuf>, String> {
-    if EMBEDDED_BUILD_WRITER_MODEL_PATH.is_empty() {
-        return Ok(None);
-    }
-    let value =
-        std::str::from_utf8(EMBEDDED_BUILD_WRITER_MODEL_PATH).map_err(|error| error.to_string())?;
-    let path = PathBuf::from(value);
-    if !path.is_absolute() {
-        return Err("embedded writer model path is not absolute".to_owned());
-    }
-    Ok(Some(path))
-}
-
 fn embedded_build_model_policy() -> Result<BuildModelPolicy, String> {
     let policy = BuildModelPolicy::from_json_slice(EMBEDDED_BUILD_MODEL_POLICY)
         .map_err(|error| error.to_string())?;
@@ -169,6 +143,9 @@ fn embedded_build_model_policy() -> Result<BuildModelPolicy, String> {
         .map_err(|error| error.to_string())?;
     if digest.to_string() != EMBEDDED_BUILD_MODEL_POLICY_SHA256 {
         return Err("embedded policy digest does not match its build identity".to_owned());
+    }
+    if policy.identity().canonical_sha256() != digest {
+        return Err("embedded policy does not match its closed compile-time identity".to_owned());
     }
     Ok(policy)
 }
@@ -188,12 +165,16 @@ mod tests {
     }
 
     #[test]
-    fn optional_embedded_writer_path_is_absent_or_absolute() {
-        assert!(
-            embedded_build_writer_model_path()
-                .expect("valid embedded writer model path")
-                .is_none_or(|path| path.is_absolute())
-        );
+    fn build_sources_have_no_writer_path_embedding_channel() {
+        let build_source = include_str!("../build.rs");
+        let runtime_source = include_str!("lib.rs");
+        let removed_environment_variable = concat!("LOOM_BUILD_WRITER_", "MODEL_PATH");
+        let removed_generated_file = concat!("loom-build-writer-", "model-path.txt");
+
+        assert!(!build_source.contains(removed_environment_variable));
+        assert!(!build_source.contains(removed_generated_file));
+        assert!(!runtime_source.contains(removed_environment_variable));
+        assert!(!runtime_source.contains(removed_generated_file));
     }
 
     #[test]

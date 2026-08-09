@@ -4,18 +4,23 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use loom_types::BuildModelPolicy;
+use loom_types::{BuildModelPolicy, BuildModelPolicyName, DEFAULT_DESKTOP_BUILD_MODEL_POLICY_NAME};
 
 const POLICY_ENV: &str = "LOOM_BUILD_MODEL_POLICY";
-const WRITER_MODEL_PATH_ENV: &str = "LOOM_BUILD_WRITER_MODEL_PATH";
 const MACOS_DEPLOYMENT_TARGET_ENV: &str = "MACOSX_DEPLOYMENT_TARGET";
 const CMAKE_MACOS_DEPLOYMENT_TARGET_ENV: &str = "CMAKE_OSX_DEPLOYMENT_TARGET";
 const MINIMUM_MACOS_MAJOR: u32 = 10;
 const MINIMUM_MACOS_MINOR: u32 = 15;
-const DEFAULT_POLICY: &str = "writer-gemma4-base-v1";
-const ALLOWED_POLICIES: [(&str, &str); 2] = [
-    ("none-v1", "none-v1.json"),
-    ("writer-gemma4-base-v1", "writer-gemma4-base-v1.json"),
+const ALLOWED_POLICIES: [(BuildModelPolicyName, &str); 3] = [
+    (BuildModelPolicyName::NoneV1, "none-v1.json"),
+    (
+        BuildModelPolicyName::WriterGemma4BaseV1,
+        "writer-gemma4-base-v1.json",
+    ),
+    (
+        BuildModelPolicyName::WriterGemma4BaseV2,
+        "writer-gemma4-base-v2.json",
+    ),
 ];
 
 fn main() {
@@ -60,7 +65,6 @@ fn parse_major_minor(value: &str) -> Option<(u32, u32)> {
 
 fn embed_build_model_policy() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed={POLICY_ENV}");
-    println!("cargo:rerun-if-env-changed={WRITER_MODEL_PATH_ENV}");
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR")
             .ok_or_else(|| "Cargo did not provide CARGO_MANIFEST_DIR".to_owned())?,
@@ -68,17 +72,19 @@ fn embed_build_model_policy() -> Result<(), String> {
     let policy_dir = manifest_dir.join("../../../model-policies");
     let requested = match env::var(POLICY_ENV) {
         Ok(value) => value,
-        Err(env::VarError::NotPresent) => DEFAULT_POLICY.to_owned(),
+        Err(env::VarError::NotPresent) => {
+            DEFAULT_DESKTOP_BUILD_MODEL_POLICY_NAME.as_str().to_owned()
+        }
         Err(env::VarError::NotUnicode(_)) => {
             return Err(format!("{POLICY_ENV} must be valid UTF-8"));
         }
     };
     let selected_file = ALLOWED_POLICIES
         .iter()
-        .find_map(|(name, file)| (*name == requested).then_some(*file))
+        .find_map(|(name, file)| (name.as_str() == requested).then_some(*file))
         .ok_or_else(|| {
             format!(
-                "unsupported {POLICY_ENV} value `{requested}`; allowed values are none-v1 and writer-gemma4-base-v1"
+                "unsupported {POLICY_ENV} value `{requested}`; allowed values are none-v1, writer-gemma4-base-v1, and writer-gemma4-base-v2"
             )
         })?;
 
@@ -87,11 +93,20 @@ fn embed_build_model_policy() -> Result<(), String> {
         let path = policy_dir.join(file);
         println!("cargo:rerun-if-changed={}", path.display());
         let policy = read_policy(&path)?;
-        if policy.name().as_str() != name {
+        if policy.name() != name {
             return Err(format!(
                 "policy file {} declares `{}` instead of `{name}`",
                 path.display(),
                 policy.name()
+            ));
+        }
+        let canonical_digest = policy
+            .canonical_digest()
+            .map_err(|error| format!("could not digest policy {}: {error}", path.display()))?;
+        if policy.identity().canonical_sha256() != canonical_digest {
+            return Err(format!(
+                "the compile-time identity for `{name}` does not match canonical policy JSON {}",
+                path.display()
             ));
         }
         if file == selected_file {
@@ -102,40 +117,21 @@ fn embed_build_model_policy() -> Result<(), String> {
     let canonical = selected
         .canonical_json()
         .map_err(|error| format!("could not canonicalize selected policy: {error}"))?;
-    let digest = selected
-        .canonical_digest()
-        .map_err(|error| format!("could not digest selected policy: {error}"))?;
+    let identity = selected.identity();
     let out_dir = PathBuf::from(
         env::var_os("OUT_DIR").ok_or_else(|| "Cargo did not provide OUT_DIR".to_owned())?,
     );
     fs::write(out_dir.join("loom-build-model-policy.json"), canonical)
         .map_err(|error| format!("could not write canonical embedded policy: {error}"))?;
-    let writer_model_path = embedded_writer_model_path()?;
-    fs::write(
-        out_dir.join("loom-build-writer-model-path.txt"),
-        writer_model_path.as_deref().unwrap_or_default().as_bytes(),
-    )
-    .map_err(|error| format!("could not write embedded writer model path: {error}"))?;
     println!(
         "cargo:rustc-env=LOOM_BUILD_MODEL_POLICY_NAME={}",
-        selected.name()
+        identity.name()
     );
-    println!("cargo:rustc-env=LOOM_BUILD_MODEL_POLICY_SHA256={digest}");
+    println!(
+        "cargo:rustc-env=LOOM_BUILD_MODEL_POLICY_SHA256={}",
+        identity.canonical_sha256()
+    );
     Ok(())
-}
-
-fn embedded_writer_model_path() -> Result<Option<String>, String> {
-    let value = match env::var(WRITER_MODEL_PATH_ENV) {
-        Ok(value) => value,
-        Err(env::VarError::NotPresent) => return Ok(None),
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err(format!("{WRITER_MODEL_PATH_ENV} must be valid UTF-8"));
-        }
-    };
-    if !Path::new(&value).is_absolute() {
-        return Err(format!("{WRITER_MODEL_PATH_ENV} must be an absolute path"));
-    }
-    Ok(Some(value))
 }
 
 fn read_policy(path: &Path) -> Result<BuildModelPolicy, String> {

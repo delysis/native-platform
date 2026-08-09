@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { ModelCapabilitySummary } from './types';
-import { isVerifiedPolicyWriter, orderedLocalWriterCandidates } from './modelPolicy';
+import {
+  automaticWriterForBuildPolicy,
+  isVerifiedPolicyWriter,
+  orderedLocalWriterCandidates
+} from './modelPolicy';
 
 function model(overrides: Partial<ModelCapabilitySummary> = {}): ModelCapabilitySummary {
   return {
@@ -90,5 +94,48 @@ describe('isVerifiedPolicyWriter', () => {
       output_tokens: false
     }, 'writer-v1'))
       .toBe(false);
+  });
+});
+
+describe('automaticWriterForBuildPolicy', () => {
+  const quietPolicy = {
+    name: 'writer-gemma4-base-v2',
+    activation: 'quiet_default',
+    canonical_sha256: '2d402d213b60ba65c4d018907e9eba67ccfbc1e97081cc0505f9713ae2dd89d2'
+  } as const;
+
+  it('ignores an arbitrary loaded completion model and selects exact policy evidence', () => {
+    const arbitrary = model({
+      model_id: 'arbitrary',
+      loaded: true,
+      completion: true,
+      output_tokens: true,
+      policy_candidate: null
+    });
+    const exact = model({
+      model_id: 'exact',
+      loaded: true,
+      completion: true,
+      output_tokens: true,
+      policy_verified: { profile_id: 'gemma_4_e2b_base_q8_loom_v1', rank: 0 },
+      tested_profile: 'gemma_4_e2b_base_q8_loom_v1'
+    });
+    expect(automaticWriterForBuildPolicy([arbitrary], quietPolicy)).toBeUndefined();
+    expect(automaticWriterForBuildPolicy([arbitrary, exact], quietPolicy)?.model_id).toBe('exact');
+  });
+
+  it('cannot produce an automatic writer for a none or unverified build policy', () => {
+    const exact = model({
+      loaded: true,
+      completion: true,
+      output_tokens: true,
+      policy_verified: { profile_id: 'gemma_4_e2b_base_q8_loom_v1', rank: 0 }
+    });
+    expect(automaticWriterForBuildPolicy([exact], null)).toBeUndefined();
+    expect(automaticWriterForBuildPolicy([exact], {
+      name: 'none-v1',
+      activation: 'project_opt_in',
+      canonical_sha256: 'ce3bdf5e3dbcac6f7bcc164ec4cc5c78b4a7b5bef7c49b3cd52c61e123b75fe0'
+    })).toBeUndefined();
   });
 });

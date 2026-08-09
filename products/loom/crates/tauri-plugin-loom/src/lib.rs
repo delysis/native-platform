@@ -35,11 +35,12 @@ use loom_store::{
     VisibleProjectionState,
 };
 use loom_types::{
-    AuthorityPolicy, BlobId, BranchId, BuildModelPolicy, ByteRange, CancelGenerationCommand,
-    CandidateId, CommandId, CommandReceipt, ContextRecipe, DocumentId, DocumentKind,
-    GenerationEventKind, GenerationRunId, GenerationStart, GenerationTerminalStatus, LoomEvent,
-    ModelEnvironment, ModelRole, ProjectId, PromoteCandidateCommand, PromptMode, PromptRecipe,
-    RevisionId, SelectionDecision, derive_weave_case_ids, now_unix_ms,
+    AuthorityPolicy, BlobId, BranchId, BuildModelPolicy, BuildModelPolicyIdentity,
+    BuildWriterProfileId, ByteRange, CancelGenerationCommand, CandidateId, CommandId,
+    CommandReceipt, ContextRecipe, DocumentId, DocumentKind, GenerationEventKind, GenerationRunId,
+    GenerationStart, GenerationTerminalStatus, LoomEvent, ModelEnvironment, ModelRole, ProjectId,
+    PromoteCandidateCommand, PromptMode, PromptRecipe, RevisionId, SelectionDecision,
+    derive_weave_case_ids, now_unix_ms,
 };
 use same_file::Handle as FileIdentityHandle;
 use serde::{Deserialize, Serialize};
@@ -161,6 +162,7 @@ struct AutomaticBudgetReservation<'authority> {
 impl AutomaticBudgetAuthority {
     fn reserve(
         &self,
+        _writer: &PolicyBoundAutomaticWriter,
         scope: AutomaticBudgetScope,
     ) -> Result<AutomaticBudgetReservation<'_>, AutomaticBudgetError> {
         let mut ledger = self
@@ -246,12 +248,11 @@ pub struct PluginState {
     download_workers: DownloadWorkerRegistry,
     model_library_root: Option<PathBuf>,
     build_model_policy: BuildModelPolicy,
-    additional_policy_model_paths: Vec<PathBuf>,
 }
 
 impl Default for PluginState {
     fn default() -> Self {
-        Self::with_model_library_root(None, BuildModelPolicy::default(), Vec::new())
+        Self::with_model_library_root(None, BuildModelPolicy::default())
     }
 }
 
@@ -259,7 +260,6 @@ impl PluginState {
     fn with_model_library_root(
         model_library_root: Option<PathBuf>,
         build_model_policy: BuildModelPolicy,
-        additional_policy_model_paths: Vec<PathBuf>,
     ) -> Self {
         let native_runtime = Arc::new(NativeHostRuntime::default());
         let backend = Arc::new(LlamaBackend::with_default_native_runtime(Arc::clone(
@@ -283,7 +283,6 @@ impl PluginState {
             download_workers: DownloadWorkerRegistry::default(),
             model_library_root,
             build_model_policy,
-            additional_policy_model_paths,
         }
     }
 }
@@ -305,6 +304,219 @@ struct LoadedModel {
     profile: LocalModelProfile,
     descriptor: VerifiedModelDescriptor,
 }
+
+mod automatic_writer_authority {
+    use super::*;
+
+    /// A resident model whose exact bytes and native capabilities were bound
+    /// to one writer entry in the closed build policy.
+    ///
+    /// The fields and constructor stay private to this module. Production code
+    /// can obtain the witness only through `AuthorizedWeaveModel::bind`.
+    #[derive(Debug)]
+    pub(super) struct PolicyBoundAutomaticWriter {
+        loaded: LoadedModel,
+        profile_id: BuildWriterProfileId,
+        rank: u32,
+        policy_identity: BuildModelPolicyIdentity,
+    }
+
+    #[derive(Debug)]
+    enum AuthorizedWeaveModelKind {
+        Automatic(PolicyBoundAutomaticWriter),
+        Manual(LoadedModel),
+    }
+
+    #[derive(Debug)]
+    enum SubmittedWeaveAuthority {
+        Automatic {
+            profile_id: BuildWriterProfileId,
+            rank: u32,
+            policy_identity: BuildModelPolicyIdentity,
+        },
+        Manual,
+    }
+
+    /// An exact request whose model authority was preserved through request
+    /// construction. Its payload is intentionally not exposed to the plugin;
+    /// submission consumes this wrapper and is the only escape hatch.
+    #[derive(Debug)]
+    pub(super) struct AuthorizedWeaveRequest {
+        request: ExactContinuationRequest,
+        authority: SubmittedWeaveAuthority,
+    }
+
+    /// The only model authority accepted by the shared Weave submission path.
+    /// Manual requests retain their explicit escape hatch; automatic requests
+    /// necessarily carry a non-forgeable policy witness until request creation.
+    #[derive(Debug)]
+    pub(super) struct AuthorizedWeaveModel {
+        policy: ValidatedWeavePolicy,
+        kind: AuthorizedWeaveModelKind,
+    }
+
+    impl PolicyBoundAutomaticWriter {
+        fn bind(loaded: LoadedModel, policy: &BuildModelPolicy) -> Result<Self, IpcFailure> {
+            let matched = policy
+                .matching_writer(
+                    &loaded.descriptor.model_sha256,
+                    loaded.descriptor.model_file_bytes,
+                )
+                .ok_or_else(|| {
+                    IpcFailure::new(
+                        "automatic_writer_not_in_build_policy",
+                        "automatic suggestions require the exact local writer selected by this Loom build",
+                        false,
+                    )
+                })?;
+            let writer = matched.writer();
+            let expectation = PolicyWriterExpectation {
+                profile_id: writer.profile_id().to_owned(),
+                rank: matched.rank(),
+                role: writer.role(),
+                prompt_mode: writer.prompt_mode(),
+                model_sha256: writer.model_sha256(),
+                model_file_bytes: writer.model_file_bytes(),
+            };
+            validate_policy_model_descriptor(
+                &loaded.descriptor,
+                &loaded.profile.model_path,
+                &expectation,
+            )?;
+            Ok(Self {
+                loaded,
+                profile_id: writer.typed_profile_id(),
+                rank: matched.rank(),
+                policy_identity: policy.identity(),
+            })
+        }
+
+        fn into_request_parts(self) -> (LocalModelProfile, SubmittedWeaveAuthority) {
+            let Self {
+                loaded,
+                profile_id,
+                rank,
+                policy_identity,
+            } = self;
+            (
+                loaded.profile,
+                SubmittedWeaveAuthority::Automatic {
+                    profile_id,
+                    rank,
+                    policy_identity,
+                },
+            )
+        }
+    }
+
+    impl AuthorizedWeaveRequest {
+        pub(super) fn submit(
+            self,
+            backend: &LlamaBackend,
+        ) -> Result<LlamaGenerationHandle, LlamaBackendError> {
+            let Self { request, authority } = self;
+            match authority {
+                SubmittedWeaveAuthority::Automatic {
+                    profile_id: _profile_id,
+                    rank: _rank,
+                    policy_identity: _policy_identity,
+                } => {}
+                SubmittedWeaveAuthority::Manual => {}
+            }
+            backend.start_exact_continuation(request)
+        }
+    }
+
+    impl AuthorizedWeaveModel {
+        pub(super) fn bind(
+            policy: ValidatedWeavePolicy,
+            loaded: LoadedModel,
+            build_policy: &BuildModelPolicy,
+        ) -> Result<Self, IpcFailure> {
+            let kind = match &policy {
+                ValidatedWeavePolicy::AutomaticV2 => AuthorizedWeaveModelKind::Automatic(
+                    PolicyBoundAutomaticWriter::bind(loaded, build_policy)?,
+                ),
+                ValidatedWeavePolicy::ManualV2 { .. } => AuthorizedWeaveModelKind::Manual(loaded),
+            };
+            Ok(Self { policy, kind })
+        }
+
+        pub(super) fn branch_count(&self) -> u32 {
+            self.policy.branch_count()
+        }
+
+        pub(super) fn bind_document_kind(
+            &self,
+            kind: DocumentKind,
+        ) -> Result<ResolvedWeavePolicy, IpcFailure> {
+            self.policy.bind_document_kind(kind)
+        }
+
+        pub(super) fn admit(&self, gate: &AgencyGate) -> Result<(), IpcFailure> {
+            let admission = match &self.kind {
+                AuthorizedWeaveModelKind::Automatic(_) => gate.admit_automation(),
+                AuthorizedWeaveModelKind::Manual(_) => gate.admit_manual_generation(),
+            };
+            admission
+                .map_err(|error| IpcFailure::new("generation_blocked", error.to_string(), false))
+        }
+
+        pub(super) fn loaded(&self) -> &LoadedModel {
+            match &self.kind {
+                AuthorizedWeaveModelKind::Automatic(writer) => &writer.loaded,
+                AuthorizedWeaveModelKind::Manual(loaded) => loaded,
+            }
+        }
+
+        pub(super) fn automatic_writer(&self) -> Option<&PolicyBoundAutomaticWriter> {
+            match &self.kind {
+                AuthorizedWeaveModelKind::Automatic(writer) => Some(writer),
+                AuthorizedWeaveModelKind::Manual(_) => None,
+            }
+        }
+
+        pub(super) fn into_exact_continuation_request(
+            self,
+            request_id: String,
+            exact_manuscript_prefix: String,
+            prompt_recipe: PromptRecipe,
+            cases: Vec<ContinuationCase>,
+        ) -> AuthorizedWeaveRequest {
+            let Self { policy: _, kind } = self;
+            let (model, authority) = match kind {
+                AuthorizedWeaveModelKind::Automatic(writer) => writer.into_request_parts(),
+                AuthorizedWeaveModelKind::Manual(loaded) => {
+                    (loaded.profile, SubmittedWeaveAuthority::Manual)
+                }
+            };
+            AuthorizedWeaveRequest {
+                request: ExactContinuationRequest {
+                    request_id,
+                    model,
+                    exact_manuscript_prefix,
+                    prompt_recipe,
+                    cases,
+                },
+                authority,
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn automatic_binding(
+            &self,
+        ) -> Option<(BuildWriterProfileId, u32, BuildModelPolicyIdentity)> {
+            match &self.kind {
+                AuthorizedWeaveModelKind::Automatic(writer) => {
+                    Some((writer.profile_id, writer.rank, writer.policy_identity))
+                }
+                AuthorizedWeaveModelKind::Manual(_) => None,
+            }
+        }
+    }
+}
+
+use automatic_writer_authority::{AuthorizedWeaveModel, PolicyBoundAutomaticWriter};
 
 #[derive(Clone, Debug)]
 struct GenerationResultBinding {
@@ -1244,7 +1456,6 @@ impl BranchCancellation for LlamaCancellation {
 #[derive(Debug, Default)]
 pub struct Builder {
     build_model_policy: BuildModelPolicy,
-    additional_policy_model_paths: Vec<PathBuf>,
 }
 
 impl Builder {
@@ -1259,15 +1470,8 @@ impl Builder {
         self
     }
 
-    #[must_use]
-    pub fn with_additional_policy_model_path(mut self, model_path: PathBuf) -> Self {
-        self.additional_policy_model_paths.push(model_path);
-        self
-    }
-
     pub fn build<R: Runtime>(self) -> TauriPlugin<R> {
         let build_model_policy = self.build_model_policy;
-        let additional_policy_model_paths = self.additional_policy_model_paths;
         PluginBuilder::new("loom")
             .invoke_handler(tauri::generate_handler![
                 project_open_default,
@@ -1282,6 +1486,7 @@ impl Builder {
                 document_draft_clear,
                 document_reconciliation_preview,
                 document_reconcile_apply,
+                build_model_policy_get,
                 model_list,
                 model_choose,
                 model_load,
@@ -1310,7 +1515,6 @@ impl Builder {
                 app.manage(PluginState::with_model_library_root(
                     model_library_root,
                     build_model_policy,
-                    additional_policy_model_paths,
                 ));
                 Ok(())
             })
@@ -1658,6 +1862,7 @@ pub struct ModelUnloadOutcome {
 pub struct BranchSnapshot {
     run_id: String,
     branch_id: String,
+    document_id: String,
     candidate_id: Option<String>,
     source_revision_id: String,
     target_start_byte: u64,
@@ -1716,6 +1921,7 @@ impl From<BranchPageCursor> for BranchCursorSnapshot {
 pub struct BranchSummarySnapshot {
     run_id: String,
     branch_id: String,
+    document_id: String,
     candidate_id: Option<String>,
     source_revision_id: String,
     target_start_byte: u64,
@@ -1741,6 +1947,15 @@ pub struct BranchPageSnapshot {
 #[derive(Clone, Debug, Serialize)]
 pub struct BranchBodySnapshot {
     run_id: String,
+    branch_id: String,
+    document_id: String,
+    candidate_id: String,
+    source_revision_id: String,
+    target_start_byte: u64,
+    target_end_byte: u64,
+    seed: String,
+    model_id: String,
+    created_at_unix_ms: i64,
     output_blob_id: String,
     byte_len: u64,
     text: String,
@@ -1784,7 +1999,7 @@ struct ResolvedWeavePolicy {
     temperature: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 enum ValidatedWeavePolicy {
     AutomaticV2,
     ManualV2 {
@@ -2926,6 +3141,14 @@ fn reconcile_apply_for_store(
         )
         .map_err(IpcFailure::store)?;
     Ok(Receipt::from(outcome))
+}
+
+// Tauri's command ABI extracts `State` by value; the identity itself is still
+// returned directly and cannot fail at runtime.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn build_model_policy_get(state: State<'_, PluginState>) -> BuildModelPolicyIdentity {
+    state.build_model_policy.identity()
 }
 
 #[tauri::command]
@@ -4230,9 +4453,6 @@ fn desktop_model_discovery_options(
     if let Some(root) = &state.model_library_root {
         options.user_paths.push(root.join("models"));
     }
-    options
-        .user_paths
-        .extend(state.additional_policy_model_paths.iter().cloned());
     options.user_paths.extend(
         state
             .user_model_paths
@@ -4496,20 +4716,37 @@ async fn branch_body(
 ) -> Result<Option<BranchBodySnapshot>, IpcFailure> {
     let document_id = parse_document_id(&document_id)?;
     let run_id = parse_generation_run_id(&run_id)?;
-    let body = {
+    let (summary, body) = {
         let mut session = lock_session(&state)?;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;
-        store
+        let summary = store
+            .branch_summary(document_id, run_id)
+            .map_err(IpcFailure::store)?;
+        let body = store
             .branch_body(document_id, run_id, u64::from(max_bytes))
-            .map_err(IpcFailure::store)?
+            .map_err(IpcFailure::store)?;
+        (summary, body)
     };
-    Ok(body.map(branch_body_snapshot))
+    match body {
+        None => Ok(None),
+        Some(body) => {
+            let summary = summary.ok_or_else(|| {
+                IpcFailure::new(
+                    "corrupt_branch_body_identity",
+                    "the stored branch body has no immutable branch occurrence",
+                    false,
+                )
+            })?;
+            branch_body_snapshot(body, summary).map(Some)
+        }
+    }
 }
 
 fn branch_snapshot(record: StoredBranchRecord, active: bool) -> BranchSnapshot {
     BranchSnapshot {
         run_id: record.run_id.to_string(),
         branch_id: record.branch_id.to_string(),
+        document_id: record.document_id.to_string(),
         candidate_id: record.candidate_id.map(|id| id.to_string()),
         source_revision_id: record.source_revision_id.to_string(),
         target_start_byte: record.target_range.start,
@@ -4531,6 +4768,7 @@ fn branch_summary_snapshot(summary: StoredBranchSummary, active: bool) -> Branch
     BranchSummarySnapshot {
         run_id: summary.run_id.to_string(),
         branch_id: summary.branch_id.to_string(),
+        document_id: summary.document_id.to_string(),
         candidate_id: summary.candidate_id.map(|id| id.to_string()),
         source_revision_id: summary.source_revision_id.to_string(),
         target_start_byte: summary.target_range.start,
@@ -4547,13 +4785,56 @@ fn branch_summary_snapshot(summary: StoredBranchSummary, active: bool) -> Branch
     }
 }
 
-fn branch_body_snapshot(body: StoredBranchBody) -> BranchBodySnapshot {
-    BranchBodySnapshot {
+fn branch_body_snapshot(
+    body: StoredBranchBody,
+    summary: StoredBranchSummary,
+) -> Result<BranchBodySnapshot, IpcFailure> {
+    if summary.run_id != body.run_id
+        || summary.output_blob_id != Some(body.output_blob_id)
+        || summary.output_byte_len != Some(body.byte_len)
+    {
+        return Err(IpcFailure::new(
+            "corrupt_branch_body_identity",
+            "the stored branch body does not match its immutable branch occurrence",
+            false,
+        ));
+    }
+    let candidate_id = summary.candidate_id.ok_or_else(|| {
+        IpcFailure::new(
+            "corrupt_branch_body_identity",
+            "the stored branch body has no candidate identity",
+            false,
+        )
+    })?;
+    let seed = summary.seed.ok_or_else(|| {
+        IpcFailure::new(
+            "corrupt_branch_body_identity",
+            "the stored branch body has no sampler identity",
+            false,
+        )
+    })?;
+    let model_id = summary.model_identifier.ok_or_else(|| {
+        IpcFailure::new(
+            "corrupt_branch_body_identity",
+            "the stored branch body has no model identity",
+            false,
+        )
+    })?;
+    Ok(BranchBodySnapshot {
         run_id: body.run_id.to_string(),
+        branch_id: summary.branch_id.to_string(),
+        document_id: summary.document_id.to_string(),
+        candidate_id: candidate_id.to_string(),
+        source_revision_id: summary.source_revision_id.to_string(),
+        target_start_byte: summary.target_range.start,
+        target_end_byte: summary.target_range.end,
+        seed: seed.to_string(),
+        model_id,
+        created_at_unix_ms: summary.created_at_ms,
         output_blob_id: body.output_blob_id.to_string(),
         byte_len: body.byte_len,
         text: body.text,
-    }
+    })
 }
 
 fn branch_status(status: StoredBranchStatus, active: bool) -> &'static str {
@@ -4618,7 +4899,7 @@ fn replay_weave_if_recorded(
     source_revision_id: RevisionId,
     expected_visible_blob_id: BlobId,
     cursor_byte: u64,
-    policy: ValidatedWeavePolicy,
+    policy: &ValidatedWeavePolicy,
 ) -> Result<Option<WeaveStarted>, IpcFailure> {
     let replay = {
         let mut session = lock_session(state)?;
@@ -4889,8 +5170,6 @@ async fn weave_start<R: Runtime>(
         )
     })?;
     let policy = validate_weave_policy(policy)?;
-    let branch_count = policy.branch_count();
-    let agency = policy.agency();
 
     // Serialize the loaded-model snapshot through native startup and family
     // registration. A switch cannot observe zero active branches in the gap.
@@ -4909,12 +5188,15 @@ async fn weave_start<R: Runtime>(
         source_revision_id,
         expected_visible_blob_id,
         cursor_byte,
-        policy,
+        &policy,
     )? {
         return Ok(replay);
     }
     let _model_lifecycle = lock_model_lifecycle(&state)?;
-    let loaded_model = loaded_model(&state)?;
+    let authorized_model =
+        AuthorizedWeaveModel::bind(policy, loaded_model(&state)?, &state.build_model_policy)?;
+    let branch_count = authorized_model.branch_count();
+    let loaded_model = authorized_model.loaded();
     let max_cases = loaded_model
         .descriptor
         .capabilities
@@ -4933,12 +5215,7 @@ async fn weave_start<R: Runtime>(
     let request_id = format!("weave-{command_id}");
     let (identity, exact_prefix, prompt_recipe, cases, queued_branches, runs) = {
         let mut session = lock_session(&state)?;
-        let admission = match agency {
-            WeaveAgency::Automatic => session.agency.admit_automation(),
-            WeaveAgency::Manual => session.agency.admit_manual_generation(),
-        };
-        admission
-            .map_err(|error| IpcFailure::new("generation_blocked", error.to_string(), false))?;
+        authorized_model.admit(&session.agency)?;
         let active_session_id = session.active_session_id.ok_or_else(|| {
             IpcFailure::new(
                 "corrupt_project_session",
@@ -4956,7 +5233,7 @@ async fn weave_start<R: Runtime>(
             branch_count: resolved_branch_count,
             max_tokens,
             temperature,
-        } = policy.bind_document_kind(loaded.kind)?;
+        } = authorized_model.bind_document_kind(loaded.kind)?;
         debug_assert_eq!(resolved_branch_count, branch_count);
         if loaded.revision_id != source_revision_id {
             return Err(IpcFailure::new(
@@ -4993,11 +5270,11 @@ async fn weave_start<R: Runtime>(
                 false,
             ));
         }
-        let automatic_budget_reservation = match agency {
-            WeaveAgency::Automatic => Some(
+        let automatic_budget_reservation = match authorized_model.automatic_writer() {
+            Some(writer) => Some(
                 state
                     .automatic_budget
-                    .reserve(AutomaticBudgetScope {
+                    .reserve(writer, AutomaticBudgetScope {
                         project: store.manifest().project_id,
                         session: active_session_id,
                         document: document_id,
@@ -5023,7 +5300,7 @@ async fn weave_start<R: Runtime>(
                         ),
                     })?,
             ),
-            WeaveAgency::Manual => None,
+            None => None,
         };
         let exact_prefix = loaded.text[..cursor].to_owned();
         let exact_prompt_blob_id = store
@@ -5132,6 +5409,7 @@ async fn weave_start<R: Runtime>(
             .map(|started| BranchSnapshot {
                 run_id: started.generation.run_id.to_string(),
                 branch_id: started.generation.branch_id.to_string(),
+                document_id: started.generation.document_id.to_string(),
                 candidate_id: None,
                 source_revision_id: started.generation.source_revision_id.to_string(),
                 target_start_byte: started.generation.target_range.start,
@@ -5167,14 +5445,13 @@ async fn weave_start<R: Runtime>(
             .map(|case| (case.generation.run_id, case.generation.clone()))
             .collect(),
     };
-    let native_request = ExactContinuationRequest {
-        request_id: request_id.clone(),
-        model: loaded_model.profile,
-        exact_manuscript_prefix: exact_prefix,
+    let native_request = authorized_model.into_exact_continuation_request(
+        request_id.clone(),
+        exact_prefix,
         prompt_recipe,
         cases,
-    };
-    let generation_owner = match state.backend.start_exact_continuation(native_request) {
+    );
+    let generation_owner = match native_request.submit(&state.backend) {
         Ok(owner) => owner,
         Err(error) => {
             if let Err(persistence) =
@@ -5315,12 +5592,6 @@ fn generation_seed(command_id: CommandId, index: u32, preset: WeavePreset) -> u3
     (entropy & !0b11) | preset.seed_tag()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WeaveAgency {
-    Automatic,
-    Manual,
-}
-
 impl WeavePreset {
     const fn seed_tag(self) -> u32 {
         match self {
@@ -5369,35 +5640,28 @@ fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePo
 }
 
 impl ValidatedWeavePolicy {
-    const fn agency(self) -> WeaveAgency {
-        match self {
-            Self::AutomaticV2 => WeaveAgency::Automatic,
-            Self::ManualV2 { .. } => WeaveAgency::Manual,
-        }
-    }
-
-    const fn branch_count(self) -> u32 {
+    const fn branch_count(&self) -> u32 {
         match self {
             Self::AutomaticV2 => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
-            Self::ManualV2 { branch_count, .. } => branch_count,
+            Self::ManualV2 { branch_count, .. } => *branch_count,
         }
     }
 
-    const fn max_tokens(self) -> u32 {
+    const fn max_tokens(&self) -> u32 {
         match self {
             Self::AutomaticV2 => AUTOMATIC_WEAVE_MAX_TOKENS_V2,
-            Self::ManualV2 { max_tokens, .. } => max_tokens,
+            Self::ManualV2 { max_tokens, .. } => *max_tokens,
         }
     }
 
-    const fn temperature(self) -> f32 {
+    const fn temperature(&self) -> f32 {
         match self {
             Self::AutomaticV2 => AUTOMATIC_WEAVE_TEMPERATURE_V2,
-            Self::ManualV2 { temperature, .. } => temperature,
+            Self::ManualV2 { temperature, .. } => *temperature,
         }
     }
 
-    fn bind_document_kind(self, kind: DocumentKind) -> Result<ResolvedWeavePolicy, IpcFailure> {
+    fn bind_document_kind(&self, kind: DocumentKind) -> Result<ResolvedWeavePolicy, IpcFailure> {
         let preset = match (self, kind) {
             (Self::AutomaticV2, DocumentKind::Prose) => WeavePreset::AutomaticProseV2,
             (Self::AutomaticV2, DocumentKind::Verse) => WeavePreset::AutomaticVerseV2,
@@ -7348,6 +7612,26 @@ mod tests {
         }
     }
 
+    fn test_policy_loaded_model(policy: &BuildModelPolicy, path: &Path) -> LoadedModel {
+        let writer = policy.writers().first().expect("writer policy");
+        let expectation =
+            policy_writer_expectation(policy, writer.profile_id()).expect("known writer policy");
+        LoadedModel {
+            profile: LocalModelProfile::for_gguf(path),
+            descriptor: test_descriptor(path, &expectation, "policy-writer"),
+        }
+    }
+
+    fn test_automatic_model_authority() -> AuthorizedWeaveModel {
+        let policy = BuildModelPolicy::writer_gemma4_base_v2();
+        AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            test_policy_loaded_model(&policy, Path::new("/tmp/policy-writer.gguf")),
+            &policy,
+        )
+        .expect("exact policy writer authority")
+    }
+
     fn assert_loaded_model_id(state: &PluginState, expected: &str) {
         let registry = state.model.lock().expect("model registry");
         let ModelRegistry::Loaded(loaded) = &*registry else {
@@ -7428,6 +7712,160 @@ mod tests {
         let error = policy_writer_expectation(&BuildModelPolicy::none_v1(), "not-present")
             .expect_err("unknown profile must fail closed");
         assert_eq!(error.code, "unknown_policy_model_profile");
+    }
+
+    #[test]
+    fn read_only_build_policy_identity_preserves_versioned_activation_and_digest() {
+        let v1 = BuildModelPolicy::writer_gemma4_base_v1().identity();
+        let v2 = BuildModelPolicy::writer_gemma4_base_v2().identity();
+
+        assert_eq!(
+            v1.name(),
+            loom_types::BuildModelPolicyName::WriterGemma4BaseV1
+        );
+        assert_eq!(
+            v1.activation(),
+            loom_types::SuggestionActivation::ProjectOptIn
+        );
+        assert_eq!(
+            v1.canonical_sha256().to_string(),
+            "c0492fb2285ad0922f89ab7288d63ef68fd17f5133f00ea4276622a15c2dc4e6"
+        );
+        assert_eq!(
+            v2.name(),
+            loom_types::BuildModelPolicyName::WriterGemma4BaseV2
+        );
+        assert_eq!(
+            v2.activation(),
+            loom_types::SuggestionActivation::QuietDefault
+        );
+        assert_eq!(
+            v2.canonical_sha256().to_string(),
+            "2d402d213b60ba65c4d018907e9eba67ccfbc1e97081cc0505f9713ae2dd89d2"
+        );
+    }
+
+    #[test]
+    fn automatic_writer_authority_rejects_none_and_arbitrary_resident_models() {
+        let writer_policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let exact_writer =
+            test_policy_loaded_model(&writer_policy, Path::new("/tmp/policy-writer.gguf"));
+        let none_error = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            exact_writer,
+            &BuildModelPolicy::none_v1(),
+        )
+        .expect_err("none-v1 cannot authorize automatic generation");
+        assert_eq!(none_error.code, "automatic_writer_not_in_build_policy");
+
+        let arbitrary = test_loaded_model(
+            Path::new("/tmp/arbitrary-completion-model.gguf"),
+            "arbitrary-completion-model",
+        );
+        let arbitrary_error = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            arbitrary,
+            &writer_policy,
+        )
+        .expect_err("an arbitrary capable resident model is not a build writer");
+        assert_eq!(arbitrary_error.code, "automatic_writer_not_in_build_policy");
+    }
+
+    #[test]
+    fn automatic_writer_authority_requires_raw_completion_and_generated_tokens() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let mut without_completion =
+            test_policy_loaded_model(&policy, Path::new("/tmp/incapable-policy-writer.gguf"));
+        without_completion.descriptor.capabilities.completion_text = CapabilitySupport::Unsupported;
+        let completion_error = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            without_completion,
+            &policy,
+        )
+        .expect_err("automatic writer must prove raw completion support");
+        assert_eq!(completion_error.code, "policy_model_capability_mismatch");
+
+        let mut without_tokens =
+            test_policy_loaded_model(&policy, Path::new("/tmp/incapable-policy-writer.gguf"));
+        without_tokens.descriptor.capabilities.generated_token_ids = CapabilitySupport::Unsupported;
+
+        let token_error =
+            AuthorizedWeaveModel::bind(ValidatedWeavePolicy::AutomaticV2, without_tokens, &policy)
+                .expect_err("automatic writer capability proof must fail closed");
+
+        assert_eq!(token_error.code, "policy_model_capability_mismatch");
+    }
+
+    #[test]
+    fn exact_policy_writer_mints_typed_automatic_authority() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let authorized = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            test_policy_loaded_model(&policy, Path::new("/tmp/policy-writer.gguf")),
+            &policy,
+        )
+        .expect("exact writer must be admitted");
+
+        assert_eq!(
+            authorized.automatic_binding(),
+            Some((
+                BuildWriterProfileId::Gemma4E2bBaseQ8LoomV1,
+                0,
+                policy.identity(),
+            ))
+        );
+    }
+
+    #[test]
+    fn manual_weave_authority_remains_independent_of_build_writer_policy() {
+        let authorized = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::ManualV2 {
+                branch_count: 1,
+                max_tokens: 32,
+                temperature: 0.8,
+            },
+            test_loaded_model(
+                Path::new("/tmp/arbitrary-manual-model.gguf"),
+                "arbitrary-manual-model",
+            ),
+            &BuildModelPolicy::none_v1(),
+        )
+        .expect("manual requests may use an explicitly loaded model");
+
+        assert_eq!(authorized.automatic_binding(), None);
+    }
+
+    #[test]
+    fn rejected_automatic_writers_leave_budget_ledger_untouched() {
+        let authority = AutomaticBudgetAuthority::default();
+        let writer_policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let arbitrary_rejection = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            test_loaded_model(Path::new("/tmp/arbitrary.gguf"), "arbitrary"),
+            &writer_policy,
+        );
+        assert_eq!(
+            arbitrary_rejection
+                .expect_err("arbitrary model cannot mint the opaque request authority")
+                .code,
+            "automatic_writer_not_in_build_policy"
+        );
+
+        let none_rejection = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            test_policy_loaded_model(&writer_policy, Path::new("/tmp/policy-writer.gguf")),
+            &BuildModelPolicy::none_v1(),
+        );
+        assert_eq!(
+            none_rejection
+                .expect_err("none-v1 cannot mint the opaque request authority")
+                .code,
+            "automatic_writer_not_in_build_policy"
+        );
+
+        let ledger = authority.ledger.lock().expect("automatic budget ledger");
+        assert_eq!(ledger.active_session, None);
+        assert!(ledger.families_by_scope.is_empty());
     }
 
     #[test]
@@ -7731,20 +8169,27 @@ mod tests {
     #[test]
     fn automatic_budget_reservations_are_affine_and_revision_bounded() {
         let authority = AutomaticBudgetAuthority::default();
+        let automatic = test_automatic_model_authority();
+        let writer = automatic
+            .automatic_writer()
+            .expect("automatic writer witness");
         let scope = AutomaticBudgetScope {
             project: ProjectId::new(),
             session: CommandId::new(),
             document: DocumentId::new(),
             source_revision: RevisionId::new(),
         };
-        authority.reserve(scope).expect("first family").commit();
         authority
-            .reserve(scope)
+            .reserve(writer, scope)
+            .expect("first family")
+            .commit();
+        authority
+            .reserve(writer, scope)
             .expect("replacement family")
             .commit();
         assert_eq!(
             authority
-                .reserve(scope)
+                .reserve(writer, scope)
                 .expect_err("revision budget exhausted"),
             AutomaticBudgetError::Exhausted
         );
@@ -7754,24 +8199,35 @@ mod tests {
     #[test]
     fn uncommitted_automatic_budget_reservation_refunds_on_drop() {
         let authority = AutomaticBudgetAuthority::default();
+        let automatic = test_automatic_model_authority();
+        let writer = automatic
+            .automatic_writer()
+            .expect("automatic writer witness");
         let scope = AutomaticBudgetScope {
             project: ProjectId::new(),
             session: CommandId::new(),
             document: DocumentId::new(),
             source_revision: RevisionId::new(),
         };
-        let abandoned = authority.reserve(scope).expect("pending family");
-        let committed = authority.reserve(scope).expect("second pending family");
+        let abandoned = authority.reserve(writer, scope).expect("pending family");
+        let committed = authority
+            .reserve(writer, scope)
+            .expect("second pending family");
         assert_eq!(
-            authority.reserve(scope).expect_err("pending slots count"),
+            authority
+                .reserve(writer, scope)
+                .expect_err("pending slots count"),
             AutomaticBudgetError::Exhausted
         );
         drop(abandoned);
-        authority.reserve(scope).expect("refunded family").commit();
+        authority
+            .reserve(writer, scope)
+            .expect("refunded family")
+            .commit();
         committed.commit();
         assert_eq!(
             authority
-                .reserve(scope)
+                .reserve(writer, scope)
                 .expect_err("committed work remains spent"),
             AutomaticBudgetError::Exhausted
         );
@@ -7780,6 +8236,10 @@ mod tests {
     #[test]
     fn automatic_budget_renews_only_for_new_authoritative_revision_or_session() {
         let authority = AutomaticBudgetAuthority::default();
+        let automatic = test_automatic_model_authority();
+        let writer = automatic
+            .automatic_writer()
+            .expect("automatic writer witness");
         let project_id = ProjectId::new();
         let session_id = CommandId::new();
         let document_id = DocumentId::new();
@@ -7789,9 +8249,12 @@ mod tests {
             document: document_id,
             source_revision: RevisionId::new(),
         };
-        authority.reserve(first).expect("first revision").commit();
         authority
-            .reserve(first)
+            .reserve(writer, first)
+            .expect("first revision")
+            .commit();
+        authority
+            .reserve(writer, first)
             .expect("first replacement")
             .commit();
 
@@ -7800,7 +8263,7 @@ mod tests {
             ..first
         };
         authority
-            .reserve(next_revision)
+            .reserve(writer, next_revision)
             .expect("new revision renews")
             .commit();
         let next_session = AutomaticBudgetScope {
@@ -7808,7 +8271,7 @@ mod tests {
             ..next_revision
         };
         authority
-            .reserve(next_session)
+            .reserve(writer, next_session)
             .expect("new project session renews")
             .commit();
     }

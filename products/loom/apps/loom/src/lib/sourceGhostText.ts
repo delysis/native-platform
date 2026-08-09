@@ -1,4 +1,8 @@
 import type { VerseNewlineKind } from './verseCodec';
+import {
+  insertionPreservesExtendedGraphemeEdges,
+  isExtendedGraphemeBoundary
+} from './graphemeBoundary';
 
 export interface SourceGhostPresentation {
   active: boolean;
@@ -13,6 +17,20 @@ export interface SourceGhostPlan {
   prefix: string;
   text: string;
   suffix: string;
+}
+
+export interface SourceGhostAnchor {
+  value: string;
+  surfaceKey: string;
+  selectionStart: number;
+  selectionEnd: number;
+}
+
+export interface SourceClientRect {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
 }
 
 export interface SourceGhostPlanInput {
@@ -70,6 +88,72 @@ export function renderedSourceGhostPresentationKey(
   viewportHidden: boolean
 ): string {
   return plan && !viewportHidden ? plan.presentationKey : '';
+}
+
+/**
+ * A presentation belongs to one immutable editor boundary. Temporary loss of
+ * focus or a caret excursion may hide it, but cannot retarget it elsewhere.
+ */
+export function sourceGhostAnchorMatches(
+  anchor: SourceGhostAnchor | null,
+  value: string,
+  surfaceKey: string,
+  selectionStart: number,
+  selectionEnd: number
+): boolean {
+  return anchor !== null &&
+    anchor.value === value &&
+    anchor.surfaceKey === surfaceKey &&
+    anchor.selectionStart === selectionStart &&
+    anchor.selectionEnd === selectionEnd;
+}
+
+/**
+ * Checks the first rendered continuation rectangle against the clipping
+ * viewport. A zero-width leading newline is accepted only when its insertion
+ * point lies inside the viewport; touching an outer edge is not visibility.
+ */
+export function sourceGhostRectIntersectsViewport(
+  ghost: SourceClientRect,
+  viewport: SourceClientRect
+): boolean {
+  const values = [
+    ghost.left,
+    ghost.top,
+    ghost.right,
+    ghost.bottom,
+    viewport.left,
+    viewport.top,
+    viewport.right,
+    viewport.bottom
+  ];
+  if (
+    values.some((value) => !Number.isFinite(value)) ||
+    ghost.right < ghost.left ||
+    ghost.bottom <= ghost.top ||
+    viewport.right <= viewport.left ||
+    viewport.bottom <= viewport.top
+  ) return false;
+
+  // Source presentation is admitted only for LTR text. The first fragment's
+  // left edge is therefore the insertion edge; requiring that edge (rather
+  // than any part of a long continuation) prevents an offscreen caret from
+  // gaining authority merely because later glyphs extend into view.
+  const horizontal = ghost.left >= viewport.left && ghost.left < viewport.right;
+  const vertical = Math.min(ghost.bottom, viewport.bottom) >
+    Math.max(ghost.top, viewport.top);
+  return horizontal && vertical;
+}
+
+/** Both the post-layout report and the keydown-time DOM witness must agree. */
+export function sourceGhostVisibilityWitnessMatches(
+  expectedPresentationKey: string,
+  reportedPresentationKey: string,
+  livePresentationKey: string
+): boolean {
+  return expectedPresentationKey.length > 0 &&
+    reportedPresentationKey === expectedPresentationKey &&
+    livePresentationKey === expectedPresentationKey;
 }
 
 /** O(1): validates that a UTF-16 caret is in range and not inside a surrogate pair. */
@@ -157,10 +241,16 @@ export function planSourceGhostText(input: SourceGhostPlanInput): SourceGhostPla
     input.selectionStart !== input.selectionEnd
   ) return null;
 
-  if (!isUtf16ScalarBoundary(input.value, input.selectionStart)) return null;
+  if (
+    !isUtf16ScalarBoundary(input.value, input.selectionStart) ||
+    !isExtendedGraphemeBoundary(input.value, input.selectionStart)
+  ) return null;
 
   const text = sourceGhostTextForTextarea(presentation.text, input.verseNewline);
-  if (text === null) return null;
+  if (
+    text === null ||
+    !insertionPreservesExtendedGraphemeEdges(input.value, input.selectionStart, text)
+  ) return null;
   return {
     candidateId: presentation.candidateId,
     presentationKey: presentation.presentationKey,

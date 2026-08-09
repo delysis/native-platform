@@ -1,14 +1,17 @@
 import { defaultMarkdownParser, defaultMarkdownSerializer } from 'prosemirror-markdown';
 import { EditorState, Selection, TextSelection } from 'prosemirror-state';
-import type { EditorView } from 'prosemirror-view';
+import { DecorationSet, type EditorView } from 'prosemirror-view';
 import { describe, expect, it } from 'vitest';
 import {
   createGhostTextPlugin,
+  exactMarkdownByteOffsetAtSelection,
   ghostTextPluginKey,
   planGhostText,
-  planGhostOverlayGeometry,
   renderedGhostPresentationKey,
   setGhostText,
+  visualGhostInsertionIsVisible,
+  visualGhostTextIsFaithfulAtSelection,
+  visualGhostTextMayBeInline,
   type GhostTextPresentation
 } from './ghostText';
 
@@ -26,21 +29,25 @@ const suggestion: GhostTextPresentation = {
   active: true,
   candidateId: '01JTESTCANDIDATE00000000000',
   presentationKey: '01JTESTCANDIDATE00000000000:blob-1',
-  text: ' for the rain to answer.\n\nThen it does.'
+  surfaceKey: 'project:document:revision:visual',
+  anchorByteOffset: 18,
+  text: ' for the rain to answer.'
 };
 
 describe('planGhostText', () => {
-  it('places the exact candidate bytes at an empty document-end selection', () => {
+  it('places the exact candidate bytes at an empty text selection', () => {
     const state = stateAtEnd();
     expect(planGhostText(state, suggestion)).toEqual({
       candidateId: suggestion.candidateId,
       position: state.selection.from,
       presentationKey: suggestion.presentationKey,
+      surfaceKey: suggestion.surfaceKey,
+      anchorByteOffset: suggestion.anchorByteOffset,
       text: suggestion.text
     });
   });
 
-  it('refuses inactive, invisible, ranged, and non-end presentations', () => {
+  it('refuses inactive, invisible, and ranged presentations', () => {
     const end = stateAtEnd();
     expect(planGhostText(end, { ...suggestion, active: false })).toBeNull();
     expect(planGhostText(end, { ...suggestion, text: ' \n\t' })).toBeNull();
@@ -53,66 +60,229 @@ describe('planGhostText', () => {
     const earlier = end.apply(end.tr.setSelection(
       TextSelection.create(end.doc, Math.max(1, end.selection.from - 2))
     ));
-    expect(planGhostText(earlier, suggestion)).toBeNull();
+    expect(planGhostText(earlier, suggestion)?.position).toBe(earlier.selection.from);
   });
 });
 
-describe('visual ghost overlay', () => {
-  it('keeps generated text out of ProseMirror DOM decorations', () => {
+describe('visual ghost widget', () => {
+  it('renders one zero-width widget without changing ProseMirror bytes', () => {
     const plugin = createGhostTextPlugin({
       accept: () => true, dismiss() {}, visible: () => true
     });
-    expect(plugin.props.decorations).toBeUndefined();
+    const doc = defaultMarkdownParser.parse('A paragraph.');
+    let state = EditorState.create({
+      doc,
+      selection: TextSelection.create(doc, 4),
+      plugins: [plugin]
+    });
+    const before = defaultMarkdownSerializer.serialize(state.doc);
+    state = state.apply(state.tr.setMeta(ghostTextPluginKey, {
+      kind: 'set', presentation: suggestion
+    }));
+    const decorations = plugin.props.decorations?.call(plugin, state);
+    expect(decorations).toBeInstanceOf(DecorationSet);
+    const found = (decorations as DecorationSet).find();
+    expect(found).toHaveLength(1);
+    expect(found[0].from).toBe(state.selection.from);
+    expect(found[0].to).toBe(state.selection.from);
+    expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(before);
+  });
+});
+
+describe('visual ghost visibility authority', () => {
+  const clip = { left: 20, top: 10, right: 220, bottom: 110 };
+
+  it('requires both the caret and first ghost fragment inside the viewport', () => {
+    expect(visualGhostInsertionIsVisible(
+      { left: 30, top: 20, right: 30, bottom: 40 },
+      { left: 30, top: 20, right: 90, bottom: 40 },
+      clip,
+      'ltr'
+    )).toBe(true);
+    expect(visualGhostInsertionIsVisible(
+      { left: 30, top: -30, right: 30, bottom: -10 },
+      { left: 30, top: 20, right: 90, bottom: 40 },
+      clip,
+      'ltr'
+    )).toBe(false);
+    expect(visualGhostInsertionIsVisible(
+      { left: 30, top: 20, right: 30, bottom: 40 },
+      { left: 30, top: -30, right: 90, bottom: -10 },
+      clip,
+      'ltr'
+    )).toBe(false);
   });
 
-  it('continues on the caret line when space remains', () => {
-    expect(planGhostOverlayGeometry({
-      caret: { left: 220, top: 80, bottom: 110 },
-      shell: { left: 100, top: 20 },
-      text: { left: 150, right: 600 }
-    })).toEqual({ left: 120, top: 60, maxWidth: 380 });
+  it('does not let a later wrapped fragment authorize an offscreen start', () => {
+    expect(visualGhostInsertionIsVisible(
+      { left: 30, top: -30, right: 30, bottom: -10 },
+      { left: 30, top: -30, right: 200, bottom: -10 },
+      clip,
+      'ltr'
+    )).toBe(false);
   });
 
-  it('starts a new visual line near the writing measure edge', () => {
-    expect(planGhostOverlayGeometry({
-      caret: { left: 570, top: 80, bottom: 110 },
-      shell: { left: 100, top: 20 },
-      text: { left: 150, right: 600 }
-    })).toEqual({ left: 50, top: 90, maxWidth: 450 });
+  it('uses the correct insertion edge for RTL text and rejects invalid geometry', () => {
+    expect(visualGhostInsertionIsVisible(
+      { left: 190, top: 20, right: 190, bottom: 40 },
+      { left: 100, top: 20, right: 190, bottom: 40 },
+      clip,
+      'rtl'
+    )).toBe(true);
+    expect(visualGhostInsertionIsVisible(
+      { left: 230, top: 20, right: 230, bottom: 40 },
+      { left: 230, top: 20, right: 260, bottom: 40 },
+      clip,
+      'rtl'
+    )).toBe(false);
+    expect(visualGhostInsertionIsVisible(
+      { left: Number.NaN, top: 20, right: 30, bottom: 40 },
+      { left: 30, top: 20, right: 90, bottom: 40 },
+      clip,
+      'ltr'
+    )).toBe(false);
+  });
+});
+
+describe('exact visual caret to Markdown boundary', () => {
+  function boundary(markdown: string, position: number): number | null {
+    const doc = defaultMarkdownParser.parse(markdown);
+    const state = EditorState.create({
+      doc,
+      selection: TextSelection.create(doc, position)
+    });
+    return exactMarkdownByteOffsetAtSelection(state, markdown);
+  }
+
+  it('maps interior prose, marked text, blocks, and list prefixes exactly', () => {
+    expect(boundary('hello world', 6)).toBe(5);
+    expect(boundary('hello **bold world** end', 12)).toBe(13);
+    expect(boundary('hello\n\nworld', 8)).toBe(7);
+    expect(boundary('* one\n* two', 10)).toBe(8);
+    expect(boundary('# Head\n\ntext', 7)).toBe(8);
   });
 
-  it('refuses non-finite or inverted layout evidence', () => {
-    expect(planGhostOverlayGeometry({
-      caret: { left: Number.NaN, top: 0, bottom: 1 },
-      shell: { left: 0, top: 0 },
-      text: { left: 0, right: 1 }
-    })).toBeNull();
-    expect(planGhostOverlayGeometry({
-      caret: { left: 1, top: 0, bottom: 1 },
-      shell: { left: 0, top: 0 },
-      text: { left: 2, right: 1 }
-    })).toBeNull();
+  it('returns UTF-8 bytes rather than UTF-16 code units', () => {
+    expect(boundary('A 🧵 waits', 5)).toBe(new TextEncoder().encode('A 🧵').byteLength);
+    expect(boundary('A 🧵 waits', 4)).toBeNull();
   });
 
-  it('refuses a caret clipped outside the scroll viewport', () => {
-    expect(planGhostOverlayGeometry({
-      caret: { left: 220, top: 680, bottom: 710 },
-      shell: { left: 100, top: 20 },
-      text: { left: 150, right: 600 },
-      clip: { left: 100, right: 700, top: 40, bottom: 640 }
-    })).toBeNull();
-    expect(planGhostOverlayGeometry({
-      caret: { left: 220, top: 80, bottom: 110 },
-      shell: { left: 100, top: 20 },
-      text: { left: 150, right: 600 },
-      clip: { left: 100, right: 700, top: 40, bottom: 640 }
-    })).toEqual({ left: 120, top: 60, maxWidth: 380 });
-    expect(planGhostOverlayGeometry({
-      caret: { left: 570, top: 610, bottom: 640 },
-      shell: { left: 100, top: 20 },
-      text: { left: 150, right: 600 },
-      clip: { left: 100, right: 700, top: 40, bottom: 640 }
-    })).toBeNull();
+  it('fails closed inside extended grapheme clusters', () => {
+    expect(boundary('A e\u0301 waits', 4)).toBeNull();
+    expect(boundary('A e\u0301 waits', 5)).toBe(new TextEncoder().encode('A e\u0301').byteLength);
+
+    const family = 'A 👩‍👩‍👧‍👦 waits';
+    const familyDoc = defaultMarkdownParser.parse(family);
+    const familyText = familyDoc.firstChild?.textContent ?? '';
+    const familyStart = familyText.indexOf('👩');
+    const familyEnd = familyStart + '👩‍👩‍👧‍👦'.length;
+    expect(boundary(family, familyStart + 2)).toBeNull();
+    expect(boundary(family, familyEnd + 1)).not.toBeNull();
+
+    const flag = 'A 🇺🇳 waits';
+    expect(boundary(flag, 5)).toBeNull();
+    expect(boundary(flag, 7)).not.toBeNull();
+  });
+
+  it('flattens visible text across mark boundaries before proving a grapheme edge', () => {
+    const markedCombining = '**e**\u0301';
+    expect(defaultMarkdownParser.parse(markedCombining).toString()).toBe(
+      'doc(paragraph(strong("e"), "\u0301"))'
+    );
+    expect(boundary(markedCombining, 2)).toBeNull();
+    expect(boundary(markedCombining, 3)).not.toBeNull();
+  });
+
+  it('fails closed around inline atoms without an exact visible-text mapping', () => {
+    const hardBreak = 'a  \nb';
+    expect(defaultMarkdownParser.parse(hardBreak).toString()).toBe(
+      'doc(paragraph("a", hard_break, "b"))'
+    );
+    expect(boundary(hardBreak, 2)).toBeNull();
+    expect(boundary(hardBreak, 3)).toBeNull();
+  });
+
+  it('fails closed for stale Markdown, ranges, and witness collisions', () => {
+    const doc = defaultMarkdownParser.parse('hello');
+    const cursor = EditorState.create({ doc, selection: TextSelection.create(doc, 3) });
+    const range = EditorState.create({ doc, selection: TextSelection.create(doc, 2, 4) });
+    expect(exactMarkdownByteOffsetAtSelection(cursor, 'different')).toBeNull();
+    expect(exactMarkdownByteOffsetAtSelection(range, 'hello')).toBeNull();
+    expect(exactMarkdownByteOffsetAtSelection(
+      cursor,
+      'hello\uE000LOOM_CARET_BOUNDARY_7F3A9D2C\uE001'
+    )).toBeNull();
+  });
+});
+
+describe('faithful visual ghost projection', () => {
+  function stateAt(markdown: string, position: number): EditorState {
+    const doc = defaultMarkdownParser.parse(markdown);
+    return EditorState.create({ doc, selection: TextSelection.create(doc, position) });
+  }
+
+  it('admits literal inline prose only when promoted Markdown has the same document', () => {
+    const markdown = 'The rain waits.';
+    const state = stateAt(markdown, Selection.atEnd(defaultMarkdownParser.parse(markdown)).from);
+    const anchor = new TextEncoder().encode(markdown).byteLength;
+    expect(visualGhostTextMayBeInline(' for morning.')).toBe(true);
+    expect(visualGhostTextIsFaithfulAtSelection(
+      state,
+      markdown,
+      anchor,
+      ' for morning.'
+    )).toBe(true);
+  });
+
+  it('rejects Markdown controls, multi-block output, and the wrong anchor', () => {
+    const markdown = 'The rain waits.';
+    const doc = defaultMarkdownParser.parse(markdown);
+    const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
+    const anchor = new TextEncoder().encode(markdown).byteLength;
+    expect(visualGhostTextMayBeInline(' **boldly**')).toBe(false);
+    expect(visualGhostTextMayBeInline('\n\nMorning came.')).toBe(false);
+    expect(visualGhostTextIsFaithfulAtSelection(
+      state,
+      markdown,
+      anchor,
+      ' **boldly**'
+    )).toBe(false);
+    expect(visualGhostTextIsFaithfulAtSelection(
+      state,
+      markdown,
+      anchor - 1,
+      ' softly'
+    )).toBe(false);
+  });
+
+  it('rejects candidate edges that join a human grapheme', () => {
+    const cases = [
+      { markdown: 'e', text: '\u0301 morning' },
+      { markdown: '👩', text: '\u200d👩 together' },
+      { markdown: '🇺', text: '🇳 together' }
+    ];
+    for (const { markdown, text } of cases) {
+      const doc = defaultMarkdownParser.parse(markdown);
+      const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
+      const anchor = new TextEncoder().encode(markdown).byteLength;
+      expect(visualGhostTextMayBeInline(text)).toBe(true);
+      expect(visualGhostTextIsFaithfulAtSelection(
+        state,
+        markdown,
+        anchor,
+        text
+      )).toBe(false);
+    }
+  });
+
+  it('rejects a candidate whose trailing regional indicator joins the suffix', () => {
+    const markdown = 'A 🇳 waits';
+    const doc = defaultMarkdownParser.parse(markdown);
+    const state = EditorState.create({ doc, selection: TextSelection.create(doc, 3) });
+    const anchor = new TextEncoder().encode('A ').byteLength;
+    const text = '🇺';
+    expect(visualGhostTextMayBeInline(text)).toBe(true);
+    expect(visualGhostTextIsFaithfulAtSelection(state, markdown, anchor, text)).toBe(false);
   });
 });
 
@@ -148,6 +318,28 @@ describe('ghost-text plugin state', () => {
     setGhostText(view, null);
     expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(before);
     expect(ghostTextPluginKey.getState(state)).toBeNull();
+  });
+
+  it('refreshes surface and anchor identity even when candidate bytes are unchanged', () => {
+    let state = stateAtEnd('The sentence waits', true);
+    const view = {
+      get state() { return state; },
+      dispatch(transaction: Parameters<EditorView['dispatch']>[0]) {
+        state = state.apply(transaction);
+      }
+    } as unknown as EditorView;
+
+    setGhostText(view, suggestion);
+    setGhostText(view, {
+      ...suggestion,
+      surfaceKey: 'project:document:new-epoch:visual',
+      anchorByteOffset: suggestion.anchorByteOffset + 1
+    });
+    expect(ghostTextPluginKey.getState(state)).toMatchObject({
+      presentationKey: suggestion.presentationKey,
+      surfaceKey: 'project:document:new-epoch:visual',
+      anchorByteOffset: suggestion.anchorByteOffset + 1
+    });
   });
 
   it('accepts with unmodified Tab only while the exact ghost is rendered', () => {

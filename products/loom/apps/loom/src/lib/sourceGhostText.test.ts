@@ -3,8 +3,11 @@ import {
   isUtf16ScalarBoundary,
   planSourceGhostText,
   renderedSourceGhostPresentationKey,
+  sourceGhostAnchorMatches,
   sourceGhostKeyAction,
   sourceGhostPresentationCompatible,
+  sourceGhostRectIntersectsViewport,
+  sourceGhostVisibilityWitnessMatches,
   sourceTextHasStrongRtl,
   sourceGhostTextForTextarea,
   sourceMirrorDirectionIsSupported,
@@ -54,6 +57,37 @@ describe('planSourceGhostText', () => {
     expect(plan({ readonly: true })).toBeNull();
     expect(plan({ exactGeometry: false })).toBeNull();
     expect(plan({ value: '🧵', selectionStart: 1, selectionEnd: 1 })).toBeNull();
+  });
+
+  it('fails closed inside extended graphemes and when candidate edges join them', () => {
+    expect(plan({
+      value: 'e\u0301 waits',
+      selectionStart: 1,
+      selectionEnd: 1
+    })).toBeNull();
+    expect(plan({
+      value: '👩‍👩 waits',
+      selectionStart: 2,
+      selectionEnd: 2
+    })).toBeNull();
+    expect(plan({
+      value: 'e',
+      selectionStart: 1,
+      selectionEnd: 1,
+      presentation: { ...presentation, text: '\u0301 morning' }
+    })).toBeNull();
+    expect(plan({
+      value: '👩 waits',
+      selectionStart: 0,
+      selectionEnd: 0,
+      presentation: { ...presentation, text: '👩‍' }
+    })).toBeNull();
+    expect(plan({
+      value: '🇳 waits',
+      selectionStart: 0,
+      selectionEnd: 0,
+      presentation: { ...presentation, text: '🇺' }
+    })).toBeNull();
   });
 
   it('explicitly fails closed for strong RTL text until the mirror proves native parity', () => {
@@ -230,5 +264,71 @@ describe('renderedSourceGhostPresentationKey', () => {
     expect(renderedSourceGhostPresentationKey(planned, true)).toBe('');
     expect(renderedSourceGhostPresentationKey(planned, false)).toBe('candidate-1:blob-1');
     expect(renderedSourceGhostPresentationKey(null, false)).toBe('');
+  });
+});
+
+describe('source ghost visibility authority', () => {
+  it('binds a presentation to its exact value, surface, and caret but permits return', () => {
+    const anchor = {
+      value: 'A waits.',
+      surfaceKey: 'document-1:revision-2',
+      selectionStart: 2,
+      selectionEnd: 2
+    };
+    expect(sourceGhostAnchorMatches(anchor, 'A waits.', 'document-1:revision-2', 2, 2)).toBe(true);
+    expect(sourceGhostAnchorMatches(anchor, 'A waits.', 'document-1:revision-2', 3, 3)).toBe(false);
+    expect(sourceGhostAnchorMatches(anchor, 'A waits!', 'document-1:revision-2', 2, 2)).toBe(false);
+    expect(sourceGhostAnchorMatches(anchor, 'A waits.', 'document-2:revision-2', 2, 2)).toBe(false);
+    // Returning after a transient blur/caret excursion does not mutate the
+    // immutable anchor or permanently suppress the same presentation key.
+    expect(sourceGhostAnchorMatches(anchor, 'A waits.', 'document-1:revision-2', 2, 2)).toBe(true);
+  });
+
+  it('requires the first rendered ghost rect to intersect the viewport', () => {
+    const viewport = { left: 20, top: 10, right: 220, bottom: 110 };
+    expect(sourceGhostRectIntersectsViewport(
+      { left: 30, top: 20, right: 80, bottom: 40 },
+      viewport
+    )).toBe(true);
+    expect(sourceGhostRectIntersectsViewport(
+      { left: 30, top: 120, right: 80, bottom: 140 },
+      viewport
+    )).toBe(false);
+    expect(sourceGhostRectIntersectsViewport(
+      { left: 30, top: -40, right: 80, bottom: 10 },
+      viewport
+    )).toBe(false);
+    expect(sourceGhostRectIntersectsViewport(
+      { left: 220, top: 20, right: 250, bottom: 40 },
+      viewport
+    )).toBe(false);
+    expect(sourceGhostRectIntersectsViewport(
+      { left: -100, top: 20, right: 80, bottom: 40 },
+      viewport
+    )).toBe(false);
+  });
+
+  it('allows a visible zero-width newline insertion point but rejects invalid geometry', () => {
+    const viewport = { left: 20, top: 10, right: 220, bottom: 110 };
+    expect(sourceGhostRectIntersectsViewport(
+      { left: 30, top: 20, right: 30, bottom: 40 },
+      viewport
+    )).toBe(true);
+    expect(sourceGhostRectIntersectsViewport(
+      { left: 30, top: 20, right: 30, bottom: 20 },
+      viewport
+    )).toBe(false);
+    expect(sourceGhostRectIntersectsViewport(
+      { left: Number.NaN, top: 20, right: 80, bottom: 40 },
+      viewport
+    )).toBe(false);
+  });
+
+  it('requires non-empty agreement between the layout report and live keydown witness', () => {
+    expect(sourceGhostVisibilityWitnessMatches('candidate:blob', 'candidate:blob', 'candidate:blob'))
+      .toBe(true);
+    expect(sourceGhostVisibilityWitnessMatches('candidate:blob', '', '')).toBe(false);
+    expect(sourceGhostVisibilityWitnessMatches('candidate:blob', 'candidate:blob', '')).toBe(false);
+    expect(sourceGhostVisibilityWitnessMatches('candidate:blob', '', 'candidate:blob')).toBe(false);
   });
 });

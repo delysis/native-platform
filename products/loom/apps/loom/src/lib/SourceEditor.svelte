@@ -4,10 +4,14 @@
   import {
     planSourceGhostText,
     renderedSourceGhostPresentationKey,
+    sourceGhostAnchorMatches,
     sourceGhostKeyAction,
+    sourceGhostRectIntersectsViewport,
+    sourceGhostVisibilityWitnessMatches,
     sourceMirrorDirectionIsSupported,
     sourceMirrorGeometry,
     sourceTextHasStrongRtl,
+    type SourceGhostAnchor,
     type SourceGhostPlan,
     type SourceGhostPresentation
   } from './sourceGhostText';
@@ -33,6 +37,7 @@
   let shell: HTMLDivElement;
   let viewport: HTMLDivElement;
   let mirror: HTMLDivElement;
+  let ghostSpan: HTMLSpanElement;
   let focused = false;
   let composing = false;
   let exactGeometry = false;
@@ -47,6 +52,7 @@
   let reportedVisiblePresentationKey = '';
   let ltrContent = true;
   let plan: SourceGhostPlan | null = null;
+  let presentationAnchor: SourceGhostAnchor | null = null;
 
   const mirroredProperties = [
     'direction',
@@ -74,9 +80,17 @@
   ] as const;
 
   function presentation(): SourceGhostPresentation | null {
+    const currentValue = element?.value ?? value;
     if (
       !ghostPresentationKey ||
-      ghostPresentationKey === suppressedPresentationKey
+      ghostPresentationKey === suppressedPresentationKey ||
+      !sourceGhostAnchorMatches(
+        presentationAnchor,
+        currentValue,
+        surfaceKey,
+        selectionStart,
+        selectionEnd
+      )
     ) return null;
     return {
       active: true,
@@ -107,6 +121,41 @@
     onGhostVisibilityChange(presentationKey);
   }
 
+  function renderedGhostPresentationKey(candidate: SourceGhostPlan | null): string {
+    if (
+      !candidate ||
+      !viewport ||
+      !ghostSpan ||
+      viewport.hidden ||
+      ghostSpan.hidden ||
+      !viewport.isConnected ||
+      !ghostSpan.isConnected
+    ) return '';
+
+    const viewportStyle = getComputedStyle(viewport);
+    const ghostStyle = getComputedStyle(ghostSpan);
+    if (
+      viewportStyle.display === 'none' ||
+      viewportStyle.visibility === 'hidden' ||
+      viewportStyle.visibility === 'collapse' ||
+      Number.parseFloat(viewportStyle.opacity) === 0 ||
+      ghostStyle.display === 'none' ||
+      ghostStyle.visibility === 'hidden' ||
+      ghostStyle.visibility === 'collapse' ||
+      Number.parseFloat(ghostStyle.opacity) === 0
+    ) return '';
+
+    // The first client rect is the continuation's insertion edge. Using the
+    // union bounding box would let a long completion reach back into view and
+    // falsely authorize an offscreen caret.
+    const firstGhostRect = ghostSpan.getClientRects().item(0);
+    if (
+      !firstGhostRect ||
+      !sourceGhostRectIntersectsViewport(firstGhostRect, viewport.getBoundingClientRect())
+    ) return '';
+    return candidate.presentationKey;
+  }
+
   function installPlan(next: SourceGhostPlan | null): void {
     const previousKey = plan?.presentationKey ?? '';
     plan = next;
@@ -117,9 +166,7 @@
       return;
     }
     if (previousKey === next.presentationKey && viewport && !viewport.hidden) {
-      reportVisiblePresentationKey(
-        renderedSourceGhostPresentationKey(next, viewport.hidden)
-      );
+      reportVisiblePresentationKey(renderedGhostPresentationKey(next));
       return;
     }
     if (viewport) viewport.hidden = true;
@@ -128,8 +175,12 @@
     void tick().then(() => {
       if (!viewport || plan?.presentationKey !== expectedKey) return;
       viewport.hidden = false;
-      reportVisiblePresentationKey(renderedSourceGhostPresentationKey(plan, viewport.hidden));
+      reportVisiblePresentationKey(renderedGhostPresentationKey(plan));
     });
+  }
+
+  function hideCurrentGhost(): void {
+    installPlan(null);
   }
 
   function suppressCurrentGhost(): void {
@@ -147,7 +198,7 @@
     if (
       suppressWhenMoved &&
       (nextStart !== selectionStart || nextEnd !== selectionEnd)
-    ) suppressCurrentGhost();
+    ) hideCurrentGhost();
     selectionStart = nextStart;
     selectionEnd = nextEnd;
     installPlan(currentPlan());
@@ -231,7 +282,7 @@
 
   function handleBlur(): void {
     focused = false;
-    suppressCurrentGhost();
+    hideCurrentGhost();
   }
 
   function handleBeforeInput(): void {
@@ -263,9 +314,15 @@
 
   function handleKeydown(event: KeyboardEvent): void {
     const candidate = currentPlan();
+    const livePresentationKey = renderedGhostPresentationKey(candidate);
     const visible = candidate &&
       renderedSourceGhostPresentationKey(candidate, viewport ? Boolean(viewport.hidden) : true) ===
-        reportedVisiblePresentationKey
+        candidate.presentationKey &&
+      sourceGhostVisibilityWitnessMatches(
+        candidate.presentationKey,
+        reportedVisiblePresentationKey,
+        livePresentationKey
+      )
       ? candidate
       : null;
     const action = sourceGhostKeyAction(event, Boolean(visible));
@@ -293,7 +350,7 @@
 
   export function focusAtDocumentEnd(): boolean {
     if (!element || readonly) return false;
-    suppressCurrentGhost();
+    hideCurrentGhost();
     element.focus({ preventScroll: true });
     const end = element.value.length;
     element.setSelectionRange(end, end);
@@ -320,6 +377,14 @@
     ltrContent;
     observedPresentationKey = ghostPresentationKey;
     suppressedPresentationKey = '';
+    presentationAnchor = ghostPresentationKey
+      ? {
+          value: element?.value ?? value,
+          surfaceKey,
+          selectionStart,
+          selectionEnd
+        }
+      : null;
     installPlan(currentPlan());
   }
 
@@ -369,7 +434,7 @@
   <div class="source-ghost-viewport" aria-hidden="true" hidden={!plan} bind:this={viewport}>
     <div class="source-ghost-mirror" bind:this={mirror}>
       {#if plan}
-        <span>{plan.prefix}</span><span class="loom-source-ghost-text">{plan.text}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
+        <span>{plan.prefix}</span><span class="loom-source-ghost-text" bind:this={ghostSpan}>{plan.text}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
       {/if}
     </div>
   </div>

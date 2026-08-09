@@ -11,6 +11,7 @@ const COMMANDS: &[&str] = &[
     "document_draft_clear",
     "document_reconciliation_preview",
     "document_reconcile_apply",
+    "build_model_policy_get",
     "model_list",
     "model_choose",
     "model_load",

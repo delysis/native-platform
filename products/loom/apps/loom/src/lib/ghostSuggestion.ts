@@ -1,4 +1,6 @@
 import type { BranchCard } from './types';
+import type { VerifiedBranchBody } from './branchBodyProof';
+import { verifiedBodyMatchesBranch } from './branchBodyProof';
 import {
   candidateSurfaceDecision,
   type CandidateSurfaceDecision
@@ -7,14 +9,21 @@ import {
 export interface VerifiedGhostSuggestion {
   candidateId: string;
   presentationKey: string;
+  targetByte: number;
   text: string;
 }
 
 export interface GhostSuggestionSelection {
   active: boolean;
   branches: readonly BranchCard[];
-  hydratedBlobByRun: Readonly<Record<string, string>>;
+  verifiedBodyByRun: Readonly<Record<string, VerifiedBranchBody>>;
   dismissedCandidateIds: readonly string[];
+  /**
+   * Immutable presentation identities rejected by the active editor surface.
+   * Candidate selection must skip them so a contextually unfaithful first
+   * branch cannot starve later exact alternatives.
+   */
+  unpresentablePresentationKeys: readonly string[];
   targetByte: number | null;
   presentationCompatible?: (text: string) => boolean;
 }
@@ -84,7 +93,7 @@ export function visibleVerifiedGhostSuggestion(
 
 export function verifiedGhostSuggestion(
   branch: BranchCard | null,
-  hydratedBlobId: string | undefined
+  body: VerifiedBranchBody | undefined
 ): VerifiedGhostSuggestion | null {
   if (
     !branch ||
@@ -93,18 +102,23 @@ export function verifiedGhostSuggestion(
     !branch.output_blob_id ||
     branch.output_byte_len === null ||
     branch.output_byte_len < 0 ||
-    hydratedBlobId !== branch.output_blob_id ||
-    !branch.text ||
-    !/\S/u.test(branch.text)
+    !Number.isSafeInteger(branch.target_start_byte) ||
+    branch.target_start_byte < 0 ||
+    branch.target_end_byte !== branch.target_start_byte ||
+    !verifiedBodyMatchesBranch(body, branch) ||
+    branch.text !== body.text ||
+    !body.text ||
+    !/\S/u.test(body.text)
   ) return null;
 
-  const actualBytes = new TextEncoder().encode(branch.text).byteLength;
+  const actualBytes = new TextEncoder().encode(body.text).byteLength;
   if (actualBytes !== branch.output_byte_len) return null;
 
   return {
     candidateId: branch.candidate_id,
     presentationKey: `${branch.candidate_id}:${branch.output_blob_id}`,
-    text: branch.text
+    targetByte: branch.target_start_byte,
+    text: body.text
   };
 }
 
@@ -137,6 +151,7 @@ export function autocompleteDisposition(
   ) return { kind: 'inactive' };
 
   const dismissed = new Set(selection.dismissedCandidateIds);
+  const unpresentable = new Set(selection.unpresentablePresentationKeys);
   const exactBranches = selection.branches.filter((branch) =>
     Boolean(
       branch.candidate_id &&
@@ -158,17 +173,21 @@ export function autocompleteDisposition(
     if (
       !branch.output_blob_id ||
       branch.output_byte_len === null ||
-      selection.hydratedBlobByRun[branch.run_id] !== branch.output_blob_id
+      !verifiedBodyMatchesBranch(selection.verifiedBodyByRun[branch.run_id], branch)
     ) {
       awaitingHydration.push(branch.run_id);
       continue;
     }
     const verified = verifiedGhostSuggestion(
       branch,
-      selection.hydratedBlobByRun[branch.run_id]
+      selection.verifiedBodyByRun[branch.run_id]
     );
     if (!verified) {
       exhausted.push({ candidateId, reason: 'invalid' });
+      continue;
+    }
+    if (unpresentable.has(verified.presentationKey)) {
+      exhausted.push({ candidateId, reason: 'unpresentable' });
       continue;
     }
     const surface = candidateSurfaceDecision(verified.text);

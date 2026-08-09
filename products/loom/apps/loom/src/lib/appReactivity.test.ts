@@ -20,16 +20,20 @@ describe('App ghost reactivity wiring', () => {
     }).js.code;
 
     const visual = dependencyThunkFor(compiled, '$.set(visualAutocompleteDisposition');
-    expect(visual).toContain('branchBodyBlobByRun');
+    expect(visual).toContain('verifiedBranchBodyByRun');
     expect(visual).toContain('currentReadyBranches');
     expect(visual).toContain('visualGhostTargetByte');
     expect(visual).toContain('branchPromotionReady');
 
     const sourceGhost = dependencyThunkFor(compiled, '$.set(sourceAutocompleteDisposition');
-    expect(sourceGhost).toContain('branchBodyBlobByRun');
+    expect(sourceGhost).toContain('verifiedBranchBodyByRun');
     expect(sourceGhost).toContain('currentReadyBranches');
     expect(sourceGhost).toContain('sourceGhostTargetByte');
     expect(sourceGhost).toContain('branchPromotionReady');
+
+    const retry = dependencyThunkFor(compiled, '$.set(retryEvaluationSnapshot');
+    expect(retry).toContain('visualAutocompleteDisposition');
+    expect(retry).toContain('sourceAutocompleteDisposition');
     expect(source).not.toContain('A private strand is ready');
   });
 });

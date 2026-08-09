@@ -16,6 +16,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-document-draft-clear`
 - `allow-document-reconciliation-preview`
 - `allow-document-reconcile-apply`
+- `allow-build-model-policy-get`
 - `allow-model-list`
 - `allow-model-choose`
 - `allow-model-download-status`
@@ -228,6 +229,32 @@ Enables the branch_page command without any pre-configured scope.
 <td>
 
 Denies the branch_page command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-build-model-policy-get`
+
+</td>
+<td>
+
+Enables the build_model_policy_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-build-model-policy-get`
+
+</td>
+<td>
+
+Denies the build_model_policy_get command without any pre-configured scope.
 
 </td>
 </tr>
