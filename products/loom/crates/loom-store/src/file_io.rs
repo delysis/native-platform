@@ -4,6 +4,13 @@ use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+};
 
 use atomic_write_file::AtomicWriteFile;
 
@@ -23,6 +30,52 @@ pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
     }
 
     let file = File::open(path)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual_bytes > max_bytes {
+        return Err(StoreError::DocumentTooLarge {
+            actual_bytes,
+            max_bytes,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Reads a regular file without following a final-component symbolic link.
+/// Descriptor metadata is authoritative, closing the inspect-then-open race.
+pub(crate) fn read_bounded_no_follow(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+
+    let file = match options.open(path) {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(StoreError::SymbolicLink(path.to_path_buf()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(StoreError::SymbolicLink(path.to_path_buf()));
+    }
+    if !metadata.is_file() {
+        return Err(StoreError::NotRegularFile(path.to_path_buf()));
+    }
+    if metadata.len() > max_bytes {
+        return Err(StoreError::DocumentTooLarge {
+            actual_bytes: metadata.len(),
+            max_bytes,
+        });
+    }
+
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;

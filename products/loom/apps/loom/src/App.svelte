@@ -52,9 +52,17 @@
   import { writeRebindsStaleDraft } from './lib/draftRecovery';
   import { documentProjectionDecision } from './lib/projectionState';
   import {
+    navigationScopeIsCurrent,
+    projectRestoreScopeIsCurrent,
+    projectSessionIsCurrent,
+    type ProjectRestoreScope
+  } from './lib/projectScope';
+  import {
     captureForIdempotentRetry,
     closeResultMayHaveCommitted
   } from './lib/sessionSafety';
+  import { drainGenerationsAndClose } from './lib/sessionCloseCoordinator';
+  import { restoreBeforeBackgroundWork, runCurrentWorkspaceStep } from './lib/startupSafety';
   import { newUlid } from './lib/ulid';
   import {
     DEFAULT_MODEL_DOWNLOAD_LIMIT_GIB,
@@ -183,6 +191,10 @@
   let compositionActive = false;
   let sourceComposing = false;
   let visualEditor: { flushPending: () => boolean } | null = null;
+  let componentMounted = false;
+  let workspaceRestoreSerial = 0;
+  let modelRefreshSerial = 0;
+  let modelLoadSerial = 0;
   let allowWindowClose = false;
   let unlistenWindowClose: (() => void) | undefined;
   let unlistenWindowFocus: (() => void) | undefined;
@@ -200,6 +212,8 @@
   let staleDraftDiscardArmed = false;
   let uncertainDraft: DraftCapture | null = null;
   let pendingCloseCommandId: string | null = null;
+  let pendingCloseMayHaveCommitted = false;
+  let closeInFlight: Promise<boolean> | null = null;
   let reconciliation: ReconciliationPreview | null = null;
   let reconciliationResolution = '';
   let pendingReconciliationApply: ReconciliationApplyCapture | null = null;
@@ -207,6 +221,7 @@
 
   interface SaveCapture {
     commandId: string;
+    restoreSerial: number;
     documentEpoch: number;
     projectId: string;
     sessionId: string;
@@ -235,11 +250,18 @@
 
   interface ReconciliationApplyCapture {
     commandId: string;
+    restoreSerial: number;
     projectId: string;
     sessionId: string;
     preview: ReconciliationPreview;
     resolvedText: string;
     reason: string;
+  }
+
+  interface WorkspaceRestoreCapture {
+    restoreSerial: number;
+    projectId: string;
+    sessionId: string;
   }
 
   interface BranchEventOverlay {
@@ -251,6 +273,7 @@
 
   interface PromotionCapture {
     commandId: string;
+    restoreSerial: number;
     projectId: string;
     sessionId: string;
     documentId: string;
@@ -373,10 +396,9 @@
   );
 
   onMount(() => {
+    componentMounted = true;
     desktop = isDesktopRuntime();
     if (desktop) {
-      void ensureModelDownloadEventListener();
-      void recoverModelDownloads();
       void installWindowLifecycleHandlers();
       void installGenerationEventListener();
       void restoreDesktopWorkspace();
@@ -384,6 +406,10 @@
     window.addEventListener('keydown', handleGlobalKeydown);
     window.addEventListener('pointerdown', handleGlobalPointerdown);
     return () => {
+      componentMounted = false;
+      workspaceRestoreSerial += 1;
+      modelRefreshSerial += 1;
+      modelLoadSerial += 1;
       window.removeEventListener('keydown', handleGlobalKeydown);
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
       if (saveTimer !== undefined) window.clearTimeout(saveTimer);
@@ -523,23 +549,37 @@
 
   async function requestReconciliationPreview(
     summary: Pick<DocumentSummary, 'document_id' | 'relative_path' | 'kind' | 'revision_id' | 'active_blob_id'>,
-    appText: string | null
+    appText: string | null,
+    expectedScope?: ProjectRestoreScope
   ): Promise<ReconciliationPreview> {
-    if (!project || !summary.revision_id || !summary.active_blob_id) {
+    const scope = expectedScope ?? (project ? {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      restoreSerial: workspaceRestoreSerial
+    } : null);
+    if (
+      !scope ||
+      !projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, scope) ||
+      !summary.revision_id ||
+      !summary.active_blob_id
+    ) {
       throw new Error('External reconciliation requires an immutable source revision and base blob.');
     }
     const preview = await previewDocumentReconciliation(
-      project.project_id,
-      project.session_id,
+      scope.projectId,
+      scope.sessionId,
       summary.document_id,
       summary.relative_path,
       summary.revision_id,
       summary.active_blob_id,
       appText
     );
+    if (!projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, scope)) {
+      throw new Error('The project session changed while Loom prepared reconciliation.');
+    }
     if (
-      preview.project_id !== project.project_id ||
-      preview.session_id !== project.session_id ||
+      preview.project_id !== scope.projectId ||
+      preview.session_id !== scope.sessionId ||
       preview.document_id !== summary.document_id ||
       preview.relative_path !== summary.relative_path ||
       preview.kind !== summary.kind ||
@@ -556,13 +596,17 @@
     receipt: CommandReceipt,
     appText: string
   ): Promise<void> {
+    if (!projectSessionIsCurrent(project, captured)) {
+      throw new Error('The checkpoint belongs to a stale project session.');
+    }
     if (!receipt.result_revision_id || !receipt.result_blob_id) {
       throw new Error('The committed checkpoint receipt is missing its result identity.');
     }
     const refreshed = await currentProjectSession();
     if (
       refreshed.project_id !== captured.projectId ||
-      refreshed.session_id !== captured.sessionId
+      refreshed.session_id !== captured.sessionId ||
+      !projectSessionIsCurrent(project, captured)
     ) {
       throw new Error('The refreshed project does not match the committed checkpoint session.');
     }
@@ -591,6 +635,9 @@
         receipt.result_revision_id,
         '0'
       );
+      if (!projectSessionIsCurrent(project, captured)) {
+        throw new Error('The project session changed while Loom protected newer editor text.');
+      }
       if (
         rebound.document_id !== captured.documentId ||
         rebound.source_revision_id !== receipt.result_revision_id ||
@@ -601,7 +648,11 @@
       }
       reboundDraftVersion = rebound.version;
     }
-    const preview = await requestReconciliationPreview(target, null);
+    const preview = await requestReconciliationPreview(target, null, {
+      projectId: captured.projectId,
+      sessionId: captured.sessionId,
+      restoreSerial: captured.restoreSerial
+    });
     if (
       reboundDraftVersion &&
       (
@@ -620,10 +671,14 @@
     captured: ReconciliationApplyCapture,
     receipt: CommandReceipt
   ): Promise<void> {
+    if (!projectSessionIsCurrent(project, captured)) {
+      throw new Error('The reconciliation belongs to a stale project session.');
+    }
     const refreshed = await currentProjectSession();
     if (
       refreshed.project_id !== captured.projectId ||
-      refreshed.session_id !== captured.sessionId
+      refreshed.session_id !== captured.sessionId ||
+      !projectSessionIsCurrent(project, captured)
     ) {
       throw new Error('The refreshed project does not match the committed reconciliation session.');
     }
@@ -638,7 +693,11 @@
       throw new Error('The project did not expose the newly committed reconciliation identity.');
     }
     project = refreshed;
-    const preview = await requestReconciliationPreview(target, captured.resolvedText);
+    const preview = await requestReconciliationPreview(target, captured.resolvedText, {
+      projectId: captured.projectId,
+      sessionId: captured.sessionId,
+      restoreSerial: captured.restoreSerial
+    });
     activateReconciliation(preview);
     announce('The resolution is in history; a newer external change now needs review');
   }
@@ -1549,23 +1608,46 @@
     }
   }
 
-  async function refreshModels(): Promise<void> {
+  function workspaceRestoreIsCurrent(captured: WorkspaceRestoreCapture): boolean {
+    return Boolean(
+      componentMounted &&
+      captured.restoreSerial === workspaceRestoreSerial &&
+      project?.project_id === captured.projectId &&
+      project.session_id === captured.sessionId
+    );
+  }
+
+  async function refreshModels(expectedWorkspace?: WorkspaceRestoreCapture): Promise<boolean> {
+    const refreshSerial = ++modelRefreshSerial;
     try {
-      models = await listModels();
-      const loaded = models.find((model) => model.loaded);
+      const discovered = await listModels();
+      if (
+        !componentMounted ||
+        refreshSerial !== modelRefreshSerial ||
+        (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
+      ) return false;
+      models = discovered;
+      const loaded = discovered.find((model) => model.loaded);
       const rememberedPath = loadLastLocalModelPath();
       if (loaded) {
         selectedModelPath = loaded.model_path;
-      } else if (rememberedPath && models.some((model) =>
+      } else if (rememberedPath && discovered.some((model) =>
         model.model_path === rememberedPath && model.header_verified
       )) {
         selectedModelPath = rememberedPath;
-      } else if (!models.some((model) => model.model_path === selectedModelPath)) {
-        selectedModelPath = models.find((model) => model.header_verified)?.model_path ?? '';
+      } else if (!discovered.some((model) => model.model_path === selectedModelPath)) {
+        selectedModelPath = discovered.find((model) => model.header_verified)?.model_path ?? '';
       }
+      return true;
     } catch {
+      if (
+        !componentMounted ||
+        refreshSerial !== modelRefreshSerial ||
+        (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
+      ) return false;
       models = [];
       selectedModelPath = '';
+      return false;
     }
   }
 
@@ -1695,13 +1777,22 @@
     }
   }
 
-  async function loadSelectedModel(): Promise<void> {
+  async function loadSelectedModel(expectedWorkspace?: WorkspaceRestoreCapture): Promise<void> {
     if (!selectedModelPath || modelLoading) return;
+    const modelPath = selectedModelPath;
+    const loadSerial = ++modelLoadSerial;
     modelLoading = true;
-    clearFailure();
-    announce('Verifying the selected local model');
+    if (!expectedWorkspace) {
+      clearFailure();
+      announce('Verifying the selected local model');
+    }
     try {
-      const loaded = await loadModel(selectedModelPath);
+      const loaded = await loadModel(modelPath);
+      if (
+        !componentMounted ||
+        loadSerial !== modelLoadSerial ||
+        (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
+      ) return;
       models = [
         loaded,
         ...models
@@ -1710,17 +1801,28 @@
       ];
       selectedModelPath = loaded.model_path;
       rememberLastLocalModelPath(loaded.model_path);
-      announce(`${loaded.display_name} is verified for exact local completion`);
+      if (!expectedWorkspace) {
+        announce(`${loaded.display_name} is verified for exact local completion`);
+      }
       if (suggestionsEnabled && loaded.completion && document) {
         await tick();
         scheduleAutomaticSuggestions(editVersion);
       }
     } catch (error) {
+      if (
+        !componentMounted ||
+        loadSerial !== modelLoadSerial ||
+        (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
+      ) return;
+      if (expectedWorkspace) {
+        await refreshModels(expectedWorkspace);
+        return;
+      }
       recordFailure(error);
       announce('The local model could not be verified');
       await refreshModels();
     } finally {
-      modelLoading = false;
+      if (loadSerial === modelLoadSerial) modelLoading = false;
     }
   }
 
@@ -1807,8 +1909,10 @@
   async function reattachNativeProject(): Promise<boolean> {
     try {
       const current = await currentProjectSession();
+      const restoreSerial = workspaceRestoreSerial;
+      if (!componentMounted) return false;
       project = current;
-      await finishOpeningProject();
+      if (!(await finishOpeningProject(current, restoreSerial))) return false;
       announce(`Reattached ${current.title}`);
       return true;
     } catch {
@@ -1816,40 +1920,112 @@
     }
   }
 
-  async function openInitialProject(): Promise<void> {
-    if (await reattachNativeProject()) return;
+  async function openInitialProject(restoreSerial: number): Promise<WorkspaceRestoreCapture | null> {
+    let current: ProjectSnapshot | null = null;
     try {
-      project = await openDefaultProject();
-      await finishOpeningProject();
+      current = await currentProjectSession();
+    } catch {
+      // No live native session is the normal first-launch path.
+    }
+    if (current) {
+      if (!componentMounted || restoreSerial !== workspaceRestoreSerial) return null;
+      project = current;
+      if (!(await finishOpeningProject(current, restoreSerial))) return null;
+      if (
+        !componentMounted ||
+        restoreSerial !== workspaceRestoreSerial ||
+        project?.project_id !== current.project_id ||
+        project.session_id !== current.session_id
+      ) return null;
+      announce(`Reattached ${current.title}`);
+      return {
+        restoreSerial,
+        projectId: current.project_id,
+        sessionId: current.session_id
+      };
+    }
+    try {
+      const opened = await openDefaultProject();
+      if (!componentMounted || restoreSerial !== workspaceRestoreSerial) return null;
+      project = opened;
+      if (!(await finishOpeningProject(opened, restoreSerial))) return null;
+      if (
+        !componentMounted ||
+        restoreSerial !== workspaceRestoreSerial ||
+        project?.project_id !== opened.project_id ||
+        project.session_id !== opened.session_id
+      ) return null;
       announce('Ready to write');
+      return {
+        restoreSerial,
+        projectId: opened.project_id,
+        sessionId: opened.session_id
+      };
     } catch (error) {
-      recordFailure(error);
+      if (componentMounted && restoreSerial === workspaceRestoreSerial) recordFailure(error);
+      return null;
     }
   }
 
-  async function restoreDesktopWorkspace(): Promise<void> {
-    await refreshModels();
-    await tick();
-    await openInitialProject();
+  function waitForWritingSurfacePaint(): Promise<void> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      window.requestAnimationFrame(finish);
+      window.setTimeout(finish, 100);
+    });
   }
 
-  async function loadRememberedSuggestionModel(): Promise<void> {
-    if (currentModel) return;
+  async function restoreDesktopWorkspace(): Promise<void> {
+    const restoreSerial = ++workspaceRestoreSerial;
+    await restoreBeforeBackgroundWork({
+      restore: () => openInitialProject(restoreSerial),
+      present: async () => {
+        await tick();
+        if (mode === 'source') sourceTextarea?.focus({ preventScroll: true });
+        await waitForWritingSurfacePaint();
+      },
+      isCurrent: workspaceRestoreIsCurrent,
+      background: async (captured) => {
+        await recoverModelDownloads();
+        if (!workspaceRestoreIsCurrent(captured)) return;
+        if (!(await refreshModels(captured)) || !workspaceRestoreIsCurrent(captured)) return;
+        if (suggestionsEnabled && !currentModel) {
+          await loadRememberedSuggestionModel(captured);
+        }
+      }
+    });
+  }
+
+  async function loadRememberedSuggestionModel(
+    expectedWorkspace?: WorkspaceRestoreCapture
+  ): Promise<void> {
+    if (currentModel || !document || transition !== 'idle') return;
+    if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return;
     const rememberedPath = loadLastLocalModelPath();
     if (!rememberedPath || !models.some((model) =>
       model.model_path === rememberedPath && model.header_verified
     )) return;
     selectedModelPath = rememberedPath;
-    await loadSelectedModel();
+    await loadSelectedModel(expectedWorkspace);
   }
 
   async function doOpenProject(): Promise<void> {
+    const restoreSerial = ++workspaceRestoreSerial;
+    modelRefreshSerial += 1;
     opening = true;
     clearFailure();
     try {
-      project = await chooseAndOpenProject();
-      await finishOpeningProject();
-      announce(`Opened ${project.title}`);
+      const opened = await chooseAndOpenProject();
+      if (!componentMounted || restoreSerial !== workspaceRestoreSerial) return;
+      project = opened;
+      if (await finishOpeningProject(opened, restoreSerial)) {
+        announce(`Opened ${opened.title}`);
+      }
     } catch (error) {
       if (!(await reattachNativeProject())) recordFailure(error);
     } finally {
@@ -1857,32 +2033,65 @@
     }
   }
 
-  async function finishOpeningProject(): Promise<void> {
-    if (!project) {
-      transition = 'idle';
-      return;
-    }
+  async function finishOpeningProject(
+    opened: ProjectSnapshot,
+    restoreSerial: number
+  ): Promise<boolean> {
+    const captured: WorkspaceRestoreCapture = {
+      restoreSerial,
+      projectId: opened.project_id,
+      sessionId: opened.session_id
+    };
+    if (!workspaceRestoreIsCurrent(captured)) return false;
     cancelSuggestionTimer();
-    const storedSuggestionsPreference = loadSuggestionPreference(project.project_id);
+    const storedSuggestionsPreference = loadSuggestionPreference(captured.projectId);
     suggestionsEnabled = false;
-    await setSuggestionsEnabled(storedSuggestionsPreference, false);
+    try {
+      const policy = await runCurrentWorkspaceStep({
+        capture: captured,
+        isCurrent: workspaceRestoreIsCurrent,
+        run: () => setSuggestionsPolicy(
+          captured.projectId,
+          captured.sessionId,
+          storedSuggestionsPreference
+        )
+      });
+      if (policy.status === 'stale') return false;
+      suggestionsEnabled = storedSuggestionsPreference;
+    } catch (error) {
+      if (!workspaceRestoreIsCurrent(captured)) return false;
+      suggestionsEnabled = false;
+      recordFailure(error);
+      announce('Suggestions remain off because the project gate could not be restored');
+    }
     dismissedCandidateIds = [];
-    if (project.pending_recovery > 0) {
-      const report = await recoverProject(project.project_id, project.session_id);
+    if (opened.pending_recovery > 0) {
+      const recovered = await runCurrentWorkspaceStep({
+        capture: captured,
+        isCurrent: workspaceRestoreIsCurrent,
+        run: () => recoverProject(captured.projectId, captured.sessionId)
+      });
+      if (recovered.status === 'stale') return false;
+      const report = recovered.value;
       if (report.conflicts.length > 0) {
+        if (!workspaceRestoreIsCurrent(captured) || !project) return false;
         project = { ...project, pending_recovery: report.conflicts.length };
         document = null;
         recordLocalFailure('recovery_conflict', `Recovery stopped at ${report.conflicts.length} externally changed file${report.conflicts.length === 1 ? '' : 's'}: ${report.conflicts.join(', ')}`);
         announce('Recovery requires reconciliation before editing');
-        return;
+        return true;
       }
       announce(`Recovered ${report.recovered} interrupted save${report.recovered === 1 ? '' : 's'}`);
+      if (!workspaceRestoreIsCurrent(captured) || !project) return false;
       project = { ...project, pending_recovery: 0 };
     }
+    if (!workspaceRestoreIsCurrent(captured) || !project) return false;
     const first = project.documents[0];
     if (first) {
       await selectDocument(first);
+      if (!workspaceRestoreIsCurrent(captured)) return false;
       await tick();
+      if (!workspaceRestoreIsCurrent(captured)) return false;
       if (suggestionsEnabled && currentModel && document) {
         scheduleAutomaticSuggestions(editVersion);
       }
@@ -1906,12 +2115,18 @@
       saveMessage = 'Project is ready';
     }
     if (storedSuggestionsPreference && suggestionsEnabled && !currentModel) {
-      void loadRememberedSuggestionModel();
+      void loadRememberedSuggestionModel(captured);
     }
+    return true;
   }
 
   async function selectDocument(summary: DocumentSummary): Promise<void> {
-    if (transition !== 'idle') return;
+    if (transition !== 'idle' || !project) return;
+    const requestedScope: ProjectRestoreScope = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      restoreSerial: workspaceRestoreSerial
+    };
     if (compositionActive) {
       announce('Finish composing text before changing documents');
       return;
@@ -1923,17 +2138,21 @@
     announce('Opening document; editing is briefly locked');
     const requestSerial = ++navigationSerial;
     if (!(await flushDraftJournal())) {
-      if (requestSerial === navigationSerial) transition = 'idle';
+      if (
+        requestSerial === navigationSerial &&
+        projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, requestedScope)
+      ) transition = 'idle';
       return;
     }
+    if (!projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, requestedScope)) return;
     if (!(await flushCurrentDocument())) {
-      if (requestSerial === navigationSerial) transition = 'idle';
+      if (
+        requestSerial === navigationSerial &&
+        projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, requestedScope)
+      ) transition = 'idle';
       return;
     }
-    if (!project) {
-      transition = 'idle';
-      return;
-    }
+    if (!projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, requestedScope)) return;
     if (branchRefreshTimer !== undefined) {
       window.clearTimeout(branchRefreshTimer);
       branchRefreshTimer = undefined;
@@ -1942,21 +2161,27 @@
     promotionArmedCandidateId = null;
     resetLiveGenerationView();
     const source = {
-      epoch: documentEpoch,
-      version: editVersion,
+      ...requestedScope,
+      documentEpoch,
+      editVersion,
       documentId: document?.summary.document_id ?? null
     };
     clearFailure();
     try {
       if (summary.externally_modified) {
-        const preview = await requestReconciliationPreview(summary, null);
+        const preview = await requestReconciliationPreview(summary, null, source);
         if (
           requestSerial !== navigationSerial ||
-          documentEpoch !== source.epoch ||
-          editVersion !== source.version ||
-          (document?.summary.document_id ?? null) !== source.documentId
+          !navigationScopeIsCurrent(
+            project,
+            document,
+            documentEpoch,
+            editVersion,
+            workspaceRestoreSerial,
+            source
+          )
         ) {
-          throw new Error('The active document changed while Loom prepared reconciliation.');
+          return;
         }
         documentEpoch += 1;
         document = null;
@@ -1973,24 +2198,27 @@
         return;
       }
       const opened = await openDocument(
-        project.project_id,
-        project.session_id,
+        source.projectId,
+        source.sessionId,
         summary.document_id,
         summary.relative_path
       );
+      if (
+        requestSerial !== navigationSerial ||
+        !navigationScopeIsCurrent(
+          project,
+          document,
+          documentEpoch,
+          editVersion,
+          workspaceRestoreSerial,
+          source
+        )
+      ) return;
       if (opened.summary.document_id !== summary.document_id) {
         throw new Error('The desktop returned a different document identity.');
       }
       if (summary.active_blob_id && opened.visible_blob_id !== summary.active_blob_id) {
         throw new Error('The desktop returned document bytes from a different active revision.');
-      }
-      if (
-        requestSerial !== navigationSerial ||
-        documentEpoch !== source.epoch ||
-        editVersion !== source.version ||
-        (document?.summary.document_id ?? null) !== source.documentId
-      ) {
-        throw new Error('The active document changed while Loom was opening another document.');
       }
       documentEpoch += 1;
       if (draftTimer !== undefined) {
@@ -2037,23 +2265,29 @@
       }
       if (summary.kind !== 'prose' || !canRoundTripMarkdownExactly(effectiveText)) mode = 'source';
       await refreshBranchesFor(
-        project.project_id,
-        project.session_id,
+        source.projectId,
+        source.sessionId,
         opened.summary.document_id,
         false
       );
     } catch (error) {
+      if (!projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source)) return;
       recordFailure(error);
-      if (
-        project &&
-        document &&
-        documentEpoch === source.epoch &&
-        document.summary.document_id === source.documentId
-      ) {
+      if (navigationScopeIsCurrent(
+        project,
+        document,
+        documentEpoch,
+        editVersion,
+        workspaceRestoreSerial,
+        source
+      )) {
         await refreshCurrentBranches(false);
       }
     } finally {
-      if (requestSerial === navigationSerial) transition = 'idle';
+      if (
+        requestSerial === navigationSerial &&
+        projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source)
+      ) transition = 'idle';
     }
   }
 
@@ -2382,6 +2616,7 @@
     if (!project || !document || !document.summary.revision_id) return null;
     return {
       commandId: newUlid(),
+      restoreSerial: workspaceRestoreSerial,
       documentEpoch,
       projectId: project.project_id,
       sessionId: project.session_id,
@@ -2506,7 +2741,10 @@
         saveMessage = 'Unsaved changes';
       }
     } catch (error) {
-      if (documentEpoch !== captured.documentEpoch) return;
+      if (
+        documentEpoch !== captured.documentEpoch ||
+        !projectSessionIsCurrent(project, captured)
+      ) return;
       const failure = recordFailure(error);
       if (
         failure.code === 'external_file_change' ||
@@ -2521,9 +2759,14 @@
             kind: captured.kind,
             revision_id: captured.revisionId,
             active_blob_id: captured.visibleBlobId
-          }, captured.text);
+          }, captured.text, {
+            projectId: captured.projectId,
+            sessionId: captured.sessionId,
+            restoreSerial: captured.restoreSerial
+          });
           activateReconciliation(preview);
         } catch (previewError) {
+          if (!projectSessionIsCurrent(project, captured)) return;
           recordFailure(previewError);
           saveState = 'error';
           saveMessage = 'External change needs reconciliation';
@@ -3091,6 +3334,7 @@
     ) return;
     const captured: PromotionCapture = {
       commandId: newUlid(),
+      restoreSerial: workspaceRestoreSerial,
       projectId: project.project_id,
       sessionId: project.session_id,
       documentId: document.summary.document_id,
@@ -3227,7 +3471,11 @@
         throw new Error('The project did not expose the revision proven by the promotion receipt.');
       }
       if (target.externally_modified) {
-        const preview = await requestReconciliationPreview(target, null);
+        const preview = await requestReconciliationPreview(target, null, {
+          projectId: captured.projectId,
+          sessionId: captured.sessionId,
+          restoreSerial: captured.restoreSerial
+        });
         activateReconciliation(preview);
         return 'reconciliation';
       }
@@ -3237,7 +3485,11 @@
       throw new Error('The project exposed an incomplete active manuscript identity.');
     }
     if (target.externally_modified) {
-      const preview = await requestReconciliationPreview(target, null);
+      const preview = await requestReconciliationPreview(target, null, {
+        projectId: captured.projectId,
+        sessionId: captured.sessionId,
+        restoreSerial: captured.restoreSerial
+      });
       activateReconciliation(preview);
       return 'reconciliation';
     }
@@ -3424,6 +3676,7 @@
     ) return;
     const captured = pendingReconciliationApply ?? {
       commandId: newUlid(),
+      restoreSerial: workspaceRestoreSerial,
       projectId: project.project_id,
       sessionId: project.session_id,
       preview: reconciliation,
@@ -3570,12 +3823,22 @@
 
   async function refreshReconciliationComparison(): Promise<void> {
     if (!project || !reconciliation || reconciliationApplying || pendingReconciliationApply) return;
+    const scope: ProjectRestoreScope = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      restoreSerial: workspaceRestoreSerial
+    };
     const previous = reconciliation;
     const appText = reconciliationResolution;
     reconciliationApplying = true;
     clearFailure();
     try {
       const refreshed = await currentProjectSession();
+      if (
+        !projectSessionIsCurrent(project, scope) ||
+        refreshed.project_id !== scope.projectId ||
+        refreshed.session_id !== scope.sessionId
+      ) return;
       const target = refreshed.documents.find(
         (candidate) => candidate.document_id === previous.document_id
       );
@@ -3588,13 +3851,13 @@
         await selectDocument(target);
         return;
       }
-      const preview = await requestReconciliationPreview(target, appText);
+      const preview = await requestReconciliationPreview(target, appText, scope);
       activateReconciliation(preview);
       announce('External comparison refreshed against the newest visible file');
     } catch (error) {
-      recordFailure(error);
+      if (projectSessionIsCurrent(project, scope)) recordFailure(error);
     } finally {
-      reconciliationApplying = false;
+      if (projectSessionIsCurrent(project, scope)) reconciliationApplying = false;
     }
   }
 
@@ -3620,13 +3883,24 @@
   }
 
   async function closeProject(): Promise<boolean> {
+    if (closeInFlight) return closeInFlight;
+    const operation = performCloseProject();
+    closeInFlight = operation;
+    try {
+      return await operation;
+    } finally {
+      if (closeInFlight === operation) closeInFlight = null;
+    }
+  }
+
+  async function performCloseProject(): Promise<boolean> {
     if (!project) return true;
-    const retryingUncertainClose = transition === 'closing' && pendingCloseCommandId !== null;
-    if (compositionActive && !retryingUncertainClose) {
+    const retryingPreparedClose = transition === 'closing' && pendingCloseCommandId !== null;
+    if (compositionActive && !retryingPreparedClose) {
       announce('Finish composing text before closing the project');
       return false;
     }
-    if (!retryingUncertainClose) {
+    if (!retryingPreparedClose) {
       if (!flushEditors()) return false;
       transition = 'closing';
       announce('Closing project; editing is briefly locked');
@@ -3642,38 +3916,117 @@
     const closing = project;
     const closingEpoch = documentEpoch;
     const closingVersion = editVersion;
-    if (documentEpoch !== closingEpoch || editVersion !== closingVersion) {
-      transition = 'idle';
-      recordLocalFailure('close_race', 'The manuscript changed while Loom prepared to close it.');
-      scheduleActiveBranchPoll();
-      return false;
-    }
-    try {
-      pendingCloseCommandId ??= newUlid();
+    pendingCloseCommandId ??= newUlid();
+    const closeCommandId = pendingCloseCommandId;
+    clearFailure();
+
+    const closeCaptureIsCurrent = () => Boolean(
+      componentMounted &&
+      project?.project_id === closing.project_id &&
+      project.session_id === closing.session_id &&
+      documentEpoch === closingEpoch &&
+      editVersion === closingVersion &&
+      pendingCloseCommandId === closeCommandId
+    );
+    const requestBoundClose = async () => {
       const receipt = await closeProjectSession(
         closing.project_id,
         closing.session_id,
-        pendingCloseCommandId
+        closeCommandId
       );
       if (
-        receipt.command_id !== pendingCloseCommandId ||
+        receipt.command_id !== closeCommandId ||
         receipt.project_id !== closing.project_id ||
         receipt.session_id !== closing.session_id
       ) {
         throw new Error('The desktop returned a close receipt for a different project session.');
       }
-    } catch (error) {
-      const failure = recordFailure(error);
-      if (closeResultMayHaveCommitted(failure)) {
+      return receipt;
+    };
+
+    if (pendingCloseMayHaveCommitted) {
+      try {
+        await requestBoundClose();
+      } catch (error) {
+        const failure = recordFailure(error);
+        if (closeResultMayHaveCommitted(failure)) {
+          transition = 'closing';
+          saveMessage = 'Close result uncertain — retry safely';
+          announce('Close result uncertain; editing remains locked until the same close command is retried');
+        } else {
+          pendingCloseCommandId = null;
+          pendingCloseMayHaveCommitted = false;
+          transition = 'idle';
+          scheduleActiveBranchPoll();
+        }
+        return false;
+      }
+    } else {
+      // Stop new automatic admission before native close drains any reserved
+      // startup already in flight. Keep the persisted preference unchanged so
+      // a later reopen can restore the author's choice deliberately.
+      suggestionsEnabled = false;
+      cancelSuggestionTimer();
+      const outcome = await drainGenerationsAndClose({
+        disableAutomation: () => setSuggestionsPolicy(
+          closing.project_id,
+          closing.session_id,
+          false
+        ),
+        cancelKnownBranches: cancelActiveBranches,
+        closeProject: requestBoundClose,
+        normalizeFailure,
+        closeResultMayHaveCommitted,
+        wait: (delayMs) => new Promise((resolve) => window.setTimeout(resolve, delayMs)),
+        isCurrent: closeCaptureIsCurrent
+      });
+
+      if (outcome.status === 'stale') {
+        if (
+          componentMounted &&
+          project?.project_id === closing.project_id &&
+          project.session_id === closing.session_id
+        ) {
+          pendingCloseCommandId = null;
+          transition = 'idle';
+          recordLocalFailure('close_race', 'The manuscript changed while Loom prepared to close it.');
+          scheduleActiveBranchPoll();
+        }
+        return false;
+      }
+      if (outcome.status === 'uncertain') {
+        recordFailure(outcome.failure);
+        pendingCloseMayHaveCommitted = true;
         transition = 'closing';
         saveMessage = 'Close result uncertain — retry safely';
         announce('Close result uncertain; editing remains locked until the same close command is retried');
-      } else {
+        return false;
+      }
+      if (outcome.status === 'waiting') {
+        pendingCloseMayHaveCommitted = false;
+        transition = 'closing';
+        if (outcome.failure) recordFailure(outcome.failure);
+        else recordLocalFailure(
+          'generation_cancellation_in_progress',
+          'Private strands are still preserving their terminal evidence. Loom kept the project open; retry close safely.'
+        );
+        saveMessage = 'Private strands are still stopping — retry close';
+        announce('The project remains open while private strands stop; retry close safely');
+        return false;
+      }
+      if (outcome.status === 'refused') {
+        recordFailure(outcome.failure);
+        pendingCloseCommandId = null;
+        pendingCloseMayHaveCommitted = false;
         transition = 'idle';
         scheduleActiveBranchPoll();
+        return false;
       }
-      return false;
     }
+
+    workspaceRestoreSerial += 1;
+    modelRefreshSerial += 1;
+    modelLoadSerial += 1;
     documentEpoch += 1;
     project = null;
     document = null;
@@ -3693,6 +4046,7 @@
     cancelSuggestionTimer();
     dismissedCandidateIds = [];
     pendingCloseCommandId = null;
+    pendingCloseMayHaveCommitted = false;
     uncertainSave = null;
     draftVersion = '0';
     draftSavedEditVersion = 0;
@@ -3703,6 +4057,7 @@
       window.clearTimeout(draftTimer);
       draftTimer = undefined;
     }
+    modelLoading = false;
     transition = 'idle';
     return true;
   }

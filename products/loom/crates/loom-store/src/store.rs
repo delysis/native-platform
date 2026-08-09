@@ -17,7 +17,8 @@ use serde_json::json;
 
 use crate::file_io::{
     atomic_install_if_absent, atomic_replace, atomic_replace_private,
-    create_private_file_if_absent, hard_link_if_absent, read_bounded, sync_parent,
+    create_private_file_if_absent, hard_link_if_absent, read_bounded, read_bounded_no_follow,
+    sync_parent,
 };
 use crate::paths::{
     ensure_directory, ensure_document_parent, ensure_private_directory, inspect_document_path,
@@ -385,6 +386,223 @@ impl ProjectStore {
         transaction.commit()?;
 
         match self.process_outbox_entry_with_boundary(outbox_id, before_projection_boundary)? {
+            OutboxResult::Applied | OutboxResult::AlreadyApplied => {}
+            OutboxResult::Conflict { relative_path } => {
+                return Err(StoreError::VisibleFileConflict {
+                    outbox_id,
+                    path: relative_path,
+                });
+            }
+        }
+        Ok(SaveOutcome {
+            blob_id,
+            artifact_id,
+            operation_id,
+            revision_id,
+            receipt,
+        })
+    }
+
+    /// Registers an existing visible manuscript as a new human-authored document
+    /// without normalizing or rewriting its bytes.
+    ///
+    /// The visible file is both the expected and target outbox state. An
+    /// unchanged file therefore completes through the no-write fast path, while
+    /// a concurrent edit remains visible and leaves a recoverable conflict.
+    pub fn adopt_visible_document_if_absent(
+        &mut self,
+        relative_path: impl AsRef<Path>,
+        kind: DocumentKind,
+        reason: impl Into<String>,
+    ) -> Result<SaveOutcome> {
+        self.adopt_visible_document_if_absent_with_boundary(relative_path, kind, reason, |_| Ok(()))
+    }
+
+    fn adopt_visible_document_if_absent_with_boundary<F>(
+        &mut self,
+        relative_path: impl AsRef<Path>,
+        kind: DocumentKind,
+        reason: impl Into<String>,
+        before_outbox_boundary: F,
+    ) -> Result<SaveOutcome>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
+        self.adopt_visible_document_if_absent_with_boundaries(
+            relative_path,
+            kind,
+            reason,
+            |_| Ok(()),
+            before_outbox_boundary,
+        )
+    }
+
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+    fn adopt_visible_document_if_absent_with_boundaries<F, G>(
+        &mut self,
+        relative_path: impl AsRef<Path>,
+        kind: DocumentKind,
+        reason: impl Into<String>,
+        before_read_boundary: F,
+        before_outbox_boundary: G,
+    ) -> Result<SaveOutcome>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+        G: FnOnce(&Path) -> Result<()>,
+    {
+        let started_at_ms = now_unix_ms();
+        let relative_path = normalize_document_path(relative_path.as_ref())?;
+        let reason = reason.into();
+        if reason.len() > MAX_REASON_BYTES {
+            return Err(StoreError::ReasonTooLong {
+                max_bytes: MAX_REASON_BYTES,
+            });
+        }
+        if self.document_by_path(&relative_path)?.is_some() {
+            return Err(StoreError::DocumentAlreadyExists(relative_path));
+        }
+
+        let visible_path = inspect_document_path(&self.root, &relative_path)?;
+        before_read_boundary(&visible_path)?;
+        let bytes = read_bounded_no_follow(&visible_path, MAX_DOCUMENT_BYTES)?;
+        if std::str::from_utf8(&bytes).is_err() {
+            return Err(StoreError::ExternalVisibleInvalidUtf8(relative_path));
+        }
+        let byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let byte_len_i64 = i64::try_from(byte_len).map_err(|_| StoreError::DocumentTooLarge {
+            actual_bytes: byte_len,
+            max_bytes: MAX_DOCUMENT_BYTES,
+        })?;
+        let blob_id = self.put_blob(&bytes)?;
+
+        let document_id = DocumentId::new();
+        let artifact_id = ArtifactId::new();
+        let operation_id = OperationId::new();
+        let revision_id = RevisionId::new();
+        let command_id = CommandId::new();
+        let created_at_ms = now_unix_ms();
+        let receipt = CommandReceipt {
+            command_id,
+            command: CommandKind::Import,
+            project_id: self.manifest.project_id,
+            project_schema_version: self.manifest.schema_version,
+            source_revision_id: None,
+            resulting_artifact_ids: vec![artifact_id],
+            resulting_operation_ids: vec![operation_id],
+            resulting_revision_ids: vec![revision_id],
+            started_at_ms,
+            completed_at_ms: created_at_ms,
+        };
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if transaction
+            .query_row(
+                "SELECT 1 FROM documents WHERE relative_path = ?1",
+                [&relative_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(StoreError::DocumentAlreadyExists(relative_path));
+        }
+        let current_visible_blob_id = visible_hash_if_present(&visible_path)?
+            .ok_or_else(|| StoreError::ExternalVisibleFileDeleted(relative_path.clone()))?;
+        if current_visible_blob_id != blob_id {
+            return Err(StoreError::ExternalVisibleBlobMismatch {
+                expected: blob_id,
+                actual: current_visible_blob_id,
+            });
+        }
+
+        transaction.execute(
+            "INSERT OR IGNORE INTO blobs(blob_id, byte_len, media_type, created_at_ms)
+             VALUES (?1, ?2, 'application/octet-stream', ?3)",
+            params![blob_id.to_string(), byte_len_i64, created_at_ms],
+        )?;
+        transaction.execute(
+            "INSERT INTO documents(document_id, relative_path, document_kind, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                document_id.to_string(),
+                relative_path,
+                kind.as_str(),
+                created_at_ms
+            ],
+        )?;
+        let metadata = serde_json::to_string(&json!({
+            "workflow": "adopt_visible_document",
+            "source": "existing_visible_file",
+            "relative_path": relative_path,
+            "reason": reason,
+            "source_blob_id": blob_id,
+        }))?;
+        transaction.execute(
+            "INSERT INTO artifacts(artifact_id, blob_id, artifact_kind, media_type, metadata_json, created_at_ms)
+             VALUES (?1, ?2, 'human_contribution', ?3, ?4, ?5)",
+            params![
+                artifact_id.to_string(),
+                blob_id.to_string(),
+                media_type(kind),
+                metadata,
+                created_at_ms,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO operations(operation_id, operation_kind, metadata_json, created_at_ms)
+             VALUES (?1, 'import', ?2, ?3)",
+            params![
+                operation_id.to_string(),
+                serde_json::to_string(&json!({
+                    "workflow": "adopt_visible_document",
+                    "source": "existing_visible_file",
+                    "relative_path": relative_path,
+                    "reason": reason,
+                    "source_blob_id": blob_id,
+                }))?,
+                created_at_ms,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO operation_outputs(operation_id, position, artifact_id) VALUES (?1, 0, ?2)",
+            params![operation_id.to_string(), artifact_id.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO revisions(revision_id, document_id, parent_revision_id, artifact_id, reason, created_at_ms)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5)",
+            params![
+                revision_id.to_string(),
+                document_id.to_string(),
+                artifact_id.to_string(),
+                reason,
+                created_at_ms,
+            ],
+        )?;
+        if byte_len_i64 != 0 {
+            transaction.execute(
+                "INSERT INTO revision_segments(revision_id, position, artifact_id, start_byte, end_byte, contribution_kind)
+                 VALUES (?1, 0, ?2, 0, ?3, 'human')",
+                params![revision_id.to_string(), artifact_id.to_string(), byte_len_i64],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO visible_file_outbox(revision_id, relative_path, target_blob_id, expected_visible_blob_id, state, created_at_ms)
+             VALUES (?1, ?2, ?3, ?3, 'pending', ?4)",
+            params![
+                revision_id.to_string(),
+                relative_path,
+                blob_id.to_string(),
+                created_at_ms,
+            ],
+        )?;
+        let outbox_id = transaction.last_insert_rowid();
+        persist_receipt_in(&transaction, &receipt)?;
+        transaction.commit()?;
+
+        before_outbox_boundary(&visible_path)?;
+        match self.process_outbox_entry(outbox_id)? {
             OutboxResult::Applied | OutboxResult::AlreadyApplied => {}
             OutboxResult::Conflict { relative_path } => {
                 return Err(StoreError::VisibleFileConflict {
@@ -1194,11 +1412,11 @@ fn media_type(kind: DocumentKind) -> &'static str {
 }
 
 pub(crate) fn visible_hash_if_present(path: &Path) -> Result<Option<BlobId>> {
-    reject_symlink_target(path)?;
-    if !path.exists() {
-        return Ok(None);
+    match read_bounded_no_follow(path, MAX_DOCUMENT_BYTES) {
+        Ok(bytes) => Ok(Some(BlobId::digest(&bytes))),
+        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-    read_bounded(path, MAX_DOCUMENT_BYTES).map(|bytes| Some(BlobId::digest(&bytes)))
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
@@ -1929,6 +2147,359 @@ mod tests {
             "must not overwrite",
         );
         assert!(matches!(second, Err(StoreError::DocumentAlreadyExists(_))));
+    }
+
+    #[test]
+    fn adopt_visible_document_preserves_exact_prose_bytes_and_human_import_provenance() {
+        let (_directory, mut store) = new_store();
+        let relative_path = "manuscript/Untitled.md";
+        let visible_path = store.root.join(relative_path);
+        let original = "  opening\r\n\r\ncafé\t \r\n".as_bytes();
+        fs::write(&visible_path, original).expect("write existing visible manuscript");
+
+        let adopted = store
+            .adopt_visible_document_if_absent(
+                relative_path,
+                DocumentKind::Prose,
+                "recover visible manuscript",
+            )
+            .expect("adopt exact visible manuscript");
+
+        assert_eq!(
+            fs::read(&visible_path).expect("read visible bytes"),
+            original
+        );
+        assert_eq!(adopted.blob_id, BlobId::digest(original));
+        assert_eq!(adopted.receipt.command, CommandKind::Import);
+        assert_eq!(adopted.receipt.source_revision_id, None);
+        assert_eq!(
+            store
+                .load_receipt(adopted.receipt.command_id)
+                .expect("load import receipt"),
+            Some(adopted.receipt.clone())
+        );
+        assert_eq!(
+            store
+                .read_document(relative_path)
+                .expect("read adopted document")
+                .text
+                .as_bytes(),
+            original
+        );
+        assert_eq!(
+            store
+                .reconstruct_revision(adopted.revision_id)
+                .expect("reconstruct adopted revision"),
+            original
+        );
+
+        let provenance = store
+            .revision_provenance(adopted.revision_id)
+            .expect("load import provenance");
+        assert_eq!(provenance.segments.len(), 1);
+        assert_eq!(provenance.segments[0].artifact_id, adopted.artifact_id);
+        assert_eq!(provenance.segments[0].byte_range.start, 0);
+        assert_eq!(
+            provenance.segments[0].byte_range.end,
+            u64::try_from(original.len()).expect("fixture length")
+        );
+        assert_eq!(
+            provenance.segments[0].contribution,
+            loom_types::ContributionKind::Human
+        );
+
+        let (artifact_kind, artifact_blob_id, metadata_json): (String, String, String) = store
+            .connection
+            .query_row(
+                "SELECT artifact_kind, blob_id, metadata_json FROM artifacts WHERE artifact_id = ?1",
+                [adopted.artifact_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load adopted artifact");
+        assert_eq!(artifact_kind, "human_contribution");
+        assert_eq!(artifact_blob_id, adopted.blob_id.to_string());
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_json).expect("parse artifact metadata");
+        assert_eq!(metadata["workflow"], "adopt_visible_document");
+        assert_eq!(metadata["source"], "existing_visible_file");
+        assert_eq!(metadata["source_blob_id"], adopted.blob_id.to_string());
+
+        let operation_kind: String = store
+            .connection
+            .query_row(
+                "SELECT operation_kind FROM operations WHERE operation_id = ?1",
+                [adopted.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("load import operation");
+        assert_eq!(operation_kind, "import");
+        let (target, expected, state): (String, Option<String>, String) = store
+            .connection
+            .query_row(
+                "SELECT target_blob_id, expected_visible_blob_id, state
+                 FROM visible_file_outbox WHERE revision_id = ?1",
+                [adopted.revision_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load adoption outbox");
+        assert_eq!(target, adopted.blob_id.to_string());
+        assert_eq!(expected, Some(target));
+        assert_eq!(state, "completed");
+        assert_eq!(store.pending_outbox_count().expect("pending count"), 0);
+    }
+
+    #[test]
+    fn adopt_visible_document_boundary_conflict_never_clobbers_newer_bytes() {
+        let (_directory, mut store) = new_store();
+        let relative_path = "manuscript/Untitled.md";
+        let visible_path = store.root.join(relative_path);
+        fs::write(&visible_path, b"original\r\n").expect("write original manuscript");
+
+        let result = store.adopt_visible_document_if_absent_with_boundary(
+            relative_path,
+            DocumentKind::Prose,
+            "recover visible manuscript",
+            |visible| {
+                fs::write(visible, b"newer external bytes\r\n")?;
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(StoreError::VisibleFileConflict { ref path, .. }) if path == relative_path
+        ));
+        assert_eq!(
+            fs::read(&visible_path).expect("read surviving visible bytes"),
+            b"newer external bytes\r\n"
+        );
+        assert_eq!(store.pending_outbox_count().expect("pending count"), 1);
+        let imported_receipts: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM command_receipts WHERE command_kind = 'import'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count atomic import receipt");
+        assert_eq!(imported_receipts, 1);
+        let document = store
+            .list_documents()
+            .expect("list imported document")
+            .into_iter()
+            .find(|document| document.relative_path == relative_path)
+            .expect("registered imported document");
+        assert_eq!(
+            store
+                .reconstruct_revision(document.active_revision_id.expect("active revision"))
+                .expect("reconstruct imported bytes"),
+            b"original\r\n"
+        );
+
+        let recovery = store.recover().expect("retry conflicted outbox");
+        assert_eq!(recovery.conflicts.len(), 1);
+        assert_eq!(store.pending_outbox_count().expect("pending count"), 1);
+        assert_eq!(
+            fs::read(&visible_path).expect("read visible after recovery"),
+            b"newer external bytes\r\n"
+        );
+    }
+
+    #[test]
+    fn adopt_visible_document_interruption_recovers_committed_receipt_and_outbox() {
+        let (directory, mut store) = new_store();
+        let root = store.root.clone();
+        let relative_path = "manuscript/Untitled.md";
+        let original = b"durable\r\nbytes\r\n";
+        fs::write(root.join(relative_path), original).expect("write visible manuscript");
+
+        let result = store.adopt_visible_document_if_absent_with_boundary(
+            relative_path,
+            DocumentKind::Prose,
+            "recover visible manuscript",
+            |_| {
+                Err(StoreError::Io(std::io::Error::other(
+                    "simulated interruption before outbox settlement",
+                )))
+            },
+        );
+        assert!(matches!(result, Err(StoreError::Io(_))));
+        assert_eq!(store.pending_outbox_count().expect("pending count"), 1);
+        let imported_receipts: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM command_receipts WHERE command_kind = 'import'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count committed import receipt");
+        assert_eq!(imported_receipts, 1);
+        drop(store);
+
+        let mut reopened = ProjectStore::open(&root).expect("reopen interrupted project");
+        let recovery = reopened.recover().expect("settle interrupted adoption");
+        assert_eq!(recovery.already_applied, 1);
+        assert_eq!(recovery.applied, 0);
+        assert!(recovery.conflicts.is_empty());
+        assert_eq!(
+            reopened
+                .read_document(relative_path)
+                .expect("read recovered document")
+                .text
+                .as_bytes(),
+            original
+        );
+        assert_eq!(reopened.pending_outbox_count().expect("pending count"), 0);
+        drop(directory);
+    }
+
+    #[test]
+    fn adopt_visible_document_rejects_non_file_and_invalid_utf8_without_state() {
+        let (_directory, mut store) = new_store();
+        let counts_before = store.counts().expect("counts before invalid adoption");
+        let directory_path = store.root.join("manuscript/not-a-file.md");
+        fs::create_dir(&directory_path).expect("create directory at document path");
+        let directory_error = store.adopt_visible_document_if_absent(
+            "manuscript/not-a-file.md",
+            DocumentKind::Prose,
+            "must fail",
+        );
+        assert!(
+            matches!(directory_error, Err(StoreError::NotRegularFile(path)) if path == directory_path)
+        );
+
+        let invalid_path = store.root.join("manuscript/invalid.md");
+        let invalid = [0xff, 0xfe, b'x'];
+        fs::write(&invalid_path, invalid).expect("write invalid UTF-8");
+        let invalid_error = store.adopt_visible_document_if_absent(
+            "manuscript/invalid.md",
+            DocumentKind::Prose,
+            "must fail",
+        );
+        assert!(matches!(
+            invalid_error,
+            Err(StoreError::ExternalVisibleInvalidUtf8(path)) if path == "manuscript/invalid.md"
+        ));
+        assert_eq!(
+            fs::read(invalid_path).expect("invalid file survives"),
+            invalid
+        );
+        assert_eq!(
+            store.counts().expect("counts after invalid adoption"),
+            counts_before
+        );
+        assert!(store.list_documents().expect("list documents").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopt_visible_document_rejects_symlink_without_reading_or_mutating_target() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, mut store) = new_store();
+        let counts_before = store.counts().expect("counts before symlink adoption");
+        let outside = directory.path().join("outside.md");
+        let outside_bytes = b"outside secret\r\n";
+        fs::write(&outside, outside_bytes).expect("write outside target");
+        let visible_path = store.root.join("manuscript/Untitled.md");
+        symlink(&outside, &visible_path).expect("create manuscript symlink");
+
+        let result = store.adopt_visible_document_if_absent(
+            "manuscript/Untitled.md",
+            DocumentKind::Prose,
+            "must refuse symlink",
+        );
+
+        assert!(matches!(result, Err(StoreError::SymbolicLink(path)) if path == visible_path));
+        assert_eq!(
+            fs::read(outside).expect("outside file survives"),
+            outside_bytes
+        );
+        assert_eq!(
+            store.counts().expect("counts after symlink adoption"),
+            counts_before
+        );
+        assert!(store.list_documents().expect("list documents").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopt_visible_document_rejects_symlink_swapped_after_inspection() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, mut store) = new_store();
+        let counts_before = store.counts().expect("counts before raced adoption");
+        let relative_path = "manuscript/Untitled.md";
+        let visible_path = store.root.join(relative_path);
+        fs::write(&visible_path, b"safe manuscript\n").expect("write inspected manuscript");
+        let outside = directory.path().join("outside-secret.md");
+        let outside_bytes = b"bytes that must never enter Loom\n";
+        fs::write(&outside, outside_bytes).expect("write outside target");
+
+        let result = store.adopt_visible_document_if_absent_with_boundaries(
+            relative_path,
+            DocumentKind::Prose,
+            "must refuse inspection race",
+            |visible| {
+                fs::remove_file(visible)?;
+                symlink(&outside, visible)?;
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+
+        assert!(matches!(result, Err(StoreError::SymbolicLink(path)) if path == visible_path));
+        assert_eq!(
+            store.counts().expect("counts after raced adoption"),
+            counts_before
+        );
+        assert!(store.list_documents().expect("list documents").is_empty());
+        assert_eq!(store.pending_outbox_count().expect("pending outbox"), 0);
+        assert_eq!(
+            fs::read(outside).expect("outside target survives"),
+            outside_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adoption_outbox_never_accepts_same_hash_symlink_after_commit() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, mut store) = new_store();
+        let relative_path = "manuscript/Untitled.md";
+        let visible_path = store.root.join(relative_path);
+        let bytes = b"identical bytes do not make a symlink safe\n";
+        fs::write(&visible_path, bytes).expect("write visible manuscript");
+        let outside = directory.path().join("same-bytes-outside.md");
+        fs::write(&outside, bytes).expect("write same-hash outside target");
+
+        let result = store.adopt_visible_document_if_absent_with_boundaries(
+            relative_path,
+            DocumentKind::Prose,
+            "must refuse outbox race",
+            |_| Ok(()),
+            |visible| {
+                fs::remove_file(visible)?;
+                symlink(&outside, visible)?;
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(StoreError::SymbolicLink(path)) if path == visible_path));
+        assert_eq!(store.pending_outbox_count().expect("pending outbox"), 1);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT state FROM visible_file_outbox WHERE relative_path = ?1",
+                    [relative_path],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("outbox state"),
+            "pending"
+        );
+        assert_eq!(fs::read(outside).expect("outside target survives"), bytes);
     }
 
     #[test]

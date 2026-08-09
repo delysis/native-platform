@@ -17,8 +17,8 @@ use loom_backend_llama::{
 };
 use loom_document::{DocumentContent, MergeError, MergeOutcome, three_way_merge};
 use loom_host::{
-    AgencyGate, BranchCancellation, GenerationFamilyIdentity, GenerationFamilyRegistration,
-    GenerationRegistry, GenerationRegistryError,
+    AgencyGate, BranchCancellation, GenerationFamilyIdentity, GenerationRegistry,
+    GenerationRegistryError,
 };
 use loom_store::{
     BranchPageCursor, DocumentReconciliationSnapshot, ExternalReconciliationOutcome,
@@ -46,6 +46,7 @@ use crate::model_download::{
 
 const INITIAL_DOCUMENT: &str = "manuscript/Untitled.md";
 const DEFAULT_PROJECT_DIRECTORY: &str = "writing";
+const PROJECT_CLOSE_GENERATION_WAIT: Duration = Duration::from_secs(3);
 const TESTED_GEMMA_4_E2B_BASE_Q8_SHA256: &str =
     "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670";
 const TESTED_GEMMA_4_E2B_BASE_PROFILE: &str = "gemma_4_e2b_base_q8_loom_v1";
@@ -779,21 +780,106 @@ fn initialize_project(path: &Path, title: String) -> Result<ProjectStore, IpcFai
 
 fn open_or_initialize_default_project(path: &Path) -> Result<ProjectStore, IpcFailure> {
     let manifest = path.join(".loom/project.json");
-    if manifest.try_exists().map_err(|error| {
+    let initialized = manifest.try_exists().map_err(|error| {
         IpcFailure::new(
             "default_project_inspection_failed",
             format!("the local writing folder could not be inspected: {error}"),
             true,
         )
-    })? {
-        let mut store = ProjectStore::open(path).map_err(IpcFailure::store)?;
-        store
-            .recover_interrupted_generations()
-            .map_err(IpcFailure::store)?;
-        store.record_open().map_err(IpcFailure::store)?;
-        return Ok(store);
+    })?;
+    let mut store = if initialized {
+        ProjectStore::open(path).map_err(IpcFailure::store)?
+    } else {
+        validate_default_document_candidate(path)?;
+        ProjectStore::initialize(path, "My Writing")
+            .map(|(store, _)| store)
+            .map_err(IpcFailure::store)?
+    };
+
+    // Settle an initialization/adoption transaction before deciding whether
+    // the default document is absent. A registered document whose visible file
+    // was later deleted is an external deletion, never permission to recreate
+    // an empty file over the author's history.
+    store.recover().map_err(IpcFailure::store)?;
+    store
+        .recover_interrupted_generations()
+        .map_err(IpcFailure::store)?;
+    ensure_default_document(&mut store)?;
+    store.record_open().map_err(IpcFailure::store)?;
+    Ok(store)
+}
+
+fn validate_default_document_candidate(path: &Path) -> Result<(), IpcFailure> {
+    let visible = path.join(INITIAL_DOCUMENT);
+    match std::fs::symlink_metadata(&visible) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(IpcFailure::new(
+            "default_document_symlink",
+            "Loom will not adopt an app-owned manuscript path that is a symbolic link",
+            false,
+        )),
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(IpcFailure::new(
+            "default_document_not_file",
+            "the app-owned manuscript path exists but is not a regular file",
+            false,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(IpcFailure::new(
+            "default_document_inspection_failed",
+            format!("the app-owned manuscript path could not be inspected: {error}"),
+            true,
+        )),
     }
-    initialize_project(path, "My Writing".to_owned())
+}
+
+fn ensure_default_document(store: &mut ProjectStore) -> Result<(), IpcFailure> {
+    if store
+        .list_documents()
+        .map_err(IpcFailure::store)?
+        .iter()
+        .any(|document| document.relative_path == INITIAL_DOCUMENT)
+    {
+        return Ok(());
+    }
+
+    let visible = store.root().join(INITIAL_DOCUMENT);
+    match std::fs::symlink_metadata(&visible) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(IpcFailure::new(
+            "default_document_symlink",
+            "Loom will not adopt an app-owned manuscript path that is a symbolic link",
+            false,
+        )),
+        Ok(metadata) if metadata.is_file() => {
+            store
+                .adopt_visible_document_if_absent(
+                    INITIAL_DOCUMENT,
+                    DocumentKind::Prose,
+                    "recover existing app-owned manuscript",
+                )
+                .map_err(IpcFailure::store)?;
+            Ok(())
+        }
+        Ok(_) => Err(IpcFailure::new(
+            "default_document_not_file",
+            "the app-owned manuscript path exists but is not a regular file",
+            false,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            store
+                .create_document_if_absent(
+                    INITIAL_DOCUMENT,
+                    DocumentContent::Prose(String::new()),
+                    "initial manuscript",
+                )
+                .map_err(IpcFailure::store)?;
+            Ok(())
+        }
+        Err(error) => Err(IpcFailure::new(
+            "default_document_inspection_failed",
+            format!("the app-owned manuscript path could not be inspected: {error}"),
+            true,
+        )),
+    }
 }
 
 #[tauri::command]
@@ -828,7 +914,107 @@ fn project_close(
             false,
         )
     })?;
-    let mut session = lock_session(&state)?;
+    close_project_with_wait(
+        &state,
+        project_id,
+        session_id,
+        command_id,
+        PROJECT_CLOSE_GENERATION_WAIT,
+    )
+}
+
+fn close_project_with_wait(
+    state: &PluginState,
+    project_id: String,
+    session_id: String,
+    command_id: CommandId,
+    generation_wait: Duration,
+) -> Result<ProjectCloseReceipt, IpcFailure> {
+    let (typed_project_id, typed_session_id) = {
+        let mut session = lock_session(state)?;
+        if session.phase == SessionPhase::Closed {
+            if let Some(receipt) = &session.last_close
+                && receipt.command_id == command_id.to_string()
+                && receipt.project_id == project_id
+                && receipt.session_id == session_id
+            {
+                return Ok(receipt.clone());
+            }
+            return Err(IpcFailure::new(
+                "project_not_open",
+                "the requested project session is not open",
+                false,
+            ));
+        }
+        require_bound_store(&mut session, &project_id, &session_id)?;
+        let typed_project_id = session
+            .store
+            .as_ref()
+            .ok_or_else(|| IpcFailure::new("project_not_open", "open a Loom project first", false))?
+            .manifest()
+            .project_id;
+        let typed_session_id = session.active_session_id.ok_or_else(|| {
+            IpcFailure::new(
+                "corrupt_project_session",
+                "the live project session is missing its session ID",
+                false,
+            )
+        })?;
+        // Admission and route reservation use this same session mutex. Once
+        // these flags change, an admitted family is either already visible to
+        // the registry below or it cannot reserve routes at all.
+        session.agency.set_automation_enabled(false);
+        session.agency.set_focus_mode(true);
+        (typed_project_id, typed_session_id)
+    };
+
+    state
+        .generations
+        .cancel_session(typed_project_id, typed_session_id)
+        .map_err(|error| IpcFailure::generation_registry(&error))?;
+    let mut generation_idle = state
+        .generations
+        .wait_for_session_idle(typed_project_id, typed_session_id, generation_wait)
+        .map_err(|error| IpcFailure::generation_registry(&error))?;
+    if !generation_idle {
+        let failures = state
+            .generations
+            .terminal_persistence_failures(typed_project_id, typed_session_id)
+            .map_err(|error| IpcFailure::generation_registry(&error))?;
+        for failure in failures {
+            terminalize_open_runs(state, &failure.identity, &failure.runs, &failure.error)
+                .and_then(|_| {
+                    release_family_after_terminal_persistence(
+                        state,
+                        &failure.identity,
+                        &failure.runs,
+                    )
+                })
+                .map_err(|error| {
+                    IpcFailure::new(
+                        "generation_terminal_persistence_failed",
+                        format!(
+                            "Loom could not preserve a terminal record before closing: {}",
+                            error.message
+                        ),
+                        true,
+                    )
+                })?;
+        }
+        generation_idle = state
+            .generations
+            .wait_for_session_idle(typed_project_id, typed_session_id, Duration::ZERO)
+            .map_err(|error| IpcFailure::generation_registry(&error))?;
+    }
+    if !generation_idle {
+        return Err(IpcFailure::new(
+            "generation_cancellation_in_progress",
+            "Loom requested cancellation and is still preserving terminal generation evidence; retry the same close command shortly",
+            true,
+        ));
+    }
+
+    let mut session = lock_session(state)?;
     if session.phase == SessionPhase::Closed {
         if let Some(receipt) = &session.last_close
             && receipt.command_id == command_id.to_string()
@@ -843,31 +1029,17 @@ fn project_close(
             false,
         ));
     }
-    {
-        require_bound_store(&mut session, &project_id, &session_id)?;
-    }
-    let typed_project_id = session
-        .store
-        .as_ref()
-        .ok_or_else(|| IpcFailure::new("project_not_open", "open a Loom project first", false))?
-        .manifest()
-        .project_id;
-    let typed_session_id = session.active_session_id.ok_or_else(|| {
-        IpcFailure::new(
-            "corrupt_project_session",
-            "the live project session is missing its session ID",
-            false,
-        )
-    })?;
-    if state
-        .generations
-        .has_active_session(typed_project_id, typed_session_id)
-        .map_err(|error| IpcFailure::generation_registry(&error))?
+    require_bound_store(&mut session, &project_id, &session_id)?;
+    if session.active_session_id != Some(typed_session_id)
+        || session
+            .store
+            .as_ref()
+            .is_none_or(|store| store.manifest().project_id != typed_project_id)
     {
         return Err(IpcFailure::new(
-            "generation_active",
-            "cancel or finish every active strand before closing this project",
-            true,
+            "stale_project_session",
+            "the project session changed while Loom cancelled its active strands",
+            false,
         ));
     }
     let receipt = ProjectCloseReceipt {
@@ -2833,7 +3005,7 @@ async fn weave_start<R: Runtime>(
         .map_err(|error| IpcFailure::backend(&error))?;
 
     let request_id = format!("weave-{command_id}");
-    let (identity, exact_prefix, prompt_recipe, cases, queued_branches) = {
+    let (identity, exact_prefix, prompt_recipe, cases, queued_branches, runs) = {
         let mut session = lock_session(&state)?;
         let admission = if automatic {
             session.agency.admit_automation()
@@ -2963,17 +3135,33 @@ async fn weave_start<R: Runtime>(
                 })?,
             );
         }
-        let family = store
-            .start_generation_family_with_command(
-                command_id,
-                cases.iter().map(|case| case.generation.clone()).collect(),
-            )
-            .map_err(IpcFailure::store)?;
         let identity = GenerationFamilyIdentity {
             request_id: request_id.clone(),
             project_id: store.manifest().project_id,
             session_id: active_session_id,
             document_id,
+        };
+        let runs = cases
+            .iter()
+            .map(|case| (case.generation.run_id, case.generation.branch_id))
+            .collect::<Vec<_>>();
+        // Reserve cancellable routes while the admission mutex is still held.
+        // A concurrent opt-out/Focus/close command can therefore never observe
+        // an admitted-but-unregistered family. Cancellation arriving before
+        // the native handle is attached is retained by GenerationRegistry.
+        state
+            .generations
+            .reserve(identity.clone(), runs.clone())
+            .map_err(|error| IpcFailure::generation_registry(&error))?;
+        let family = match store.start_generation_family_with_command(
+            command_id,
+            cases.iter().map(|case| case.generation.clone()).collect(),
+        ) {
+            Ok(family) => family,
+            Err(error) => {
+                let _ = state.generations.complete_family(&request_id);
+                return Err(IpcFailure::store(error));
+            }
         };
         let queued_branches = family
             .generations
@@ -3003,13 +3191,9 @@ async fn weave_start<R: Runtime>(
             prompt_recipe,
             cases,
             queued_branches,
+            runs,
         )
     };
-
-    let runs = cases
-        .iter()
-        .map(|case| (case.generation.run_id, case.generation.branch_id))
-        .collect::<Vec<_>>();
     let exact_prompt_blob_id = BlobId::digest(exact_prefix.as_bytes());
     let result_binding = GenerationResultBinding {
         exact_prompt_blob_id,
@@ -3030,30 +3214,41 @@ async fn weave_start<R: Runtime>(
     let handle = match state.backend.start_exact_continuation(native_request) {
         Ok(handle) => Arc::new(handle),
         Err(error) => {
-            fail_open_runs(&state, &identity, &runs, &error.to_string(), &app);
+            if let Err(persistence) =
+                fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
+            {
+                let _ = state
+                    .generations
+                    .mark_terminal_persistence_failure(&request_id, persistence.message.clone());
+                return Err(persistence);
+            }
             return Err(IpcFailure::backend(&error));
         }
     };
-    state
-        .generations
-        .register(GenerationFamilyRegistration {
-            identity: identity.clone(),
-            branches: runs.clone(),
-            cancellation: Arc::new(LlamaCancellation {
-                handle: Arc::clone(&handle),
-            }),
-        })
-        .map_err(|error| {
-            for (_, branch_id) in &runs {
-                let _ = handle.cancel_branch(*branch_id);
-            }
-            fail_open_runs(&state, &identity, &runs, &error.to_string(), &app);
-            IpcFailure::generation_registry(&error)
-        })?;
+    if let Err(error) = state.generations.attach_cancellation(
+        &request_id,
+        Arc::new(LlamaCancellation {
+            handle: Arc::clone(&handle),
+        }),
+    ) {
+        for (_, branch_id) in &runs {
+            let _ = handle.cancel_branch(*branch_id);
+        }
+        if let Err(persistence) =
+            fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
+        {
+            let _ = state
+                .generations
+                .mark_terminal_persistence_failure(&request_id, persistence.message.clone());
+            return Err(persistence);
+        }
+        return Err(IpcFailure::generation_registry(&error));
+    }
     let worker_app = app.clone();
     let worker_identity = identity.clone();
     let worker_runs = runs.clone();
     let worker_binding = result_binding.clone();
+    let worker_handle = Arc::clone(&handle);
     if let Err(error) = std::thread::Builder::new()
         .name("loom-desktop-generation".to_string())
         .spawn(move || {
@@ -3062,12 +3257,21 @@ async fn weave_start<R: Runtime>(
                 &worker_identity,
                 &worker_runs,
                 &worker_binding,
-                &handle,
+                &worker_handle,
             );
         })
     {
-        let _ = state.generations.complete_family(&request_id);
-        fail_open_runs(&state, &identity, &runs, &error.to_string(), &app);
+        for (_, branch_id) in &runs {
+            let _ = handle.cancel_branch(*branch_id);
+        }
+        if let Err(persistence) =
+            fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
+        {
+            let _ = state
+                .generations
+                .mark_terminal_persistence_failure(&request_id, persistence.message.clone());
+            return Err(persistence);
+        }
         return Err(IpcFailure::new(
             "generation_worker_spawn_failed",
             format!("the desktop generation worker could not start: {error}"),
@@ -3142,18 +3346,35 @@ fn run_desktop_generation<R: Runtime>(
     };
 
     let state = app.state::<PluginState>();
-    match result {
+    let persistence = match result {
         Ok(result) => {
             let drained = drain_backend_events(app, identity, handle);
-            if let Err(error) = drained
-                .and_then(|()| persist_generation_result(app, identity, runs, binding, result))
-            {
-                fail_open_runs(&state, identity, runs, &error.message, app);
-            }
+            drained.and_then(|()| persist_generation_result(app, identity, runs, binding, result))
         }
-        Err(error) => fail_open_runs(&state, identity, runs, &error, app),
+        Err(error) => Err(IpcFailure::new("generation_runtime_failed", error, true)),
+    };
+    let terminalized = match persistence {
+        Ok(()) => Ok(()),
+        Err(primary) => fail_open_runs(&state, identity, runs, &primary.message, app).map_err(
+            |fallback| {
+                IpcFailure::new(
+                    "generation_terminal_persistence_failed",
+                    format!(
+                        "generation result persistence failed: {}; fallback terminal persistence also failed: {}",
+                        primary.message, fallback.message
+                    ),
+                    true,
+                )
+            },
+        ),
+    };
+    let finalized = terminalized
+        .and_then(|()| release_family_after_terminal_persistence(&state, identity, runs));
+    if let Err(error) = finalized {
+        let _ = state
+            .generations
+            .mark_terminal_persistence_failure(&identity.request_id, error.message);
     }
-    let _ = state.generations.complete_family(&identity.request_id);
 }
 
 fn drain_backend_events<R: Runtime>(
@@ -3379,46 +3600,114 @@ fn persist_generation_result<R: Runtime>(
 }
 
 fn fail_open_runs<R: Runtime>(
-    state: &State<'_, PluginState>,
+    state: &PluginState,
     identity: &GenerationFamilyIdentity,
     runs: &[(GenerationRunId, BranchId)],
     error: &str,
     app: &AppHandle<R>,
-) {
+) -> Result<(), IpcFailure> {
+    let terminals = terminalize_open_runs(state, identity, runs, error)?;
+    for terminal in terminals {
+        let _ = emit_desktop_event(app, identity, terminal);
+    }
+    Ok(())
+}
+
+fn fail_and_release_open_runs<R: Runtime>(
+    state: &PluginState,
+    identity: &GenerationFamilyIdentity,
+    runs: &[(GenerationRunId, BranchId)],
+    error: &str,
+    app: &AppHandle<R>,
+) -> Result<(), IpcFailure> {
+    fail_open_runs(state, identity, runs, error, app)?;
+    release_family_after_terminal_persistence(state, identity, runs)
+}
+
+fn terminalize_open_runs(
+    state: &PluginState,
+    identity: &GenerationFamilyIdentity,
+    runs: &[(GenerationRunId, BranchId)],
+    error: &str,
+) -> Result<Vec<LoomEvent>, IpcFailure> {
     let message = if error.trim().is_empty() {
         "local generation failed without an error message".to_string()
     } else {
         error.to_string()
     };
-    let terminals = {
-        let Ok(mut session) = lock_session_internal(state) else {
-            return;
-        };
-        let Ok(store) = require_bound_store(
-            &mut session,
-            &identity.project_id.to_string(),
-            &identity.session_id.to_string(),
-        ) else {
-            return;
-        };
-        runs.iter()
-            .filter_map(|(run_id, _)| {
-                if store.generation_terminal_count(*run_id).ok()? != 0 {
-                    return None;
-                }
+    let mut session = lock_session_internal(state)?;
+    let store = require_bound_store(
+        &mut session,
+        &identity.project_id.to_string(),
+        &identity.session_id.to_string(),
+    )?;
+    let mut terminals = Vec::new();
+    for (run_id, _) in runs {
+        match store
+            .generation_terminal_count(*run_id)
+            .map_err(IpcFailure::store)?
+        {
+            0 => terminals.push(LoomEvent::GenerationTerminal(
                 store
                     .finish_generation(
                         *run_id,
                         GenerationTerminalStatus::Failed,
                         Some(message.clone()),
                     )
-                    .ok()
-            })
-            .collect::<Vec<_>>()
-    };
-    for terminal in terminals {
-        let _ = emit_desktop_event(app, identity, LoomEvent::GenerationTerminal(terminal));
+                    .map_err(IpcFailure::store)?,
+            )),
+            1 => {}
+            count => {
+                return Err(IpcFailure::new(
+                    "generation_terminal_count_invalid",
+                    format!(
+                        "generation run {run_id} has {count} terminal events; expected exactly one"
+                    ),
+                    false,
+                ));
+            }
+        }
     }
+    Ok(terminals)
+}
+
+fn release_family_after_terminal_persistence(
+    state: &PluginState,
+    identity: &GenerationFamilyIdentity,
+    runs: &[(GenerationRunId, BranchId)],
+) -> Result<(), IpcFailure> {
+    {
+        let mut session = lock_session_internal(state)?;
+        let store = require_bound_store(
+            &mut session,
+            &identity.project_id.to_string(),
+            &identity.session_id.to_string(),
+        )?;
+        for (run_id, _) in runs {
+            let count = store
+                .generation_terminal_count(*run_id)
+                .map_err(IpcFailure::store)?;
+            if count != 1 {
+                return Err(IpcFailure::new(
+                    "generation_terminal_not_durable",
+                    format!("generation run {run_id} has {count} durable terminal events"),
+                    true,
+                ));
+            }
+        }
+    }
+    state
+        .generations
+        .complete_family(&identity.request_id)
+        .map_err(|error| IpcFailure::generation_registry(&error))?
+        .ok_or_else(|| {
+            IpcFailure::new(
+                "generation_family_not_active",
+                "the terminalized generation family was not active in the lifecycle registry",
+                false,
+            )
+        })?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -3873,9 +4162,7 @@ fn registered_document_kind(
     Ok(stored_document.kind)
 }
 
-fn lock_session<'a>(
-    state: &'a State<'_, PluginState>,
-) -> Result<std::sync::MutexGuard<'a, Session>, IpcFailure> {
+fn lock_session(state: &PluginState) -> Result<std::sync::MutexGuard<'_, Session>, IpcFailure> {
     state.session.try_lock().map_err(|error| match error {
         TryLockError::WouldBlock => IpcFailure::new(
             "project_busy",
@@ -3890,9 +4177,9 @@ fn lock_session<'a>(
     })
 }
 
-fn lock_session_internal<'a>(
-    state: &'a State<'_, PluginState>,
-) -> Result<std::sync::MutexGuard<'a, Session>, IpcFailure> {
+fn lock_session_internal(
+    state: &PluginState,
+) -> Result<std::sync::MutexGuard<'_, Session>, IpcFailure> {
     state.session.lock().map_err(|_| {
         IpcFailure::new(
             "session_poisoned",
@@ -4066,6 +4353,106 @@ impl From<ExternalReconciliationOutcome> for Receipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct RecordingCancellation {
+        branches: Mutex<Vec<BranchId>>,
+        signal: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    impl BranchCancellation for RecordingCancellation {
+        fn cancel_branch(&self, branch_id: BranchId) -> bool {
+            self.branches
+                .lock()
+                .expect("recording cancellation lock")
+                .push(branch_id);
+            if let Some(signal) = self.signal.lock().expect("signal lock").take() {
+                let _ = signal.send(());
+            }
+            true
+        }
+    }
+
+    fn start_persisted_test_generation(
+        store: &mut ProjectStore,
+    ) -> (GenerationRunId, BranchId, DocumentId) {
+        let initial = store
+            .read_document(INITIAL_DOCUMENT)
+            .expect("read initial manuscript");
+        store
+            .save_document_if_source(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("Once ".to_owned()),
+                "establish generation prefix",
+                initial.revision_id,
+                initial.blob_id,
+            )
+            .expect("save generation prefix");
+        let loaded = store
+            .read_document(INITIAL_DOCUMENT)
+            .expect("read generation prefix");
+        let environment = ModelEnvironment {
+            environment_id: loom_types::ModelEnvironmentId::digest(b"test-close-environment"),
+            model_identifier: "test-close-model".to_owned(),
+            model_fingerprint: BlobId::digest(b"test-close-model"),
+            tokenizer_fingerprint: BlobId::digest(b"test-close-tokenizer"),
+            backend_identifier: "test-close-backend".to_owned(),
+            capabilities: serde_json::json!({"completion": true}),
+        };
+        let environment_artifact = store
+            .record_model_environment(&environment)
+            .expect("record test environment")
+            .artifact_id;
+        let prompt_blob = store
+            .store_provenance_blob(loaded.text.as_bytes())
+            .expect("store test prompt");
+        let prompt_artifact = store
+            .record_prompt_recipe(&PromptRecipe {
+                mode: PromptMode::Completion,
+                exact_prompt_blob_id: prompt_blob,
+                exact_prompt_token_ids: None,
+                ordered_input_artifact_ids: vec![loaded.artifact_id],
+                prompt_token_count: None,
+            })
+            .expect("record test prompt recipe")
+            .artifact_id;
+        let context_artifact = store
+            .record_context_recipe(&ContextRecipe {
+                source_revision_id: loaded.revision_id,
+                ordered_source_artifact_ids: Vec::new(),
+                token_budget: 128,
+                retrieval_evidence_blob_id: None,
+            })
+            .expect("record test context")
+            .artifact_id;
+        let policy_artifact = store
+            .record_authority_policy(&AuthorityPolicy {
+                policy_version: 1,
+                writer_environment_artifact_ids: vec![environment_artifact],
+                critic_environment_artifact_ids: Vec::new(),
+            })
+            .expect("record test authority")
+            .artifact_id;
+        let run_id = GenerationRunId::new();
+        let branch_id = BranchId::new();
+        let cursor = u64::try_from(loaded.text.len()).expect("test prefix length");
+        store
+            .start_generation(GenerationStart {
+                run_id,
+                branch_id,
+                document_id: loaded.document_id,
+                source_revision_id: loaded.revision_id,
+                target_range: ByteRange::new(cursor, cursor).expect("test target range"),
+                model_environment_artifact_id: environment_artifact,
+                prompt_recipe_artifact_id: prompt_artifact,
+                context_recipe_artifact_id: context_artifact,
+                authority_policy_artifact_id: policy_artifact,
+                seed: 7,
+                sampling: serde_json::json!({"temperature": 0.8}),
+            })
+            .expect("persist queued generation");
+        (run_id, branch_id, loaded.document_id)
+    }
 
     struct ReconciliationFixture {
         _temporary: tempfile::TempDir,
@@ -4253,6 +4640,350 @@ mod tests {
                 .expect("read reopened manuscript")
                 .text,
             ""
+        );
+    }
+
+    #[test]
+    fn default_project_repairs_interruption_after_manifest_before_document() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let (store, _) =
+            ProjectStore::initialize(&root, "My Writing").expect("initialize sidecar only");
+        let project_id = store.manifest().project_id;
+        assert!(store.list_documents().expect("list documents").is_empty());
+        drop(store);
+
+        let repaired = open_or_initialize_default_project(&root)
+            .expect("repair interrupted default initialization");
+        assert_eq!(repaired.manifest().project_id, project_id);
+        assert_eq!(
+            repaired
+                .read_document(INITIAL_DOCUMENT)
+                .expect("read repaired manuscript")
+                .text,
+            ""
+        );
+        assert_eq!(
+            std::fs::read(root.join(INITIAL_DOCUMENT)).expect("read visible manuscript"),
+            b""
+        );
+    }
+
+    #[test]
+    fn default_project_adopts_exact_visible_bytes_when_sidecar_is_absent() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let manuscript = root.join(INITIAL_DOCUMENT);
+        std::fs::create_dir_all(manuscript.parent().expect("manuscript parent"))
+            .expect("create manuscript directory");
+        let original = "  opening\r\n\r\ncafé\t \r\n".as_bytes();
+        std::fs::write(&manuscript, original).expect("write surviving manuscript");
+
+        let recovered =
+            open_or_initialize_default_project(&root).expect("adopt surviving manuscript");
+        assert_eq!(
+            recovered
+                .read_document(INITIAL_DOCUMENT)
+                .expect("read adopted manuscript")
+                .text
+                .as_bytes(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(&manuscript).expect("read unchanged visible manuscript"),
+            original
+        );
+        assert!(root.join(".loom/project.json").is_file());
+    }
+
+    #[test]
+    fn default_project_recovers_after_complete_sidecar_loss_without_rewriting_text() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let first = open_or_initialize_default_project(&root).expect("create default project");
+        let first_project_id = first.manifest().project_id;
+        drop(first);
+        let original = "surviving\r\nexternal  text\r\n".as_bytes();
+        std::fs::write(root.join(INITIAL_DOCUMENT), original).expect("write surviving text");
+        std::fs::rename(root.join(".loom"), root.join("lost-sidecar"))
+            .expect("preserve lost sidecar outside the active location");
+
+        let recovered =
+            open_or_initialize_default_project(&root).expect("recreate sidecar from manuscript");
+        assert_ne!(recovered.manifest().project_id, first_project_id);
+        assert_eq!(
+            recovered
+                .read_document(INITIAL_DOCUMENT)
+                .expect("read recovered manuscript")
+                .text
+                .as_bytes(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(root.join(INITIAL_DOCUMENT)).expect("read preserved manuscript"),
+            original
+        );
+    }
+
+    #[test]
+    fn default_project_never_recreates_a_registered_external_deletion() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let store = open_or_initialize_default_project(&root).expect("create default project");
+        let project_id = store.manifest().project_id;
+        drop(store);
+        std::fs::remove_file(root.join(INITIAL_DOCUMENT)).expect("simulate external deletion");
+
+        let reopened =
+            open_or_initialize_default_project(&root).expect("reopen deleted manuscript project");
+        assert_eq!(reopened.manifest().project_id, project_id);
+        assert!(
+            reopened
+                .list_documents()
+                .expect("list registered document")
+                .iter()
+                .any(|document| document.relative_path == INITIAL_DOCUMENT)
+        );
+        assert!(!root.join(INITIAL_DOCUMENT).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_project_refuses_visible_symlink_before_creating_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let manuscript = root.join(INITIAL_DOCUMENT);
+        std::fs::create_dir_all(manuscript.parent().expect("manuscript parent"))
+            .expect("create manuscript directory");
+        let outside = temporary.path().join("outside.md");
+        let outside_bytes = b"outside remains untouched\n";
+        std::fs::write(&outside, outside_bytes).expect("write outside target");
+        symlink(&outside, &manuscript).expect("create visible symlink");
+
+        let error = open_or_initialize_default_project(&root)
+            .expect_err("default project must refuse visible symlink");
+        assert_eq!(error.code, "default_document_symlink");
+        assert!(!root.join(".loom").exists());
+        assert_eq!(
+            std::fs::read(&outside).expect("outside target survives"),
+            outside_bytes
+        );
+    }
+
+    #[test]
+    fn close_cancels_active_family_waits_for_terminal_release_and_replays() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Closing Novel");
+        let mut store = initialize_project(&root, "Closing Novel".to_owned()).expect("initialize");
+        let project_id = store.manifest().project_id;
+        let session_id = CommandId::new();
+        let (run_id, branch_id, document_id) = start_persisted_test_generation(&mut store);
+        let state = Arc::new(PluginState::default());
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+            session.agency.set_automation_enabled(true);
+        }
+        let request_id = "close-active-family".to_owned();
+        let (signal, cancelled) = std::sync::mpsc::channel();
+        let cancellation = Arc::new(RecordingCancellation {
+            branches: Mutex::new(Vec::new()),
+            signal: Mutex::new(Some(signal)),
+        });
+        state
+            .generations
+            .register(loom_host::GenerationFamilyRegistration {
+                identity: GenerationFamilyIdentity {
+                    request_id: request_id.clone(),
+                    project_id,
+                    session_id,
+                    document_id,
+                },
+                branches: vec![(run_id, branch_id)],
+                cancellation: cancellation.clone(),
+            })
+            .expect("register active family");
+        let completing_state = Arc::clone(&state);
+        let completing_identity = GenerationFamilyIdentity {
+            request_id: request_id.clone(),
+            project_id,
+            session_id,
+            document_id,
+        };
+        let completion = std::thread::spawn(move || {
+            cancelled
+                .recv_timeout(Duration::from_secs(1))
+                .expect("close must request cancellation");
+            terminalize_open_runs(
+                &completing_state,
+                &completing_identity,
+                &[(run_id, branch_id)],
+                "cancelled while closing",
+            )
+            .expect("persist terminal generation before release");
+            release_family_after_terminal_persistence(
+                &completing_state,
+                &completing_identity,
+                &[(run_id, branch_id)],
+            )
+            .expect("release terminal family");
+        });
+
+        let command_id = CommandId::new();
+        let receipt = close_project_with_wait(
+            &state,
+            project_id.to_string(),
+            session_id.to_string(),
+            command_id,
+            Duration::from_secs(1),
+        )
+        .expect("close after cancellation terminalizes");
+        completion.join().expect("completion thread");
+        assert_eq!(
+            *cancellation.branches.lock().expect("cancelled branches"),
+            vec![branch_id]
+        );
+        assert_eq!(receipt.command_id, command_id.to_string());
+        assert_eq!(
+            state.session.lock().expect("session lock").phase,
+            SessionPhase::Closed
+        );
+        let reopened = ProjectStore::open(&root).expect("reopen closed project");
+        assert_eq!(
+            reopened
+                .generation_terminal_count(run_id)
+                .expect("count durable terminal"),
+            1
+        );
+        drop(reopened);
+
+        let replay = close_project_with_wait(
+            &state,
+            project_id.to_string(),
+            session_id.to_string(),
+            command_id,
+            Duration::ZERO,
+        )
+        .expect("same close command replays");
+        assert_eq!(replay.command_id, receipt.command_id);
+        assert_eq!(replay.closed_at_unix_ms, receipt.closed_at_unix_ms);
+    }
+
+    #[test]
+    fn close_timeout_is_bounded_and_leaves_session_revoked_for_exact_retry() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Slow Closing Novel");
+        let store = initialize_project(&root, "Slow Closing Novel".to_owned()).expect("initialize");
+        let project_id = store.manifest().project_id;
+        let session_id = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+            session.agency.set_automation_enabled(true);
+        }
+        let run_id = GenerationRunId::new();
+        let branch_id = BranchId::new();
+        let cancellation = Arc::new(RecordingCancellation::default());
+        state
+            .generations
+            .register(loom_host::GenerationFamilyRegistration {
+                identity: GenerationFamilyIdentity {
+                    request_id: "slow-close".to_owned(),
+                    project_id,
+                    session_id,
+                    document_id: DocumentId::new(),
+                },
+                branches: vec![(run_id, branch_id)],
+                cancellation: cancellation.clone(),
+            })
+            .expect("register active family");
+
+        let error = close_project_with_wait(
+            &state,
+            project_id.to_string(),
+            session_id.to_string(),
+            CommandId::new(),
+            Duration::ZERO,
+        )
+        .expect_err("zero wait must return a retryable bounded result");
+        assert_eq!(error.code, "generation_cancellation_in_progress");
+        assert!(error.retryable);
+        let session = state.session.lock().expect("session lock");
+        assert_eq!(session.phase, SessionPhase::Open);
+        assert!(session.agency.focus_mode());
+        assert!(!session.agency.automation_enabled());
+        drop(session);
+        assert_eq!(
+            *cancellation.branches.lock().expect("cancelled branches"),
+            vec![branch_id]
+        );
+        state
+            .generations
+            .complete_family("slow-close")
+            .expect("release test family");
+    }
+
+    #[test]
+    fn close_repairs_recorded_terminal_persistence_failure_before_releasing_store() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Persistence Repair Novel");
+        let mut store =
+            initialize_project(&root, "Persistence Repair Novel".to_owned()).expect("initialize");
+        let project_id = store.manifest().project_id;
+        let session_id = CommandId::new();
+        let (run_id, branch_id, document_id) = start_persisted_test_generation(&mut store);
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+            session.agency.set_automation_enabled(true);
+        }
+        let request_id = "persistence-repair";
+        state
+            .generations
+            .register(loom_host::GenerationFamilyRegistration {
+                identity: GenerationFamilyIdentity {
+                    request_id: request_id.to_owned(),
+                    project_id,
+                    session_id,
+                    document_id,
+                },
+                branches: vec![(run_id, branch_id)],
+                cancellation: Arc::new(RecordingCancellation::default()),
+            })
+            .expect("register failed-persistence family");
+        state
+            .generations
+            .mark_terminal_persistence_failure(request_id, "simulated SQLite interruption")
+            .expect("record persistence failure");
+
+        close_project_with_wait(
+            &state,
+            project_id.to_string(),
+            session_id.to_string(),
+            CommandId::new(),
+            Duration::ZERO,
+        )
+        .expect("close repairs terminal before releasing project");
+        assert_eq!(
+            state.session.lock().expect("session lock").phase,
+            SessionPhase::Closed
+        );
+        let reopened = ProjectStore::open(&root).expect("reopen repaired project");
+        assert_eq!(
+            reopened
+                .generation_terminal_count(run_id)
+                .expect("count repaired terminal"),
+            1
         );
     }
 

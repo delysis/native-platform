@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -42,11 +43,20 @@ pub struct ActiveGenerationRoute {
     pub branch_id: BranchId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationPersistenceFailure {
+    pub identity: GenerationFamilyIdentity,
+    pub runs: Vec<(GenerationRunId, BranchId)>,
+    pub error: String,
+}
+
 #[derive(Debug)]
 struct ActiveFamily {
     identity: GenerationFamilyIdentity,
     branches: Vec<(GenerationRunId, BranchId)>,
-    cancellation: Arc<dyn BranchCancellation>,
+    cancellation: Option<Arc<dyn BranchCancellation>>,
+    pending_cancellations: BTreeSet<BranchId>,
+    terminal_persistence_error: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +75,7 @@ struct GenerationRegistryState {
 pub struct GenerationRegistry {
     max_active_branches: usize,
     state: Mutex<GenerationRegistryState>,
+    session_idle: Condvar,
 }
 
 impl Default for GenerationRegistry {
@@ -84,6 +95,7 @@ impl GenerationRegistry {
         Ok(Self {
             max_active_branches,
             state: Mutex::new(GenerationRegistryState::default()),
+            session_idle: Condvar::new(),
         })
     }
 
@@ -91,49 +103,112 @@ impl GenerationRegistry {
         &self,
         registration: GenerationFamilyRegistration,
     ) -> Result<(), GenerationRegistryError> {
-        if registration.identity.request_id.trim().is_empty() {
+        self.insert_family(
+            registration.identity,
+            registration.branches,
+            Some(registration.cancellation),
+        )
+    }
+
+    /// Reserves every route before a backend handle exists.
+    ///
+    /// Cancellation delivered after this returns is retained in the registry
+    /// and replayed when `attach_cancellation` installs the concrete handle.
+    /// This closes the otherwise-unavoidable admission-to-registration race.
+    pub fn reserve(
+        &self,
+        identity: GenerationFamilyIdentity,
+        branches: Vec<(GenerationRunId, BranchId)>,
+    ) -> Result<(), GenerationRegistryError> {
+        self.insert_family(identity, branches, None)
+    }
+
+    pub fn attach_cancellation(
+        &self,
+        request_id: &str,
+        cancellation: Arc<dyn BranchCancellation>,
+    ) -> Result<Vec<GenerationRunId>, GenerationRegistryError> {
+        let (cancellation, pending) = {
+            let mut state = self.lock()?;
+            let family = state
+                .families
+                .get_mut(request_id)
+                .ok_or_else(|| GenerationRegistryError::RequestNotActive(request_id.to_owned()))?;
+            if family.cancellation.is_some() {
+                return Err(GenerationRegistryError::CancellationAlreadyAttached(
+                    request_id.to_owned(),
+                ));
+            }
+            family.cancellation = Some(cancellation);
+            let cancellation = family
+                .cancellation
+                .as_ref()
+                .map(Arc::clone)
+                .ok_or(GenerationRegistryError::CorruptRegistry)?;
+            let pending = std::mem::take(&mut family.pending_cancellations);
+            let pending = family
+                .branches
+                .iter()
+                .filter_map(|(run_id, branch_id)| {
+                    pending.contains(branch_id).then_some((*run_id, *branch_id))
+                })
+                .collect::<Vec<_>>();
+            (cancellation, pending)
+        };
+        Ok(pending
+            .into_iter()
+            .filter_map(|(run_id, branch_id)| {
+                cancellation.cancel_branch(branch_id).then_some(run_id)
+            })
+            .collect())
+    }
+
+    fn insert_family(
+        &self,
+        identity: GenerationFamilyIdentity,
+        branches: Vec<(GenerationRunId, BranchId)>,
+        cancellation: Option<Arc<dyn BranchCancellation>>,
+    ) -> Result<(), GenerationRegistryError> {
+        if identity.request_id.trim().is_empty() {
             return Err(GenerationRegistryError::EmptyRequestId);
         }
-        if registration.branches.is_empty() {
+        if branches.is_empty() {
             return Err(GenerationRegistryError::EmptyFamily);
         }
         let mut runs = BTreeSet::new();
-        let mut branches = BTreeSet::new();
-        for (run_id, branch_id) in &registration.branches {
+        let mut unique_branches = BTreeSet::new();
+        for (run_id, branch_id) in &branches {
             if !runs.insert(*run_id) {
                 return Err(GenerationRegistryError::DuplicateRun(*run_id));
             }
-            if !branches.insert(*branch_id) {
+            if !unique_branches.insert(*branch_id) {
                 return Err(GenerationRegistryError::DuplicateBranch(*branch_id));
             }
         }
 
         let mut state = self.lock()?;
-        if state
-            .families
-            .contains_key(&registration.identity.request_id)
-        {
+        if state.families.contains_key(&identity.request_id) {
             return Err(GenerationRegistryError::DuplicateRequest(
-                registration.identity.request_id,
+                identity.request_id,
             ));
         }
         let requested_total = state
             .branch_requests
             .len()
-            .checked_add(registration.branches.len())
+            .checked_add(branches.len())
             .ok_or(GenerationRegistryError::CapacityExceeded {
                 active: state.branch_requests.len(),
-                requested: registration.branches.len(),
+                requested: branches.len(),
                 limit: self.max_active_branches,
             })?;
         if requested_total > self.max_active_branches {
             return Err(GenerationRegistryError::CapacityExceeded {
                 active: state.branch_requests.len(),
-                requested: registration.branches.len(),
+                requested: branches.len(),
                 limit: self.max_active_branches,
             });
         }
-        for (run_id, branch_id) in &registration.branches {
+        for (run_id, branch_id) in &branches {
             if state.run_branches.contains_key(run_id) {
                 return Err(GenerationRegistryError::RunAlreadyActive(*run_id));
             }
@@ -142,17 +217,19 @@ impl GenerationRegistry {
             }
         }
 
-        let request_id = registration.identity.request_id.clone();
-        for (run_id, branch_id) in &registration.branches {
+        let request_id = identity.request_id.clone();
+        for (run_id, branch_id) in &branches {
             state.run_branches.insert(*run_id, *branch_id);
             state.branch_requests.insert(*branch_id, request_id.clone());
         }
         state.families.insert(
             request_id,
             ActiveFamily {
-                identity: registration.identity,
-                branches: registration.branches,
-                cancellation: registration.cancellation,
+                identity,
+                branches,
+                cancellation,
+                pending_cancellations: BTreeSet::new(),
+                terminal_persistence_error: None,
             },
         );
         Ok(())
@@ -176,7 +253,7 @@ impl GenerationRegistry {
         run_id: GenerationRunId,
     ) -> Result<bool, GenerationRegistryError> {
         let (route, cancellation) = {
-            let state = self.lock()?;
+            let mut state = self.lock()?;
             let branch_id = state
                 .run_branches
                 .get(&run_id)
@@ -188,11 +265,15 @@ impl GenerationRegistry {
             }
             let family = state
                 .families
-                .get(&route.identity.request_id)
+                .get_mut(&route.identity.request_id)
                 .ok_or(GenerationRegistryError::CorruptRegistry)?;
-            (route, Arc::clone(&family.cancellation))
+            let cancellation = family.cancellation.as_ref().map(Arc::clone);
+            if cancellation.is_none() {
+                family.pending_cancellations.insert(route.branch_id);
+            }
+            (route, cancellation)
         };
-        Ok(cancellation.cancel_branch(route.branch_id))
+        Ok(cancellation.is_none_or(|cancellation| cancellation.cancel_branch(route.branch_id)))
     }
 
     pub fn complete_family(
@@ -207,11 +288,54 @@ impl GenerationRegistry {
             state.run_branches.remove(run_id);
             state.branch_requests.remove(branch_id);
         }
-        Ok(Some(family.identity))
+        let identity = family.identity;
+        drop(state);
+        self.session_idle.notify_all();
+        Ok(Some(identity))
     }
 
     pub fn active_branch_count(&self) -> Result<usize, GenerationRegistryError> {
         Ok(self.lock()?.branch_requests.len())
+    }
+
+    pub fn mark_terminal_persistence_failure(
+        &self,
+        request_id: &str,
+        error: impl Into<String>,
+    ) -> Result<(), GenerationRegistryError> {
+        let mut state = self.lock()?;
+        let family = state
+            .families
+            .get_mut(request_id)
+            .ok_or_else(|| GenerationRegistryError::RequestNotActive(request_id.to_owned()))?;
+        family.terminal_persistence_error = Some(error.into());
+        drop(state);
+        self.session_idle.notify_all();
+        Ok(())
+    }
+
+    pub fn terminal_persistence_failures(
+        &self,
+        project_id: ProjectId,
+        session_id: CommandId,
+    ) -> Result<Vec<GenerationPersistenceFailure>, GenerationRegistryError> {
+        Ok(self
+            .lock()?
+            .families
+            .values()
+            .filter(|family| {
+                family.identity.project_id == project_id && family.identity.session_id == session_id
+            })
+            .filter_map(|family| {
+                family.terminal_persistence_error.as_ref().map(|error| {
+                    GenerationPersistenceFailure {
+                        identity: family.identity.clone(),
+                        runs: family.branches.clone(),
+                        error: error.clone(),
+                    }
+                })
+            })
+            .collect())
     }
 
     pub fn has_active_session(
@@ -232,28 +356,85 @@ impl GenerationRegistry {
         project_id: ProjectId,
         session_id: CommandId,
     ) -> Result<Vec<GenerationRunId>, GenerationRegistryError> {
-        let cancellations = {
-            let state = self.lock()?;
-            state
-                .families
-                .values()
-                .filter(|family| {
+        let (pending, cancellations) = {
+            let mut state = self.lock()?;
+            let mut pending = Vec::new();
+            let mut cancellations = Vec::new();
+            for family in state.families.values_mut().filter(|family| {
+                family.identity.project_id == project_id && family.identity.session_id == session_id
+            }) {
+                for (run_id, branch_id) in &family.branches {
+                    if let Some(cancellation) = &family.cancellation {
+                        cancellations.push((*run_id, *branch_id, Arc::clone(cancellation)));
+                    } else {
+                        family.pending_cancellations.insert(*branch_id);
+                        pending.push(*run_id);
+                    }
+                }
+            }
+            (pending, cancellations)
+        };
+        Ok(pending
+            .into_iter()
+            .chain(
+                cancellations
+                    .into_iter()
+                    .filter_map(|(run_id, branch_id, cancellation)| {
+                        cancellation.cancel_branch(branch_id).then_some(run_id)
+                    }),
+            )
+            .collect())
+    }
+
+    /// Waits for workers to persist terminal state and release every route for
+    /// one session. The timeout is a hard upper bound; callers may retry the
+    /// same idempotent command without guessing whether close committed.
+    pub fn wait_for_session_idle(
+        &self,
+        project_id: ProjectId,
+        session_id: CommandId,
+        timeout: Duration,
+    ) -> Result<bool, GenerationRegistryError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        let mut state = self.lock()?;
+        loop {
+            let mut active = false;
+            let mut persistence_failed = false;
+            for family in state.families.values().filter(|family| {
+                family.identity.project_id == project_id && family.identity.session_id == session_id
+            }) {
+                active = true;
+                persistence_failed |= family.terminal_persistence_error.is_some();
+            }
+            if !active {
+                return Ok(true);
+            }
+            // The worker has stopped and asked the close path to retry its
+            // durable terminal write. Waiting longer cannot change that
+            // condition, so return control to the repair path immediately.
+            if persistence_failed {
+                return Ok(false);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let (next, wait) = self
+                .session_idle
+                .wait_timeout(state, remaining)
+                .map_err(|_| GenerationRegistryError::Poisoned)?;
+            state = next;
+            if wait.timed_out()
+                && state.families.values().any(|family| {
                     family.identity.project_id == project_id
                         && family.identity.session_id == session_id
                 })
-                .flat_map(|family| {
-                    family.branches.iter().map(|(run_id, branch_id)| {
-                        (*run_id, *branch_id, Arc::clone(&family.cancellation))
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-        Ok(cancellations
-            .into_iter()
-            .filter_map(|(run_id, branch_id, cancellation)| {
-                cancellation.cancel_branch(branch_id).then_some(run_id)
-            })
-            .collect())
+            {
+                return Ok(false);
+            }
+        }
     }
 
     fn lock(
@@ -305,6 +486,10 @@ pub enum GenerationRegistryError {
     DuplicateBranch(BranchId),
     #[error("generation request `{0}` is already active")]
     DuplicateRequest(String),
+    #[error("generation request `{0}` is not active")]
+    RequestNotActive(String),
+    #[error("generation request `{0}` already has cancellation authority")]
+    CancellationAlreadyAttached(String),
     #[error("generation run {0} is already active")]
     RunAlreadyActive(GenerationRunId),
     #[error("generation branch {0} is already active")]
@@ -601,5 +786,128 @@ mod tests {
             GenerationRegistryError::CapacityExceeded { .. }
         ));
         assert_eq!(registry.active_branch_count().expect("active count"), 0);
+    }
+
+    #[test]
+    fn cancellation_before_backend_attachment_is_replayed_exactly_once() {
+        for index in 0..64 {
+            let registry = Arc::new(GenerationRegistry::new(1).expect("registry"));
+            let project_id = ProjectId::new();
+            let session_id = CommandId::new();
+            let run_id = GenerationRunId::new();
+            let branch_id = BranchId::new();
+            let request_id = format!("reserved-{index}");
+            registry
+                .reserve(
+                    GenerationFamilyIdentity {
+                        request_id: request_id.clone(),
+                        project_id,
+                        session_id,
+                        document_id: DocumentId::new(),
+                    },
+                    vec![(run_id, branch_id)],
+                )
+                .expect("reserve family before native startup");
+
+            let cancellation = Arc::new(FakeCancellation::default());
+            let authority: Arc<dyn BranchCancellation> = cancellation.clone();
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let cancel_thread = {
+                let registry = Arc::clone(&registry);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry
+                        .cancel_session(project_id, session_id)
+                        .expect("cancel reserved family")
+                })
+            };
+            let attach_thread = {
+                let registry = Arc::clone(&registry);
+                let barrier = Arc::clone(&barrier);
+                let request_id = request_id.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry
+                        .attach_cancellation(&request_id, authority)
+                        .expect("attach native cancellation authority")
+                })
+            };
+            barrier.wait();
+            let cancelled = cancel_thread.join().expect("cancel thread");
+            let replayed = attach_thread.join().expect("attach thread");
+
+            assert_eq!(cancelled, vec![run_id]);
+            assert!(replayed.is_empty() || replayed == vec![run_id]);
+            assert_eq!(
+                *cancellation.branches.lock().expect("cancelled branches"),
+                vec![branch_id]
+            );
+            registry
+                .complete_family(&request_id)
+                .expect("complete family");
+        }
+    }
+
+    #[test]
+    fn session_idle_wait_is_bounded_and_observes_release() {
+        let registry = GenerationRegistry::new(1).expect("registry");
+        let project_id = ProjectId::new();
+        let session_id = CommandId::new();
+        registry
+            .reserve(
+                GenerationFamilyIdentity {
+                    request_id: "waiting".to_owned(),
+                    project_id,
+                    session_id,
+                    document_id: DocumentId::new(),
+                },
+                vec![(GenerationRunId::new(), BranchId::new())],
+            )
+            .expect("reserve family");
+
+        assert!(
+            !registry
+                .wait_for_session_idle(project_id, session_id, Duration::ZERO)
+                .expect("bounded busy result")
+        );
+        registry
+            .complete_family("waiting")
+            .expect("complete family");
+        assert!(
+            registry
+                .wait_for_session_idle(project_id, session_id, Duration::ZERO)
+                .expect("idle result")
+        );
+    }
+
+    #[test]
+    fn session_idle_wait_wakes_for_terminal_persistence_repair() {
+        let registry = GenerationRegistry::new(1).expect("registry");
+        let project_id = ProjectId::new();
+        let session_id = CommandId::new();
+        let request_id = "persistence-failure";
+        registry
+            .reserve(
+                GenerationFamilyIdentity {
+                    request_id: request_id.to_owned(),
+                    project_id,
+                    session_id,
+                    document_id: DocumentId::new(),
+                },
+                vec![(GenerationRunId::new(), BranchId::new())],
+            )
+            .expect("reserve family");
+        registry
+            .mark_terminal_persistence_failure(request_id, "disk unavailable")
+            .expect("record persistence failure");
+
+        let started = Instant::now();
+        assert!(
+            !registry
+                .wait_for_session_idle(project_id, session_id, Duration::from_secs(1))
+                .expect("wait result")
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 }
