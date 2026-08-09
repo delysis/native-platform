@@ -2950,6 +2950,8 @@ pub enum NativeErrorCode {
     DecodeFailed,
     #[error("cancelled")]
     Cancelled,
+    #[error("queue_full")]
+    QueueFull,
     #[error("worker_stopped")]
     WorkerStopped,
     #[error("cache_incompatible")]

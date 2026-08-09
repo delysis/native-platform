@@ -39,7 +39,7 @@ use llama_native_types::{
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, Metadata};
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
@@ -64,6 +64,7 @@ type NativeResult<T> = Result<T, NativeError>;
 type CancelKey = (String, String);
 type CancelRegistry = Arc<Mutex<HashMap<CancelKey, Arc<AtomicBool>>>>;
 type ReasoningForceRegistry = Arc<Mutex<HashMap<CancelKey, Arc<AtomicBool>>>>;
+type EmbeddingCancelRegistry = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,15 +282,17 @@ pub struct GenerationTicket {
     result: Receiver<NativeResult<GenerationCompletion>>,
     cancellations: CancelRegistry,
     reasoning_forces: ReasoningForceRegistry,
+    owned_cancellations: Vec<(String, Arc<AtomicBool>)>,
+    owned_reasoning_forces: Vec<(String, Arc<AtomicBool>)>,
 }
 
 impl GenerationTicket {
     pub fn cancel_branch(&self, branch_id: &str) -> bool {
-        cancel_in_registry(&self.cancellations, &self.request_id, branch_id)
+        set_owned_flag(&self.owned_cancellations, branch_id)
     }
 
     pub fn cancel_all(&self) -> usize {
-        cancel_request_in_registry(&self.cancellations, &self.request_id)
+        set_all_owned_flags(&self.owned_cancellations)
     }
 
     pub fn wait(self) -> NativeResult<Vec<GenerationOutput>> {
@@ -299,8 +302,7 @@ impl GenerationTicket {
                 format!("native worker stopped before returning a result: {error}"),
             )
         })?;
-        cleanup_request_in_registry(&self.cancellations, &self.request_id);
-        cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
+        self.cleanup_owned_registry_entries();
         result.map(GenerationCompletion::into_outputs)
     }
 
@@ -311,16 +313,14 @@ impl GenerationTicket {
                 format!("native generation did not finish before the timeout: {error}"),
             )
         })?;
-        cleanup_request_in_registry(&self.cancellations, &self.request_id);
-        cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
+        self.cleanup_owned_registry_entries();
         result.map(GenerationCompletion::into_outputs)
     }
 
     pub fn try_wait(&self) -> NativeResult<Option<Vec<GenerationOutput>>> {
         match self.result.try_recv() {
             Ok(result) => {
-                cleanup_request_in_registry(&self.cancellations, &self.request_id);
-                cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
+                self.cleanup_owned_registry_entries();
                 result.map(|completion| Some(completion.into_outputs()))
             }
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
@@ -342,8 +342,7 @@ impl GenerationTicket {
                 format!("native worker stopped before returning a verified result: {error}"),
             )
         })?;
-        cleanup_request_in_registry(&self.cancellations, &self.request_id);
-        cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
+        self.cleanup_owned_registry_entries();
         result?.into_verified()
     }
 
@@ -357,16 +356,14 @@ impl GenerationTicket {
                 format!("native verified generation did not finish before the timeout: {error}"),
             )
         })?;
-        cleanup_request_in_registry(&self.cancellations, &self.request_id);
-        cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
+        self.cleanup_owned_registry_entries();
         result?.into_verified()
     }
 
     pub fn try_wait_verified(&self) -> NativeResult<Option<VerifiedGenerationBatch>> {
         match self.result.try_recv() {
             Ok(result) => {
-                cleanup_request_in_registry(&self.cancellations, &self.request_id);
-                cleanup_request_in_registry(&self.reasoning_forces, &self.request_id);
+                self.cleanup_owned_registry_entries();
                 result?.into_verified().map(Some)
             }
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
@@ -376,6 +373,26 @@ impl GenerationTicket {
             )),
         }
     }
+
+    fn cleanup_owned_registry_entries(&self) {
+        cleanup_owned_request_in_registry(
+            &self.cancellations,
+            &self.request_id,
+            &self.owned_cancellations,
+        );
+        cleanup_owned_request_in_registry(
+            &self.reasoning_forces,
+            &self.request_id,
+            &self.owned_reasoning_forces,
+        );
+    }
+}
+
+impl Drop for GenerationTicket {
+    fn drop(&mut self) {
+        set_all_owned_flags(&self.owned_cancellations);
+        self.cleanup_owned_registry_entries();
+    }
 }
 
 /// One cancellable owner-worker embedding request.
@@ -384,6 +401,7 @@ pub struct EmbeddingTicket {
     pub request_id: String,
     result: Receiver<NativeResult<EmbeddingBatchOutput>>,
     cancellation: Arc<AtomicBool>,
+    cancellations: EmbeddingCancelRegistry,
 }
 
 impl EmbeddingTicket {
@@ -423,6 +441,22 @@ impl EmbeddingTicket {
     }
 }
 
+impl Drop for EmbeddingTicket {
+    fn drop(&mut self) {
+        self.cancellation.store(true, Ordering::Release);
+        cleanup_embedding_in_registry(&self.cancellations, &self.request_id);
+    }
+}
+
+/// Revocable command client for a worker owned by [`NativeModelOwner`].
+///
+/// Worker creation is deliberately unavailable on this cloneable type:
+///
+/// ```compile_fail
+/// use llama_native_engine::NativeModelHandle;
+/// use llama_native_types::NativeModelConfig;
+/// let _ = NativeModelHandle::load(NativeModelConfig::local("model.gguf".into()));
+/// ```
 #[derive(Debug)]
 pub struct NativeModelHandle {
     inner: Arc<NativeModelInner>,
@@ -444,6 +478,7 @@ impl Clone for NativeModelHandle {
 #[derive(Debug)]
 pub struct JoinedNativeModel {
     model_id: String,
+    worker_identity: Arc<WorkerIdentity>,
 }
 
 impl JoinedNativeModel {
@@ -451,56 +486,115 @@ impl JoinedNativeModel {
     pub fn model_id(&self) -> &str {
         &self.model_id
     }
+
+    #[must_use]
+    pub fn belongs_to(&self, handle: &NativeModelHandle) -> bool {
+        Arc::ptr_eq(&self.worker_identity, &handle.inner.worker_identity)
+    }
 }
 
-/// A consuming shutdown could not prove unique ownership of the model worker.
+/// Unique owner authority for one native model worker.
 ///
-/// The attempted handle is retained so an owning host can restore it without
-/// detaching a still-live worker from its residency registry.
+/// Cloneable [`NativeModelHandle`] values are command clients only. They do
+/// not own the worker thread and cannot keep it alive after this owner begins
+/// shutdown. Dropping the owner synchronously cancels work, closes admission,
+/// signals the priority shutdown channel, and joins the worker.
 #[derive(Debug)]
-pub struct NativeModelInUse {
-    handle: NativeModelHandle,
-    additional_handles: NonZeroUsize,
+pub struct NativeModelOwner {
+    inner: Arc<NativeModelInner>,
+    join: Option<JoinHandle<()>>,
 }
 
-impl NativeModelInUse {
-    #[must_use]
-    pub const fn additional_handles(&self) -> NonZeroUsize {
-        self.additional_handles
+impl NativeModelOwner {
+    pub fn load(config: NativeModelConfig) -> NativeResult<Self> {
+        let (inner, join) = NativeModelHandle::load_inner(config)?;
+        Ok(Self {
+            inner,
+            join: Some(join),
+        })
     }
 
     #[must_use]
-    pub fn into_handle(self) -> NativeModelHandle {
-        self.handle
+    pub fn handle(&self) -> NativeModelHandle {
+        NativeModelHandle {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> ResidentModelStatus {
+        self.handle().status()
+    }
+
+    /// Atomically closes command admission, cancels every registered request,
+    /// and signals the worker's priority shutdown lane without waiting for its
+    /// current native call to return.
+    pub fn begin_shutdown(&self) {
+        self.inner.begin_shutdown();
+    }
+
+    pub fn shutdown_joined(mut self) -> NativeResult<JoinedNativeModel> {
+        let model_id = self.status().model_id;
+        let worker_identity = Arc::clone(&self.inner.worker_identity);
+        self.inner.begin_shutdown();
+        self.join_worker()?;
+        Ok(JoinedNativeModel {
+            model_id,
+            worker_identity,
+        })
+    }
+
+    fn join_worker(&mut self) -> NativeResult<()> {
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        join.join().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                "native model owner worker panicked before it could be joined",
+            )
+        })
     }
 }
 
-#[derive(Debug)]
-#[must_use = "shutdown attempts must be matched so a live worker is never mistaken for a joined one"]
-pub enum NativeModelShutdown {
-    Joined(JoinedNativeModel),
-    InUse(NativeModelInUse),
+impl Drop for NativeModelOwner {
+    fn drop(&mut self) {
+        self.inner.begin_shutdown();
+        let _ = self.join_worker();
+    }
 }
 
 #[derive(Debug)]
 struct WorkerBootstrapGuard {
     command_tx: Option<Sender<WorkerCommand>>,
+    shutdown_tx: Option<Sender<()>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl WorkerBootstrapGuard {
-    fn new(command_tx: Sender<WorkerCommand>, join: JoinHandle<()>) -> Self {
+    fn new(
+        command_tx: Sender<WorkerCommand>,
+        shutdown_tx: Sender<()>,
+        join: JoinHandle<()>,
+    ) -> Self {
         Self {
             command_tx: Some(command_tx),
+            shutdown_tx: Some(shutdown_tx),
             join: Some(join),
         }
     }
 
-    fn into_parts(mut self) -> NativeResult<(Sender<WorkerCommand>, JoinHandle<()>)> {
+    fn into_parts(mut self) -> NativeResult<(Sender<WorkerCommand>, Sender<()>, JoinHandle<()>)> {
         let command_tx = self.command_tx.take().ok_or_else(|| {
             NativeError::new(
                 NativeErrorCode::Internal,
                 "native model bootstrap lost its command sender",
+            )
+        })?;
+        let shutdown_tx = self.shutdown_tx.take().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "native model bootstrap lost its shutdown sender",
             )
         })?;
         let join = self.join.take().ok_or_else(|| {
@@ -509,14 +603,15 @@ impl WorkerBootstrapGuard {
                 "native model bootstrap lost its worker join handle",
             )
         })?;
-        Ok((command_tx, join))
+        Ok((command_tx, shutdown_tx, join))
     }
 
     fn shutdown_and_join(&mut self) -> NativeResult<()> {
-        if let Some(command_tx) = &self.command_tx {
-            let _ = command_tx.send(WorkerCommand::Shutdown);
+        if let Some(shutdown_tx) = &self.shutdown_tx {
+            let _ = shutdown_tx.try_send(());
         }
         self.command_tx.take();
+        self.shutdown_tx.take();
         let Some(join) = self.join.take() else {
             return Ok(());
         };
@@ -537,22 +632,60 @@ impl Drop for WorkerBootstrapGuard {
 
 #[derive(Debug)]
 struct NativeModelInner {
+    worker_identity: Arc<WorkerIdentity>,
     command_tx: Sender<WorkerCommand>,
+    shutdown_tx: Sender<()>,
+    closing: AtomicBool,
+    admission: Mutex<()>,
     cancellations: CancelRegistry,
+    embedding_cancellations: EmbeddingCancelRegistry,
     reasoning_forces: ReasoningForceRegistry,
     status: Arc<RwLock<ResidentModelStatus>>,
-    join: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl Drop for NativeModelInner {
-    fn drop(&mut self) {
-        let _ = self.shutdown_and_join();
-    }
-}
+#[derive(Debug)]
+struct WorkerIdentity;
 
 impl NativeModelInner {
+    fn ensure_accepting(&self) -> NativeResult<()> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                "native model worker admission is closed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn send_command(&self, command: WorkerCommand, context: &str) -> NativeResult<()> {
+        let _admission = self.admission.lock().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "native model admission lock is poisoned",
+            )
+        })?;
+        self.ensure_accepting()?;
+        self.command_tx
+            .try_send(command)
+            .map_err(|error| match error {
+                crossbeam_channel::TrySendError::Full(_) => NativeError::new(
+                    NativeErrorCode::QueueFull,
+                    format!("native model command queue is full while {context}"),
+                ),
+                crossbeam_channel::TrySendError::Disconnected(_) => NativeError::new(
+                    NativeErrorCode::WorkerStopped,
+                    format!("native model worker stopped while {context}"),
+                ),
+            })
+    }
+
     fn cancel_active_work(&self) {
         if let Ok(registry) = self.cancellations.lock() {
+            for flag in registry.values() {
+                flag.store(true, Ordering::Release);
+            }
+        }
+        if let Ok(registry) = self.embedding_cancellations.lock() {
             for flag in registry.values() {
                 flag.store(true, Ordering::Release);
             }
@@ -564,26 +697,17 @@ impl NativeModelInner {
         }
     }
 
-    fn shutdown_and_join(&mut self) -> NativeResult<()> {
-        let join = self
-            .join
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let Some(join) = join else {
-            return Ok(());
-        };
+    fn begin_shutdown(&self) {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.closing.store(true, Ordering::Release);
         self.cancel_active_work();
-        // A blocking send is intentional. `try_send` can lose Shutdown when
-        // the bounded queue is full and then deadlock while joining a worker
-        // whose final sender is still alive.
-        let _ = self.command_tx.send(WorkerCommand::Shutdown);
-        join.join().map_err(|_| {
-            NativeError::new(
-                NativeErrorCode::WorkerStopped,
-                "native model owner worker panicked before it could be joined",
-            )
-        })
+        // This independent one-slot channel is the shutdown priority lane. A
+        // full command queue cannot delay or lose the signal; an already-full
+        // shutdown lane means the signal is already pending.
+        let _ = self.shutdown_tx.try_send(());
     }
 }
 
@@ -639,7 +763,6 @@ enum WorkerCommand {
         input: GenerationInput,
         response: Sender<NativeResult<Vec<PreparedPrompt>>>,
     },
-    Shutdown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -649,9 +772,12 @@ enum GenerationBatchAdmission {
 }
 
 impl NativeModelHandle {
-    pub fn load(config: NativeModelConfig) -> NativeResult<Self> {
+    fn load_inner(
+        config: NativeModelConfig,
+    ) -> NativeResult<(Arc<NativeModelInner>, JoinHandle<()>)> {
         validate_config(&config)?;
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
         let (ready_tx, ready_rx) = bounded(1);
         let cancellations = Arc::new(Mutex::new(HashMap::new()));
         let reasoning_forces = Arc::new(Mutex::new(HashMap::new()));
@@ -667,14 +793,16 @@ impl NativeModelHandle {
         let worker_status = Arc::clone(&status);
         let worker = thread::Builder::new()
             .name(format!("llama-model-{}", config.model_id))
-            .spawn(move || run_worker(config, command_rx, ready_tx, worker_status))
+            .spawn(move || {
+                run_worker(config, command_rx, shutdown_rx, ready_tx, worker_status);
+            })
             .map_err(|error| {
                 NativeError::new(
                     NativeErrorCode::Internal,
                     format!("failed to start native model worker: {error}"),
                 )
             })?;
-        let mut bootstrap = WorkerBootstrapGuard::new(command_tx, worker);
+        let mut bootstrap = WorkerBootstrapGuard::new(command_tx, shutdown_tx, worker);
         let readiness = ready_rx.recv_timeout(Duration::from_secs(300));
         match readiness {
             Ok(Ok(())) => {}
@@ -705,16 +833,21 @@ impl NativeModelHandle {
                 return Err(load_error);
             }
         }
-        let (command_tx, worker) = bootstrap.into_parts()?;
-        Ok(Self {
-            inner: Arc::new(NativeModelInner {
+        let (command_tx, shutdown_tx, worker) = bootstrap.into_parts()?;
+        Ok((
+            Arc::new(NativeModelInner {
+                worker_identity: Arc::new(WorkerIdentity),
                 command_tx,
+                shutdown_tx,
+                closing: AtomicBool::new(false),
+                admission: Mutex::new(()),
                 cancellations,
+                embedding_cancellations: Arc::new(Mutex::new(HashMap::new())),
                 reasoning_forces,
                 status,
-                join: Mutex::new(Some(worker)),
             }),
-        })
+            worker,
+        ))
     }
 
     pub fn status(&self) -> ResidentModelStatus {
@@ -742,60 +875,45 @@ impl NativeModelHandle {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    /// Consumes the final handle, shuts down its worker, and joins the owner
-    /// thread before returning linear shutdown evidence.
-    ///
-    /// When another handle still exists, no shutdown is attempted. The
-    /// returned `NativeModelInUse` retains this handle so the owning registry
-    /// can restore it and retry after outstanding leases are dropped.
-    pub fn try_shutdown(self) -> NativeResult<NativeModelShutdown> {
-        let model_id = self.status().model_id;
-        match Arc::try_unwrap(self.inner) {
-            Ok(mut inner) => {
-                inner.shutdown_and_join()?;
-                Ok(NativeModelShutdown::Joined(JoinedNativeModel { model_id }))
-            }
-            Err(inner) => {
-                let additional_handles = Arc::strong_count(&inner).saturating_sub(1);
-                let additional_handles =
-                    NonZeroUsize::new(additional_handles).ok_or_else(|| {
-                        NativeError::new(
-                            NativeErrorCode::Internal,
-                            "native model ownership changed while shutdown was being attempted",
-                        )
-                    })?;
-                Ok(NativeModelShutdown::InUse(NativeModelInUse {
-                    handle: Self { inner },
-                    additional_handles,
-                }))
-            }
-        }
-    }
-
     /// Submit exact token IDs for in-process embedding on this model's owner
     /// worker. No text tokenization or generation-context mutation occurs.
     pub fn embed_batch(&self, request: EmbeddingBatchRequest) -> NativeResult<EmbeddingTicket> {
+        self.inner.ensure_accepting()?;
         validate_embedding_batch_request(&request, &self.status())?;
         let cancellation = Arc::new(AtomicBool::new(false));
         let (result_tx, result_rx) = bounded(1);
         let request_id = request.request_id().to_string();
-        self.inner
-            .command_tx
-            .send(WorkerCommand::EmbedBatch {
+        {
+            let mut registry = self.inner.embedding_cancellations.lock().map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "cancellation registry is poisoned",
+                )
+            })?;
+            if registry.contains_key(&request_id) {
+                return Err(NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    format!("embedding request ID {request_id:?} is already active"),
+                ));
+            }
+            registry.insert(request_id.clone(), Arc::clone(&cancellation));
+        }
+        if let Err(error) = self.inner.send_command(
+            WorkerCommand::EmbedBatch {
                 request,
                 result: result_tx,
                 cancellation: Arc::clone(&cancellation),
-            })
-            .map_err(|error| {
-                NativeError::new(
-                    NativeErrorCode::WorkerStopped,
-                    format!("native model worker is not accepting embeddings: {error}"),
-                )
-            })?;
+            },
+            "submitting embeddings",
+        ) {
+            cleanup_embedding_in_registry(&self.inner.embedding_cancellations, &request_id);
+            return Err(error);
+        }
         Ok(EmbeddingTicket {
             request_id,
             result: result_rx,
             cancellation,
+            cancellations: Arc::clone(&self.inner.embedding_cancellations),
         })
     }
 
@@ -874,6 +992,7 @@ impl NativeModelHandle {
         request: GenerationBatchRequest,
         admission: GenerationBatchAdmission,
     ) -> NativeResult<GenerationTicket> {
+        self.inner.ensure_accepting()?;
         let status = self.status();
         validate_generation_batch_request(&request, &status)?;
         let exact_cell_budget = exact_token_budget_for_submission(&request, &status)?;
@@ -889,6 +1008,21 @@ impl NativeModelHandle {
             let mut reasoning_registry = self.inner.reasoning_forces.lock().map_err(|_| {
                 NativeError::new(NativeErrorCode::Internal, "reasoning registry is poisoned")
             })?;
+            if registry
+                .keys()
+                .any(|(request_id, _)| request_id == &request.request_id)
+                || reasoning_registry
+                    .keys()
+                    .any(|(request_id, _)| request_id == &request.request_id)
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    format!(
+                        "generation request ID {:?} is already active",
+                        request.request_id
+                    ),
+                ));
+            }
             for case in &request.cases {
                 let cancellation = Arc::new(AtomicBool::new(false));
                 let reasoning = Arc::new(AtomicBool::new(false));
@@ -907,21 +1041,33 @@ impl NativeModelHandle {
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
         let (result_tx, result_rx) = bounded(1);
         let request_id = request.request_id.clone();
-        if let Err(error) = self.inner.command_tx.send(WorkerCommand::GenerateBatch {
-            request,
-            exact_cell_budget,
-            admission,
-            event_tx,
-            result_tx,
-            cancellations,
-            reasoning_forces,
-        }) {
+        let owned_cancellations = request
+            .cases
+            .iter()
+            .zip(&cancellations)
+            .map(|(case, flag)| (case.case_id.clone(), Arc::clone(flag)))
+            .collect();
+        let owned_reasoning_forces = request
+            .cases
+            .iter()
+            .zip(&reasoning_forces)
+            .map(|(case, flag)| (case.case_id.clone(), Arc::clone(flag)))
+            .collect();
+        if let Err(error) = self.inner.send_command(
+            WorkerCommand::GenerateBatch {
+                request,
+                exact_cell_budget,
+                admission,
+                event_tx,
+                result_tx,
+                cancellations,
+                reasoning_forces,
+            },
+            "submitting an exact generation batch",
+        ) {
             cleanup_request_in_registry(&self.inner.cancellations, &request_id);
             cleanup_request_in_registry(&self.inner.reasoning_forces, &request_id);
-            return Err(NativeError::new(
-                NativeErrorCode::WorkerStopped,
-                format!("native model worker is not accepting batch requests: {error}"),
-            ));
+            return Err(error);
         }
         Ok(GenerationTicket {
             request_id,
@@ -929,10 +1075,13 @@ impl NativeModelHandle {
             result: result_rx,
             cancellations: Arc::clone(&self.inner.cancellations),
             reasoning_forces: Arc::clone(&self.inner.reasoning_forces),
+            owned_cancellations,
+            owned_reasoning_forces,
         })
     }
 
     fn generate_multimodal(&self, request: GenerationRequest) -> NativeResult<GenerationTicket> {
+        self.inner.ensure_accepting()?;
         validate_generation_request(&request, &self.status())?;
         let cancellation = Arc::new(AtomicBool::new(false));
         let reasoning_force = Arc::new(AtomicBool::new(false));
@@ -943,43 +1092,46 @@ impl NativeModelHandle {
                     "cancellation registry is poisoned",
                 )
             })?;
-            registry.insert(
-                (request.request_id.clone(), "assistant".to_string()),
-                Arc::clone(&cancellation),
-            );
-        }
-        {
-            let mut registry = self.inner.reasoning_forces.lock().map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "reasoning force registry is poisoned",
-                )
+            let mut reasoning_registry = self.inner.reasoning_forces.lock().map_err(|_| {
+                NativeError::new(NativeErrorCode::Internal, "reasoning registry is poisoned")
             })?;
-            registry.insert(
-                (request.request_id.clone(), "assistant".to_string()),
-                Arc::clone(&reasoning_force),
-            );
+            let key = (request.request_id.clone(), "assistant".to_string());
+            if registry
+                .keys()
+                .any(|(request_id, _)| request_id == &request.request_id)
+                || reasoning_registry
+                    .keys()
+                    .any(|(request_id, _)| request_id == &request.request_id)
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    format!(
+                        "generation request ID {:?} is already active",
+                        request.request_id
+                    ),
+                ));
+            }
+            registry.insert(key.clone(), Arc::clone(&cancellation));
+            reasoning_registry.insert(key, Arc::clone(&reasoning_force));
         }
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
         let (result_tx, result_rx) = bounded(1);
         let request_id = request.request_id.clone();
-        if let Err(error) = self
-            .inner
-            .command_tx
-            .send(WorkerCommand::GenerateMultimodal {
+        let owned_cancellations = vec![("assistant".to_owned(), Arc::clone(&cancellation))];
+        let owned_reasoning_forces = vec![("assistant".to_owned(), Arc::clone(&reasoning_force))];
+        if let Err(error) = self.inner.send_command(
+            WorkerCommand::GenerateMultimodal {
                 request,
                 event_tx,
                 result_tx,
                 cancellation,
                 reasoning_force,
-            })
-        {
+            },
+            "submitting multimodal generation",
+        ) {
             cleanup_request_in_registry(&self.inner.cancellations, &request_id);
             cleanup_request_in_registry(&self.inner.reasoning_forces, &request_id);
-            return Err(NativeError::new(
-                NativeErrorCode::WorkerStopped,
-                format!("native model worker is not accepting requests: {error}"),
-            ));
+            return Err(error);
         }
         Ok(GenerationTicket {
             request_id,
@@ -987,6 +1139,8 @@ impl NativeModelHandle {
             result: result_rx,
             cancellations: Arc::clone(&self.inner.cancellations),
             reasoning_forces: Arc::clone(&self.inner.reasoning_forces),
+            owned_cancellations,
+            owned_reasoning_forces,
         })
     }
 
@@ -994,6 +1148,7 @@ impl NativeModelHandle {
         &self,
         request: SharedPrefixBatchRequest,
     ) -> NativeResult<GenerationTicket> {
+        self.inner.ensure_accepting()?;
         validate_batch_request(&request, &self.status())?;
         let mut flags = Vec::with_capacity(request.branches.len());
         let mut reasoning_flags = Vec::with_capacity(request.branches.len());
@@ -1004,47 +1159,67 @@ impl NativeModelHandle {
                     "cancellation registry is poisoned",
                 )
             })?;
+            let mut reasoning_registry = self.inner.reasoning_forces.lock().map_err(|_| {
+                NativeError::new(NativeErrorCode::Internal, "reasoning registry is poisoned")
+            })?;
+            if registry
+                .keys()
+                .any(|(request_id, _)| request_id == &request.request_id)
+                || reasoning_registry
+                    .keys()
+                    .any(|(request_id, _)| request_id == &request.request_id)
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    format!(
+                        "generation request ID {:?} is already active",
+                        request.request_id
+                    ),
+                ));
+            }
             for branch in &request.branches {
                 let flag = Arc::new(AtomicBool::new(false));
+                let reasoning = Arc::new(AtomicBool::new(false));
                 registry.insert(
                     (request.request_id.clone(), branch.branch_id.clone()),
                     Arc::clone(&flag),
+                );
+                reasoning_registry.insert(
+                    (request.request_id.clone(), branch.branch_id.clone()),
+                    Arc::clone(&reasoning),
                 );
                 flags.push(flag);
-            }
-        }
-        {
-            let mut registry = self.inner.reasoning_forces.lock().map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "reasoning force registry is poisoned",
-                )
-            })?;
-            for branch in &request.branches {
-                let flag = Arc::new(AtomicBool::new(false));
-                registry.insert(
-                    (request.request_id.clone(), branch.branch_id.clone()),
-                    Arc::clone(&flag),
-                );
-                reasoning_flags.push(flag);
+                reasoning_flags.push(reasoning);
             }
         }
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
         let (result_tx, result_rx) = bounded(1);
         let request_id = request.request_id.clone();
-        if let Err(error) = self.inner.command_tx.send(WorkerCommand::Generate {
-            request,
-            event_tx,
-            result_tx,
-            cancellations: flags,
-            reasoning_forces: reasoning_flags,
-        }) {
-            cancel_request_in_registry(&self.inner.cancellations, &request_id);
+        let owned_cancellations = request
+            .branches
+            .iter()
+            .zip(&flags)
+            .map(|(branch, flag)| (branch.branch_id.clone(), Arc::clone(flag)))
+            .collect();
+        let owned_reasoning_forces = request
+            .branches
+            .iter()
+            .zip(&reasoning_flags)
+            .map(|(branch, flag)| (branch.branch_id.clone(), Arc::clone(flag)))
+            .collect();
+        if let Err(error) = self.inner.send_command(
+            WorkerCommand::Generate {
+                request,
+                event_tx,
+                result_tx,
+                cancellations: flags,
+                reasoning_forces: reasoning_flags,
+            },
+            "submitting shared-prefix generation",
+        ) {
+            cleanup_request_in_registry(&self.inner.cancellations, &request_id);
             cleanup_request_in_registry(&self.inner.reasoning_forces, &request_id);
-            return Err(NativeError::new(
-                NativeErrorCode::WorkerStopped,
-                format!("native model worker is not accepting requests: {error}"),
-            ));
+            return Err(error);
         }
         Ok(GenerationTicket {
             request_id,
@@ -1052,6 +1227,8 @@ impl NativeModelHandle {
             result: result_rx,
             cancellations: Arc::clone(&self.inner.cancellations),
             reasoning_forces: Arc::clone(&self.inner.reasoning_forces),
+            owned_cancellations,
+            owned_reasoning_forces,
         })
     }
 
@@ -1078,19 +1255,15 @@ impl NativeModelHandle {
     }
 
     pub fn snapshot_sequence(&self, sequence_id: i32) -> NativeResult<SequenceStateBlob> {
+        self.inner.ensure_accepting()?;
         let (response_tx, response_rx) = bounded(1);
-        self.inner
-            .command_tx
-            .send(WorkerCommand::Snapshot {
+        self.inner.send_command(
+            WorkerCommand::Snapshot {
                 sequence_id,
                 response: response_tx,
-            })
-            .map_err(|error| {
-                NativeError::new(
-                    NativeErrorCode::WorkerStopped,
-                    format!("native model worker is unavailable: {error}"),
-                )
-            })?;
+            },
+            "submitting a sequence snapshot",
+        )?;
         response_rx.recv().map_err(|error| {
             NativeError::new(
                 NativeErrorCode::WorkerStopped,
@@ -1104,20 +1277,16 @@ impl NativeModelHandle {
         state: SequenceStateBlob,
         destination_sequence_id: i32,
     ) -> NativeResult<()> {
+        self.inner.ensure_accepting()?;
         let (response_tx, response_rx) = bounded(1);
-        self.inner
-            .command_tx
-            .send(WorkerCommand::Restore {
+        self.inner.send_command(
+            WorkerCommand::Restore {
                 state,
                 destination_sequence_id,
                 response: response_tx,
-            })
-            .map_err(|error| {
-                NativeError::new(
-                    NativeErrorCode::WorkerStopped,
-                    format!("native model worker is unavailable: {error}"),
-                )
-            })?;
+            },
+            "submitting a sequence restore",
+        )?;
         response_rx.recv().map_err(|error| {
             NativeError::new(
                 NativeErrorCode::WorkerStopped,
@@ -1130,6 +1299,7 @@ impl NativeModelHandle {
         &self,
         request: SharedPrefixBatchRequest,
     ) -> NativeResult<SequenceStateBlob> {
+        self.inner.ensure_accepting()?;
         validate_batch_request(&request, &self.status())?;
         if request.branches.len() < 2 {
             return Err(NativeError::new(
@@ -1138,18 +1308,13 @@ impl NativeModelHandle {
             ));
         }
         let (response_tx, response_rx) = bounded(1);
-        self.inner
-            .command_tx
-            .send(WorkerCommand::PrefillPrefix {
+        self.inner.send_command(
+            WorkerCommand::PrefillPrefix {
                 request,
                 response: response_tx,
-            })
-            .map_err(|error| {
-                NativeError::new(
-                    NativeErrorCode::WorkerStopped,
-                    format!("native model worker is unavailable: {error}"),
-                )
-            })?;
+            },
+            "submitting prefix prefill",
+        )?;
         response_rx.recv().map_err(|error| {
             NativeError::new(
                 NativeErrorCode::WorkerStopped,
@@ -1167,20 +1332,16 @@ impl NativeModelHandle {
         messages: Vec<ChatMessage>,
         chat_template: ChatTemplateChoice,
     ) -> NativeResult<TokenizedPrompt> {
+        self.inner.ensure_accepting()?;
         let (response_tx, response_rx) = bounded(1);
-        self.inner
-            .command_tx
-            .send(WorkerCommand::Tokenize {
+        self.inner.send_command(
+            WorkerCommand::Tokenize {
                 messages,
                 chat_template,
                 response: response_tx,
-            })
-            .map_err(|error| {
-                NativeError::new(
-                    NativeErrorCode::WorkerStopped,
-                    format!("native model worker is not accepting tokenization: {error}"),
-                )
-            })?;
+            },
+            "submitting tokenization",
+        )?;
         response_rx.recv().map_err(|error| {
             NativeError::new(
                 NativeErrorCode::WorkerStopped,
@@ -1190,19 +1351,15 @@ impl NativeModelHandle {
     }
 
     pub fn prepare_input(&self, input: GenerationInput) -> NativeResult<Vec<PreparedPrompt>> {
+        self.inner.ensure_accepting()?;
         let (response_tx, response_rx) = bounded(1);
-        self.inner
-            .command_tx
-            .send(WorkerCommand::PrepareInput {
+        self.inner.send_command(
+            WorkerCommand::PrepareInput {
                 input,
                 response: response_tx,
-            })
-            .map_err(|error| {
-                NativeError::new(
-                    NativeErrorCode::WorkerStopped,
-                    format!("native model worker is not accepting prompt preparation: {error}"),
-                )
-            })?;
+            },
+            "submitting prompt preparation",
+        )?;
         response_rx.recv().map_err(|error| {
             NativeError::new(
                 NativeErrorCode::WorkerStopped,
@@ -1598,6 +1755,7 @@ fn artifact_changed_error(label: &str, path: &std::path::Path, detail: &str) -> 
 fn run_worker(
     config: NativeModelConfig,
     command_rx: Receiver<WorkerCommand>,
+    shutdown_rx: Receiver<()>,
     ready_tx: Sender<NativeResult<()>>,
     status: Arc<RwLock<ResidentModelStatus>>,
 ) {
@@ -1754,7 +1912,17 @@ fn run_worker(
     let _ = ready_tx.send(Ok(()));
     let mut sequence_token_counts = HashMap::<i32, usize>::new();
     let mut sequence_token_ids = HashMap::<i32, Vec<i32>>::new();
-    while let Ok(command) = command_rx.recv() {
+    loop {
+        let command = crossbeam_channel::select_biased! {
+            recv(shutdown_rx) -> _ => {
+                reject_queued_commands(&command_rx);
+                break;
+            },
+            recv(command_rx) -> command => match command {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
         match command {
             WorkerCommand::EmbedBatch {
                 request,
@@ -1988,10 +2156,87 @@ fn run_worker(
             WorkerCommand::PrepareInput { input, response } => {
                 let _ = response.send(prepare_input(&model, input));
             }
-            WorkerCommand::Shutdown => break,
         }
     }
     set_status_state(&status, ModelRuntimeState::Stopped, 0);
+}
+
+fn reject_queued_commands(command_rx: &Receiver<WorkerCommand>) {
+    while let Ok(command) = command_rx.try_recv() {
+        reject_queued_command(command);
+    }
+}
+
+fn reject_queued_command(command: WorkerCommand) {
+    let cancelled = || {
+        NativeError::new(
+            NativeErrorCode::Cancelled,
+            "native model shutdown cancelled an admitted queued command",
+        )
+    };
+    match command {
+        WorkerCommand::EmbedBatch {
+            result,
+            cancellation,
+            ..
+        } => {
+            cancellation.store(true, Ordering::Release);
+            let _ = result.send(Err(cancelled()));
+        }
+        WorkerCommand::GenerateBatch {
+            request,
+            event_tx,
+            result_tx,
+            cancellations,
+            reasoning_forces: _,
+            ..
+        } => {
+            for flag in cancellations {
+                flag.store(true, Ordering::Release);
+            }
+            emit_cancelled_case_events(&event_tx, &request);
+            let _ = result_tx.send(Err(cancelled()));
+        }
+        WorkerCommand::Generate {
+            request,
+            event_tx,
+            result_tx,
+            cancellations,
+            reasoning_forces: _,
+        } => {
+            for flag in cancellations {
+                flag.store(true, Ordering::Release);
+            }
+            emit_cancelled_branch_events(&event_tx, &request);
+            let _ = result_tx.send(Err(cancelled()));
+        }
+        WorkerCommand::GenerateMultimodal {
+            request,
+            event_tx,
+            result_tx,
+            cancellation,
+            reasoning_force: _,
+        } => {
+            cancellation.store(true, Ordering::Release);
+            emit_generation_state(&event_tx, &request, u64::MAX, GenerationState::Cancelled);
+            let _ = result_tx.send(Err(cancelled()));
+        }
+        WorkerCommand::Snapshot { response, .. } => {
+            let _ = response.send(Err(cancelled()));
+        }
+        WorkerCommand::Restore { response, .. } => {
+            let _ = response.send(Err(cancelled()));
+        }
+        WorkerCommand::PrefillPrefix { response, .. } => {
+            let _ = response.send(Err(cancelled()));
+        }
+        WorkerCommand::Tokenize { response, .. } => {
+            let _ = response.send(Err(cancelled()));
+        }
+        WorkerCommand::PrepareInput { response, .. } => {
+            let _ = response.send(Err(cancelled()));
+        }
+    }
 }
 
 fn generation_context_params(
@@ -4775,6 +5020,27 @@ fn emit_failed_case_events(event_tx: &Sender<GenerationEvent>, request: &Generat
     }
 }
 
+fn emit_cancelled_case_events(
+    event_tx: &Sender<GenerationEvent>,
+    request: &GenerationBatchRequest,
+) {
+    for (index, case) in request.cases.iter().enumerate() {
+        try_emit_terminal(
+            event_tx,
+            GenerationEvent {
+                request_id: request.request_id.clone(),
+                branch_id: case.case_id.clone(),
+                sequence_id: index as i32,
+                input_index: index,
+                event_index: u64::MAX,
+                event: GenerationEventKind::State {
+                    state: GenerationState::Cancelled,
+                },
+            },
+        );
+    }
+}
+
 fn emit_failed_branch_events(
     event_tx: &Sender<GenerationEvent>,
     request: &SharedPrefixBatchRequest,
@@ -4790,6 +5056,27 @@ fn emit_failed_branch_events(
                 event_index: u64::MAX,
                 event: GenerationEventKind::State {
                     state: GenerationState::Failed,
+                },
+            },
+        );
+    }
+}
+
+fn emit_cancelled_branch_events(
+    event_tx: &Sender<GenerationEvent>,
+    request: &SharedPrefixBatchRequest,
+) {
+    for (index, branch) in request.branches.iter().enumerate() {
+        try_emit_terminal(
+            event_tx,
+            GenerationEvent {
+                request_id: request.request_id.clone(),
+                branch_id: branch.branch_id.clone(),
+                sequence_id: index as i32,
+                input_index: index,
+                event_index: u64::MAX,
+                event: GenerationEventKind::State {
+                    state: GenerationState::Cancelled,
                 },
             },
         );
@@ -4872,9 +5159,50 @@ fn set_request_flags_in_registry(registry: &ReasoningForceRegistry, request_id: 
     cancel_request_in_registry(registry, request_id)
 }
 
+fn set_owned_flag(flags: &[(String, Arc<AtomicBool>)], branch_id: &str) -> bool {
+    flags
+        .iter()
+        .find(|(candidate, _)| candidate == branch_id)
+        .map(|(_, flag)| {
+            flag.store(true, Ordering::Release);
+            true
+        })
+        .unwrap_or(false)
+}
+
+fn set_all_owned_flags(flags: &[(String, Arc<AtomicBool>)]) -> usize {
+    for (_, flag) in flags {
+        flag.store(true, Ordering::Release);
+    }
+    flags.len()
+}
+
+fn cleanup_owned_request_in_registry(
+    registry: &CancelRegistry,
+    request_id: &str,
+    owned_flags: &[(String, Arc<AtomicBool>)],
+) {
+    if let Ok(mut entries) = registry.lock() {
+        entries.retain(|(candidate_request, candidate_branch), registered| {
+            if candidate_request != request_id {
+                return true;
+            }
+            !owned_flags.iter().any(|(owned_branch, owned)| {
+                owned_branch == candidate_branch && Arc::ptr_eq(owned, registered)
+            })
+        });
+    }
+}
+
 fn cleanup_request_in_registry(registry: &CancelRegistry, request_id: &str) {
     if let Ok(mut entries) = registry.lock() {
         entries.retain(|(candidate, _), _| candidate != request_id);
+    }
+}
+
+fn cleanup_embedding_in_registry(registry: &EmbeddingCancelRegistry, request_id: &str) {
+    if let Ok(mut entries) = registry.lock() {
+        entries.remove(request_id);
     }
 }
 
@@ -4900,59 +5228,118 @@ mod tests {
     static TEST_ARTIFACT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
     static REAL_MODEL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn test_worker_handle(model_id: &str, stopped: Arc<AtomicBool>) -> NativeModelHandle {
+    fn test_worker_owner(
+        model_id: &str,
+        stopped: Arc<AtomicBool>,
+    ) -> (NativeModelOwner, NativeModelHandle) {
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
         let join = std::thread::spawn(move || {
-            while let Ok(command) = command_rx.recv() {
-                if matches!(command, WorkerCommand::Shutdown) {
-                    break;
-                }
+            crossbeam_channel::select_biased! {
+                recv(shutdown_rx) -> _ => {},
+                recv(command_rx) -> _ => {},
             }
             stopped.store(true, Ordering::Release);
         });
-        NativeModelHandle {
-            inner: Arc::new(NativeModelInner {
-                command_tx,
-                cancellations: Arc::new(Mutex::new(HashMap::new())),
-                reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
-                status: Arc::new(RwLock::new(ResidentModelStatus {
-                    model_id: model_id.to_string(),
-                    model_path: std::path::PathBuf::new(),
-                    state: ModelRuntimeState::Ready,
-                    fingerprint: None,
-                    descriptor: None,
-                    active_sequences: 0,
-                    max_sequences: 1,
-                })),
-                join: Mutex::new(Some(join)),
-            }),
-        }
+        let inner = Arc::new(NativeModelInner {
+            worker_identity: Arc::new(WorkerIdentity),
+            command_tx,
+            shutdown_tx,
+            closing: AtomicBool::new(false),
+            admission: Mutex::new(()),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
+            embedding_cancellations: Arc::new(Mutex::new(HashMap::new())),
+            reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
+            status: Arc::new(RwLock::new(ResidentModelStatus {
+                model_id: model_id.to_string(),
+                model_path: std::path::PathBuf::new(),
+                state: ModelRuntimeState::Ready,
+                fingerprint: None,
+                descriptor: None,
+                active_sequences: 0,
+                max_sequences: 1,
+            })),
+        });
+        let handle = NativeModelHandle {
+            inner: Arc::clone(&inner),
+        };
+        (
+            NativeModelOwner {
+                inner,
+                join: Some(join),
+            },
+            handle,
+        )
     }
 
     #[test]
-    fn joined_shutdown_requires_the_final_handle_and_observes_worker_return() {
+    fn unique_owner_revokes_live_clients_and_joins_without_arc_inference() {
         let stopped = Arc::new(AtomicBool::new(false));
-        let handle = test_worker_handle("shutdown-test", Arc::clone(&stopped));
-        let outstanding = handle.clone();
+        let (owner, client) = test_worker_owner("owned-shutdown-test", Arc::clone(&stopped));
 
-        let blocked = match handle.try_shutdown().expect("typed shutdown attempt") {
-            NativeModelShutdown::InUse(blocked) => blocked,
-            NativeModelShutdown::Joined(_) => panic!("a live clone must block shutdown authority"),
-        };
-        assert_eq!(blocked.additional_handles().get(), 1);
-        assert!(!stopped.load(Ordering::Acquire));
-
-        drop(outstanding);
-        let joined = match blocked
-            .into_handle()
-            .try_shutdown()
-            .expect("final handle joins")
-        {
-            NativeModelShutdown::Joined(joined) => joined,
-            NativeModelShutdown::InUse(_) => panic!("no additional handle remains"),
-        };
-        assert_eq!(joined.model_id(), "shutdown-test");
+        let joined = owner
+            .shutdown_joined()
+            .expect("unique owner joins despite live command client");
+        assert!(joined.belongs_to(&client));
         assert!(stopped.load(Ordering::Acquire));
+        assert_eq!(
+            client
+                .snapshot_sequence(0)
+                .expect_err("live client is revoked after owner shutdown")
+                .code,
+            NativeErrorCode::WorkerStopped
+        );
+    }
+
+    #[test]
+    fn queued_generation_rejection_emits_one_cancelled_terminal_per_case() {
+        let (request, _, _, _, _, _) = seal_fixture();
+        let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
+        let (result_tx, result_rx) = bounded(1);
+        let cancellations = request
+            .cases
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect::<Vec<_>>();
+        reject_queued_command(WorkerCommand::GenerateBatch {
+            request: request.clone(),
+            exact_cell_budget: None,
+            admission: GenerationBatchAdmission::Compatibility,
+            event_tx,
+            result_tx,
+            cancellations: cancellations.clone(),
+            reasoning_forces: request
+                .cases
+                .iter()
+                .map(|_| Arc::new(AtomicBool::new(false)))
+                .collect(),
+        });
+
+        assert!(
+            cancellations
+                .iter()
+                .all(|flag| flag.load(Ordering::Acquire))
+        );
+        assert_eq!(
+            result_rx
+                .recv()
+                .expect("queued result is resolved")
+                .expect_err("queued generation is cancelled")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        let terminals = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(terminals.len(), request.cases.len());
+        for (index, event) in terminals.iter().enumerate() {
+            assert_eq!(event.input_index, index);
+            assert_eq!(event.branch_id, request.cases[index].case_id);
+            assert!(matches!(
+                event.event,
+                GenerationEventKind::State {
+                    state: GenerationState::Cancelled
+                }
+            ));
+        }
     }
 
     #[test]
@@ -4960,46 +5347,52 @@ mod tests {
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = Arc::clone(&stopped);
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
         let join = std::thread::spawn(move || {
-            while let Ok(command) = command_rx.recv() {
-                if matches!(command, WorkerCommand::Shutdown) {
-                    break;
-                }
+            crossbeam_channel::select_biased! {
+                recv(shutdown_rx) -> _ => {},
+                recv(command_rx) -> _ => {},
             }
             worker_stopped.store(true, Ordering::Release);
         });
 
-        drop(WorkerBootstrapGuard::new(command_tx, join));
+        drop(WorkerBootstrapGuard::new(command_tx, shutdown_tx, join));
         assert!(stopped.load(Ordering::Acquire));
     }
 
     #[test]
     fn worker_panic_cannot_mint_joined_shutdown_authority() {
-        let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let (command_tx, _command_rx) = bounded(COMMAND_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
         let join = std::thread::spawn(move || {
-            let _ = command_rx.recv();
+            let _ = shutdown_rx.recv();
             panic!("intentional owner-worker panic");
         });
-        let handle = NativeModelHandle {
-            inner: Arc::new(NativeModelInner {
-                command_tx,
-                cancellations: Arc::new(Mutex::new(HashMap::new())),
-                reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
-                status: Arc::new(RwLock::new(ResidentModelStatus {
-                    model_id: "panicking-worker".to_string(),
-                    model_path: std::path::PathBuf::new(),
-                    state: ModelRuntimeState::Ready,
-                    fingerprint: None,
-                    descriptor: None,
-                    active_sequences: 0,
-                    max_sequences: 1,
-                })),
-                join: Mutex::new(Some(join)),
-            }),
+        let inner = Arc::new(NativeModelInner {
+            worker_identity: Arc::new(WorkerIdentity),
+            command_tx,
+            shutdown_tx,
+            closing: AtomicBool::new(false),
+            admission: Mutex::new(()),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
+            embedding_cancellations: Arc::new(Mutex::new(HashMap::new())),
+            reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
+            status: Arc::new(RwLock::new(ResidentModelStatus {
+                model_id: "panicking-worker".to_string(),
+                model_path: std::path::PathBuf::new(),
+                state: ModelRuntimeState::Ready,
+                fingerprint: None,
+                descriptor: None,
+                active_sequences: 0,
+                max_sequences: 1,
+            })),
+        });
+        let owner = NativeModelOwner {
+            inner,
+            join: Some(join),
         };
-
-        let error = handle
-            .try_shutdown()
+        let error = owner
+            .shutdown_joined()
             .expect_err("a panicked worker must not yield joined evidence");
         assert_eq!(error.code, NativeErrorCode::WorkerStopped);
     }
@@ -5238,7 +5631,77 @@ mod tests {
             result: result_rx,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
+            owned_cancellations: Vec::new(),
+            owned_reasoning_forces: Vec::new(),
         }
+    }
+
+    #[test]
+    fn completed_ticket_drop_cannot_cancel_a_reused_request_identity() {
+        let request_id = "reused-request".to_owned();
+        let branch_id = "branch".to_owned();
+        let cancellations = Arc::new(Mutex::new(HashMap::new()));
+        let reasoning_forces = Arc::new(Mutex::new(HashMap::new()));
+        let old_cancel = Arc::new(AtomicBool::new(false));
+        let old_reasoning = Arc::new(AtomicBool::new(false));
+        cancellations.lock().expect("cancel lock").insert(
+            (request_id.clone(), branch_id.clone()),
+            Arc::clone(&old_cancel),
+        );
+        reasoning_forces.lock().expect("reasoning lock").insert(
+            (request_id.clone(), branch_id.clone()),
+            Arc::clone(&old_reasoning),
+        );
+        let (result_tx, result_rx) = bounded(1);
+        result_tx
+            .send(Ok(GenerationCompletion::unverified(Vec::new())))
+            .expect("result receiver remains live");
+        let (_event_tx, event_rx) = bounded(EVENT_CAPACITY);
+        let old_ticket = GenerationTicket {
+            request_id: request_id.clone(),
+            events: event_rx,
+            result: result_rx,
+            cancellations: Arc::clone(&cancellations),
+            reasoning_forces: Arc::clone(&reasoning_forces),
+            owned_cancellations: vec![(branch_id.clone(), old_cancel)],
+            owned_reasoning_forces: vec![(branch_id.clone(), old_reasoning)],
+        };
+
+        assert_eq!(
+            old_ticket.try_wait().expect("completed result"),
+            Some(Vec::new())
+        );
+
+        let new_cancel = Arc::new(AtomicBool::new(false));
+        let new_reasoning = Arc::new(AtomicBool::new(false));
+        cancellations.lock().expect("cancel lock").insert(
+            (request_id.clone(), branch_id.clone()),
+            Arc::clone(&new_cancel),
+        );
+        reasoning_forces.lock().expect("reasoning lock").insert(
+            (request_id.clone(), branch_id.clone()),
+            Arc::clone(&new_reasoning),
+        );
+        drop(old_ticket);
+
+        assert!(!new_cancel.load(Ordering::Acquire));
+        assert!(!new_reasoning.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(
+            cancellations
+                .lock()
+                .expect("cancel lock")
+                .get(&(request_id.clone(), branch_id.clone()))
+                .expect("new cancellation remains"),
+            &new_cancel
+        ));
+        assert!(Arc::ptr_eq(
+            reasoning_forces
+                .lock()
+                .expect("reasoning lock")
+                .get(&(request_id, branch_id))
+                .expect("new reasoning flag remains"),
+            &new_reasoning
+        ));
     }
 
     #[test]
@@ -6192,6 +6655,7 @@ mod tests {
             request_id: "embedding-request".to_string(),
             result: result_rx,
             cancellation: Arc::clone(&cancellation),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
         };
         ticket.cancel();
         assert!(cancellation.load(Ordering::Acquire));
@@ -6321,7 +6785,7 @@ mod tests {
 
     #[test]
     fn missing_model_is_typed_before_binding_initialization() {
-        let error = NativeModelHandle::load(NativeModelConfig::local(PathBuf::from(
+        let error = NativeModelOwner::load(NativeModelConfig::local(PathBuf::from(
             "/missing/model.gguf",
         )))
         .expect_err("missing models must fail");
@@ -6781,7 +7245,8 @@ mod tests {
         let mut config = NativeModelConfig::local(PathBuf::from(model_path));
         // CI and sandboxed smoke tests cannot assume access to a Metal command queue.
         config.device = NativeDevice::Cpu;
-        let handle = NativeModelHandle::load(config)?;
+        let owner = NativeModelOwner::load(config)?;
+        let handle = owner.handle();
         let model_id = handle.status().model_id;
         let ticket = handle.generate(GenerationRequest {
             request_id: "native-real-smoke".to_string(),
@@ -6820,7 +7285,8 @@ mod tests {
         let mut config = NativeModelConfig::local(PathBuf::from(model_path));
         config.device = NativeDevice::Cpu;
         config.max_sequences = 2;
-        let handle = NativeModelHandle::load(config)?;
+        let owner = NativeModelOwner::load(config)?;
+        let handle = owner.handle();
         let status = handle.status();
         let descriptor = status
             .descriptor
@@ -7217,7 +7683,8 @@ mod tests {
         config.context_tokens = 512;
         config.batch_tokens = 64;
         config.max_sequences = 2;
-        let handle = NativeModelHandle::load(config)?;
+        let owner = NativeModelOwner::load(config)?;
+        let handle = owner.handle();
         let status = handle.status();
         let fingerprint = status
             .fingerprint
@@ -7319,7 +7786,8 @@ mod tests {
         config.context_tokens = 512;
         config.batch_tokens = 64;
         config.max_sequences = 1;
-        let handle = NativeModelHandle::load(config)?;
+        let owner = NativeModelOwner::load(config)?;
+        let handle = owner.handle();
         let status_before = handle.status();
         let resident_fingerprint = status_before
             .fingerprint

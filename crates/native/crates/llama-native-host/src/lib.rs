@@ -8,7 +8,7 @@
 
 use llama_native_cache::{CacheFingerprint, MemoryPrefixCache, PrefixCacheValue};
 use llama_native_engine::{
-    GenerationTicket, JoinedNativeModel, NativeModelHandle, NativeModelShutdown,
+    GenerationTicket, JoinedNativeModel, NativeModelHandle, NativeModelOwner,
 };
 use llama_native_types::{
     GenerationBatchRequest, GenerationRequest, ModelFingerprint, NativeDevice, NativeError,
@@ -16,7 +16,6 @@ use llama_native_types::{
     SharedPrefixBatchRequest,
 };
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -106,6 +105,7 @@ pub struct HostSlotStatus {
 /// Linear evidence that one host slot's native owner thread was joined.
 #[derive(Debug)]
 pub struct JoinedHostSlot {
+    host_identity: Arc<HostIdentity>,
     slot_id: usize,
     worker: JoinedNativeModel,
 }
@@ -120,23 +120,15 @@ impl JoinedHostSlot {
     pub fn model_id(&self) -> &str {
         self.worker.model_id()
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostModelInUse {
-    slot_id: usize,
-    additional_handles: NonZeroUsize,
-}
-
-impl HostModelInUse {
     #[must_use]
-    pub const fn slot_id(self) -> usize {
-        self.slot_id
+    pub fn belongs_to(&self, host: &NativeHost) -> bool {
+        Arc::ptr_eq(&self.host_identity, &host.identity)
     }
 
     #[must_use]
-    pub const fn additional_handles(self) -> NonZeroUsize {
-        self.additional_handles
+    pub fn worker_belongs_to(&self, handle: &NativeModelHandle) -> bool {
+        self.worker.belongs_to(handle)
     }
 }
 
@@ -145,13 +137,13 @@ impl HostModelInUse {
 pub enum HostSlotShutdown {
     Vacant,
     Joined(JoinedHostSlot),
-    InUse(HostModelInUse),
 }
 
 /// Linear evidence that a host was permanently closed to admission only after
 /// every resident native model worker had returned and been joined.
 #[derive(Debug)]
 pub struct JoinedNativeHost {
+    host_identity: Arc<HostIdentity>,
     joined_worker_count: usize,
 }
 
@@ -160,31 +152,12 @@ impl JoinedNativeHost {
     pub const fn joined_worker_count(&self) -> usize {
         self.joined_worker_count
     }
-}
 
-#[derive(Debug)]
-pub struct HostShutdownInUse {
-    blockers: Vec<HostModelInUse>,
-    joined_worker_count: usize,
-}
-
-impl HostShutdownInUse {
+    /// Returns true only for the exact host instance that minted this token.
     #[must_use]
-    pub fn blockers(&self) -> &[HostModelInUse] {
-        &self.blockers
+    pub fn belongs_to(&self, host: &NativeHost) -> bool {
+        Arc::ptr_eq(&self.host_identity, &host.identity)
     }
-
-    #[must_use]
-    pub const fn joined_worker_count(&self) -> usize {
-        self.joined_worker_count
-    }
-}
-
-#[derive(Debug)]
-#[must_use = "host shutdown attempts must be matched before process exit"]
-pub enum HostShutdown {
-    Joined(JoinedNativeHost),
-    InUse(HostShutdownInUse),
 }
 
 impl std::fmt::Debug for HostSlotStatus {
@@ -247,7 +220,7 @@ impl std::fmt::Debug for ResidentModelKey {
 struct ResidentEntry {
     key: ResidentModelKey,
     fingerprint: ModelFingerprint,
-    handle: NativeModelHandle,
+    owner: NativeModelOwner,
     model_bytes: u64,
     reserved_bytes: u64,
 }
@@ -263,10 +236,16 @@ struct HostState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HostPhase {
     Running,
+    Quiescing,
     Stopped,
+    ShutdownFailed,
 }
 
+#[derive(Debug)]
+struct HostIdentity;
+
 pub struct NativeHost {
+    identity: Arc<HostIdentity>,
     config: NativeHostConfig,
     state: Mutex<HostState>,
     load_gate: Mutex<()>,
@@ -284,6 +263,31 @@ impl std::fmt::Debug for NativeHost {
     }
 }
 
+impl Drop for NativeHost {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.phase = HostPhase::Quiescing;
+        let slots = std::mem::take(&mut state.slots);
+        for entry in slots.values() {
+            entry.owner.begin_shutdown();
+        }
+        let mut failed = false;
+        for (_, entry) in slots {
+            if entry.owner.shutdown_joined().is_err() {
+                failed = true;
+            }
+        }
+        state.phase = if failed {
+            HostPhase::ShutdownFailed
+        } else {
+            HostPhase::Stopped
+        };
+    }
+}
+
 impl NativeHost {
     #[must_use]
     pub fn new(config: NativeHostConfig) -> Self {
@@ -297,6 +301,7 @@ impl NativeHost {
         persistent_cache: Option<Arc<dyn PrefixCacheStore>>,
     ) -> Self {
         Self {
+            identity: Arc::new(HostIdentity),
             state: Mutex::new(HostState {
                 slots: BTreeMap::new(),
                 cache: MemoryPrefixCache::new(config.memory_cache_bytes),
@@ -367,7 +372,7 @@ impl NativeHost {
                     &model,
                 )?;
                 if reusable_slot.is_some() {
-                    return Ok(existing.handle.clone());
+                    return Ok(existing.owner.handle());
                 }
                 return Err(NativeError::new(
                     NativeErrorCode::ModelInUse,
@@ -418,20 +423,21 @@ impl NativeHost {
                 ));
             }
         }
-        let handle = NativeModelHandle::load(model.clone())?;
-        let fingerprint = handle.status().fingerprint.ok_or_else(|| {
+        let owner = NativeModelOwner::load(model.clone())?;
+        let fingerprint = owner.status().fingerprint.ok_or_else(|| {
             NativeError::new(
                 NativeErrorCode::ModelLoadFailed,
                 "loaded resident did not publish a model fingerprint",
             )
         })?;
+        let handle = owner.handle();
         let mut state = self.state.lock().map_err(host_poisoned)?;
         state.slots.insert(
             slot_id,
             ResidentEntry {
                 key: requested_key,
                 fingerprint,
-                handle: handle.clone(),
+                owner,
                 model_bytes,
                 reserved_bytes,
             },
@@ -445,6 +451,7 @@ impl NativeHost {
     ) -> Result<Option<NativeModelHandle>, NativeError> {
         let requested_key = ResidentModelKey::from(model);
         let state = self.state.lock().map_err(host_poisoned)?;
+        ensure_host_running(&state)?;
         let slot_id = resolve_resident_slot(
             state
                 .slots
@@ -453,7 +460,7 @@ impl NativeHost {
             &requested_key,
             model,
         )?;
-        Ok(slot_id.and_then(|slot_id| state.slots.get(&slot_id).map(|entry| entry.handle.clone())))
+        Ok(slot_id.and_then(|slot_id| state.slots.get(&slot_id).map(|entry| entry.owner.handle())))
     }
 
     fn with_load_gate<T>(
@@ -500,7 +507,7 @@ impl NativeHost {
                 state
                     .slots
                     .values()
-                    .map(|entry| entry.handle.cancel(request_id, branch_id))
+                    .map(|entry| entry.owner.handle().cancel(request_id, branch_id))
                     .sum()
             })
             .unwrap_or_default()
@@ -513,7 +520,7 @@ impl NativeHost {
                 state
                     .slots
                     .values()
-                    .map(|entry| entry.handle.skip_reasoning(request_id, branch_id))
+                    .map(|entry| entry.owner.handle().skip_reasoning(request_id, branch_id))
                     .sum()
             })
             .unwrap_or_default()
@@ -526,7 +533,7 @@ impl NativeHost {
                 state
                     .slots
                     .values()
-                    .filter_map(|entry| entry.handle.status().descriptor)
+                    .filter_map(|entry| entry.owner.status().descriptor)
                     .collect()
             })
             .unwrap_or_default()
@@ -544,7 +551,7 @@ impl NativeHost {
                         model_path: entry.key.model_path.clone(),
                         model_bytes: entry.model_bytes,
                         reserved_bytes: entry.reserved_bytes,
-                        status: entry.handle.status(),
+                        status: entry.owner.status(),
                     })
                     .collect()
             })
@@ -552,19 +559,16 @@ impl NativeHost {
     }
 
     pub fn handle(&self, slot_id: usize) -> Option<NativeModelHandle> {
-        self.state
-            .lock()
-            .ok()?
-            .slots
-            .get(&slot_id)
-            .map(|entry| entry.handle.clone())
+        let state = self.state.lock().ok()?;
+        ensure_host_running(&state).ok()?;
+        state.slots.get(&slot_id).map(|entry| entry.owner.handle())
     }
 
     /// Compatibility wrapper around joined slot shutdown.
     ///
-    /// `true` now means the native owner thread was joined, not merely that a
-    /// map entry was removed. A live external handle leaves the slot resident
-    /// and returns `false`.
+    /// `true` means the native owner thread was joined, not merely that a map
+    /// entry was removed. External command clients are revoked by the unique
+    /// host-owned worker owner and cannot prolong worker lifetime.
     pub fn unload(&self, slot_id: usize) -> bool {
         matches!(
             self.shutdown_slot_joined(slot_id),
@@ -575,6 +579,13 @@ impl NativeHost {
     pub fn unload_all(&self) -> usize {
         self.with_load_gate(|| {
             self.ensure_running()?;
+            {
+                let state = self.state.lock().map_err(host_poisoned)?;
+                state
+                    .slots
+                    .values()
+                    .for_each(|entry| entry.owner.begin_shutdown());
+            }
             let slot_ids = self
                 .state
                 .lock()
@@ -592,14 +603,35 @@ impl NativeHost {
         .unwrap_or_default()
     }
 
-    /// Removes one resident slot only after consuming the final model handle
-    /// and joining its native owner thread. If another handle exists, the host
-    /// restores the slot and returns typed outstanding-ownership evidence.
+    /// Removes one resident slot only after consuming its unique worker owner
+    /// and joining the native thread. Cloneable command clients are revoked;
+    /// they never own the worker join handle.
     pub fn shutdown_slot_joined(&self, slot_id: usize) -> Result<HostSlotShutdown, NativeError> {
         self.with_load_gate(|| {
             self.ensure_running()?;
-            self.shutdown_slot_joined_inner(slot_id)
+            match self.shutdown_slot_joined_inner(slot_id) {
+                Ok(outcome) => Ok(outcome),
+                Err(error) => {
+                    self.drain_remaining_after_failure();
+                    Err(error)
+                }
+            }
         })
+    }
+
+    fn drain_remaining_after_failure(&self) {
+        let slot_ids = match self.state.lock() {
+            Ok(state) => {
+                for entry in state.slots.values() {
+                    entry.owner.begin_shutdown();
+                }
+                state.slots.keys().copied().collect::<Vec<_>>()
+            }
+            Err(_) => return,
+        };
+        for slot_id in slot_ids {
+            let _ = self.shutdown_slot_joined_inner(slot_id);
+        }
     }
 
     fn shutdown_slot_joined_inner(&self, slot_id: usize) -> Result<HostSlotShutdown, NativeError> {
@@ -613,50 +645,66 @@ impl NativeHost {
             return Ok(HostSlotShutdown::Vacant);
         };
         let ResidentEntry {
-            key,
-            fingerprint,
-            handle,
-            model_bytes,
-            reserved_bytes,
+            key: _,
+            fingerprint: _,
+            owner,
+            model_bytes: _,
+            reserved_bytes: _,
         } = entry;
-        match handle.try_shutdown()? {
-            NativeModelShutdown::Joined(worker) => {
-                let mut state = self.state.lock().map_err(host_poisoned)?;
-                state.joined_worker_count =
-                    state.joined_worker_count.checked_add(1).ok_or_else(|| {
-                        NativeError::new(
-                            NativeErrorCode::Internal,
-                            "native host joined-worker accounting overflowed",
-                        )
-                    })?;
-                Ok(HostSlotShutdown::Joined(JoinedHostSlot { slot_id, worker }))
+        let worker = match owner.shutdown_joined() {
+            Ok(worker) => worker,
+            Err(error) => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.phase = HostPhase::ShutdownFailed;
+                }
+                return Err(error);
             }
-            NativeModelShutdown::InUse(in_use) => {
-                let additional_handles = in_use.additional_handles();
-                let handle = in_use.into_handle();
-                self.state.lock().map_err(host_poisoned)?.slots.insert(
-                    slot_id,
-                    ResidentEntry {
-                        key,
-                        fingerprint,
-                        handle,
-                        model_bytes,
-                        reserved_bytes,
-                    },
-                );
-                Ok(HostSlotShutdown::InUse(HostModelInUse {
-                    slot_id,
-                    additional_handles,
-                }))
-            }
-        }
+        };
+        let mut state = self.state.lock().map_err(host_poisoned)?;
+        state.joined_worker_count = state.joined_worker_count.checked_add(1).ok_or_else(|| {
+            state.phase = HostPhase::ShutdownFailed;
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "native host joined-worker accounting overflowed",
+            )
+        })?;
+        Ok(HostSlotShutdown::Joined(JoinedHostSlot {
+            host_identity: Arc::clone(&self.identity),
+            slot_id,
+            worker,
+        }))
     }
 
     /// Permanently closes model admission and returns linear host-shutdown
     /// evidence only after every resident model worker has been joined.
-    pub fn shutdown_joined(&self) -> Result<HostShutdown, NativeError> {
+    pub fn shutdown_joined(&self) -> Result<JoinedNativeHost, NativeError> {
         self.with_load_gate(|| {
-            self.ensure_running()?;
+            {
+                let mut state = self.state.lock().map_err(host_poisoned)?;
+                match state.phase {
+                    HostPhase::Running => state.phase = HostPhase::Quiescing,
+                    HostPhase::Quiescing => {}
+                    HostPhase::Stopped => {
+                        return Err(NativeError::new(
+                            NativeErrorCode::WorkerStopped,
+                            "native host shutdown was already completed",
+                        ));
+                    }
+                    HostPhase::ShutdownFailed => {
+                        return Err(NativeError::new(
+                            NativeErrorCode::WorkerStopped,
+                            "native host shutdown previously failed; joined authority is permanently unavailable",
+                        ));
+                    }
+                }
+            }
+            {
+                let state = self.state.lock().map_err(host_poisoned)?;
+                state
+                    .slots
+                    .values()
+                    .for_each(|entry| entry.owner.begin_shutdown());
+            }
             let slot_ids = self
                 .state
                 .lock()
@@ -665,24 +713,17 @@ impl NativeHost {
                 .keys()
                 .copied()
                 .collect::<Vec<_>>();
-            let mut blockers = Vec::new();
+            let mut first_join_error = None;
             for slot_id in slot_ids {
-                match self.shutdown_slot_joined_inner(slot_id)? {
-                    HostSlotShutdown::Vacant => {}
-                    HostSlotShutdown::Joined(_) => {}
-                    HostSlotShutdown::InUse(blocker) => blockers.push(blocker),
+                match self.shutdown_slot_joined_inner(slot_id) {
+                    Ok(HostSlotShutdown::Vacant | HostSlotShutdown::Joined(_)) => {}
+                    Err(error) => {
+                        first_join_error.get_or_insert(error);
+                    }
                 }
             }
-            if !blockers.is_empty() {
-                let joined_worker_count = self
-                    .state
-                    .lock()
-                    .map_err(host_poisoned)?
-                    .joined_worker_count;
-                return Ok(HostShutdown::InUse(HostShutdownInUse {
-                    blockers,
-                    joined_worker_count,
-                }));
+            if let Some(error) = first_join_error {
+                return Err(error);
             }
             let mut state = self.state.lock().map_err(host_poisoned)?;
             if !state.slots.is_empty() {
@@ -693,9 +734,10 @@ impl NativeHost {
             }
             state.phase = HostPhase::Stopped;
             let joined_worker_count = state.joined_worker_count;
-            Ok(HostShutdown::Joined(JoinedNativeHost {
+            Ok(JoinedNativeHost {
+                host_identity: Arc::clone(&self.identity),
                 joined_worker_count,
-            }))
+            })
         })
     }
 
@@ -794,13 +836,21 @@ fn host_poisoned<T>(_error: std::sync::PoisonError<T>) -> NativeError {
 }
 
 fn ensure_host_running(state: &HostState) -> Result<(), NativeError> {
-    if state.phase == HostPhase::Stopped {
-        return Err(NativeError::new(
+    match state.phase {
+        HostPhase::Running => Ok(()),
+        HostPhase::Quiescing => Err(NativeError::new(
+            NativeErrorCode::WorkerStopped,
+            "native host admission is closed while joined shutdown drains workers",
+        )),
+        HostPhase::Stopped => Err(NativeError::new(
             NativeErrorCode::WorkerStopped,
             "native host admission is permanently closed after joined shutdown",
-        ));
+        )),
+        HostPhase::ShutdownFailed => Err(NativeError::new(
+            NativeErrorCode::WorkerStopped,
+            "native host admission is permanently closed after a failed worker join",
+        )),
     }
-    Ok(())
 }
 
 fn resolve_resident_slot<'a>(
@@ -1009,11 +1059,11 @@ mod tests {
     #[test]
     fn joined_host_shutdown_permanently_closes_admission() {
         let host = NativeHost::new(NativeHostConfig::default());
-        let joined = match host.shutdown_joined().expect("empty shutdown") {
-            HostShutdown::Joined(joined) => joined,
-            HostShutdown::InUse(_) => panic!("an empty host has no outstanding handles"),
-        };
+        let other = NativeHost::new(NativeHostConfig::default());
+        let joined = host.shutdown_joined().expect("empty shutdown");
         assert_eq!(joined.joined_worker_count(), 0);
+        assert!(joined.belongs_to(&host));
+        assert!(!joined.belongs_to(&other));
 
         let error = host
             .acquire(NativeModelConfig::local(PathBuf::from("never-opened.gguf")))
@@ -1105,7 +1155,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires MOM_LLAMA_MODEL_PATH, MOM_LLAMA_MODEL_SHA256, and a real local GGUF"]
-    fn real_joined_shutdown_blocks_on_a_live_handle_then_joins_and_stops_admission()
+    fn real_joined_shutdown_revokes_live_clients_then_joins_and_stops_admission()
     -> Result<(), Box<dyn std::error::Error>> {
         let model_path = PathBuf::from(std::env::var("MOM_LLAMA_MODEL_PATH")?);
         let mut config = NativeModelConfig::local(model_path);
@@ -1124,21 +1174,17 @@ mod tests {
         });
         let handle = host.acquire(config.clone())?;
 
-        let blocked = match host.shutdown_joined()? {
-            HostShutdown::InUse(blocked) => blocked,
-            HostShutdown::Joined(_) => panic!("the caller's live handle must block shutdown"),
-        };
-        assert_eq!(blocked.blockers().len(), 1);
-        assert_eq!(blocked.blockers()[0].additional_handles().get(), 1);
-        assert_eq!(host.slots().len(), 1);
-
-        drop(handle);
-        let joined = match host.shutdown_joined()? {
-            HostShutdown::Joined(joined) => joined,
-            HostShutdown::InUse(_) => panic!("dropping the last lease must permit shutdown"),
-        };
+        let joined = host.shutdown_joined()?;
         assert_eq!(joined.joined_worker_count(), 1);
+        assert!(joined.belongs_to(&host));
         assert!(host.slots().is_empty());
+        assert_eq!(
+            handle
+                .snapshot_sequence(0)
+                .expect_err("a revoked client cannot submit work")
+                .code,
+            NativeErrorCode::WorkerStopped
+        );
         assert_eq!(
             host.acquire(config)
                 .expect_err("joined host stays stopped")
