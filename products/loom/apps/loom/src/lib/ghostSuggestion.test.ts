@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { BranchCard } from './types';
-import { verifiedGhostSuggestion } from './ghostSuggestion';
+import {
+  verifiedGhostSuggestion,
+  visibleVerifiedGhostSuggestion
+} from './ghostSuggestion';
 
 function branch(overrides: Partial<BranchCard> = {}): BranchCard {
   const text = ' rain.\n\nThen light.';
@@ -48,5 +51,14 @@ describe('verifiedGhostSuggestion', () => {
       .toBe(text);
     expect(verifiedGhostSuggestion(branch({ text, output_byte_len: text.length }), 'blob-1'))
       .toBeNull();
+  });
+});
+
+describe('visibleVerifiedGhostSuggestion', () => {
+  it('exposes menu and announcement state only for the child-rendered identity', () => {
+    const suggestion = verifiedGhostSuggestion(branch(), 'blob-1');
+    expect(visibleVerifiedGhostSuggestion(suggestion, '')).toBeNull();
+    expect(visibleVerifiedGhostSuggestion(suggestion, 'candidate-1:another-blob')).toBeNull();
+    expect(visibleVerifiedGhostSuggestion(suggestion, 'candidate-1:blob-1')).toBe(suggestion);
   });
 });

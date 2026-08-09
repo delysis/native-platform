@@ -295,10 +295,10 @@
       "type": "string",
       "oneOf": [
         {
-          "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
+          "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
           "type": "string",
           "const": "local-generation",
-          "markdownDescription": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`"
+          "markdownDescription": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`"
         },
         {
           "description": "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command.\n#### This permission set includes:\n\n- `allow-candidate-promote`",
@@ -563,6 +563,18 @@
           "type": "string",
           "const": "deny-model-load",
           "markdownDescription": "Denies the model_load command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the model_load_policy_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-model-load-policy-candidate",
+          "markdownDescription": "Enables the model_load_policy_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the model_load_policy_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-model-load-policy-candidate",
+          "markdownDescription": "Denies the model_load_policy_candidate command without any pre-configured scope."
         },
         {
           "description": "Enables the model_unload command without any pre-configured scope.",

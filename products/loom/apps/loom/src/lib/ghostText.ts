@@ -16,8 +16,8 @@ export interface GhostTextPlan {
 }
 
 export interface GhostTextHandlers {
-  accept: (candidateId: string) => void;
-  dismiss: (candidateId: string) => void;
+  accept: (candidateId: string, presentationKey: string) => void;
+  dismiss: (candidateId: string, presentationKey: string) => void;
 }
 
 type GhostTextMeta =
@@ -55,6 +55,11 @@ export function planGhostText(
     presentationKey: presentation.presentationKey,
     text: presentation.text
   };
+}
+
+export function renderedGhostPresentationKey(state: EditorState): string {
+  const presentation = ghostTextPluginKey.getState(state) ?? null;
+  return planGhostText(state, presentation)?.presentationKey ?? '';
 }
 
 export function createGhostTextElement(
@@ -145,7 +150,7 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
         if (!plan || event.isComposing || event.keyCode === 229) return false;
         if (event.key === 'Escape' && !event.metaKey && !event.ctrlKey && !event.altKey) {
           view.dispatch(clearTransaction(view));
-          handlers.dismiss(plan.candidateId);
+          handlers.dismiss(plan.candidateId, plan.presentationKey);
           return true;
         }
         if (
@@ -156,7 +161,7 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           !event.altKey
         ) {
           view.dispatch(clearTransaction(view));
-          handlers.accept(plan.candidateId);
+          handlers.accept(plan.candidateId, plan.presentationKey);
           return true;
         }
         return false;

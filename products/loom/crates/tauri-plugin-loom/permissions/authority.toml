@@ -5,6 +5,7 @@ identifier = "local-generation"
 description = "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript."
 permissions = [
   "allow-model-load",
+  "allow-model-load-policy-candidate",
   "allow-model-unload",
   "allow-weave-start",
   "allow-generation-cancel",

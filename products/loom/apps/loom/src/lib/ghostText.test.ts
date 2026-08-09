@@ -8,6 +8,7 @@ import {
   createGhostTextPlugin,
   ghostTextPluginKey,
   planGhostText,
+  renderedGhostPresentationKey,
   setGhostText,
   type GhostTextPresentation
 } from './ghostText';
@@ -105,8 +106,10 @@ describe('ghost-text plugin state', () => {
 
     setGhostText(view, suggestion);
     expect(ghostTextPluginKey.getState(state)?.presentationKey).toBe(suggestion.presentationKey);
+    expect(renderedGhostPresentationKey(state)).toBe(suggestion.presentationKey);
     state = state.apply(state.tr.insertText('!'));
     expect(ghostTextPluginKey.getState(state)).toBeNull();
+    expect(renderedGhostPresentationKey(state)).toBe('');
   });
 
   it('sets and clears presentation state without changing manuscript bytes', () => {

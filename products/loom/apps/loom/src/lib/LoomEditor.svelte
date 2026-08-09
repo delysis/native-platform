@@ -10,6 +10,7 @@
   import {
     clearGhostText,
     createGhostTextPlugin,
+    renderedGhostPresentationKey,
     setGhostText
   } from './ghostText';
 
@@ -23,8 +24,9 @@
   export let onChange: (markdown: string) => void = () => {};
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onImmediateDocumentMutation: () => void = () => {};
-  export let onGhostAccept: (candidateId: string) => void = () => {};
-  export let onGhostDismiss: (candidateId: string) => void = () => {};
+  export let onGhostAccept: (candidateId: string, presentationKey: string) => void = () => {};
+  export let onGhostDismiss: (candidateId: string, presentationKey: string) => void = () => {};
+  export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
   export let onSelectionChange: (atDocumentEnd: boolean) => void = () => {};
 
   let mount: HTMLDivElement;
@@ -34,6 +36,14 @@
   let localDocumentChanged = false;
   let composing = false;
   let suppressedGhostKey = '';
+  let reportedGhostPresentationKey = '';
+
+  function reportGhostVisibility(): void {
+    const presentationKey = view ? renderedGhostPresentationKey(view.state) : '';
+    if (reportedGhostPresentationKey === presentationKey) return;
+    reportedGhostPresentationKey = presentationKey;
+    onGhostVisibilityChange(presentationKey);
+  }
 
   function projectDocument(): void {
     if (!view || composing || !localDocumentChanged) return;
@@ -94,8 +104,8 @@
         }),
         keymap(baseKeymap),
         createGhostTextPlugin({
-          accept: (candidateId) => onGhostAccept(candidateId),
-          dismiss: (candidateId) => onGhostDismiss(candidateId)
+          accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
+          dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey)
         })
       ]
     });
@@ -126,6 +136,7 @@
         const next = view.state.apply(transaction);
         view.updateState(next);
         reportSelection(next);
+        reportGhostVisibility();
         if (transaction.docChanged) {
           suppressedGhostKey = ghostPresentationKey;
           onImmediateDocumentMutation();
@@ -150,6 +161,7 @@
       }
     });
     reportSelection(view.state);
+    reportGhostVisibility();
     if (autofocus) view.focus();
   });
 
@@ -158,6 +170,7 @@
     const next = stateFor(value);
     view.updateState(next);
     reportSelection(next);
+    reportGhostVisibility();
   }
 
   $: if (view) {
@@ -169,12 +182,14 @@
       text: ghostText
     } : null;
     setGhostText(view, presentation);
+    reportGhostVisibility();
   }
 
   onDestroy(() => {
     if (projectionTimer !== undefined) window.clearTimeout(projectionTimer);
     if (composing) onCompositionChange(false);
     onSelectionChange(false);
+    if (reportedGhostPresentationKey) onGhostVisibilityChange('');
     view?.destroy();
   });
 </script>

@@ -2,6 +2,7 @@
   import { onMount, tick } from 'svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
+  import SourceEditor from './lib/SourceEditor.svelte';
   import {
     cancelGeneration,
     cancelModelDownload,
@@ -22,6 +23,7 @@
     listenForGenerationEvents,
     listenForModelDownloadEvents,
     loadModel,
+    loadPolicyModelCandidate,
     listModels,
     listModelDownloads,
     openDefaultProject,
@@ -44,7 +46,12 @@
     type VerseEditorCodec
   } from './lib/verseCodec';
   import { canRoundTripMarkdownExactly, canUseVisualMarkdown } from './lib/markdownSafety';
-  import { verifiedGhostSuggestion } from './lib/ghostSuggestion';
+  import {
+    verifiedGhostSuggestion,
+    visibleVerifiedGhostSuggestion
+  } from './lib/ghostSuggestion';
+  import { sourceGhostTextForTextarea } from './lib/sourceGhostText';
+  import { branchIsActionableOnShelf } from './lib/branchShelf';
   import {
     appendUniquePage,
     branchBodyDisposition,
@@ -63,7 +70,11 @@
     closeResultMayHaveCommitted
   } from './lib/sessionSafety';
   import { drainGenerationsAndClose } from './lib/sessionCloseCoordinator';
-  import { restoreBeforeBackgroundWork, runCurrentWorkspaceStep } from './lib/startupSafety';
+  import {
+    restoreBeforeBackgroundWork,
+    runCurrentWorkspaceStep,
+    shouldDiscoverModelsOnStartup
+  } from './lib/startupSafety';
   import { newUlid } from './lib/ulid';
   import {
     DEFAULT_MODEL_DOWNLOAD_LIMIT_GIB,
@@ -77,6 +88,10 @@
     generationEventBelongsToScope,
     utf8ByteOffset
   } from './lib/weaveSafety';
+  import {
+    isVerifiedPolicyWriter,
+    orderedLocalWriterCandidates
+  } from './lib/modelPolicy';
   import type {
     BranchCard,
     BranchPageCursor,
@@ -110,6 +125,9 @@
   let opening = false;
   let focusMode = false;
   let search = '';
+  let outlineOpen = false;
+  let outlineToggle: HTMLButtonElement | undefined;
+  let outlineSearch: HTMLInputElement | undefined;
   let models: ModelCapabilitySummary[] = [];
   let selectedModelPath = '';
   let modelLoading = false;
@@ -188,6 +206,8 @@
   let sourceDisplayText = '';
   let sourceSelectionStart = 0;
   let sourceSelectionEnd = 0;
+  let visibleVisualGhostPresentationKey = '';
+  let visibleSourceGhostPresentationKey = '';
   let visualSelectionAtEnd = false;
   let visualMutationPending = false;
   let verseCodec: VerseEditorCodec | null = null;
@@ -195,6 +215,9 @@
   let sourceComposing = false;
   let visualEditor: {
     flushPending: () => boolean;
+    focusAtDocumentEnd: () => boolean;
+  } | null = null;
+  let sourceEditor: {
     focusAtDocumentEnd: () => boolean;
   } | null = null;
   let componentMounted = false;
@@ -308,6 +331,11 @@
     commandId: string;
   }
 
+  interface ModelLoadOptions {
+    expectedWorkspace?: WorkspaceRestoreCapture;
+    quiet?: boolean;
+  }
+
   type PromotionReloadOutcome = 'unchanged' | 'promoted' | 'source_changed' | 'reconciliation';
 
   const saveDelayMs = 900;
@@ -340,28 +368,33 @@
     branch.selection !== 'reject' &&
     branch.source_revision_id === document?.summary.revision_id
   );
-  $: inlineSuggestion = suggestionsEnabled && !focusMode
-    ? currentReadyBranches.find((branch) =>
-      Boolean(branch.candidate_id) && !dismissedCandidateIds.includes(branch.candidate_id ?? '')
-    ) ?? null
-    : null;
-  $: inlineSuggestionAtCaret = Boolean(
-    inlineSuggestion &&
-    (mode === 'visual' || mode === 'source') &&
-    sourceSelectionStart >= 0 &&
-    suggestionMatchesCurrentCaret(
-      inlineSuggestion,
-      visualSelectionAtEnd,
-      sourceSelectionStart,
-      sourceSelectionEnd
-    )
+  $: shelfBranches = branches.filter((branch) =>
+    branchIsActionableOnShelf(branch, document?.summary.revision_id)
   );
+  $: shelfReadyCount = shelfBranches.filter((branch) => branch.status === 'ready').length;
+  $: shelfFailureCount = shelfBranches.length - shelfReadyCount;
+  $: branchShelfVisible = shelfBranches.length > 0;
+  $: branchShelfLabel = shelfReadyCount > 0
+    ? `${shelfReadyCount} ${shelfReadyCount === 1 ? 'strand' : 'strands'} ready${shelfFailureCount > 0 ? ` · ${shelfFailureCount} need attention` : ''}`
+    : `${shelfFailureCount} ${shelfFailureCount === 1 ? 'suggestion needs' : 'suggestions need'} attention`;
   $: ghostSuggestion = findVisualGhostSuggestion();
+  $: sourceGhostSuggestion = findSourceGhostSuggestion();
+  $: activeGhostSuggestion = mode === 'visual'
+    ? visibleVerifiedGhostSuggestion(
+      ghostSuggestion,
+      visibleVisualGhostPresentationKey
+    )
+    : mode === 'source'
+      ? visibleVerifiedGhostSuggestion(
+        sourceGhostSuggestion,
+        visibleSourceGhostPresentationKey
+      )
+      : null;
   $: if (
-    ghostSuggestion &&
-    ghostSuggestion.presentationKey !== announcedGhostPresentationKey
+    activeGhostSuggestion &&
+    activeGhostSuggestion.presentationKey !== announcedGhostPresentationKey
   ) {
-    announcedGhostPresentationKey = ghostSuggestion.presentationKey;
+    announcedGhostPresentationKey = activeGhostSuggestion.presentationKey;
     announce('Suggestion available. Tab accepts; Escape dismisses.');
   }
   $: automaticBoundaryIsExact = mode === 'visual'
@@ -1670,6 +1703,13 @@
     if (projectMenu) projectMenu.open = false;
   }
 
+  async function setOutlineOpen(open: boolean): Promise<void> {
+    outlineOpen = open;
+    await tick();
+    if (open) outlineSearch?.focus();
+    else outlineToggle?.focus();
+  }
+
   function openModelManager(trigger: HTMLElement): void {
     closeProjectMenu();
     modelManagerReturnFocus = trigger;
@@ -1751,12 +1791,24 @@
           .filter((candidateId): candidateId is string => Boolean(candidateId));
         scheduleActiveBranchPoll();
       }
+      let writerReady = Boolean(currentModel);
+      if (enabled && !writerReady) {
+        const captured: WorkspaceRestoreCapture = {
+          restoreSerial: workspaceRestoreSerial,
+          projectId: boundProject.project_id,
+          sessionId: boundProject.session_id
+        };
+        if (await refreshModels(captured)) {
+          writerReady = await loadPreferredSuggestionModel(captured);
+        }
+        if (!workspaceRestoreIsCurrent(captured)) return;
+      }
       announce(enabled
-        ? currentModel
+        ? writerReady
           ? 'Suggestions on; Loom will quietly prepare private strands when typing pauses'
-          : 'Suggestions on; choose a local completion model before Loom can prepare strands'
+          : 'Suggestions on; no tested local writer is available yet'
         : 'Suggestions off');
-      if (enabled && currentModel && document) {
+      if (enabled && writerReady && document) {
         scheduleAutomaticSuggestions(editVersion);
       }
     } catch (error) {
@@ -1792,12 +1844,37 @@
     }
   }
 
-  async function loadSelectedModel(expectedWorkspace?: WorkspaceRestoreCapture): Promise<void> {
-    if (!selectedModelPath || modelLoading) return;
+  async function installLoadedModel(
+    loaded: ModelCapabilitySummary,
+    quiet: boolean,
+    expectedWorkspace?: WorkspaceRestoreCapture
+  ): Promise<boolean> {
+    if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+    models = [
+      loaded,
+      ...models
+        .filter((model) => model.model_path !== loaded.model_path)
+        .map((model) => ({ ...model, loaded: false }))
+    ];
+    selectedModelPath = loaded.model_path;
+    rememberLastLocalModelPath(loaded.model_path);
+    if (!quiet) {
+      announce(`${loaded.display_name} is verified for exact local completion`);
+    }
+    if (suggestionsEnabled && loaded.completion && document) {
+      await tick();
+      scheduleAutomaticSuggestions(editVersion);
+    }
+    return true;
+  }
+
+  async function loadSelectedModel(options: ModelLoadOptions = {}): Promise<boolean> {
+    const { expectedWorkspace, quiet = false } = options;
+    if (!selectedModelPath || modelLoading) return false;
     const modelPath = selectedModelPath;
     const loadSerial = ++modelLoadSerial;
     modelLoading = true;
-    if (!expectedWorkspace) {
+    if (!quiet) {
       clearFailure();
       announce('Verifying the selected local model');
     }
@@ -1805,40 +1882,63 @@
       const loaded = await loadModel(modelPath);
       if (
         !componentMounted ||
-        loadSerial !== modelLoadSerial ||
-        (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
-      ) return;
-      models = [
-        loaded,
-        ...models
-          .filter((model) => model.model_path !== loaded.model_path)
-          .map((model) => ({ ...model, loaded: false }))
-      ];
-      selectedModelPath = loaded.model_path;
-      rememberLastLocalModelPath(loaded.model_path);
-      if (!expectedWorkspace) {
-        announce(`${loaded.display_name} is verified for exact local completion`);
-      }
-      if (suggestionsEnabled && loaded.completion && document) {
-        await tick();
-        scheduleAutomaticSuggestions(editVersion);
-      }
+        loadSerial !== modelLoadSerial
+      ) return false;
+      return await installLoadedModel(loaded, quiet, expectedWorkspace);
     } catch (error) {
       if (
         !componentMounted ||
         loadSerial !== modelLoadSerial ||
         (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
-      ) return;
-      if (expectedWorkspace) {
+      ) return false;
+      if (quiet) {
         await refreshModels(expectedWorkspace);
-        return;
+        return false;
       }
       recordFailure(error);
       announce('The local model could not be verified');
       await refreshModels();
+      return false;
     } finally {
       if (loadSerial === modelLoadSerial) modelLoading = false;
     }
+  }
+
+  async function loadPreferredSuggestionModel(
+    expectedWorkspace?: WorkspaceRestoreCapture
+  ): Promise<boolean> {
+    if (currentModel) return true;
+    if (!document || transition !== 'idle' || modelLoading || modelUnloading) return false;
+    if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+    const candidates = orderedLocalWriterCandidates(models);
+    for (const candidate of candidates) {
+      if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+      const loadSerial = ++modelLoadSerial;
+      modelLoading = true;
+      try {
+        const loaded = await loadPolicyModelCandidate(candidate.profileId, candidate.modelPath);
+        if (
+          !componentMounted ||
+          loadSerial !== modelLoadSerial ||
+          (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
+        ) return false;
+        if (!isVerifiedPolicyWriter(loaded, candidate.profileId)) {
+          await refreshModels(expectedWorkspace);
+          continue;
+        }
+        return await installLoadedModel(loaded, true, expectedWorkspace);
+      } catch {
+        if (
+          !componentMounted ||
+          loadSerial !== modelLoadSerial ||
+          (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
+        ) return false;
+        await refreshModels(expectedWorkspace);
+      } finally {
+        if (loadSerial === modelLoadSerial) modelLoading = false;
+      }
+    }
+    return false;
   }
 
   async function chooseExistingModel(): Promise<void> {
@@ -2002,10 +2102,8 @@
       present: async () => {
         await tick();
         await waitForWritingSurfacePaint();
-        if (mode === 'source' && sourceTextarea) {
-          sourceTextarea.focus({ preventScroll: true });
-          const end = sourceTextarea.value.length;
-          sourceTextarea.setSelectionRange(end, end);
+        if (mode === 'source') {
+          sourceEditor?.focusAtDocumentEnd();
         } else {
           visualEditor?.focusAtDocumentEnd();
         }
@@ -2014,25 +2112,13 @@
       background: async (captured) => {
         await recoverModelDownloads();
         if (!workspaceRestoreIsCurrent(captured)) return;
+        if (!shouldDiscoverModelsOnStartup(suggestionsEnabled)) return;
         if (!(await refreshModels(captured)) || !workspaceRestoreIsCurrent(captured)) return;
         if (suggestionsEnabled && !currentModel) {
-          await loadRememberedSuggestionModel(captured);
+          await loadPreferredSuggestionModel(captured);
         }
       }
     });
-  }
-
-  async function loadRememberedSuggestionModel(
-    expectedWorkspace?: WorkspaceRestoreCapture
-  ): Promise<void> {
-    if (currentModel || !document || transition !== 'idle') return;
-    if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return;
-    const rememberedPath = loadLastLocalModelPath();
-    if (!rememberedPath || !models.some((model) =>
-      model.model_path === rememberedPath && model.header_verified
-    )) return;
-    selectedModelPath = rememberedPath;
-    await loadSelectedModel(expectedWorkspace);
   }
 
   async function doOpenProject(): Promise<void> {
@@ -2064,6 +2150,7 @@
       sessionId: opened.session_id
     };
     if (!workspaceRestoreIsCurrent(captured)) return false;
+    outlineOpen = false;
     cancelSuggestionTimer();
     const storedSuggestionsPreference = loadSuggestionPreference(captured.projectId);
     suggestionsEnabled = false;
@@ -2136,7 +2223,7 @@
       saveMessage = 'Project is ready';
     }
     if (storedSuggestionsPreference && suggestionsEnabled && !currentModel) {
-      void loadRememberedSuggestionModel(captured);
+      void loadPreferredSuggestionModel(captured);
     }
     return true;
   }
@@ -2349,6 +2436,8 @@
     sourceDirty = false;
     sourceSelectionStart = 0;
     sourceSelectionEnd = 0;
+    visibleVisualGhostPresentationKey = '';
+    visibleSourceGhostPresentationKey = '';
     visualSelectionAtEnd = false;
     visualMutationPending = false;
     if (kind === 'verse') {
@@ -2372,11 +2461,11 @@
     compositionActive = true;
   }
 
-  function finishSourceComposition(event: CompositionEvent & { currentTarget: HTMLTextAreaElement }): void {
+  function finishSourceComposition(textarea: HTMLTextAreaElement): void {
     sourceComposing = false;
     compositionActive = false;
-    updateSourceSelection(event.currentTarget);
-    updateFromSource(event.currentTarget.value);
+    updateSourceSelection(textarea);
+    updateFromSource(textarea.value);
     scheduleSourceProjection(0);
     announce('Text composition committed');
   }
@@ -2859,12 +2948,6 @@
     announce(focusMode ? 'Focus mode on' : 'Focus mode off');
   }
 
-  function eventComesFromWritingSurface(event: KeyboardEvent): boolean {
-    return event.target instanceof HTMLElement && Boolean(
-      event.target.closest('.loom-prosemirror, .source-pane textarea')
-    );
-  }
-
   function suggestionMatchesCurrentCaret(
     branch: BranchCard,
     visualAtEnd: boolean,
@@ -2918,7 +3001,42 @@
     return null;
   }
 
-  function dismissInlineSuggestion(candidateId = inlineSuggestion?.candidate_id): void {
+  function findSourceGhostSuggestion() {
+    if (
+      mode !== 'source' ||
+      !suggestionsEnabled ||
+      focusMode ||
+      sourceDirty ||
+      compositionActive
+    ) return null;
+    const newline = document?.summary.kind === 'verse'
+      ? verseCodec?.newline ?? 'mixed'
+      : null;
+    for (const branch of currentReadyBranches) {
+      if (
+        !branch.candidate_id ||
+        dismissedCandidateIds.includes(branch.candidate_id) ||
+        !suggestionMatchesCurrentCaret(
+          branch,
+          visualSelectionAtEnd,
+          sourceSelectionStart,
+          sourceSelectionEnd
+        ) ||
+        !canPromoteBranch(branch)
+      ) continue;
+      const verified = verifiedGhostSuggestion(
+        branch,
+        branchBodyBlobByRun[branch.run_id]
+      );
+      if (
+        verified &&
+        sourceGhostTextForTextarea(verified.text, newline) !== null
+      ) return verified;
+    }
+    return null;
+  }
+
+  function dismissInlineSuggestion(candidateId: string | null | undefined): void {
     if (!candidateId || dismissedCandidateIds.includes(candidateId)) return;
     dismissedCandidateIds = [...dismissedCandidateIds, candidateId];
     announce('Suggestion dismissed; its private strand remains recoverable');
@@ -2930,14 +3048,31 @@
     await confirmPromotion(branch);
   }
 
-  function acceptVisualGhost(candidateId: string): void {
+  function eligibleGhostForCurrentMode() {
+    return mode === 'visual'
+      ? ghostSuggestion
+      : mode === 'source'
+        ? sourceGhostSuggestion
+        : null;
+  }
+
+  function acceptActiveGhost(candidateId: string, presentationKey: string): void {
+    const eligible = eligibleGhostForCurrentMode();
     const branch = branches.find((candidate) => candidate.candidate_id === candidateId);
-    if (!branch || ghostSuggestion?.candidateId !== candidateId) return;
+    if (
+      !branch ||
+      eligible?.candidateId !== candidateId ||
+      eligible.presentationKey !== presentationKey
+    ) return;
     void acceptInlineSuggestion(branch);
   }
 
-  function dismissVisualGhost(candidateId: string): void {
-    if (ghostSuggestion?.candidateId !== candidateId) return;
+  function dismissActiveGhost(candidateId: string, presentationKey: string): void {
+    const eligible = eligibleGhostForCurrentMode();
+    if (
+      eligible?.candidateId !== candidateId ||
+      eligible.presentationKey !== presentationKey
+    ) return;
     dismissInlineSuggestion(candidateId);
   }
 
@@ -2951,34 +3086,6 @@
       event.preventDefault();
       closeProjectMenu();
       projectMenuTrigger?.focus();
-      return;
-    }
-    if (
-      event.key === 'Escape' &&
-      inlineSuggestion &&
-      inlineSuggestionAtCaret &&
-      !compositionActive &&
-      mode === 'source' &&
-      eventComesFromWritingSurface(event)
-    ) {
-      event.preventDefault();
-      dismissInlineSuggestion();
-      return;
-    }
-    if (
-      event.key === 'Tab' &&
-      !event.shiftKey &&
-      !event.metaKey &&
-      !event.ctrlKey &&
-      !event.altKey &&
-      inlineSuggestion &&
-      inlineSuggestionAtCaret &&
-      mode === 'source' &&
-      eventComesFromWritingSurface(event) &&
-      canPromoteBranch(inlineSuggestion)
-    ) {
-      event.preventDefault();
-      void acceptInlineSuggestion(inlineSuggestion);
       return;
     }
     const modifier = event.metaKey || event.ctrlKey;
@@ -4117,6 +4224,7 @@
     saveState = 'clean';
     saveMessage = 'No project open';
     focusMode = false;
+    outlineOpen = false;
     suggestionsEnabled = false;
     cancelSuggestionTimer();
     dismissedCandidateIds = [];
@@ -4189,6 +4297,17 @@
 
   {#if project}
     <header class="topbar" aria-label="Writing controls">
+      {#if project.documents.length > 1}
+        <button
+          bind:this={outlineToggle}
+          class="outline-toggle"
+          type="button"
+          aria-controls="project-outline"
+          aria-expanded={outlineOpen}
+          aria-label={outlineOpen ? 'Close manuscript outline' : 'Open manuscript outline'}
+          on:click={() => void setOutlineOpen(!outlineOpen)}
+        >☰</button>
+      {/if}
       <h1 class="context-title" title={document?.summary.title ?? project.title}>
         {document?.summary.title ?? project.title}
       </h1>
@@ -4221,13 +4340,13 @@
           <button class:active={focusMode} type="button" aria-pressed={focusMode} disabled={editorReadonly} on:click={() => { closeProjectMenu(); void toggleFocusMode(); }}>
             <span>Focus mode</span><span aria-hidden="true">{focusMode ? '✓' : ''}</span>
           </button>
-          {#if ghostSuggestion}
+          {#if activeGhostSuggestion}
             <div class="project-menu-separator"></div>
             <div class="project-menu-label">Suggestion</div>
-            <button type="button" on:click={() => { closeProjectMenu(); acceptVisualGhost(ghostSuggestion.candidateId); }}>
+            <button type="button" on:click={() => { closeProjectMenu(); acceptActiveGhost(activeGhostSuggestion.candidateId, activeGhostSuggestion.presentationKey); }}>
               <span>Accept suggestion</span><kbd>Tab</kbd>
             </button>
-            <button type="button" on:click={() => { closeProjectMenu(); dismissVisualGhost(ghostSuggestion.candidateId); }}>
+            <button type="button" on:click={() => { closeProjectMenu(); dismissActiveGhost(activeGhostSuggestion.candidateId, activeGhostSuggestion.presentationKey); }}>
               <span>Dismiss suggestion</span><kbd>Esc</kbd>
             </button>
           {/if}
@@ -4241,15 +4360,18 @@
   {/if}
 
   {#if project}
+    {#if outlineOpen}
+      <button class="outline-scrim" type="button" aria-label="Close manuscript outline" on:click={() => void setOutlineOpen(false)}></button>
+    {/if}
     <div class:single-document={project.documents.length === 1} class="workspace-grid">
-      <aside class="outline-panel" aria-label="Project outline">
+      <aside id="project-outline" class:open={outlineOpen} class="outline-panel" aria-label="Project outline">
         <div class="panel-heading">
           <span>Manuscript</span>
         </div>
         <label class="search-field">
           <span class="sr-only">Search project</span>
           <span aria-hidden="true">⌕</span>
-          <input bind:value={search} type="search" placeholder="Find in project" />
+          <input bind:this={outlineSearch} bind:value={search} type="search" placeholder="Find in project" />
         </label>
         <nav class="document-list" aria-label="Documents">
           {#each visibleDocuments as candidate (candidate.document_id)}
@@ -4257,7 +4379,7 @@
               class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}
               type="button"
               disabled={editorReadonly}
-              on:click={() => selectDocument(candidate)}
+              on:click={() => { outlineOpen = false; void selectDocument(candidate); }}
             >
               <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
               <span class="document-label">
@@ -4392,8 +4514,11 @@
                       onChange={updateText}
                       onCompositionChange={setVisualComposition}
                       onImmediateDocumentMutation={invalidateVisualSuggestionImmediately}
-                      onGhostAccept={acceptVisualGhost}
-                      onGhostDismiss={dismissVisualGhost}
+                      onGhostAccept={acceptActiveGhost}
+                      onGhostDismiss={dismissActiveGhost}
+                      onGhostVisibilityChange={(presentationKey) => {
+                        visibleVisualGhostPresentationKey = presentationKey;
+                      }}
                       onSelectionChange={updateVisualSelection}
                       readonly={editorReadonly}
                       autofocus={true}
@@ -4412,36 +4537,43 @@
                 {#if document.summary.kind === 'hybrid'}
                   <div class="verse-notice" role="alert">Hybrid source editing is locked until its prose/verse block manifest can cross the IPC boundary losslessly.</div>
                 {/if}
-                <textarea
-                  bind:this={sourceTextarea}
-                  class:verse={exactTextSurface}
+                <SourceEditor
+                  bind:this={sourceEditor}
+                  bind:element={sourceTextarea}
                   value={sourceDisplayText}
                   readonly={editorReadonly || document.summary.kind === 'hybrid' || Boolean(exactTextSurface && verseCodec && !verseCodec.editable)}
-                  on:compositionstart={beginSourceComposition}
-                  on:compositionend={finishSourceComposition}
-                  on:input={(event) => {
-                    updateSourceSelection(event.currentTarget);
-                    updateFromSource(event.currentTarget.value);
+                  verse={exactTextSurface}
+                  verseNewline={exactTextSurface ? verseCodec?.newline ?? 'mixed' : null}
+                  surfaceKey={`${project.session_id}:${document.summary.document_id}:${documentEpoch}:${mode}`}
+                  ghostText={sourceGhostSuggestion?.text ?? ''}
+                  ghostCandidateId={sourceGhostSuggestion?.candidateId ?? ''}
+                  ghostPresentationKey={sourceGhostSuggestion?.presentationKey ?? ''}
+                  onCompositionStart={beginSourceComposition}
+                  onCompositionEnd={finishSourceComposition}
+                  onValueInput={(textarea) => {
+                    updateSourceSelection(textarea);
+                    updateFromSource(textarea.value);
                   }}
-                  on:select={(event) => updateSourceSelection(event.currentTarget)}
-                  on:click={(event) => updateSourceSelection(event.currentTarget)}
-                  on:keyup={(event) => updateSourceSelection(event.currentTarget)}
-                  aria-label={exactTextSurface ? 'Exact-whitespace verse editor' : 'Markdown source editor'}
-                  spellcheck="true"
-                  wrap={exactTextSurface ? 'off' : 'soft'}
-                ></textarea>
+                  onSelectionChange={updateSourceSelection}
+                  onGhostAccept={acceptActiveGhost}
+                  onGhostDismiss={dismissActiveGhost}
+                  onGhostVisibilityChange={(presentationKey) => {
+                    visibleSourceGhostPresentationKey = presentationKey;
+                  }}
+                  label={exactTextSurface ? 'Exact-whitespace verse editor' : 'Markdown source editor'}
+                />
               </div>
             {/if}
           </section>
 
-          {#if branches.length > 0}
+          {#if branchShelfVisible}
             <details class="branch-shelf">
               <summary>
-                <span class:ready={currentReadyBranches.length > 0} class="status-dot"></span>
-                <span>{activeBranchCount > 0 ? 'Suggestions growing' : currentReadyBranches.length > 0 ? `${currentReadyBranches.length} ${currentReadyBranches.length === 1 ? 'strand' : 'strands'} ready` : 'Earlier strands'}</span>
+                <span class:ready={shelfReadyCount > 0} class="status-dot"></span>
+                <span>{branchShelfLabel}</span>
               </summary>
               <div class="branch-shelf-body" aria-label="Private strands">
-                {#each branches as branch (branch.branch_id)}
+                {#each shelfBranches as branch (branch.branch_id)}
                   <article class="branch-card status-{branch.status}">
                     <header>
                       <span class="branch-status">{branchStatusLabel(branch)}</span>
@@ -4479,11 +4611,6 @@
                     </div>
                   </article>
                 {/each}
-                {#if branchHasMore}
-                  <button class="secondary-button compact branch-load-more" type="button" on:click={() => void loadMoreBranches()} disabled={branchLoadingMore}>
-                    {branchLoadingMore ? 'Loading…' : 'Load older strands'}
-                  </button>
-                {/if}
               </div>
             </details>
           {/if}
@@ -4513,9 +4640,9 @@
   {:else}
     <main class="welcome" id="manuscript">
       <section class="welcome-note" aria-labelledby="welcome-title">
-        <h1 id="welcome-title">Open a Loom.</h1>
+        <h1 id="welcome-title">{errorMessage ? 'Your writing did not open.' : desktop ? 'Opening your writing…' : 'Desktop app required.'}</h1>
         {#if !desktop}
-          <div class="runtime-note" role="note">Open the desktop app to write.</div>
+          <div class="runtime-note" role="note">Writing and local models are available in the desktop app.</div>
         {/if}
         {#if errorMessage}
           <div class="error-banner" role="alert">
@@ -4524,7 +4651,7 @@
         {/if}
         <div class="welcome-actions">
           <button class="secondary-button" type="button" on:click={doOpenProject} disabled={!desktop || opening}>
-            {opening ? 'Opening…' : 'Open a Loom folder…'}
+            {opening ? 'Opening…' : 'Choose another folder…'}
           </button>
         </div>
       </section>
@@ -4550,8 +4677,8 @@
       >
         <header class="model-manager-header">
           <div>
-            <h2 id="model-manager-title">Suggestions</h2>
-            <p>Private continuations from a local model, only when you choose to enable them.</p>
+            <h2 id="model-manager-title">Writing suggestions</h2>
+            <p>Optional, private continuations made on this computer.</p>
           </div>
           <button class="icon-button" type="button" on:click={closeModelManager} aria-label="Close model manager">×</button>
         </header>
@@ -4567,23 +4694,23 @@
               />
               <span>
                 <strong>Suggest while I pause</strong>
-                <small>{project ? currentModel ? 'Strands stay private until you accept one.' : 'Load a raw-completion model below.' : 'Open a note first.'}</small>
+                <small>{project ? currentModel ? 'Tab accepts a suggestion; ignoring it changes nothing.' : 'Choose a local writer below.' : 'Open a note first.'}</small>
               </span>
             </label>
             <div class="section-heading">
               <div>
-                <h3 id="model-library-title">On this computer</h3>
-                <p>GGUF files are inspected before Loom claims a capability.</p>
+                <h3 id="model-library-title">Local writer</h3>
+                <p>No manuscript text leaves your computer.</p>
               </div>
               <div class="model-library-actions">
-                <button class="bare-button compact" type="button" on:click={() => void chooseExistingModel()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>{modelChoosing ? 'Choosing…' : 'Choose GGUF…'}</button>
+                <button class="bare-button compact" type="button" on:click={() => void chooseExistingModel()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>{modelChoosing ? 'Choosing…' : 'Choose model file…'}</button>
                 <button class="bare-button compact" type="button" on:click={() => void refreshModels()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>Refresh</button>
               </div>
             </div>
 
             {#if models.length > 0}
               <label class="model-manager-picker">
-                <span>Model file</span>
+                <span>Writer model</span>
                 <select bind:value={selectedModelPath} disabled={modelChoosing || modelLoading || modelUnloading}>
                   {#each models as model (model.model_path)}
                     <option value={model.model_path} disabled={!model.header_verified}>
@@ -4594,8 +4721,8 @@
               </label>
             {:else}
               <div class="model-empty-state">
-                <strong>No GGUF model discovered yet.</strong>
-                <span>You can keep writing without one, choose an existing cache file, or add a verified download below.</span>
+                <strong>No local writer is set up yet.</strong>
+                <span>Keep writing as usual, or choose a GGUF model file when you want suggestions.</span>
               </div>
             {/if}
 
@@ -4608,23 +4735,23 @@
                   </div>
                   <span class:verified={selectedModel.header_verified} class="fact-chip">{selectedModel.header_verified ? 'GGUF verified' : 'Unavailable'}</span>
                 </header>
-                <dl>
-                  <div><dt>Prompt mode</dt><dd>{modelCapabilityMode(selectedModel)}</dd></div>
-                  <div><dt>Architecture</dt><dd>{selectedModel.architecture ?? 'Inspect on load'}</dd></div>
-                  <div><dt>Context</dt><dd>{selectedModel.context_tokens === null ? 'Inspect on load' : `${selectedModel.context_tokens.toLocaleString()} tokens`}</dd></div>
-                  <div><dt>Media</dt><dd>{modelMediaLabel(selectedModel)}</dd></div>
-                  <div><dt>Generated tokens</dt><dd>{selectedModel.loaded ? (selectedModel.output_tokens ? 'Available' : 'Unavailable') : 'Inspect on load'}</dd></div>
-                  <div><dt>Log probabilities</dt><dd>{selectedModel.loaded ? (selectedModel.logprobs ? 'Available' : 'Unavailable') : 'Inspect on load'}</dd></div>
-                  <div><dt>Fill in middle</dt><dd>{selectedModel.loaded ? (selectedModel.fill_in_middle ? 'Verified' : 'Unavailable') : 'Inspect on load'}</dd></div>
-                  <div><dt>Projector</dt><dd>{selectedModel.projector_present === null ? 'Inspect on load' : selectedModel.projector_present ? 'Present' : 'None'}</dd></div>
-                </dl>
                 {#if selectedModel.tested_profile}
-                  <p class="tested-profile"><span aria-hidden="true">✓</span> Loom acceptance profile: <code>{selectedModel.tested_profile}</code></p>
+                  <p class="tested-profile"><span aria-hidden="true">✓</span> Tested for local continuation</p>
                 {/if}
-                <details>
-                  <summary>File and fingerprint evidence</summary>
+                <details class="model-technical">
+                  <summary>Technical details</summary>
+                  <dl>
+                    <div><dt>Prompt mode</dt><dd>{modelCapabilityMode(selectedModel)}</dd></div>
+                    <div><dt>Architecture</dt><dd>{selectedModel.architecture ?? 'Inspect on load'}</dd></div>
+                    <div><dt>Context</dt><dd>{selectedModel.context_tokens === null ? 'Inspect on load' : `${selectedModel.context_tokens.toLocaleString()} tokens`}</dd></div>
+                    <div><dt>Media</dt><dd>{modelMediaLabel(selectedModel)}</dd></div>
+                    <div><dt>Generated tokens</dt><dd>{selectedModel.loaded ? (selectedModel.output_tokens ? 'Available' : 'Unavailable') : 'Inspect on load'}</dd></div>
+                    <div><dt>Log probabilities</dt><dd>{selectedModel.loaded ? (selectedModel.logprobs ? 'Available' : 'Unavailable') : 'Inspect on load'}</dd></div>
+                    <div><dt>Fill in middle</dt><dd>{selectedModel.loaded ? (selectedModel.fill_in_middle ? 'Verified' : 'Unavailable') : 'Inspect on load'}</dd></div>
+                    <div><dt>Projector</dt><dd>{selectedModel.projector_present === null ? 'Inspect on load' : selectedModel.projector_present ? 'Present' : 'None'}</dd></div>
+                  </dl>
                   <dl class="model-evidence">
-                    <div><dt>Path</dt><dd><code>{selectedModel.model_path}</code></dd></div>
+                    <div><dt>File</dt><dd><code>{selectedModel.model_path}</code></dd></div>
                     <div><dt>SHA-256</dt><dd><code>{selectedModel.model_sha256 ?? 'Computed during native load'}</code></dd></div>
                   </dl>
                 </details>
@@ -4635,7 +4762,7 @@
                     </button>
                   {:else}
                     <button class="primary-button" type="button" on:click={() => void loadSelectedModel()} disabled={!selectedModel.header_verified || modelLoading || modelUnloading || activeBranchCount > 0}>
-                      {modelLoading ? 'Inspecting natively…' : 'Load and inspect locally'}
+                      {modelLoading ? 'Checking model…' : 'Use this model'}
                     </button>
                   {/if}
                 </div>
@@ -4643,15 +4770,17 @@
             {/if}
 
             <div class="model-language-note">
-              <strong>Base versus chat.</strong>
-              A base model continues the manuscript exactly where it ends. A chat model expects a conversation template. Loom never disguises one as the other or inserts a hidden chat prompt into raw continuation.
+              <strong>Why a base model?</strong>
+              It continues the writing already on the page. Loom does not turn your manuscript into a chat or add hidden instructions.
             </div>
           </section>
 
-          <section class="model-download-panel" aria-labelledby="model-download-title">
+          <details class="model-download-panel">
+            <summary>Advanced · add a model from a verified URL</summary>
+            <div class="model-download-content">
             <div class="section-heading">
               <div>
-                <h3 id="model-download-title">Add a verified GGUF</h3>
+                <h3>Add a verified GGUF</h3>
                 <p>Bring a publisher URL and its exact checksum. Loom will not guess either one.</p>
               </div>
               {#if activeModelDownloads.length > 0}
@@ -4772,7 +4901,8 @@
                 {/each}
               </div>
             {/if}
-          </section>
+            </div>
+          </details>
         </div>
       </div>
     </div>

@@ -3,9 +3,11 @@
 mod model_download;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, Metadata};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, TryLockError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use loom_backend_llama::{
     ContinuationCase, DownloadControl, DownloadError, ExactContinuationRequest,
@@ -28,13 +30,15 @@ use loom_store::{
     VisibleProjectionState,
 };
 use loom_types::{
-    AuthorityPolicy, BlobId, BranchId, ByteRange, CancelGenerationCommand, CandidateId, CommandId,
-    CommandReceipt, ContextRecipe, DocumentId, DocumentKind, GenerationEventKind, GenerationRunId,
-    GenerationStart, GenerationTerminalStatus, LoomEvent, ModelEnvironment, ProjectId,
-    PromoteCandidateCommand, PromptMode, PromptRecipe, RevisionId, SelectionDecision,
-    derive_weave_case_ids, now_unix_ms,
+    AuthorityPolicy, BlobId, BranchId, BuildModelPolicy, ByteRange, CancelGenerationCommand,
+    CandidateId, CommandId, CommandReceipt, ContextRecipe, DocumentId, DocumentKind,
+    GenerationEventKind, GenerationRunId, GenerationStart, GenerationTerminalStatus, LoomEvent,
+    ModelEnvironment, ModelRole, ProjectId, PromoteCandidateCommand, PromptMode, PromptRecipe,
+    RevisionId, SelectionDecision, derive_weave_case_ids, now_unix_ms,
 };
+use same_file::Handle as FileIdentityHandle;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
@@ -47,10 +51,8 @@ use crate::model_download::{
 const INITIAL_DOCUMENT: &str = "manuscript/Untitled.md";
 const DEFAULT_PROJECT_DIRECTORY: &str = "writing";
 const PROJECT_CLOSE_GENERATION_WAIT: Duration = Duration::from_secs(3);
-const TESTED_GEMMA_4_E2B_BASE_Q8_SHA256: &str =
-    "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670";
-const TESTED_GEMMA_4_E2B_BASE_PROFILE: &str = "gemma_4_e2b_base_q8_loom_v1";
 const MAX_MODEL_DOWNLOAD_URL_BYTES: usize = 16 * 1024;
+const POLICY_MODEL_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum SessionPhase {
@@ -79,16 +81,22 @@ pub struct PluginState {
     generations: GenerationRegistry,
     downloads: Arc<ModelDownloadRegistry>,
     model_library_root: Option<PathBuf>,
+    build_model_policy: BuildModelPolicy,
+    additional_policy_model_paths: Vec<PathBuf>,
 }
 
 impl Default for PluginState {
     fn default() -> Self {
-        Self::with_model_library_root(None)
+        Self::with_model_library_root(None, BuildModelPolicy::default(), Vec::new())
     }
 }
 
 impl PluginState {
-    fn with_model_library_root(model_library_root: Option<PathBuf>) -> Self {
+    fn with_model_library_root(
+        model_library_root: Option<PathBuf>,
+        build_model_policy: BuildModelPolicy,
+        additional_policy_model_paths: Vec<PathBuf>,
+    ) -> Self {
         Self {
             session: Mutex::new(Session::default()),
             backend: Arc::new(LlamaBackend::default()),
@@ -98,6 +106,8 @@ impl PluginState {
             generations: GenerationRegistry::default(),
             downloads: Arc::new(ModelDownloadRegistry::default()),
             model_library_root,
+            build_model_policy,
+            additional_policy_model_paths,
         }
     }
 }
@@ -135,6 +145,44 @@ enum ModelLoadPlan {
     },
 }
 
+enum PolicyModelLoadPlan {
+    Ready(ModelCapabilitySummary),
+    Inspect {
+        canonical_path: PathBuf,
+        profile: LocalModelProfile,
+        expectation: PolicyWriterExpectation,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PolicyWriterExpectation {
+    profile_id: String,
+    rank: u32,
+    role: ModelRole,
+    prompt_mode: PromptMode,
+    model_sha256: BlobId,
+    model_file_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PolicyFileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug)]
+struct VerifiedPolicyFile {
+    canonical_path: PathBuf,
+    identity: FileIdentityHandle,
+    stamp: PolicyFileStamp,
+}
+
+#[derive(Debug)]
+struct PolicyInspectionFailure {
+    failure: IpcFailure,
+    native_inspection_started: bool,
+}
+
 struct PreparedModelDownload {
     command_id: CommandId,
     request: GgufDownloadRequest,
@@ -153,15 +201,32 @@ impl BranchCancellation for LlamaCancellation {
 }
 
 #[derive(Debug, Default)]
-pub struct Builder;
+pub struct Builder {
+    build_model_policy: BuildModelPolicy,
+    additional_policy_model_paths: Vec<PathBuf>,
+}
 
 impl Builder {
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_build_model_policy(mut self, build_model_policy: BuildModelPolicy) -> Self {
+        self.build_model_policy = build_model_policy;
+        self
+    }
+
+    #[must_use]
+    pub fn with_additional_policy_model_path(mut self, model_path: PathBuf) -> Self {
+        self.additional_policy_model_paths.push(model_path);
+        self
     }
 
     pub fn build<R: Runtime>(self) -> TauriPlugin<R> {
+        let build_model_policy = self.build_model_policy;
+        let additional_policy_model_paths = self.additional_policy_model_paths;
         PluginBuilder::new("loom")
             .invoke_handler(tauri::generate_handler![
                 project_open_default,
@@ -179,6 +244,7 @@ impl Builder {
                 model_list,
                 model_choose,
                 model_load,
+                model_load_policy_candidate,
                 model_unload,
                 model_download_start,
                 model_download_cancel,
@@ -196,9 +262,13 @@ impl Builder {
                 focus_mode_set,
                 application_close,
             ])
-            .setup(|app, _api| {
+            .setup(move |app, _api| {
                 let model_library_root = app.path().app_local_data_dir().ok();
-                app.manage(PluginState::with_model_library_root(model_library_root));
+                app.manage(PluginState::with_model_library_root(
+                    model_library_root,
+                    build_model_policy,
+                    additional_policy_model_paths,
+                ));
                 Ok(())
             })
             .build()
@@ -489,7 +559,19 @@ pub struct ModelCapabilitySummary {
     model_sha256: Option<String>,
     projector_present: Option<bool>,
     media_kinds: Vec<&'static str>,
-    tested_profile: Option<&'static str>,
+    /// A size-only policy hint. It is emitted only for uninspected discoveries.
+    policy_candidate: Option<PolicyProfileSummary>,
+    /// Exact policy identity after native inspection and digest agreement.
+    policy_verified: Option<PolicyProfileSummary>,
+    /// Compatibility alias for the first UI slice. New code uses
+    /// `policy_verified.profile_id`.
+    tested_profile: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PolicyProfileSummary {
+    profile_id: String,
+    rank: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1758,7 +1840,7 @@ async fn model_list(
                 .as_ref()
                 .filter(|loaded| loaded.profile.model_path == model.resolved_path)
             {
-                return model_summary(loaded, true);
+                return model_summary(loaded, true, &state.build_model_policy);
             }
             ModelCapabilitySummary {
                 model_id: format!("discovered:{}", BlobId::digest(model_path.as_bytes())),
@@ -1780,6 +1862,11 @@ async fn model_list(
                 model_sha256: None,
                 projector_present: None,
                 media_kinds: Vec::new(),
+                policy_candidate: policy_candidate_summary(
+                    &state.build_model_policy,
+                    model.file_bytes,
+                ),
+                policy_verified: None,
                 tested_profile: None,
             }
         })
@@ -1787,12 +1874,23 @@ async fn model_list(
     if let Some(loaded) = &loaded
         && !models.iter().any(|model| model.loaded)
     {
-        models.push(model_summary(loaded, true));
+        models.push(model_summary(loaded, true, &state.build_model_policy));
     }
     models.sort_by(|left, right| {
         right
             .loaded
             .cmp(&left.loaded)
+            .then_with(|| {
+                left.policy_candidate
+                    .as_ref()
+                    .map_or(u32::MAX, |candidate| candidate.rank)
+                    .cmp(
+                        &right
+                            .policy_candidate
+                            .as_ref()
+                            .map_or(u32::MAX, |candidate| candidate.rank),
+                    )
+            })
             .then_with(|| left.display_name.cmp(&right.display_name))
             .then_with(|| left.model_path.cmp(&right.model_path))
     });
@@ -1879,6 +1977,403 @@ async fn model_load(
     )
 }
 
+/// Automatically loads only a writer named by the embedded build policy.
+///
+/// This command hashes the canonical local file through an open identity
+/// handle before llama.cpp sees the path. It rechecks that the path still
+/// names the same file before and after native inspection, and it requires the
+/// native descriptor to report the same digest and size. See
+/// `docs/model-policy-loading.md` for the remaining cross-process mutation
+/// limit of a path-based native loader.
+#[tauri::command]
+async fn model_load_policy_candidate(
+    profile_id: String,
+    model_path: String,
+    state: State<'_, PluginState>,
+) -> Result<ModelCapabilitySummary, IpcFailure> {
+    let (canonical_path, profile, expectation) =
+        match prepare_policy_model_load(&profile_id, &model_path, &state)? {
+            PolicyModelLoadPlan::Ready(summary) => return Ok(summary),
+            PolicyModelLoadPlan::Inspect {
+                canonical_path,
+                profile,
+                expectation,
+            } => (canonical_path, profile, expectation),
+        };
+    let worker_path = canonical_path.clone();
+    let worker_profile = profile.clone();
+    let worker_expectation = expectation.clone();
+    let backend = Arc::clone(&state.backend);
+    let inspected = tauri::async_runtime::spawn_blocking(move || {
+        inspect_preverified_policy_file(&worker_path, &worker_expectation, || {
+            let descriptor = backend
+                .inspect_model(&worker_profile)
+                .map_err(|error| IpcFailure::backend(&error))?;
+            validate_policy_model_descriptor(&descriptor, &worker_path, &worker_expectation)?;
+            Ok(descriptor)
+        })
+    })
+    .await
+    .map_err(|error| PolicyInspectionFailure {
+        failure: IpcFailure::new(
+            "model_worker_failed",
+            format!("the policy model verification worker stopped: {error}"),
+            true,
+        ),
+        // The worker may have crossed the native boundary before its join
+        // failed, so cleanup must conservatively attempt a native release.
+        native_inspection_started: true,
+    })
+    .and_then(|result| result);
+    let descriptor = resolve_policy_model_inspection(&state, &canonical_path, &profile, inspected)?;
+    commit_model_load(
+        &state,
+        &canonical_path,
+        LoadedModel {
+            profile,
+            descriptor,
+        },
+    )
+}
+
+fn prepare_policy_model_load(
+    profile_id: &str,
+    model_path: &str,
+    state: &State<'_, PluginState>,
+) -> Result<PolicyModelLoadPlan, IpcFailure> {
+    // Resolve the profile before touching the path so an unknown policy name
+    // cannot be used as a filesystem-probing oracle.
+    let expectation = policy_writer_expectation(&state.build_model_policy, profile_id)?;
+    let requested = PathBuf::from(model_path);
+    let canonical_path = requested.canonicalize().map_err(|error| {
+        IpcFailure::new(
+            "policy_model_path_error",
+            format!("the policy model path cannot be opened: {error}"),
+            false,
+        )
+    })?;
+    let discovered = discover_loadable_model(state, &canonical_path)?;
+    if discovered.file_bytes != expectation.model_file_bytes {
+        return Err(IpcFailure::new(
+            "policy_model_size_mismatch",
+            "the local file size does not match the selected writer policy",
+            false,
+        ));
+    }
+
+    let _lifecycle = lock_model_lifecycle(state)?;
+    let mut registry = lock_model_registry(state)?;
+    match &*registry {
+        ModelRegistry::Loaded(loaded) if loaded.profile.model_path == canonical_path => {
+            validate_policy_model_descriptor(&loaded.descriptor, &canonical_path, &expectation)?;
+            let summary = model_summary(loaded, true, &state.build_model_policy);
+            return Ok(PolicyModelLoadPlan::Ready(summary));
+        }
+        ModelRegistry::Loading { path, .. } => {
+            return Err(IpcFailure::new(
+                "model_load_in_progress",
+                format!("Loom is already verifying {}", path.display()),
+                true,
+            ));
+        }
+        ModelRegistry::Loaded(_) | ModelRegistry::Empty => {}
+    }
+    ensure_no_active_generations(state, "switching local models")?;
+    let previous = match std::mem::take(&mut *registry) {
+        ModelRegistry::Loaded(previous) => Some(previous),
+        ModelRegistry::Empty => None,
+        ModelRegistry::Loading { .. } => {
+            unreachable!("the loading state was rejected while holding the registry lock")
+        }
+    };
+    *registry = ModelRegistry::Loading {
+        path: canonical_path.clone(),
+        previous,
+    };
+    Ok(PolicyModelLoadPlan::Inspect {
+        canonical_path: canonical_path.clone(),
+        profile: LocalModelProfile::for_gguf(canonical_path),
+        expectation,
+    })
+}
+
+fn policy_writer_expectation(
+    policy: &BuildModelPolicy,
+    profile_id: &str,
+) -> Result<PolicyWriterExpectation, IpcFailure> {
+    let ranked = policy.writer_by_profile_id(profile_id).ok_or_else(|| {
+        IpcFailure::new(
+            "unknown_policy_model_profile",
+            "the requested writer profile is not in this build policy",
+            false,
+        )
+    })?;
+    let writer = ranked.writer();
+    if writer.role() != ModelRole::Writer || writer.prompt_mode() != PromptMode::Completion {
+        return Err(IpcFailure::new(
+            "unsupported_policy_model_contract",
+            "the selected profile is not an accepted raw-completion writer contract",
+            false,
+        ));
+    }
+    Ok(PolicyWriterExpectation {
+        profile_id: writer.profile_id().to_owned(),
+        rank: ranked.rank(),
+        role: writer.role(),
+        prompt_mode: writer.prompt_mode(),
+        model_sha256: writer.model_sha256(),
+        model_file_bytes: writer.model_file_bytes(),
+    })
+}
+
+fn inspect_preverified_policy_file<T>(
+    canonical_path: &Path,
+    expectation: &PolicyWriterExpectation,
+    inspect: impl FnOnce() -> Result<T, IpcFailure>,
+) -> Result<T, PolicyInspectionFailure> {
+    let verified = VerifiedPolicyFile::open(canonical_path, expectation).map_err(|failure| {
+        PolicyInspectionFailure {
+            failure,
+            native_inspection_started: false,
+        }
+    })?;
+    verified
+        .ensure_path_binding()
+        .map_err(|failure| PolicyInspectionFailure {
+            failure,
+            native_inspection_started: false,
+        })?;
+    let inspected = inspect().map_err(|failure| PolicyInspectionFailure {
+        failure,
+        native_inspection_started: true,
+    })?;
+    verified
+        .ensure_path_binding()
+        .map_err(|failure| PolicyInspectionFailure {
+            failure,
+            native_inspection_started: true,
+        })?;
+    Ok(inspected)
+}
+
+impl VerifiedPolicyFile {
+    fn open(
+        canonical_path: &Path,
+        expectation: &PolicyWriterExpectation,
+    ) -> Result<Self, IpcFailure> {
+        ensure_regular_policy_path(canonical_path)?;
+        let mut identity = FileIdentityHandle::from_path(canonical_path).map_err(|error| {
+            policy_model_io_failure("open the policy model for identity verification", &error)
+        })?;
+        let stamp =
+            policy_file_stamp(&identity.as_file().metadata().map_err(|error| {
+                policy_model_io_failure("inspect the opened policy model", &error)
+            })?);
+        if stamp.len != expectation.model_file_bytes {
+            return Err(IpcFailure::new(
+                "policy_model_size_mismatch",
+                "the opened local file size does not match the selected writer policy",
+                false,
+            ));
+        }
+        let digest = hash_policy_model_file(identity.as_file_mut(), expectation.model_file_bytes)?;
+        if digest != expectation.model_sha256 {
+            return Err(IpcFailure::new(
+                "policy_model_digest_mismatch",
+                "the local file digest does not match the selected writer policy",
+                false,
+            ));
+        }
+        let verified = Self {
+            canonical_path: canonical_path.to_path_buf(),
+            identity,
+            stamp,
+        };
+        verified.ensure_path_binding()?;
+        Ok(verified)
+    }
+
+    fn ensure_path_binding(&self) -> Result<(), IpcFailure> {
+        ensure_regular_policy_path(&self.canonical_path)?;
+        let resolved = self.canonical_path.canonicalize().map_err(|error| {
+            policy_model_io_failure("canonicalize the verified policy model", &error)
+        })?;
+        if resolved != self.canonical_path {
+            return Err(policy_model_file_changed());
+        }
+        let current = FileIdentityHandle::from_path(&self.canonical_path).map_err(|error| {
+            policy_model_io_failure("reopen the verified policy model identity", &error)
+        })?;
+        if current != self.identity {
+            return Err(policy_model_file_changed());
+        }
+        let open_stamp =
+            policy_file_stamp(&self.identity.as_file().metadata().map_err(|error| {
+                policy_model_io_failure("reinspect the verified open model", &error)
+            })?);
+        let path_stamp = policy_file_stamp(&current.as_file().metadata().map_err(|error| {
+            policy_model_io_failure("reinspect the verified model path", &error)
+        })?);
+        if open_stamp != self.stamp || path_stamp != self.stamp {
+            return Err(policy_model_file_changed());
+        }
+        Ok(())
+    }
+}
+
+fn ensure_regular_policy_path(path: &Path) -> Result<(), IpcFailure> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| policy_model_io_failure("inspect the policy model path", &error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(IpcFailure::new(
+            "policy_model_not_regular_file",
+            "the policy model path must name one regular file without a final symlink",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn policy_file_stamp(metadata: &Metadata) -> PolicyFileStamp {
+    PolicyFileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    }
+}
+
+fn hash_policy_model_file(file: &mut File, expected_bytes: u64) -> Result<BlobId, IpcFailure> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; POLICY_MODEL_HASH_BUFFER_BYTES];
+    let mut observed_bytes = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| policy_model_io_failure("hash the policy model", &error))?;
+        if read == 0 {
+            break;
+        }
+        observed_bytes = observed_bytes
+            .checked_add(u64::try_from(read).map_err(|_| {
+                IpcFailure::new(
+                    "policy_model_size_overflow",
+                    "the policy model read size does not fit the platform",
+                    false,
+                )
+            })?)
+            .ok_or_else(|| {
+                IpcFailure::new(
+                    "policy_model_size_overflow",
+                    "the policy model byte count overflowed",
+                    false,
+                )
+            })?;
+        if observed_bytes > expected_bytes {
+            return Err(policy_model_file_changed());
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if observed_bytes != expected_bytes {
+        return Err(policy_model_file_changed());
+    }
+    Ok(BlobId::from_bytes(hasher.finalize().into()))
+}
+
+fn validate_policy_model_descriptor(
+    descriptor: &VerifiedModelDescriptor,
+    canonical_path: &Path,
+    expectation: &PolicyWriterExpectation,
+) -> Result<(), IpcFailure> {
+    let descriptor_digest = descriptor.model_sha256.parse::<BlobId>().map_err(|_| {
+        IpcFailure::new(
+            "policy_model_native_identity_mismatch",
+            "native inspection returned an invalid model digest",
+            false,
+        )
+    })?;
+    if descriptor.model_path != canonical_path
+        || descriptor.model_file_bytes != expectation.model_file_bytes
+        || descriptor_digest != expectation.model_sha256
+    {
+        return Err(IpcFailure::new(
+            "policy_model_native_identity_mismatch",
+            "native inspection did not return the preverified policy model identity",
+            false,
+        ));
+    }
+    if expectation.role != ModelRole::Writer
+        || expectation.prompt_mode != PromptMode::Completion
+        || !descriptor.capabilities.completion_text.is_supported()
+        || !descriptor.capabilities.generated_token_ids.is_supported()
+    {
+        return Err(IpcFailure::new(
+            "policy_model_capability_mismatch",
+            "native inspection did not prove raw completion and generated-token support required by the writer policy",
+            false,
+        ));
+    }
+    // Schema v1 does not encode a chat-support requirement. Do not infer one:
+    // a future policy field must be checked here before that contract can be
+    // accepted automatically.
+    Ok(())
+}
+
+fn resolve_policy_model_inspection(
+    state: &PluginState,
+    canonical_path: &Path,
+    profile: &LocalModelProfile,
+    inspected: Result<VerifiedModelDescriptor, PolicyInspectionFailure>,
+) -> Result<VerifiedModelDescriptor, IpcFailure> {
+    match inspected {
+        Ok(descriptor) => Ok(descriptor),
+        Err(error) => {
+            if error.native_inspection_started {
+                release_staged_model(state, canonical_path, profile)?;
+            } else {
+                restore_staged_model(state, canonical_path)?;
+            }
+            Err(error.failure)
+        }
+    }
+}
+
+fn restore_staged_model(state: &PluginState, path: &Path) -> Result<(), IpcFailure> {
+    let mut registry = lock_model_registry(state)?;
+    let current = std::mem::take(&mut *registry);
+    match current {
+        ModelRegistry::Loading {
+            path: loading,
+            previous,
+        } if loading == path => {
+            *registry = previous.map_or(ModelRegistry::Empty, ModelRegistry::Loaded);
+            Ok(())
+        }
+        current => {
+            *registry = current;
+            Err(IpcFailure::new(
+                "model_load_state_changed",
+                "the selected model changed during policy verification",
+                true,
+            ))
+        }
+    }
+}
+
+fn policy_model_io_failure(action: &str, error: &std::io::Error) -> IpcFailure {
+    IpcFailure::new(
+        "policy_model_io_error",
+        format!("could not {action}: {error}"),
+        true,
+    )
+}
+
+fn policy_model_file_changed() -> IpcFailure {
+    IpcFailure::new(
+        "policy_model_file_changed",
+        "the policy model changed during identity verification; retry from a stable local file",
+        true,
+    )
+}
+
 fn prepare_model_load(
     model_path: &str,
     state: &State<'_, PluginState>,
@@ -1896,7 +2391,11 @@ fn prepare_model_load(
     let mut registry = lock_model_registry(state)?;
     match &*registry {
         ModelRegistry::Loaded(loaded) if loaded.profile.model_path == canonical => {
-            return Ok(ModelLoadPlan::Ready(model_summary(loaded, true)));
+            return Ok(ModelLoadPlan::Ready(model_summary(
+                loaded,
+                true,
+                &state.build_model_policy,
+            )));
         }
         ModelRegistry::Loading { path, .. } => {
             return Err(IpcFailure::new(
@@ -1949,7 +2448,7 @@ fn commit_model_load(
     canonical_path: &Path,
     loaded: LoadedModel,
 ) -> Result<ModelCapabilitySummary, IpcFailure> {
-    let summary = model_summary(&loaded, true);
+    let summary = model_summary(&loaded, true, &state.build_model_policy);
     let mut registry = lock_model_registry(state)?;
     match std::mem::take(&mut *registry) {
         ModelRegistry::Loading { path, previous } if path == canonical_path => {
@@ -2375,6 +2874,9 @@ fn desktop_model_discovery_options(
     if let Some(root) = &state.model_library_root {
         options.user_paths.push(root.join("models"));
     }
+    options
+        .user_paths
+        .extend(state.additional_policy_model_paths.iter().cloned());
     options.user_paths.extend(
         state
             .user_model_paths
@@ -2411,7 +2913,7 @@ fn remember_user_model_path(
 }
 
 fn release_staged_model(
-    state: &State<'_, PluginState>,
+    state: &PluginState,
     path: &Path,
     profile: &LocalModelProfile,
 ) -> Result<(), IpcFailure> {
@@ -2443,7 +2945,20 @@ fn release_staged_model(
     })
 }
 
-fn model_summary(model: &LoadedModel, header_verified: bool) -> ModelCapabilitySummary {
+fn model_summary(
+    model: &LoadedModel,
+    header_verified: bool,
+    build_model_policy: &BuildModelPolicy,
+) -> ModelCapabilitySummary {
+    let policy_verified = build_model_policy
+        .matching_writer(
+            &model.descriptor.model_sha256,
+            model.descriptor.model_file_bytes,
+        )
+        .map(|matched| PolicyProfileSummary {
+            profile_id: matched.writer().profile_id().to_owned(),
+            rank: matched.rank(),
+        });
     ModelCapabilitySummary {
         model_id: model.descriptor.stable_model_id.clone(),
         display_name: model.descriptor.display_name.clone(),
@@ -2483,9 +2998,26 @@ fn model_summary(model: &LoadedModel, header_verified: bool) -> ModelCapabilityS
                 loom_backend_llama::VerifiedMediaKind::Audio => "audio",
             })
             .collect(),
-        tested_profile: (model.descriptor.model_sha256 == TESTED_GEMMA_4_E2B_BASE_Q8_SHA256)
-            .then_some(TESTED_GEMMA_4_E2B_BASE_PROFILE),
+        // Once native inspection has produced an exact digest, a size-only
+        // hint has served its purpose and must not survive a mismatch.
+        policy_candidate: None,
+        tested_profile: policy_verified
+            .as_ref()
+            .map(|profile| profile.profile_id.clone()),
+        policy_verified,
     }
+}
+
+fn policy_candidate_summary(
+    policy: &BuildModelPolicy,
+    model_file_bytes: u64,
+) -> Option<PolicyProfileSummary> {
+    policy
+        .unverified_size_candidate(model_file_bytes)
+        .map(|candidate| PolicyProfileSummary {
+            profile_id: candidate.writer().profile_id().to_owned(),
+            rank: candidate.rank(),
+        })
 }
 
 #[tauri::command]
@@ -4204,9 +4736,9 @@ fn lock_session_internal(
     })
 }
 
-fn lock_model_registry<'a>(
-    state: &'a State<'_, PluginState>,
-) -> Result<std::sync::MutexGuard<'a, ModelRegistry>, IpcFailure> {
+fn lock_model_registry(
+    state: &PluginState,
+) -> Result<std::sync::MutexGuard<'_, ModelRegistry>, IpcFailure> {
     state.model.try_lock().map_err(|error| match error {
         TryLockError::WouldBlock => IpcFailure::new(
             "model_registry_busy",
@@ -4221,9 +4753,7 @@ fn lock_model_registry<'a>(
     })
 }
 
-fn lock_model_lifecycle<'a>(
-    state: &'a State<'_, PluginState>,
-) -> Result<std::sync::MutexGuard<'a, ()>, IpcFailure> {
+fn lock_model_lifecycle(state: &PluginState) -> Result<std::sync::MutexGuard<'_, ()>, IpcFailure> {
     state
         .model_lifecycle
         .try_lock()
@@ -4368,6 +4898,10 @@ impl From<ExternalReconciliationOutcome> for Receipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    use loom_backend_llama::{CapabilitySupport, VerifiedCapabilitySet};
+    use loom_types::ModelEnvironmentId;
 
     #[derive(Debug, Default)]
     struct RecordingCancellation {
@@ -4386,6 +4920,201 @@ mod tests {
             }
             true
         }
+    }
+
+    fn test_policy_expectation(expected_bytes: &[u8]) -> PolicyWriterExpectation {
+        PolicyWriterExpectation {
+            profile_id: "test-writer".to_owned(),
+            rank: 0,
+            role: ModelRole::Writer,
+            prompt_mode: PromptMode::Completion,
+            model_sha256: BlobId::digest(expected_bytes),
+            model_file_bytes: u64::try_from(expected_bytes.len()).expect("fixture byte length"),
+        }
+    }
+
+    fn test_capabilities() -> VerifiedCapabilitySet {
+        VerifiedCapabilitySet {
+            chat: CapabilitySupport::Unsupported,
+            completion_text: CapabilitySupport::Supported,
+            completion_token_ids: CapabilitySupport::Supported,
+            fill_in_middle_contract_id: None,
+            generated_token_ids: CapabilitySupport::Supported,
+            token_observations: CapabilitySupport::Unsupported,
+            probability_stages: Vec::new(),
+            log_probability_stages: Vec::new(),
+            max_cases: 4,
+            ordered_outputs: CapabilitySupport::Supported,
+            per_case_sampling: CapabilitySupport::Supported,
+            per_case_cancellation: CapabilitySupport::Supported,
+            sequence_snapshot: CapabilitySupport::Unsupported,
+            sequence_restore: CapabilitySupport::Unsupported,
+            per_case_restore: CapabilitySupport::Unsupported,
+            token_exact_shared_prefix: CapabilitySupport::Unsupported,
+            media: Vec::new(),
+        }
+    }
+
+    fn test_descriptor(
+        path: &Path,
+        expectation: &PolicyWriterExpectation,
+        stable_model_id: &str,
+    ) -> VerifiedModelDescriptor {
+        VerifiedModelDescriptor {
+            model_environment_id: ModelEnvironmentId::digest(stable_model_id.as_bytes()),
+            stable_model_id: stable_model_id.to_owned(),
+            local_model_id: stable_model_id.to_owned(),
+            model_path: path.to_path_buf(),
+            display_name: stable_model_id.to_owned(),
+            architecture: Some("test".to_owned()),
+            parameter_count: None,
+            model_file_bytes: expectation.model_file_bytes,
+            model_sha256: expectation.model_sha256.to_string(),
+            tokenizer_sha256: BlobId::digest(b"test-tokenizer").to_string(),
+            chat_template_sha256: BlobId::digest(b"no-chat-template").to_string(),
+            projector_sha256: None,
+            binding_version: "test-binding".to_owned(),
+            build_id: "test-build".to_owned(),
+            backend: "test-backend".to_owned(),
+            context_tokens: 4_096,
+            batch_tokens: 512,
+            max_parallel_cases: 4,
+            rope_config_sha256: BlobId::digest(b"test-rope").to_string(),
+            kv_layout_sha256: BlobId::digest(b"test-kv").to_string(),
+            capabilities: test_capabilities(),
+        }
+    }
+
+    fn test_loaded_model(path: &Path, stable_model_id: &str) -> LoadedModel {
+        let expectation = test_policy_expectation(stable_model_id.as_bytes());
+        LoadedModel {
+            profile: LocalModelProfile::for_gguf(path),
+            descriptor: test_descriptor(path, &expectation, stable_model_id),
+        }
+    }
+
+    fn assert_loaded_model_id(state: &PluginState, expected: &str) {
+        let registry = state.model.lock().expect("model registry");
+        let ModelRegistry::Loaded(loaded) = &*registry else {
+            panic!("expected the previous model to remain loaded");
+        };
+        assert_eq!(loaded.descriptor.stable_model_id, expected);
+    }
+
+    #[test]
+    fn same_size_wrong_policy_digest_never_reaches_native_inspection() {
+        let temporary = tempfile::tempdir().expect("temporary model directory");
+        let path = temporary.path().join("writer.gguf");
+        let expected = b"correct identity";
+        let wrong = b"incorrect idents";
+        assert_eq!(expected.len(), wrong.len());
+        std::fs::write(&path, wrong).expect("write same-size wrong model");
+        let canonical = path.canonicalize().expect("canonical model path");
+        let expectation = test_policy_expectation(expected);
+        let inspected = Cell::new(false);
+
+        let error = inspect_preverified_policy_file(&canonical, &expectation, || {
+            inspected.set(true);
+            Ok(())
+        })
+        .expect_err("wrong digest must fail before native inspection");
+
+        assert_eq!(error.failure.code, "policy_model_digest_mismatch");
+        assert!(!error.native_inspection_started);
+        assert!(!inspected.get());
+    }
+
+    #[test]
+    fn unknown_policy_profile_is_rejected_without_path_resolution() {
+        let error = policy_writer_expectation(&BuildModelPolicy::none_v1(), "not-present")
+            .expect_err("unknown profile must fail closed");
+        assert_eq!(error.code, "unknown_policy_model_profile");
+    }
+
+    #[test]
+    fn policy_candidate_and_exact_match_preserve_source_order_rank() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v1();
+        let writer = policy.writers().first().expect("writer policy");
+        let expected =
+            policy_writer_expectation(&policy, writer.profile_id()).expect("known writer profile");
+        let candidate = policy_candidate_summary(&policy, writer.model_file_bytes())
+            .expect("unique size candidate");
+
+        assert_eq!(expected.rank, 0);
+        assert_eq!(candidate.rank, expected.rank);
+        assert_eq!(candidate.profile_id, expected.profile_id);
+    }
+
+    #[test]
+    fn pre_native_policy_failure_restores_the_previous_model() {
+        let state = PluginState::default();
+        let staged_path = PathBuf::from("/tmp/new-writer.gguf");
+        let staged_profile = LocalModelProfile::for_gguf(&staged_path);
+        let previous = test_loaded_model(Path::new("/tmp/previous.gguf"), "previous-model");
+        *state.model.lock().expect("model registry") = ModelRegistry::Loading {
+            path: staged_path.clone(),
+            previous: Some(Box::new(previous)),
+        };
+
+        let error = resolve_policy_model_inspection(
+            &state,
+            &staged_path,
+            &staged_profile,
+            Err(PolicyInspectionFailure {
+                failure: IpcFailure::new("policy_model_digest_mismatch", "wrong digest", false),
+                native_inspection_started: false,
+            }),
+        )
+        .expect_err("failed verification must not replace the previous model");
+
+        assert_eq!(error.code, "policy_model_digest_mismatch");
+        assert_loaded_model_id(&state, "previous-model");
+    }
+
+    #[test]
+    fn capability_mismatch_is_rejected_without_committing_the_staged_model() {
+        let state = PluginState::default();
+        let staged_path = PathBuf::from("/tmp/incapable-writer.gguf");
+        let staged_profile = LocalModelProfile::for_gguf(&staged_path);
+        let expectation = test_policy_expectation(b"incapable-writer");
+        let mut descriptor = test_descriptor(&staged_path, &expectation, "staged-model");
+        descriptor.capabilities.generated_token_ids = CapabilitySupport::Unsupported;
+        let validation = validate_policy_model_descriptor(&descriptor, &staged_path, &expectation)
+            .expect_err("policy capabilities must be proven");
+        assert_eq!(validation.code, "policy_model_capability_mismatch");
+
+        let previous = test_loaded_model(Path::new("/tmp/previous.gguf"), "previous-model");
+        *state.model.lock().expect("model registry") = ModelRegistry::Loading {
+            path: staged_path.clone(),
+            previous: Some(Box::new(previous)),
+        };
+        let error = resolve_policy_model_inspection(
+            &state,
+            &staged_path,
+            &staged_profile,
+            Err(PolicyInspectionFailure {
+                failure: validation,
+                native_inspection_started: true,
+            }),
+        )
+        .expect_err("capability failure must not commit the staged model");
+
+        assert_eq!(error.code, "policy_model_capability_mismatch");
+        assert_loaded_model_id(&state, "previous-model");
+    }
+
+    #[test]
+    fn loaded_identity_mismatch_has_no_unverified_size_hint() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v1();
+        let writer = policy.writers().first().expect("writer policy");
+        let path = Path::new("/tmp/same-size-wrong-identity.gguf");
+        let mut mismatch = test_loaded_model(path, "same-size-wrong-identity");
+        mismatch.descriptor.model_file_bytes = writer.model_file_bytes();
+        let summary = model_summary(&mismatch, true, &policy);
+
+        assert!(summary.policy_candidate.is_none());
+        assert!(summary.policy_verified.is_none());
+        assert!(summary.tested_profile.is_none());
     }
 
     fn start_persisted_test_generation(

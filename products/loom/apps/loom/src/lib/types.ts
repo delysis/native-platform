@@ -103,7 +103,17 @@ export interface ModelCapabilitySummary {
   model_sha256: string | null;
   projector_present: boolean | null;
   media_kinds: Array<'image' | 'audio'>;
+  /** Size-only build-policy hint. It is never evidence that the file matches. */
+  policy_candidate: ModelPolicyProfile | null;
+  /** Exact policy identity established by native descriptor verification. */
+  policy_verified: ModelPolicyProfile | null;
+  /** Compatibility alias for policy_verified.profile_id. */
   tested_profile: string | null;
+}
+
+export interface ModelPolicyProfile {
+  profile_id: string;
+  rank: number;
 }
 
 export interface ModelUnloadOutcome {

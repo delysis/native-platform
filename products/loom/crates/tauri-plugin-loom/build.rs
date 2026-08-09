@@ -14,6 +14,7 @@ const COMMANDS: &[&str] = &[
     "model_list",
     "model_choose",
     "model_load",
+    "model_load_policy_candidate",
     "model_unload",
     "model_download_start",
     "model_download_cancel",

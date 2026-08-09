@@ -196,6 +196,13 @@ export function loadModel(modelPath: string): Promise<ModelCapabilitySummary> {
   return call('model_load', { modelPath });
 }
 
+export function loadPolicyModelCandidate(
+  profileId: string,
+  modelPath: string
+): Promise<ModelCapabilitySummary> {
+  return call('model_load_policy_candidate', { profileId, modelPath });
+}
+
 export function unloadModel(): Promise<ModelUnloadOutcome> {
   return call('model_unload');
 }

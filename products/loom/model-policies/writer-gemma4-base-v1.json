@@ -1,0 +1,17 @@
+{
+  "format": "loom-build-model-policy",
+  "schema_version": 1,
+  "name": "writer-gemma4-base-v1",
+  "activation": "project_opt_in",
+  "inference_boundary": "local_only",
+  "hosted_fallback": "forbidden",
+  "writers": [
+    {
+      "profile_id": "gemma_4_e2b_base_q8_loom_v1",
+      "role": "writer",
+      "prompt_mode": "completion",
+      "model_sha256": "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670",
+      "model_file_bytes": 4954576032
+    }
+  ]
+}

@@ -623,6 +623,32 @@ Denies the model_load command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-model-load-policy-candidate`
+
+</td>
+<td>
+
+Enables the model_load_policy_candidate command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-model-load-policy-candidate`
+
+</td>
+<td>
+
+Denies the model_load_policy_candidate command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-model-unload`
 
 </td>

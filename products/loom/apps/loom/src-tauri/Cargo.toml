@@ -16,9 +16,11 @@ name = "loom"
 path = "src/main.rs"
 
 [build-dependencies]
+loom-types = { path = "../../../crates/loom-types" }
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
+loom-types = { path = "../../../crates/loom-types" }
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-loom = { path = "../../../crates/tauri-plugin-loom" }

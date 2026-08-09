@@ -1,5 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
-import { restoreBeforeBackgroundWork, runCurrentWorkspaceStep } from './startupSafety';
+import {
+  restoreBeforeBackgroundWork,
+  runCurrentWorkspaceStep,
+  shouldDiscoverModelsOnStartup
+} from './startupSafety';
+
+describe('shouldDiscoverModelsOnStartup', () => {
+  it('keeps the local model library cold until a project opts into suggestions', () => {
+    expect(shouldDiscoverModelsOnStartup(false)).toBe(false);
+    expect(shouldDiscoverModelsOnStartup(true)).toBe(true);
+  });
+});
 
 describe('restoreBeforeBackgroundWork', () => {
   it('presents the restored document before model discovery begins', async () => {

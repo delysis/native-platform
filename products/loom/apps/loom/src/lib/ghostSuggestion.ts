@@ -6,6 +6,13 @@ export interface VerifiedGhostSuggestion {
   text: string;
 }
 
+export function visibleVerifiedGhostSuggestion(
+  suggestion: VerifiedGhostSuggestion | null,
+  renderedPresentationKey: string
+): VerifiedGhostSuggestion | null {
+  return suggestion?.presentationKey === renderedPresentationKey ? suggestion : null;
+}
+
 export function verifiedGhostSuggestion(
   branch: BranchCard | null,
   hydratedBlobId: string | undefined
