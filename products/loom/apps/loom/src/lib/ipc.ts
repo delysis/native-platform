@@ -366,6 +366,18 @@ export function listenForGenerationEvents(
   return listen<DesktopGenerationEnvelope>('loom://generation', ({ payload }) => handler(payload));
 }
 
+export function listenForApplicationCloseRequests(
+  handler: () => void
+): Promise<UnlistenFn> {
+  if (!isDesktopRuntime()) {
+    return Promise.reject({
+      code: 'desktop_runtime_required',
+      message: 'Application close requests require the Loom desktop runtime.'
+    });
+  }
+  return listen('loom://application-close-requested', handler);
+}
+
 export function setFocusMode(
   projectId: string,
   sessionId: string,
@@ -384,6 +396,14 @@ export function setSuggestions(
 
 export function requestApplicationClose(): Promise<void> {
   return call('application_close');
+}
+
+export function abortApplicationClose(): Promise<void> {
+  return call('application_close_abort');
+}
+
+export function applicationClosePending(): Promise<boolean> {
+  return call('application_close_pending');
 }
 
 export function describeFailure(error: unknown): string {

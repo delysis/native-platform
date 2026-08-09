@@ -15,6 +15,44 @@ export interface GhostSuggestionSelection {
   targetByte: number | null;
 }
 
+export interface GhostReviewAffordance {
+  visible: boolean;
+  label: string;
+  ariaLabel: string;
+}
+
+export function ghostReviewAffordance(
+  activeGhost: boolean,
+  reviewableCount: number
+): GhostReviewAffordance {
+  if (!Number.isSafeInteger(reviewableCount) || reviewableCount <= 0) {
+    return { visible: false, label: '', ariaLabel: '' };
+  }
+  if (!activeGhost) {
+    const suffix = reviewableCount === 1 ? '' : 's';
+    return {
+      visible: true,
+      label: `${reviewableCount} alternative${suffix}`,
+      ariaLabel: `Review ${reviewableCount} writing alternative${suffix}`
+    };
+  }
+
+  const alternatives = reviewableCount - 1;
+  if (alternatives <= 0) {
+    return {
+      visible: true,
+      label: 'Review',
+      ariaLabel: 'Review the current writing suggestion'
+    };
+  }
+  const suffix = alternatives === 1 ? '' : 's';
+  return {
+    visible: true,
+    label: `${alternatives} more`,
+    ariaLabel: `Review the current writing suggestion and ${alternatives} more alternative${suffix}`
+  };
+}
+
 export function visibleVerifiedGhostSuggestion(
   suggestion: VerifiedGhostSuggestion | null,
   renderedPresentationKey: string

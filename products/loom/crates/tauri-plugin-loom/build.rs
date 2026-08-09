@@ -31,6 +31,8 @@ const COMMANDS: &[&str] = &[
     "suggestions_set",
     "focus_mode_set",
     "application_close",
+    "application_close_abort",
+    "application_close_pending",
 ];
 
 fn main() {

@@ -68,10 +68,13 @@ export function createGhostTextElement(
 ): HTMLElement {
   const element = ownerDocument.createElement('span');
   element.className = 'loom-ghost-text';
-  element.textContent = text;
+  // Keep proposal bytes out of the contenteditable text tree. WebKit includes
+  // hidden widget text in the AX value even with aria-hidden, which makes a
+  // screen reader report a private suggestion as accepted manuscript text.
+  element.textContent = '';
   element.contentEditable = 'false';
   element.setAttribute('aria-hidden', 'true');
-  element.setAttribute('data-loom-ghost-text', '');
+  element.setAttribute('data-loom-ghost-text', text);
   element.setAttribute('draggable', 'false');
   element.setAttribute('spellcheck', 'false');
   return element;

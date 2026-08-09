@@ -6,21 +6,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, Metadata};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use loom_backend_llama::{
     ContinuationCase, DownloadControl, DownloadError, ExactContinuationRequest,
     ExactContinuationResult, GgufDownloadRequest, GgufHeaderStatus, LlamaBackend,
     LlamaBackendError, LlamaGenerationHandle, LocalModelProfile, MAX_MODEL_DOWNLOAD_BYTES,
-    ModelDiscoveryOptions, SamplingConfig, Sha256Digest, VerifiedModelDescriptor,
+    ModelDiscoveryOptions, ModelRelease, SamplingConfig, Sha256Digest, VerifiedModelDescriptor,
     discover_gguf_models, download_gguf, model_environment_from_verified,
     validate_candidate_receipt_binding, validate_gguf_download_request,
 };
 use loom_document::{DocumentContent, MergeError, MergeOutcome, three_way_merge};
 use loom_host::{
-    AgencyGate, BranchCancellation, GenerationFamilyIdentity, GenerationRegistry,
-    GenerationRegistryError,
+    AgencyGate, BranchCancellation, DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES,
+    GenerationFamilyIdentity, GenerationRegistry, GenerationRegistryError,
 };
 use loom_store::{
     BranchPageCursor, DocumentReconciliationSnapshot, ExternalReconciliationOutcome,
@@ -40,7 +42,7 @@ use same_file::Handle as FileIdentityHandle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::model_download::{
@@ -53,6 +55,22 @@ const DEFAULT_PROJECT_DIRECTORY: &str = "writing";
 const PROJECT_CLOSE_GENERATION_WAIT: Duration = Duration::from_secs(3);
 const MAX_MODEL_DOWNLOAD_URL_BYTES: usize = 16 * 1024;
 const POLICY_MODEL_HASH_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_TRACKED_GENERATION_WORKERS: usize = DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ApplicationPhase {
+    #[default]
+    Running,
+    Closing,
+    ExitAuthorized,
+}
+
+struct ApplicationCloseAttempt<'a> {
+    state: &'a PluginState,
+    authorized: bool,
+}
+
+struct ReadyToExit;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum SessionPhase {
@@ -73,12 +91,16 @@ struct Session {
 
 #[derive(Debug)]
 pub struct PluginState {
+    close_requested: AtomicBool,
+    exit_authorized: AtomicBool,
+    application: Mutex<ApplicationPhase>,
     session: Mutex<Session>,
     backend: Arc<LlamaBackend>,
     model: Mutex<ModelRegistry>,
     model_lifecycle: Mutex<()>,
     user_model_paths: Mutex<BTreeSet<PathBuf>>,
     generations: GenerationRegistry,
+    generation_workers: GenerationWorkerRegistry,
     downloads: Arc<ModelDownloadRegistry>,
     model_library_root: Option<PathBuf>,
     build_model_policy: BuildModelPolicy,
@@ -98,12 +120,16 @@ impl PluginState {
         additional_policy_model_paths: Vec<PathBuf>,
     ) -> Self {
         Self {
+            close_requested: AtomicBool::new(false),
+            exit_authorized: AtomicBool::new(false),
+            application: Mutex::new(ApplicationPhase::default()),
             session: Mutex::new(Session::default()),
             backend: Arc::new(LlamaBackend::default()),
             model: Mutex::new(ModelRegistry::default()),
             model_lifecycle: Mutex::new(()),
             user_model_paths: Mutex::new(BTreeSet::new()),
             generations: GenerationRegistry::default(),
+            generation_workers: GenerationWorkerRegistry::default(),
             downloads: Arc::new(ModelDownloadRegistry::default()),
             model_library_root,
             build_model_policy,
@@ -134,7 +160,219 @@ enum ModelRegistry {
         path: PathBuf,
         previous: Option<Box<LoadedModel>>,
     },
+    Unloading(Box<LoadedModel>),
+    ResidencyUnknown {
+        reason: String,
+    },
     Loaded(Box<LoadedModel>),
+}
+
+#[derive(Debug)]
+enum GenerationWorkerSlot {
+    Reserved,
+    Running(JoinHandle<()>),
+}
+
+#[derive(Debug, Default)]
+struct GenerationWorkerState {
+    workers: BTreeMap<String, GenerationWorkerSlot>,
+    join_failure: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct GenerationWorkerRegistry {
+    state: Mutex<GenerationWorkerState>,
+}
+
+#[derive(Debug)]
+struct GenerationWorkerReservation<'a> {
+    registry: &'a GenerationWorkerRegistry,
+    request_id: String,
+    attached: bool,
+}
+
+#[derive(Debug)]
+struct GenerationWorkerAttachError {
+    failure: IpcFailure,
+    worker: JoinHandle<()>,
+}
+
+impl GenerationWorkerRegistry {
+    fn reserve(&self, request_id: &str) -> Result<GenerationWorkerReservation<'_>, IpcFailure> {
+        self.reap_finished()?;
+        let mut state = self.lock()?;
+        if let Some(failure) = &state.join_failure {
+            return Err(IpcFailure::new(
+                "generation_worker_join_failed",
+                failure.clone(),
+                false,
+            ));
+        }
+        if state.workers.len() >= MAX_TRACKED_GENERATION_WORKERS {
+            return Err(IpcFailure::new(
+                "generation_worker_capacity",
+                format!(
+                    "Loom already owns the maximum of {MAX_TRACKED_GENERATION_WORKERS} generation workers"
+                ),
+                true,
+            ));
+        }
+        if state.workers.contains_key(request_id) {
+            return Err(IpcFailure::new(
+                "generation_worker_duplicate",
+                "the generation request already owns a desktop worker",
+                false,
+            ));
+        }
+        state
+            .workers
+            .insert(request_id.to_owned(), GenerationWorkerSlot::Reserved);
+        Ok(GenerationWorkerReservation {
+            registry: self,
+            request_id: request_id.to_owned(),
+            attached: false,
+        })
+    }
+
+    fn reap_finished(&self) -> Result<usize, IpcFailure> {
+        let finished = {
+            let mut state = self.lock()?;
+            if let Some(failure) = &state.join_failure {
+                return Err(IpcFailure::new(
+                    "generation_worker_join_failed",
+                    failure.clone(),
+                    false,
+                ));
+            }
+            let finished_ids = state
+                .workers
+                .iter()
+                .filter_map(|(request_id, slot)| match slot {
+                    GenerationWorkerSlot::Running(worker) if worker.is_finished() => {
+                        Some(request_id.clone())
+                    }
+                    GenerationWorkerSlot::Reserved | GenerationWorkerSlot::Running(_) => None,
+                })
+                .collect::<Vec<_>>();
+            finished_ids
+                .into_iter()
+                .filter_map(|request_id| match state.workers.remove(&request_id) {
+                    Some(GenerationWorkerSlot::Running(worker)) => Some(worker),
+                    Some(GenerationWorkerSlot::Reserved) | None => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        self.join_workers(finished)
+    }
+
+    fn join_all(&self) -> Result<usize, IpcFailure> {
+        let workers = {
+            let mut state = self.lock()?;
+            if let Some(failure) = &state.join_failure {
+                return Err(IpcFailure::new(
+                    "generation_worker_join_failed",
+                    failure.clone(),
+                    false,
+                ));
+            }
+            if state
+                .workers
+                .values()
+                .any(|slot| matches!(slot, GenerationWorkerSlot::Reserved))
+            {
+                return Err(IpcFailure::new(
+                    "generation_worker_starting",
+                    "a generation worker is still entering its owned lifecycle",
+                    true,
+                ));
+            }
+            std::mem::take(&mut state.workers)
+                .into_values()
+                .filter_map(|slot| match slot {
+                    GenerationWorkerSlot::Running(worker) => Some(worker),
+                    GenerationWorkerSlot::Reserved => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        self.join_workers(workers)
+    }
+
+    fn join_workers(&self, workers: Vec<JoinHandle<()>>) -> Result<usize, IpcFailure> {
+        let count = workers.len();
+        let mut panicked = false;
+        for worker in workers {
+            panicked |= worker.join().is_err();
+        }
+        if panicked {
+            return Err(self.record_join_failure());
+        }
+        Ok(count)
+    }
+
+    fn record_join_failure(&self) -> IpcFailure {
+        let message =
+            "a desktop generation worker panicked; Loom will not infer safe native teardown"
+                .to_owned();
+        let Ok(mut state) = self.lock() else {
+            return IpcFailure::new(
+                "generation_worker_state_poisoned",
+                "the generation worker registry entered an invalid state; restart Loom",
+                false,
+            );
+        };
+        state.join_failure = Some(message.clone());
+        IpcFailure::new("generation_worker_join_failed", message, false)
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, GenerationWorkerState>, IpcFailure> {
+        self.state.lock().map_err(|_| {
+            IpcFailure::new(
+                "generation_worker_state_poisoned",
+                "the generation worker registry entered an invalid state; restart Loom",
+                false,
+            )
+        })
+    }
+}
+
+impl GenerationWorkerReservation<'_> {
+    fn attach(mut self, worker: JoinHandle<()>) -> Result<(), GenerationWorkerAttachError> {
+        let mut state = match self.registry.lock() {
+            Ok(state) => state,
+            Err(failure) => return Err(GenerationWorkerAttachError { failure, worker }),
+        };
+        match state.workers.get_mut(&self.request_id) {
+            Some(slot @ GenerationWorkerSlot::Reserved) => {
+                *slot = GenerationWorkerSlot::Running(worker);
+                self.attached = true;
+                Ok(())
+            }
+            Some(GenerationWorkerSlot::Running(_)) | None => Err(GenerationWorkerAttachError {
+                failure: IpcFailure::new(
+                    "generation_worker_state_changed",
+                    "the desktop generation worker reservation changed before attachment",
+                    false,
+                ),
+                worker,
+            }),
+        }
+    }
+}
+
+impl Drop for GenerationWorkerReservation<'_> {
+    fn drop(&mut self) {
+        if self.attached {
+            return;
+        }
+        if let Ok(mut state) = self.registry.state.lock()
+            && matches!(
+                state.workers.get(&self.request_id),
+                Some(GenerationWorkerSlot::Reserved)
+            )
+        {
+            state.workers.remove(&self.request_id);
+        }
+    }
 }
 
 enum ModelLoadPlan {
@@ -261,6 +499,8 @@ impl Builder {
                 suggestions_set,
                 focus_mode_set,
                 application_close,
+                application_close_abort,
+                application_close_pending,
             ])
             .setup(move |app, _api| {
                 let model_library_root = app.path().app_local_data_dir().ok();
@@ -270,6 +510,28 @@ impl Builder {
                     additional_policy_model_paths,
                 ));
                 Ok(())
+            })
+            .on_window_ready(|window| {
+                if window.label() != "main" {
+                    return;
+                }
+                let app = window.app_handle().clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event
+                        && !prepare_application_exit_request(&app)
+                    {
+                        api.prevent_close();
+                        emit_application_close_request(&app);
+                    }
+                });
+            })
+            .on_event(|app, event| {
+                if let RunEvent::ExitRequested { api, .. } = event
+                    && !prepare_application_exit_request(app)
+                {
+                    api.prevent_exit();
+                    emit_application_close_request(app);
+                }
             })
             .build()
     }
@@ -701,6 +963,7 @@ async fn project_open_default<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
+    ensure_application_running(&state, "a project session")?;
     reserve_project_choice(&state)?;
     let result = app
         .path()
@@ -722,12 +985,14 @@ async fn project_choose_create<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
+    ensure_application_running(&state, "a project session")?;
     reserve_project_choice(&state)?;
     let result = choose_project_folder(&app).and_then(|path| initialize_project(&path, title));
     finish_project_choice(&state, result)
 }
 
 fn reserve_project_choice(state: &State<'_, PluginState>) -> Result<(), IpcFailure> {
+    let _application_admission = lock_application_admission(state, "a project session")?;
     let mut session = lock_session(state)?;
     if session.phase != SessionPhase::Closed {
         return Err(IpcFailure::new(
@@ -969,6 +1234,7 @@ async fn project_choose_open<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
+    ensure_application_running(&state, "a project session")?;
     reserve_project_choice(&state)?;
     let result = choose_project_folder(&app).and_then(|path| {
         let mut store = ProjectStore::open(path).map_err(IpcFailure::store)?;
@@ -1817,9 +2083,9 @@ async fn model_list(
     let loaded = {
         let registry = lock_model_registry(&state)?;
         match &*registry {
-            ModelRegistry::Loaded(model) => Some(model.clone()),
+            ModelRegistry::Loaded(model) | ModelRegistry::Unloading(model) => Some(model.clone()),
             ModelRegistry::Loading { previous, .. } => previous.clone(),
-            ModelRegistry::Empty => None,
+            ModelRegistry::ResidencyUnknown { .. } | ModelRegistry::Empty => None,
         }
     };
     let options = desktop_model_discovery_options(&state)?;
@@ -1947,6 +2213,7 @@ async fn model_load(
     model_path: String,
     state: State<'_, PluginState>,
 ) -> Result<ModelCapabilitySummary, IpcFailure> {
+    ensure_application_running(&state, "local model verification")?;
     let (canonical_path, profile) = match prepare_model_load(&model_path, &state)? {
         ModelLoadPlan::Ready(summary) => return Ok(summary),
         ModelLoadPlan::Inspect {
@@ -1991,6 +2258,7 @@ async fn model_load_policy_candidate(
     model_path: String,
     state: State<'_, PluginState>,
 ) -> Result<ModelCapabilitySummary, IpcFailure> {
+    ensure_application_running(&state, "local model verification")?;
     let (canonical_path, profile, expectation) =
         match prepare_policy_model_load(&profile_id, &model_path, &state)? {
             PolicyModelLoadPlan::Ready(summary) => return Ok(summary),
@@ -2062,6 +2330,7 @@ fn prepare_policy_model_load(
     }
 
     let _lifecycle = lock_model_lifecycle(state)?;
+    let _application_admission = lock_application_admission(state, "local model verification")?;
     let mut registry = lock_model_registry(state)?;
     match &*registry {
         ModelRegistry::Loaded(loaded) if loaded.profile.model_path == canonical_path => {
@@ -2076,13 +2345,25 @@ fn prepare_policy_model_load(
                 true,
             ));
         }
+        ModelRegistry::Unloading(_) => {
+            return Err(IpcFailure::new(
+                "model_unload_in_progress",
+                "wait for the selected local model to finish unloading",
+                true,
+            ));
+        }
+        ModelRegistry::ResidencyUnknown { reason } => {
+            return Err(model_residency_unknown(reason));
+        }
         ModelRegistry::Loaded(_) | ModelRegistry::Empty => {}
     }
     ensure_no_active_generations(state, "switching local models")?;
     let previous = match std::mem::take(&mut *registry) {
         ModelRegistry::Loaded(previous) => Some(previous),
         ModelRegistry::Empty => None,
-        ModelRegistry::Loading { .. } => {
+        ModelRegistry::Loading { .. }
+        | ModelRegistry::Unloading(_)
+        | ModelRegistry::ResidencyUnknown { .. } => {
             unreachable!("the loading state was rejected while holding the registry lock")
         }
     };
@@ -2388,6 +2669,7 @@ fn prepare_model_load(
     })?;
     let discovered = discover_loadable_model(state, &canonical)?;
     let _lifecycle = lock_model_lifecycle(state)?;
+    let _application_admission = lock_application_admission(state, "local model verification")?;
     let mut registry = lock_model_registry(state)?;
     match &*registry {
         ModelRegistry::Loaded(loaded) if loaded.profile.model_path == canonical => {
@@ -2404,13 +2686,25 @@ fn prepare_model_load(
                 true,
             ));
         }
+        ModelRegistry::Unloading(_) => {
+            return Err(IpcFailure::new(
+                "model_unload_in_progress",
+                "wait for the selected local model to finish unloading",
+                true,
+            ));
+        }
+        ModelRegistry::ResidencyUnknown { reason } => {
+            return Err(model_residency_unknown(reason));
+        }
         ModelRegistry::Loaded(_) | ModelRegistry::Empty => {}
     }
     ensure_no_active_generations(state, "switching local models")?;
     let previous = match std::mem::take(&mut *registry) {
         ModelRegistry::Loaded(previous) => Some(previous),
         ModelRegistry::Empty => None,
-        ModelRegistry::Loading { .. } => {
+        ModelRegistry::Loading { .. }
+        | ModelRegistry::Unloading(_)
+        | ModelRegistry::ResidencyUnknown { .. } => {
             unreachable!("the loading state was rejected while holding the registry lock")
         }
     };
@@ -2452,22 +2746,93 @@ fn commit_model_load(
     let mut registry = lock_model_registry(state)?;
     match std::mem::take(&mut *registry) {
         ModelRegistry::Loading { path, previous } if path == canonical_path => {
-            if let Some(previous) = previous
-                && let Err(error) = state.backend.release_model(&previous.profile)
-            {
-                let _ = state.backend.release_model(&loaded.profile);
-                *registry = ModelRegistry::Loaded(previous);
-                return Err(IpcFailure::new(
-                    "model_release_failed",
-                    format!("the previous local model could not be released safely: {error}"),
-                    true,
-                ));
+            if let Some(previous) = previous {
+                match state.backend.release_model(&previous.profile) {
+                    Ok(ModelRelease::Released { .. }) => {}
+                    Ok(ModelRelease::AlreadyAbsent) => {
+                        match state.backend.release_model(&loaded.profile) {
+                            Ok(ModelRelease::Released { .. }) => {}
+                            Ok(ModelRelease::AlreadyAbsent) => {
+                                let reason = "the previous slot was absent and cleanup could not prove access to the verified staged model's native resident slot".to_owned();
+                                *registry = ModelRegistry::ResidencyUnknown {
+                                    reason: reason.clone(),
+                                };
+                                return Err(model_residency_unknown(&reason));
+                            }
+                            Err(cleanup) => {
+                                let reason = format!(
+                                    "the previous slot was absent and the verified staged model cleanup failed: {cleanup}"
+                                );
+                                *registry = ModelRegistry::ResidencyUnknown {
+                                    reason: reason.clone(),
+                                };
+                                return Err(model_residency_unknown(&reason));
+                            }
+                        }
+                        let reason =
+                            "the previous selected model had no provably accessible native resident slot"
+                                .to_owned();
+                        *registry = ModelRegistry::ResidencyUnknown {
+                            reason: reason.clone(),
+                        };
+                        return Err(model_residency_unknown(&reason));
+                    }
+                    Err(error) => {
+                        match state.backend.release_model(&loaded.profile) {
+                            Ok(ModelRelease::Released { .. }) => {}
+                            Ok(ModelRelease::AlreadyAbsent) => {
+                                let reason = format!(
+                                    "the previous model release failed ({error}) and cleanup could not prove access to the verified staged model's native resident slot"
+                                );
+                                *registry = ModelRegistry::ResidencyUnknown {
+                                    reason: reason.clone(),
+                                };
+                                return Err(model_residency_unknown(&reason));
+                            }
+                            Err(cleanup) => {
+                                let reason = format!(
+                                    "the previous model release failed ({error}) and the verified staged model cleanup also failed ({cleanup})"
+                                );
+                                *registry = ModelRegistry::ResidencyUnknown {
+                                    reason: reason.clone(),
+                                };
+                                return Err(model_residency_unknown(&reason));
+                            }
+                        }
+                        *registry = ModelRegistry::Loaded(previous);
+                        return Err(IpcFailure::new(
+                            "model_release_failed",
+                            format!(
+                                "the previous local model could not be released safely: {error}"
+                            ),
+                            true,
+                        ));
+                    }
+                }
             }
             *registry = ModelRegistry::Loaded(Box::new(loaded));
         }
         current => {
+            match state.backend.release_model(&loaded.profile) {
+                Ok(ModelRelease::Released { .. }) => {}
+                Ok(ModelRelease::AlreadyAbsent) => {
+                    let reason = "the model registry changed during verification and cleanup could not prove access to the verified staged model's native resident slot".to_owned();
+                    *registry = ModelRegistry::ResidencyUnknown {
+                        reason: reason.clone(),
+                    };
+                    return Err(model_residency_unknown(&reason));
+                }
+                Err(cleanup) => {
+                    let reason = format!(
+                        "the model registry changed during verification and the verified staged model cleanup failed: {cleanup}"
+                    );
+                    *registry = ModelRegistry::ResidencyUnknown {
+                        reason: reason.clone(),
+                    };
+                    return Err(model_residency_unknown(&reason));
+                }
+            }
             *registry = current;
-            let _ = state.backend.release_model(&loaded.profile);
             return Err(IpcFailure::new(
                 "model_load_state_changed",
                 "the selected model changed while native verification was running",
@@ -2478,12 +2843,28 @@ fn commit_model_load(
     Ok(summary)
 }
 
+fn model_residency_unknown(reason: &str) -> IpcFailure {
+    IpcFailure::new(
+        "model_residency_unknown",
+        format!(
+            "Loom cannot prove that every native model resource was released: {reason}; restart after preserving the manuscript"
+        ),
+        false,
+    )
+}
+
 #[tauri::command]
 async fn model_unload(state: State<'_, PluginState>) -> Result<ModelUnloadOutcome, IpcFailure> {
+    ensure_application_running(&state, "local model teardown")?;
     let _lifecycle = lock_model_lifecycle(&state)?;
+    let _application_admission = lock_application_admission(&state, "local model teardown")?;
     ensure_no_active_generations(&state, "unloading the local model")?;
-    let profile = {
-        let mut registry = lock_model_registry(&state)?;
+    unload_registered_model(&state)
+}
+
+fn unload_registered_model(state: &PluginState) -> Result<ModelUnloadOutcome, IpcFailure> {
+    let loaded = {
+        let mut registry = lock_model_registry(state)?;
         match std::mem::take(&mut *registry) {
             ModelRegistry::Empty => {
                 return Ok(ModelUnloadOutcome {
@@ -2499,24 +2880,34 @@ async fn model_unload(state: State<'_, PluginState>) -> Result<ModelUnloadOutcom
                     true,
                 ));
             }
+            unloading @ ModelRegistry::Unloading(_) => {
+                *registry = unloading;
+                return Err(IpcFailure::new(
+                    "model_unload_in_progress",
+                    "wait for the selected local model to finish unloading",
+                    true,
+                ));
+            }
+            ModelRegistry::ResidencyUnknown { reason } => {
+                let failure = model_residency_unknown(&reason);
+                *registry = ModelRegistry::ResidencyUnknown { reason };
+                return Err(failure);
+            }
             ModelRegistry::Loaded(loaded) => {
-                let profile = loaded.profile.clone();
-                *registry = ModelRegistry::Loading {
-                    path: profile.model_path.clone(),
-                    previous: Some(loaded),
-                };
-                profile
+                *registry = ModelRegistry::Unloading(loaded.clone());
+                loaded
             }
         }
     };
-    let release = state.backend.release_model(&profile);
-    let mut registry = lock_model_registry(&state)?;
+    let release = state.backend.release_model(&loaded.profile);
+    let mut registry = lock_model_registry(state)?;
     let current = std::mem::take(&mut *registry);
-    let (path, previous) = match current {
-        ModelRegistry::Loading {
-            path,
-            previous: Some(previous),
-        } => (path, previous),
+    let unloading = match current {
+        ModelRegistry::Unloading(unloading)
+            if unloading.profile.model_path == loaded.profile.model_path =>
+        {
+            unloading
+        }
         current => {
             *registry = current;
             return Err(IpcFailure::new(
@@ -2526,28 +2917,25 @@ async fn model_unload(state: State<'_, PluginState>) -> Result<ModelUnloadOutcom
             ));
         }
     };
-    if path != profile.model_path {
-        *registry = ModelRegistry::Loading {
-            path,
-            previous: Some(previous),
-        };
-        return Err(IpcFailure::new(
-            "model_load_state_changed",
-            "the selected model changed while native unload was running",
-            true,
-        ));
-    }
-    let model_id = previous.descriptor.stable_model_id.clone();
+    let model_id = unloading.descriptor.stable_model_id.clone();
     match release {
-        Ok(resident_slot_released) => {
+        Ok(ModelRelease::Released { .. }) => {
             *registry = ModelRegistry::Empty;
             Ok(ModelUnloadOutcome {
                 model_id: Some(model_id),
-                resident_slot_released,
+                resident_slot_released: true,
             })
         }
+        Ok(ModelRelease::AlreadyAbsent) => {
+            let reason =
+                "the selected model had no provably accessible native resident slot".to_owned();
+            *registry = ModelRegistry::ResidencyUnknown {
+                reason: reason.clone(),
+            };
+            Err(model_residency_unknown(&reason))
+        }
         Err(error) => {
-            *registry = ModelRegistry::Loaded(previous);
+            *registry = ModelRegistry::Loaded(unloading);
             Err(IpcFailure::new(
                 "model_release_failed",
                 format!("the selected local model could not be released safely: {error}"),
@@ -2569,6 +2957,7 @@ async fn model_download_start<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ModelDownloadSnapshot, IpcFailure> {
+    ensure_application_running(&state, "a model download")?;
     let PreparedModelDownload {
         command_id,
         request,
@@ -2582,10 +2971,13 @@ async fn model_download_start<R: Runtime>(
         expected_bytes,
         max_bytes,
     )?;
-    let (reservation, snapshot) = state
-        .downloads
-        .reserve(spec, now_unix_ms())
-        .map_err(|error| IpcFailure::model_download_registry(&error))?;
+    let (reservation, snapshot) = {
+        let _application_admission = lock_application_admission(&state, "a model download")?;
+        state
+            .downloads
+            .reserve(spec, now_unix_ms())
+            .map_err(|error| IpcFailure::model_download_registry(&error))?
+    };
     if reservation == ReservationOutcome::Replayed {
         return Ok(snapshot);
     }
@@ -2924,25 +3316,55 @@ fn release_staged_model(
         ModelRegistry::Loading {
             path: loading,
             previous,
-        } if loading == path => {
-            *registry = previous.map_or(ModelRegistry::Empty, ModelRegistry::Loaded);
-        }
-        current => {
-            *registry = current;
-            return Err(IpcFailure::new(
-                "model_load_state_changed",
-                "the selected model changed while native verification was running",
-                true,
-            ));
-        }
+        } if loading == path => match release {
+            Ok(ModelRelease::Released { .. }) => {
+                *registry = previous.map_or(ModelRegistry::Empty, ModelRegistry::Loaded);
+            }
+            Ok(ModelRelease::AlreadyAbsent) => {
+                let reason =
+                    "native inspection started, but staged model cleanup could not prove access to its resident slot"
+                        .to_owned();
+                *registry = ModelRegistry::ResidencyUnknown {
+                    reason: reason.clone(),
+                };
+                return Err(model_residency_unknown(&reason));
+            }
+            Err(error) => {
+                let reason = format!("rejected staged model cleanup failed: {error}");
+                *registry = ModelRegistry::ResidencyUnknown {
+                    reason: reason.clone(),
+                };
+                return Err(model_residency_unknown(&reason));
+            }
+        },
+        current => match release {
+            Ok(ModelRelease::Released { .. }) => {
+                *registry = current;
+                return Err(IpcFailure::new(
+                    "model_load_state_changed",
+                    "the selected model changed while native verification was running",
+                    true,
+                ));
+            }
+            Ok(ModelRelease::AlreadyAbsent) => {
+                let reason = "the model registry changed during rejected-model cleanup and cleanup could not prove access to the staged native resident slot".to_owned();
+                *registry = ModelRegistry::ResidencyUnknown {
+                    reason: reason.clone(),
+                };
+                return Err(model_residency_unknown(&reason));
+            }
+            Err(error) => {
+                let reason = format!(
+                    "the model registry changed during rejected-model cleanup, which then failed: {error}"
+                );
+                *registry = ModelRegistry::ResidencyUnknown {
+                    reason: reason.clone(),
+                };
+                return Err(model_residency_unknown(&reason));
+            }
+        },
     }
-    release.map(|_| ()).map_err(|error| {
-        IpcFailure::new(
-            "model_release_failed",
-            format!("the rejected local model could not be released safely: {error}"),
-            true,
-        )
-    })
+    Ok(())
 }
 
 fn model_summary(
@@ -3471,6 +3893,7 @@ async fn weave_start<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<WeaveStarted, IpcFailure> {
+    ensure_application_running(&state, "a writing suggestion")?;
     let command_id = parse_command_id(&command_id)?;
     let document_id = document_id.parse::<DocumentId>().map_err(|_| {
         IpcFailure::new(
@@ -3535,6 +3958,7 @@ async fn weave_start<R: Runtime>(
     // Serialize the loaded-model snapshot through native startup and family
     // registration. A switch cannot observe zero active branches in the gap.
     let _model_lifecycle = lock_model_lifecycle(&state)?;
+    let _application_admission = lock_application_admission(&state, "a writing suggestion")?;
     let loaded_model = loaded_model(&state)?;
     let max_cases = loaded_model
         .descriptor
@@ -3791,12 +4215,29 @@ async fn weave_start<R: Runtime>(
         }
         return Err(IpcFailure::generation_registry(&error));
     }
+    let worker_reservation = match state.generation_workers.reserve(&request_id) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            for (_, branch_id) in &runs {
+                let _ = handle.cancel_branch(*branch_id);
+            }
+            if let Err(persistence) =
+                fail_and_release_open_runs(&state, &identity, &runs, &error.message, &app)
+            {
+                let _ = state
+                    .generations
+                    .mark_terminal_persistence_failure(&request_id, persistence.message.clone());
+                return Err(persistence);
+            }
+            return Err(error);
+        }
+    };
     let worker_app = app.clone();
     let worker_identity = identity.clone();
     let worker_runs = runs.clone();
     let worker_binding = result_binding.clone();
     let worker_handle = Arc::clone(&handle);
-    if let Err(error) = std::thread::Builder::new()
+    let worker = match std::thread::Builder::new()
         .name("loom-desktop-generation".to_string())
         .spawn(move || {
             run_desktop_generation(
@@ -3806,24 +4247,46 @@ async fn weave_start<R: Runtime>(
                 &worker_binding,
                 &worker_handle,
             );
-        })
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            for (_, branch_id) in &runs {
+                let _ = handle.cancel_branch(*branch_id);
+            }
+            if let Err(persistence) =
+                fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
+            {
+                let _ = state
+                    .generations
+                    .mark_terminal_persistence_failure(&request_id, persistence.message.clone());
+                return Err(persistence);
+            }
+            return Err(IpcFailure::new(
+                "generation_worker_spawn_failed",
+                format!("the desktop generation worker could not start: {error}"),
+                true,
+            ));
+        }
+    };
+    if let Err(GenerationWorkerAttachError { failure, worker }) = worker_reservation.attach(worker)
     {
         for (_, branch_id) in &runs {
             let _ = handle.cancel_branch(*branch_id);
         }
+        let failure = if worker.join().is_err() {
+            state.generation_workers.record_join_failure()
+        } else {
+            failure
+        };
         if let Err(persistence) =
-            fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
+            fail_and_release_open_runs(&state, &identity, &runs, &failure.message, &app)
         {
             let _ = state
                 .generations
                 .mark_terminal_persistence_failure(&request_id, persistence.message.clone());
             return Err(persistence);
         }
-        return Err(IpcFailure::new(
-            "generation_worker_spawn_failed",
-            format!("the desktop generation worker could not start: {error}"),
-            true,
-        ));
+        return Err(failure);
     }
 
     Ok(WeaveStarted {
@@ -3849,6 +4312,10 @@ fn generation_seed(command_id: CommandId, index: u32) -> u32 {
 }
 
 fn loaded_model(state: &State<'_, PluginState>) -> Result<LoadedModel, IpcFailure> {
+    loaded_model_for_state(state)
+}
+
+fn loaded_model_for_state(state: &PluginState) -> Result<LoadedModel, IpcFailure> {
     let registry = lock_model_registry(state)?;
     match &*registry {
         ModelRegistry::Loaded(model) => Ok((**model).clone()),
@@ -3857,6 +4324,12 @@ fn loaded_model(state: &State<'_, PluginState>) -> Result<LoadedModel, IpcFailur
             "wait for local model verification to finish before weaving",
             true,
         )),
+        ModelRegistry::Unloading(_) => Err(IpcFailure::new(
+            "model_unload_in_progress",
+            "wait for the selected local model to finish unloading",
+            true,
+        )),
+        ModelRegistry::ResidencyUnknown { reason } => Err(model_residency_unknown(reason)),
         ModelRegistry::Empty => Err(IpcFailure::new(
             "model_not_loaded",
             "load and verify a local raw-completion model before weaving",
@@ -4462,12 +4935,135 @@ fn emit_desktop_event<R: Runtime>(
     })
 }
 
+fn prepare_application_exit_request<R: Runtime>(app: &AppHandle<R>) -> bool {
+    let Some(state) = app.try_state::<PluginState>() else {
+        return false;
+    };
+    record_application_exit_request(&state)
+}
+
+fn emit_application_close_request<R: Runtime>(app: &AppHandle<R>) {
+    let _ = app.emit("loom://application-close-requested", ());
+}
+
+fn record_application_exit_request(state: &PluginState) -> bool {
+    if state.exit_authorized.load(Ordering::Acquire) {
+        true
+    } else {
+        // AppKit invokes this path on its event thread. Recording intent must
+        // never wait for the admission mutex held while native work starts.
+        state.close_requested.store(true, Ordering::Release);
+        false
+    }
+}
+
+fn begin_application_close(state: &PluginState) -> Result<ApplicationCloseAttempt<'_>, IpcFailure> {
+    state.close_requested.store(true, Ordering::Release);
+    let mut phase = lock_application_phase(state)?;
+    match *phase {
+        ApplicationPhase::Running => {
+            *phase = ApplicationPhase::Closing;
+            Ok(ApplicationCloseAttempt {
+                state,
+                authorized: false,
+            })
+        }
+        ApplicationPhase::Closing => Err(IpcFailure::new(
+            "application_close_in_progress",
+            "Loom is already proving that native work is safe to close",
+            true,
+        )),
+        ApplicationPhase::ExitAuthorized => Err(IpcFailure::new(
+            "application_exit_authorized",
+            "Loom has already authorized native process exit",
+            false,
+        )),
+    }
+}
+
+fn ensure_application_running(state: &PluginState, action: &str) -> Result<(), IpcFailure> {
+    drop(lock_application_admission(state, action)?);
+    Ok(())
+}
+
+fn lock_application_admission<'a>(
+    state: &'a PluginState,
+    action: &str,
+) -> Result<std::sync::MutexGuard<'a, ApplicationPhase>, IpcFailure> {
+    if state.close_requested.load(Ordering::Acquire) {
+        return Err(IpcFailure::new(
+            "application_quiescing",
+            format!("Loom will not start {action} while the application is closing"),
+            true,
+        ));
+    }
+    let phase = lock_application_phase(state)?;
+    // The second load establishes admission before a later close request, or
+    // observes that request and refuses the work while still holding phase.
+    if *phase == ApplicationPhase::Running && !state.close_requested.load(Ordering::Acquire) {
+        Ok(phase)
+    } else {
+        Err(IpcFailure::new(
+            "application_quiescing",
+            format!("Loom will not start {action} while the application is closing"),
+            true,
+        ))
+    }
+}
+
+fn lock_application_phase(
+    state: &PluginState,
+) -> Result<std::sync::MutexGuard<'_, ApplicationPhase>, IpcFailure> {
+    state.application.lock().map_err(|_| {
+        IpcFailure::new(
+            "application_state_poisoned",
+            "the application lifecycle entered an invalid state; Loom will not infer safe exit",
+            false,
+        )
+    })
+}
+
+impl ApplicationCloseAttempt<'_> {
+    fn authorize(mut self) -> Result<ReadyToExit, IpcFailure> {
+        let mut phase = lock_application_phase(self.state)?;
+        if *phase != ApplicationPhase::Closing {
+            return Err(IpcFailure::new(
+                "application_close_state_changed",
+                "the native application close authority changed during teardown",
+                false,
+            ));
+        }
+        *phase = ApplicationPhase::ExitAuthorized;
+        self.state.exit_authorized.store(true, Ordering::Release);
+        self.authorized = true;
+        Ok(ReadyToExit)
+    }
+}
+
+impl Drop for ApplicationCloseAttempt<'_> {
+    fn drop(&mut self) {
+        if self.authorized {
+            return;
+        }
+        if let Ok(mut phase) = self.state.application.lock()
+            && *phase == ApplicationPhase::Closing
+        {
+            *phase = ApplicationPhase::Running;
+        }
+    }
+}
+
+fn exit_application<R: Runtime>(app: &AppHandle<R>, _permit: ReadyToExit) {
+    app.exit(0);
+}
+
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 fn application_close<R: Runtime>(
-    window: WebviewWindow<R>,
+    app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
+    let close_attempt = begin_application_close(&state)?;
     if state
         .generations
         .active_branch_count()
@@ -4489,13 +5085,73 @@ fn application_close<R: Runtime>(
         ));
     }
     drop(session);
-    window.destroy().map_err(|error| {
-        IpcFailure::new(
-            "window_close_failed",
-            format!("the native Loom window could not close: {error}"),
+    let active_downloads = state
+        .downloads
+        .active_count()
+        .map_err(|error| IpcFailure::model_download_registry(&error))?;
+    if active_downloads != 0 {
+        state
+            .downloads
+            .cancel_all_active(now_unix_ms())
+            .map_err(|error| IpcFailure::model_download_registry(&error))?;
+        return Err(IpcFailure::new(
+            "model_download_active",
+            format!(
+                "Loom requested cancellation for {active_downloads} active model download(s); retry close after they reach a terminal state"
+            ),
             true,
-        )
-    })
+        ));
+    }
+    state.generation_workers.join_all()?;
+    let _model_lifecycle = lock_model_lifecycle(&state)?;
+    let _model_release = unload_registered_model(&state)?;
+    let _host_shutdown = state.backend.shutdown_and_verify_empty().map_err(|error| {
+        model_residency_unknown(&format!(
+            "the native runtime could not prove an empty host during application shutdown: {error}"
+        ))
+    })?;
+    let permit = close_attempt.authorize()?;
+    exit_application(&app, permit);
+    Ok(())
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn application_close_abort(state: State<'_, PluginState>) -> Result<(), IpcFailure> {
+    abort_application_close(&state)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn application_close_pending(state: State<'_, PluginState>) -> Result<bool, IpcFailure> {
+    application_close_is_pending(&state)
+}
+
+fn application_close_is_pending(state: &PluginState) -> Result<bool, IpcFailure> {
+    if state.close_requested.load(Ordering::Acquire) {
+        return Ok(true);
+    }
+    Ok(*lock_application_phase(state)? != ApplicationPhase::Running)
+}
+
+fn abort_application_close(state: &PluginState) -> Result<(), IpcFailure> {
+    let phase = lock_application_phase(state)?;
+    match *phase {
+        ApplicationPhase::Running => {
+            state.close_requested.store(false, Ordering::Release);
+            Ok(())
+        }
+        ApplicationPhase::Closing => Err(IpcFailure::new(
+            "application_close_in_progress",
+            "wait for the current native close proof before resuming Loom",
+            true,
+        )),
+        ApplicationPhase::ExitAuthorized => Err(IpcFailure::new(
+            "application_exit_authorized",
+            "native process exit has already been authorized",
+            false,
+        )),
+    }
 }
 
 #[tauri::command]
@@ -4922,6 +5578,150 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_exit_request_quiesces_until_a_private_permit_authorizes_exit() {
+        let state = PluginState::default();
+
+        assert!(!record_application_exit_request(&state));
+        assert_eq!(
+            *state.application.lock().expect("application phase"),
+            ApplicationPhase::Running
+        );
+        assert_eq!(
+            ensure_application_running(&state, "new work")
+                .expect_err("quiescence must close admission")
+                .code,
+            "application_quiescing"
+        );
+
+        let attempt = begin_application_close(&state).expect("begin close proof");
+        assert_eq!(
+            *state.application.lock().expect("application phase"),
+            ApplicationPhase::Closing
+        );
+        let _permit = attempt.authorize().expect("authorize proven close");
+        assert_eq!(
+            *state.application.lock().expect("application phase"),
+            ApplicationPhase::ExitAuthorized
+        );
+        assert!(record_application_exit_request(&state));
+    }
+
+    #[test]
+    fn failed_close_attempt_restores_admission_and_explicit_abort_is_idempotent() {
+        let state = PluginState::default();
+        {
+            let _attempt = begin_application_close(&state).expect("begin close proof");
+            assert_eq!(
+                abort_application_close(&state)
+                    .expect_err("an executing proof cannot be aborted concurrently")
+                    .code,
+                "application_close_in_progress"
+            );
+        }
+        assert_eq!(
+            ensure_application_running(&state, "new work")
+                .expect_err("failed proof remains quiesced until explicit abort")
+                .code,
+            "application_quiescing"
+        );
+        abort_application_close(&state).expect("abort failed proof");
+        ensure_application_running(&state, "new work").expect("abort restores running");
+
+        assert!(!record_application_exit_request(&state));
+        abort_application_close(&state).expect("abort quiescence");
+        abort_application_close(&state).expect("abort replay");
+        ensure_application_running(&state, "new work").expect("abort restores running");
+    }
+
+    #[test]
+    fn pending_close_handshake_covers_an_exit_request_before_renderer_listener_installation() {
+        let state = PluginState::default();
+        assert!(!application_close_is_pending(&state).expect("running query"));
+
+        assert!(!record_application_exit_request(&state));
+        assert!(application_close_is_pending(&state).expect("quiescing query"));
+
+        abort_application_close(&state).expect("abort quiescence");
+        assert!(!application_close_is_pending(&state).expect("resumed query"));
+    }
+
+    #[test]
+    fn native_exit_recording_never_blocks_on_an_owned_application_admission_boundary() {
+        let state = Arc::new(PluginState::default());
+        let admission =
+            lock_application_admission(&state, "fixture work").expect("admit fixture work");
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            sent.send(record_application_exit_request(&worker_state))
+                .expect("send exit disposition");
+        });
+
+        assert!(
+            !received
+                .recv_timeout(Duration::from_millis(20))
+                .expect("event-thread exit recording must be nonblocking")
+        );
+        worker.join().expect("join exit-request worker");
+        drop(admission);
+        assert_eq!(
+            *state.application.lock().expect("application phase"),
+            ApplicationPhase::Running
+        );
+        assert_eq!(
+            ensure_application_running(&state, "new work")
+                .expect_err("recorded close intent must stop later admission")
+                .code,
+            "application_quiescing"
+        );
+    }
+
+    #[test]
+    fn generation_worker_reservation_prevents_exit_race_and_join_is_owned() {
+        let workers = GenerationWorkerRegistry::default();
+        let reservation = workers.reserve("request-one").expect("reserve worker");
+        assert_eq!(
+            workers
+                .join_all()
+                .expect_err("reserved worker must block teardown")
+                .code,
+            "generation_worker_starting"
+        );
+        reservation
+            .attach(std::thread::spawn(|| {}))
+            .map_err(|error| error.failure)
+            .expect("attach worker");
+        assert_eq!(workers.join_all().expect("join owned worker"), 1);
+        assert_eq!(workers.join_all().expect("join replay"), 0);
+    }
+
+    #[test]
+    fn generation_worker_panic_latches_fail_closed_teardown() {
+        let workers = GenerationWorkerRegistry::default();
+        workers
+            .reserve("request-panic")
+            .expect("reserve worker")
+            .attach(std::thread::spawn(|| panic!("fixture desktop panic")))
+            .map_err(|error| error.failure)
+            .expect("attach worker");
+
+        assert_eq!(
+            workers
+                .join_all()
+                .expect_err("worker panic must fail close")
+                .code,
+            "generation_worker_join_failed"
+        );
+        assert_eq!(
+            workers
+                .reserve("request-after-panic")
+                .expect_err("panic evidence remains latched")
+                .code,
+            "generation_worker_join_failed"
+        );
+    }
+
     fn test_policy_expectation(expected_bytes: &[u8]) -> PolicyWriterExpectation {
         PolicyWriterExpectation {
             profile_id: "test-writer".to_owned(),
@@ -5002,6 +5802,50 @@ mod tests {
     }
 
     #[test]
+    fn loaded_registry_latches_unknown_residency_when_native_slot_access_is_absent() {
+        let state = PluginState::default();
+        *state.model.lock().expect("model registry") = ModelRegistry::Loaded(Box::new(
+            test_loaded_model(Path::new("/tmp/not-resident.gguf"), "not-resident"),
+        ));
+
+        let error = unload_registered_model(&state)
+            .expect_err("loaded authority requires a proved native slot release");
+
+        assert_eq!(error.code, "model_residency_unknown");
+        assert!(matches!(
+            &*state.model.lock().expect("model registry"),
+            ModelRegistry::ResidencyUnknown { .. }
+        ));
+        assert_eq!(
+            unload_registered_model(&state)
+                .expect_err("unknown residency must remain fail closed")
+                .code,
+            "model_residency_unknown"
+        );
+    }
+
+    #[test]
+    fn unknown_native_residency_blocks_inference_and_application_teardown() {
+        let state = PluginState::default();
+        *state.model.lock().expect("model registry") = ModelRegistry::ResidencyUnknown {
+            reason: "fixture cleanup failure".to_owned(),
+        };
+
+        assert_eq!(
+            loaded_model_for_state(&state)
+                .expect_err("unknown residency cannot mint generation authority")
+                .code,
+            "model_residency_unknown"
+        );
+        assert_eq!(
+            unload_registered_model(&state)
+                .expect_err("unknown residency cannot mint exit authority")
+                .code,
+            "model_residency_unknown"
+        );
+    }
+
+    #[test]
     fn same_size_wrong_policy_digest_never_reaches_native_inspection() {
         let temporary = tempfile::tempdir().expect("temporary model directory");
         let path = temporary.path().join("writer.gguf");
@@ -5072,7 +5916,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_mismatch_is_rejected_without_committing_the_staged_model() {
+    fn capability_mismatch_with_unproved_cleanup_latches_unknown_residency() {
         let state = PluginState::default();
         let staged_path = PathBuf::from("/tmp/incapable-writer.gguf");
         let staged_profile = LocalModelProfile::for_gguf(&staged_path);
@@ -5099,8 +5943,30 @@ mod tests {
         )
         .expect_err("capability failure must not commit the staged model");
 
-        assert_eq!(error.code, "policy_model_capability_mismatch");
-        assert_loaded_model_id(&state, "previous-model");
+        assert_eq!(error.code, "model_residency_unknown");
+        assert!(matches!(
+            &*state.model.lock().expect("model registry"),
+            ModelRegistry::ResidencyUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn changed_registry_and_absent_staged_release_latches_unknown_residency() {
+        let state = PluginState::default();
+        *state.model.lock().expect("model registry") = ModelRegistry::Loaded(Box::new(
+            test_loaded_model(Path::new("/tmp/other.gguf"), "other-model"),
+        ));
+        let staged_path = PathBuf::from("/tmp/staged.gguf");
+        let staged_profile = LocalModelProfile::for_gguf(&staged_path);
+
+        let error = release_staged_model(&state, &staged_path, &staged_profile)
+            .expect_err("an absent staged slot cannot prove cleanup after authority changed");
+
+        assert_eq!(error.code, "model_residency_unknown");
+        assert!(matches!(
+            &*state.model.lock().expect("model registry"),
+            ModelRegistry::ResidencyUnknown { .. }
+        ));
     }
 
     #[test]

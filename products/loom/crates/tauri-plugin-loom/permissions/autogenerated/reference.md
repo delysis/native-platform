@@ -25,6 +25,8 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-branch-body`
 - `allow-weave-status`
 - `allow-application-close`
+- `allow-application-close-abort`
+- `allow-application-close-pending`
 
 ## Permission Table
 
@@ -96,6 +98,58 @@ Enables the application_close command without any pre-configured scope.
 <td>
 
 Denies the application_close command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-application-close-abort`
+
+</td>
+<td>
+
+Enables the application_close_abort command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-application-close-abort`
+
+</td>
+<td>
+
+Denies the application_close_abort command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-application-close-pending`
+
+</td>
+<td>
+
+Enables the application_close_pending command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-application-close-pending`
+
+</td>
+<td>
+
+Denies the application_close_pending command without any pre-configured scope.
 
 </td>
 </tr>

@@ -85,10 +85,10 @@ describe('createGhostTextDecorations', () => {
     const created = createGhostTextElement(fakeDocument, suggestion.text);
     expect(created).toBe(element);
     expect(element.className).toBe('loom-ghost-text');
-    expect(element.textContent).toBe(suggestion.text);
+    expect(element.textContent).toBe('');
     expect(element.contentEditable).toBe('false');
     expect(attributes.get('aria-hidden')).toBe('true');
-    expect(attributes.get('data-loom-ghost-text')).toBe('');
+    expect(attributes.get('data-loom-ghost-text')).toBe(suggestion.text);
     expect(attributes.get('draggable')).toBe('false');
     expect(attributes.get('spellcheck')).toBe('false');
   });

@@ -24,4 +24,6 @@ permissions = [
   "allow-branch-body",
   "allow-weave-status",
   "allow-application-close",
+  "allow-application-close-abort",
+  "allow-application-close-pending",
 ]

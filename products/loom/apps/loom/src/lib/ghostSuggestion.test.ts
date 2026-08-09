@@ -1,10 +1,39 @@
 import { describe, expect, it } from 'vitest';
 import type { BranchCard } from './types';
 import {
+  ghostReviewAffordance,
   selectVerifiedGhostSuggestion,
   verifiedGhostSuggestion,
   visibleVerifiedGhostSuggestion
 } from './ghostSuggestion';
+
+describe('ghostReviewAffordance', () => {
+  it('keeps a compact readable review action for one active suggestion', () => {
+    expect(ghostReviewAffordance(true, 1)).toEqual({
+      visible: true,
+      label: 'Review',
+      ariaLabel: 'Review the current writing suggestion'
+    });
+  });
+
+  it('describes additional and non-inline alternatives without empty controls', () => {
+    expect(ghostReviewAffordance(true, 3)).toEqual({
+      visible: true,
+      label: '2 more',
+      ariaLabel: 'Review the current writing suggestion and 2 more alternatives'
+    });
+    expect(ghostReviewAffordance(false, 1)).toEqual({
+      visible: true,
+      label: '1 alternative',
+      ariaLabel: 'Review 1 writing alternative'
+    });
+    expect(ghostReviewAffordance(false, 0)).toEqual({
+      visible: false,
+      label: '',
+      ariaLabel: ''
+    });
+  });
+});
 
 function branch(overrides: Partial<BranchCard> = {}): BranchCard {
   const text = ' rain.\n\nThen light.';
@@ -112,5 +141,36 @@ describe('selectVerifiedGhostSuggestion', () => {
       dismissedCandidateIds: [],
       targetByte: 9
     })).toBeNull();
+  });
+
+  it('skips a hydrated c630-shaped loop and selects the next exact branch', () => {
+    const loop = ` ${'Be'.repeat(180)}[image]\n\nS`;
+    const clean = ' Beyond the wet glass, a bicycle bell answered.';
+    const loopBranch = branch({
+      text: loop,
+      output_byte_len: new TextEncoder().encode(loop).byteLength
+    });
+    const cleanBranch = branch({
+      run_id: 'run-2',
+      branch_id: 'branch-2',
+      candidate_id: 'candidate-2',
+      text: clean,
+      output_blob_id: 'blob-2',
+      output_byte_len: new TextEncoder().encode(clean).byteLength
+    });
+
+    expect(selectVerifiedGhostSuggestion({
+      active: true,
+      branches: [loopBranch, cleanBranch],
+      hydratedBlobByRun: { 'run-1': 'blob-1', 'run-2': 'blob-2' },
+      dismissedCandidateIds: [],
+      targetByte: 9
+    })).toEqual({
+      candidateId: 'candidate-2',
+      presentationKey: 'candidate-2:blob-2',
+      text: clean
+    });
+    expect(loopBranch.text).toBe(loop);
+    expect(loopBranch.output_blob_id).toBe('blob-1');
   });
 });

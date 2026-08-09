@@ -294,6 +294,34 @@ impl ModelDownloadRegistry {
             .ok_or(ModelDownloadRegistryError::NotFound(command_id))
     }
 
+    pub(crate) fn cancel_all_active(
+        &self,
+        now_unix_ms: i64,
+    ) -> Result<usize, ModelDownloadRegistryError> {
+        let mut state = self.lock()?;
+        let mut cancelled = 0usize;
+        for entry in state.entries.values_mut() {
+            if entry.status.is_terminal() {
+                continue;
+            }
+            entry.cancel_requested = true;
+            entry.event_sequence = entry.event_sequence.saturating_add(1);
+            entry.updated_at_unix_ms = now_unix_ms;
+            entry.cancellation.cancel();
+            cancelled = cancelled.saturating_add(1);
+        }
+        Ok(cancelled)
+    }
+
+    pub(crate) fn active_count(&self) -> Result<usize, ModelDownloadRegistryError> {
+        let state = self.lock()?;
+        Ok(state
+            .entries
+            .values()
+            .filter(|entry| !entry.status.is_terminal())
+            .count())
+    }
+
     pub(crate) fn record_delivery_failure(
         &self,
         command_id: CommandId,
@@ -587,6 +615,35 @@ mod tests {
             .finish_cancelled(first, 4)
             .expect("finish cancelled");
         registry.reserve(spec(third, "three"), 5).expect("third");
+    }
+
+    #[test]
+    fn application_shutdown_cancels_every_active_download_and_requires_terminal_state() {
+        let registry = ModelDownloadRegistry::default();
+        let first = CommandId::new();
+        let second = CommandId::new();
+        registry.reserve(spec(first, "one"), 1).expect("first");
+        registry.reserve(spec(second, "two"), 2).expect("second");
+
+        assert_eq!(registry.active_count().expect("active count"), 2);
+        assert_eq!(registry.cancel_all_active(3).expect("cancel all"), 2);
+        for command_id in [first, second] {
+            let snapshot = registry.status(command_id).expect("cancel snapshot");
+            assert!(snapshot.cancel_requested);
+            assert!(
+                registry
+                    .cancellation(command_id)
+                    .expect("cancellation authority")
+                    .is_cancelled()
+            );
+        }
+        assert_eq!(registry.active_count().expect("active until terminal"), 2);
+
+        registry.finish_cancelled(first, 4).expect("first terminal");
+        registry
+            .finish_cancelled(second, 5)
+            .expect("second terminal");
+        assert_eq!(registry.active_count().expect("terminal count"), 0);
     }
 
     #[test]

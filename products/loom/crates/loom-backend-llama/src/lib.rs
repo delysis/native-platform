@@ -27,7 +27,10 @@ pub use model::{
     ProbabilitySemantics, RuntimeModelInspection, VerifiedCapabilitySet, VerifiedMediaCapability,
     VerifiedMediaKind, VerifiedModelDescriptor, is_gguf_path, verify_model_inspection,
 };
-pub use runtime::{BatchExecution, BatchRuntime, NativeHostRuntime, RuntimeEvidenceClass};
+pub use runtime::{
+    BatchExecution, BatchRuntime, CompleteModelRelease, HostShutdownReceipt, ModelRelease,
+    NativeHostRuntime, RuntimeEvidenceClass,
+};
 
 pub use adapter::{
     CandidateProvenanceRecord, ContinuationCase, DEFAULT_EVENT_CAPACITY, ExactContinuationRequest,

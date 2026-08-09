@@ -4,6 +4,8 @@
   import LoomEditor from './lib/LoomEditor.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
   import {
+    abortApplicationClose,
+    applicationClosePending,
     cancelGeneration,
     cancelModelDownload,
     checkpointDocument,
@@ -19,6 +21,7 @@
     getModelDownloadStatus,
     getWeaveStatus,
     isDesktopRuntime,
+    listenForApplicationCloseRequests,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
     loadModel,
@@ -31,6 +34,7 @@
     promoteCandidate,
     recoverProject,
     requestApplicationClose,
+    setFocusMode,
     setSuggestions as setSuggestionsPolicy,
     startWeave,
     startModelDownload,
@@ -45,6 +49,7 @@
   } from './lib/verseCodec';
   import { canRoundTripMarkdownExactly, canUseVisualMarkdown } from './lib/markdownSafety';
   import {
+    ghostReviewAffordance,
     selectVerifiedGhostSuggestion,
     verifiedGhostSuggestion,
     visibleVerifiedGhostSuggestion
@@ -73,6 +78,21 @@
     closeResultMayHaveCommitted
   } from './lib/sessionSafety';
   import { drainGenerationsAndClose } from './lib/sessionCloseCoordinator';
+  import {
+    ApplicationCloseCoordinator,
+    applicationAllowsModelPreparation,
+    applicationStartupDisposition,
+    isApplicationCloseAbortFailure,
+    type ApplicationCloseOutcome,
+    type ApplicationClosePhase,
+    type ProjectCloseOutcome
+  } from './lib/applicationCloseCoordinator';
+  import { ApplicationCloseRetryScheduler } from './lib/applicationCloseRetry';
+  import {
+    captureProjectCloseAgency,
+    restoreProjectCloseAgency,
+    type ProjectCloseAgencySnapshot
+  } from './lib/projectCloseAgency';
   import {
     restoreBeforeBackgroundWork,
     runCurrentWorkspaceStep,
@@ -225,6 +245,8 @@
     focusAtDocumentEnd: () => boolean;
   } | null = null;
   let componentMounted = false;
+  let desktopWorkspaceStarted = false;
+  let startupHeldForApplicationClose = false;
   let workspaceRestoreSerial = 0;
   let modelRefreshSerial = 0;
   let modelRefreshInFlightCount = 0;
@@ -232,8 +254,8 @@
   let preferredWriterPending: WorkspaceRestoreCapture | null = null;
   let preferredWriterEnsureInFlight: Promise<boolean> | null = null;
   let preferredWriterWakeQueued = false;
-  let allowWindowClose = false;
-  let unlistenWindowClose: (() => void) | undefined;
+  let applicationClosePhase: ApplicationClosePhase = 'running';
+  let unlistenApplicationCloseRequest: (() => void) | undefined;
   let unlistenWindowFocus: (() => void) | undefined;
   let transition: 'idle' | 'navigation' | 'closing' = 'idle';
   let navigationSerial = 0;
@@ -250,7 +272,8 @@
   let uncertainDraft: DraftCapture | null = null;
   let pendingCloseCommandId: string | null = null;
   let pendingCloseMayHaveCommitted = false;
-  let closeInFlight: Promise<boolean> | null = null;
+  let pendingCloseAgency: ProjectCloseAgencySnapshot | null = null;
+  let closeInFlight: Promise<ProjectCloseOutcome> | null = null;
   let reconciliation: ReconciliationPreview | null = null;
   let reconciliationResolution = '';
   let pendingReconciliationApply: ReconciliationApplyCapture | null = null;
@@ -350,6 +373,11 @@
     bodyErrorByRun: Record<string, string>;
   }
 
+  type WindowLifecycleInstallation =
+    | { status: 'ready' }
+    | { status: 'close_pending'; outcome: ApplicationCloseOutcome }
+    | { status: 'disposed' };
+
   type PromotionReloadOutcome = 'unchanged' | 'promoted' | 'source_changed' | 'reconciliation';
 
   const saveDelayMs = 900;
@@ -358,6 +386,43 @@
   const branchPollMaxMs = 4_000;
   const branchPageSize = 24;
   const branchShelfBodyMaxBytes = 1024 * 1024;
+  const applicationCloseRetry = new ApplicationCloseRetryScheduler({
+    schedule: (callback, delayMs) => window.setTimeout(callback, delayMs),
+    cancel: (handle) => window.clearTimeout(handle)
+  }, 300);
+
+  const applicationCloseCoordinator = new ApplicationCloseCoordinator({
+    begin: () => {
+      applicationClosePhase = 'closing';
+      clearPreferredWriterRequest();
+      cancelSuggestionTimer();
+      if (compositionActive) {
+        recordLocalFailure(
+          'composition_active',
+          'Finish the active text composition before closing Loom.'
+        );
+        announce(errorMessage);
+        return false;
+      }
+      return true;
+    },
+    closeProject: async () => project ? closeProject() : { status: 'closed' },
+    authorizeNativeClose: requestApplicationClose,
+    abortNativeClose: abortApplicationClose,
+    reset: () => {
+      applicationClosePhase = 'running';
+      if (transition === 'idle') requestPreferredWriterForCurrentWorkspace();
+    },
+    fail: (error) => {
+      recordFailure(error);
+      if (isApplicationCloseAbortFailure(error)) {
+        transition = 'closing';
+        cancelSuggestionTimer();
+        saveMessage = 'Application close state unknown';
+        announce('Loom could not confirm whether native closing was cancelled; editing remains locked');
+      }
+    }
+  });
   const modelDownloadPollBaseMs = 750;
   const modelDownloadPollMaxMs = 5_000;
   const suggestionsIdleDelayMs = 1_800;
@@ -479,12 +544,9 @@
   $: reviewBranchIndex = reviewBranch
     ? reviewableBranches.findIndex((branch) => branch.run_id === reviewBranch.run_id)
     : -1;
-  $: alternativeReviewCount = Math.max(
-    0,
-    reviewableBranches.length - (activeGhostSuggestion ? 1 : 0)
-  );
-  $: alternativeReviewVisible = reviewableBranches.length > 1 || (
-    reviewableBranches.length === 1 && !activeGhostSuggestion
+  $: reviewAffordance = ghostReviewAffordance(
+    Boolean(activeGhostSuggestion),
+    reviewableBranches.length
   );
   $: if (
     activeGhostSuggestion &&
@@ -542,14 +604,35 @@
     componentMounted = true;
     desktop = isDesktopRuntime();
     if (desktop) {
-      void installWindowLifecycleHandlers();
-      void installGenerationEventListener();
-      void restoreDesktopWorkspace();
+      void (async () => {
+        try {
+          const lifecycle = await installWindowLifecycleHandlers();
+          switch (lifecycle.status) {
+            case 'ready':
+              startDesktopWorkspace();
+              return;
+            case 'close_pending':
+              startupHeldForApplicationClose = true;
+              return;
+            case 'disposed':
+              return;
+            default: {
+              const unreachable: never = lifecycle;
+              return unreachable;
+            }
+          }
+        } catch (error) {
+          if (!componentMounted) return;
+          recordFailure(error);
+          announce('Loom could not install safe application close handling');
+        }
+      })();
     }
     window.addEventListener('keydown', handleGlobalKeydown);
     window.addEventListener('pointerdown', handleGlobalPointerdown);
     return () => {
       componentMounted = false;
+      startupHeldForApplicationClose = false;
       workspaceRestoreSerial += 1;
       modelRefreshSerial += 1;
       modelLoadSerial += 1;
@@ -567,14 +650,25 @@
       modelDownloadListenerDisposed = true;
       unlistenGenerationEvents?.();
       unlistenModelDownloadEvents?.();
+      const closeRequestListener = unlistenApplicationCloseRequest;
+      unlistenApplicationCloseRequest = undefined;
+      closeRequestListener?.();
       if (modelDownloadPollTimer !== undefined) window.clearTimeout(modelDownloadPollTimer);
       if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
+      applicationCloseRetry.dispose();
       for (const timer of staleWeaveCleanupTimers) window.clearTimeout(timer);
       staleWeaveCleanupTimers.clear();
-      unlistenWindowClose?.();
       unlistenWindowFocus?.();
     };
   });
+
+  function startDesktopWorkspace(): void {
+    if (!componentMounted || desktopWorkspaceStarted) return;
+    desktopWorkspaceStarted = true;
+    void installWindowFocusHandler();
+    void installGenerationEventListener();
+    void restoreDesktopWorkspace();
+  }
 
   function countWords(text: string): number {
     return text.match(/[\p{L}\p{N}]+(?:[’'-][\p{L}\p{N}]+)*/gu)?.length ?? 0;
@@ -845,19 +939,60 @@
     announce('The resolution is in history; a newer external change now needs review');
   }
 
-  async function installWindowLifecycleHandlers(): Promise<void> {
-    const appWindow = getCurrentWindow();
-    unlistenWindowFocus = await appWindow.onFocusChanged(({ payload: focused }) => {
-      if (!focused && !compositionActive && !reconciliation) {
-        flushEditors();
-        void saveNow();
-      }
-    });
-    unlistenWindowClose = await appWindow.onCloseRequested((event) => {
-      if (allowWindowClose) return;
-      event.preventDefault();
+  async function installWindowLifecycleHandlers(): Promise<WindowLifecycleInstallation> {
+    const unlisten = await listenForApplicationCloseRequests(() => {
       void closeWindowGracefully();
     });
+    if (!componentMounted) {
+      unlisten();
+      return { status: 'disposed' };
+    }
+    const previousListener = unlistenApplicationCloseRequest;
+    unlistenApplicationCloseRequest = unlisten;
+    previousListener?.();
+    let closePending: boolean;
+    try {
+      closePending = await applicationClosePending();
+    } catch (error) {
+      if (unlistenApplicationCloseRequest === unlisten) {
+        unlistenApplicationCloseRequest = undefined;
+        unlisten();
+      }
+      throw error;
+    }
+    if (!componentMounted) {
+      if (unlistenApplicationCloseRequest === unlisten) {
+        unlistenApplicationCloseRequest = undefined;
+        unlisten();
+      }
+      return { status: 'disposed' };
+    }
+    if (!closePending) return { status: 'ready' };
+
+    const outcome = await closeWindowGracefully();
+    if (!componentMounted) return { status: 'disposed' };
+    return applicationStartupDisposition(outcome) === 'continue'
+      ? { status: 'ready' }
+      : { status: 'close_pending', outcome };
+  }
+
+  async function installWindowFocusHandler(): Promise<void> {
+    try {
+      const unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+        if (!focused && !compositionActive && !reconciliation) {
+          flushEditors();
+          void saveNow();
+        }
+      });
+      if (!componentMounted) {
+        unlisten();
+        return;
+      }
+      unlistenWindowFocus?.();
+      unlistenWindowFocus = unlisten;
+    } catch (error) {
+      if (componentMounted) recordFailure(error);
+    }
   }
 
   async function installGenerationEventListener(): Promise<void> {
@@ -1730,20 +1865,20 @@
     }, 150);
   }
 
-  async function closeWindowGracefully(): Promise<void> {
-    if (compositionActive) {
-      recordLocalFailure('composition_active', 'Finish the active text composition before closing Loom.');
-      announce(errorMessage);
-      return;
+  async function closeWindowGracefully(): Promise<ApplicationCloseOutcome> {
+    const attemptEpoch = applicationCloseRetry.beginAttempt();
+    const outcome = await applicationCloseCoordinator.request();
+    applicationCloseRetry.settle(attemptEpoch, outcome, () => {
+      if (componentMounted) void closeWindowGracefully();
+    });
+    if (
+      startupHeldForApplicationClose &&
+      applicationStartupDisposition(outcome) === 'continue'
+    ) {
+      startupHeldForApplicationClose = false;
+      startDesktopWorkspace();
     }
-    if (project && !(await closeProject())) return;
-    try {
-      await requestApplicationClose();
-      allowWindowClose = true;
-    } catch (error) {
-      allowWindowClose = false;
-      recordFailure(error);
-    }
+    return outcome;
   }
 
   function workspaceRestoreIsCurrent(captured: WorkspaceRestoreCapture): boolean {
@@ -1784,12 +1919,20 @@
   }
 
   function queuePreferredWriterRequest(captured: WorkspaceRestoreCapture): void {
-    if (!suggestionsEnabled || !workspaceRestoreIsCurrent(captured)) return;
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !suggestionsEnabled ||
+      !workspaceRestoreIsCurrent(captured)
+    ) return;
     preferredWriterPending = { ...captured };
   }
 
   function wakePreferredWriterEnsure(): void {
-    if (preferredWriterWakeQueued || !preferredWriterPending) return;
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      preferredWriterWakeQueued ||
+      !preferredWriterPending
+    ) return;
     preferredWriterWakeQueued = true;
     queueMicrotask(() => {
       preferredWriterWakeQueued = false;
@@ -1804,7 +1947,12 @@
 
   function requestPreferredWriterForCurrentWorkspace(): void {
     const captured = currentWorkspaceCapture();
-    if (!captured || !suggestionsEnabled || currentModel) return;
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !captured ||
+      !suggestionsEnabled ||
+      currentModel
+    ) return;
     requestPreferredWriterEnsure(captured);
   }
 
@@ -1812,7 +1960,11 @@
     if (preferredWriterEnsureInFlight) return preferredWriterEnsureInFlight;
     const captured = preferredWriterPending;
     if (!captured) return Promise.resolve(Boolean(currentModel));
-    if (!suggestionsEnabled || !workspaceRestoreIsCurrent(captured)) {
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !suggestionsEnabled ||
+      !workspaceRestoreIsCurrent(captured)
+    ) {
       clearPreferredWriterRequest(captured);
       return Promise.resolve(false);
     }
@@ -1838,19 +1990,28 @@
   async function ensurePreferredWriterOnce(
     captured: WorkspaceRestoreCapture
   ): Promise<boolean> {
-    if (!suggestionsEnabled || !workspaceRestoreIsCurrent(captured)) return false;
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !suggestionsEnabled ||
+      !workspaceRestoreIsCurrent(captured)
+    ) return false;
     if (currentModel) {
       if (document) scheduleAutomaticSuggestions(editVersion);
       return true;
     }
 
     const refreshed = await refreshModels(captured);
-    if (!suggestionsEnabled || !workspaceRestoreIsCurrent(captured)) return false;
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !suggestionsEnabled ||
+      !workspaceRestoreIsCurrent(captured)
+    ) return false;
     if (!refreshed && modelRefreshInFlightCount > 0) {
       queuePreferredWriterRequest(captured);
       return false;
     }
     await tick();
+    if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
     if (currentModel) {
       if (document) scheduleAutomaticSuggestions(editVersion);
       return true;
@@ -1896,14 +2057,21 @@
       return false;
     } finally {
       modelRefreshInFlightCount = Math.max(0, modelRefreshInFlightCount - 1);
-      if (modelRefreshInFlightCount === 0) wakePreferredWriterEnsure();
+      if (
+        applicationAllowsModelPreparation(applicationClosePhase) &&
+        modelRefreshInFlightCount === 0
+      ) wakePreferredWriterEnsure();
     }
   }
 
   async function refreshCurrentModelsAndEnsureWriter(): Promise<boolean> {
     const captured = currentWorkspaceCapture();
     const refreshed = await refreshModels(captured ?? undefined);
-    if (captured && workspaceRestoreIsCurrent(captured)) {
+    if (
+      applicationAllowsModelPreparation(applicationClosePhase) &&
+      captured &&
+      workspaceRestoreIsCurrent(captured)
+    ) {
       requestPreferredWriterForCurrentWorkspace();
     }
     return refreshed;
@@ -1975,7 +2143,11 @@
   }
 
   async function setSuggestionsEnabled(enabled: boolean, persist = true): Promise<void> {
-    if (!project || suggestionsChanging) return;
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !project ||
+      suggestionsChanging
+    ) return;
     const boundProject = project;
     suggestionsChanging = true;
     suggestionIntentEpoch += 1;
@@ -1983,6 +2155,7 @@
     try {
       await setSuggestionsPolicy(boundProject.project_id, boundProject.session_id, enabled);
       if (
+        !applicationAllowsModelPreparation(applicationClosePhase) ||
         project?.project_id !== boundProject.project_id ||
         project.session_id !== boundProject.session_id
       ) return;
@@ -2059,6 +2232,7 @@
     quiet: boolean,
     expectedWorkspace?: WorkspaceRestoreCapture
   ): Promise<boolean> {
+    if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
     if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
     models = [
       loaded,
@@ -2073,6 +2247,7 @@
     }
     if (suggestionsEnabled && loaded.completion && document) {
       await tick();
+      if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
       scheduleAutomaticSuggestions(editVersion);
     }
     return true;
@@ -2080,7 +2255,11 @@
 
   async function loadSelectedModel(options: ModelLoadOptions = {}): Promise<boolean> {
     const { expectedWorkspace, quiet = false } = options;
-    if (!selectedModelPath || modelLoading) return false;
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !selectedModelPath ||
+      modelLoading
+    ) return false;
     const modelPath = selectedModelPath;
     const loadSerial = ++modelLoadSerial;
     modelLoading = true;
@@ -2092,12 +2271,14 @@
       const loaded = await loadModel(modelPath);
       if (
         !componentMounted ||
+        !applicationAllowsModelPreparation(applicationClosePhase) ||
         loadSerial !== modelLoadSerial
       ) return false;
       return await installLoadedModel(loaded, quiet, expectedWorkspace);
     } catch (error) {
       if (
         !componentMounted ||
+        !applicationAllowsModelPreparation(applicationClosePhase) ||
         loadSerial !== modelLoadSerial ||
         (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
       ) return false;
@@ -2120,11 +2301,13 @@
   async function loadPreferredSuggestionModel(
     expectedWorkspace?: WorkspaceRestoreCapture
   ): Promise<boolean> {
+    if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
     if (currentModel) return true;
     if (!document || transition !== 'idle' || modelLoading || modelUnloading) return false;
     if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
     const candidates = orderedLocalWriterCandidates(models);
     for (const candidate of candidates) {
+      if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
       if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
       const loadSerial = ++modelLoadSerial;
       modelLoading = true;
@@ -2132,6 +2315,7 @@
         const loaded = await loadPolicyModelCandidate(candidate.profileId, candidate.modelPath);
         if (
           !componentMounted ||
+          !applicationAllowsModelPreparation(applicationClosePhase) ||
           loadSerial !== modelLoadSerial ||
           (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
         ) return false;
@@ -2143,6 +2327,7 @@
       } catch {
         if (
           !componentMounted ||
+          !applicationAllowsModelPreparation(applicationClosePhase) ||
           loadSerial !== modelLoadSerial ||
           (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
         ) return false;
@@ -4168,7 +4353,7 @@
     window.setTimeout(() => (liveRegion = message), 0);
   }
 
-  async function closeProject(): Promise<boolean> {
+  async function closeProject(): Promise<ProjectCloseOutcome> {
     if (closeInFlight) return closeInFlight;
     const operation = performCloseProject();
     closeInFlight = operation;
@@ -4179,22 +4364,72 @@
     }
   }
 
-  async function performCloseProject(): Promise<boolean> {
-    if (!project) return true;
+  async function resumeProjectAfterDefinitiveClose(
+    closing: Pick<ProjectSnapshot, 'project_id' | 'session_id'>
+  ): Promise<ProjectCloseOutcome> {
+    const sameSession = Boolean(
+      project?.project_id === closing.project_id &&
+      project.session_id === closing.session_id
+    );
+    const agency = pendingCloseAgency;
+    const restoreSuggestions = agency?.suggestionsEnabled ?? suggestionsEnabled;
+    if (agency && sameSession) {
+      try {
+        await restoreProjectCloseAgency(agency, {
+          setFocusMode: (enabled) => setFocusMode(
+            closing.project_id,
+            closing.session_id,
+            enabled
+          ),
+          setSuggestionsEnabled: (enabled) => setSuggestionsPolicy(
+            closing.project_id,
+            closing.session_id,
+            enabled
+          )
+        });
+      } catch (error) {
+        pendingCloseMayHaveCommitted = false;
+        transition = 'closing';
+        recordFailure(error);
+        saveMessage = 'Close recovery is still settling';
+        announce('The project remains safely locked until its writing policy can be restored');
+        return { status: 'quiesced' };
+      }
+    }
+
+    if (sameSession) suggestionsEnabled = restoreSuggestions;
+    pendingCloseCommandId = null;
+    pendingCloseMayHaveCommitted = false;
+    pendingCloseAgency = null;
+    transition = 'idle';
+    scheduleActiveBranchPoll();
+    if (
+      sameSession &&
+      restoreSuggestions &&
+      applicationAllowsModelPreparation(applicationClosePhase)
+    ) {
+      requestPreferredWriterForCurrentWorkspace();
+      if (currentModel && document) scheduleAutomaticSuggestions(editVersion);
+    }
+    return { status: 'resume' };
+  }
+
+  async function performCloseProject(): Promise<ProjectCloseOutcome> {
+    if (!project) return { status: 'closed' };
     const retryingPreparedClose = transition === 'closing' && pendingCloseCommandId !== null;
     if (compositionActive && !retryingPreparedClose) {
       announce('Finish composing text before closing the project');
-      return false;
+      return { status: 'resume' };
     }
     if (!retryingPreparedClose) {
-      if (!flushEditors()) return false;
+      if (!flushEditors()) return { status: 'resume' };
       transition = 'closing';
       announce('Closing project; editing is briefly locked');
       stopBranchPolling();
       if (!(await flushCurrentDocument())) {
         transition = 'idle';
         scheduleActiveBranchPoll();
-        return false;
+        return { status: 'resume' };
       }
     } else {
       stopBranchPolling();
@@ -4239,18 +4474,16 @@
           transition = 'closing';
           saveMessage = 'Close result uncertain — retry safely';
           announce('Close result uncertain; editing remains locked until the same close command is retried');
+          return { status: 'quiesced' };
         } else {
-          pendingCloseCommandId = null;
-          pendingCloseMayHaveCommitted = false;
-          transition = 'idle';
-          scheduleActiveBranchPoll();
+          return await resumeProjectAfterDefinitiveClose(closing);
         }
-        return false;
       }
     } else {
       // Stop new automatic admission before native close drains any reserved
       // startup already in flight. Keep the persisted preference unchanged so
       // a later reopen can restore the author's choice deliberately.
+      pendingCloseAgency ??= captureProjectCloseAgency(suggestionsEnabled);
       suggestionsEnabled = false;
       cancelSuggestionTimer();
       const outcome = await drainGenerationsAndClose({
@@ -4267,46 +4500,43 @@
         isCurrent: closeCaptureIsCurrent
       });
 
-      if (outcome.status === 'stale') {
-        if (
-          componentMounted &&
-          project?.project_id === closing.project_id &&
-          project.session_id === closing.session_id
-        ) {
-          pendingCloseCommandId = null;
-          transition = 'idle';
-          recordLocalFailure('close_race', 'The manuscript changed while Loom prepared to close it.');
-          scheduleActiveBranchPoll();
+      switch (outcome.status) {
+        case 'closed':
+          break;
+        case 'stale':
+          if (
+            componentMounted &&
+            project?.project_id === closing.project_id &&
+            project.session_id === closing.session_id
+          ) {
+            recordLocalFailure('close_race', 'The manuscript changed while Loom prepared to close it.');
+          }
+          return await resumeProjectAfterDefinitiveClose(closing);
+        case 'uncertain':
+          recordFailure(outcome.failure);
+          pendingCloseMayHaveCommitted = true;
+          transition = 'closing';
+          saveMessage = 'Close result uncertain — retry safely';
+          announce('Close result uncertain; editing remains locked until the same close command is retried');
+          return { status: 'quiesced' };
+        case 'waiting':
+          pendingCloseMayHaveCommitted = false;
+          transition = 'closing';
+          if (outcome.failure) recordFailure(outcome.failure);
+          else recordLocalFailure(
+            'generation_cancellation_in_progress',
+            'Private strands are still preserving their terminal evidence. Loom kept the project open; retry close safely.'
+          );
+          saveMessage = 'Private strands are still stopping — retry close';
+          announce('The project remains open while private strands stop; retry close safely');
+          return { status: 'quiesced' };
+        case 'refused':
+          recordFailure(outcome.failure);
+          return await resumeProjectAfterDefinitiveClose(closing);
+        default: {
+          const unreachable: never = outcome;
+          return unreachable;
         }
-        return false;
-      }
-      if (outcome.status === 'uncertain') {
-        recordFailure(outcome.failure);
-        pendingCloseMayHaveCommitted = true;
-        transition = 'closing';
-        saveMessage = 'Close result uncertain — retry safely';
-        announce('Close result uncertain; editing remains locked until the same close command is retried');
-        return false;
-      }
-      if (outcome.status === 'waiting') {
-        pendingCloseMayHaveCommitted = false;
-        transition = 'closing';
-        if (outcome.failure) recordFailure(outcome.failure);
-        else recordLocalFailure(
-          'generation_cancellation_in_progress',
-          'Private strands are still preserving their terminal evidence. Loom kept the project open; retry close safely.'
-        );
-        saveMessage = 'Private strands are still stopping — retry close';
-        announce('The project remains open while private strands stop; retry close safely');
-        return false;
-      }
-      if (outcome.status === 'refused') {
-        recordFailure(outcome.failure);
-        pendingCloseCommandId = null;
-        pendingCloseMayHaveCommitted = false;
-        transition = 'idle';
-        scheduleActiveBranchPoll();
-        return false;
       }
     }
 
@@ -4335,6 +4565,7 @@
     dismissedCandidateIds = [];
     pendingCloseCommandId = null;
     pendingCloseMayHaveCommitted = false;
+    pendingCloseAgency = null;
     uncertainSave = null;
     draftVersion = '0';
     draftSavedEditVersion = 0;
@@ -4347,7 +4578,7 @@
     }
     modelLoading = false;
     transition = 'idle';
-    return true;
+    return { status: 'closed' };
   }
 
   function kindLabel(kind: DocumentKind): string {
@@ -4400,17 +4631,16 @@
           <span class="status-dot"></span>{saveMessage}
         </div>
       {/if}
-      {#if document && alternativeReviewVisible}
+      {#if document && reviewAffordance.visible}
         <button
           class="alternatives-button"
           bind:this={strandReviewTrigger}
           type="button"
           aria-haspopup="dialog"
+          aria-label={reviewAffordance.ariaLabel}
           on:click={() => void openStrandReview()}
         >
-          {activeGhostSuggestion
-            ? `${alternativeReviewCount} more`
-            : `${reviewableBranches.length} alternatives`}
+          {reviewAffordance.label}
         </button>
       {/if}
       <details class="project-menu" bind:this={projectMenu}>

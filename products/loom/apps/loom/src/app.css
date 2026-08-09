@@ -139,6 +139,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .loom-prosemirror h1, .loom-prosemirror h2, .loom-prosemirror h3 { font-family: inherit; font-weight: 600; line-height: 1.25; }
 .loom-prosemirror blockquote { margin-left: 0; padding-left: 1.2em; border-left: 2px solid var(--line); color: #5d5d57; }
 .loom-ghost-text { color: var(--ghost-ink); overflow-wrap: anywhere; pointer-events: none; user-select: none; -webkit-user-select: none; white-space: break-spaces; }
+.loom-ghost-text::before { content: attr(data-loom-ghost-text); }
 .loom-prosemirror ::selection, .source-pane textarea::selection { color: var(--selection-ink); background: var(--selection-bg); }
 .source-pane textarea::selection { -webkit-text-fill-color: var(--selection-ink); }
 .verse-notice { margin: 32px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); font-size: 13px; }

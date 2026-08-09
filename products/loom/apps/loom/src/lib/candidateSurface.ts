@@ -1,10 +1,37 @@
 export type CandidateSurfaceDecision =
   | { surface: true }
-  | { surface: false; reason: 'empty' | 'numeric' | 'repetition' };
+  | { surface: false; reason: 'artifact' | 'empty' | 'invisible' | 'numeric' | 'repetition' };
 
 const wordPattern = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu;
 const letterPattern = /\p{L}/u;
 const digitPattern = /\p{N}/u;
+const visibleScalarPattern = /[^\p{C}\p{Z}\p{Default_Ignorable_Code_Point}]/u;
+const generatedMediaMarkerPattern = /^[\p{Zs}\t\r]*(?:\[image\]|<image>|<\|image(?:_pad)?\|>|<start_of_image>|<end_of_image>)[\p{Zs}\t\r]*$/imu;
+const unbrokenWordPattern = /[^\s\p{P}\p{S}]{64,}/gu;
+const maxScannedCodeUnits = 8_192;
+const maxScannedRunCodePoints = 512;
+const maxPeriodCodePoints = 16;
+const minimumPeriodRepeats = 12;
+const minimumPeriodAgreement = 0.95;
+
+function hasDegenerateUnbrokenPeriod(text: string): boolean {
+  const runs = text.slice(0, maxScannedCodeUnits).match(unbrokenWordPattern) ?? [];
+  for (const run of runs) {
+    const codePoints = Array.from(run).slice(0, maxScannedRunCodePoints);
+    const maximumPeriod = Math.min(
+      maxPeriodCodePoints,
+      Math.floor(codePoints.length / minimumPeriodRepeats)
+    );
+    for (let period = 1; period <= maximumPeriod; period += 1) {
+      let matching = 0;
+      for (let index = period; index < codePoints.length; index += 1) {
+        if (codePoints[index] === codePoints[index - period]) matching += 1;
+      }
+      if (matching / (codePoints.length - period) >= minimumPeriodAgreement) return true;
+    }
+  }
+  return false;
+}
 
 /**
  * A deliberately conservative presentation gate for obviously broken model
@@ -12,8 +39,15 @@ const digitPattern = /\p{N}/u;
  */
 export function candidateSurfaceDecision(text: string): CandidateSurfaceDecision {
   if (!/\S/u.test(text)) return { surface: false, reason: 'empty' };
+  if (!visibleScalarPattern.test(text)) return { surface: false, reason: 'invisible' };
+  if (generatedMediaMarkerPattern.test(text.slice(0, maxScannedCodeUnits))) {
+    return { surface: false, reason: 'artifact' };
+  }
+  if (hasDegenerateUnbrokenPeriod(text)) {
+    return { surface: false, reason: 'repetition' };
+  }
 
-  const tokens = (text.slice(0, 8_192).match(wordPattern) ?? [])
+  const tokens = (text.slice(0, maxScannedCodeUnits).match(wordPattern) ?? [])
     .slice(0, 512)
     .map((token) => token.toLocaleLowerCase());
   if (tokens.length === 0) return { surface: true };
