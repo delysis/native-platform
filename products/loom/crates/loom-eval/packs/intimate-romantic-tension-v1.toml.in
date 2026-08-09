@@ -1,0 +1,22 @@
+format = "loom.genre-pack.v1"
+name = "intimate-romantic-tension-v1"
+description = "Consent-legible intimate and romantic tension without generic erotic compression"
+genre_functions = ["intimate_romantic_tension"]
+
+[core_pack]
+format = "loom.core-pack.v1"
+artifact_sha256 = "{{CORE_ARTIFACT_SHA256}}"
+
+[criteria.intimate_blocking]
+description = "Keeps bodies, clothing, touch, distance, permission, and withdrawal spatially and causally legible"
+weight_multiplier = 1.25
+behavioral_anchors = ["Every consequential touch has a locatable initiator, target, and response", "Consent and hesitation are conveyed through choices and behavior rather than legalistic summary", "Physical progression does not skip the actions that make later positions possible"]
+
+[criteria.desire_and_ambivalence]
+description = "Sustains character-specific desire, risk, restraint, and mixed motive across the movement"
+weight_multiplier = 1.25
+behavioral_anchors = ["Desire changes tactics and attention rather than only increasing heat", "Vulnerability has relationship-specific stakes", "Intimacy does not collapse into generic anatomical inventory or therapeutic reassurance"]
+
+[project_anchors.intimate_movement]
+description = "Nearby project prose with matching intimacy, consent, and blocking demands"
+retrieval_limit = 2

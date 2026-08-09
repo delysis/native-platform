@@ -312,6 +312,7 @@ fn map_text_limit(_: TextLimitError) -> AntiCopyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loom_types::RevisionId;
 
     fn blob(byte: u8) -> BlobId {
         BlobId::from_bytes([byte; 32])
@@ -320,6 +321,7 @@ mod tests {
     fn excerpt(id: u8, text: &str) -> ExactExcerpt {
         ExactExcerpt::new(
             ArtifactId::new(),
+            RevisionId::new(),
             blob(id),
             crate::SourceByteRange::new(0, u64::try_from(text.len()).unwrap()).unwrap(),
             text,

@@ -1,0 +1,30 @@
+[package]
+name = "loom-trial"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Frozen, replayable single-treatment trial kernel for Loom research"
+
+[features]
+default = []
+real-native-tests = ["loom-inference/native-llama"]
+
+[dependencies]
+loom-inference = { path = "../loom-inference" }
+loom-research-types = { path = "../loom-research-types" }
+loom-store = { path = "../loom-store" }
+loom-types = { path = "../loom-types" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit.git", rev = "6a82439ee449599f7a7e477e1150ae29efdb23d6" }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit.git", rev = "6a82439ee449599f7a7e477e1150ae29efdb23d6" }
+tempfile.workspace = true
+
+[lints]
+workspace = true

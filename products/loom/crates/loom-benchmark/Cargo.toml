@@ -1,0 +1,21 @@
+[package]
+name = "loom-benchmark"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sealed confirmatory fiction benchmark protocol for Loom"
+
+[dependencies]
+loom-research-types = { path = "../loom-research-types" }
+loom-types = { path = "../loom-types" }
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

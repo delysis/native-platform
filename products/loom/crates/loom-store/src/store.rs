@@ -3,10 +3,11 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fs4::TryLockError;
 use loom_document::DocumentContent;
+use loom_research_types::TrialRunId;
 use loom_types::{
     ArtifactId, BlobId, CommandId, CommandKind, CommandReceipt, DocumentId, DocumentKind,
     OperationId, OperationKind, ProjectManifest, RevisionId, now_unix_ms,
@@ -24,11 +25,15 @@ use crate::paths::{
     ensure_directory, ensure_document_parent, ensure_private_directory, inspect_document_path,
     normalize_document_path, reject_symlink_target,
 };
+use crate::research_session::{
+    ExclusiveResearchSessionLease, ResearchSessionKey, ResearchSessionRegistry,
+    ResearchSessionRegistryState, ResearchSubjectLocator, load_research_subject_snapshot,
+};
 use crate::schema::{CURRENT_SCHEMA_VERSION, configure, migrate};
 use crate::{Result, StoreError};
 
 const PROJECT_FORMAT: &str = "loom-project";
-const DATABASE_FILE: &str = "loom.sqlite3";
+pub(crate) const DATABASE_FILE: &str = "loom.sqlite3";
 const PROJECT_LEASE_FILE: &str = "session.lock";
 const MANIFEST_FILE: &str = "project.json";
 const MAX_PROJECT_NAME_BYTES: usize = 512;
@@ -41,9 +46,7 @@ pub struct ProjectStore {
     pub(crate) manifest: ProjectManifest,
     pub(crate) connection: Connection,
     pub(crate) session_nonce: StoreSessionNonce,
-    // Holding this descriptor is the project ownership lease. The operating
-    // system releases it on normal close, panic, or process termination.
-    _lease: ProjectLease,
+    research_sessions: ResearchSessionRegistry,
 }
 
 /// Unpersisted, per-open capability domain. Copying a database or reopening a
@@ -59,6 +62,10 @@ impl StoreSessionNonce {
             .map_err(|error| StoreError::SessionEntropy(error.to_string()))?;
         Ok(Self(bytes))
     }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 impl fmt::Debug for StoreSessionNonce {
@@ -67,7 +74,7 @@ impl fmt::Debug for StoreSessionNonce {
     }
 }
 
-struct ProjectLease {
+pub(crate) struct ProjectLease {
     _file: File,
     root: PathBuf,
 }
@@ -92,6 +99,14 @@ impl fmt::Debug for ProjectStore {
 }
 
 impl ProjectStore {
+    pub(crate) fn research_authority_domain_fingerprint(&self) -> BlobId {
+        let mut material = Vec::with_capacity(64 + self.session_nonce.as_bytes().len());
+        material.extend_from_slice(b"loom/store-research-authority-domain/v1\0");
+        material.extend_from_slice(self.session_nonce.as_bytes());
+        material.extend_from_slice(&self.manifest.project_id.as_ulid().to_bytes());
+        BlobId::digest(&material)
+    }
+
     pub fn initialize(
         path: impl AsRef<Path>,
         name: impl Into<String>,
@@ -205,12 +220,13 @@ impl ProjectStore {
         let mut connection = Connection::open(&database_path)?;
         configure(&connection)?;
         migrate(&mut connection)?;
+        let project_lease = Arc::new(lease);
         let mut store = Self {
             root,
             manifest,
             connection,
             session_nonce: StoreSessionNonce::generate()?,
-            _lease: lease,
+            research_sessions: ResearchSessionRegistryState::new(project_lease),
         };
         store.quarantine_pending_legacy_candidates()?;
         Ok(store)
@@ -222,6 +238,112 @@ impl ProjectStore {
 
     pub const fn manifest(&self) -> &ProjectManifest {
         &self.manifest
+    }
+
+    /// Acquires the sole process-local scheduler lock for one frozen campaign.
+    pub fn acquire_campaign_session(
+        &self,
+        campaign_fingerprint: BlobId,
+    ) -> Result<ExclusiveResearchSessionLease> {
+        self.acquire_research_session(ResearchSubjectLocator::Campaign(campaign_fingerprint))
+    }
+
+    /// Acquires the sole process-local executor lock for one durable trial
+    /// run. Campaign-owned runs are admitted only after their exact dispatch
+    /// event and are rejected after a campaign terminal/release event.
+    pub fn acquire_trial_run_session(
+        &self,
+        trial_run_id: TrialRunId,
+    ) -> Result<ExclusiveResearchSessionLease> {
+        let admissible: i64 = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM research_trial_runs run
+                WHERE run.trial_run_id = ?1
+                  AND (
+                    run.origin_kind = 'standalone'
+                    OR (
+                      run.origin_kind = 'campaign'
+                      AND EXISTS (
+                        SELECT 1 FROM research_campaign_events dispatched
+                        WHERE dispatched.trial_attempt_id = run.trial_run_id
+                          AND dispatched.event_kind = 'trial_dispatched'
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM research_campaign_events terminal
+                        WHERE terminal.trial_attempt_id = run.trial_run_id
+                          AND terminal.event_kind IN (
+                            'trial_finished', 'trial_reservation_released'
+                          )
+                      )
+                    )
+                  )
+             )",
+            [trial_run_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if admissible != 1 {
+            return Err(StoreError::TrialRunNotDispatched(trial_run_id));
+        }
+        self.acquire_research_session(ResearchSubjectLocator::TrialRun(trial_run_id))
+    }
+
+    fn acquire_research_session(
+        &self,
+        locator: ResearchSubjectLocator,
+    ) -> Result<ExclusiveResearchSessionLease> {
+        let kind = locator.kind();
+        let subject_fingerprint = locator.subject_fingerprint();
+        let snapshot = load_research_subject_snapshot(&self.connection, locator)?;
+        let Some(snapshot) = snapshot else {
+            return Err(StoreError::ResearchSessionSubjectNotPersisted {
+                kind,
+                subject_fingerprint,
+            });
+        };
+        if snapshot.project_id() != self.manifest.project_id {
+            return Err(StoreError::ResearchSubjectProjectMismatch);
+        }
+        let record_fingerprint = snapshot.record_fingerprint();
+
+        let key = ResearchSessionKey {
+            kind,
+            subject_fingerprint,
+        };
+        let mut registry = self
+            .research_sessions
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !registry.insert(key) {
+            return Err(StoreError::ResearchSessionAlreadyActive {
+                kind,
+                subject_fingerprint,
+            });
+        }
+
+        let session_id = ArtifactId::new();
+        let mut fingerprint_material = Vec::with_capacity(98);
+        fingerprint_material.extend_from_slice(b"loom/research-session/v1\0");
+        fingerprint_material.extend_from_slice(self.session_nonce.as_bytes());
+        fingerprint_material.push(kind.domain_tag());
+        fingerprint_material.extend_from_slice(subject_fingerprint.as_bytes());
+        fingerprint_material.extend_from_slice(record_fingerprint.as_bytes());
+        fingerprint_material.extend_from_slice(&self.manifest.project_id.as_ulid().to_bytes());
+        fingerprint_material.extend_from_slice(&session_id.as_ulid().to_bytes());
+        let lease_fingerprint = BlobId::digest(&fingerprint_material);
+        drop(registry);
+
+        Ok(ExclusiveResearchSessionLease::new(
+            key,
+            record_fingerprint,
+            self.manifest.project_id,
+            snapshot,
+            locator.trial_run_id(),
+            session_id,
+            lease_fingerprint,
+            Arc::clone(&self.research_sessions),
+        ))
     }
 
     pub fn record_open(&mut self) -> Result<CommandReceipt> {
@@ -1109,7 +1231,17 @@ impl ProjectStore {
         let blob_id = BlobId::digest(bytes);
         let path = self.blob_path(blob_id);
         if path.exists() {
-            let existing = self.read_blob(blob_id)?;
+            // `read_blob` is a document API and is intentionally capped at
+            // 128 MiB. Research receipts have their own larger, checked
+            // bounds, so idempotent content-addressed insertion must verify
+            // against the exact caller-owned byte length instead of silently
+            // inheriting the document limit.
+            let exact_len = u64::try_from(bytes.len()).map_err(|_| {
+                StoreError::CorruptDatabase(
+                    "content blob length does not fit the store size domain".into(),
+                )
+            })?;
+            let existing = self.read_blob_bounded(blob_id, exact_len)?;
             if existing != bytes {
                 return Err(StoreError::CorruptBlob {
                     path,

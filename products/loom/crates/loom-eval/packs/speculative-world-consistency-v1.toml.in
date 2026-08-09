@@ -1,0 +1,22 @@
+format = "loom.genre-pack.v1"
+name = "speculative-world-consistency-v1"
+description = "World-rule consistency expressed through consequence rather than exposition"
+genre_functions = ["speculative_world_consistency"]
+
+[core_pack]
+format = "loom.core-pack.v1"
+artifact_sha256 = "{{CORE_ARTIFACT_SHA256}}"
+
+[criteria.world_rule_consequence]
+description = "Applies established material, social, magical, or technological rules consistently under pressure"
+weight_multiplier = 1.25
+behavioral_anchors = ["Capabilities retain costs, limits, and prerequisites", "Institutions and characters act on the world's actual incentives", "A new rule does not appear solely to solve the current problem"]
+
+[criteria.exposition_in_action]
+description = "Makes unfamiliar world facts legible through desire, conflict, work, and sensory consequence"
+weight_multiplier = 1.10
+behavioral_anchors = ["Necessary context arrives when it changes interpretation or choice", "Terminology is inferable without glossary-like interruption", "World detail creates affordances and constraints rather than decorative nouns"]
+
+[project_anchors.world_movement]
+description = "Nearby project prose exercising the same world rules under a different event"
+retrieval_limit = 2

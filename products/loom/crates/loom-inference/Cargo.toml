@@ -1,0 +1,36 @@
+[package]
+name = "loom-inference"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Backend-neutral inference contracts and fail-closed admission for Loom research"
+
+[features]
+default = []
+native-evidence = [
+    "dep:llama-native-types",
+    "dep:serde_json",
+]
+native-llama = [
+    "native-evidence",
+    "dep:llama-native-engine",
+]
+# Synthetic, persisted receipt graphs for downstream crate tests. This feature
+# deliberately depends only on the nonauthorizing replay surface and is never
+# enabled by the native inference bridge.
+test-support = ["native-evidence"]
+
+[dependencies]
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit.git", rev = "6a82439ee449599f7a7e477e1150ae29efdb23d6", optional = true }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit.git", rev = "6a82439ee449599f7a7e477e1150ae29efdb23d6", optional = true }
+loom-research-types = { path = "../loom-research-types" }
+loom-types = { path = "../loom-types" }
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

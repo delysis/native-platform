@@ -1049,8 +1049,9 @@ mod tests {
     use llama_native_types::{
         CacheOperationCapabilities, CapabilityDeclarationStatus, ExactModelCapabilities,
         GenerationBatchCapabilities, GenerationCacheMetrics, GenerationMetrics as NativeMetrics,
-        GenerationOutputCapabilities, ModelCapabilities, ModelFingerprint, NativeModelDescriptor,
-        PromptForm, PromptInputCapabilities, SamplingParameter,
+        GenerationOutputCapabilities, ModelCapabilities, ModelFingerprint,
+        NativeEvidenceCapabilities, NativeModelDescriptor, ProbabilityStage, PromptForm,
+        PromptInputCapabilities, SamplingParameter,
     };
 
     use super::*;
@@ -1158,7 +1159,6 @@ mod tests {
         let tokenizer_sha256 = "22".repeat(32);
         let fingerprint = ModelFingerprint {
             model_id: profile.model_id.clone(),
-            model_path: profile.model_path.clone(),
             model_size: 1_000,
             model_sha256: model_sha256.clone(),
             tokenizer_sha256,
@@ -1184,7 +1184,7 @@ mod tests {
             outputs: GenerationOutputCapabilities {
                 generated_token_ids: true,
                 token_observations: false,
-                probability_stages: Vec::new(),
+                probability_stages: vec![ProbabilityStage::PostGuidance],
                 log_probability_stages: Vec::new(),
             },
             batches: GenerationBatchCapabilities {
@@ -1199,9 +1199,11 @@ mod tests {
                 per_case_restore: true,
                 token_exact_shared_prefix: true,
             },
+            evidence: NativeEvidenceCapabilities::default(),
             media: Vec::new(),
         };
         RuntimeModelInspection {
+            live_model_path: profile.model_path.clone(),
             descriptor: NativeModelDescriptor {
                 stable_model_id: format!("sha256:{model_sha256}"),
                 model_id: profile.model_id.clone(),
@@ -1549,6 +1551,15 @@ mod tests {
         assert_exact_native_request(&captured, &request);
         assert_fixture_candidate_provenance(&result);
         assert_stream_contract(&loom_events, &request);
+        assert_eq!(
+            result.model.capabilities.probability_stages,
+            vec![crate::ProbabilitySemantics::PostGuidance]
+        );
+        assert_eq!(
+            result.model.capabilities.evidence,
+            NativeEvidenceCapabilities::default(),
+            "unreported additive capabilities must remain unreported"
+        );
         assert!(
             backend
                 .release_model(&request.model)
@@ -1559,6 +1570,68 @@ mod tests {
                 .release_model(&request.model)
                 .expect("second release is idempotent")
         );
+    }
+
+    #[test]
+    fn native_config_preserves_digest_assertions() {
+        let mut profile = model_profile();
+        profile.expected_model_sha256 = Some("11".repeat(32));
+        profile.projector_path = Some("fixture.mmproj".into());
+        profile.expected_mmproj_sha256 = Some("66".repeat(32));
+
+        let native = profile.as_native_config();
+        assert_eq!(native.model_path, profile.model_path);
+        assert_eq!(native.expected_model_sha256, profile.expected_model_sha256);
+        assert_eq!(native.mmproj_path, profile.projector_path);
+        assert_eq!(
+            native.expected_mmproj_sha256,
+            profile.expected_mmproj_sha256
+        );
+    }
+
+    #[test]
+    fn model_identity_is_path_free_but_live_path_must_match_the_request() {
+        let first_profile = model_profile();
+        let first = verify_model_inspection(&first_profile, model_inspection(&first_profile))
+            .expect("first inspection");
+
+        let mut relocated_profile = first_profile.clone();
+        relocated_profile.model_path = "relocated/fixture.gguf".into();
+        let relocated =
+            verify_model_inspection(&relocated_profile, model_inspection(&relocated_profile))
+                .expect("relocated inspection");
+
+        assert_eq!(first.model_environment_id, relocated.model_environment_id);
+        assert_ne!(first.model_path, relocated.model_path);
+
+        let mut mismatched = model_inspection(&first_profile);
+        mismatched.live_model_path = "wrong/fixture.gguf".into();
+        assert!(matches!(
+            verify_model_inspection(&first_profile, mismatched),
+            Err(ModelInspectionError::ModelPathMismatch)
+        ));
+    }
+
+    #[test]
+    fn inspection_rechecks_configured_digest_assertions() {
+        let mut profile = model_profile();
+        let unrestricted = verify_model_inspection(&profile, model_inspection(&profile))
+            .expect("unrestricted inspection");
+        profile.expected_model_sha256 = Some("11".repeat(32));
+        let strict = verify_model_inspection(&profile, model_inspection(&profile))
+            .expect("matching assertion");
+        assert_eq!(
+            unrestricted.model_environment_id, strict.model_environment_id,
+            "a validation assertion must not become model identity"
+        );
+
+        profile.expected_model_sha256 = Some("99".repeat(32));
+        assert!(matches!(
+            verify_model_inspection(&profile, model_inspection(&profile)),
+            Err(ModelInspectionError::ExpectedDigestMismatch {
+                field: "expected_model_sha256"
+            })
+        ));
     }
 
     #[test]
@@ -1643,10 +1716,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires LOOM_GGUF_MODEL_PATH and a real local GGUF"]
+    #[ignore = "requires LOOM_GGUF_MODEL_PATH, LOOM_GGUF_MODEL_SHA256, and a real local GGUF"]
     fn real_gguf_raw_family_acceptance() -> Result<(), Box<dyn std::error::Error>> {
         let model_path = std::env::var("LOOM_GGUF_MODEL_PATH")?;
-        let result = run_real_raw_family(&model_path)?;
+        let expected_sha256 = std::env::var("LOOM_GGUF_MODEL_SHA256")?;
+        let result = run_real_raw_family(&model_path, &expected_sha256)?;
+        assert_eq!(result.model.model_sha256, expected_sha256);
         assert_eq!(result.candidates.len(), 2);
         assert!(result.candidates.iter().all(|candidate| {
             candidate
@@ -1666,7 +1741,7 @@ mod tests {
         const EXPECTED_SHA256: &str =
             "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670";
         let model_path = std::env::var("LOOM_GEMMA4_E2B_BASE_PATH")?;
-        let result = run_real_raw_family(&model_path)?;
+        let result = run_real_raw_family(&model_path, EXPECTED_SHA256)?;
 
         assert_eq!(result.model.architecture.as_deref(), Some("gemma4"));
         assert_eq!(result.model.model_sha256, EXPECTED_SHA256);
@@ -1702,9 +1777,11 @@ mod tests {
 
     fn run_real_raw_family(
         model_path: &str,
+        expected_sha256: &str,
     ) -> Result<ExactContinuationResult, Box<dyn std::error::Error>> {
         let mut request = request_with_two_cases();
         request.model = LocalModelProfile::for_gguf(model_path);
+        request.model.expected_model_sha256 = Some(expected_sha256.to_string());
         request.model.device = crate::LocalDevicePreference::Cpu;
         request.model.max_parallel_cases = 2;
         request.request_id = "real-raw-family".to_string();

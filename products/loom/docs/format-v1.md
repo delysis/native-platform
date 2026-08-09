@@ -1,6 +1,6 @@
 # Loom project format v1
 
-Status: initial versioned foundation. Project manifest schema version `1` is the stable on-disk compatibility boundary. The current branch reaches additive SQLite migration `7`; database migration numbers do not change the manifest version when they preserve the v1 contract.
+Status: initial versioned foundation. Project manifest schema version `1` is the stable on-disk compatibility boundary. The current branch reaches additive SQLite migration `9`; database migration numbers do not change the manifest version when they preserve the v1 contract.
 
 ## Authority split
 
@@ -105,7 +105,29 @@ Migration `7` adds the clean-port research admission foundation:
 - canonical, internally fingerprinted promotion requests and append-only, actor-bound, single-use user-presence events tied to one command and strictly increasing host-session index;
 - immutable legacy review events. Pre-migration candidates and every new diagnostic legacy candidate receive a terminal quarantine record rather than implicit research eligibility.
 
-`LiveBaseWriterClaim` and related values are declarations, not credentials. The raw receipt/event-stream replay mint is test-only, and no production constructor for `AdmittedModelCall` exists at this checkpoint. Strict live admission intentionally remains unavailable until `loom-inference` alone can consume the native backend's opaque generation seal and mint a `VerifiedInferenceEnvelope`. `loom-store` may adopt and persist that envelope and derive private downstream tokens for the current random store-session nonce; reopening or copying the project invalidates them. It must never recreate authority from receipt fields, JSON, hashes, record replay, or an admission row. Persisted fixture, mock, critic, historical, literal, or caller-declared live records cannot become strict assemblies. Promotion settlement and manuscript mutation remain absent until one transaction can consume opaque authority, revalidate the active visible source, and bind the exact resulting receipt and revision.
+`LiveBaseWriterClaim` and related values are declarations, not credentials. The raw receipt/event-stream replay mint is test-only, and no production constructor for `AdmittedModelCall` exists. `loom-inference` alone consumes the native backend's opaque generation seal and mints a move-only `VerifiedInferenceOutcome`. `loom-store` may adopt that value once and derive private downstream tokens for the current random store-session nonce; reopening or copying the project invalidates them. It must never recreate authority from receipt fields, JSON, hashes, record replay, or an admission row. Persisted fixture, mock, critic, historical, literal, or caller-declared live records cannot become strict assemblies.
+
+Migration `8` makes verified batch adoption atomic and replayable:
+
+- one immutable batch header binds the exact non-empty UTF-8 prompt, completion/no-BOS semantics, ordered token IDs, compiled prompt fingerprint, model binding, native request ID, and expected case count;
+- every completed or cancelled branch occupies one contiguous request-order position and retains its independently verified terminal evidence;
+- cancelled partial output is diagnostic-only and never receives an admitted-call lease;
+- a final immutable seal is accepted only when every expected position is present and the completed/cancelled counts agree;
+- an all-cancelled batch may be retained as diagnostic evidence, but cannot mint assembly authority.
+
+Migration `9` adds the append-only autoresearch execution ledger:
+
+- immutable campaign and trial specifications, separate campaign and stage DAG dependencies, attempts, event chains, whole-trial and per-stage reservations and charges, and search decisions;
+- immutable story graphs and states, prompt masks, evidence-grounded backtranslation proposals and auditions, evaluation tasks and exact candidate evidence, quality-diversity archive snapshots, benchmark seals, qualification journals, and sealed results;
+- one process-local exclusive session lease for each frozen campaign or trial. A durable journal writer consumes and retains that lease and the operating-system project lock until the writer is dropped;
+- persist-before-reducer transitions. A failed SQLite append leaves the in-memory journal unchanged, while restart replay conservatively abandons an unstarted reservation or charges the full reservation for work that may have started;
+- exact, bounded journal replay from content-addressed canonical records. Replayed rows are diagnostic facts and cannot recreate a stage terminal, evaluator, archive, benchmark, or promotion lease;
+- separate diagnostic and qualification benchmark namespaces. A qualification result counts only the exact ordered members committed by its one sealed journal; diagnostic or failed alternative runs cannot contaminate that set;
+- exact candidate projections and candidate blobs on qualified evaluation rows. An occurrence identifier alone is never evidence that a quotation came from that candidate.
+
+Controller-token maxima may be zero for a controller-free treatment such as exact direct continuation. Writer-token, evaluation, and wall-time maxima for an executable trial remain nonzero. Stored zero controller use is an honest absence of controller inference, not an implicit free call.
+
+Blob installation may leave harmless content-addressed orphans if a process dies before the SQLite transaction commits. No semantic row or live authority is partially committed.
 
 ## SQLite guarantees
 

@@ -34,4 +34,5 @@ pub use adapter::{
     ExactContinuationResult, LlamaBackend, LlamaBackendError, LlamaGenerationHandle,
     MAX_EVENT_CAPACITY, model_environment_from_verified, validate_candidate_receipt_binding,
 };
+pub use llama_native_host::JoinedHostSlot;
 pub use llama_native_types::{SamplerKind, SamplingConfig};

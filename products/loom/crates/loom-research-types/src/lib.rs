@@ -12,18 +12,34 @@
 //! a serialized enum, hash, receipt label, or record replay.
 
 mod assembly;
+mod backtranslation;
 mod bounded;
 mod call;
+mod endpoint;
 mod graph;
 mod ids;
+mod manifest;
+mod mask;
+mod prompt;
 mod range;
+mod run;
+mod stage_graph;
+mod story;
 
 pub use assembly::*;
+pub use backtranslation::*;
 pub use bounded::*;
 pub use call::*;
+pub use endpoint::*;
 pub use graph::*;
 pub use ids::*;
+pub use manifest::*;
+pub use mask::*;
+pub use prompt::*;
 pub use range::*;
+pub use run::*;
+pub use stage_graph::*;
+pub use story::*;
 
 /// Maximum declared bytes in one raw model completion.
 pub const MAX_RAW_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -45,6 +61,29 @@ pub const MAX_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_ASSEMBLY_EVIDENCE_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum aggregate generated token IDs replayed for one assembly.
 pub const MAX_ASSEMBLY_EVIDENCE_TOKENS: usize = 4_194_304;
+/// Maximum bytes in any one verified backend event or receipt blob.
+///
+/// Both the live verifier and durable store must enforce this same value so a
+/// move-only verified outcome can never be minted and then rejected solely by
+/// a narrower persistence limit.
+pub const MAX_BACKEND_EVIDENCE_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum sibling occurrences in one direct writer batch.
+///
+/// The confirmatory protocol tops out at N=32; the extra headroom supports
+/// paired controls without permitting an unbounded caller allocation.
+pub const MAX_BASE_WRITER_BATCH_CASES: usize = 64;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod stage_graph_tests;
+
+#[cfg(test)]
+mod story_tests;
+
+#[cfg(test)]
+mod prompt_tests;
+
+#[cfg(test)]
+mod research_input_tests;

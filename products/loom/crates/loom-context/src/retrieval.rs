@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
-use loom_types::{ArtifactId, BlobId};
+use loom_types::{ArtifactId, BlobId, RevisionId};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::text::{
@@ -22,6 +23,7 @@ pub const MAX_EXCERPT_TOKENS: u32 = 1_000_000;
 pub const MAX_RETRIEVAL_SHINGLES: usize = 500_000;
 
 const DIVERSITY_SHINGLE_WORDS: usize = 3;
+const SELECTION_FINGERPRINT_DOMAIN: &[u8] = b"loom/diversified-retrieval-selection/v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -120,8 +122,10 @@ impl<'de> Deserialize<'de> for SourceByteRange {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExactExcerptIdentity {
     pub source_artifact_id: ArtifactId,
+    pub source_revision_id: RevisionId,
     pub source_blob_id: BlobId,
     pub source_range: SourceByteRange,
     pub excerpt_hash: BlobId,
@@ -136,6 +140,7 @@ pub struct ExactExcerpt {
 impl ExactExcerpt {
     pub fn new(
         source_artifact_id: ArtifactId,
+        source_revision_id: RevisionId,
         source_blob_id: BlobId,
         source_range: SourceByteRange,
         text: impl Into<String>,
@@ -144,6 +149,7 @@ impl ExactExcerpt {
         validate_excerpt_text(source_range, &text)?;
         let identity = ExactExcerptIdentity {
             source_artifact_id,
+            source_revision_id,
             source_blob_id,
             source_range,
             excerpt_hash: BlobId::digest(text.as_bytes()),
@@ -170,6 +176,7 @@ impl<'de> Deserialize<'de> for ExactExcerpt {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct WireExcerpt {
             identity: ExactExcerptIdentity,
             text: String,
@@ -177,6 +184,7 @@ impl<'de> Deserialize<'de> for ExactExcerpt {
         let wire = WireExcerpt::deserialize(deserializer)?;
         let excerpt = Self::new(
             wire.identity.source_artifact_id,
+            wire.identity.source_revision_id,
             wire.identity.source_blob_id,
             wire.identity.source_range,
             wire.text,
@@ -427,21 +435,84 @@ pub struct HybridScoreEvidence {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DiversifiedExcerpt {
-    pub candidate: RetrievalCandidate,
-    pub score_evidence: HybridScoreEvidence,
-    pub maximum_selected_similarity: Option<UnitScore>,
-    pub mmr_millionths: i64,
+    candidate: RetrievalCandidate,
+    score_evidence: HybridScoreEvidence,
+    maximum_selected_similarity: Option<UnitScore>,
+    mmr_millionths: i64,
     /// Zero is the first (strongest) MMR choice. Prompt order is reversed, so
     /// this strongest choice is nearest the live manuscript boundary.
-    pub selection_rank: usize,
+    selection_rank: usize,
 }
 
+impl DiversifiedExcerpt {
+    pub const fn candidate(&self) -> &RetrievalCandidate {
+        &self.candidate
+    }
+
+    pub const fn score_evidence(&self) -> HybridScoreEvidence {
+        self.score_evidence
+    }
+
+    pub const fn maximum_selected_similarity(&self) -> Option<UnitScore> {
+        self.maximum_selected_similarity
+    }
+
+    pub const fn mmr_millionths(&self) -> i64 {
+        self.mmr_millionths
+    }
+
+    pub const fn selection_rank(&self) -> usize {
+        self.selection_rank
+    }
+}
+
+/// Replayable result of the deterministic selector.
+///
+/// This is intentionally not deserializable and all fields are private. A
+/// stored score vector or reordered excerpt list cannot recreate a live
+/// selector result; persistence is diagnostic and selection must rerun from
+/// its bounded candidate pool.
+///
+/// ```compile_fail
+/// use loom_context::DiversifiedSelection;
+/// fn requires_deserialize<T: serde::de::DeserializeOwned>() {}
+/// requires_deserialize::<DiversifiedSelection>();
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DiversifiedSelection {
     /// Prompt order: weaker selections first, strongest selection last.
-    pub prompt_order: Vec<DiversifiedExcerpt>,
-    pub total_tokens: u64,
-    pub total_bytes: usize,
+    prompt_order: Vec<DiversifiedExcerpt>,
+    total_tokens: u64,
+    total_bytes: usize,
+    query: RetrievalQuery,
+    budget: SelectionBudget,
+    selection_fingerprint: BlobId,
+}
+
+impl DiversifiedSelection {
+    pub fn prompt_order(&self) -> &[DiversifiedExcerpt] {
+        &self.prompt_order
+    }
+
+    pub const fn total_tokens(&self) -> u64 {
+        self.total_tokens
+    }
+
+    pub const fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub const fn query(&self) -> &RetrievalQuery {
+        &self.query
+    }
+
+    pub const fn budget(&self) -> SelectionBudget {
+        self.budget
+    }
+
+    pub const fn selection_fingerprint(&self) -> BlobId {
+        self.selection_fingerprint
+    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -570,11 +641,106 @@ pub fn select_diversified(
         })
         .collect::<Vec<_>>();
     prompt_order.reverse();
+    let selection_fingerprint = fingerprint_selection(
+        candidates,
+        query,
+        budget,
+        &prompt_order,
+        total_tokens,
+        total_bytes,
+    );
     Ok(DiversifiedSelection {
         prompt_order,
         total_tokens,
         total_bytes,
+        query: query.clone(),
+        budget,
+        selection_fingerprint,
     })
+}
+
+fn fingerprint_selection(
+    candidates: &[RetrievalCandidate],
+    query: &RetrievalQuery,
+    budget: SelectionBudget,
+    prompt_order: &[DiversifiedExcerpt],
+    total_tokens: u64,
+    total_bytes: usize,
+) -> BlobId {
+    let mut digest = Sha256::new();
+    digest.update(SELECTION_FINGERPRINT_DOMAIN);
+    digest.update((query.craft_tags.len() as u64).to_be_bytes());
+    for tag in &query.craft_tags {
+        digest.update((tag.len() as u64).to_be_bytes());
+        digest.update(tag.as_bytes());
+    }
+    for score in [
+        query.weights.lexical,
+        query.weights.embedding,
+        query.weights.craft_tags,
+        query.weights.diversity_penalty,
+    ] {
+        digest.update(score.millionths().to_be_bytes());
+    }
+    digest.update(budget.tokenizer_fingerprint.as_bytes());
+    digest.update(budget.max_tokens.to_be_bytes());
+    digest.update((budget.max_bytes as u64).to_be_bytes());
+    digest.update((budget.max_excerpts as u64).to_be_bytes());
+    let mut canonical_candidates = candidates.iter().collect::<Vec<_>>();
+    canonical_candidates.sort_unstable_by_key(|candidate| candidate.excerpt.identity);
+    digest.update((canonical_candidates.len() as u64).to_be_bytes());
+    for candidate in canonical_candidates {
+        update_candidate_digest(&mut digest, candidate);
+    }
+    digest.update(total_tokens.to_be_bytes());
+    digest.update((total_bytes as u64).to_be_bytes());
+    digest.update((prompt_order.len() as u64).to_be_bytes());
+    for item in prompt_order {
+        digest.update(item.candidate.excerpt.identity.excerpt_hash.as_bytes());
+        update_optional_score(&mut digest, item.score_evidence.lexical);
+        update_optional_score(&mut digest, item.score_evidence.embedding);
+        update_optional_score(&mut digest, item.score_evidence.craft_tags);
+        digest.update(
+            item.score_evidence
+                .available_weight_millionths
+                .to_be_bytes(),
+        );
+        digest.update(item.score_evidence.relevance.millionths().to_be_bytes());
+        update_optional_score(&mut digest, item.maximum_selected_similarity);
+        digest.update(item.mmr_millionths.to_be_bytes());
+        digest.update((item.selection_rank as u64).to_be_bytes());
+    }
+    BlobId::from_bytes(digest.finalize().into())
+}
+
+fn update_candidate_digest(digest: &mut Sha256, candidate: &RetrievalCandidate) {
+    let identity = candidate.excerpt.identity;
+    digest.update(identity.source_artifact_id.as_ulid().to_bytes());
+    digest.update(identity.source_revision_id.as_ulid().to_bytes());
+    digest.update(identity.source_blob_id.as_bytes());
+    digest.update(identity.source_range.start.to_be_bytes());
+    digest.update(identity.source_range.end_exclusive.to_be_bytes());
+    digest.update(identity.excerpt_hash.as_bytes());
+    digest.update(candidate.exact_token_count.tokenizer_fingerprint.as_bytes());
+    digest.update(candidate.exact_token_count.excerpt_hash.as_bytes());
+    digest.update(candidate.exact_token_count.tokens.to_be_bytes());
+    update_optional_score(digest, candidate.lexical_score);
+    update_optional_score(digest, candidate.embedding_score);
+    digest.update((candidate.craft_tags.len() as u64).to_be_bytes());
+    for tag in &candidate.craft_tags {
+        digest.update((tag.len() as u64).to_be_bytes());
+        digest.update(tag.as_bytes());
+    }
+}
+
+fn update_optional_score(digest: &mut Sha256, score: Option<UnitScore>) {
+    match score {
+        Some(score) => {
+            digest.update([1]);
+            digest.update(score.millionths().to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
 }
 
 fn validate_excerpt_text(range: SourceByteRange, text: &str) -> Result<(), RetrievalError> {
@@ -816,6 +982,7 @@ mod tests {
     fn excerpt(id: u8, text: &str) -> ExactExcerpt {
         ExactExcerpt::new(
             ArtifactId::new(),
+            RevisionId::new(),
             blob(id),
             SourceByteRange::new(10, 10 + u64::try_from(text.len()).unwrap()).unwrap(),
             text,
@@ -872,6 +1039,7 @@ mod tests {
         assert_eq!(
             ExactExcerpt::new(
                 ArtifactId::new(),
+                RevisionId::new(),
                 blob(1),
                 SourceByteRange::new(0, 4).unwrap(),
                 "café"
@@ -898,7 +1066,7 @@ mod tests {
             budget(1, 100, 100),
         )
         .unwrap();
-        let evidence = selection.prompt_order[0].score_evidence;
+        let evidence = selection.prompt_order()[0].score_evidence();
         assert_eq!(evidence.lexical, Some(UnitScore::new(700_000).unwrap()));
         assert_eq!(evidence.embedding, None);
         assert_eq!(evidence.craft_tags, None);
@@ -929,7 +1097,7 @@ mod tests {
         )
         .unwrap();
         let selection = select_diversified(&[candidate], &query, budget(1, 100, 100)).unwrap();
-        let evidence = selection.prompt_order[0].score_evidence;
+        let evidence = selection.prompt_order()[0].score_evidence();
         assert_eq!(evidence.lexical, None);
         assert_eq!(evidence.embedding, None);
         assert_eq!(evidence.craft_tags, Some(UnitScore::new(500_000).unwrap()));
@@ -952,25 +1120,56 @@ mod tests {
         .unwrap();
         let identities = |selection: &DiversifiedSelection| {
             selection
-                .prompt_order
+                .prompt_order()
                 .iter()
-                .map(|item| item.candidate.excerpt.identity())
+                .map(|item| item.candidate().excerpt().identity())
                 .collect::<Vec<_>>()
         };
         assert_eq!(identities(&forward), identities(&reversed));
         assert_eq!(
-            forward.prompt_order.last().unwrap().selection_rank,
+            forward.selection_fingerprint(),
+            reversed.selection_fingerprint(),
+            "candidate input order is not semantic"
+        );
+        assert_eq!(
+            forward.prompt_order().last().unwrap().selection_rank(),
             0,
             "strongest choice must be nearest the live boundary"
         );
         assert_eq!(
             forward
-                .prompt_order
+                .prompt_order()
                 .last()
                 .unwrap()
-                .score_evidence
+                .score_evidence()
                 .relevance,
             UnitScore::new(900_000).unwrap()
+        );
+    }
+
+    #[test]
+    fn selection_fingerprint_commits_to_the_complete_audition_pool() {
+        let chosen = candidate(1, "red green blue", 900_000);
+        let first = select_diversified(
+            &[chosen.clone(), candidate(2, "oak ash elm", 100_000)],
+            &query(0),
+            budget(1, 1_000, 1_000),
+        )
+        .unwrap();
+        let second = select_diversified(
+            &[chosen, candidate(3, "moon tide salt", 100_000)],
+            &query(0),
+            budget(1, 1_000, 1_000),
+        )
+        .unwrap();
+        assert_eq!(
+            first.prompt_order()[0].candidate().excerpt().text(),
+            second.prompt_order()[0].candidate().excerpt().text()
+        );
+        assert_ne!(
+            first.selection_fingerprint(),
+            second.selection_fingerprint(),
+            "unselected candidates are causal inputs and must remain in provenance"
         );
     }
 
@@ -984,9 +1183,9 @@ mod tests {
         let selection =
             select_diversified(&candidates, &query(SCORE_SCALE), budget(2, 1_000, 1_000)).unwrap();
         let chosen = selection
-            .prompt_order
+            .prompt_order()
             .iter()
-            .map(|item| item.candidate.excerpt.identity().source_blob_id)
+            .map(|item| item.candidate().excerpt().identity().source_blob_id)
             .collect::<BTreeSet<_>>();
         assert!(chosen.contains(&blob(1)));
         assert!(chosen.contains(&blob(3)));
@@ -1013,21 +1212,21 @@ mod tests {
                         budget(count, bytes, tokens),
                     )
                     .unwrap();
-                    assert!(selection.prompt_order.len() <= count);
-                    assert!(selection.total_bytes <= bytes);
-                    assert!(selection.total_tokens <= tokens);
+                    assert!(selection.prompt_order().len() <= count);
+                    assert!(selection.total_bytes() <= bytes);
+                    assert!(selection.total_tokens() <= tokens);
                     let recomputed_bytes = selection
-                        .prompt_order
+                        .prompt_order()
                         .iter()
-                        .map(|item| item.candidate.excerpt.text().len())
+                        .map(|item| item.candidate().excerpt().text().len())
                         .sum::<usize>();
                     let recomputed_tokens = selection
-                        .prompt_order
+                        .prompt_order()
                         .iter()
-                        .map(|item| u64::from(item.candidate.exact_token_count.tokens()))
+                        .map(|item| u64::from(item.candidate().exact_token_count().tokens()))
                         .sum::<u64>();
-                    assert_eq!(selection.total_bytes, recomputed_bytes);
-                    assert_eq!(selection.total_tokens, recomputed_tokens);
+                    assert_eq!(selection.total_bytes(), recomputed_bytes);
+                    assert_eq!(selection.total_tokens(), recomputed_tokens);
                 }
             }
         }

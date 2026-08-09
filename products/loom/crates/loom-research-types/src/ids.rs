@@ -114,9 +114,19 @@ occurrence_id!(ModelCallId);
 occurrence_id!(CampaignId);
 occurrence_id!(StageId);
 occurrence_id!(StageAttemptId);
+// Durable identity of one execution of a frozen trial specification. A trial
+// specification is reusable; every execution, retry, journal, and completion
+// authority is partitioned by this occurrence ID.
+occurrence_id!(TrialRunId);
 occurrence_id!(TrialCaseId);
 occurrence_id!(GeneratedSpanOccurrenceId);
 occurrence_id!(CandidateAssemblyId);
 occurrence_id!(CandidateProjectionId);
 occurrence_id!(MixedAuthorshipAssemblyId);
 occurrence_id!(PipelineOperationId);
+occurrence_id!(StoryGraphId);
+occurrence_id!(StoryNodeId);
+occurrence_id!(StoryRelationId);
+occurrence_id!(StoryStateId);
+occurrence_id!(StoryStateFactId);
+occurrence_id!(StageGraphId);

@@ -1,0 +1,107 @@
+format = "loom.core-pack.v1"
+name = "fiction-core-v1"
+description = "General behavioral criteria for long-form literary and genre fiction"
+
+[[criteria]]
+id = "continuity"
+label = "Continuity"
+description = "Preserves established facts, chronology, spatial blocking, knowledge, and physical state"
+weight = 1.0
+behavioral_anchors = ["No unsupported changes of place, possession, knowledge, clothing, injury, or body position", "References and pronouns remain locally resolvable", "A reader can reconstruct where people and consequential objects are"]
+tags = ["state", "longform"]
+
+[[criteria]]
+id = "causal_intelligibility"
+label = "Causal intelligibility"
+description = "Makes each consequential action arise from legible pressure and change what can happen next"
+weight = 1.0
+behavioral_anchors = ["Actions have perceivable motives or triggers", "Consequences alter choices, information, risk, or relationship state", "The scene does not substitute unrelated events for promised developments"]
+tags = ["causal", "movement"]
+
+[[criteria]]
+id = "agency_and_voice"
+label = "Agency and voice"
+description = "Gives characters distinct wants, tactics, perceptions, and diction rather than authorial puppetry"
+weight = 1.0
+behavioral_anchors = ["At least one character makes a choice that redirects the movement", "Dialogue and interiority differ by character", "The narration does not explain away conflict with therapeutic summary"]
+tags = ["character", "voice"]
+
+[[criteria]]
+id = "movement_and_pacing"
+label = "Movement and pacing"
+description = "Develops an ongoing trajectory at an earned rate without premature scene closure or inert repetition"
+weight = 1.0
+behavioral_anchors = ["Each paragraph advances pressure, perception, tactic, or state", "Emphasis expands consequential moments and compresses routine transitions", "Intermediate continuations remain open trajectories rather than generic endings"]
+tags = ["movement", "longform"]
+
+[[criteria]]
+id = "prose_precision"
+label = "Prose precision"
+description = "Uses concrete, controlled language whose images and syntax perform specific narrative work"
+weight = 1.0
+behavioral_anchors = ["Sensory details are discriminating rather than interchangeable", "Verbs carry action without redundant explanation", "Figurative language clarifies pressure or perception instead of decorating it"]
+tags = ["prose", "style"]
+
+[[criteria]]
+id = "dialogue_and_subtext"
+label = "Dialogue and subtext"
+description = "Lets speech act tactically while implication, silence, and misalignment carry more than paraphrasable information"
+weight = 1.0
+behavioral_anchors = ["Utterances pursue character-specific aims", "Responses need not answer the literal question but remain causally legible", "Attribution, gesture, and silence sharpen rather than translate the dialogue"]
+tags = ["dialogue", "character"]
+
+[[criteria]]
+id = "emotional_credibility"
+label = "Emotional credibility"
+description = "Earns feeling through perception, behavior, ambivalence, and accumulated context"
+weight = 1.0
+behavioral_anchors = ["Emotional changes have visible causes and resistance", "Conflicting feelings can coexist without being summarized into a lesson", "Bodily response and interpretation remain character-specific"]
+tags = ["emotion", "character"]
+
+[[criteria]]
+id = "tension_and_payoff"
+label = "Tension and payoff"
+description = "Creates specific uncertainty and converts setup into complication, revelation, reversal, or earned partial payoff"
+weight = 1.0
+behavioral_anchors = ["The reader can name what may be gained, lost, exposed, or misunderstood", "Escalation changes the situation rather than merely intensifying adjectives", "Payoffs answer planted pressures while creating materially grounded next pressures"]
+tags = ["tension", "structure"]
+
+[[criteria]]
+id = "originality"
+label = "Originality"
+description = "Avoids default phrasing and generic event templates while remaining coherent with the project"
+weight = 1.0
+behavioral_anchors = ["Specific choices could not be transplanted unchanged into most stories", "The scene avoids stock emotional compression and familiar model cadences", "Novelty emerges from character, world, and situation rather than random incongruity"]
+tags = ["originality", "prose"]
+
+[[criteria]]
+id = "engagement"
+label = "Engagement"
+description = "Sustains a reader's desire to continue through meaningful curiosity, attachment, surprise, or dread"
+weight = 1.0
+behavioral_anchors = ["Attention is renewed before existing pressure goes stale", "Questions arise from the scene rather than withheld basic legibility", "The final paragraph creates a specific forward pull without a canned cliffhanger"]
+tags = ["engagement", "longform"]
+
+[prompt_roles.bookfront]
+description = "Natural publication-shaped bookfront or anthology continuation context"
+max_tokens = 2048
+
+[prompt_roles.operator_demonstration]
+description = "Heterogeneous observable-event to prose operator demonstrations"
+max_tokens = 4096
+
+[prompt_roles.project_anchor]
+description = "One exact nearby project mapping or prose anchor"
+max_tokens = 4096
+
+[prompt_roles.story_state]
+description = "Evidence-grounded chronology, knowledge, physical state, and unresolved promises"
+max_tokens = 4096
+
+[prompt_roles.movement_contract]
+description = "An ongoing movement trajectory without a learned scene-ending sentinel"
+max_tokens = 2048
+
+[prompt_roles.source_apprenticeship]
+description = "Exact work-disjoint raw prose or graph-to-prose apprenticeship evidence"
+max_tokens = 8192

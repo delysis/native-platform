@@ -2,8 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::RecvTimeoutError;
-use llama_native_engine::GenerationTicket;
-use llama_native_host::{HostCachePolicy, NativeHost, NativeHostConfig};
+use llama_native_engine::{GenerationTicket, NativeModelHandle};
+use llama_native_host::{
+    HostCachePolicy, HostSlotShutdown, JoinedHostSlot, NativeHost, NativeHostConfig,
+};
 use llama_native_types::{
     GenerationBatchRequest, GenerationEvent, GenerationOutput, NativeError, NativeErrorCode,
 };
@@ -56,6 +58,48 @@ impl NativeHostRuntime {
             host: NativeHost::new(config),
         }
     }
+
+    /// Acquire the revocable command client for headless research inference.
+    /// The host retains unique worker ownership; callers cannot detach or
+    /// manufacture a worker join token from this handle.
+    pub fn acquire_research_handle(
+        &self,
+        profile: &LocalModelProfile,
+    ) -> Result<NativeModelHandle, NativeError> {
+        self.host.acquire(profile.as_native_config())
+    }
+
+    /// Join the exact resident addressed by `handle` after a campaign has
+    /// retained all per-call lineage witnesses. This is lifecycle evidence,
+    /// not a prerequisite for individual call authorship admission.
+    pub fn shutdown_research_handle_joined(
+        &self,
+        handle: &NativeModelHandle,
+    ) -> Result<JoinedHostSlot, NativeError> {
+        let slot_id = self
+            .host
+            .slots()
+            .into_iter()
+            .find_map(|slot| {
+                self.host
+                    .handle(slot.slot_id)
+                    .filter(|resident| resident.is_same_worker(handle))
+                    .map(|_| slot.slot_id)
+            })
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::InvalidConfig,
+                    "research handle does not belong to a live slot in this host",
+                )
+            })?;
+        match self.host.shutdown_slot_joined(slot_id)? {
+            HostSlotShutdown::Joined(joined) => Ok(joined),
+            HostSlotShutdown::Vacant => Err(NativeError::new(
+                NativeErrorCode::WorkerStopped,
+                "research resident became vacant before joined shutdown",
+            )),
+        }
+    }
 }
 
 impl Default for NativeHostRuntime {
@@ -78,7 +122,9 @@ impl BatchRuntime for NativeHostRuntime {
     ) -> Result<RuntimeModelInspection, NativeError> {
         let handle = self.host.acquire(profile.as_native_config())?;
         let status = handle.status();
+        let live_model_path = status.model_path;
         Ok(RuntimeModelInspection {
+            live_model_path,
             descriptor: status.descriptor.ok_or_else(|| {
                 NativeError::new(
                     NativeErrorCode::Internal,

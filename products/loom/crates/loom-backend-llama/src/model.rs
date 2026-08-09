@@ -3,8 +3,8 @@ use std::str::FromStr;
 
 use llama_native_types::{
     CapabilityDeclarationStatus, ExactModelCapabilities, MediaKind, ModelFingerprint, NativeDevice,
-    NativeError, NativeErrorCode, NativeModelConfig, NativeModelDescriptor, ProbabilityStage,
-    ProjectorRequirement,
+    NativeError, NativeErrorCode, NativeEvidenceCapabilities, NativeModelConfig,
+    NativeModelDescriptor, ProbabilityStage, ProjectorRequirement,
 };
 use loom_types::{BlobId, ModelEnvironmentId};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,17 @@ impl From<LocalDevicePreference> for NativeDevice {
 pub struct LocalModelProfile {
     pub model_id: String,
     pub model_path: PathBuf,
+    /// Trusted content assertion for the model at `model_path`.
+    ///
+    /// This is a load-time assertion, not part of resident model identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_model_sha256: Option<String>,
     pub projector_path: Option<PathBuf>,
+    /// Trusted content assertion for the projector at `projector_path`.
+    ///
+    /// This is a load-time assertion, not part of resident model identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_mmproj_sha256: Option<String>,
     pub device: LocalDevicePreference,
     pub context_tokens: u32,
     pub batch_tokens: u32,
@@ -53,7 +63,9 @@ impl LocalModelProfile {
         Self {
             model_id,
             model_path,
+            expected_model_sha256: None,
             projector_path: None,
+            expected_mmproj_sha256: None,
             device: LocalDevicePreference::Auto,
             context_tokens: 8_192,
             batch_tokens: 512,
@@ -67,7 +79,9 @@ impl LocalModelProfile {
         NativeModelConfig {
             model_id: self.model_id.clone(),
             model_path: self.model_path.clone(),
+            expected_model_sha256: self.expected_model_sha256.clone(),
             mmproj_path: self.projector_path.clone(),
+            expected_mmproj_sha256: self.expected_mmproj_sha256.clone(),
             device: self.device.into(),
             context_tokens: self.context_tokens,
             batch_tokens: self.batch_tokens,
@@ -82,6 +96,7 @@ impl LocalModelProfile {
 pub enum ProbabilitySemantics {
     RawModel,
     PostConstraint,
+    PostGuidance,
     PostSampler,
 }
 
@@ -90,6 +105,7 @@ impl From<ProbabilityStage> for ProbabilitySemantics {
         match value {
             ProbabilityStage::RawModel => Self::RawModel,
             ProbabilityStage::PostConstraint => Self::PostConstraint,
+            ProbabilityStage::PostGuidance => Self::PostGuidance,
             ProbabilityStage::PostSampler => Self::PostSampler,
         }
     }
@@ -162,6 +178,10 @@ pub struct VerifiedCapabilitySet {
     pub sequence_restore: CapabilitySupport,
     pub per_case_restore: CapabilitySupport,
     pub token_exact_shared_prefix: CapabilitySupport,
+    /// Exact inspected declarations for additive native evidence and controls.
+    /// Nested `Unreported` values remain unreported; Loom never promotes them
+    /// to unsupported or supported by inference.
+    pub evidence: NativeEvidenceCapabilities,
     pub media: Vec<VerifiedMediaCapability>,
 }
 
@@ -192,6 +212,11 @@ pub struct VerifiedModelDescriptor {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeModelInspection {
+    /// Operational location reported by the live resident model.
+    ///
+    /// Paths are deliberately kept out of [`ModelFingerprint`] so content
+    /// identity and cache keys remain independent of installation location.
+    pub live_model_path: PathBuf,
     pub descriptor: NativeModelDescriptor,
     pub fingerprint: ModelFingerprint,
 }
@@ -230,8 +255,10 @@ pub enum ModelInspectionError {
         #[source]
         source: loom_types::HashIdParseError,
     },
-    #[error("model fingerprint path does not match the requested local model path")]
+    #[error("live model path does not match the requested local model path")]
     ModelPathMismatch,
+    #[error("configured {field} does not match the inspected content digest")]
+    ExpectedDigestMismatch { field: &'static str },
     #[error("projector fingerprint presence does not match the requested projector path")]
     ProjectorMismatch,
     #[error("required raw-completion capability is unavailable: {0}")]
@@ -252,13 +279,15 @@ pub fn verify_model_inspection(
     inspection: RuntimeModelInspection,
 ) -> Result<VerifiedModelDescriptor, ModelInspectionError> {
     let RuntimeModelInspection {
+        live_model_path,
         descriptor,
         fingerprint,
     } = inspection;
     validate_identity(profile, &descriptor, &fingerprint)?;
     validate_required_capabilities(&descriptor.capabilities.exact)?;
-    validate_inspection_consistency(profile, &descriptor, &fingerprint)?;
+    validate_inspection_consistency(profile, &live_model_path, &descriptor, &fingerprint)?;
     validate_fingerprint_digests(&fingerprint)?;
+    validate_expected_digests(profile, &fingerprint)?;
     let canonical_environment = serde_json::to_vec(&(&descriptor, &fingerprint))?;
     let model_environment_id = ModelEnvironmentId::digest(&canonical_environment);
     let exact = descriptor.capabilities.exact;
@@ -272,7 +301,7 @@ pub fn verify_model_inspection(
         model_environment_id,
         stable_model_id: descriptor.stable_model_id,
         local_model_id: profile.model_id.clone(),
-        model_path: fingerprint.model_path,
+        model_path: live_model_path,
         display_name: descriptor.display_name,
         architecture,
         parameter_count,
@@ -317,10 +346,11 @@ fn validate_identity(
 
 fn validate_inspection_consistency(
     profile: &LocalModelProfile,
+    live_model_path: &Path,
     descriptor: &NativeModelDescriptor,
     fingerprint: &ModelFingerprint,
 ) -> Result<(), ModelInspectionError> {
-    if fingerprint.model_path != profile.model_path {
+    if live_model_path != profile.model_path {
         return Err(ModelInspectionError::ModelPathMismatch);
     }
     if profile.projector_path.is_some() != fingerprint.multimodal_projector_sha256.is_some() {
@@ -347,6 +377,33 @@ fn validate_inspection_consistency(
         &descriptor.capabilities.exact.batches.max_cases,
         &descriptor.max_sequences,
     )?;
+    Ok(())
+}
+
+fn validate_expected_digests(
+    profile: &LocalModelProfile,
+    fingerprint: &ModelFingerprint,
+) -> Result<(), ModelInspectionError> {
+    if profile
+        .expected_model_sha256
+        .as_deref()
+        .is_some_and(|expected| expected != fingerprint.model_sha256)
+    {
+        return Err(ModelInspectionError::ExpectedDigestMismatch {
+            field: "expected_model_sha256",
+        });
+    }
+    if profile
+        .expected_mmproj_sha256
+        .as_deref()
+        .is_some_and(|expected| {
+            fingerprint.multimodal_projector_sha256.as_deref() != Some(expected)
+        })
+    {
+        return Err(ModelInspectionError::ExpectedDigestMismatch {
+            field: "expected_mmproj_sha256",
+        });
+    }
     Ok(())
 }
 
@@ -456,6 +513,7 @@ fn map_capabilities(exact: ExactModelCapabilities) -> VerifiedCapabilitySet {
         sequence_restore: exact.cache.sequence_restore.into(),
         per_case_restore: exact.cache.per_case_restore.into(),
         token_exact_shared_prefix: exact.cache.token_exact_shared_prefix.into(),
+        evidence: exact.evidence,
         media: exact
             .media
             .into_iter()

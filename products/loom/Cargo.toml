@@ -3,6 +3,13 @@ resolver = "2"
 members = [
     "crates/loom-types",
     "crates/loom-research-types",
+    "crates/loom-inference",
+    "crates/loom-eval",
+    "crates/loom-eval-codex",
+    "crates/loom-trial",
+    "crates/loom-campaign",
+    "crates/loom-benchmark",
+    "crates/loom-learning",
     "crates/loom-document",
     "crates/loom-store",
     "crates/loom-context",
@@ -28,15 +35,21 @@ clap = { version = "4.6.6", features = ["derive"] }
 fs4 = "1.1.0"
 getrandom = "0.3.4"
 hex = "0.4.3"
+jsonschema = { version = "0.49.8", default-features = false }
+ndarray = { version = "0.17.2", default-features = false, features = ["std"] }
+rand_chacha = "0.9.0"
+rand_core = "0.9.5"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+safetensors = "0.8.0"
 sha2 = "0.10.9"
 similar = "3.1.1"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "rt", "sync"] }
+toml = "0.9.12"
 ulid = { version = "1.2.1", features = ["serde"] }
 
 [workspace.lints.rust]
@@ -55,3 +68,8 @@ missing_panics_doc = "allow"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Exact real-model tests hash multi-gigabyte artifacts before admission. Keep
+# the cryptographic primitive optimized without optimizing the whole test graph.
+[profile.test.package.sha2]
+opt-level = 3

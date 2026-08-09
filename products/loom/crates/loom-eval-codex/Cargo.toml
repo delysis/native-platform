@@ -1,0 +1,28 @@
+[package]
+name = "loom-eval-codex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Isolated, fail-closed Codex frontier-critic adapter for Loom"
+
+[dependencies]
+getrandom.workspace = true
+hex.workspace = true
+jsonschema.workspace = true
+loom-eval = { path = "../loom-eval" }
+loom-research-types = { path = "../loom-research-types" }
+loom-search = { path = "../loom-search" }
+loom-types = { path = "../loom-types" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30.1", default-features = false, features = ["process", "signal"] }
+
+[lints]
+workspace = true
