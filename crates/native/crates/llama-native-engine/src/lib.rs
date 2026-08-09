@@ -1,3 +1,4 @@
+pub mod control_math;
 mod state_buffer;
 
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -20,11 +21,11 @@ use llama_native_types::{
     GenerationEventKind, GenerationInput, GenerationMetrics, GenerationOutput,
     GenerationOutputCapabilities, GenerationRequest, GenerationState, MAX_PARALLEL_SEQUENCES,
     MediaInput, MediaInputCapability, MediaKind, ModelCapabilities, ModelFingerprint,
-    ModelRuntimeState, NativeDevice, NativeError, NativeErrorCode, NativeModelConfig,
-    NativeModelDescriptor, NativeTransport, PreparedPrompt, ProjectorRequirement, PromptForm,
-    PromptInputCapabilities, PromptTokenPolicy, ResidentModelStatus, SamplerKind, SamplingConfig,
-    SamplingParameter, SequenceStateBlob, SharedPrefixBatchRequest, SpecialTokenPolicy,
-    TokenizedPrompt,
+    ModelRuntimeState, NativeDevice, NativeError, NativeErrorCode, NativeEvidenceCapabilities,
+    NativeModelConfig, NativeModelDescriptor, NativeTransport, PreparedPrompt,
+    ProjectorRequirement, PromptForm, PromptInputCapabilities, PromptTokenPolicy,
+    ResidentModelStatus, SamplerKind, SamplingConfig, SamplingParameter, SequenceStateBlob,
+    SharedPrefixBatchRequest, SpecialTokenPolicy, TokenizedPrompt,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -1693,6 +1694,8 @@ fn generate_multimodal(
             forced_tokens.extend(tokens);
             supervision.reasoning_force.store(false, Ordering::Release);
         }
+        // `sample` samples and accepts. Only an externally forced token needs
+        // an explicit accept here; accepting again corrupts stateful samplers.
         let token = if let Some(token) = forced_tokens.pop_front() {
             sampler.accept(token);
             token
@@ -1702,7 +1705,6 @@ fn generate_multimodal(
         if model.is_eog_token(token) {
             break "end_of_generation".to_string();
         }
-        sampler.accept(token);
         generated_token_ids.push(token.0);
         let bytes = model
             .token_to_piece_bytes(token, 512, false, None)
@@ -2619,6 +2621,7 @@ fn inspected_capabilities(
             per_case_restore: true,
             token_exact_shared_prefix: true,
         },
+        evidence: NativeEvidenceCapabilities::default(),
         media: media_kinds
             .iter()
             .copied()
