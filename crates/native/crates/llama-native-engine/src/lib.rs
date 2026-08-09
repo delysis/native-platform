@@ -4711,7 +4711,7 @@ fn native_decode_error(context: &str, error: impl std::fmt::Display) -> NativeEr
 mod tests {
     use super::*;
     use llama_native_types::EmbeddingInput;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::{Mutex, atomic::AtomicU64};
 
     type TestSealFixture = (
         GenerationBatchRequest,
@@ -4723,6 +4723,7 @@ mod tests {
     );
 
     static TEST_ARTIFACT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+    static REAL_MODEL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct TestArtifactDirectory {
         path: std::path::PathBuf,
@@ -6496,6 +6497,7 @@ mod tests {
     #[test]
     #[ignore = "requires MOM_LLAMA_MODEL_PATH and a real local GGUF"]
     fn real_in_process_prompt_smoke() -> Result<(), Box<dyn std::error::Error>> {
+        let _real_model_guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model test lock");
         let model_path = std::env::var("MOM_LLAMA_MODEL_PATH")?;
         let mut config = NativeModelConfig::local(PathBuf::from(model_path));
         // CI and sandboxed smoke tests cannot assume access to a Metal command queue.
@@ -6534,6 +6536,7 @@ mod tests {
     #[ignore = "requires MOM_LLAMA_MODEL_PATH and a real local GGUF"]
     fn real_completion_text_tokens_batch_and_capabilities() -> Result<(), Box<dyn std::error::Error>>
     {
+        let _real_model_guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model test lock");
         let model_path = std::env::var("MOM_LLAMA_MODEL_PATH")?;
         let mut config = NativeModelConfig::local(PathBuf::from(model_path));
         config.device = NativeDevice::Cpu;
@@ -6926,6 +6929,7 @@ mod tests {
     #[ignore = "requires MOM_LLAMA_MODEL_PATH, MOM_LLAMA_MODEL_SHA256, and a real local GGUF"]
     fn real_strict_batch_retains_a_pre_cancelled_case_under_exact_model_binding()
     -> Result<(), Box<dyn std::error::Error>> {
+        let _real_model_guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model test lock");
         let model_path = std::env::var("MOM_LLAMA_MODEL_PATH")?;
         let model_sha256 = std::env::var("MOM_LLAMA_MODEL_SHA256")?;
         let mut config = NativeModelConfig::local(PathBuf::from(model_path));
@@ -7029,6 +7033,7 @@ mod tests {
     #[ignore = "requires MOM_LLAMA_MODEL_PATH and a real local GGUF"]
     fn real_per_token_embeddings_preserve_generation_context()
     -> Result<(), Box<dyn std::error::Error>> {
+        let _real_model_guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model test lock");
         let model_path = std::env::var("MOM_LLAMA_MODEL_PATH")?;
         let mut config = NativeModelConfig::local(PathBuf::from(model_path));
         config.device = NativeDevice::Cpu;

@@ -9,8 +9,9 @@
 use llama_native_cache::{CacheFingerprint, MemoryPrefixCache, PrefixCacheValue};
 use llama_native_engine::{GenerationTicket, NativeModelHandle};
 use llama_native_types::{
-    GenerationBatchRequest, GenerationRequest, NativeError, NativeErrorCode, NativeModelConfig,
-    NativeModelDescriptor, ResidentModelStatus, SharedPrefixBatchRequest,
+    GenerationBatchRequest, GenerationRequest, ModelFingerprint, NativeDevice, NativeError,
+    NativeErrorCode, NativeModelConfig, NativeModelDescriptor, ResidentModelStatus,
+    SharedPrefixBatchRequest,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -112,9 +113,53 @@ impl std::fmt::Debug for HostSlotStatus {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct ResidentModelKey {
+    model_id: String,
+    model_path: PathBuf,
+    mmproj_path: Option<PathBuf>,
+    device: NativeDevice,
+    context_tokens: u32,
+    batch_tokens: u32,
+    max_sequences: u32,
+    gpu_layers: i32,
+}
+
+impl From<&NativeModelConfig> for ResidentModelKey {
+    fn from(config: &NativeModelConfig) -> Self {
+        Self {
+            model_id: config.model_id.clone(),
+            model_path: config.model_path.clone(),
+            mmproj_path: config.mmproj_path.clone(),
+            device: config.device,
+            context_tokens: config.context_tokens,
+            batch_tokens: config.batch_tokens,
+            max_sequences: config.max_sequences,
+            gpu_layers: config.gpu_layers,
+        }
+    }
+}
+
+impl std::fmt::Debug for ResidentModelKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResidentModelKey")
+            .field("model_id", &self.model_id)
+            .field("model_path", &"<redacted>")
+            .field("has_mmproj", &self.mmproj_path.is_some())
+            .field("device", &self.device)
+            .field("context_tokens", &self.context_tokens)
+            .field("batch_tokens", &self.batch_tokens)
+            .field("max_sequences", &self.max_sequences)
+            .field("gpu_layers", &self.gpu_layers)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 struct ResidentEntry {
-    config: NativeModelConfig,
+    key: ResidentModelKey,
+    fingerprint: ModelFingerprint,
     handle: NativeModelHandle,
     model_bytes: u64,
     reserved_bytes: u64,
@@ -169,6 +214,7 @@ impl NativeHost {
     }
 
     pub fn acquire(&self, model: NativeModelConfig) -> Result<NativeModelHandle, NativeError> {
+        validate_digest_assertions(&model)?;
         if let Some(existing) = self.resident_handle(&model)? {
             return Ok(existing);
         }
@@ -210,6 +256,21 @@ impl NativeHost {
                 format!("slot {slot_id} is outside the configured host bound"),
             ));
         }
+        validate_digest_assertions(&model)?;
+        let requested_key = ResidentModelKey::from(&model);
+        {
+            let state = self.state.lock().map_err(host_poisoned)?;
+            if let Some(existing) = state.slots.get(&slot_id) {
+                let reusable_slot = resolve_resident_slot(
+                    std::iter::once((slot_id, &existing.key, &existing.fingerprint)),
+                    &requested_key,
+                    &model,
+                )?;
+                if reusable_slot.is_some() {
+                    return Ok(existing.handle.clone());
+                }
+            }
+        }
         let model_bytes = std::fs::metadata(&model.model_path)
             .map_err(|error| {
                 NativeError::new(
@@ -234,11 +295,6 @@ impl NativeHost {
         let reserved_bytes = memory_reservation(model_bytes, projector_bytes);
         {
             let state = self.state.lock().map_err(host_poisoned)?;
-            if let Some(existing) = state.slots.get(&slot_id)
-                && existing.config == model
-            {
-                return Ok(existing.handle.clone());
-            }
             let used = state
                 .slots
                 .iter()
@@ -257,11 +313,18 @@ impl NativeHost {
             }
         }
         let handle = NativeModelHandle::load(model.clone())?;
+        let fingerprint = handle.status().fingerprint.ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ModelLoadFailed,
+                "loaded resident did not publish a model fingerprint",
+            )
+        })?;
         let mut state = self.state.lock().map_err(host_poisoned)?;
         state.slots.insert(
             slot_id,
             ResidentEntry {
-                config: model,
+                key: requested_key,
+                fingerprint,
                 handle: handle.clone(),
                 model_bytes,
                 reserved_bytes,
@@ -274,14 +337,17 @@ impl NativeHost {
         &self,
         model: &NativeModelConfig,
     ) -> Result<Option<NativeModelHandle>, NativeError> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(host_poisoned)?
-            .slots
-            .values()
-            .find(|entry| &entry.config == model)
-            .map(|entry| entry.handle.clone()))
+        let requested_key = ResidentModelKey::from(model);
+        let state = self.state.lock().map_err(host_poisoned)?;
+        let slot_id = resolve_resident_slot(
+            state
+                .slots
+                .iter()
+                .map(|(slot_id, entry)| (*slot_id, &entry.key, &entry.fingerprint)),
+            &requested_key,
+            model,
+        )?;
+        Ok(slot_id.and_then(|slot_id| state.slots.get(&slot_id).map(|entry| entry.handle.clone())))
     }
 
     fn with_load_gate<T>(
@@ -364,7 +430,7 @@ impl NativeHost {
                     .iter()
                     .map(|(slot_id, entry)| HostSlotStatus {
                         slot_id: *slot_id,
-                        model_path: entry.config.model_path.clone(),
+                        model_path: entry.key.model_path.clone(),
                         model_bytes: entry.model_bytes,
                         reserved_bytes: entry.reserved_bytes,
                         status: entry.handle.status(),
@@ -495,6 +561,83 @@ fn host_poisoned<T>(_error: std::sync::PoisonError<T>) -> NativeError {
     NativeError::new(NativeErrorCode::Internal, "native host state is poisoned")
 }
 
+fn resolve_resident_slot<'a>(
+    candidates: impl IntoIterator<Item = (usize, &'a ResidentModelKey, &'a ModelFingerprint)>,
+    requested_key: &ResidentModelKey,
+    requested_config: &NativeModelConfig,
+) -> Result<Option<usize>, NativeError> {
+    for (slot_id, key, fingerprint) in candidates {
+        if key == requested_key {
+            validate_resident_digest_assertions(requested_config, fingerprint)?;
+            return Ok(Some(slot_id));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_digest_assertions(config: &NativeModelConfig) -> Result<(), NativeError> {
+    validate_digest_syntax(
+        "expected_model_sha256",
+        config.expected_model_sha256.as_deref(),
+    )?;
+    validate_digest_syntax(
+        "expected_mmproj_sha256",
+        config.expected_mmproj_sha256.as_deref(),
+    )?;
+    if config.expected_mmproj_sha256.is_some() && config.mmproj_path.is_none() {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "expected_mmproj_sha256 requires a multimodal projector path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_digest_syntax(field: &str, value: Option<&str>) -> Result<(), NativeError> {
+    if let Some(value) = value
+        && (value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            format!("{field} must be exactly 64 lowercase hexadecimal characters"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_resident_digest_assertions(
+    config: &NativeModelConfig,
+    fingerprint: &ModelFingerprint,
+) -> Result<(), NativeError> {
+    validate_digest_assertions(config)?;
+    if config
+        .expected_model_sha256
+        .as_deref()
+        .is_some_and(|expected| expected != fingerprint.model_sha256)
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            "resident model fingerprint does not match expected_model_sha256",
+        ));
+    }
+    if config
+        .expected_mmproj_sha256
+        .as_deref()
+        .is_some_and(|expected| {
+            fingerprint.multimodal_projector_sha256.as_deref() != Some(expected)
+        })
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            "resident projector fingerprint does not match expected_mmproj_sha256",
+        ));
+    }
+    Ok(())
+}
+
 #[must_use]
 pub const fn memory_reservation(model_bytes: u64, projector_bytes: u64) -> u64 {
     const MINIMUM_RUNTIME_RESERVE: u64 = 384 * 1024 * 1024;
@@ -544,6 +687,37 @@ mod tests {
         }
     }
 
+    fn resident_test_config(expected_model_sha256: Option<&str>) -> NativeModelConfig {
+        let mut config = NativeModelConfig::local(PathBuf::from("/private/MODEL_SENTINEL.gguf"));
+        config.model_id = "resident-test-model".to_string();
+        config.expected_model_sha256 = expected_model_sha256.map(str::to_owned);
+        config.device = NativeDevice::Cpu;
+        config.context_tokens = 512;
+        config.batch_tokens = 64;
+        config.max_sequences = 1;
+        config.gpu_layers = 0;
+        config
+    }
+
+    fn resident_test_fingerprint(model_sha256: &str) -> ModelFingerprint {
+        ModelFingerprint {
+            model_id: "resident-test-model".to_string(),
+            model_size: 17,
+            model_sha256: model_sha256.to_string(),
+            tokenizer_sha256: model_sha256.to_string(),
+            chat_template_sha256: "chat-template".to_string(),
+            multimodal_projector_sha256: None,
+            binding_version: "binding".to_string(),
+            build_id: "build".to_string(),
+            backend: "cpu".to_string(),
+            context_tokens: 512,
+            batch_tokens: 64,
+            max_sequences: 1,
+            rope_config_sha256: "rope".to_string(),
+            kv_layout_sha256: "kv".to_string(),
+        }
+    }
+
     fn cache_value(id: &str, token: i32) -> PrefixCacheValue {
         let fingerprint = CacheFingerprint {
             prompt_form: PromptForm::Chat,
@@ -588,6 +762,87 @@ mod tests {
         assert!(right.slots().is_empty());
         assert_eq!(left.unload_all(), 0);
         assert_eq!(right.unload_all(), 0);
+    }
+
+    #[test]
+    fn digest_assertions_validate_without_participating_in_resident_identity() {
+        const CORRECT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const WRONG: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+        let unpinned = resident_test_config(None);
+        let pinned = resident_test_config(Some(CORRECT));
+        let fingerprint = resident_test_fingerprint(CORRECT);
+        let unpinned_key = ResidentModelKey::from(&unpinned);
+        let pinned_key = ResidentModelKey::from(&pinned);
+
+        assert_eq!(unpinned_key, pinned_key);
+        assert_eq!(
+            resolve_resident_slot(
+                std::iter::once((3, &unpinned_key, &fingerprint)),
+                &pinned_key,
+                &pinned,
+            )
+            .expect("a correct assertion reuses an unpinned resident"),
+            Some(3)
+        );
+        assert_eq!(
+            resolve_resident_slot(
+                std::iter::once((3, &pinned_key, &fingerprint)),
+                &unpinned_key,
+                &unpinned,
+            )
+            .expect("an unpinned request reuses a pinned resident"),
+            Some(3)
+        );
+
+        let wrong = resident_test_config(Some(WRONG));
+        let error = resolve_resident_slot(
+            std::iter::once((3, &unpinned_key, &fingerprint)),
+            &ResidentModelKey::from(&wrong),
+            &wrong,
+        )
+        .expect_err("a wrong assertion rejects the resident");
+        assert_eq!(error.code, NativeErrorCode::ModelInvalid);
+    }
+
+    #[test]
+    #[ignore = "requires MOM_LLAMA_MODEL_PATH, MOM_LLAMA_MODEL_SHA256, and a real local GGUF"]
+    fn real_digest_assertions_reuse_one_resident_and_wrong_digest_cannot_mutate_slots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let model_path = PathBuf::from(std::env::var("MOM_LLAMA_MODEL_PATH")?);
+        let model_sha256 = std::env::var("MOM_LLAMA_MODEL_SHA256")?;
+        let make_config = |expected_model_sha256: Option<String>| {
+            let mut config = NativeModelConfig::local(model_path.clone());
+            config.expected_model_sha256 = expected_model_sha256;
+            config.device = NativeDevice::Cpu;
+            config.context_tokens = 512;
+            config.batch_tokens = 64;
+            config.max_sequences = 1;
+            config.gpu_layers = 0;
+            config
+        };
+        let host_config = NativeHostConfig {
+            max_slots: 1,
+            cache_policy: HostCachePolicy::Disabled,
+            ..NativeHostConfig::default()
+        };
+
+        let unpinned_first = NativeHost::new(host_config.clone());
+        unpinned_first.acquire(make_config(None))?;
+        unpinned_first.acquire(make_config(Some(model_sha256.clone())))?;
+        assert_eq!(unpinned_first.slots().len(), 1);
+
+        let pinned_first = NativeHost::new(host_config);
+        pinned_first.acquire(make_config(Some(model_sha256)))?;
+        pinned_first.acquire(make_config(None))?;
+        assert_eq!(pinned_first.slots().len(), 1);
+
+        let before = pinned_first.slots();
+        let error = pinned_first
+            .acquire(make_config(Some("0".repeat(64))))
+            .expect_err("a wrong digest must reject the resident");
+        assert_eq!(error.code, NativeErrorCode::ModelInvalid);
+        assert_eq!(pinned_first.slots(), before);
+        Ok(())
     }
 
     #[test]
