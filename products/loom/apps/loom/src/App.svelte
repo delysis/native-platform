@@ -88,6 +88,7 @@
     type ProjectCloseOutcome
   } from './lib/applicationCloseCoordinator';
   import { ApplicationCloseRetryScheduler } from './lib/applicationCloseRetry';
+  import { suggestionsEnabledFromStoredPreference } from './lib/suggestionPreference';
   import {
     captureProjectCloseAgency,
     restoreProjectCloseAgency,
@@ -2129,9 +2130,11 @@
 
   function loadSuggestionPreference(projectId: string): boolean {
     try {
-      return window.localStorage.getItem(suggestionPreferenceKey(projectId)) === 'on';
+      return suggestionsEnabledFromStoredPreference(
+        window.localStorage.getItem(suggestionPreferenceKey(projectId))
+      );
     } catch {
-      return false;
+      return true;
     }
   }
 
