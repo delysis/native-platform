@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+mod controlled_generation;
+
+pub use controlled_generation::*;
+
 pub const MAX_PARALLEL_SEQUENCES: u32 = 4;
 pub const MAX_EMBEDDING_BATCH_INPUTS: usize = 64;
 pub const MAX_EMBEDDING_INPUT_TOKENS: usize = 262_144;

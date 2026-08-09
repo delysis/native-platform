@@ -8,6 +8,7 @@ description = "Stable product-neutral request, event, model and cache DTOs for l
 
 [dependencies]
 serde.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
