@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+loom-types = { path = "../loom-types" }
 thiserror.workspace = true
 
 [lints]

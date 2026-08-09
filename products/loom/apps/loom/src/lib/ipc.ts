@@ -1,8 +1,16 @@
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
+  BranchBody,
+  BranchPage,
+  BranchPageCursor,
+  BranchSummary,
   CommandReceipt,
+  DesktopGenerationEnvelope,
   DocumentKind,
   ModelCapabilitySummary,
+  ModelDownloadSnapshot,
+  ModelUnloadOutcome,
   OpenDocument,
   ProjectCloseReceipt,
   ProjectSnapshot,
@@ -10,7 +18,8 @@ import type {
   ReconciliationPreview,
   LoomFailure,
   TransientDraftSnapshot,
-  TransientDraftWriteReceipt
+  TransientDraftWriteReceipt,
+  WeaveStarted
 } from './types';
 
 const PREFIX = 'plugin:loom|';
@@ -28,6 +37,10 @@ async function call<T>(command: string, args: Record<string, unknown> = {}): Pro
 
 export function chooseAndCreateProject(title: string): Promise<ProjectSnapshot> {
   return call('project_choose_create', { title });
+}
+
+export function openDefaultProject(): Promise<ProjectSnapshot> {
+  return call('project_open_default');
 }
 
 export function chooseAndOpenProject(): Promise<ProjectSnapshot> {
@@ -175,12 +188,191 @@ export function listModels(): Promise<ModelCapabilitySummary[]> {
   return call('model_list');
 }
 
+export function chooseModel(): Promise<ModelCapabilitySummary | null> {
+  return call('model_choose');
+}
+
+export function loadModel(modelPath: string): Promise<ModelCapabilitySummary> {
+  return call('model_load', { modelPath });
+}
+
+export function unloadModel(): Promise<ModelUnloadOutcome> {
+  return call('model_unload');
+}
+
+export interface StartModelDownloadArgs {
+  commandId: string;
+  url: string;
+  fileName: string;
+  expectedSha256: string;
+  expectedBytes: number | null;
+  maxBytes: number;
+}
+
+export function startModelDownload(
+  args: StartModelDownloadArgs
+): Promise<ModelDownloadSnapshot> {
+  return call('model_download_start', { ...args });
+}
+
+export function cancelModelDownload(commandId: string): Promise<ModelDownloadSnapshot> {
+  return call('model_download_cancel', { commandId });
+}
+
+export function getModelDownloadStatus(commandId: string): Promise<ModelDownloadSnapshot> {
+  return call('model_download_status', { commandId });
+}
+
+export function listModelDownloads(): Promise<ModelDownloadSnapshot[]> {
+  return call('model_download_list');
+}
+
+export async function listenForModelDownloadEvents(
+  handler: (event: ModelDownloadSnapshot) => void
+): Promise<UnlistenFn> {
+  if (!isDesktopRuntime()) {
+    return Promise.reject({
+      code: 'desktop_runtime_required',
+      message: 'Model download events require the Loom desktop runtime.'
+    });
+  }
+  const unlistenProgress = await listen<ModelDownloadSnapshot>(
+    'loom://model-download-progress',
+    ({ payload }) => handler(payload)
+  );
+  try {
+    const unlistenTerminal = await listen<ModelDownloadSnapshot>(
+      'loom://model-download-terminal',
+      ({ payload }) => handler(payload)
+    );
+    return () => {
+      unlistenProgress();
+      unlistenTerminal();
+    };
+  } catch (error) {
+    unlistenProgress();
+    throw error;
+  }
+}
+
+export function getBranchPage(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  after: BranchPageCursor | null,
+  limit: number
+): Promise<BranchPage> {
+  return call('branch_page', { projectId, sessionId, documentId, after, limit });
+}
+
+export function getBranch(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  runId: string
+): Promise<BranchSummary | null> {
+  return call('branch_get', { projectId, sessionId, documentId, runId });
+}
+
+export function getBranchBody(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  runId: string,
+  maxBytes: number
+): Promise<BranchBody | null> {
+  return call('branch_body', { projectId, sessionId, documentId, runId, maxBytes });
+}
+
+export interface WeaveStartArgs {
+  projectId: string;
+  sessionId: string;
+  commandId: string;
+  documentId: string;
+  relativePath: string;
+  sourceRevisionId: string;
+  expectedVisibleBlobId: string;
+  cursorByte: number;
+  branchCount: number;
+  maxTokens: number;
+  temperature: number;
+  automatic: boolean;
+}
+
+export function startWeave(args: WeaveStartArgs): Promise<WeaveStarted> {
+  return call('weave_start', { ...args });
+}
+
+export function getWeaveStatus(
+  projectId: string,
+  sessionId: string,
+  commandId: string
+): Promise<WeaveStarted | null> {
+  return call('weave_status', { projectId, sessionId, commandId });
+}
+
+export function cancelGeneration(
+  projectId: string,
+  sessionId: string,
+  commandId: string,
+  runId: string
+): Promise<CommandReceipt> {
+  return call('generation_cancel', { projectId, sessionId, commandId, runId });
+}
+
+export function keepCandidate(
+  projectId: string,
+  sessionId: string,
+  commandId: string,
+  candidateId: string
+): Promise<CommandReceipt> {
+  return call('candidate_keep', { projectId, sessionId, commandId, candidateId });
+}
+
+export function promoteCandidate(
+  projectId: string,
+  sessionId: string,
+  commandId: string,
+  candidateId: string,
+  expectedSourceRevisionId: string,
+  expectedVisibleBlobId: string
+): Promise<CommandReceipt> {
+  return call('candidate_promote', {
+    projectId,
+    sessionId,
+    commandId,
+    candidateId,
+    expectedSourceRevisionId,
+    expectedVisibleBlobId
+  });
+}
+
+export function listenForGenerationEvents(
+  handler: (event: DesktopGenerationEnvelope) => void
+): Promise<UnlistenFn> {
+  if (!isDesktopRuntime()) {
+    return Promise.reject({
+      code: 'desktop_runtime_required',
+      message: 'Generation events require the Loom desktop runtime.'
+    });
+  }
+  return listen<DesktopGenerationEnvelope>('loom://generation', ({ payload }) => handler(payload));
+}
+
 export function setFocusMode(
   projectId: string,
   sessionId: string,
   enabled: boolean
 ): Promise<void> {
   return call('focus_mode_set', { projectId, sessionId, enabled });
+}
+
+export function setSuggestions(
+  projectId: string,
+  sessionId: string,
+  enabled: boolean
+): Promise<void> {
+  return call('suggestions_set', { projectId, sessionId, enabled });
 }
 
 export function requestApplicationClose(): Promise<void> {

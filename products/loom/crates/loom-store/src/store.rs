@@ -1,8 +1,11 @@
+use std::collections::BTreeSet;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Mutex, OnceLock};
 
+use fs4::TryLockError;
 use loom_document::DocumentContent;
 use loom_types::{
     ArtifactId, BlobId, CommandId, CommandKind, CommandReceipt, DocumentId, DocumentKind,
@@ -25,6 +28,7 @@ use crate::{Result, StoreError};
 
 const PROJECT_FORMAT: &str = "loom-project";
 const DATABASE_FILE: &str = "loom.sqlite3";
+const PROJECT_LEASE_FILE: &str = "session.lock";
 const MANIFEST_FILE: &str = "project.json";
 const MAX_PROJECT_NAME_BYTES: usize = 512;
 const MAX_REASON_BYTES: usize = 4 * 1024;
@@ -35,6 +39,23 @@ pub struct ProjectStore {
     pub(crate) root: PathBuf,
     pub(crate) manifest: ProjectManifest,
     pub(crate) connection: Connection,
+    // Holding this descriptor is the project ownership lease. The operating
+    // system releases it on normal close, panic, or process termination.
+    _lease: ProjectLease,
+}
+
+struct ProjectLease {
+    _file: File,
+    root: PathBuf,
+}
+
+impl Drop for ProjectLease {
+    fn drop(&mut self) {
+        process_project_leases()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.root);
+    }
 }
 
 impl fmt::Debug for ProjectStore {
@@ -87,6 +108,14 @@ impl ProjectStore {
             ensure_private_directory(&directory)?;
         }
 
+        let lease = acquire_project_lease(&loom_dir, &root)?;
+        // A concurrent initializer can create the manifest between the first
+        // inspection and our lease acquisition. Never overwrite it.
+        reject_symlink_target(&manifest_path)?;
+        if manifest_path.exists() {
+            return Err(StoreError::AlreadyInitialized(root));
+        }
+
         let started_at_ms = now_unix_ms();
         let manifest = ProjectManifest {
             format: PROJECT_FORMAT.to_owned(),
@@ -98,7 +127,7 @@ impl ProjectStore {
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         atomic_replace_private(&manifest_path, &manifest_bytes)?;
 
-        let mut store = Self::open_internal(root, manifest)?;
+        let mut store = Self::open_internal(root, manifest, Some(lease))?;
         let receipt =
             store.new_receipt(CommandKind::InitProject, started_at_ms, None, &[], &[], &[]);
         store.persist_receipt(&receipt)?;
@@ -126,10 +155,14 @@ impl ProjectStore {
         let manifest: ProjectManifest =
             serde_json::from_slice(&read_bounded(&manifest_path, MAX_MANIFEST_BYTES)?)?;
         validate_manifest(&manifest)?;
-        Self::open_internal(root, manifest)
+        Self::open_internal(root, manifest, None)
     }
 
-    fn open_internal(root: PathBuf, manifest: ProjectManifest) -> Result<Self> {
+    fn open_internal(
+        root: PathBuf,
+        manifest: ProjectManifest,
+        lease: Option<ProjectLease>,
+    ) -> Result<Self> {
         let loom_dir = root.join(".loom");
         for directory in [
             loom_dir.clone(),
@@ -140,6 +173,10 @@ impl ProjectStore {
         ] {
             ensure_private_directory(&directory)?;
         }
+        let lease = match lease {
+            Some(lease) => lease,
+            None => acquire_project_lease(&loom_dir, &root)?,
+        };
         let database_path = loom_dir.join(DATABASE_FILE);
         create_private_file_if_absent(&database_path)?;
         let mut connection = Connection::open(&database_path)?;
@@ -149,6 +186,7 @@ impl ProjectStore {
             root,
             manifest,
             connection,
+            _lease: lease,
         })
     }
 
@@ -807,12 +845,16 @@ impl ProjectStore {
     }
 
     pub fn read_blob(&self, blob_id: BlobId) -> Result<Vec<u8>> {
+        self.read_blob_bounded(blob_id, MAX_DOCUMENT_BYTES)
+    }
+
+    pub(crate) fn read_blob_bounded(&self, blob_id: BlobId, max_bytes: u64) -> Result<Vec<u8>> {
         let path = self.blob_path(blob_id);
         reject_symlink_target(&path)?;
         if !path.exists() {
             return Err(StoreError::MissingBlob { blob_id, path });
         }
-        let bytes = read_bounded(&path, MAX_DOCUMENT_BYTES)?;
+        let bytes = read_bounded(&path, max_bytes)?;
         let actual = BlobId::digest(&bytes);
         if actual != blob_id {
             return Err(StoreError::CorruptBlob {
@@ -1167,6 +1209,44 @@ fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
+fn acquire_project_lease(loom_dir: &Path, root: &Path) -> Result<ProjectLease> {
+    let lease_path = loom_dir.join(PROJECT_LEASE_FILE);
+    create_private_file_if_absent(&lease_path)?;
+    reject_symlink_target(&lease_path)?;
+
+    let lease = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lease_path)?;
+    if !lease.metadata()?.is_file() {
+        return Err(StoreError::NotRegularFile(lease_path));
+    }
+    match fs4::FileExt::try_lock(&lease) {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(StoreError::ProjectAlreadyOpen(root.to_path_buf())),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }?;
+
+    let mut process_leases = process_project_leases().lock().map_err(|_| {
+        StoreError::Io(std::io::Error::other(
+            "process-local project lease registry is poisoned",
+        ))
+    })?;
+    if !process_leases.insert(root.to_path_buf()) {
+        return Err(StoreError::ProjectAlreadyOpen(root.to_path_buf()));
+    }
+    drop(process_leases);
+    Ok(ProjectLease {
+        _file: lease,
+        root: root.to_path_buf(),
+    })
+}
+
+fn process_project_leases() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static LEASES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    LEASES.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
 fn validate_manifest(manifest: &ProjectManifest) -> Result<()> {
     if manifest.format != PROJECT_FORMAT {
         return Err(StoreError::UnsupportedFormat(manifest.format.clone()));
@@ -1397,6 +1477,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn project_lease_rejects_concurrent_open_and_releases_on_drop() {
+        let directory = tempdir().expect("temporary project root");
+        let project = directory.path().join("Novel");
+        let (store, _) = ProjectStore::initialize(&project, "Novel").expect("initialize project");
+        let canonical_project = project.canonicalize().expect("canonical project path");
+
+        assert!(matches!(
+            ProjectStore::open(&project),
+            Err(StoreError::ProjectAlreadyOpen(path)) if path == canonical_project
+        ));
+
+        drop(store);
+        let reopened = ProjectStore::open(&project).expect("lease released when store dropped");
+        assert_eq!(reopened.root(), canonical_project);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_lease_refuses_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().expect("temporary project root");
+        let project = directory.path().join("Novel");
+        let (store, _) = ProjectStore::initialize(&project, "Novel").expect("initialize project");
+        drop(store);
+
+        let lease_path = project
+            .canonicalize()
+            .expect("canonical project path")
+            .join(".loom")
+            .join(PROJECT_LEASE_FILE);
+        fs::remove_file(&lease_path).expect("remove lease file");
+        let outside = directory.path().join("outside-lock");
+        fs::write(&outside, b"").expect("create outside lock target");
+        symlink(&outside, &lease_path).expect("replace lease with symlink");
+
+        assert!(matches!(
+            ProjectStore::open(&project),
+            Err(StoreError::SymbolicLink(path)) if path == lease_path
+        ));
+    }
+
     fn insert_pending_projection(
         store: &mut ProjectStore,
         saved: &SaveOutcome,
@@ -1571,6 +1694,8 @@ mod tests {
             "generation_events",
             "generation_candidates",
             "generation_terminals",
+            "generation_terminal_evidence",
+            "generation_command_events",
             "selection_events",
             "authorship_attestations",
             "command_requests",

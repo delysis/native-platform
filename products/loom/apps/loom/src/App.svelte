@@ -3,20 +3,38 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
   import {
+    cancelGeneration,
+    cancelModelDownload,
     checkpointDocument,
     clearTransientDraft,
     applyDocumentReconciliation,
-    chooseAndCreateProject,
     chooseAndOpenProject,
+    chooseModel,
     closeProject as closeProjectSession,
     currentProjectSession,
+    getBranch,
+    getBranchBody,
+    getBranchPage,
+    getModelDownloadStatus,
+    getWeaveStatus,
     isDesktopRuntime,
+    keepCandidate,
+    listenForGenerationEvents,
+    listenForModelDownloadEvents,
+    loadModel,
     listModels,
+    listModelDownloads,
+    openDefaultProject,
     openDocument,
     previewDocumentReconciliation,
+    promoteCandidate,
     recoverProject,
     requestApplicationClose,
     setFocusMode,
+    setSuggestions as setSuggestionsPolicy,
+    startWeave,
+    startModelDownload,
+    unloadModel,
     normalizeFailure,
     upsertTransientDraft
   } from './lib/ipc';
@@ -25,7 +43,12 @@
     encodeVerseFromEditor,
     type VerseEditorCodec
   } from './lib/verseCodec';
-  import { canRoundTripMarkdownExactly } from './lib/markdownSafety';
+  import { canRoundTripMarkdownExactly, canUseVisualMarkdown } from './lib/markdownSafety';
+  import {
+    appendUniquePage,
+    branchBodyDisposition,
+    mergeNewestPage
+  } from './lib/branchPaging';
   import { writeRebindsStaleDraft } from './lib/draftRecovery';
   import { documentProjectionDecision } from './lib/projectionState';
   import {
@@ -33,19 +56,37 @@
     closeResultMayHaveCommitted
   } from './lib/sessionSafety';
   import { newUlid } from './lib/ulid';
+  import {
+    DEFAULT_MODEL_DOWNLOAD_LIMIT_GIB,
+    deriveGgufFileName,
+    downloadProgressPercent,
+    formatByteCount,
+    validateVerifiedDownload,
+    type VerifiedDownloadForm
+  } from './lib/modelDownload';
+  import {
+    generationEventBelongsToScope,
+    utf8ByteOffset
+  } from './lib/weaveSafety';
   import type {
     BranchCard,
+    BranchPageCursor,
+    BranchSummary,
     CommandReceipt,
+    DesktopGenerationEnvelope,
     DocumentKind,
     DocumentSummary,
     EditorMode,
     ModelCapabilitySummary,
+    ModelDownloadPhase,
+    ModelDownloadSnapshot,
     LoomFailure,
     OpenDocument,
     ProjectSnapshot,
     ReconciliationPreview,
     SaveState,
-    TransientDraftSnapshot
+    TransientDraftSnapshot,
+    WeaveStarted
   } from './lib/types';
 
   let desktop = false;
@@ -57,13 +98,76 @@
   let saveMessage = 'No project open';
   let errorMessage = '';
   let lastFailure: LoomFailure | null = null;
-  let projectTitle = 'Untitled Loom';
-  let creating = false;
   let opening = false;
   let focusMode = false;
   let search = '';
   let models: ModelCapabilitySummary[] = [];
+  let selectedModelPath = '';
+  let modelLoading = false;
+  let modelUnloading = false;
+  let modelChoosing = false;
+  let modelManagerOpen = false;
+  let modelManagerPanel: HTMLElement | undefined;
+  let modelManagerReturnFocus: HTMLElement | null = null;
+  let projectMenu: HTMLDetailsElement | undefined;
+  let projectMenuTrigger: HTMLElement | undefined;
+  let suggestionsEnabled = false;
+  let suggestionsChanging = false;
+  let suggestionsIdleTimer: number | undefined;
+  let suggestionTargetEditVersion: number | null = null;
+  let suggestionIntentEpoch = 0;
+  let dismissedCandidateIds: string[] = [];
+  let modelDownloadUrl = '';
+  let modelDownloadFileName = '';
+  let lastDerivedModelFileName = '';
+  let modelDownloadSha256 = '';
+  let modelDownloadExpectedBytes = '';
+  let modelDownloadMaximumGiB = String(DEFAULT_MODEL_DOWNLOAD_LIMIT_GIB);
+  let modelDownloadStarting = false;
+  let modelDownloadCancellingIds: string[] = [];
+  let modelDownloadError = '';
+  let pendingModelDownload: ModelDownloadCapture | null = null;
+  let modelDownloadUncertain = false;
+  let modelDownloadCanAbandon = false;
+  let modelDownloads: ModelDownloadSnapshot[] = [];
+  let modelDownloadSequenceByCommand: Record<string, number> = {};
+  let handledModelDownloadCompletions: string[] = [];
+  let unlistenModelDownloadEvents: (() => void) | undefined;
+  let modelDownloadListenerDisposed = false;
+  let modelDownloadListenerPromise: Promise<void> | null = null;
+  let modelDownloadPollTimer: number | undefined;
+  let modelDownloadPollInFlight = false;
+  let modelDownloadPollAttempt = 0;
   let branches: BranchCard[] = [];
+  let branchNextCursor: BranchPageCursor | null = null;
+  let branchFirstPageCursor: BranchPageCursor | null = null;
+  let branchHasMore = false;
+  let branchLoadingMore = false;
+  let branchLoadedPastFirstPage = false;
+  let branchBodyBlobByRun: Record<string, string> = {};
+  let branchBodyErrorByRun: Record<string, string> = {};
+  let branchRefreshSerial = 0;
+  let sourceTextarea: HTMLTextAreaElement | undefined;
+  let weaveStarting = false;
+  let uncertainWeave: WeaveCapture | null = null;
+  const staleWeaveCleanupTimers = new Set<number>();
+  let branchRefreshTimer: number | undefined;
+  let branchPollTimer: number | undefined;
+  let branchPollInFlight = false;
+  let branchPollAttempt = 0;
+  let branchPollEpoch = 0;
+  let liveBranchText: Record<string, string> = {};
+  let liveBranchState: Record<string, BranchEventOverlay> = {};
+  let generationSequenceByRun: Record<string, number> = {};
+  let cancellingRunIds: string[] = [];
+  let cancellationCommandByRun: Record<string, string> = {};
+  let keepingCandidateIds: string[] = [];
+  let keepCommandByCandidate: Record<string, string> = {};
+  let promotionArmedCandidateId: string | null = null;
+  let promotionInFlight = false;
+  let uncertainPromotion: PromotionCapture | null = null;
+  let unlistenGenerationEvents: (() => void) | undefined;
+  let generationListenerDisposed = false;
   let saveTimer: number | undefined;
   let saveInFlight: Promise<void> | null = null;
   let saveQueued = false;
@@ -72,6 +176,9 @@
   let savedVersion = 0;
   let liveRegion = '';
   let sourceDisplayText = '';
+  let sourceSelectionStart = 0;
+  let sourceSelectionEnd = 0;
+  let visualSelectionAtEnd = false;
   let verseCodec: VerseEditorCodec | null = null;
   let compositionActive = false;
   let sourceComposing = false;
@@ -135,31 +242,126 @@
     reason: string;
   }
 
+  interface BranchEventOverlay {
+    branchId: string;
+    status?: BranchCard['status'];
+    candidateId?: string;
+    error?: string;
+  }
+
+  interface PromotionCapture {
+    commandId: string;
+    projectId: string;
+    sessionId: string;
+    documentId: string;
+    relativePath: string;
+    candidateId: string;
+    runId: string;
+    sourceRevisionId: string;
+    visibleBlobId: string;
+  }
+
+  interface WeaveCapture {
+    commandId: string;
+    epoch: number;
+    projectId: string;
+    sessionId: string;
+    documentId: string;
+    relativePath: string;
+    sourceRevisionId: string;
+    visibleBlobId: string;
+    cursorByte: number;
+    editVersion: number;
+    intentEpoch: number;
+  }
+
+  interface ModelDownloadCapture extends VerifiedDownloadForm {
+    commandId: string;
+  }
+
+  type PromotionReloadOutcome = 'unchanged' | 'promoted' | 'source_changed' | 'reconciliation';
+
   const saveDelayMs = 900;
   const draftIntervalMs = 750;
+  const branchPollBaseMs = 500;
+  const branchPollMaxMs = 4_000;
+  const branchPageSize = 24;
+  const branchShelfBodyMaxBytes = 1024 * 1024;
+  const modelDownloadPollBaseMs = 750;
+  const modelDownloadPollMaxMs = 5_000;
+  const suggestionsIdleDelayMs = 1_800;
 
   $: visibleDocuments = project?.documents.filter((candidate) => {
     const query = search.trim().toLocaleLowerCase();
     return !query || candidate.title.toLocaleLowerCase().includes(query) || candidate.relative_path.toLocaleLowerCase().includes(query);
   }) ?? [];
-  $: wordCount = countWords(documentText);
-  $: characterCount = [...documentText].length;
+  $: loadedModel = models.find((model) => model.loaded) ?? null;
   $: currentModel = models.find((model) => model.loaded && model.completion);
-  $: canUseVisual = Boolean(
-    document?.summary.kind === 'prose' && canRoundTripMarkdownExactly(documentText)
+  $: selectedModel = models.find((model) => model.model_path === selectedModelPath) ?? null;
+  $: activeModelDownloads = modelDownloads.filter((download) => !modelDownloadIsTerminal(download));
+  $: pendingModelDownloadSnapshot = pendingModelDownload
+    ? modelDownloads.find((download) => download.command_id === pendingModelDownload?.commandId) ?? null
+    : null;
+  $: activeBranchCount = branches.filter(
+    (branch) => branch.status === 'queued' || branch.status === 'generating'
+  ).length;
+  $: currentReadyBranches = branches.filter((branch) =>
+    branch.status === 'ready' &&
+    branch.selection !== 'promote' &&
+    branch.selection !== 'reject' &&
+    branch.source_revision_id === document?.summary.revision_id
   );
-  $: canWeave = Boolean(
-    document &&
+  $: inlineSuggestion = suggestionsEnabled && !focusMode
+    ? currentReadyBranches.find((branch) =>
+      Boolean(branch.candidate_id) && !dismissedCandidateIds.includes(branch.candidate_id ?? '')
+    ) ?? null
+    : null;
+  $: inlineSuggestionAtCaret = Boolean(
+    inlineSuggestion &&
+    (mode === 'visual' || mode === 'source') &&
+    sourceSelectionStart >= 0 &&
+    suggestionMatchesCurrentCaret(
+      inlineSuggestion,
+      visualSelectionAtEnd,
+      sourceSelectionStart,
+      sourceSelectionEnd
+    )
+  );
+  $: automaticBoundaryIsExact = mode === 'visual'
+    ? visualSelectionAtEnd
+    : mode === 'source' && Boolean(sourceTextarea) && sourceSelectionStart === sourceSelectionEnd;
+  $: canUseVisual = Boolean(
+    document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')
+  );
+  $: weaveCursorAtStart = mode === 'source'
+    ? sourceSelectionStart === 0
+    : documentText.length === 0;
+  $: canStartAutomaticSuggestions = Boolean(
+      document &&
+      document.summary.kind !== 'hybrid' &&
       currentModel &&
+      suggestionsEnabled &&
+      !uncertainWeave &&
       !focusMode &&
       !compositionActive &&
+      !sourceDirty &&
       !saveInFlight &&
-      editVersion === savedVersion
+      !weaveStarting &&
+      !promotionInFlight &&
+      transition === 'idle' &&
+      !editorReadonly &&
+      (saveState === 'clean' || saveState === 'saved') &&
+      editVersion === savedVersion &&
+      document.summary.revision_id &&
+      document.summary.active_blob_id === document.visible_blob_id &&
+      !weaveCursorAtStart &&
+      automaticBoundaryIsExact &&
+      activeBranchCount === 0
   );
   $: showVisual = mode === 'visual' || mode === 'split';
   $: showSource = mode === 'source' || mode === 'split';
   $: exactTextSurface = document?.summary.kind === 'verse';
-  $: editorReadonly = transition !== 'idle' || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null;
+  $: editorReadonly = transition !== 'idle' || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
   $: reconciliationResolutionLocked = reconciliationApplying || pendingReconciliationApply !== null;
   $: reconciliationResolutionIsExact = Boolean(
     reconciliation && (
@@ -173,16 +375,32 @@
   onMount(() => {
     desktop = isDesktopRuntime();
     if (desktop) {
-      void refreshModels();
+      void ensureModelDownloadEventListener();
+      void recoverModelDownloads();
       void installWindowLifecycleHandlers();
-      void reattachNativeProject();
+      void installGenerationEventListener();
+      void restoreDesktopWorkspace();
     }
     window.addEventListener('keydown', handleGlobalKeydown);
+    window.addEventListener('pointerdown', handleGlobalPointerdown);
     return () => {
       window.removeEventListener('keydown', handleGlobalKeydown);
+      window.removeEventListener('pointerdown', handleGlobalPointerdown);
       if (saveTimer !== undefined) window.clearTimeout(saveTimer);
       if (sourceProjectionTimer !== undefined) window.clearTimeout(sourceProjectionTimer);
       if (draftTimer !== undefined) window.clearTimeout(draftTimer);
+      if (branchRefreshTimer !== undefined) window.clearTimeout(branchRefreshTimer);
+      if (branchPollTimer !== undefined) window.clearTimeout(branchPollTimer);
+      branchPollEpoch += 1;
+      branchPollInFlight = false;
+      generationListenerDisposed = true;
+      modelDownloadListenerDisposed = true;
+      unlistenGenerationEvents?.();
+      unlistenModelDownloadEvents?.();
+      if (modelDownloadPollTimer !== undefined) window.clearTimeout(modelDownloadPollTimer);
+      if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
+      for (const timer of staleWeaveCleanupTimers) window.clearTimeout(timer);
+      staleWeaveCleanupTimers.clear();
       unlistenWindowClose?.();
       unlistenWindowFocus?.();
     };
@@ -216,6 +434,34 @@
     reconciliationApplying = false;
   }
 
+  function resetLiveGenerationView(): void {
+    stopBranchPolling();
+    branchRefreshSerial += 1;
+    branchNextCursor = null;
+    branchFirstPageCursor = null;
+    branchHasMore = false;
+    branchLoadingMore = false;
+    branchLoadedPastFirstPage = false;
+    branchBodyBlobByRun = {};
+    branchBodyErrorByRun = {};
+    liveBranchText = {};
+    liveBranchState = {};
+    generationSequenceByRun = {};
+    cancellingRunIds = [];
+    cancellationCommandByRun = {};
+    keepingCandidateIds = [];
+    keepCommandByCandidate = {};
+    uncertainWeave = null;
+  }
+
+  function stopBranchPolling(): void {
+    if (branchPollTimer !== undefined) window.clearTimeout(branchPollTimer);
+    branchPollTimer = undefined;
+    branchPollInFlight = false;
+    branchPollAttempt = 0;
+    branchPollEpoch += 1;
+  }
+
   function detachDocumentForReconciliation(): void {
     if (saveTimer !== undefined) {
       window.clearTimeout(saveTimer);
@@ -238,6 +484,9 @@
     visualEditor = null;
     compositionActive = false;
     sourceComposing = false;
+    branches = [];
+    promotionArmedCandidateId = null;
+    resetLiveGenerationView();
     editVersion = 0;
     savedVersion = 0;
     draftVersion = '0';
@@ -364,7 +613,7 @@
       throw new Error('The reconciliation preview omitted the newly rebound transient draft.');
     }
     activateReconciliation(preview);
-    announce('The checkpoint is in history, but the changed visible file still needs reconciliation');
+    announce('The save is in history, but the changed visible file still needs reconciliation');
   }
 
   async function activateReconciliationProjectionConflict(
@@ -409,6 +658,881 @@
     });
   }
 
+  async function installGenerationEventListener(): Promise<void> {
+    try {
+      const unlisten = await listenForGenerationEvents(handleGenerationEnvelope);
+      if (generationListenerDisposed) {
+        unlisten();
+      } else {
+        unlistenGenerationEvents?.();
+        unlistenGenerationEvents = unlisten;
+      }
+    } catch (error) {
+      if (!generationListenerDisposed) {
+        recordFailure(error);
+        announce('Private strand events are unavailable');
+      }
+    }
+  }
+
+  async function ensureModelDownloadEventListener(): Promise<void> {
+    if (unlistenModelDownloadEvents || modelDownloadListenerDisposed) return;
+    if (!modelDownloadListenerPromise) {
+      modelDownloadListenerPromise = (async () => {
+        const unlisten = await listenForModelDownloadEvents(handleModelDownloadEvent);
+        if (modelDownloadListenerDisposed) {
+          unlisten();
+        } else {
+          unlistenModelDownloadEvents = unlisten;
+        }
+      })();
+    }
+    try {
+      await modelDownloadListenerPromise;
+    } finally {
+      modelDownloadListenerPromise = null;
+    }
+  }
+
+  function handleModelDownloadEvent(snapshot: ModelDownloadSnapshot): void {
+    try {
+      applyModelDownloadSnapshot(snapshot, true);
+    } catch (error) {
+      modelDownloadError = error instanceof Error
+        ? error.message
+        : 'Loom ignored an invalid model download event.';
+    }
+  }
+
+  function applyModelDownloadSnapshot(
+    snapshot: ModelDownloadSnapshot,
+    arrivedAsEvent: boolean
+  ): void {
+    validateModelDownloadSnapshot(snapshot);
+    const priorSequence = modelDownloadSequenceByCommand[snapshot.command_id];
+    const priorSnapshot = modelDownloads.find(
+      (download) => download.command_id === snapshot.command_id
+    );
+    if (
+      priorSequence !== undefined &&
+      (
+        snapshot.event_sequence < priorSequence ||
+        (
+          snapshot.event_sequence === priorSequence &&
+          (arrivedAsEvent || snapshot.event_delivery_failures <= (priorSnapshot?.event_delivery_failures ?? 0))
+        )
+      )
+    ) return;
+    modelDownloadSequenceByCommand = {
+      ...modelDownloadSequenceByCommand,
+      [snapshot.command_id]: snapshot.event_sequence
+    };
+    const withoutCurrent = modelDownloads.filter(
+      (download) => download.command_id !== snapshot.command_id
+    );
+    modelDownloads = [snapshot, ...withoutCurrent].sort(
+      (left, right) => right.updated_at_unix_ms - left.updated_at_unix_ms
+    );
+    if (arrivedAsEvent) modelDownloadPollAttempt = 0;
+
+    if (modelDownloadIsTerminal(snapshot)) {
+      if (pendingModelDownload?.commandId === snapshot.command_id) {
+        pendingModelDownload = null;
+        modelDownloadUncertain = false;
+        modelDownloadCanAbandon = false;
+      }
+      modelDownloadCancellingIds = modelDownloadCancellingIds.filter(
+        (commandId) => commandId !== snapshot.command_id
+      );
+      if (snapshot.status.status === 'failed') {
+        modelDownloadError = snapshot.status.message;
+      } else if (snapshot.status.status === 'cancelled') {
+        modelDownloadError = '';
+        announce(`${snapshot.display_name} download cancelled`);
+      } else if (snapshot.status.status === 'completed') {
+        modelDownloadError = '';
+        void reconcileCompletedModelDownload(snapshot);
+      }
+    }
+    scheduleModelDownloadPoll();
+  }
+
+  function validateModelDownloadSnapshot(snapshot: ModelDownloadSnapshot): void {
+    if (!/^[0-9A-HJKMNP-TV-Z]{26}$/u.test(snapshot.command_id)) {
+      throw new Error('Loom ignored a model download with an invalid command identity.');
+    }
+    const numbers = [
+      snapshot.downloaded_bytes,
+      snapshot.resumed_from_bytes,
+      snapshot.event_sequence,
+      snapshot.event_delivery_failures,
+      snapshot.updated_at_unix_ms
+    ];
+    if (snapshot.expected_bytes !== null) numbers.push(snapshot.expected_bytes);
+    if (snapshot.total_bytes !== null) numbers.push(snapshot.total_bytes);
+    if (numbers.some((value) => !Number.isSafeInteger(value) || value < 0)) {
+      throw new Error('Loom ignored model download evidence outside the safe numeric range.');
+    }
+    if (!/^[0-9a-f]{64}$/u.test(snapshot.expected_sha256)) {
+      throw new Error('Loom ignored a model download with an invalid expected checksum.');
+    }
+    if (snapshot.status.status === 'completed') {
+      if (
+        !Number.isSafeInteger(snapshot.status.bytes) ||
+        snapshot.status.bytes < 0 ||
+        snapshot.status.sha256 !== snapshot.expected_sha256
+      ) {
+        throw new Error('Loom ignored a completed model download whose evidence did not match its request.');
+      }
+    }
+  }
+
+  function modelDownloadIsTerminal(download: ModelDownloadSnapshot): boolean {
+    return download.status.status === 'completed' ||
+      download.status.status === 'cancelled' ||
+      download.status.status === 'failed';
+  }
+
+  async function reconcileCompletedModelDownload(
+    snapshot: ModelDownloadSnapshot
+  ): Promise<void> {
+    if (handledModelDownloadCompletions.includes(snapshot.command_id)) return;
+    handledModelDownloadCompletions = [
+      ...handledModelDownloadCompletions,
+      snapshot.command_id
+    ];
+    await refreshModels();
+    const downloaded = models.find((model) => model.model_path === snapshot.target_path);
+    if (downloaded) {
+      selectedModelPath = downloaded.model_path;
+      announce(`${snapshot.display_name} passed checksum and GGUF verification and is ready to inspect`);
+    } else {
+      modelDownloadError = 'The verified file was installed, but model discovery did not return it yet.';
+      announce('Model download verified; discovery needs another refresh');
+    }
+  }
+
+  async function selectCompletedModelDownload(
+    snapshot: ModelDownloadSnapshot
+  ): Promise<void> {
+    modelDownloadError = '';
+    await refreshModels();
+    const discovered = models.find((model) => model.model_path === snapshot.target_path);
+    if (!discovered) {
+      modelDownloadError = 'The verified file is installed, but model discovery did not return it.';
+      return;
+    }
+    selectedModelPath = discovered.model_path;
+    announce(`${discovered.display_name} selected; load it when you want local continuation`);
+  }
+
+  async function recoverModelDownloads(): Promise<void> {
+    try {
+      await ensureModelDownloadEventListener();
+    } catch (error) {
+      if (modelManagerOpen) {
+        modelDownloadError = `${normalizeFailure(error).message} Command-status recovery remains active.`;
+      }
+    }
+    try {
+      const snapshots = await listModelDownloads();
+      for (const snapshot of snapshots.slice().reverse()) {
+        applyModelDownloadSnapshot(snapshot, false);
+      }
+      scheduleModelDownloadPoll();
+    } catch (error) {
+      if (modelManagerOpen) modelDownloadError = normalizeFailure(error).message;
+    }
+  }
+
+  function scheduleModelDownloadPoll(): void {
+    if (modelDownloadPollTimer !== undefined) {
+      window.clearTimeout(modelDownloadPollTimer);
+      modelDownloadPollTimer = undefined;
+    }
+    if (
+      modelDownloadListenerDisposed ||
+      modelDownloadPollInFlight ||
+      modelDownloads.every(modelDownloadIsTerminal)
+    ) return;
+    const delay = Math.min(
+      modelDownloadPollBaseMs * (2 ** Math.min(modelDownloadPollAttempt, 3)),
+      modelDownloadPollMaxMs
+    );
+    modelDownloadPollTimer = window.setTimeout(() => {
+      modelDownloadPollTimer = undefined;
+      void pollActiveModelDownloads();
+    }, delay);
+  }
+
+  async function pollActiveModelDownloads(): Promise<void> {
+    if (modelDownloadPollInFlight) return;
+    const commandIds = modelDownloads
+      .filter((download) => !modelDownloadIsTerminal(download))
+      .slice(0, 2)
+      .map((download) => download.command_id);
+    if (commandIds.length === 0) return;
+    modelDownloadPollInFlight = true;
+    try {
+      for (const commandId of commandIds) {
+        const snapshot = await getModelDownloadStatus(commandId);
+        applyModelDownloadSnapshot(snapshot, false);
+      }
+      modelDownloadPollAttempt += 1;
+    } catch (error) {
+      modelDownloadPollAttempt += 1;
+      if (modelManagerOpen) modelDownloadError = normalizeFailure(error).message;
+    } finally {
+      modelDownloadPollInFlight = false;
+      scheduleModelDownloadPoll();
+    }
+  }
+
+  function updateModelDownloadUrl(value: string): void {
+    modelDownloadUrl = value;
+    const derived = deriveGgufFileName(value);
+    if (!modelDownloadFileName || modelDownloadFileName === lastDerivedModelFileName) {
+      modelDownloadFileName = derived;
+    }
+    lastDerivedModelFileName = derived;
+  }
+
+  async function beginOrRetryModelDownload(): Promise<void> {
+    if (modelDownloadStarting) return;
+    let capture = pendingModelDownload;
+    if (!capture) {
+      let request: VerifiedDownloadForm;
+      try {
+        request = validateVerifiedDownload({
+          url: modelDownloadUrl,
+          fileName: modelDownloadFileName,
+          sha256: modelDownloadSha256,
+          expectedBytes: modelDownloadExpectedBytes,
+          maximumGiB: modelDownloadMaximumGiB
+        });
+      } catch (error) {
+        modelDownloadError = error instanceof Error ? error.message : 'Review the download request.';
+        return;
+      }
+      capture = { commandId: newUlid(), ...request };
+      pendingModelDownload = capture;
+    }
+    modelDownloadStarting = true;
+    modelDownloadUncertain = false;
+    modelDownloadCanAbandon = false;
+    modelDownloadError = '';
+    try {
+      // Both event channels must exist before the command can emit its first
+      // queued snapshot. Polling remains the recovery oracle for lost events.
+      await ensureModelDownloadEventListener();
+      const snapshot = await startModelDownload({
+        commandId: capture.commandId,
+        url: capture.url,
+        fileName: capture.fileName,
+        expectedSha256: capture.sha256,
+        expectedBytes: capture.expectedBytes,
+        maxBytes: capture.maxBytes
+      });
+      applyModelDownloadSnapshot(snapshot, false);
+      const observed = modelDownloads.find(
+        (download) => download.command_id === capture.commandId
+      );
+      if (observed && !modelDownloadIsTerminal(observed)) {
+        announce(`Verified local download started for ${capture.fileName}`);
+      }
+    } catch (startError) {
+      try {
+        const snapshot = await getModelDownloadStatus(capture.commandId);
+        applyModelDownloadSnapshot(snapshot, false);
+        announce(`Recovered ${capture.fileName} download state after a lost command reply`);
+      } catch (statusError) {
+        const startFailure = normalizeFailure(startError);
+        const statusFailure = normalizeFailure(statusError);
+        modelDownloadUncertain = true;
+        modelDownloadCanAbandon = statusFailure.code === 'model_download_not_found' && !startFailure.retryable;
+        modelDownloadError = `${startFailure.message} The exact command can be retried without starting a duplicate transfer.`;
+      }
+    } finally {
+      modelDownloadStarting = false;
+      scheduleModelDownloadPoll();
+    }
+  }
+
+  function abandonUnstartedModelDownload(): void {
+    if (!modelDownloadUncertain || !modelDownloadCanAbandon) return;
+    pendingModelDownload = null;
+    modelDownloadUncertain = false;
+    modelDownloadCanAbandon = false;
+    modelDownloadError = '';
+  }
+
+  async function cancelVerifiedModelDownload(commandId: string): Promise<void> {
+    if (modelDownloadCancellingIds.includes(commandId)) return;
+    modelDownloadCancellingIds = [...modelDownloadCancellingIds, commandId];
+    modelDownloadError = '';
+    try {
+      const snapshot = await cancelModelDownload(commandId);
+      applyModelDownloadSnapshot(snapshot, false);
+      announce('Model download cancellation requested');
+    } catch (error) {
+      modelDownloadError = normalizeFailure(error).message;
+      modelDownloadCancellingIds = modelDownloadCancellingIds.filter(
+        (candidate) => candidate !== commandId
+      );
+    }
+  }
+
+  function handleGenerationEnvelope(envelope: DesktopGenerationEnvelope): void {
+    if (!project || !document || !generationEventBelongsToScope(envelope, {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id
+    })) return;
+
+    const stream = envelope.event;
+    const generation = stream.payload;
+    if (!Number.isSafeInteger(generation.sequence) || generation.sequence < 0) {
+      recordLocalFailure(
+        'unsafe_generation_sequence',
+        'Loom ignored a generation event whose sequence cannot be represented safely.'
+      );
+      return;
+    }
+    const previousSequence = generationSequenceByRun[generation.run_id];
+    if (previousSequence !== undefined && generation.sequence <= previousSequence) return;
+    const nextSequences = {
+      ...generationSequenceByRun,
+      [generation.run_id]: generation.sequence
+    };
+    const sequencedRunIds = Object.keys(nextSequences);
+    while (sequencedRunIds.length > 64) delete nextSequences[sequencedRunIds.shift() as string];
+    generationSequenceByRun = nextSequences;
+
+    if (stream.event === 'generation_terminal') {
+      const status = stream.payload.status === 'completed' ? 'ready' : stream.payload.status;
+      recordLiveBranchState(generation.run_id, generation.branch_id, {
+        status,
+        candidateId: stream.payload.candidate_id,
+        error: stream.payload.error
+      });
+      updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
+        ...branch,
+        candidate_id: stream.payload.candidate_id ?? branch.candidate_id,
+        status,
+        error: stream.payload.error ?? branch.error,
+        text: liveBranchText[generation.run_id] ?? branch.text
+      }));
+      cancellingRunIds = cancellingRunIds.filter((runId) => runId !== generation.run_id);
+      scheduleBranchRefresh();
+      announce(status === 'ready' ? 'A private strand is ready' : `A private strand ${status}`);
+      return;
+    }
+
+    const kind = stream.payload.kind;
+    switch (kind.kind) {
+      case 'queued':
+        recordLiveBranchState(generation.run_id, generation.branch_id, { status: 'queued' });
+        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
+          ...branch,
+          status: 'queued'
+        }));
+        break;
+      case 'prefilling':
+      case 'generating':
+      case 'token':
+        recordLiveBranchState(generation.run_id, generation.branch_id, { status: 'generating' });
+        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
+          ...branch,
+          status: 'generating'
+        }));
+        break;
+      case 'text_delta': {
+        const text = `${liveBranchText[generation.run_id] ?? ''}${kind.text}`;
+        recordLiveBranchText(generation.run_id, text);
+        recordLiveBranchState(generation.run_id, generation.branch_id, { status: 'generating' });
+        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
+          ...branch,
+          status: 'generating',
+          text
+        }));
+        break;
+      }
+      case 'warning':
+        recordLiveBranchState(generation.run_id, generation.branch_id, { error: kind.message });
+        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
+          ...branch,
+          error: kind.message
+        }));
+        break;
+      case 'cancellation_requested':
+        recordLiveBranchState(generation.run_id, generation.branch_id, { status: 'generating' });
+        if (!cancellingRunIds.includes(generation.run_id)) {
+          cancellingRunIds = [...cancellingRunIds, generation.run_id];
+        }
+        break;
+      case 'candidate_ready':
+        recordLiveBranchState(generation.run_id, generation.branch_id, {
+          status: 'ready',
+          candidateId: kind.candidate_id
+        });
+        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
+          ...branch,
+          candidate_id: kind.candidate_id,
+          status: 'ready',
+          text: liveBranchText[generation.run_id] ?? branch.text
+        }));
+        break;
+    }
+  }
+
+  function recordLiveBranchText(runId: string, text: string): void {
+    const next = { ...liveBranchText, [runId]: text };
+    const runIds = Object.keys(next);
+    while (runIds.length > 32) delete next[runIds.shift() as string];
+    liveBranchText = next;
+  }
+
+  function recordLiveBranchState(
+    runId: string,
+    branchId: string,
+    patch: Omit<BranchEventOverlay, 'branchId'>
+  ): void {
+    const next = {
+      ...liveBranchState,
+      [runId]: {
+        ...liveBranchState[runId],
+        ...patch,
+        branchId
+      }
+    };
+    const runIds = Object.keys(next);
+    while (runIds.length > 32) delete next[runIds.shift() as string];
+    liveBranchState = next;
+  }
+
+  function applyLiveBranchState(branch: BranchCard, persisted: boolean): BranchCard {
+    const overlay = liveBranchState[branch.run_id];
+    if (!overlay || overlay.branchId !== branch.branch_id) return branch;
+    const storedIsTerminal = branch.status !== 'queued' && branch.status !== 'generating';
+    if (persisted && storedIsTerminal) return branch;
+    return {
+      ...branch,
+      candidate_id: overlay.candidateId ?? branch.candidate_id,
+      status: overlay.status ?? branch.status,
+      error: overlay.error ?? branch.error,
+      text: liveBranchText[branch.run_id] ?? branch.text
+    };
+  }
+
+  function updateBranchFromEvent(
+    runId: string,
+    branchId: string,
+    update: (branch: BranchCard) => BranchCard
+  ): void {
+    let matched = false;
+    const next = branches.map((branch) => {
+      if (branch.run_id !== runId || branch.branch_id !== branchId) return branch;
+      matched = true;
+      return update(branch);
+    });
+    if (matched) branches = next;
+  }
+
+  function validateBranchSnapshots(snapshots: BranchSummary[]): void {
+    for (const branch of snapshots) {
+      if (
+        !Number.isSafeInteger(branch.target_start_byte) ||
+        !Number.isSafeInteger(branch.target_end_byte) ||
+        branch.target_start_byte < 0 ||
+        branch.target_end_byte < branch.target_start_byte
+      ) {
+        throw new Error('The desktop returned a branch target outside JavaScript\'s safe integer range.');
+      }
+      if (
+        branch.output_byte_len !== null &&
+        (!Number.isSafeInteger(branch.output_byte_len) || branch.output_byte_len < 0)
+      ) {
+        throw new Error('The desktop returned a branch body length outside JavaScript\'s safe integer range.');
+      }
+      if ((branch.output_blob_id === null) !== (branch.output_byte_len === null)) {
+        throw new Error('The desktop returned incomplete branch body metadata.');
+      }
+    }
+  }
+
+  function validateBranchCursor(cursor: BranchPageCursor | null): void {
+    if (!cursor) return;
+    if (!/^[1-9][0-9]*$/.test(cursor.sequence) || !cursor.run_id) {
+      throw new Error('The desktop returned an invalid branch page cursor.');
+    }
+  }
+
+  function branchScopeMatches(
+    projectId: string,
+    sessionId: string,
+    documentId: string,
+    expectedViewEpoch: number,
+    refreshSerial: number
+  ): boolean {
+    return expectedViewEpoch === branchPollEpoch &&
+      refreshSerial === branchRefreshSerial &&
+      project?.project_id === projectId &&
+      project.session_id === sessionId &&
+      document?.summary.document_id === documentId;
+  }
+
+  function cardsFromSummaries(summaries: BranchSummary[]): BranchCard[] {
+    const existingByRun = new Map(branches.map((branch) => [branch.run_id, branch]));
+    return summaries.map((summary) => {
+      const existing = existingByRun.get(summary.run_id);
+      const bodyIsCached = branchBodyDisposition(
+        summary,
+        branchBodyBlobByRun[summary.run_id],
+        branchShelfBodyMaxBytes
+      ) === 'cached';
+      const text = bodyIsCached
+        ? existing?.text ?? ''
+        : liveBranchText[summary.run_id] ?? '';
+      return applyLiveBranchState({ ...summary, text }, true);
+    });
+  }
+
+  async function hydrateBranchBodies(
+    projectId: string,
+    sessionId: string,
+    documentId: string,
+    cards: BranchCard[],
+    expectedViewEpoch: number,
+    refreshSerial: number
+  ): Promise<BranchCard[]> {
+    const hydrated = [...cards];
+    const bodyBlobByRun = { ...branchBodyBlobByRun };
+    const bodyErrorByRun = { ...branchBodyErrorByRun };
+    for (let index = 0; index < hydrated.length; index += 1) {
+      const branch = hydrated[index];
+      const outputBlobId = branch.output_blob_id;
+      const disposition = branchBodyDisposition(
+        branch,
+        bodyBlobByRun[branch.run_id],
+        branchShelfBodyMaxBytes
+      );
+      if (disposition === 'absent' || disposition === 'cached') continue;
+      if (!outputBlobId) throw new Error('The desktop omitted the branch body identity.');
+      if (branch.output_byte_len === null) {
+        throw new Error('The desktop omitted the indexed branch body length.');
+      }
+      if (disposition === 'too_large') {
+        hydrated[index] = { ...branch, text: '' };
+        bodyBlobByRun[branch.run_id] = outputBlobId;
+        bodyErrorByRun[branch.run_id] = `Candidate text is ${branch.output_byte_len.toLocaleString()} bytes; the shelf preview limit is ${branchShelfBodyMaxBytes.toLocaleString()} bytes.`;
+        continue;
+      }
+      const body = await getBranchBody(
+        projectId,
+        sessionId,
+        documentId,
+        branch.run_id,
+        branchShelfBodyMaxBytes
+      );
+      if (!branchScopeMatches(
+        projectId,
+        sessionId,
+        documentId,
+        expectedViewEpoch,
+        refreshSerial
+      )) return hydrated;
+      if (
+        !body ||
+        body.run_id !== branch.run_id ||
+        body.output_blob_id !== outputBlobId ||
+        body.byte_len !== branch.output_byte_len ||
+        new TextEncoder().encode(body.text).byteLength !== body.byte_len
+      ) {
+        throw new Error('The desktop returned a branch body that does not match its immutable metadata.');
+      }
+      hydrated[index] = { ...branch, text: body.text };
+      bodyBlobByRun[branch.run_id] = outputBlobId;
+      delete bodyErrorByRun[branch.run_id];
+    }
+    if (branchScopeMatches(
+      projectId,
+      sessionId,
+      documentId,
+      expectedViewEpoch,
+      refreshSerial
+    )) {
+      branchBodyBlobByRun = bodyBlobByRun;
+      branchBodyErrorByRun = bodyErrorByRun;
+    }
+    return hydrated;
+  }
+
+  function reconcileBranchActionState(): void {
+    const activeRunIds = new Set(
+      branches.filter(isBranchActive).map((branch) => branch.run_id)
+    );
+    cancellingRunIds = cancellingRunIds.filter((runId) => activeRunIds.has(runId));
+    const nextCancellationCommands = { ...cancellationCommandByRun };
+    for (const runId of Object.keys(nextCancellationCommands)) {
+      if (!activeRunIds.has(runId)) delete nextCancellationCommands[runId];
+    }
+    cancellationCommandByRun = nextCancellationCommands;
+    const selectableCandidateIds = new Set(
+      branches
+        .filter((branch) => branch.candidate_id && branch.selection === null)
+        .map((branch) => branch.candidate_id as string)
+    );
+    const nextKeepCommands = { ...keepCommandByCandidate };
+    for (const candidateId of Object.keys(nextKeepCommands)) {
+      if (!selectableCandidateIds.has(candidateId)) delete nextKeepCommands[candidateId];
+    }
+    keepCommandByCandidate = nextKeepCommands;
+    if (
+      promotionArmedCandidateId &&
+      !branches.some((branch) => branch.candidate_id === promotionArmedCandidateId)
+    ) {
+      promotionArmedCandidateId = null;
+    }
+  }
+
+  async function refreshBranchesFor(
+    projectId: string,
+    sessionId: string,
+    documentId: string,
+    reportFailure = true,
+    expectedViewEpoch = branchPollEpoch
+  ): Promise<boolean> {
+    const refreshSerial = ++branchRefreshSerial;
+    try {
+      const page = await getBranchPage(
+        projectId,
+        sessionId,
+        documentId,
+        null,
+        branchPageSize
+      );
+      if (!branchScopeMatches(
+        projectId,
+        sessionId,
+        documentId,
+        expectedViewEpoch,
+        refreshSerial
+      )) return false;
+      validateBranchSnapshots(page.branches);
+      validateBranchCursor(page.next_cursor);
+      if (page.has_more !== (page.next_cursor !== null)) {
+        throw new Error('The desktop returned inconsistent branch page metadata.');
+      }
+      const firstPageCards = cardsFromSummaries(page.branches);
+      branches = mergeNewestPage(firstPageCards, branches);
+      const firstPageCursorChanged =
+        page.next_cursor?.sequence !== branchFirstPageCursor?.sequence ||
+        page.next_cursor?.run_id !== branchFirstPageCursor?.run_id;
+      if (!branchLoadedPastFirstPage || firstPageCursorChanged) {
+        branchNextCursor = page.next_cursor;
+        branchHasMore = page.has_more;
+        branchLoadedPastFirstPage = false;
+      }
+      branchFirstPageCursor = page.next_cursor;
+      const hydrated = await hydrateBranchBodies(
+        projectId,
+        sessionId,
+        documentId,
+        firstPageCards,
+        expectedViewEpoch,
+        refreshSerial
+      );
+      if (!branchScopeMatches(
+        projectId,
+        sessionId,
+        documentId,
+        expectedViewEpoch,
+        refreshSerial
+      )) return false;
+      const hydratedByRun = new Map(hydrated.map((branch) => [branch.run_id, branch]));
+      branches = branches.map((branch) => hydratedByRun.get(branch.run_id) ?? branch);
+      reconcileBranchActionState();
+      if (branches.some(isBranchActive)) scheduleActiveBranchPoll();
+      return true;
+    } catch (error) {
+      if (
+        reportFailure &&
+        project?.project_id === projectId &&
+        project.session_id === sessionId &&
+        document?.summary.document_id === documentId
+      ) {
+        recordFailure(error);
+        announce('Stored strands could not be refreshed');
+      }
+      return false;
+    }
+  }
+
+  function refreshCurrentBranches(reportFailure = true): Promise<boolean> {
+    if (!project || !document) {
+      branches = [];
+      return Promise.resolve(false);
+    }
+    return refreshBranchesFor(
+      project.project_id,
+      project.session_id,
+      document.summary.document_id,
+      reportFailure
+    );
+  }
+
+  async function loadMoreBranches(): Promise<void> {
+    if (!project || !document || !branchNextCursor || !branchHasMore || branchLoadingMore) return;
+    const scope = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id,
+      viewEpoch: branchPollEpoch,
+      cursor: branchNextCursor
+    };
+    const refreshSerial = ++branchRefreshSerial;
+    branchLoadingMore = true;
+    try {
+      const page = await getBranchPage(
+        scope.projectId,
+        scope.sessionId,
+        scope.documentId,
+        scope.cursor,
+        branchPageSize
+      );
+      if (!branchScopeMatches(
+        scope.projectId,
+        scope.sessionId,
+        scope.documentId,
+        scope.viewEpoch,
+        refreshSerial
+      )) return;
+      validateBranchSnapshots(page.branches);
+      validateBranchCursor(page.next_cursor);
+      if (page.has_more !== (page.next_cursor !== null)) {
+        throw new Error('The desktop returned inconsistent branch page metadata.');
+      }
+      const cards = cardsFromSummaries(page.branches);
+      branches = appendUniquePage(branches, cards);
+      branchNextCursor = page.next_cursor;
+      branchHasMore = page.has_more;
+      branchLoadedPastFirstPage = true;
+      const hydrated = await hydrateBranchBodies(
+        scope.projectId,
+        scope.sessionId,
+        scope.documentId,
+        cards,
+        scope.viewEpoch,
+        refreshSerial
+      );
+      if (!branchScopeMatches(
+        scope.projectId,
+        scope.sessionId,
+        scope.documentId,
+        scope.viewEpoch,
+        refreshSerial
+      )) return;
+      const hydratedByRun = new Map(hydrated.map((branch) => [branch.run_id, branch]));
+      branches = branches.map((branch) => hydratedByRun.get(branch.run_id) ?? branch);
+      reconcileBranchActionState();
+    } catch (error) {
+      if (
+        project?.project_id === scope.projectId &&
+        project.session_id === scope.sessionId &&
+        document?.summary.document_id === scope.documentId
+      ) {
+        recordFailure(error);
+        announce('Older strands could not be loaded');
+      }
+    } finally {
+      branchLoadingMore = false;
+    }
+  }
+
+  function scheduleBranchRefresh(): void {
+    if (branchRefreshTimer !== undefined) window.clearTimeout(branchRefreshTimer);
+    branchRefreshTimer = window.setTimeout(() => {
+      branchRefreshTimer = undefined;
+      void refreshCurrentBranches(false);
+    }, 120);
+  }
+
+  function scheduleActiveBranchPoll(): void {
+    if (
+      branchPollTimer !== undefined ||
+      branchPollInFlight ||
+      !project ||
+      !document ||
+      !branches.some(isBranchActive)
+    ) return;
+    const pollEpoch = branchPollEpoch;
+    const scope = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id
+    };
+    const delay = Math.min(
+      branchPollBaseMs * (2 ** Math.min(branchPollAttempt, 3)),
+      branchPollMaxMs
+    );
+    branchPollTimer = window.setTimeout(() => {
+      branchPollTimer = undefined;
+      void pollActiveBranches(scope, pollEpoch);
+    }, delay);
+  }
+
+  async function pollActiveBranches(
+    scope: { projectId: string; sessionId: string; documentId: string },
+    pollEpoch: number
+  ): Promise<void> {
+    if (
+      branchPollInFlight ||
+      pollEpoch !== branchPollEpoch ||
+      project?.project_id !== scope.projectId ||
+      project.session_id !== scope.sessionId ||
+      document?.summary.document_id !== scope.documentId
+    ) return;
+    branchPollInFlight = true;
+    const refreshed = await refreshBranchesFor(
+      scope.projectId,
+      scope.sessionId,
+      scope.documentId,
+      false,
+      pollEpoch
+    );
+    if (pollEpoch !== branchPollEpoch) return;
+    branchPollInFlight = false;
+    if (
+      project?.project_id !== scope.projectId ||
+      project.session_id !== scope.sessionId ||
+      document?.summary.document_id !== scope.documentId
+    ) return;
+    if (!refreshed || branches.some(isBranchActive)) {
+      branchPollAttempt += 1;
+      scheduleActiveBranchPoll();
+      return;
+    }
+
+    // One final authoritative read closes the local transition even when the
+    // terminal Tauri emit was lost after the store committed it.
+    branchPollAttempt = 0;
+    branchPollTimer = window.setTimeout(() => {
+      branchPollTimer = undefined;
+      if (
+        pollEpoch === branchPollEpoch &&
+        project?.project_id === scope.projectId &&
+        project.session_id === scope.sessionId &&
+        document?.summary.document_id === scope.documentId
+      ) void refreshBranchesFor(
+        scope.projectId,
+        scope.sessionId,
+        scope.documentId,
+        false,
+        pollEpoch
+      );
+    }, 150);
+  }
+
   async function closeWindowGracefully(): Promise<void> {
     if (compositionActive) {
       recordLocalFailure('composition_active', 'Finish the active text composition before closing Loom.');
@@ -428,9 +1552,256 @@
   async function refreshModels(): Promise<void> {
     try {
       models = await listModels();
+      const loaded = models.find((model) => model.loaded);
+      const rememberedPath = loadLastLocalModelPath();
+      if (loaded) {
+        selectedModelPath = loaded.model_path;
+      } else if (rememberedPath && models.some((model) =>
+        model.model_path === rememberedPath && model.header_verified
+      )) {
+        selectedModelPath = rememberedPath;
+      } else if (!models.some((model) => model.model_path === selectedModelPath)) {
+        selectedModelPath = models.find((model) => model.header_verified)?.model_path ?? '';
+      }
     } catch {
       models = [];
+      selectedModelPath = '';
     }
+  }
+
+  function closeProjectMenu(): void {
+    if (projectMenu) projectMenu.open = false;
+  }
+
+  function openModelManager(trigger: HTMLElement): void {
+    closeProjectMenu();
+    modelManagerReturnFocus = trigger;
+    modelManagerOpen = true;
+    modelDownloadError = '';
+    void recoverModelDownloads();
+    void refreshModels();
+    void tick().then(() => modelManagerPanel?.focus());
+  }
+
+  function closeModelManager(): void {
+    modelManagerOpen = false;
+    const trigger = modelManagerReturnFocus;
+    modelManagerReturnFocus = null;
+    void tick().then(() => trigger?.focus());
+  }
+
+  function suggestionPreferenceKey(projectId: string): string {
+    return `loom:suggestions:${projectId}`;
+  }
+
+  const lastLocalModelKey = 'loom:last-local-model';
+
+  function loadLastLocalModelPath(): string | null {
+    try {
+      return window.localStorage.getItem(lastLocalModelKey);
+    } catch {
+      return null;
+    }
+  }
+
+  function rememberLastLocalModelPath(modelPath: string): void {
+    try {
+      window.localStorage.setItem(lastLocalModelKey, modelPath);
+    } catch {
+      // Discovery remains available when browser persistence is unavailable.
+    }
+  }
+
+  function loadSuggestionPreference(projectId: string): boolean {
+    try {
+      return window.localStorage.getItem(suggestionPreferenceKey(projectId)) === 'on';
+    } catch {
+      return false;
+    }
+  }
+
+  function cancelSuggestionTimer(): void {
+    if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
+    suggestionsIdleTimer = undefined;
+    suggestionTargetEditVersion = null;
+    suggestionIntentEpoch += 1;
+  }
+
+  async function setSuggestionsEnabled(enabled: boolean, persist = true): Promise<void> {
+    if (!project || suggestionsChanging) return;
+    const boundProject = project;
+    suggestionsChanging = true;
+    suggestionIntentEpoch += 1;
+    if (!enabled) cancelSuggestionTimer();
+    try {
+      await setSuggestionsPolicy(boundProject.project_id, boundProject.session_id, enabled);
+      if (
+        project?.project_id !== boundProject.project_id ||
+        project.session_id !== boundProject.session_id
+      ) return;
+      suggestionsEnabled = enabled;
+      if (persist) {
+        try {
+          window.localStorage.setItem(suggestionPreferenceKey(project.project_id), enabled ? 'on' : 'off');
+        } catch {
+          // The backend gate remains authoritative if browser persistence is unavailable.
+        }
+      }
+      if (!enabled) {
+        cancelSuggestionTimer();
+        dismissedCandidateIds = currentReadyBranches
+          .map((branch) => branch.candidate_id)
+          .filter((candidateId): candidateId is string => Boolean(candidateId));
+        scheduleActiveBranchPoll();
+      }
+      announce(enabled
+        ? currentModel
+          ? 'Suggestions on; Loom will quietly prepare private strands when typing pauses'
+          : 'Suggestions on; choose a local completion model before Loom can prepare strands'
+        : 'Suggestions off');
+      if (enabled && currentModel && document) {
+        scheduleAutomaticSuggestions(editVersion);
+      }
+    } catch (error) {
+      suggestionsEnabled = false;
+      cancelSuggestionTimer();
+      if (!enabled && activeBranchCount > 0) void cancelActiveBranches();
+      recordFailure(error);
+      announce('Suggestions remain off because the project gate could not be changed');
+    } finally {
+      suggestionsChanging = false;
+    }
+  }
+
+  function trapModelManagerFocus(event: KeyboardEvent): void {
+    if (event.key !== 'Tab' || !modelManagerPanel) return;
+    const focusable = Array.from(modelManagerPanel.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
+    )).filter((element) => !element.hasAttribute('hidden'));
+    if (focusable.length === 0) {
+      event.preventDefault();
+      modelManagerPanel.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (!first || !last) return;
+    if (event.shiftKey && (window.document.activeElement === first || !modelManagerPanel.contains(window.document.activeElement))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && window.document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  async function loadSelectedModel(): Promise<void> {
+    if (!selectedModelPath || modelLoading) return;
+    modelLoading = true;
+    clearFailure();
+    announce('Verifying the selected local model');
+    try {
+      const loaded = await loadModel(selectedModelPath);
+      models = [
+        loaded,
+        ...models
+          .filter((model) => model.model_path !== loaded.model_path)
+          .map((model) => ({ ...model, loaded: false }))
+      ];
+      selectedModelPath = loaded.model_path;
+      rememberLastLocalModelPath(loaded.model_path);
+      announce(`${loaded.display_name} is verified for exact local completion`);
+      if (suggestionsEnabled && loaded.completion && document) {
+        await tick();
+        scheduleAutomaticSuggestions(editVersion);
+      }
+    } catch (error) {
+      recordFailure(error);
+      announce('The local model could not be verified');
+      await refreshModels();
+    } finally {
+      modelLoading = false;
+    }
+  }
+
+  async function chooseExistingModel(): Promise<void> {
+    if (modelChoosing || modelLoading || modelUnloading) return;
+    modelChoosing = true;
+    clearFailure();
+    announce('Choose a local GGUF model');
+    try {
+      const selected = await chooseModel();
+      if (!selected) {
+        announce('Model choice cancelled');
+        return;
+      }
+      models = [selected, ...models.filter((model) => model.model_path !== selected.model_path)];
+      selectedModelPath = selected.model_path;
+      announce(`${selected.display_name} added; load it to inspect exact capabilities`);
+    } catch (error) {
+      recordFailure(error);
+      announce('The selected model could not be added safely');
+    } finally {
+      modelChoosing = false;
+    }
+  }
+
+  async function unloadCurrentModel(): Promise<void> {
+    if (!models.some((model) => model.loaded) || modelUnloading) return;
+    modelUnloading = true;
+    clearFailure();
+    announce('Releasing the local writer model');
+    try {
+      const outcome = await unloadModel();
+      await refreshModels();
+      announce(outcome.model_id
+        ? 'Local writer model released; editing remains fully available'
+        : 'No local writer model was resident');
+    } catch (error) {
+      recordFailure(error);
+      announce('The local writer model could not be released safely');
+      await refreshModels();
+    } finally {
+      modelUnloading = false;
+    }
+  }
+
+  function modelDownloadPhaseLabel(phase: ModelDownloadPhase | null): string {
+    switch (phase) {
+      case 'inspecting_existing': return 'Checking local files';
+      case 'hashing_partial': return 'Verifying resumable data';
+      case 'downloading': return 'Downloading';
+      case 'verifying': return 'Verifying SHA-256 and GGUF';
+      case 'installing': return 'Installing privately';
+      case 'complete': return 'Verified';
+      case null: return 'Queued';
+    }
+  }
+
+  function modelDownloadStatusLabel(download: ModelDownloadSnapshot): string {
+    switch (download.status.status) {
+      case 'queued': return 'Queued';
+      case 'running': return modelDownloadPhaseLabel(download.phase);
+      case 'completed': return download.status.disposition === 'reused_existing'
+        ? 'Existing file verified'
+        : 'Download verified';
+      case 'cancelled': return 'Cancelled';
+      case 'failed': return download.status.retryable ? 'Interrupted · retryable' : 'Failed';
+    }
+  }
+
+  function modelCapabilityMode(model: ModelCapabilitySummary): string {
+    if (!model.loaded) return 'Capabilities inspected when loaded';
+    if (model.completion && model.chat) return 'Raw completion and chat';
+    if (model.completion) return 'Raw completion';
+    if (model.chat) return 'Chat only';
+    return 'No supported text prompt mode';
+  }
+
+  function modelMediaLabel(model: ModelCapabilitySummary): string {
+    if (!model.loaded) return 'Media not inspected';
+    if (model.media_kinds.length === 0) return 'Text only';
+    return model.media_kinds.join(' + ');
   }
 
   async function reattachNativeProject(): Promise<boolean> {
@@ -445,19 +1816,31 @@
     }
   }
 
-  async function doCreateProject(): Promise<void> {
-    if (!projectTitle.trim()) return;
-    creating = true;
-    clearFailure();
+  async function openInitialProject(): Promise<void> {
+    if (await reattachNativeProject()) return;
     try {
-      project = await chooseAndCreateProject(projectTitle.trim());
+      project = await openDefaultProject();
       await finishOpeningProject();
-      announce(`Created ${project.title}`);
+      announce('Ready to write');
     } catch (error) {
-      if (!(await reattachNativeProject())) recordFailure(error);
-    } finally {
-      creating = false;
+      recordFailure(error);
     }
+  }
+
+  async function restoreDesktopWorkspace(): Promise<void> {
+    await refreshModels();
+    await tick();
+    await openInitialProject();
+  }
+
+  async function loadRememberedSuggestionModel(): Promise<void> {
+    if (currentModel) return;
+    const rememberedPath = loadLastLocalModelPath();
+    if (!rememberedPath || !models.some((model) =>
+      model.model_path === rememberedPath && model.header_verified
+    )) return;
+    selectedModelPath = rememberedPath;
+    await loadSelectedModel();
   }
 
   async function doOpenProject(): Promise<void> {
@@ -479,6 +1862,11 @@
       transition = 'idle';
       return;
     }
+    cancelSuggestionTimer();
+    const storedSuggestionsPreference = loadSuggestionPreference(project.project_id);
+    suggestionsEnabled = false;
+    await setSuggestionsEnabled(storedSuggestionsPreference, false);
+    dismissedCandidateIds = [];
     if (project.pending_recovery > 0) {
       const report = await recoverProject(project.project_id, project.session_id);
       if (report.conflicts.length > 0) {
@@ -492,8 +1880,13 @@
       project = { ...project, pending_recovery: 0 };
     }
     const first = project.documents[0];
-    if (first) await selectDocument(first);
-    else {
+    if (first) {
+      await selectDocument(first);
+      await tick();
+      if (suggestionsEnabled && currentModel && document) {
+        scheduleAutomaticSuggestions(editVersion);
+      }
+    } else {
       documentEpoch += 1;
       document = null;
       documentText = '';
@@ -505,9 +1898,15 @@
       draftSavedEditVersion = 0;
       staleDraft = null;
       uncertainDraft = null;
+      branches = [];
+      promotionArmedCandidateId = null;
+      resetLiveGenerationView();
       clearReconciliationState();
       saveState = 'clean';
       saveMessage = 'Project is ready';
+    }
+    if (storedSuggestionsPreference && suggestionsEnabled && !currentModel) {
+      void loadRememberedSuggestionModel();
     }
   }
 
@@ -518,6 +1917,8 @@
       return;
     }
     if (!flushEditors()) return;
+    cancelSuggestionTimer();
+    dismissedCandidateIds = [];
     transition = 'navigation';
     announce('Opening document; editing is briefly locked');
     const requestSerial = ++navigationSerial;
@@ -533,6 +1934,13 @@
       transition = 'idle';
       return;
     }
+    if (branchRefreshTimer !== undefined) {
+      window.clearTimeout(branchRefreshTimer);
+      branchRefreshTimer = undefined;
+    }
+    branches = [];
+    promotionArmedCandidateId = null;
+    resetLiveGenerationView();
     const source = {
       epoch: documentEpoch,
       version: editVersion,
@@ -619,7 +2027,7 @@
         );
       } else if (draftIsCurrent) {
         saveState = 'dirty';
-        saveMessage = 'Recovered a crash-safe local draft · checkpoint pending';
+        saveMessage = 'Recovered an unsaved local draft';
         scheduleSave();
         announce(`Recovered a local draft for ${summary.title}`);
       } else {
@@ -628,8 +2036,22 @@
         announce(`Opened ${summary.title}`);
       }
       if (summary.kind !== 'prose' || !canRoundTripMarkdownExactly(effectiveText)) mode = 'source';
+      await refreshBranchesFor(
+        project.project_id,
+        project.session_id,
+        opened.summary.document_id,
+        false
+      );
     } catch (error) {
       recordFailure(error);
+      if (
+        project &&
+        document &&
+        documentEpoch === source.epoch &&
+        document.summary.document_id === source.documentId
+      ) {
+        await refreshCurrentBranches(false);
+      }
     } finally {
       if (requestSerial === navigationSerial) transition = 'idle';
     }
@@ -640,10 +2062,16 @@
     if (text === documentText) return;
     documentText = text;
     editVersion += 1;
+    suggestionIntentEpoch += 1;
+    uncertainWeave = null;
     saveState = 'dirty';
     saveMessage = saveInFlight ? 'Saving earlier changes…' : 'Unsaved changes';
+    promotionArmedCandidateId = null;
+    dismissedCandidateIds = [];
+    if (activeBranchCount > 0) void cancelActiveBranches();
     scheduleDraftJournal();
     scheduleSave();
+    scheduleAutomaticSuggestions(editVersion);
   }
 
   function setSourceDocument(text: string, kind: DocumentKind): void {
@@ -652,6 +2080,9 @@
       sourceProjectionTimer = undefined;
     }
     sourceDirty = false;
+    sourceSelectionStart = 0;
+    sourceSelectionEnd = 0;
+    visualSelectionAtEnd = false;
     if (kind === 'verse') {
       const decoded = decodeVerseForEditor(text);
       verseCodec = decoded.codec;
@@ -676,6 +2107,7 @@
   function finishSourceComposition(event: CompositionEvent & { currentTarget: HTMLTextAreaElement }): void {
     sourceComposing = false;
     compositionActive = false;
+    updateSourceSelection(event.currentTarget);
     updateFromSource(event.currentTarget.value);
     scheduleSourceProjection(0);
     announce('Text composition committed');
@@ -686,6 +2118,15 @@
     sourceDisplayText = display;
     sourceDirty = true;
     if (!sourceComposing) scheduleSourceProjection();
+  }
+
+  function updateSourceSelection(textarea: HTMLTextAreaElement): void {
+    sourceSelectionStart = textarea.selectionStart;
+    sourceSelectionEnd = textarea.selectionEnd;
+  }
+
+  function updateVisualSelection(atDocumentEnd: boolean): void {
+    visualSelectionAtEnd = atDocumentEnd;
   }
 
   function scheduleSourceProjection(delay = 240): void {
@@ -718,6 +2159,62 @@
     if (!desktop || !document) return;
     if (saveTimer !== undefined) window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => void saveNow(), saveDelayMs);
+  }
+
+  function scheduleAutomaticSuggestions(
+    targetEditVersion: number,
+    delay = suggestionsIdleDelayMs
+  ): void {
+    if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
+    suggestionsIdleTimer = undefined;
+    suggestionTargetEditVersion = null;
+    if (
+      !desktop ||
+      !suggestionsEnabled ||
+      !currentModel ||
+      !project ||
+      !document ||
+      focusMode ||
+      document.summary.kind === 'hybrid'
+    ) return;
+    suggestionTargetEditVersion = targetEditVersion;
+    suggestionsIdleTimer = window.setTimeout(() => {
+      suggestionsIdleTimer = undefined;
+      void tryStartAutomaticSuggestions(targetEditVersion);
+    }, delay);
+  }
+
+  async function tryStartAutomaticSuggestions(targetEditVersion: number): Promise<void> {
+    if (
+      suggestionTargetEditVersion !== targetEditVersion ||
+      targetEditVersion !== editVersion ||
+      !suggestionsEnabled ||
+      !currentModel ||
+      !project ||
+      !document ||
+      focusMode ||
+      compositionActive ||
+      transition !== 'idle'
+    ) {
+      suggestionTargetEditVersion = null;
+      return;
+    }
+    if (activeBranchCount > 0 || weaveStarting) {
+      scheduleAutomaticSuggestions(targetEditVersion, 450);
+      return;
+    }
+    if (!canStartAutomaticSuggestions) {
+      if (
+        sourceDirty ||
+        saveInFlight ||
+        saveState === 'dirty' ||
+        saveState === 'saving'
+      ) scheduleAutomaticSuggestions(targetEditVersion, 350);
+      else suggestionTargetEditVersion = null;
+      return;
+    }
+    suggestionTargetEditVersion = null;
+    await startAutomaticWeave();
   }
 
   function scheduleDraftJournal(delay = draftIntervalMs): void {
@@ -805,7 +2302,7 @@
           saveState = 'dirty';
         }
         if (saveState === 'dirty') {
-          saveMessage = 'Draft protected locally · checkpoint pending';
+          saveMessage = 'Draft protected locally';
           scheduleSave();
         }
         return true;
@@ -940,7 +2437,7 @@
       if (projectionDecision === 'retry') {
         uncertainSave = captured;
         saveState = 'uncertain';
-        saveMessage = 'Checkpoint committed · visible file projection needs retry';
+        saveMessage = 'Save recorded · visible file needs retry';
         const projectionError = receipt.visible_projection?.status === 'pending_retry'
           ? receipt.visible_projection.error
           : 'The visible file could not be replaced.';
@@ -950,14 +2447,14 @@
           retryable: true
         };
         errorMessage = projectionError;
-        announce('The checkpoint is durable, but editing is locked until the same command projects its visible file');
+        announce('The save is durable, but editing is locked until the same command projects its visible file');
         return;
       }
       if (projectionDecision === 'reconcile') {
         const heldAppText = documentText;
         uncertainSave = captured;
         saveState = 'uncertain';
-        saveMessage = 'Checkpoint committed · external file held for review';
+        saveMessage = 'Save recorded · external file held for review';
         try {
           await activateCheckpointProjectionConflict(captured, receipt, heldAppText);
         } catch (projectionError) {
@@ -967,7 +2464,7 @@
           // identity or opening its reconciliation preview was refused.
           uncertainSave = captured;
           saveState = 'uncertain';
-          saveMessage = 'Checkpoint committed · retry external-file review';
+          saveMessage = 'Save recorded · retry external-file review';
         }
         return;
       }
@@ -1066,7 +2563,9 @@
 
   async function toggleFocusMode(): Promise<void> {
     if (!project) return;
-    focusMode = !focusMode;
+    const enabling = !focusMode;
+    if (enabling) cancelSuggestionTimer();
+    focusMode = enabling;
     if (desktop) {
       try {
         await setFocusMode(project.project_id, project.session_id, focusMode);
@@ -1075,21 +2574,107 @@
         recordFailure(error);
       }
     }
+    if (focusMode) {
+      scheduleActiveBranchPoll();
+    } else if (suggestionsEnabled && currentModel && document) {
+      scheduleAutomaticSuggestions(editVersion);
+    }
     announce(focusMode ? 'Focus mode on' : 'Focus mode off');
   }
 
+  function eventComesFromWritingSurface(event: KeyboardEvent): boolean {
+    return event.target instanceof HTMLElement && Boolean(
+      event.target.closest('.loom-prosemirror, .source-pane textarea')
+    );
+  }
+
+  function suggestionMatchesCurrentCaret(
+    branch: BranchCard,
+    visualAtEnd: boolean,
+    sourceStart: number,
+    sourceEnd: number
+  ): boolean {
+    if (mode === 'visual') {
+      const endByte = utf8ByteOffset(documentText, documentText.length);
+      return visualAtEnd &&
+        branch.target_start_byte === endByte &&
+        branch.target_end_byte === endByte;
+    }
+    if (
+      mode !== 'source' ||
+      !sourceTextarea ||
+      sourceStart !== sourceEnd
+    ) return false;
+    try {
+      const cursorByte = captureWeaveCursorByte();
+      return branch.target_start_byte === cursorByte && branch.target_end_byte === cursorByte;
+    } catch {
+      return false;
+    }
+  }
+
+  function dismissInlineSuggestion(): void {
+    const candidateId = inlineSuggestion?.candidate_id;
+    if (!candidateId || dismissedCandidateIds.includes(candidateId)) return;
+    dismissedCandidateIds = [...dismissedCandidateIds, candidateId];
+    announce('Suggestion dismissed; its private strand remains recoverable');
+  }
+
+  async function acceptInlineSuggestion(branch: BranchCard): Promise<void> {
+    if (!branch.candidate_id || !canPromoteBranch(branch)) return;
+    promotionArmedCandidateId = branch.candidate_id;
+    await confirmPromotion(branch);
+  }
+
   function handleGlobalKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Escape' && modelManagerOpen) {
+      event.preventDefault();
+      closeModelManager();
+      return;
+    }
+    if (event.key === 'Escape' && projectMenu?.open) {
+      event.preventDefault();
+      closeProjectMenu();
+      projectMenuTrigger?.focus();
+      return;
+    }
+    if (
+      event.key === 'Escape' &&
+      inlineSuggestion &&
+      inlineSuggestionAtCaret &&
+      !compositionActive &&
+      eventComesFromWritingSurface(event)
+    ) {
+      event.preventDefault();
+      dismissInlineSuggestion();
+      return;
+    }
+    if (
+      event.key === 'Tab' &&
+      !event.shiftKey &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      inlineSuggestion &&
+      inlineSuggestionAtCaret &&
+      eventComesFromWritingSurface(event) &&
+      canPromoteBranch(inlineSuggestion)
+    ) {
+      event.preventDefault();
+      void acceptInlineSuggestion(inlineSuggestion);
+      return;
+    }
     const modifier = event.metaKey || event.ctrlKey;
     if (modifier && event.key.toLocaleLowerCase() === 's') {
       event.preventDefault();
       if (reconciliation) {
         announce(pendingReconciliationApply
           ? 'Retry the exact reconciliation command with the review button'
-          : 'Review and checkpoint the external-file resolution');
+          : 'Review and save the external-file resolution');
         return;
       }
       if (compositionActive) {
-        announce('Finish composing text before checkpointing');
+        announce('Finish composing text before saving');
         return;
       }
       flushEditors();
@@ -1101,14 +2686,645 @@
     }
   }
 
-  async function checkpointNow(): Promise<void> {
-    if (compositionActive) {
-      announce('Finish composing text before checkpointing');
+  function handleGlobalPointerdown(event: PointerEvent): void {
+    if (
+      projectMenu?.open &&
+      event.target instanceof Node &&
+      !projectMenu.contains(event.target)
+    ) closeProjectMenu();
+  }
+
+  function captureWeaveCursorByte(): number {
+    if (!document) throw new Error('Open a manuscript before weaving.');
+    if (mode !== 'source') {
+      // ProseMirror positions address its document tree, not the canonical
+      // Markdown bytes. EOF is the only honest visual-mode mapping in v1.
+      return utf8ByteOffset(documentText, documentText.length);
+    }
+    if (!sourceTextarea) throw new Error('The source editor is not available.');
+    const selectionStart = sourceTextarea.selectionStart;
+    const displayPrefix = sourceTextarea.value.slice(0, selectionStart);
+    if (document.summary.kind === 'verse' && (!verseCodec || !verseCodec.editable)) {
+      throw new Error('This poem does not expose a lossless source-caret boundary.');
+    }
+    const manuscriptPrefix = document.summary.kind === 'verse' && verseCodec
+      ? encodeVerseFromEditor(displayPrefix, verseCodec)
+      : displayPrefix;
+    if (!documentText.startsWith(manuscriptPrefix)) {
+      throw new Error('The source caret no longer matches the saved manuscript bytes.');
+    }
+    return utf8ByteOffset(manuscriptPrefix, manuscriptPrefix.length);
+  }
+
+  function installWeaveSnapshot(started: WeaveStarted, captured: WeaveCapture): boolean {
+    if (
+      started.command_id !== captured.commandId ||
+      started.request_id !== `weave-${captured.commandId}` ||
+      started.project_id !== captured.projectId ||
+      started.session_id !== captured.sessionId ||
+      started.document_id !== captured.documentId ||
+      started.source_revision_id !== captured.sourceRevisionId ||
+      !started.exact_prompt_blob_id ||
+      started.branches.length !== 3
+    ) {
+      throw new Error('The desktop returned a branch family for different source identities.');
+    }
+    validateBranchSnapshots(started.branches);
+    if (started.branches.some((branch) =>
+      branch.source_revision_id !== captured.sourceRevisionId ||
+      branch.target_start_byte !== captured.cursorByte ||
+      branch.target_end_byte !== captured.cursorByte
+    )) {
+      throw new Error('The desktop returned a branch outside the requested manuscript boundary.');
+    }
+    if (!weaveCaptureStillCurrent(captured)) return false;
+    const runIds = new Set(started.branches.map((branch) => branch.run_id));
+    branches = [
+      ...started.branches.map((branch) => applyLiveBranchState(branch, false)),
+      ...branches.filter((branch) => !runIds.has(branch.run_id))
+    ];
+    scheduleActiveBranchPoll();
+    return true;
+  }
+
+  function weaveCaptureStillCurrent(captured: WeaveCapture): boolean {
+    return Boolean(
+      project?.project_id === captured.projectId &&
+      project.session_id === captured.sessionId &&
+      document?.summary.document_id === captured.documentId &&
+      document.summary.revision_id === captured.sourceRevisionId &&
+      document.visible_blob_id === captured.visibleBlobId &&
+      documentEpoch === captured.epoch &&
+      editVersion === captured.editVersion &&
+      suggestionIntentEpoch === captured.intentEpoch &&
+      suggestionsEnabled &&
+      !focusMode
+    );
+  }
+
+  async function cancelDetachedWeave(started: WeaveStarted, captured: WeaveCapture): Promise<void> {
+    if (
+      project?.project_id !== captured.projectId ||
+      project.session_id !== captured.sessionId
+    ) return;
+    await Promise.all(started.branches.filter(isBranchActive).map(async (branch) => {
+      try {
+        await cancelGeneration(
+          captured.projectId,
+          captured.sessionId,
+          newUlid(),
+          branch.run_id
+        );
+      } catch {
+        // The run may already be terminal or the backend gate may have cancelled it.
+      }
+    }));
+    scheduleActiveBranchPoll();
+  }
+
+  function scheduleStaleWeaveCleanup(captured: WeaveCapture, attempt = 0): void {
+    if (attempt >= 8) return;
+    const delay = Math.min(400 * (2 ** attempt), 4_000);
+    const timer = window.setTimeout(async () => {
+      staleWeaveCleanupTimers.delete(timer);
+      if (
+        project?.project_id !== captured.projectId ||
+        project.session_id !== captured.sessionId ||
+        document?.summary.document_id !== captured.documentId
+      ) return;
+      let retry = attempt < 2;
+      try {
+        const status = await getWeaveStatus(
+          captured.projectId,
+          captured.sessionId,
+          captured.commandId
+        );
+        if (status) {
+          await cancelDetachedWeave(status, captured);
+          retry = status.branches.some(isBranchActive);
+        } else {
+          const refreshed = await refreshBranchesFor(
+            captured.projectId,
+            captured.sessionId,
+            captured.documentId,
+            false
+          );
+          if (refreshed) {
+            const staleActive = branches.filter((branch) =>
+              isBranchActive(branch) && branch.source_revision_id === captured.sourceRevisionId
+            );
+            await Promise.all(staleActive.map(async (branch) => {
+              try {
+                await cancelGeneration(
+                  captured.projectId,
+                  captured.sessionId,
+                  newUlid(),
+                  branch.run_id
+                );
+              } catch {
+                // Retry through the authoritative status/page path below.
+              }
+            }));
+            retry ||= staleActive.length > 0;
+          } else {
+            retry = true;
+          }
+        }
+      } catch {
+        retry = true;
+      }
+      if (retry) scheduleStaleWeaveCleanup(captured, attempt + 1);
+    }, delay);
+    staleWeaveCleanupTimers.add(timer);
+  }
+
+  async function startAutomaticWeave(): Promise<void> {
+    if (weaveStarting || !project || !document) return;
+    const startingEditVersion = editVersion;
+    if (compositionActive || !flushEditors() || editVersion !== startingEditVersion) return;
+    if (!canStartAutomaticSuggestions || uncertainWeave) return;
+
+    let cursorByte: number;
+    try {
+      cursorByte = captureWeaveCursorByte();
+    } catch (error) {
+      recordFailure(error);
       return;
     }
-    if (!flushEditors()) return;
-    await saveNow();
-    if (saveState !== 'error' && saveState !== 'uncertain') announce('Checkpoint saved');
+    if (cursorByte === 0) return;
+    const sourceRevisionId = document.summary.revision_id;
+    if (!sourceRevisionId) return;
+    const captured: WeaveCapture = {
+      commandId: newUlid(),
+      epoch: documentEpoch,
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id,
+      relativePath: document.summary.relative_path,
+      sourceRevisionId,
+      visibleBlobId: document.visible_blob_id,
+      cursorByte,
+      editVersion,
+      intentEpoch: suggestionIntentEpoch
+    };
+    weaveStarting = true;
+    clearFailure();
+    try {
+      const started = await startWeave({
+        projectId: captured.projectId,
+        sessionId: captured.sessionId,
+        commandId: captured.commandId,
+        documentId: captured.documentId,
+        relativePath: captured.relativePath,
+        sourceRevisionId: captured.sourceRevisionId,
+        expectedVisibleBlobId: captured.visibleBlobId,
+        cursorByte: captured.cursorByte,
+        branchCount: 3,
+        maxTokens: 128,
+        temperature: 0.8,
+        automatic: true
+      });
+      if (installWeaveSnapshot(started, captured)) {
+        uncertainWeave = null;
+        announce(started.branches.some(isBranchActive)
+          ? 'Suggestions are growing privately'
+          : 'Stored strands were recovered');
+      } else {
+        await cancelDetachedWeave(started, captured);
+      }
+    } catch (error) {
+      if (
+        project?.project_id === captured.projectId &&
+        project.session_id === captured.sessionId &&
+        document?.summary.document_id === captured.documentId
+      ) {
+        const captureIsCurrent = weaveCaptureStillCurrent(captured);
+        if (captureIsCurrent) {
+          recordFailure(error);
+          uncertainWeave = captured;
+        }
+        try {
+          const status = await getWeaveStatus(
+            captured.projectId,
+            captured.sessionId,
+            captured.commandId
+          );
+          if (status) {
+            if (captureIsCurrent && installWeaveSnapshot(status, captured)) {
+              uncertainWeave = null;
+              clearFailure();
+              announce('The durable Weave result was recovered');
+            } else {
+              await cancelDetachedWeave(status, captured);
+            }
+          } else if (captureIsCurrent) {
+            uncertainWeave = null;
+            announce('No Weave was committed; the request can be started again');
+          }
+        } catch {
+          if (captureIsCurrent) {
+            await refreshBranchesFor(
+              captured.projectId,
+              captured.sessionId,
+              captured.documentId,
+              false
+            );
+            announce('Suggestion result remains uncertain; editing stays available');
+          }
+          scheduleStaleWeaveCleanup(captured);
+        }
+      }
+    } finally {
+      weaveStarting = false;
+    }
+  }
+
+  function isBranchActive(branch: BranchCard): boolean {
+    return branch.status === 'queued' || branch.status === 'generating';
+  }
+
+  async function cancelBranch(branch: BranchCard): Promise<void> {
+    if (!project || !isBranchActive(branch) || cancellingRunIds.includes(branch.run_id)) return;
+    const captured = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      commandId: cancellationCommandByRun[branch.run_id] ?? newUlid(),
+      runId: branch.run_id
+    };
+    cancellationCommandByRun = {
+      ...cancellationCommandByRun,
+      [branch.run_id]: captured.commandId
+    };
+    cancellingRunIds = [...cancellingRunIds, branch.run_id];
+    try {
+      const receipt = await cancelGeneration(
+        captured.projectId,
+        captured.sessionId,
+        captured.commandId,
+        captured.runId
+      );
+      if (
+        receipt.command_id !== captured.commandId ||
+        receipt.project_id !== captured.projectId
+      ) {
+        throw new Error('The desktop returned a cancellation receipt for another command.');
+      }
+      announce('Cancellation requested for one private strand');
+    } catch (error) {
+      if (
+        project?.project_id === captured.projectId &&
+        project.session_id === captured.sessionId
+      ) {
+        recordFailure(error);
+        announce('Cancellation was not confirmed; stored strand state will be checked');
+      }
+    } finally {
+      cancellingRunIds = cancellingRunIds.filter((runId) => runId !== captured.runId);
+      scheduleBranchRefresh();
+    }
+  }
+
+  async function cancelActiveBranches(): Promise<void> {
+    const active = branches.filter(isBranchActive);
+    if (active.length === 0) return;
+    await Promise.all(active.map((branch) => cancelBranch(branch)));
+  }
+
+  async function keepBranch(branch: BranchCard): Promise<void> {
+    if (
+      !project ||
+      !document ||
+      branch.status !== 'ready' ||
+      !branch.candidate_id ||
+      branch.selection !== null ||
+      keepingCandidateIds.includes(branch.candidate_id)
+    ) return;
+    const candidateId = branch.candidate_id;
+    const captured = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id,
+      commandId: keepCommandByCandidate[candidateId] ?? newUlid(),
+      candidateId
+    };
+    keepCommandByCandidate = {
+      ...keepCommandByCandidate,
+      [candidateId]: captured.commandId
+    };
+    keepingCandidateIds = [...keepingCandidateIds, candidateId];
+    try {
+      const receipt = await keepCandidate(
+        captured.projectId,
+        captured.sessionId,
+        captured.commandId,
+        captured.candidateId
+      );
+      if (
+        receipt.command_id !== captured.commandId ||
+        receipt.project_id !== captured.projectId
+      ) {
+        throw new Error('The desktop returned a keep receipt for another command.');
+      }
+      announce('Private strand kept as an alternative');
+    } catch (error) {
+      if (
+        project?.project_id === captured.projectId &&
+        project.session_id === captured.sessionId
+      ) recordFailure(error);
+    } finally {
+      keepingCandidateIds = keepingCandidateIds.filter((id) => id !== candidateId);
+      await refreshBranchesFor(
+        captured.projectId,
+        captured.sessionId,
+        captured.documentId,
+        false
+      );
+    }
+  }
+
+  function canPromoteBranch(branch: BranchCard): boolean {
+    return Boolean(
+      project &&
+      document &&
+      document.summary.kind !== 'hybrid' &&
+      branch.status === 'ready' &&
+      branch.candidate_id &&
+      branch.selection !== 'promote' &&
+      branch.selection !== 'reject' &&
+      branch.source_revision_id === document.summary.revision_id &&
+      document.summary.active_blob_id === document.visible_blob_id &&
+      transition === 'idle' &&
+      editVersion === savedVersion &&
+      (saveState === 'clean' || saveState === 'saved') &&
+      !sourceDirty &&
+      !compositionActive &&
+      !saveInFlight &&
+      !weaveStarting &&
+      !staleDraft &&
+      !uncertainDraft &&
+      !uncertainSave &&
+      !reconciliation &&
+      !promotionInFlight &&
+      !uncertainPromotion
+    );
+  }
+
+  function armPromotion(branch: BranchCard): void {
+    if (!canPromoteBranch(branch) || !branch.candidate_id) return;
+    promotionArmedCandidateId = branch.candidate_id;
+    announce('Confirm promotion to change the active manuscript');
+  }
+
+  function cancelPromotion(): void {
+    promotionArmedCandidateId = null;
+    announce('Promotion cancelled; the manuscript is unchanged');
+  }
+
+  async function confirmPromotion(branch: BranchCard): Promise<void> {
+    if (
+      !project ||
+      !document ||
+      !branch.candidate_id ||
+      promotionArmedCandidateId !== branch.candidate_id ||
+      !flushEditors() ||
+      !canPromoteBranch(branch)
+    ) return;
+    const captured: PromotionCapture = {
+      commandId: newUlid(),
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id,
+      relativePath: document.summary.relative_path,
+      candidateId: branch.candidate_id,
+      runId: branch.run_id,
+      sourceRevisionId: branch.source_revision_id,
+      visibleBlobId: document.visible_blob_id
+    };
+    promotionInFlight = true;
+    uncertainPromotion = captured;
+    promotionArmedCandidateId = null;
+    clearFailure();
+    announce('Promoting the strand through the immutable store');
+    try {
+      const receipt = await promoteCandidate(
+        captured.projectId,
+        captured.sessionId,
+        captured.commandId,
+        captured.candidateId,
+        captured.sourceRevisionId,
+        captured.visibleBlobId
+      );
+      if (
+        receipt.command_id !== captured.commandId ||
+        receipt.project_id !== captured.projectId ||
+        receipt.source_revision_id !== captured.sourceRevisionId ||
+        !receipt.result_revision_id ||
+        !receipt.result_blob_id ||
+        documentProjectionDecision(receipt.visible_projection) !== 'applied'
+      ) {
+        throw new Error('The promotion receipt did not prove an applied manuscript revision.');
+      }
+      const outcome = await reloadPromotionResult(
+        captured,
+        receipt.result_revision_id,
+        receipt.result_blob_id
+      );
+      if (outcome !== 'promoted' && outcome !== 'reconciliation') {
+        throw new Error('The promoted revision was not visible in the project snapshot.');
+      }
+      uncertainPromotion = null;
+      announce(outcome === 'reconciliation'
+        ? 'Promotion is durable; an external file change now needs review'
+        : 'Strand promoted from authoritative manuscript bytes');
+    } catch (error) {
+      recordFailure(error);
+      try {
+        const outcome = await reloadPromotionResult(captured);
+        uncertainPromotion = null;
+        clearFailure();
+        switch (outcome) {
+          case 'promoted':
+            announce('Promotion had committed; Loom reopened the authoritative manuscript');
+            break;
+          case 'source_changed':
+            announce('The manuscript changed independently; Loom reopened it without attributing the change to this strand');
+            break;
+          case 'reconciliation':
+            announce('An external manuscript change needs review before promotion can be attributed');
+            break;
+          case 'unchanged':
+            await refreshCurrentBranches(false);
+            announce('Promotion was refused; the manuscript is unchanged');
+            break;
+        }
+      } catch (refreshError) {
+        recordFailure(refreshError);
+        announce('Promotion result is uncertain; editing remains locked until checked');
+      }
+    } finally {
+      promotionInFlight = false;
+    }
+  }
+
+  async function resolveUncertainPromotion(): Promise<void> {
+    if (!uncertainPromotion || promotionInFlight) return;
+    const captured = uncertainPromotion;
+    promotionInFlight = true;
+    try {
+      const outcome = await reloadPromotionResult(captured);
+      uncertainPromotion = null;
+      clearFailure();
+      if (outcome === 'unchanged') await refreshCurrentBranches(false);
+      switch (outcome) {
+        case 'promoted':
+          announce('Promotion confirmed; authoritative manuscript reopened');
+          break;
+        case 'source_changed':
+          announce('An independent revision was reopened; it was not attributed to this strand');
+          break;
+        case 'reconciliation':
+          announce('External manuscript bytes need review before promotion can be attributed');
+          break;
+        case 'unchanged':
+          announce('Promotion did not commit; editing unlocked');
+          break;
+      }
+    } catch (error) {
+      recordFailure(error);
+      announce('Promotion result is still uncertain; manuscript editing stays locked');
+    } finally {
+      promotionInFlight = false;
+    }
+  }
+
+  async function reloadPromotionResult(
+    captured: PromotionCapture,
+    expectedRevisionId?: string,
+    expectedBlobId?: string
+  ): Promise<PromotionReloadOutcome> {
+    const refreshed = await currentProjectSession();
+    if (
+      refreshed.project_id !== captured.projectId ||
+      refreshed.session_id !== captured.sessionId
+    ) {
+      throw new Error('The refreshed project does not match the promotion session.');
+    }
+    const target = refreshed.documents.find(
+      (candidate) => candidate.document_id === captured.documentId
+    );
+    if (!target || target.relative_path !== captured.relativePath) {
+      throw new Error('The promoted document disappeared from the project outline.');
+    }
+    project = refreshed;
+    if (expectedRevisionId && (
+      target.revision_id !== expectedRevisionId ||
+      target.active_blob_id !== expectedBlobId
+    )) {
+      throw new Error('The project exposed a different revision than the promoted receipt.');
+    }
+    if (target.revision_id === captured.sourceRevisionId) {
+      if (expectedRevisionId) {
+        throw new Error('The project did not expose the revision proven by the promotion receipt.');
+      }
+      if (target.externally_modified) {
+        const preview = await requestReconciliationPreview(target, null);
+        activateReconciliation(preview);
+        return 'reconciliation';
+      }
+      return 'unchanged';
+    }
+    if (!target.revision_id || !target.active_blob_id) {
+      throw new Error('The project exposed an incomplete active manuscript identity.');
+    }
+    if (target.externally_modified) {
+      const preview = await requestReconciliationPreview(target, null);
+      activateReconciliation(preview);
+      return 'reconciliation';
+    }
+
+    let outcome: PromotionReloadOutcome = 'promoted';
+    if (!expectedRevisionId) {
+      const candidate = await getBranch(
+        captured.projectId,
+        captured.sessionId,
+        captured.documentId,
+        captured.runId
+      );
+      if (candidate) validateBranchSnapshots([candidate]);
+      outcome = candidate?.candidate_id === captured.candidateId &&
+        candidate.source_revision_id === captured.sourceRevisionId &&
+        candidate.selection === 'promote'
+        ? 'promoted'
+        : 'source_changed';
+    }
+
+    // Once a new semantic revision is known to exist, detach the old editor
+    // before reading it. A failed reopen can never unlock stale source bytes.
+    detachDocumentForReconciliation();
+    clearReconciliationState();
+    const opened = await openDocument(
+      captured.projectId,
+      captured.sessionId,
+      captured.documentId,
+      captured.relativePath
+    );
+    if (
+      opened.summary.document_id !== captured.documentId ||
+      opened.summary.revision_id !== target.revision_id ||
+      opened.summary.active_blob_id !== target.active_blob_id ||
+      opened.visible_blob_id !== target.active_blob_id
+    ) {
+      throw new Error('The reopened manuscript does not match the promoted project revision.');
+    }
+    installPromotedDocument(refreshed, opened, outcome === 'promoted');
+    await refreshBranchesFor(
+      captured.projectId,
+      captured.sessionId,
+      captured.documentId,
+      false
+    );
+    return outcome;
+  }
+
+  function installPromotedDocument(
+    refreshed: ProjectSnapshot,
+    opened: OpenDocument,
+    promotionConfirmed: boolean
+  ): void {
+    project = refreshed;
+    document = { ...opened, text: opened.text };
+    documentText = opened.text;
+    setSourceDocument(opened.text, opened.summary.kind);
+    editVersion = 0;
+    savedVersion = 0;
+    draftVersion = opened.transient_draft?.version ?? '0';
+    draftSavedEditVersion = 0;
+    staleDraft = opened.transient_draft;
+    staleDraftRestoring = false;
+    staleDraftDiscardArmed = false;
+    uncertainDraft = null;
+    uncertainSave = null;
+    branches = [];
+    resetLiveGenerationView();
+    if (opened.summary.kind !== 'prose' || !canRoundTripMarkdownExactly(opened.text)) {
+      mode = 'source';
+    }
+    if (opened.transient_draft) {
+      saveState = 'error';
+      saveMessage = promotionConfirmed
+        ? 'A preserved draft needs review after promotion'
+        : 'A preserved draft needs review after the revision changed';
+      recordLocalFailure(
+        promotionConfirmed ? 'promotion_draft_requires_review' : 'revision_draft_requires_review',
+        promotionConfirmed
+          ? 'The promoted manuscript reopened, but a separate crash-safe draft remains preserved for explicit review.'
+          : 'The authoritative manuscript reopened, but a separate crash-safe draft remains preserved for explicit review.'
+      );
+    } else {
+      saveState = 'clean';
+      saveMessage = promotionConfirmed ? 'Promotion saved' : 'Authoritative revision reopened';
+      clearFailure();
+    }
   }
 
   async function restoreStaleDraft(): Promise<void> {
@@ -1414,10 +3630,14 @@
       if (!flushEditors()) return false;
       transition = 'closing';
       announce('Closing project; editing is briefly locked');
+      stopBranchPolling();
       if (!(await flushCurrentDocument())) {
         transition = 'idle';
+        scheduleActiveBranchPoll();
         return false;
       }
+    } else {
+      stopBranchPolling();
     }
     const closing = project;
     const closingEpoch = documentEpoch;
@@ -1425,6 +3645,7 @@
     if (documentEpoch !== closingEpoch || editVersion !== closingVersion) {
       transition = 'idle';
       recordLocalFailure('close_race', 'The manuscript changed while Loom prepared to close it.');
+      scheduleActiveBranchPoll();
       return false;
     }
     try {
@@ -1449,6 +3670,7 @@
         announce('Close result uncertain; editing remains locked until the same close command is retried');
       } else {
         transition = 'idle';
+        scheduleActiveBranchPoll();
       }
       return false;
     }
@@ -1461,9 +3683,15 @@
     editVersion = 0;
     savedVersion = 0;
     branches = [];
+    promotionArmedCandidateId = null;
+    uncertainPromotion = null;
+    resetLiveGenerationView();
     saveState = 'clean';
     saveMessage = 'No project open';
     focusMode = false;
+    suggestionsEnabled = false;
+    cancelSuggestionTimer();
+    dismissedCandidateIds = [];
     pendingCloseCommandId = null;
     uncertainSave = null;
     draftVersion = '0';
@@ -1484,6 +3712,42 @@
     if (kind === 'hybrid') return 'Hybrid';
     return 'Prose';
   }
+
+  function branchStatusLabel(branch: BranchCard): string {
+    if (branch.selection === 'promote') return 'Promoted';
+    if (branch.selection === 'keep_alternative') return 'Kept';
+    if (branch.selection === 'reject') return 'Rejected';
+    switch (branch.status) {
+      case 'queued': return 'Queued';
+      case 'generating': return cancellingRunIds.includes(branch.run_id) ? 'Cancelling' : 'Writing';
+      case 'ready': return 'Ready';
+      case 'failed': return 'Failed';
+      case 'cancelled': return 'Cancelled';
+      case 'pruned': return 'Pruned';
+      case 'rejected': return 'Rejected';
+      case 'interrupted': return 'Interrupted';
+    }
+  }
+
+  function branchBoundaryLabel(branch: BranchCard): string {
+    return branch.target_start_byte === branch.target_end_byte
+      ? `byte ${branch.target_start_byte.toLocaleString()}`
+      : `bytes ${branch.target_start_byte.toLocaleString()}–${branch.target_end_byte.toLocaleString()}`;
+  }
+
+  function promotionUnavailableReason(branch: BranchCard): string {
+    if (document?.summary.kind === 'hybrid') {
+      return 'Hybrid promotion waits for a lossless block-manifest IPC boundary.';
+    }
+    if (branch.source_revision_id !== document?.summary.revision_id) {
+      return 'This strand belongs to an earlier manuscript revision. Keep it as an alternative instead.';
+    }
+    if (editVersion !== savedVersion || sourceDirty) return 'Wait for the manuscript to finish saving.';
+    if (branch.selection === 'promote' || branch.selection === 'reject') {
+      return 'This strand already has a final recorded selection.';
+    }
+    return 'Promotion is unavailable while manuscript state is unsettled.';
+  }
 </script>
 
 <svelte:head>
@@ -1499,35 +3763,51 @@
       <span>Loom</span>
     </div>
     {#if project}
-      <button class="project-switcher" type="button" on:click={() => void closeProject()} disabled={reconciliationResolutionLocked || (editorReadonly && transition !== 'closing' && !(reconciliation && !document))} title={transition === 'closing' ? 'Retry the same close command safely' : 'Close project'}>
-        <span>{transition === 'closing' ? 'Retry close' : project.title}</span>
-        <span class="muted">⌄</span>
-      </button>
-    {:else}
-      <span class="topbar-caption">local-first writing</span>
+      <details class="project-menu" bind:this={projectMenu}>
+        <summary class="project-switcher" bind:this={projectMenuTrigger}>
+          <span>{project.title}</span>
+          <span class="muted" aria-hidden="true">⌄</span>
+        </summary>
+        <div class="project-menu-popover" aria-label="Project and editor options">
+          {#if document}
+            <div class="project-menu-label">View</div>
+            <button class:active={mode === 'visual'} type="button" aria-pressed={mode === 'visual'} disabled={!canUseVisual || editorReadonly} on:click={() => { closeProjectMenu(); void setMode('visual'); }}>
+              <span>Visual editor</span><span aria-hidden="true">{mode === 'visual' ? '✓' : ''}</span>
+            </button>
+            <button class:active={mode === 'source'} type="button" aria-pressed={mode === 'source'} disabled={editorReadonly} on:click={() => { closeProjectMenu(); void setMode('source'); }}>
+              <span>Source editor</span><span aria-hidden="true">{mode === 'source' ? '✓' : ''}</span>
+            </button>
+            <div class="project-menu-separator"></div>
+          {/if}
+          <button type="button" on:click={(event) => openModelManager(projectMenuTrigger ?? event.currentTarget)}>
+            <span>Suggestions &amp; models…</span>
+            <span class:ready={suggestionsEnabled && currentModel} class="menu-state">
+              {suggestionsEnabled ? currentModel ? 'On' : 'Needs model' : 'Off'}
+            </span>
+          </button>
+          <button class:active={focusMode} type="button" aria-pressed={focusMode} disabled={editorReadonly} on:click={() => { closeProjectMenu(); void toggleFocusMode(); }}>
+            <span>Focus mode</span><span aria-hidden="true">{focusMode ? '✓' : ''}</span>
+          </button>
+          <div class="project-menu-separator"></div>
+          <button class="danger-menu-item" type="button" disabled={reconciliationResolutionLocked || (editorReadonly && transition !== 'closing' && !(reconciliation && !document))} on:click={() => { closeProjectMenu(); void closeProject(); }}>
+            {transition === 'closing' ? 'Retry closing project' : 'Close project'}
+          </button>
+        </div>
+      </details>
     {/if}
     <div class="topbar-spacer"></div>
-    {#if document}
+    {#if document && saveState !== 'clean' && saveState !== 'saved'}
       <div class="save-status state-{saveState}" role="status" aria-live="polite">
         <span class="status-dot"></span>{saveMessage}
       </div>
-      <div class="mode-switch" aria-label="Editor view">
-        <button class:active={mode === 'visual'} disabled={!canUseVisual || editorReadonly} type="button" on:click={() => void setMode('visual')} title={canUseVisual ? 'Visual editor' : 'Visual editing requires lossless CommonMark round-trip'}>Visual</button>
-        <button class:active={mode === 'source'} disabled={editorReadonly} type="button" on:click={() => void setMode('source')}>Source</button>
-        <button class:active={mode === 'split'} disabled type="button" title="Split editing is disabled until cross-view history is lossless">Split</button>
-      </div>
     {/if}
-    <button class:active={focusMode} class="icon-button" type="button" on:click={toggleFocusMode} aria-pressed={focusMode} disabled={!project || editorReadonly} title="Focus mode (⌘⇧L)">
-      <span aria-hidden="true">◉</span><span class="button-label">Focus</span>
-    </button>
   </header>
 
   {#if project}
-    <div class="workspace-grid">
+    <div class:single-document={project.documents.length === 1} class="workspace-grid">
       <aside class="outline-panel" aria-label="Project outline">
         <div class="panel-heading">
           <span>Manuscript</span>
-          <button class="bare-button" type="button" title="New document" aria-label="New document" disabled>＋</button>
         </div>
         <label class="search-field">
           <span class="sr-only">Search project</span>
@@ -1549,7 +3829,7 @@
               </span>
             </button>
           {:else}
-            <p class="empty-copy">No documents yet. The CLI can import or checkpoint the first UTF-8 manuscript.</p>
+            <p class="empty-copy">No notes.</p>
           {/each}
         </nav>
         <div class="outline-footer">
@@ -1614,7 +3894,7 @@
             {/if}
 
             <section class="resolution-panel" aria-labelledby="resolution-title">
-              <div class="panel-heading"><span id="resolution-title">Resolution to checkpoint</span></div>
+              <div class="panel-heading"><span id="resolution-title">Resolution</span></div>
               {#if reconciliation.kind === 'prose'}
                 <textarea bind:value={reconciliationResolution} readonly={reconciliationResolutionLocked} aria-label="Resolved Markdown" spellcheck="true"></textarea>
               {:else}
@@ -1633,24 +3913,18 @@
             <footer class="reconciliation-actions">
               <button class="secondary-button" type="button" on:click={refreshReconciliationComparison} disabled={reconciliationResolutionLocked}>Refresh comparison</button>
               <button class="primary-button" type="button" on:click={applyReconciliationResolution} disabled={reconciliationApplying || !reconciliationResolutionIsExact}>
-                {reconciliationApplying ? 'Checking exact identities…' : pendingReconciliationApply ? 'Retry exact reconciliation' : 'Checkpoint this resolution'}
+                {reconciliationApplying ? 'Checking exact identities…' : pendingReconciliationApply ? 'Retry exact reconciliation' : 'Save resolution'}
               </button>
             </footer>
           </section>
         {:else if document}
           <header class="document-header">
-            <span class="eyebrow">{kindLabel(document.summary.kind)}</span>
             <h1>{document.summary.title}</h1>
-            <div class="document-meta">
-              <span>{wordCount.toLocaleString()} words</span>
-              <span>{characterCount.toLocaleString()} characters</span>
-              <span>{document.summary.relative_path}</span>
-            </div>
           </header>
 
           {#if staleDraft}
             <div class="runtime-note" role="alert">
-              A crash-safe draft from revision {staleDraft.source_revision_id} is preserved. Editing is locked because the active revision differs; Loom will not overwrite either version.
+              A crash-safe draft from revision {staleDraft.source_revision_id} is preserved separately. Editing is locked until you explicitly restore or discard it; Loom will not overwrite either version.
               <details>
                 <summary>Inspect recovered draft</summary>
                 <pre>{staleDraft.text}</pre>
@@ -1680,6 +3954,7 @@
                       value={documentText}
                       onChange={updateText}
                       onCompositionChange={setVisualComposition}
+                      onSelectionChange={updateVisualSelection}
                       readonly={editorReadonly}
                       autofocus={true}
                     />
@@ -1698,12 +3973,19 @@
                   <div class="verse-notice" role="alert">Hybrid source editing is locked until its prose/verse block manifest can cross the IPC boundary losslessly.</div>
                 {/if}
                 <textarea
+                  bind:this={sourceTextarea}
                   class:verse={exactTextSurface}
                   value={sourceDisplayText}
                   readonly={editorReadonly || document.summary.kind === 'hybrid' || Boolean(exactTextSurface && verseCodec && !verseCodec.editable)}
                   on:compositionstart={beginSourceComposition}
                   on:compositionend={finishSourceComposition}
-                  on:input={(event) => updateFromSource(event.currentTarget.value)}
+                  on:input={(event) => {
+                    updateSourceSelection(event.currentTarget);
+                    updateFromSource(event.currentTarget.value);
+                  }}
+                  on:select={(event) => updateSourceSelection(event.currentTarget)}
+                  on:click={(event) => updateSourceSelection(event.currentTarget)}
+                  on:keyup={(event) => updateSourceSelection(event.currentTarget)}
                   aria-label={exactTextSurface ? 'Exact-whitespace verse editor' : 'Markdown source editor'}
                   spellcheck="true"
                   wrap={exactTextSurface ? 'off' : 'soft'}
@@ -1712,84 +3994,362 @@
             {/if}
           </section>
 
-          {#if branches.length > 0}
-            <aside class="branch-shelf" aria-label="Private strands">
-              <div class="panel-heading"><span>Strands ready</span><span class="count-badge">{branches.length}</span></div>
-              {#each branches as branch (branch.branch_id)}
-                <article class="branch-card">
-                  <p>{branch.text}</p>
-                  <footer><span>{branch.model_id}</span><span>seed {branch.seed}</span></footer>
-                </article>
-              {/each}
-            </aside>
+          {#if inlineSuggestion && inlineSuggestionAtCaret && canPromoteBranch(inlineSuggestion)}
+            <div class="inline-suggestion" role="group" aria-label="Private writing suggestion">
+              <span class="sr-only" aria-live="polite">A private writing suggestion is ready. Press Tab to accept or Escape to dismiss.</span>
+              <button class="inline-suggestion-copy" type="button" on:click={() => void acceptInlineSuggestion(inlineSuggestion)} title="Accept this private strand">
+                <span aria-hidden="true">∿</span>
+                <span>{inlineSuggestion.text || 'A private strand is ready'}</span>
+                <kbd>Tab</kbd>
+              </button>
+              <button class="inline-suggestion-dismiss" type="button" on:click={dismissInlineSuggestion} aria-label="Dismiss suggestion (Escape)">×</button>
+            </div>
           {/if}
 
-          <footer class="authoring-footer">
-            <div class="model-state">
-              <span class:ready={currentModel} class="status-dot"></span>
-              {#if currentModel}
-                <span>{currentModel.display_name} · local</span>
-              {:else}
-                <span>No writer model loaded — {models.length > 0 ? `${models.length} local GGUF ${models.length === 1 ? 'file' : 'files'} discovered` : 'editing remains fully available'}</span>
-              {/if}
-            </div>
-            <div class="authoring-actions">
-              <button class="secondary-button" type="button" on:click={checkpointNow} disabled={!document || compositionActive || transition !== 'idle' || (editorReadonly && uncertainSave === null)}>
-                {uncertainSave ? 'Retry save safely' : 'Checkpoint'}
+          {#if branches.length > 0}
+            <details class="branch-shelf">
+              <summary>
+                <span class:ready={currentReadyBranches.length > 0} class="status-dot"></span>
+                <span>{activeBranchCount > 0 ? 'Suggestions growing' : currentReadyBranches.length > 0 ? `${currentReadyBranches.length} ${currentReadyBranches.length === 1 ? 'strand' : 'strands'} ready` : 'Earlier strands'}</span>
+              </summary>
+              <div class="branch-shelf-body" aria-label="Private strands">
+                {#each branches as branch (branch.branch_id)}
+                  <article class="branch-card status-{branch.status}">
+                    <header>
+                      <span class="branch-status">{branchStatusLabel(branch)}</span>
+                      <span>{branchBoundaryLabel(branch)}</span>
+                    </header>
+                    {#if branch.text}
+                      <p>{branch.text}</p>
+                    {:else if branchBodyErrorByRun[branch.run_id]}
+                      <p class="branch-placeholder">{branchBodyErrorByRun[branch.run_id]}</p>
+                    {:else}
+                      <p class="branch-placeholder">{isBranchActive(branch) ? 'Waiting for local model text…' : 'No candidate text was produced.'}</p>
+                    {/if}
+                    {#if branch.error}
+                      <div class="branch-error" role={branch.status === 'failed' ? 'alert' : 'status'}>{branch.error}{branch.error_truncated ? '…' : ''}</div>
+                    {/if}
+                    <footer><span title={branch.model_id ?? 'Model identity is available in immutable provenance'}>{branch.model_id ?? 'Recorded model'}</span><span>{branch.seed ? `seed ${branch.seed}` : 'seed in provenance'}</span></footer>
+                    <div class="branch-actions">
+                      {#if isBranchActive(branch)}
+                        <button class="secondary-button compact" type="button" on:click={() => void cancelBranch(branch)} disabled={cancellingRunIds.includes(branch.run_id)}>
+                          {cancellingRunIds.includes(branch.run_id) ? 'Cancelling…' : 'Cancel'}
+                        </button>
+                      {:else if branch.status === 'ready' && branch.candidate_id && branch.selection !== 'promote' && branch.selection !== 'reject'}
+                        {#if branch.selection === null}
+                          <button class="secondary-button compact" type="button" on:click={() => void keepBranch(branch)} disabled={keepingCandidateIds.includes(branch.candidate_id)}>
+                            {keepingCandidateIds.includes(branch.candidate_id) ? 'Keeping…' : 'Keep'}
+                          </button>
+                        {/if}
+                        <button class="primary-button compact" type="button" on:click={() => promotionArmedCandidateId === branch.candidate_id ? void confirmPromotion(branch) : armPromotion(branch)} disabled={!canPromoteBranch(branch)} title={canPromoteBranch(branch) ? (promotionArmedCandidateId === branch.candidate_id ? 'Confirm promotion through the immutable store' : 'Promote through the immutable store') : promotionUnavailableReason(branch)}>
+                          {promotionArmedCandidateId === branch.candidate_id ? 'Confirm promotion' : 'Promote…'}
+                        </button>
+                        {#if promotionArmedCandidateId === branch.candidate_id}
+                          <button class="bare-button compact" type="button" on:click={cancelPromotion}>Cancel</button>
+                        {/if}
+                      {/if}
+                    </div>
+                  </article>
+                {/each}
+                {#if branchHasMore}
+                  <button class="secondary-button compact branch-load-more" type="button" on:click={() => void loadMoreBranches()} disabled={branchLoadingMore}>
+                    {branchLoadingMore ? 'Loading…' : 'Load older strands'}
+                  </button>
+                {/if}
+              </div>
+            </details>
+          {/if}
+
+          {#if uncertainPromotion}
+            <div class="attention-action">
+              <button class="secondary-button" type="button" on:click={() => void resolveUncertainPromotion()} disabled={promotionInFlight}>
+                {promotionInFlight ? 'Checking suggestion…' : 'Check suggestion result'}
               </button>
-              <button class="weave-button" type="button" disabled={!canWeave} title={canWeave ? 'Generate private strands' : focusMode ? 'Focus mode blocks generation' : 'Load a local raw-completion model to weave'}>
-                <span aria-hidden="true">∿</span> Weave
-              </button>
             </div>
-          </footer>
+          {/if}
         {:else}
           <section class="empty-project">
             <span class="empty-mark" aria-hidden="true">∿</span>
-            <h1>Your project is ready.</h1>
-            <p>Import or checkpoint a Markdown manuscript with the CLI; document creation is the next UI command to land.</p>
+            {#if uncertainPromotion}
+              <h1>Promotion needs confirmation.</h1>
+              <p>The active editor was detached so stale bytes cannot overwrite a promotion that may already be durable.</p>
+              <button class="primary-button" type="button" on:click={() => void resolveUncertainPromotion()} disabled={promotionInFlight}>
+                {promotionInFlight ? 'Checking authoritative state…' : 'Check promotion result'}
+              </button>
+            {:else}
+              <h1>No notes.</h1>
+            {/if}
           </section>
         {/if}
       </main>
     </div>
   {:else}
     <main class="welcome" id="manuscript">
-      <section class="welcome-copy">
+      <section class="welcome-note" aria-labelledby="welcome-title">
         <div class="large-mark" aria-hidden="true">∿</div>
-        <span class="eyebrow">Write beside the possible</span>
-        <h1>A quiet place for prose, poetry, and private branches.</h1>
-        <p>Loom keeps your manuscript as ordinary files. Local models may suggest strands, but only you can promote one into the work.</p>
-        <ul>
-          <li><span aria-hidden="true">✓</span> Readable Markdown and exact-whitespace verse</li>
-          <li><span aria-hidden="true">✓</span> Offline by default, with no silent cloud route</li>
-          <li><span aria-hidden="true">✓</span> Immutable revision and generation provenance</li>
-        </ul>
-      </section>
-      <section class="project-card" aria-labelledby="project-card-title">
-        <span class="eyebrow">Open folder</span>
-        <h2 id="project-card-title">Begin with a project you own</h2>
+        <h1 id="welcome-title">Open a Loom.</h1>
         {#if !desktop}
-          <div class="runtime-note" role="note">Browser preview: project commands are available in the Tauri desktop build.</div>
+          <div class="runtime-note" role="note">Open the desktop app to write.</div>
         {/if}
-        <label>
-          <span>Title for a new project</span>
-          <input bind:value={projectTitle} placeholder="Untitled Loom" autocomplete="off" />
-        </label>
         {#if errorMessage}
           <div class="error-banner" role="alert">
             {errorMessage}{#if lastFailure}<small> · {lastFailure.code}{lastFailure.retryable ? ' · retryable' : ''}</small>{/if}
           </div>
         {/if}
-        <div class="project-actions">
-          <button class="secondary-button" type="button" on:click={doOpenProject} disabled={!desktop || opening || creating}>
-            {opening ? 'Choosing…' : 'Choose existing folder'}
-          </button>
-          <button class="primary-button" type="button" on:click={doCreateProject} disabled={!desktop || !projectTitle.trim() || opening || creating}>
-            {creating ? 'Choosing…' : 'Choose folder & create'}
+        <div class="welcome-actions">
+          <button class="secondary-button" type="button" on:click={doOpenProject} disabled={!desktop || opening}>
+            {opening ? 'Opening…' : 'Open a Loom folder…'}
           </button>
         </div>
-        <small>Nothing is uploaded. Hosted providers remain off until explicitly configured.</small>
       </section>
     </main>
+  {/if}
+
+  {#if modelManagerOpen}
+    <div
+      class="model-manager-backdrop"
+      role="presentation"
+      on:click={(event) => {
+        if (event.target === event.currentTarget) closeModelManager();
+      }}
+    >
+      <div
+        bind:this={modelManagerPanel}
+        class="model-manager"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="model-manager-title"
+        tabindex="-1"
+        on:keydown={trapModelManagerFocus}
+      >
+        <header class="model-manager-header">
+          <div>
+            <h2 id="model-manager-title">Suggestions</h2>
+            <p>Private continuations from a local model, only when you choose to enable them.</p>
+          </div>
+          <button class="icon-button" type="button" on:click={closeModelManager} aria-label="Close model manager">×</button>
+        </header>
+
+        <div class="model-manager-body">
+          <section class="model-library" aria-labelledby="model-library-title">
+            <label class="suggestions-setting">
+              <input
+                type="checkbox"
+                checked={suggestionsEnabled}
+                disabled={!project || suggestionsChanging}
+                on:change={(event) => void setSuggestionsEnabled(event.currentTarget.checked)}
+              />
+              <span>
+                <strong>Suggest while I pause</strong>
+                <small>{project ? currentModel ? 'Strands stay private until you accept one.' : 'Load a raw-completion model below.' : 'Open a note first.'}</small>
+              </span>
+            </label>
+            <div class="section-heading">
+              <div>
+                <h3 id="model-library-title">On this computer</h3>
+                <p>GGUF files are inspected before Loom claims a capability.</p>
+              </div>
+              <div class="model-library-actions">
+                <button class="bare-button compact" type="button" on:click={() => void chooseExistingModel()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>{modelChoosing ? 'Choosing…' : 'Choose GGUF…'}</button>
+                <button class="bare-button compact" type="button" on:click={() => void refreshModels()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>Refresh</button>
+              </div>
+            </div>
+
+            {#if models.length > 0}
+              <label class="model-manager-picker">
+                <span>Model file</span>
+                <select bind:value={selectedModelPath} disabled={modelChoosing || modelLoading || modelUnloading}>
+                  {#each models as model (model.model_path)}
+                    <option value={model.model_path} disabled={!model.header_verified}>
+                      {model.loaded ? 'Loaded · ' : ''}{model.display_name} · {formatByteCount(model.file_bytes)}
+                    </option>
+                  {/each}
+                </select>
+              </label>
+            {:else}
+              <div class="model-empty-state">
+                <strong>No GGUF model discovered yet.</strong>
+                <span>You can keep writing without one, choose an existing cache file, or add a verified download below.</span>
+              </div>
+            {/if}
+
+            {#if selectedModel}
+              <article class="model-facts">
+                <header>
+                  <div>
+                    <strong>{selectedModel.display_name}</strong>
+                    <span>{selectedModel.loaded ? 'Native inspection complete' : 'GGUF header verified · load for exact capabilities'}</span>
+                  </div>
+                  <span class:verified={selectedModel.header_verified} class="fact-chip">{selectedModel.header_verified ? 'GGUF verified' : 'Unavailable'}</span>
+                </header>
+                <dl>
+                  <div><dt>Prompt mode</dt><dd>{modelCapabilityMode(selectedModel)}</dd></div>
+                  <div><dt>Architecture</dt><dd>{selectedModel.architecture ?? 'Inspect on load'}</dd></div>
+                  <div><dt>Context</dt><dd>{selectedModel.context_tokens === null ? 'Inspect on load' : `${selectedModel.context_tokens.toLocaleString()} tokens`}</dd></div>
+                  <div><dt>Media</dt><dd>{modelMediaLabel(selectedModel)}</dd></div>
+                  <div><dt>Generated tokens</dt><dd>{selectedModel.loaded ? (selectedModel.output_tokens ? 'Available' : 'Unavailable') : 'Inspect on load'}</dd></div>
+                  <div><dt>Log probabilities</dt><dd>{selectedModel.loaded ? (selectedModel.logprobs ? 'Available' : 'Unavailable') : 'Inspect on load'}</dd></div>
+                  <div><dt>Fill in middle</dt><dd>{selectedModel.loaded ? (selectedModel.fill_in_middle ? 'Verified' : 'Unavailable') : 'Inspect on load'}</dd></div>
+                  <div><dt>Projector</dt><dd>{selectedModel.projector_present === null ? 'Inspect on load' : selectedModel.projector_present ? 'Present' : 'None'}</dd></div>
+                </dl>
+                {#if selectedModel.tested_profile}
+                  <p class="tested-profile"><span aria-hidden="true">✓</span> Loom acceptance profile: <code>{selectedModel.tested_profile}</code></p>
+                {/if}
+                <details>
+                  <summary>File and fingerprint evidence</summary>
+                  <dl class="model-evidence">
+                    <div><dt>Path</dt><dd><code>{selectedModel.model_path}</code></dd></div>
+                    <div><dt>SHA-256</dt><dd><code>{selectedModel.model_sha256 ?? 'Computed during native load'}</code></dd></div>
+                  </dl>
+                </details>
+                <div class="model-manager-actions">
+                  {#if selectedModel.loaded}
+                    <button class="secondary-button" type="button" on:click={() => void unloadCurrentModel()} disabled={modelUnloading || activeBranchCount > 0} title={activeBranchCount > 0 ? 'Finish or cancel active strands first' : 'Release model weights from memory'}>
+                      {modelUnloading ? 'Releasing…' : 'Unload from memory'}
+                    </button>
+                  {:else}
+                    <button class="primary-button" type="button" on:click={() => void loadSelectedModel()} disabled={!selectedModel.header_verified || modelLoading || modelUnloading || activeBranchCount > 0}>
+                      {modelLoading ? 'Inspecting natively…' : 'Load and inspect locally'}
+                    </button>
+                  {/if}
+                </div>
+              </article>
+            {/if}
+
+            <div class="model-language-note">
+              <strong>Base versus chat.</strong>
+              A base model continues the manuscript exactly where it ends. A chat model expects a conversation template. Loom never disguises one as the other or inserts a hidden chat prompt into raw continuation.
+            </div>
+          </section>
+
+          <section class="model-download-panel" aria-labelledby="model-download-title">
+            <div class="section-heading">
+              <div>
+                <h3 id="model-download-title">Add a verified GGUF</h3>
+                <p>Bring a publisher URL and its exact checksum. Loom will not guess either one.</p>
+              </div>
+              {#if activeModelDownloads.length > 0}
+                <span class="fact-chip verified">{activeModelDownloads.length} active</span>
+              {/if}
+            </div>
+
+            {#if !desktop}
+              <div class="runtime-note" role="note">Verified downloads are available in the Tauri desktop build.</div>
+            {/if}
+
+            <form class="model-download-form" on:submit|preventDefault={() => void beginOrRetryModelDownload()}>
+              <label class="wide-field">
+                <span>HTTPS model URL</span>
+                <input
+                  value={modelDownloadUrl}
+                  on:input={(event) => updateModelDownloadUrl(event.currentTarget.value)}
+                  type="url"
+                  inputmode="url"
+                  autocomplete="off"
+                  placeholder="https://publisher.example/model.gguf"
+                  disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting}
+                  required
+                />
+              </label>
+              <label class="wide-field">
+                <span>Local file name</span>
+                <input bind:value={modelDownloadFileName} autocomplete="off" spellcheck="false" placeholder="writer-base.Q8_0.gguf" disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting} required />
+              </label>
+              <label class="wide-field">
+                <span>Expected SHA-256 <small>required · 64 hexadecimal characters</small></span>
+                <input bind:value={modelDownloadSha256} autocomplete="off" spellcheck="false" inputmode="text" placeholder="Publisher checksum" disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting} required />
+              </label>
+              <label>
+                <span>Exact bytes <small>optional</small></span>
+                <input bind:value={modelDownloadExpectedBytes} autocomplete="off" inputmode="numeric" placeholder="4954576032" disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting} />
+              </label>
+              <label>
+                <span>Hard ceiling <small>GiB</small></span>
+                <input bind:value={modelDownloadMaximumGiB} type="number" min="0.001" max="1024" step="0.001" disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting} required />
+              </label>
+              <p class="download-boundary wide-field">The URL is contacted only after you press download. Credentials in URLs are refused. A partial file may be resumed, but installation occurs only after a cold SHA-256 check and GGUF validation.</p>
+
+              {#if modelDownloadError}
+                <div class="download-error wide-field" role="alert">{modelDownloadError}</div>
+              {/if}
+              {#if modelDownloadUncertain && pendingModelDownload}
+                <div class="uncertain-download wide-field" role="status">
+                  <strong>Command reply uncertain.</strong>
+                  Retrying preserves command <code>{pendingModelDownload.commandId}</code> and every request byte.
+                  {#if modelDownloadCanAbandon}
+                    The desktop confirmed that this non-retryable request was not registered, so it is safe to edit.
+                    <button class="bare-button compact" type="button" on:click={abandonUnstartedModelDownload}>Edit rejected request</button>
+                  {:else}
+                    Inputs remain locked until authoritative status is recovered.
+                  {/if}
+                </div>
+              {/if}
+
+              <div class="model-download-actions wide-field">
+                <button
+                  class="primary-button"
+                  type="submit"
+                  disabled={!desktop || modelDownloadStarting || (pendingModelDownload !== null && !modelDownloadUncertain)}
+                >
+                  {modelDownloadStarting
+                    ? 'Registering verified transfer…'
+                    : modelDownloadUncertain
+                      ? 'Retry exact command safely'
+                      : pendingModelDownloadSnapshot
+                        ? 'Download in progress'
+                        : 'Download and verify'}
+                </button>
+              </div>
+            </form>
+
+            {#if modelDownloads.length > 0}
+              <div class="download-history" aria-label="Recent model downloads">
+                <h4>Transfers on this app session</h4>
+                {#each modelDownloads.slice(0, 6) as download (download.command_id)}
+                  {@const percent = downloadProgressPercent(download.downloaded_bytes, download.total_bytes)}
+                  <article class:terminal={modelDownloadIsTerminal(download)} class="download-card">
+                    <header>
+                      <div>
+                        <strong>{download.display_name}</strong>
+                        <span>{modelDownloadStatusLabel(download)}</span>
+                      </div>
+                      <span>{formatByteCount(download.downloaded_bytes)}{download.total_bytes === null ? '' : ` / ${formatByteCount(download.total_bytes)}`}</span>
+                    </header>
+                    {#if percent === null && !modelDownloadIsTerminal(download)}
+                      <progress aria-label={`${download.display_name} download progress`}></progress>
+                    {:else if percent !== null}
+                      <progress max="100" value={percent} aria-label={`${download.display_name} download progress`}>{percent.toFixed(0)}%</progress>
+                    {/if}
+                    {#if download.resumed_from_bytes > 0}
+                      <small>Resumed after verifying {formatByteCount(download.resumed_from_bytes)} of partial data.</small>
+                    {/if}
+                    {#if download.cancel_requested && !modelDownloadIsTerminal(download)}
+                      <small>Cancellation requested; waiting for the transfer to reach a safe stop.</small>
+                    {/if}
+                    {#if download.status.status === 'failed'}
+                      <p class="download-card-error">{download.status.message}</p>
+                    {/if}
+                    {#if download.event_delivery_failures > 0}
+                      <small>Desktop event delivery missed {download.event_delivery_failures} update{download.event_delivery_failures === 1 ? '' : 's'}; this view reconciles from command status.</small>
+                    {/if}
+                    <footer>
+                      <code title={download.command_id}>{download.expected_sha256.slice(0, 12)}…</code>
+                      {#if !modelDownloadIsTerminal(download)}
+                        <button class="secondary-button compact" type="button" on:click={() => void cancelVerifiedModelDownload(download.command_id)} disabled={download.cancel_requested || modelDownloadCancellingIds.includes(download.command_id)}>
+                          {download.cancel_requested || modelDownloadCancellingIds.includes(download.command_id) ? 'Cancelling…' : 'Cancel'}
+                        </button>
+                      {:else if download.status.status === 'completed'}
+                        <button class="secondary-button compact" type="button" on:click={() => void selectCompletedModelDownload(download)}>Select model</button>
+                      {/if}
+                    </footer>
+                  </article>
+                {/each}
+              </div>
+            {/if}
+          </section>
+        </div>
+      </div>
+    </div>
   {/if}
 
   {#if errorMessage && project}
@@ -1800,7 +4360,7 @@
       {:else if uncertainDraft}
         <button type="button" on:click={() => void persistTransientDraft()} aria-label="Retry draft safely">Retry draft</button>
       {:else if uncertainSave}
-        <button type="button" on:click={() => void saveNow()} aria-label="Retry checkpoint safely">Retry checkpoint</button>
+        <button type="button" on:click={() => void saveNow()} aria-label="Retry save safely">Retry save</button>
       {:else}
         <button type="button" on:click={clearFailure} aria-label="Dismiss error">×</button>
       {/if}

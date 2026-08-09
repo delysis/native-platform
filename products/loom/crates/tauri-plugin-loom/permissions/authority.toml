@@ -1,0 +1,27 @@
+"$schema" = "schemas/schema.json"
+
+[[set]]
+identifier = "local-generation"
+description = "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript."
+permissions = [
+  "allow-model-load",
+  "allow-model-unload",
+  "allow-weave-start",
+  "allow-generation-cancel",
+  "allow-candidate-keep",
+  "allow-suggestions-set",
+  "allow-focus-mode-set",
+]
+
+[[set]]
+identifier = "manuscript-promotion"
+description = "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command."
+permissions = ["allow-candidate-promote"]
+
+[[set]]
+identifier = "verified-model-download"
+description = "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling."
+permissions = [
+  "allow-model-download-start",
+  "allow-model-download-cancel",
+]

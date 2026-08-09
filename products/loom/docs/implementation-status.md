@@ -12,17 +12,17 @@ This document audits the checked-out source tree. It separates implemented behav
 
 ## Verification snapshot
 
-The following was observed on one Apple-silicon macOS development machine with Rust/Cargo 1.95.0, Node.js 26.0.0, and pnpm 11.16.0. The manifest declares Rust 1.88, but no Rust 1.88-specific run was performed. This snapshot does not cover Windows or Linux.
+The following was observed on one Apple-silicon macOS development machine with Rust/Cargo 1.95.0, Node.js 26.0.0, and pnpm 11.16.0. The full workspace also passed `cargo check --workspace --all-targets` with the declared Rust 1.88 minimum. This remains a local macOS result, not a cross-platform MSRV job, and does not cover Windows or Linux.
 
 | Check | Observed result |
 | --- | --- |
-| `cargo test --workspace` | Passed: 102 Rust tests; 1 real-GGUF test ignored by default; no failures |
-| `pnpm --filter @delysis/loom test` | Passed: 6 files, 20 tests |
+| `cargo test --workspace --all-targets` | Passed: 202 Rust tests; 2 real-GGUF tests ignored by default; no failures |
+| `pnpm --filter @delysis/loom test` | Passed: 9 files, 33 tests |
 | `pnpm --filter @delysis/loom check` | Passed with 0 errors and 0 warnings |
 | `pnpm --filter @delysis/loom build` | Passed; Vite produced the static frontend bundle |
-| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Passed with no warnings |
-| Real GGUF ignored test | Passed separately with the qualified local evidence below |
-| Frontend browser smoke | Landing shell rendered at the available desktop viewport with its headings, controls, skip link, and privacy boundary exposed; native IPC, the active editor, and compact-window workflows were not exercised in this browser-only pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed with no warnings |
+| Real GGUF ignored tests | Generic Loom raw-family smoke, pinned Gemma 4 E2B base Loom acceptance, and the companion native-kit raw batch/cancellation acceptance passed separately as qualified below |
+| Native macOS development smoke | An unsigned debug `.app` bundle built and launched. Native accessibility interaction exercised project opening, the source/visual editor, autosave, the model manager, keyboard Escape/focus restoration, and the visual-editor trailing-space regression below. The later quiet-shell/automatic-suggestion redesign passed frontend and Rust gates but was not re-exercised through native accessibility because the running window was in active user use. It did not exercise real-model suggestions end to end |
 
 Not run as part of this snapshot: signed packaging, updater tests, Windows/Linux builds, Metal/CUDA/Vulkan certification, Playwright/Tauri end-to-end workflows, screen-reader certification, exhaustive IME matrices, fuzzing, forced termination at every filesystem phase, full large-project latency measurement, and adapter-overhead benchmarking.
 
@@ -37,15 +37,26 @@ LOOM_GGUF_MODEL_PATH=/absolute/path/to/model.gguf \
   -- --ignored --exact --nocapture
 ```
 
-Two local development runs passed 1/1 using `Qwen_Qwen3-0.6B-Q4_K_M.gguf` (Qwen3 0.6B, Q4_K_M) on the CPU path and returned two candidates labeled by the adapter as live inference. Observed wall times were 81.47 seconds and 206.43 seconds; the slower rerun shared the machine with concurrent build/test work, so neither duration is a throughput claim. The test asserts the two-candidate result and live-evidence classification.
+Two earlier local development runs passed 1/1 using `Qwen_Qwen3-0.6B-Q4_K_M.gguf` (Qwen3 0.6B, Q4_K_M) on the CPU path and returned two candidates labeled by the adapter as live inference. Observed wall times were 81.47 seconds and 206.43 seconds; the slower rerun shared the machine with concurrent build/test work, so neither duration is a throughput claim. This remains generic smoke evidence rather than the base-model gate.
 
-That result is only a local smoke test. It does **not** establish:
+The stricter ignored test is:
 
-- Gemma 4 base-model acceptance;
+```sh
+LOOM_GEMMA4_E2B_BASE_PATH=/absolute/path/to/gemma-4-E2B-base-Q8_0.gguf \
+  cargo test -p loom-backend-llama \
+  adapter::tests::real_gemma4_e2b_base_raw_family_acceptance \
+  -- --ignored --exact --nocapture
+```
+
+It passed 1/1 on the CPU path in 203.51 seconds using the 4,954,576,032-byte Gemma 4 E2B base Q8 GGUF whose required SHA-256 is `aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670`. The test fails closed unless native inspection reports architecture `gemma4`, raw completion support, chat as unsupported, and that exact digest. It asserts two distinct branches with seeds 41 and 42, nonempty generated token IDs, live-inference evidence, positive shared-prefix metrics for each branch, and an exact prompt-byte digest.
+
+The companion real-model `llama-native-kit` acceptance also passed against the configured local GGUF. That separate test covers exact text/token completion inputs, ordered seeded raw-family outputs, measured shared-prefix reuse, exactly one terminal state per branch, independent cancellation of one branch while its sibling completes, and fail-closed unsupported FIM. This is evidence for the pinned dependency, not a Loom desktop end-to-end test.
+
+Those results establish the local CPU backend gates described above. They do **not** establish:
+
 - macOS Metal, Windows CUDA/CPU, Linux CUDA/Vulkan/CPU support;
-- real-model independent-cancellation behavior;
 - throughput, responsiveness, thermal behavior, or less-than-5-percent adapter overhead;
-- desktop generation, persistence, promotion, or restart recovery; or
+- real-model model-load, generation, cancellation, persistence, promotion, and restart recovery through the desktop UI as one workflow; or
 - signed-release readiness.
 
 ## Implemented surface
@@ -82,7 +93,7 @@ That result is only a local smoke test. It does **not** establish:
 **Implemented and automated:**
 
 - Project initialization/open and manifest schema v1.
-- Additive SQLite store migrations 1-4, `STRICT` semantic tables, foreign keys, WAL, `synchronous=FULL`, `trusted_schema=OFF`, and immutable-row triggers. Manifest schema remains v1; migration 4 adds monotonic draft-generation identity.
+- Additive SQLite store migrations 1-6, `STRICT` semantic tables, foreign keys, WAL, `synchronous=FULL`, `trusted_schema=OFF`, and immutable-row triggers. Manifest schema remains v1; migrations 5-6 add idempotent generation-command evidence and a bounded monotonic branch index.
 - SHA-256 content-addressed blobs verified on read.
 - Document registration, initial creation without clobbering an existing visible file, import, checkpoint, open, export, and command receipts.
 - Source-bound and idempotent saves. The caller names source revision, source visible blob, and command ID; stale or ambiguous writes fail closed.
@@ -94,7 +105,10 @@ That result is only a local smoke test. It does **not** establish:
 - Atomic checkpoint consumption of an exact draft claim, including the narrowly validated exact successor used to recover a committed draft write whose reply was lost.
 - Provenance-preserving human edit diffing. Equal ranges retain prior artifact slices while changed ranges become explicit human contributions.
 - Immutable model, prompt/context recipe, authority-policy, generation-run/event/candidate/terminal, selection, and authorship records.
+- Atomic generation-family creation bound to one idempotent command, exact-retry replay, command-fingerprint conflict rejection, and immutable command-event/terminal evidence.
 - Exactly one terminal event per generation; duplicate output bytes may share a blob while keeping distinct candidate/run occurrences.
+- Bounded cursor-based branch summaries and separately bounded body reads. Pagination remains stable when newer branches arrive, error metadata is truncated, and indexed/filesystem lengths are checked before allocation.
+- Explicit atomic interrupted-generation recovery that remains idempotent and leaves terminal, cancelled, rejected, pruned, and failed occurrences inspectable.
 - Writer/critic promotion authority. Generation, cancellation, rejection, pruning, and keeping an alternative do not mutate the active manuscript; explicit writer-candidate promotion does.
 - Path confinement and document-symlink refusal.
 
@@ -113,27 +127,27 @@ That result is only a local smoke test. It does **not** establish:
 
 ### `loom-context`
 
-**Implemented and automated:** bounded ordered completion-prompt parts, deterministic prompt-byte assembly, token-cost metadata, and a validation rule that the live manuscript is the final bytes of a raw completion prompt. Control bytes after the manuscript boundary are rejected.
+**Implemented and automated:** bounded ordered completion-prompt parts, deterministic prompt-byte assembly, token-cost metadata, and a validation rule that the live manuscript is the final bytes of a raw completion prompt. Control bytes after the manuscript boundary are rejected. The crate also has bounded exact-excerpt occurrences tied to source artifact/blob/range/hash, tokenizer-bound exact token counts, deterministic fixed-point hybrid ranking, craft-tag evidence, byte/token/count budgets, diversity-aware selection, and exact/fuzzy anti-copy evidence over every prompt excerpt. Semantic retrieval/copy values remain absent unless an external scorer supplies evidence for the exact excerpt occurrence.
 
-**Deferred:** retrieval, excerpt ranking, tokenization-backed budget calculation, model-specific demonstrations, FIM recipes, poetry operations, anti-copy evidence, source annotations, and tolerant base-model proposal parsing.
+**Deferred:** source ingestion, persistence, FTS5/embedding index adapters, actual tokenizer calls, model-assisted reranking, UI/automation integration, model-specific demonstrations, FIM recipes, poetry operations, durable source annotations, and tolerant base-model proposal parsing. The implemented retrieval and anti-copy code is a library primitive, not a source-library product path.
 
 ### `loom-search`
 
-**Implemented and automated:** a bounded search budget, pause/resume state transitions, usage accounting, and deterministic Pareto-frontier extraction over quality and novelty points.
+**Implemented and automated:** bounded project/global budget ledgers with atomic charging and resume-safe serialization; pause/resume state transitions; occurrence-preserving exact-content grouping; explicit semantic clustering that never fabricates missing observations; evidence-bound hard gates; fixed-point weighted rubrics with abstention; pairwise aggregation that normalizes candidate-order reversal and exposes position/rubric-permutation disagreement; deterministic Pareto extraction; and replayable quality-plus-seeded-novelty selection that does not let duplicate content occupy both slots.
 
-**Deferred:** branch scheduling, breadth/depth search, generation integration, validators, exact/semantic deduplication, clustering, pairwise judges, rubric permutation, abstention/disagreement handling, local preference learning, overnight policies, and inspectable frontier persistence.
+**Deferred:** branch scheduling, breadth/depth generation integration, concrete domain validators/judges, embedding/scorer execution, persistence, desktop UI, local preference learning, overnight policies, and an inspectable durable frontier. Current modules aggregate supplied observations; they do not run models or autonomously search.
 
 ### `loom-host`
 
-**Implemented and automated:** bounded job queues, cooperative cancellation, project-level automation opt-in, and a focus gate that blocks both manual and automatic generation admission.
+**Implemented and automated:** bounded job queues, cooperative cancellation, project-level automation opt-in, a focus gate that blocks both manual and automatic generation admission, and bounded generation-family registration/status/cancellation bookkeeping for the desktop lifecycle.
 
-**Deferred:** a complete background-job lifecycle, persistence/restart, thermal and resource arbitration, typing-sensitive inference pause, dependency injection for all adapters, and GUI event delivery.
+**Implemented, limited evidence:** the desktop can explicitly enable the project automation gate and uses it for idle nearby suggestions; turning Suggestions off or entering Focus cancels active session generations. **Deferred:** a complete background-garden lifecycle, persisted scheduler/restart state, thermal and resource arbitration, native decoding pause/resume, and dependency injection for all planned adapters.
 
 ### `loom-backend-llama`
 
 **Implemented and automated or locally smoke-tested:**
 
-- Direct in-process use of the locally checked-out `llama-native-kit` raw batch API.
+- Direct in-process use of the raw batch API from pinned published `llama-native-kit` commit `c61692d48b0768bb242bcecb7a80c3318fc476b4`.
 - Exact `GenerationInput::Completion` construction with no Loom-added system prompt, chat template, instruction, or suffix after the manuscript boundary.
 - Multiple continuation cases with independent sampling records, bounded event forwarding, ordered output validation, branch-specific cancellation calls, and one Loom terminal event per branch.
 - Generated token IDs and optional typed probability observations mapped into Loom token traces.
@@ -142,16 +156,16 @@ That result is only a local smoke test. It does **not** establish:
 - Runtime model inspection and required completion/token/cache capability checks.
 - Bounded GGUF discovery in configured user paths and Hugging Face cache roots, with header verification and no completeness claim.
 - Conservative RAM/VRAM fit calculations that leave unknown inputs and performance unknown.
+- HTTPS-only verified GGUF download with credential-bearing URL rejection, bounded redirects and size, exact range-resume validation, cancellation, cold SHA-256 and GGUF checks, symlink/non-regular-file refusal, no-clobber installation, and redacted request diagnostics.
 
 **Limits and deferred work:**
 
-- The three native-kit dependencies are local relative paths that resolve under `/Users/george/Documents/llama-native-kit`; they are neither vendored nor pinned to a portable published revision.
-- The backend's automated generation tests use fixture runtimes; the one real Qwen smoke test is separately qualified above.
-- No Gemma 4 base recipe or acceptance result exists.
-- No desktop command currently starts this adapter.
-- No model loading/selection UI, resumable download, hash-verified catalog, quantization recommendation, or acceleration diagnostic exists.
-- Capability discovery in the desktop model list verifies only the GGUF container header. It deliberately reports completion/FIM/output-token/logprob support as unavailable until native inspection.
-- Real-model cache reuse, independent cancellation, bounded-backpressure loss policy, and cross-platform device paths have not passed product acceptance here.
+- Automated adapter and desktop-command tests still use fixture runtimes; the real CPU evidence is separately qualified above.
+- The Gemma gate is a digest-bound raw-family backend recipe/test, not a curated downloadable catalog, quantization recommendation, or complete author-facing profile suite.
+- Discovery verifies only the GGUF container header. Completion/FIM/output-token/logprob support remains unavailable until native load/inspection.
+- The downloader requires an author-supplied HTTPS URL, exact SHA-256, and limit; it does not discover publisher catalogs or assert that a downloaded model is suitable.
+- Real shared-prefix and independent-cancellation evidence exists at the backend/native-kit layers, but the same path has not been exercised as a desktop real-model end-to-end workflow.
+- Acceleration diagnostics, measured backpressure/cancellation latency, throughput/overhead, and cross-platform device paths have not passed product acceptance.
 
 ### `loom-cli`
 
@@ -163,23 +177,29 @@ That result is only a local smoke test. It does **not** establish:
 
 **Implemented and automated:**
 
-- Allowlisted commands for project choose/create/open/current/recover/close, document open/checkpoint, transient draft upsert/clear, bounded reconciliation preview/apply, local model listing, focus mode, and application close.
+- Allowlisted commands for direct app-owned default-project open plus secondary project choose/create/open/current/recover/close; document open/checkpoint and transient draft/reconciliation lifecycle; model list/choose/load/unload; verified model-download start/cancel/status/list; bounded branch page/get/body; Weave start/status; project Suggestions opt-in; per-generation cancellation; keep/promotion; focus mode; and application close.
 - A single explicit session state machine with project/session/document identity checks.
 - Source revision/blob and command-ID binding on checkpoints.
 - Draft-version binding and stale-draft handling.
 - Existing default-manuscript collision refusal before project initialization.
 - Conflict-aware close behavior and refusal to destroy a window with an active project session.
 - Read-only external-change preview bound to project/session/document/revision/base identities, plus idempotent reconciliation apply bound to the exact raw external-visible blob.
+- Serialized model load/unload/Weave admission, so model residency cannot change between source binding and native generation registration. Automatic starts must pass the distinct opt-in automation gate; switching or unloading is refused while generations are active.
+- Exact command replay/fingerprint validation for Weave and model downloads, bounded in-memory active-command registries, status recovery when event delivery is missed, and branch snapshots rebuilt from the durable store.
+- Source-revision/blob/cursor-bound raw Weave creation for one to four branches, independently derived seeds, private streaming events, per-run cancellation, immutable result/receipt validation, and fail-closed generation provenance checks before persistence.
+- Candidate keep and two-step UI promotion commands. Promotion is source-bound, conflict-preserving, and the only command in this group that may change the active manuscript.
+- Permission sets separate ordinary editing/status, local generation, verified network download, and manuscript promotion authority even though the desktop capability currently grants all four sets.
 - Typed error codes crossing IPC.
 
-**Deferred:** document create/import UI commands, continuous file watching and rename/delete policy, inference streaming, branch commands, source/retrieval/model-management writes, settings, search, and evaluation commands. Generation permissions are not granted by the current default capability.
+**Deferred:** document create/import UI commands, continuous file watching and rename/delete policy, source/retrieval/settings/search/evaluation commands, persisted model-download history across app restarts, and the background-automation command surface. No attachment, speech, FTE, or hosted-provider commands exist.
 
 ### `apps/loom`
 
 **Implemented and automated or locally smoke-tested:**
 
 - Svelte 5 shell with a direct ProseMirror editor, source surface, outline, project selection, document switching, counts, save state, focus mode, status/live regions, reduced-motion/high-contrast CSS, and keyboard shortcuts.
-- Lossless-subset gate for visual Markdown. Content that the current parser/serializer cannot round-trip exactly is held in source mode.
+- Normal desktop launch reattaches the live session or provisions/reopens an app-owned ordinary-file `My Writing` project and focuses its `Untitled.md` note. The explanatory landing page and open-versus-create fork are absent from the normal path; one-document projects hide the empty outline.
+- Lossless-subset gate for visual Markdown. Imported or reopened content that the current parser/serializer cannot round-trip exactly is held in source mode. Once a document has safely entered a visual session, transient trailing end-of-file whitespace no longer unmounts the editor mid-keystroke; the native regression was reproduced, fixed, and checked while preserving the exact visible file bytes.
 - Exact verse codec for uniform LF, CRLF, or CR line endings. Mixed line endings are shown but editing is locked rather than normalized.
 - IME composition gates around editor projection, navigation, checkpointing, and close.
 - Serialized semantic saves, idempotent retry after uncertain acknowledgements, project/session/document/revision/blob validation, and stale-result suppression.
@@ -187,19 +207,21 @@ That result is only a local smoke test. It does **not** establish:
 - Old-source crash drafts are atomically rebound to the current revision before checkpoint; recovered-text deletion requires an explicit two-step permanent-discard confirmation.
 - An external-change review surface showing immutable base, Loom side, and exact external file; structured conflict evidence; deterministic safe-merge selection; editable prose resolution; exact-side-only verse resolution; and identity-bound retry-safe apply.
 - Reconciliation unmounts the stale editor, locks the captured resolution while apply/refresh is in flight, and re-journals any newer edit made during a checkpoint against the newly committed revision before opening conflict review.
+- A secondary Suggestions/model manager for bounded cache discovery, native file selection, explicit native load/unload, exact inspected capability facts, base-versus-chat explanation, and an explicit verified-download form with progress, cancellation, exact-command retry/status recovery, and completed-model selection. A previously and explicitly loaded local model is remembered and may reload in the background after the project's saved Suggestions opt-in is restored; the editor opens first and never waits for weights.
+- After explicit per-project opt-in, a quiet idle timer waits for autosave, then starts three private raw-completion branches from the exact Source caret or verified Visual EOF. New typing invalidates and cancels stale work. A matching ready suggestion appears without a generation button; Tab/click promotes only at the same exact boundary, Escape dismisses it, and the bounded alternative shelf remains collapsed until requested.
+- There is no manual checkpoint or Weave button on the authoring surface. Semantic checkpoints remain automatic safety machinery; generation/cancellation/status/promotion retain the same typed IPC and durable receipts.
+- Stale generation events are rejected by project/session/document/request identity; active manuscript mutation remains impossible until a candidate promotion receipt is explicitly confirmed.
 - Safe window/project close choreography.
 - Editing remains available without a model.
 
 **Visible but intentionally unavailable:**
 
 - Split mode is disabled until cross-view history is lossless.
-- The `Weave` button cannot become active because discovered GGUF files are not loaded or capability-verified by the desktop path.
-- The branch shelf renders only if in-memory branch cards exist; no backend command populates it.
 - The new-document control is disabled.
 - Project search filters document title/path only; it is not manuscript full-text search.
 - Hybrid editing is locked.
 
-**Deferred:** continuous filesystem watching, rename/delete reconciliation, notes/comments, revision/recovery timeline, full-text search, global graph/canvas, context/provenance/evaluation/token views, polished model manager, accessibility/IME certification, visual regression, Playwright/Tauri workflows, compact-window certification, and production performance measurement.
+**Deferred:** continuous filesystem watching, rename/delete reconciliation, notes/comments, revision/recovery timeline, full-text search, global graph/canvas, context/provenance/evaluation/token views, model catalogs/recommendations and acceleration diagnostics, accessibility/IME certification, automated visual regression, Playwright/Tauri workflows, compact-window certification, and production performance measurement. The native smoke above is useful interaction evidence, not certification.
 
 ## Storage and authorship boundary
 
@@ -219,6 +241,7 @@ That result is only a local smoke test. It does **not** establish:
 - Normal Loom code contains no subprocess or loopback inference transport; local inference is called through the Rust native-kit API.
 - No hosted-provider adapter, telemetry client, or automatic network fallback is present.
 - No credential is required by implemented Loom paths.
+- Editing and inference do not initiate network traffic. The sole current network client is an explicitly submitted model download, which requires HTTPS, refuses URL credentials, and requires an exact SHA-256 and hard byte ceiling before transfer.
 - Tauri IPC is allowlisted and the desktop CSP does not allow arbitrary remote origins.
 - Write commands are bound to the active project/session and, where applicable, document/revision/blob/draft/command identities.
 - Document paths are confined under `manuscript/`; symlink traversal is refused.
@@ -244,8 +267,8 @@ That result is only a local smoke test. It does **not** establish:
 ### 1. Security and family stabilization — **incomplete**
 
 - [x] Created the Rust 2024 Loom workspace and kept project-owned Rust free of `unsafe`.
-- [x] Added a direct adapter against the locally evolved raw batch-family native-kit API.
-- [ ] Replace local native-kit paths with reviewed portable pinned dependencies.
+- [x] Added a direct adapter against the product-neutral raw batch-family native-kit API.
+- [x] Pinned the three native-kit crates to published commit `c61692d48b0768bb242bcecb7a80c3318fc476b4`, including the reviewed host single-flight/cache-policy follow-up, and reran compatibility gates.
 - [ ] Complete and independently verify external Bloom credential revocation/rotation and any separately approved history remediation.
 - [x] Add SHA-pinned Loom Native full-history secret scanning and pull-request dependency-review automation. A successful remote run is not yet evidenced here.
 - [ ] Pin and integrate a verified `attachment-native-kit` release; no attachment dependency exists here.
@@ -256,34 +279,38 @@ That result is only a local smoke test. It does **not** establish:
 
 - [x] Project folder, v1 manifest, SQLite migrations, content-addressed blobs, outbox, recovery CLI, prose/verse projection, and transient drafts.
 - [x] Direct Svelte/ProseMirror shell with guarded visual/source editing, outline, autosave/checkpoints, focus/close choreography, and exact verse handling.
+- [x] Keep an already-safe visual session mounted through transient trailing EOF whitespace while continuing to force unsafe imported/reopened bytes into source mode.
 - [x] Standalone deterministic three-way merge, read-only store snapshot, and an idempotent explicit-reconciliation command that records external/import/merge causality.
 - [x] Wire detected external changes through CLI and typed plugin/UI merge review with explicit identity-bound reconciliation submission.
 - [ ] Add filesystem watching, rename/delete handling, full-text search, source/split parity, new-document/import UI, and hybrid metadata persistence.
 - [ ] Complete crash-injection, corruption, migration, large-document, Unicode/RTL/IME, and end-to-end matrices.
 
-### 3. Complete local base-model vertical slice — **library slice only**
+### 3. Complete local base-model vertical slice — **implemented development path, incomplete real desktop acceptance**
 
 - [x] Exact raw completion adapter, typed capability verification, ordered branch results, bounded events, cancellation calls, token/provenance conversion, fixture honesty tests, and local discovery/fit libraries.
-- [x] One qualified CPU-only Qwen3 0.6B Q4 real-GGUF smoke test.
-- [ ] Connect desktop `Weave` through model load, generation persistence, streaming, branch comparison, explicit promotion, cancellation, and restart recovery.
-- [ ] Prove real shared-prefix reuse and independent cancellation in the Loom acceptance path.
-- [ ] Pass a real Gemma 4 **base** model recipe; instruct-model or Qwen evidence does not satisfy this item.
+- [x] Pin the generalized native branch-family implementation and pass its real ordered-batch, shared-prefix, independent-cancellation, and capability acceptance.
+- [x] Connect desktop `Weave` through model choose/load/unload, source-bound generation persistence, streaming, bounded durable branch comparison, explicit promotion, independent cancellation, exact-command recovery, and restart-visible branch reconstruction.
+- [x] Pass the digest-bound real Gemma 4 E2B **base** Q8 Loom backend acceptance with two independent seeds, exact raw prompt identity, generated tokens, live evidence, and positive shared-prefix metrics.
+- [ ] Exercise model load, Weave, one-branch cancellation, candidate comparison, promotion, restart recovery, and exact provenance reconstruction through the desktop UI against the real Gemma model as one acceptance workflow.
 - [ ] Establish portable macOS/Windows/Linux backends and measured responsiveness/overhead.
 
-### 4. Automation, retrieval, and evaluation — **domain primitives only**
+### 4. Automation, retrieval, and evaluation — **nearby suggestions integrated; broader automation/retrieval incomplete**
 
-- [x] Opt-in/focus gates, search budgets/state, simple Pareto frontier, immutable recipe/authority/generation records, and promotion-only manuscript mutation.
-- [ ] Background garden, staged weave, Studio/overnight scheduling, clustering, validators, quality-plus-novelty selection, and persistent frontier.
-- [ ] Source ingestion, exact-excerpt retrieval, FTS5/embeddings, craft tags, reranking, and anti-copy evidence.
-- [ ] Evaluation artifacts, blind/pairwise comparison, judge robustness tests, abstention/disagreement, and local preference learning.
+- [x] Opt-in/focus gates, bounded atomic budget ledgers/state, immutable recipe/authority/generation records, and promotion-only manuscript mutation.
+- [x] Connect opt-in idle nearby suggestions to autosave, exact caret-bound generation, stale-work cancellation, collapsed alternatives, and explicit Tab/Escape accept/dismiss behavior without manual generation/checkpoint controls.
+- [x] Implement bounded hard-gate aggregation, occurrence-preserving exact deduplication, explicit semantic clustering, fixed-point rubrics, pairwise order/rubric-permutation disagreement, abstention, Pareto extraction, and replayable quality-plus-seeded-novelty selection as pure Rust primitives.
+- [x] Implement exact source-excerpt identity/range/hash, tokenizer-bound counts, deterministic hybrid ranking/diversity/budgets, craft-tag evidence, and exact/fuzzy plus externally evidenced semantic anti-copy checks as pure Rust primitives.
+- [ ] Add source ingestion, FTS5/embedding/tokenizer/scorer adapters, immutable retrieval/evaluation persistence, and product UI; current primitives receive already-extracted observations.
+- [ ] Add background garden, staged Weave, Studio/overnight schedulers, generation integration, concrete validators/judges, inspectable persistent frontier, and local preference learning.
 
 ### 5. Polished solo-writer release — **not reached**
 
 - [x] Development editor remains usable without a loaded model.
 - [x] Implemented paths have no hosted credential or silent cloud fallback.
-- [ ] Attachment and speech adapters, model downloads, tested profiles, polished recovery/backups, and DOCX/EPUB export.
+- [x] Explicit HTTPS model download with resume, mandatory hash verification, cancellation/status recovery, and no-clobber installation.
+- [ ] Attachment and speech adapters, publisher catalogs/tested hardware profiles, polished recovery/backups, and DOCX/EPUB export.
 - [ ] Accessibility, IME, keyboard, visual, compact-window, latency, and offline certification.
-- [ ] Signed macOS/Windows/Linux installers, updater, and platform smoke suites. Tauri bundling is currently disabled.
+- [ ] Signed macOS/Windows/Linux installers, updater, and platform smoke suites. An unsigned debug macOS app bundle built for native smoke testing; default release bundling remains disabled.
 - [ ] Optional FTE/hosted composition behind an explicit visible cloud boundary.
 
 ### 6. Post-v1 — **deferred**
@@ -292,4 +319,4 @@ That result is only a local smoke test. It does **not** establish:
 
 ## Definition of the current milestone
 
-The current milestone is a crash-conscious local editor/storage foundation plus a directly callable raw-model adapter. It is suitable for continued development and targeted local experiments. It is not yet a complete Loom vertical slice because the desktop cannot load a model, run `Weave`, persist streamed candidates, or promote them through the UI. It is not a release candidate.
+The current milestone is a crash-conscious local editor/storage foundation plus a quiet local-model suggestion slice: launch reaches an ordinary-file note, autosave/checkpoints are implicit, and explicitly enabled local suggestions grow after an idle pause and remain private until exact-boundary acceptance. Model inspection, verified download, durable branches, cancellation, comparison, and promotion exist behind typed authority boundaries. The Gemma 4 E2B base backend gate passed, but the redesigned desktop sequence has not yet been run against that real model as one native acceptance workflow. Retrieval/search/evaluation remain non-persisted library primitives, and attachment, speech, FTE, richer export, platform certification, signing, and release operations remain deferred. This is not a release candidate.

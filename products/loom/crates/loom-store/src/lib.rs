@@ -13,8 +13,13 @@ mod store;
 pub use draft::{TransientDraft, TransientDraftClaim, TransientDraftWriteOutcome};
 pub use error::{Result, StoreError};
 pub use generation::{
-    CancelGenerationOutcome, GenerationStarted, KeepAlternativeOutcome, PromotionOutcome,
-    RecordedArtifact, TerminalCandidateInput, TerminalCandidateOutcome,
+    BranchPageCursor, CancelGenerationOutcome, GenerationFamilyStarted, GenerationStarted,
+    GenerationTerminalEvidence, INTERRUPTED_GENERATION_ERROR, KeepAlternativeOutcome,
+    MAX_BRANCH_BODY_BYTES, MAX_BRANCH_PAGE_SIZE, PromotionOutcome, RecordedArtifact,
+    StoredBranchBody, StoredBranchPage, StoredBranchRecord, StoredBranchStatus,
+    StoredBranchSummary, StoredGenerationTerminalEvidence, TerminalCandidateInput,
+    TerminalCandidateOutcome, TerminalEvidenceInput, TerminalGenerationInput,
+    TerminalGenerationOutcome,
 };
 pub use provenance::{
     IdempotentSaveOutcome, MAX_EDIT_DIFF_WINDOW_BYTES, MAX_EDIT_DIFF_WINDOW_CHARACTERS,

@@ -1,8 +1,9 @@
 "$schema" = "schemas/schema.json"
 
 [default]
-description = "Open and edit a user-selected Loom project. Generation and hosted-provider authority are separate permissions."
+description = "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions."
 permissions = [
+  "allow-project-open-default",
   "allow-project-choose-create",
   "allow-project-choose-open",
   "allow-project-close",
@@ -15,6 +16,12 @@ permissions = [
   "allow-document-reconciliation-preview",
   "allow-document-reconcile-apply",
   "allow-model-list",
-  "allow-focus-mode-set",
+  "allow-model-choose",
+  "allow-model-download-status",
+  "allow-model-download-list",
+  "allow-branch-page",
+  "allow-branch-get",
+  "allow-branch-body",
+  "allow-weave-status",
   "allow-application-close",
 ]

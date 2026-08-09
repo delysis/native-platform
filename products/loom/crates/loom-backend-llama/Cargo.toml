@@ -9,13 +9,18 @@ description = "Direct in-process llama.cpp adapter for Loom"
 
 [dependencies]
 crossbeam-channel = "0.5.15"
-llama-native-engine = { path = "../../../../Documents/llama-native-kit/crates/llama-native-engine" }
-llama-native-host = { path = "../../../../Documents/llama-native-kit/crates/llama-native-host" }
-llama-native-types = { path = "../../../../Documents/llama-native-kit/crates/llama-native-types" }
+fs4.workspace = true
+hex.workspace = true
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit.git", rev = "c61692d48b0768bb242bcecb7a80c3318fc476b4" }
+llama-native-host = { git = "https://github.com/delysis/llama-native-kit.git", rev = "c61692d48b0768bb242bcecb7a80c3318fc476b4" }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit.git", rev = "c61692d48b0768bb242bcecb7a80c3318fc476b4" }
 loom-types = { path = "../loom-types" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

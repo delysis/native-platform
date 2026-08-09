@@ -2259,16 +2259,64 @@
           "markdownDescription": "Denies the save command without any pre-configured scope."
         },
         {
-          "description": "Open and edit a user-selected Loom project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-model-list`\n- `allow-focus-mode-set`\n- `allow-application-close`",
+          "description": "Open and edit a user-selected Loom project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`",
           "type": "string",
           "const": "loom:default",
-          "markdownDescription": "Open and edit a user-selected Loom project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-model-list`\n- `allow-focus-mode-set`\n- `allow-application-close`"
+          "markdownDescription": "Open and edit a user-selected Loom project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`"
+        },
+        {
+          "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-focus-mode-set`",
+          "type": "string",
+          "const": "loom:local-generation",
+          "markdownDescription": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-focus-mode-set`"
+        },
+        {
+          "description": "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command.\n#### This permission set includes:\n\n- `allow-candidate-promote`",
+          "type": "string",
+          "const": "loom:manuscript-promotion",
+          "markdownDescription": "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command.\n#### This permission set includes:\n\n- `allow-candidate-promote`"
+        },
+        {
+          "description": "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`",
+          "type": "string",
+          "const": "loom:verified-model-download",
+          "markdownDescription": "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`"
         },
         {
           "description": "Enables the application_close command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-application-close",
           "markdownDescription": "Enables the application_close command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the branch_body command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-branch-body",
+          "markdownDescription": "Enables the branch_body command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the branch_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-branch-get",
+          "markdownDescription": "Enables the branch_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the branch_page command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-branch-page",
+          "markdownDescription": "Enables the branch_page command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the candidate_keep command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-candidate-keep",
+          "markdownDescription": "Enables the candidate_keep command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the candidate_promote command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-candidate-promote",
+          "markdownDescription": "Enables the candidate_promote command without any pre-configured scope."
         },
         {
           "description": "Enables the document_checkpoint command without any pre-configured scope.",
@@ -2313,10 +2361,58 @@
           "markdownDescription": "Enables the focus_mode_set command without any pre-configured scope."
         },
         {
+          "description": "Enables the generation_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-generation-cancel",
+          "markdownDescription": "Enables the generation_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the model_choose command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-model-choose",
+          "markdownDescription": "Enables the model_choose command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the model_download_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-model-download-cancel",
+          "markdownDescription": "Enables the model_download_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the model_download_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-model-download-list",
+          "markdownDescription": "Enables the model_download_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the model_download_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-model-download-start",
+          "markdownDescription": "Enables the model_download_start command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the model_download_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-model-download-status",
+          "markdownDescription": "Enables the model_download_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the model_list command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-model-list",
           "markdownDescription": "Enables the model_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the model_load command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-model-load",
+          "markdownDescription": "Enables the model_load command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the model_unload command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-model-unload",
+          "markdownDescription": "Enables the model_unload command without any pre-configured scope."
         },
         {
           "description": "Enables the project_choose_create command without any pre-configured scope.",
@@ -2349,10 +2445,52 @@
           "markdownDescription": "Enables the project_recover command without any pre-configured scope."
         },
         {
+          "description": "Enables the weave_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-weave-start",
+          "markdownDescription": "Enables the weave_start command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the weave_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-weave-status",
+          "markdownDescription": "Enables the weave_status command without any pre-configured scope."
+        },
+        {
           "description": "Denies the application_close command without any pre-configured scope.",
           "type": "string",
           "const": "loom:deny-application-close",
           "markdownDescription": "Denies the application_close command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the branch_body command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-branch-body",
+          "markdownDescription": "Denies the branch_body command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the branch_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-branch-get",
+          "markdownDescription": "Denies the branch_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the branch_page command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-branch-page",
+          "markdownDescription": "Denies the branch_page command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the candidate_keep command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-candidate-keep",
+          "markdownDescription": "Denies the candidate_keep command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the candidate_promote command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-candidate-promote",
+          "markdownDescription": "Denies the candidate_promote command without any pre-configured scope."
         },
         {
           "description": "Denies the document_checkpoint command without any pre-configured scope.",
@@ -2397,10 +2535,58 @@
           "markdownDescription": "Denies the focus_mode_set command without any pre-configured scope."
         },
         {
+          "description": "Denies the generation_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-generation-cancel",
+          "markdownDescription": "Denies the generation_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the model_choose command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-model-choose",
+          "markdownDescription": "Denies the model_choose command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the model_download_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-model-download-cancel",
+          "markdownDescription": "Denies the model_download_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the model_download_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-model-download-list",
+          "markdownDescription": "Denies the model_download_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the model_download_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-model-download-start",
+          "markdownDescription": "Denies the model_download_start command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the model_download_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-model-download-status",
+          "markdownDescription": "Denies the model_download_status command without any pre-configured scope."
+        },
+        {
           "description": "Denies the model_list command without any pre-configured scope.",
           "type": "string",
           "const": "loom:deny-model-list",
           "markdownDescription": "Denies the model_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the model_load command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-model-load",
+          "markdownDescription": "Denies the model_load command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the model_unload command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-model-unload",
+          "markdownDescription": "Denies the model_unload command without any pre-configured scope."
         },
         {
           "description": "Denies the project_choose_create command without any pre-configured scope.",
@@ -2431,6 +2617,18 @@
           "type": "string",
           "const": "loom:deny-project-recover",
           "markdownDescription": "Denies the project_recover command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the weave_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-weave-start",
+          "markdownDescription": "Denies the weave_start command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the weave_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-weave-status",
+          "markdownDescription": "Denies the weave_status command without any pre-configured scope."
         }
       ]
     },

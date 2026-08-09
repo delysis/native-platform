@@ -2,6 +2,7 @@
 
 mod adapter;
 mod discovery;
+mod download;
 mod fit;
 mod model;
 mod runtime;
@@ -10,6 +11,12 @@ pub use discovery::{
     DEFAULT_MAX_DISCOVERY_DEPTH, DEFAULT_MAX_DISCOVERY_ENTRIES, DiscoveredGguf, DiscoveryError,
     DiscoveryWarning, GgufHeaderStatus, ModelDiscoveryOptions, ModelDiscoveryReport,
     ModelDiscoverySource, default_hugging_face_cache_roots, discover_gguf_models,
+};
+pub use download::{
+    DEFAULT_PROGRESS_INTERVAL_BYTES, DownloadCancellation, DownloadControl, DownloadDisposition,
+    DownloadError, DownloadPhase, DownloadProgress, GgufDownloadRequest, GgufDownloadResult,
+    MAX_MODEL_DOWNLOAD_BYTES, MAX_PROGRESS_INTERVAL_BYTES, MAX_REDIRECTS,
+    MIN_PROGRESS_INTERVAL_BYTES, Sha256Digest, download_gguf, validate_gguf_download_request,
 };
 pub use fit::{
     ByteEstimate, ByteEstimateBasis, FitEstimationError, FitVerdict, ModelFitEstimate,
@@ -25,6 +32,6 @@ pub use runtime::{BatchExecution, BatchRuntime, NativeHostRuntime, RuntimeEviden
 pub use adapter::{
     CandidateProvenanceRecord, ContinuationCase, DEFAULT_EVENT_CAPACITY, ExactContinuationRequest,
     ExactContinuationResult, LlamaBackend, LlamaBackendError, LlamaGenerationHandle,
-    MAX_EVENT_CAPACITY,
+    MAX_EVENT_CAPACITY, model_environment_from_verified, validate_candidate_receipt_binding,
 };
 pub use llama_native_types::{SamplerKind, SamplingConfig};

@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use crate::{Result, StoreError};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
-pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 6;
 
 pub(crate) fn configure(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -49,6 +49,22 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch(include_str!("../migrations/0004_draft_generations.sql"))?;
         transaction.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (4, ?1)",
+            [loom_types::now_unix_ms()],
+        )?;
+    }
+    if version < 5 {
+        transaction.execute_batch(include_str!(
+            "../migrations/0005_generation_command_hardening.sql"
+        ))?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (5, ?1)",
+            [loom_types::now_unix_ms()],
+        )?;
+    }
+    if version < 6 {
+        transaction.execute_batch(include_str!("../migrations/0006_bounded_branch_index.sql"))?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (6, ?1)",
             [loom_types::now_unix_ms()],
         )?;
     }
@@ -144,5 +160,101 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn version_five_adds_strict_immutable_generation_command_evidence_tables() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure(&connection).expect("configure SQLite");
+        for migration in [
+            include_str!("../migrations/0001_initial.sql"),
+            include_str!("../migrations/0002_generation_provenance.sql"),
+            include_str!("../migrations/0003_transient_drafts.sql"),
+            include_str!("../migrations/0004_draft_generations.sql"),
+        ] {
+            connection
+                .execute_batch(migration)
+                .expect("apply pre-v5 migration");
+        }
+        connection
+            .pragma_update(None, "user_version", 4_i64)
+            .expect("mark version four");
+
+        migrate(&mut connection).expect("migrate generation command evidence");
+
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read migrated version");
+        assert_eq!(version, CURRENT_STORE_SCHEMA_VERSION);
+        for table in ["generation_terminal_evidence", "generation_command_events"] {
+            let strict: i64 = connection
+                .query_row(
+                    "SELECT strict FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("read strict table metadata");
+            assert_eq!(strict, 1, "{table} must be STRICT");
+        }
+        for trigger in [
+            "generation_terminal_evidence_are_immutable_update",
+            "generation_terminal_evidence_are_immutable_delete",
+            "generation_command_events_are_immutable_update",
+            "generation_command_events_are_immutable_delete",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                    [trigger],
+                    |row| row.get(0),
+                )
+                .expect("read migration trigger");
+            assert_eq!(count, 1, "{trigger} must exist");
+        }
+    }
+
+    #[test]
+    fn version_six_adds_a_strict_immutable_monotonic_generation_index() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure(&connection).expect("configure SQLite");
+        for migration in [
+            include_str!("../migrations/0001_initial.sql"),
+            include_str!("../migrations/0002_generation_provenance.sql"),
+            include_str!("../migrations/0003_transient_drafts.sql"),
+            include_str!("../migrations/0004_draft_generations.sql"),
+            include_str!("../migrations/0005_generation_command_hardening.sql"),
+        ] {
+            connection
+                .execute_batch(migration)
+                .expect("apply pre-v6 migration");
+        }
+        connection
+            .pragma_update(None, "user_version", 5_i64)
+            .expect("mark version five");
+
+        migrate(&mut connection).expect("migrate bounded branch index");
+
+        let strict: i64 = connection
+            .query_row(
+                "SELECT strict FROM pragma_table_list
+                 WHERE schema = 'main' AND name = 'generation_run_index'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read strict table metadata");
+        assert_eq!(strict, 1);
+        for trigger in [
+            "generation_run_index_are_immutable_update",
+            "generation_run_index_are_immutable_delete",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                    [trigger],
+                    |row| row.get(0),
+                )
+                .expect("read generation index trigger");
+            assert_eq!(count, 1, "{trigger} must exist");
+        }
     }
 }

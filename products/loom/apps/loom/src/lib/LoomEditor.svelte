@@ -4,7 +4,7 @@
   import { keymap } from 'prosemirror-keymap';
   import { defaultMarkdownParser, defaultMarkdownSerializer, schema } from 'prosemirror-markdown';
   import type { Node as ProseMirrorNode } from 'prosemirror-model';
-  import { EditorState } from 'prosemirror-state';
+  import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
   import { onDestroy, onMount } from 'svelte';
 
@@ -14,6 +14,7 @@
   export let autofocus = false;
   export let onChange: (markdown: string) => void = () => {};
   export let onCompositionChange: (active: boolean) => void = () => {};
+  export let onSelectionChange: (atDocumentEnd: boolean) => void = () => {};
 
   let mount: HTMLDivElement;
   let view: EditorView | undefined;
@@ -74,6 +75,15 @@
     });
   }
 
+  function reportSelection(state: EditorState): void {
+    const documentEnd = Selection.atEnd(state.doc);
+    onSelectionChange(
+      state.selection.empty &&
+      state.selection.from === documentEnd.from &&
+      state.selection.to === documentEnd.to
+    );
+  }
+
   onMount(() => {
     view = new EditorView(mount, {
       state: stateFor(value),
@@ -89,6 +99,7 @@
         if (!view) return;
         const next = view.state.apply(transaction);
         view.updateState(next);
+        reportSelection(next);
         if (transaction.docChanged) {
           localDocumentChanged = true;
           if (!composing) scheduleProjection();
@@ -108,12 +119,15 @@
         }
       }
     });
+    reportSelection(view.state);
     if (autofocus) view.focus();
   });
 
   $: if (view && value !== lastEmitted && !composing && !localDocumentChanged) {
     lastEmitted = value;
-    view.updateState(stateFor(value));
+    const next = stateFor(value);
+    view.updateState(next);
+    reportSelection(next);
   }
 
   $: if (view) {
@@ -123,6 +137,7 @@
   onDestroy(() => {
     if (projectionTimer !== undefined) window.clearTimeout(projectionTimer);
     if (composing) onCompositionChange(false);
+    onSelectionChange(false);
     view?.destroy();
   });
 </script>

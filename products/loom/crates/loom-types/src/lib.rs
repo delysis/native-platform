@@ -69,6 +69,43 @@ ulid_id!(ProjectId);
 ulid_id!(RevisionId);
 ulid_id!(SelectionId);
 
+/// Derives stable occurrence IDs for one case of an idempotent Weave command.
+///
+/// The command ULID supplies the timestamp bits so derived IDs retain useful
+/// ordering. Domain-separated SHA-256 bytes supply deterministic entropy; a
+/// retry with the same command and case index therefore addresses the exact
+/// same run and branch instead of minting a conflicting family.
+pub fn derive_weave_case_ids(
+    command_id: CommandId,
+    case_index: u32,
+) -> (GenerationRunId, BranchId) {
+    (
+        GenerationRunId::from_ulid(derive_child_ulid(
+            command_id,
+            b"loom-native/weave-run/v1",
+            case_index,
+        )),
+        BranchId::from_ulid(derive_child_ulid(
+            command_id,
+            b"loom-native/weave-branch/v1",
+            case_index,
+        )),
+    )
+}
+
+fn derive_child_ulid(command_id: CommandId, domain: &[u8], case_index: u32) -> Ulid {
+    let command_bytes = command_id.as_ulid().to_bytes();
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(command_bytes);
+    hasher.update(case_index.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes[..6].copy_from_slice(&command_bytes[..6]);
+    bytes[6..].copy_from_slice(&digest[..10]);
+    Ulid::from_bytes(bytes)
+}
+
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BlobId([u8; 32]);
 
@@ -503,6 +540,19 @@ mod tests {
     #[test]
     fn occurrence_ids_are_distinct() {
         assert_ne!(ArtifactId::new(), ArtifactId::new());
+    }
+
+    #[test]
+    fn weave_case_ids_are_stable_domain_separated_and_time_ordered() {
+        let command = CommandId::new();
+        let first = derive_weave_case_ids(command, 0);
+        assert_eq!(first, derive_weave_case_ids(command, 0));
+        assert_ne!(first, derive_weave_case_ids(command, 1));
+        assert_ne!(first.0.as_ulid(), first.1.as_ulid());
+        assert_eq!(
+            &first.0.as_ulid().to_bytes()[..6],
+            &command.as_ulid().to_bytes()[..6]
+        );
     }
 
     #[test]

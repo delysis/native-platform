@@ -6,6 +6,9 @@
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
-    "loom:default"
+    "loom:default",
+    "loom:local-generation",
+    "loom:verified-model-download",
+    "loom:manuscript-promotion"
   ]
 }

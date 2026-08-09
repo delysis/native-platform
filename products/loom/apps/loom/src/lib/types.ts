@@ -90,6 +90,7 @@ export interface ModelCapabilitySummary {
   display_name: string;
   local: boolean;
   loaded: boolean;
+  chat: boolean;
   completion: boolean;
   fill_in_middle: boolean;
   output_tokens: boolean;
@@ -97,17 +98,162 @@ export interface ModelCapabilitySummary {
   model_path: string;
   file_bytes: number;
   header_verified: boolean;
+  architecture: string | null;
+  context_tokens: number | null;
+  model_sha256: string | null;
+  projector_present: boolean | null;
+  media_kinds: Array<'image' | 'audio'>;
+  tested_profile: string | null;
+}
+
+export interface ModelUnloadOutcome {
+  model_id: string | null;
+  resident_slot_released: boolean;
+}
+
+export type ModelDownloadPhase =
+  | 'inspecting_existing'
+  | 'hashing_partial'
+  | 'downloading'
+  | 'verifying'
+  | 'installing'
+  | 'complete';
+
+export type ModelDownloadStatus =
+  | { status: 'queued' }
+  | { status: 'running' }
+  | {
+      status: 'completed';
+      bytes: number;
+      sha256: string;
+      disposition:
+        | 'reused_existing'
+        | 'downloaded_fresh'
+        | 'downloaded_resumed'
+        | 'downloaded_after_restart';
+    }
+  | { status: 'cancelled' }
+  | {
+      status: 'failed';
+      message: string;
+      retryable: boolean;
+    };
+
+export interface ModelDownloadSnapshot {
+  command_id: string;
+  request_fingerprint: string;
+  display_name: string;
+  target_path: string;
+  expected_sha256: string;
+  expected_bytes: number | null;
+  phase: ModelDownloadPhase | null;
+  downloaded_bytes: number;
+  total_bytes: number | null;
+  resumed_from_bytes: number;
+  status: ModelDownloadStatus;
+  cancel_requested: boolean;
+  event_sequence: number;
+  event_delivery_failures: number;
+  updated_at_unix_ms: number;
+  replayed: boolean;
 }
 
 export interface BranchCard {
+  run_id: string;
   branch_id: string;
+  candidate_id: string | null;
   source_revision_id: string;
+  target_start_byte: number;
+  target_end_byte: number;
   text: string;
-  status: 'queued' | 'generating' | 'ready' | 'failed' | 'cancelled' | 'pruned';
+  output_blob_id: string | null;
+  output_byte_len: number | null;
+  status: 'queued' | 'generating' | 'ready' | 'failed' | 'cancelled' | 'pruned' | 'rejected' | 'interrupted';
   /** Decimal u64. Strings preserve replay identity across the JS boundary. */
-  seed: string;
-  model_id: string;
+  seed: string | null;
+  model_id: string | null;
+  selection: 'keep_alternative' | 'promote' | 'reject' | null;
+  error: string | null;
+  error_truncated: boolean;
   created_at_unix_ms: number;
+}
+
+export type BranchSummary = Omit<BranchCard, 'text'>;
+
+export interface BranchPageCursor {
+  /** Decimal u64, preserved as text across the JS boundary. */
+  sequence: string;
+  run_id: string;
+}
+
+export interface BranchPage {
+  branches: BranchSummary[];
+  next_cursor: BranchPageCursor | null;
+  has_more: boolean;
+}
+
+export interface BranchBody {
+  run_id: string;
+  output_blob_id: string;
+  byte_len: number;
+  text: string;
+}
+
+export interface WeaveStarted {
+  command_id: string;
+  request_id: string;
+  project_id: string;
+  session_id: string;
+  document_id: string;
+  source_revision_id: string;
+  exact_prompt_blob_id: string;
+  branches: BranchCard[];
+}
+
+export type GenerationEventKind =
+  | { kind: 'queued' }
+  | { kind: 'prefilling' }
+  | { kind: 'generating' }
+  | { kind: 'text_delta'; text: string }
+  | { kind: 'token'; observation: unknown }
+  | { kind: 'warning'; code: string; message: string }
+  | { kind: 'cancellation_requested' }
+  | {
+      kind: 'candidate_ready';
+      candidate_id: string;
+      generated_span_artifact_id: string;
+    };
+
+export interface GenerationProgressEvent {
+  event_id: string;
+  run_id: string;
+  branch_id: string;
+  sequence: number;
+  kind: GenerationEventKind;
+  occurred_at_ms: number;
+}
+
+export interface GenerationTerminalEvent {
+  event_id: string;
+  run_id: string;
+  branch_id: string;
+  sequence: number;
+  status: 'cancelled' | 'completed' | 'failed' | 'pruned' | 'rejected';
+  candidate_id?: string;
+  error?: string;
+  occurred_at_ms: number;
+}
+
+export type GenerationStreamEvent =
+  | { event: 'generation'; payload: GenerationProgressEvent }
+  | { event: 'generation_terminal'; payload: GenerationTerminalEvent };
+
+export interface DesktopGenerationEnvelope {
+  project_id: string;
+  session_id: string;
+  document_id: string;
+  request_id: string;
+  event: GenerationStreamEvent;
 }
 
 export interface LoomFailure {

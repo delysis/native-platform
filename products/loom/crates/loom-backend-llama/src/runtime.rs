@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crossbeam_channel::RecvTimeoutError;
 use llama_native_engine::GenerationTicket;
-use llama_native_host::{NativeHost, NativeHostConfig};
+use llama_native_host::{HostCachePolicy, NativeHost, NativeHostConfig};
 use llama_native_types::{
     GenerationBatchRequest, GenerationEvent, GenerationOutput, NativeError, NativeErrorCode,
 };
@@ -36,6 +36,12 @@ pub trait BatchRuntime: std::fmt::Debug + Send + Sync + 'static {
         profile: &LocalModelProfile,
         request: GenerationBatchRequest,
     ) -> Result<Arc<dyn BatchExecution>, NativeError>;
+
+    /// Releases resident native slots associated with a profile. Test and
+    /// remote runtimes without resident model state may report `false`.
+    fn release_model(&self, _profile: &LocalModelProfile) -> Result<bool, NativeError> {
+        Ok(false)
+    }
 }
 
 #[derive(Debug)]
@@ -54,7 +60,10 @@ impl NativeHostRuntime {
 
 impl Default for NativeHostRuntime {
     fn default() -> Self {
-        Self::new(NativeHostConfig::default())
+        Self::new(NativeHostConfig {
+            cache_policy: HostCachePolicy::MemoryOnly,
+            ..NativeHostConfig::default()
+        })
     }
 }
 
@@ -91,6 +100,21 @@ impl BatchRuntime for NativeHostRuntime {
         Ok(Arc::new(NativeBatchExecution {
             ticket: Arc::new(ticket),
         }))
+    }
+
+    fn release_model(&self, profile: &LocalModelProfile) -> Result<bool, NativeError> {
+        let slot_ids = self
+            .host
+            .slots()
+            .into_iter()
+            .filter(|slot| slot.model_path == profile.model_path)
+            .map(|slot| slot.slot_id)
+            .collect::<Vec<_>>();
+        let mut released = false;
+        for slot_id in slot_ids {
+            released |= self.host.unload(slot_id);
+        }
+        Ok(released)
     }
 }
 

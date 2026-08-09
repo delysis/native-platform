@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use loom_types::{
-    ArtifactId, BlobId, CandidateId, CommandId, DocumentKind, GenerationRunId, RevisionId,
+    ArtifactId, BlobId, BranchId, CandidateId, CommandId, DocumentKind, GenerationRunId,
+    ModelEnvironmentId, RevisionId,
 };
 use thiserror::Error;
 
@@ -27,6 +28,8 @@ pub enum StoreError {
     NotRegularFile(PathBuf),
     #[error("project is already initialized at {0:?}")]
     AlreadyInitialized(PathBuf),
+    #[error("project is already open in another Loom process: {0:?}")]
+    ProjectAlreadyOpen(PathBuf),
     #[error("no Loom project manifest exists at {0:?}")]
     NotAProject(PathBuf),
     #[error("unsupported project manifest format `{0}`")]
@@ -85,8 +88,34 @@ pub enum StoreError {
         artifact_id: ArtifactId,
         expected_kind: &'static str,
     },
+    #[error(
+        "model environment ID {environment_id} is already registered with different canonical content"
+    )]
+    ModelEnvironmentContentConflict { environment_id: ModelEnvironmentId },
     #[error("generation run {0} does not exist")]
     GenerationRunNotFound(GenerationRunId),
+    #[error("branch page limit {requested} is outside the supported range 1 through {max}")]
+    InvalidBranchPageLimit { requested: usize, max: usize },
+    #[error("branch page cursor does not identify a run in the requested document")]
+    InvalidBranchPageCursor,
+    #[error("branch body limit {requested} is outside the supported range 1 through {max} bytes")]
+    InvalidBranchBodyLimit { requested: u64, max: u64 },
+    #[error(
+        "branch body for generation run {run_id} has {actual_bytes} bytes; requested limit is {max_bytes} bytes"
+    )]
+    BranchBodyTooLarge {
+        run_id: GenerationRunId,
+        actual_bytes: u64,
+        max_bytes: u64,
+    },
+    #[error("generation family must contain at least one run")]
+    EmptyGenerationFamily,
+    #[error("generation family repeats run ID {0}")]
+    DuplicateGenerationRun(GenerationRunId),
+    #[error("generation family repeats branch ID {0}")]
+    DuplicateGenerationBranch(BranchId),
+    #[error("every run in a generation family must share one document and source revision")]
+    GenerationFamilySourceMismatch,
     #[error("candidate {0} does not exist")]
     CandidateNotFound(CandidateId),
     #[error("generation run {0} already has a terminal event")]

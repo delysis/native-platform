@@ -144,6 +144,12 @@ impl LlamaBackend {
         verify_model_inspection(profile, inspection).map_err(Into::into)
     }
 
+    /// Releases native resident state for a model that is no longer selected.
+    /// Callers must ensure no active generation still references the profile.
+    pub fn release_model(&self, profile: &LocalModelProfile) -> Result<bool, LlamaBackendError> {
+        self.runtime.release_model(profile).map_err(Into::into)
+    }
+
     pub fn start_exact_continuation(
         &self,
         request: ExactContinuationRequest,
@@ -151,7 +157,7 @@ impl LlamaBackend {
         let model = self.inspect_model(&request.model)?;
         validate_request(&request, &model, self.event_capacity)?;
         let exact_prompt_blob_id = BlobId::digest(request.exact_manuscript_prefix.as_bytes());
-        let model_environment = model_environment(&model)?;
+        let model_environment = model_environment_from_verified(&model)?;
         let native_request = build_native_request(&request);
         let execution = self.runtime.start_batch(&request.model, native_request)?;
         let identities = request
@@ -592,6 +598,82 @@ struct BackendReceipt<'a> {
     output: &'a GenerationOutput,
 }
 
+#[derive(Deserialize)]
+struct OwnedBackendReceipt {
+    exact_prompt_blob_id: BlobId,
+    model_environment_id: loom_types::ModelEnvironmentId,
+    output: GenerationOutput,
+}
+
+/// Verifies that preserved native receipt bytes describe this exact Loom run.
+///
+/// The receipt is deliberately checked again at the product boundary. A
+/// digest proves that bytes were preserved; these comparisons prove that the
+/// preserved bytes bind the prompt, model environment, branch, output, and
+/// token evidence that the store is about to attribute.
+pub fn validate_candidate_receipt_binding(
+    record: &CandidateProvenanceRecord,
+    expected_request_id: &str,
+    expected_prompt_blob_id: BlobId,
+    expected_model_environment_id: loom_types::ModelEnvironmentId,
+    expected_local_model_id: &str,
+    expected_input_index: usize,
+) -> Result<(), LlamaBackendError> {
+    let receipt: OwnedBackendReceipt = serde_json::from_slice(&record.backend_receipt_bytes)?;
+    let output = &receipt.output;
+    let output_token_ids = output
+        .generated_token_ids
+        .iter()
+        .copied()
+        .map(|token_id| {
+            u32::try_from(token_id).map_err(|_| {
+                LlamaBackendError::OutputContract(format!(
+                    "preserved receipt returned negative token ID {token_id}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let receipt_status = match output.state {
+        GenerationState::Completed => GenerationTerminalStatus::Completed,
+        GenerationState::Cancelled => GenerationTerminalStatus::Cancelled,
+        GenerationState::Failed => GenerationTerminalStatus::Failed,
+        state @ (GenerationState::Queued
+        | GenerationState::Prefilling
+        | GenerationState::Generating) => {
+            return Err(LlamaBackendError::OutputContract(format!(
+                "preserved receipt contains nonterminal output state {state:?}"
+            )));
+        }
+    };
+    let output_blob_id = BlobId::digest(output.text.as_bytes());
+    let identities_match = receipt.exact_prompt_blob_id == expected_prompt_blob_id
+        && receipt.model_environment_id == expected_model_environment_id
+        && output.request_id == expected_request_id
+        && output.branch_id == record.generation.branch_id.to_string()
+        && output.input_index == expected_input_index
+        && output.model_id == expected_local_model_id
+        && output.text == record.output_text
+        && output.finish_reason == record.finish_reason
+        && output_token_ids == record.token_trace.generated_token_ids
+        && receipt_status == record.terminal.status
+        && record.candidate.run_id == record.generation.run_id
+        && record.candidate.branch_id == record.generation.branch_id
+        && record.candidate.output_blob_id == output_blob_id
+        && record.generated_span.candidate_id == record.candidate.candidate_id
+        && record.generated_span.run_id == record.generation.run_id
+        && record.generated_span.branch_id == record.generation.branch_id
+        && record.generated_span.output_blob_id == output_blob_id
+        && record.terminal.run_id == record.generation.run_id
+        && record.terminal.branch_id == record.generation.branch_id;
+    if !identities_match {
+        return Err(LlamaBackendError::OutputContract(
+            "preserved backend receipt is not bound to the expected prompt, model, run, and output"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_result(
     request: &ExactContinuationRequest,
@@ -941,7 +1023,12 @@ fn to_u64(value: usize) -> Result<u64, LlamaBackendError> {
     })
 }
 
-fn model_environment(
+/// Canonical Loom environment artifact payload for a verified native model.
+///
+/// Callers persist this exact value before starting a branch family; the
+/// backend returns the same value with the result so the coordinator can fail
+/// closed if model identity changes between inspection and decoding.
+pub fn model_environment_from_verified(
     model: &VerifiedModelDescriptor,
 ) -> Result<ModelEnvironment, LlamaBackendError> {
     Ok(ModelEnvironment {
@@ -1027,6 +1114,7 @@ mod tests {
         inspection: RuntimeModelInspection,
         execution: Arc<FakeExecution>,
         captured: Mutex<Option<GenerationBatchRequest>>,
+        released: AtomicBool,
     }
 
     impl BatchRuntime for FakeRuntime {
@@ -1051,6 +1139,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request);
             Ok(self.execution.clone())
+        }
+
+        fn release_model(&self, _profile: &LocalModelProfile) -> Result<bool, NativeError> {
+            Ok(!self.released.swap(true, Ordering::AcqRel))
         }
     }
 
@@ -1310,6 +1402,7 @@ mod tests {
                 cancelled: Mutex::new(Vec::new()),
             }),
             captured: Mutex::new(None),
+            released: AtomicBool::new(false),
         })
     }
 
@@ -1360,7 +1453,7 @@ mod tests {
             result.candidates[0].candidate.output_blob_id,
             result.candidates[1].candidate.output_blob_id
         );
-        for record in &result.candidates {
+        for (input_index, record) in result.candidates.iter().enumerate() {
             let provenance = record
                 .token_trace
                 .provenance
@@ -1390,6 +1483,15 @@ mod tests {
                 provenance.backend_receipt_blob_id,
                 Some(BlobId::digest(&record.backend_receipt_bytes))
             );
+            validate_candidate_receipt_binding(
+                record,
+                &result.request_id,
+                result.exact_prompt_blob_id,
+                result.model_environment.environment_id,
+                &result.model.local_model_id,
+                input_index,
+            )
+            .expect("receipt must bind the exact fixture result");
         }
     }
 
@@ -1447,6 +1549,16 @@ mod tests {
         assert_exact_native_request(&captured, &request);
         assert_fixture_candidate_provenance(&result);
         assert_stream_contract(&loom_events, &request);
+        assert!(
+            backend
+                .release_model(&request.model)
+                .expect("release fixture model")
+        );
+        assert!(
+            !backend
+                .release_model(&request.model)
+                .expect("second release is idempotent")
+        );
     }
 
     #[test]
@@ -1534,17 +1646,7 @@ mod tests {
     #[ignore = "requires LOOM_GGUF_MODEL_PATH and a real local GGUF"]
     fn real_gguf_raw_family_acceptance() -> Result<(), Box<dyn std::error::Error>> {
         let model_path = std::env::var("LOOM_GGUF_MODEL_PATH")?;
-        let mut request = request_with_two_cases();
-        request.model = LocalModelProfile::for_gguf(model_path);
-        request.model.device = crate::LocalDevicePreference::Cpu;
-        request.model.max_parallel_cases = 2;
-        request.request_id = "real-raw-family".to_string();
-        request.exact_manuscript_prefix = "The lamp made a small island of light".to_string();
-        request.prompt_recipe.exact_prompt_blob_id =
-            BlobId::digest(request.exact_manuscript_prefix.as_bytes());
-        let backend = LlamaBackend::default();
-        let handle = backend.start_exact_continuation(request)?;
-        let result = handle.wait_timeout(Duration::from_secs(300))?;
+        let result = run_real_raw_family(&model_path)?;
         assert_eq!(result.candidates.len(), 2);
         assert!(result.candidates.iter().all(|candidate| {
             candidate
@@ -1556,5 +1658,61 @@ mod tests {
                 })
         }));
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires LOOM_GEMMA4_E2B_BASE_PATH and the pinned Gemma 4 E2B base Q8 GGUF"]
+    fn real_gemma4_e2b_base_raw_family_acceptance() -> Result<(), Box<dyn std::error::Error>> {
+        const EXPECTED_SHA256: &str =
+            "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670";
+        let model_path = std::env::var("LOOM_GEMMA4_E2B_BASE_PATH")?;
+        let result = run_real_raw_family(&model_path)?;
+
+        assert_eq!(result.model.architecture.as_deref(), Some("gemma4"));
+        assert_eq!(result.model.model_sha256, EXPECTED_SHA256);
+        assert_eq!(
+            result.model.capabilities.chat,
+            crate::CapabilitySupport::Unsupported
+        );
+        assert!(result.model.capabilities.completion_text.is_supported());
+        assert_eq!(result.candidates.len(), 2);
+        assert_eq!(result.candidates[0].generation.seed, 41);
+        assert_eq!(result.candidates[1].generation.seed, 42);
+        assert_ne!(
+            result.candidates[0].generation.branch_id,
+            result.candidates[1].generation.branch_id
+        );
+        assert!(result.candidates.iter().all(|candidate| {
+            !candidate.token_trace.generated_token_ids.is_empty()
+                && candidate
+                    .token_trace
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|provenance| {
+                        provenance.evidence_kind == InferenceEvidenceKind::LiveInference
+                            && provenance.metrics.shared_prefix_tokens.unwrap_or_default() > 0
+                    })
+        }));
+        assert_eq!(
+            result.exact_prompt_blob_id,
+            BlobId::digest(result.exact_manuscript_prefix.as_bytes())
+        );
+        Ok(())
+    }
+
+    fn run_real_raw_family(
+        model_path: &str,
+    ) -> Result<ExactContinuationResult, Box<dyn std::error::Error>> {
+        let mut request = request_with_two_cases();
+        request.model = LocalModelProfile::for_gguf(model_path);
+        request.model.device = crate::LocalDevicePreference::Cpu;
+        request.model.max_parallel_cases = 2;
+        request.request_id = "real-raw-family".to_string();
+        request.exact_manuscript_prefix = "The lamp made a small island of light".to_string();
+        request.prompt_recipe.exact_prompt_blob_id =
+            BlobId::digest(request.exact_manuscript_prefix.as_bytes());
+        let backend = LlamaBackend::default();
+        let handle = backend.start_exact_continuation(request)?;
+        Ok(handle.wait_timeout(Duration::from_secs(300))?)
     }
 }
