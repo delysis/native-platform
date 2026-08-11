@@ -9,6 +9,11 @@ use fte_types::{
     RequestId, ResponseFormat, RoutingPolicy, SamplingOptions, StoragePolicy, StreamPolicy,
     TerminalStatus, ToolPolicy,
 };
+use llama_native_types::{
+    CompletionPrompt, GenerationInput as NativeGenerationInput,
+    GenerationRequest as NativeGenerationRequest, GenerationState, SamplingConfig,
+    SpecialTokenPolicy,
+};
 use mom_llama_runtime::config::{SettingsUpdate, set_data_dir_override_for_tests};
 use mom_llama_runtime::{
     ChatDispatchOutput, ChatSendInput, ChatSendOptions, ConsultPanel, ConsultPersona,
@@ -1524,7 +1529,7 @@ fn product_runtime_rejects_network_process_and_copied_native_authority() -> Resu
         );
     }
     let workspace_manifest = fs::read_to_string(repo_root.join("Cargo.toml"))?;
-    assert!(workspace_manifest.contains("rev = \"f87f57a5beb986d234c3fb059c92940578c70b27\""));
+    assert!(workspace_manifest.contains("rev = \"2d69f086e922ed7bdfd6236baf5a1ad0ed568360\""));
     assert!(workspace_manifest.contains("rev = \"472900732ded5bcfb5cc639c49b3a4f77feece27\""));
     assert!(!workspace_manifest.contains("[patch."));
     assert!(!workspace_manifest.contains("attachment-native-host = { path ="));
@@ -2816,6 +2821,51 @@ fn repeated_profile_acquisition_reuses_the_same_resident_worker() -> Result<()> 
         "reacquiring an unchanged profile must reuse its resident worker"
     );
     assert_eq!(mom_llama_runtime::native_runtime::resident_slots().len(), 1);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local base GGUF"]
+fn real_native_base_completion_invokes_no_fixture() -> Result<()> {
+    let Some(_session) = configured_real_session("real-base-completion")? else {
+        return Ok(());
+    };
+    let model_path = std::env::var_os("MOM_LLAMA_MODEL_PATH")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("real model path disappeared"))?;
+    let settings = mom_llama_runtime::config::resolve_settings()?;
+    let handle = mom_llama_runtime::resident_model_for_profile(&settings, &model_path, None)
+        .map_err(|blocked| anyhow!(blocked.blocker.message))?;
+    let output = handle
+        .generate(NativeGenerationRequest {
+            request_id: format!("real-base-completion-{}", uuid::Uuid::new_v4()),
+            model_id: handle.status().model_id,
+            input: NativeGenerationInput::Completion {
+                prompts: vec![CompletionPrompt::Text {
+                    text: "At dawn, the locked observatory began to breathe.".to_string(),
+                    special_tokens: SpecialTokenPolicy::AddBosParseSpecial,
+                }],
+            },
+            sampling: SamplingConfig {
+                seed: 17,
+                temperature: 0.8,
+                max_tokens: 16,
+                ..SamplingConfig::default()
+            },
+            media: Vec::new(),
+            cached_prefix: None,
+        })
+        .map_err(|error| anyhow!(error))?
+        .wait()
+        .map_err(|error| anyhow!(error))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("native base completion returned no output"))?;
+    assert_eq!(output.state, GenerationState::Completed);
+    assert!(output.real_engine_invoked);
+    assert!(!output.fake_fixture);
+    assert!(output.metrics.completion_tokens > 0);
+    assert!(!output.text.trim().is_empty());
     Ok(())
 }
 
