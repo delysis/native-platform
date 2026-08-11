@@ -231,6 +231,25 @@ pub struct BudgetUsage {
     pub transform_requests: u32,
 }
 
+impl BudgetUsage {
+    /// Returns true when every monotonic accounting dimension is at least the
+    /// corresponding value in an earlier observation.
+    #[must_use]
+    pub fn dominates(&self, earlier: &Self) -> bool {
+        self.root_bytes >= earlier.root_bytes
+            && self.total_derived_bytes >= earlier.total_derived_bytes
+            && self.retained_bytes >= earlier.retained_bytes
+            && self.objects >= earlier.objects
+            && self.edges >= earlier.edges
+            && self.entries >= earlier.entries
+            && self.deepest_object >= earlier.deepest_object
+            && self.text_bytes >= earlier.text_bytes
+            && self.media_objects >= earlier.media_objects
+            && self.media_bytes >= earlier.media_bytes
+            && self.transform_requests >= earlier.transform_requests
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachmentGraph {
     pub schema: String,
@@ -2141,6 +2160,60 @@ const fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_inspection_policy_is_valid_by_construction() {
+        assert!(InspectionPolicy::default().validate().is_ok());
+    }
+
+    #[test]
+    fn budget_usage_dominance_checks_every_counter() {
+        let earlier = BudgetUsage {
+            root_bytes: 1,
+            total_derived_bytes: 2,
+            retained_bytes: 3,
+            objects: 4,
+            edges: 5,
+            entries: 6,
+            deepest_object: 7,
+            text_bytes: 8,
+            media_objects: 9,
+            media_bytes: 10,
+            transform_requests: 11,
+        };
+        let later = BudgetUsage {
+            root_bytes: 2,
+            total_derived_bytes: 3,
+            retained_bytes: 4,
+            objects: 5,
+            edges: 6,
+            entries: 7,
+            deepest_object: 8,
+            text_bytes: 9,
+            media_objects: 10,
+            media_bytes: 11,
+            transform_requests: 12,
+        };
+        assert!(later.dominates(&earlier));
+        for field in 0..11 {
+            let mut regressed = later.clone();
+            match field {
+                0 => regressed.root_bytes = 0,
+                1 => regressed.total_derived_bytes = 1,
+                2 => regressed.retained_bytes = 2,
+                3 => regressed.objects = 3,
+                4 => regressed.edges = 4,
+                5 => regressed.entries = 5,
+                6 => regressed.deepest_object = 6,
+                7 => regressed.text_bytes = 7,
+                8 => regressed.media_objects = 8,
+                9 => regressed.media_bytes = 9,
+                10 => regressed.transform_requests = 10,
+                _ => unreachable!(),
+            }
+            assert!(!regressed.dominates(&earlier), "field {field}");
+        }
+    }
 
     fn complete_root_graph() -> AttachmentGraph {
         let root = ObjectId("a".repeat(64));

@@ -112,7 +112,9 @@ impl ProvidedAttachment {
     }
 }
 
-#[derive(Debug, Clone)]
+/// The derived default is exactly the crate-owned, valid-by-construction
+/// [`InspectionPolicy::default`]. User policies still go through [`Self::new`].
+#[derive(Debug, Clone, Default)]
 pub struct Inspector {
     policy: InspectionPolicy,
 }
@@ -134,14 +136,6 @@ impl Inspector {
         let mut state = InspectionState::new(self.policy.clone());
         state.insert_root(input)?;
         state.run()
-    }
-}
-
-impl Default for Inspector {
-    fn default() -> Self {
-        Self::new(InspectionPolicy::default()).unwrap_or_else(|_| Self {
-            policy: InspectionPolicy::default(),
-        })
     }
 }
 
@@ -2645,6 +2639,11 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     #[test]
+    fn default_inspector_uses_exact_default_policy() {
+        assert_eq!(Inspector::default().policy(), &InspectionPolicy::default());
+    }
+
+    #[test]
     fn bounded_reader_rejects_at_limit_plus_one_without_trusting_metadata() {
         let error =
             ProvidedAttachment::read_bounded("growing.bin", None, Cursor::new(vec![0_u8; 9]), 8)
@@ -3233,12 +3232,15 @@ mod tests {
             .expect("inspection should complete");
         assert_eq!(bundle.graph.objects.len(), 1);
         assert_eq!(bundle.graph.edges[0].outcome, EdgeOutcome::RejectedName);
+        assert_eq!(bundle.graph.usage.entries, 1);
+        assert_eq!(bundle.graph.usage.edges, 1);
         assert!(matches!(bundle.graph.coverage, Coverage::Partial { .. }));
     }
 
     #[test]
     fn duplicate_payload_is_analyzed_once_but_keeps_both_edges() {
         let zip = zip_bytes(&[("a.txt", b"same"), ("b.txt", b"same")]);
+        let root_bytes = u64::try_from(zip.len()).expect("fixture length fits u64");
         let bundle = Inspector::default()
             .inspect(ProvidedAttachment::from_bytes("duplicates.zip", None, zip))
             .expect("inspection should complete");
@@ -3253,6 +3255,35 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(bundle.graph.usage.entries, 2);
+        assert_eq!(bundle.graph.usage.edges, 2);
+        assert_eq!(bundle.graph.usage.objects, 2);
+        assert_eq!(bundle.graph.usage.total_derived_bytes, 8);
+        assert_eq!(bundle.graph.usage.retained_bytes, root_bytes + 4);
+    }
+
+    #[test]
+    fn graph_order_status_issues_and_usage_are_deterministic() {
+        let zip = zip_bytes(&[
+            ("b.txt", b"same"),
+            ("../../unsafe.txt", b"unsafe"),
+            ("a.txt", b"same"),
+        ]);
+        let inspect = || {
+            Inspector::default()
+                .inspect(ProvidedAttachment::from_bytes(
+                    "determinism.zip",
+                    None,
+                    zip.clone(),
+                ))
+                .expect("inspection should complete")
+                .graph
+        };
+
+        let first = inspect();
+        let mut second = inspect();
+        second.job_id = first.job_id.clone();
+        assert_eq!(second, first);
     }
 
     #[test]

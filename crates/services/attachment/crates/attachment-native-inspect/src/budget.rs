@@ -269,7 +269,7 @@ fn integer_overflow() -> AttachmentError {
 #[cfg(test)]
 mod tests {
     use super::BudgetLedger;
-    use attachment_native_types::BudgetLimits;
+    use attachment_native_types::{BudgetLimits, BudgetUsage};
 
     #[test]
     fn unique_object_reservation_is_atomic_when_object_count_is_exhausted() {
@@ -287,5 +287,51 @@ mod tests {
         assert_eq!(usage.objects, 1);
         assert_eq!(usage.retained_bytes, 7);
         assert_eq!(usage.deepest_object, 0);
+    }
+
+    #[test]
+    fn every_successful_charge_is_monotonic_and_limits_are_independent() {
+        let limits = BudgetLimits {
+            max_depth: 1,
+            max_edges: 3,
+            ..BudgetLimits::default()
+        };
+        let mut budget = BudgetLedger::new(limits);
+        let mut earlier = BudgetUsage::default();
+
+        budget.charge_root(7).expect("root");
+        assert!(budget.usage.dominates(&earlier));
+        earlier = budget.usage.clone();
+        budget.charge_entry().expect("entry");
+        assert!(budget.usage.dominates(&earlier));
+        earlier = budget.usage.clone();
+        budget.charge_derived_chunk(5).expect("derived bytes");
+        assert!(budget.usage.dominates(&earlier));
+        earlier = budget.usage.clone();
+        budget.charge_edge(1).expect("edge at depth bound");
+        assert!(budget.usage.dominates(&earlier));
+        assert!(!budget.depth_allows_derivation(2));
+        assert_eq!(budget.remaining_edges(), 2);
+    }
+
+    #[test]
+    fn attempted_derived_work_is_charged_without_overflow_or_wraparound() {
+        let limits = BudgetLimits {
+            max_total_derived_bytes: 4,
+            max_object_bytes: 4,
+            ..BudgetLimits::default()
+        };
+        let mut budget = BudgetLedger::new(limits);
+        budget.charge_rejected_stream_attempt(u64::MAX);
+        assert_eq!(budget.usage.total_derived_bytes, 4);
+        budget.charge_rejected_stream_attempt(u64::MAX);
+        assert_eq!(budget.usage.total_derived_bytes, 4);
+
+        budget.usage.total_derived_bytes = u64::MAX;
+        let error = budget
+            .charge_derived_chunk(1)
+            .expect_err("checked accounting cannot wrap");
+        assert_eq!(error.code, "budget_integer_overflow");
+        assert_eq!(budget.usage.total_derived_bytes, u64::MAX);
     }
 }
