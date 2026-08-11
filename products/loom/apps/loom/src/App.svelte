@@ -3834,17 +3834,16 @@
   function acceptActiveGhost(candidateId: string, presentationKey: string): boolean {
     const eligible = eligibleGhostForCurrentMode();
     const branch = branches.find((candidate) => candidate.candidate_id === candidateId);
-    const visiblePresentationKey = mode === 'visual'
-      ? visibleVisualGhostPresentationKey
-      : mode === 'source'
-        ? visibleSourceGhostPresentationKey
-        : '';
     if (
       !branch ||
       eligible?.candidateId !== candidateId ||
       eligible.presentationKey !== presentationKey ||
-      visiblePresentationKey !== presentationKey
+      !canPromoteBranch(branch)
     ) return false;
+    // LoomEditor and SourceEditor invoke this callback only after synchronously
+    // proving the exact rendered key, surface, caret, and viewport witness.
+    // Rechecking an asynchronously reported duplicate here can race that
+    // stronger witness and turn Tab into focus traversal.
     void acceptInlineSuggestion(branch);
     return true;
   }

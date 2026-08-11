@@ -454,8 +454,9 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           // exists. Clearing first would invalidate every legitimate
           // acceptance before the parent can bind it to durable authority.
           const accepted = handlers.accept(plan.candidateId, plan.presentationKey);
+          if (!accepted) return false;
           view.dispatch(clearTransaction(view));
-          return accepted;
+          return true;
         }
         return false;
       }

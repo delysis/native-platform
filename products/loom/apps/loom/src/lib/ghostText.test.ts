@@ -398,7 +398,7 @@ describe('ghost-text plugin state', () => {
     expect(ghostTextPluginKey.getState(state)).toBeNull();
   });
 
-  it('clears a parent-rejected ghost without consuming ordinary Tab', () => {
+  it('retains a parent-rejected ghost without consuming ordinary Tab', () => {
     const plugin = createGhostTextPlugin({
       accept: () => false,
       dismiss() {},
@@ -429,7 +429,7 @@ describe('ghost-text plugin state', () => {
     } as KeyboardEvent);
 
     expect(handled).toBe(false);
-    expect(ghostTextPluginKey.getState(state)).toBeNull();
+    expect(ghostTextPluginKey.getState(state)).not.toBeNull();
   });
 
   it('dismisses with Escape and ignores IME or modified acceptance keys', () => {
