@@ -44,7 +44,7 @@ pub(crate) fn reviewed_binding_profile(
     }
 }
 
-pub(crate) fn validate_reviewed_cmake_cache(cache: &[u8]) -> Result<(), String> {
+pub(crate) fn validate_reviewed_cmake_cache(cache: &[u8]) -> Result<&str, String> {
     let cache =
         std::str::from_utf8(cache).map_err(|_| "llama.cpp CMake cache is not UTF-8".to_string())?;
     for (key, expected_type, expected_value) in [
@@ -61,7 +61,7 @@ pub(crate) fn validate_reviewed_cmake_cache(cache: &[u8]) -> Result<(), String> 
         }
     }
     match unique_cmake_cache_value(cache, "CMAKE_GENERATOR", "INTERNAL")? {
-        Some("Ninja" | "Unix Makefiles") => Ok(()),
+        Some(generator @ ("Ninja" | "Unix Makefiles" | "Visual Studio 17 2022")) => Ok(generator),
         _ => Err("effective llama.cpp CMake generator is not reviewed".to_string()),
     }
 }
@@ -550,7 +550,21 @@ mod tests {
             GGML_CPU_ALL_VARIANTS:BOOL=OFF\n\
             LLAMA_USE_SYSTEM_GGML:BOOL=OFF\n\
             CMAKE_GENERATOR:INTERNAL=Ninja\n";
-        validate_reviewed_cmake_cache(accepted).expect("reviewed cache is accepted");
+        assert_eq!(
+            validate_reviewed_cmake_cache(accepted).expect("reviewed cache is accepted"),
+            "Ninja"
+        );
+
+        let windows = replace_once(
+            accepted,
+            b"CMAKE_GENERATOR:INTERNAL=Ninja",
+            b"CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022",
+        );
+        assert_eq!(
+            validate_reviewed_cmake_cache(&windows)
+                .expect("the pinned Windows runner generator is accepted"),
+            "Visual Studio 17 2022"
+        );
 
         for rejected in [
             replace_once(

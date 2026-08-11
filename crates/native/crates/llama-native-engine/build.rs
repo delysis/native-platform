@@ -180,10 +180,12 @@ fn emit_build_identity() -> Result<(), String> {
     add_rustc_identity(&mut identity)?;
 
     let dependency_root = PathBuf::from(required_os("DEP_LLAMA_ROOT")?);
-    validate_reviewed_cmake_cache(&private_read(
+    let cmake_cache = private_read(
         &dependency_root.join("build/CMakeCache.txt"),
         "llama.cpp CMake cache",
-    )?)?;
+    )?;
+    let cmake_generator = validate_reviewed_cmake_cache(&cmake_cache)?;
+    identity.add_bytes("dependency.cmake_generator", cmake_generator.as_bytes())?;
     identity.add_bytes(
         "dependency.upstream_build_evidence",
         binding_build_evidence_digest(&target)?.as_bytes(),
