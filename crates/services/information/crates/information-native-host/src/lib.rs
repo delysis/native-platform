@@ -359,12 +359,7 @@ impl InformationHost {
                 };
                 let target_exists = path_exists(&target.path)?;
                 let sidecar_exists = path_exists(&resume_sidecar)?;
-                if target_exists && !sidecar_exists {
-                    // Exact bytes without their acquisition journal are not
-                    // provenance. Reacquire rather than laundering an
-                    // interrupted transfer as a preexisting local artifact.
-                    remove_unverified_staged_file(&target.path)?;
-                } else if target_exists
+                if target_exists
                     && sidecar_exists
                     && (!http_source || resume_policy == ResumePolicy::Disabled)
                 {
@@ -1234,6 +1229,11 @@ fn acquisition_information_error(error: &AcquireError) -> InformationError {
         AcquireError::FilePolicyIo(_) | AcquireError::SourceIo(_) | AcquireError::StagingIo(_) => {
             (ErrorClass::Io, "information_acquisition_io_failure", false)
         }
+        AcquireError::PublishedDurabilityUnknown { .. } => (
+            ErrorClass::Io,
+            "information_acquisition_publication_durability_unknown",
+            true,
+        ),
         AcquireError::Cancelled { .. } => (
             ErrorClass::ResourceBusy,
             "information_acquisition_cancelled",
@@ -1445,6 +1445,9 @@ fn network_attempted_for_failure(
             | AcquireError::SourceIo(_)
             | AcquireError::Cancelled { .. },
         ) => next_source_is_network(),
+        HostError::Acquire(AcquireError::PublishedDurabilityUnknown { .. }) => {
+            next_source_is_network()
+        }
         HostError::Acquire(
             AcquireError::InvalidResumeState(_)
             | AcquireError::StagingIo(_)
@@ -1544,6 +1547,48 @@ fn acquisition_from_fetch(
     artifact: &PlannedArtifact,
     fetched: VerifiedFetch,
 ) -> Result<ArtifactAcquisition, HostError> {
+    if fetched.publication.idempotent_recovery {
+        let expected_sha256 = artifact
+            .sha256
+            .strip_prefix("sha256:")
+            .unwrap_or(&artifact.sha256);
+        if fetched.network_used
+            || fetched.source_attestation.is_some()
+            || !fetched.source_attestations.is_empty()
+            || fetched.final_source_uri.is_some()
+            || fetched.redirects != 0
+            || fetched.bytes != artifact.expected_bytes
+            || !fetched.sha256.eq_ignore_ascii_case(expected_sha256)
+            || fetched.publication.bytes != artifact.expected_bytes
+            || !fetched
+                .publication
+                .sha256
+                .eq_ignore_ascii_case(expected_sha256)
+            || !fetched.publication.visible
+            || !fetched.publication.file_synced
+        {
+            return Err(InformationError::new(
+                ErrorClass::Integrity,
+                "information_acquisition_recovery_inconsistent",
+                "idempotently recovered acquisition facts are internally inconsistent",
+            )
+            .into());
+        }
+        return Ok(ArtifactAcquisition {
+            artifact_id: artifact.artifact_id.clone(),
+            transport: AcquisitionTransport::PreexistingStage,
+            requested_uri: None,
+            final_uri: None,
+            final_peer_address: None,
+            redirect_chain: Vec::new(),
+            attempts: Vec::new(),
+            started_at: None,
+            finished_at: unix_millis_to_utc(fetched.finished_at_unix_ms)?,
+            resumed_bytes: 0,
+            verified_bytes: fetched.bytes,
+            sha256: fetched.sha256,
+        });
+    }
     let attestation = fetched.source_attestation.ok_or_else(|| {
         InformationError::new(
             ErrorClass::Integrity,
@@ -2071,6 +2116,18 @@ mod tests {
             started_at_unix_ms: 1_700_000_002_000,
             finished_at_unix_ms: 1_700_000_003_000,
             resumed_bytes: 4,
+            publication: information_native_acquire::PublicationReceipt {
+                artifact_id: None,
+                sha256: "0".repeat(64),
+                bytes: 10,
+                destination: PathBuf::from("archive.zim"),
+                destination_identity:
+                    information_native_acquire::PublicationDestinationIdentity::Unavailable,
+                visible: true,
+                file_synced: true,
+                directory_synced: true,
+                idempotent_recovery: false,
+            },
         };
         let artifact = PlannedArtifact {
             artifact_id: ArtifactId::parse("payload")?,
@@ -2083,6 +2140,51 @@ mod tests {
         assert_eq!(acquisition.attempts.len(), 2);
         assert_eq!(acquisition.attempts[0].byte_start, 0);
         assert_eq!(acquisition.attempts[1].byte_start, 4);
+        acquisition.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_publication_recovery_does_not_fabricate_source_contact() -> TestResult {
+        let artifact = PlannedArtifact {
+            artifact_id: ArtifactId::parse("payload")?,
+            file_name: "archive.zim".to_string(),
+            source_uri: "https://example.test/archive.zim".to_string(),
+            expected_bytes: 10,
+            sha256: "0".repeat(64),
+        };
+        let fetched = VerifiedFetch {
+            bytes: 10,
+            sha256: "0".repeat(64),
+            network_used: false,
+            final_source_uri: None,
+            redirects: 0,
+            source_attestation: None,
+            source_attestations: Vec::new(),
+            started_at_unix_ms: 1_700_000_000_000,
+            finished_at_unix_ms: 1_700_000_000_000,
+            resumed_bytes: 0,
+            publication: information_native_acquire::PublicationReceipt {
+                artifact_id: Some(artifact.artifact_id.clone()),
+                sha256: "0".repeat(64),
+                bytes: 10,
+                destination: PathBuf::from("archive.zim"),
+                destination_identity:
+                    information_native_acquire::PublicationDestinationIdentity::Unavailable,
+                visible: true,
+                file_synced: true,
+                directory_synced: true,
+                idempotent_recovery: true,
+            },
+        };
+
+        let acquisition = acquisition_from_fetch(&artifact, fetched)?;
+        assert_eq!(
+            acquisition.transport,
+            AcquisitionTransport::PreexistingStage
+        );
+        assert!(acquisition.attempts.is_empty());
+        assert!(acquisition.requested_uri.is_none());
         acquisition.validate()?;
         Ok(())
     }

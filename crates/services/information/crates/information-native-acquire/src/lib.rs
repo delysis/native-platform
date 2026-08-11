@@ -8,7 +8,7 @@
 //! canonical root. Artifact bytes are streamed into private staging files and
 //! become usable only after their declared length and SHA-256 both match.
 
-use information_native_types::PlannedArtifact;
+use information_native_types::{ArtifactId, PlannedArtifact};
 use reqwest::header::{
     ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_RANGE, ETAG, HeaderValue, IF_RANGE,
     LAST_MODIFIED, LOCATION, RANGE,
@@ -374,7 +374,7 @@ impl AcquireClient {
         options: &ArtifactFetchOptions,
         progress: &mut dyn ProgressCallback,
     ) -> Result<VerifiedFetch, AcquireError> {
-        self.fetch_artifact_with_options(
+        let mut result = self.fetch_artifact_with_options(
             &artifact.source_uri,
             staging_path,
             artifact.expected_bytes,
@@ -382,7 +382,17 @@ impl AcquireClient {
             max_bytes,
             options,
             progress,
-        )
+        );
+        match &mut result {
+            Ok(fetched) => {
+                fetched.publication.artifact_id = Some(artifact.artifact_id.clone());
+            }
+            Err(AcquireError::PublishedDurabilityUnknown { receipt, .. }) => {
+                receipt.artifact_id = Some(artifact.artifact_id.clone());
+            }
+            Err(_) => {}
+        }
+        result
     }
 
     /// Fetch an HTTP(S) URI under the restrictive default policy.
@@ -436,6 +446,20 @@ impl AcquireClient {
                 if options.resume != ResumePolicy::Disabled {
                     return Err(AcquireError::ResumeUnsupportedForFile);
                 }
+                let expected_digest = canonical_sha256(expected_sha256)?;
+                if let Some(recovered) = recover_exact_published_artifact(
+                    staging_path,
+                    expected_bytes,
+                    &expected_digest,
+                )? {
+                    let _control = progress.on_progress(TransferProgress {
+                        phase: TransferPhase::Complete,
+                        downloaded_bytes: expected_bytes,
+                        expected_bytes,
+                        resumed_bytes: 0,
+                    });
+                    return Ok(recovered);
+                }
                 let source = options.acquisition_policy.open_file_uri(&path)?;
                 let attestation = SourceAttestation::direct(uri);
                 self.fetch_open_file_inner(
@@ -482,6 +506,18 @@ impl AcquireClient {
         progress: &mut dyn ProgressCallback,
     ) -> Result<VerifiedFetch, AcquireError> {
         validate_expectation(expected_bytes, expected_sha256, max_bytes)?;
+        let expected_digest = canonical_sha256(expected_sha256)?;
+        if let Some(recovered) =
+            recover_exact_published_artifact(staging_path, expected_bytes, &expected_digest)?
+        {
+            let _control = progress.on_progress(TransferProgress {
+                phase: TransferPhase::Complete,
+                downloaded_bytes: expected_bytes,
+                expected_bytes,
+                resumed_bytes: 0,
+            });
+            return Ok(recovered);
+        }
         self.fetch_file_inner(
             source_path,
             staging_path,
@@ -631,10 +667,23 @@ impl AcquireClient {
         validate_artifact_url_metadata(&initial_url)?;
         let started_at_unix_ms = unix_time_millis()?;
         let expected_digest = canonical_sha256(expected_sha256)?;
+        let may_be_committed = match options.resume.sidecar_path() {
+            Some(sidecar) => !path_exists(sidecar)?,
+            None => true,
+        };
+        if may_be_committed
+            && let Some(recovered) =
+                recover_exact_published_artifact(staging_path, expected_bytes, &expected_digest)?
+        {
+            let _control = progress.on_progress(TransferProgress {
+                phase: TransferPhase::Complete,
+                downloaded_bytes: expected_bytes,
+                expected_bytes,
+                resumed_bytes: 0,
+            });
+            return Ok(recovered);
+        }
         if options.resume == ResumePolicy::Disabled {
-            if path_exists(staging_path)? {
-                return Err(AcquireError::StagingPathExists);
-            }
             let deadline = transfer_deadline(self.timeouts.total_transfer_timeout)?;
             return self.run_network(self.fetch_http_fresh_artifact_async(
                 requested_uri,
@@ -673,25 +722,33 @@ impl AcquireClient {
                     actual: actual_digest,
                 });
             }
-            if prepared.source_attestations.is_empty() {
-                return Err(AcquireError::InvalidResumeState(
-                    "completed partial lacks source attestation history".to_string(),
-                ));
-            }
-            prepared.files.complete()?;
+            let attestation = prepared
+                .source_attestations
+                .last()
+                .map(|attempt| attempt.source.clone())
+                .ok_or_else(|| {
+                    AcquireError::InvalidResumeState(
+                        "completed partial lacks source attestation history".to_string(),
+                    )
+                })?;
+            let finished_at_unix_ms = unix_time_millis()?;
+            let publication = prepared.files.complete(expected_bytes, &expected_digest)?;
             let _control = progress.on_progress(TransferProgress {
                 phase: TransferPhase::Complete,
                 downloaded_bytes: expected_bytes,
                 expected_bytes,
                 resumed_bytes: expected_bytes,
             });
-            return verified_from_attestations(
+            return Ok(verified_from_attestations_at(
                 expected_bytes,
                 expected_digest,
+                attestation,
                 prepared.source_attestations,
                 started_at_unix_ms,
+                finished_at_unix_ms,
                 expected_bytes,
-            );
+                publication,
+            ));
         }
 
         let deadline = transfer_deadline(self.timeouts.total_transfer_timeout)?;
@@ -794,8 +851,8 @@ impl AcquireClient {
                 resumed_bytes: 0,
             },
         )?;
-        let _published = unpublished.publish()?;
         let finished_at_unix_ms = unix_time_millis()?;
+        let (_published, publication) = unpublished.publish(received, &actual_digest)?;
         let attestation = opened.attestation;
         let source_attestations = vec![SourceAttemptAttestation {
             source: attestation.clone(),
@@ -821,6 +878,7 @@ impl AcquireClient {
             started_at_unix_ms,
             finished_at_unix_ms,
             resumed_bytes: 0,
+            publication,
         })
     }
 
@@ -978,21 +1036,32 @@ impl AcquireClient {
         }
         let finished_at_unix_ms = unix_time_millis()?;
         prepared.finish_active_attestation(received, finished_at_unix_ms)?;
-        prepared.files.complete()?;
+        let attestation = prepared
+            .source_attestations
+            .last()
+            .map(|attempt| attempt.source.clone())
+            .ok_or_else(|| {
+                AcquireError::InvalidResumeState(
+                    "verified network fetch has no source attempt history".to_string(),
+                )
+            })?;
+        let publication = prepared.files.complete(received, &actual_digest)?;
         let _control = progress.on_progress(TransferProgress {
             phase: TransferPhase::Complete,
             downloaded_bytes: received,
             expected_bytes,
             resumed_bytes,
         });
-        verified_from_attestations_at(
+        Ok(verified_from_attestations_at(
             received,
             actual_digest,
+            attestation,
             std::mem::take(&mut prepared.source_attestations),
             started_at_unix_ms,
             finished_at_unix_ms,
             resumed_bytes,
-        )
+            publication,
+        ))
     }
 
     async fn fetch_catalogue_http(
@@ -1354,6 +1423,33 @@ pub struct VerifiedFetch {
     pub started_at_unix_ms: u64,
     pub finished_at_unix_ms: u64,
     pub resumed_bytes: u64,
+    pub publication: PublicationReceipt,
+}
+
+/// Evidence for the filesystem commit that made verified bytes authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationReceipt {
+    pub artifact_id: Option<ArtifactId>,
+    pub sha256: String,
+    pub bytes: u64,
+    pub destination: PathBuf,
+    pub destination_identity: PublicationDestinationIdentity,
+    pub visible: bool,
+    pub file_synced: bool,
+    pub directory_synced: bool,
+    pub idempotent_recovery: bool,
+}
+
+/// The strongest safe destination identity available on this platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PublicationDestinationIdentity {
+    #[cfg(unix)]
+    Unix {
+        device: u64,
+        inode: u64,
+    },
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1439,6 +1535,12 @@ pub enum AcquireError {
     DigestMismatch { expected: String, actual: String },
     #[error("staging path already exists")]
     StagingPathExists,
+    #[error("verified bytes are visible, but parent-directory durability is unknown: {source}")]
+    PublishedDurabilityUnknown {
+        receipt: PublicationReceipt,
+        #[source]
+        source: io::Error,
+    },
     #[error("resume sidecar path already exists without its staging file")]
     OrphanedResumeSidecar,
     #[error("staging file exists without its resume sidecar")]
@@ -2003,13 +2105,41 @@ impl TransferFiles {
         Ok(())
     }
 
-    fn complete(&mut self) -> Result<(), AcquireError> {
-        self.staging.finish()?;
-        self.retain_partial = false;
+    fn complete(
+        &mut self,
+        expected_bytes: u64,
+        expected_sha256: &str,
+    ) -> Result<PublicationReceipt, AcquireError> {
+        self.staging.sync_partial()?;
+        let path = self.staging.path.clone();
+        let identity = self.staging.identity;
+
         if let Some(sidecar) = &mut self.sidecar {
-            sidecar.remove_now()?;
+            // Keep both the complete staging file and its sidecar recoverable
+            // until the staging bytes and their directory entry are durable.
+            sync_parent_directory(&path)?;
+            sidecar.ensure_current()?;
+            fs::remove_file(&sidecar.path).map_err(staging_io)?;
+            sidecar.keep = true;
         }
-        Ok(())
+
+        self.retain_partial = false;
+        self.staging.keep = true;
+        let receipt = publication_receipt(
+            &path,
+            identity,
+            expected_bytes,
+            expected_sha256,
+            false,
+            false,
+        );
+        if let Err(source) = sync_parent_directory_io(&path) {
+            return Err(AcquireError::PublishedDurabilityUnknown { receipt, source });
+        }
+        Ok(PublicationReceipt {
+            directory_synced: parent_directory_sync_is_durable(),
+            ..receipt
+        })
     }
 }
 
@@ -2031,7 +2161,6 @@ impl Drop for TransferFiles {
 struct UnpublishedFile {
     destination: PathBuf,
     temporary: Option<tempfile::NamedTempFile>,
-    #[cfg(unix)]
     identity: FileIdentity,
 }
 
@@ -2053,12 +2182,10 @@ impl UnpublishedFile {
         builder.disable_cleanup(true);
         let temporary = builder.tempfile_in(parent).map_err(staging_io)?;
         enforce_private_regular_file(temporary.as_file())?;
-        #[cfg(unix)]
         let identity = FileIdentity::from_file(temporary.as_file())?;
         Ok(Self {
             destination: destination.to_path_buf(),
             temporary: Some(temporary),
-            #[cfg(unix)]
             identity,
         })
     }
@@ -2074,7 +2201,23 @@ impl UnpublishedFile {
             })
     }
 
-    fn publish(mut self) -> Result<File, AcquireError> {
+    fn publish(
+        self,
+        expected_bytes: u64,
+        expected_sha256: &str,
+    ) -> Result<(File, PublicationReceipt), AcquireError> {
+        self.publish_with_parent_sync(expected_bytes, expected_sha256, sync_parent_directory_io)
+    }
+
+    fn publish_with_parent_sync<F>(
+        mut self,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        sync_parent: F,
+    ) -> Result<(File, PublicationReceipt), AcquireError>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
         self.file_mut()?.flush().map_err(staging_io)?;
         self.temporary
             .as_ref()
@@ -2109,8 +2252,22 @@ impl UnpublishedFile {
             // unlink. Remove only the still-matching private link.
             let _ignored = fs::remove_file(&temporary_path);
         }
-        sync_parent_directory(&self.destination)?;
-        Ok(persisted)
+        let receipt = publication_receipt(
+            &self.destination,
+            self.identity,
+            expected_bytes,
+            expected_sha256,
+            false,
+            false,
+        );
+        if let Err(source) = sync_parent(&self.destination) {
+            return Err(AcquireError::PublishedDurabilityUnknown { receipt, source });
+        }
+        let receipt = PublicationReceipt {
+            directory_synced: parent_directory_sync_is_durable(),
+            ..receipt
+        };
+        Ok((persisted, receipt))
     }
 }
 
@@ -2226,13 +2383,6 @@ impl StagingFile {
         self.file.sync_all().map_err(staging_io)
     }
 
-    fn finish(&mut self) -> Result<(), AcquireError> {
-        self.sync_partial()?;
-        sync_parent_directory(&self.path)?;
-        self.keep = true;
-        Ok(())
-    }
-
     fn ensure_current(&self) -> Result<(), AcquireError> {
         if self.identity.matches_path(&self.path)? {
             Ok(())
@@ -2307,11 +2457,23 @@ impl SidecarFile {
     }
 
     fn replace_state(&mut self, state: &ResumeSidecar) -> Result<(), AcquireError> {
+        self.replace_state_with_parent_sync(state, sync_parent_directory_io)
+    }
+
+    fn replace_state_with_parent_sync<F>(
+        &mut self,
+        state: &ResumeSidecar,
+        sync_parent: F,
+    ) -> Result<(), AcquireError>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
         let encoded = encode_resume_sidecar(state)?;
         let replacement = PrivateSidecarTemp::create(&self.path, &encoded)?;
         let path = self.path.clone();
         self.ensure_current()?;
-        let published = replacement.publish_replace(&path, self.identity)?;
+        let published =
+            replacement.publish_replace_with_parent_sync(&path, self.identity, sync_parent)?;
         *self = published;
         Ok(())
     }
@@ -2354,6 +2516,8 @@ struct PrivateSidecarTemp {
     path: PathBuf,
     file: Option<File>,
     identity: FileIdentity,
+    bytes: u64,
+    sha256: String,
     keep: bool,
 }
 
@@ -2375,6 +2539,8 @@ impl PrivateSidecarTemp {
                 path,
                 file: Some(file),
                 identity,
+                bytes: u64::try_from(encoded.len()).map_err(|_| AcquireError::IntegerOverflow)?,
+                sha256: hex::encode(Sha256::digest(encoded)),
                 keep: false,
             };
             enforce_private_regular_file(
@@ -2410,14 +2576,17 @@ impl PrivateSidecarTemp {
                 staging_io(error)
             }
         })?;
-        if let Err(error) = sync_parent_directory(target_path) {
-            let _cleanup_result = remove_identity_bound_path(target_path, self.identity);
-            return Err(error);
+        let receipt = publication_receipt(
+            target_path,
+            self.identity,
+            self.bytes,
+            &self.sha256,
+            false,
+            false,
+        );
+        if let Err(source) = sync_parent_directory_io(target_path) {
+            return Err(AcquireError::PublishedDurabilityUnknown { receipt, source });
         }
-        if !self.identity.matches_path(target_path)? {
-            return Err(AcquireError::CleanupIdentityChanged);
-        }
-
         // The published link is durable. Temp cleanup is best-effort and
         // identity-bound; failure must not invalidate the usable sidecar.
         let _temp_cleanup = self.remove_now();
@@ -2429,11 +2598,15 @@ impl PrivateSidecarTemp {
         })
     }
 
-    fn publish_replace(
+    fn publish_replace_with_parent_sync<F>(
         mut self,
         target_path: &Path,
         expected_identity: FileIdentity,
-    ) -> Result<SidecarFile, AcquireError> {
+        sync_parent: F,
+    ) -> Result<SidecarFile, AcquireError>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
         if !expected_identity.matches_path(target_path)? {
             return Err(AcquireError::CleanupIdentityChanged);
         }
@@ -2445,9 +2618,16 @@ impl PrivateSidecarTemp {
             .map_err(staging_io)?;
         fs::rename(&self.path, target_path).map_err(staging_io)?;
         self.keep = true;
-        sync_parent_directory(target_path)?;
-        if !self.identity.matches_path(target_path)? {
-            return Err(AcquireError::CleanupIdentityChanged);
+        let receipt = publication_receipt(
+            target_path,
+            self.identity,
+            self.bytes,
+            &self.sha256,
+            false,
+            false,
+        );
+        if let Err(source) = sync_parent(target_path) {
+            return Err(AcquireError::PublishedDurabilityUnknown { receipt, source });
         }
         Ok(SidecarFile {
             path: target_path.to_path_buf(),
@@ -2579,6 +2759,16 @@ impl FileIdentity {
     }
 }
 
+#[cfg(unix)]
+impl From<FileIdentity> for PublicationDestinationIdentity {
+    fn from(identity: FileIdentity) -> Self {
+        Self::Unix {
+            device: identity.device,
+            inode: identity.inode,
+        }
+    }
+}
+
 #[cfg(not(unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct FileIdentity;
@@ -2594,6 +2784,34 @@ impl FileIdentity {
         // every platform. Fail closed by retaining the path instead of risking
         // deletion of a replacement file.
         Ok(false)
+    }
+}
+
+#[cfg(not(unix))]
+impl From<FileIdentity> for PublicationDestinationIdentity {
+    fn from(_identity: FileIdentity) -> Self {
+        Self::Unavailable
+    }
+}
+
+fn publication_receipt(
+    destination: &Path,
+    identity: FileIdentity,
+    bytes: u64,
+    sha256: &str,
+    directory_synced: bool,
+    idempotent_recovery: bool,
+) -> PublicationReceipt {
+    PublicationReceipt {
+        artifact_id: None,
+        sha256: sha256.to_string(),
+        bytes,
+        destination: destination.to_path_buf(),
+        destination_identity: identity.into(),
+        visible: true,
+        file_synced: true,
+        directory_synced,
+        idempotent_recovery,
     }
 }
 
@@ -2951,6 +3169,94 @@ fn canonical_sha256(value: &str) -> Result<String, AcquireError> {
     Ok(digest.to_ascii_lowercase())
 }
 
+fn recover_exact_published_artifact(
+    destination: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> Result<Option<VerifiedFetch>, AcquireError> {
+    if !path_exists(destination)? {
+        return Ok(None);
+    }
+
+    let mut file = open_existing_private_file(destination, true)
+        .map_err(|_| AcquireError::StagingPathExists)?;
+    enforce_private_regular_file(&file).map_err(|_| AcquireError::StagingPathExists)?;
+    let identity = FileIdentity::from_file(&file).map_err(|_| AcquireError::StagingPathExists)?;
+    if file
+        .metadata()
+        .map_err(|_| AcquireError::StagingPathExists)?
+        .len()
+        != expected_bytes
+    {
+        return Err(AcquireError::StagingPathExists);
+    }
+
+    let mut hasher = Sha256::new();
+    let mut received = 0_u64;
+    let mut buffer = [0_u8; STREAM_BUFFER_BYTES];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| AcquireError::StagingPathExists)?;
+        if read == 0 {
+            break;
+        }
+        received = received
+            .checked_add(u64::try_from(read).map_err(|_| AcquireError::IntegerOverflow)?)
+            .ok_or(AcquireError::IntegerOverflow)?;
+        if received > expected_bytes {
+            return Err(AcquireError::StagingPathExists);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if received != expected_bytes || hex::encode(hasher.finalize()) != expected_sha256 {
+        return Err(AcquireError::StagingPathExists);
+    }
+    if !open_file_matches_path(&file, destination).map_err(|_| AcquireError::StagingPathExists)? {
+        return Err(AcquireError::StagingPathExists);
+    }
+
+    let timestamp = unix_time_millis()?;
+    let unsynced = publication_receipt(
+        destination,
+        identity,
+        expected_bytes,
+        expected_sha256,
+        false,
+        true,
+    );
+    if let Err(source) = file.sync_all() {
+        let receipt = PublicationReceipt {
+            file_synced: false,
+            ..unsynced
+        };
+        return Err(AcquireError::PublishedDurabilityUnknown { receipt, source });
+    }
+    if let Err(source) = sync_parent_directory_io(destination) {
+        return Err(AcquireError::PublishedDurabilityUnknown {
+            receipt: unsynced,
+            source,
+        });
+    }
+    let publication = PublicationReceipt {
+        directory_synced: parent_directory_sync_is_durable(),
+        ..unsynced
+    };
+    Ok(Some(VerifiedFetch {
+        bytes: expected_bytes,
+        sha256: expected_sha256.to_string(),
+        network_used: false,
+        final_source_uri: None,
+        redirects: 0,
+        source_attestation: None,
+        source_attestations: Vec::new(),
+        started_at_unix_ms: timestamp,
+        finished_at_unix_ms: timestamp,
+        resumed_bytes: 0,
+        publication,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_verified_file(
     source: &mut dyn Read,
@@ -3033,7 +3339,8 @@ fn stream_verified_file(
             resumed_bytes: 0,
         },
     )?;
-    let _published = staging.publish()?;
+    let finished_at_unix_ms = unix_time_millis()?;
+    let (_published, publication) = staging.publish(received, &actual_digest)?;
     let _control = progress.on_progress(TransferProgress {
         phase: TransferPhase::Complete,
         downloaded_bytes: received,
@@ -3046,7 +3353,6 @@ fn stream_verified_file(
     let redirects = attestation
         .as_ref()
         .map_or(0, |attestation| attestation.redirect_chain.len());
-    let finished_at_unix_ms = unix_time_millis()?;
     let source_attestations = attestation
         .clone()
         .map(|source| SourceAttemptAttestation {
@@ -3069,43 +3375,22 @@ fn stream_verified_file(
         started_at_unix_ms,
         finished_at_unix_ms,
         resumed_bytes: 0,
+        publication,
     })
 }
 
-fn verified_from_attestations(
-    bytes: u64,
-    sha256: String,
-    source_attestations: Vec<SourceAttemptAttestation>,
-    started_at_unix_ms: u64,
-    resumed_bytes: u64,
-) -> Result<VerifiedFetch, AcquireError> {
-    verified_from_attestations_at(
-        bytes,
-        sha256,
-        source_attestations,
-        started_at_unix_ms,
-        unix_time_millis()?,
-        resumed_bytes,
-    )
-}
-
+#[allow(clippy::too_many_arguments)]
 fn verified_from_attestations_at(
     bytes: u64,
     sha256: String,
+    attestation: SourceAttestation,
     source_attestations: Vec<SourceAttemptAttestation>,
     started_at_unix_ms: u64,
     finished_at_unix_ms: u64,
     resumed_bytes: u64,
-) -> Result<VerifiedFetch, AcquireError> {
-    let attestation = source_attestations
-        .last()
-        .map(|attempt| attempt.source.clone())
-        .ok_or_else(|| {
-            AcquireError::InvalidResumeState(
-                "verified network fetch has no source attempt history".to_string(),
-            )
-        })?;
-    Ok(VerifiedFetch {
+    publication: PublicationReceipt,
+) -> VerifiedFetch {
+    VerifiedFetch {
         bytes,
         sha256,
         network_used: true,
@@ -3116,7 +3401,8 @@ fn verified_from_attestations_at(
         started_at_unix_ms,
         finished_at_unix_ms,
         resumed_bytes,
-    })
+        publication,
+    }
 }
 
 fn notify_progress(
@@ -3233,18 +3519,30 @@ fn path_exists(path: &Path) -> Result<bool, AcquireError> {
 
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<(), AcquireError> {
+    sync_parent_directory_io(path).map_err(staging_io)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory_io(path: &Path) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(staging_io)
+    File::open(parent).and_then(|directory| directory.sync_all())
 }
 
 #[cfg(not(unix))]
 fn sync_parent_directory(_path: &Path) -> Result<(), AcquireError> {
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory_io(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+const fn parent_directory_sync_is_durable() -> bool {
+    cfg!(unix)
 }
 
 fn transfer_deadline(timeout: Duration) -> Result<Instant, AcquireError> {
