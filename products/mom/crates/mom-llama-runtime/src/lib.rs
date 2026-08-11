@@ -93,6 +93,16 @@ pub const RESULT_SCHEMA: &str = "mom_llama.command_result.v1";
 pub const RECEIPT_SCHEMA: &str = "mom_llama.command_receipt.v1";
 const GATEWAY_RESPONSE_NAMESPACE_PREFIX: &str = "fte.response.v1:";
 
+/// Requests cancellation from every product operation registry without
+/// waiting for completion. The application composition root calls this after
+/// closing admission and before it drains services and application leases.
+pub fn request_product_cancellation() -> usize {
+    mcp::request_all_mcp_cancellation();
+    chat::request_all_chat_cancellation()
+        .saturating_add(mentions::request_all_mention_cancellation())
+        .saturating_add(tool_loop::request_all_tool_loop_cancellation())
+}
+
 pub fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

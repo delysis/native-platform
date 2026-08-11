@@ -990,6 +990,23 @@ pub fn tool_loop_cancel(conversation_id: &str) -> Result<CommandResult<ToolLoopC
     ))
 }
 
+pub(crate) fn request_all_tool_loop_cancellation() -> usize {
+    let controls = tool_loop_controls()
+        .lock()
+        .map(|registry| registry.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    controls.iter().fold(0_usize, |total, control| {
+        control.cancel_requested.store(true, Ordering::Release);
+        let cancelled = control
+            .current_model_request_id
+            .lock()
+            .ok()
+            .and_then(|request_id| request_id.clone())
+            .map_or(0, |request_id| cancel_native_request(&request_id, None));
+        total.saturating_add(cancelled)
+    })
+}
+
 pub fn tool_loop_status(
     conversation_id: Option<&str>,
 ) -> Result<CommandResult<Vec<ActiveToolLoop>>> {

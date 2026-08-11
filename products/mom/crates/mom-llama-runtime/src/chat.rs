@@ -983,6 +983,26 @@ pub fn chat_cancel(conversation_id: &str) -> Result<CommandResult<ChatCancelOutp
     ))
 }
 
+pub(crate) fn request_all_chat_cancellation() -> usize {
+    let Ok(settings) = resolve_settings() else {
+        return 0;
+    };
+    let Ok(db) = load_active_requests(&settings.data_dir) else {
+        return 0;
+    };
+    db.requests
+        .iter()
+        .filter(|request| {
+            matches!(
+                request.state,
+                ChatRequestState::Running | ChatRequestState::CancelRequested
+            )
+        })
+        .fold(0_usize, |total, request| {
+            total.saturating_add(cancel_native_request(&request.request_id, None))
+        })
+}
+
 pub fn chat_skip_reasoning(
     conversation_id: &str,
 ) -> Result<CommandResult<ChatSkipReasoningOutput>> {

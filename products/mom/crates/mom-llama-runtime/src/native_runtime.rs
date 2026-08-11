@@ -10,7 +10,7 @@ use llama_native_host::{
 use llama_native_types::{NativeError, NativeErrorCode, NativeModelConfig, ResidentModelStatus};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResidentSlotStatus {
@@ -35,7 +35,7 @@ struct ProductHostKey {
 #[derive(Debug)]
 struct ProductHost {
     key: ProductHostKey,
-    host: Arc<NativeHost>,
+    host: Weak<NativeHost>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,56 @@ enum ProductPhase {
 struct ProductRuntimeState {
     phase: ProductPhase,
     host: Option<ProductHost>,
+}
+
+/// Sole installation authority held by a product composition root. Runtime
+/// modules retain only compatibility access through `PRODUCT_HOST`; they can
+/// neither manufacture nor replace the process host identity.
+pub struct ProductRuntimeOwner {
+    host: Arc<NativeHost>,
+}
+
+impl ProductRuntimeOwner {
+    pub fn initialize(settings: &Settings) -> anyhow::Result<Self> {
+        let key = host_key(settings);
+        let mut current = product_host()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("The native model host is unavailable."))?;
+        if current.phase != ProductPhase::Running {
+            anyhow::bail!("The product runtime is shutting down.");
+        }
+        if current.host.is_some() {
+            anyhow::bail!("The product native host already has an owner.");
+        }
+        let host =
+            create_product_host(&key).map_err(|error| anyhow::anyhow!(error.message.clone()))?;
+        current.host = Some(ProductHost {
+            key,
+            host: Arc::downgrade(&host),
+        });
+        Ok(Self { host })
+    }
+
+    pub fn host(&self) -> Arc<NativeHost> {
+        Arc::clone(&self.host)
+    }
+}
+
+impl Drop for ProductRuntimeOwner {
+    fn drop(&mut self) {
+        let _ = shutdown_product_runtime_for_process_exit(&self.host);
+    }
+}
+
+fn installed_host_for_key(
+    runtime: &ProductRuntimeState,
+    key: &ProductHostKey,
+) -> Result<Option<Arc<NativeHost>>, ()> {
+    match runtime.host.as_ref() {
+        Some(product) if product.key == *key => Ok(product.host.upgrade()),
+        Some(_) => Err(()),
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,7 +255,7 @@ fn with_host<T>(
     operation: impl FnOnce(&NativeHost) -> Result<T, NativeError>,
 ) -> Result<T, ValidationBlocker> {
     let key = host_key(settings);
-    let mut current = product_host().lock().map_err(|_| {
+    let current = product_host().lock().map_err(|_| {
         native_blocker(
             "native_host_poisoned",
             "The native model host is unavailable.",
@@ -217,21 +267,17 @@ fn with_host<T>(
             "The product runtime is shutting down.",
         ));
     }
-    if current.host.as_ref().is_none_or(|host| host.key != key) {
-        current.host = Some(ProductHost {
-            host: create_product_host(&key).map_err(native_error_blocker)?,
-            key,
-        });
+    match installed_host_for_key(&current, &key) {
+        Ok(Some(host)) => operation(&host).map_err(native_error_blocker),
+        Ok(None) => Err(native_blocker(
+            "product_native_host_uninitialized",
+            "The product composition root has not initialized the native host.",
+        )),
+        Err(()) => Err(native_blocker(
+            "product_native_host_identity_locked",
+            "Host-level native settings changed; restart Mom Llama to apply them.",
+        )),
     }
-    operation(
-        current
-            .host
-            .as_ref()
-            .expect("product host is initialized")
-            .host
-            .as_ref(),
-    )
-    .map_err(native_error_blocker)
 }
 
 /// Returns the product-owned host and exact configured model profile for a
@@ -251,26 +297,26 @@ pub fn gateway_native_configuration() -> anyhow::Result<(Arc<NativeHost>, Option
     let settings = crate::config::resolve_settings()?;
     let config = selected_model_config(&settings)?;
     let key = host_key(&settings);
-    let mut current = product_host()
+    let current = product_host()
         .lock()
         .map_err(|_| anyhow::anyhow!("The native model host is unavailable."))?;
     if current.phase != ProductPhase::Running {
         anyhow::bail!("The product runtime is shutting down.");
     }
-    if current.host.as_ref().is_none_or(|host| host.key != key) {
-        current.host = Some(ProductHost {
-            host: create_product_host(&key)
-                .map_err(|error| anyhow::anyhow!(error.message.clone()))?,
-            key,
-        });
+    match installed_host_for_key(&current, &key) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            anyhow::bail!("The product composition root has not initialized the native host.")
+        }
+        Err(()) => {
+            anyhow::bail!("Host-level native settings changed; restart Mom Llama to apply them.")
+        }
     }
-    let host = Arc::clone(
-        &current
-            .host
-            .as_ref()
-            .expect("product host is initialized")
-            .host,
-    );
+    let host = current
+        .host
+        .as_ref()
+        .and_then(|product| product.host.upgrade())
+        .ok_or_else(|| anyhow::anyhow!("The product native host owner was dropped."))?;
     Ok((host, config))
 }
 
@@ -292,7 +338,11 @@ pub fn gateway_native_model_configuration(
         .host
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("The product native host is not initialized."))?;
-    if !Arc::ptr_eq(&product.host, expected_host) {
+    let installed = product
+        .host
+        .upgrade()
+        .ok_or_else(|| anyhow::anyhow!("The product native host owner was dropped."))?;
+    if !Arc::ptr_eq(&installed, expected_host) {
         anyhow::bail!("The product native host identity changed.");
     }
     if product.key != expected_key {
@@ -367,7 +417,8 @@ pub fn resident_model_for_slot(
         if let Some(handle) = current
             .host
             .as_ref()
-            .and_then(|product| product.host.handle(slot_id))
+            .and_then(|product| product.host.upgrade())
+            .and_then(|host| host.handle(slot_id))
         {
             return Ok(handle);
         }
@@ -391,6 +442,7 @@ pub fn resident_status() -> Option<ResidentModelStatus> {
     product_host().lock().ok().and_then(|current| {
         current.host.as_ref().and_then(|host| {
             host.host
+                .upgrade()?
                 .slots()
                 .into_iter()
                 .find(|slot| slot.slot_id == 0)
@@ -409,14 +461,16 @@ pub fn resident_slots() -> Vec<ResidentSlotStatus> {
                 .map(|product| {
                     product
                         .host
-                        .slots()
+                        .upgrade()
                         .into_iter()
-                        .map(|slot| ResidentSlotStatus {
-                            slot_id: slot.slot_id,
-                            model_path: slot.model_path,
-                            model_bytes: slot.model_bytes,
-                            reserved_bytes: slot.reserved_bytes,
-                            status: slot.status,
+                        .flat_map(|host| {
+                            host.slots().into_iter().map(|slot| ResidentSlotStatus {
+                                slot_id: slot.slot_id,
+                                model_path: slot.model_path,
+                                model_bytes: slot.model_bytes,
+                                reserved_bytes: slot.reserved_bytes,
+                                status: slot.status,
+                            })
                         })
                         .collect()
                 })
@@ -429,7 +483,8 @@ pub fn unload_resident_slot(slot_id: usize) -> bool {
     product_host()
         .lock()
         .ok()
-        .and_then(|current| current.host.as_ref().map(|host| host.host.unload(slot_id)))
+        .and_then(|current| current.host.as_ref()?.host.upgrade())
+        .map(|host| host.unload(slot_id))
         .unwrap_or(false)
 }
 
@@ -437,7 +492,8 @@ pub fn unload_resident_model() -> bool {
     product_host()
         .lock()
         .ok()
-        .and_then(|current| current.host.as_ref().map(|host| host.host.unload_all() > 0))
+        .and_then(|current| current.host.as_ref()?.host.upgrade())
+        .map(|host| host.unload_all() > 0)
         .unwrap_or(false)
 }
 
@@ -449,7 +505,8 @@ pub fn cancel_native_request(request_id: &str, branch_id: Option<&str>) -> usize
             current
                 .host
                 .as_ref()
-                .map(|host| host.host.cancel(request_id, branch_id))
+                .and_then(|host| host.host.upgrade())
+                .map(|host| host.cancel(request_id, branch_id))
         })
         .unwrap_or_default()
 }
@@ -462,7 +519,8 @@ pub fn skip_native_reasoning(request_id: &str, branch_id: Option<&str>) -> usize
             current
                 .host
                 .as_ref()
-                .map(|host| host.host.skip_reasoning(request_id, branch_id))
+                .and_then(|host| host.host.upgrade())
+                .map(|host| host.skip_reasoning(request_id, branch_id))
         })
         .unwrap_or_default()
 }
@@ -501,11 +559,15 @@ fn take_product_host(
         runtime.phase = ProductPhase::Closed;
         return Err(ProductShutdownError::HostMissing);
     };
-    if !Arc::ptr_eq(&product.host, expected) {
+    let Some(host) = product.host.upgrade() else {
+        runtime.phase = ProductPhase::Closed;
+        return Err(ProductShutdownError::HostMissing);
+    };
+    if !Arc::ptr_eq(&host, expected) {
         runtime.phase = ProductPhase::Closed;
         return Err(ProductShutdownError::HostIdentityMismatch);
     }
-    Ok(product.host)
+    Ok(host)
 }
 
 fn native_error_blocker(error: NativeError) -> ValidationBlocker {
@@ -548,7 +610,7 @@ mod tests {
     use super::{
         HostCachePolicy, PrefixCacheStore, ProductHost, ProductHostKey, ProductPhase,
         ProductPrefixCacheStore, ProductRuntimeState, ProductShutdownError, create_product_host,
-        host_cache_policy, take_product_host,
+        host_cache_policy, installed_host_for_key, take_product_host,
     };
     use crate::config::KvCachePolicy;
     use llama_native_cache::{CacheFingerprint, CacheTier, PrefixCacheMetadata, PrefixCacheValue};
@@ -591,7 +653,7 @@ mod tests {
         }
     }
 
-    fn test_product(host: std::sync::Arc<NativeHost>) -> ProductHost {
+    fn test_product(host: &std::sync::Arc<NativeHost>) -> ProductHost {
         ProductHost {
             key: ProductHostKey {
                 memory_budget_bytes: 1,
@@ -599,7 +661,7 @@ mod tests {
                 data_dir: std::path::PathBuf::from("test"),
                 cache_policy: KvCachePolicy::None,
             },
-            host,
+            host: std::sync::Arc::downgrade(host),
         }
     }
 
@@ -608,7 +670,7 @@ mod tests {
         let host = std::sync::Arc::new(NativeHost::new(NativeHostConfig::default()));
         let mut runtime = ProductRuntimeState {
             phase: ProductPhase::Running,
-            host: Some(test_product(std::sync::Arc::clone(&host))),
+            host: Some(test_product(&host)),
         };
 
         let taken = take_product_host(&mut runtime, &host).expect("take exact host");
@@ -637,7 +699,7 @@ mod tests {
 
         let mut mismatch = ProductRuntimeState {
             phase: ProductPhase::Running,
-            host: Some(test_product(actual)),
+            host: Some(test_product(&actual)),
         };
         assert!(matches!(
             take_product_host(&mut mismatch, &expected),
@@ -645,6 +707,47 @@ mod tests {
         ));
         assert_eq!(mismatch.phase, ProductPhase::Closed);
         assert!(mismatch.host.is_none());
+    }
+
+    #[test]
+    fn product_host_key_mismatch_cannot_replace_hidden_compatibility_slot() {
+        let original = std::sync::Arc::new(NativeHost::new(NativeHostConfig::default()));
+        let runtime = ProductRuntimeState {
+            phase: ProductPhase::Running,
+            host: Some(test_product(&original)),
+        };
+        let replacement_key = ProductHostKey {
+            memory_budget_bytes: 2,
+            max_slots: 1,
+            data_dir: std::path::PathBuf::from("test"),
+            cache_policy: KvCachePolicy::None,
+        };
+        assert!(installed_host_for_key(&runtime, &replacement_key).is_err());
+        assert!(std::sync::Weak::ptr_eq(
+            &runtime.host.as_ref().expect("installed host").host,
+            &std::sync::Arc::downgrade(&original)
+        ));
+    }
+
+    #[test]
+    fn compatibility_slot_never_owns_or_recreates_the_native_host() {
+        let owner = std::sync::Arc::new(NativeHost::new(NativeHostConfig::default()));
+        let key = ProductHostKey {
+            memory_budget_bytes: 1,
+            max_slots: 1,
+            data_dir: std::path::PathBuf::from("test"),
+            cache_policy: KvCachePolicy::None,
+        };
+        let runtime = ProductRuntimeState {
+            phase: ProductPhase::Running,
+            host: Some(ProductHost {
+                key: key.clone(),
+                host: std::sync::Arc::downgrade(&owner),
+            }),
+        };
+        assert!(installed_host_for_key(&runtime, &key).is_ok_and(|host| host.is_some()));
+        drop(owner);
+        assert!(installed_host_for_key(&runtime, &key).is_ok_and(|host| host.is_none()));
     }
 
     #[test]

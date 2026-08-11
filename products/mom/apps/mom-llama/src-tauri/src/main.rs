@@ -1,4 +1,5 @@
 mod app_runtime;
+mod command_registry;
 mod commands;
 mod view;
 
@@ -328,6 +329,9 @@ fn build_runtime() -> Result<(AppRuntimeHandle, TauriPlugin<tauri::Wry>)> {
     let gateway = Arc::new(Gateway::new(GatewayDefaults {
         catalog_version: "mom-llama-local-v1".to_string(),
     }));
+    let settings = mom_llama_runtime::config::resolve_settings()?;
+    let native_owner =
+        mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(&settings)?;
     let (host, model) = mom_llama_runtime::gateway_native_configuration()?;
     let backend = Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host)));
     backend
@@ -336,7 +340,7 @@ fn build_runtime() -> Result<(AppRuntimeHandle, TauriPlugin<tauri::Wry>)> {
     gateway
         .register_backend(backend.clone())
         .map_err(anyhow::Error::msg)?;
-    let runtime = AppRuntimeHandle::new(Arc::clone(&gateway), backend, host);
+    let runtime = AppRuntimeHandle::new(Arc::clone(&gateway), backend, native_owner);
     let plugin = tauri_plugin_free_token_energy::Builder::new()
         .with_gateway(runtime.gateway())
         .with_store(Arc::new(MomGatewayStore))

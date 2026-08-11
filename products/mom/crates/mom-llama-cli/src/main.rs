@@ -901,13 +901,17 @@ enum KvCacheCommand {
 }
 
 fn main() -> Result<()> {
-    let result = run();
-    mom_llama_runtime::unload_resident_model();
-    result
+    run()
 }
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let _native_owner = command_uses_native(&cli.command)
+        .then(|| {
+            let settings = mom_llama_runtime::config::resolve_settings()?;
+            mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(&settings)
+        })
+        .transpose()?;
     match cli.command {
         Command::Engine { command } => match command {
             EngineCommand::Check { json } => print_result(
@@ -1606,6 +1610,32 @@ fn run() -> Result<()> {
                 print_result(mom_llama_runtime::kv_cache_clear()?, json)
             }
         },
+    }
+}
+
+fn command_uses_native(command: &Command) -> bool {
+    match command {
+        Command::Engine { .. } | Command::Chat { .. } | Command::Server { .. } => true,
+        Command::Model { command } => matches!(
+            command,
+            ModelCommand::Status { .. } | ModelCommand::Load { .. } | ModelCommand::Unload { .. }
+        ),
+        Command::Persona { command } => matches!(command, PersonaCommand::Update { .. }),
+        Command::Mention { command } => !matches!(command, MentionCommand::Candidates { .. }),
+        Command::ToolLoop { command } => matches!(
+            command,
+            ToolLoopCommand::Run { .. } | ToolLoopCommand::Cancel { .. }
+        ),
+        Command::KvCache { command } => !matches!(command, KvCacheCommand::Status { .. }),
+        Command::Consult { .. }
+        | Command::PersonaGroup { .. }
+        | Command::Message { .. }
+        | Command::Attachment { .. }
+        | Command::Path { .. }
+        | Command::Conversation { .. }
+        | Command::Settings { .. }
+        | Command::Mcp { .. }
+        | Command::Skill { .. } => false,
     }
 }
 

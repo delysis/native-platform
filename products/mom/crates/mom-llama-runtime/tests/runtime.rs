@@ -2460,6 +2460,11 @@ fn configured_real_session(name: &str) -> Result<Option<TestSession>> {
     Ok(Some(session))
 }
 
+fn initialize_product_runtime() -> Result<mom_llama_runtime::native_runtime::ProductRuntimeOwner> {
+    let settings = mom_llama_runtime::config::resolve_settings()?;
+    mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(&settings)
+}
+
 async fn product_gateway_cache_request(
     stable_system: &str,
     user_message: &str,
@@ -2560,6 +2565,7 @@ async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_cor
         kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
         ..SettingsUpdate::default()
     })?;
+    let _native_owner = initialize_product_runtime()?;
     let stable_system = format!(
         "This is an immutable local persona prefix used only for cache verification. {}",
         "Keep the complete prior statement in context and answer the next user briefly. "
@@ -2781,6 +2787,7 @@ fn resident_model_profiles_fail_closed_before_memory_overcommit_without_eviction
         max_parallel_sequences: Some(2),
         ..SettingsUpdate::default()
     })?;
+    let _native_owner = initialize_product_runtime()?;
     let settings = mom_llama_runtime::config::resolve_settings()?;
     let first = mom_llama_runtime::resident_model_for_profile(&settings, &model_path, None)
         .map_err(|blocked| anyhow!(blocked.blocker.message))?;
@@ -2814,6 +2821,7 @@ fn repeated_profile_acquisition_reuses_the_same_resident_worker() -> Result<()> 
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("real model path disappeared"))?;
     let settings = mom_llama_runtime::config::resolve_settings()?;
+    let _native_owner = initialize_product_runtime()?;
 
     let first = mom_llama_runtime::resident_model_for_profile(&settings, &model_path, None)
         .map_err(|blocked| anyhow!(blocked.blocker.message))?;
@@ -2838,6 +2846,7 @@ fn real_native_base_completion_invokes_no_fixture() -> Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("real model path disappeared"))?;
     let settings = mom_llama_runtime::config::resolve_settings()?;
+    let _native_owner = initialize_product_runtime()?;
     let handle = mom_llama_runtime::resident_model_for_profile(&settings, &model_path, None)
         .map_err(|blocked| anyhow!(blocked.blocker.message))?;
     let output = handle
@@ -2879,6 +2888,7 @@ fn real_native_chat_invokes_no_fixture_and_persists() -> Result<()> {
     let Some(_session) = configured_real_session("real-chat")? else {
         return Ok(());
     };
+    let _native_owner = initialize_product_runtime()?;
     let result = mom_llama_runtime::chat_send(
         ChatSendInput {
             conversation_id: "real-chat".to_string(),
@@ -2925,6 +2935,7 @@ fn real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_byt
         resident_memory_budget_bytes: Some(12 * 1024 * 1024 * 1024),
         ..SettingsUpdate::default()
     })?;
+    let _native_owner = initialize_product_runtime()?;
     let image_bytes = std::fs::read(&image_path)?;
     let imported = mom_llama_runtime::attachment_import("real-multimodal-image", &image_path)?;
     let attachment = imported
@@ -3041,6 +3052,7 @@ fn real_native_reasoning_stream_can_be_forced_to_the_answer() -> Result<()> {
         ])),
         ..SettingsUpdate::default()
     })?;
+    let _native_owner = initialize_product_runtime()?;
     let mut reasoning_preview = String::new();
     let mut skip_result = None;
     let result = mom_llama_runtime::chat_send_stream(
@@ -3097,6 +3109,7 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
         max_tokens: Some(64),
         ..SettingsUpdate::default()
     })?;
+    let _native_owner = initialize_product_runtime()?;
     let cancellation_panel = mom_llama_runtime::consult_panel_list()?
         .result
         .and_then(|panels| panels.into_iter().next())
@@ -3185,6 +3198,7 @@ fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
         kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
         ..SettingsUpdate::default()
     })?;
+    let _native_owner = initialize_product_runtime()?;
     let source = mom_llama_runtime::conversation_new(Some("Cache source".to_string()))?
         .result
         .ok_or_else(|| anyhow!("cache source missing"))?;
@@ -3317,6 +3331,7 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
         max_tokens: Some(64),
         ..SettingsUpdate::default()
     })?;
+    let _native_owner = initialize_product_runtime()?;
     let source = mom_llama_runtime::conversation_new(Some("Group source".to_string()))?
         .result
         .ok_or_else(|| anyhow!("group source missing"))?;
@@ -3464,6 +3479,7 @@ fn real_native_kv_cache_save_restore_proves_equivalence() -> Result<()> {
     let Some(_session) = configured_real_session("real-cache")? else {
         return Ok(());
     };
+    let _native_owner = initialize_product_runtime()?;
     let skill = mom_llama_runtime::skill_store::skill_create(
         "Cache proof".to_string(),
         "Deterministic cache verification".to_string(),
@@ -3493,6 +3509,7 @@ fn real_native_tool_loop_invokes_model_and_persists_tool_lineage() -> Result<()>
     let Some(session) = configured_real_session("real-tool-loop")? else {
         return Ok(());
     };
+    let _native_owner = initialize_product_runtime()?;
     configure_mcp_fixture(&session)?;
     let prepared = mom_llama_runtime::tool_loop_prepare(
         "real-tool-loop",
@@ -3571,6 +3588,7 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
         max_tokens: Some(512),
         ..SettingsUpdate::default()
     })?;
+    let _native_owner = initialize_product_runtime()?;
     configure_mcp_fixture(&session)?;
     let conversation_id = "real-tool-loop-cancel";
     let prompt =

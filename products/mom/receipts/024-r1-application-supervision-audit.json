@@ -1,0 +1,76 @@
+{
+  "schema": "mom_llama.application_supervision_audit.v1",
+  "task_id": "R1-MOM-SUPERVISE",
+  "status": "code_verified_evidence_open",
+  "generated_at_utc": "2026-08-11T20:45:16Z",
+  "candidate_base_revision": "3474a1b5320ceddbbee4d004e1c5b01e61677960",
+  "candidate_source_patch_sha256_excluding_this_receipt": "1f020fdef1165bca71892c94fed553de69649a008094d443be0d580108fa9e2a",
+  "scope": {
+    "classified_tauri_commands": 85,
+    "permission_scope": "default",
+    "application_admission": "single mutex-protected phase and occurrence registry",
+    "late_registration_cancellation": "product cancellation is re-swept every 20 ms until every admitted lease drains",
+    "native_host_ownership": "ProductRuntimeOwner is the sole installation authority held by the composition root; the compatibility slot stores only Weak<NativeHost>",
+    "shutdown_order": [
+      "close application admission",
+      "request and continuously re-sweep product cancellation",
+      "drain gateway and application leases",
+      "terminally join native host",
+      "mark application closed"
+    ]
+  },
+  "focused_gates": [
+    {
+      "command": "cargo test -p mom-llama-app",
+      "outcome": "passed",
+      "detail": "31 passed, including semantic command inventory, late-registration cancellation, atomic admission races, drain ordering, and repeated quit"
+    },
+    {
+      "command": "cargo test -p mom-llama-runtime",
+      "outcome": "passed_with_declared_ignored_real_model_gates",
+      "detail": "129 passed; 13 ignored tests require explicit real-model environment variables"
+    },
+    {
+      "command": "cargo test -p mom-llama-cli",
+      "outcome": "passed_with_declared_ignored_real_model_gate",
+      "detail": "13 passed; 1 ignored test requires MOM_LLAMA_MODEL_PATH"
+    },
+    {
+      "command": "cargo clippy -p mom-llama-runtime -p mom-llama-app -p mom-llama-cli --all-targets -- -D warnings",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "outcome": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "outcome": "passed"
+    }
+  ],
+  "file_sha256": {
+    "apps/mom-llama/src-tauri/src/app_runtime.rs": "388c68d448456388d404b255c33a764bf9d06d9f4900ba6b5f11e4cc5ed88fc6",
+    "apps/mom-llama/src-tauri/src/command_registry.rs": "93e6e2f1f42d607d02c9b10f1760ab47745e118a16db9db4192bc0d2869166bf",
+    "apps/mom-llama/src-tauri/src/commands.rs": "27cfafaa55c43843bc673b0d065f59637d5829e77179dd05c1d5314674871c84",
+    "apps/mom-llama/src-tauri/src/main.rs": "428e9d9c424533bb45675620eee2b225bb0f0015392e3a10917513ab71db8969",
+    "crates/mom-llama-cli/src/main.rs": "ea2d18bab6268eae9a2b88877f22a2f42bbb16a6726185e907ebd708323f8d73",
+    "crates/mom-llama-runtime/src/chat.rs": "605f00a651a4c82a3a505c07013a1de741596e13c844cb058b56c2cf54e4b5fe",
+    "crates/mom-llama-runtime/src/lib.rs": "27eb62304d02774a6be7f0c723268483e14e1f0ad4df970552020aca4eb1d744",
+    "crates/mom-llama-runtime/src/mcp.rs": "d23d4917e4da04af605c93cf6a9c17a405162160f509dc273025d3c1fc11397d",
+    "crates/mom-llama-runtime/src/mentions.rs": "b48605df56158c42b7fd7e55d2a515b167cbd5a0ba97ac3e094a1bd3ca75ae94",
+    "crates/mom-llama-runtime/src/native_runtime.rs": "4e40f541f3d45ccab9b948c2a8f4deb0c586972703d5d5e4d46dad3a8bd96adb",
+    "crates/mom-llama-runtime/src/tool_loop.rs": "0680577acd35ce094a1817eab448c871927915061f1f91d035f0eb8e877ba0e5",
+    "crates/mom-llama-runtime/tests/runtime.rs": "e2ca465ee771bf6149e18944dfc7acee90d7217138f88cb4bb5b7d47994d8a05"
+  },
+  "open_promotion_evidence": [
+    "Build and identity-lock the exact candidate bundle represented by this receipt.",
+    "During visible real-Qwen Metal generation, exercise product-owned Cmd+Q and Dock/AppleEvent quit paths.",
+    "Confirm cancellation, gateway drain, native final join, exit code 0, and immediate clean relaunch against this candidate.",
+    "Replace the uncommitted candidate patch identity with an immutable repository revision before promotion."
+  ],
+  "claims_not_made": [
+    "No real-model test was run by this correction pass.",
+    "No macOS UI lifecycle acceptance was run by this correction pass.",
+    "This receipt does not promote the candidate to desktop release readiness."
+  ]
+}
