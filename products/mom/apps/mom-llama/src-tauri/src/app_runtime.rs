@@ -221,12 +221,6 @@ impl AppRuntimeHandle {
     }
 
     pub fn admit(&self, command: &'static CommandSpec) -> Result<AppWorkLease, String> {
-        if command.class == CommandClass::ReadOnly {
-            return Err(format!(
-                "read-only command {} does not require an application work lease",
-                command.name
-            ));
-        }
         let mut lifecycle = self
             .0
             .lifecycle
@@ -542,6 +536,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receipt_and_native_reads_drain_before_final_join() {
+        let finalizer_called = Arc::new(AtomicBool::new(false));
+        let runtime = runtime_with_finalizer(Arc::clone(&finalizer_called));
+        let receipt_read = runtime
+            .admit(command_spec("mom_llama_conversation_list"))
+            .expect("admit receipt-writing read");
+        let native_read = runtime
+            .admit(command_spec("mom_llama_model_slot_list"))
+            .expect("admit native read");
+        assert!(receipt_read.cancellation.is_none());
+        assert!(native_read.cancellation.is_none());
+
+        let shutdown = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.shutdown().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!finalizer_called.load(Ordering::Acquire));
+
+        drop(receipt_read);
+        tokio::task::yield_now().await;
+        assert!(!finalizer_called.load(Ordering::Acquire));
+
+        drop(native_read);
+        let _ = shutdown.await.expect("shutdown task");
+        assert!(finalizer_called.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn cancellation_is_reswept_until_late_registered_work_drains() {
         let finalizer_called = Arc::new(AtomicBool::new(false));
         let runtime = runtime_with_finalizer(Arc::clone(&finalizer_called));
@@ -642,5 +665,15 @@ mod tests {
     #[test]
     fn settings_update_vs_quit_has_one_winner() {
         command_vs_quit_has_one_winner("mom_llama_settings_update");
+    }
+
+    #[test]
+    fn receipt_writing_read_vs_quit_has_one_winner() {
+        command_vs_quit_has_one_winner("mom_llama_conversation_list");
+    }
+
+    #[test]
+    fn native_read_vs_quit_has_one_winner() {
+        command_vs_quit_has_one_winner("mom_llama_model_slot_list");
     }
 }

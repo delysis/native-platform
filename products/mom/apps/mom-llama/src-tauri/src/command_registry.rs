@@ -17,15 +17,15 @@ pub struct CommandSpec {
     pub permission: &'static str,
 }
 
-const fn read(name: &'static str, uses_native: bool) -> CommandSpec {
+const fn read(name: &'static str, writes_receipt: bool, uses_native: bool) -> CommandSpec {
     CommandSpec {
         name,
         class: CommandClass::ReadOnly,
-        mutates_store: false,
+        mutates_store: writes_receipt,
         starts_operation: false,
         uses_gateway: false,
         uses_native,
-        allowed_during_quiesce: true,
+        allowed_during_quiesce: false,
         permission: "default",
     }
 }
@@ -57,29 +57,29 @@ const fn long(name: &'static str, mutates_store: bool, uses_native: bool) -> Com
 }
 
 pub static COMMAND_SPECS: &[CommandSpec] = &[
-    read("mom_llama_render_app", true),
-    read("mom_llama_render_chat_fragment", true),
-    read("mom_llama_render_sidebar_fragment", false),
-    read("mom_llama_render_persona_picker_fragment", false),
-    read("mom_llama_render_settings_fragment", true),
+    read("mom_llama_render_app", false, true),
+    read("mom_llama_render_chat_fragment", false, true),
+    read("mom_llama_render_sidebar_fragment", false, false),
+    read("mom_llama_render_persona_picker_fragment", false, false),
+    read("mom_llama_render_settings_fragment", false, true),
     long("mom_llama_pick_file", false, false),
     long("mom_llama_engine_check", false, true),
     mutation("mom_llama_engine_configure", true, true),
-    read("mom_llama_model_list", false),
+    read("mom_llama_model_list", true, false),
     mutation("mom_llama_model_select", true, true),
     long("mom_llama_chat_send", true, true),
     long("mom_llama_chat_dispatch", true, true),
     long("mom_llama_mention_dispatch", true, true),
-    read("mom_llama_mention_candidates", false),
+    read("mom_llama_mention_candidates", true, false),
     mutation("mom_llama_mention_cancel", false, true),
     long("mom_llama_mention_synthesize", true, true),
     mutation("mom_llama_persona_freeze", true, false),
-    read("mom_llama_persona_list", false),
-    read("mom_llama_persona_get", false),
+    read("mom_llama_persona_list", true, false),
+    read("mom_llama_persona_get", true, false),
     long("mom_llama_persona_update", true, true),
     mutation("mom_llama_persona_delete", true, false),
     mutation("mom_llama_persona_instantiate", true, false),
-    read("mom_llama_persona_group_list", false),
+    read("mom_llama_persona_group_list", true, false),
     mutation("mom_llama_persona_group_create", true, false),
     mutation("mom_llama_persona_group_update", true, false),
     mutation("mom_llama_persona_group_delete", true, false),
@@ -88,44 +88,44 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_chat_regenerate", true, true),
     long("mom_llama_chat_continue", true, true),
     mutation("mom_llama_conversation_new", true, false),
-    read("mom_llama_conversation_list", false),
+    read("mom_llama_conversation_list", true, false),
     mutation("mom_llama_conversation_select", true, false),
-    read("mom_llama_conversation_search", false),
+    read("mom_llama_conversation_search", true, false),
     mutation("mom_llama_conversation_rename", true, false),
     mutation("mom_llama_conversation_system_message_update", true, false),
     mutation("mom_llama_conversation_delete", true, false),
     mutation("mom_llama_conversation_fork", true, false),
-    read("mom_llama_conversation_siblings", false),
-    read("mom_llama_draft_get", false),
+    read("mom_llama_conversation_siblings", true, false),
+    read("mom_llama_draft_get", true, false),
     mutation("mom_llama_draft_update", true, false),
     mutation("mom_llama_draft_clear", true, false),
-    read("mom_llama_conversation_export", false),
+    read("mom_llama_conversation_export", true, false),
     mutation("mom_llama_conversation_import", true, false),
-    read("mom_llama_message_copy", false),
+    read("mom_llama_message_copy", true, false),
     mutation("mom_llama_message_edit", true, false),
     mutation("mom_llama_message_delete", true, false),
-    read("mom_llama_message_branches", false),
+    read("mom_llama_message_branches", true, false),
     mutation("mom_llama_message_branch_select", true, false),
     long("mom_llama_attachment_import_text", true, false),
     long("mom_llama_attachment_import_paste", true, false),
     long("mom_llama_attachment_import", true, false),
-    read("mom_llama_attachment_list", false),
+    read("mom_llama_attachment_list", true, false),
     long("mom_llama_attachment_preview", false, false),
     long("mom_llama_attachment_preview_bytes", false, false),
-    read("mom_llama_settings_get", false),
+    read("mom_llama_settings_get", true, false),
     mutation("mom_llama_settings_reset", true, true),
     mutation("mom_llama_settings_update", true, true),
     mutation("mom_llama_skill_create", true, false),
     mutation("mom_llama_skill_update", true, false),
-    read("mom_llama_skill_list", false),
+    read("mom_llama_skill_list", true, false),
     mutation("mom_llama_skill_apply", true, false),
-    read("mom_llama_kv_cache_status", false),
+    read("mom_llama_kv_cache_status", true, false),
     long("mom_llama_kv_cache_save", true, true),
     long("mom_llama_kv_cache_restore", true, true),
     long("mom_llama_kv_cache_clear", true, true),
-    read("mom_llama_mcp_status", false),
+    read("mom_llama_mcp_status", true, false),
     mutation("mom_llama_mcp_configure", true, false),
-    read("mom_llama_mcp_list_servers", false),
+    read("mom_llama_mcp_list_servers", true, false),
     long("mom_llama_mcp_list_tools", false, false),
     long("mom_llama_mcp_call_tool", true, false),
     long("mom_llama_mcp_list_resources", false, false),
@@ -135,11 +135,11 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     mutation("mom_llama_tool_loop_prepare", true, false),
     long("mom_llama_tool_loop_run", true, true),
     mutation("mom_llama_tool_loop_cancel", true, true),
-    read("mom_llama_tool_loop_status", false),
-    read("mom_llama_tool_permission_list", false),
+    read("mom_llama_tool_loop_status", true, false),
+    read("mom_llama_tool_permission_list", true, false),
     mutation("mom_llama_tool_permission_set", true, false),
     mutation("mom_llama_tool_permission_revoke", true, false),
-    read("mom_llama_model_slot_list", true),
+    read("mom_llama_model_slot_list", true, true),
     long("mom_llama_model_slot_load", true, true),
     long("mom_llama_model_slot_unload", true, true),
 ];
@@ -270,6 +270,7 @@ mod tests {
             "mom_llama_mcp_list_prompts",
             "mom_llama_mcp_get_prompt",
         ]);
+        let command_source = include_str!("commands.rs");
 
         for spec in COMMAND_SPECS {
             assert_eq!(spec.permission, "default", "{} permission", spec.name);
@@ -286,14 +287,11 @@ mod tests {
                 "{} operation lifetime",
                 spec.name
             );
-            assert_eq!(
-                spec.allowed_during_quiesce,
-                spec.class == CommandClass::ReadOnly,
-                "{} quiesce policy",
-                spec.name
-            );
+            assert!(!spec.allowed_during_quiesce, "{} quiesce policy", spec.name);
             let expected_store_mutation = match spec.class {
-                CommandClass::ReadOnly => false,
+                CommandClass::ReadOnly => {
+                    command_body(command_source, spec.name).contains("command_value(")
+                }
                 CommandClass::Mutation => !non_store_mutations.contains(spec.name),
                 CommandClass::LongOperation => !non_store_long_operations.contains(spec.name),
             };
@@ -321,12 +319,9 @@ mod tests {
     }
 
     #[test]
-    fn every_mutation_has_app_lease() {
+    fn every_command_has_app_lease() {
         let source = include_str!("commands.rs");
-        for spec in COMMAND_SPECS
-            .iter()
-            .filter(|spec| spec.class == CommandClass::Mutation)
-        {
+        for spec in COMMAND_SPECS {
             assert!(
                 command_body(source, spec.name)
                     .contains(&format!("admit(command_spec(\"{}\"))", spec.name)),
