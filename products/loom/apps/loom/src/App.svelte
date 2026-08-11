@@ -66,7 +66,7 @@
     candidateTextIsSurfaceable
   } from './lib/candidateSurface';
   import { sourceGhostPresentationCompatible } from './lib/sourceGhostText';
-  import { visualGhostTextMayBeInline } from './lib/ghostText';
+  import { visualGhostTextMayBePlainProse } from './lib/ghostText';
   import { isExtendedGraphemeBoundary } from './lib/graphemeBoundary';
   import { branchIsActionableOnShelf } from './lib/branchShelf';
   import {
@@ -565,7 +565,7 @@
     dismissedCandidateIds,
     unpresentablePresentationKeys: unpresentableVisualGhostPresentationKeys,
     targetByte: visualGhostTargetByte,
-    presentationCompatible: visualGhostTextMayBeInline
+    presentationCompatible: visualGhostTextMayBePlainProse
   });
   $: ghostSuggestion = visualAutocompleteDisposition.kind === 'available'
     ? visualAutocompleteDisposition.suggestion

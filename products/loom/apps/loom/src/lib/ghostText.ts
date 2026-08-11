@@ -199,32 +199,46 @@ export function exactMarkdownByteOffsetAtSelection(
  * Cheap context-neutral screen used while choosing among branch candidates.
  * The exact document-context proof below remains authoritative.
  */
-export function visualGhostTextMayBeInline(text: string): boolean {
-  if (!text || !/\S/u.test(text) || /[\r\n]/u.test(text)) return false;
+export function visualGhostTextMayBePlainProse(text: string): boolean {
+  if (!text || !/\S/u.test(text) || /\r/u.test(text)) return false;
+  const prose = text.startsWith('\n\n') ? text.slice(2) : text;
+  if (!prose || prose.startsWith('\n') || prose.endsWith('\n')) return false;
+  const paragraphs = prose.split('\n\n');
+  if (paragraphs.some((paragraph) => !paragraph || paragraph.includes('\n'))) return false;
+
   try {
     const left = '\uE100LOOM_LEFT\uE101';
     const right = '\uE102LOOM_RIGHT\uE103';
-    const wrapped = `${left}${text}${right}`;
-    const parsed = defaultMarkdownParser.parse(wrapped);
-    const paragraph = parsed.childCount === 1 ? parsed.firstChild : null;
-    if (!paragraph || paragraph.type.name !== 'paragraph' || paragraph.textContent !== wrapped) {
-      return false;
-    }
-    let plain = true;
-    paragraph.descendants((node) => {
-      if (!node.isText || node.marks.length > 0) plain = false;
+    return paragraphs.every((paragraphText) => {
+      const raw = defaultMarkdownParser.parse(paragraphText);
+      if (raw.childCount !== 1 || raw.firstChild?.type.name !== 'paragraph') return false;
+      const wrapped = `${left}${paragraphText}${right}`;
+      const parsed = defaultMarkdownParser.parse(wrapped);
+      const paragraph = parsed.childCount === 1 ? parsed.firstChild : null;
+      if (
+        !paragraph ||
+        paragraph.type.name !== 'paragraph' ||
+        paragraph.textContent !== wrapped
+      ) {
+        return false;
+      }
+      let plain = true;
+      paragraph.descendants((node) => {
+        if (!node.isText || node.marks.length > 0) plain = false;
+      });
+      return plain && defaultMarkdownSerializer.serialize(parsed) === wrapped;
     });
-    return plain && defaultMarkdownSerializer.serialize(parsed) === wrapped;
   } catch {
     return false;
   }
 }
 
 /**
- * Prove that promoting the exact raw bytes would produce the same visual
- * ProseMirror document as inserting those bytes literally at this caret. This
- * prevents raw Markdown controls or multi-block output from masquerading as
- * faithful inline prose.
+ * Prove that promoting the exact raw bytes yields canonical plain prose at the
+ * exact visual caret. Inline text is checked against a literal ProseMirror
+ * transaction. Paragraph continuations are checked by parsing and serializing
+ * the complete promoted manuscript, so Markdown controls cannot masquerade as
+ * prose and no normalization can silently change the admitted bytes.
  */
 export function visualGhostTextIsFaithfulAtSelection(
   state: EditorState,
@@ -234,7 +248,7 @@ export function visualGhostTextIsFaithfulAtSelection(
 ): boolean {
   if (
     exactMarkdownByteOffsetAtSelection(state, canonicalMarkdown) !== anchorByteOffset ||
-    !visualGhostTextMayBeInline(text) ||
+    !visualGhostTextMayBePlainProse(text) ||
     !insertionPreservesVisibleGraphemeEdges(state, text)
   ) return false;
   const boundary = utf8BoundaryToUtf16Index(canonicalMarkdown, anchorByteOffset);
@@ -242,6 +256,10 @@ export function visualGhostTextIsFaithfulAtSelection(
   try {
     const promotedMarkdown =
       canonicalMarkdown.slice(0, boundary) + text + canonicalMarkdown.slice(boundary);
+    if (text.includes('\n')) {
+      const promotedDocument = defaultMarkdownParser.parse(promotedMarkdown);
+      return defaultMarkdownSerializer.serialize(promotedDocument) === promotedMarkdown;
+    }
     const literalDocument = state.tr.insertText(text).doc;
     return defaultMarkdownSerializer.serialize(literalDocument) === promotedMarkdown &&
       defaultMarkdownParser.parse(promotedMarkdown).eq(literalDocument);
