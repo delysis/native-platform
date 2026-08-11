@@ -44,6 +44,7 @@ const MAX_RESUME_SIDECAR_BYTES: u64 = 64 * 1024;
 const RESUME_SIDECAR_VERSION: u32 = 2;
 const MAX_SOURCE_ATTESTATIONS: usize = 128;
 const MAX_SIDECAR_TEMP_ATTEMPTS: usize = 128;
+#[cfg(unix)]
 const MAX_SIDECAR_DIRECTORY_ENTRIES: usize = 4_096;
 
 static NEXT_SIDECAR_TEMP_ID: AtomicU64 = AtomicU64::new(1);
@@ -1622,6 +1623,7 @@ impl DurableResumePaths {
     }
 }
 
+#[cfg(unix)]
 fn canonical_parent(path: &Path) -> Result<PathBuf, AcquireError> {
     let parent = path
         .parent()

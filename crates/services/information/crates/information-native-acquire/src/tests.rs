@@ -1424,6 +1424,7 @@ fn local_options(resume: ResumePolicy) -> ArtifactFetchOptions {
     }
 }
 
+#[cfg(unix)]
 fn test_resume_state(uri: &str, sha256: &str, etag: &str) -> ResumeSidecar {
     ResumeSidecar {
         version: RESUME_SIDECAR_VERSION,
@@ -1453,11 +1454,6 @@ fn test_file_identity() -> FileIdentity {
         device: 0,
         inode: 0,
     }
-}
-
-#[cfg(not(unix))]
-fn test_file_identity() -> FileIdentity {
-    FileIdentity
 }
 
 fn resolve_destination_for_test(
