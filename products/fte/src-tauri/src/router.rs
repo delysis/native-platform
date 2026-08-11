@@ -1216,10 +1216,10 @@ fn validate_chat_request(req: &ChatRequest) -> anyhow::Result<()> {
             ));
         }
     }
-    if let Some(temperature) = req.temperature {
-        if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
-            return Err(anyhow::anyhow!("temperature must be between 0 and 2"));
-        }
+    if let Some(temperature) = req.temperature
+        && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
+    {
+        return Err(anyhow::anyhow!("temperature must be between 0 and 2"));
     }
     if req.max_tokens == Some(0) {
         return Err(anyhow::anyhow!("max_tokens must be greater than zero"));
@@ -1238,10 +1238,10 @@ fn validate_completion_request(req: &CompletionRequest) -> anyhow::Result<()> {
     if prompt_count > 2_048 {
         return Err(anyhow::anyhow!("prompt exceeds the limit of 2048 items"));
     }
-    if let Some(temperature) = req.temperature {
-        if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
-            return Err(anyhow::anyhow!("temperature must be between 0 and 2"));
-        }
+    if let Some(temperature) = req.temperature
+        && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
+    {
+        return Err(anyhow::anyhow!("temperature must be between 0 and 2"));
     }
     if req.max_tokens == Some(0) {
         return Err(anyhow::anyhow!("max_tokens must be greater than zero"));

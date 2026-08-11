@@ -412,12 +412,12 @@ fn nonnegative_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
 }
 
 fn create_parent_if_missing(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-            harden_directory_permissions(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+        harden_directory_permissions(parent)?;
     }
     Ok(())
 }

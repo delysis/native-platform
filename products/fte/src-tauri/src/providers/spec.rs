@@ -612,18 +612,17 @@ fn gemini_request_body(req: &ChatRequest) -> anyhow::Result<Value> {
         "thinking_config",
         "thinkingConfig",
     );
-    if let Some(response_format) = req.extra.get("response_format") {
-        if response_format
+    if let Some(response_format) = req.extra.get("response_format")
+        && response_format
             .get("type")
             .and_then(Value::as_str)
             .map(|kind| kind == "json_object" || kind == "json_schema")
             .unwrap_or(false)
-        {
-            generation_config.insert(
-                "responseMimeType".to_string(),
-                Value::String("application/json".to_string()),
-            );
-        }
+    {
+        generation_config.insert(
+            "responseMimeType".to_string(),
+            Value::String("application/json".to_string()),
+        );
     }
     if !generation_config.is_empty() {
         body.insert(
@@ -1042,15 +1041,13 @@ fn merge_consecutive_anthropic_messages(messages: Vec<Value>) -> Vec<Value> {
             .cloned()
             .unwrap_or_default();
 
-        if let Some(previous) = merged.last_mut() {
-            if previous.get("role").and_then(Value::as_str) == Some(role.as_str()) {
-                if let Some(previous_content) =
-                    previous.get_mut("content").and_then(Value::as_array_mut)
-                {
-                    previous_content.extend(content);
-                    continue;
-                }
-            }
+        if let Some(previous) = merged.last_mut()
+            && previous.get("role").and_then(Value::as_str) == Some(role.as_str())
+            && let Some(previous_content) =
+                previous.get_mut("content").and_then(Value::as_array_mut)
+        {
+            previous_content.extend(content);
+            continue;
         }
 
         merged.push(json!({
@@ -1067,13 +1064,13 @@ fn apply_dynamic_headers(headers: &mut HeaderMap, body: &mut Value) -> anyhow::R
         return Ok(());
     };
 
-    if let Some(beta) = object.remove("anthropic_beta") {
-        if let Some(beta) = beta.as_str() {
-            headers.insert(
-                HeaderName::from_static("anthropic-beta"),
-                HeaderValue::from_str(beta)?,
-            );
-        }
+    if let Some(beta) = object.remove("anthropic_beta")
+        && let Some(beta) = beta.as_str()
+    {
+        headers.insert(
+            HeaderName::from_static("anthropic-beta"),
+            HeaderValue::from_str(beta)?,
+        );
     }
 
     Ok(())

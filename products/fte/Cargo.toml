@@ -41,10 +41,10 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["limit", "timeout"] }
 tracing = "0.1.44"
 uuid = { version = "1", features = ["v4", "serde"] }
-llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "4dd744209ff85886be9dce7df46cd65eaa19c804" }
-llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "4dd744209ff85886be9dce7df46cd65eaa19c804" }
-llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "4dd744209ff85886be9dce7df46cd65eaa19c804" }
-llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "4dd744209ff85886be9dce7df46cd65eaa19c804" }
+llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "2361560593cba95de49a7bb58380b5b4bacd58da" }
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "2361560593cba95de49a7bb58380b5b4bacd58da" }
+llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "2361560593cba95de49a7bb58380b5b4bacd58da" }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "2361560593cba95de49a7bb58380b5b4bacd58da" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
