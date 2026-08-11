@@ -275,14 +275,19 @@ mod tests {
                 spec.name
             );
             assert!(!spec.allowed_during_quiesce, "{} quiesce policy", spec.name);
-            let body = command_body(command_source, spec.name);
-            let expected_store_mutation =
-                body.contains("command_value(") || body.contains("blocking_command(");
-            assert_eq!(
-                spec.mutates_store, expected_store_mutation,
-                "{} store authority",
-                spec.name
-            );
+            for (implementation, body) in command_bodies(command_source, spec.name)
+                .into_iter()
+                .enumerate()
+            {
+                let expected_store_mutation = body.contains("command_value(")
+                    || body.contains("blocking_command(")
+                    || body.contains("picker_blocked(");
+                assert_eq!(
+                    spec.mutates_store, expected_store_mutation,
+                    "{} implementation {} store authority",
+                    spec.name, implementation
+                );
+            }
         }
     }
 
@@ -305,21 +310,40 @@ mod tests {
     fn every_command_has_app_lease() {
         let source = include_str!("commands.rs");
         for spec in COMMAND_SPECS {
-            let body = command_body(source, spec.name);
-            let executable = body
-                .split_once('{')
-                .map(|(_, executable)| executable)
-                .unwrap_or_else(|| panic!("{} must have a function body", spec.name));
-            let admission = format!("admit(command_spec(\"{}\"))", spec.name);
-            let admission_offset = executable
-                .find(&admission)
-                .unwrap_or_else(|| panic!("{} must acquire its classified app lease", spec.name));
-            assert!(
-                effect_offsets(executable).all(|effect_offset| admission_offset < effect_offset),
-                "{} must acquire its app lease before every effectful command boundary",
-                spec.name
-            );
+            for (implementation, body) in command_bodies(source, spec.name).into_iter().enumerate()
+            {
+                assert!(
+                    admission_precedes_effects(body, spec.name),
+                    "{} implementation {} must acquire its app lease before every effectful command boundary",
+                    spec.name,
+                    implementation
+                );
+            }
         }
+    }
+
+    #[test]
+    fn admission_check_rejects_a_misordered_later_cfg_implementation() {
+        assert_eq!(
+            command_bodies(include_str!("commands.rs"), "mom_llama_pick_file").len(),
+            2,
+            "both cfg-gated native picker implementations must remain in the inventory"
+        );
+        let source = r#"
+pub async fn sample(runtime: Runtime) {
+    let _lease = runtime.admit(command_spec("sample"));
+    command_value(operation());
+}
+#[tauri::command]
+pub async fn sample(runtime: Runtime) {
+    command_value(operation());
+    let _lease = runtime.admit(command_spec("sample"));
+}
+"#;
+        let bodies = command_bodies(source, "sample");
+        assert_eq!(bodies.len(), 2);
+        assert!(admission_precedes_effects(bodies[0], "sample"));
+        assert!(!admission_precedes_effects(bodies[1], "sample"));
     }
 
     #[test]
@@ -329,33 +353,63 @@ mod tests {
             .iter()
             .filter(|spec| spec.class == CommandClass::LongOperation)
         {
-            let body = command_body(source, spec.name);
-            assert!(
-                body.contains(&format!("admit(command_spec(\"{}\"))", spec.name)),
-                "{} must atomically acquire its classified app lease",
-                spec.name
-            );
-            assert!(
-                body.contains("blocking_command(")
+            for (implementation, body) in command_bodies(source, spec.name).into_iter().enumerate()
+            {
+                assert!(
+                    body.contains(&format!("admit(command_spec(\"{}\"))", spec.name)),
+                    "{} implementation {} must atomically acquire its classified app lease",
+                    spec.name,
+                    implementation
+                );
+                let starts_long_work = body.contains("blocking_command(")
                     || body.contains("blocking_response(")
-                    || body.contains("lease.cancellation")
-                    || body.contains("lease.cancelled()"),
-                "{} must carry an application cancellation control",
-                spec.name
-            );
+                    || body.contains("AsyncFileDialog::");
+                if starts_long_work {
+                    assert!(
+                        body.contains("blocking_command(")
+                            || body.contains("blocking_response(")
+                            || body.contains("lease.cancellation")
+                            || body.contains("lease.cancelled()"),
+                        "{} implementation {} must carry an application cancellation control",
+                        spec.name,
+                        implementation
+                    );
+                }
+            }
         }
     }
 
-    fn command_body<'a>(source: &'a str, name: &str) -> &'a str {
-        let sync = format!("pub fn {name}(");
-        let asynchronous = format!("pub async fn {name}(");
-        let start = source
-            .find(&sync)
-            .or_else(|| source.find(&asynchronous))
-            .unwrap_or_else(|| panic!("missing Tauri command {name}"));
-        let rest = &source[start..];
-        let end = rest.find("\n#[tauri::command]").unwrap_or(rest.len());
-        &rest[..end]
+    fn command_bodies<'a>(source: &'a str, name: &str) -> Vec<&'a str> {
+        let declarations = [format!("pub fn {name}("), format!("pub async fn {name}(")];
+        let mut starts = declarations
+            .iter()
+            .flat_map(|declaration| source.match_indices(declaration).map(|(offset, _)| offset))
+            .collect::<Vec<_>>();
+        starts.sort_unstable();
+        starts.dedup();
+        assert!(!starts.is_empty(), "missing Tauri command {name}");
+        starts
+            .into_iter()
+            .map(|start| {
+                let rest = &source[start..];
+                let end = rest
+                    .find("\n}\n")
+                    .map(|closing_brace| closing_brace + 2)
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect()
+    }
+
+    fn admission_precedes_effects(body: &str, name: &str) -> bool {
+        let Some((_, executable)) = body.split_once('{') else {
+            return false;
+        };
+        let admission = format!("admit(command_spec(\"{name}\"))");
+        let Some(admission_offset) = executable.find(&admission) else {
+            return false;
+        };
+        effect_offsets(executable).all(|effect_offset| admission_offset < effect_offset)
     }
 
     fn effect_offsets(body: &str) -> impl Iterator<Item = usize> + '_ {
