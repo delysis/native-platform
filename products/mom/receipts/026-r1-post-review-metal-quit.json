@@ -1,0 +1,58 @@
+{
+  "schema": "mom_llama.application_supervision_acceptance.v1",
+  "task_id": "R1-MOM-SUPERVISE-POST-REVIEW-METAL-ACCEPTANCE",
+  "status": "cmd_q_passed_dock_apple_event_open",
+  "observed_at_utc": "2026-08-11T22:35:31Z",
+  "runtime_source_revision": "57a69aea00caeacd31ff2922b90520f6016fbbdc",
+  "evidence_commit_parent": "bc9a148",
+  "bundle": {
+    "path_recorded": false,
+    "product_name": "Mom Llama R1 57a69ae",
+    "bundle_identifier": "com.delysis.mom-llama.r1.57a69ae.acceptance",
+    "executable_bytes": 95037600,
+    "executable_sha256": "bc8b03d7aade0fabf4679113e4d5e7cef2fa65169657e1ef7a370c7f38ac6efb",
+    "signature": "ad-hoc linker signature",
+    "architecture": "arm64"
+  },
+  "real_model": {
+    "path_recorded": false,
+    "file_name": "Qwen_Qwen3-0.6B-Q4_K_M.gguf",
+    "bytes": 484220320,
+    "sha256": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14",
+    "device": "Metal on Apple M4 Max",
+    "fixture_used": false
+  },
+  "cmd_q_acceptance": {
+    "prompt": "Describe lightning over the lighthouse in one sentence. Now.",
+    "pre_quit_visible_state": "real Qwen reasoning text was visibly streaming and Skip reasoning plus Stop were enabled",
+    "quit_input": "Cmd+Q through the product-owned ordinary menu accelerator",
+    "process_exit_code": 0,
+    "shutdown_receipt": {
+      "elapsed_ms": 107,
+      "gateway_drained": true,
+      "native_host_joined": true,
+      "joined_native_worker_count": 1,
+      "application_work_drained": true
+    },
+    "native_teardown_evidence": "ggml_metal_free: deallocating",
+    "crash_report_observed": false
+  },
+  "relaunch_acceptance": {
+    "same_isolated_store": true,
+    "immediate_relaunch": true,
+    "draft_recovered_exactly": "Describe lightning over the lighthouse in one sentence. Now.",
+    "second_quit_exit_code": 0,
+    "second_shutdown_elapsed_ms": 4,
+    "second_shutdown_joined_native_worker_count": 0,
+    "process_left_running": false
+  },
+  "open_promotion_evidence": [
+    "Exercise Dock Quit or a directly identified AppleEvent Quit against this exact source with a trustworthy OS interaction harness.",
+    "Run current-head remote CI after publication.",
+    "Record a review by a steward independent of both implementation passes."
+  ],
+  "claims_not_made": [
+    "This receipt does not claim Dock or direct AppleEvent quit acceptance.",
+    "This receipt does not claim remote CI or release readiness."
+  ]
+}

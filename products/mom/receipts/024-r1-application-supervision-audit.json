@@ -65,14 +65,13 @@
     "crates/mom-llama-runtime/tests/runtime.rs": "e2ca465ee771bf6149e18944dfc7acee90d7217138f88cb4bb5b7d47994d8a05"
   },
   "open_promotion_evidence": [
-    "Build and identity-lock the exact post-review candidate bundle from revision 57a69aea00caeacd31ff2922b90520f6016fbbdc.",
-    "During visible real-Qwen Metal generation, exercise product-owned Cmd+Q and Dock/AppleEvent quit paths against that post-review bundle.",
-    "Confirm cancellation, gateway drain, application-command drain, native final join, exit code 0, and immediate clean relaunch against the post-review candidate."
+    "Exercise Dock Quit or a directly identified AppleEvent Quit against post-review revision 57a69aea00caeacd31ff2922b90520f6016fbbdc.",
+    "Run current-head remote CI after publication.",
+    "Record a review by a steward independent of both implementation passes."
   ],
   "claims_not_made": [
-    "The exact-bundle real-model Cmd+Q evidence in receipt 025 was produced from parent revision aaa6996 before this review correction and does not validate the post-review source.",
-    "No real-model test was run against the post-review source.",
-    "No macOS UI lifecycle acceptance was run against the post-review source.",
+    "Receipt 025 remains historical evidence for parent revision aaa6996 and does not validate the post-review source.",
+    "Receipt 026 proves product-owned Cmd+Q and immediate relaunch for the post-review source but not Dock or direct AppleEvent quit.",
     "This receipt does not promote the candidate to desktop release readiness."
   ]
 }
