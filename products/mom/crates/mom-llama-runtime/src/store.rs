@@ -479,10 +479,17 @@ fn disposable_cache_quarantine_namespace(
 }
 
 fn resolve_store_key(data_dir: &Path) -> Result<[u8; 32]> {
+    // Unit tests share one process and may exercise the public test data-dir
+    // override concurrently.  Store identity must follow the explicit path,
+    // not the instantaneous value of that unrelated process-global switch.
+    // `cfg!(test)` is immutable for this binary and keeps every unit-test open
+    // on the same deterministic key derivation.
+    let deterministic_test_store =
+        deterministic_test_store(crate::config::data_dir_override_is_set());
     if let Some(key) = configured_store_key(
         data_dir,
         std::env::var(STORE_KEY_ENV).ok().as_deref(),
-        crate::config::data_dir_override_is_set(),
+        deterministic_test_store,
         crate::config::insecure_development_store_enabled(),
     )? {
         return Ok(key);
@@ -501,6 +508,10 @@ fn resolve_store_key(data_dir: &Path) -> Result<[u8; 32]> {
             "Set LLAMA_NATIVE_KIT_STORE_KEY_HEX on platforms without a supported OS credential store"
         ))
     }
+}
+
+const fn deterministic_test_store(data_dir_override_is_set: bool) -> bool {
+    cfg!(test) || data_dir_override_is_set
 }
 
 fn configured_store_key(
@@ -609,6 +620,12 @@ fn decode_hex_key(input: &str) -> Result<[u8; 32]> {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+
+    #[test]
+    fn unit_test_key_selection_does_not_depend_on_the_mutable_data_dir_override() {
+        assert!(deterministic_test_store(false));
+        assert!(deterministic_test_store(true));
+    }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
     struct SecretDocument {
