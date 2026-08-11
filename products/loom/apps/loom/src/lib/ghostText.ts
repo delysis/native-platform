@@ -342,13 +342,10 @@ export function visibleGhostWidgetPresentationKey(view: EditorView): string {
   ) return '';
   const clip = view.dom.closest<HTMLElement>('.editor-pane')?.getBoundingClientRect();
   if (!clip) return '';
-  // A paragraph-leading newline may contribute a zero-height client rect
-  // before the first rendered glyph. It is not a visible fragment and must
-  // neither authorize nor veto the presentation.
-  const firstGhostFragment = Array.from(widget.getClientRects()).find((rect) =>
-    validRect(rect, true)
-  );
-  if (!firstGhostFragment) return '';
+  // The union rectangle is authoritative for a text widget that can begin
+  // with paragraph whitespace. WebKit may expose only zero-height fragment
+  // rects for those leading newlines even while the prose glyphs are visible.
+  const renderedGhost = widget.getBoundingClientRect();
   let caret: ReturnType<EditorView['coordsAtPos']>;
   try {
     caret = view.coordsAtPos(plan.position);
@@ -358,7 +355,7 @@ export function visibleGhostWidgetPresentationKey(view: EditorView): string {
   const direction = widget.ownerDocument.defaultView?.getComputedStyle(widget).direction;
   if (!visualGhostInsertionIsVisible(
     caret,
-    firstGhostFragment,
+    renderedGhost,
     clip,
     direction === 'rtl' ? 'rtl' : 'ltr'
   )) return '';
