@@ -3,7 +3,9 @@ import type { ModelCapabilitySummary } from './types';
 import {
   automaticWriterForBuildPolicy,
   isVerifiedPolicyWriter,
-  orderedLocalWriterCandidates
+  orderedLocalWriterCandidates,
+  preferredWriterModelPath,
+  writerProfileForBuildPolicy
 } from './modelPolicy';
 
 function model(overrides: Partial<ModelCapabilitySummary> = {}): ModelCapabilitySummary {
@@ -63,6 +65,38 @@ describe('orderedLocalWriterCandidates', () => {
       { modelPath: '/z.gguf', profileId: 'writer-first', policyRank: 1 },
       { modelPath: '/a.gguf', profileId: 'writer-later', policyRank: 4 }
     ]);
+  });
+});
+
+describe('preferredWriterModelPath', () => {
+  it('never selects a merely parseable unrelated model', () => {
+    const incompatible = model({
+      model_path: '/models/instruct.gguf',
+      policy_candidate: null
+    });
+    const writer = model({ model_path: '/models/base-writer.gguf' });
+
+    expect(preferredWriterModelPath(
+      [incompatible, writer],
+      incompatible.model_path,
+      incompatible.model_path
+    )).toBe(writer.model_path);
+    expect(preferredWriterModelPath([incompatible], incompatible.model_path, '')).toBe('');
+  });
+
+  it('prefers resident evidence, then a remembered compatible candidate', () => {
+    const first = model({ model_path: '/models/first.gguf' });
+    const remembered = model({ model_path: '/models/remembered.gguf' });
+    const resident = model({
+      model_path: '/models/resident.gguf',
+      loaded: true,
+      policy_candidate: null
+    });
+
+    expect(preferredWriterModelPath([first, remembered], remembered.model_path, ''))
+      .toBe(remembered.model_path);
+    expect(preferredWriterModelPath([first, resident], first.model_path, first.model_path))
+      .toBe(resident.model_path);
   });
 });
 
@@ -137,5 +171,21 @@ describe('automaticWriterForBuildPolicy', () => {
       activation: 'project_opt_in',
       canonical_sha256: 'ce3bdf5e3dbcac6f7bcc164ec4cc5c78b4a7b5bef7c49b3cd52c61e123b75fe0'
     })).toBeUndefined();
+  });
+});
+
+describe('writerProfileForBuildPolicy', () => {
+  it('binds both Gemma writer policies and rejects a build without a writer', () => {
+    expect(writerProfileForBuildPolicy({
+      name: 'writer-gemma4-base-v2',
+      activation: 'quiet_default',
+      canonical_sha256: '2d402d213b60ba65c4d018907e9eba67ccfbc1e97081cc0505f9713ae2dd89d2'
+    })).toBe('gemma_4_e2b_base_q8_loom_v1');
+    expect(writerProfileForBuildPolicy({
+      name: 'none-v1',
+      activation: 'project_opt_in',
+      canonical_sha256: 'ce3bdf5e3dbcac6f7bcc164ec4cc5c78b4a7b5bef7c49b3cd52c61e123b75fe0'
+    })).toBeNull();
+    expect(writerProfileForBuildPolicy(null)).toBeNull();
   });
 });

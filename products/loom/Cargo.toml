@@ -74,3 +74,9 @@ strip = "symbols"
 # the cryptographic primitive optimized without optimizing the whole test graph.
 [profile.test.package.sha2]
 opt-level = 3
+
+# The debug desktop app performs the same cold identity check before it can
+# admit a multi-gigabyte local model. Leaving SHA-256 unoptimized makes normal
+# setup appear hung even though the UI thread remains responsive.
+[profile.dev.package.sha2]
+opt-level = 3

@@ -21,7 +21,7 @@ export type AutomaticWriterSummary = ModelCapabilitySummary & {
 
 const GEMMA_4_BASE_WRITER_PROFILE = 'gemma_4_e2b_base_q8_loom_v1';
 
-function automaticWriterProfile(
+export function writerProfileForBuildPolicy(
   policy: BuildModelPolicySummary | null
 ): string | null {
   switch (policy?.name) {
@@ -60,6 +60,26 @@ export function orderedLocalWriterCandidates(
     );
 }
 
+/**
+ * Chooses only a resident model or a policy candidate for the writer picker.
+ * A remembered arbitrary GGUF must never displace the compatible-model setup
+ * path merely because its header can be parsed.
+ */
+export function preferredWriterModelPath(
+  models: readonly ModelCapabilitySummary[],
+  rememberedPath: string | null,
+  currentPath: string
+): string {
+  const loaded = models.find((model) => model.loaded);
+  if (loaded) return loaded.model_path;
+
+  const candidates = orderedLocalWriterCandidates(models);
+  const candidatePaths = new Set(candidates.map((candidate) => candidate.modelPath));
+  if (rememberedPath && candidatePaths.has(rememberedPath)) return rememberedPath;
+  if (candidatePaths.has(currentPath)) return currentPath;
+  return candidates[0]?.modelPath ?? '';
+}
+
 export function isVerifiedPolicyWriter(
   model: ModelCapabilitySummary,
   profileId: string
@@ -81,7 +101,7 @@ export function automaticWriterForBuildPolicy(
   models: readonly ModelCapabilitySummary[],
   policy: BuildModelPolicySummary | null
 ): AutomaticWriterSummary | undefined {
-  const profileId = automaticWriterProfile(policy);
+  const profileId = writerProfileForBuildPolicy(policy);
   return profileId
     ? models.find((model): model is AutomaticWriterSummary =>
       isVerifiedPolicyWriter(model, profileId))

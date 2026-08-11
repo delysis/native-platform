@@ -163,7 +163,15 @@ pub struct AuthorshipAttestation {
     pub generated_span_artifact_id: ArtifactId,
     pub promoted_revision_id: RevisionId,
     pub promotion_command_id: CommandId,
-    pub human_confirmed: bool,
+    /// The strongest claim this record makes. Interactive selection is useful
+    /// product provenance, but is not verified base-writer research authority.
+    pub evidence_class: AuthorshipEvidenceClass,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorshipEvidenceClass {
+    DiagnosticGenerationSelectedByUser,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

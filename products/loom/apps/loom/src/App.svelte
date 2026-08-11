@@ -25,7 +25,6 @@
     listenForApplicationCloseRequests,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
-    loadModel,
     loadPolicyModelCandidate,
     listModels,
     listModelDownloads,
@@ -130,7 +129,9 @@
   import {
     automaticWriterForBuildPolicy,
     isVerifiedPolicyWriter,
-    orderedLocalWriterCandidates
+    orderedLocalWriterCandidates,
+    preferredWriterModelPath,
+    writerProfileForBuildPolicy
   } from './lib/modelPolicy';
   import type {
     BranchCard,
@@ -173,6 +174,9 @@
   let outlineSearch: HTMLInputElement | undefined;
   let models: ModelCapabilitySummary[] = [];
   let selectedModelPath = '';
+  let compatibleWriterModels: ModelCapabilitySummary[] = [];
+  let otherLocalModels: ModelCapabilitySummary[] = [];
+  let modelSetupError = '';
   let modelLoading = false;
   let modelUnloading = false;
   let modelChoosing = false;
@@ -410,11 +414,6 @@
     commandId: string;
   }
 
-  interface ModelLoadOptions {
-    expectedWorkspace?: WorkspaceRestoreCapture;
-    quiet?: boolean;
-  }
-
   interface HydratedBranchBodies {
     cards: BranchCard[];
     bodyBlobByRun: Record<string, string>;
@@ -499,6 +498,15 @@
     transition === 'idle'
   );
   $: selectedModel = models.find((model) => model.model_path === selectedModelPath) ?? null;
+  $: compatibleWriterModels = orderedLocalWriterCandidates(models)
+    .map((candidate) => models.find((model) => model.model_path === candidate.modelPath))
+    .filter((model): model is ModelCapabilitySummary => Boolean(model));
+  $: otherLocalModels = models.filter((model) =>
+    model.local &&
+    model.header_verified &&
+    !model.loaded &&
+    !model.policy_candidate
+  );
   $: activeModelDownloads = modelDownloads.filter((download) => !modelDownloadIsTerminal(download));
   $: pendingModelDownloadSnapshot = pendingModelDownload
     ? modelDownloads.find((download) => download.command_id === pendingModelDownload?.commandId) ?? null
@@ -623,6 +631,15 @@
     Boolean(activeGhostSuggestion),
     reviewableBranches.length
   );
+  $: suggestionMenuState = suggestionsChanging
+    ? '…'
+    : modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0
+      ? 'Preparing'
+      : !suggestionsEnabled
+        ? 'Off'
+        : currentModel
+          ? 'Ready'
+          : 'Set up';
   $: if (
     activeGhostSuggestion &&
     activeGhostSuggestion.presentationKey !== announcedGhostPresentationKey
@@ -2198,17 +2215,12 @@
         (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
       ) return false;
       models = discovered;
-      const loaded = discovered.find((model) => model.loaded);
       const rememberedPath = loadLastLocalModelPath();
-      if (loaded) {
-        selectedModelPath = loaded.model_path;
-      } else if (rememberedPath && discovered.some((model) =>
-        model.model_path === rememberedPath && model.header_verified
-      )) {
-        selectedModelPath = rememberedPath;
-      } else if (!discovered.some((model) => model.model_path === selectedModelPath)) {
-        selectedModelPath = discovered.find((model) => model.header_verified)?.model_path ?? '';
-      }
+      selectedModelPath = preferredWriterModelPath(
+        discovered,
+        rememberedPath,
+        selectedModelPath
+      );
       return true;
     } catch {
       if (
@@ -2254,6 +2266,10 @@
 
   function openModelManager(trigger: HTMLElement): void {
     closeProjectMenu();
+    if (lastFailure?.code.startsWith('model_') || lastFailure?.code.startsWith('writing_model_')) {
+      clearFailure();
+    }
+    modelSetupError = '';
     modelManagerReturnFocus = trigger;
     modelManagerOpen = true;
     modelDownloadError = '';
@@ -2268,11 +2284,15 @@
     });
   }
 
-  function closeModelManager(): void {
+  function closeModelManager(focusWritingSurface = false): void {
     modelManagerOpen = false;
     const trigger = modelManagerReturnFocus;
     modelManagerReturnFocus = null;
     void tick().then(() => {
+      if (focusWritingSurface) {
+        focusCurrentWritingSurfaceAtEnd();
+        return;
+      }
       if (focusConnectedControl(trigger)) return;
       if (focusConnectedControl(projectMenuTrigger)) return;
       focusCurrentWritingSurfaceAtEnd();
@@ -2304,6 +2324,32 @@
       window.localStorage.setItem(lastLocalModelKey, modelPath);
     } catch {
       // Discovery remains available when browser persistence is unavailable.
+    }
+  }
+
+  function forgetLastLocalModelPath(modelPath: string): void {
+    try {
+      if (window.localStorage.getItem(lastLocalModelKey) === modelPath) {
+        window.localStorage.removeItem(lastLocalModelKey);
+      }
+    } catch {
+      // Storage is only a convenience; native policy verification is authority.
+    }
+  }
+
+  function rememberedWriterPathIsInvalid(code: string): boolean {
+    switch (code) {
+      case 'policy_model_not_found':
+      case 'policy_model_path_error':
+      case 'policy_model_size_mismatch':
+      case 'policy_model_digest_mismatch':
+      case 'policy_model_file_changed':
+      case 'policy_model_header_unverified':
+      case 'policy_model_identity_mismatch':
+      case 'policy_model_capability_mismatch':
+        return true;
+      default:
+        return false;
     }
   }
 
@@ -2456,51 +2502,6 @@
     return true;
   }
 
-  async function loadSelectedModel(options: ModelLoadOptions = {}): Promise<boolean> {
-    const { expectedWorkspace, quiet = false } = options;
-    if (
-      !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !selectedModelPath ||
-      modelLoading
-    ) return false;
-    const modelPath = selectedModelPath;
-    const loadSerial = ++modelLoadSerial;
-    modelLoading = true;
-    if (!quiet) {
-      clearFailure();
-      announce('Verifying the selected local model');
-    }
-    try {
-      const loaded = await loadModel(modelPath);
-      if (
-        !componentMounted ||
-        !applicationAllowsModelPreparation(applicationClosePhase) ||
-        loadSerial !== modelLoadSerial
-      ) return false;
-      return await installLoadedModel(loaded, quiet, expectedWorkspace);
-    } catch (error) {
-      if (
-        !componentMounted ||
-        !applicationAllowsModelPreparation(applicationClosePhase) ||
-        loadSerial !== modelLoadSerial ||
-        (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
-      ) return false;
-      if (quiet) {
-        await refreshModels(expectedWorkspace);
-        return false;
-      }
-      recordFailure(error);
-      announce('The local model could not be verified');
-      await refreshModels();
-      return false;
-    } finally {
-      if (loadSerial === modelLoadSerial) {
-        modelLoading = false;
-        wakePreferredWriterEnsure();
-      }
-    }
-  }
-
   async function loadPreferredSuggestionModel(
     expectedWorkspace?: WorkspaceRestoreCapture
   ): Promise<boolean> {
@@ -2508,7 +2509,21 @@
     if (currentModel) return true;
     if (!document || transition !== 'idle' || modelLoading || modelUnloading) return false;
     if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
-    const candidates = orderedLocalWriterCandidates(models);
+    const discoveredCandidates = orderedLocalWriterCandidates(models);
+    const rememberedPath = loadLastLocalModelPath();
+    const rememberedProfile = writerProfileForBuildPolicy(buildModelPolicy);
+    const candidates = [
+      ...(rememberedPath && rememberedProfile &&
+      !discoveredCandidates.some((candidate) => candidate.modelPath === rememberedPath)
+        ? [{
+            modelPath: rememberedPath,
+            profileId: rememberedProfile,
+            policyRank: -1,
+            remembered: true
+          }]
+        : []),
+      ...discoveredCandidates.map((candidate) => ({ ...candidate, remembered: false }))
+    ];
     for (const candidate of candidates) {
       if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
       if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
@@ -2527,13 +2542,17 @@
           continue;
         }
         return await installLoadedModel(loaded, true, expectedWorkspace);
-      } catch {
+      } catch (error) {
         if (
           !componentMounted ||
           !applicationAllowsModelPreparation(applicationClosePhase) ||
           loadSerial !== modelLoadSerial ||
           (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
         ) return false;
+        const failure = normalizeFailure(error);
+        if (candidate.remembered && rememberedWriterPathIsInvalid(failure.code)) {
+          forgetLastLocalModelPath(candidate.modelPath);
+        }
         await refreshModels(expectedWorkspace);
       } finally {
         if (loadSerial === modelLoadSerial) {
@@ -2543,29 +2562,6 @@
       }
     }
     return false;
-  }
-
-  async function chooseExistingModel(): Promise<void> {
-    if (modelChoosing || modelLoading || modelUnloading) return;
-    modelChoosing = true;
-    clearFailure();
-    announce('Choose a local GGUF model');
-    try {
-      const selected = await chooseModel();
-      if (!selected) {
-        announce('Model choice cancelled');
-        return;
-      }
-      models = [selected, ...models.filter((model) => model.model_path !== selected.model_path)];
-      selectedModelPath = selected.model_path;
-      requestPreferredWriterForCurrentWorkspace();
-      announce(`${selected.display_name} added; load it to inspect exact capabilities`);
-    } catch (error) {
-      recordFailure(error);
-      announce('The selected model could not be added safely');
-    } finally {
-      modelChoosing = false;
-    }
   }
 
   function expectedPolicyWriterName(): string {
@@ -2579,44 +2575,25 @@
     }
   }
 
-  async function choosePolicyWriterModel(): Promise<void> {
-    if (modelChoosing || modelLoading || modelUnloading) return;
-    const captured = currentWorkspaceCapture();
-    if (!captured || !buildModelPolicy || buildModelPolicy.name === 'none-v1') {
-      recordLocalFailure(
-        'writing_model_policy_unavailable',
-        'This version of Loom does not have a verified writing-model setup. Suggestions remain off.'
-      );
-      announce('Suggestions remain off because no verified writing model is configured');
-      return;
+  async function activatePolicyWriter(
+    selected: ModelCapabilitySummary,
+    captured: WorkspaceRestoreCapture
+  ): Promise<boolean> {
+    if (modelLoading || modelUnloading || !workspaceRestoreIsCurrent(captured)) return false;
+    const policyCandidate = selected.policy_candidate;
+    if (!policyCandidate) {
+      modelSetupError = `This file is not ${expectedPolicyWriterName()}. It cannot power suggestions in this build.`;
+      announce('That model is not compatible with suggestions in this version of Loom');
+      return false;
     }
 
-    modelChoosing = true;
-    clearFailure();
-    announce('Choose the supported writing model stored on this computer');
-    let loadSerial: number | null = null;
+    models = [selected, ...models.filter((model) => model.model_path !== selected.model_path)];
+    selectedModelPath = selected.model_path;
+    const loadSerial = ++modelLoadSerial;
+    modelLoading = true;
+    modelSetupError = '';
+    announce('Verifying the writing model');
     try {
-      const selected = await chooseModel();
-      if (!selected) {
-        announce('Writing model choice cancelled');
-        return;
-      }
-      if (!workspaceRestoreIsCurrent(captured)) return;
-
-      const policyCandidate = selected.policy_candidate;
-      if (!policyCandidate) {
-        recordLocalFailure(
-          'writing_model_not_supported',
-          `That file is not ${expectedPolicyWriterName()}. Loom did not enable suggestions. Other GGUF files can still be inspected under Advanced.`
-        );
-        announce('That file cannot power suggestions in this version of Loom');
-        return;
-      }
-
-      models = [selected, ...models.filter((model) => model.model_path !== selected.model_path)];
-      selectedModelPath = selected.model_path;
-      loadSerial = ++modelLoadSerial;
-      modelLoading = true;
       const loaded = await loadPolicyModelCandidate(
         policyCandidate.profile_id,
         selected.model_path
@@ -2626,7 +2603,7 @@
         !applicationAllowsModelPreparation(applicationClosePhase) ||
         loadSerial !== modelLoadSerial ||
         !workspaceRestoreIsCurrent(captured)
-      ) return;
+      ) return false;
       if (!isVerifiedPolicyWriter(loaded, policyCandidate.profile_id)) {
         throw new Error('Native verification did not return the exact writer capabilities required by this build.');
       }
@@ -2634,29 +2611,66 @@
         throw new Error('The verified writer could not be attached to the current writing session.');
       }
       clearFailure();
+      modelSetupError = '';
       announce(`${loaded.display_name} is ready to suggest writing`);
+      if (modelManagerOpen) closeModelManager(true);
+      return true;
     } catch (error) {
       if (
         componentMounted &&
         applicationAllowsModelPreparation(applicationClosePhase) &&
         workspaceRestoreIsCurrent(captured) &&
-        (loadSerial === null || loadSerial === modelLoadSerial)
+        loadSerial === modelLoadSerial
       ) {
         const failure = normalizeFailure(error);
-        recordLocalFailure(
-          'writing_model_verification_failed',
-          `That file could not be verified as ${expectedPolicyWriterName()}. Loom did not enable suggestions. ${failure.message}`
-        );
-        announce('The chosen file failed exact writing-model verification');
+        modelSetupError = `Loom could not verify this as ${expectedPolicyWriterName()}. ${failure.message}`;
+        announce('That model did not pass writing-model verification');
         await refreshModels(captured);
       }
+      return false;
     } finally {
-      modelChoosing = false;
-      if (loadSerial !== null && loadSerial === modelLoadSerial) {
+      if (loadSerial === modelLoadSerial) {
         modelLoading = false;
         wakePreferredWriterEnsure();
       }
     }
+  }
+
+  async function choosePolicyWriterModel(): Promise<void> {
+    if (modelChoosing || modelLoading || modelUnloading) return;
+    const captured = currentWorkspaceCapture();
+    if (!captured || !buildModelPolicy || buildModelPolicy.name === 'none-v1') {
+      modelSetupError = 'This build does not define a verified local writing model.';
+      announce('Suggestions remain off because no verified writing model is configured');
+      return;
+    }
+
+    modelChoosing = true;
+    modelSetupError = '';
+    announce('Locate the supported writing model on this computer');
+    try {
+      const selected = await chooseModel();
+      if (!selected) {
+        announce('Writing model choice cancelled');
+        return;
+      }
+      if (!workspaceRestoreIsCurrent(captured)) return;
+      await activatePolicyWriter(selected, captured);
+    } catch (error) {
+      if (componentMounted && workspaceRestoreIsCurrent(captured)) {
+        const failure = normalizeFailure(error);
+        modelSetupError = `Loom could not inspect that file. ${failure.message}`;
+        announce('The selected model file could not be inspected');
+      }
+    } finally {
+      modelChoosing = false;
+    }
+  }
+
+  async function useDiscoveredPolicyWriter(model: ModelCapabilitySummary): Promise<void> {
+    const captured = currentWorkspaceCapture();
+    if (!captured) return;
+    await activatePolicyWriter(model, captured);
   }
 
   async function unloadCurrentModel(): Promise<void> {
@@ -3780,7 +3794,7 @@
   function dismissInlineSuggestion(candidateId: string | null | undefined): void {
     if (!candidateId || dismissedCandidateIds.includes(candidateId)) return;
     dismissedCandidateIds = [...dismissedCandidateIds, candidateId];
-    announce('Suggestion dismissed; its private strand remains recoverable');
+    announce('Suggestion dismissed; it remains available under alternatives');
   }
 
   function rejectVisualGhostPresentation(
@@ -4252,11 +4266,12 @@
       sourceRevisionId: branch.source_revision_id,
       visibleBlobId: document.visible_blob_id
     };
+    let restoreWritingFocus = false;
     promotionInFlight = true;
     uncertainPromotion = captured;
     promotionArmedCandidateId = null;
     clearFailure();
-    announce('Promoting the strand through the immutable store');
+    announce('Accepting the suggestion');
     try {
       const receipt = await promoteCandidate(
         captured.projectId,
@@ -4286,9 +4301,10 @@
       }
       uncertainPromotion = null;
       closeStrandReview();
+      restoreWritingFocus = true;
       announce(outcome === 'reconciliation'
-        ? 'Promotion is durable; an external file change now needs review'
-        : 'Strand promoted from authoritative manuscript bytes');
+        ? 'The suggestion is saved; an external file change now needs review'
+        : 'Suggestion accepted');
     } catch (error) {
       recordFailure(error);
       try {
@@ -4298,7 +4314,8 @@
         switch (outcome) {
           case 'promoted':
             closeStrandReview();
-            announce('Promotion had committed; Loom reopened the authoritative manuscript');
+            restoreWritingFocus = true;
+            announce('Suggestion accepted');
             break;
           case 'source_changed':
             closeStrandReview();
@@ -4310,7 +4327,7 @@
             break;
           case 'unchanged':
             await refreshCurrentBranches(false);
-            announce('Promotion was refused; the manuscript is unchanged');
+            announce('The suggestion was not accepted; the manuscript is unchanged');
             break;
         }
       } catch (refreshError) {
@@ -4319,6 +4336,16 @@
       }
     } finally {
       promotionInFlight = false;
+      if (restoreWritingFocus) {
+        await tick();
+        await waitForWritingSurfacePaint();
+        focusCurrentWritingSurfaceAtEnd();
+        // The authoritative revision swap remounts the editor. A second
+        // post-paint focus prevents that remount's completion from stealing
+        // the caret after the first focus succeeds.
+        await waitForWritingSurfacePaint();
+        focusCurrentWritingSurfaceAtEnd();
+      }
     }
   }
 
@@ -4486,7 +4513,7 @@
       );
     } else {
       saveState = 'clean';
-      saveMessage = promotionConfirmed ? 'Promotion saved' : 'Authoritative revision reopened';
+      saveMessage = promotionConfirmed ? 'Suggestion accepted' : 'Authoritative revision reopened';
       clearFailure();
     }
   }
@@ -5083,13 +5110,6 @@
           {reviewAffordance.label}
         </button>
       {/if}
-      {#if suggestionSetupNeeded}
-        <button
-          class="suggestion-setup-button"
-          type="button"
-          on:click={(event) => openModelManager(event.currentTarget)}
-        >Set up suggestions</button>
-      {/if}
       <details class="project-menu" bind:this={projectMenu}>
         <summary class="more-button" bind:this={projectMenuTrigger} title="Writing options">
           <span aria-hidden="true">•••</span>
@@ -5108,22 +5128,15 @@
             <div class="project-menu-separator"></div>
           {/if}
           <button
-            class:active={suggestionsEnabled}
+            class:active={suggestionsEnabled && Boolean(currentModel)}
             type="button"
-            aria-pressed={suggestionsEnabled}
-            disabled={suggestionsChanging}
-            on:click={() => {
-              closeProjectMenu();
-              void setSuggestionsEnabled(!suggestionsEnabled);
-            }}
+            aria-haspopup="dialog"
+            on:click={(event) => openModelManager(projectMenuTrigger ?? event.currentTarget)}
           >
             <span>Suggestions</span>
-            <span class:ready={suggestionsEnabled} class="menu-state">
-              {suggestionsChanging ? '…' : suggestionsEnabled ? 'On' : 'Off'}
+            <span class:ready={suggestionMenuState === 'Ready'} class="menu-state">
+              {suggestionMenuState}
             </span>
-          </button>
-          <button type="button" on:click={(event) => openModelManager(projectMenuTrigger ?? event.currentTarget)}>
-            <span>Suggestion settings…</span>
           </button>
           <div class="project-menu-separator"></div>
           <button type="button" disabled={reconciliationResolutionLocked || (editorReadonly && transition !== 'closing' && !(reconciliation && !document))} on:click={() => { closeProjectMenu(); void closeProject(); }}>
@@ -5500,7 +5513,7 @@
       >
         <header class="model-manager-header">
           <h2 id="model-manager-title">Suggestions</h2>
-          <button class="icon-button" type="button" on:click={closeModelManager} aria-label="Close suggestions">×</button>
+          <button class="icon-button" type="button" on:click={() => closeModelManager()} aria-label="Close suggestions">×</button>
         </header>
 
         <div class="model-manager-body">
@@ -5536,13 +5549,48 @@
 
           {#if suggestionSetupNeeded}
             <section class="model-setup-callout">
-              <p>To suggest words while you write, Loom needs {expectedPolicyWriterName()} stored on this computer.</p>
-              <button
-                class="primary-button"
-                type="button"
-                on:click={() => void choosePolicyWriterModel()}
-                disabled={!desktop || modelChoosing || modelLoading || modelUnloading}
-              >{modelChoosing ? 'Choosing…' : 'Choose a writing model…'}</button>
+              <div class="model-setup-intro">
+                <strong>Private writing model</strong>
+                <p>Loom uses {expectedPolicyWriterName()} for suggestions. The model stays on this computer.</p>
+              </div>
+
+              {#if compatibleWriterModels.length > 0}
+                <div class="writer-model-list" aria-label="Compatible writing models">
+                  {#each compatibleWriterModels as model (model.model_path)}
+                    <article class="writer-model-choice">
+                      <div>
+                        <strong>{model.display_name}</strong>
+                        <span>{formatByteCount(model.file_bytes)} · Possible local match</span>
+                      </div>
+                      <button
+                        class="primary-button compact"
+                        type="button"
+                        on:click={() => void useDiscoveredPolicyWriter(model)}
+                        disabled={!desktop || modelChoosing || modelLoading || modelUnloading}
+                      >{modelLoading && selectedModelPath === model.model_path ? 'Verifying…' : 'Verify and use'}</button>
+                    </article>
+                  {/each}
+                </div>
+              {:else}
+                <div class="model-empty-state">
+                  <strong>No compatible writing model found.</strong>
+                  <span>Loom checked its model library and the local Hugging Face cache. You can locate an existing GGUF file without moving it.</span>
+                </div>
+              {/if}
+
+              {#if modelSetupError}
+                <p class="model-setup-error" role="alert">{modelSetupError}</p>
+              {/if}
+
+              <div class="model-setup-actions">
+                <button
+                  class={compatibleWriterModels.length > 0 ? 'bare-button compact' : 'secondary-button'}
+                  type="button"
+                  on:click={() => void choosePolicyWriterModel()}
+                  disabled={!desktop || modelChoosing || modelLoading || modelUnloading}
+                >{modelChoosing ? 'Locating…' : 'Locate compatible model file…'}</button>
+                <button class="bare-button compact" type="button" on:click={() => void refreshCurrentModelsAndEnsureWriter()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>Refresh library</button>
+              </div>
             </section>
           {/if}
 
@@ -5551,34 +5599,34 @@
             <div class="model-advanced-content">
               <section class="model-library" aria-labelledby="model-library-title">
             <div class="section-heading">
-              <h3 id="model-library-title">Model</h3>
-              <div class="model-library-actions">
-                <button class="bare-button compact" type="button" on:click={() => void chooseExistingModel()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>{modelChoosing ? 'Choosing…' : 'Choose model file…'}</button>
-                <button class="bare-button compact" type="button" on:click={() => void refreshCurrentModelsAndEnsureWriter()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>Refresh</button>
+              <div>
+                <h3 id="model-library-title">Other local models</h3>
+                <p>Visible for diagnosis only. This build will not use an unverified model for suggestions.</p>
               </div>
             </div>
 
-            {#if models.length > 0}
-              <label class="model-manager-picker">
-                <span>Writer model</span>
-                <select bind:value={selectedModelPath} disabled={modelChoosing || modelLoading || modelUnloading}>
-                  {#each models as model (model.model_path)}
-                    <option value={model.model_path} disabled={!model.header_verified}>
-                      {model.loaded ? 'Loaded · ' : ''}{model.display_name} · {formatByteCount(model.file_bytes)}
-                    </option>
-                  {/each}
-                </select>
-              </label>
+            {#if otherLocalModels.length > 0}
+              <div class="other-model-list">
+                {#each otherLocalModels as model (model.model_path)}
+                  <article class="other-model-row">
+                    <div>
+                      <strong>{model.display_name}</strong>
+                      <span>{formatByteCount(model.file_bytes)}</span>
+                    </div>
+                    <span class="model-incompatible">Not compatible with suggestions</span>
+                  </article>
+                {/each}
+              </div>
             {:else}
               <div class="model-empty-state">
-                <strong>No model found.</strong>
+                <strong>No other local GGUF models found.</strong>
               </div>
             {/if}
 
-            {#if selectedModel}
+            {#if selectedModel?.loaded}
               <article class="model-facts">
                 <details class="model-technical">
-                  <summary>Technical details</summary>
+                  <summary>Loaded writer details</summary>
                   <dl>
                     <div><dt>Compatibility</dt><dd>{selectedModel.tested_profile ? 'Tested for Loom' : selectedModel.header_verified ? 'File inspected' : 'Unavailable'}</dd></div>
                     <div><dt>Prompt mode</dt><dd>{modelCapabilityMode(selectedModel)}</dd></div>
@@ -5596,15 +5644,9 @@
                   </dl>
                 </details>
                 <div class="model-manager-actions">
-                  {#if selectedModel.loaded}
-                    <button class="secondary-button" type="button" on:click={() => void unloadCurrentModel()} disabled={modelUnloading || activeBranchCount > 0} title={activeBranchCount > 0 ? 'Finish or cancel active strands first' : 'Release model weights from memory'}>
-                      {modelUnloading ? 'Releasing…' : 'Unload from memory'}
-                    </button>
-                  {:else}
-                    <button class="primary-button" type="button" on:click={() => void loadSelectedModel()} disabled={!selectedModel.header_verified || modelLoading || modelUnloading || activeBranchCount > 0}>
-                      {modelLoading ? 'Checking model…' : 'Use this model'}
-                    </button>
-                  {/if}
+                  <button class="secondary-button" type="button" on:click={() => void unloadCurrentModel()} disabled={modelUnloading || activeBranchCount > 0} title={activeBranchCount > 0 ? 'Finish or cancel active strands first' : 'Release model weights from memory'}>
+                    {modelUnloading ? 'Releasing…' : 'Unload from memory'}
+                  </button>
                 </div>
               </article>
             {/if}

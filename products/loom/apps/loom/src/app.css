@@ -106,18 +106,18 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .document-label small { color: var(--muted); font-size: 11px; }
 .empty-copy { margin: 10px; color: var(--muted); font: 13px/1.5 Georgia, serif; }
 
-.manuscript-area { position: relative; min-width: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--paper); }
+.manuscript-area { position: relative; min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--paper); }
 .document-header { width: min(1080px, calc(100% - 56px)); margin: 0 auto; padding: 24px 0 10px; }
 .eyebrow { color: var(--moss); font-size: 10px; font-weight: 750; letter-spacing: .14em; text-transform: uppercase; }
 .document-header h1 { margin: 0; font-family: Iowan Old Style, Palatino, Georgia, serif; font-size: clamp(28px, 3vw, 40px); font-weight: 500; letter-spacing: -.025em; }
 .document-meta { display: flex; flex-wrap: wrap; gap: 8px 17px; color: var(--quiet); font-size: 11px; }
 .editor-stage { min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(0, 1fr); overflow: hidden; }
-.editor-pane { min-width: 0; overflow: auto; }
+.editor-pane { min-width: 0; min-height: 0; overflow: auto; }
 .visual-pane { padding: 0; }
-.source-pane { padding: 0; background: #f4f1ea; }
-.source-editor-shell { position: relative; min-height: 100%; color: var(--ink); isolation: isolate; }
+.source-pane { overflow: hidden; padding: 0; background: #f4f1ea; }
+.source-editor-shell { position: relative; height: 100%; min-height: 0; color: var(--ink); isolation: isolate; }
 .source-editor-shell.verse { background: var(--paper); }
-.source-pane textarea { --writing-gutter: clamp(24px, 5vw, 72px); width: min(100%, calc(100ch + var(--writing-gutter) + var(--writing-gutter))); min-height: 100%; display: block; resize: none; margin: 0 auto; padding: clamp(24px, 4vh, 42px) var(--writing-gutter) 25vh; border: 0; outline: 0; color: inherit; background: transparent; font: 15px/1.75 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: break-word; tab-size: 4; white-space: pre-wrap; }
+.source-pane textarea { --writing-gutter: clamp(24px, 5vw, 72px); width: min(100%, calc(100ch + var(--writing-gutter) + var(--writing-gutter))); height: 100%; min-height: 0; display: block; resize: none; margin: 0 auto; padding: clamp(24px, 4vh, 42px) var(--writing-gutter) 25vh; overflow: auto; border: 0; outline: 0; color: inherit; background: transparent; font: 15px/1.75 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: break-word; tab-size: 4; white-space: pre-wrap; }
 .source-pane textarea.verse { color: var(--ink); background: transparent; font: 18px/1.75 Iowan Old Style, Palatino, Georgia, serif; white-space: pre; }
 .source-editor-shell textarea { position: relative; z-index: 2; caret-color: var(--clay); }
 .source-editor-shell.ghost-active textarea { color: transparent; -webkit-text-fill-color: transparent; }
@@ -144,8 +144,6 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .secondary-button:hover { border-color: #bdb6aa; background: #fdfcf9; }
 .alternatives-button { min-height: 28px; padding: 4px 8px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; }
 .alternatives-button:hover { color: var(--ink); background: var(--paper-deep); }
-.suggestion-setup-button { min-height: 28px; padding: 4px 8px; border: 0; border-radius: 6px; color: var(--moss-dark); background: var(--moss-soft); cursor: pointer; font-size: 11px; }
-.suggestion-setup-button:hover { color: var(--ink); }
 .strand-review { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 13px; color: var(--ink); background: var(--paper); box-shadow: 0 24px 70px rgb(25 24 21 / 24%); }
 .strand-review::backdrop { background: rgb(30 31 28 / 30%); backdrop-filter: blur(2px); }
 .strand-review-shell { min-width: 0; max-height: calc(100dvh - 32px); display: flex; flex-direction: column; }
@@ -183,9 +181,18 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .model-manager-header .icon-button { flex: 0 0 auto; justify-content: center; min-width: 32px; min-height: 32px; padding: 4px; font-size: 21px; }
 .model-manager-body { max-height: calc(min(760px, 100dvh - 48px) - 54px); overflow: auto; }
 .model-manager-summary { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 13px 17px; }
-.model-setup-callout { display: grid; gap: 11px; padding: 0 17px 17px; }
+.model-setup-callout { display: grid; gap: 12px; padding: 0 17px 17px; }
+.model-setup-intro { display: grid; gap: 4px; }
+.model-setup-intro > strong { font: 600 16px/1.25 Iowan Old Style, Palatino, Georgia, serif; }
 .model-setup-callout p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
-.model-setup-callout .primary-button { justify-self: start; }
+.writer-model-list { display: grid; gap: 7px; }
+.writer-model-choice, .other-model-row { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--paper); }
+.writer-model-choice > div, .other-model-row > div { min-width: 0; display: grid; gap: 3px; }
+.writer-model-choice strong, .other-model-row strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.writer-model-choice span, .other-model-row span { color: var(--muted); font-size: 10px; }
+.writer-model-choice button { flex: 0 0 auto; }
+.model-setup-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.model-setup-error { padding: 9px 10px; border-radius: 8px; color: #762f2d !important; background: #f4dddd; }
 .model-readiness { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
 .model-readiness .status-dot { background: var(--quiet); }
 .model-readiness .status-dot.ready { background: var(--moss); }
@@ -206,6 +213,9 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .suggestions-setting > span { min-width: 0; display: grid; }
 .suggestions-setting strong { font-size: 13px; }
 .model-library-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.other-model-list { display: grid; gap: 7px; }
+.other-model-row { align-items: flex-start; }
+.other-model-row .model-incompatible { flex: 0 0 auto; max-width: 150px; color: var(--quiet); text-align: right; line-height: 1.35; }
 .model-manager-picker, .model-download-form label { display: grid; gap: 6px; color: #575853; font-size: 11px; font-weight: 650; }
 .model-manager-picker select, .model-download-form input { width: 100%; min-width: 0; min-height: 38px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--paper); }
 .model-manager-picker select { cursor: pointer; }
@@ -361,7 +371,6 @@ button:disabled { cursor: not-allowed; opacity: .45; }
     --ghost-ink: color-mix(in srgb, var(--muted) 84%, transparent);
   }
   .topbar, .outline-panel, .source-pane { background: #252722; }
-  .suggestion-setup-button { color: var(--ink); }
   .secondary-button, .document-list button.active, .project-card, .project-card input, .model-manager-picker select, .model-download-form input { color: var(--ink); background: #30322e; }
   .download-error { color: #ffd7d5; background: #603532; }
   .search-field { background: rgb(255 255 255 / 4%); }

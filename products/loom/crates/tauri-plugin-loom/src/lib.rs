@@ -3480,7 +3480,7 @@ fn prepare_policy_model_load(
             false,
         )
     })?;
-    let discovered = discover_loadable_model(state, &canonical_path)?;
+    let discovered = discover_strict_policy_candidate(&canonical_path)?;
     if discovered.file_bytes != expectation.model_file_bytes {
         return Err(IpcFailure::new(
             "policy_model_size_mismatch",
@@ -3907,10 +3907,10 @@ fn commit_model_load(
             if let Some(previous) = previous {
                 match state.backend.release_model(&previous.profile) {
                     Ok(ModelRelease::Released { .. }) => {}
-                    Ok(ModelRelease::AlreadyAbsent) => {
+                    Ok(ModelRelease::NeverAcquired) => {
                         match state.backend.release_model(&loaded.profile) {
                             Ok(ModelRelease::Released { .. }) => {}
-                            Ok(ModelRelease::AlreadyAbsent) => {
+                            Ok(ModelRelease::NeverAcquired) => {
                                 let reason = "the previous slot was absent and cleanup could not prove access to the verified staged model's native resident slot".to_owned();
                                 *registry = ModelRegistry::ResidencyUnknown {
                                     reason: reason.clone(),
@@ -3938,7 +3938,7 @@ fn commit_model_load(
                     Err(error) => {
                         match state.backend.release_model(&loaded.profile) {
                             Ok(ModelRelease::Released { .. }) => {}
-                            Ok(ModelRelease::AlreadyAbsent) => {
+                            Ok(ModelRelease::NeverAcquired) => {
                                 let reason = format!(
                                     "the previous model release failed ({error}) and cleanup could not prove access to the verified staged model's native resident slot"
                                 );
@@ -3973,7 +3973,7 @@ fn commit_model_load(
         current => {
             match state.backend.release_model(&loaded.profile) {
                 Ok(ModelRelease::Released { .. }) => {}
-                Ok(ModelRelease::AlreadyAbsent) => {
+                Ok(ModelRelease::NeverAcquired) => {
                     let reason = "the model registry changed during verification and cleanup could not prove access to the verified staged model's native resident slot".to_owned();
                     *registry = ModelRegistry::ResidencyUnknown {
                         reason: reason.clone(),
@@ -4083,7 +4083,7 @@ fn unload_registered_model(state: &PluginState) -> Result<ModelUnloadOutcome, Ip
                 resident_slot_released: true,
             })
         }
-        Ok(ModelRelease::AlreadyAbsent) => {
+        Ok(ModelRelease::NeverAcquired) => {
             let reason =
                 "the selected model had no provably accessible native resident slot".to_owned();
             *registry = ModelRegistry::ResidencyUnknown {
@@ -4478,6 +4478,41 @@ fn discover_loadable_model(
     Ok(model)
 }
 
+/// Reopens one exact path for the closed build-policy loader.
+///
+/// Unlike manual loading, this does not depend on the process-local path
+/// registry: a verified choice must survive an application restart. The path
+/// still cannot become a writer merely by naming a GGUF. The caller binds it
+/// to an embedded profile first, then enforces exact file size, a SHA-256 over
+/// an open identity handle, unchanged path identity, native inspection, and
+/// the required raw-completion capabilities before committing residency.
+fn discover_strict_policy_candidate(
+    canonical: &Path,
+) -> Result<loom_backend_llama::DiscoveredGguf, IpcFailure> {
+    let report = discover_gguf_models(&ModelDiscoveryOptions {
+        hugging_face_cache_roots: Vec::new(),
+        user_paths: vec![canonical.to_path_buf()],
+        max_entries: 1,
+        max_depth: 1,
+    })
+    .map_err(|error| IpcFailure::new("model_discovery_error", error.to_string(), false))?;
+    let model = report.models.into_iter().next().ok_or_else(|| {
+        IpcFailure::new(
+            "policy_model_not_found",
+            "the remembered writing model is no longer a readable local GGUF file",
+            false,
+        )
+    })?;
+    if model.resolved_path != canonical || !matches!(model.header, GgufHeaderStatus::Verified) {
+        return Err(IpcFailure::new(
+            "policy_model_header_unverified",
+            "the remembered writing model no longer has the expected local GGUF identity",
+            false,
+        ));
+    }
+    Ok(model)
+}
+
 fn desktop_model_discovery_options(
     state: &State<'_, PluginState>,
 ) -> Result<ModelDiscoveryOptions, IpcFailure> {
@@ -4541,14 +4576,12 @@ fn release_staged_model(
             Ok(ModelRelease::Released { .. }) => {
                 *registry = previous.map_or(ModelRegistry::Empty, ModelRegistry::Loaded);
             }
-            Ok(ModelRelease::AlreadyAbsent) => {
-                let reason =
-                    "native inspection started, but staged model cleanup could not prove access to its resident slot"
-                        .to_owned();
-                *registry = ModelRegistry::ResidencyUnknown {
-                    reason: reason.clone(),
-                };
-                return Err(model_residency_unknown(&reason));
+            Ok(ModelRelease::NeverAcquired) => {
+                // Native inspection can fail before host acquisition. The
+                // runtime's independent ledger proves that this exact staged
+                // attempt never became resident, so restoring the previous
+                // registry is safe and preserves the useful inspection error.
+                *registry = previous.map_or(ModelRegistry::Empty, ModelRegistry::Loaded);
             }
             Err(error) => {
                 let reason = format!("rejected staged model cleanup failed: {error}");
@@ -4567,7 +4600,7 @@ fn release_staged_model(
                     true,
                 ));
             }
-            Ok(ModelRelease::AlreadyAbsent) => {
+            Ok(ModelRelease::NeverAcquired) => {
                 let reason = "the model registry changed during rejected-model cleanup and cleanup could not prove access to the staged native resident slot".to_owned();
                 *registry = ModelRegistry::ResidencyUnknown {
                     reason: reason.clone(),
@@ -6283,9 +6316,9 @@ async fn candidate_promote(
     expected_visible_blob_id: String,
     state: State<'_, PluginState>,
 ) -> Result<Receipt, IpcFailure> {
-    let _command_id = parse_command_id(&command_id)?;
-    let _candidate_id = parse_candidate_id(&candidate_id)?;
-    let _expected_source_revision_id =
+    let command_id = parse_command_id(&command_id)?;
+    let candidate_id = parse_candidate_id(&candidate_id)?;
+    let expected_source_revision_id =
         expected_source_revision_id
             .parse::<RevisionId>()
             .map_err(|_| {
@@ -6295,7 +6328,7 @@ async fn candidate_promote(
                     false,
                 )
             })?;
-    let _expected_visible_blob_id = expected_visible_blob_id.parse::<BlobId>().map_err(|_| {
+    let expected_visible_blob_id = expected_visible_blob_id.parse::<BlobId>().map_err(|_| {
         IpcFailure::new(
             "invalid_blob_id",
             "visible blob ID is not a valid SHA-256 digest",
@@ -6303,12 +6336,27 @@ async fn candidate_promote(
         )
     })?;
     let mut session = lock_session(&state)?;
-    let _store = require_bound_store(&mut session, &project_id, &session_id)?;
-    Err(IpcFailure::new(
-        "strict_promotion_unavailable",
-        "legacy candidates are diagnostic-only; promotion requires an admitted assembly projection and verified foreground user-presence authority",
-        false,
-    ))
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    let outcome = store
+        .accept_diagnostic_candidate_with_command(
+            command_id,
+            loom_types::PromoteCandidateCommand {
+                candidate_id,
+                expected_source_revision_id,
+                expected_visible_blob_id,
+            },
+        )
+        .map_err(IpcFailure::store)?;
+    let result_blob_id = outcome.save.blob_id.to_string();
+    let request_fingerprint = outcome.request_fingerprint.to_string();
+    let replayed = outcome.replayed;
+    let visible_projection = outcome.visible_projection;
+    let mut receipt = Receipt::from(outcome.save.receipt);
+    receipt.result_blob_id = Some(result_blob_id);
+    receipt.request_fingerprint = Some(request_fingerprint);
+    receipt.replayed = replayed;
+    receipt.visible_projection = Some(visible_projection);
+    Ok(receipt)
 }
 
 fn parse_command_id(value: &str) -> Result<CommandId, IpcFailure> {
@@ -7740,6 +7788,19 @@ mod tests {
     }
 
     #[test]
+    fn strict_policy_candidate_can_reopen_an_exact_path_after_restart() {
+        let temporary = tempfile::tempdir().expect("temporary model directory");
+        let path = temporary.path().join("remembered-writer.gguf");
+        std::fs::write(&path, b"GGUFremembered-writer-fixture").expect("write GGUF fixture");
+        let canonical = path.canonicalize().expect("canonical fixture path");
+
+        let reopened = discover_strict_policy_candidate(&canonical)
+            .expect("strict policy path is independently rediscovered");
+        assert_eq!(reopened.resolved_path, canonical);
+        assert!(matches!(reopened.header, GgufHeaderStatus::Verified));
+    }
+
+    #[test]
     fn read_only_build_policy_identity_preserves_versioned_activation_and_digest() {
         let v1 = BuildModelPolicy::writer_gemma4_base_v1().identity();
         let v2 = BuildModelPolicy::writer_gemma4_base_v2().identity();
@@ -7934,7 +7995,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_mismatch_with_unproved_cleanup_latches_unknown_residency() {
+    fn failed_native_inspection_that_never_acquired_restores_previous_model() {
         let state = PluginState::default();
         let staged_path = PathBuf::from("/tmp/incapable-writer.gguf");
         let staged_profile = LocalModelProfile::for_gguf(&staged_path);
@@ -7961,10 +8022,39 @@ mod tests {
         )
         .expect_err("capability failure must not commit the staged model");
 
-        assert_eq!(error.code, "model_residency_unknown");
+        assert_eq!(error.code, "policy_model_capability_mismatch");
+        assert_loaded_model_id(&state, "previous-model");
+    }
+
+    #[test]
+    fn failed_native_inspection_that_never_acquired_restores_empty_registry() {
+        let state = PluginState::default();
+        let staged_path = PathBuf::from("/tmp/rejected-writer.gguf");
+        let staged_profile = LocalModelProfile::for_gguf(&staged_path);
+        *state.model.lock().expect("model registry") = ModelRegistry::Loading {
+            path: staged_path.clone(),
+            previous: None,
+        };
+
+        let error = resolve_policy_model_inspection(
+            &state,
+            &staged_path,
+            &staged_profile,
+            Err(PolicyInspectionFailure {
+                failure: IpcFailure::new(
+                    "native_model_rejected",
+                    "native inspection rejected the model before acquisition",
+                    false,
+                ),
+                native_inspection_started: true,
+            }),
+        )
+        .expect_err("the original inspection failure must be retained");
+
+        assert_eq!(error.code, "native_model_rejected");
         assert!(matches!(
             &*state.model.lock().expect("model registry"),
-            ModelRegistry::ResidencyUnknown { .. }
+            ModelRegistry::Empty
         ));
     }
 

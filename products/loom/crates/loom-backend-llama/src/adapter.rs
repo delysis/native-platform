@@ -1188,7 +1188,13 @@ fn build_native_request(request: &ExactContinuationRequest) -> GenerationBatchRe
                 input: llama_native_types::GenerationInput::Completion {
                     prompts: vec![CompletionPrompt::Text {
                         text: request.exact_manuscript_prefix.clone(),
-                        special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+                        // Raw completion still needs the model's beginning-of-sequence
+                        // token.  Omitting it is not a purer prompt: Gemma 4 loses its
+                        // trained sequence boundary and collapses into token loops.
+                        // The manuscript bytes remain exact and independently hashed;
+                        // the typed token policy makes the one added control token
+                        // explicit in native evidence.
+                        special_tokens: SpecialTokenPolicy::AddBosParseSpecial,
                     }],
                 },
                 sampling: case.sampling.clone(),
@@ -1411,7 +1417,7 @@ mod tests {
 
         fn release_model(&self, _profile: &LocalModelProfile) -> Result<ModelRelease, NativeError> {
             Ok(if self.released.swap(true, Ordering::AcqRel) {
-                ModelRelease::AlreadyAbsent
+                ModelRelease::NeverAcquired
             } else {
                 ModelRelease::Released {
                     proof: CompleteModelRelease::from_complete_count(std::num::NonZeroUsize::MIN),
@@ -1711,7 +1717,7 @@ mod tests {
                         prompts[0],
                         CompletionPrompt::Text {
                             text: request.exact_manuscript_prefix.clone(),
-                            special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+                            special_tokens: SpecialTokenPolicy::AddBosParseSpecial,
                         }
                     );
                 }
@@ -1863,7 +1869,7 @@ mod tests {
             backend
                 .release_model(&request.model)
                 .expect("second release is idempotent"),
-            ModelRelease::AlreadyAbsent
+            ModelRelease::NeverAcquired
         ));
         assert!(matches!(
             backend.shutdown_joined(),
@@ -2240,11 +2246,35 @@ mod tests {
                             && provenance.metrics.shared_prefix_tokens.unwrap_or_default() > 0
                     })
         }));
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| plausible_real_continuation(&candidate.output_text)),
+            "real Gemma completion collapsed instead of producing prose: {:?}",
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.output_text.as_str())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(
             result.exact_prompt_blob_id,
             BlobId::digest(result.exact_manuscript_prefix.as_bytes())
         );
         Ok(())
+    }
+
+    fn plausible_real_continuation(text: &str) -> bool {
+        let words = text
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        words.len() >= 4
+            && !words
+                .windows(6)
+                .any(|window| window.iter().all(|word| word == &window[0]))
     }
 
     fn run_real_raw_family(
@@ -2257,9 +2287,20 @@ mod tests {
         request.model.device = crate::LocalDevicePreference::Cpu;
         request.model.max_parallel_cases = 2;
         request.request_id = "real-raw-family".to_string();
-        request.exact_manuscript_prefix = "The lamp made a small island of light".to_string();
+        request.exact_manuscript_prefix =
+            "Mara pressed her palm to the cold brass, and".to_string();
         request.prompt_recipe.exact_prompt_blob_id =
             BlobId::digest(request.exact_manuscript_prefix.as_bytes());
+        for case in &mut request.cases {
+            case.sampling.temperature = 0.8;
+            case.sampling.top_k = 40;
+            case.sampling.top_p = 0.95;
+            case.sampling.min_p = 0.02;
+            case.sampling.repeat_last_n = 64;
+            case.sampling.repeat_penalty = 1.02;
+            case.sampling.max_tokens = 48;
+            case.generation.sampling = serde_json::to_value(&case.sampling)?;
+        }
         let backend = LlamaBackend::default();
         let handle = backend.start_exact_continuation(request)?;
         Ok(handle.wait_timeout(Duration::from_secs(300))?)

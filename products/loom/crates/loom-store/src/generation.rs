@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-#[cfg(test)]
 use std::path::Path;
 use std::str::FromStr;
 
-#[cfg(test)]
 use loom_document::DocumentContent;
 use loom_types::{
     ArtifactId, ArtifactKind, AuthorityPolicy, BlobId, BranchCandidate, BranchId, ByteRange,
@@ -15,14 +13,12 @@ use loom_types::{
     ModelRole, OperationId, PromoteCandidateCommand, PromptRecipe, RevisionId, SelectionDecision,
     SelectionEvent, SelectionId, TokenTrace, now_unix_ms,
 };
-#[cfg(test)]
-use loom_types::{AuthorshipAttestation, ContributionKind};
+use loom_types::{AuthorshipAttestation, AuthorshipEvidenceClass, ContributionKind};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-#[cfg(test)]
 use crate::provenance::{
     StoredSegment, document_media_type, insert_revision_segments, merge_adjacent_segments,
     slice_segments, validate_expected_source,
@@ -1186,6 +1182,20 @@ impl ProjectStore {
         Err(StoreError::LegacyCandidateNotAdmitted)
     }
 
+    /// Applies a user-selected diagnostic generation to the active document.
+    ///
+    /// This is the product autocomplete lane, not the research-admission
+    /// lane. It preserves the exact generation, source, result, selection, and
+    /// generated-segment evidence while explicitly declining to mint strict
+    /// base-writer research authority.
+    pub fn accept_diagnostic_candidate_with_command(
+        &mut self,
+        command_id: CommandId,
+        command: PromoteCandidateCommand,
+    ) -> Result<PromotionOutcome> {
+        self.promote_candidate_with_command_inner(command_id, command, |_| Ok(()))
+    }
+
     #[cfg(test)]
     fn promote_legacy_candidate_for_test(
         &mut self,
@@ -1216,10 +1226,6 @@ impl ProjectStore {
         self.promote_candidate_with_command_inner(command_id, command, before_projection_boundary)
     }
 
-    // Retained only to validate one-time legacy migrations and adversarial
-    // tests. The caller-controlled `human_confirmed` record below must not be
-    // present in a production promotion path.
-    #[cfg(test)]
     #[allow(clippy::too_many_lines)]
     fn promote_candidate_with_command_inner<F>(
         &mut self,
@@ -1331,7 +1337,7 @@ impl ProjectStore {
             generated_span_artifact_id: candidate.generated_span_artifact_id,
             promoted_revision_id: revision_id,
             promotion_command_id: command_id,
-            human_confirmed: true,
+            evidence_class: AuthorshipEvidenceClass::DiagnosticGenerationSelectedByUser,
         };
         let selection_payload =
             bounded_json("selection event", &selection, MAX_PROVENANCE_JSON_BYTES)?;
@@ -3820,12 +3826,15 @@ mod tests {
 
         fixture
             .store
-            .promote_legacy_candidate_for_test(PromoteCandidateCommand {
-                candidate_id: terminal.candidate.candidate_id,
-                expected_source_revision_id: fixture.loaded.revision_id,
-                expected_visible_blob_id: fixture.loaded.blob_id,
-            })
-            .expect("promote candidate");
+            .accept_diagnostic_candidate_with_command(
+                CommandId::new(),
+                PromoteCandidateCommand {
+                    candidate_id: terminal.candidate.candidate_id,
+                    expected_source_revision_id: fixture.loaded.revision_id,
+                    expected_visible_blob_id: fixture.loaded.blob_id,
+                },
+            )
+            .expect("accept diagnostic candidate");
         assert_eq!(
             fixture
                 .store

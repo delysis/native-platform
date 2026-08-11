@@ -24,8 +24,15 @@ pub enum RuntimeEvidenceClass {
 
 #[derive(Debug)]
 pub enum ModelRelease {
-    AlreadyAbsent,
-    Released { proof: CompleteModelRelease },
+    /// This exact runtime never recorded acquiring the requested model.
+    ///
+    /// This is useful only while rolling back a staged operation whose native
+    /// acquisition may have failed before residency began. A caller that
+    /// already owns loaded-model authority must not treat it as release proof.
+    NeverAcquired,
+    Released {
+        proof: CompleteModelRelease,
+    },
 }
 
 /// Proof that every native slot matched by one model release was removed.
@@ -141,12 +148,11 @@ pub trait BatchRuntime: std::fmt::Debug + Send + Sync + 'static {
 
     /// Releases resident native slots associated with a profile.
     ///
-    /// `AlreadyAbsent` is distinct from a proved release so callers that own
-    /// a loaded-model authority cannot silently treat missing native state as
-    /// successful teardown.
-    fn release_model(&self, _profile: &LocalModelProfile) -> Result<ModelRelease, NativeError> {
-        Ok(ModelRelease::AlreadyAbsent)
-    }
+    /// `NeverAcquired` is distinct from a proved release so callers that own a
+    /// loaded-model authority cannot silently treat missing native state as
+    /// successful teardown. Implementors must provide their own independent
+    /// acquisition ledger; an erased runtime has no safe default answer.
+    fn release_model(&self, profile: &LocalModelProfile) -> Result<ModelRelease, NativeError>;
 }
 
 #[derive(Debug, Default)]
@@ -354,7 +360,7 @@ impl BatchRuntime for NativeHostRuntime {
                     "a tracked model had no observable native slot",
                 ));
             }
-            return Ok(ModelRelease::AlreadyAbsent);
+            return Ok(ModelRelease::NeverAcquired);
         }
 
         residency.model_paths.insert(profile.model_path.clone());
@@ -510,5 +516,19 @@ mod tests {
 
         assert!(runtime.release_model(&profile).is_err());
         assert!(runtime.shutdown_joined().is_err());
+    }
+
+    #[test]
+    fn untracked_profile_is_proved_never_acquired_by_this_runtime() {
+        let runtime = NativeHostRuntime::default();
+        let profile = LocalModelProfile::for_gguf("never-acquired.gguf");
+
+        assert!(matches!(
+            runtime.release_model(&profile).expect("consult ledger"),
+            ModelRelease::NeverAcquired
+        ));
+        let joined = runtime.shutdown_joined().expect("fresh runtime joins");
+        assert!(joined.belongs_to(&runtime));
+        assert_eq!(joined.joined_worker_count(), 0);
     }
 }
