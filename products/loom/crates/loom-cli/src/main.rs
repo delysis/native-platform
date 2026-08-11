@@ -480,13 +480,48 @@ fn ensure_same_file(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn ensure_same_file(
-    _path: &Path,
+    path: &Path,
+    initial: &fs::Metadata,
+    opened: &fs::Metadata,
+) -> Result<(), io::Error> {
+    use std::os::windows::fs::MetadataExt;
+
+    let identity_matches = initial
+        .volume_serial_number()
+        .zip(initial.file_index())
+        .zip(opened.volume_serial_number().zip(opened.file_index()))
+        .is_some_and(
+            |((initial_volume, initial_file), (opened_volume, opened_file))| {
+                initial_volume == opened_volume && initial_file == opened_file
+            },
+        );
+    if !identity_matches {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "input path changed or could not be identified while it was opened: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn ensure_same_file(
+    path: &Path,
     _initial: &fs::Metadata,
     _opened: &fs::Metadata,
 ) -> Result<(), io::Error> {
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "this platform cannot verify input file identity: {}",
+            path.display()
+        ),
+    ))
 }
 
 fn print_json(value: &impl Serialize) -> Result<(), serde_json::Error> {
