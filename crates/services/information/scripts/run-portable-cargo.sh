@@ -7,7 +7,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 packages=()
 while IFS= read -r package; do
   packages+=("-p" "$package")
-done < "$repo_root/scripts/portable-packages.txt"
+done < <(tr -d '\r' < "$repo_root/scripts/portable-packages.txt")
 
 case "${1:-}" in
   test)
