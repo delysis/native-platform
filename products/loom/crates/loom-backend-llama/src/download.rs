@@ -719,11 +719,12 @@ where
         })?;
         let disposition = match std::fs::hard_link(partial_path, &self.request.target_path) {
             Ok(()) => {
-                // The no-clobber link operates on a path, not the locked file
-                // handle. Re-read the installed target before acknowledging it
-                // so a same-size path replacement cannot inherit the verified
-                // digest from another inode.
-                self.validate_install_race(completed).await?;
+                // `hard_link` committed the exact inode represented by the
+                // verified, locked handle. Compare file identities instead of
+                // reading through the target path: Windows byte-range locks
+                // intentionally reject that second read even though both names
+                // address the same file.
+                self.validate_linked_target(partial).await?;
                 completed.disposition
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -747,6 +748,40 @@ where
             disposition,
             partial_removed,
         })
+    }
+
+    async fn validate_linked_target(&self, partial: &tokio::fs::File) -> Result<(), DownloadError> {
+        let partial_clone = partial
+            .try_clone()
+            .await
+            .map_err(|source| {
+                io_error(
+                    "clone verified partial file",
+                    &self.request.target_path,
+                    source,
+                )
+            })?
+            .into_std()
+            .await;
+        let partial_identity = same_file::Handle::from_file(partial_clone).map_err(|source| {
+            io_error(
+                "identify verified partial file",
+                &self.request.target_path,
+                source,
+            )
+        })?;
+        let target_identity =
+            same_file::Handle::from_path(&self.request.target_path).map_err(|source| {
+                io_error(
+                    "identify installed model",
+                    &self.request.target_path,
+                    source,
+                )
+            })?;
+        if partial_identity != target_identity {
+            return Err(DownloadError::TargetRaceMismatch);
+        }
+        Ok(())
     }
 
     async fn validate_install_race(

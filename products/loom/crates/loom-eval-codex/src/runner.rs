@@ -1143,12 +1143,13 @@ fn read_bounded(
     }
 }
 
+#[cfg(unix)]
 fn configure_process_group(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        command.process_group(0);
-    }
+    command.process_group(0);
 }
+
+#[cfg(not(unix))]
+fn configure_process_group(_: &mut Command) {}
 
 fn terminate_process_group(child: &mut Child) -> Result<(), FrontierCriticError> {
     #[cfg(unix)]
@@ -1857,6 +1858,7 @@ mod tests {
         .expect("packet")
     }
 
+    #[cfg(unix)]
     fn ok_packet() -> FrontierCriticPacket {
         FrontierCriticPacket::new(
             BlobId::digest(b"comparison"),

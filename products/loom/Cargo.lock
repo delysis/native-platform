@@ -2328,6 +2328,7 @@ dependencies = [
  "llama-native-types",
  "loom-types",
  "reqwest",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",

@@ -16,6 +16,7 @@ llama-native-host = { git = "https://github.com/delysis/llama-native-kit.git", r
 llama-native-types = { git = "https://github.com/delysis/llama-native-kit.git", rev = "2d69f086e922ed7bdfd6236baf5a1ad0ed568360" }
 loom-types = { path = "../loom-types" }
 reqwest.workspace = true
+same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
