@@ -7,11 +7,13 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(target_os = "macos")]
+use std::str::FromStr as _;
 
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt as _, process::CommandExt as _};
