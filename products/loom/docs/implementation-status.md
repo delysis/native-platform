@@ -1,6 +1,6 @@
 # Loom Native implementation status
 
-Status date: 2026-08-10.
+Status date: 2026-08-11.
 
 This document audits the checked-out source tree. It separates implemented behavior from local evidence and from deferred work. It is not a release declaration, performance claim, or substitute for platform acceptance.
 
@@ -16,15 +16,15 @@ The following was observed on one Apple-silicon macOS development machine with R
 
 | Check | Observed result |
 | --- | --- |
-| `cargo test --workspace --all-targets` | Passed: 610 Rust tests; 4 explicitly environment-bound tests ignored by default; no failures |
-| `pnpm --filter @delysis/loom test` | Passed: 29 files, 166 tests |
+| `cargo test --workspace --all-targets` | Passed on exact head; environment-bound real-model/frontier tests remained explicitly ignored by the default suite; no failures |
+| `pnpm --filter @delysis/loom test` | Passed: 29 files, 169 tests |
 | `pnpm --filter @delysis/loom check` | Passed with 0 errors and 0 warnings |
 | `pnpm --filter @delysis/loom build` | Passed; Vite produced the static frontend bundle |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed with no warnings |
 | Real GGUF ignored tests | The generic Loom raw-family smoke and the feature-gated native writer bridge passed against the exact 484,220,320-byte Qwen artifact on the final native pin; the pinned Gemma 4 E2B base Loom acceptance and companion native-kit raw batch/cancellation acceptance remain separately qualified below |
-| Native macOS development smoke | An unsigned debug `.app` bundle built and launched. Native accessibility interaction exercised project opening, the source/visual editor, autosave, the model manager, keyboard Escape/focus restoration, and the visual-editor trailing-space regression below. The later quiet-shell/automatic-suggestion redesign passed frontend and Rust gates but was not re-exercised through native accessibility because the running window was in active user use. It did not exercise real-model suggestions end to end |
+| Native macOS real-model smoke | The unique unsigned `app.delysis.loom.c1fb2a6f.acceptance` bundle loaded the exact Gemma 4 E2B base Q8 model on M4 Max Metal, produced three durable alternatives, rendered and accepted a multiline caret ghost, persisted an immutable promotion, quit with native resources deallocated, reopened the exact manuscript, and quit cleanly again. Exact identities are in the audit receipt. |
 
-Not run as part of this snapshot: signed packaging, updater tests, Windows/Linux builds, Metal/CUDA/Vulkan certification, Playwright/Tauri end-to-end workflows, screen-reader certification, exhaustive IME matrices, fuzzing, forced termination at every filesystem phase, full large-project latency measurement, and adapter-overhead benchmarking.
+Not run as part of this snapshot: signed packaging, updater tests, Windows/Linux launched-app workflows, CUDA/Vulkan certification, Playwright automation, screen-reader certification, exhaustive IME matrices, forced termination at every filesystem phase, full large-project latency measurement, and adapter-overhead benchmarking. Source CI nevertheless compiles and tests the portable workspace on Linux, macOS, and Windows.
 
 ### Qualified real-model evidence
 
@@ -52,11 +52,11 @@ It passed 1/1 on the CPU path in 203.51 seconds using the 4,954,576,032-byte Gem
 
 The companion real-model `llama-native-kit` acceptance also passed against the configured local GGUF. That separate test covers exact text/token completion inputs, ordered seeded raw-family outputs, measured shared-prefix reuse, exactly one terminal state per branch, independent cancellation of one branch while its sibling completes, and fail-closed unsupported FIM. This is evidence for the pinned dependency, not a Loom desktop end-to-end test.
 
-Those results establish the local CPU backend gates described above. They do **not** establish:
+The separate desktop acceptance is recorded in [audit-receipts/2026-08-11-real-gemma-desktop.md](audit-receipts/2026-08-11-real-gemma-desktop.md). It establishes the exact local Metal suggestion/promotion/quit/relaunch slice described there. These combined results do **not** establish:
 
-- macOS Metal, Windows CUDA/CPU, Linux CUDA/Vulkan/CPU support;
+- Windows CUDA/CPU or Linux CUDA/Vulkan/CPU support, nor general macOS Metal certification beyond the exercised machine and model;
 - throughput, responsiveness, thermal behavior, or less-than-5-percent adapter overhead;
-- real-model model-load, generation, cancellation, persistence, promotion, and restart recovery through the desktop UI as one workflow; or
+- real-model per-branch cancellation through the desktop UI; cancellation remains covered by native/backend acceptance rather than the one desktop sequence; or
 - signed-release readiness.
 
 ## Implemented surface
@@ -166,7 +166,7 @@ Those results establish the local CPU backend gates described above. They do **n
 - The Gemma gate is a digest-bound raw-family backend recipe/test, not a curated downloadable catalog, quantization recommendation, or complete author-facing profile suite.
 - Discovery verifies only the GGUF container header. Completion/FIM/output-token/logprob support remains unavailable until native load/inspection.
 - The downloader requires an author-supplied HTTPS URL, exact SHA-256, and limit; it does not discover publisher catalogs or assert that a downloaded model is suitable.
-- Real shared-prefix and independent-cancellation evidence exists at the backend/native-kit layers, but the same path has not been exercised as a desktop real-model end-to-end workflow.
+- Real shared-prefix and independent-cancellation evidence exists at the backend/native-kit layers. The desktop receipt exercises real generation, persistence, promotion, and restart, but not independent branch cancellation through the UI.
 - Acceleration diagnostics, measured backpressure/cancellation latency, throughput/overhead, and cross-platform device paths have not passed product acceptance.
 
 ### `loom-cli`
@@ -287,13 +287,14 @@ Those results establish the local CPU backend gates described above. They do **n
 - [ ] Add filesystem watching, rename/delete handling, full-text search, source/split parity, new-document/import UI, and hybrid metadata persistence.
 - [ ] Complete crash-injection, corruption, migration, large-document, Unicode/RTL/IME, and end-to-end matrices.
 
-### 3. Complete local base-model vertical slice — **implemented development path, incomplete real desktop acceptance**
+### 3. Complete local base-model vertical slice — **real desktop suggestion slice accepted; broader certification incomplete**
 
 - [x] Exact raw completion adapter, typed capability verification, ordered branch results, bounded events, cancellation calls, token/provenance conversion, fixture honesty tests, and local discovery/fit libraries.
 - [x] Pin the generalized native branch-family implementation and pass its real ordered-batch, shared-prefix, independent-cancellation, and capability acceptance.
 - [x] Connect desktop `Weave` through model choose/load/unload, source-bound generation persistence, streaming, bounded durable branch comparison, explicit promotion, independent cancellation, exact-command recovery, and restart-visible branch reconstruction.
 - [x] Pass the digest-bound real Gemma 4 E2B **base** Q8 Loom backend acceptance with two independent seeds, exact raw prompt identity, generated tokens, live evidence, and positive shared-prefix metrics.
-- [ ] Exercise model load, Weave, one-branch cancellation, candidate comparison, promotion, restart recovery, and exact provenance reconstruction through the desktop UI against the real Gemma model as one acceptance workflow.
+- [x] Exercise real Gemma model load, a three-candidate automatic suggestion, caret-local comparison affordance, explicit Tab promotion, durable selection/revision evidence, loaded-model quit, and immediate restart recovery through the desktop UI.
+- [ ] Exercise independent one-branch cancellation through the desktop UI; it is currently proven only at the native/backend boundary.
 - [ ] Establish portable macOS/Windows/Linux backends and measured responsiveness/overhead.
 
 ### 4. Automation, retrieval, and evaluation — **nearby suggestions integrated; broader automation/retrieval incomplete**
@@ -321,4 +322,4 @@ Those results establish the local CPU backend gates described above. They do **n
 
 ## Definition of the current milestone
 
-The current milestone is a crash-conscious local editor/storage foundation plus a quiet local-model suggestion slice: launch reaches an ordinary-file note, autosave/checkpoints are implicit, and explicitly enabled local suggestions grow after an idle pause and remain private until exact-boundary acceptance. Model inspection, verified download, durable branches, cancellation, comparison, and promotion exist behind typed authority boundaries. The Gemma 4 E2B base backend gate passed, but the redesigned desktop sequence has not yet been run against that real model as one native acceptance workflow. Retrieval/search/evaluation remain non-persisted library primitives, and attachment, speech, FTE, richer export, platform certification, signing, and release operations remain deferred. This is not a release candidate.
+The current milestone is a crash-conscious local editor/storage foundation plus a quiet local-model suggestion slice: launch reaches an ordinary-file note, autosave/checkpoints are implicit, and local suggestions grow after an idle pause and remain private until exact-boundary acceptance. Model inspection, verified download, durable branches, cancellation, comparison, and promotion exist behind typed authority boundaries. The Gemma 4 E2B base backend gate and the exact Metal desktop suggestion/promotion/quit/relaunch slice passed. The native research engine now has persisted headless trial/campaign/evaluation/benchmark foundations, but the five-function qualification program, frozen profiles, Studio views, attachment/speech/FTE product composition, richer export, platform certification, signing, and release operations remain deferred. This is not a release candidate.
