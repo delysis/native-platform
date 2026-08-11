@@ -2319,6 +2319,7 @@ fn create_private_dir_all(path: &Path) -> Result<(), StoreError> {
 
 fn create_private_dir(path: &Path) -> Result<(), StoreError> {
     let mut builder = DirBuilder::new();
+    builder.recursive(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
