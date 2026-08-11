@@ -16,8 +16,13 @@ permissions = [
 
 [[set]]
 identifier = "manuscript-promotion"
-description = "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command."
-permissions = ["allow-candidate-promote"]
+description = "Promote an explicitly selected private candidate or host-staged research result into the active manuscript through Loom's source-bound store commands."
+permissions = [
+  "allow-candidate-promote",
+  "allow-research-promotion-import",
+  "allow-research-promotion-pending",
+  "allow-research-promotion-confirm",
+]
 
 [[set]]
 identifier = "verified-model-download"

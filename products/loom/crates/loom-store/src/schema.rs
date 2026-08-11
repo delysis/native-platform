@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use crate::{Result, StoreError};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
-pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 11;
 
 pub(crate) fn configure(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -100,6 +100,15 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<()> {
             [loom_types::now_unix_ms()],
         )?;
     }
+    if version < 11 {
+        transaction.execute_batch(include_str!(
+            "../migrations/0011_foreground_command_receipts.sql"
+        ))?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (11, ?1)",
+            [loom_types::now_unix_ms()],
+        )?;
+    }
     transaction.pragma_update(
         None,
         "user_version",
@@ -185,6 +194,71 @@ mod tests {
                 .expect("read v10 trigger");
             assert_eq!(count, 1, "{trigger} must exist");
         }
+    }
+
+    #[test]
+    fn version_eleven_adds_foreground_receipts_after_token_piece_evidence() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure(&connection).expect("configure SQLite");
+        for migration in [
+            include_str!("../migrations/0001_initial.sql"),
+            include_str!("../migrations/0002_generation_provenance.sql"),
+            include_str!("../migrations/0003_transient_drafts.sql"),
+            include_str!("../migrations/0004_draft_generations.sql"),
+            include_str!("../migrations/0005_generation_command_hardening.sql"),
+            include_str!("../migrations/0006_bounded_branch_index.sql"),
+            include_str!("../migrations/0007_research_admission.sql"),
+            include_str!("../migrations/0008_verified_inference_batches.sql"),
+            include_str!("../migrations/0009_research_execution_ledger.sql"),
+        ] {
+            connection
+                .execute_batch(migration)
+                .expect("apply through v9");
+        }
+        connection
+            .pragma_update(None, "user_version", 9_i64)
+            .expect("mark version nine");
+
+        migrate(&mut connection).expect("migrate v9 through v11");
+
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read migrated version");
+        assert_eq!(version, 11);
+        for (table, expected_columns) in [
+            ("research_token_piece_evidence", 7_i64),
+            ("research_foreground_command_receipts", 15_i64),
+        ] {
+            let (strict, columns): (i64, i64) = connection
+                .query_row(
+                    "SELECT strict, (SELECT COUNT(*) FROM pragma_table_info(?1))
+                     FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
+                    [table],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap_or_else(|error| panic!("read {table} metadata: {error}"));
+            assert_eq!(strict, 1, "{table} must be STRICT");
+            assert_eq!(columns, expected_columns, "{table} column count");
+        }
+        for expected in [10_i64, 11_i64] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                    [expected],
+                    |row| row.get(0),
+                )
+                .expect("read migration ledger");
+            assert_eq!(
+                count, 1,
+                "migration {expected} must be recorded exactly once"
+            );
+        }
+
+        migrate(&mut connection).expect("reopen at current schema");
+        let version_after_reopen: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read reopened version");
+        assert_eq!(version_after_reopen, 11);
     }
 
     #[test]

@@ -38,9 +38,10 @@ pub use provenance::{
 pub use reconciliation::{ExternalReconciliationOutcome, ExternalReconciliationRequest};
 pub use research_admission::{
     AdmittedCandidateAssembly, AdmittedCandidateProjection, AdmittedGeneratedSpan,
-    AdmittedModelCall, AdoptedInferenceBatch, FrozenPromptSourceLease, MixedAuthorshipAdmission,
-    PromotionSubjectLease, RecordedPromotionAuthority, RecordedPromotionRequest,
-    ReplayedInferenceBatchEvidence, ResearchAdmissionRecordId, VerifiedUserPresence,
+    AdmittedModelCall, AdoptedInferenceBatch, ForegroundPromotionBindingParts,
+    ForegroundPromotionOutcome, FrozenPromptSourceLease, MixedAuthorshipAdmission,
+    PromotionSubjectLease, RecordedForegroundPromotionReceipt, RecordedPromotionRequest,
+    ReplayedInferenceBatchEvidence, ResearchAdmissionRecordId,
 };
 pub use research_archive::{
     DiagnosticArchiveSnapshotPersistence, PersistedDiagnosticArchiveSnapshot,

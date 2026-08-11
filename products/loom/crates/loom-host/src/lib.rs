@@ -8,11 +8,488 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use loom_types::{BranchId, CommandId, DocumentId, GenerationRunId, ProjectId};
+use loom_types::{
+    BlobId, BranchId, CommandId, DocumentId, GenerationRunId, ProjectId, now_unix_ms,
+};
 
 pub const MAX_QUEUE_CAPACITY: usize = 65_536;
 pub const DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES: usize = 64;
 pub const MAX_ACTIVE_GENERATION_BRANCHES: usize = 4_096;
+pub const MAX_FOREGROUND_WINDOW_ID_BYTES: usize = 128;
+pub const MAX_FOREGROUND_COMMAND_TTL: Duration = Duration::from_secs(60);
+pub const MAX_NATIVE_FOCUS_SAMPLE_AGE: Duration = Duration::from_secs(1);
+pub const MAX_FOREGROUND_WINDOWS: usize = 64;
+pub const MAX_PENDING_FOREGROUND_COMMANDS: usize = 1_024;
+
+/// Native window identity used by one foreground-command challenge.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ForegroundWindowId(Arc<str>);
+
+impl ForegroundWindowId {
+    pub fn new(value: impl AsRef<str>) -> Result<Self, ForegroundCommandError> {
+        let value = value.as_ref();
+        if value.is_empty() || value.len() > MAX_FOREGROUND_WINDOW_ID_BYTES {
+            return Err(ForegroundCommandError::InvalidWindowId);
+        }
+        Ok(Self(Arc::from(value)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Exact pending promotion identity. This data may cross IPC; it is not
+/// authority until the native host atomically consumes the matching nonce.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForegroundCommandBinding {
+    pub application_session_id: CommandId,
+    pub window_id: ForegroundWindowId,
+    pub document_id: DocumentId,
+    pub candidate_fingerprint: BlobId,
+    pub command_id: CommandId,
+    pub promotion_fingerprint: BlobId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForegroundCommandChallenge {
+    pub nonce: CommandId,
+    pub binding: ForegroundCommandBinding,
+    pub focus_epoch: u64,
+    pub issued_at_unix_ms: i64,
+    pub expires_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForegroundCommandAttempt {
+    pub nonce: CommandId,
+    pub binding: ForegroundCommandBinding,
+}
+
+/// Move-only evidence that the native host sampled one window's focus state.
+///
+/// The fields are private so ordinary callers cannot construct, alter, clone,
+/// or deserialize a sample. A sample is also bound to one registry process and
+/// expires quickly. The native application edge must obtain it immediately
+/// after reading focus from the platform window API.
+#[derive(Debug)]
+pub struct NativeWindowFocusSample {
+    process_session_fingerprint: BlobId,
+    window_id: ForegroundWindowId,
+    focused: bool,
+    sampled_at: Instant,
+}
+
+impl NativeWindowFocusSample {
+    /// Returns the native window identity captured at the sampling edge.
+    pub const fn window_id(&self) -> &ForegroundWindowId {
+        &self.window_id
+    }
+}
+
+/// Move-only proof of the narrow claim the host can actually make:
+/// one command was accepted from the focused bound window in this process.
+///
+/// It intentionally implements neither `Clone` nor serialization. The nonce
+/// remains process-local and is consumed before this value is minted.
+#[derive(Debug, Eq, PartialEq)]
+pub struct VerifiedForegroundCommand {
+    process_session_fingerprint: BlobId,
+    binding: ForegroundCommandBinding,
+    _nonce: CommandId,
+    focus_epoch: u64,
+    monotonic_event_index: u64,
+    issued_at_unix_ms: i64,
+    expires_at_unix_ms: i64,
+    occurred_at_unix_ms: i64,
+}
+
+impl VerifiedForegroundCommand {
+    pub const fn process_session_fingerprint(&self) -> BlobId {
+        self.process_session_fingerprint
+    }
+
+    pub const fn binding(&self) -> &ForegroundCommandBinding {
+        &self.binding
+    }
+
+    pub const fn focus_epoch(&self) -> u64 {
+        self.focus_epoch
+    }
+
+    pub const fn monotonic_event_index(&self) -> u64 {
+        self.monotonic_event_index
+    }
+
+    pub const fn issued_at_unix_ms(&self) -> i64 {
+        self.issued_at_unix_ms
+    }
+
+    pub const fn expires_at_unix_ms(&self) -> i64 {
+        self.expires_at_unix_ms
+    }
+
+    pub const fn occurred_at_unix_ms(&self) -> i64 {
+        self.occurred_at_unix_ms
+    }
+}
+
+#[derive(Debug)]
+struct PendingForegroundCommand {
+    binding: ForegroundCommandBinding,
+    focus_epoch: u64,
+    issued_at: Instant,
+    expires_at: Instant,
+    issued_at_unix_ms: i64,
+    expires_at_unix_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WindowFocus {
+    epoch: u64,
+    focused: bool,
+}
+
+#[derive(Debug, Default)]
+struct ForegroundCommandState {
+    windows: BTreeMap<ForegroundWindowId, WindowFocus>,
+    pending: BTreeMap<CommandId, PendingForegroundCommand>,
+    next_event_index: u64,
+}
+
+/// Process-local owner of foreground-command challenges.
+#[derive(Debug)]
+pub struct ForegroundCommandRegistry {
+    process_session_fingerprint: BlobId,
+    state: Mutex<ForegroundCommandState>,
+}
+
+impl Default for ForegroundCommandRegistry {
+    fn default() -> Self {
+        let identity = CommandId::new();
+        let mut material = Vec::with_capacity(64);
+        material.extend_from_slice(b"loom/foreground-command-process-session/v1\0");
+        material.extend_from_slice(&identity.as_ulid().to_bytes());
+        Self {
+            process_session_fingerprint: BlobId::digest(&material),
+            state: Mutex::new(ForegroundCommandState::default()),
+        }
+    }
+}
+
+impl ForegroundCommandRegistry {
+    pub fn observe_window_focus(
+        &self,
+        window_id: ForegroundWindowId,
+        focused: bool,
+    ) -> Result<u64, ForegroundCommandError> {
+        let mut state = self.lock()?;
+        if !state.windows.contains_key(&window_id) && state.windows.len() >= MAX_FOREGROUND_WINDOWS
+        {
+            return Err(ForegroundCommandError::RegistryCapacityExceeded);
+        }
+        let window = state.windows.entry(window_id).or_default();
+        window.epoch = window
+            .epoch
+            .checked_add(1)
+            .ok_or(ForegroundCommandError::EventIndexExhausted)?;
+        window.focused = focused;
+        Ok(window.epoch)
+    }
+
+    pub fn issue(
+        &self,
+        binding: ForegroundCommandBinding,
+        ttl: Duration,
+    ) -> Result<ForegroundCommandChallenge, ForegroundCommandError> {
+        self.issue_at(binding, ttl, Instant::now(), now_unix_ms())
+    }
+
+    fn issue_at(
+        &self,
+        binding: ForegroundCommandBinding,
+        ttl: Duration,
+        now: Instant,
+        now_unix_ms: i64,
+    ) -> Result<ForegroundCommandChallenge, ForegroundCommandError> {
+        if ttl.is_zero() || ttl > MAX_FOREGROUND_COMMAND_TTL || now_unix_ms <= 0 {
+            return Err(ForegroundCommandError::InvalidExpiry);
+        }
+        let expires_at = now
+            .checked_add(ttl)
+            .ok_or(ForegroundCommandError::InvalidExpiry)?;
+        let ttl_ms =
+            i64::try_from(ttl.as_millis()).map_err(|_| ForegroundCommandError::InvalidExpiry)?;
+        let expires_at_unix_ms = now_unix_ms
+            .checked_add(ttl_ms)
+            .ok_or(ForegroundCommandError::InvalidExpiry)?;
+        let mut state = self.lock()?;
+        state.pending.retain(|_, pending| pending.expires_at >= now);
+        if state.pending.len() >= MAX_PENDING_FOREGROUND_COMMANDS {
+            return Err(ForegroundCommandError::RegistryCapacityExceeded);
+        }
+        let focus = state
+            .windows
+            .get(&binding.window_id)
+            .copied()
+            .filter(|focus| focus.focused)
+            .ok_or(ForegroundCommandError::WindowNotFocused)?;
+        let nonce = loop {
+            let candidate = CommandId::new();
+            if !state.pending.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        state.pending.insert(
+            nonce,
+            PendingForegroundCommand {
+                binding: binding.clone(),
+                focus_epoch: focus.epoch,
+                issued_at: now,
+                expires_at,
+                issued_at_unix_ms: now_unix_ms,
+                expires_at_unix_ms,
+            },
+        );
+        Ok(ForegroundCommandChallenge {
+            nonce,
+            binding,
+            focus_epoch: focus.epoch,
+            issued_at_unix_ms: now_unix_ms,
+            expires_at_unix_ms,
+        })
+    }
+
+    /// Samples focus directly from a Tauri native window and binds that value
+    /// to this process-local registry and the window's host-owned label.
+    #[cfg(feature = "tauri-native-focus")]
+    pub fn sample_tauri_window_focus<R: tauri::Runtime>(
+        &self,
+        window: &tauri::Window<R>,
+    ) -> Result<NativeWindowFocusSample, NativeWindowFocusSampleError> {
+        let window_id = ForegroundWindowId::new(window.label())?;
+        let focused = window.is_focused()?;
+        Ok(self.bind_native_window_focus_sample_at(window_id, focused, Instant::now()))
+    }
+
+    /// Constructs a synthetic focus sample for cross-crate regression tests.
+    /// This method is absent from normal production dependency builds.
+    #[cfg(feature = "test-fixtures")]
+    #[doc(hidden)]
+    pub fn bind_test_native_window_focus_sample(
+        &self,
+        window_id: ForegroundWindowId,
+        focused: bool,
+    ) -> NativeWindowFocusSample {
+        self.bind_native_window_focus_sample_at(window_id, focused, Instant::now())
+    }
+
+    /// Consumes a challenge using a fresh, registry-bound native focus sample.
+    /// The registry's event-derived epoch is checked as well; neither signal
+    /// substitutes for the other.
+    pub fn consume_with_native_focus(
+        &self,
+        attempt: ForegroundCommandAttempt,
+        native_focus: NativeWindowFocusSample,
+    ) -> Result<VerifiedForegroundCommand, ForegroundCommandError> {
+        self.consume_with_native_focus_at(attempt, native_focus, Instant::now(), now_unix_ms())
+    }
+
+    #[cfg(any(test, feature = "tauri-native-focus", feature = "test-fixtures"))]
+    fn bind_native_window_focus_sample_at(
+        &self,
+        window_id: ForegroundWindowId,
+        focused: bool,
+        sampled_at: Instant,
+    ) -> NativeWindowFocusSample {
+        NativeWindowFocusSample {
+            process_session_fingerprint: self.process_session_fingerprint,
+            window_id,
+            focused,
+            sampled_at,
+        }
+    }
+
+    fn consume_with_native_focus_at(
+        &self,
+        attempt: ForegroundCommandAttempt,
+        native_focus: NativeWindowFocusSample,
+        now: Instant,
+        occurred_at_unix_ms: i64,
+    ) -> Result<VerifiedForegroundCommand, ForegroundCommandError> {
+        let ForegroundCommandAttempt { nonce, binding } = attempt;
+        let NativeWindowFocusSample {
+            process_session_fingerprint,
+            window_id,
+            focused,
+            sampled_at,
+        } = native_focus;
+        let mut state = self.lock()?;
+        // Removing under the same mutex as validation makes every presented
+        // nonce one-shot, including a mismatched or expired attempt.
+        let pending = state
+            .pending
+            .remove(&nonce)
+            .ok_or(ForegroundCommandError::StaleNonce)?;
+        if now < pending.issued_at
+            || now > pending.expires_at
+            || occurred_at_unix_ms < pending.issued_at_unix_ms
+            || occurred_at_unix_ms > pending.expires_at_unix_ms
+        {
+            return Err(ForegroundCommandError::Expired);
+        }
+        validate_foreground_binding(&pending.binding, &binding)?;
+        if process_session_fingerprint != self.process_session_fingerprint {
+            return Err(ForegroundCommandError::WrongProcess);
+        }
+        if window_id != pending.binding.window_id {
+            return Err(ForegroundCommandError::WrongWindow);
+        }
+        let sample_age = now
+            .checked_duration_since(sampled_at)
+            .ok_or(ForegroundCommandError::InvalidNativeFocusSample)?;
+        if sampled_at < pending.issued_at || sample_age > MAX_NATIVE_FOCUS_SAMPLE_AGE {
+            return Err(ForegroundCommandError::InvalidNativeFocusSample);
+        }
+        if !focused {
+            return Err(ForegroundCommandError::WindowNotFocused);
+        }
+        let focus = state
+            .windows
+            .get(&pending.binding.window_id)
+            .copied()
+            .ok_or(ForegroundCommandError::FocusChanged)?;
+        if !focus.focused || focus.epoch != pending.focus_epoch {
+            return Err(ForegroundCommandError::FocusChanged);
+        }
+        let event_index = state
+            .next_event_index
+            .checked_add(1)
+            .ok_or(ForegroundCommandError::EventIndexExhausted)?;
+        state.next_event_index = event_index;
+        Ok(VerifiedForegroundCommand {
+            process_session_fingerprint: self.process_session_fingerprint,
+            binding: pending.binding,
+            _nonce: nonce,
+            focus_epoch: pending.focus_epoch,
+            monotonic_event_index: event_index,
+            issued_at_unix_ms: pending.issued_at_unix_ms,
+            expires_at_unix_ms: pending.expires_at_unix_ms,
+            occurred_at_unix_ms,
+        })
+    }
+
+    #[cfg(test)]
+    fn consume_at(
+        &self,
+        attempt: ForegroundCommandAttempt,
+        now: Instant,
+        occurred_at_unix_ms: i64,
+    ) -> Result<VerifiedForegroundCommand, ForegroundCommandError> {
+        let native_focus =
+            self.bind_native_window_focus_sample_at(attempt.binding.window_id.clone(), true, now);
+        self.consume_with_native_focus_at(attempt, native_focus, now, occurred_at_unix_ms)
+    }
+
+    pub fn revoke_application_session(
+        &self,
+        session_id: CommandId,
+    ) -> Result<usize, ForegroundCommandError> {
+        let mut state = self.lock()?;
+        let before = state.pending.len();
+        state
+            .pending
+            .retain(|_, pending| pending.binding.application_session_id != session_id);
+        Ok(before.saturating_sub(state.pending.len()))
+    }
+
+    pub fn revoke_all(&self) -> Result<usize, ForegroundCommandError> {
+        let mut state = self.lock()?;
+        let revoked = state.pending.len();
+        state.pending.clear();
+        Ok(revoked)
+    }
+
+    fn lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ForegroundCommandState>, ForegroundCommandError> {
+        self.state
+            .lock()
+            .map_err(|_| ForegroundCommandError::StateUnavailable)
+    }
+}
+
+fn validate_foreground_binding(
+    expected: &ForegroundCommandBinding,
+    actual: &ForegroundCommandBinding,
+) -> Result<(), ForegroundCommandError> {
+    if actual.window_id != expected.window_id {
+        return Err(ForegroundCommandError::WrongWindow);
+    }
+    if actual.application_session_id != expected.application_session_id {
+        return Err(ForegroundCommandError::WrongSession);
+    }
+    if actual.document_id != expected.document_id {
+        return Err(ForegroundCommandError::WrongDocument);
+    }
+    if actual.candidate_fingerprint != expected.candidate_fingerprint {
+        return Err(ForegroundCommandError::WrongCandidate);
+    }
+    if actual.command_id != expected.command_id {
+        return Err(ForegroundCommandError::WrongCommand);
+    }
+    if actual.promotion_fingerprint != expected.promotion_fingerprint {
+        return Err(ForegroundCommandError::WrongPromotion);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ForegroundCommandError {
+    #[error("foreground window identity is empty or too large")]
+    InvalidWindowId,
+    #[error("foreground command expiry is outside the bounded domain")]
+    InvalidExpiry,
+    #[error("foreground command registry is unavailable")]
+    StateUnavailable,
+    #[error("foreground command registry capacity is exhausted")]
+    RegistryCapacityExceeded,
+    #[error("the bound window is not focused")]
+    WindowNotFocused,
+    #[error("the foreground command nonce is stale, unknown, or already consumed")]
+    StaleNonce,
+    #[error("the foreground command nonce expired")]
+    Expired,
+    #[error("the foreground command names another window")]
+    WrongWindow,
+    #[error("the foreground command names another application session")]
+    WrongSession,
+    #[error("the foreground command names another document")]
+    WrongDocument,
+    #[error("the foreground command names another candidate")]
+    WrongCandidate,
+    #[error("the foreground command names another command occurrence")]
+    WrongCommand,
+    #[error("the foreground command names another pending promotion")]
+    WrongPromotion,
+    #[error("the native focus sample belongs to another process registry")]
+    WrongProcess,
+    #[error("the native focus sample is stale or predates the challenge")]
+    InvalidNativeFocusSample,
+    #[error("the window focus epoch changed before command consumption")]
+    FocusChanged,
+    #[error("the foreground command event index is exhausted")]
+    EventIndexExhausted,
+}
+
+#[cfg(feature = "tauri-native-focus")]
+#[derive(Debug, Error)]
+pub enum NativeWindowFocusSampleError {
+    #[error(transparent)]
+    InvalidWindow(#[from] ForegroundCommandError),
+    #[error("could not verify native window focus: {0}")]
+    NativeQuery(#[from] tauri::Error),
+}
 
 /// Minimal cancellation authority retained by the lifecycle registry. The
 /// concrete inference handle stays behind this boundary, so the host owns
@@ -680,6 +1157,360 @@ pub struct QueueDisconnected;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn foreground_binding() -> ForegroundCommandBinding {
+        ForegroundCommandBinding {
+            application_session_id: CommandId::new(),
+            window_id: ForegroundWindowId::new("main").expect("window ID"),
+            document_id: DocumentId::new(),
+            candidate_fingerprint: BlobId::digest(b"candidate"),
+            command_id: CommandId::new(),
+            promotion_fingerprint: loom_types::BlobId::digest(b"promotion"),
+        }
+    }
+
+    fn focused_registry(
+        binding: &ForegroundCommandBinding,
+    ) -> (ForegroundCommandRegistry, Instant) {
+        let registry = ForegroundCommandRegistry::default();
+        registry
+            .observe_window_focus(binding.window_id.clone(), true)
+            .expect("focus main window");
+        (registry, Instant::now())
+    }
+
+    #[test]
+    fn stale_nonce_rejected() {
+        let binding = foreground_binding();
+        let (registry, now) = focused_registry(&binding);
+        let attempt = ForegroundCommandAttempt {
+            nonce: CommandId::new(),
+            binding,
+        };
+        assert_eq!(
+            registry.consume_at(attempt, now, 10),
+            Err(ForegroundCommandError::StaleNonce)
+        );
+    }
+
+    #[test]
+    fn wrong_window_rejected() {
+        let binding = foreground_binding();
+        let (registry, now) = focused_registry(&binding);
+        let challenge = registry
+            .issue_at(binding.clone(), Duration::from_secs(5), now, 10)
+            .expect("issue challenge");
+        let mut wrong = binding;
+        wrong.window_id = ForegroundWindowId::new("other").expect("other window");
+        assert_eq!(
+            registry.consume_at(
+                ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding: wrong,
+                },
+                now,
+                11,
+            ),
+            Err(ForegroundCommandError::WrongWindow)
+        );
+    }
+
+    #[test]
+    fn focus_epoch_change_rejected() {
+        let binding = foreground_binding();
+        let (registry, now) = focused_registry(&binding);
+        let challenge = registry
+            .issue_at(binding.clone(), Duration::from_secs(5), now, 10)
+            .expect("issue challenge");
+        registry
+            .observe_window_focus(binding.window_id.clone(), false)
+            .expect("blur window");
+        registry
+            .observe_window_focus(binding.window_id.clone(), true)
+            .expect("refocus window");
+        assert_eq!(
+            registry.consume_at(
+                ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding,
+                },
+                now,
+                11,
+            ),
+            Err(ForegroundCommandError::FocusChanged)
+        );
+    }
+
+    #[test]
+    fn wrong_candidate_rejected() {
+        let binding = foreground_binding();
+        let (registry, now) = focused_registry(&binding);
+        let challenge = registry
+            .issue_at(binding.clone(), Duration::from_secs(5), now, 10)
+            .expect("issue challenge");
+        let mut wrong = binding;
+        wrong.candidate_fingerprint = BlobId::digest(b"other candidate");
+        assert_eq!(
+            registry.consume_at(
+                ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding: wrong,
+                },
+                now,
+                11,
+            ),
+            Err(ForegroundCommandError::WrongCandidate)
+        );
+    }
+
+    #[test]
+    fn session_document_command_and_promotion_substitution_are_rejected() {
+        let mutations: [fn(&mut ForegroundCommandBinding); 4] = [
+            |binding| binding.application_session_id = CommandId::new(),
+            |binding| binding.document_id = DocumentId::new(),
+            |binding| binding.command_id = CommandId::new(),
+            |binding| binding.promotion_fingerprint = BlobId::digest(b"other promotion"),
+        ];
+        let expected = [
+            ForegroundCommandError::WrongSession,
+            ForegroundCommandError::WrongDocument,
+            ForegroundCommandError::WrongCommand,
+            ForegroundCommandError::WrongPromotion,
+        ];
+        for (mutate, expected) in mutations.into_iter().zip(expected) {
+            let binding = foreground_binding();
+            let (registry, now) = focused_registry(&binding);
+            let challenge = registry
+                .issue_at(binding.clone(), Duration::from_secs(5), now, 10)
+                .expect("issue challenge");
+            let mut wrong = binding;
+            mutate(&mut wrong);
+            assert_eq!(
+                registry.consume_at(
+                    ForegroundCommandAttempt {
+                        nonce: challenge.nonce,
+                        binding: wrong,
+                    },
+                    now,
+                    11,
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn expired_nonce_rejected() {
+        let binding = foreground_binding();
+        let (registry, now) = focused_registry(&binding);
+        let challenge = registry
+            .issue_at(binding.clone(), Duration::from_secs(5), now, 10)
+            .expect("issue challenge");
+        assert_eq!(
+            registry.consume_at(
+                ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding,
+                },
+                now + Duration::from_secs(6),
+                16,
+            ),
+            Err(ForegroundCommandError::Expired)
+        );
+    }
+
+    #[test]
+    fn second_use_rejected() {
+        let binding = foreground_binding();
+        let (registry, now) = focused_registry(&binding);
+        let challenge = registry
+            .issue_at(binding.clone(), Duration::from_secs(5), now, 10)
+            .expect("issue challenge");
+        let first = ForegroundCommandAttempt {
+            nonce: challenge.nonce,
+            binding: binding.clone(),
+        };
+        registry
+            .consume_at(first, now, 11)
+            .expect("first use succeeds");
+        assert_eq!(
+            registry.consume_at(
+                ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding,
+                },
+                now,
+                12,
+            ),
+            Err(ForegroundCommandError::StaleNonce)
+        );
+    }
+
+    #[test]
+    fn native_focus_recheck_fails_closed_and_spends_nonce() {
+        let binding = foreground_binding();
+        let (registry, now) = focused_registry(&binding);
+        let challenge = registry
+            .issue_at(binding.clone(), Duration::from_secs(5), now, 10)
+            .expect("issue challenge");
+        let unfocused =
+            registry.bind_native_window_focus_sample_at(binding.window_id.clone(), false, now);
+        assert_eq!(
+            registry.consume_with_native_focus_at(
+                ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding: binding.clone(),
+                },
+                unfocused,
+                now,
+                11,
+            ),
+            Err(ForegroundCommandError::WindowNotFocused)
+        );
+        let focused =
+            registry.bind_native_window_focus_sample_at(binding.window_id.clone(), true, now);
+        assert_eq!(
+            registry.consume_with_native_focus_at(
+                ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding,
+                },
+                focused,
+                now,
+                12,
+            ),
+            Err(ForegroundCommandError::StaleNonce)
+        );
+    }
+
+    #[test]
+    fn native_focus_sample_is_bound_to_registry_and_spends_nonce() {
+        let binding = foreground_binding();
+        let (registry, now) = focused_registry(&binding);
+        let challenge = registry
+            .issue_at(binding.clone(), Duration::from_secs(5), now, 10)
+            .expect("issue challenge");
+        let other_registry = ForegroundCommandRegistry::default();
+        let foreign_sample =
+            other_registry.bind_native_window_focus_sample_at(binding.window_id.clone(), true, now);
+        assert_eq!(
+            registry.consume_with_native_focus_at(
+                ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding: binding.clone(),
+                },
+                foreign_sample,
+                now,
+                11,
+            ),
+            Err(ForegroundCommandError::WrongProcess)
+        );
+        assert_eq!(
+            registry.consume_at(
+                ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding,
+                },
+                now,
+                12,
+            ),
+            Err(ForegroundCommandError::StaleNonce)
+        );
+    }
+
+    #[test]
+    fn stale_native_focus_sample_fails_closed_and_spends_nonce() {
+        let binding = foreground_binding();
+        let (registry, now) = focused_registry(&binding);
+        let challenge = registry
+            .issue_at(binding.clone(), Duration::from_secs(5), now, 10)
+            .expect("issue challenge");
+        let sample =
+            registry.bind_native_window_focus_sample_at(binding.window_id.clone(), true, now);
+        let late = now + MAX_NATIVE_FOCUS_SAMPLE_AGE + Duration::from_millis(1);
+        assert_eq!(
+            registry.consume_with_native_focus_at(
+                ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding: binding.clone(),
+                },
+                sample,
+                late,
+                12,
+            ),
+            Err(ForegroundCommandError::InvalidNativeFocusSample)
+        );
+        assert_eq!(
+            registry.consume_at(
+                ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding,
+                },
+                late,
+                13,
+            ),
+            Err(ForegroundCommandError::StaleNonce)
+        );
+    }
+
+    #[test]
+    fn foreground_registry_bounds_windows_and_pending_challenges() {
+        let registry = ForegroundCommandRegistry::default();
+        for index in 0..MAX_FOREGROUND_WINDOWS {
+            registry
+                .observe_window_focus(
+                    ForegroundWindowId::new(format!("window-{index}")).expect("window ID"),
+                    true,
+                )
+                .expect("bounded window");
+        }
+        assert_eq!(
+            registry.observe_window_focus(
+                ForegroundWindowId::new("one-window-too-many").expect("window ID"),
+                true,
+            ),
+            Err(ForegroundCommandError::RegistryCapacityExceeded)
+        );
+
+        let binding = ForegroundCommandBinding {
+            window_id: ForegroundWindowId::new("window-0").expect("window ID"),
+            ..foreground_binding()
+        };
+        let now = Instant::now();
+        for _ in 0..MAX_PENDING_FOREGROUND_COMMANDS {
+            registry
+                .issue_at(binding.clone(), Duration::from_secs(5), now, 10)
+                .expect("bounded challenge");
+        }
+        assert_eq!(
+            registry.issue_at(binding, Duration::from_secs(5), now, 10),
+            Err(ForegroundCommandError::RegistryCapacityExceeded)
+        );
+    }
+
+    #[test]
+    fn restart_rejected() {
+        let binding = foreground_binding();
+        let (first_registry, now) = focused_registry(&binding);
+        let challenge = first_registry
+            .issue_at(binding.clone(), Duration::from_secs(5), now, 10)
+            .expect("issue challenge");
+        let second_registry = ForegroundCommandRegistry::default();
+        second_registry
+            .observe_window_focus(binding.window_id.clone(), true)
+            .expect("focus after restart");
+        assert_eq!(
+            second_registry.consume_at(
+                ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding,
+                },
+                now,
+                11,
+            ),
+            Err(ForegroundCommandError::StaleNonce)
+        );
+    }
 
     #[derive(Debug, Default)]
     struct FakeCancellation {

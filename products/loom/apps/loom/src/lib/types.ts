@@ -100,6 +100,22 @@ export interface CommandReceipt {
   completed_at_unix_ms: number;
 }
 
+export interface ResearchPromotionPrompt {
+  command_id: string;
+  nonce: string;
+  document_id: string;
+  candidate_fingerprint: string;
+  promotion_fingerprint: string;
+  subject_kind: 'candidate_projection' | 'mixed_authorship';
+  expires_at_unix_ms: number;
+  result_text: string;
+}
+
+export interface ResearchPromotionResult {
+  receipt: CommandReceipt;
+  foreground_receipt_blob_id: string;
+}
+
 export interface RecoveryReport {
   recovered: number;
   conflicts: string[];

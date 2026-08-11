@@ -2446,6 +2446,7 @@ name = "loom-host"
 version = "0.1.0"
 dependencies = [
  "loom-types",
+ "tauri",
  "thiserror 2.0.20",
 ]
 
@@ -2512,6 +2513,7 @@ dependencies = [
  "loom-benchmark",
  "loom-document",
  "loom-eval",
+ "loom-host",
  "loom-inference",
  "loom-research-types",
  "loom-search",
@@ -4597,6 +4599,7 @@ dependencies = [
  "loom-backend-llama",
  "loom-document",
  "loom-host",
+ "loom-research-types",
  "loom-store",
  "loom-types",
  "same-file",

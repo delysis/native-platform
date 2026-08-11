@@ -10,7 +10,8 @@ repository.workspace = true
 [dependencies]
 loom-document = { path = "../loom-document" }
 loom-backend-llama = { path = "../loom-backend-llama" }
-loom-host = { path = "../loom-host" }
+loom-host = { path = "../loom-host", features = ["tauri-native-focus"] }
+loom-research-types = { path = "../loom-research-types" }
 loom-store = { path = "../loom-store" }
 loom-types = { path = "../loom-types" }
 same-file.workspace = true
@@ -25,6 +26,7 @@ thiserror.workspace = true
 tauri-plugin = { version = "2.5.4", features = ["build"] }
 
 [dev-dependencies]
+loom-host = { path = "../loom-host", features = ["test-fixtures"] }
 tempfile.workspace = true
 
 [lints]

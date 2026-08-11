@@ -59,7 +59,7 @@ Load a local model and create, cancel, or retain private generation branches. Th
 </td>
 <td>
 
-Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command.
+Promote an explicitly selected private candidate or host-staged research result into the active manuscript through Loom's source-bound store commands.
 
 </td>
 </tr>
@@ -905,6 +905,84 @@ Enables the project_recover command without any pre-configured scope.
 <td>
 
 Denies the project_recover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-research-promotion-confirm`
+
+</td>
+<td>
+
+Enables the research_promotion_confirm command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-research-promotion-confirm`
+
+</td>
+<td>
+
+Denies the research_promotion_confirm command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-research-promotion-import`
+
+</td>
+<td>
+
+Enables the research_promotion_import command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-research-promotion-import`
+
+</td>
+<td>
+
+Denies the research_promotion_import command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-research-promotion-pending`
+
+</td>
+<td>
+
+Enables the research_promotion_pending command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-research-promotion-pending`
+
+</td>
+<td>
+
+Denies the research_promotion_pending command without any pre-configured scope.
 
 </td>
 </tr>
