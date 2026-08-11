@@ -28,6 +28,7 @@ use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
@@ -40,6 +41,7 @@ const STAGING_SCHEMA: &str = "information_native.staging.v2";
 const ACQUISITION_JOURNAL_SCHEMA: &str = "information_native.acquisition_journal.v1";
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const MINIMUM_FREE_SPACE_RESERVE: u64 = 64 * 1024 * 1024;
+static PROCESS_LOCKS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 
 /// Failures returned by local store operations.
 #[derive(Debug, Error)]
@@ -397,6 +399,8 @@ impl ManagedStore {
         let path = self
             .leases_root()
             .join(format!("{}.lock", installation_key(&plan.installation_id)?));
+        let process_lock = ProcessLock::try_acquire(&path)
+            .ok_or_else(|| StoreError::InstallationBusy(plan.installation_id.clone()))?;
         if path_exists(&path)? {
             reject_symlink(&path)?;
         }
@@ -420,6 +424,7 @@ impl ManagedStore {
             Ok(()) => Ok(InstallLease {
                 file,
                 installation_id: plan.installation_id.clone(),
+                _process_lock: process_lock,
             }),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 Err(StoreError::InstallationBusy(plan.installation_id.clone()))
@@ -1119,6 +1124,7 @@ impl ManagedStore {
 
     fn try_lock(&self) -> Result<StoreLock, StoreError> {
         let path = self.root.join("store.lock");
+        let process_lock = ProcessLock::try_acquire(&path).ok_or(StoreError::StoreBusy)?;
         if path_exists(&path)? {
             reject_symlink(&path)?;
         }
@@ -1139,7 +1145,10 @@ impl ManagedStore {
         }
         enforce_private_file(&path)?;
         match file.try_lock_exclusive() {
-            Ok(()) => Ok(StoreLock { file }),
+            Ok(()) => Ok(StoreLock {
+                file,
+                _process_lock: process_lock,
+            }),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(StoreError::StoreBusy),
             Err(error) => Err(StoreError::io("lock managed store", &path, error)),
         }
@@ -1421,6 +1430,7 @@ impl ManagedStore {
 pub struct InstallLease {
     file: File,
     installation_id: InstallationId,
+    _process_lock: ProcessLock,
 }
 
 impl InstallLease {
@@ -1432,6 +1442,34 @@ impl InstallLease {
 
 struct StoreLock {
     file: File,
+    _process_lock: ProcessLock,
+}
+
+#[derive(Debug)]
+struct ProcessLock {
+    path: PathBuf,
+}
+
+impl ProcessLock {
+    fn try_acquire(path: &Path) -> Option<Self> {
+        let mut held = PROCESS_LOCKS
+            .get_or_init(|| Mutex::new(BTreeSet::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.insert(path.to_path_buf()).then(|| Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        let mut held = PROCESS_LOCKS
+            .get_or_init(|| Mutex::new(BTreeSet::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.remove(&self.path);
+    }
 }
 
 struct TemporaryDirectoryGuard {
