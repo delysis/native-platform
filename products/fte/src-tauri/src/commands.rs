@@ -1,49 +1,92 @@
-use crate::api_server::{ProxyManager, ProxyStatus};
-use crate::backend::CredentialRequirement;
 use crate::db::Database;
-use crate::providers::{ChatRequest, ChatResponse, CompletionRequest, CompletionResponse};
-use crate::router::Router;
+use crate::gateway_runtime::{GatewayRuntimeOwner, LocalModelStatus, ProviderStatus, PublicModel};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command]
 pub async fn chat_request(
-    router: State<'_, Arc<Router>>,
-    req: ChatRequest,
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
+    req: serde_json::Value,
     task_hint: Option<String>,
-) -> Result<ChatResponse, String> {
-    let hint = task_hint.unwrap_or_else(|| "general".to_string());
-    router.chat(&req, &hint).await.map_err(|e| e.to_string())
+) -> Result<serde_json::Value, String> {
+    reject_legacy_task_hint(task_hint)?;
+    runtime.chat(req).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn completion_request(
-    router: State<'_, Arc<Router>>,
-    req: CompletionRequest,
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
+    req: serde_json::Value,
     task_hint: Option<String>,
-) -> Result<CompletionResponse, String> {
-    let hint = task_hint.unwrap_or_else(|| "general".to_string());
-    router
-        .complete(&req, &hint)
+) -> Result<serde_json::Value, String> {
+    reject_legacy_task_hint(task_hint)?;
+    runtime
+        .complete(req)
         .await
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
+pub async fn choose_local_model(
+    app: AppHandle,
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
+    expected_sha256: Option<String>,
+) -> Result<LocalModelStatus, String> {
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("Choose a local GGUF model")
+            .add_filter("GGUF model", &["gguf"])
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(|error| format!("Local model picker failed: {error}"))?;
+    let Some(selected) = selected else {
+        return runtime
+            .local_model_status()
+            .map_err(|error| error.to_string());
+    };
+    let path = selected
+        .into_path()
+        .map_err(|error| format!("The selected model is not a local file: {error}"))?;
+    runtime
+        .configure_local_model(path, expected_sha256)
+        .map_err(|error| error.to_string())?;
+    runtime
+        .local_model_status()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_local_model_status(
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
+) -> Result<LocalModelStatus, String> {
+    runtime
+        .local_model_status()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn configure_local_model(
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
+    model_path: String,
+    expected_sha256: Option<String>,
+) -> Result<String, String> {
+    runtime
+        .configure_local_model(model_path, expected_sha256)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn save_key(
-    db: State<'_, Arc<Database>>,
-    router: State<'_, Arc<Router>>,
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
     provider_id: String,
     key_value: String,
 ) -> Result<(), String> {
     let provider_id = provider_id.trim().to_ascii_lowercase();
-    if !router.supports_provider(&provider_id) {
+    if !runtime.supports_provider(&provider_id) {
         return Err(format!("Unsupported provider '{provider_id}'."));
-    }
-    if router.credential_requirement(&provider_id) != Some(CredentialRequirement::ApiKey) {
-        return Err(format!(
-            "Inference backend '{provider_id}' does not accept a provider API key."
-        ));
     }
     let key_value = key_value.trim();
     if key_value.len() < 8 || key_value.len() > 16_384 {
@@ -53,26 +96,23 @@ pub async fn save_key(
         return Err("API key must not contain control characters.".to_string());
     }
 
-    db.save_api_key(&provider_id, key_value)
+    runtime
+        .save_credential(&provider_id, key_value)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn delete_key(
-    db: State<'_, Arc<Database>>,
-    router: State<'_, Arc<Router>>,
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
     provider_id: String,
 ) -> Result<bool, String> {
     let provider_id = provider_id.trim().to_ascii_lowercase();
-    if !router.supports_provider(&provider_id) {
+    if !runtime.supports_provider(&provider_id) {
         return Err(format!("Unsupported provider '{provider_id}'."));
     }
-    if router.credential_requirement(&provider_id) != Some(CredentialRequirement::ApiKey) {
-        return Err(format!(
-            "Inference backend '{provider_id}' does not use a provider API key."
-        ));
-    }
-    db.delete_api_key(&provider_id).map_err(|e| e.to_string())
+    runtime
+        .delete_credential(&provider_id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -112,10 +152,10 @@ pub async fn get_master_profile(
 #[tauri::command]
 pub async fn get_dashboard_stats(
     db: State<'_, Arc<Database>>,
-    router: State<'_, Arc<Router>>,
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
 ) -> Result<serde_json::Value, String> {
     let summary = db.get_global_log_summary().map_err(|e| e.to_string())?;
-    let headroom = router
+    let headroom = runtime
         .global_headroom_percent()
         .map_err(|e| e.to_string())?;
 
@@ -149,37 +189,16 @@ pub async fn get_recent_logs(
 
 #[tauri::command]
 pub async fn get_providers(
-    router: State<'_, Arc<Router>>,
-) -> Result<Vec<crate::router::ProviderStatus>, String> {
-    router.provider_statuses().map_err(|e| e.to_string())
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
+) -> Result<Vec<ProviderStatus>, String> {
+    runtime.provider_statuses().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn get_models(
-    router: State<'_, Arc<Router>>,
-) -> Result<Vec<crate::router::PublicModel>, String> {
-    Ok(router.public_models())
-}
-
-#[tauri::command]
-pub async fn get_proxy_status(proxy: State<'_, Arc<ProxyManager>>) -> Result<ProxyStatus, String> {
-    Ok(proxy.status().await)
-}
-
-#[tauri::command]
-pub async fn restart_proxy(
-    db: State<'_, Arc<Database>>,
-    proxy: State<'_, Arc<ProxyManager>>,
-    port: u16,
-) -> Result<ProxyStatus, String> {
-    let proxy = proxy.inner().clone();
-    let status = proxy
-        .restart(port)
-        .await
-        .map_err(|error| error.to_string())?;
-    db.save_setting("proxy_port", &port.to_string())
-        .map_err(|error| error.to_string())?;
-    Ok(status)
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
+) -> Result<Vec<PublicModel>, String> {
+    Ok(runtime.public_models())
 }
 
 fn looks_like_email(value: &str) -> bool {
@@ -193,9 +212,19 @@ fn looks_like_email(value: &str) -> bool {
         && !value.chars().any(char::is_whitespace)
 }
 
+fn reject_legacy_task_hint(task_hint: Option<String>) -> Result<(), String> {
+    if task_hint.is_some() {
+        return Err(
+            "task_hint is no longer accepted: the legacy task router was retired, and the modern Gateway has no equivalent typed evaluation signal; omit task_hint"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::looks_like_email;
+    use super::{looks_like_email, reject_legacy_task_hint};
 
     #[test]
     fn validates_basic_email_shape() {
@@ -203,5 +232,13 @@ mod tests {
         assert!(!looks_like_email("person"));
         assert!(!looks_like_email("@example.com"));
         assert!(!looks_like_email("person@example"));
+    }
+
+    #[test]
+    fn legacy_task_hint_is_explicitly_rejected_instead_of_ignored() {
+        assert!(reject_legacy_task_hint(None).is_ok());
+        let error = reject_legacy_task_hint(Some("coding".to_string())).unwrap_err();
+        assert!(error.contains("no equivalent typed evaluation signal"));
+        assert!(reject_legacy_task_hint(Some(String::new())).is_err());
     }
 }

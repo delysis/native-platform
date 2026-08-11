@@ -4,32 +4,29 @@ Free Token Energy is local-first, but local-first is not the same as encrypted.
 
 ## Local data
 
-- Provider API keys are stored in the app's SQLite database. On Unix, the app
-  data directory is restricted to the current user (`0700`) and the database
-  file to that user (`0600`).
-- Keys are not currently encrypted at rest. Use revocable, least-privilege
-  provider keys and rely on full-disk encryption for protection against device
-  theft or offline access.
+- Provider API keys are stored through the platform credential service. Fresh
+  SQLite databases never create plaintext key storage. On upgrade, the app
+  refuses conflicts, requires an exact credential-store readback for every
+  legacy value, and then deletes the rows and drops the legacy table in one
+  SQLite transaction.
+- Use revocable, least-privilege provider keys. Platform credential storage
+  reduces exposure but does not make a compromised signed-in account safe.
 - Request logs contain provider ID, public model ID, token count, latency,
   status, and timestamp. Prompts, responses, profile values, and API keys are
   not logged.
 - The signup profile accepts only name, email, and a non-secret password hint.
   Startup removes the reusable-password field written by older builds.
+- Local GGUF configuration stores the canonical model path and optional
+  expected SHA-256 in the private application database. The webview receives
+  only the filename and readiness detail, not the full path.
 - The application does not include telemetry.
 
 ## Local interfaces
 
-The reusable `fte-loopback` server is disabled until explicitly started. It
+The `fte-loopback` server is disabled until explicitly started. It
 binds only loopback addresses, validates `Host` and configured origins, applies
 bounded request/stream limits, and requires a random app-private bearer token.
 Hosted provider credentials never cross that interface.
-
-The older desktop router and its IPv4-only proxy remain a migration surface.
-That proxy does not have the reusable gateway's bearer-token boundary, so any
-process running as the same operating-system user can send requests through
-configured provider accounts while it is enabled. Do not enable that legacy
-surface while running untrusted local software. Removing it after transactional
-database and credential migration is the next breaking pre-1.0 step.
 
 ## Provider traffic
 

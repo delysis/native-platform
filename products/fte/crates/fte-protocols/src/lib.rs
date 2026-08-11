@@ -6,11 +6,11 @@
 
 use fte_types::{
     CacheMode, CachePolicy, CacheRequirement, CompletionPrompt, ContentBlock, DeadlinePolicy,
-    ErrorClass, GatewayError, GatewayEvent, GatewayRequest, GatewayResponse, GatewayUsage,
-    GenerationInput, InputItem, MessageRole, ModelSelector, OutputItem, PrivacyPolicy,
-    ProviderCacheBreakpoint, ProviderCacheTtl, RequestId, ResponseFormat, RouteProfile,
-    RoutingPolicy, SamplingOptions, StoragePolicy, StreamPolicy, ToolDefinition,
-    ToolExecutionPolicy, ToolOwner, ToolPolicy, UsageProvenance,
+    GatewayError, GatewayEvent, GatewayRequest, GatewayResponse, GatewayUsage, GenerationInput,
+    InputItem, MessageRole, ModelSelector, OutputItem, PrivacyPolicy, ProviderCacheBreakpoint,
+    ProviderCacheTtl, RequestId, ResponseFormat, RouteProfile, RoutingPolicy, SamplingOptions,
+    StoragePolicy, StreamPolicy, ToolDefinition, ToolExecutionPolicy, ToolOwner, ToolPolicy,
+    UsageProvenance,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -200,8 +200,11 @@ impl OpenAiChatRequest {
                 items: self
                     .messages
                     .into_iter()
-                    .map(OpenAiMessage::into_item)
-                    .collect::<Result<Vec<_>, _>>()?,
+                    .map(OpenAiMessage::into_items)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect(),
             },
             SamplingOptions {
                 max_output_tokens: self.max_completion_tokens.or(self.max_tokens),
@@ -243,26 +246,69 @@ pub struct OpenAiMessage {
 }
 
 impl OpenAiMessage {
-    fn into_item(self) -> Result<InputItem, GatewayError> {
+    fn into_items(self) -> Result<Vec<InputItem>, GatewayError> {
         let request_id = RequestId::new();
-        if self.tool_calls.is_some() {
-            return Err(capability_error(
+        if self.tool_call_id.is_some() && self.tool_calls.is_some() {
+            return Err(GatewayError::invalid_request(
                 &request_id,
-                "chat_tool_call_message_requires_responses",
-                "assistant tool-call history must use the Responses Item surface",
+                "chat_tool_message_ambiguous",
+                "a Chat Completions message cannot be both a tool result and an assistant tool call",
             ));
         }
         if let Some(call_id) = self.tool_call_id {
+            reject_if(
+                &request_id,
+                call_id.trim().is_empty(),
+                "chat_tool_result_identity_invalid",
+                "tool-call results require a non-empty call ID",
+            )?;
+            if self.role != "tool" {
+                return Err(GatewayError::invalid_request(
+                    &request_id,
+                    "chat_tool_result_role_invalid",
+                    "tool_call_id is valid only on a tool-role message",
+                ));
+            }
             let output = match self.content {
                 Some(content) => content.into_blocks()?,
                 None => Vec::new(),
             };
-            return Ok(InputItem::FunctionResult {
+            return Ok(vec![InputItem::FunctionResult {
                 id: None,
                 call_id,
                 output,
                 is_error: false,
-            });
+            }]);
+        }
+        if let Some(tool_calls) = self.tool_calls {
+            reject_if(
+                &request_id,
+                tool_calls.is_empty(),
+                "chat_tool_calls_empty",
+                "assistant tool_calls must contain at least one function call",
+            )?;
+            if self.role != "assistant" {
+                return Err(GatewayError::invalid_request(
+                    &request_id,
+                    "chat_tool_call_role_invalid",
+                    "tool_calls is valid only on an assistant-role message",
+                ));
+            }
+            let mut items = Vec::with_capacity(tool_calls.len().saturating_add(1));
+            if let Some(content) = self.content {
+                let content = content.into_blocks()?;
+                if !content.is_empty() {
+                    items.push(InputItem::Message {
+                        id: None,
+                        role: MessageRole::Assistant,
+                        content,
+                    });
+                }
+            }
+            for tool_call in tool_calls {
+                items.push(tool_call.into_item(&request_id)?);
+            }
+            return Ok(items);
         }
         let role = parse_role(&request_id, &self.role)?;
         let _ = self.name;
@@ -270,11 +316,11 @@ impl OpenAiMessage {
             Some(content) => content.into_blocks()?,
             None => Vec::new(),
         };
-        Ok(InputItem::Message {
+        Ok(vec![InputItem::Message {
             id: None,
             role,
             content,
-        })
+        }])
     }
 }
 
@@ -334,6 +380,36 @@ pub struct OpenAiToolCall {
     #[serde(rename = "type")]
     pub kind: String,
     pub function: OpenAiFunctionCall,
+}
+
+impl OpenAiToolCall {
+    fn into_item(self, request_id: &RequestId) -> Result<InputItem, GatewayError> {
+        reject_if(
+            request_id,
+            self.kind != "function",
+            "chat_tool_call_type_unsupported",
+            "Chat Completions tool-call history supports only function calls",
+        )?;
+        reject_if(
+            request_id,
+            self.id.trim().is_empty() || self.function.name.trim().is_empty(),
+            "chat_tool_call_identity_invalid",
+            "tool-call history requires non-empty call and function names",
+        )?;
+        let arguments = serde_json::from_str(&self.function.arguments).map_err(|_| {
+            GatewayError::invalid_request(
+                request_id,
+                "chat_tool_call_arguments_invalid",
+                "tool-call arguments must be valid JSON",
+            )
+        })?;
+        Ok(InputItem::FunctionCall {
+            id: None,
+            call_id: self.id,
+            name: self.function.name,
+            arguments,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1294,18 +1370,6 @@ fn reject_if(
     }
 }
 
-fn capability_error(request_id: &RequestId, code: &str, detail: &str) -> GatewayError {
-    GatewayError {
-        code: code.to_string(),
-        class: ErrorClass::Capability,
-        retryable: false,
-        http_status: 400,
-        request_id: request_id.clone(),
-        provider: None,
-        safe_detail: detail.to_string(),
-    }
-}
-
 fn empty_object() -> Value {
     json!({})
 }
@@ -1542,11 +1606,40 @@ fn output_item_id(item: &OutputItem) -> &str {
 #[must_use]
 pub fn openai_chat_json(response: &GatewayResponse) -> Value {
     let text = response_text(response);
+    let tool_calls = response
+        .output
+        .iter()
+        .filter_map(|item| match item {
+            OutputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } => Some(json!({
+                "id":call_id,
+                "type":"function",
+                "function":{
+                    "name":name,
+                    "arguments":arguments.to_string(),
+                }
+            })),
+            OutputItem::Message { .. } | OutputItem::Reasoning { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let mut message = json!({"role":"assistant","content":text});
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+    let finish_reason = if message.get("tool_calls").is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
     json!({
         "id": format!("chatcmpl_{}", response.id),
         "object": "chat.completion",
         "model": response.model,
-        "choices": [{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],
+        "choices": [{"index":0,"message":message,"finish_reason":finish_reason}],
         "usage": openai_legacy_usage(&response.usage),
         "x_free_token_energy": {"backend":response.route.backend_id}
     })
@@ -2133,6 +2226,118 @@ mod tests {
         };
         assert!(matches!(items[0], InputItem::FunctionCall { .. }));
         assert!(matches!(items[1], InputItem::FunctionResult { .. }));
+    }
+
+    #[test]
+    fn openai_chat_json_preserves_tool_calls_for_replay() {
+        let route = ResolvedRoute {
+            backend_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            display_name: "Model".to_string(),
+            location: BackendLocation::Hosted,
+            catalog_version: "test".to_string(),
+        };
+        let response = GatewayResponse {
+            id: "resp".to_string(),
+            request_id: RequestId::new(),
+            model: route.model_id.clone(),
+            route,
+            output: vec![
+                OutputItem::Message {
+                    id: "message_1".to_string(),
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "Checking.".to_string(),
+                    }],
+                },
+                OutputItem::FunctionCall {
+                    id: "item_1".to_string(),
+                    call_id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    arguments: json!({"term":"FTE"}),
+                },
+            ],
+            usage: GatewayUsage::default(),
+            status: fte_types::TerminalStatus::Completed,
+            previous_response_id: None,
+        };
+
+        let body = openai_chat_json(&response);
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(body["choices"][0]["message"]["content"], "Checking.");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"term\":\"FTE\"}"
+        );
+    }
+
+    #[test]
+    fn chat_assistant_tool_history_remains_typed_items() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "model":"auto",
+            "messages":[
+                {
+                    "role":"assistant",
+                    "content":"I will check.",
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"weather","arguments":"{\"city\":\"Boston\"}"}
+                    }]
+                },
+                {"role":"tool","tool_call_id":"call_1","content":"sunny"}
+            ]
+        }))
+        .expect("decode Chat Completions request");
+        let gateway = request
+            .into_gateway(EdgeDefaults::default())
+            .expect("canonical request");
+        let GenerationInput::Chat { items } = gateway.input else {
+            panic!("chat messages become canonical chat Items");
+        };
+        assert!(matches!(items[0], InputItem::Message { .. }));
+        assert!(matches!(items[1], InputItem::FunctionCall { .. }));
+        assert!(matches!(items[2], InputItem::FunctionResult { .. }));
+        let InputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+            ..
+        } = &items[1]
+        else {
+            unreachable!()
+        };
+        assert_eq!(call_id, "call_1");
+        assert_eq!(name, "weather");
+        assert_eq!(arguments, &json!({"city":"Boston"}));
+    }
+
+    #[test]
+    fn chat_tool_history_rejects_invalid_role_kind_and_arguments() {
+        for message in [
+            json!({
+                "role":"user",
+                "content":"not an assistant",
+                "tool_calls":[{"id":"call_1","type":"function","function":{"name":"tool","arguments":"{}"}}]
+            }),
+            json!({
+                "role":"assistant",
+                "content":null,
+                "tool_calls":[{"id":"call_1","type":"custom","function":{"name":"tool","arguments":"{}"}}]
+            }),
+            json!({
+                "role":"assistant",
+                "content":null,
+                "tool_calls":[{"id":"call_1","type":"function","function":{"name":"tool","arguments":"not-json"}}]
+            }),
+        ] {
+            let request: OpenAiChatRequest = serde_json::from_value(json!({
+                "model":"auto",
+                "messages":[message]
+            }))
+            .expect("strict message shape");
+            assert!(request.into_gateway(EdgeDefaults::default()).is_err());
+        }
     }
 
     #[test]

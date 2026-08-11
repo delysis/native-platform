@@ -22,26 +22,20 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.52.1", features = ["full"] }
-reqwest = { version = "0.13.2", features = ["json", "stream"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
-futures = "0.3.32"
-chrono = { version = "0.4.44", features = ["serde"] }
-tracing = "0.1.44"
-axum = { version = "0.8.9", optional = true }
-async-trait = "0.1.89"
+keyring = "4.1.6"
 anyhow = "1.0.102"
-async-stream = "0.3.6"
-bytes = "1.11.1"
 fte-types = { path = "../crates/fte-types" }
+fte-protocols = { path = "../crates/fte-protocols" }
 fte-router = { path = "../crates/fte-router" }
 fte-store = { path = "../crates/fte-store" }
 fte-providers = { path = "../crates/fte-providers" }
-tauri-plugin-free-token-energy = { path = "../crates/tauri-plugin-free-token-energy" }
-
-[features]
-default = ["axum"]
-axum = ["dep:axum"]
+fte-backend-llama = { path = "../crates/fte-backend-llama" }
+llama-native-host.workspace = true
+llama-native-types.workspace = true
+tauri-plugin-free-token-energy = { path = "../crates/tauri-plugin-free-token-energy", features = ["native-llama"] }

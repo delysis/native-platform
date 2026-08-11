@@ -356,7 +356,12 @@ impl HostedProviderBackend {
         Ok(secret)
     }
 
-    fn headers(&self, secret: &str, request_id: &RequestId) -> Result<HeaderMap, GatewayError> {
+    fn headers(
+        &self,
+        secret: &str,
+        request: &fte_types::GatewayRequest,
+    ) -> Result<HeaderMap, GatewayError> {
+        let request_id = &request.request_id;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         match &self.config.auth {
@@ -383,6 +388,9 @@ impl HostedProviderBackend {
                 HeaderValue::from_str(value)
                     .map_err(|error| provider_request_error(request_id, &self.config.id, error))?,
             );
+        }
+        if self.config.protocol == HostedProtocol::Anthropic {
+            apply_anthropic_request_headers(&mut headers, request)?;
         }
         Ok(headers)
     }
@@ -434,7 +442,7 @@ impl GatewayBackend for HostedProviderBackend {
             }
             response = self.client
                 .post(&prepared.url)
-                .headers(self.headers(&secret, &request_id)?)
+                .headers(self.headers(&secret, &request.request)?)
                 .json(&prepared.body)
                 .send() => response.map_err(|error| map_transport_error(&request_id, &self.config.id, error))?,
         };
@@ -584,7 +592,7 @@ impl GatewayBackend for HostedProviderBackend {
             response = self
                 .client
                 .post(url)
-                .headers(self.headers(&secret, &request_id)?)
+                .headers(self.headers(&secret, &request.request)?)
                 .json(&body)
                 .send() => response.map_err(|error| map_transport_error(&request_id, &self.config.id, error))?,
         };
@@ -902,8 +910,28 @@ fn openai_responses_body(request: &BackendRequest) -> Result<Value, GatewayError
             }
         }
     }
-    for (name, value) in &request.request.provider_extensions {
-        if let Some(name) = name.strip_prefix("openai.") {
+    validate_provider_extensions(
+        request,
+        &[
+            "openai.reasoning",
+            "openai.include",
+            "openai.metadata",
+            "openai.service_tier",
+            "openai.parallel_tool_calls",
+        ],
+    )?;
+    for name in [
+        "reasoning",
+        "include",
+        "metadata",
+        "service_tier",
+        "parallel_tool_calls",
+    ] {
+        if let Some(value) = request
+            .request
+            .provider_extensions
+            .get(&format!("openai.{name}"))
+        {
             body.insert(name.to_string(), value.clone());
         }
     }
@@ -931,6 +959,14 @@ fn openai_chat_body(request: &BackendRequest) -> Result<Value, GatewayError> {
     }
     insert_openai_legacy_sampling(&mut body, request, "max_tokens")?;
     insert_openai_chat_tools(&mut body, request)?;
+    validate_provider_extensions(request, &["openai.parallel_tool_calls"])?;
+    if let Some(value) = request
+        .request
+        .provider_extensions
+        .get("openai.parallel_tool_calls")
+    {
+        body.insert("parallel_tool_calls".to_string(), value.clone());
+    }
     if !matches!(
         request.request.response_format,
         fte_types::ResponseFormat::Text
@@ -1083,8 +1119,21 @@ fn anthropic_body(request: &BackendRequest) -> Result<Value, GatewayError> {
         &request.request.cache.provider_breakpoints,
         &request.request.request_id,
     )?;
-    for (name, value) in &request.request.provider_extensions {
-        if let Some(name) = name.strip_prefix("anthropic.") {
+    validate_provider_extensions(
+        request,
+        &[
+            "anthropic.thinking",
+            "anthropic.metadata",
+            "anthropic.service_tier",
+            "anthropic.beta",
+        ],
+    )?;
+    for name in ["thinking", "metadata", "service_tier"] {
+        if let Some(value) = request
+            .request
+            .provider_extensions
+            .get(&format!("anthropic.{name}"))
+        {
             body.insert(name.to_string(), value.clone());
         }
     }
@@ -1092,6 +1141,15 @@ fn anthropic_body(request: &BackendRequest) -> Result<Value, GatewayError> {
 }
 
 fn anthropic_count_body(request: &BackendRequest) -> Result<Value, GatewayError> {
+    validate_provider_extensions(
+        request,
+        &[
+            "anthropic.thinking",
+            "anthropic.metadata",
+            "anthropic.service_tier",
+            "anthropic.beta",
+        ],
+    )?;
     let GenerationInput::Chat { items } = &request.request.input else {
         return Err(capability_error(
             &request.request.request_id,
@@ -1156,10 +1214,10 @@ fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
                 ..
             } => {
                 call_names.insert(call_id.clone(), name.clone());
-                contents.push(json!({
-                    "role":"model",
-                    "parts":[{"functionCall":{"name":name,"args":arguments}}]
-                }));
+                let part = json!({"functionCall":{"name":name,"args":arguments}});
+                if !append_to_last_role(&mut contents, "model", "parts", part.clone()) {
+                    contents.push(json!({"role":"model","parts":[part]}));
+                }
             }
             fte_types::InputItem::FunctionResult {
                 call_id, output, ..
@@ -1231,6 +1289,22 @@ fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
     if !sampling.stop.is_empty() {
         generation.insert("stopSequences".to_string(), json!(sampling.stop));
     }
+    validate_provider_extensions(
+        request,
+        &[
+            "gemini.thinkingConfig",
+            "gemini.toolConfig",
+            "gemini.safetySettings",
+            "gemini.cachedContent",
+        ],
+    )?;
+    if let Some(value) = request
+        .request
+        .provider_extensions
+        .get("gemini.thinkingConfig")
+    {
+        generation.insert("thinkingConfig".to_string(), value.clone());
+    }
     match &request.request.response_format {
         fte_types::ResponseFormat::Text => {}
         fte_types::ResponseFormat::JsonObject => {
@@ -1269,27 +1343,36 @@ fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
             "tools".to_string(),
             json!([{"functionDeclarations":declarations}]),
         );
-        let mode = match request.request.tool_policy.execution {
-            fte_types::ToolExecutionPolicy::Deny => "NONE",
-            fte_types::ToolExecutionPolicy::ClientOnly | fte_types::ToolExecutionPolicy::Ask => {
-                "AUTO"
-            }
-            fte_types::ToolExecutionPolicy::AllowGateway => {
-                return Err(capability_error(
-                    &request.request.request_id,
-                    &request.route.backend_id,
-                    "gateway_tool_execution_not_bound",
-                    "hosted tool execution requires an explicit gateway-owned tool adapter",
-                ));
-            }
-        };
-        body.insert(
-            "toolConfig".to_string(),
-            json!({"functionCallingConfig":{"mode":mode}}),
-        );
+        if let Some(tool_config) = request.request.provider_extensions.get("gemini.toolConfig") {
+            body.insert("toolConfig".to_string(), tool_config.clone());
+        } else {
+            let mode = match request.request.tool_policy.execution {
+                fte_types::ToolExecutionPolicy::Deny => "NONE",
+                fte_types::ToolExecutionPolicy::ClientOnly
+                | fte_types::ToolExecutionPolicy::Ask => "AUTO",
+                fte_types::ToolExecutionPolicy::AllowGateway => {
+                    return Err(capability_error(
+                        &request.request.request_id,
+                        &request.route.backend_id,
+                        "gateway_tool_execution_not_bound",
+                        "hosted tool execution requires an explicit gateway-owned tool adapter",
+                    ));
+                }
+            };
+            body.insert(
+                "toolConfig".to_string(),
+                json!({"functionCallingConfig":{"mode":mode}}),
+            );
+        }
+    } else if let Some(tool_config) = request.request.provider_extensions.get("gemini.toolConfig") {
+        body.insert("toolConfig".to_string(), tool_config.clone());
     }
-    for (name, value) in &request.request.provider_extensions {
-        if let Some(name) = name.strip_prefix("gemini.") {
+    for name in ["safetySettings", "cachedContent"] {
+        if let Some(value) = request
+            .request
+            .provider_extensions
+            .get(&format!("gemini.{name}"))
+        {
             body.insert(name.to_string(), value.clone());
         }
     }
@@ -1420,6 +1503,28 @@ fn openai_input_content(block: &fte_types::ContentBlock) -> Result<Value, Gatewa
     }
 }
 
+fn append_to_last_role(
+    messages: &mut [Value],
+    role: &str,
+    array_field: &str,
+    value: Value,
+) -> bool {
+    let Some(last) = messages.last_mut().and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if last.get("role").and_then(Value::as_str) != Some(role) {
+        return false;
+    }
+    match last.get_mut(array_field) {
+        Some(Value::Array(values)) => values.push(value),
+        Some(_) => return false,
+        None => {
+            last.insert(array_field.to_string(), Value::Array(vec![value]));
+        }
+    }
+    true
+}
+
 fn openai_chat_messages(
     items: &[fte_types::InputItem],
     request_id: &RequestId,
@@ -1436,11 +1541,16 @@ fn openai_chat_messages(
                 name,
                 arguments,
                 ..
-            } => messages.push(json!({
-                "role":"assistant",
-                "content":Value::Null,
-                "tool_calls":[{"id":call_id,"type":"function","function":{"name":name,"arguments":serde_json::to_string(arguments).map_err(|error|provider_request_error(request_id,"openai-compatible",error))?}}],
-            })),
+            } => {
+                let call = json!({"id":call_id,"type":"function","function":{"name":name,"arguments":serde_json::to_string(arguments).map_err(|error|provider_request_error(request_id,"openai-compatible",error))?}});
+                if !append_to_last_role(&mut messages, "assistant", "tool_calls", call.clone()) {
+                    messages.push(json!({
+                        "role":"assistant",
+                        "content":Value::Null,
+                        "tool_calls":[call],
+                    }));
+                }
+            }
             fte_types::InputItem::FunctionResult {
                 call_id, output, ..
             } => messages.push(json!({
@@ -1502,10 +1612,18 @@ fn anthropic_messages_from_items(
                 name,
                 arguments,
                 ..
-            } => messages.push(json!({
-                "role":"assistant",
-                "content":[{"type":"tool_use","id":call_id,"name":name,"input":arguments}]
-            })),
+            } => {
+                let block =
+                    json!({"type":"tool_use","id":call_id,"name":name,"input":arguments});
+                if !append_to_last_role(
+                    &mut messages,
+                    "assistant",
+                    "content",
+                    block.clone(),
+                ) {
+                    messages.push(json!({"role":"assistant","content":[block]}));
+                }
+            }
             fte_types::InputItem::FunctionResult {
                 call_id,
                 output,
@@ -3535,6 +3653,47 @@ fn provider_internal(provider: &str, code: &str, error: impl std::fmt::Display) 
     }
 }
 
+fn validate_provider_extensions(
+    request: &BackendRequest,
+    allowed: &[&str],
+) -> Result<(), GatewayError> {
+    if let Some(name) = request
+        .request
+        .provider_extensions
+        .keys()
+        .find(|name| !allowed.contains(&name.as_str()))
+    {
+        return Err(GatewayError::invalid_request(
+            &request.request.request_id,
+            "hosted_provider_extension_unsupported",
+            &format!("the selected hosted protocol does not accept provider extension {name}"),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_anthropic_request_headers(
+    headers: &mut HeaderMap,
+    request: &fte_types::GatewayRequest,
+) -> Result<(), GatewayError> {
+    let Some(beta) = request.provider_extensions.get("anthropic.beta") else {
+        return Ok(());
+    };
+    let Some(beta) = beta.as_str() else {
+        return Err(GatewayError::invalid_request(
+            &request.request_id,
+            "anthropic_beta_invalid",
+            "anthropic_beta must be a string",
+        ));
+    };
+    headers.insert(
+        HeaderName::from_static("anthropic-beta"),
+        HeaderValue::from_str(beta)
+            .map_err(|error| provider_request_error(&request.request_id, "anthropic", error))?,
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3827,5 +3986,132 @@ mod tests {
         assert!(body.get("generationConfig").is_none());
         assert!(body.get("toolConfig").is_none());
         assert!(body.get("cachedContent").is_none());
+    }
+
+    #[test]
+    fn anthropic_beta_is_a_validated_header_and_never_a_body_field() {
+        let mut request = request(GenerationInput::Chat {
+            items: vec![fte_types::InputItem::Message {
+                id: None,
+                role: fte_types::MessageRole::User,
+                content: vec![fte_types::ContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+            }],
+        });
+        request.request.provider_extensions.insert(
+            "anthropic.beta".to_string(),
+            json!("interleaved-thinking-2025-05-14"),
+        );
+        let body = anthropic_body(&request).expect("Anthropic body");
+        assert!(body.get("beta").is_none());
+        assert!(body.get("anthropic_beta").is_none());
+
+        let mut headers = HeaderMap::new();
+        apply_anthropic_request_headers(&mut headers, &request.request)
+            .expect("Anthropic request headers");
+        assert_eq!(
+            headers
+                .get("anthropic-beta")
+                .expect("beta header")
+                .to_str()
+                .expect("valid header"),
+            "interleaved-thinking-2025-05-14"
+        );
+    }
+
+    #[test]
+    fn gemini_extensions_keep_generation_and_top_level_placement() {
+        let mut request = request(GenerationInput::Chat {
+            items: vec![fte_types::InputItem::Message {
+                id: None,
+                role: fte_types::MessageRole::User,
+                content: vec![fte_types::ContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+            }],
+        });
+        request.request.provider_extensions.extend([
+            (
+                "gemini.thinkingConfig".to_string(),
+                json!({"thinkingBudget":512}),
+            ),
+            (
+                "gemini.safetySettings".to_string(),
+                json!([{"category":"HARM_CATEGORY_HATE_SPEECH","threshold":"BLOCK_NONE"}]),
+            ),
+            (
+                "gemini.cachedContent".to_string(),
+                json!("cachedContents/stable"),
+            ),
+        ]);
+
+        let body = gemini_body(&request).expect("Gemini body");
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({"thinkingBudget":512})
+        );
+        assert!(body.get("thinkingConfig").is_none());
+        assert_eq!(body["cachedContent"], "cachedContents/stable");
+        assert!(body["safetySettings"].is_array());
+    }
+
+    #[test]
+    fn hosted_protocols_reject_foreign_provider_extensions() {
+        let mut request = request(GenerationInput::Chat { items: Vec::new() });
+        request
+            .request
+            .provider_extensions
+            .insert("gemini.cachedContent".to_string(), json!("foreign"));
+        let error = anthropic_body(&request).expect_err("foreign extension must fail");
+        assert_eq!(error.code, "hosted_provider_extension_unsupported");
+    }
+
+    #[test]
+    fn assistant_text_and_multiple_calls_stay_in_one_provider_turn() {
+        let items = vec![
+            fte_types::InputItem::Message {
+                id: None,
+                role: fte_types::MessageRole::Assistant,
+                content: vec![fte_types::ContentBlock::Text {
+                    text: "Checking.".to_string(),
+                }],
+            },
+            fte_types::InputItem::FunctionCall {
+                id: None,
+                call_id: "call_1".to_string(),
+                name: "first".to_string(),
+                arguments: json!({}),
+            },
+            fte_types::InputItem::FunctionCall {
+                id: None,
+                call_id: "call_2".to_string(),
+                name: "second".to_string(),
+                arguments: json!({}),
+            },
+        ];
+
+        let openai = openai_chat_messages(&items, &RequestId::new()).expect("OpenAI messages");
+        assert_eq!(openai.len(), 1);
+        assert_eq!(openai[0]["tool_calls"].as_array().expect("calls").len(), 2);
+
+        let (_, anthropic) =
+            anthropic_messages_from_items(&items, &RequestId::new()).expect("Anthropic messages");
+        assert_eq!(anthropic.len(), 1);
+        assert_eq!(
+            anthropic[0]["content"].as_array().expect("content").len(),
+            3
+        );
+
+        let request = request(GenerationInput::Chat { items });
+        let gemini = gemini_body(&request).expect("Gemini body");
+        assert_eq!(gemini["contents"].as_array().expect("contents").len(), 1);
+        assert_eq!(
+            gemini["contents"][0]["parts"]
+                .as_array()
+                .expect("parts")
+                .len(),
+            3
+        );
     }
 }
