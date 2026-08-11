@@ -1274,10 +1274,14 @@ fn blocked_chat_stream_never_claims_native_engine_invocation() -> Result<()> {
     )?;
     assert_eq!(result.status, "blocked");
     assert_eq!(result.readiness, "blocked_missing_model");
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     assert_eq!(events[0].event, "started");
-    assert!(!events[0].real_engine_invoked);
-    assert!(!events[0].fake_fixture);
+    assert_eq!(events[1].event, "failed");
+    assert_eq!(events[0].request_id, events[1].request_id);
+    for event in &events {
+        assert!(!event.real_engine_invoked);
+        assert!(!event.fake_fixture);
+    }
     assert!(!result.receipt.real_engine_invoked);
     Ok(())
 }
