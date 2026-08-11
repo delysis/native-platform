@@ -17,7 +17,7 @@ use operation_registry::{
 };
 
 use crossbeam_channel::{Receiver, Sender, bounded};
-use encoding_rs::UTF_8;
+use encoding_rs::{CoderResult, UTF_8};
 use fs4::FileExt as Fs4FileExt;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
@@ -82,6 +82,15 @@ type NativeResult<T> = Result<T, NativeError>;
 pub enum WaitOutcome<Ticket, Output> {
     Ready(Output),
     TimedOut(Ticket),
+}
+
+/// A nonblocking wait consumes the ticket without discarding the caller's only
+/// completion handle when the operation is still pending.
+#[derive(Debug)]
+#[must_use]
+pub enum TryWaitOutcome<Ticket, Output> {
+    Ready(Output),
+    Pending(Ticket),
 }
 
 #[cfg(unix)]
@@ -184,6 +193,93 @@ pub struct VerifiedGenerationBatch {
     outputs: Vec<GenerationOutput>,
     terminal_sampled_token_ids: Vec<Option<i32>>,
     events: Vec<GenerationEvent>,
+    token_piece_traces: Vec<TokenPieceTrace>,
+}
+
+/// Exact token-piece bytes captured at the live sampled-token decode site.
+///
+/// Boundaries are cumulative byte offsets. They always begin at zero, contain
+/// one entry beyond the generated token count, are nondecreasing, and end at
+/// `raw_piece_bytes().len()`. Equal adjacent boundaries represent a zero-byte
+/// token piece. Individual pieces are raw bytes and need not be valid UTF-8.
+///
+/// This type has no public constructor and deliberately implements neither
+/// `Clone` nor Serde traits. It is inspectable evidence held by a live
+/// [`VerifiedGenerationBatch`], not independently reconstructable authority.
+///
+/// ```compile_fail
+/// use llama_native_engine::TokenPieceTrace;
+/// fn clone_trace(trace: &TokenPieceTrace) -> TokenPieceTrace { trace.clone() }
+/// ```
+///
+/// ```compile_fail
+/// use llama_native_engine::TokenPieceTrace;
+/// fn require_serialize<T: serde::Serialize>() {}
+/// require_serialize::<TokenPieceTrace>();
+/// ```
+///
+/// ```compile_fail
+/// use llama_native_engine::TokenPieceTrace;
+/// let _ = TokenPieceTrace {
+///     raw_piece_bytes: Vec::new(),
+///     cumulative_boundaries: vec![0],
+/// };
+/// ```
+#[derive(Debug)]
+pub struct TokenPieceTrace {
+    raw_piece_bytes: Vec<u8>,
+    cumulative_boundaries: Vec<u64>,
+}
+
+impl TokenPieceTrace {
+    fn with_token_capacity(token_capacity: usize) -> Self {
+        let mut cumulative_boundaries = Vec::with_capacity(token_capacity.saturating_add(1));
+        cumulative_boundaries.push(0);
+        Self {
+            raw_piece_bytes: Vec::new(),
+            cumulative_boundaries,
+        }
+    }
+
+    fn push_piece(&mut self, piece: &[u8]) -> NativeResult<()> {
+        let next_len = checked_generated_output_len(self.raw_piece_bytes.len(), piece.len())?;
+        let boundary = u64::try_from(next_len).map_err(|_| {
+            generation_verification_error("token-piece byte boundary does not fit u64")
+        })?;
+        self.raw_piece_bytes.extend_from_slice(piece);
+        self.cumulative_boundaries.push(boundary);
+        Ok(())
+    }
+
+    fn validate(&self, token_count: usize) -> NativeResult<()> {
+        let expected_boundary_count = token_count.checked_add(1).ok_or_else(|| {
+            generation_verification_error("token-piece boundary count overflowed")
+        })?;
+        if self.cumulative_boundaries.len() != expected_boundary_count
+            || self.cumulative_boundaries.first() != Some(&0)
+            || !self
+                .cumulative_boundaries
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1])
+            || self.cumulative_boundaries.last().copied()
+                != u64::try_from(self.raw_piece_bytes.len()).ok()
+        {
+            return Err(generation_verification_error(
+                "token-piece bytes and cumulative boundaries are inconsistent",
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn raw_piece_bytes(&self) -> &[u8] {
+        &self.raw_piece_bytes
+    }
+
+    #[must_use]
+    pub fn cumulative_boundaries(&self) -> &[u64] {
+        &self.cumulative_boundaries
+    }
 }
 
 impl std::fmt::Debug for VerifiedGenerationBatch {
@@ -197,6 +293,7 @@ impl std::fmt::Debug for VerifiedGenerationBatch {
             .field("output_count", &self.outputs.len())
             .field("terminal_count", &self.terminal_sampled_token_ids.len())
             .field("event_count", &self.events.len())
+            .field("token_piece_trace_count", &self.token_piece_traces.len())
             .finish()
     }
 }
@@ -229,6 +326,11 @@ impl VerifiedGenerationBatch {
     pub fn events(&self) -> &[GenerationEvent] {
         &self.events
     }
+
+    #[must_use]
+    pub fn token_piece_traces(&self) -> &[TokenPieceTrace] {
+        &self.token_piece_traces
+    }
 }
 
 #[derive(Debug)]
@@ -237,6 +339,14 @@ struct VerifiedGenerationEvidence {
     model_fingerprint: ModelFingerprint,
     terminal_sampled_token_ids: Vec<Option<i32>>,
     events: Vec<GenerationEvent>,
+    token_piece_traces: Vec<TokenPieceTrace>,
+}
+
+#[derive(Debug)]
+struct GenerationAuthorityCapture {
+    terminal_sampled_token_ids: Vec<Option<i32>>,
+    events: Vec<GenerationEvent>,
+    token_piece_traces: Vec<TokenPieceTrace>,
 }
 
 #[derive(Debug)]
@@ -249,6 +359,7 @@ struct GenerationCompletion {
 struct GeneratedBatchExecution {
     outputs: Vec<GenerationOutput>,
     terminal_sampled_token_ids: Vec<Option<i32>>,
+    token_piece_traces: Vec<TokenPieceTrace>,
 }
 
 /// Private bounded trace emitted at the exact legacy sampler call site.
@@ -301,6 +412,7 @@ impl GenerationCompletion {
             outputs,
             terminal_sampled_token_ids: evidence.terminal_sampled_token_ids,
             events: evidence.events,
+            token_piece_traces: evidence.token_piece_traces,
         })
     }
 }
@@ -348,10 +460,12 @@ impl GenerationTicket {
         }
     }
 
-    pub fn try_wait(&self) -> NativeResult<Option<Vec<GenerationOutput>>> {
+    pub fn try_wait(self) -> NativeResult<TryWaitOutcome<Self, Vec<GenerationOutput>>> {
         match self.result.try_recv() {
-            Ok(result) => result.map(|completion| Some(completion.into_outputs())),
-            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Ok(result) => result
+                .map(GenerationCompletion::into_outputs)
+                .map(TryWaitOutcome::Ready),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(TryWaitOutcome::Pending(self)),
             Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
                 "native worker stopped before returning a result",
@@ -387,10 +501,10 @@ impl GenerationTicket {
         }
     }
 
-    pub fn try_wait_verified(&self) -> NativeResult<Option<VerifiedGenerationBatch>> {
+    pub fn try_wait_verified(self) -> NativeResult<TryWaitOutcome<Self, VerifiedGenerationBatch>> {
         match self.result.try_recv() {
-            Ok(result) => result?.into_verified().map(Some),
-            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Ok(result) => result?.into_verified().map(TryWaitOutcome::Ready),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(TryWaitOutcome::Pending(self)),
             Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
                 "native worker stopped before returning a verified result",
@@ -444,10 +558,10 @@ impl EmbeddingTicket {
         }
     }
 
-    pub fn try_wait(&self) -> NativeResult<Option<EmbeddingBatchOutput>> {
+    pub fn try_wait(self) -> NativeResult<TryWaitOutcome<Self, EmbeddingBatchOutput>> {
         match self.result.try_recv() {
-            Ok(completion) => completion.into_output().map(Some),
-            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Ok(completion) => completion.into_output().map(TryWaitOutcome::Ready),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(TryWaitOutcome::Pending(self)),
             Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
                 "native worker stopped before returning embeddings",
@@ -482,10 +596,10 @@ impl EmbeddingTicket {
         }
     }
 
-    pub fn try_wait_verified(&self) -> NativeResult<Option<VerifiedEmbeddingBatch>> {
+    pub fn try_wait_verified(self) -> NativeResult<TryWaitOutcome<Self, VerifiedEmbeddingBatch>> {
         match self.result.try_recv() {
-            Ok(completion) => completion.into_verified().map(Some),
-            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Ok(completion) => completion.into_verified().map(TryWaitOutcome::Ready),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(TryWaitOutcome::Pending(self)),
             Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
                 "native worker stopped before returning verified embeddings",
@@ -1220,7 +1334,8 @@ impl NativeModelHandle {
             (RequestClass::Generation | RequestClass::ControlledGeneration, None) => {
                 active.cancel_all()
             }
-            (RequestClass::Embedding, _) => 0,
+            (RequestClass::Embedding, None) => active.cancel_all(),
+            (RequestClass::Embedding, Some(_)) => 0,
         }
     }
 
@@ -2036,6 +2151,7 @@ fn run_worker(
                             BatchSupervision {
                                 event_tx: &event_tx,
                                 retained_events: retained_events.as_mut(),
+                                retain_token_piece_traces: retain_authority_evidence,
                                 unrecorded_control_used: retain_authority_evidence
                                     .then_some(&mut unrecorded_control_used),
                                 runtime_sample_trace: None,
@@ -2063,6 +2179,7 @@ fn run_worker(
                     let GeneratedBatchExecution {
                         outputs,
                         terminal_sampled_token_ids,
+                        token_piece_traces,
                     } = execution;
                     let authority = strict_precheck.and_then(|()| {
                         if !sealable_batch {
@@ -2084,8 +2201,11 @@ fn run_worker(
                             request,
                             fingerprint.clone(),
                             &outputs,
-                            terminal_sampled_token_ids,
-                            events,
+                            GenerationAuthorityCapture {
+                                terminal_sampled_token_ids,
+                                events,
+                                token_piece_traces,
+                            },
                             &artifacts,
                         )
                     });
@@ -2115,6 +2235,7 @@ fn run_worker(
                     BatchSupervision {
                         event_tx: &event_tx,
                         retained_events: None,
+                        retain_token_piece_traces: false,
                         unrecorded_control_used: None,
                         runtime_sample_trace: None,
                         cancellations: &cancellations,
@@ -2949,6 +3070,7 @@ fn generate_batch(
     mut supervision: BatchSupervision<'_>,
     tracking: SequenceTracking<'_>,
 ) -> NativeResult<GeneratedBatchExecution> {
+    let retain_token_piece_traces = supervision.retain_token_piece_traces;
     context.clear_kv_cache();
     tracking.token_counts.clear();
     tracking.token_ids.clear();
@@ -3158,6 +3280,9 @@ fn generate_batch(
                 decoder: UTF_8.new_decoder(),
                 text: String::new(),
                 generated_token_ids: Vec::with_capacity(branch.sampling.max_tokens as usize),
+                token_piece_trace: retain_token_piece_traces.then(|| {
+                    TokenPieceTrace::with_token_capacity(branch.sampling.max_tokens as usize)
+                }),
                 terminal_sampled_token_id: None,
                 generated: 0,
                 next_position: token_sets[index].len() as i32,
@@ -3238,10 +3363,10 @@ fn generate_batch(
                         format!("failed to decode generated token: {error}"),
                     )
                 })?;
-            let mut piece = String::with_capacity(bytes.len());
-            let _ = branch
-                .decoder
-                .decode_to_string(bytes.as_slice(), &mut piece, false);
+            if let Some(trace) = &mut branch.token_piece_trace {
+                trace.push_piece(&bytes)?;
+            }
+            let piece = decode_generated_utf8_piece(&mut branch.decoder, &bytes, false)?;
             if branch.first_token_ms.is_none() {
                 branch.first_token_ms = Some(started.elapsed().as_millis());
             }
@@ -3301,6 +3426,19 @@ fn generate_batch(
             .map_err(|error| native_decode_error("failed to decode generation batch", error))?;
     }
     for branch in &mut branches {
+        let piece = decode_generated_utf8_piece(&mut branch.decoder, &[], true)?;
+        append_generated_utf8_piece(&mut branch.text, &piece)?;
+        if !piece.is_empty() {
+            supervision.emit(GenerationEvent {
+                request_id: request.request_id.clone(),
+                branch_id: branch.request.branch_id.clone(),
+                sequence_id: branch.sequence_id,
+                input_index: branch.sequence_id as usize,
+                event_index: branch.event_index,
+                event: GenerationEventKind::Delta { text: piece },
+            });
+            branch.event_index += 1;
+        }
         if matches!(
             branch.state,
             GenerationState::Completed | GenerationState::Cancelled
@@ -3318,6 +3456,7 @@ fn generate_batch(
     let duration_ms = started.elapsed().as_millis();
     let mut outputs = Vec::with_capacity(branches.len());
     let mut terminal_sampled_token_ids = Vec::with_capacity(branches.len());
+    let mut token_piece_traces = Vec::with_capacity(branches.len());
     for branch in branches {
         let completion_tokens = branch.generated;
         let tokens_per_second = if duration_ms == 0 {
@@ -3326,6 +3465,9 @@ fn generate_batch(
             completion_tokens as f64 / (duration_ms as f64 / 1000.0)
         };
         terminal_sampled_token_ids.push(branch.terminal_sampled_token_id);
+        if let Some(trace) = branch.token_piece_trace {
+            token_piece_traces.push(trace);
+        }
         outputs.push(GenerationOutput {
             request_id: request.request_id.clone(),
             branch_id: branch.request.branch_id.clone(),
@@ -3365,6 +3507,7 @@ fn generate_batch(
     Ok(GeneratedBatchExecution {
         outputs,
         terminal_sampled_token_ids,
+        token_piece_traces,
     })
 }
 
@@ -3462,13 +3605,26 @@ fn verify_generation_batch_authority(
     request: GenerationBatchRequest,
     model_fingerprint: ModelFingerprint,
     outputs: &[GenerationOutput],
-    terminal_sampled_token_ids: Vec<Option<i32>>,
-    events: Vec<GenerationEvent>,
+    capture: GenerationAuthorityCapture,
     artifacts: &ModelArtifactGuards,
 ) -> NativeResult<VerifiedGenerationEvidence> {
+    let GenerationAuthorityCapture {
+        terminal_sampled_token_ids,
+        events,
+        token_piece_traces,
+    } = capture;
+    if token_piece_traces.len() != outputs.len() {
+        return Err(generation_verification_error(
+            "token-piece trace count does not match the generated outputs",
+        ));
+    }
     let decoded_token_text = outputs
         .iter()
-        .map(|output| decode_verified_token_text(model, &output.generated_token_ids))
+        .zip(&token_piece_traces)
+        .map(|(output, trace)| {
+            validate_live_token_piece_trace(model, output, trace)?;
+            strict_verified_utf8_bytes(trace.raw_piece_bytes())
+        })
         .collect::<NativeResult<Vec<_>>>()?;
     validate_verified_generation_batch(
         &request,
@@ -3488,7 +3644,45 @@ fn verify_generation_batch_authority(
         model_fingerprint,
         terminal_sampled_token_ids,
         events,
+        token_piece_traces,
     })
+}
+
+fn validate_live_token_piece_trace(
+    model: &LlamaModel,
+    output: &GenerationOutput,
+    trace: &TokenPieceTrace,
+) -> NativeResult<()> {
+    trace.validate(output.generated_token_ids.len())?;
+    for (index, (token_id, boundaries)) in output
+        .generated_token_ids
+        .iter()
+        .zip(trace.cumulative_boundaries.windows(2))
+        .enumerate()
+    {
+        let start = usize::try_from(boundaries[0]).map_err(|_| {
+            generation_verification_error("token-piece start boundary does not fit usize")
+        })?;
+        let end = usize::try_from(boundaries[1]).map_err(|_| {
+            generation_verification_error("token-piece end boundary does not fit usize")
+        })?;
+        let captured = trace.raw_piece_bytes.get(start..end).ok_or_else(|| {
+            generation_verification_error("token-piece boundary falls outside captured bytes")
+        })?;
+        let expected = model
+            .token_to_piece_bytes(LlamaToken::new(*token_id), 512, false, None)
+            .map_err(|error| {
+                generation_verification_error(format!(
+                    "failed to verify generated token piece {index}: {error}"
+                ))
+            })?;
+        if captured != expected {
+            return Err(generation_verification_error(
+                "captured token-piece bytes disagree with the sampled token ID",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_verified_generation_batch<F>(
@@ -3716,17 +3910,79 @@ fn strict_verified_utf8(pieces: &[Vec<u8>]) -> NativeResult<String> {
     for piece in pieces {
         bytes.extend_from_slice(piece);
     }
-    String::from_utf8(bytes).map_err(|error| {
-        generation_verification_error(format!(
-            "generated token pieces are not complete canonical UTF-8: {error}"
-        ))
-    })
+    strict_verified_utf8_bytes(&bytes)
+}
+
+fn strict_verified_utf8_bytes(bytes: &[u8]) -> NativeResult<String> {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|error| {
+            generation_verification_error(format!(
+                "generated token pieces are not complete canonical UTF-8: {error}"
+            ))
+        })
 }
 
 fn append_generated_utf8_piece(output: &mut String, piece: &str) -> NativeResult<()> {
     let _ = checked_generated_output_len(output.len(), piece.len())?;
     output.push_str(piece);
     Ok(())
+}
+
+fn decode_generated_utf8_piece(
+    decoder: &mut encoding_rs::Decoder,
+    bytes: &[u8],
+    last: bool,
+) -> NativeResult<String> {
+    let capacity = decoder.max_utf8_buffer_length(bytes.len()).ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::MemoryBudgetExceeded,
+            "generated UTF-8 decoder capacity overflowed",
+        )
+    })?;
+    let mut piece = String::new();
+    piece.try_reserve_exact(capacity).map_err(|error| {
+        NativeError::new(
+            NativeErrorCode::MemoryBudgetExceeded,
+            format!("generated UTF-8 decoder allocation failed: {error}"),
+        )
+    })?;
+    let mut remaining = bytes;
+    loop {
+        let (result, read, _had_errors) = decoder.decode_to_string(remaining, &mut piece, last);
+        remaining = remaining.get(read..).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::DecodeFailed,
+                "generated UTF-8 decoder consumed beyond its input",
+            )
+        })?;
+        match result {
+            CoderResult::InputEmpty if remaining.is_empty() => return Ok(piece),
+            CoderResult::InputEmpty => {
+                return Err(NativeError::new(
+                    NativeErrorCode::DecodeFailed,
+                    "generated UTF-8 decoder left unconsumed input",
+                ));
+            }
+            CoderResult::OutputFull => {
+                let additional =
+                    decoder
+                        .max_utf8_buffer_length(remaining.len())
+                        .ok_or_else(|| {
+                            NativeError::new(
+                                NativeErrorCode::MemoryBudgetExceeded,
+                                "generated UTF-8 decoder retry capacity overflowed",
+                            )
+                        })?;
+                piece.try_reserve(additional.max(1)).map_err(|error| {
+                    NativeError::new(
+                        NativeErrorCode::MemoryBudgetExceeded,
+                        format!("generated UTF-8 decoder retry allocation failed: {error}"),
+                    )
+                })?;
+            }
+        }
+    }
 }
 
 fn checked_generated_output_len(current: usize, additional: usize) -> NativeResult<usize> {
@@ -4015,12 +4271,6 @@ fn generate_multimodal(
     let finish_reason = loop {
         if supervision.cancellation.load(Ordering::Acquire) {
             let _ = context.clear_kv_cache_seq(Some(0), None, None);
-            emit_generation_state(
-                supervision.event_tx,
-                request,
-                event_index,
-                GenerationState::Cancelled,
-            );
             break "cancelled".to_string();
         }
         if supervision.reasoning_force.load(Ordering::Acquire)
@@ -4058,8 +4308,7 @@ fn generate_multimodal(
                     format!("failed to decode generated token: {error}"),
                 )
             })?;
-        let mut piece = String::with_capacity(bytes.len());
-        let _ = decoder.decode_to_string(bytes.as_slice(), &mut piece, false);
+        let piece = decode_generated_utf8_piece(&mut decoder, &bytes, false)?;
         if first_token_ms.is_none() {
             first_token_ms = Some(started.elapsed().as_millis());
         }
@@ -4103,17 +4352,28 @@ fn generate_multimodal(
         next_position += 1;
         tracking.token_counts.insert(0, next_position as usize);
     };
+    let final_piece = decode_generated_utf8_piece(&mut decoder, &[], true)?;
+    append_generated_utf8_piece(&mut text, &final_piece)?;
+    if !final_piece.is_empty() {
+        try_emit_nonterminal(
+            supervision.event_tx,
+            GenerationEvent {
+                request_id: request.request_id.clone(),
+                branch_id: "assistant".to_string(),
+                sequence_id: 0,
+                input_index: 0,
+                event_index,
+                event: GenerationEventKind::Delta { text: final_piece },
+            },
+        );
+        event_index += 1;
+    }
     let state = if finish_reason == "cancelled" {
         GenerationState::Cancelled
     } else {
-        emit_generation_state(
-            supervision.event_tx,
-            request,
-            event_index,
-            GenerationState::Completed,
-        );
         GenerationState::Completed
     };
+    emit_generation_state(supervision.event_tx, request, event_index, state);
     let duration_ms = started.elapsed().as_millis();
     Ok(GenerationOutput {
         request_id: request.request_id.clone(),
@@ -4152,6 +4412,7 @@ struct SequenceTracking<'a> {
 struct BatchSupervision<'a> {
     event_tx: &'a Sender<GenerationEvent>,
     retained_events: Option<&'a mut Vec<GenerationEvent>>,
+    retain_token_piece_traces: bool,
     unrecorded_control_used: Option<&'a mut bool>,
     runtime_sample_trace: Option<&'a mut Vec<RuntimeSampleSelection>>,
     cancellations: &'a [Arc<AtomicBool>],
@@ -4365,6 +4626,7 @@ struct ActiveBranch<'a> {
     decoder: encoding_rs::Decoder,
     text: String,
     generated_token_ids: Vec<i32>,
+    token_piece_trace: Option<TokenPieceTrace>,
     terminal_sampled_token_id: Option<i32>,
     generated: usize,
     next_position: i32,
@@ -5962,6 +6224,19 @@ mod tests {
         matches!(token_id, 900 | 901)
     }
 
+    fn test_token_piece_traces(decoded: &[String]) -> Vec<TokenPieceTrace> {
+        decoded
+            .iter()
+            .map(|text| {
+                let mut trace = TokenPieceTrace::with_token_capacity(1);
+                trace
+                    .push_piece(text.as_bytes())
+                    .expect("test piece fits the bounded trace");
+                trace
+            })
+            .collect()
+    }
+
     fn test_verified_generation() -> VerifiedGenerationBatch {
         let (request, model_fingerprint, outputs, terminal_sampled_token_ids, events, decoded) =
             seal_fixture();
@@ -5975,12 +6250,14 @@ mod tests {
             is_test_eog_token,
         )
         .expect("test authority fixture must satisfy live invariants");
+        let token_piece_traces = test_token_piece_traces(&decoded);
         VerifiedGenerationBatch {
             request,
             model_fingerprint,
             outputs,
             terminal_sampled_token_ids,
             events,
+            token_piece_traces,
         }
     }
 
@@ -5991,6 +6268,7 @@ mod tests {
             outputs,
             terminal_sampled_token_ids,
             events,
+            token_piece_traces,
         } = verified;
         GenerationCompletion::verified(
             outputs,
@@ -5999,6 +6277,7 @@ mod tests {
                 model_fingerprint,
                 terminal_sampled_token_ids,
                 events,
+                token_piece_traces,
             },
         )
     }
@@ -6017,6 +6296,76 @@ mod tests {
             result: result_rx,
             control,
         }
+    }
+
+    #[test]
+    fn consuming_try_wait_pending_returns_ticket() {
+        let (result_tx, result_rx) = bounded(1);
+        let (_event_tx, event_rx) = bounded(EVENT_CAPACITY);
+        let (control, lease) = test_generation_reservation("pending-request", &["case"]);
+        let ticket = GenerationTicket {
+            request_id: "pending-request".to_string(),
+            events: event_rx,
+            result: result_rx,
+            control,
+        };
+
+        let ticket = match ticket.try_wait().expect("pending poll is valid") {
+            TryWaitOutcome::Pending(ticket) => ticket,
+            TryWaitOutcome::Ready(_) => panic!("empty result channel cannot be ready"),
+        };
+        result_tx
+            .send(Ok(GenerationCompletion::unverified(Vec::new())))
+            .expect("pending ticket still owns its receiver");
+        drop(lease);
+        assert!(
+            ticket
+                .wait()
+                .expect("returned ticket remains usable")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn consuming_try_wait_ready_returns_output() {
+        let ticket = completed_generation_ticket(GenerationCompletion::unverified(Vec::new()));
+        match ticket.try_wait().expect("completed poll is valid") {
+            TryWaitOutcome::Ready(outputs) => assert!(outputs.is_empty()),
+            TryWaitOutcome::Pending(_) => panic!("published result cannot remain pending"),
+        }
+    }
+
+    #[test]
+    fn generic_cancel_cancels_embedding() {
+        let (handle, _command_rx) = test_admission_handle(
+            ResidentModelStatus {
+                model_id: "model".to_string(),
+                model_path: PathBuf::new(),
+                state: ModelRuntimeState::Ready,
+                fingerprint: Some(test_model_fingerprint("model")),
+                descriptor: None,
+                active_sequences: 0,
+                max_sequences: 4,
+            },
+            COMMAND_CAPACITY,
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (_control, lease) = handle
+            .inner
+            .requests
+            .reserve(
+                "embedding-request",
+                RequestClass::Embedding,
+                RequestControls::Embedding {
+                    cancellation: Arc::clone(&cancellation),
+                },
+            )
+            .expect("embedding request reserves");
+
+        assert_eq!(handle.cancel("embedding-request", None), 1);
+        assert!(cancellation.load(Ordering::Acquire));
+        assert_eq!(handle.cancel("embedding-request", Some("not-a-branch")), 0);
+        drop(lease);
     }
 
     #[test]
@@ -6049,10 +6398,10 @@ mod tests {
             control: old_control,
         };
 
-        assert_eq!(
-            old_ticket.try_wait().expect("completed result"),
-            Some(Vec::new())
-        );
+        match old_ticket.try_wait().expect("completed result") {
+            TryWaitOutcome::Ready(outputs) => assert!(outputs.is_empty()),
+            TryWaitOutcome::Pending(_) => panic!("completed result cannot remain pending"),
+        }
 
         let new_cancel = Arc::new(AtomicBool::new(false));
         let new_reasoning = Arc::new(AtomicBool::new(false));
@@ -6067,8 +6416,6 @@ mod tests {
                 },
             )
             .expect("new request reserves");
-        drop(old_ticket);
-
         assert!(!new_cancel.load(Ordering::Acquire));
         assert!(!new_reasoning.load(Ordering::Acquire));
         assert_eq!(new_registry.active_count(), 1);
@@ -6204,12 +6551,14 @@ mod tests {
         .expect("coherent owner-worker evidence verifies");
 
         let expected_outputs = outputs.clone();
+        let token_piece_traces = test_token_piece_traces(&decoded);
         let verified = VerifiedGenerationBatch {
             request,
             model_fingerprint: fingerprint,
             outputs,
             terminal_sampled_token_ids: terminal_ids,
             events,
+            token_piece_traces,
         };
         assert_eq!(verified.request().request_id, "verified-request");
         assert_eq!(verified.model_fingerprint().model_id, "model");
@@ -6690,6 +7039,132 @@ mod tests {
     }
 
     #[test]
+    fn token_piece_boundaries_match_token_count() {
+        let mut trace = TokenPieceTrace::with_token_capacity(3);
+        trace.push_piece(b"ab").expect("first piece");
+        trace.push_piece(b"").expect("zero-byte piece");
+        trace.push_piece(b"c").expect("third piece");
+
+        trace
+            .validate(3)
+            .expect("three tokens have four boundaries");
+        assert_eq!(trace.raw_piece_bytes(), b"abc");
+        assert_eq!(trace.cumulative_boundaries(), [0, 2, 2, 3]);
+        assert_eq!(
+            trace.cumulative_boundaries().len(),
+            4,
+            "one terminal boundary follows every generated token"
+        );
+    }
+
+    #[test]
+    fn zero_byte_piece_is_representable() {
+        let mut trace = TokenPieceTrace::with_token_capacity(1);
+        trace.push_piece(&[]).expect("zero-byte piece is valid");
+
+        trace
+            .validate(1)
+            .expect("equal adjacent boundaries are valid");
+        assert!(trace.raw_piece_bytes().is_empty());
+        assert_eq!(trace.cumulative_boundaries(), [0, 0]);
+    }
+
+    #[test]
+    fn invalid_utf8_piece_is_preserved() {
+        let mut trace = TokenPieceTrace::with_token_capacity(2);
+        trace
+            .push_piece(&[0xe2])
+            .expect("incomplete leading byte is retained exactly");
+        trace
+            .push_piece(&[0x82, 0xac])
+            .expect("continuation bytes are retained exactly");
+
+        trace
+            .validate(2)
+            .expect("raw piece boundaries remain coherent");
+        assert_eq!(trace.raw_piece_bytes(), [0xe2, 0x82, 0xac]);
+        assert_eq!(trace.cumulative_boundaries(), [0, 1, 3]);
+        assert_eq!(
+            strict_verified_utf8_bytes(trace.raw_piece_bytes())
+                .expect("the complete projection is canonical UTF-8"),
+            "€"
+        );
+    }
+
+    #[test]
+    fn split_utf8_projection_reaches_verified_seal_validation() {
+        let mut decoder = UTF_8.new_decoder();
+        let first = decode_generated_utf8_piece(&mut decoder, &[0xe2], false)
+            .expect("leading byte is buffered");
+        let second = decode_generated_utf8_piece(&mut decoder, &[0x82, 0xac], false)
+            .expect("continuation bytes complete the scalar");
+        let final_piece = decode_generated_utf8_piece(&mut decoder, &[], true)
+            .expect("complete decoder state finalizes cleanly");
+        assert!(first.is_empty());
+        assert_eq!(second, "€");
+        assert!(final_piece.is_empty());
+
+        let (request, fingerprint, mut outputs, terminal_ids, mut events, mut decoded) =
+            seal_fixture();
+        outputs[0].text = second.clone();
+        outputs[0].generated_token_ids = vec![100, 101];
+        outputs[0].metrics.completion_tokens = 2;
+        events[4].event = GenerationEventKind::Delta {
+            text: second.clone(),
+        };
+        decoded[0] = second;
+
+        let mut trace = TokenPieceTrace::with_token_capacity(2);
+        trace.push_piece(&[0xe2]).expect("first exact piece");
+        trace.push_piece(&[0x82, 0xac]).expect("second exact piece");
+        trace
+            .validate(outputs[0].generated_token_ids.len())
+            .expect("trace cardinality matches the sampled tokens");
+        assert_eq!(
+            strict_verified_utf8_bytes(trace.raw_piece_bytes()).expect("complete exact UTF-8"),
+            decoded[0]
+        );
+        validate_verified_generation_batch(
+            &request,
+            &fingerprint,
+            &outputs,
+            &terminal_ids,
+            &events,
+            &decoded,
+            is_test_eog_token,
+        )
+        .expect("live projection and exact trace agree at the seal validator");
+
+        let mut traces = test_token_piece_traces(&decoded);
+        traces[0] = trace;
+        let verified = VerifiedGenerationBatch {
+            request,
+            model_fingerprint: fingerprint,
+            outputs,
+            terminal_sampled_token_ids: terminal_ids,
+            events,
+            token_piece_traces: traces,
+        };
+        assert_eq!(verified_completion(verified).into_outputs()[0].text, "€");
+    }
+
+    #[test]
+    fn tampered_trace_cannot_verify() {
+        let mut trace = TokenPieceTrace::with_token_capacity(2);
+        trace.push_piece(b"a").expect("first piece");
+        trace.push_piece(b"b").expect("second piece");
+        trace.cumulative_boundaries[1] = 3;
+
+        assert_eq!(
+            trace
+                .validate(2)
+                .expect_err("an out-of-range, nonmonotonic boundary must fail")
+                .code,
+            NativeErrorCode::Internal
+        );
+    }
+
+    #[test]
     fn generated_output_byte_accounting_accepts_the_ceiling_and_rejects_overflow() {
         assert_eq!(
             checked_generated_output_len(MAX_GENERATED_OUTPUT_BYTES - 3, 3)
@@ -6804,6 +7279,7 @@ mod tests {
         BatchSupervision {
             event_tx: &event_tx,
             retained_events: retained_events.as_mut(),
+            retain_token_piece_traces: false,
             unrecorded_control_used: statically_sealable.then_some(&mut unrecorded_control_used),
             runtime_sample_trace: None,
             cancellations: &cancellations,
@@ -6851,10 +7327,13 @@ mod tests {
         assert_eq!(verified.outputs().len(), 2);
 
         let ticket = completed_generation_ticket(verified_completion(test_verified_generation()));
-        let verified = ticket
+        let verified = match ticket
             .try_wait_verified()
             .expect("nonblocking verified wait is typed")
-            .expect("completed result is ready");
+        {
+            TryWaitOutcome::Ready(verified) => verified,
+            TryWaitOutcome::Pending(_) => panic!("completed result cannot remain pending"),
+        };
         assert_eq!(verified.events().len(), 8);
 
         let ticket = completed_generation_ticket(verified_completion(test_verified_generation()));
@@ -6932,6 +7411,7 @@ mod tests {
             let mut supervision = BatchSupervision {
                 event_tx: &event_tx,
                 retained_events: Some(&mut retained_events),
+                retain_token_piece_traces: true,
                 unrecorded_control_used: None,
                 runtime_sample_trace: None,
                 cancellations: &cancellations,
@@ -8307,7 +8787,25 @@ mod tests {
         assert_eq!(verified.outputs()[1].state, GenerationState::Cancelled);
         assert_eq!(verified.outputs()[1].finish_reason, "cancelled");
         assert!(verified.terminal_sampled_token_ids()[1].is_none());
+        assert_eq!(
+            verified.token_piece_traces().len(),
+            verified.outputs().len()
+        );
         for (index, output) in verified.outputs().iter().enumerate() {
+            let trace = &verified.token_piece_traces()[index];
+            assert_eq!(
+                trace.cumulative_boundaries().len(),
+                output.generated_token_ids.len() + 1
+            );
+            assert_eq!(trace.cumulative_boundaries().first(), Some(&0));
+            assert_eq!(
+                trace.cumulative_boundaries().last().copied(),
+                Some(u64::try_from(trace.raw_piece_bytes().len())?)
+            );
+            assert_eq!(
+                strict_verified_utf8_bytes(trace.raw_piece_bytes())?,
+                output.text
+            );
             let terminal_count = verified
                 .events()
                 .iter()
