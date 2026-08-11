@@ -2,3 +2,10 @@ title = "Loom Native secret scanning"
 
 [extend]
 useDefault = true
+
+[allowlist]
+description = "Published Free Token Energy commit recorded as provenance"
+regexTarget = "secret"
+regexes = [
+  '''9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe''',
+]
