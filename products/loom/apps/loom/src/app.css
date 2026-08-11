@@ -36,8 +36,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:fo
 button:disabled { cursor: not-allowed; opacity: .45; }
 
 .app-shell { height: 100dvh; min-height: 0; display: flex; flex-direction: column; background: var(--paper); }
-.skip-link { position: fixed; z-index: 100; top: 8px; left: 8px; padding: 8px 12px; color: white; background: var(--moss-dark); transform: translateY(-150%); }
-.skip-link:focus { transform: translateY(0); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 
 .topbar {
@@ -142,8 +140,6 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .primary-button:hover { background: #304c3a; }
 .secondary-button { border: 1px solid var(--line); background: white; }
 .secondary-button:hover { border-color: #bdb6aa; background: #fdfcf9; }
-.alternatives-button { min-height: 28px; padding: 4px 8px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; }
-.alternatives-button:hover { color: var(--ink); background: var(--paper-deep); }
 .strand-review { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 13px; color: var(--ink); background: var(--paper); box-shadow: 0 24px 70px rgb(25 24 21 / 24%); }
 .strand-review::backdrop { background: rgb(30 31 28 / 30%); backdrop-filter: blur(2px); }
 .strand-review-shell { min-width: 0; max-height: calc(100dvh - 32px); display: flex; flex-direction: column; }

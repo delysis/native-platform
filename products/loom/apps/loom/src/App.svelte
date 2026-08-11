@@ -51,7 +51,6 @@
   import { canRoundTripMarkdownExactly, canUseVisualMarkdown } from './lib/markdownSafety';
   import {
     autocompleteDisposition,
-    ghostReviewAffordance,
     verifiedGhostSuggestion,
     visibleVerifiedGhostSuggestion,
     type AutocompleteDisposition
@@ -184,7 +183,6 @@
   let modelManagerPanel: HTMLElement | undefined;
   let modelManagerReturnFocus: HTMLElement | null = null;
   let strandReviewDialog: HTMLDialogElement | undefined;
-  let strandReviewTrigger: HTMLButtonElement | undefined;
   let strandReviewOpen = false;
   let reviewCandidateId: string | null = null;
   let projectMenu: HTMLDetailsElement | undefined;
@@ -611,9 +609,20 @@
       Boolean(verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[branch.run_id]))
     )
     : [];
-  $: reviewableBranches = exactReviewBranches.filter((branch) =>
-    candidateTextIsSurfaceable(branch.text)
-  );
+  $: reviewableBranches = exactReviewBranches.filter((branch) => {
+    if (!candidateTextIsSurfaceable(branch.text)) return false;
+    const suggestion = verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[branch.run_id]);
+    if (!suggestion) return false;
+    if (mode === 'visual') {
+      return visualGhostTextMayBePlainProse(suggestion.text) &&
+        !unpresentableVisualGhostPresentationKeys.includes(suggestion.presentationKey);
+    }
+    return sourceGhostPresentationCompatible(
+      sourceDisplayText,
+      suggestion.text,
+      sourceGhostNewline
+    );
+  });
   $: suppressedReviewBranches = exactReviewBranches.filter((branch) =>
     !candidateTextIsSurfaceable(branch.text)
   );
@@ -627,10 +636,6 @@
   $: reviewBranchIndex = reviewBranch
     ? reviewableBranches.findIndex((branch) => branch.run_id === reviewBranch.run_id)
     : -1;
-  $: reviewAffordance = ghostReviewAffordance(
-    Boolean(activeGhostSuggestion),
-    reviewableBranches.length
-  );
   $: suggestionMenuState = suggestionsChanging
     ? '…'
     : modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0
@@ -3794,7 +3799,7 @@
   function dismissInlineSuggestion(candidateId: string | null | undefined): void {
     if (!candidateId || dismissedCandidateIds.includes(candidateId)) return;
     dismissedCandidateIds = [...dismissedCandidateIds, candidateId];
-    announce('Suggestion dismissed; it remains available under alternatives');
+    announce('Suggestion dismissed; it remains available in Writing options');
   }
 
   function rejectVisualGhostPresentation(
@@ -3863,6 +3868,7 @@
       reviewableBranches[0].candidate_id;
     promotionArmedCandidateId = null;
     strandReviewOpen = true;
+    closeProjectMenu();
     await tick();
     if (!strandReviewDialog) return;
     if (!strandReviewDialog.open) strandReviewDialog.showModal();
@@ -3885,7 +3891,7 @@
     ) % reviewableBranches.length;
     reviewCandidateId = reviewableBranches[nextIndex].candidate_id;
     promotionArmedCandidateId = null;
-    announce(`Alternative ${nextIndex + 1} of ${reviewableBranches.length}`);
+    announce(`Suggestion ${nextIndex + 1} of ${reviewableBranches.length}`);
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
@@ -4811,6 +4817,8 @@
       preferredProseMode = next;
     }
     mode = next;
+    await tick();
+    focusCurrentWritingSurfaceAtEnd();
     announce(`${next} editor mode`);
   }
 
@@ -5073,8 +5081,6 @@
 </svelte:head>
 
 <div class="app-shell">
-  <a class="skip-link" href="#manuscript">Skip to manuscript</a>
-
   {#if project}
     <header class="topbar" aria-label="Writing controls">
       {#if project.documents.length > 1}
@@ -5096,18 +5102,6 @@
         <div class="save-status state-{saveState}" role="status" aria-live="polite">
           <span class="status-dot"></span>{saveMessage}
         </div>
-      {/if}
-      {#if document && reviewAffordance.visible}
-        <button
-          class="alternatives-button"
-          bind:this={strandReviewTrigger}
-          type="button"
-          aria-haspopup="dialog"
-          aria-label={reviewAffordance.ariaLabel}
-          on:click={() => void openStrandReview()}
-        >
-          {reviewAffordance.label}
-        </button>
       {/if}
       <details class="project-menu" bind:this={projectMenu}>
         <summary class="more-button" bind:this={projectMenuTrigger} title="Writing options">
@@ -5137,6 +5131,17 @@
               {suggestionMenuState}
             </span>
           </button>
+          {#if document && reviewableBranches.length > 0}
+            <button
+              type="button"
+              aria-haspopup="dialog"
+              aria-label={`Review ${reviewableBranches.length} saved writing ${reviewableBranches.length === 1 ? 'suggestion' : 'suggestions'}`}
+              on:click={() => void openStrandReview()}
+            >
+              <span>Review suggestions</span>
+              <span class="menu-state">{reviewableBranches.length}</span>
+            </button>
+          {/if}
           <div class="project-menu-separator"></div>
           <button type="button" disabled={reconciliationResolutionLocked || (editorReadonly && transition !== 'closing' && !(reconciliation && !document))} on:click={() => { closeProjectMenu(); void closeProject(); }}>
             {transition === 'closing' ? 'Retry closing project' : 'Close project'}
@@ -5382,7 +5387,7 @@
               on:close={() => {
                 strandReviewOpen = false;
                 promotionArmedCandidateId = null;
-                strandReviewTrigger?.focus();
+                projectMenuTrigger?.focus();
               }}
               on:cancel={() => {
                 strandReviewOpen = false;
@@ -5392,7 +5397,7 @@
               <div class="strand-review-shell">
               <header class="strand-review-header">
                 <div>
-                  <h2 id="strand-review-title">Alternatives</h2>
+                  <h2 id="strand-review-title">Suggestions</h2>
                   {#if reviewBranchIndex >= 0}
                     <span>{reviewBranchIndex + 1} of {reviewableBranches.length}</span>
                   {/if}
@@ -5401,7 +5406,7 @@
                   class="dialog-close"
                   data-review-close
                   type="button"
-                  aria-label="Close alternatives"
+                  aria-label="Close suggestions"
                   on:click={closeStrandReview}
                 >×</button>
               </header>
@@ -5410,7 +5415,7 @@
                 <div class="strand-review-prose">{reviewBranch.text}</div>
 
                 {#if reviewableBranches.length > 1}
-                  <nav class="strand-review-navigation" aria-label="Alternative navigation">
+                  <nav class="strand-review-navigation" aria-label="Suggestion navigation">
                     <button type="button" on:click={() => moveStrandReview(-1)}>Previous</button>
                     <button type="button" on:click={() => moveStrandReview(1)}>Next</button>
                   </nav>
@@ -5440,7 +5445,7 @@
 
                 <footer class="strand-review-actions">
                   <button class="primary-button" type="button" on:click={() => void acceptInlineSuggestion(reviewBranch)} disabled={!canPromoteBranch(reviewBranch)} title={promotionUnavailableReason(reviewBranch)}>
-                    Use this
+                    Insert suggestion
                   </button>
                 </footer>
               {:else}

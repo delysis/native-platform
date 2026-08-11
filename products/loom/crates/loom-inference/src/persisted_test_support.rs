@@ -29,9 +29,9 @@ use super::{
     StrictGenerationEventKind, StrictGenerationMetrics, StrictGenerationOutput,
     StrictModelFingerprint, StrictSamplingConfig, compiled_prompt_fingerprint,
     derive_batch_verification_fingerprint, derive_call_verification_fingerprint, derive_request_id,
-    generated_token_ids_blob_id, model_fingerprint_id, prompt_token_fingerprint,
-    sampling_fingerprint, uncontrolled_program_fingerprint, validate_prompt, validate_sampling,
-    verify_persisted_batch_evidence,
+    derive_token_piece_fingerprint, generated_token_ids_blob_id, model_fingerprint_id,
+    prompt_token_fingerprint, sampling_fingerprint, uncontrolled_program_fingerprint,
+    validate_prompt, validate_sampling, verify_persisted_batch_evidence,
 };
 
 const TEST_BINDING_ID: &str = "nonauthorizing-test-binding";
@@ -147,6 +147,9 @@ pub struct NonauthorizingPersistedCaseTestVector {
     pub model_call: ModelCall,
     pub raw_output: Vec<u8>,
     pub generated_token_ids: Vec<u32>,
+    pub raw_token_piece_bytes: Vec<u8>,
+    pub token_byte_boundaries: Vec<u64>,
+    pub has_exact_token_piece_trace: bool,
     pub event_json: Vec<u8>,
     pub backend_audit_json: Vec<u8>,
     pub terminal_sampled_token_id: Option<i32>,
@@ -161,6 +164,12 @@ impl NonauthorizingPersistedCaseTestVector {
             model_call: &self.model_call,
             raw_output: &self.raw_output,
             generated_token_ids: &self.generated_token_ids,
+            raw_token_piece_bytes: self
+                .has_exact_token_piece_trace
+                .then_some(self.raw_token_piece_bytes.as_slice()),
+            token_byte_boundaries: self
+                .has_exact_token_piece_trace
+                .then_some(self.token_byte_boundaries.as_slice()),
             event_json: &self.event_json,
             backend_audit_json: &self.backend_audit_json,
             terminal_sampled_token_id: self.terminal_sampled_token_id,
@@ -304,12 +313,16 @@ pub enum NonauthorizingPersistedCaseTestSpec {
         sampling: SamplingConfig,
         raw_output: Vec<u8>,
         generated_token_ids: Vec<u32>,
+        raw_token_piece_bytes: Option<Vec<u8>>,
+        token_byte_boundaries: Option<Vec<u64>>,
     },
     Cancelled {
         call_id: ModelCallId,
         sampling: SamplingConfig,
         partial_raw_output: Vec<u8>,
         generated_token_ids: Vec<u32>,
+        raw_token_piece_bytes: Option<Vec<u8>>,
+        token_byte_boundaries: Option<Vec<u64>>,
     },
 }
 
@@ -326,6 +339,8 @@ impl NonauthorizingPersistedCaseTestSpec {
             sampling: simple_sampling(seed, generated_token_ids.len())?,
             raw_output: raw_output.to_vec(),
             generated_token_ids: generated_token_ids.to_vec(),
+            raw_token_piece_bytes: None,
+            token_byte_boundaries: None,
         })
     }
 
@@ -341,6 +356,56 @@ impl NonauthorizingPersistedCaseTestSpec {
             sampling: simple_sampling(seed, generated_token_ids.len())?,
             partial_raw_output: partial_raw_output.to_vec(),
             generated_token_ids: generated_token_ids.to_vec(),
+            raw_token_piece_bytes: None,
+            token_byte_boundaries: None,
+        })
+    }
+
+    /// Creates a completed case with caller-specified tokenizer-emitted bytes.
+    pub fn completed_with_token_piece_trace(
+        call_id: ModelCallId,
+        seed: u32,
+        raw_output: &[u8],
+        generated_token_ids: &[u32],
+        raw_token_piece_bytes: &[u8],
+        token_byte_boundaries: &[u64],
+    ) -> Result<Self, PersistedEvidenceError> {
+        validate_test_token_piece_trace(
+            generated_token_ids.len(),
+            raw_token_piece_bytes,
+            token_byte_boundaries,
+        )?;
+        Ok(Self::Completed {
+            call_id,
+            sampling: simple_sampling(seed, generated_token_ids.len())?,
+            raw_output: raw_output.to_vec(),
+            generated_token_ids: generated_token_ids.to_vec(),
+            raw_token_piece_bytes: Some(raw_token_piece_bytes.to_vec()),
+            token_byte_boundaries: Some(token_byte_boundaries.to_vec()),
+        })
+    }
+
+    /// Creates a cancelled diagnostic with exact partial token-piece bytes.
+    pub fn cancelled_with_token_piece_trace(
+        call_id: ModelCallId,
+        seed: u32,
+        partial_raw_output: &[u8],
+        generated_token_ids: &[u32],
+        raw_token_piece_bytes: &[u8],
+        token_byte_boundaries: &[u64],
+    ) -> Result<Self, PersistedEvidenceError> {
+        validate_test_token_piece_trace(
+            generated_token_ids.len(),
+            raw_token_piece_bytes,
+            token_byte_boundaries,
+        )?;
+        Ok(Self::Cancelled {
+            call_id,
+            sampling: simple_sampling(seed, generated_token_ids.len())?,
+            partial_raw_output: partial_raw_output.to_vec(),
+            generated_token_ids: generated_token_ids.to_vec(),
+            raw_token_piece_bytes: Some(raw_token_piece_bytes.to_vec()),
+            token_byte_boundaries: Some(token_byte_boundaries.to_vec()),
         })
     }
 
@@ -378,9 +443,45 @@ impl NonauthorizingPersistedCaseTestSpec {
         }
     }
 
+    fn explicit_token_piece_trace(&self) -> Option<(&[u8], &[u64])> {
+        let (raw, boundaries) = match self {
+            Self::Completed {
+                raw_token_piece_bytes,
+                token_byte_boundaries,
+                ..
+            }
+            | Self::Cancelled {
+                raw_token_piece_bytes,
+                token_byte_boundaries,
+                ..
+            } => (
+                raw_token_piece_bytes.as_deref(),
+                token_byte_boundaries.as_deref(),
+            ),
+        };
+        raw.zip(boundaries)
+    }
+
     fn is_completed(&self) -> bool {
         matches!(self, Self::Completed { .. })
     }
+}
+
+fn validate_test_token_piece_trace(
+    token_count: usize,
+    raw: &[u8],
+    boundaries: &[u64],
+) -> Result<(), PersistedEvidenceError> {
+    if boundaries.len() != token_count.saturating_add(1)
+        || boundaries.first() != Some(&0)
+        || boundaries.windows(2).any(|pair| pair[0] > pair[1])
+        || boundaries.last() != Some(&(raw.len() as u64))
+    {
+        return Err(PersistedEvidenceError::Batch(
+            "test token-piece trace is malformed",
+        ));
+    }
+    Ok(())
 }
 
 fn simple_sampling(
@@ -425,6 +526,7 @@ struct SyntheticInputs {
     prompt: NonauthorizingPersistedPromptTestVector,
     case_specs: Vec<NonauthorizingPersistedCaseTestSpec>,
     backend_request_id: String,
+    include_exact_token_piece_trace: bool,
 }
 
 fn synthetic_model(
@@ -501,6 +603,7 @@ fn synthetic_inputs_for(
     binding: NonauthorizingPersistedBindingTestVector,
     prompt: NonauthorizingPersistedPromptTestVector,
     case_specs: Vec<NonauthorizingPersistedCaseTestSpec>,
+    include_exact_token_piece_trace: bool,
 ) -> Result<SyntheticInputs, PersistedEvidenceError> {
     if binding.binding_id.is_empty()
         || binding.binding_id.len() > MAX_RECEIPT_ID_BYTES
@@ -557,6 +660,7 @@ fn synthetic_inputs_for(
         prompt,
         case_specs,
         backend_request_id,
+        include_exact_token_piece_trace,
     })
 }
 
@@ -572,6 +676,7 @@ fn synthetic_inputs() -> Result<SyntheticInputs, PersistedEvidenceError> {
         default_binding(),
         synthetic_prompt(project_id, scope),
         default_case_specs()?,
+        true,
     )
 }
 
@@ -704,6 +809,8 @@ fn synthetic_audit_json(
     spec: &NonauthorizingPersistedCaseTestSpec,
     event_blob_id: BlobId,
 ) -> Result<Vec<u8>, PersistedEvidenceError> {
+    let boundaries = synthetic_token_boundaries(spec);
+    let exact_trace = inputs.include_exact_token_piece_trace;
     encode_json(
         &StrictBackendAuditRecord {
             format: BACKEND_AUDIT_FORMAT.to_owned(),
@@ -724,6 +831,14 @@ fn synthetic_audit_json(
             sampling: strict_sampling(spec.sampling()),
             model_fingerprint: strict_model(&inputs.model),
             output: synthetic_output(inputs, index, spec),
+            raw_token_piece_bytes_blob_id: exact_trace
+                .then(|| BlobId::digest(synthetic_token_piece_bytes(spec))),
+            raw_token_piece_byte_len: exact_trace
+                .then_some(synthetic_token_piece_bytes(spec).len()),
+            token_piece_fingerprint: exact_trace.then(|| {
+                derive_token_piece_fingerprint(synthetic_token_piece_bytes(spec), &boundaries)
+            }),
+            token_byte_boundaries: exact_trace.then_some(boundaries),
             terminal_sampled_token_id: terminal_sampled_token_id(spec),
             event_stream_blob_id: event_blob_id,
         },
@@ -773,6 +888,7 @@ fn synthetic_case_fingerprint(
     event_blob_id: BlobId,
     backend_receipt_blob_id: BlobId,
 ) -> BlobId {
+    let boundaries = synthetic_token_boundaries(spec);
     derive_call_verification_fingerprint(&CallVerificationCommitment {
         project_id: inputs.project_id,
         request_id: &inputs.backend_request_id,
@@ -788,10 +904,36 @@ fn synthetic_case_fingerprint(
         control_program_fingerprint: uncontrolled_program_fingerprint(),
         raw_output: spec.raw_output(),
         generated_token_ids: spec.generated_token_ids(),
+        raw_token_piece_bytes: if inputs.include_exact_token_piece_trace {
+            synthetic_token_piece_bytes(spec)
+        } else {
+            &[]
+        },
+        token_byte_boundaries: if inputs.include_exact_token_piece_trace {
+            &boundaries
+        } else {
+            &[]
+        },
         event_blob_id,
         backend_receipt_blob_id,
         terminal_sampled_token_id: terminal_sampled_token_id(spec),
     })
+}
+
+fn synthetic_token_boundaries(spec: &NonauthorizingPersistedCaseTestSpec) -> Vec<u64> {
+    if let Some((_, boundaries)) = spec.explicit_token_piece_trace() {
+        return boundaries.to_vec();
+    }
+    let mut boundaries = vec![0; spec.generated_token_ids().len().saturating_add(1)];
+    if let Some(last) = boundaries.last_mut() {
+        *last = spec.raw_output().len() as u64;
+    }
+    boundaries
+}
+
+fn synthetic_token_piece_bytes(spec: &NonauthorizingPersistedCaseTestSpec) -> &[u8] {
+    spec.explicit_token_piece_trace()
+        .map_or_else(|| spec.raw_output(), |(raw, _)| raw)
 }
 
 fn synthetic_batch_fingerprint(
@@ -853,6 +995,9 @@ fn synthetic_case(
         model_call,
         raw_output: spec.raw_output().to_vec(),
         generated_token_ids: spec.generated_token_ids().to_vec(),
+        raw_token_piece_bytes: synthetic_token_piece_bytes(spec).to_vec(),
+        token_byte_boundaries: synthetic_token_boundaries(spec),
+        has_exact_token_piece_trace: inputs.include_exact_token_piece_trace,
         event_json,
         backend_audit_json,
         terminal_sampled_token_id: terminal_sampled_token_id(spec),
@@ -938,6 +1083,7 @@ pub fn nonauthorizing_persisted_evidence_test_vector_for(
         own_binding(binding),
         own_prompt(&prompt),
         default_case_specs()?,
+        true,
     )?)
 }
 
@@ -956,6 +1102,24 @@ pub fn nonauthorizing_persisted_evidence_test_vector_for_cases(
         own_binding(binding),
         own_prompt(&prompt),
         cases.to_vec(),
+        true,
+    )?)
+}
+
+/// Builds schema-9-shaped synthetic receipts with no exact token-piece trace.
+///
+/// This exists only for migration and replay regressions. The receipt graph is
+/// nonauthorizing and retains the byte-identical v1 call commitment.
+pub fn nonauthorizing_legacy_persisted_evidence_test_vector_for_cases(
+    binding: PersistedBindingEvidenceRef<'_>,
+    prompt: PersistedPromptEvidenceRef<'_>,
+    cases: &[NonauthorizingPersistedCaseTestSpec],
+) -> Result<NonauthorizingPersistedEvidenceTestVector, PersistedEvidenceError> {
+    finish_synthetic_vector(synthetic_inputs_for(
+        own_binding(binding),
+        own_prompt(&prompt),
+        cases.to_vec(),
+        false,
     )?)
 }
 
@@ -981,11 +1145,11 @@ mod tests {
         );
         assert_eq!(
             vector.cases[0].verification_fingerprint.to_hex(),
-            "0391f1e1a277e742a9568762323f4c91be3c200b0505faedd0a5414341b144b8"
+            "55c14f4df5da47bafe4b51b0487ca0212bfd0b019dc7d21d30ccfa1d01f1d7a4"
         );
         assert_eq!(
             vector.verification_fingerprint.to_hex(),
-            "e07d7946f76b81ad79c01ef2e570888cc51b360b1f53c7840a94a49d376a5ecf"
+            "cb4b333fb08d59959d3cf60e90bb1bc9dd624dc6c5e445f73e1122c1b26baf87"
         );
         assert_eq!(
             checked.cases()[0].event_blob_id().to_hex(),
@@ -993,7 +1157,7 @@ mod tests {
         );
         assert_eq!(
             checked.cases()[0].backend_receipt_blob_id().to_hex(),
-            "4799c591669e00cffed03ee7d7070d54a2da3ec92980d68b870cdfe084a123a1"
+            "7f914cea612ef7d571a655f25b8b4807b2ff99ed2d5cb96c5b7018e55a6eb89a"
         );
     }
 

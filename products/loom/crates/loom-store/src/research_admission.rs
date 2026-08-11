@@ -58,7 +58,9 @@ pub struct AdmittedModelCall {
     call: ModelCall,
     raw_output: Vec<u8>,
     token_ids: Vec<u32>,
+    raw_token_piece_bytes: Option<Vec<u8>>,
     token_byte_boundaries: Option<Vec<u64>>,
+    token_mapping_fingerprint: Option<BlobId>,
     verification_fingerprint: BlobId,
 }
 
@@ -84,6 +86,34 @@ impl fmt::Debug for AdmittedModelCall {
 impl AdmittedModelCall {
     pub const fn call_id(&self) -> loom_research_types::ModelCallId {
         self.call.id()
+    }
+
+    /// Returns the exact tokenizer-emitted bytes for a half-open token range.
+    /// Display UTF-8 and stop-sequence projection are deliberately irrelevant.
+    pub fn exact_token_span(&self, range: std::ops::Range<usize>) -> Result<&[u8]> {
+        let boundaries = self
+            .token_byte_boundaries
+            .as_deref()
+            .ok_or_else(|| admission_error("call has no exact token-piece boundary evidence"))?;
+        let raw = self
+            .raw_token_piece_bytes
+            .as_deref()
+            .ok_or_else(|| admission_error("call has no exact token-piece bytes"))?;
+        if range.start > range.end {
+            return Err(admission_error("token span is reversed"));
+        }
+        let start = boundaries
+            .get(range.start)
+            .copied()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| admission_error("token span start is out of bounds"))?;
+        let end = boundaries
+            .get(range.end)
+            .copied()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| admission_error("token span end is out of bounds"))?;
+        raw.get(start..end)
+            .ok_or_else(|| admission_error("token span boundaries exceed exact piece bytes"))
     }
 }
 
@@ -1226,6 +1256,9 @@ struct CompletedAdoptionMaterial {
     call: ModelCall,
     raw_output: Vec<u8>,
     generated_token_ids: Vec<u32>,
+    raw_token_piece_bytes: Option<Vec<u8>>,
+    token_byte_boundaries: Option<Vec<u64>>,
+    token_piece_fingerprint: Option<BlobId>,
     event_json: Vec<u8>,
     backend_audit_json: Vec<u8>,
     displayed_output: Vec<u8>,
@@ -1239,6 +1272,9 @@ struct CancelledAdoptionMaterial {
     call: ModelCall,
     partial_raw_output: Vec<u8>,
     generated_token_ids: Vec<u32>,
+    raw_token_piece_bytes: Option<Vec<u8>>,
+    token_byte_boundaries: Option<Vec<u64>>,
+    token_piece_fingerprint: Option<BlobId>,
     event_json: Vec<u8>,
     backend_audit_json: Vec<u8>,
     verification_fingerprint: BlobId,
@@ -1251,11 +1287,30 @@ struct StoredCaseBlobs {
     raw_output_byte_len: usize,
     token_ids_blob_id: BlobId,
     token_ids_byte_len: usize,
+    token_piece: Option<StoredTokenPieceBlobs>,
     event_blob_id: BlobId,
     event_byte_len: usize,
     receipt_blob_id: BlobId,
     receipt_byte_len: usize,
     displayed_output: Option<(BlobId, usize)>,
+}
+
+struct StoredTokenPieceBlobs {
+    raw_piece_bytes_blob_id: BlobId,
+    raw_piece_byte_len: usize,
+    boundary_vector_blob_id: BlobId,
+    boundary_vector_byte_len: usize,
+}
+
+struct StoreCaseBlobInput<'a> {
+    call: &'a ModelCall,
+    raw_output: &'a [u8],
+    token_ids: &'a [u32],
+    raw_piece_bytes: Option<&'a [u8]>,
+    token_byte_boundaries: Option<&'a [u64]>,
+    event_json: &'a [u8],
+    receipt_json: &'a [u8],
+    displayed_output: Option<&'a [u8]>,
 }
 
 struct StoredBindingBlobs {
@@ -1411,6 +1466,9 @@ fn completed_adoption_material(
         |call,
          raw_output,
          generated_token_ids,
+         raw_token_piece_bytes,
+         token_byte_boundaries,
+         token_piece_fingerprint,
          event_json,
          backend_audit_json,
          displayed_output,
@@ -1421,6 +1479,9 @@ fn completed_adoption_material(
             call,
             raw_output,
             generated_token_ids,
+            raw_token_piece_bytes,
+            token_byte_boundaries,
+            token_piece_fingerprint,
             event_json,
             backend_audit_json,
             displayed_output,
@@ -1439,6 +1500,9 @@ fn cancelled_adoption_material(
         |call,
          partial_raw_output,
          generated_token_ids,
+         raw_token_piece_bytes,
+         token_byte_boundaries,
+         token_piece_fingerprint,
          event_json,
          backend_audit_json,
          verification_fingerprint| CancelledAdoptionMaterial {
@@ -1446,6 +1510,9 @@ fn cancelled_adoption_material(
             call,
             partial_raw_output,
             generated_token_ids,
+            raw_token_piece_bytes,
+            token_byte_boundaries,
+            token_piece_fingerprint,
             event_json,
             backend_audit_json,
             verification_fingerprint,
@@ -1638,6 +1705,12 @@ fn validate_completed_adoption(
     completed
         .token_evidence()
         .verify(&material.generated_token_ids)?;
+    validate_optional_token_piece_material(
+        material.raw_token_piece_bytes.as_deref(),
+        material.token_byte_boundaries.as_deref(),
+        material.generated_token_ids.len(),
+        material.token_piece_fingerprint,
+    )?;
     if material
         .generated_token_ids
         .iter()
@@ -1703,6 +1776,12 @@ fn validate_cancelled_adoption(
         ));
     }
     TokenEvidence::from_exact(&material.generated_token_ids)?;
+    validate_optional_token_piece_material(
+        material.raw_token_piece_bytes.as_deref(),
+        material.token_byte_boundaries.as_deref(),
+        material.generated_token_ids.len(),
+        material.token_piece_fingerprint,
+    )?;
     if material
         .generated_token_ids
         .iter()
@@ -1715,6 +1794,56 @@ fn validate_cancelled_adoption(
     validate_native_json_evidence(&material.event_json, "cancelled event stream")?;
     validate_native_json_evidence(&material.backend_audit_json, "cancelled backend receipt")?;
     Ok(())
+}
+
+fn validate_exact_token_piece_material(
+    raw_piece_bytes: &[u8],
+    boundaries: &[u64],
+    token_count: usize,
+    expected_fingerprint: BlobId,
+) -> Result<()> {
+    if boundaries.len() != token_count.saturating_add(1)
+        || boundaries.first() != Some(&0)
+        || boundaries.last().copied() != u64::try_from(raw_piece_bytes.len()).ok()
+        || boundaries.windows(2).any(|pair| pair[0] > pair[1])
+        || token_piece_trace_fingerprint(raw_piece_bytes, boundaries) != expected_fingerprint
+    {
+        return Err(admission_error("exact token-piece evidence is malformed"));
+    }
+    Ok(())
+}
+
+fn validate_optional_token_piece_material(
+    raw_piece_bytes: Option<&[u8]>,
+    boundaries: Option<&[u64]>,
+    token_count: usize,
+    expected_fingerprint: Option<BlobId>,
+) -> Result<()> {
+    match (raw_piece_bytes, boundaries, expected_fingerprint) {
+        (Some(raw), Some(boundaries), Some(fingerprint)) => {
+            validate_exact_token_piece_material(raw, boundaries, token_count, fingerprint)
+        }
+        (None, None, None) => Ok(()),
+        _ => Err(admission_error(
+            "token-piece evidence is only partially present",
+        )),
+    }
+}
+
+fn token_piece_trace_fingerprint(raw_piece_bytes: &[u8], boundaries: &[u64]) -> BlobId {
+    let mut bytes = Vec::with_capacity(
+        40usize
+            .saturating_add(raw_piece_bytes.len())
+            .saturating_add(boundaries.len().saturating_mul(8)),
+    );
+    bytes.extend_from_slice(b"loom/token-piece-trace/v1\0");
+    bytes.extend_from_slice(&(raw_piece_bytes.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(raw_piece_bytes);
+    bytes.extend_from_slice(&(boundaries.len() as u64).to_be_bytes());
+    for boundary in boundaries {
+        bytes.extend_from_slice(&boundary.to_be_bytes());
+    }
+    BlobId::digest(&bytes)
 }
 
 fn validate_native_json_evidence(bytes: &[u8], field: &'static str) -> Result<()> {
@@ -1935,6 +2064,19 @@ fn insert_completed_adoption(
             created_at_ms,
         ],
     )?;
+    if let (Some(boundaries), Some(fingerprint)) = (
+        material.token_byte_boundaries.as_deref(),
+        material.token_piece_fingerprint,
+    ) {
+        insert_token_piece_evidence(
+            transaction,
+            material.call.id(),
+            blobs,
+            boundaries.len(),
+            fingerprint,
+            created_at_ms,
+        )?;
+    }
     insert_completed_projection_evidence(transaction, material, blobs, created_at_ms)?;
     insert_batch_case(
         transaction,
@@ -2085,6 +2227,19 @@ fn insert_cancelled_adoption(
             created_at_ms,
         ],
     )?;
+    if let (Some(boundaries), Some(fingerprint)) = (
+        material.token_byte_boundaries.as_deref(),
+        material.token_piece_fingerprint,
+    ) {
+        insert_token_piece_evidence(
+            transaction,
+            material.call.id(),
+            blobs,
+            boundaries.len(),
+            fingerprint,
+            created_at_ms,
+        )?;
+    }
     insert_batch_case(
         transaction,
         batch_fingerprint,
@@ -2093,6 +2248,40 @@ fn insert_cancelled_adoption(
         "cancelled",
         material.verification_fingerprint,
     )
+}
+
+fn insert_token_piece_evidence(
+    transaction: &Transaction<'_>,
+    call_id: loom_research_types::ModelCallId,
+    blobs: &StoredCaseBlobs,
+    boundary_count: usize,
+    token_piece_fingerprint: BlobId,
+    created_at_ms: i64,
+) -> Result<()> {
+    let token_piece = blobs
+        .token_piece
+        .as_ref()
+        .ok_or_else(|| admission_error("token-piece blobs are absent"))?;
+    transaction.execute(
+        "INSERT INTO research_token_piece_evidence(
+            call_id, raw_piece_bytes_blob_id, raw_piece_byte_len,
+            boundary_vector_blob_id, boundary_count,
+            token_piece_fingerprint, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            call_id.to_string(),
+            token_piece.raw_piece_bytes_blob_id.to_string(),
+            checked_sql_usize(
+                token_piece.raw_piece_byte_len,
+                "raw token-piece byte length"
+            )?,
+            token_piece.boundary_vector_blob_id.to_string(),
+            checked_sql_usize(boundary_count, "token-piece boundary count")?,
+            token_piece_fingerprint.to_string(),
+            created_at_ms,
+        ],
+    )?;
+    Ok(())
 }
 
 fn insert_adopted_model_call(
@@ -2378,6 +2567,22 @@ fn decode_token_ids(bytes: &[u8], expected_count: usize) -> Result<Vec<u32>> {
     Ok(bytes
         .chunks_exact(4)
         .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn decode_token_boundaries(bytes: &[u8], expected_count: usize) -> Result<Vec<u64>> {
+    if bytes.len() != expected_count.saturating_mul(8) || !bytes.len().is_multiple_of(8) {
+        return Err(StoreError::CorruptDatabase(
+            "token boundary byte length is inconsistent".into(),
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|chunk| {
+            u64::from_be_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ])
+        })
         .collect())
 }
 
@@ -2949,6 +3154,15 @@ fn verify_completed_case(
 ) -> Result<CaseAdoptionMaterial> {
     let raw = load_raw_completed_case(store, &case.call_id)?;
     let (raw_output, generated_token_ids) = load_completed_output(store, &raw)?;
+    let (raw_token_piece_bytes, token_byte_boundaries, token_piece_fingerprint) =
+        match load_token_piece_evidence(store, &case.call_id, generated_token_ids.len())? {
+            Some(evidence) => (
+                Some(evidence.raw_piece_bytes),
+                Some(evidence.boundaries),
+                Some(evidence.fingerprint),
+            ),
+            None => (None, None, None),
+        };
     let event_json = read_backend_evidence_blob(store, &raw.event_blob_id, "event stream blob ID")?;
     let backend_audit_json =
         read_backend_evidence_blob(store, &raw.receipt_blob_id, "backend receipt blob ID")?;
@@ -2978,6 +3192,9 @@ fn verify_completed_case(
         call,
         raw_output,
         generated_token_ids,
+        raw_token_piece_bytes,
+        token_byte_boundaries,
+        token_piece_fingerprint,
         event_json,
         backend_audit_json,
         displayed_output,
@@ -3130,6 +3347,7 @@ fn load_completed_projection(
     Ok(projection)
 }
 
+#[allow(clippy::too_many_lines)]
 fn verify_cancelled_case(
     store: &ProjectStore,
     case: &StoredBatchCaseRow,
@@ -3202,6 +3420,15 @@ fn verify_cancelled_case(
         "cancelled token blob ID",
     )?)?;
     let generated_token_ids = decode_token_ids(&token_bytes, token_count)?;
+    let (raw_token_piece_bytes, token_byte_boundaries, token_piece_fingerprint) =
+        match load_token_piece_evidence(store, &case.call_id, generated_token_ids.len())? {
+            Some(evidence) => (
+                Some(evidence.raw_piece_bytes),
+                Some(evidence.boundaries),
+                Some(evidence.fingerprint),
+            ),
+            None => (None, None, None),
+        };
     if TokenEvidence::from_exact(&generated_token_ids)?.token_ids_fingerprint()
         != sql_blob_id(&raw.token_ids_fingerprint, "cancelled token fingerprint")?
     {
@@ -3223,6 +3450,9 @@ fn verify_cancelled_case(
         call,
         partial_raw_output,
         generated_token_ids,
+        raw_token_piece_bytes,
+        token_byte_boundaries,
+        token_piece_fingerprint,
         event_json: read_backend_evidence_blob(
             store,
             &raw.event_blob_id,
@@ -3237,6 +3467,75 @@ fn verify_cancelled_case(
     };
     validate_cancelled_adoption(&material, compiled_prompt_fingerprint)?;
     Ok(CaseAdoptionMaterial::Cancelled(material))
+}
+
+struct LoadedTokenPieceEvidence {
+    raw_piece_bytes: Vec<u8>,
+    boundaries: Vec<u64>,
+    fingerprint: BlobId,
+}
+
+fn load_token_piece_evidence(
+    store: &ProjectStore,
+    call_id: &str,
+    token_count: usize,
+) -> Result<Option<LoadedTokenPieceEvidence>> {
+    let (raw_blob, raw_len, boundary_blob, boundary_count, fingerprint): (
+        String,
+        i64,
+        String,
+        i64,
+        String,
+    ) = match store.connection.query_row(
+        "SELECT raw_piece_bytes_blob_id, raw_piece_byte_len,
+                boundary_vector_blob_id, boundary_count, token_piece_fingerprint
+         FROM research_token_piece_evidence WHERE call_id = ?1",
+        [call_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    ) {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let raw_piece_bytes = store.read_blob(sql_blob_id(&raw_blob, "raw token-piece blob ID")?)?;
+    if raw_piece_bytes.len() != sql_usize(raw_len, "raw token-piece byte length")? {
+        return Err(StoreError::CorruptDatabase(
+            "raw token-piece blob length mismatch".into(),
+        ));
+    }
+    let expected_boundary_count = token_count
+        .checked_add(1)
+        .ok_or_else(|| StoreError::CorruptDatabase("token boundary count overflow".into()))?;
+    if sql_usize(boundary_count, "token boundary count")? != expected_boundary_count {
+        return Err(StoreError::CorruptDatabase(
+            "token boundary count does not match generated tokens".into(),
+        ));
+    }
+    let boundary_bytes = store.read_blob(sql_blob_id(
+        &boundary_blob,
+        "token boundary vector blob ID",
+    )?)?;
+    let token_byte_boundaries = decode_token_boundaries(&boundary_bytes, expected_boundary_count)?;
+    let token_piece_fingerprint = sql_blob_id(&fingerprint, "token-piece fingerprint")?;
+    validate_exact_token_piece_material(
+        &raw_piece_bytes,
+        &token_byte_boundaries,
+        token_count,
+        token_piece_fingerprint,
+    )?;
+    Ok(Some(LoadedTokenPieceEvidence {
+        raw_piece_bytes,
+        boundaries: token_byte_boundaries,
+        fingerprint: token_piece_fingerprint,
+    }))
 }
 
 #[cfg(test)]
@@ -3576,6 +3875,8 @@ fn persisted_case_ref(case: &CaseAdoptionMaterial) -> PersistedInferenceCaseRef<
             model_call: &material.call,
             raw_output: &material.raw_output,
             generated_token_ids: &material.generated_token_ids,
+            raw_token_piece_bytes: material.raw_token_piece_bytes.as_deref(),
+            token_byte_boundaries: material.token_byte_boundaries.as_deref(),
             event_json: &material.event_json,
             backend_audit_json: &material.backend_audit_json,
             terminal_sampled_token_id: material.terminal_sampled_token_id,
@@ -3590,6 +3891,8 @@ fn persisted_case_ref(case: &CaseAdoptionMaterial) -> PersistedInferenceCaseRef<
             model_call: &material.call,
             raw_output: &material.partial_raw_output,
             generated_token_ids: &material.generated_token_ids,
+            raw_token_piece_bytes: material.raw_token_piece_bytes.as_deref(),
+            token_byte_boundaries: material.token_byte_boundaries.as_deref(),
             event_json: &material.event_json,
             backend_audit_json: &material.backend_audit_json,
             terminal_sampled_token_id: None,
@@ -3884,28 +4187,32 @@ fn stage_case_adoptions(
         .into_iter()
         .map(|outcome| match outcome {
             CaseAdoptionMaterial::Completed(material) => {
-                let blobs = store.store_case_blobs(
-                    &material.call,
-                    &material.raw_output,
-                    &material.generated_token_ids,
-                    &material.event_json,
-                    &material.backend_audit_json,
-                    material
+                let blobs = store.store_case_blobs(&StoreCaseBlobInput {
+                    call: &material.call,
+                    raw_output: &material.raw_output,
+                    token_ids: &material.generated_token_ids,
+                    raw_piece_bytes: material.raw_token_piece_bytes.as_deref(),
+                    token_byte_boundaries: material.token_byte_boundaries.as_deref(),
+                    event_json: &material.event_json,
+                    receipt_json: &material.backend_audit_json,
+                    displayed_output: material
                         .output_projection
                         .as_ref()
                         .map(|_| material.displayed_output.as_slice()),
-                )?;
+                })?;
                 Ok(StoredCaseAdoption::Completed { material, blobs })
             }
             CaseAdoptionMaterial::Cancelled(material) => {
-                let blobs = store.store_case_blobs(
-                    &material.call,
-                    &material.partial_raw_output,
-                    &material.generated_token_ids,
-                    &material.event_json,
-                    &material.backend_audit_json,
-                    None,
-                )?;
+                let blobs = store.store_case_blobs(&StoreCaseBlobInput {
+                    call: &material.call,
+                    raw_output: &material.partial_raw_output,
+                    token_ids: &material.generated_token_ids,
+                    raw_piece_bytes: material.raw_token_piece_bytes.as_deref(),
+                    token_byte_boundaries: material.token_byte_boundaries.as_deref(),
+                    event_json: &material.event_json,
+                    receipt_json: &material.backend_audit_json,
+                    displayed_output: None,
+                })?;
                 Ok(StoredCaseAdoption::Cancelled { material, blobs })
             }
         })
@@ -4013,6 +4320,20 @@ fn register_staged_blob_rows(
         ] {
             insert_blob_row(transaction, blob_id, byte_len, created_at_ms)?;
         }
+        if let Some(token_piece) = &blobs.token_piece {
+            insert_blob_row(
+                transaction,
+                token_piece.raw_piece_bytes_blob_id,
+                token_piece.raw_piece_byte_len,
+                created_at_ms,
+            )?;
+            insert_blob_row(
+                transaction,
+                token_piece.boundary_vector_blob_id,
+                token_piece.boundary_vector_byte_len,
+                created_at_ms,
+            )?;
+        }
         if let Some((blob_id, byte_len)) = blobs.displayed_output {
             insert_blob_row(transaction, blob_id, byte_len, created_at_ms)?;
         }
@@ -4109,7 +4430,9 @@ fn persist_staged_cases(
                     call: material.call,
                     raw_output: material.raw_output,
                     token_ids: material.generated_token_ids,
-                    token_byte_boundaries: None,
+                    raw_token_piece_bytes: material.raw_token_piece_bytes,
+                    token_byte_boundaries: material.token_byte_boundaries,
+                    token_mapping_fingerprint: material.token_piece_fingerprint,
                     verification_fingerprint: material.verification_fingerprint,
                 });
             }
@@ -4376,32 +4699,38 @@ impl ProjectStore {
         preflight_batch_adoption(self, &material)
     }
 
-    fn store_case_blobs(
-        &self,
-        call: &ModelCall,
-        raw_output: &[u8],
-        token_ids: &[u32],
-        event_json: &[u8],
-        receipt_json: &[u8],
-        displayed_output: Option<&[u8]>,
-    ) -> Result<StoredCaseBlobs> {
-        let call_record = serde_json::to_vec(call)?;
-        let token_bytes = encode_token_ids(token_ids);
-        let displayed_output = match displayed_output {
+    fn store_case_blobs(&self, input: &StoreCaseBlobInput<'_>) -> Result<StoredCaseBlobs> {
+        let call_record = serde_json::to_vec(input.call)?;
+        let token_bytes = encode_token_ids(input.token_ids);
+        let token_piece = match (input.raw_piece_bytes, input.token_byte_boundaries) {
+            (Some(raw), Some(boundaries)) => {
+                let boundary_bytes = encode_token_boundaries(boundaries);
+                Some(StoredTokenPieceBlobs {
+                    raw_piece_bytes_blob_id: self.put_blob(raw)?,
+                    raw_piece_byte_len: raw.len(),
+                    boundary_vector_blob_id: self.put_blob(&boundary_bytes)?,
+                    boundary_vector_byte_len: boundary_bytes.len(),
+                })
+            }
+            (None, None) => None,
+            _ => return Err(admission_error("token-piece evidence is partially present")),
+        };
+        let displayed_output = match input.displayed_output {
             Some(bytes) => Some((self.put_blob(bytes)?, bytes.len())),
             None => None,
         };
         Ok(StoredCaseBlobs {
             call_record_blob_id: self.put_blob(&call_record)?,
             call_record_byte_len: call_record.len(),
-            raw_output_blob_id: self.put_blob(raw_output)?,
-            raw_output_byte_len: raw_output.len(),
+            raw_output_blob_id: self.put_blob(input.raw_output)?,
+            raw_output_byte_len: input.raw_output.len(),
             token_ids_blob_id: self.put_blob(&token_bytes)?,
             token_ids_byte_len: token_bytes.len(),
-            event_blob_id: self.put_blob(event_json)?,
-            event_byte_len: event_json.len(),
-            receipt_blob_id: self.put_blob(receipt_json)?,
-            receipt_byte_len: receipt_json.len(),
+            token_piece,
+            event_blob_id: self.put_blob(input.event_json)?,
+            event_byte_len: input.event_json.len(),
+            receipt_blob_id: self.put_blob(input.receipt_json)?,
+            receipt_byte_len: input.receipt_json.len(),
             displayed_output,
         })
     }
@@ -4503,8 +4832,16 @@ impl ProjectStore {
         Ok(AdmittedModelCall {
             session_nonce: self.session_nonce,
             call,
+            raw_token_piece_bytes: replay
+                .token_byte_boundaries
+                .as_ref()
+                .map(|_| raw_output.clone()),
             raw_output,
             token_ids,
+            token_mapping_fingerprint: replay
+                .token_byte_boundaries
+                .as_deref()
+                .map(token_boundaries_fingerprint),
             token_byte_boundaries: replay.token_byte_boundaries,
             verification_fingerprint: replay.verification_fingerprint,
         })
@@ -5292,7 +5629,7 @@ fn verify_declared_token_mapping(
                 .token_byte_boundaries
                 .as_deref()
                 .ok_or_else(|| admission_error("span claims token mapping absent from receipt"))?;
-            if token_boundaries_fingerprint(boundaries) != claim {
+            if admitted_call.token_mapping_fingerprint != Some(claim) {
                 return Err(admission_error(
                     "span token-boundary claim differs from replayed receipt",
                 ));
@@ -5318,6 +5655,7 @@ fn verify_declared_token_mapping(
     }
 }
 
+#[cfg(test)]
 fn token_boundaries_fingerprint(boundaries: &[u64]) -> BlobId {
     let mut bytes = Vec::with_capacity(40 + boundaries.len() * 8);
     bytes.extend_from_slice(b"loom/token-byte-boundaries/v1\0");
@@ -5723,6 +6061,14 @@ fn encode_token_ids(token_ids: &[u32]) -> Vec<u8> {
     bytes
 }
 
+fn encode_token_boundaries(boundaries: &[u64]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(boundaries.len().saturating_mul(8));
+    for boundary in boundaries {
+        bytes.extend_from_slice(&boundary.to_be_bytes());
+    }
+    bytes
+}
+
 fn admission_record_id(kind: &str, subject: &str) -> ResearchAdmissionRecordId {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"loom/research-admission/v1\0");
@@ -5756,6 +6102,7 @@ pub(crate) mod tests {
     use loom_inference::{
         NonauthorizingPersistedCaseOutcomeTestVector, NonauthorizingPersistedCaseTestSpec,
         NonauthorizingPersistedCaseTestVector, NonauthorizingPersistedEvidenceTestVector,
+        nonauthorizing_legacy_persisted_evidence_test_vector_for_cases,
         nonauthorizing_persisted_evidence_test_vector_for_cases,
     };
     use loom_research_types::{
@@ -6095,6 +6442,9 @@ adapters = []
             call,
             partial_raw_output,
             generated_token_ids,
+            raw_token_piece_bytes: None,
+            token_byte_boundaries: None,
+            token_piece_fingerprint: None,
             event_json,
             backend_audit_json,
             verification_fingerprint: BlobId::digest(
@@ -6162,6 +6512,9 @@ adapters = []
             model_call,
             raw_output,
             generated_token_ids,
+            raw_token_piece_bytes,
+            token_byte_boundaries,
+            has_exact_token_piece_trace,
             event_json,
             backend_audit_json,
             terminal_sampled_token_id,
@@ -6177,6 +6530,11 @@ adapters = []
                 call: model_call,
                 raw_output,
                 generated_token_ids,
+                token_piece_fingerprint: has_exact_token_piece_trace.then(|| {
+                    token_piece_trace_fingerprint(&raw_token_piece_bytes, &token_byte_boundaries)
+                }),
+                raw_token_piece_bytes: has_exact_token_piece_trace.then_some(raw_token_piece_bytes),
+                token_byte_boundaries: has_exact_token_piece_trace.then_some(token_byte_boundaries),
                 event_json,
                 backend_audit_json,
                 displayed_output,
@@ -6190,6 +6548,16 @@ adapters = []
                     call: model_call,
                     partial_raw_output: raw_output,
                     generated_token_ids,
+                    token_piece_fingerprint: has_exact_token_piece_trace.then(|| {
+                        token_piece_trace_fingerprint(
+                            &raw_token_piece_bytes,
+                            &token_byte_boundaries,
+                        )
+                    }),
+                    raw_token_piece_bytes: has_exact_token_piece_trace
+                        .then_some(raw_token_piece_bytes),
+                    token_byte_boundaries: has_exact_token_piece_trace
+                        .then_some(token_byte_boundaries),
                     event_json,
                     backend_audit_json,
                     verification_fingerprint,
@@ -6204,33 +6572,62 @@ adapters = []
         prompt_evidence: StorePromptEvidence,
         case_specs: &[NonauthorizingPersistedCaseTestSpec],
     ) -> BatchAdoptionMaterial {
+        batch_adoption_fixture(store, binding, prompt_evidence, case_specs, false)
+    }
+
+    fn legacy_batch_adoption_fixture(
+        store: &ProjectStore,
+        binding: BaseWriterBinding,
+        prompt_evidence: StorePromptEvidence,
+        case_specs: &[NonauthorizingPersistedCaseTestSpec],
+    ) -> BatchAdoptionMaterial {
+        batch_adoption_fixture(store, binding, prompt_evidence, case_specs, true)
+    }
+
+    fn batch_adoption_fixture(
+        store: &ProjectStore,
+        binding: BaseWriterBinding,
+        prompt_evidence: StorePromptEvidence,
+        case_specs: &[NonauthorizingPersistedCaseTestSpec],
+        legacy_v1: bool,
+    ) -> BatchAdoptionMaterial {
         let binding: StoreBindingEvidence = binding.into();
-        let vector = nonauthorizing_persisted_evidence_test_vector_for_cases(
-            PersistedBindingEvidenceRef {
-                binding_id: &binding.binding_id,
-                binding_fingerprint: binding.binding_fingerprint,
-                model_sha256: binding.model_sha256,
-                model_byte_len: binding.model_byte_len,
-                tokenizer_sha256: binding.tokenizer_sha256,
-                multimodal_projector_sha256: binding.projector_sha256,
-                context_tokens: binding.context_tokens,
-            },
-            PersistedPromptEvidenceRef {
-                project_id: prompt_evidence.project_id,
-                scope: prompt_evidence.scope,
-                source_prompt_fingerprint: prompt_evidence.source_prompt_fingerprint,
-                content_fingerprint: prompt_evidence.content_fingerprint,
-                treatment_recipe_fingerprint: prompt_evidence.treatment_recipe_fingerprint,
-                raw_utf8: &prompt_evidence.raw_utf8,
-                raw_blob_id: prompt_evidence.raw_blob_id,
-                form: prompt_evidence.form,
-                token_policy: prompt_evidence.token_policy,
-                ordered_token_ids: &prompt_evidence.ordered_token_ids,
-                token_fingerprint: prompt_evidence.token_fingerprint,
-                compiled_fingerprint: prompt_evidence.compiled_fingerprint,
-            },
-            case_specs,
-        )
+        let binding_ref = PersistedBindingEvidenceRef {
+            binding_id: &binding.binding_id,
+            binding_fingerprint: binding.binding_fingerprint,
+            model_sha256: binding.model_sha256,
+            model_byte_len: binding.model_byte_len,
+            tokenizer_sha256: binding.tokenizer_sha256,
+            multimodal_projector_sha256: binding.projector_sha256,
+            context_tokens: binding.context_tokens,
+        };
+        let prompt_ref = PersistedPromptEvidenceRef {
+            project_id: prompt_evidence.project_id,
+            scope: prompt_evidence.scope,
+            source_prompt_fingerprint: prompt_evidence.source_prompt_fingerprint,
+            content_fingerprint: prompt_evidence.content_fingerprint,
+            treatment_recipe_fingerprint: prompt_evidence.treatment_recipe_fingerprint,
+            raw_utf8: &prompt_evidence.raw_utf8,
+            raw_blob_id: prompt_evidence.raw_blob_id,
+            form: prompt_evidence.form,
+            token_policy: prompt_evidence.token_policy,
+            ordered_token_ids: &prompt_evidence.ordered_token_ids,
+            token_fingerprint: prompt_evidence.token_fingerprint,
+            compiled_fingerprint: prompt_evidence.compiled_fingerprint,
+        };
+        let vector = if legacy_v1 {
+            nonauthorizing_legacy_persisted_evidence_test_vector_for_cases(
+                binding_ref,
+                prompt_ref,
+                case_specs,
+            )
+        } else {
+            nonauthorizing_persisted_evidence_test_vector_for_cases(
+                binding_ref,
+                prompt_ref,
+                case_specs,
+            )
+        }
         .expect("strict synthetic persisted vector");
         let NonauthorizingPersistedEvidenceTestVector {
             backend_request_id,
@@ -6760,9 +7157,21 @@ adapters = []
             call: call.clone(),
             raw_output: raw_output.clone(),
             token_ids: token_ids.clone(),
+            raw_token_piece_bytes: Some(raw_output.clone()),
             token_byte_boundaries: Some(vec![0, raw_output.len() as u64]),
+            token_mapping_fingerprint: Some(token_boundaries_fingerprint(&[
+                0,
+                raw_output.len() as u64,
+            ])),
             verification_fingerprint: BlobId::digest(b"admitted call verification"),
         };
+        assert_eq!(
+            admitted_call
+                .exact_token_span(0..1)
+                .expect("exact token span"),
+            raw_output.as_slice()
+        );
+        assert!(admitted_call.exact_token_span(0..2).is_err());
         let admitted_span = AdmittedGeneratedSpan {
             session_nonce,
             record: span_record,
@@ -6927,6 +7336,164 @@ adapters = []
             )
             .expect("diagnostic seal");
         assert_eq!(seal, (0, 1));
+    }
+
+    #[test]
+    fn schema_nine_v1_receipt_replays_after_v10_without_claiming_exact_spans() {
+        let directory = tempdir().expect("temporary project");
+        let root = directory.path().join("Novel");
+        let batch_fingerprint = {
+            let (mut store, _) = ProjectStore::initialize(&root, "Novel").expect("initialize");
+            let prompt = store_prompt_fixture(&mut store);
+            let cases = [strict_case_spec(0, ModelCallId::new(), true)];
+            let batch =
+                legacy_batch_adoption_fixture(&store, test_base_writer_binding(), prompt, &cases);
+            let adopted = adopt_strict_test_batch(&mut store, batch);
+            assert_eq!(adopted.admitted_calls().len(), 1);
+            assert!(adopted.admitted_calls()[0].exact_token_span(0..1).is_err());
+            let trace_rows: i64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM research_token_piece_evidence",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("token-piece row count");
+            assert_eq!(
+                trace_rows, 0,
+                "legacy evidence must not gain a synthetic trace"
+            );
+            let fingerprint = adopted.verification_fingerprint();
+            let replayed = store
+                .replay_inference_batch_evidence(fingerprint)
+                .expect("legacy v1 receipt replays under schema 10");
+            assert_eq!(replayed.batch_fingerprint(), fingerprint);
+            fingerprint
+        };
+
+        let reopened = ProjectStore::open(&root).expect("reopen migrated project");
+        let replayed = reopened
+            .replay_inference_batch_evidence(batch_fingerprint)
+            .expect("legacy v1 receipt survives reopen");
+        assert_eq!(replayed.completed_call_count(), 1);
+    }
+
+    fn assert_split_zero_and_endpoint_token_pieces(admitted: &AdmittedModelCall) {
+        assert_eq!(
+            admitted.exact_token_span(0..1).expect("split prefix"),
+            &[0xc3]
+        );
+        assert_eq!(
+            admitted.exact_token_span(1..2).expect("split suffix"),
+            &[0xa9]
+        );
+        assert_eq!(
+            admitted.exact_token_span(2..3).expect("zero-byte piece"),
+            b""
+        );
+        assert_eq!(
+            admitted.exact_token_span(3..4).expect("endpoint piece"),
+            b"STOP"
+        );
+    }
+
+    #[test]
+    fn exact_trace_survives_store_reopen_and_rejects_retokenized_boundary_tampering() {
+        let directory = tempdir().expect("temporary project");
+        let root = directory.path().join("Novel");
+        let (batch_fingerprint, completed_call_id) = {
+            let (mut store, _) = ProjectStore::initialize(&root, "Novel").expect("initialize");
+            let prompt = store_prompt_fixture(&mut store);
+            // Token 0 and 1 split one UTF-8 scalar; token 2 is zero-byte; token
+            // 3 is an endpoint/stop piece absent from the displayed output.
+            let completed = NonauthorizingPersistedCaseTestSpec::completed_with_token_piece_trace(
+                ModelCallId::new(),
+                101,
+                "é".as_bytes(),
+                &[701, 702, 703, 704],
+                b"\xc3\xa9STOP",
+                &[0, 1, 2, 2, 6],
+            )
+            .expect("completed exact trace");
+            // The partial cancelled trace deliberately contains invalid UTF-8.
+            let cancelled = NonauthorizingPersistedCaseTestSpec::cancelled_with_token_piece_trace(
+                ModelCallId::new(),
+                102,
+                b"partial",
+                &[801, 802],
+                &[0xff, 0x00],
+                &[0, 1, 2],
+            )
+            .expect("cancelled exact trace");
+            let batch = strict_batch_adoption_fixture(
+                &store,
+                test_base_writer_binding(),
+                prompt,
+                &[completed, cancelled],
+            );
+            let adopted = adopt_strict_test_batch(&mut store, batch);
+            let admitted = &adopted.admitted_calls()[0];
+            assert_split_zero_and_endpoint_token_pieces(admitted);
+            let trace_rows: i64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM research_token_piece_evidence",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("token-piece row count");
+            assert_eq!(
+                trace_rows, 2,
+                "completed and cancelled traces are diagnostic evidence"
+            );
+            (
+                adopted.verification_fingerprint(),
+                admitted.call_id().to_string(),
+            )
+        };
+
+        let reopened = ProjectStore::open(&root).expect("reopen exact trace store");
+        let replayed = reopened
+            .replay_inference_batch_evidence(batch_fingerprint)
+            .expect("exact completed and cancelled traces survive reopen");
+        assert_eq!(replayed.completed_call_count(), 1);
+        assert_eq!(replayed.cancelled_call_count(), 1);
+
+        let retokenized = encode_token_boundaries(&[0, 2, 2, 2, 6]);
+        let substituted_blob = reopened
+            .put_blob(&retokenized)
+            .expect("store tampered boundary blob");
+        reopened
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO blobs(blob_id, byte_len, media_type, created_at_ms)
+                 VALUES (?1, ?2, 'application/octet-stream', ?3)",
+                rusqlite::params![
+                    substituted_blob.to_string(),
+                    i64::try_from(retokenized.len()).expect("bounded boundary blob"),
+                    now_unix_ms().max(1),
+                ],
+            )
+            .expect("register tampered boundary blob");
+        reopened
+            .connection
+            .execute_batch("DROP TRIGGER research_token_piece_evidence_immutable_update")
+            .expect("cross the immutable boundary for corruption test");
+        reopened
+            .connection
+            .execute(
+                "UPDATE research_token_piece_evidence
+                 SET boundary_vector_blob_id = ?1
+                 WHERE call_id = ?2",
+                rusqlite::params![substituted_blob.to_string(), completed_call_id],
+            )
+            .expect("inject retokenized boundary corruption");
+        assert!(
+            reopened
+                .replay_inference_batch_evidence(batch_fingerprint)
+                .is_err(),
+            "persisted boundary substitution must fail against the committed trace fingerprint"
+        );
     }
 
     #[test]

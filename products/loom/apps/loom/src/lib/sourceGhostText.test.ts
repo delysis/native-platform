@@ -8,6 +8,7 @@ import {
   sourceGhostPresentationCompatible,
   sourceGhostRectIntersectsViewport,
   sourceGhostVisibilityWitnessMatches,
+  sourceTabEdit,
   sourceTextHasStrongRtl,
   sourceGhostTextForTextarea,
   sourceMirrorDirectionIsSupported,
@@ -243,17 +244,40 @@ describe('sourceGhostKeyAction', () => {
     ...overrides
   });
 
-  it('accepts only an unmodified Tab for a currently visible ghost', () => {
+  it('accepts a visible ghost and otherwise inserts an ordinary tab', () => {
     expect(sourceGhostKeyAction(key(), true)).toBe('accept');
     expect(sourceGhostKeyAction(key({ shiftKey: true }), true)).toBeNull();
     expect(sourceGhostKeyAction(key({ metaKey: true }), true)).toBeNull();
-    expect(sourceGhostKeyAction(key(), false)).toBeNull();
+    expect(sourceGhostKeyAction(key(), false)).toBe('insert_tab');
   });
 
   it('dismisses with Escape and ignores IME key events', () => {
     expect(sourceGhostKeyAction(key({ key: 'Escape', keyCode: 27 }), true)).toBe('dismiss');
     expect(sourceGhostKeyAction(key({ isComposing: true }), true)).toBeNull();
     expect(sourceGhostKeyAction(key({ keyCode: 229 }), true)).toBeNull();
+  });
+});
+
+describe('sourceTabEdit', () => {
+  it('inserts a literal tab at the caret and replaces selections', () => {
+    expect(sourceTabEdit('beforeafter', 6, 6)).toEqual({
+      value: 'before\tafter',
+      caret: 7
+    });
+    expect(sourceTabEdit('before selected after', 7, 15)).toEqual({
+      value: 'before \t after',
+      caret: 8
+    });
+  });
+
+  it('uses textarea UTF-16 offsets without splitting adjacent emoji', () => {
+    expect(sourceTabEdit('A 🧵 waits', 4, 4)).toEqual({
+      value: 'A 🧵\t waits',
+      caret: 5
+    });
+    expect(sourceTabEdit('text', -1, 2)).toBeNull();
+    expect(sourceTabEdit('text', 3, 2)).toBeNull();
+    expect(sourceTabEdit('text', 0, 5)).toBeNull();
   });
 });
 
@@ -324,11 +348,11 @@ describe('source ghost visibility authority', () => {
     )).toBe(false);
   });
 
-  it('requires non-empty agreement between the layout report and live keydown witness', () => {
-    expect(sourceGhostVisibilityWitnessMatches('candidate:blob', 'candidate:blob', 'candidate:blob'))
+  it('requires the live keydown witness to match the exact presentation', () => {
+    expect(sourceGhostVisibilityWitnessMatches('candidate:blob', 'candidate:blob'))
       .toBe(true);
-    expect(sourceGhostVisibilityWitnessMatches('candidate:blob', '', '')).toBe(false);
-    expect(sourceGhostVisibilityWitnessMatches('candidate:blob', 'candidate:blob', '')).toBe(false);
-    expect(sourceGhostVisibilityWitnessMatches('candidate:blob', '', 'candidate:blob')).toBe(false);
+    expect(sourceGhostVisibilityWitnessMatches('candidate:blob', '')).toBe(false);
+    expect(sourceGhostVisibilityWitnessMatches('', '')).toBe(false);
+    expect(sourceGhostVisibilityWitnessMatches('candidate:blob', 'other:blob')).toBe(false);
   });
 });

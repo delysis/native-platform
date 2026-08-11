@@ -3,39 +3,10 @@ import type { BranchCard } from './types';
 import { verifyBranchBody, type VerifiedBranchBody } from './branchBodyProof';
 import {
   autocompleteDisposition,
-  ghostReviewAffordance,
   selectVerifiedGhostSuggestion,
   verifiedGhostSuggestion,
   visibleVerifiedGhostSuggestion
 } from './ghostSuggestion';
-
-describe('ghostReviewAffordance', () => {
-  it('keeps a compact readable review action for one active suggestion', () => {
-    expect(ghostReviewAffordance(true, 1)).toEqual({
-      visible: true,
-      label: 'Review',
-      ariaLabel: 'Review the current writing suggestion'
-    });
-  });
-
-  it('describes additional and non-inline alternatives without empty controls', () => {
-    expect(ghostReviewAffordance(true, 3)).toEqual({
-      visible: true,
-      label: '2 more',
-      ariaLabel: 'Review the current writing suggestion and 2 more alternatives'
-    });
-    expect(ghostReviewAffordance(false, 1)).toEqual({
-      visible: true,
-      label: '1 alternative',
-      ariaLabel: 'Review 1 writing alternative'
-    });
-    expect(ghostReviewAffordance(false, 0)).toEqual({
-      visible: false,
-      label: '',
-      ariaLabel: ''
-    });
-  });
-});
 
 function branch(overrides: Partial<BranchCard> = {}): BranchCard {
   const text = ' rain.\n\nThen light.';

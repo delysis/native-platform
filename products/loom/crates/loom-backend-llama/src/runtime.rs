@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crossbeam_channel::RecvTimeoutError;
-use llama_native_engine::{GenerationTicket, NativeModelHandle};
+use crossbeam_channel::{Receiver, RecvTimeoutError};
+use llama_native_engine::{GenerationTicket, NativeModelHandle, TryWaitOutcome};
 use llama_native_host::{
     HostCachePolicy, HostSlotShutdown, JoinedHostSlot, JoinedNativeHost, NativeHost,
     NativeHostConfig, ProcessExitJoinedNativeHost,
@@ -340,8 +340,10 @@ impl BatchRuntime for NativeHostRuntime {
         let handle = self.host.acquire(profile.as_native_config())?;
         residency.model_paths.insert(profile.model_path.clone());
         let ticket = handle.generate_batch(request)?;
+        let event_receiver = ticket.events.clone();
         Ok(Arc::new(NativeBatchExecution {
-            ticket: Arc::new(ticket),
+            ticket: Mutex::new(Some(ticket)),
+            event_receiver,
         }))
     }
 
@@ -436,26 +438,44 @@ fn unobservable_residency_error(context: &str) -> NativeError {
 
 #[derive(Debug)]
 struct NativeBatchExecution {
-    ticket: Arc<GenerationTicket>,
+    ticket: Mutex<Option<GenerationTicket>>,
+    event_receiver: Receiver<GenerationEvent>,
 }
 
 impl BatchExecution for NativeBatchExecution {
     fn cancel_case(&self, case_id: &str) -> bool {
-        self.ticket.cancel_branch(case_id)
+        self.ticket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|ticket| ticket.cancel_branch(case_id))
     }
 
     fn receive_event_timeout(
         &self,
         timeout: Duration,
     ) -> Result<Option<GenerationEvent>, NativeError> {
-        match self.ticket.events.recv_timeout(timeout) {
+        match self.event_receiver.recv_timeout(timeout) {
             Ok(event) => Ok(Some(event)),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Ok(None),
         }
     }
 
     fn try_result(&self) -> Result<Option<Vec<GenerationOutput>>, NativeError> {
-        self.ticket.try_wait()
+        let mut guard = self
+            .ticket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(ticket) = guard.take() else {
+            return Ok(None);
+        };
+        match ticket.try_wait()? {
+            TryWaitOutcome::Pending(ticket) => {
+                *guard = Some(ticket);
+                Ok(None)
+            }
+            TryWaitOutcome::Ready(outputs) => Ok(Some(outputs)),
+        }
     }
 }
 

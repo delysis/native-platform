@@ -81,7 +81,31 @@ export interface SourceGhostKey {
   altKey: boolean;
 }
 
-export type SourceGhostKeyAction = 'accept' | 'dismiss' | null;
+export type SourceGhostKeyAction = 'accept' | 'dismiss' | 'insert_tab' | null;
+
+export interface SourceTabEdit {
+  value: string;
+  caret: number;
+}
+
+/** Exact textarea replacement semantics for an ordinary literal Tab edit. */
+export function sourceTabEdit(
+  value: string,
+  selectionStart: number,
+  selectionEnd: number
+): SourceTabEdit | null {
+  if (
+    !Number.isSafeInteger(selectionStart) ||
+    !Number.isSafeInteger(selectionEnd) ||
+    selectionStart < 0 ||
+    selectionEnd < selectionStart ||
+    selectionEnd > value.length
+  ) return null;
+  return {
+    value: `${value.slice(0, selectionStart)}\t${value.slice(selectionEnd)}`,
+    caret: selectionStart + 1
+  };
+}
 
 export function renderedSourceGhostPresentationKey(
   plan: SourceGhostPlan | null,
@@ -145,14 +169,12 @@ export function sourceGhostRectIntersectsViewport(
   return horizontal && vertical;
 }
 
-/** Both the post-layout report and the keydown-time DOM witness must agree. */
+/** The keydown-time DOM witness is authoritative for what is visible now. */
 export function sourceGhostVisibilityWitnessMatches(
   expectedPresentationKey: string,
-  reportedPresentationKey: string,
   livePresentationKey: string
 ): boolean {
   return expectedPresentationKey.length > 0 &&
-    reportedPresentationKey === expectedPresentationKey &&
     livePresentationKey === expectedPresentationKey;
 }
 
@@ -303,14 +325,15 @@ export function sourceGhostKeyAction(
   hasVisibleGhost: boolean
 ): SourceGhostKeyAction {
   if (
-    !hasVisibleGhost ||
     event.isComposing ||
     event.keyCode === 229 ||
     event.metaKey ||
     event.ctrlKey ||
     event.altKey
   ) return null;
-  if (event.key === 'Escape') return 'dismiss';
-  if (event.key === 'Tab' && !event.shiftKey) return 'accept';
+  if (event.key === 'Escape') return hasVisibleGhost ? 'dismiss' : null;
+  if (event.key === 'Tab' && !event.shiftKey) {
+    return hasVisibleGhost ? 'accept' : 'insert_tab';
+  }
   return null;
 }

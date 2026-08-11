@@ -28,7 +28,8 @@ use crate::{
 
 const REQUEST_DOMAIN: &str = "loom/native-base-writer-request/v1";
 const CONTROLLED_REQUEST_DOMAIN: &str = "loom/native-controlled-base-writer-request/v1";
-const VERIFICATION_DOMAIN: &str = "loom/native-base-writer-verification/v1";
+const LEGACY_VERIFICATION_DOMAIN: &str = "loom/native-base-writer-verification/v1";
+const TOKEN_PIECE_VERIFICATION_DOMAIN: &str = "loom/native-base-writer-verification/v2";
 const ENVELOPE_DOMAIN: &str = "loom/native-base-writer-envelope/v1";
 const COMPILED_PROMPT_DOMAIN: &str = "loom/compiled-base-completion-prompt/v1";
 const PROMPT_TOKEN_DOMAIN: &str = "loom/exact-native-token-ids/v1";
@@ -149,6 +150,8 @@ pub struct PersistedInferenceCaseRef<'a> {
     pub model_call: &'a ModelCall,
     pub raw_output: &'a [u8],
     pub generated_token_ids: &'a [u32],
+    pub raw_token_piece_bytes: Option<&'a [u8]>,
+    pub token_byte_boundaries: Option<&'a [u64]>,
     pub event_json: &'a [u8],
     pub backend_audit_json: &'a [u8],
     pub terminal_sampled_token_id: Option<i32>,
@@ -164,6 +167,10 @@ impl fmt::Debug for PersistedInferenceCaseRef<'_> {
             .field("call_id", &self.model_call.id())
             .field("raw_output_bytes", &self.raw_output.len())
             .field("generated_token_count", &self.generated_token_ids.len())
+            .field(
+                "has_exact_token_piece_trace",
+                &self.raw_token_piece_bytes.is_some(),
+            )
             .field("event_json_bytes", &self.event_json.len())
             .field("backend_audit_json_bytes", &self.backend_audit_json.len())
             .field(
@@ -497,6 +504,14 @@ struct StrictBackendAuditRecord {
     sampling: StrictSamplingConfig,
     model_fingerprint: StrictModelFingerprint,
     output: StrictGenerationOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_token_piece_bytes_blob_id: Option<BlobId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_token_piece_byte_len: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token_byte_boundaries: Option<Vec<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token_piece_fingerprint: Option<BlobId>,
     terminal_sampled_token_id: Option<i32>,
     event_stream_blob_id: BlobId,
 }
@@ -744,6 +759,8 @@ pub(crate) struct CallVerificationCommitment<'a> {
     pub(crate) control_program_fingerprint: BlobId,
     pub(crate) raw_output: &'a [u8],
     pub(crate) generated_token_ids: &'a [u32],
+    pub(crate) raw_token_piece_bytes: &'a [u8],
+    pub(crate) token_byte_boundaries: &'a [u64],
     pub(crate) event_blob_id: BlobId,
     pub(crate) backend_receipt_blob_id: BlobId,
     pub(crate) terminal_sampled_token_id: Option<i32>,
@@ -752,7 +769,17 @@ pub(crate) struct CallVerificationCommitment<'a> {
 pub(crate) fn derive_call_verification_fingerprint(
     commitment: &CallVerificationCommitment<'_>,
 ) -> BlobId {
-    let mut digest = CanonicalDigest::new(VERIFICATION_DOMAIN);
+    // Schema 9 and earlier receipts committed no exact token-piece trace. Keep
+    // their v1 byte stream identical; a migration must not invalidate evidence
+    // that was already admitted. A non-empty boundary vector (including `[0]`
+    // for an empty generated sequence) selects the trace-aware v2 commitment.
+    let has_exact_token_piece_trace = !commitment.token_byte_boundaries.is_empty();
+    let domain = if has_exact_token_piece_trace {
+        TOKEN_PIECE_VERIFICATION_DOMAIN
+    } else {
+        LEGACY_VERIFICATION_DOMAIN
+    };
+    let mut digest = CanonicalDigest::new(domain);
     digest.project_id(commitment.project_id);
     digest.str(commitment.request_id);
     digest.model_call_id(commitment.call_id);
@@ -769,6 +796,13 @@ pub(crate) fn derive_call_verification_fingerprint(
     digest.u64(commitment.generated_token_ids.len() as u64);
     for token in commitment.generated_token_ids {
         digest.u32(*token);
+    }
+    if has_exact_token_piece_trace {
+        digest.blob(BlobId::digest(commitment.raw_token_piece_bytes));
+        digest.u64(commitment.token_byte_boundaries.len() as u64);
+        for boundary in commitment.token_byte_boundaries {
+            digest.u64(*boundary);
+        }
     }
     digest.blob(commitment.event_blob_id);
     digest.blob(commitment.backend_receipt_blob_id);
@@ -852,6 +886,7 @@ pub use test_support::{
     NonauthorizingPersistedBindingTestVector, NonauthorizingPersistedCaseOutcomeTestVector,
     NonauthorizingPersistedCaseTestSpec, NonauthorizingPersistedCaseTestVector,
     NonauthorizingPersistedEvidenceTestVector, NonauthorizingPersistedPromptTestVector,
+    nonauthorizing_legacy_persisted_evidence_test_vector_for_cases,
     nonauthorizing_persisted_evidence_test_vector,
     nonauthorizing_persisted_evidence_test_vector_for,
     nonauthorizing_persisted_evidence_test_vector_for_cases,
@@ -1504,6 +1539,7 @@ fn validate_uncontrolled_case_audit(
     }
     validate_event_ledger(ledger, case, &native_case_id, audit.output.state)?;
     let backend_receipt_blob_id = BlobId::digest(case.backend_audit_json);
+    let exact_trace = validate_audit_token_piece_trace(case, audit, index)?;
     let (completed, displayed_output_blob_id) = validate_output_and_terminal(
         case,
         &audit.output,
@@ -1533,6 +1569,8 @@ fn validate_uncontrolled_case_audit(
             control_program_fingerprint: uncontrolled_program_fingerprint(),
             raw_output: case.raw_output,
             generated_token_ids: case.generated_token_ids,
+            raw_token_piece_bytes: exact_trace.raw_piece_bytes,
+            token_byte_boundaries: exact_trace.boundaries,
             event_blob_id,
             backend_receipt_blob_id,
             terminal_sampled_token_id: case.terminal_sampled_token_id,
@@ -1552,6 +1590,94 @@ fn validate_uncontrolled_case_audit(
         event_blob_id,
         backend_receipt_blob_id,
     })
+}
+
+#[derive(Clone, Copy)]
+struct PersistedTokenPieceTraceRef<'a> {
+    raw_piece_bytes: &'a [u8],
+    boundaries: &'a [u64],
+}
+
+fn validate_audit_token_piece_trace<'a>(
+    case: PersistedInferenceCaseRef<'a>,
+    audit: &StrictBackendAuditRecord,
+    index: usize,
+) -> Result<PersistedTokenPieceTraceRef<'a>, PersistedEvidenceError> {
+    if let Some(trace) = validate_persisted_token_piece_trace(case, index)? {
+        if audit.raw_token_piece_bytes_blob_id != Some(BlobId::digest(trace.raw_piece_bytes))
+            || audit.raw_token_piece_byte_len != Some(trace.raw_piece_bytes.len())
+            || audit.token_byte_boundaries.as_deref() != Some(trace.boundaries)
+            || audit.token_piece_fingerprint
+                != Some(derive_token_piece_fingerprint(
+                    trace.raw_piece_bytes,
+                    trace.boundaries,
+                ))
+        {
+            return Err(case_error(
+                index,
+                "backend audit token-piece trace mismatch",
+            ));
+        }
+        return Ok(trace);
+    }
+    if audit.raw_token_piece_bytes_blob_id.is_some()
+        || audit.raw_token_piece_byte_len.is_some()
+        || audit.token_byte_boundaries.is_some()
+        || audit.token_piece_fingerprint.is_some()
+    {
+        return Err(case_error(
+            index,
+            "backend audit has unpaired token-piece evidence",
+        ));
+    }
+    Ok(PersistedTokenPieceTraceRef {
+        raw_piece_bytes: &[],
+        boundaries: &[],
+    })
+}
+
+fn validate_persisted_token_piece_trace(
+    case: PersistedInferenceCaseRef<'_>,
+    index: usize,
+) -> Result<Option<PersistedTokenPieceTraceRef<'_>>, PersistedEvidenceError> {
+    let (raw_piece_bytes, boundaries) =
+        match (case.raw_token_piece_bytes, case.token_byte_boundaries) {
+            (Some(raw), Some(boundaries)) => (raw, boundaries),
+            (None, None) => return Ok(None),
+            _ => return Err(case_error(index, "token-piece trace is partially present")),
+        };
+    let expected = case
+        .generated_token_ids
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| case_error(index, "token-piece boundary count overflow"))?;
+    if boundaries.len() != expected
+        || boundaries.first() != Some(&0)
+        || boundaries.last().copied() != u64::try_from(raw_piece_bytes.len()).ok()
+        || boundaries.windows(2).any(|pair| pair[0] > pair[1])
+    {
+        return Err(case_error(index, "token-piece trace is not canonical"));
+    }
+    Ok(Some(PersistedTokenPieceTraceRef {
+        raw_piece_bytes,
+        boundaries,
+    }))
+}
+
+fn derive_token_piece_fingerprint(raw_piece_bytes: &[u8], boundaries: &[u64]) -> BlobId {
+    let mut bytes = Vec::with_capacity(
+        40usize
+            .saturating_add(raw_piece_bytes.len())
+            .saturating_add(boundaries.len().saturating_mul(8)),
+    );
+    bytes.extend_from_slice(b"loom/token-piece-trace/v1\0");
+    bytes.extend_from_slice(&(raw_piece_bytes.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(raw_piece_bytes);
+    bytes.extend_from_slice(&(boundaries.len() as u64).to_be_bytes());
+    for boundary in boundaries {
+        bytes.extend_from_slice(&boundary.to_be_bytes());
+    }
+    BlobId::digest(&bytes)
 }
 
 fn validate_controlled_case_audit(
@@ -1714,6 +1840,12 @@ fn finish_controlled_case_facts(
     receipt: ControlledCaseReceiptFacts,
 ) -> Result<CheckedPersistedCaseFacts, PersistedEvidenceError> {
     let index = case.input_index;
+    if case.raw_token_piece_bytes.is_some() || case.token_byte_boundaries.is_some() {
+        return Err(case_error(
+            index,
+            "controlled receipts do not carry exact token-piece evidence",
+        ));
+    }
     let verification_fingerprint =
         derive_call_verification_fingerprint(&CallVerificationCommitment {
             project_id: batch.prompt.project_id,
@@ -1730,6 +1862,8 @@ fn finish_controlled_case_facts(
             control_program_fingerprint: audit.control_program_fingerprint,
             raw_output: case.raw_output,
             generated_token_ids: case.generated_token_ids,
+            raw_token_piece_bytes: &[],
+            token_byte_boundaries: &[],
             event_blob_id: receipt.event,
             backend_receipt_blob_id: receipt.backend_receipt,
             terminal_sampled_token_id: case.terminal_sampled_token_id,
@@ -2336,6 +2470,8 @@ mod tests {
                 control_program_fingerprint: self.control_program_fingerprint,
                 raw_output: &self.raw_output,
                 generated_token_ids: &self.generated_token_ids,
+                raw_token_piece_bytes: &[],
+                token_byte_boundaries: &[],
                 event_blob_id: self.event_blob_id,
                 backend_receipt_blob_id: self.backend_receipt_blob_id,
                 terminal_sampled_token_id: self.terminal_sampled_token_id,
@@ -2416,6 +2552,8 @@ mod tests {
             control_program_fingerprint: uncontrolled_program_fingerprint(),
             raw_output: b"output",
             generated_token_ids: &[7, 8, 9],
+            raw_token_piece_bytes: &[],
+            token_byte_boundaries: &[],
             event_blob_id: blob(b"events"),
             backend_receipt_blob_id: blob(b"receipt"),
             terminal_sampled_token_id: Some(2),
@@ -2442,6 +2580,43 @@ mod tests {
             batch_fingerprint.to_hex(),
             "9e9e4ee8584133e39a914b6e83ae21b9a9ea2019e866195f6a7f3445a6e817e6"
         );
+    }
+
+    #[test]
+    fn exact_token_piece_trace_versions_the_legacy_call_commitment() {
+        let project_id = ProjectId::from_str("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("project ID");
+        let call_id = ModelCallId::from_str("01ARZ3NDEKTSV4RRFFQ69G5FAE").expect("model-call ID");
+        let request_id = "loom-base-v1-fixed-request";
+        let commitment = |raw_token_piece_bytes: &[u8], token_byte_boundaries: &[u64]| {
+            derive_call_verification_fingerprint(&CallVerificationCommitment {
+                project_id,
+                request_id,
+                call_id,
+                scope: fixed_scope(),
+                model_fingerprint: blob(b"model"),
+                source_prompt_fingerprint: blob(b"source"),
+                treatment_recipe_fingerprint: blob(b"treatment"),
+                raw_prompt_blob_id: blob(b"raw prompt"),
+                compiled_prompt_fingerprint: blob(b"compiled"),
+                prompt_token_fingerprint: blob(b"prompt tokens"),
+                sampler_fingerprint: blob(b"sampler"),
+                control_program_fingerprint: uncontrolled_program_fingerprint(),
+                raw_output: b"output",
+                generated_token_ids: &[7, 8, 9],
+                raw_token_piece_bytes,
+                token_byte_boundaries,
+                event_blob_id: blob(b"events"),
+                backend_receipt_blob_id: blob(b"receipt"),
+                terminal_sampled_token_id: Some(2),
+            })
+        };
+
+        let legacy = commitment(&[], &[]);
+
+        let exact = commitment(b"output", &[0, 1, 3, 6]);
+        assert_ne!(exact, legacy);
+        assert_ne!(exact, commitment(b"output", &[0, 1, 2, 6]));
+        assert_ne!(exact, commitment(b"outpu!", &[0, 1, 3, 6]));
     }
 
     #[test]
@@ -2835,6 +3010,8 @@ mod tests {
             model_call: &call,
             raw_output: raw,
             generated_token_ids: &tokens,
+            raw_token_piece_bytes: None,
+            token_byte_boundaries: None,
             event_json: b"{}",
             backend_audit_json: b"{}",
             terminal_sampled_token_id: None,
@@ -2971,6 +3148,8 @@ mod tests {
             model_call: &call,
             raw_output: raw,
             generated_token_ids: &tokens,
+            raw_token_piece_bytes: None,
+            token_byte_boundaries: None,
             event_json: b"{}",
             backend_audit_json: b"{}",
             terminal_sampled_token_id: None,

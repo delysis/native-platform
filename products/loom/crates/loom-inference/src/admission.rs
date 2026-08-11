@@ -145,6 +145,9 @@ pub struct VerifiedBaseWriterCall {
     pub(crate) model_call: ModelCall,
     pub(crate) raw_output: Vec<u8>,
     pub(crate) generated_token_ids: Vec<u32>,
+    pub(crate) raw_token_piece_bytes: Option<Vec<u8>>,
+    pub(crate) token_byte_boundaries: Option<Vec<u64>>,
+    pub(crate) token_piece_fingerprint: Option<BlobId>,
     pub(crate) event_json: Vec<u8>,
     pub(crate) backend_audit_json: Vec<u8>,
     pub(crate) displayed_output: Vec<u8>,
@@ -217,6 +220,18 @@ impl fmt::Debug for VerifiedBaseWriterCall {
             .field("call_id", &self.model_call.id())
             .field("raw_output_bytes", &self.raw_output.len())
             .field("generated_token_count", &self.generated_token_ids.len())
+            .field(
+                "has_exact_token_piece_trace",
+                &self.token_piece_fingerprint.is_some(),
+            )
+            .field(
+                "raw_token_piece_bytes",
+                &self.raw_token_piece_bytes.as_ref().map_or(0, Vec::len),
+            )
+            .field(
+                "token_byte_boundary_count",
+                &self.token_byte_boundaries.as_ref().map_or(0, Vec::len),
+            )
             .field("event_json_bytes", &self.event_json.len())
             .field("backend_audit_json_bytes", &self.backend_audit_json.len())
             .field("displayed_output_bytes", &self.displayed_output.len())
@@ -244,6 +259,14 @@ impl VerifiedBaseWriterCall {
         &self.generated_token_ids
     }
 
+    pub fn raw_token_piece_bytes(&self) -> Option<&[u8]> {
+        self.raw_token_piece_bytes.as_deref()
+    }
+
+    pub fn token_byte_boundaries(&self) -> Option<&[u64]> {
+        self.token_byte_boundaries.as_deref()
+    }
+
     pub fn event_json(&self) -> &[u8] {
         &self.event_json
     }
@@ -261,7 +284,7 @@ impl VerifiedBaseWriterCall {
     }
 
     pub const fn token_boundaries_fingerprint(&self) -> Option<BlobId> {
-        None
+        self.token_piece_fingerprint
     }
 
     pub const fn terminal_sampled_token_id(&self) -> Option<i32> {
@@ -281,6 +304,9 @@ impl VerifiedBaseWriterCall {
             model_call: self.model_call,
             raw_output: self.raw_output,
             generated_token_ids: self.generated_token_ids,
+            raw_token_piece_bytes: self.raw_token_piece_bytes,
+            token_byte_boundaries: self.token_byte_boundaries,
+            token_piece_fingerprint: self.token_piece_fingerprint,
             event_json: self.event_json,
             backend_audit_json: self.backend_audit_json,
             displayed_output: self.displayed_output,
@@ -297,6 +323,9 @@ pub struct VerifiedBaseWriterCallParts {
     model_call: ModelCall,
     raw_output: Vec<u8>,
     generated_token_ids: Vec<u32>,
+    raw_token_piece_bytes: Option<Vec<u8>>,
+    token_byte_boundaries: Option<Vec<u64>>,
+    token_piece_fingerprint: Option<BlobId>,
     event_json: Vec<u8>,
     backend_audit_json: Vec<u8>,
     displayed_output: Vec<u8>,
@@ -313,6 +342,15 @@ impl fmt::Debug for VerifiedBaseWriterCallParts {
             .field("call_id", &self.model_call.id())
             .field("raw_output_bytes", &self.raw_output.len())
             .field("generated_token_count", &self.generated_token_ids.len())
+            .field(
+                "raw_token_piece_bytes",
+                &self.raw_token_piece_bytes.as_ref().map_or(0, Vec::len),
+            )
+            .field(
+                "token_byte_boundary_count",
+                &self.token_byte_boundaries.as_ref().map_or(0, Vec::len),
+            )
+            .field("token_piece_fingerprint", &self.token_piece_fingerprint)
             .field("event_json_bytes", &self.event_json.len())
             .field("backend_audit_json_bytes", &self.backend_audit_json.len())
             .field("displayed_output_bytes", &self.displayed_output.len())
@@ -339,6 +377,9 @@ impl VerifiedBaseWriterCallParts {
             ModelCall,
             Vec<u8>,
             Vec<u32>,
+            Option<Vec<u8>>,
+            Option<Vec<u64>>,
+            Option<BlobId>,
             Vec<u8>,
             Vec<u8>,
             Vec<u8>,
@@ -351,6 +392,9 @@ impl VerifiedBaseWriterCallParts {
             self.model_call,
             self.raw_output,
             self.generated_token_ids,
+            self.raw_token_piece_bytes,
+            self.token_byte_boundaries,
+            self.token_piece_fingerprint,
             self.event_json,
             self.backend_audit_json,
             self.displayed_output,
@@ -366,6 +410,9 @@ pub struct CancelledBaseWriterDiagnostic {
     pub(crate) model_call: ModelCall,
     pub(crate) partial_raw_output: Vec<u8>,
     pub(crate) generated_token_ids: Vec<u32>,
+    pub(crate) raw_token_piece_bytes: Option<Vec<u8>>,
+    pub(crate) token_byte_boundaries: Option<Vec<u64>>,
+    pub(crate) token_piece_fingerprint: Option<BlobId>,
     pub(crate) event_json: Vec<u8>,
     pub(crate) backend_audit_json: Vec<u8>,
     pub(crate) verification_fingerprint: BlobId,
@@ -378,6 +425,15 @@ impl fmt::Debug for CancelledBaseWriterDiagnostic {
             .field("call_id", &self.model_call.id())
             .field("partial_raw_output_bytes", &self.partial_raw_output.len())
             .field("generated_token_count", &self.generated_token_ids.len())
+            .field(
+                "raw_token_piece_bytes",
+                &self.raw_token_piece_bytes.as_ref().map_or(0, Vec::len),
+            )
+            .field(
+                "token_byte_boundary_count",
+                &self.token_byte_boundaries.as_ref().map_or(0, Vec::len),
+            )
+            .field("token_piece_fingerprint", &self.token_piece_fingerprint)
             .field("event_json_bytes", &self.event_json.len())
             .field("backend_audit_json_bytes", &self.backend_audit_json.len())
             .field("verification_fingerprint", &self.verification_fingerprint)
@@ -415,6 +471,9 @@ impl CancelledBaseWriterDiagnostic {
             model_call: self.model_call,
             partial_raw_output: self.partial_raw_output,
             generated_token_ids: self.generated_token_ids,
+            raw_token_piece_bytes: self.raw_token_piece_bytes,
+            token_byte_boundaries: self.token_byte_boundaries,
+            token_piece_fingerprint: self.token_piece_fingerprint,
             event_json: self.event_json,
             backend_audit_json: self.backend_audit_json,
             verification_fingerprint: self.verification_fingerprint,
@@ -427,6 +486,9 @@ pub struct CancelledBaseWriterDiagnosticParts {
     model_call: ModelCall,
     partial_raw_output: Vec<u8>,
     generated_token_ids: Vec<u32>,
+    raw_token_piece_bytes: Option<Vec<u8>>,
+    token_byte_boundaries: Option<Vec<u64>>,
+    token_piece_fingerprint: Option<BlobId>,
     event_json: Vec<u8>,
     backend_audit_json: Vec<u8>,
     verification_fingerprint: BlobId,
@@ -439,6 +501,15 @@ impl fmt::Debug for CancelledBaseWriterDiagnosticParts {
             .field("call_id", &self.model_call.id())
             .field("partial_raw_output_bytes", &self.partial_raw_output.len())
             .field("generated_token_count", &self.generated_token_ids.len())
+            .field(
+                "raw_token_piece_bytes",
+                &self.raw_token_piece_bytes.as_ref().map_or(0, Vec::len),
+            )
+            .field(
+                "token_byte_boundary_count",
+                &self.token_byte_boundaries.as_ref().map_or(0, Vec::len),
+            )
+            .field("token_piece_fingerprint", &self.token_piece_fingerprint)
             .field("event_json_bytes", &self.event_json.len())
             .field("backend_audit_json_bytes", &self.backend_audit_json.len())
             .field("verification_fingerprint", &self.verification_fingerprint)
@@ -449,12 +520,25 @@ impl fmt::Debug for CancelledBaseWriterDiagnosticParts {
 impl CancelledBaseWriterDiagnosticParts {
     pub fn consume<R>(
         self,
-        consumer: impl FnOnce(ModelCall, Vec<u8>, Vec<u32>, Vec<u8>, Vec<u8>, BlobId) -> R,
+        consumer: impl FnOnce(
+            ModelCall,
+            Vec<u8>,
+            Vec<u32>,
+            Option<Vec<u8>>,
+            Option<Vec<u64>>,
+            Option<BlobId>,
+            Vec<u8>,
+            Vec<u8>,
+            BlobId,
+        ) -> R,
     ) -> R {
         consumer(
             self.model_call,
             self.partial_raw_output,
             self.generated_token_ids,
+            self.raw_token_piece_bytes,
+            self.token_byte_boundaries,
+            self.token_piece_fingerprint,
             self.event_json,
             self.backend_audit_json,
             self.verification_fingerprint,

@@ -17,12 +17,12 @@ The following was observed on one Apple-silicon macOS development machine with R
 | Check | Observed result |
 | --- | --- |
 | `cargo test --workspace --all-targets` | Passed on exact head; environment-bound real-model/frontier tests remained explicitly ignored by the default suite; no failures |
-| `pnpm --filter @delysis/loom test` | Passed: 29 files, 169 tests |
+| `pnpm --filter @delysis/loom test` | Passed: 29 files, 173 tests |
 | `pnpm --filter @delysis/loom check` | Passed with 0 errors and 0 warnings |
 | `pnpm --filter @delysis/loom build` | Passed; Vite produced the static frontend bundle |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed with no warnings |
 | Real GGUF ignored tests | The generic Loom raw-family smoke and the feature-gated native writer bridge passed against the exact 484,220,320-byte Qwen artifact on the final native pin; the pinned Gemma 4 E2B base Loom acceptance and companion native-kit raw batch/cancellation acceptance remain separately qualified below |
-| Native macOS real-model smoke | The unique unsigned `app.delysis.loom.c1fb2a6f.acceptance` bundle loaded the exact Gemma 4 E2B base Q8 model on M4 Max Metal, produced three durable alternatives, rendered and accepted a multiline caret ghost, persisted an immutable promotion, quit with native resources deallocated, reopened the exact manuscript, and quit cleanly again. Exact identities are in the audit receipt. |
+| Native macOS real-model smoke | The corrected unique unsigned `app.delysis.loom.r4ux3.f7a693.acceptance` bundle removed the rejected skip/count chrome, inserted and reopened an exact literal tab, loaded the exact Gemma 4 E2B base Q8 model on M4 Max Metal, rendered and accepted a caret-local ghost, persisted an immutable promotion, and returned focus to Source mode for a second literal-tab edit. Exact identities and limits are in the UX receipt. |
 
 Not run as part of this snapshot: signed packaging, updater tests, Windows/Linux launched-app workflows, CUDA/Vulkan certification, Playwright automation, screen-reader certification, exhaustive IME matrices, forced termination at every filesystem phase, full large-project latency measurement, and adapter-overhead benchmarking. Source CI nevertheless compiles and tests the portable workspace on Linux, macOS, and Windows.
 
@@ -52,7 +52,7 @@ It passed 1/1 on the CPU path in 203.51 seconds using the 4,954,576,032-byte Gem
 
 The companion real-model `llama-native-kit` acceptance also passed against the configured local GGUF. That separate test covers exact text/token completion inputs, ordered seeded raw-family outputs, measured shared-prefix reuse, exactly one terminal state per branch, independent cancellation of one branch while its sibling completes, and fail-closed unsupported FIM. This is evidence for the pinned dependency, not a Loom desktop end-to-end test.
 
-The separate desktop acceptance is recorded in [audit-receipts/2026-08-11-real-gemma-desktop.md](audit-receipts/2026-08-11-real-gemma-desktop.md). It establishes the exact local Metal suggestion/promotion/quit/relaunch slice described there. These combined results do **not** establish:
+The original desktop slice is recorded in [audit-receipts/2026-08-11-real-gemma-desktop.md](audit-receipts/2026-08-11-real-gemma-desktop.md). Direct author feedback rejected that build's Tab fallback and visible review chrome, so it is historical evidence rather than current product acceptance. The corrected exact-bundle exercise is recorded in [audit-receipts/2026-08-11-r4-quiet-editor-ux.md](audit-receipts/2026-08-11-r4-quiet-editor-ux.md). These combined results do **not** establish:
 
 - Windows CUDA/CPU or Linux CUDA/Vulkan/CPU support, nor general macOS Metal certification beyond the exercised machine and model;
 - throughput, responsiveness, thermal behavior, or less-than-5-percent adapter overhead;
@@ -72,7 +72,7 @@ The separate desktop acceptance is recorded in [audit-receipts/2026-08-11-real-g
 - Generation model/environment, authority, prompt/context recipe, token trace, generated-span, attestation, selection, terminal, command, and event DTOs.
 - Explicit probability stages and inference-evidence classes; absence remains representable instead of being converted to confidence.
 - Closed build-model policies with typed names, activations, writer profile identities, exact model digests/sizes, and source-order rank. The default desktop selection is the immutable `writer-gemma4-base-v2`/`quiet_default` contract; v1 retains `project_opt_in` semantics. Build artifacts contain the canonical policy and digest but no builder-local model path. A read-only IPC exposes the bound name/activation/digest identity; the renderer decoder rejects anything outside the exact checked-in triples, and preference derivation defaults off until a verified activation is supplied. Rust admits automatic generation only through a private move-only witness bound to the exact resident model and policy capabilities; automatic budget reservation borrows that proof, request construction preserves it, and native submission consumes the opaque authorized request. Arbitrary loaded models remain manual-only.
-- The quiet writing surface presents exact cursor-bound continuations as non-document ProseMirror ghost decorations. Selection requires an exact UTF-8 Markdown witness, a flattened visible-text grapheme boundary, faithful parse/serialize projection, an onscreen caret and first fragment, and a renderer-side SHA-256 proof for the immutable branch body and run. Tab consumes only the currently visible presentation identity; Escape, editing, IME composition, blur, and caret movement fail closed without changing manuscript bytes. Contextually unpresentable candidates are skipped so later exact alternatives or one bounded retry can proceed. Alternatives use a temporary bounded dialog rather than a persistent rail, and technical evidence stays collapsed until requested.
+- The quiet writing surface presents exact cursor-bound continuations as non-document ProseMirror ghost decorations. Selection requires an exact UTF-8 Markdown witness, a flattened visible-text grapheme boundary, faithful parse/serialize projection, an onscreen caret and first fragment, and a renderer-side SHA-256 proof for the immutable branch body and run. A live keydown-time DOM witness authorizes Tab promotion; otherwise Tab inserts the same literal U+0009 in Visual and Source mode and never traverses into application chrome. Loom's documented visual Markdown dialect reserves every raw tab as manuscript indentation, including at a line edge; it intentionally does not claim CommonMark's conflicting tab-indented-code interpretation. Tabs inside unsupported fenced or inline code fail the exact visual round-trip gate. Escape, editing, IME composition, blur, and caret movement fail closed without changing candidate authority. Contextually unpresentable candidates are skipped so later exact suggestions or one bounded retry can proceed. Suggestion review is available only under Writing options, filtered by the active surface's presentation contract; technical evidence stays collapsed until requested.
 
 **Deferred:** a frozen public compatibility promise beyond the checked-in v1 project/generation golden fixtures. The DTO set does not yet cover the entire planned search, evaluation, retrieval, source, replay-witness, and export domain.
 
@@ -149,10 +149,10 @@ The separate desktop acceptance is recorded in [audit-receipts/2026-08-11-real-g
 
 **Implemented and automated or locally smoke-tested:**
 
-- Direct in-process use of the raw and controlled batch APIs from pinned published `llama-native-kit` commit `2d69f086e922ed7bdfd6236baf5a1ad0ed568360`.
+- Direct in-process use of the raw and controlled batch APIs from exact `llama-native-kit` successor commit `f7a69316c64d857b99bd847dd44cd852fc5b4ca4`. The commit is not yet remotely published, so this candidate currently requires the audited local source rewrite described in the R4 receipt.
 - Exact `GenerationInput::Completion` construction with no Loom-added system prompt, chat template, instruction, or suffix after the manuscript boundary.
 - Multiple continuation cases with independent sampling records, bounded event forwarding, ordered output validation, branch-specific cancellation calls, and one Loom terminal event per branch.
-- Generated token IDs and optional typed probability observations mapped into Loom token traces.
+- Generated token IDs and optional typed probability observations mapped into Loom token traces. Ordinary verified generation additionally persists the tokenizer-emitted raw piece bytes and cumulative boundaries under a v2 verification commitment; controlled and historical calls make no exact-piece claim.
 - Preservation/digesting of native raw event streams and backend receipts.
 - Fail-closed distinction between live inference and fixtures; fixture runtimes cannot label output as live.
 - Runtime model inspection and required completion/token/cache capability checks.
@@ -201,7 +201,7 @@ The separate desktop acceptance is recorded in [audit-receipts/2026-08-11-real-g
 
 - Svelte 5 shell with a direct ProseMirror editor, source surface, outline, project selection, document switching, counts, save state, focus mode, status/live regions, reduced-motion/high-contrast CSS, and keyboard shortcuts.
 - Normal desktop launch reattaches the live session or provisions/reopens an app-owned ordinary-file `My Writing` project and focuses its `Untitled.md` note. The explanatory landing page and open-versus-create fork are absent from the normal path; one-document projects hide the empty outline.
-- Lossless-subset gate for visual Markdown. Imported or reopened content that the current parser/serializer cannot round-trip exactly is held in source mode. Once a document has safely entered a visual session, transient trailing end-of-file whitespace no longer unmounts the editor mid-keystroke; the native regression was reproduced, fixed, and checked while preserving the exact visible file bytes.
+- Lossless-dialect gate for visual Markdown. Imported or reopened content that the current parser/serializer cannot round-trip exactly is held in source mode. The dialect's one deliberate CommonMark divergence is raw U+0009, which always means manuscript indentation in Visual mode; external tab-indented code must be handled in Source mode. Once a document has safely entered a visual session, transient trailing end-of-file whitespace no longer unmounts the editor mid-keystroke; the native regression was reproduced, fixed, and checked while preserving the exact visible file bytes.
 - Exact verse codec for uniform LF, CRLF, or CR line endings. Mixed line endings are shown but editing is locked rather than normalized.
 - IME composition gates around editor projection, navigation, checkpointing, and close.
 - Serialized semantic saves, idempotent retry after uncertain acknowledgements, project/session/document/revision/blob validation, and stale-result suppression.
@@ -232,6 +232,7 @@ The separate desktop acceptance is recorded in [audit-receipts/2026-08-11-real-g
 - `.loom/drafts/**` is bounded mutable recovery state, not semantic history.
 - Equal bytes may share a blob but never collapse two causal occurrences.
 - Promoted model output retains immutable generation and token evidence. Later human edits retain unchanged generated slices and mark changed spans as human contributions.
+- Newly verified ordinary native calls retain content-addressed exact token-piece bytes and cumulative boundaries. Schema-9 and controlled receipts remain diagnostic without synthetic boundary reconstruction.
 - Text-only provenance cannot prove keystroke intent when a human retypes bytes identical to the source. The store does not claim otherwise.
 - Deleting `.loom/` leaves the visible manuscript readable and irreversibly removes sidecar-only history, branches, evidence, and drafts unless separately backed up.
 
@@ -270,7 +271,7 @@ The separate desktop acceptance is recorded in [audit-receipts/2026-08-11-real-g
 
 - [x] Created the Rust 2024 Loom workspace and kept project-owned Rust free of `unsafe`.
 - [x] Added a direct adapter against the product-neutral raw batch-family native-kit API.
-- [x] Pinned every native-kit consumer to published commit `2d69f086e922ed7bdfd6236baf5a1ad0ed568360`, including controlled generation, executor-owned operation leases, immutable build identity, host residency policy, joined-shutdown authority, and the cross-platform invariant tests, and reran the complete workspace compatibility gates.
+- [x] Pinned every native-kit consumer to exact successor `f7a69316c64d857b99bd847dd44cd852fc5b4ca4`, including move-only polling and ordinary-generation token-piece traces, and reran the complete workspace plus real Qwen/Gemma compatibility gates. Publication of that native commit remains a promotion prerequisite.
 - [ ] Complete and independently verify external Bloom credential revocation/rotation and any separately approved history remediation.
 - [x] Add SHA-pinned Loom Native full-history secret scanning and pull-request dependency-review automation. A successful remote run is not yet evidenced here.
 - [ ] Pin and integrate a verified `attachment-native-kit` release; no attachment dependency exists here.

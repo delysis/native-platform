@@ -1,6 +1,6 @@
 # Loom project format v1
 
-Status: initial versioned foundation. Project manifest schema version `1` is the stable on-disk compatibility boundary. The current branch reaches additive SQLite migration `9`; database migration numbers do not change the manifest version when they preserve the v1 contract.
+Status: initial versioned foundation. Project manifest schema version `1` is the stable on-disk compatibility boundary. The current branch reaches additive SQLite migration `10`; database migration numbers do not change the manifest version when they preserve the v1 contract. Migration 10 adds immutable, content-addressed exact token-piece bytes and cumulative boundary vectors for newly verified native calls while leaving historical migration-9 evidence replayable as diagnostic data without inventing missing boundaries.
 
 ## Authority split
 
@@ -8,6 +8,15 @@ Status: initial versioned foundation. Project manifest schema version `1` is the
 - `.loom/loom.sqlite3` is authoritative for revisions, causal occurrences, receipts, generation evidence, branch state, and pending visible-file projection.
 - `.loom/blobs/sha256/**` contains immutable payload bytes referenced by semantic history.
 - `.loom/drafts/**` contains at most two mutable crash-safe draft slots per document. Draft slots are explicitly not semantic history or immutable content-addressed artifacts.
+
+Visual prose uses Loom's byte-preserving Markdown dialect over the checked-in
+ProseMirror schema. It matches the admitted CommonMark subset except for raw
+U+0009: Visual mode always treats that byte as manuscript indentation, including
+at a line edge, so Tab has one exact meaning in both Visual and Source surfaces.
+It does not claim CommonMark's conflicting tab-indented-code interpretation.
+Authors who need that external syntax must use Source mode; fenced or inline code
+containing tabs remains outside the exact visual round-trip gate. Ordinary files
+retain the literal tab byte and no sidecar-only reconstruction is required.
 - `.loom/backups/outbox/**` temporarily preserves the exact file displaced at an outbox projection boundary or the bytes involved in a projection conflict.
 
 A missing `.loom/` sidecar means lost history and drafts, not a lost active manuscript.
