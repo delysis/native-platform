@@ -82,6 +82,24 @@
     "resolution": "the complete Rust 1.88 toolchain bin directory was placed first in PATH and both clippy scopes were rerun successfully with clippy 0.1.88",
     "claim": "the excluded mixed-toolchain attempt is not counted as product evidence"
   },
+  "supplemental_exact_evidence": {
+    "bundle": {
+      "source_revision": "4084d1120f63f7bf561e7381da7daec947cbcd44",
+      "path": "target/release/bundle/macos/Mom Llama R1 4084d11.app",
+      "identifier": "com.delysis.mom-llama.r1.4084d11.acceptance",
+      "executable_bytes": 34961856,
+      "executable_sha256": "7b010c7c4a76ae6fac66c2fce67100d7dca399f954f50f66e69a46a0ff11c157",
+      "minimum_macos": "13.0",
+      "packaging": "passed",
+      "launched": false
+    },
+    "real_qwen_cpu": {
+      "command": "MOM_LLAMA_MODEL_PATH=/Users/george/Documents/llama-native-kit/target/test-models/Qwen_Qwen3-0.6B-Q4_K_M.gguf cargo test -p mom-llama-runtime --test runtime real_native_base_completion_invokes_no_fixture -- --ignored --nocapture",
+      "model_bytes": 484220320,
+      "model_sha256": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14",
+      "outcome": "passed_1_of_1_real_engine_invoked_no_fixture_cpu_2.64s"
+    }
+  },
   "file_sha256": {
     "Cargo.lock": "e2f1a4bf856e1c10e704025cc93b88495f4332f379d64ae012b482d9ad3871fd",
     "Cargo.toml": "04a19f37c5a517177fd203b5b48170f4f37daff4266d14bb515802748a168aa9",
@@ -92,7 +110,6 @@
   "open_promotion_evidence": [
     "Publish immutable dependency commits f7a69316c64d857b99bd847dd44cd852fc5b4ca4 and 1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a before testing clean remote-only resolution.",
     "Run current-candidate remote CI after publication.",
-    "Build and identity-lock a bundle from exact source revision 4084d1120f63f7bf561e7381da7daec947cbcd44 or a docs-only descendant.",
     "Repeat real-Qwen active-generation Cmd+Q, joined shutdown, and immediate same-store relaunch against that exact bundle.",
     "Exercise Dock Quit or a directly identified AppleEvent Quit against that exact bundle."
   ],
