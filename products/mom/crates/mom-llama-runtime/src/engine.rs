@@ -1,5 +1,5 @@
 use crate::config::{Settings, resolve_settings};
-use crate::native_runtime::{resident_model, resident_status};
+use crate::native_runtime::{resident_model, resident_slots, resident_status};
 use crate::receipts::{Blocker, CommandResult};
 use anyhow::Result;
 use llama_native_engine::LLAMA_CPP_BINDING_VERSION;
@@ -32,13 +32,18 @@ pub fn engine_status() -> Result<CommandResult<EngineCheckOutput>> {
         ));
     }
     let model_path = settings.model_path.as_ref().cloned().unwrap_or_default();
+    let slot = resident_slots().into_iter().find(|slot| slot.slot_id == 0);
     let resident = resident_status().filter(|status| {
-        status.fingerprint.as_ref().is_some_and(|fingerprint| {
-            fingerprint.model_path == model_path
-                && fingerprint.context_tokens == settings.context_tokens
-                && fingerprint.batch_tokens == settings.batch_tokens
-                && fingerprint.max_sequences == settings.max_parallel_sequences.clamp(1, 4)
-        })
+        let Some(slot) = slot.as_ref() else {
+            return false;
+        };
+        let Some(fingerprint) = status.fingerprint.as_ref() else {
+            return false;
+        };
+        slot.model_path == model_path
+            && fingerprint.context_tokens == settings.context_tokens
+            && fingerprint.batch_tokens == settings.batch_tokens
+            && fingerprint.max_sequences == settings.max_parallel_sequences.clamp(1, 4)
     });
     let (readiness, backend) = resident.and_then(|status| status.fingerprint).map_or_else(
         || ("configured", "not_loaded".to_string()),

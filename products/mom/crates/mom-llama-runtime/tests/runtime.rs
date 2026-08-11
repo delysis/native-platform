@@ -1524,8 +1524,8 @@ fn product_runtime_rejects_network_process_and_copied_native_authority() -> Resu
         );
     }
     let workspace_manifest = fs::read_to_string(repo_root.join("Cargo.toml"))?;
-    assert!(workspace_manifest.contains("rev = \"c61692d48b0768bb242bcecb7a80c3318fc476b4\""));
-    assert!(workspace_manifest.contains("rev = \"9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe\""));
+    assert!(workspace_manifest.contains("rev = \"6a82439ee449599f7a7e477e1150ae29efdb23d6\""));
+    assert!(workspace_manifest.contains("rev = \"cf9b7ea2f8d381601ba674179d26d4d56e80f3df\""));
     assert!(workspace_manifest.contains("rev = \"a7702f423102716d9fa21b64c51c331d4044a31d\""));
     assert!(!workspace_manifest.contains("[patch."));
     assert!(!workspace_manifest.contains("attachment-native-host = { path ="));

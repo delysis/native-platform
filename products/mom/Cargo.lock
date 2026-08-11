@@ -1590,9 +1590,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "fte-backend-llama"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe#9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe"
+source = "git+https://github.com/delysis/free-token-energy?rev=cf9b7ea2f8d381601ba674179d26d4d56e80f3df#cf9b7ea2f8d381601ba674179d26d4d56e80f3df"
 dependencies = [
  "async-trait",
  "fte-types",
@@ -1607,7 +1617,7 @@ dependencies = [
 [[package]]
 name = "fte-loopback"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe#9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe"
+source = "git+https://github.com/delysis/free-token-energy?rev=cf9b7ea2f8d381601ba674179d26d4d56e80f3df#cf9b7ea2f8d381601ba674179d26d4d56e80f3df"
 dependencies = [
  "async-stream",
  "axum",
@@ -1628,7 +1638,7 @@ dependencies = [
 [[package]]
 name = "fte-protocols"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe#9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe"
+source = "git+https://github.com/delysis/free-token-energy?rev=cf9b7ea2f8d381601ba674179d26d4d56e80f3df#cf9b7ea2f8d381601ba674179d26d4d56e80f3df"
 dependencies = [
  "fte-types",
  "serde",
@@ -1638,7 +1648,7 @@ dependencies = [
 [[package]]
 name = "fte-router"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe#9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe"
+source = "git+https://github.com/delysis/free-token-energy?rev=cf9b7ea2f8d381601ba674179d26d4d56e80f3df#cf9b7ea2f8d381601ba674179d26d4d56e80f3df"
 dependencies = [
  "fte-types",
  "tokio",
@@ -1647,7 +1657,7 @@ dependencies = [
 [[package]]
 name = "fte-store"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe#9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe"
+source = "git+https://github.com/delysis/free-token-energy?rev=cf9b7ea2f8d381601ba674179d26d4d56e80f3df#cf9b7ea2f8d381601ba674179d26d4d56e80f3df"
 dependencies = [
  "fte-types",
  "rusqlite",
@@ -1657,7 +1667,7 @@ dependencies = [
 [[package]]
 name = "fte-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe#9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe"
+source = "git+https://github.com/delysis/free-token-energy?rev=cf9b7ea2f8d381601ba674179d26d4d56e80f3df#cf9b7ea2f8d381601ba674179d26d4d56e80f3df"
 dependencies = [
  "async-trait",
  "futures",
@@ -2792,9 +2802,8 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "llama-cpp-2"
-version = "0.1.153"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a86ff114bb5ec602625776ec11d80d6ac8d113c74460e6a17bd44a6fedff15ef"
+version = "0.1.154"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f#01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2806,22 +2815,22 @@ dependencies = [
 
 [[package]]
 name = "llama-cpp-sys-2"
-version = "0.1.153"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f244dd304a9ef81b0875c6a7cc04bc84a022870623dd292736527d59645f9c55"
+version = "0.1.154"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f#01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f"
 dependencies = [
  "bindgen",
  "cc",
  "cmake",
  "find_cuda_helper",
  "glob",
+ "sha2 0.10.9",
  "walkdir",
 ]
 
 [[package]]
 name = "llama-native-cache"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=c61692d48b0768bb242bcecb7a80c3318fc476b4#c61692d48b0768bb242bcecb7a80c3318fc476b4"
+source = "git+https://github.com/delysis/llama-native-kit?rev=6a82439ee449599f7a7e477e1150ae29efdb23d6#6a82439ee449599f7a7e477e1150ae29efdb23d6"
 dependencies = [
  "llama-native-types",
  "serde",
@@ -2831,10 +2840,11 @@ dependencies = [
 [[package]]
 name = "llama-native-engine"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=c61692d48b0768bb242bcecb7a80c3318fc476b4#c61692d48b0768bb242bcecb7a80c3318fc476b4"
+source = "git+https://github.com/delysis/llama-native-kit?rev=6a82439ee449599f7a7e477e1150ae29efdb23d6#6a82439ee449599f7a7e477e1150ae29efdb23d6"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",
+ "fs4",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "llama-native-types",
@@ -2844,7 +2854,7 @@ dependencies = [
 [[package]]
 name = "llama-native-host"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=c61692d48b0768bb242bcecb7a80c3318fc476b4#c61692d48b0768bb242bcecb7a80c3318fc476b4"
+source = "git+https://github.com/delysis/llama-native-kit?rev=6a82439ee449599f7a7e477e1150ae29efdb23d6#6a82439ee449599f7a7e477e1150ae29efdb23d6"
 dependencies = [
  "llama-native-cache",
  "llama-native-engine",
@@ -2854,9 +2864,10 @@ dependencies = [
 [[package]]
 name = "llama-native-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=c61692d48b0768bb242bcecb7a80c3318fc476b4#c61692d48b0768bb242bcecb7a80c3318fc476b4"
+source = "git+https://github.com/delysis/llama-native-kit?rev=6a82439ee449599f7a7e477e1150ae29efdb23d6#6a82439ee449599f7a7e477e1150ae29efdb23d6"
 dependencies = [
  "serde",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
 ]
 
@@ -4867,7 +4878,7 @@ dependencies = [
 [[package]]
 name = "tauri-plugin-free-token-energy"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe#9d98d6e0c079e5730cb8f5cd0a71cc89d22c96fe"
+source = "git+https://github.com/delysis/free-token-energy?rev=cf9b7ea2f8d381601ba674179d26d4d56e80f3df#cf9b7ea2f8d381601ba674179d26d4d56e80f3df"
 dependencies = [
  "fte-loopback",
  "fte-router",
