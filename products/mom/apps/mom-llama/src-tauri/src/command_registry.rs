@@ -62,8 +62,8 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     read("mom_llama_render_sidebar_fragment", false, false),
     read("mom_llama_render_persona_picker_fragment", false, false),
     read("mom_llama_render_settings_fragment", false, true),
-    long("mom_llama_pick_file", false, false),
-    long("mom_llama_engine_check", false, true),
+    long("mom_llama_pick_file", true, false),
+    long("mom_llama_engine_check", true, true),
     mutation("mom_llama_engine_configure", true, true),
     read("mom_llama_model_list", true, false),
     mutation("mom_llama_model_select", true, true),
@@ -71,7 +71,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_chat_dispatch", true, true),
     long("mom_llama_mention_dispatch", true, true),
     read("mom_llama_mention_candidates", true, false),
-    mutation("mom_llama_mention_cancel", false, true),
+    mutation("mom_llama_mention_cancel", true, true),
     long("mom_llama_mention_synthesize", true, true),
     mutation("mom_llama_persona_freeze", true, false),
     read("mom_llama_persona_list", true, false),
@@ -84,7 +84,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     mutation("mom_llama_persona_group_update", true, false),
     mutation("mom_llama_persona_group_delete", true, false),
     mutation("mom_llama_chat_cancel", true, true),
-    mutation("mom_llama_chat_skip_reasoning", false, true),
+    mutation("mom_llama_chat_skip_reasoning", true, true),
     long("mom_llama_chat_regenerate", true, true),
     long("mom_llama_chat_continue", true, true),
     mutation("mom_llama_conversation_new", true, false),
@@ -110,7 +110,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_attachment_import_paste", true, false),
     long("mom_llama_attachment_import", true, false),
     read("mom_llama_attachment_list", true, false),
-    long("mom_llama_attachment_preview", false, false),
+    long("mom_llama_attachment_preview", true, false),
     long("mom_llama_attachment_preview_bytes", false, false),
     read("mom_llama_settings_get", true, false),
     mutation("mom_llama_settings_reset", true, true),
@@ -126,12 +126,12 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     read("mom_llama_mcp_status", true, false),
     mutation("mom_llama_mcp_configure", true, false),
     read("mom_llama_mcp_list_servers", true, false),
-    long("mom_llama_mcp_list_tools", false, false),
+    long("mom_llama_mcp_list_tools", true, false),
     long("mom_llama_mcp_call_tool", true, false),
-    long("mom_llama_mcp_list_resources", false, false),
-    long("mom_llama_mcp_read_resource", false, false),
-    long("mom_llama_mcp_list_prompts", false, false),
-    long("mom_llama_mcp_get_prompt", false, false),
+    long("mom_llama_mcp_list_resources", true, false),
+    long("mom_llama_mcp_read_resource", true, false),
+    long("mom_llama_mcp_list_prompts", true, false),
+    long("mom_llama_mcp_get_prompt", true, false),
     mutation("mom_llama_tool_loop_prepare", true, false),
     long("mom_llama_tool_loop_run", true, true),
     mutation("mom_llama_tool_loop_cancel", true, true),
@@ -257,19 +257,6 @@ mod tests {
             "mom_llama_model_slot_load",
             "mom_llama_model_slot_unload",
         ]);
-        let non_store_mutations =
-            BTreeSet::from(["mom_llama_mention_cancel", "mom_llama_chat_skip_reasoning"]);
-        let non_store_long_operations = BTreeSet::from([
-            "mom_llama_pick_file",
-            "mom_llama_engine_check",
-            "mom_llama_attachment_preview",
-            "mom_llama_attachment_preview_bytes",
-            "mom_llama_mcp_list_tools",
-            "mom_llama_mcp_list_resources",
-            "mom_llama_mcp_read_resource",
-            "mom_llama_mcp_list_prompts",
-            "mom_llama_mcp_get_prompt",
-        ]);
         let command_source = include_str!("commands.rs");
 
         for spec in COMMAND_SPECS {
@@ -288,13 +275,9 @@ mod tests {
                 spec.name
             );
             assert!(!spec.allowed_during_quiesce, "{} quiesce policy", spec.name);
-            let expected_store_mutation = match spec.class {
-                CommandClass::ReadOnly => {
-                    command_body(command_source, spec.name).contains("command_value(")
-                }
-                CommandClass::Mutation => !non_store_mutations.contains(spec.name),
-                CommandClass::LongOperation => !non_store_long_operations.contains(spec.name),
-            };
+            let body = command_body(command_source, spec.name);
+            let expected_store_mutation =
+                body.contains("command_value(") || body.contains("blocking_command(");
             assert_eq!(
                 spec.mutates_store, expected_store_mutation,
                 "{} store authority",
@@ -322,10 +305,18 @@ mod tests {
     fn every_command_has_app_lease() {
         let source = include_str!("commands.rs");
         for spec in COMMAND_SPECS {
+            let body = command_body(source, spec.name);
+            let executable = body
+                .split_once('{')
+                .map(|(_, executable)| executable)
+                .unwrap_or_else(|| panic!("{} must have a function body", spec.name));
+            let admission = format!("admit(command_spec(\"{}\"))", spec.name);
+            let admission_offset = executable
+                .find(&admission)
+                .unwrap_or_else(|| panic!("{} must acquire its classified app lease", spec.name));
             assert!(
-                command_body(source, spec.name)
-                    .contains(&format!("admit(command_spec(\"{}\"))", spec.name)),
-                "{} must atomically acquire its classified app lease",
+                effect_offsets(executable).all(|effect_offset| admission_offset < effect_offset),
+                "{} must acquire its app lease before every effectful command boundary",
                 spec.name
             );
         }
@@ -365,5 +356,20 @@ mod tests {
         let rest = &source[start..];
         let end = rest.find("\n#[tauri::command]").unwrap_or(rest.len());
         &rest[..end]
+    }
+
+    fn effect_offsets(body: &str) -> impl Iterator<Item = usize> + '_ {
+        const EFFECTFUL_BOUNDARIES: &[&str] = &[
+            "AsyncFileDialog::",
+            "command_value(",
+            "crate::view::",
+            "mom_llama_runtime::",
+            "picker_blocked(",
+            "runtime.refresh_native_model(",
+            "std::fs::read_to_string(",
+        ];
+        EFFECTFUL_BOUNDARIES
+            .iter()
+            .flat_map(|boundary| body.match_indices(boundary).map(|(offset, _)| offset))
     }
 }

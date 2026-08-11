@@ -60,13 +60,13 @@ pub async fn mom_llama_pick_file(
     runtime: State<'_, AppRuntimeHandle>,
     kind: String,
 ) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_pick_file"))?;
     let Some(path_kind) = PathSelectionKind::parse(&kind) else {
         return picker_blocked(
             "path_selection_kind_invalid",
             format!("Unsupported native file picker kind: {kind}"),
         );
     };
-    let lease = runtime.admit(command_spec("mom_llama_pick_file"))?;
     let dialog = match kind.as_str() {
         "model" => {
             let dialog = AsyncFileDialog::new().add_filter("GGUF model", &["gguf"]);
