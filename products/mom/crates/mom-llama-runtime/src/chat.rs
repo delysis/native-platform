@@ -675,20 +675,32 @@ where
             cache_reused,
         )
     };
-    if assistant_text.trim().is_empty()
-        && reasoning_content
-            .as_deref()
-            .is_none_or(|reasoning| reasoning.trim().is_empty())
-    {
+    if assistant_text.trim().is_empty() {
         mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Failed)?;
-        return Ok(CommandResult::blocked(
-            "mom_llama.chat_send",
-            "blocked_native_runtime",
-            Blocker::new(
+        let (code, message, actions) = if reasoning_content
+            .as_deref()
+            .is_some_and(|reasoning| !reasoning.trim().is_empty())
+        {
+            (
+                "native_response_reasoning_only",
+                "The native model exhausted its response before producing visible assistant text.",
+                vec![
+                    "Increase the response-token budget or skip reasoning during generation."
+                        .to_string(),
+                    "Try the request again with a more concise prompt.".to_string(),
+                ],
+            )
+        } else {
+            (
                 "native_response_empty",
                 "The native model returned no assistant text.",
                 vec!["Try a smaller prompt or another model.".to_string()],
-            ),
+            )
+        };
+        return Ok(CommandResult::blocked(
+            "mom_llama.chat_send",
+            "blocked_native_runtime",
+            Blocker::new(code, message, actions),
         ));
     }
     let user_message = regenerate_user_id.as_ref().map_or_else(

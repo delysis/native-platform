@@ -66,8 +66,9 @@ pub use mentions::{
 };
 pub use models::{hugging_face_hub_cache_dir, model_list, model_select};
 pub use native_runtime::{
-    gateway_native_configuration, gateway_native_host_and_model, resident_model_for_profile,
-    resident_status, unload_resident_model,
+    ProductShutdownError, gateway_native_configuration, gateway_native_host_and_model,
+    gateway_native_model_configuration, resident_model_for_profile, resident_status,
+    shutdown_product_runtime_for_process_exit, unload_resident_model,
 };
 pub use path_selection::{PathSelection, PathSelectionKind, path_select};
 pub use personas::{

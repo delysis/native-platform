@@ -1,13 +1,16 @@
+mod app_runtime;
 mod commands;
 mod view;
 
 use anyhow::Result;
+use app_runtime::AppRuntimeHandle;
 use fte_backend_llama::LlamaNativeBackend;
 use fte_router::{Gateway, GatewayDefaults};
 use fte_store::ResponseStore;
 use fte_types::{GatewayError, GatewayResponse, RequestId};
 use serde_json::json;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::plugin::TauriPlugin;
 
 fn main() {
@@ -32,8 +35,19 @@ fn main() {
         return;
     }
 
+    let (runtime, gateway_plugin) = match build_runtime() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("failed to initialize Mom Llama runtime: {error:#}");
+            std::process::exit(1);
+        }
+    };
+    let event_runtime = runtime.clone();
+    let exit_allowed = Arc::new(AtomicBool::new(false));
+    let event_exit_allowed = Arc::clone(&exit_allowed);
     let app = tauri::Builder::default()
-        .plugin(gateway_plugin())
+        .manage(runtime)
+        .plugin(gateway_plugin)
         .invoke_handler(tauri::generate_handler![
             commands::mom_llama_render_app,
             commands::mom_llama_render_chat_fragment,
@@ -123,9 +137,40 @@ fn main() {
         ])
         .build(tauri::generate_context!());
     match app {
-        Ok(app) => app.run(|_, event| {
-            if matches!(event, tauri::RunEvent::Exit) {
-                mom_llama_runtime::unload_resident_model();
+        Ok(app) => app.run(move |app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if event_exit_allowed.load(Ordering::Acquire) {
+                    return;
+                }
+                api.prevent_exit();
+                if event_runtime.begin_quiesce() {
+                    let runtime = event_runtime.clone();
+                    let app_handle = app_handle.clone();
+                    let exit_allowed = Arc::clone(&event_exit_allowed);
+                    tauri::async_runtime::spawn(async move {
+                        let result = runtime.shutdown().await;
+                        match serde_json::to_string(&result) {
+                            Ok(receipt) => eprintln!("mom-llama shutdown: {receipt}"),
+                            Err(error) => {
+                                eprintln!(
+                                    "Mom Llama could not encode its shutdown receipt: {error}"
+                                );
+                            }
+                        }
+                        let safe_to_exit = match &result {
+                            Ok(_) => true,
+                            Err(error) => error.summary.native_host_joined,
+                        };
+                        if safe_to_exit {
+                            exit_allowed.store(true, Ordering::Release);
+                            app_handle.exit(code.unwrap_or(0));
+                        } else if let Err(error) = result {
+                            eprintln!(
+                                "Mom Llama remains open because native shutdown failed: {error}"
+                            );
+                        }
+                    });
+                }
             }
         }),
         Err(error) => {
@@ -135,43 +180,25 @@ fn main() {
     }
 }
 
-fn gateway_plugin() -> TauriPlugin<tauri::Wry> {
+fn build_runtime() -> Result<(AppRuntimeHandle, TauriPlugin<tauri::Wry>)> {
     let gateway = Arc::new(Gateway::new(GatewayDefaults {
         catalog_version: "mom-llama-local-v1".to_string(),
     }));
-    match mom_llama_runtime::gateway_native_configuration() {
-        Ok((host, model)) => {
-            let backend = Arc::new(LlamaNativeBackend::new(Arc::clone(&host)));
-            if let Err(error) = backend.replace_configuration(host, model) {
-                eprintln!("Mom Llama could not configure its local gateway model: {error}");
-            } else if let Err(error) = gateway.register_backend(backend.clone()) {
-                eprintln!("Mom Llama could not register its local gateway backend: {error}");
-            } else if GATEWAY_NATIVE_BACKEND.set(backend).is_err() {
-                eprintln!("Mom Llama local gateway backend was initialized more than once");
-            }
-        }
-        Err(error) => {
-            eprintln!("Mom Llama could not initialize its local gateway host: {error}");
-        }
-    }
-    tauri_plugin_free_token_energy::Builder::new()
-        .with_gateway(gateway)
+    let (host, model) = mom_llama_runtime::gateway_native_configuration()?;
+    let backend = Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host)));
+    backend
+        .replace_configuration(Arc::clone(&host), model)
+        .map_err(anyhow::Error::msg)?;
+    gateway
+        .register_backend(backend.clone())
+        .map_err(anyhow::Error::msg)?;
+    let runtime = AppRuntimeHandle::new(Arc::clone(&gateway), backend, host);
+    let plugin = tauri_plugin_free_token_energy::Builder::new()
+        .with_gateway(runtime.gateway())
         .with_store(Arc::new(MomGatewayStore))
         .with_default_loopback()
-        .build()
-}
-
-static GATEWAY_NATIVE_BACKEND: OnceLock<Arc<LlamaNativeBackend>> = OnceLock::new();
-
-pub(crate) fn refresh_gateway_native_model() -> Result<(), String> {
-    let Some(backend) = GATEWAY_NATIVE_BACKEND.get() else {
-        return Ok(());
-    };
-    let (host, model) = mom_llama_runtime::gateway_native_configuration()
-        .map_err(|error| format!("local gateway configuration failed: {error}"))?;
-    backend
-        .replace_configuration(host, model)
-        .map_err(|error| format!("local gateway configuration failed: {error}"))
+        .build();
+    Ok((runtime, plugin))
 }
 
 struct MomGatewayStore;

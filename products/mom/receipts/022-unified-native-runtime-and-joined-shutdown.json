@@ -1,0 +1,73 @@
+{
+  "schema": "mom_llama.native_composition_receipt.v1",
+  "task_id": "unified-native-runtime-and-joined-shutdown-2026-08-11",
+  "role": "product_runtime_steward",
+  "status": "passed_with_native_ui_exit_pending",
+  "date": "2026-08-11",
+  "repository": "https://github.com/delysis/mom-llama",
+  "source_revision": "the commit containing this receipt",
+  "dependency_boundaries": {
+    "attachment_native_kit": "472900732ded5bcfb5cc639c49b3a4f77feece27",
+    "llama_native_kit": "4dd744209ff85886be9dce7df46cd65eaa19c804",
+    "free_token_energy": "aa8ce2dab3baf46087f1cff68b8619f947647187",
+    "llama_cpp_rs": "152dabbd3492d8e35fdf7112e556685c6c75ec9a"
+  },
+  "composition": {
+    "native_host_instances": 1,
+    "gateway_instances": 1,
+    "fte_native_host_ownership": "borrowed",
+    "process_exit_order": [
+      "close application admission",
+      "cancel and drain the FTE gateway and borrowed backend",
+      "consume the exact product NativeHost and join every native worker",
+      "wait for every admitted product blocking operation to release its move-only lease",
+      "permit Tauri and AppKit process exit"
+    ],
+    "shutdown_authority": "the composition root retains ProcessExitJoinedNativeHost; ordinary command clients cannot mint it"
+  },
+  "real_model": {
+    "path_recorded": false,
+    "file_name": "Qwen_Qwen3-0.6B-Q4_K_M.gguf",
+    "bytes": 484220320,
+    "sha256": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14",
+    "device": "CPU on Apple M4 Max",
+    "fixture_used": false
+  },
+  "negative_evidence": {
+    "observation": "With a 96-token response budget, the real reasoning-capable Qwen model exhausted the completion inside private reasoning and produced no visible assistant text.",
+    "defect": "The product could previously treat reasoning-only output as a successful visible response.",
+    "correction": "Any empty visible assistant response now fails closed; reasoning-only exhaustion has its own typed blocker, and the smoke profile budgets 256 tokens.",
+    "promotion_rule": "Reasoning content is never accepted as a substitute for non-empty visible assistant text."
+  },
+  "tests_run": [
+    {
+      "command": "cargo test --workspace --all-targets",
+      "outcome": "passed",
+      "detail": "After the final app-work lease addition: 18 app tests, 13 CLI tests with 1 real-model ignore, 85 runtime unit tests, and 38 runtime integration tests with 12 real-environment ignores."
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "outcome": "passed"
+    },
+    {
+      "command": "rustup run 1.88.0 cargo check --workspace --all-targets",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo fmt --all -- --check && git diff --check && ./scripts/check-architecture.sh && ./scripts/check-contracts.sh",
+      "outcome": "passed",
+      "detail": "One immutable source per native boundary; 78 commands, 87 affordances, 26 effects, 36 parity rows, 58 settings, and zero contract blockers."
+    },
+    {
+      "command": "MOM_LLAMA_MODEL_PATH=<verified Qwen GGUF> cargo test -p mom-llama-runtime --test runtime real_native_chat_invokes_no_fixture_and_persists -- --ignored --exact --nocapture",
+      "outcome": "passed",
+      "detail": "One real in-process llama.cpp invocation passed with non-empty visible assistant text, real_engine_invoked=true, fake_fixture=false, and encrypted persistence."
+    }
+  ],
+  "deferred_acceptance": [
+    {
+      "surface": "native_desktop_exit",
+      "reason": "A launched, identity-locked Mom Llama bundle still needs a loaded-model Cmd+Q or Dock quit followed by immediate clean relaunch. Unit, integration, and direct real-model inference do not substitute for that OS lifecycle proof."
+    }
+  ]
+}

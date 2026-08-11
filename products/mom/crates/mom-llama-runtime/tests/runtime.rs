@@ -1524,9 +1524,9 @@ fn product_runtime_rejects_network_process_and_copied_native_authority() -> Resu
         );
     }
     let workspace_manifest = fs::read_to_string(repo_root.join("Cargo.toml"))?;
-    assert!(workspace_manifest.contains("rev = \"b71dfaa16c77b7069259bd15add740b80f895017\""));
-    assert!(workspace_manifest.contains("rev = \"70f0990f377e4ec2fc8908992e2ba3faccef6331\""));
-    assert!(workspace_manifest.contains("rev = \"a7702f423102716d9fa21b64c51c331d4044a31d\""));
+    assert!(workspace_manifest.contains("rev = \"4dd744209ff85886be9dce7df46cd65eaa19c804\""));
+    assert!(workspace_manifest.contains("rev = \"aa8ce2dab3baf46087f1cff68b8619f947647187\""));
+    assert!(workspace_manifest.contains("rev = \"472900732ded5bcfb5cc639c49b3a4f77feece27\""));
     assert!(!workspace_manifest.contains("[patch."));
     assert!(!workspace_manifest.contains("attachment-native-host = { path ="));
     assert!(!workspace_manifest.contains("attachment-native-types = { path ="));
@@ -2442,7 +2442,10 @@ fn configured_real_session(name: &str) -> Result<Option<TestSession>> {
     mom_llama_runtime::settings_update(SettingsUpdate {
         model_path: Some(model_path),
         native_device: Some(llama_native_types::NativeDevice::Cpu),
-        max_tokens: Some(96),
+        // Reasoning-capable small models can spend the first hundred tokens
+        // inside a private reasoning block. A real acceptance must budget
+        // enough room to prove that visible assistant text is produced.
+        max_tokens: Some(256),
         kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
         ..SettingsUpdate::default()
     })?;
