@@ -105,13 +105,20 @@ enum FilePolicy {
 
 fn atomic_replace_with_policy(path: &Path, bytes: &[u8], policy: FilePolicy) -> Result<()> {
     reject_symlink_target(path)?;
-    let mut options = AtomicWriteFile::options();
+    let options = AtomicWriteFile::options();
     #[cfg(unix)]
-    if policy == FilePolicy::Private {
-        options.mode(0o600);
-    }
+    let options = {
+        let mut options = options;
+        if policy == FilePolicy::Private {
+            options.mode(0o600);
+        }
+        options
+    };
     #[cfg(not(unix))]
-    let _ = policy;
+    let options = {
+        let _ = policy;
+        options
+    };
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.commit()?;
@@ -214,7 +221,14 @@ pub(crate) fn sync_parent(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn sync_parent(_path: &Path) -> Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> Result<()> {
+    // Rust does not expose a portable directory-flush primitive on Windows.
+    // Still validate the parent at the durability boundary so disappearance or
+    // replacement is reported instead of silently treating the boundary as
+    // infallible.
+    if let Some(parent) = path.parent() {
+        fs::metadata(parent)?;
+    }
     Ok(())
 }
 

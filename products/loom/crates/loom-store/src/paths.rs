@@ -71,13 +71,20 @@ fn ensure_directory_with_policy(path: &Path, policy: DirectoryPolicy) -> Result<
 }
 
 fn create_directory(path: &Path, policy: DirectoryPolicy) -> std::io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
+    let builder = fs::DirBuilder::new();
     #[cfg(unix)]
-    if policy == DirectoryPolicy::Private {
-        builder.mode(0o700);
-    }
+    let builder = {
+        let mut builder = builder;
+        if policy == DirectoryPolicy::Private {
+            builder.mode(0o700);
+        }
+        builder
+    };
     #[cfg(not(unix))]
-    let _ = policy;
+    let builder = {
+        let _ = policy;
+        builder
+    };
     builder.create(path)
 }
 
