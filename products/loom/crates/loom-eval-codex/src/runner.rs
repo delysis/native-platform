@@ -1917,6 +1917,9 @@ pub enum FrontierCriticError {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    static FAKE_CLI_EXECUTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn packet() -> FrontierCriticPacket {
         FrontierCriticPacket::new(
             BlobId::digest(b"comparison"),
@@ -1947,6 +1950,15 @@ mod tests {
         script: &[u8],
         expected_version: &str,
     ) -> Result<DiagnosticFrontierCriticReceipt, FrontierCriticError> {
+        // These tests exercise process groups, bounded pipe readers, and three
+        // short-lived child processes per call. Running many synthetic CLIs at
+        // once adds runner-resource scheduling to protocol tests and has made
+        // otherwise deterministic Linux CI results intermittent. Production
+        // execution remains concurrent; only this shared test helper is
+        // serialized.
+        let _execution = FAKE_CLI_EXECUTION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let directory = TempDir::new().expect("tempdir");
         let cli = directory.path().join("diagnostic-cli");
         fs::write(&cli, script).expect("script");
