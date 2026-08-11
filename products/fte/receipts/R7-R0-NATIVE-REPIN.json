@@ -65,14 +65,16 @@
       "command": "MOM_LLAMA_MODEL_PATH=/Users/george/Documents/llama-native-kit/target/test-models/Qwen_Qwen3-0.6B-Q4_K_M.gguf rustup run 1.88.0 cargo test --locked -p fte-backend-llama --test real real_chat_completion_and_stable_prefix_hit_are_in_process -- --ignored --nocapture",
       "model_bytes": 484220320,
       "model_sha256": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14",
-      "result": "pass_in_process_cpu_stable_prefix_79.06s"
+      "result": "pass_in_process_cpu_stable_prefix_79.06s",
+      "desktop_command": "MOM_LLAMA_MODEL_PATH=/Users/george/Documents/llama-native-kit/target/test-models/Qwen_Qwen3-0.6B-Q4_K_M.gguf cargo test -p free-token-energy real_desktop_local_route_runs_in_process_and_joins_on_shutdown --all-features -- --ignored --nocapture",
+      "desktop_result": "pass_apple_m4_max_metal_shared_gateway_drain_native_join_and_deallocation_37.19s"
     }
   },
   "evidence_limits": {
     "full_r7_promotable": false,
     "github_can_resolve_native_revision": false,
     "remote_ci_exercised": false,
-    "real_desktop_route_retested_on_r0": false,
+    "real_desktop_route_retested_on_r0": true,
     "real_local_adapter_retested_on_r0": true,
     "launched_bundle_exercised": false,
     "sole_gateway_architecture_changed": false
