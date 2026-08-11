@@ -1533,7 +1533,14 @@ fn product_runtime_rejects_network_process_and_copied_native_authority() -> Resu
         );
     }
     let workspace_manifest = fs::read_to_string(repo_root.join("Cargo.toml"))?;
-    assert!(workspace_manifest.contains("rev = \"2d69f086e922ed7bdfd6236baf5a1ad0ed568360\""));
+    assert_eq!(
+        workspace_manifest
+            .matches("rev = \"f7a69316c64d857b99bd847dd44cd852fc5b4ca4\"")
+            .count(),
+        4,
+        "all four direct native-kit crates must share the reviewed R0 revision"
+    );
+    assert!(!workspace_manifest.contains("2d69f086e922ed7bdfd6236baf5a1ad0ed568360"));
     assert!(workspace_manifest.contains("rev = \"472900732ded5bcfb5cc639c49b3a4f77feece27\""));
     assert!(!workspace_manifest.contains("[patch."));
     assert!(!workspace_manifest.contains("attachment-native-host = { path ="));

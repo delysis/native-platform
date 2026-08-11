@@ -712,7 +712,7 @@ fn tool_loop_run_with_events(
             .generate(request)
             .map_err(|error| anyhow::anyhow!(error))?;
         let Some(outputs) = wait_for_tool_model(
-            &ticket,
+            ticket,
             ToolModelWaitContext {
                 data_dir: &settings.data_dir,
                 request_id: &request_id,
@@ -1051,7 +1051,7 @@ fn tool_loop_cancelled_result(
 }
 
 fn wait_for_tool_model(
-    ticket: &llama_native_engine::GenerationTicket,
+    ticket: llama_native_engine::GenerationTicket,
     context: ToolModelWaitContext<'_>,
     on_event: &mut Option<&mut dyn FnMut(ToolLoopStreamEvent) -> Result<()>>,
 ) -> Result<Option<Vec<GenerationOutput>>> {
@@ -1066,6 +1066,7 @@ fn wait_for_tool_model(
     } = context;
     let started = Instant::now();
     let mut cancelled = false;
+    let mut ticket = ticket;
     loop {
         while let Ok(event) = ticket.events.try_recv() {
             match event.event {
@@ -1111,8 +1112,11 @@ fn wait_for_tool_model(
             ticket.cancel_all();
             cancelled = true;
         }
-        if let Some(outputs) = ticket.try_wait().map_err(anyhow::Error::new)? {
-            return Ok((!cancelled).then_some(outputs));
+        match ticket.try_wait().map_err(anyhow::Error::new)? {
+            llama_native_engine::TryWaitOutcome::Ready(outputs) => {
+                return Ok((!cancelled).then_some(outputs));
+            }
+            llama_native_engine::TryWaitOutcome::Pending(pending) => ticket = pending,
         }
         if started.elapsed() >= timeout {
             ticket.cancel_all();

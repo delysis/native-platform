@@ -42,7 +42,7 @@ then
   exit 1
 fi
 
-if ! rg -q 'source = "git\+https://github\.com/delysis/llama-native-kit\?rev=2d69f086e922ed7bdfd6236baf5a1ad0ed568360#' Cargo.lock
+if ! rg -q 'source = "git\+https://github\.com/delysis/llama-native-kit\?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"' Cargo.lock
 then
   echo "the locked native-kit source does not match the reviewed boundary" >&2
   exit 1
@@ -55,7 +55,7 @@ then
   exit 1
 fi
 
-if ! rg -q 'source = "git\+https://github\.com/delysis/free-token-energy\?rev=d86edfef40771589af4cd8cd72907fa6d3ce6e96#' Cargo.lock
+if ! rg -q 'source = "git\+https://github\.com/delysis/free-token-energy\?rev=1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a#1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a"' Cargo.lock
 then
   echo "the locked Free Token Energy source does not match the reviewed boundary" >&2
   exit 1
