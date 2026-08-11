@@ -1317,13 +1317,7 @@ impl ReviewedEnvironment {
     fn capture() -> Result<Self, FrontierCriticError> {
         let mut variables = Vec::new();
         let mut evidence = Vec::new();
-        push_environment_value(
-            &mut variables,
-            &mut evidence,
-            "PATH",
-            OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"),
-            EnvironmentValueClass::FixedNonSecret,
-        );
+        push_platform_environment(&mut variables, &mut evidence)?;
         push_environment_value(
             &mut variables,
             &mut evidence,
@@ -1338,19 +1332,8 @@ impl ReviewedEnvironment {
             OsString::from("dumb"),
             EnvironmentValueClass::FixedNonSecret,
         );
-
-        let home =
-            env::var_os("HOME").ok_or(FrontierCriticError::MissingRequiredEnvironment("HOME"))?;
-        push_environment_value(
-            &mut variables,
-            &mut evidence,
-            "HOME",
-            home,
-            EnvironmentValueClass::HashedPrivatePath,
-        );
         for (name, class) in [
             ("CODEX_HOME", EnvironmentValueClass::HashedPrivatePath),
-            ("TMPDIR", EnvironmentValueClass::HashedPrivatePath),
             ("SSL_CERT_FILE", EnvironmentValueClass::HashedPrivatePath),
             ("SSL_CERT_DIR", EnvironmentValueClass::HashedPrivatePath),
             ("LANG", EnvironmentValueClass::HashedNonSecret),
@@ -1389,6 +1372,94 @@ impl ReviewedEnvironment {
     fn apply(&self, command: &mut Command) {
         command.env_clear();
         command.envs(self.variables.iter().cloned());
+    }
+}
+
+#[cfg(unix)]
+fn push_platform_environment(
+    variables: &mut Vec<(OsString, OsString)>,
+    evidence: &mut Vec<EnvironmentValueEvidence>,
+) -> Result<(), FrontierCriticError> {
+    push_environment_value(
+        variables,
+        evidence,
+        "PATH",
+        OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"),
+        EnvironmentValueClass::FixedNonSecret,
+    );
+    push_required_environment_value(
+        variables,
+        evidence,
+        "HOME",
+        EnvironmentValueClass::HashedPrivatePath,
+    )?;
+    push_optional_environment_value(
+        variables,
+        evidence,
+        "TMPDIR",
+        EnvironmentValueClass::HashedPrivatePath,
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn push_platform_environment(
+    variables: &mut Vec<(OsString, OsString)>,
+    evidence: &mut Vec<EnvironmentValueEvidence>,
+) -> Result<(), FrontierCriticError> {
+    // The executable is invoked by absolute path, so an inherited PATH is
+    // neither necessary nor acceptable. Windows does require its system root
+    // and uses USERPROFILE as the canonical home for Codex state discovery.
+    push_required_environment_value(
+        variables,
+        evidence,
+        "SystemRoot",
+        EnvironmentValueClass::HashedPrivatePath,
+    )?;
+    push_required_environment_value(
+        variables,
+        evidence,
+        "USERPROFILE",
+        EnvironmentValueClass::HashedPrivatePath,
+    )?;
+    for name in ["TEMP", "TMP"] {
+        push_optional_environment_value(
+            variables,
+            evidence,
+            name,
+            EnvironmentValueClass::HashedPrivatePath,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn push_platform_environment(
+    _: &mut Vec<(OsString, OsString)>,
+    _: &mut Vec<EnvironmentValueEvidence>,
+) -> Result<(), FrontierCriticError> {
+    Err(FrontierCriticError::UnsupportedPinnedPlatform)
+}
+
+fn push_required_environment_value(
+    variables: &mut Vec<(OsString, OsString)>,
+    evidence: &mut Vec<EnvironmentValueEvidence>,
+    name: &'static str,
+    class: EnvironmentValueClass,
+) -> Result<(), FrontierCriticError> {
+    let value = env::var_os(name).ok_or(FrontierCriticError::MissingRequiredEnvironment(name))?;
+    push_environment_value(variables, evidence, name, value, class);
+    Ok(())
+}
+
+fn push_optional_environment_value(
+    variables: &mut Vec<(OsString, OsString)>,
+    evidence: &mut Vec<EnvironmentValueEvidence>,
+    name: &'static str,
+    class: EnvironmentValueClass,
+) {
+    if let Some(value) = env::var_os(name) {
+        push_environment_value(variables, evidence, name, value, class);
     }
 }
 
@@ -2277,6 +2348,7 @@ printf '%s\n' \
         assert!(gone, "grandchild survived process-group termination");
     }
 
+    #[cfg(unix)]
     #[test]
     fn cleared_environment_exposes_only_reviewed_hashed_values() {
         let environment = ReviewedEnvironment::capture().expect("reviewed environment");
