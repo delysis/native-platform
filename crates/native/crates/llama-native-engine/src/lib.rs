@@ -59,7 +59,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const LLAMA_CPP_BINDING_VERSION: &str = "0.1.154";
-pub const LLAMA_CPP_BINDING_REV: &str = "152dabbd3492d8e35fdf7112e556685c6c75ec9a";
+pub const LLAMA_CPP_BINDING_REV: &str = "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391";
 pub const LLAMA_CPP_REV: &str = "5f55650a78f92aff4d48d671423e888fac0469ff";
 /// SHA-256 of a private, domain-separated build-input accumulator. The raw
 /// inputs are deliberately neither compiled into this crate nor exposed.
@@ -6078,7 +6078,7 @@ mod tests {
     fn reported_binding_identity_matches_the_private_recipe_and_lock_pin() {
         assert_eq!(
             LLAMA_CPP_BINDING_REV,
-            "152dabbd3492d8e35fdf7112e556685c6c75ec9a"
+            "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"
         );
         assert_eq!(LLAMA_CPP_REV, "5f55650a78f92aff4d48d671423e888fac0469ff");
         let manifest = include_str!("../Cargo.toml");
