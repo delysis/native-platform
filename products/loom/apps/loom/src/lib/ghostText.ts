@@ -343,7 +343,12 @@ export function visibleGhostWidgetPresentationKey(view: EditorView): string {
   ) return '';
   const clip = view.dom.closest<HTMLElement>('.editor-pane')?.getBoundingClientRect();
   if (!clip) return '';
-  const firstGhostFragment = Array.from(widget.getClientRects())[0];
+  // A paragraph-leading newline may contribute a zero-height client rect
+  // before the first rendered glyph. It is not a visible fragment and must
+  // neither authorize nor veto the presentation.
+  const firstGhostFragment = Array.from(widget.getClientRects()).find((rect) =>
+    validRect(rect, true)
+  );
   if (!firstGhostFragment) return '';
   let caret: ReturnType<EditorView['coordsAtPos']>;
   try {
