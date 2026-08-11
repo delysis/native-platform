@@ -11,7 +11,14 @@ use fte_types::{GatewayError, GatewayResponse, RequestId};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::menu::{
+    AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID,
+};
 use tauri::plugin::TauriPlugin;
+use tauri::{AppHandle, Runtime};
+
+const APPLICATION_QUIT_MENU_ID: &str = "mom-llama.application.quit";
+const APPLICATION_QUIT_ACCELERATOR: &str = "CmdOrCtrl+Q";
 
 fn main() {
     if std::env::args().any(|arg| arg == "--dump-html") {
@@ -46,6 +53,11 @@ fn main() {
     let exit_allowed = Arc::new(AtomicBool::new(false));
     let event_exit_allowed = Arc::clone(&exit_allowed);
     let app = tauri::Builder::default()
+        // Tauri's stock macOS Quit item calls AppKit `terminate:` directly and
+        // can bypass `RunEvent::ExitRequested`. Mom owns a regular Cmd+Q menu
+        // command so graceful quit always enters the composed shutdown path.
+        .enable_macos_default_menu(false)
+        .menu(build_desktop_menu)
         .manage(runtime)
         .plugin(gateway_plugin)
         .invoke_handler(tauri::generate_handler![
@@ -138,45 +150,177 @@ fn main() {
         .build(tauri::generate_context!());
     match app {
         Ok(app) => app.run(move |app_handle, event| {
+            if let tauri::RunEvent::MenuEvent(menu_event) = &event
+                && menu_event.id() == APPLICATION_QUIT_MENU_ID
+            {
+                request_graceful_exit(app_handle, &event_runtime, &event_exit_allowed, 0);
+                return;
+            }
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 if event_exit_allowed.load(Ordering::Acquire) {
                     return;
                 }
                 api.prevent_exit();
-                if event_runtime.begin_quiesce() {
-                    let runtime = event_runtime.clone();
-                    let app_handle = app_handle.clone();
-                    let exit_allowed = Arc::clone(&event_exit_allowed);
-                    tauri::async_runtime::spawn(async move {
-                        let result = runtime.shutdown().await;
-                        match serde_json::to_string(&result) {
-                            Ok(receipt) => eprintln!("mom-llama shutdown: {receipt}"),
-                            Err(error) => {
-                                eprintln!(
-                                    "Mom Llama could not encode its shutdown receipt: {error}"
-                                );
-                            }
-                        }
-                        let safe_to_exit = match &result {
-                            Ok(_) => true,
-                            Err(error) => error.summary.native_host_joined,
-                        };
-                        if safe_to_exit {
-                            exit_allowed.store(true, Ordering::Release);
-                            app_handle.exit(code.unwrap_or(0));
-                        } else if let Err(error) = result {
-                            eprintln!(
-                                "Mom Llama remains open because native shutdown failed: {error}"
-                            );
-                        }
-                    });
-                }
+                request_graceful_exit(
+                    app_handle,
+                    &event_runtime,
+                    &event_exit_allowed,
+                    code.unwrap_or(0),
+                );
+                return;
+            }
+            if let tauri::RunEvent::Exit = event
+                && !event_exit_allowed.load(Ordering::Acquire)
+            {
+                // Dock Quit and AppleEvent Quit may reach this final boundary
+                // without an interceptable ExitRequested. Do not let AppKit
+                // or static teardown proceed while Metal owns live resources.
+                let result = tauri::async_runtime::block_on(event_runtime.shutdown());
+                log_shutdown_result(&result);
             }
         }),
         Err(error) => {
             eprintln!("failed to build Mom Llama: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+    let package = app.package_info();
+    let about = AboutMetadata {
+        name: Some(package.name.clone()),
+        version: Some(package.version.to_string()),
+        copyright: app.config().bundle.copyright.clone(),
+        authors: app
+            .config()
+            .bundle
+            .publisher
+            .clone()
+            .map(|value| vec![value]),
+        ..AboutMetadata::default()
+    };
+    let quit = MenuItem::with_id(
+        app,
+        APPLICATION_QUIT_MENU_ID,
+        format!("Quit {}", package.name),
+        true,
+        Some(APPLICATION_QUIT_ACCELERATOR),
+    )?;
+    let window = Submenu::with_id_and_items(
+        app,
+        WINDOW_SUBMENU_ID,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, None)?,
+            &PredefinedMenuItem::maximize(app, None)?,
+            #[cfg(target_os = "macos")]
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::close_window(app, None)?,
+        ],
+    )?;
+    let help = Submenu::with_id_and_items(
+        app,
+        HELP_SUBMENU_ID,
+        "Help",
+        true,
+        &[
+            #[cfg(not(target_os = "macos"))]
+            &PredefinedMenuItem::about(app, None, Some(about.clone()))?,
+        ],
+    )?;
+
+    Menu::with_items(
+        app,
+        &[
+            #[cfg(target_os = "macos")]
+            &Submenu::with_items(
+                app,
+                package.name.clone(),
+                true,
+                &[
+                    &PredefinedMenuItem::about(app, None, Some(about))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::services(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::hide(app, None)?,
+                    &PredefinedMenuItem::hide_others(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &quit,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "File",
+                true,
+                &[
+                    &PredefinedMenuItem::close_window(app, None)?,
+                    #[cfg(not(target_os = "macos"))]
+                    &quit,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "Edit",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, None)?,
+                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, None)?,
+                    &PredefinedMenuItem::copy(app, None)?,
+                    &PredefinedMenuItem::paste(app, None)?,
+                    &PredefinedMenuItem::select_all(app, None)?,
+                ],
+            )?,
+            #[cfg(target_os = "macos")]
+            &Submenu::with_items(
+                app,
+                "View",
+                true,
+                &[&PredefinedMenuItem::fullscreen(app, None)?],
+            )?,
+            &window,
+            &help,
+        ],
+    )
+}
+
+fn request_graceful_exit<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    runtime: &AppRuntimeHandle,
+    exit_allowed: &Arc<AtomicBool>,
+    exit_code: i32,
+) {
+    if exit_allowed.load(Ordering::Acquire) || !runtime.begin_quiesce() {
+        return;
+    }
+    let runtime = runtime.clone();
+    let app_handle = app_handle.clone();
+    let exit_allowed = Arc::clone(exit_allowed);
+    tauri::async_runtime::spawn(async move {
+        let result = runtime.shutdown().await;
+        log_shutdown_result(&result);
+        let safe_to_exit = match &result {
+            Ok(_) => true,
+            Err(error) => error.summary.native_host_joined,
+        };
+        if safe_to_exit {
+            exit_allowed.store(true, Ordering::Release);
+            app_handle.exit(exit_code);
+        } else if let Err(error) = result {
+            eprintln!("Mom Llama remains open because native shutdown failed: {error}");
+        }
+    });
+}
+
+fn log_shutdown_result(
+    result: &Result<app_runtime::AppShutdownSummary, app_runtime::AppShutdownError>,
+) {
+    match serde_json::to_string(result) {
+        Ok(receipt) => eprintln!("mom-llama shutdown: {receipt}"),
+        Err(error) => eprintln!("Mom Llama could not encode its shutdown receipt: {error}"),
     }
 }
 
@@ -275,6 +419,21 @@ fn smoke_receipt(rendered_html_bytes: usize) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::smoke_receipt;
+
+    #[test]
+    fn macos_quit_source_cannot_reintroduce_appkit_terminate_bypass() {
+        let source = include_str!("main.rs");
+        let predefined_quit = concat!("PredefinedMenuItem::", "quit");
+        let predefined_quit_with_text = concat!("PredefinedMenuItem::", "quit_with_text");
+        let default_menu = concat!("Menu::", "default");
+
+        assert!(source.contains("enable_macos_default_menu(false)"));
+        assert!(source.contains("APPLICATION_QUIT_MENU_ID"));
+        assert!(source.contains("RunEvent::Exit"));
+        assert!(!source.contains(predefined_quit));
+        assert!(!source.contains(predefined_quit_with_text));
+        assert!(!source.contains(default_menu));
+    }
 
     #[test]
     fn smoke_receipt_reports_only_derived_registry_evidence() {
