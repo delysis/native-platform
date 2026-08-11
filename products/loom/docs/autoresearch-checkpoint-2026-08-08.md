@@ -6,7 +6,7 @@ The historical checkpoint inventory below records the exact foundations used
 while the native research crates were developed. The current unified Loom tree
 has since merged the quiet manuscript editor and native autoresearch work and
 pins every `llama-native-kit` consumer to
-`f87f57a5beb986d234c3fb059c92940578c70b27`. That revision is the current
+`2d69f086e922ed7bdfd6236baf5a1ad0ed568360`. That revision is the current
 product boundary; the older native revisions remain listed only to explain the
 evidence and decisions made at this checkpoint. Current static workspace and
 frontend gates pass after the merge. Real-model results below remain historical

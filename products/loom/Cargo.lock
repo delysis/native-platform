@@ -2222,7 +2222,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 [[package]]
 name = "llama-cpp-2"
 version = "0.1.154"
-source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=152dabbd3492d8e35fdf7112e556685c6c75ec9a#152dabbd3492d8e35fdf7112e556685c6c75ec9a"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391#a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2235,7 +2235,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.154"
-source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=152dabbd3492d8e35fdf7112e556685c6c75ec9a#152dabbd3492d8e35fdf7112e556685c6c75ec9a"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391#a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"
 dependencies = [
  "bindgen",
  "cc",
@@ -2249,7 +2249,7 @@ dependencies = [
 [[package]]
 name = "llama-native-cache"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=f87f57a5beb986d234c3fb059c92940578c70b27#f87f57a5beb986d234c3fb059c92940578c70b27"
+source = "git+https://github.com/delysis/llama-native-kit.git?rev=2d69f086e922ed7bdfd6236baf5a1ad0ed568360#2d69f086e922ed7bdfd6236baf5a1ad0ed568360"
 dependencies = [
  "llama-native-types",
  "serde",
@@ -2259,7 +2259,7 @@ dependencies = [
 [[package]]
 name = "llama-native-engine"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=f87f57a5beb986d234c3fb059c92940578c70b27#f87f57a5beb986d234c3fb059c92940578c70b27"
+source = "git+https://github.com/delysis/llama-native-kit.git?rev=2d69f086e922ed7bdfd6236baf5a1ad0ed568360#2d69f086e922ed7bdfd6236baf5a1ad0ed568360"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",
@@ -2273,7 +2273,7 @@ dependencies = [
 [[package]]
 name = "llama-native-host"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=f87f57a5beb986d234c3fb059c92940578c70b27#f87f57a5beb986d234c3fb059c92940578c70b27"
+source = "git+https://github.com/delysis/llama-native-kit.git?rev=2d69f086e922ed7bdfd6236baf5a1ad0ed568360#2d69f086e922ed7bdfd6236baf5a1ad0ed568360"
 dependencies = [
  "llama-native-cache",
  "llama-native-engine",
@@ -2283,7 +2283,7 @@ dependencies = [
 [[package]]
 name = "llama-native-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=f87f57a5beb986d234c3fb059c92940578c70b27#f87f57a5beb986d234c3fb059c92940578c70b27"
+source = "git+https://github.com/delysis/llama-native-kit.git?rev=2d69f086e922ed7bdfd6236baf5a1ad0ed568360#2d69f086e922ed7bdfd6236baf5a1ad0ed568360"
 dependencies = [
  "serde",
  "sha2",

@@ -149,7 +149,7 @@ Those results establish the local CPU backend gates described above. They do **n
 
 **Implemented and automated or locally smoke-tested:**
 
-- Direct in-process use of the raw and controlled batch APIs from pinned published `llama-native-kit` commit `f87f57a5beb986d234c3fb059c92940578c70b27`.
+- Direct in-process use of the raw and controlled batch APIs from pinned published `llama-native-kit` commit `2d69f086e922ed7bdfd6236baf5a1ad0ed568360`.
 - Exact `GenerationInput::Completion` construction with no Loom-added system prompt, chat template, instruction, or suffix after the manuscript boundary.
 - Multiple continuation cases with independent sampling records, bounded event forwarding, ordered output validation, branch-specific cancellation calls, and one Loom terminal event per branch.
 - Generated token IDs and optional typed probability observations mapped into Loom token traces.
@@ -270,7 +270,7 @@ Those results establish the local CPU backend gates described above. They do **n
 
 - [x] Created the Rust 2024 Loom workspace and kept project-owned Rust free of `unsafe`.
 - [x] Added a direct adapter against the product-neutral raw batch-family native-kit API.
-- [x] Pinned every native-kit consumer to published commit `f87f57a5beb986d234c3fb059c92940578c70b27`, including controlled generation, executor-owned operation leases, immutable build identity, host residency policy, joined-shutdown authority, and the cross-platform invariant tests, and reran the complete workspace compatibility gates.
+- [x] Pinned every native-kit consumer to published commit `2d69f086e922ed7bdfd6236baf5a1ad0ed568360`, including controlled generation, executor-owned operation leases, immutable build identity, host residency policy, joined-shutdown authority, and the cross-platform invariant tests, and reran the complete workspace compatibility gates.
 - [ ] Complete and independently verify external Bloom credential revocation/rotation and any separately approved history remediation.
 - [x] Add SHA-pinned Loom Native full-history secret scanning and pull-request dependency-review automation. A successful remote run is not yet evidenced here.
 - [ ] Pin and integrate a verified `attachment-native-kit` release; no attachment dependency exists here.
