@@ -10,6 +10,16 @@ pub(crate) fn normalize_document_path(path: &Path) -> Result<String> {
     if path.is_absolute() {
         return Err(StoreError::UnsafeRelativePath(path.display().to_string()));
     }
+    let encoded = path
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| StoreError::NonUtf8Path(path.to_path_buf()))?;
+    // Reject the foreign separator before `Path::components` can normalize it
+    // into an ordinary Windows component boundary. Stored paths have one
+    // platform-independent spelling and are never caller-selected OS paths.
+    if encoded.contains('\\') {
+        return Err(StoreError::UnsafeRelativePath(path.display().to_string()));
+    }
 
     let mut components = Vec::new();
     for component in path.components() {
@@ -19,7 +29,7 @@ pub(crate) fn normalize_document_path(path: &Path) -> Result<String> {
         let component = component
             .to_str()
             .ok_or_else(|| StoreError::NonUtf8Path(path.to_path_buf()))?;
-        if component.contains('\\') || component == ".loom" {
+        if component == ".loom" {
             return Err(StoreError::UnsafeRelativePath(path.display().to_string()));
         }
         components.push(component.to_owned());
