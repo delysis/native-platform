@@ -61,7 +61,12 @@ pub(crate) fn validate_reviewed_cmake_cache(cache: &[u8]) -> Result<&str, String
         }
     }
     match unique_cmake_cache_value(cache, "CMAKE_GENERATOR", "INTERNAL")? {
-        Some(generator @ ("Ninja" | "Unix Makefiles" | "Visual Studio 17 2022")) => Ok(generator),
+        Some(
+            generator @ ("Ninja"
+            | "Unix Makefiles"
+            | "Visual Studio 17 2022"
+            | "Visual Studio 18 2026"),
+        ) => Ok(generator),
         _ => Err("effective llama.cpp CMake generator is not reviewed".to_string()),
     }
 }
@@ -564,6 +569,17 @@ mod tests {
             validate_reviewed_cmake_cache(&windows)
                 .expect("the pinned Windows runner generator is accepted"),
             "Visual Studio 17 2022"
+        );
+
+        let windows_2026 = replace_once(
+            accepted,
+            b"CMAKE_GENERATOR:INTERNAL=Ninja",
+            b"CMAKE_GENERATOR:INTERNAL=Visual Studio 18 2026",
+        );
+        assert_eq!(
+            validate_reviewed_cmake_cache(&windows_2026)
+                .expect("the current pinned Windows runner generator is accepted"),
+            "Visual Studio 18 2026"
         );
 
         for rejected in [
