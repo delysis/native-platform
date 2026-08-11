@@ -34,6 +34,7 @@ if [[ "$binding_lock_count" -ne 2 ]]; then
 fi
 
 for obsolete in \
+  2d69f086e922ed7bdfd6236baf5a1ad0ed568360 \
   c61692d48b0768bb242bcecb7a80c3318fc476b4 \
   b71dfaa16c77b7069259bd15add740b80f895017 \
   d4e4eb8f4255cf84017c9fa37ec8af9396f7995a \
