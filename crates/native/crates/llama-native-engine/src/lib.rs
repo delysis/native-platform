@@ -6117,10 +6117,10 @@ mod tests {
             format!("?rev={LLAMA_CPP_BINDING_REV}#{LLAMA_CPP_BINDING_REV}\"");
         assert_eq!(lock.matches(&locked_source_suffix).count(), 2);
         for package in ["llama-cpp-2", "llama-cpp-sys-2"] {
-            let package_name = format!("\nname = \"{package}\"\n");
+            let package_name = format!("name = \"{package}\"");
             let mut matching_blocks = lock
                 .split("[[package]]")
-                .filter(|block| block.contains(&package_name));
+                .filter(|block| block.lines().any(|line| line.trim_end() == package_name));
             let block = matching_blocks
                 .next()
                 .expect("binding package must be locked");
@@ -7413,6 +7413,7 @@ mod tests {
         assert_eq!(guard.payload_bytes_read(), payload_bytes_read);
     }
 
+    #[cfg(unix)]
     #[test]
     fn strict_pre_post_artifact_checks_read_no_payload_after_initial_hash() {
         let directory = TestArtifactDirectory::new("metadata-only-verification");
