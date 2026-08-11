@@ -346,12 +346,12 @@ impl AuthScheme {
             AuthScheme::Bearer => {
                 headers.insert(
                     AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {}", api_key))?,
+                    HeaderValue::from_str(&format!("Bearer {api_key}"))?,
                 );
             }
             AuthScheme::Header { name, prefix } => {
                 let value = match prefix {
-                    Some(prefix) => format!("{}{}", prefix, api_key),
+                    Some(prefix) => format!("{prefix}{api_key}"),
                     None => api_key.to_string(),
                 };
                 headers.insert(

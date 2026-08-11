@@ -1626,7 +1626,9 @@ fn map_native_error(request_id: &RequestId, error: NativeError) -> GatewayError 
         | NativeErrorCode::MemoryBudgetExceeded
         | NativeErrorCode::ContextCreateFailed
         | NativeErrorCode::WorkerStopped => (ErrorClass::Unavailable, true, 503),
-        NativeErrorCode::ModelInUse => (ErrorClass::Unavailable, false, 409),
+        NativeErrorCode::ModelInUse | NativeErrorCode::DuplicateActiveRequest => {
+            (ErrorClass::Unavailable, false, 409)
+        }
         NativeErrorCode::QueueFull => (ErrorClass::RateLimit, true, 429),
         NativeErrorCode::Cancelled => (ErrorClass::Cancelled, false, 499),
         NativeErrorCode::UnsupportedMedia => (ErrorClass::Capability, false, 422),
@@ -1654,6 +1656,9 @@ const fn native_error_safe_detail(code: NativeErrorCode) -> &'static str {
         NativeErrorCode::ModelLoadFailed => "llama.cpp could not load the configured local model",
         NativeErrorCode::ModelNotLoaded => "the requested local model is not resident",
         NativeErrorCode::ModelInUse => "the requested local model slot is in use",
+        NativeErrorCode::DuplicateActiveRequest => {
+            "the local native request identifier is already active"
+        }
         NativeErrorCode::ModelSlotsFull => "all configured local model slots are occupied",
         NativeErrorCode::MemoryBudgetExceeded => {
             "the local model exceeds the configured memory budget"
@@ -1771,6 +1776,22 @@ mod tests {
         assert_eq!(queue_full.code, "native_queue_full");
         assert_eq!(queue_full.class, ErrorClass::RateLimit);
         assert_eq!(queue_full.http_status, 429);
+
+        let duplicate = map_native_error(
+            &RequestId::new(),
+            NativeError::new(
+                NativeErrorCode::DuplicateActiveRequest,
+                "untrusted native detail",
+            ),
+        );
+        assert_eq!(duplicate.class, ErrorClass::Unavailable);
+        assert!(!duplicate.retryable);
+        assert_eq!(duplicate.http_status, 409);
+        assert_eq!(
+            duplicate.safe_detail,
+            "the local native request identifier is already active"
+        );
+        assert!(!duplicate.safe_detail.contains("untrusted"));
         assert!(queue_full.retryable);
 
         let private_path = "/Users/private/models/secret-model.gguf";

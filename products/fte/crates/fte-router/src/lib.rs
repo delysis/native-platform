@@ -1,12 +1,13 @@
 //! Privacy-first route planning and backend orchestration.
 
 use fte_types::{
-    BackendDescriptor, BackendLocation, BackendRequest, CancelTarget, GatewayBackend, GatewayError,
-    GatewayLifecycle, GatewayRequest, GatewayStatus, GatewayTicket, GatewayUsage, ModelDescriptor,
-    ModelSelector, PrivacyPolicy, RequestId, ResolvedRoute, ResponseFormat, RouteProfile,
+    BackendDescriptor, BackendLocation, BackendRequest, CancelTarget, ErrorClass, GatewayBackend,
+    GatewayError, GatewayLifecycle, GatewayRequest, GatewayStatus, GatewayTicket, GatewayUsage,
+    ModelDescriptor, ModelSelector, PrivacyPolicy, RequestId, ResolvedRoute, ResponseFormat,
+    RouteProfile,
 };
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -72,7 +73,7 @@ impl BackendCircuit {
 #[derive(Default)]
 struct LifecycleState {
     phase: GatewayLifecycle,
-    active_requests: BTreeMap<RequestId, usize>,
+    active_requests: BTreeSet<RequestId>,
     shutdown_error: Option<GatewayError>,
 }
 
@@ -115,22 +116,23 @@ impl LifecycleControl {
         if state.phase != GatewayLifecycle::Running {
             return Err(gateway_closed_error(request_id, state.phase));
         }
-        *state.active_requests.entry(request_id.clone()).or_default() += 1;
+        if !state.active_requests.insert(request_id.clone()) {
+            return Err(GatewayError {
+                code: "request_already_active".to_string(),
+                class: ErrorClass::Unavailable,
+                retryable: false,
+                http_status: 409,
+                request_id: request_id.clone(),
+                provider: None,
+                safe_detail: "a request with this identifier is already active".to_string(),
+            });
+        }
         Ok(())
     }
 
     fn release_request(&self, request_id: &RequestId) {
         let mut state = self.lock_state();
-        let remove = state
-            .active_requests
-            .get_mut(request_id)
-            .is_some_and(|count| {
-                *count = count.saturating_sub(1);
-                *count == 0
-            });
-        if remove {
-            state.active_requests.remove(request_id);
-        }
+        state.active_requests.remove(request_id);
         self.changed.notify_waiters();
     }
 
@@ -139,7 +141,7 @@ impl LifecycleControl {
         match state.phase {
             GatewayLifecycle::Running => {
                 state.phase = GatewayLifecycle::Quiescing;
-                let active = state.active_requests.keys().cloned().collect();
+                let active = state.active_requests.iter().cloned().collect();
                 self.changed.notify_waiters();
                 ShutdownDisposition::Lead(active)
             }
@@ -154,7 +156,7 @@ impl LifecycleControl {
         let state = self.lock_state();
         (
             state.phase,
-            state.active_requests.values().sum(),
+            state.active_requests.len(),
             state.shutdown_error.clone(),
         )
     }
@@ -1433,6 +1435,86 @@ mod tests {
                 .forget();
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_active_public_request_id_is_rejected_without_a_second_backend_start() {
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let gateway = Gateway::new(GatewayDefaults::default());
+        gateway
+            .register_backend(Arc::new(HangingBackend {
+                cancelled: Arc::clone(&cancelled),
+            }))
+            .expect("register hanging backend");
+        let mut request = request();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "hanging".to_string(),
+            model_id: "hanging-model".to_string(),
+        };
+
+        let first = gateway
+            .execute(request.clone())
+            .await
+            .expect("first request owns its public identity");
+        let duplicate = gateway
+            .execute(request)
+            .await
+            .expect_err("a concurrent public request ID must be unique");
+
+        assert_eq!(duplicate.code, "request_already_active");
+        assert_eq!(duplicate.class, ErrorClass::Unavailable);
+        assert_eq!(duplicate.http_status, 409);
+        assert!(!duplicate.retryable);
+        assert_eq!(gateway.status().active_requests, 1);
+
+        drop(first);
+        wait_for_no_active(&gateway).await;
+        assert_eq!(cancelled.load(AtomicOrdering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_consumer_ticket_keeps_admission_until_backend_final() {
+        let completion = Arc::new(Mutex::new(None));
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+        gateway
+            .register_backend(Arc::new(DelayedFinalBackend {
+                completion: Arc::clone(&completion),
+                cancellations: Arc::clone(&cancellations),
+            }))
+            .expect("register delayed-final backend");
+        let mut request = request();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "delayed-final".to_string(),
+            model_id: "delayed-final-model".to_string(),
+        };
+
+        let ticket = gateway.execute(request).await.expect("start request");
+        drop(ticket);
+        assert_eq!(gateway.status().active_requests, 1);
+
+        let shutdown_gateway = Arc::clone(&gateway);
+        let shutdown = tokio::spawn(async move { shutdown_gateway.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        assert!(cancellations.load(AtomicOrdering::Acquire) >= 1);
+
+        let final_tx = completion
+            .lock()
+            .expect("completion state")
+            .take()
+            .expect("pending backend final");
+        let _ = final_tx.send(Err(GatewayError::unavailable(
+            &RequestId::new(),
+            "fixture_backend_stopped",
+            "the delayed backend has now terminated",
+        )));
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown must finish after backend final")
+            .expect("shutdown task")
+            .expect("gateway shutdown");
+        assert_eq!(gateway.status().active_requests, 0);
     }
 
     #[tokio::test]

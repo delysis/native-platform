@@ -17,7 +17,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/delysis/free-token-energy"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 async-trait = "0.1.89"
@@ -41,10 +41,10 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["limit", "timeout"] }
 tracing = "0.1.44"
 uuid = { version = "1", features = ["v4", "serde"] }
-llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "6a82439ee449599f7a7e477e1150ae29efdb23d6" }
-llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "6a82439ee449599f7a7e477e1150ae29efdb23d6" }
-llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "6a82439ee449599f7a7e477e1150ae29efdb23d6" }
-llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "6a82439ee449599f7a7e477e1150ae29efdb23d6" }
+llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "4dd744209ff85886be9dce7df46cd65eaa19c804" }
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "4dd744209ff85886be9dce7df46cd65eaa19c804" }
+llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "4dd744209ff85886be9dce7df46cd65eaa19c804" }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "4dd744209ff85886be9dce7df46cd65eaa19c804" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
