@@ -45,9 +45,30 @@ fuzz_target!(|input: &[u8]| {
     let Ok(inspector) = Inspector::new(policy) else {
         return;
     };
-    let attachment = ProvidedAttachment::from_bytes(case.name, case.media_type, case.bytes);
+    let attachment = ProvidedAttachment::from_bytes(
+        case.name.clone(),
+        case.media_type.clone(),
+        case.bytes.clone(),
+    );
     if let Ok(bundle) = inspector.inspect(attachment) {
         assert!(bundle.validate().is_ok());
+        assert!(
+            bundle
+                .graph
+                .usage
+                .dominates(&attachment_native_types::BudgetUsage::default())
+        );
+
+        let repeated = inspector.inspect(ProvidedAttachment::from_bytes(
+            case.name,
+            case.media_type,
+            case.bytes,
+        ));
+        if let Ok(repeated) = repeated {
+            let mut repeated_graph = repeated.graph;
+            repeated_graph.job_id = bundle.graph.job_id.clone();
+            assert_eq!(repeated_graph, bundle.graph);
+        }
     }
 });
 
