@@ -4,7 +4,7 @@
   "status": "historical_cmd_q_passed_post_review_source_unverified",
   "observed_at_utc": "2026-08-11T22:23:43Z",
   "runtime_source_revision": "aaa6996ff0dcb2c331e5ec252e8a4af59d19e7e9",
-  "evidence_scope": "This exact-bundle evidence predates the subsequent uncommitted review correction that supervises receipt-writing and native read commands. It cannot promote the post-review source.",
+  "evidence_scope": "This exact-bundle evidence predates revision 57a69aea00caeacd31ff2922b90520f6016fbbdc and the later uncommitted post-57a review remediation. It cannot promote either source.",
   "bundle": {
     "path_recorded": false,
     "product_name": "Mom Llama R1 aaa6996",
@@ -64,6 +64,7 @@
   ],
   "claims_not_made": [
     "This receipt does not validate or promote source after revision aaa6996ff0dcb2c331e5ec252e8a4af59d19e7e9.",
+    "This receipt does not validate the uncommitted post-57a review remediation.",
     "This receipt does not claim Dock or direct AppleEvent quit acceptance.",
     "This receipt does not claim remote CI or release readiness."
   ]

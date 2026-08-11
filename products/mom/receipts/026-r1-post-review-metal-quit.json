@@ -1,10 +1,11 @@
 {
   "schema": "mom_llama.application_supervision_acceptance.v1",
   "task_id": "R1-MOM-SUPERVISE-POST-REVIEW-METAL-ACCEPTANCE",
-  "status": "cmd_q_passed_dock_apple_event_open",
+  "status": "historical_cmd_q_passed_post_57a_remediation_unverified",
   "observed_at_utc": "2026-08-11T22:35:31Z",
   "runtime_source_revision": "57a69aea00caeacd31ff2922b90520f6016fbbdc",
   "evidence_commit_parent": "bc9a148",
+  "evidence_scope": "This exact-bundle evidence validates revision 57a69aea00caeacd31ff2922b90520f6016fbbdc only. It does not validate or promote the later uncommitted command-admission remediation.",
   "bundle": {
     "path_recorded": false,
     "product_name": "Mom Llama R1 57a69ae",
@@ -47,11 +48,14 @@
     "process_left_running": false
   },
   "open_promotion_evidence": [
-    "Exercise Dock Quit or a directly identified AppleEvent Quit against this exact source with a trustworthy OS interaction harness.",
+    "Commit and identity-lock the post-57a command-admission remediation.",
+    "Repeat real-Qwen active-generation Cmd+Q and immediate same-store relaunch against that exact remediated bundle.",
+    "Exercise Dock Quit or a directly identified AppleEvent Quit against the remediated bundle with a trustworthy OS interaction harness.",
     "Run current-head remote CI after publication.",
     "Record a review by a steward independent of both implementation passes."
   ],
   "claims_not_made": [
+    "This receipt does not validate source after revision 57a69aea00caeacd31ff2922b90520f6016fbbdc.",
     "This receipt does not claim Dock or direct AppleEvent quit acceptance.",
     "This receipt does not claim remote CI or release readiness."
   ]

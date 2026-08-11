@@ -1,16 +1,18 @@
 {
   "schema": "mom_llama.application_supervision_audit.v1",
   "task_id": "R1-MOM-SUPERVISE",
-  "status": "portable_code_verified_immutable_evidence_open",
-  "generated_at_utc": "2026-08-11T22:29:11Z",
+  "status": "portable_code_reverified_immutable_evidence_open",
+  "generated_at_utc": "2026-08-11T22:57:00Z",
   "candidate_base_revision": "3474a1b5320ceddbbee4d004e1c5b01e61677960",
   "review_correction_parent_revision": "aaa6996ff0dcb2c331e5ec252e8a4af59d19e7e9",
-  "post_review_source_revision": "57a69aea00caeacd31ff2922b90520f6016fbbdc",
+  "reviewed_source_parent_revision": "57a69aea00caeacd31ff2922b90520f6016fbbdc",
+  "candidate_source_revision": "035655a0f7aaa80e85ee8e519b9e13509a61b037",
   "scope": {
     "classified_tauri_commands": 85,
     "permission_scope": "default",
-    "application_admission": "all 85 Tauri commands acquire the single mutex-protected phase and occurrence registry before reading, writing receipts, mutating product state, or touching native state",
-    "receipt_writing_reads": "21 domain-read commands are truthfully marked as store-mutating because their Tauri boundary persists an encrypted command receipt; all five markup reads are also admitted",
+    "application_admission": "all 85 Tauri commands acquire the single mutex-protected phase and occurrence registry before every effectful command boundary; the invalid native-picker kind now acquires admission before constructing and persisting its blocked receipt",
+    "receipt_writing_commands": "all 79 commands whose Tauri boundary reaches command_value or blocking_command are marked store-mutating because that boundary persists an encrypted command receipt; only the five markup reads and raw attachment-preview bytes do not persist receipts, and all six are still admitted",
+    "admission_test": "the source inventory requires each command admission to precede every enumerated effectful boundary instead of accepting an admit substring anywhere in the body",
     "late_registration_cancellation": "product cancellation is re-swept every 20 ms until every admitted lease drains",
     "native_host_ownership": "ProductRuntimeOwner is the sole installation authority held by the composition root; the compatibility slot stores only Weak<NativeHost>",
     "shutdown_order": [
@@ -25,7 +27,7 @@
     {
       "command": "cargo test -p mom-llama-app",
       "outcome": "passed",
-      "detail": "34 passed, including semantic command inventory, receipt/native-read admission races, receipt/native-read drain ordering, late-registration cancellation, mutation admission races, and repeated quit"
+      "detail": "34 passed, including effect-ordering command inventory, receipt/native-read admission races, receipt/native-read drain ordering, late-registration cancellation, mutation admission races, and repeated quit"
     },
     {
       "command": "cargo test -p mom-llama-runtime",
@@ -52,8 +54,8 @@
   ],
   "file_sha256": {
     "apps/mom-llama/src-tauri/src/app_runtime.rs": "343b4c6055dce74ab8e3da32d0501955d82612fc2f5df800b404861cf0c506d2",
-    "apps/mom-llama/src-tauri/src/command_registry.rs": "2e84ec4638f4e44862f718ce77d6af0bce3013ebbe702e568346b419ce850cbc",
-    "apps/mom-llama/src-tauri/src/commands.rs": "40cd4b4df5b5693eb6e0b3e08c4cc116054ade1cb12c283b8ff4011f57077f98",
+    "apps/mom-llama/src-tauri/src/command_registry.rs": "339e69ca88310e98c8fd34e9f4643f3c5b734a8416560158631846a9dd09fa71",
+    "apps/mom-llama/src-tauri/src/commands.rs": "5b9a57b4b3130fde71f054071b9a219af656d36027b881706bd5c04fa81759dd",
     "apps/mom-llama/src-tauri/src/main.rs": "428e9d9c424533bb45675620eee2b225bb0f0015392e3a10917513ab71db8969",
     "crates/mom-llama-cli/src/main.rs": "ea2d18bab6268eae9a2b88877f22a2f42bbb16a6726185e907ebd708323f8d73",
     "crates/mom-llama-runtime/src/chat.rs": "605f00a651a4c82a3a505c07013a1de741596e13c844cb058b56c2cf54e4b5fe",
@@ -65,13 +67,16 @@
     "crates/mom-llama-runtime/tests/runtime.rs": "e2ca465ee771bf6149e18944dfc7acee90d7217138f88cb4bb5b7d47994d8a05"
   },
   "open_promotion_evidence": [
-    "Exercise Dock Quit or a directly identified AppleEvent Quit against post-review revision 57a69aea00caeacd31ff2922b90520f6016fbbdc.",
+    "Build and identity-lock a bundle from exact revision 035655a0f7aaa80e85ee8e519b9e13509a61b037.",
+    "Repeat real-Qwen active-generation Cmd+Q and immediate same-store relaunch against that exact bundle.",
+    "Exercise Dock Quit or a directly identified AppleEvent Quit against that exact bundle.",
     "Run current-head remote CI after publication.",
     "Record a review by a steward independent of both implementation passes."
   ],
   "claims_not_made": [
     "Receipt 025 remains historical evidence for parent revision aaa6996 and does not validate the post-review source.",
-    "Receipt 026 proves product-owned Cmd+Q and immediate relaunch for the post-review source but not Dock or direct AppleEvent quit.",
+    "Receipt 026 proves product-owned Cmd+Q and immediate relaunch for exact revision 57a69aea00caeacd31ff2922b90520f6016fbbdc but does not validate this post-57a remediation.",
+    "No real-model or macOS bundle acceptance was run for revision 035655a0f7aaa80e85ee8e519b9e13509a61b037 when this receipt was written.",
     "This receipt does not promote the candidate to desktop release readiness."
   ]
 }
