@@ -1,9 +1,19 @@
 #![forbid(unsafe_code)]
 
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use loom_document::{DocumentContent, MergeConflict, MergeOutcome, three_way_merge};
@@ -410,19 +420,27 @@ fn canonical_merge_text(
 }
 
 fn read_bounded_utf8_file(path: &Path) -> Result<String, io::Error> {
-    let initial_metadata = fs::symlink_metadata(path)?;
-    if initial_metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("input path is a symbolic link: {}", path.display()),
-        ));
-    }
-    validate_regular_file_metadata(path, &initial_metadata)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
 
-    let file = File::open(path)?;
+    let file = match options.open(path) {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(symbolic_link_error(path));
+        }
+        Err(error) => return Err(error),
+    };
     let opened_metadata = file.metadata()?;
+    #[cfg(windows)]
+    if opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(symbolic_link_error(path));
+    }
     validate_regular_file_metadata(path, &opened_metadata)?;
-    ensure_same_file(path, &initial_metadata, &opened_metadata)?;
 
     let capacity = usize::try_from(opened_metadata.len()).unwrap_or(0);
     let mut bytes = Vec::with_capacity(capacity);
@@ -438,6 +456,13 @@ fn read_bounded_utf8_file(path: &Path) -> Result<String, io::Error> {
             format!("input file is not valid UTF-8: {}: {error}", path.display()),
         )
     })
+}
+
+fn symbolic_link_error(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("input path is a symbolic link: {}", path.display()),
+    )
 }
 
 fn validate_regular_file_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), io::Error> {
@@ -463,67 +488,6 @@ fn file_too_large_error(path: &Path, actual_bytes: u64) -> io::Error {
     )
 }
 
-#[cfg(unix)]
-fn ensure_same_file(
-    path: &Path,
-    initial: &fs::Metadata,
-    opened: &fs::Metadata,
-) -> Result<(), io::Error> {
-    use std::os::unix::fs::MetadataExt;
-
-    if initial.dev() != opened.dev() || initial.ino() != opened.ino() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("input path changed while it was opened: {}", path.display()),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn ensure_same_file(
-    path: &Path,
-    initial: &fs::Metadata,
-    opened: &fs::Metadata,
-) -> Result<(), io::Error> {
-    use std::os::windows::fs::MetadataExt;
-
-    let identity_matches = initial
-        .volume_serial_number()
-        .zip(initial.file_index())
-        .zip(opened.volume_serial_number().zip(opened.file_index()))
-        .is_some_and(
-            |((initial_volume, initial_file), (opened_volume, opened_file))| {
-                initial_volume == opened_volume && initial_file == opened_file
-            },
-        );
-    if !identity_matches {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "input path changed or could not be identified while it was opened: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn ensure_same_file(
-    path: &Path,
-    _initial: &fs::Metadata,
-    _opened: &fs::Metadata,
-) -> Result<(), io::Error> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "this platform cannot verify input file identity: {}",
-            path.display()
-        ),
-    ))
-}
-
 fn print_json(value: &impl Serialize) -> Result<(), serde_json::Error> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -531,7 +495,7 @@ fn print_json(value: &impl Serialize) -> Result<(), serde_json::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, File};
 
     use clap::CommandFactory;
     use loom_store::StoreCounts;

@@ -2371,12 +2371,14 @@ name = "loom-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "loom-document",
  "loom-store",
  "loom-types",
  "serde",
  "serde_json",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
