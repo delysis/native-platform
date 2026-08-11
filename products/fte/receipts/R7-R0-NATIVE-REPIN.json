@@ -1,0 +1,91 @@
+{
+  "base_sha": "aab16f2d7d3adcc8d93a1590c93dae264fb6d38b",
+  "implementation_revision": "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a",
+  "dependency_transition": {
+    "from_audited_native_revision": "2d69f086e922ed7bdfd6236baf5a1ad0ed568360",
+    "to_r0_native_revision": "f7a69316c64d857b99bd847dd44cd852fc5b4ca4",
+    "manifest_packages": [
+      "llama-native-cache",
+      "llama-native-engine",
+      "llama-native-host",
+      "llama-native-types"
+    ],
+    "manifest_pin_count": 4,
+    "lock_source_count": 4,
+    "canonical_source": "https://github.com/delysis/llama-native-kit",
+    "type_identity_preserved": true
+  },
+  "evidence": {
+    "r0_source": {
+      "local_worktree": "/Users/george/.codex/worktrees/phase1-r0-native-api",
+      "local_revision_present": true,
+      "local_worktree_clean": true,
+      "github_revision_reachable": false,
+      "github_main_revision": "2d69f086e922ed7bdfd6236baf5a1ad0ed568360"
+    },
+    "lock_generation": {
+      "result": "pass_against_exact_local_git_object",
+      "method": "Cargo fetched the exact clean R0 Git object through a process-local URL rewrite while retaining the canonical HTTPS source and immutable revision in Cargo.lock.",
+      "unrelated_lock_changes": 0
+    },
+    "rust_1_88_workspace": {
+      "command": "rustup run 1.88.0 cargo test --locked --workspace --all-targets --all-features",
+      "ignored_real_gguf": 2,
+      "passed": 102,
+      "result": "pass"
+    },
+    "rust_1_88_clippy": {
+      "command": "rustup run 1.88.0 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
+      "result": "pass"
+    },
+    "frontend": {
+      "syntax_command": "npm run check:frontend",
+      "syntax_result": "pass",
+      "test_command": "npm run test:frontend",
+      "tests_passed": 2,
+      "result": "pass"
+    },
+    "policy": {
+      "format": "pass",
+      "module_boundaries": "pass",
+      "native_pins": "pass",
+      "workflow_policy": "pass",
+      "git_diff_check": "pass"
+    },
+    "exact_bundle": {
+      "bundle_path": "src-tauri/target/release/bundle/macos/FTE R7 1b4cc9c.app",
+      "bundle_identifier": "com.delysis.fte.r7.1b4cc9c.acceptance",
+      "executable_bytes": 26378416,
+      "executable_sha256": "dab8089ed3420886005b17ea47cdbf9c99ef2daac6a7deaeb1feec0344704dfd",
+      "minimum_macos": "10.15",
+      "packaging_result": "pass",
+      "launched": false
+    },
+    "real_gguf": {
+      "command": "MOM_LLAMA_MODEL_PATH=/Users/george/Documents/llama-native-kit/target/test-models/Qwen_Qwen3-0.6B-Q4_K_M.gguf rustup run 1.88.0 cargo test --locked -p fte-backend-llama --test real real_chat_completion_and_stable_prefix_hit_are_in_process -- --ignored --nocapture",
+      "model_bytes": 484220320,
+      "model_sha256": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14",
+      "result": "pass_in_process_cpu_stable_prefix_79.06s"
+    }
+  },
+  "evidence_limits": {
+    "full_r7_promotable": false,
+    "github_can_resolve_native_revision": false,
+    "remote_ci_exercised": false,
+    "real_desktop_route_retested_on_r0": false,
+    "real_local_adapter_retested_on_r0": true,
+    "launched_bundle_exercised": false,
+    "sole_gateway_architecture_changed": false
+  },
+  "git_actions": {
+    "commit": true,
+    "pull_request": false,
+    "push": false
+  },
+  "micro_goal": "R7-R0-NATIVE-REPIN",
+  "receipt_schema": "delysis-remediation-receipt.v1",
+  "recorded_on": "2026-08-11",
+  "repository": "delysis/free-token-energy",
+  "status": "local_repin_verified_remote_source_and_ci_pending",
+  "worktree": "/Users/george/.codex/worktrees/phase1-r7-fte"
+}
