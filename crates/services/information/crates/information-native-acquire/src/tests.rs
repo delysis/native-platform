@@ -14,6 +14,23 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 type TestServer = JoinHandle<io::Result<Vec<String>>>;
 
+fn unpublished_siblings(directory: &Path) -> io::Result<Vec<PathBuf>> {
+    fs::read_dir(directory)?
+        .filter_map(|entry| match entry {
+            Ok(entry)
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".information-native-unpublished-") =>
+            {
+                Some(Ok(entry.path()))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
 #[test]
 fn restrictive_policy_denies_non_public_destinations() -> TestResult {
     for address in [
@@ -191,6 +208,226 @@ fn explicit_file_fetch_verifies_and_never_overwrites() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn digest_mismatch_leaves_destination_absent_and_removes_private_temp() -> TestResult {
+    let directory = tempdir()?;
+    let source = directory.path().join("source.bin");
+    let destination = directory.path().join("destination.bin");
+    fs::write(&source, b"payload")?;
+
+    let result = AcquireClient::with_defaults()?.fetch_file_artifact(
+        &source,
+        &destination,
+        7,
+        &digest(b"different"),
+        1024,
+    );
+
+    assert!(matches!(result, Err(AcquireError::DigestMismatch { .. })));
+    assert!(!destination.exists());
+    assert!(unpublished_siblings(directory.path())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn length_mismatch_leaves_destination_absent_and_removes_private_temp() -> TestResult {
+    let directory = tempdir()?;
+    let destination = directory.path().join("destination.bin");
+    let mut source = io::Cursor::new(b"short".to_vec());
+    let mut progress = |_progress| ProgressControl::Continue;
+
+    let result = stream_verified_file(
+        &mut source,
+        &destination,
+        6,
+        &digest(b"short!"),
+        1024,
+        None,
+        0,
+        &mut progress,
+    );
+
+    assert!(matches!(result, Err(AcquireError::LengthMismatch { .. })));
+    assert!(!destination.exists());
+    assert!(unpublished_siblings(directory.path())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn source_read_error_leaves_destination_absent_and_removes_private_temp() -> TestResult {
+    struct FailingSource {
+        emitted: bool,
+    }
+
+    impl Read for FailingSource {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.emitted {
+                return Err(io::Error::other("injected source read failure"));
+            }
+            self.emitted = true;
+            buffer[..4].copy_from_slice(b"part");
+            Ok(4)
+        }
+    }
+
+    let directory = tempdir()?;
+    let destination = directory.path().join("destination.bin");
+    let mut source = FailingSource { emitted: false };
+    let mut progress = |_progress| ProgressControl::Continue;
+    let result = stream_verified_file(
+        &mut source,
+        &destination,
+        8,
+        &digest(b"partrest"),
+        1024,
+        None,
+        0,
+        &mut progress,
+    );
+
+    assert!(matches!(result, Err(AcquireError::SourceIo(_))));
+    assert!(!destination.exists());
+    assert!(unpublished_siblings(directory.path())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cancellation_at_start_leaves_destination_absent() -> TestResult {
+    let directory = tempdir()?;
+    let source = directory.path().join("source.bin");
+    let destination = directory.path().join("destination.bin");
+    fs::write(&source, b"payload")?;
+    let mut progress = |event: TransferProgress| {
+        if event.phase == TransferPhase::Starting {
+            ProgressControl::Cancel
+        } else {
+            ProgressControl::Continue
+        }
+    };
+
+    let result = AcquireClient::with_defaults()?.fetch_file_artifact_with_progress(
+        &source,
+        &destination,
+        7,
+        &digest(b"payload"),
+        1024,
+        &mut progress,
+    );
+
+    assert!(matches!(result, Err(AcquireError::Cancelled { .. })));
+    assert!(!destination.exists());
+    assert!(unpublished_siblings(directory.path())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cancellation_after_validation_but_before_publish_leaves_destination_absent() -> TestResult {
+    let directory = tempdir()?;
+    let source = directory.path().join("source.bin");
+    let destination = directory.path().join("destination.bin");
+    fs::write(&source, b"payload")?;
+    let mut progress = |event: TransferProgress| {
+        if event.phase == TransferPhase::Publishing {
+            ProgressControl::Cancel
+        } else {
+            ProgressControl::Continue
+        }
+    };
+
+    let result = AcquireClient::with_defaults()?.fetch_file_artifact_with_progress(
+        &source,
+        &destination,
+        7,
+        &digest(b"payload"),
+        1024,
+        &mut progress,
+    );
+
+    assert!(matches!(result, Err(AcquireError::Cancelled { .. })));
+    assert!(!destination.exists());
+    assert!(unpublished_siblings(directory.path())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn destination_created_at_publish_is_never_clobbered() -> TestResult {
+    let directory = tempdir()?;
+    let source = directory.path().join("source.bin");
+    let destination = directory.path().join("destination.bin");
+    fs::write(&source, b"payload")?;
+    let callback_destination = destination.clone();
+    let mut progress = move |event: TransferProgress| {
+        if event.phase == TransferPhase::Publishing {
+            fs::write(&callback_destination, b"caller-owned")
+                .expect("test publishes a competing destination");
+        }
+        ProgressControl::Continue
+    };
+
+    let result = AcquireClient::with_defaults()?.fetch_file_artifact_with_progress(
+        &source,
+        &destination,
+        7,
+        &digest(b"payload"),
+        1024,
+        &mut progress,
+    );
+
+    assert!(matches!(result, Err(AcquireError::StagingPathExists)));
+    assert_eq!(fs::read(&destination)?, b"caller-owned");
+    assert!(unpublished_siblings(directory.path())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn successful_fresh_publish_leaves_exact_bytes_and_no_private_temp() -> TestResult {
+    let directory = tempdir()?;
+    let source = directory.path().join("source.bin");
+    let destination = directory.path().join("destination.bin");
+    fs::write(&source, b"payload")?;
+
+    AcquireClient::with_defaults()?.fetch_file_artifact(
+        &source,
+        &destination,
+        7,
+        &digest(b"payload"),
+        1024,
+    )?;
+
+    assert_eq!(fs::read(&destination)?, b"payload");
+    assert!(unpublished_siblings(directory.path())?.is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn unpublished_temp_is_private_and_replacement_safe() -> TestResult {
+    let directory = tempdir()?;
+    let destination = directory.path().join("destination.bin");
+    let unpublished = UnpublishedFile::create(&destination)?;
+    let temporary_path = unpublished
+        .temporary
+        .as_ref()
+        .ok_or_else(|| io::Error::other("missing unpublished temp"))?
+        .path()
+        .to_path_buf();
+    assert_eq!(temporary_path.parent(), Some(directory.path()));
+    assert_eq!(
+        fs::metadata(&temporary_path)?.permissions().mode() & 0o077,
+        0
+    );
+
+    let displaced = directory.path().join("displaced-private-temp.bin");
+    fs::rename(&temporary_path, &displaced)?;
+    fs::write(&temporary_path, b"caller replacement")?;
+    drop(unpublished);
+
+    assert_eq!(fs::read(&temporary_path)?, b"caller replacement");
+    assert!(displaced.exists());
+    assert!(!destination.exists());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn staging_files_are_private_at_creation() -> TestResult {
@@ -334,6 +571,73 @@ fn http_fetch_records_full_redirect_attestation() -> TestResult {
     assert_eq!(attestation.redirect_chain[0].status, 302);
     assert_eq!(attestation.redirect_chain[0].from_uri, initial_url);
     assert_eq!(attestation.redirect_chain[0].to_uri, final_url);
+    Ok(())
+}
+
+#[test]
+fn fresh_http_digest_mismatch_never_publishes_destination() -> TestResult {
+    let body = b"network corpus";
+    let (url, server) = serve_sequence(vec![response(
+        "200 OK",
+        &[("Content-Length", &body.len().to_string())],
+        body,
+    )])?;
+    let directory = tempdir()?;
+    let destination = directory.path().join("destination.bin");
+    let options = local_options(ResumePolicy::Disabled);
+    let mut progress = |_progress| ProgressControl::Continue;
+
+    let result = AcquireClient::with_defaults()?.fetch_artifact_with_options(
+        &url,
+        &destination,
+        u64::try_from(body.len())?,
+        &digest(b"different bytes"),
+        1024,
+        &options,
+        &mut progress,
+    );
+    join_server(server)?;
+
+    assert!(matches!(result, Err(AcquireError::DigestMismatch { .. })));
+    assert!(!destination.exists());
+    assert!(unpublished_siblings(directory.path())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn fresh_http_destination_race_is_no_clobber() -> TestResult {
+    let body = b"network corpus";
+    let (url, server) = serve_sequence(vec![response(
+        "200 OK",
+        &[("Content-Length", &body.len().to_string())],
+        body,
+    )])?;
+    let directory = tempdir()?;
+    let destination = directory.path().join("destination.bin");
+    let callback_destination = destination.clone();
+    let options = local_options(ResumePolicy::Disabled);
+    let mut progress = move |event: TransferProgress| {
+        if event.phase == TransferPhase::Publishing {
+            fs::write(&callback_destination, b"caller-owned")
+                .expect("test publishes a competing destination");
+        }
+        ProgressControl::Continue
+    };
+
+    let result = AcquireClient::with_defaults()?.fetch_artifact_with_options(
+        &url,
+        &destination,
+        u64::try_from(body.len())?,
+        &digest(body),
+        1024,
+        &options,
+        &mut progress,
+    );
+    join_server(server)?;
+
+    assert!(matches!(result, Err(AcquireError::StagingPathExists)));
+    assert_eq!(fs::read(&destination)?, b"caller-owned");
+    assert!(unpublished_siblings(directory.path())?.is_empty());
     Ok(())
 }
 

@@ -255,6 +255,8 @@ pub enum TransferPhase {
     Starting,
     Resuming,
     Downloading,
+    /// Exact length and digest have passed; destination publication has not.
+    Publishing,
     Complete,
 }
 
@@ -628,6 +630,24 @@ impl AcquireClient {
         validate_artifact_url_metadata(&initial_url)?;
         let started_at_unix_ms = unix_time_millis()?;
         let expected_digest = canonical_sha256(expected_sha256)?;
+        if options.resume == ResumePolicy::Disabled {
+            if path_exists(staging_path)? {
+                return Err(AcquireError::StagingPathExists);
+            }
+            let deadline = transfer_deadline(self.timeouts.total_transfer_timeout)?;
+            return self.run_network(self.fetch_http_fresh_artifact_async(
+                requested_uri,
+                initial_url,
+                staging_path,
+                expected_bytes,
+                &expected_digest,
+                max_bytes,
+                &options.acquisition_policy,
+                progress,
+                deadline,
+                started_at_unix_ms,
+            ));
+        }
         let mut prepared = PreparedTransfer::open(
             requested_uri,
             staging_path,
@@ -690,6 +710,117 @@ impl AcquireClient {
             prepared.settle_failed_attempt(requested_uri, expected_bytes, &expected_digest)?;
         }
         result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_http_fresh_artifact_async(
+        &self,
+        requested_uri: &str,
+        initial_url: Url,
+        staging_path: &Path,
+        expected_bytes: u64,
+        expected_digest: &str,
+        max_bytes: u64,
+        policy: &AcquisitionPolicy,
+        progress: &mut dyn ProgressCallback,
+        deadline: Instant,
+        started_at_unix_ms: u64,
+    ) -> Result<VerifiedFetch, AcquireError> {
+        notify_progress(
+            progress,
+            TransferProgress {
+                phase: TransferPhase::Starting,
+                downloaded_bytes: 0,
+                expected_bytes,
+                resumed_bytes: 0,
+            },
+        )?;
+        let mut opened = self
+            .open_http(requested_uri, initial_url, policy, deadline, None, false)
+            .await?;
+        require_fresh_response(&opened.response, expected_bytes)?;
+
+        let mut unpublished = UnpublishedFile::create(staging_path)?;
+        let mut hasher = Sha256::new();
+        let mut received = 0_u64;
+        while let Some(chunk) = opened.response.chunk().await.map_err(network_error)? {
+            received = received
+                .checked_add(u64::try_from(chunk.len()).map_err(|_| AcquireError::IntegerOverflow)?)
+                .ok_or(AcquireError::IntegerOverflow)?;
+            if received > max_bytes {
+                return Err(AcquireError::LimitExceeded { max_bytes });
+            }
+            if received > expected_bytes {
+                return Err(AcquireError::LengthMismatch {
+                    expected: expected_bytes,
+                    actual: received,
+                });
+            }
+            hasher.update(&chunk);
+            unpublished
+                .file_mut()?
+                .write_all(&chunk)
+                .map_err(staging_io)?;
+            notify_progress(
+                progress,
+                TransferProgress {
+                    phase: TransferPhase::Downloading,
+                    downloaded_bytes: received,
+                    expected_bytes,
+                    resumed_bytes: 0,
+                },
+            )?;
+        }
+        if received != expected_bytes {
+            return Err(AcquireError::LengthMismatch {
+                expected: expected_bytes,
+                actual: received,
+            });
+        }
+        let actual_digest = hex::encode(hasher.finalize());
+        if actual_digest != expected_digest {
+            return Err(AcquireError::DigestMismatch {
+                expected: expected_digest.to_string(),
+                actual: actual_digest,
+            });
+        }
+        notify_progress(
+            progress,
+            TransferProgress {
+                phase: TransferPhase::Publishing,
+                downloaded_bytes: received,
+                expected_bytes,
+                resumed_bytes: 0,
+            },
+        )?;
+        let _published = unpublished.publish()?;
+        let finished_at_unix_ms = unix_time_millis()?;
+        let attestation = opened.attestation;
+        let source_attestations = vec![SourceAttemptAttestation {
+            source: attestation.clone(),
+            byte_start: 0,
+            byte_end: received,
+            started_at_unix_ms,
+            finished_at_unix_ms: Some(finished_at_unix_ms),
+        }];
+        let _control = progress.on_progress(TransferProgress {
+            phase: TransferPhase::Complete,
+            downloaded_bytes: received,
+            expected_bytes,
+            resumed_bytes: 0,
+        });
+        Ok(VerifiedFetch {
+            bytes: received,
+            sha256: actual_digest,
+            network_used: true,
+            final_source_uri: Some(attestation.final_uri.clone()),
+            redirects: attestation.redirect_chain.len(),
+            source_attestation: Some(attestation),
+            source_attestations,
+            started_at_unix_ms,
+            finished_at_unix_ms,
+            resumed_bytes: 0,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1891,6 +2022,122 @@ impl Drop for TransferFiles {
     }
 }
 
+/// Fresh transfers write to a library-owned sibling and publish only after
+/// byte count and digest validation. The caller's destination is never a
+/// partial-download path.
+#[derive(Debug)]
+struct UnpublishedFile {
+    destination: PathBuf,
+    temporary: Option<tempfile::NamedTempFile>,
+    #[cfg(unix)]
+    identity: FileIdentity,
+}
+
+impl UnpublishedFile {
+    fn create(destination: &Path) -> Result<Self, AcquireError> {
+        if path_exists(destination)? {
+            return Err(AcquireError::StagingPathExists);
+        }
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".information-native-unpublished-");
+        // tempfile's Unix cleanup is path-based. Disable it so replacement of
+        // the private name cannot make Drop delete caller bytes; our cleanup
+        // below is bound to the opened inode instead.
+        #[cfg(unix)]
+        builder.disable_cleanup(true);
+        let temporary = builder.tempfile_in(parent).map_err(staging_io)?;
+        enforce_private_regular_file(temporary.as_file())?;
+        #[cfg(unix)]
+        let identity = FileIdentity::from_file(temporary.as_file())?;
+        Ok(Self {
+            destination: destination.to_path_buf(),
+            temporary: Some(temporary),
+            #[cfg(unix)]
+            identity,
+        })
+    }
+
+    fn file_mut(&mut self) -> Result<&mut File, AcquireError> {
+        self.temporary
+            .as_mut()
+            .map(tempfile::NamedTempFile::as_file_mut)
+            .ok_or_else(|| {
+                staging_io(io::Error::other(
+                    "unpublished file disappeared before publication",
+                ))
+            })
+    }
+
+    fn publish(mut self) -> Result<File, AcquireError> {
+        self.file_mut()?.flush().map_err(staging_io)?;
+        self.temporary
+            .as_ref()
+            .ok_or_else(|| {
+                staging_io(io::Error::other(
+                    "unpublished file disappeared before publication",
+                ))
+            })?
+            .as_file()
+            .sync_all()
+            .map_err(staging_io)?;
+        let temporary = self.temporary.take().ok_or_else(|| {
+            staging_io(io::Error::other(
+                "unpublished file disappeared before publication",
+            ))
+        })?;
+        #[cfg(unix)]
+        let temporary_path = temporary.path().to_path_buf();
+        let persisted = match temporary.persist_noclobber(&self.destination) {
+            Ok(file) => file,
+            Err(error) => {
+                let tempfile::PersistError { error, file } = error;
+                #[cfg(unix)]
+                cleanup_unpublished_temp(&file, self.identity);
+                drop(file);
+                return Err(map_unpublished_persist_error(error));
+            }
+        };
+        #[cfg(unix)]
+        if self.identity.matches_path(&temporary_path).unwrap_or(false) {
+            // `persist_noclobber` may fall back to hard-link plus best-effort
+            // unlink. Remove only the still-matching private link.
+            let _ignored = fs::remove_file(&temporary_path);
+        }
+        sync_parent_directory(&self.destination)?;
+        Ok(persisted)
+    }
+}
+
+impl Drop for UnpublishedFile {
+    fn drop(&mut self) {
+        let Some(temporary) = self.temporary.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        cleanup_unpublished_temp(&temporary, self.identity);
+        drop(temporary);
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_unpublished_temp(temporary: &tempfile::NamedTempFile, identity: FileIdentity) {
+    if identity.matches_path(temporary.path()).unwrap_or(false) {
+        let _ignored = fs::remove_file(temporary.path());
+    }
+}
+
+fn map_unpublished_persist_error(error: io::Error) -> AcquireError {
+    if error.kind() == io::ErrorKind::AlreadyExists {
+        AcquireError::StagingPathExists
+    } else {
+        staging_io(error)
+    }
+}
+
 #[derive(Debug)]
 struct StagingFile {
     path: PathBuf,
@@ -2714,7 +2961,7 @@ fn stream_verified_file(
     progress: &mut dyn ProgressCallback,
 ) -> Result<VerifiedFetch, AcquireError> {
     let expected_digest = canonical_sha256(expected_sha256)?;
-    let mut staging = StagingFile::create(staging_path)?;
+    let mut staging = UnpublishedFile::create(staging_path)?;
     let mut hasher = Sha256::new();
     let mut received = 0_u64;
     notify_progress(
@@ -2746,7 +2993,7 @@ fn stream_verified_file(
         }
         hasher.update(&buffer[..read]);
         staging
-            .file
+            .file_mut()?
             .write_all(&buffer[..read])
             .map_err(staging_io)?;
         notify_progress(
@@ -2772,7 +3019,19 @@ fn stream_verified_file(
             actual: actual_digest,
         });
     }
-    staging.finish()?;
+    // This is the final cancellable observation before no-clobber
+    // publication. A Complete callback is observational because validated
+    // bytes are already visible by then.
+    notify_progress(
+        progress,
+        TransferProgress {
+            phase: TransferPhase::Publishing,
+            downloaded_bytes: received,
+            expected_bytes,
+            resumed_bytes: 0,
+        },
+    )?;
+    let _published = staging.publish()?;
     let _control = progress.on_progress(TransferProgress {
         phase: TransferPhase::Complete,
         downloaded_bytes: received,
