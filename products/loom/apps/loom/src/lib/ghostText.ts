@@ -27,8 +27,7 @@ export interface GhostTextPlan {
 export interface GhostTextHandlers {
   /**
    * Synchronously consume the exact visible presentation. A false result
-   * leaves Tab with its ordinary browser meaning after the stale ghost is
-   * cleared.
+   * leaves both the presentation and Tab's ordinary browser meaning intact.
    */
   accept: (candidateId: string, presentationKey: string) => boolean;
   dismiss: (candidateId: string, presentationKey: string) => void;
@@ -330,7 +329,7 @@ function elementAndAncestorsAreVisible(element: HTMLElement, root: HTMLElement):
 /** Return the key only when the exact widget is connected and on screen. */
 export function visibleGhostWidgetPresentationKey(view: EditorView): string {
   const plan = currentGhostTextPlan(view.state);
-  if (!plan || !view.hasFocus()) return '';
+  if (!plan) return '';
   const widget = Array.from(
     view.dom.querySelectorAll<HTMLElement>(`[${GHOST_PRESENTATION_ATTRIBUTE}]`)
   ).find((candidate) =>
