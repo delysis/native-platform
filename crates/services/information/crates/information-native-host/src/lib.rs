@@ -1315,6 +1315,11 @@ fn store_information_error(error: &StoreError) -> InformationError {
             "information_store_integrity_failure",
             false,
         ),
+        StoreError::CommittedDurabilityUnknown { .. } => (
+            ErrorClass::Io,
+            "information_store_commit_durability_unknown",
+            true,
+        ),
         StoreError::Io { .. } => (ErrorClass::Io, "information_store_io_failure", false),
         StoreError::IntegerOverflow => (
             ErrorClass::Internal,
@@ -2296,6 +2301,26 @@ mod tests {
         let busy = HostError::Store(StoreError::StoreBusy).as_information_error();
         assert_eq!(busy.class, ErrorClass::ResourceBusy);
         assert!(busy.retryable);
+        let durability_unknown = HostError::Store(StoreError::CommittedDurabilityUnknown {
+            receipt: information_native_store::StoreCommitReceipt {
+                installation_id: InstallationId::parse("durability-unknown")?,
+                kind: information_native_store::StoreCommitKind::ReadyReceipt,
+                destination: PathBuf::from("registry/ready.json"),
+                visible: true,
+                destination_directory_synced: false,
+                source_absent: None,
+                source_directory_synced: None,
+                idempotent_recovery: false,
+            },
+            source: std::io::Error::other("injected directory sync failure"),
+        })
+        .as_information_error();
+        assert_eq!(durability_unknown.class, ErrorClass::Io);
+        assert_eq!(
+            durability_unknown.code,
+            "information_store_commit_durability_unknown"
+        );
+        assert!(durability_unknown.retryable);
         let missing = HostError::Store(StoreError::InstallationNotFound(InstallationId::parse(
             "missing",
         )?))

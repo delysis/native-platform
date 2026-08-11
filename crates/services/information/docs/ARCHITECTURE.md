@@ -75,6 +75,16 @@ returns a receipt marked `idempotent_recovery`; a conflicting destination is
 left untouched and fails closed. Recovery records `PreexistingStage` rather
 than inventing a source contact that did not occur during the retry.
 
+Managed-store publication uses the same rule. Package activation records
+whether the destination `packages` directory and the source-removal `staging`
+directory were synced after the rename. Ready, non-ready, and external registry
+events are file-synced before rename and directory-synced afterward. A
+post-rename sync failure returns `StoreError::CommittedDurabilityUnknown` with
+the visible destination and exact sync facts. Retrying activation re-hashes the
+complete package, rejects a conflicting plan or changed artifact, re-syncs both
+rename parents and the existing ready-event directory, and returns the one
+existing ready receipt without appending a duplicate revision.
+
 The resumability boundary is explicit. A completed staged artifact is rehashed
 and reused after interruption, and its acquisition record is persisted in the
 staging package as an immutable per-artifact journal entry; `stage.json` is
