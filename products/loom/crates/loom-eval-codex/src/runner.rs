@@ -58,12 +58,14 @@ const MAX_EFFECTIVE_ENVIRONMENT_BYTES: usize = 256 * 1024;
 
 const PACKET_DOMAIN: &[u8] = b"loom/codex-frontier-critic-packet/v2\0";
 const RECEIPT_DOMAIN: &[u8] = b"loom/codex-frontier-critic-diagnostic-receipt/v2\0";
+#[cfg(target_os = "macos")]
 const CODE_SIGNATURE_DOMAIN: &[u8] = b"loom/codex-frontier-code-signature/v1\0";
 const PROTOCOL_DOMAIN: &[u8] = b"loom/codex-frontier-protocol/v1\0";
 const BUILD_DOMAIN: &[u8] = b"loom/codex-frontier-build/v1\0";
 const ENVIRONMENT_DOMAIN: &[u8] = b"loom/codex-frontier-environment/v1\0";
 const AUTHENTICATION_DOMAIN: &[u8] = b"loom/codex-frontier-authentication/v1\0";
 const INVOCATION_DOMAIN: &[u8] = b"loom/codex-frontier-invocation/v1\0";
+#[cfg(target_os = "macos")]
 const CHALLENGE_DOMAIN: &[u8] = b"loom/codex-frontier-live-challenge/v1\0";
 const SESSION_DOMAIN: &[u8] = b"loom/codex-frontier-session/v1\0";
 
@@ -247,6 +249,7 @@ impl FrontierCriticPacket {
         self.prompt_injection_disposition = disposition;
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn bind_live_challenge(
         mut self,
         challenge: &LiveChallenge,
@@ -591,6 +594,7 @@ pub fn run_diagnostic_frontier_critic(
     packet: FrontierCriticPacket,
 ) -> Result<DiagnosticFrontierCriticReceipt, FrontierCriticError> {
     let owned_cli = OwnedCli::copy_exact(config.cli_path(), config.expected_cli_sha256)?;
+    owned_cli.revalidate()?;
     run_exact_frontier_critic(
         owned_cli.path(),
         config.expected_cli_sha256,
@@ -616,7 +620,7 @@ pub fn run_chatgpt_bundled_frontier_critic_diagnostic(
 ) -> Result<DiagnosticFrontierCriticReceipt, FrontierCriticError> {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = packet;
+        drop(packet);
         Err(FrontierCriticError::UnsupportedPinnedPlatform)
     }
     #[cfg(target_os = "macos")]
@@ -1520,11 +1524,13 @@ fn hash_bounded_regular_file(path: &Path, maximum: u64) -> Result<BlobId, Fronti
     Ok(BlobId::from_bytes(digest.finalize().into()))
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PinnedCodeSignature {
     fingerprint: BlobId,
 }
 
+#[cfg(target_os = "macos")]
 impl PinnedCodeSignature {
     fn evidence(self) -> DiagnosticCodeSignatureEvidence {
         DiagnosticCodeSignatureEvidence {
@@ -1585,11 +1591,7 @@ fn verify_pinned_code_signature(path: &Path) -> Result<PinnedCodeSignature, Fron
     })
 }
 
-#[cfg(not(target_os = "macos"))]
-fn verify_pinned_code_signature(_path: &Path) -> Result<PinnedCodeSignature, FrontierCriticError> {
-    Err(FrontierCriticError::UnsupportedPinnedPlatform)
-}
-
+#[cfg(target_os = "macos")]
 fn run_fixed_system_command(
     path: &Path,
     args: &[OsString],
@@ -1624,12 +1626,15 @@ fn run_fixed_system_command(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct LiveChallenge {
     bytes: [u8; 32],
     fingerprint: BlobId,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl LiveChallenge {
+    #[cfg(target_os = "macos")]
     fn fresh() -> Result<Self, FrontierCriticError> {
         let mut bytes = [0_u8; 32];
         getrandom::fill(&mut bytes).map_err(|_| FrontierCriticError::RandomUnavailable)?;
@@ -1647,6 +1652,7 @@ impl LiveChallenge {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn pinned_cli_sha256() -> BlobId {
     BlobId::from_str(PINNED_CHATGPT_CODEX_SHA256).expect("reviewed SHA-256 is canonical")
 }
@@ -2169,6 +2175,7 @@ printf '%s\n' \
             bytes,
             fingerprint: BlobId::digest(b"challenge"),
         };
+        assert_eq!(challenge.fingerprint, BlobId::digest(b"challenge"));
         let original = packet();
         let original_fingerprint = original.packet_fingerprint();
         let challenged = original.bind_live_challenge(&challenge).expect("challenge");
