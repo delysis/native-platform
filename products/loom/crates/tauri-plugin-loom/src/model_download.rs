@@ -370,7 +370,10 @@ pub(crate) fn prepare_model_library(
     match fs::symlink_metadata(&library) {
         Ok(metadata) => validate_model_library_metadata(&library, &metadata)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(&library) {
-            Ok(()) => set_private_directory_permissions(&library)?,
+            Ok(()) => {
+                #[cfg(unix)]
+                set_private_directory_permissions(&library)?;
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let metadata =
                     fs::symlink_metadata(&library).map_err(|source| ModelLibraryError::Io {
@@ -479,11 +482,6 @@ fn set_private_directory_permissions(path: &std::path::Path) -> Result<(), Model
             source,
         }
     })
-}
-
-#[cfg(not(unix))]
-fn set_private_directory_permissions(_path: &std::path::Path) -> Result<(), ModelLibraryError> {
-    Ok(())
 }
 
 fn terminal_entry(
