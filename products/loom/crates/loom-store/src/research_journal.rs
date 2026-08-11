@@ -287,7 +287,7 @@ pub struct ResearchJournalWriter {
     lease_fingerprint: BlobId,
     store_authority_domain_fingerprint: BlobId,
     accounting: JournalAccounting,
-    _session_lease: ExclusiveResearchSessionLease,
+    session_lease: ExclusiveResearchSessionLease,
 }
 
 impl fmt::Debug for ResearchJournalWriter {
@@ -347,12 +347,8 @@ impl ProjectStore {
         if current.as_ref() != Some(lease.snapshot()) {
             return Err(StoreError::ResearchJournalLeaseMismatch);
         }
-        let accounting = load_journal_accounting(
-            &connection,
-            lease.kind(),
-            lease.trial_run_id(),
-            campaign_id,
-        )?;
+        let accounting =
+            load_journal_accounting(&connection, lease.kind(), lease.trial_run_id(), campaign_id)?;
         let store_authority_domain_fingerprint = self.research_authority_domain_fingerprint();
 
         Ok(ResearchJournalWriter {
@@ -367,7 +363,7 @@ impl ProjectStore {
             lease_fingerprint: lease.lease_fingerprint(),
             store_authority_domain_fingerprint,
             accounting,
-            _session_lease: lease,
+            session_lease: lease,
         })
     }
 }
@@ -478,10 +474,10 @@ impl ResearchJournalWriter {
     ) -> Result<()> {
         self.ensure_subject(ResearchSessionKind::Campaign, input.campaign_fingerprint)?;
         let columns = campaign_event_columns(input.mutation);
-        if campaign_event_replay_is_exact(&self.connection, self.campaign_id, input, &columns)? {
+        if campaign_event_replay_is_exact(&self.connection, self.campaign_id, &input, &columns)? {
             return Ok(());
         }
-        let added_record_bytes = campaign_append_record_bytes(input)?;
+        let added_record_bytes = campaign_append_record_bytes(&input)?;
         let next_accounting = self.accounting.preflight_new_event(
             input.event_index,
             MAX_PERSISTED_CAMPAIGN_JOURNAL_EVENTS,
@@ -532,7 +528,7 @@ impl ResearchJournalWriter {
         verify_campaign_event_row(
             &transaction,
             self.campaign_id,
-            input,
+            &input,
             event_kind,
             attempt_id,
             attempt_outcome,
@@ -622,7 +618,7 @@ impl ResearchJournalWriter {
     }
 
     fn trial_fingerprint(&self) -> Result<BlobId> {
-        match self._session_lease.snapshot() {
+        match self.session_lease.snapshot() {
             PersistedResearchSubjectSnapshot::Trial(snapshot) => Ok(snapshot.trial_fingerprint()),
             PersistedResearchSubjectSnapshot::Campaign(_) => {
                 Err(StoreError::ResearchJournalLeaseMismatch)
@@ -654,7 +650,7 @@ fn trial_append_record_bytes(input: TrialJournalEventPersistence<'_>) -> Result<
     append_record_bytes(input.canonical_event_bytes, &supporting)
 }
 
-fn campaign_append_record_bytes(input: CampaignJournalEventPersistence<'_>) -> Result<u64> {
+fn campaign_append_record_bytes(input: &CampaignJournalEventPersistence<'_>) -> Result<u64> {
     let supporting = match input.mutation {
         CampaignJournalMutation::TrialReserved {
             canonical_run_bytes,
@@ -788,6 +784,28 @@ struct RowPersistenceContext<'transaction, 'connection> {
     occurred_at_ms: i64,
 }
 
+#[derive(Clone, Copy)]
+struct StageReservationPersistence<'a> {
+    trial_run_id: TrialRunId,
+    attempt_id: StageAttemptId,
+    stage_id: StageId,
+    attempt_ordinal: u16,
+    reservation: ResearchJournalBudget,
+    canonical_attempt_bytes: &'a [u8],
+    canonical_reservation_bytes: &'a [u8],
+}
+
+#[derive(Clone, Copy)]
+struct CampaignTrialReservationPersistence<'a> {
+    attempt_id: TrialRunId,
+    trial_fingerprint: BlobId,
+    attempt_ordinal: u16,
+    reservation: ResearchJournalBudget,
+    canonical_run_bytes: &'a [u8],
+    canonical_attempt_bytes: &'a [u8],
+    canonical_reservation_bytes: &'a [u8],
+}
+
 fn persist_trial_supporting_rows(
     transaction: &Transaction<'_>,
     campaign_id: CampaignId,
@@ -812,13 +830,15 @@ fn persist_trial_supporting_rows(
             canonical_reservation_bytes,
         } => persist_stage_reservation(
             context,
-            trial_run_id,
-            attempt_id,
-            stage_id,
-            attempt_ordinal,
-            reservation,
-            canonical_attempt_bytes,
-            canonical_reservation_bytes,
+            StageReservationPersistence {
+                trial_run_id,
+                attempt_id,
+                stage_id,
+                attempt_ordinal,
+                reservation,
+                canonical_attempt_bytes,
+                canonical_reservation_bytes,
+            },
         ),
         TrialJournalMutation::AttemptFinished {
             attempt_id,
@@ -863,13 +883,15 @@ fn persist_campaign_supporting_rows(
             canonical_reservation_bytes,
         } => persist_campaign_trial_reservation(
             context,
-            attempt_id,
-            trial_fingerprint,
-            attempt_ordinal,
-            reservation,
-            canonical_run_bytes,
-            canonical_attempt_bytes,
-            canonical_reservation_bytes,
+            CampaignTrialReservationPersistence {
+                attempt_id,
+                trial_fingerprint,
+                attempt_ordinal,
+                reservation,
+                canonical_run_bytes,
+                canonical_attempt_bytes,
+                canonical_reservation_bytes,
+            },
         ),
         CampaignJournalMutation::TrialFinished {
             attempt_id,
@@ -909,14 +931,17 @@ fn persist_campaign_supporting_rows(
 
 fn persist_stage_reservation(
     context: RowPersistenceContext<'_, '_>,
-    trial_run_id: TrialRunId,
-    attempt_id: StageAttemptId,
-    stage_id: StageId,
-    attempt_ordinal: u16,
-    reservation: ResearchJournalBudget,
-    canonical_attempt_bytes: &[u8],
-    canonical_reservation_bytes: &[u8],
+    input: StageReservationPersistence<'_>,
 ) -> Result<()> {
+    let StageReservationPersistence {
+        trial_run_id,
+        attempt_id,
+        stage_id,
+        attempt_ordinal,
+        reservation,
+        canonical_attempt_bytes,
+        canonical_reservation_bytes,
+    } = input;
     if attempt_ordinal == 0 || reservation.wall_time_ms == 0 {
         return Err(StoreError::InvalidResearchJournalMutation);
     }
@@ -1002,14 +1027,17 @@ fn persist_stage_budget_reservation(
 
 fn persist_campaign_trial_reservation(
     context: RowPersistenceContext<'_, '_>,
-    attempt_id: TrialRunId,
-    trial_fingerprint: BlobId,
-    attempt_ordinal: u16,
-    reservation: ResearchJournalBudget,
-    canonical_run_bytes: &[u8],
-    canonical_attempt_bytes: &[u8],
-    canonical_reservation_bytes: &[u8],
+    input: CampaignTrialReservationPersistence<'_>,
 ) -> Result<()> {
+    let CampaignTrialReservationPersistence {
+        attempt_id,
+        trial_fingerprint,
+        attempt_ordinal,
+        reservation,
+        canonical_run_bytes,
+        canonical_attempt_bytes,
+        canonical_reservation_bytes,
+    } = input;
     if attempt_ordinal == 0
         || reservation.writer_tokens == 0
         || reservation.evaluations == 0
@@ -1372,7 +1400,7 @@ fn trial_event_replay_is_exact(
 fn campaign_event_replay_is_exact(
     connection: &Connection,
     campaign_id: CampaignId,
-    input: CampaignJournalEventPersistence<'_>,
+    input: &CampaignJournalEventPersistence<'_>,
     columns: &EventColumns,
 ) -> Result<bool> {
     let stored = query_journal_event_row(
@@ -1487,7 +1515,7 @@ fn verify_trial_event_row(
 fn verify_campaign_event_row(
     transaction: &Transaction<'_>,
     campaign_id: CampaignId,
-    input: CampaignJournalEventPersistence<'_>,
+    input: &CampaignJournalEventPersistence<'_>,
     event_kind: &'static str,
     attempt_id: Option<String>,
     attempt_outcome: Option<&'static str>,
@@ -2346,11 +2374,11 @@ mod tests {
             },
         };
         assert_eq!(
-            campaign_append_record_bytes(input).expect("bounded append bytes"),
+            campaign_append_record_bytes(&input).expect("bounded append bytes"),
             u64::try_from(
                 input.canonical_event_bytes.len() + run.len() + attempt.len() + reservation.len()
             )
-                .expect("fixture byte count")
+            .expect("fixture byte count")
         );
     }
 

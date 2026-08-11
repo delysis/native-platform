@@ -3,22 +3,29 @@
 mod model_download;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, Metadata};
+use std::io::Read as _;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, TryLockError};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime};
 
 use loom_backend_llama::{
-    ContinuationCase, DownloadControl, DownloadError, ExactContinuationRequest,
-    ExactContinuationResult, GgufDownloadRequest, GgufHeaderStatus, LlamaBackend,
-    LlamaBackendError, LlamaGenerationHandle, LocalModelProfile, MAX_MODEL_DOWNLOAD_BYTES,
-    ModelDiscoveryOptions, SamplingConfig, Sha256Digest, VerifiedModelDescriptor,
-    discover_gguf_models, download_gguf, model_environment_from_verified,
-    validate_candidate_receipt_binding, validate_gguf_download_request,
+    ContinuationCase, DownloadCancellation, DownloadControl, DownloadError,
+    ExactContinuationRequest, ExactContinuationResult, GgufDownloadRequest, GgufHeaderStatus,
+    JoinedLlamaGeneration, JoinedLlamaRuntime, LlamaBackend, LlamaBackendError,
+    LlamaGenerationControl, LlamaGenerationHandle, LocalModelProfile, MAX_MODEL_DOWNLOAD_BYTES,
+    ModelDiscoveryOptions, ModelRelease, NativeHostRuntime, ProcessExitJoinedLlamaRuntime,
+    SamplerKind, SamplingConfig, Sha256Digest, VerifiedModelDescriptor, discover_gguf_models,
+    download_gguf, model_environment_from_verified, validate_candidate_receipt_binding,
+    validate_gguf_download_request,
 };
 use loom_document::{DocumentContent, MergeError, MergeOutcome, three_way_merge};
 use loom_host::{
-    AgencyGate, BranchCancellation, GenerationFamilyIdentity, GenerationRegistry,
-    GenerationRegistryError,
+    AgencyGate, BranchCancellation, DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES,
+    GenerationFamilyIdentity, GenerationRegistry, GenerationRegistryError,
 };
 use loom_store::{
     BranchPageCursor, DocumentReconciliationSnapshot, ExternalReconciliationOutcome,
@@ -28,14 +35,17 @@ use loom_store::{
     VisibleProjectionState,
 };
 use loom_types::{
-    AuthorityPolicy, BlobId, BranchId, ByteRange, CancelGenerationCommand, CandidateId, CommandId,
+    AuthorityPolicy, BlobId, BranchId, BuildModelPolicy, BuildModelPolicyIdentity,
+    BuildWriterProfileId, ByteRange, CancelGenerationCommand, CandidateId, CommandId,
     CommandReceipt, ContextRecipe, DocumentId, DocumentKind, GenerationEventKind, GenerationRunId,
-    GenerationStart, GenerationTerminalStatus, LoomEvent, ModelEnvironment, ProjectId, PromptMode,
-    PromptRecipe, RevisionId, SelectionDecision, derive_weave_case_ids, now_unix_ms,
+    GenerationStart, GenerationTerminalStatus, LoomEvent, ModelEnvironment, ModelRole, ProjectId,
+    PromptMode, PromptRecipe, RevisionId, SelectionDecision, derive_weave_case_ids, now_unix_ms,
 };
+use same_file::Handle as FileIdentityHandle;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::model_download::{
@@ -46,10 +56,51 @@ use crate::model_download::{
 const INITIAL_DOCUMENT: &str = "manuscript/Untitled.md";
 const DEFAULT_PROJECT_DIRECTORY: &str = "writing";
 const PROJECT_CLOSE_GENERATION_WAIT: Duration = Duration::from_secs(3);
-const TESTED_GEMMA_4_E2B_BASE_Q8_SHA256: &str =
-    "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670";
-const TESTED_GEMMA_4_E2B_BASE_PROFILE: &str = "gemma_4_e2b_base_q8_loom_v1";
 const MAX_MODEL_DOWNLOAD_URL_BYTES: usize = 16 * 1024;
+const POLICY_MODEL_HASH_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_TRACKED_GENERATION_WORKERS: usize = DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES;
+pub const APPLICATION_QUIT_MENU_ID: &str = "loom.application.quit";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ApplicationPhase {
+    #[default]
+    Running,
+    Closing,
+    ExitAuthorized,
+}
+
+struct ApplicationCloseAttempt<'a> {
+    state: &'a PluginState,
+    phase: MutexGuard<'a, ApplicationPhase>,
+    authorized: bool,
+}
+
+#[derive(Debug)]
+struct ApplicationShutdownProof {
+    native_runtime: ApplicationNativeShutdown,
+    desktop_workers: DesktopWorkersJoined,
+}
+
+#[derive(Debug)]
+enum ApplicationNativeShutdown {
+    Graceful(JoinedLlamaRuntime),
+    ProcessExit(ProcessExitJoinedLlamaRuntime),
+}
+
+#[derive(Debug)]
+struct ReadyToExit {
+    proof: ApplicationShutdownProof,
+}
+
+#[derive(Debug)]
+struct WorkerRegistryIdentity;
+
+#[derive(Debug)]
+struct DesktopWorkersJoined {
+    model_loads: ModelLoadsDrained,
+    generation_workers: GenerationWorkersJoined,
+    download_workers: DownloadWorkersJoined,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum SessionPhase {
@@ -68,36 +119,182 @@ struct Session {
     last_close: Option<ProjectCloseReceipt>,
 }
 
+const AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2: u8 = 2;
+const MAX_TRACKED_AUTOMATIC_REVISION_BUDGETS_V2: usize = 16_384;
+const AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2: u32 = AUTOMATIC_WEAVE_BRANCH_COUNT_V2
+    * AUTOMATIC_WEAVE_MAX_TOKENS_V2
+    * AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2 as u32;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AutomaticBudgetScope {
+    project: ProjectId,
+    session: CommandId,
+    document: DocumentId,
+    source_revision: RevisionId,
+}
+
+#[derive(Debug, Default)]
+struct AutomaticBudgetLedger {
+    active_session: Option<(ProjectId, CommandId)>,
+    families_by_scope: BTreeMap<AutomaticBudgetScope, u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutomaticBudgetError {
+    Capacity,
+    Exhausted,
+    Poisoned,
+}
+
+#[derive(Debug, Default)]
+struct AutomaticBudgetAuthority {
+    ledger: Mutex<AutomaticBudgetLedger>,
+}
+
+#[derive(Debug)]
+struct AutomaticBudgetReservation<'authority> {
+    authority: &'authority AutomaticBudgetAuthority,
+    scope: AutomaticBudgetScope,
+    committed: bool,
+}
+
+impl AutomaticBudgetAuthority {
+    fn reserve(
+        &self,
+        _writer: &PolicyBoundAutomaticWriter,
+        scope: AutomaticBudgetScope,
+    ) -> Result<AutomaticBudgetReservation<'_>, AutomaticBudgetError> {
+        let mut ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| AutomaticBudgetError::Poisoned)?;
+        let session = (scope.project, scope.session);
+        if ledger.active_session != Some(session) {
+            ledger.active_session = Some(session);
+            ledger.families_by_scope.clear();
+        }
+        // Only the current immutable revision of each document can request
+        // automatic work. Dropping superseded revisions keeps the ledger
+        // bounded by the number of project documents, not edit count.
+        ledger.families_by_scope.retain(|candidate, _| {
+            candidate.document != scope.document
+                || candidate.source_revision == scope.source_revision
+        });
+        if !ledger.families_by_scope.contains_key(&scope)
+            && ledger.families_by_scope.len() >= MAX_TRACKED_AUTOMATIC_REVISION_BUDGETS_V2
+        {
+            return Err(AutomaticBudgetError::Capacity);
+        }
+        let spent = ledger.families_by_scope.entry(scope).or_default();
+        if *spent >= AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2 {
+            return Err(AutomaticBudgetError::Exhausted);
+        }
+        *spent += 1;
+        drop(ledger);
+        Ok(AutomaticBudgetReservation {
+            authority: self,
+            scope,
+            committed: false,
+        })
+    }
+
+    fn refund(&self, scope: AutomaticBudgetScope) {
+        let Ok(mut ledger) = self.ledger.lock() else {
+            // Poisoning fails closed: never mint replacement authority when
+            // the exact prior reservation state cannot be proven.
+            return;
+        };
+        let Some(spent) = ledger.families_by_scope.get_mut(&scope) else {
+            return;
+        };
+        *spent = spent.saturating_sub(1);
+        if *spent == 0 {
+            ledger.families_by_scope.remove(&scope);
+        }
+    }
+}
+
+impl AutomaticBudgetReservation<'_> {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AutomaticBudgetReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.authority.refund(self.scope);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PluginState {
+    close_requested: AtomicBool,
+    exit_authorized: AtomicBool,
+    application: Mutex<ApplicationPhase>,
     session: Mutex<Session>,
+    native_runtime: Arc<NativeHostRuntime>,
     backend: Arc<LlamaBackend>,
     model: Mutex<ModelRegistry>,
     model_lifecycle: Mutex<()>,
     user_model_paths: Mutex<BTreeSet<PathBuf>>,
+    automatic_budget: AutomaticBudgetAuthority,
     generations: GenerationRegistry,
+    generation_workers: GenerationWorkerRegistry,
+    model_loads: Arc<ModelLoadRegistry>,
     downloads: Arc<ModelDownloadRegistry>,
+    download_workers: DownloadWorkerRegistry,
     model_library_root: Option<PathBuf>,
+    build_model_policy: BuildModelPolicy,
 }
 
 impl Default for PluginState {
     fn default() -> Self {
-        Self::with_model_library_root(None)
+        Self::with_model_library_root(None, BuildModelPolicy::default())
     }
 }
 
 impl PluginState {
-    fn with_model_library_root(model_library_root: Option<PathBuf>) -> Self {
+    fn with_model_library_root(
+        model_library_root: Option<PathBuf>,
+        build_model_policy: BuildModelPolicy,
+    ) -> Self {
+        let native_runtime = Arc::new(NativeHostRuntime::default());
+        let backend = Arc::new(LlamaBackend::with_default_native_runtime(Arc::clone(
+            &native_runtime,
+        )));
         Self {
+            close_requested: AtomicBool::new(false),
+            exit_authorized: AtomicBool::new(false),
+            application: Mutex::new(ApplicationPhase::default()),
             session: Mutex::new(Session::default()),
-            backend: Arc::new(LlamaBackend::default()),
+            native_runtime,
+            backend,
             model: Mutex::new(ModelRegistry::default()),
             model_lifecycle: Mutex::new(()),
             user_model_paths: Mutex::new(BTreeSet::new()),
+            automatic_budget: AutomaticBudgetAuthority::default(),
             generations: GenerationRegistry::default(),
+            generation_workers: GenerationWorkerRegistry::default(),
+            model_loads: Arc::new(ModelLoadRegistry::default()),
             downloads: Arc::new(ModelDownloadRegistry::default()),
+            download_workers: DownloadWorkerRegistry::default(),
             model_library_root,
+            build_model_policy,
         }
+    }
+}
+
+impl Drop for PluginState {
+    fn drop(&mut self) {
+        self.close_requested.store(true, Ordering::Release);
+        self.exit_authorized.store(false, Ordering::Release);
+        if let Ok(phase) = self.application.get_mut() {
+            *phase = ApplicationPhase::Closing;
+        }
+        let _desktop_workers = self.join_desktop_workers_for_exit();
+        let _native_runtime = self.native_runtime.shutdown_for_process_exit();
     }
 }
 
@@ -106,6 +303,219 @@ struct LoadedModel {
     profile: LocalModelProfile,
     descriptor: VerifiedModelDescriptor,
 }
+
+mod automatic_writer_authority {
+    use super::*;
+
+    /// A resident model whose exact bytes and native capabilities were bound
+    /// to one writer entry in the closed build policy.
+    ///
+    /// The fields and constructor stay private to this module. Production code
+    /// can obtain the witness only through `AuthorizedWeaveModel::bind`.
+    #[derive(Debug)]
+    pub(super) struct PolicyBoundAutomaticWriter {
+        loaded: LoadedModel,
+        profile_id: BuildWriterProfileId,
+        rank: u32,
+        policy_identity: BuildModelPolicyIdentity,
+    }
+
+    #[derive(Debug)]
+    enum AuthorizedWeaveModelKind {
+        Automatic(PolicyBoundAutomaticWriter),
+        Manual(LoadedModel),
+    }
+
+    #[derive(Debug)]
+    enum SubmittedWeaveAuthority {
+        Automatic {
+            profile_id: BuildWriterProfileId,
+            rank: u32,
+            policy_identity: BuildModelPolicyIdentity,
+        },
+        Manual,
+    }
+
+    /// An exact request whose model authority was preserved through request
+    /// construction. Its payload is intentionally not exposed to the plugin;
+    /// submission consumes this wrapper and is the only escape hatch.
+    #[derive(Debug)]
+    pub(super) struct AuthorizedWeaveRequest {
+        request: ExactContinuationRequest,
+        authority: SubmittedWeaveAuthority,
+    }
+
+    /// The only model authority accepted by the shared Weave submission path.
+    /// Manual requests retain their explicit escape hatch; automatic requests
+    /// necessarily carry a non-forgeable policy witness until request creation.
+    #[derive(Debug)]
+    pub(super) struct AuthorizedWeaveModel {
+        policy: ValidatedWeavePolicy,
+        kind: AuthorizedWeaveModelKind,
+    }
+
+    impl PolicyBoundAutomaticWriter {
+        fn bind(loaded: LoadedModel, policy: &BuildModelPolicy) -> Result<Self, IpcFailure> {
+            let matched = policy
+                .matching_writer(
+                    &loaded.descriptor.model_sha256,
+                    loaded.descriptor.model_file_bytes,
+                )
+                .ok_or_else(|| {
+                    IpcFailure::new(
+                        "automatic_writer_not_in_build_policy",
+                        "automatic suggestions require the exact local writer selected by this Loom build",
+                        false,
+                    )
+                })?;
+            let writer = matched.writer();
+            let expectation = PolicyWriterExpectation {
+                profile_id: writer.profile_id().to_owned(),
+                rank: matched.rank(),
+                role: writer.role(),
+                prompt_mode: writer.prompt_mode(),
+                model_sha256: writer.model_sha256(),
+                model_file_bytes: writer.model_file_bytes(),
+            };
+            validate_policy_model_descriptor(
+                &loaded.descriptor,
+                &loaded.profile.model_path,
+                &expectation,
+            )?;
+            Ok(Self {
+                loaded,
+                profile_id: writer.typed_profile_id(),
+                rank: matched.rank(),
+                policy_identity: policy.identity(),
+            })
+        }
+
+        fn into_request_parts(self) -> (LocalModelProfile, SubmittedWeaveAuthority) {
+            let Self {
+                loaded,
+                profile_id,
+                rank,
+                policy_identity,
+            } = self;
+            (
+                loaded.profile,
+                SubmittedWeaveAuthority::Automatic {
+                    profile_id,
+                    rank,
+                    policy_identity,
+                },
+            )
+        }
+    }
+
+    impl AuthorizedWeaveRequest {
+        pub(super) fn submit(
+            self,
+            backend: &LlamaBackend,
+        ) -> Result<LlamaGenerationHandle, LlamaBackendError> {
+            let Self { request, authority } = self;
+            match authority {
+                SubmittedWeaveAuthority::Automatic {
+                    profile_id: _profile_id,
+                    rank: _rank,
+                    policy_identity: _policy_identity,
+                } => {}
+                SubmittedWeaveAuthority::Manual => {}
+            }
+            backend.start_exact_continuation(request)
+        }
+    }
+
+    impl AuthorizedWeaveModel {
+        pub(super) fn bind(
+            policy: ValidatedWeavePolicy,
+            loaded: LoadedModel,
+            build_policy: &BuildModelPolicy,
+        ) -> Result<Self, IpcFailure> {
+            let kind = match &policy {
+                ValidatedWeavePolicy::AutomaticV2 => AuthorizedWeaveModelKind::Automatic(
+                    PolicyBoundAutomaticWriter::bind(loaded, build_policy)?,
+                ),
+                ValidatedWeavePolicy::ManualV2 { .. } => AuthorizedWeaveModelKind::Manual(loaded),
+            };
+            Ok(Self { policy, kind })
+        }
+
+        pub(super) fn branch_count(&self) -> u32 {
+            self.policy.branch_count()
+        }
+
+        pub(super) fn bind_document_kind(
+            &self,
+            kind: DocumentKind,
+        ) -> Result<ResolvedWeavePolicy, IpcFailure> {
+            self.policy.bind_document_kind(kind)
+        }
+
+        pub(super) fn admit(&self, gate: &AgencyGate) -> Result<(), IpcFailure> {
+            let admission = match &self.kind {
+                AuthorizedWeaveModelKind::Automatic(_) => gate.admit_automation(),
+                AuthorizedWeaveModelKind::Manual(_) => gate.admit_manual_generation(),
+            };
+            admission
+                .map_err(|error| IpcFailure::new("generation_blocked", error.to_string(), false))
+        }
+
+        pub(super) fn loaded(&self) -> &LoadedModel {
+            match &self.kind {
+                AuthorizedWeaveModelKind::Automatic(writer) => &writer.loaded,
+                AuthorizedWeaveModelKind::Manual(loaded) => loaded,
+            }
+        }
+
+        pub(super) fn automatic_writer(&self) -> Option<&PolicyBoundAutomaticWriter> {
+            match &self.kind {
+                AuthorizedWeaveModelKind::Automatic(writer) => Some(writer),
+                AuthorizedWeaveModelKind::Manual(_) => None,
+            }
+        }
+
+        pub(super) fn into_exact_continuation_request(
+            self,
+            request_id: String,
+            exact_manuscript_prefix: String,
+            prompt_recipe: PromptRecipe,
+            cases: Vec<ContinuationCase>,
+        ) -> AuthorizedWeaveRequest {
+            let Self { policy: _, kind } = self;
+            let (model, authority) = match kind {
+                AuthorizedWeaveModelKind::Automatic(writer) => writer.into_request_parts(),
+                AuthorizedWeaveModelKind::Manual(loaded) => {
+                    (loaded.profile, SubmittedWeaveAuthority::Manual)
+                }
+            };
+            AuthorizedWeaveRequest {
+                request: ExactContinuationRequest {
+                    request_id,
+                    model,
+                    exact_manuscript_prefix,
+                    prompt_recipe,
+                    cases,
+                },
+                authority,
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn automatic_binding(
+            &self,
+        ) -> Option<(BuildWriterProfileId, u32, BuildModelPolicyIdentity)> {
+            match &self.kind {
+                AuthorizedWeaveModelKind::Automatic(writer) => {
+                    Some((writer.profile_id, writer.rank, writer.policy_identity))
+                }
+                AuthorizedWeaveModelKind::Manual(_) => None,
+            }
+        }
+    }
+}
+
+use automatic_writer_authority::{AuthorizedWeaveModel, PolicyBoundAutomaticWriter};
 
 #[derive(Clone, Debug)]
 struct GenerationResultBinding {
@@ -123,7 +533,860 @@ enum ModelRegistry {
         path: PathBuf,
         previous: Option<Box<LoadedModel>>,
     },
+    Unloading(Box<LoadedModel>),
+    ResidencyUnknown {
+        reason: String,
+    },
     Loaded(Box<LoadedModel>),
+}
+
+#[derive(Debug)]
+enum GenerationWorkerSlot {
+    Reserved,
+    Running {
+        worker: JoinHandle<()>,
+        owner: GenerationWorkerOwner,
+    },
+}
+
+/// Product builds have exactly one owner kind. The test-only fixture variant
+/// exercises hostile cancellation and nested-worker schedules without adding
+/// an erasable production authority surface.
+#[derive(Debug)]
+enum GenerationWorkerOwner {
+    Llama(LlamaGenerationHandle),
+    #[cfg(test)]
+    Fixture(FixtureGenerationWorkerOwner),
+}
+
+#[cfg(test)]
+trait FixtureGenerationWorkerCancellation: std::fmt::Debug + Send + Sync {
+    fn cancel_all(&self);
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct FixtureGenerationWorkerOwner {
+    cancellation: Arc<dyn FixtureGenerationWorkerCancellation>,
+    backend_worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+enum GenerationBackendWorkerJoined {
+    Llama(JoinedLlamaGeneration),
+    #[cfg(test)]
+    Fixture {
+        worker_was_present: bool,
+        worker_panicked: bool,
+    },
+}
+
+#[derive(Debug, Default)]
+struct GenerationWorkerState {
+    workers: BTreeMap<String, GenerationWorkerSlot>,
+    join_failure: Option<String>,
+}
+
+#[derive(Debug)]
+struct GenerationWorkerRegistry {
+    identity: Arc<WorkerRegistryIdentity>,
+    state: Mutex<GenerationWorkerState>,
+}
+
+#[derive(Debug)]
+struct ModelLoadRegistry {
+    identity: Arc<WorkerRegistryIdentity>,
+    state: Mutex<ModelLoadState>,
+    drained: Condvar,
+}
+
+#[derive(Debug)]
+struct ModelLoadState {
+    accepting: bool,
+    active: usize,
+}
+
+#[derive(Debug)]
+struct ModelLoadPermit {
+    lifetime: Arc<ModelLoadLifetime>,
+}
+
+#[derive(Debug)]
+struct ModelLoadWorkerGuard {
+    _lifetime: Arc<ModelLoadLifetime>,
+}
+
+#[derive(Debug)]
+struct ModelLoadLifetime {
+    registry: Arc<ModelLoadRegistry>,
+}
+
+#[derive(Debug)]
+struct ModelLoadsDrained {
+    registry_identity: Arc<WorkerRegistryIdentity>,
+    count: usize,
+}
+
+#[derive(Debug)]
+struct GenerationWorkersJoined {
+    registry_identity: Arc<WorkerRegistryIdentity>,
+    family_count: usize,
+    backend_workers: Vec<GenerationBackendWorkerJoined>,
+}
+
+#[derive(Debug)]
+enum DownloadWorkerSlot {
+    Reserved,
+    Running {
+        worker: JoinHandle<()>,
+        cancellation: DownloadCancellation,
+    },
+}
+
+#[derive(Debug, Default)]
+struct DownloadWorkerState {
+    workers: BTreeMap<CommandId, DownloadWorkerSlot>,
+    join_failure: Option<String>,
+}
+
+#[derive(Debug)]
+struct DownloadWorkerRegistry {
+    identity: Arc<WorkerRegistryIdentity>,
+    state: Mutex<DownloadWorkerState>,
+}
+
+#[derive(Debug)]
+struct DownloadWorkerReservation<'registry, 'admission> {
+    registry: &'registry DownloadWorkerRegistry,
+    command_id: CommandId,
+    attached: bool,
+    _admission: PhantomData<&'admission ApplicationPhase>,
+}
+
+#[derive(Debug)]
+struct DownloadWorkerAttachError {
+    failure: IpcFailure,
+    worker: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct DownloadWorkersJoined {
+    registry_identity: Arc<WorkerRegistryIdentity>,
+    count: usize,
+}
+
+#[derive(Debug)]
+struct GenerationWorkerReservation<'registry, 'admission> {
+    registry: &'registry GenerationWorkerRegistry,
+    request_id: String,
+    attached: bool,
+    _admission: PhantomData<&'admission ApplicationPhase>,
+}
+
+#[derive(Debug)]
+struct GenerationWorkerAttachError {
+    failure: IpcFailure,
+    worker: JoinHandle<()>,
+    owner: GenerationWorkerOwner,
+}
+
+impl Default for ModelLoadRegistry {
+    fn default() -> Self {
+        Self {
+            identity: Arc::new(WorkerRegistryIdentity),
+            state: Mutex::new(ModelLoadState {
+                accepting: true,
+                active: 0,
+            }),
+            drained: Condvar::new(),
+        }
+    }
+}
+
+impl ModelLoadRegistry {
+    fn reserve(
+        self: &Arc<Self>,
+        _admission: &MutexGuard<'_, ApplicationPhase>,
+    ) -> Result<ModelLoadPermit, IpcFailure> {
+        let mut state = self.state.lock().map_err(|_| {
+            IpcFailure::new(
+                "model_load_worker_state_poisoned",
+                "the local model loader entered an invalid state; restart Loom",
+                false,
+            )
+        })?;
+        if !state.accepting {
+            return Err(IpcFailure::new(
+                "application_quiescing",
+                "Loom will not start local model verification while the application is closing",
+                true,
+            ));
+        }
+        state.active = state.active.checked_add(1).ok_or_else(|| {
+            IpcFailure::new(
+                "model_load_worker_capacity",
+                "the local model loader count overflowed",
+                false,
+            )
+        })?;
+        Ok(ModelLoadPermit {
+            lifetime: Arc::new(ModelLoadLifetime {
+                registry: Arc::clone(self),
+            }),
+        })
+    }
+
+    /// Permanently closes model-load admission and waits until both every
+    /// admitted async command and its blocking worker have released their
+    /// shared lifetime, including registry commit or rollback.
+    fn close_and_drain(&self) -> ModelLoadsDrained {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.accepting = false;
+        let count = state.active;
+        while state.active != 0 {
+            state = self
+                .drained
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        ModelLoadsDrained {
+            registry_identity: Arc::clone(&self.identity),
+            count,
+        }
+    }
+
+    fn reopen_after_aborted_close(&self) -> Result<(), IpcFailure> {
+        let mut state = self.state.lock().map_err(|_| {
+            IpcFailure::new(
+                "model_load_worker_state_poisoned",
+                "the local model loader entered an invalid state; restart Loom",
+                false,
+            )
+        })?;
+        if state.active != 0 {
+            return Err(IpcFailure::new(
+                "model_load_worker_active",
+                "the local model loader cannot reopen while verification is active",
+                true,
+            ));
+        }
+        state.accepting = true;
+        Ok(())
+    }
+}
+
+impl ModelLoadPermit {
+    fn worker_guard(&self) -> ModelLoadWorkerGuard {
+        ModelLoadWorkerGuard {
+            _lifetime: Arc::clone(&self.lifetime),
+        }
+    }
+}
+
+impl Drop for ModelLoadLifetime {
+    fn drop(&mut self) {
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("a model-load permit can be released only once");
+        if state.active == 0 {
+            self.registry.drained.notify_all();
+        }
+    }
+}
+
+impl ModelLoadsDrained {
+    fn belongs_to(&self, registry: &ModelLoadRegistry) -> bool {
+        Arc::ptr_eq(&self.registry_identity, &registry.identity)
+    }
+
+    const fn count(&self) -> usize {
+        self.count
+    }
+}
+
+impl GenerationWorkerOwner {
+    fn cancel_all(&self) {
+        match self {
+            Self::Llama(owner) => {
+                let _ = owner.cancel_all();
+            }
+            #[cfg(test)]
+            Self::Fixture(owner) => owner.cancellation.cancel_all(),
+        }
+    }
+
+    /// Consumes the sole backend-worker owner and returns only after its exact
+    /// nested worker has been joined. Cancellation panics in hostile fixtures
+    /// are contained before the join; product owners use the infallible,
+    /// per-case-catch native path.
+    fn shutdown_joined(self) -> GenerationBackendWorkerJoined {
+        match self {
+            Self::Llama(owner) => GenerationBackendWorkerJoined::Llama(owner.shutdown_joined()),
+            #[cfg(test)]
+            Self::Fixture(mut owner) => {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    owner.cancellation.cancel_all();
+                }));
+                let backend_worker = owner.backend_worker.take();
+                GenerationBackendWorkerJoined::Fixture {
+                    worker_was_present: backend_worker.is_some(),
+                    worker_panicked: backend_worker
+                        .is_some_and(|backend_worker| backend_worker.join().is_err()),
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn fixture(
+        cancellation: Arc<dyn FixtureGenerationWorkerCancellation>,
+        backend_worker: JoinHandle<()>,
+    ) -> Self {
+        Self::Fixture(FixtureGenerationWorkerOwner {
+            cancellation,
+            backend_worker: Some(backend_worker),
+        })
+    }
+}
+
+impl GenerationBackendWorkerJoined {
+    const fn worker_panicked(&self) -> bool {
+        match self {
+            Self::Llama(joined) => joined.worker_panicked(),
+            #[cfg(test)]
+            Self::Fixture {
+                worker_panicked, ..
+            } => *worker_panicked,
+        }
+    }
+
+    const fn joined_worker_count(&self) -> usize {
+        match self {
+            Self::Llama(joined) => joined.joined_worker_count(),
+            #[cfg(test)]
+            Self::Fixture {
+                worker_was_present, ..
+            } => *worker_was_present as usize,
+        }
+    }
+}
+
+impl GenerationWorkerRegistry {
+    fn reserve<'registry, 'admission>(
+        &'registry self,
+        request_id: &str,
+        _admission: &'admission MutexGuard<'_, ApplicationPhase>,
+    ) -> Result<GenerationWorkerReservation<'registry, 'admission>, IpcFailure> {
+        self.reap_finished()?;
+        let mut state = self.lock()?;
+        if let Some(failure) = &state.join_failure {
+            return Err(IpcFailure::new(
+                "generation_worker_join_failed",
+                failure.clone(),
+                false,
+            ));
+        }
+        if state.workers.len() >= MAX_TRACKED_GENERATION_WORKERS {
+            return Err(IpcFailure::new(
+                "generation_worker_capacity",
+                format!(
+                    "Loom already owns the maximum of {MAX_TRACKED_GENERATION_WORKERS} generation workers"
+                ),
+                true,
+            ));
+        }
+        if state.workers.contains_key(request_id) {
+            return Err(IpcFailure::new(
+                "generation_worker_duplicate",
+                "the generation request already owns a desktop worker",
+                false,
+            ));
+        }
+        state
+            .workers
+            .insert(request_id.to_owned(), GenerationWorkerSlot::Reserved);
+        Ok(GenerationWorkerReservation {
+            registry: self,
+            request_id: request_id.to_owned(),
+            attached: false,
+            _admission: PhantomData,
+        })
+    }
+
+    fn reap_finished(&self) -> Result<usize, IpcFailure> {
+        let finished = {
+            let mut state = self.lock()?;
+            if let Some(failure) = &state.join_failure {
+                return Err(IpcFailure::new(
+                    "generation_worker_join_failed",
+                    failure.clone(),
+                    false,
+                ));
+            }
+            let finished_ids = state
+                .workers
+                .iter()
+                .filter_map(|(request_id, slot)| match slot {
+                    GenerationWorkerSlot::Running { worker, .. } if worker.is_finished() => {
+                        Some(request_id.clone())
+                    }
+                    GenerationWorkerSlot::Reserved | GenerationWorkerSlot::Running { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            finished_ids
+                .into_iter()
+                .filter_map(|request_id| match state.workers.remove(&request_id) {
+                    Some(GenerationWorkerSlot::Running { worker, owner }) => Some((worker, owner)),
+                    Some(GenerationWorkerSlot::Reserved) | None => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        self.join_workers(finished).map(|(count, _)| count)
+    }
+
+    fn join_all(&self) -> Result<GenerationWorkersJoined, IpcFailure> {
+        let workers = {
+            let mut state = self.lock()?;
+            if let Some(failure) = &state.join_failure {
+                return Err(IpcFailure::new(
+                    "generation_worker_join_failed",
+                    failure.clone(),
+                    false,
+                ));
+            }
+            if state
+                .workers
+                .values()
+                .any(|slot| matches!(slot, GenerationWorkerSlot::Reserved))
+            {
+                return Err(IpcFailure::new(
+                    "generation_worker_starting",
+                    "a generation worker is still entering its owned lifecycle",
+                    true,
+                ));
+            }
+            std::mem::take(&mut state.workers)
+                .into_values()
+                .filter_map(|slot| match slot {
+                    GenerationWorkerSlot::Running { worker, owner } => Some((worker, owner)),
+                    GenerationWorkerSlot::Reserved => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (family_count, backend_workers) = self.join_workers(workers)?;
+        Ok(GenerationWorkersJoined {
+            registry_identity: Arc::clone(&self.identity),
+            family_count,
+            backend_workers,
+        })
+    }
+
+    /// Final event-loop fallback for an operating-system exit that can no
+    /// longer be prevented. Every reservation is statically tied to an
+    /// application-admission guard, so owning that phase mutex proves there
+    /// can be no unattached worker here.
+    fn join_all_for_exit(&self) -> GenerationWorkersJoined {
+        let workers = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut state.workers)
+                .into_values()
+                .filter_map(|slot| match slot {
+                    GenerationWorkerSlot::Running { worker, owner } => Some((worker, owner)),
+                    GenerationWorkerSlot::Reserved => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let family_count = workers.len();
+        let mut backend_workers = Vec::with_capacity(family_count);
+        for (worker, owner) in workers {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                owner.cancel_all();
+            }));
+            let _ = worker.join();
+            backend_workers.push(owner.shutdown_joined());
+        }
+        GenerationWorkersJoined {
+            registry_identity: Arc::clone(&self.identity),
+            family_count,
+            backend_workers,
+        }
+    }
+
+    fn join_workers(
+        &self,
+        workers: Vec<(JoinHandle<()>, GenerationWorkerOwner)>,
+    ) -> Result<(usize, Vec<GenerationBackendWorkerJoined>), IpcFailure> {
+        let family_count = workers.len();
+        let mut panicked = false;
+        let mut backend_workers = Vec::with_capacity(family_count);
+        for (worker, owner) in workers {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                owner.cancel_all();
+            }));
+            panicked |= worker.join().is_err();
+            let backend_worker = owner.shutdown_joined();
+            panicked |= backend_worker.worker_panicked();
+            backend_workers.push(backend_worker);
+        }
+        if panicked {
+            return Err(self.record_join_failure());
+        }
+        Ok((family_count, backend_workers))
+    }
+
+    fn record_join_failure(&self) -> IpcFailure {
+        let message =
+            "a desktop generation worker panicked; Loom will not infer safe native teardown"
+                .to_owned();
+        let Ok(mut state) = self.lock() else {
+            return IpcFailure::new(
+                "generation_worker_state_poisoned",
+                "the generation worker registry entered an invalid state; restart Loom",
+                false,
+            );
+        };
+        state.join_failure = Some(message.clone());
+        IpcFailure::new("generation_worker_join_failed", message, false)
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, GenerationWorkerState>, IpcFailure> {
+        self.state.lock().map_err(|_| {
+            IpcFailure::new(
+                "generation_worker_state_poisoned",
+                "the generation worker registry entered an invalid state; restart Loom",
+                false,
+            )
+        })
+    }
+}
+
+impl Default for GenerationWorkerRegistry {
+    fn default() -> Self {
+        Self {
+            identity: Arc::new(WorkerRegistryIdentity),
+            state: Mutex::new(GenerationWorkerState::default()),
+        }
+    }
+}
+
+impl GenerationWorkersJoined {
+    fn belongs_to(&self, registry: &GenerationWorkerRegistry) -> bool {
+        Arc::ptr_eq(&self.registry_identity, &registry.identity)
+    }
+
+    #[cfg(test)]
+    const fn count(&self) -> usize {
+        self.family_count
+    }
+
+    fn joined_worker_count(&self) -> usize {
+        self.family_count.saturating_add(
+            self.backend_workers
+                .iter()
+                .map(GenerationBackendWorkerJoined::joined_worker_count)
+                .sum::<usize>(),
+        )
+    }
+}
+
+impl Default for DownloadWorkerRegistry {
+    fn default() -> Self {
+        Self {
+            identity: Arc::new(WorkerRegistryIdentity),
+            state: Mutex::new(DownloadWorkerState::default()),
+        }
+    }
+}
+
+impl DownloadWorkerRegistry {
+    fn reserve<'registry, 'admission>(
+        &'registry self,
+        command_id: CommandId,
+        _admission: &'admission MutexGuard<'_, ApplicationPhase>,
+    ) -> Result<DownloadWorkerReservation<'registry, 'admission>, IpcFailure> {
+        let mut state = self.lock()?;
+        if let Some(failure) = &state.join_failure {
+            return Err(IpcFailure::new(
+                "download_worker_join_failed",
+                failure.clone(),
+                false,
+            ));
+        }
+        if state.workers.contains_key(&command_id) {
+            return Err(IpcFailure::new(
+                "download_worker_duplicate",
+                "the model download already owns a desktop worker",
+                false,
+            ));
+        }
+        if state.workers.len() >= crate::model_download::MAX_RETAINED_MODEL_DOWNLOADS {
+            return Err(IpcFailure::new(
+                "download_worker_capacity",
+                "Loom must join completed model downloads before starting another",
+                true,
+            ));
+        }
+        state
+            .workers
+            .insert(command_id, DownloadWorkerSlot::Reserved);
+        Ok(DownloadWorkerReservation {
+            registry: self,
+            command_id,
+            attached: false,
+            _admission: PhantomData,
+        })
+    }
+
+    fn reap_finished(&self) -> Result<usize, IpcFailure> {
+        let workers = {
+            let mut state = self.lock()?;
+            if let Some(failure) = &state.join_failure {
+                return Err(IpcFailure::new(
+                    "download_worker_join_failed",
+                    failure.clone(),
+                    false,
+                ));
+            }
+            let finished = state
+                .workers
+                .iter()
+                .filter_map(|(command_id, slot)| match slot {
+                    DownloadWorkerSlot::Running { worker, .. } if worker.is_finished() => {
+                        Some(*command_id)
+                    }
+                    DownloadWorkerSlot::Reserved | DownloadWorkerSlot::Running { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            finished
+                .into_iter()
+                .filter_map(|command_id| match state.workers.remove(&command_id) {
+                    Some(DownloadWorkerSlot::Running { worker, .. }) => Some(worker),
+                    Some(DownloadWorkerSlot::Reserved) | None => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        self.join_workers(workers)
+    }
+
+    fn join_all(&self) -> Result<DownloadWorkersJoined, IpcFailure> {
+        let workers = {
+            let mut state = self.lock()?;
+            if let Some(failure) = &state.join_failure {
+                return Err(IpcFailure::new(
+                    "download_worker_join_failed",
+                    failure.clone(),
+                    false,
+                ));
+            }
+            if state
+                .workers
+                .values()
+                .any(|slot| matches!(slot, DownloadWorkerSlot::Reserved))
+            {
+                return Err(IpcFailure::new(
+                    "download_worker_starting",
+                    "a model download is still entering its owned lifecycle",
+                    true,
+                ));
+            }
+            std::mem::take(&mut state.workers)
+                .into_values()
+                .filter_map(|slot| match slot {
+                    DownloadWorkerSlot::Running { worker, .. } => Some(worker),
+                    DownloadWorkerSlot::Reserved => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let count = self.join_workers(workers)?;
+        Ok(DownloadWorkersJoined {
+            registry_identity: Arc::clone(&self.identity),
+            count,
+        })
+    }
+
+    fn join_all_for_exit(&self) -> DownloadWorkersJoined {
+        let workers = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut state.workers)
+                .into_values()
+                .filter_map(|slot| match slot {
+                    DownloadWorkerSlot::Running {
+                        worker,
+                        cancellation,
+                    } => Some((worker, cancellation)),
+                    DownloadWorkerSlot::Reserved => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let count = workers.len();
+        for (worker, cancellation) in workers {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cancellation.cancel();
+            }));
+            let _ = worker.join();
+        }
+        DownloadWorkersJoined {
+            registry_identity: Arc::clone(&self.identity),
+            count,
+        }
+    }
+
+    fn join_workers(&self, workers: Vec<JoinHandle<()>>) -> Result<usize, IpcFailure> {
+        let count = workers.len();
+        let mut first_failure = None;
+        for worker in workers {
+            if worker.join().is_err() {
+                first_failure.get_or_insert_with(|| "worker panicked".to_owned());
+            }
+        }
+        if let Some(error) = first_failure {
+            let message = format!(
+                "a desktop model download worker failed before it could be joined: {error}"
+            );
+            if let Ok(mut state) = self.state.lock() {
+                state.join_failure = Some(message.clone());
+            }
+            return Err(IpcFailure::new(
+                "download_worker_join_failed",
+                message,
+                false,
+            ));
+        }
+        Ok(count)
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, DownloadWorkerState>, IpcFailure> {
+        self.state.lock().map_err(|_| {
+            IpcFailure::new(
+                "download_worker_state_poisoned",
+                "the download worker registry entered an invalid state; restart Loom",
+                false,
+            )
+        })
+    }
+}
+
+impl DownloadWorkerReservation<'_, '_> {
+    fn attach(
+        mut self,
+        worker: JoinHandle<()>,
+        cancellation: DownloadCancellation,
+    ) -> Result<(), DownloadWorkerAttachError> {
+        let mut state = match self.registry.lock() {
+            Ok(state) => state,
+            Err(failure) => return Err(DownloadWorkerAttachError { failure, worker }),
+        };
+        match state.workers.get_mut(&self.command_id) {
+            Some(slot @ DownloadWorkerSlot::Reserved) => {
+                *slot = DownloadWorkerSlot::Running {
+                    worker,
+                    cancellation,
+                };
+                self.attached = true;
+                Ok(())
+            }
+            Some(DownloadWorkerSlot::Running { .. }) | None => Err(DownloadWorkerAttachError {
+                failure: IpcFailure::new(
+                    "download_worker_state_changed",
+                    "the model download worker reservation changed before attachment",
+                    false,
+                ),
+                worker,
+            }),
+        }
+    }
+}
+
+impl Drop for DownloadWorkerReservation<'_, '_> {
+    fn drop(&mut self) {
+        if self.attached {
+            return;
+        }
+        if let Ok(mut state) = self.registry.state.lock()
+            && matches!(
+                state.workers.get(&self.command_id),
+                Some(DownloadWorkerSlot::Reserved)
+            )
+        {
+            state.workers.remove(&self.command_id);
+        }
+    }
+}
+
+impl DownloadWorkersJoined {
+    fn belongs_to(&self, registry: &DownloadWorkerRegistry) -> bool {
+        Arc::ptr_eq(&self.registry_identity, &registry.identity)
+    }
+
+    const fn count(&self) -> usize {
+        self.count
+    }
+}
+
+impl GenerationWorkerReservation<'_, '_> {
+    fn attach(
+        mut self,
+        worker: JoinHandle<()>,
+        owner: GenerationWorkerOwner,
+    ) -> Result<(), GenerationWorkerAttachError> {
+        let mut state = match self.registry.lock() {
+            Ok(state) => state,
+            Err(failure) => {
+                return Err(GenerationWorkerAttachError {
+                    failure,
+                    worker,
+                    owner,
+                });
+            }
+        };
+        match state.workers.get_mut(&self.request_id) {
+            Some(slot @ GenerationWorkerSlot::Reserved) => {
+                *slot = GenerationWorkerSlot::Running { worker, owner };
+                self.attached = true;
+                Ok(())
+            }
+            Some(GenerationWorkerSlot::Running { .. }) | None => Err(GenerationWorkerAttachError {
+                failure: IpcFailure::new(
+                    "generation_worker_state_changed",
+                    "the desktop generation worker reservation changed before attachment",
+                    false,
+                ),
+                worker,
+                owner,
+            }),
+        }
+    }
+}
+
+impl Drop for GenerationWorkerReservation<'_, '_> {
+    fn drop(&mut self) {
+        if self.attached {
+            return;
+        }
+        if let Ok(mut state) = self.registry.state.lock()
+            && matches!(
+                state.workers.get(&self.request_id),
+                Some(GenerationWorkerSlot::Reserved)
+            )
+        {
+            state.workers.remove(&self.request_id);
+        }
+    }
 }
 
 enum ModelLoadPlan {
@@ -134,6 +1397,44 @@ enum ModelLoadPlan {
     },
 }
 
+enum PolicyModelLoadPlan {
+    Ready(ModelCapabilitySummary),
+    Inspect {
+        canonical_path: PathBuf,
+        profile: LocalModelProfile,
+        expectation: PolicyWriterExpectation,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PolicyWriterExpectation {
+    profile_id: String,
+    rank: u32,
+    role: ModelRole,
+    prompt_mode: PromptMode,
+    model_sha256: BlobId,
+    model_file_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PolicyFileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug)]
+struct VerifiedPolicyFile {
+    canonical_path: PathBuf,
+    identity: FileIdentityHandle,
+    stamp: PolicyFileStamp,
+}
+
+#[derive(Debug)]
+struct PolicyInspectionFailure {
+    failure: IpcFailure,
+    native_inspection_started: bool,
+}
+
 struct PreparedModelDownload {
     command_id: CommandId,
     request: GgufDownloadRequest,
@@ -142,7 +1443,7 @@ struct PreparedModelDownload {
 
 #[derive(Debug)]
 struct LlamaCancellation {
-    handle: Arc<LlamaGenerationHandle>,
+    handle: Arc<LlamaGenerationControl>,
 }
 
 impl BranchCancellation for LlamaCancellation {
@@ -152,15 +1453,24 @@ impl BranchCancellation for LlamaCancellation {
 }
 
 #[derive(Debug, Default)]
-pub struct Builder;
+pub struct Builder {
+    build_model_policy: BuildModelPolicy,
+}
 
 impl Builder {
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_build_model_policy(mut self, build_model_policy: BuildModelPolicy) -> Self {
+        self.build_model_policy = build_model_policy;
+        self
     }
 
     pub fn build<R: Runtime>(self) -> TauriPlugin<R> {
+        let build_model_policy = self.build_model_policy;
         PluginBuilder::new("loom")
             .invoke_handler(tauri::generate_handler![
                 project_open_default,
@@ -175,9 +1485,11 @@ impl Builder {
                 document_draft_clear,
                 document_reconciliation_preview,
                 document_reconcile_apply,
+                build_model_policy_get,
                 model_list,
                 model_choose,
                 model_load,
+                model_load_policy_candidate,
                 model_unload,
                 model_download_start,
                 model_download_cancel,
@@ -194,11 +1506,47 @@ impl Builder {
                 suggestions_set,
                 focus_mode_set,
                 application_close,
+                application_close_abort,
+                application_close_pending,
             ])
-            .setup(|app, _api| {
+            .setup(move |app, _api| {
                 let model_library_root = app.path().app_local_data_dir().ok();
-                app.manage(PluginState::with_model_library_root(model_library_root));
+                app.manage(PluginState::with_model_library_root(
+                    model_library_root,
+                    build_model_policy,
+                ));
                 Ok(())
+            })
+            .on_window_ready(|window| {
+                if window.label() != "main" {
+                    return;
+                }
+                let app = window.app_handle().clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event
+                        && !prepare_application_exit_request(&app)
+                    {
+                        api.prevent_close();
+                        emit_application_close_request(&app);
+                    }
+                });
+            })
+            .on_event(|app, event| {
+                if let RunEvent::Exit = event {
+                    quiesce_unpreventable_runtime_exit(app);
+                }
+                if let RunEvent::MenuEvent(menu_event) = event
+                    && menu_event.id() == APPLICATION_QUIT_MENU_ID
+                {
+                    let _ = prepare_application_exit_request(app);
+                    emit_application_close_request(app);
+                }
+                if let RunEvent::ExitRequested { api, .. } = event
+                    && !prepare_application_exit_request(app)
+                {
+                    api.prevent_exit();
+                    emit_application_close_request(app);
+                }
             })
             .build()
     }
@@ -220,6 +1568,10 @@ impl IpcFailure {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exhaustive store-to-IPC mapping is safer as one auditable match"
+    )]
     #[allow(clippy::needless_pass_by_value)]
     fn store(error: loom_store::StoreError) -> Self {
         use loom_store::StoreError;
@@ -232,6 +1584,30 @@ impl IpcFailure {
             StoreError::ResearchCall(_) => "research_call_invalid",
             StoreError::ResearchAssembly(_) => "research_assembly_invalid",
             StoreError::ResearchAdmission(_) => "research_admission_rejected",
+            StoreError::EmptyResearchExecutionRecord => "research_execution_record_empty",
+            StoreError::ResearchExecutionRecordTooLarge { .. } => {
+                "research_execution_record_too_large"
+            }
+            StoreError::ResearchExecutionRecordConflict { .. } => {
+                "research_execution_record_conflict"
+            }
+            StoreError::ResearchSubjectProjectMismatch => "research_subject_project_mismatch",
+            StoreError::ResearchExecutionSubjectConflict { .. } => {
+                "research_execution_subject_conflict"
+            }
+            StoreError::ResearchCampaignNotPersisted(_) => "research_campaign_not_persisted",
+            StoreError::InvalidFrozenResearchSubject(_) => "invalid_frozen_research_subject",
+            StoreError::InvalidResearchDiagnostic(_) => "invalid_research_diagnostic",
+            StoreError::ResearchSessionSubjectNotPersisted { .. } => {
+                "research_session_subject_not_persisted"
+            }
+            StoreError::ResearchSessionAlreadyActive { .. } => "research_session_already_active",
+            StoreError::TrialRunNotDispatched(_) => "trial_run_not_dispatched",
+            StoreError::ResearchJournalLeaseMismatch => "research_journal_lease_mismatch",
+            StoreError::InvalidResearchJournalMutation => "invalid_research_journal_mutation",
+            StoreError::ResearchJournalEventLimit { .. } => "research_journal_event_limit",
+            StoreError::ResearchJournalRecordTooLarge { .. } => "research_journal_record_too_large",
+            StoreError::ResearchJournalTotalTooLarge { .. } => "research_journal_total_too_large",
             StoreError::SessionEntropy(_) => "session_entropy_unavailable",
             StoreError::NonUtf8Path(_) => "non_utf8_path",
             StoreError::UnsafeRelativePath(_) => "unsafe_relative_path",
@@ -300,7 +1676,9 @@ impl IpcFailure {
         };
         let retryable = matches!(
             error,
-            StoreError::ProjectAlreadyOpen(_) | StoreError::SessionEntropy(_)
+            StoreError::ProjectAlreadyOpen(_)
+                | StoreError::ResearchSessionAlreadyActive { .. }
+                | StoreError::SessionEntropy(_)
         );
         Self::new(code, error.to_string(), retryable)
     }
@@ -496,7 +1874,19 @@ pub struct ModelCapabilitySummary {
     model_sha256: Option<String>,
     projector_present: Option<bool>,
     media_kinds: Vec<&'static str>,
-    tested_profile: Option<&'static str>,
+    /// A size-only policy hint. It is emitted only for uninspected discoveries.
+    policy_candidate: Option<PolicyProfileSummary>,
+    /// Exact policy identity after native inspection and digest agreement.
+    policy_verified: Option<PolicyProfileSummary>,
+    /// Compatibility alias for the first UI slice. New code uses
+    /// `policy_verified.profile_id`.
+    tested_profile: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PolicyProfileSummary {
+    profile_id: String,
+    rank: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -509,6 +1899,7 @@ pub struct ModelUnloadOutcome {
 pub struct BranchSnapshot {
     run_id: String,
     branch_id: String,
+    document_id: String,
     candidate_id: Option<String>,
     source_revision_id: String,
     target_start_byte: u64,
@@ -567,6 +1958,7 @@ impl From<BranchPageCursor> for BranchCursorSnapshot {
 pub struct BranchSummarySnapshot {
     run_id: String,
     branch_id: String,
+    document_id: String,
     candidate_id: Option<String>,
     source_revision_id: String,
     target_start_byte: u64,
@@ -592,6 +1984,15 @@ pub struct BranchPageSnapshot {
 #[derive(Clone, Debug, Serialize)]
 pub struct BranchBodySnapshot {
     run_id: String,
+    branch_id: String,
+    document_id: String,
+    candidate_id: String,
+    source_revision_id: String,
+    target_start_byte: u64,
+    target_end_byte: u64,
+    seed: String,
+    model_id: String,
+    created_at_unix_ms: i64,
     output_blob_id: String,
     byte_len: u64,
     text: String,
@@ -608,6 +2009,46 @@ pub struct WeaveStarted {
     exact_prompt_blob_id: String,
     branches: Vec<BranchSnapshot>,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum WeavePolicySnapshot {
+    AutomaticV2 {},
+    ManualV2 {
+        branch_count: u32,
+        max_tokens: u32,
+        temperature: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WeavePreset {
+    AutomaticProseV2,
+    AutomaticVerseV2,
+    ManualV2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ResolvedWeavePolicy {
+    preset: WeavePreset,
+    branch_count: u32,
+    max_tokens: u32,
+    temperature: f32,
+}
+
+#[derive(Debug, PartialEq)]
+enum ValidatedWeavePolicy {
+    AutomaticV2,
+    ManualV2 {
+        branch_count: u32,
+        max_tokens: u32,
+        temperature: f32,
+    },
+}
+
+const AUTOMATIC_WEAVE_BRANCH_COUNT_V2: u32 = 3;
+const AUTOMATIC_WEAVE_MAX_TOKENS_V2: u32 = 48;
+const AUTOMATIC_WEAVE_TEMPERATURE_V2: f32 = 0.8;
 
 #[derive(Clone, Debug, Serialize)]
 struct DesktopLoomEvent {
@@ -626,6 +2067,7 @@ async fn project_open_default<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
+    ensure_application_running(&state, "a project session")?;
     reserve_project_choice(&state)?;
     let result = app
         .path()
@@ -647,12 +2089,14 @@ async fn project_choose_create<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
+    ensure_application_running(&state, "a project session")?;
     reserve_project_choice(&state)?;
     let result = choose_project_folder(&app).and_then(|path| initialize_project(&path, title));
     finish_project_choice(&state, result)
 }
 
 fn reserve_project_choice(state: &State<'_, PluginState>) -> Result<(), IpcFailure> {
+    let _application_admission = lock_application_admission(state, "a project session")?;
     let mut session = lock_session(state)?;
     if session.phase != SessionPhase::Closed {
         return Err(IpcFailure::new(
@@ -894,6 +2338,7 @@ async fn project_choose_open<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
+    ensure_application_running(&state, "a project session")?;
     reserve_project_choice(&state)?;
     let result = choose_project_folder(&app).and_then(|path| {
         let mut store = ProjectStore::open(path).map_err(IpcFailure::store)?;
@@ -1155,7 +2600,7 @@ async fn document_open(
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 async fn document_checkpoint(
     project_id: String,
     session_id: String,
@@ -1265,7 +2710,7 @@ fn parse_checkpoint_draft_version(
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 async fn document_draft_upsert(
     project_id: String,
     session_id: String,
@@ -1735,6 +3180,14 @@ fn reconcile_apply_for_store(
     Ok(Receipt::from(outcome))
 }
 
+// Tauri's command ABI extracts `State` by value; the identity itself is still
+// returned directly and cannot fail at runtime.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn build_model_policy_get(state: State<'_, PluginState>) -> BuildModelPolicyIdentity {
+    state.build_model_policy.identity()
+}
+
 #[tauri::command]
 async fn model_list(
     state: State<'_, PluginState>,
@@ -1742,9 +3195,9 @@ async fn model_list(
     let loaded = {
         let registry = lock_model_registry(&state)?;
         match &*registry {
-            ModelRegistry::Loaded(model) => Some(model.clone()),
+            ModelRegistry::Loaded(model) | ModelRegistry::Unloading(model) => Some(model.clone()),
             ModelRegistry::Loading { previous, .. } => previous.clone(),
-            ModelRegistry::Empty => None,
+            ModelRegistry::ResidencyUnknown { .. } | ModelRegistry::Empty => None,
         }
     };
     let options = desktop_model_discovery_options(&state)?;
@@ -1765,7 +3218,7 @@ async fn model_list(
                 .as_ref()
                 .filter(|loaded| loaded.profile.model_path == model.resolved_path)
             {
-                return model_summary(loaded, true);
+                return model_summary(loaded, true, &state.build_model_policy);
             }
             ModelCapabilitySummary {
                 model_id: format!("discovered:{}", BlobId::digest(model_path.as_bytes())),
@@ -1787,6 +3240,11 @@ async fn model_list(
                 model_sha256: None,
                 projector_present: None,
                 media_kinds: Vec::new(),
+                policy_candidate: policy_candidate_summary(
+                    &state.build_model_policy,
+                    model.file_bytes,
+                ),
+                policy_verified: None,
                 tested_profile: None,
             }
         })
@@ -1794,12 +3252,23 @@ async fn model_list(
     if let Some(loaded) = &loaded
         && !models.iter().any(|model| model.loaded)
     {
-        models.push(model_summary(loaded, true));
+        models.push(model_summary(loaded, true, &state.build_model_policy));
     }
     models.sort_by(|left, right| {
         right
             .loaded
             .cmp(&left.loaded)
+            .then_with(|| {
+                left.policy_candidate
+                    .as_ref()
+                    .map_or(u32::MAX, |candidate| candidate.rank)
+                    .cmp(
+                        &right
+                            .policy_candidate
+                            .as_ref()
+                            .map_or(u32::MAX, |candidate| candidate.rank),
+                    )
+            })
             .then_with(|| left.display_name.cmp(&right.display_name))
             .then_with(|| left.model_path.cmp(&right.model_path))
     });
@@ -1852,37 +3321,496 @@ async fn model_choose<R: Runtime>(
 }
 
 #[tauri::command]
-async fn model_load(
+async fn model_load<R: Runtime>(
     model_path: String,
+    app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ModelCapabilitySummary, IpcFailure> {
-    let (canonical_path, profile) = match prepare_model_load(&model_path, &state)? {
+    let (model_load, plan) = {
+        let application_admission = lock_application_admission(&state, "local model verification")?;
+        let model_load = state.model_loads.reserve(&application_admission)?;
+        let plan = prepare_model_load(&model_path, &state)?;
+        (model_load, plan)
+    };
+    let (canonical_path, profile) = match plan {
         ModelLoadPlan::Ready(summary) => return Ok(summary),
         ModelLoadPlan::Inspect {
             canonical_path,
             profile,
         } => (canonical_path, profile),
     };
+    let worker_app = app.clone();
+    let worker_path = canonical_path.clone();
     let worker_profile = profile.clone();
+    let cleanup_profile = profile;
     let backend = Arc::clone(&state.backend);
-    let inspected =
-        tauri::async_runtime::spawn_blocking(move || backend.inspect_model(&worker_profile))
-            .await
-            .map_err(|error| {
-                IpcFailure::new(
-                    "model_worker_failed",
-                    format!("the local model verification worker stopped: {error}"),
-                    true,
-                )
-            });
-    let descriptor = resolve_model_inspection(&state, &canonical_path, &profile, inspected)?;
-    commit_model_load(
-        &state,
-        &canonical_path,
-        LoadedModel {
+    let worker_guard = model_load.worker_guard();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _worker_guard = worker_guard;
+        let worker_state = worker_app.state::<PluginState>();
+        let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let inspected = Ok(backend.inspect_model(&worker_profile));
+            let descriptor =
+                resolve_model_inspection(&worker_state, &worker_path, &worker_profile, inspected)?;
+            commit_model_load(
+                &worker_state,
+                &worker_path,
+                LoadedModel {
+                    profile: worker_profile,
+                    descriptor,
+                },
+            )
+        }));
+        match operation {
+            Ok(result) => result,
+            Err(panic) => {
+                let _ = release_staged_model(&worker_state, &worker_path, &cleanup_profile);
+                std::panic::resume_unwind(panic);
+            }
+        }
+    })
+    .await
+    .map_err(|error| {
+        IpcFailure::new(
+            "model_worker_failed",
+            format!("the local model verification worker stopped: {error}"),
+            true,
+        )
+    })?
+}
+
+/// Automatically loads only a writer named by the embedded build policy.
+///
+/// This command hashes the canonical local file through an open identity
+/// handle before llama.cpp sees the path. It rechecks that the path still
+/// names the same file before and after native inspection, and it requires the
+/// native descriptor to report the same digest and size. See
+/// `docs/model-policy-loading.md` for the remaining cross-process mutation
+/// limit of a path-based native loader.
+#[tauri::command]
+async fn model_load_policy_candidate<R: Runtime>(
+    profile_id: String,
+    model_path: String,
+    app: AppHandle<R>,
+    state: State<'_, PluginState>,
+) -> Result<ModelCapabilitySummary, IpcFailure> {
+    let (model_load, plan) = {
+        let application_admission = lock_application_admission(&state, "local model verification")?;
+        let model_load = state.model_loads.reserve(&application_admission)?;
+        let plan = prepare_policy_model_load(&profile_id, &model_path, &state)?;
+        (model_load, plan)
+    };
+    let (canonical_path, profile, expectation) = match plan {
+        PolicyModelLoadPlan::Ready(summary) => return Ok(summary),
+        PolicyModelLoadPlan::Inspect {
+            canonical_path,
             profile,
-            descriptor,
-        },
+            expectation,
+        } => (canonical_path, profile, expectation),
+    };
+    let worker_app = app.clone();
+    let worker_path = canonical_path.clone();
+    let worker_profile = profile.clone();
+    let cleanup_profile = profile;
+    let worker_expectation = expectation.clone();
+    let backend = Arc::clone(&state.backend);
+    let worker_guard = model_load.worker_guard();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _worker_guard = worker_guard;
+        let worker_state = worker_app.state::<PluginState>();
+        let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let inspected =
+                inspect_preverified_policy_file(&worker_path, &worker_expectation, || {
+                    let descriptor = backend
+                        .inspect_model(&worker_profile)
+                        .map_err(|error| IpcFailure::backend(&error))?;
+                    validate_policy_model_descriptor(
+                        &descriptor,
+                        &worker_path,
+                        &worker_expectation,
+                    )?;
+                    Ok(descriptor)
+                });
+            let descriptor = resolve_policy_model_inspection(
+                &worker_state,
+                &worker_path,
+                &worker_profile,
+                inspected,
+            )?;
+            commit_model_load(
+                &worker_state,
+                &worker_path,
+                LoadedModel {
+                    profile: worker_profile,
+                    descriptor,
+                },
+            )
+        }));
+        match operation {
+            Ok(result) => result,
+            Err(panic) => {
+                let _ = release_staged_model(&worker_state, &worker_path, &cleanup_profile);
+                std::panic::resume_unwind(panic);
+            }
+        }
+    })
+    .await
+    .map_err(|error| {
+        IpcFailure::new(
+            "model_worker_failed",
+            format!("the policy model verification worker stopped: {error}"),
+            true,
+        )
+    })?
+}
+
+fn prepare_policy_model_load(
+    profile_id: &str,
+    model_path: &str,
+    state: &State<'_, PluginState>,
+) -> Result<PolicyModelLoadPlan, IpcFailure> {
+    // Resolve the profile before touching the path so an unknown policy name
+    // cannot be used as a filesystem-probing oracle.
+    let expectation = policy_writer_expectation(&state.build_model_policy, profile_id)?;
+    let requested = PathBuf::from(model_path);
+    let canonical_path = requested.canonicalize().map_err(|error| {
+        IpcFailure::new(
+            "policy_model_path_error",
+            format!("the policy model path cannot be opened: {error}"),
+            false,
+        )
+    })?;
+    let discovered = discover_loadable_model(state, &canonical_path)?;
+    if discovered.file_bytes != expectation.model_file_bytes {
+        return Err(IpcFailure::new(
+            "policy_model_size_mismatch",
+            "the local file size does not match the selected writer policy",
+            false,
+        ));
+    }
+
+    let _lifecycle = lock_model_lifecycle(state)?;
+    let mut registry = lock_model_registry(state)?;
+    match &*registry {
+        ModelRegistry::Loaded(loaded) if loaded.profile.model_path == canonical_path => {
+            validate_policy_model_descriptor(&loaded.descriptor, &canonical_path, &expectation)?;
+            let summary = model_summary(loaded, true, &state.build_model_policy);
+            return Ok(PolicyModelLoadPlan::Ready(summary));
+        }
+        ModelRegistry::Loading { path, .. } => {
+            return Err(IpcFailure::new(
+                "model_load_in_progress",
+                format!("Loom is already verifying {}", path.display()),
+                true,
+            ));
+        }
+        ModelRegistry::Unloading(_) => {
+            return Err(IpcFailure::new(
+                "model_unload_in_progress",
+                "wait for the selected local model to finish unloading",
+                true,
+            ));
+        }
+        ModelRegistry::ResidencyUnknown { reason } => {
+            return Err(model_residency_unknown(reason));
+        }
+        ModelRegistry::Loaded(_) | ModelRegistry::Empty => {}
+    }
+    ensure_no_active_generations(state, "switching local models")?;
+    let previous = match std::mem::take(&mut *registry) {
+        ModelRegistry::Loaded(previous) => Some(previous),
+        ModelRegistry::Empty => None,
+        ModelRegistry::Loading { .. }
+        | ModelRegistry::Unloading(_)
+        | ModelRegistry::ResidencyUnknown { .. } => {
+            unreachable!("the loading state was rejected while holding the registry lock")
+        }
+    };
+    *registry = ModelRegistry::Loading {
+        path: canonical_path.clone(),
+        previous,
+    };
+    Ok(PolicyModelLoadPlan::Inspect {
+        canonical_path: canonical_path.clone(),
+        profile: LocalModelProfile::for_gguf(canonical_path),
+        expectation,
+    })
+}
+
+fn policy_writer_expectation(
+    policy: &BuildModelPolicy,
+    profile_id: &str,
+) -> Result<PolicyWriterExpectation, IpcFailure> {
+    let ranked = policy.writer_by_profile_id(profile_id).ok_or_else(|| {
+        IpcFailure::new(
+            "unknown_policy_model_profile",
+            "the requested writer profile is not in this build policy",
+            false,
+        )
+    })?;
+    let writer = ranked.writer();
+    if writer.role() != ModelRole::Writer || writer.prompt_mode() != PromptMode::Completion {
+        return Err(IpcFailure::new(
+            "unsupported_policy_model_contract",
+            "the selected profile is not an accepted raw-completion writer contract",
+            false,
+        ));
+    }
+    Ok(PolicyWriterExpectation {
+        profile_id: writer.profile_id().to_owned(),
+        rank: ranked.rank(),
+        role: writer.role(),
+        prompt_mode: writer.prompt_mode(),
+        model_sha256: writer.model_sha256(),
+        model_file_bytes: writer.model_file_bytes(),
+    })
+}
+
+fn inspect_preverified_policy_file<T>(
+    canonical_path: &Path,
+    expectation: &PolicyWriterExpectation,
+    inspect: impl FnOnce() -> Result<T, IpcFailure>,
+) -> Result<T, PolicyInspectionFailure> {
+    let verified = VerifiedPolicyFile::open(canonical_path, expectation).map_err(|failure| {
+        PolicyInspectionFailure {
+            failure,
+            native_inspection_started: false,
+        }
+    })?;
+    verified
+        .ensure_path_binding()
+        .map_err(|failure| PolicyInspectionFailure {
+            failure,
+            native_inspection_started: false,
+        })?;
+    let inspected = inspect().map_err(|failure| PolicyInspectionFailure {
+        failure,
+        native_inspection_started: true,
+    })?;
+    verified
+        .ensure_path_binding()
+        .map_err(|failure| PolicyInspectionFailure {
+            failure,
+            native_inspection_started: true,
+        })?;
+    Ok(inspected)
+}
+
+impl VerifiedPolicyFile {
+    fn open(
+        canonical_path: &Path,
+        expectation: &PolicyWriterExpectation,
+    ) -> Result<Self, IpcFailure> {
+        ensure_regular_policy_path(canonical_path)?;
+        let mut identity = FileIdentityHandle::from_path(canonical_path).map_err(|error| {
+            policy_model_io_failure("open the policy model for identity verification", &error)
+        })?;
+        let stamp =
+            policy_file_stamp(&identity.as_file().metadata().map_err(|error| {
+                policy_model_io_failure("inspect the opened policy model", &error)
+            })?);
+        if stamp.len != expectation.model_file_bytes {
+            return Err(IpcFailure::new(
+                "policy_model_size_mismatch",
+                "the opened local file size does not match the selected writer policy",
+                false,
+            ));
+        }
+        let digest = hash_policy_model_file(identity.as_file_mut(), expectation.model_file_bytes)?;
+        if digest != expectation.model_sha256 {
+            return Err(IpcFailure::new(
+                "policy_model_digest_mismatch",
+                "the local file digest does not match the selected writer policy",
+                false,
+            ));
+        }
+        let verified = Self {
+            canonical_path: canonical_path.to_path_buf(),
+            identity,
+            stamp,
+        };
+        verified.ensure_path_binding()?;
+        Ok(verified)
+    }
+
+    fn ensure_path_binding(&self) -> Result<(), IpcFailure> {
+        ensure_regular_policy_path(&self.canonical_path)?;
+        let resolved = self.canonical_path.canonicalize().map_err(|error| {
+            policy_model_io_failure("canonicalize the verified policy model", &error)
+        })?;
+        if resolved != self.canonical_path {
+            return Err(policy_model_file_changed());
+        }
+        let current = FileIdentityHandle::from_path(&self.canonical_path).map_err(|error| {
+            policy_model_io_failure("reopen the verified policy model identity", &error)
+        })?;
+        if current != self.identity {
+            return Err(policy_model_file_changed());
+        }
+        let open_stamp =
+            policy_file_stamp(&self.identity.as_file().metadata().map_err(|error| {
+                policy_model_io_failure("reinspect the verified open model", &error)
+            })?);
+        let path_stamp = policy_file_stamp(&current.as_file().metadata().map_err(|error| {
+            policy_model_io_failure("reinspect the verified model path", &error)
+        })?);
+        if open_stamp != self.stamp || path_stamp != self.stamp {
+            return Err(policy_model_file_changed());
+        }
+        Ok(())
+    }
+}
+
+fn ensure_regular_policy_path(path: &Path) -> Result<(), IpcFailure> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| policy_model_io_failure("inspect the policy model path", &error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(IpcFailure::new(
+            "policy_model_not_regular_file",
+            "the policy model path must name one regular file without a final symlink",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn policy_file_stamp(metadata: &Metadata) -> PolicyFileStamp {
+    PolicyFileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    }
+}
+
+fn hash_policy_model_file(file: &mut File, expected_bytes: u64) -> Result<BlobId, IpcFailure> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; POLICY_MODEL_HASH_BUFFER_BYTES];
+    let mut observed_bytes = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| policy_model_io_failure("hash the policy model", &error))?;
+        if read == 0 {
+            break;
+        }
+        observed_bytes = observed_bytes
+            .checked_add(u64::try_from(read).map_err(|_| {
+                IpcFailure::new(
+                    "policy_model_size_overflow",
+                    "the policy model read size does not fit the platform",
+                    false,
+                )
+            })?)
+            .ok_or_else(|| {
+                IpcFailure::new(
+                    "policy_model_size_overflow",
+                    "the policy model byte count overflowed",
+                    false,
+                )
+            })?;
+        if observed_bytes > expected_bytes {
+            return Err(policy_model_file_changed());
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if observed_bytes != expected_bytes {
+        return Err(policy_model_file_changed());
+    }
+    Ok(BlobId::from_bytes(hasher.finalize().into()))
+}
+
+fn validate_policy_model_descriptor(
+    descriptor: &VerifiedModelDescriptor,
+    canonical_path: &Path,
+    expectation: &PolicyWriterExpectation,
+) -> Result<(), IpcFailure> {
+    let descriptor_digest = descriptor.model_sha256.parse::<BlobId>().map_err(|_| {
+        IpcFailure::new(
+            "policy_model_native_identity_mismatch",
+            "native inspection returned an invalid model digest",
+            false,
+        )
+    })?;
+    if descriptor.model_path != canonical_path
+        || descriptor.model_file_bytes != expectation.model_file_bytes
+        || descriptor_digest != expectation.model_sha256
+    {
+        return Err(IpcFailure::new(
+            "policy_model_native_identity_mismatch",
+            "native inspection did not return the preverified policy model identity",
+            false,
+        ));
+    }
+    if expectation.role != ModelRole::Writer
+        || expectation.prompt_mode != PromptMode::Completion
+        || !descriptor.capabilities.completion_text.is_supported()
+        || !descriptor.capabilities.generated_token_ids.is_supported()
+    {
+        return Err(IpcFailure::new(
+            "policy_model_capability_mismatch",
+            "native inspection did not prove raw completion and generated-token support required by the writer policy",
+            false,
+        ));
+    }
+    // Schema v1 does not encode a chat-support requirement. Do not infer one:
+    // a future policy field must be checked here before that contract can be
+    // accepted automatically.
+    Ok(())
+}
+
+fn resolve_policy_model_inspection(
+    state: &PluginState,
+    canonical_path: &Path,
+    profile: &LocalModelProfile,
+    inspected: Result<VerifiedModelDescriptor, PolicyInspectionFailure>,
+) -> Result<VerifiedModelDescriptor, IpcFailure> {
+    match inspected {
+        Ok(descriptor) => Ok(descriptor),
+        Err(error) => {
+            if error.native_inspection_started {
+                release_staged_model(state, canonical_path, profile)?;
+            } else {
+                restore_staged_model(state, canonical_path)?;
+            }
+            Err(error.failure)
+        }
+    }
+}
+
+fn restore_staged_model(state: &PluginState, path: &Path) -> Result<(), IpcFailure> {
+    let mut registry = lock_model_registry(state)?;
+    let current = std::mem::take(&mut *registry);
+    match current {
+        ModelRegistry::Loading {
+            path: loading,
+            previous,
+        } if loading == path => {
+            *registry = previous.map_or(ModelRegistry::Empty, ModelRegistry::Loaded);
+            Ok(())
+        }
+        current => {
+            *registry = current;
+            Err(IpcFailure::new(
+                "model_load_state_changed",
+                "the selected model changed during policy verification",
+                true,
+            ))
+        }
+    }
+}
+
+fn policy_model_io_failure(action: &str, error: &std::io::Error) -> IpcFailure {
+    IpcFailure::new(
+        "policy_model_io_error",
+        format!("could not {action}: {error}"),
+        true,
+    )
+}
+
+fn policy_model_file_changed() -> IpcFailure {
+    IpcFailure::new(
+        "policy_model_file_changed",
+        "the policy model changed during identity verification; retry from a stable local file",
+        true,
     )
 }
 
@@ -1903,7 +3831,11 @@ fn prepare_model_load(
     let mut registry = lock_model_registry(state)?;
     match &*registry {
         ModelRegistry::Loaded(loaded) if loaded.profile.model_path == canonical => {
-            return Ok(ModelLoadPlan::Ready(model_summary(loaded, true)));
+            return Ok(ModelLoadPlan::Ready(model_summary(
+                loaded,
+                true,
+                &state.build_model_policy,
+            )));
         }
         ModelRegistry::Loading { path, .. } => {
             return Err(IpcFailure::new(
@@ -1912,13 +3844,25 @@ fn prepare_model_load(
                 true,
             ));
         }
+        ModelRegistry::Unloading(_) => {
+            return Err(IpcFailure::new(
+                "model_unload_in_progress",
+                "wait for the selected local model to finish unloading",
+                true,
+            ));
+        }
+        ModelRegistry::ResidencyUnknown { reason } => {
+            return Err(model_residency_unknown(reason));
+        }
         ModelRegistry::Loaded(_) | ModelRegistry::Empty => {}
     }
     ensure_no_active_generations(state, "switching local models")?;
     let previous = match std::mem::take(&mut *registry) {
         ModelRegistry::Loaded(previous) => Some(previous),
         ModelRegistry::Empty => None,
-        ModelRegistry::Loading { .. } => {
+        ModelRegistry::Loading { .. }
+        | ModelRegistry::Unloading(_)
+        | ModelRegistry::ResidencyUnknown { .. } => {
             unreachable!("the loading state was rejected while holding the registry lock")
         }
     };
@@ -1956,26 +3900,97 @@ fn commit_model_load(
     canonical_path: &Path,
     loaded: LoadedModel,
 ) -> Result<ModelCapabilitySummary, IpcFailure> {
-    let summary = model_summary(&loaded, true);
+    let summary = model_summary(&loaded, true, &state.build_model_policy);
     let mut registry = lock_model_registry(state)?;
     match std::mem::take(&mut *registry) {
         ModelRegistry::Loading { path, previous } if path == canonical_path => {
-            if let Some(previous) = previous
-                && let Err(error) = state.backend.release_model(&previous.profile)
-            {
-                let _ = state.backend.release_model(&loaded.profile);
-                *registry = ModelRegistry::Loaded(previous);
-                return Err(IpcFailure::new(
-                    "model_release_failed",
-                    format!("the previous local model could not be released safely: {error}"),
-                    true,
-                ));
+            if let Some(previous) = previous {
+                match state.backend.release_model(&previous.profile) {
+                    Ok(ModelRelease::Released { .. }) => {}
+                    Ok(ModelRelease::AlreadyAbsent) => {
+                        match state.backend.release_model(&loaded.profile) {
+                            Ok(ModelRelease::Released { .. }) => {}
+                            Ok(ModelRelease::AlreadyAbsent) => {
+                                let reason = "the previous slot was absent and cleanup could not prove access to the verified staged model's native resident slot".to_owned();
+                                *registry = ModelRegistry::ResidencyUnknown {
+                                    reason: reason.clone(),
+                                };
+                                return Err(model_residency_unknown(&reason));
+                            }
+                            Err(cleanup) => {
+                                let reason = format!(
+                                    "the previous slot was absent and the verified staged model cleanup failed: {cleanup}"
+                                );
+                                *registry = ModelRegistry::ResidencyUnknown {
+                                    reason: reason.clone(),
+                                };
+                                return Err(model_residency_unknown(&reason));
+                            }
+                        }
+                        let reason =
+                            "the previous selected model had no provably accessible native resident slot"
+                                .to_owned();
+                        *registry = ModelRegistry::ResidencyUnknown {
+                            reason: reason.clone(),
+                        };
+                        return Err(model_residency_unknown(&reason));
+                    }
+                    Err(error) => {
+                        match state.backend.release_model(&loaded.profile) {
+                            Ok(ModelRelease::Released { .. }) => {}
+                            Ok(ModelRelease::AlreadyAbsent) => {
+                                let reason = format!(
+                                    "the previous model release failed ({error}) and cleanup could not prove access to the verified staged model's native resident slot"
+                                );
+                                *registry = ModelRegistry::ResidencyUnknown {
+                                    reason: reason.clone(),
+                                };
+                                return Err(model_residency_unknown(&reason));
+                            }
+                            Err(cleanup) => {
+                                let reason = format!(
+                                    "the previous model release failed ({error}) and the verified staged model cleanup also failed ({cleanup})"
+                                );
+                                *registry = ModelRegistry::ResidencyUnknown {
+                                    reason: reason.clone(),
+                                };
+                                return Err(model_residency_unknown(&reason));
+                            }
+                        }
+                        *registry = ModelRegistry::Loaded(previous);
+                        return Err(IpcFailure::new(
+                            "model_release_failed",
+                            format!(
+                                "the previous local model could not be released safely: {error}"
+                            ),
+                            true,
+                        ));
+                    }
+                }
             }
             *registry = ModelRegistry::Loaded(Box::new(loaded));
         }
         current => {
+            match state.backend.release_model(&loaded.profile) {
+                Ok(ModelRelease::Released { .. }) => {}
+                Ok(ModelRelease::AlreadyAbsent) => {
+                    let reason = "the model registry changed during verification and cleanup could not prove access to the verified staged model's native resident slot".to_owned();
+                    *registry = ModelRegistry::ResidencyUnknown {
+                        reason: reason.clone(),
+                    };
+                    return Err(model_residency_unknown(&reason));
+                }
+                Err(cleanup) => {
+                    let reason = format!(
+                        "the model registry changed during verification and the verified staged model cleanup failed: {cleanup}"
+                    );
+                    *registry = ModelRegistry::ResidencyUnknown {
+                        reason: reason.clone(),
+                    };
+                    return Err(model_residency_unknown(&reason));
+                }
+            }
             *registry = current;
-            let _ = state.backend.release_model(&loaded.profile);
             return Err(IpcFailure::new(
                 "model_load_state_changed",
                 "the selected model changed while native verification was running",
@@ -1986,12 +4001,27 @@ fn commit_model_load(
     Ok(summary)
 }
 
+fn model_residency_unknown(reason: &str) -> IpcFailure {
+    IpcFailure::new(
+        "model_residency_unknown",
+        format!(
+            "Loom cannot prove that every native model resource was released: {reason}; restart after preserving the manuscript"
+        ),
+        false,
+    )
+}
+
 #[tauri::command]
 async fn model_unload(state: State<'_, PluginState>) -> Result<ModelUnloadOutcome, IpcFailure> {
+    let _application_admission = lock_application_admission(&state, "local model teardown")?;
     let _lifecycle = lock_model_lifecycle(&state)?;
     ensure_no_active_generations(&state, "unloading the local model")?;
-    let profile = {
-        let mut registry = lock_model_registry(&state)?;
+    unload_registered_model(&state)
+}
+
+fn unload_registered_model(state: &PluginState) -> Result<ModelUnloadOutcome, IpcFailure> {
+    let loaded = {
+        let mut registry = lock_model_registry(state)?;
         match std::mem::take(&mut *registry) {
             ModelRegistry::Empty => {
                 return Ok(ModelUnloadOutcome {
@@ -2007,24 +4037,34 @@ async fn model_unload(state: State<'_, PluginState>) -> Result<ModelUnloadOutcom
                     true,
                 ));
             }
+            unloading @ ModelRegistry::Unloading(_) => {
+                *registry = unloading;
+                return Err(IpcFailure::new(
+                    "model_unload_in_progress",
+                    "wait for the selected local model to finish unloading",
+                    true,
+                ));
+            }
+            ModelRegistry::ResidencyUnknown { reason } => {
+                let failure = model_residency_unknown(&reason);
+                *registry = ModelRegistry::ResidencyUnknown { reason };
+                return Err(failure);
+            }
             ModelRegistry::Loaded(loaded) => {
-                let profile = loaded.profile.clone();
-                *registry = ModelRegistry::Loading {
-                    path: profile.model_path.clone(),
-                    previous: Some(loaded),
-                };
-                profile
+                *registry = ModelRegistry::Unloading(loaded.clone());
+                loaded
             }
         }
     };
-    let release = state.backend.release_model(&profile);
-    let mut registry = lock_model_registry(&state)?;
+    let release = state.backend.release_model(&loaded.profile);
+    let mut registry = lock_model_registry(state)?;
     let current = std::mem::take(&mut *registry);
-    let (path, previous) = match current {
-        ModelRegistry::Loading {
-            path,
-            previous: Some(previous),
-        } => (path, previous),
+    let unloading = match current {
+        ModelRegistry::Unloading(unloading)
+            if unloading.profile.model_path == loaded.profile.model_path =>
+        {
+            unloading
+        }
         current => {
             *registry = current;
             return Err(IpcFailure::new(
@@ -2034,28 +4074,25 @@ async fn model_unload(state: State<'_, PluginState>) -> Result<ModelUnloadOutcom
             ));
         }
     };
-    if path != profile.model_path {
-        *registry = ModelRegistry::Loading {
-            path,
-            previous: Some(previous),
-        };
-        return Err(IpcFailure::new(
-            "model_load_state_changed",
-            "the selected model changed while native unload was running",
-            true,
-        ));
-    }
-    let model_id = previous.descriptor.stable_model_id.clone();
+    let model_id = unloading.descriptor.stable_model_id.clone();
     match release {
-        Ok(resident_slot_released) => {
+        Ok(ModelRelease::Released { .. }) => {
             *registry = ModelRegistry::Empty;
             Ok(ModelUnloadOutcome {
                 model_id: Some(model_id),
-                resident_slot_released,
+                resident_slot_released: true,
             })
         }
+        Ok(ModelRelease::AlreadyAbsent) => {
+            let reason =
+                "the selected model had no provably accessible native resident slot".to_owned();
+            *registry = ModelRegistry::ResidencyUnknown {
+                reason: reason.clone(),
+            };
+            Err(model_residency_unknown(&reason))
+        }
         Err(error) => {
-            *registry = ModelRegistry::Loaded(previous);
+            *registry = ModelRegistry::Loaded(unloading);
             Err(IpcFailure::new(
                 "model_release_failed",
                 format!("the selected local model could not be released safely: {error}"),
@@ -2065,9 +4102,9 @@ async fn model_unload(state: State<'_, PluginState>) -> Result<ModelUnloadOutcom
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 #[tauri::command]
-async fn model_download_start<R: Runtime>(
+fn model_download_start<R: Runtime>(
     command_id: String,
     url: String,
     file_name: String,
@@ -2077,6 +4114,8 @@ async fn model_download_start<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ModelDownloadSnapshot, IpcFailure> {
+    ensure_application_running(&state, "a model download")?;
+    state.download_workers.reap_finished()?;
     let PreparedModelDownload {
         command_id,
         request,
@@ -2090,13 +4129,29 @@ async fn model_download_start<R: Runtime>(
         expected_bytes,
         max_bytes,
     )?;
+    let application_admission = lock_application_admission(&state, "a model download")?;
     let (reservation, snapshot) = state
         .downloads
         .reserve(spec, now_unix_ms())
         .map_err(|error| IpcFailure::model_download_registry(&error))?;
-    if reservation == ReservationOutcome::Replayed {
-        return Ok(snapshot);
+    match reservation {
+        ReservationOutcome::Replayed => {
+            drop(application_admission);
+            return Ok(snapshot);
+        }
+        ReservationOutcome::Started => {}
     }
+    let worker_reservation = state
+        .download_workers
+        .reserve(command_id, &application_admission)
+        .inspect_err(|failure| {
+            let _ = state.downloads.fail(
+                command_id,
+                failure.message.clone(),
+                failure.retryable,
+                now_unix_ms(),
+            );
+        })?;
     emit_model_download_snapshot(
         &app,
         &state.downloads,
@@ -2108,14 +4163,62 @@ async fn model_download_start<R: Runtime>(
         .downloads
         .cancellation(command_id)
         .map_err(|error| IpcFailure::model_download_registry(&error))?;
-    spawn_model_download(
+    start_model_download_worker(
         app,
-        Arc::clone(&state.downloads),
+        &state.downloads,
         command_id,
         request,
-        cancellation,
-    );
+        &cancellation,
+        worker_reservation,
+    )?;
+    drop(application_admission);
     Ok(snapshot)
+}
+
+fn start_model_download_worker<R: Runtime>(
+    app: AppHandle<R>,
+    downloads: &Arc<ModelDownloadRegistry>,
+    command_id: CommandId,
+    request: GgufDownloadRequest,
+    cancellation: &DownloadCancellation,
+    reservation: DownloadWorkerReservation<'_, '_>,
+) -> Result<(), IpcFailure> {
+    let worker = spawn_model_download(
+        app,
+        Arc::clone(downloads),
+        command_id,
+        request,
+        cancellation.clone(),
+    )
+    .map_err(|error| {
+        cancellation.cancel();
+        let failure = IpcFailure::new(
+            "download_worker_spawn_failed",
+            format!("the model download worker could not start: {error}"),
+            true,
+        );
+        let _ = downloads.fail(
+            command_id,
+            failure.message.clone(),
+            failure.retryable,
+            now_unix_ms(),
+        );
+        failure
+    })?;
+    if let Err(DownloadWorkerAttachError { failure, worker }) =
+        reservation.attach(worker, cancellation.clone())
+    {
+        cancellation.cancel();
+        let _ = worker.join();
+        let _ = downloads.fail(
+            command_id,
+            failure.message.clone(),
+            failure.retryable,
+            now_unix_ms(),
+        );
+        return Err(failure);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2192,56 +4295,61 @@ fn spawn_model_download<R: Runtime>(
     downloads: Arc<ModelDownloadRegistry>,
     command_id: CommandId,
     request: GgufDownloadRequest,
-    cancellation: loom_backend_llama::DownloadCancellation,
-) {
-    std::mem::drop(tauri::async_runtime::spawn(async move {
-        let progress_downloads = Arc::clone(&downloads);
-        let progress_app = app.clone();
-        let result = download_gguf(
-            &request,
-            &cancellation,
-            move |progress| match progress_downloads.record_progress(
-                command_id,
-                progress,
-                now_unix_ms(),
-            ) {
-                Ok(snapshot) => {
-                    emit_model_download_snapshot(
-                        &progress_app,
-                        &progress_downloads,
-                        "loom://model-download-progress",
+    cancellation: DownloadCancellation,
+) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("loom-model-download".to_owned())
+        .spawn(move || {
+            tauri::async_runtime::block_on(async move {
+                let progress_downloads = Arc::clone(&downloads);
+                let progress_app = app.clone();
+                let result =
+                    download_gguf(
+                        &request,
+                        &cancellation,
+                        move |progress| match progress_downloads.record_progress(
+                            command_id,
+                            progress,
+                            now_unix_ms(),
+                        ) {
+                            Ok(snapshot) => {
+                                emit_model_download_snapshot(
+                                    &progress_app,
+                                    &progress_downloads,
+                                    "loom://model-download-progress",
+                                    command_id,
+                                    &snapshot,
+                                );
+                                DownloadControl::Continue
+                            }
+                            Err(_) => DownloadControl::Cancel,
+                        },
+                    )
+                    .await;
+                let terminal = match result {
+                    Ok(result) => downloads.complete(command_id, &result, now_unix_ms()),
+                    Err(error) if error.is_cancelled() => {
+                        downloads.finish_cancelled(command_id, now_unix_ms())
+                    }
+                    Err(error) => downloads.fail(
+                        command_id,
+                        error.to_string(),
+                        error.is_retryable(),
+                        now_unix_ms(),
+                    ),
+                };
+                match terminal {
+                    Ok(snapshot) => emit_model_download_snapshot(
+                        &app,
+                        &downloads,
+                        "loom://model-download-terminal",
                         command_id,
                         &snapshot,
-                    );
-                    DownloadControl::Continue
+                    ),
+                    Err(error) => eprintln!("Loom model download terminal state failed: {error}"),
                 }
-                Err(_) => DownloadControl::Cancel,
-            },
-        )
-        .await;
-        let terminal = match result {
-            Ok(result) => downloads.complete(command_id, &result, now_unix_ms()),
-            Err(error) if error.is_cancelled() => {
-                downloads.finish_cancelled(command_id, now_unix_ms())
-            }
-            Err(error) => downloads.fail(
-                command_id,
-                error.to_string(),
-                error.is_retryable(),
-                now_unix_ms(),
-            ),
-        };
-        match terminal {
-            Ok(snapshot) => emit_model_download_snapshot(
-                &app,
-                &downloads,
-                "loom://model-download-terminal",
-                command_id,
-                &snapshot,
-            ),
-            Err(error) => eprintln!("Loom model download terminal state failed: {error}"),
-        }
-    }));
+            });
+        })
 }
 
 #[tauri::command]
@@ -2418,7 +4526,7 @@ fn remember_user_model_path(
 }
 
 fn release_staged_model(
-    state: &State<'_, PluginState>,
+    state: &PluginState,
     path: &Path,
     profile: &LocalModelProfile,
 ) -> Result<(), IpcFailure> {
@@ -2429,28 +4537,71 @@ fn release_staged_model(
         ModelRegistry::Loading {
             path: loading,
             previous,
-        } if loading == path => {
-            *registry = previous.map_or(ModelRegistry::Empty, ModelRegistry::Loaded);
-        }
-        current => {
-            *registry = current;
-            return Err(IpcFailure::new(
-                "model_load_state_changed",
-                "the selected model changed while native verification was running",
-                true,
-            ));
-        }
+        } if loading == path => match release {
+            Ok(ModelRelease::Released { .. }) => {
+                *registry = previous.map_or(ModelRegistry::Empty, ModelRegistry::Loaded);
+            }
+            Ok(ModelRelease::AlreadyAbsent) => {
+                let reason =
+                    "native inspection started, but staged model cleanup could not prove access to its resident slot"
+                        .to_owned();
+                *registry = ModelRegistry::ResidencyUnknown {
+                    reason: reason.clone(),
+                };
+                return Err(model_residency_unknown(&reason));
+            }
+            Err(error) => {
+                let reason = format!("rejected staged model cleanup failed: {error}");
+                *registry = ModelRegistry::ResidencyUnknown {
+                    reason: reason.clone(),
+                };
+                return Err(model_residency_unknown(&reason));
+            }
+        },
+        current => match release {
+            Ok(ModelRelease::Released { .. }) => {
+                *registry = current;
+                return Err(IpcFailure::new(
+                    "model_load_state_changed",
+                    "the selected model changed while native verification was running",
+                    true,
+                ));
+            }
+            Ok(ModelRelease::AlreadyAbsent) => {
+                let reason = "the model registry changed during rejected-model cleanup and cleanup could not prove access to the staged native resident slot".to_owned();
+                *registry = ModelRegistry::ResidencyUnknown {
+                    reason: reason.clone(),
+                };
+                return Err(model_residency_unknown(&reason));
+            }
+            Err(error) => {
+                let reason = format!(
+                    "the model registry changed during rejected-model cleanup, which then failed: {error}"
+                );
+                *registry = ModelRegistry::ResidencyUnknown {
+                    reason: reason.clone(),
+                };
+                return Err(model_residency_unknown(&reason));
+            }
+        },
     }
-    release.map(|_| ()).map_err(|error| {
-        IpcFailure::new(
-            "model_release_failed",
-            format!("the rejected local model could not be released safely: {error}"),
-            true,
-        )
-    })
+    Ok(())
 }
 
-fn model_summary(model: &LoadedModel, header_verified: bool) -> ModelCapabilitySummary {
+fn model_summary(
+    model: &LoadedModel,
+    header_verified: bool,
+    build_model_policy: &BuildModelPolicy,
+) -> ModelCapabilitySummary {
+    let policy_verified = build_model_policy
+        .matching_writer(
+            &model.descriptor.model_sha256,
+            model.descriptor.model_file_bytes,
+        )
+        .map(|matched| PolicyProfileSummary {
+            profile_id: matched.writer().profile_id().to_owned(),
+            rank: matched.rank(),
+        });
     ModelCapabilitySummary {
         model_id: model.descriptor.stable_model_id.clone(),
         display_name: model.descriptor.display_name.clone(),
@@ -2490,9 +4641,26 @@ fn model_summary(model: &LoadedModel, header_verified: bool) -> ModelCapabilityS
                 loom_backend_llama::VerifiedMediaKind::Audio => "audio",
             })
             .collect(),
-        tested_profile: (model.descriptor.model_sha256 == TESTED_GEMMA_4_E2B_BASE_Q8_SHA256)
-            .then_some(TESTED_GEMMA_4_E2B_BASE_PROFILE),
+        // Once native inspection has produced an exact digest, a size-only
+        // hint has served its purpose and must not survive a mismatch.
+        policy_candidate: None,
+        tested_profile: policy_verified
+            .as_ref()
+            .map(|profile| profile.profile_id.clone()),
+        policy_verified,
     }
+}
+
+fn policy_candidate_summary(
+    policy: &BuildModelPolicy,
+    model_file_bytes: u64,
+) -> Option<PolicyProfileSummary> {
+    policy
+        .unverified_size_candidate(model_file_bytes)
+        .map(|candidate| PolicyProfileSummary {
+            profile_id: candidate.writer().profile_id().to_owned(),
+            rank: candidate.rank(),
+        })
 }
 
 #[tauri::command]
@@ -2585,20 +4753,37 @@ async fn branch_body(
 ) -> Result<Option<BranchBodySnapshot>, IpcFailure> {
     let document_id = parse_document_id(&document_id)?;
     let run_id = parse_generation_run_id(&run_id)?;
-    let body = {
+    let (summary, body) = {
         let mut session = lock_session(&state)?;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;
-        store
+        let summary = store
+            .branch_summary(document_id, run_id)
+            .map_err(IpcFailure::store)?;
+        let body = store
             .branch_body(document_id, run_id, u64::from(max_bytes))
-            .map_err(IpcFailure::store)?
+            .map_err(IpcFailure::store)?;
+        (summary, body)
     };
-    Ok(body.map(branch_body_snapshot))
+    match body {
+        None => Ok(None),
+        Some(body) => {
+            let summary = summary.ok_or_else(|| {
+                IpcFailure::new(
+                    "corrupt_branch_body_identity",
+                    "the stored branch body has no immutable branch occurrence",
+                    false,
+                )
+            })?;
+            branch_body_snapshot(body, summary).map(Some)
+        }
+    }
 }
 
 fn branch_snapshot(record: StoredBranchRecord, active: bool) -> BranchSnapshot {
     BranchSnapshot {
         run_id: record.run_id.to_string(),
         branch_id: record.branch_id.to_string(),
+        document_id: record.document_id.to_string(),
         candidate_id: record.candidate_id.map(|id| id.to_string()),
         source_revision_id: record.source_revision_id.to_string(),
         target_start_byte: record.target_range.start,
@@ -2620,6 +4805,7 @@ fn branch_summary_snapshot(summary: StoredBranchSummary, active: bool) -> Branch
     BranchSummarySnapshot {
         run_id: summary.run_id.to_string(),
         branch_id: summary.branch_id.to_string(),
+        document_id: summary.document_id.to_string(),
         candidate_id: summary.candidate_id.map(|id| id.to_string()),
         source_revision_id: summary.source_revision_id.to_string(),
         target_start_byte: summary.target_range.start,
@@ -2636,13 +4822,56 @@ fn branch_summary_snapshot(summary: StoredBranchSummary, active: bool) -> Branch
     }
 }
 
-fn branch_body_snapshot(body: StoredBranchBody) -> BranchBodySnapshot {
-    BranchBodySnapshot {
+fn branch_body_snapshot(
+    body: StoredBranchBody,
+    summary: StoredBranchSummary,
+) -> Result<BranchBodySnapshot, IpcFailure> {
+    if summary.run_id != body.run_id
+        || summary.output_blob_id != Some(body.output_blob_id)
+        || summary.output_byte_len != Some(body.byte_len)
+    {
+        return Err(IpcFailure::new(
+            "corrupt_branch_body_identity",
+            "the stored branch body does not match its immutable branch occurrence",
+            false,
+        ));
+    }
+    let candidate_id = summary.candidate_id.ok_or_else(|| {
+        IpcFailure::new(
+            "corrupt_branch_body_identity",
+            "the stored branch body has no candidate identity",
+            false,
+        )
+    })?;
+    let seed = summary.seed.ok_or_else(|| {
+        IpcFailure::new(
+            "corrupt_branch_body_identity",
+            "the stored branch body has no sampler identity",
+            false,
+        )
+    })?;
+    let model_id = summary.model_identifier.ok_or_else(|| {
+        IpcFailure::new(
+            "corrupt_branch_body_identity",
+            "the stored branch body has no model identity",
+            false,
+        )
+    })?;
+    Ok(BranchBodySnapshot {
         run_id: body.run_id.to_string(),
+        branch_id: summary.branch_id.to_string(),
+        document_id: summary.document_id.to_string(),
+        candidate_id: candidate_id.to_string(),
+        source_revision_id: summary.source_revision_id.to_string(),
+        target_start_byte: summary.target_range.start,
+        target_end_byte: summary.target_range.end,
+        seed: seed.to_string(),
+        model_id,
+        created_at_unix_ms: summary.created_at_ms,
         output_blob_id: body.output_blob_id.to_string(),
         byte_len: body.byte_len,
         text: body.text,
-    }
+    })
 }
 
 fn branch_status(status: StoredBranchStatus, active: bool) -> &'static str {
@@ -2707,9 +4936,7 @@ fn replay_weave_if_recorded(
     source_revision_id: RevisionId,
     expected_visible_blob_id: BlobId,
     cursor_byte: u64,
-    branch_count: u32,
-    max_tokens: u32,
-    temperature: f32,
+    policy: &ValidatedWeavePolicy,
 ) -> Result<Option<WeaveStarted>, IpcFailure> {
     let replay = {
         let mut session = lock_session(state)?;
@@ -2720,13 +4947,17 @@ fn replay_weave_if_recorded(
         else {
             return Ok(None);
         };
-        let document_matches = store
+        let document_kind = store
             .list_documents()
             .map_err(IpcFailure::store)?
             .into_iter()
-            .any(|document| {
+            .find(|document| {
                 document.document_id == document_id && document.relative_path == relative_path
-            });
+            })
+            .map(|document| document.kind);
+        let resolved = document_kind
+            .map(|kind| policy.bind_document_kind(kind))
+            .transpose()?;
         let source_bytes = store
             .reconstruct_revision(source_revision_id)
             .map_err(IpcFailure::store)?;
@@ -2751,38 +4982,47 @@ fn replay_weave_if_recorded(
                 false,
             )
         })?;
-        let family_matches = family.generations.len() == branch_count as usize
-            && family.receipt.source_revision_id == Some(source_revision_id)
-            && document_matches
-            && BlobId::digest(&source_bytes) == expected_visible_blob_id
-            && cursor <= source_text.len()
-            && source_text.is_char_boundary(cursor)
-            && family
-                .generations
-                .iter()
-                .enumerate()
-                .all(|(index, started)| {
-                    let Ok(case_index) = u32::try_from(index) else {
-                        return false;
-                    };
-                    let (run_id, branch_id) = derive_weave_case_ids(command_id, case_index);
-                    let sampling = SamplingConfig {
-                        seed: generation_seed(command_id, case_index),
-                        temperature,
-                        max_tokens,
-                        ..SamplingConfig::default()
-                    };
-                    serde_json::to_value(sampling).is_ok_and(|sampling| {
-                        started.generation.run_id == run_id
-                            && started.generation.branch_id == branch_id
-                            && started.generation.document_id == document_id
-                            && started.generation.source_revision_id == source_revision_id
-                            && started.generation.target_range == expected_range
-                            && started.generation.seed
-                                == u64::from(generation_seed(command_id, case_index))
-                            && started.generation.sampling == sampling
+        let family_matches = resolved.is_some_and(|resolved| {
+            family.generations.len() == resolved.branch_count as usize
+                && family.receipt.source_revision_id == Some(source_revision_id)
+                && BlobId::digest(&source_bytes) == expected_visible_blob_id
+                && cursor <= source_text.len()
+                && source_text.is_char_boundary(cursor)
+                && family
+                    .generations
+                    .iter()
+                    .enumerate()
+                    .all(|(index, started)| {
+                        let Ok(case_index) = u32::try_from(index) else {
+                            return false;
+                        };
+                        let (run_id, branch_id) = derive_weave_case_ids(command_id, case_index);
+                        let sampling = sampling_for_weave_case(
+                            command_id,
+                            case_index,
+                            resolved.max_tokens,
+                            resolved.temperature,
+                            resolved.preset,
+                        );
+                        serde_json::from_value::<SamplingConfig>(
+                            started.generation.sampling.clone(),
+                        )
+                        .is_ok_and(|recorded_sampling| {
+                            started.generation.run_id == run_id
+                                && started.generation.branch_id == branch_id
+                                && started.generation.document_id == document_id
+                                && started.generation.source_revision_id == source_revision_id
+                                && started.generation.target_range == expected_range
+                                && started.generation.seed
+                                    == u64::from(generation_seed(
+                                        command_id,
+                                        case_index,
+                                        resolved.preset,
+                                    ))
+                                && recorded_sampling.fingerprint() == sampling.fingerprint()
+                        })
                     })
-                });
+        });
         if !family_matches {
             return Err(IpcFailure::new(
                 "idempotency_conflict",
@@ -2939,13 +5179,11 @@ async fn weave_start<R: Runtime>(
     source_revision_id: String,
     expected_visible_blob_id: String,
     cursor_byte: u64,
-    branch_count: u32,
-    max_tokens: u32,
-    temperature: f32,
-    automatic: bool,
+    policy: WeavePolicySnapshot,
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<WeaveStarted, IpcFailure> {
+    ensure_application_running(&state, "a writing suggestion")?;
     let command_id = parse_command_id(&command_id)?;
     let document_id = document_id.parse::<DocumentId>().map_err(|_| {
         IpcFailure::new(
@@ -2968,28 +5206,15 @@ async fn weave_start<R: Runtime>(
             false,
         )
     })?;
-    if branch_count == 0 || branch_count > 4 {
-        return Err(IpcFailure::new(
-            "invalid_branch_count",
-            "a weave must request between one and four branches",
-            false,
-        ));
-    }
-    if max_tokens == 0 || max_tokens > 2_048 {
-        return Err(IpcFailure::new(
-            "invalid_generation_budget",
-            "a weave must request between one and 2,048 tokens per branch",
-            false,
-        ));
-    }
-    if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
-        return Err(IpcFailure::new(
-            "invalid_temperature",
-            "temperature must be a finite value from 0 through 2",
-            false,
-        ));
-    }
+    let policy = validate_weave_policy(policy)?;
 
+    // Serialize the loaded-model snapshot through native startup and family
+    // registration. A switch cannot observe zero active branches in the gap.
+    let application_admission = lock_application_admission(&state, "a writing suggestion")?;
+    // Replay is read-only recovery, so focus/automation policy does not hide
+    // durable private evidence. It is checked while holding the same admission
+    // boundary as new work: concurrent first calls cannot both miss the row,
+    // and an exact replay never consumes automatic budget or reaches native.
     if let Some(replay) = replay_weave_if_recorded(
         &state,
         &project_id,
@@ -3000,17 +5225,15 @@ async fn weave_start<R: Runtime>(
         source_revision_id,
         expected_visible_blob_id,
         cursor_byte,
-        branch_count,
-        max_tokens,
-        temperature,
+        &policy,
     )? {
         return Ok(replay);
     }
-
-    // Serialize the loaded-model snapshot through native startup and family
-    // registration. A switch cannot observe zero active branches in the gap.
     let _model_lifecycle = lock_model_lifecycle(&state)?;
-    let loaded_model = loaded_model(&state)?;
+    let authorized_model =
+        AuthorizedWeaveModel::bind(policy, loaded_model(&state)?, &state.build_model_policy)?;
+    let branch_count = authorized_model.branch_count();
+    let loaded_model = authorized_model.loaded();
     let max_cases = loaded_model
         .descriptor
         .capabilities
@@ -3029,13 +5252,7 @@ async fn weave_start<R: Runtime>(
     let request_id = format!("weave-{command_id}");
     let (identity, exact_prefix, prompt_recipe, cases, queued_branches, runs) = {
         let mut session = lock_session(&state)?;
-        let admission = if automatic {
-            session.agency.admit_automation()
-        } else {
-            session.agency.admit_manual_generation()
-        };
-        admission
-            .map_err(|error| IpcFailure::new("generation_blocked", error.to_string(), false))?;
+        authorized_model.admit(&session.agency)?;
         let active_session_id = session.active_session_id.ok_or_else(|| {
             IpcFailure::new(
                 "corrupt_project_session",
@@ -3048,6 +5265,13 @@ async fn weave_start<R: Runtime>(
             .read_document(&relative_path)
             .map_err(IpcFailure::store)?;
         ensure_document_id(&loaded, &document_id.to_string())?;
+        let ResolvedWeavePolicy {
+            preset,
+            branch_count: resolved_branch_count,
+            max_tokens,
+            temperature,
+        } = authorized_model.bind_document_kind(loaded.kind)?;
+        debug_assert_eq!(resolved_branch_count, branch_count);
         if loaded.revision_id != source_revision_id {
             return Err(IpcFailure::new(
                 "source_revision_conflict",
@@ -3083,6 +5307,38 @@ async fn weave_start<R: Runtime>(
                 false,
             ));
         }
+        let automatic_budget_reservation = match authorized_model.automatic_writer() {
+            Some(writer) => Some(
+                state
+                    .automatic_budget
+                    .reserve(writer, AutomaticBudgetScope {
+                        project: store.manifest().project_id,
+                        session: active_session_id,
+                        document: document_id,
+                        source_revision: source_revision_id,
+                    })
+                    .map_err(|error| match error {
+                        AutomaticBudgetError::Exhausted => IpcFailure::new(
+                            "automatic_revision_budget_exhausted",
+                            format!(
+                                "this immutable manuscript revision has already used its {AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2} automatic families ({AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2} generated-token ceiling)",
+                            ),
+                            false,
+                        ),
+                        AutomaticBudgetError::Capacity => IpcFailure::new(
+                            "automatic_budget_capacity",
+                            "the bounded automatic-budget ledger is full; close and reopen the project before requesting more automatic work",
+                            false,
+                        ),
+                        AutomaticBudgetError::Poisoned => IpcFailure::new(
+                            "automatic_budget_state_invalid",
+                            "automatic generation is unavailable because its budget authority cannot be proven",
+                            false,
+                        ),
+                    })?,
+            ),
+            None => None,
+        };
         let exact_prefix = loaded.text[..cursor].to_owned();
         let exact_prompt_blob_id = store
             .store_provenance_blob(exact_prefix.as_bytes())
@@ -3132,12 +5388,8 @@ async fn weave_start<R: Runtime>(
         let mut cases = Vec::with_capacity(branch_count as usize);
         for index in 0..branch_count {
             let (run_id, branch_id) = derive_weave_case_ids(command_id, index);
-            let sampling = SamplingConfig {
-                seed: generation_seed(command_id, index),
-                temperature,
-                max_tokens,
-                ..SamplingConfig::default()
-            };
+            let sampling =
+                sampling_for_weave_case(command_id, index, max_tokens, temperature, preset);
             let generation = GenerationStart {
                 run_id,
                 branch_id,
@@ -3185,12 +5437,16 @@ async fn weave_start<R: Runtime>(
                 return Err(IpcFailure::store(error));
             }
         };
+        if let Some(reservation) = automatic_budget_reservation {
+            reservation.commit();
+        }
         let queued_branches = family
             .generations
             .into_iter()
             .map(|started| BranchSnapshot {
                 run_id: started.generation.run_id.to_string(),
                 branch_id: started.generation.branch_id.to_string(),
+                document_id: started.generation.document_id.to_string(),
                 candidate_id: None,
                 source_revision_id: started.generation.source_revision_id.to_string(),
                 target_start_byte: started.generation.target_range.start,
@@ -3226,15 +5482,14 @@ async fn weave_start<R: Runtime>(
             .map(|case| (case.generation.run_id, case.generation.clone()))
             .collect(),
     };
-    let native_request = ExactContinuationRequest {
-        request_id: request_id.clone(),
-        model: loaded_model.profile,
-        exact_manuscript_prefix: exact_prefix,
+    let native_request = authorized_model.into_exact_continuation_request(
+        request_id.clone(),
+        exact_prefix,
         prompt_recipe,
         cases,
-    };
-    let handle = match state.backend.start_exact_continuation(native_request) {
-        Ok(handle) => Arc::new(handle),
+    );
+    let generation_owner = match native_request.submit(&state.backend) {
+        Ok(owner) => owner,
         Err(error) => {
             if let Err(persistence) =
                 fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
@@ -3247,6 +5502,7 @@ async fn weave_start<R: Runtime>(
             return Err(IpcFailure::backend(&error));
         }
     };
+    let handle = generation_owner.control();
     if let Err(error) = state.generations.attach_cancellation(
         &request_id,
         Arc::new(LlamaCancellation {
@@ -3266,12 +5522,32 @@ async fn weave_start<R: Runtime>(
         }
         return Err(IpcFailure::generation_registry(&error));
     }
+    let worker_reservation = match state
+        .generation_workers
+        .reserve(&request_id, &application_admission)
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            for (_, branch_id) in &runs {
+                let _ = handle.cancel_branch(*branch_id);
+            }
+            if let Err(persistence) =
+                fail_and_release_open_runs(&state, &identity, &runs, &error.message, &app)
+            {
+                let _ = state
+                    .generations
+                    .mark_terminal_persistence_failure(&request_id, persistence.message.clone());
+                return Err(persistence);
+            }
+            return Err(error);
+        }
+    };
     let worker_app = app.clone();
     let worker_identity = identity.clone();
     let worker_runs = runs.clone();
     let worker_binding = result_binding.clone();
     let worker_handle = Arc::clone(&handle);
-    if let Err(error) = std::thread::Builder::new()
+    let worker = match std::thread::Builder::new()
         .name("loom-desktop-generation".to_string())
         .spawn(move || {
             run_desktop_generation(
@@ -3281,24 +5557,50 @@ async fn weave_start<R: Runtime>(
                 &worker_binding,
                 &worker_handle,
             );
-        })
-    {
-        for (_, branch_id) in &runs {
-            let _ = handle.cancel_branch(*branch_id);
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            for (_, branch_id) in &runs {
+                let _ = handle.cancel_branch(*branch_id);
+            }
+            if let Err(persistence) =
+                fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
+            {
+                let _ = state
+                    .generations
+                    .mark_terminal_persistence_failure(&request_id, persistence.message.clone());
+                return Err(persistence);
+            }
+            return Err(IpcFailure::new(
+                "generation_worker_spawn_failed",
+                format!("the desktop generation worker could not start: {error}"),
+                true,
+            ));
         }
+    };
+    if let Err(GenerationWorkerAttachError {
+        failure,
+        worker,
+        owner,
+    }) = worker_reservation.attach(worker, GenerationWorkerOwner::Llama(generation_owner))
+    {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.cancel_all()));
+        let desktop_panicked = worker.join().is_err();
+        let backend_joined = owner.shutdown_joined();
+        let failure = if desktop_panicked || backend_joined.worker_panicked() {
+            state.generation_workers.record_join_failure()
+        } else {
+            failure
+        };
         if let Err(persistence) =
-            fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
+            fail_and_release_open_runs(&state, &identity, &runs, &failure.message, &app)
         {
             let _ = state
                 .generations
                 .mark_terminal_persistence_failure(&request_id, persistence.message.clone());
             return Err(persistence);
         }
-        return Err(IpcFailure::new(
-            "generation_worker_spawn_failed",
-            format!("the desktop generation worker could not start: {error}"),
-            true,
-        ));
+        return Err(failure);
     }
 
     Ok(WeaveStarted {
@@ -3313,17 +5615,162 @@ async fn weave_start<R: Runtime>(
     })
 }
 
-fn generation_seed(command_id: CommandId, index: u32) -> u32 {
+fn generation_seed(command_id: CommandId, index: u32, preset: WeavePreset) -> u32 {
     let material = format!("{command_id}:{index}");
     let digest = BlobId::digest(material.as_bytes());
-    u32::from_le_bytes(
+    let entropy = u32::from_le_bytes(
         digest.as_bytes()[..4]
             .try_into()
             .expect("a SHA-256 digest always contains four seed bytes"),
-    )
+    );
+    // The low two bits are a lossless policy-version tag. For one command and
+    // case index, no two current presets can ever share a seed, even if every
+    // other sampling field happens to match.
+    (entropy & !0b11) | preset.seed_tag()
+}
+
+impl WeavePreset {
+    const fn seed_tag(self) -> u32 {
+        match self {
+            Self::AutomaticProseV2 => 0,
+            Self::AutomaticVerseV2 => 1,
+            Self::ManualV2 => 2,
+        }
+    }
+}
+
+fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePolicy, IpcFailure> {
+    let validated = match policy {
+        WeavePolicySnapshot::AutomaticV2 {} => ValidatedWeavePolicy::AutomaticV2,
+        WeavePolicySnapshot::ManualV2 {
+            branch_count,
+            max_tokens,
+            temperature,
+        } => ValidatedWeavePolicy::ManualV2 {
+            branch_count,
+            max_tokens,
+            temperature,
+        },
+    };
+    if validated.branch_count() == 0 || validated.branch_count() > 4 {
+        return Err(IpcFailure::new(
+            "invalid_branch_count",
+            "a manual Weave must request between one and four branches",
+            false,
+        ));
+    }
+    if validated.max_tokens() == 0 || validated.max_tokens() > 2_048 {
+        return Err(IpcFailure::new(
+            "invalid_generation_budget",
+            "a manual Weave must request between one and 2,048 tokens per branch",
+            false,
+        ));
+    }
+    if !validated.temperature().is_finite() || !(0.0..=2.0).contains(&validated.temperature()) {
+        return Err(IpcFailure::new(
+            "invalid_temperature",
+            "manual Weave temperature must be a finite value from 0 through 2",
+            false,
+        ));
+    }
+    Ok(validated)
+}
+
+impl ValidatedWeavePolicy {
+    const fn branch_count(&self) -> u32 {
+        match self {
+            Self::AutomaticV2 => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
+            Self::ManualV2 { branch_count, .. } => *branch_count,
+        }
+    }
+
+    const fn max_tokens(&self) -> u32 {
+        match self {
+            Self::AutomaticV2 => AUTOMATIC_WEAVE_MAX_TOKENS_V2,
+            Self::ManualV2 { max_tokens, .. } => *max_tokens,
+        }
+    }
+
+    const fn temperature(&self) -> f32 {
+        match self {
+            Self::AutomaticV2 => AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            Self::ManualV2 { temperature, .. } => *temperature,
+        }
+    }
+
+    fn bind_document_kind(&self, kind: DocumentKind) -> Result<ResolvedWeavePolicy, IpcFailure> {
+        let preset = match (self, kind) {
+            (Self::AutomaticV2, DocumentKind::Prose) => WeavePreset::AutomaticProseV2,
+            (Self::AutomaticV2, DocumentKind::Verse) => WeavePreset::AutomaticVerseV2,
+            (Self::AutomaticV2, DocumentKind::Hybrid) => {
+                return Err(IpcFailure::new(
+                    "automatic_hybrid_boundary_unresolved",
+                    "automatic suggestions require an authoritative prose or verse block boundary",
+                    false,
+                ));
+            }
+            (Self::ManualV2 { .. }, _) => WeavePreset::ManualV2,
+        };
+        Ok(ResolvedWeavePolicy {
+            preset,
+            branch_count: self.branch_count(),
+            max_tokens: self.max_tokens(),
+            temperature: self.temperature(),
+        })
+    }
+}
+
+fn sampling_for_weave_case(
+    command_id: CommandId,
+    index: u32,
+    max_tokens: u32,
+    temperature: f32,
+    preset: WeavePreset,
+) -> SamplingConfig {
+    let repetition_resistant_prose = preset == WeavePreset::AutomaticProseV2;
+    SamplingConfig {
+        seed: generation_seed(command_id, index, preset),
+        temperature,
+        dynamic_temperature_range: 0.0,
+        dynamic_temperature_exponent: 1.0,
+        top_k: 40,
+        top_p: 0.95,
+        min_p: 0.0,
+        typical_p: 1.0,
+        xtc_probability: 0.0,
+        xtc_threshold: 0.1,
+        repeat_last_n: 64,
+        repeat_penalty: if repetition_resistant_prose {
+            1.08
+        } else {
+            1.0
+        },
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
+        dry_multiplier: if repetition_resistant_prose { 0.8 } else { 0.0 },
+        dry_base: 1.75,
+        dry_allowed_length: if repetition_resistant_prose { 4 } else { 2 },
+        dry_penalty_last_n: if repetition_resistant_prose { 256 } else { -1 },
+        sampler_order: vec![
+            SamplerKind::Penalties,
+            SamplerKind::Dry,
+            SamplerKind::TopK,
+            SamplerKind::TypicalP,
+            SamplerKind::TopP,
+            SamplerKind::MinP,
+            SamplerKind::Xtc,
+            SamplerKind::Temperature,
+        ],
+        max_tokens,
+        stop: Vec::new(),
+    }
 }
 
 fn loaded_model(state: &State<'_, PluginState>) -> Result<LoadedModel, IpcFailure> {
+    loaded_model_for_state(state)
+}
+
+fn loaded_model_for_state(state: &PluginState) -> Result<LoadedModel, IpcFailure> {
     let registry = lock_model_registry(state)?;
     match &*registry {
         ModelRegistry::Loaded(model) => Ok((**model).clone()),
@@ -3332,6 +5779,12 @@ fn loaded_model(state: &State<'_, PluginState>) -> Result<LoadedModel, IpcFailur
             "wait for local model verification to finish before weaving",
             true,
         )),
+        ModelRegistry::Unloading(_) => Err(IpcFailure::new(
+            "model_unload_in_progress",
+            "wait for the selected local model to finish unloading",
+            true,
+        )),
+        ModelRegistry::ResidencyUnknown { reason } => Err(model_residency_unknown(reason)),
         ModelRegistry::Empty => Err(IpcFailure::new(
             "model_not_loaded",
             "load and verify a local raw-completion model before weaving",
@@ -3345,7 +5798,7 @@ fn run_desktop_generation<R: Runtime>(
     identity: &GenerationFamilyIdentity,
     runs: &[(GenerationRunId, BranchId)],
     binding: &GenerationResultBinding,
-    handle: &Arc<LlamaGenerationHandle>,
+    handle: &Arc<LlamaGenerationControl>,
 ) {
     let result = loop {
         match handle.receive_event_timeout(Duration::from_millis(10)) {
@@ -3360,7 +5813,7 @@ fn run_desktop_generation<R: Runtime>(
             Ok(None) | Err(LlamaBackendError::ResultDisconnected) => {}
             Err(error) => break Err(error.to_string()),
         }
-        match handle.wait_timeout(Duration::ZERO) {
+        match handle.receive_result_timeout(Duration::ZERO) {
             Ok(result) => break Ok(result),
             Err(LlamaBackendError::ResultTimeout) => {}
             Err(error) => break Err(error.to_string()),
@@ -3402,7 +5855,7 @@ fn run_desktop_generation<R: Runtime>(
 fn drain_backend_events<R: Runtime>(
     app: &AppHandle<R>,
     identity: &GenerationFamilyIdentity,
-    handle: &LlamaGenerationHandle,
+    handle: &LlamaGenerationControl,
 ) -> Result<(), IpcFailure> {
     loop {
         match handle.receive_event_timeout(Duration::ZERO) {
@@ -3922,12 +6375,268 @@ fn emit_desktop_event<R: Runtime>(
     })
 }
 
+fn prepare_application_exit_request<R: Runtime>(app: &AppHandle<R>) -> bool {
+    let Some(state) = app.try_state::<PluginState>() else {
+        return false;
+    };
+    record_application_exit_request(&state)
+}
+
+/// `RunEvent::Exit` is the last synchronous boundary before Tauri calls
+/// `cleanup_before_exit`. On macOS, Dock Quit and `AppleEvent` Quit can reach
+/// this boundary without an interceptable `ExitRequested`, so this fallback
+/// owns the same admission barrier and performs all joins on the event-loop
+/// thread before AppKit/static teardown may continue.
+fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
+    let Some(state) = app.try_state::<PluginState>() else {
+        return;
+    };
+    if state.exit_authorized.load(Ordering::Acquire) {
+        return;
+    }
+    state.close_requested.store(true, Ordering::Release);
+    let mut phase = state
+        .application
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *phase == ApplicationPhase::ExitAuthorized || state.exit_authorized.load(Ordering::Acquire) {
+        return;
+    }
+    *phase = ApplicationPhase::Closing;
+
+    // Owning `phase` is an application-wide admission barrier. Worker
+    // reservations borrow an admission guard until their JoinHandle and
+    // cancellation authority are attached, making a detached start
+    // impossible at this point in safe code.
+    let desktop_workers = state.join_desktop_workers_for_exit();
+    let _model_lifecycle = state
+        .model_lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut model_registry = state
+        .model
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let native_runtime = state.native_runtime.shutdown_for_process_exit();
+    *model_registry = ModelRegistry::Empty;
+    let proof = ApplicationShutdownProof::from_process_exit(native_runtime, desktop_workers);
+    let joined = proof.joined_worker_count();
+    *phase = ApplicationPhase::ExitAuthorized;
+    state.exit_authorized.store(true, Ordering::Release);
+    eprintln!("Loom joined {joined} owned worker(s) before unpreventable runtime exit");
+}
+
+fn emit_application_close_request<R: Runtime>(app: &AppHandle<R>) {
+    let _ = app.emit("loom://application-close-requested", ());
+}
+
+fn record_application_exit_request(state: &PluginState) -> bool {
+    if state.exit_authorized.load(Ordering::Acquire) {
+        true
+    } else {
+        // AppKit invokes this path on its event thread. Recording intent must
+        // never wait for the admission mutex held while native work starts.
+        state.close_requested.store(true, Ordering::Release);
+        false
+    }
+}
+
+fn begin_application_close(state: &PluginState) -> Result<ApplicationCloseAttempt<'_>, IpcFailure> {
+    state.close_requested.store(true, Ordering::Release);
+    let mut phase = lock_application_phase(state)?;
+    match *phase {
+        ApplicationPhase::Running => {
+            *phase = ApplicationPhase::Closing;
+            Ok(ApplicationCloseAttempt {
+                state,
+                phase,
+                authorized: false,
+            })
+        }
+        ApplicationPhase::Closing => Err(IpcFailure::new(
+            "application_close_in_progress",
+            "Loom is already proving that native work is safe to close",
+            true,
+        )),
+        ApplicationPhase::ExitAuthorized => Err(IpcFailure::new(
+            "application_exit_authorized",
+            "Loom has already authorized native process exit",
+            false,
+        )),
+    }
+}
+
+fn ensure_application_running(state: &PluginState, action: &str) -> Result<(), IpcFailure> {
+    drop(lock_application_admission(state, action)?);
+    Ok(())
+}
+
+fn lock_application_admission<'a>(
+    state: &'a PluginState,
+    action: &str,
+) -> Result<std::sync::MutexGuard<'a, ApplicationPhase>, IpcFailure> {
+    if state.close_requested.load(Ordering::Acquire) {
+        return Err(IpcFailure::new(
+            "application_quiescing",
+            format!("Loom will not start {action} while the application is closing"),
+            true,
+        ));
+    }
+    let phase = lock_application_phase(state)?;
+    // The second load establishes admission before a later close request, or
+    // observes that request and refuses the work while still holding phase.
+    if *phase == ApplicationPhase::Running && !state.close_requested.load(Ordering::Acquire) {
+        Ok(phase)
+    } else {
+        Err(IpcFailure::new(
+            "application_quiescing",
+            format!("Loom will not start {action} while the application is closing"),
+            true,
+        ))
+    }
+}
+
+fn lock_application_phase(
+    state: &PluginState,
+) -> Result<std::sync::MutexGuard<'_, ApplicationPhase>, IpcFailure> {
+    state.application.lock().map_err(|_| {
+        IpcFailure::new(
+            "application_state_poisoned",
+            "the application lifecycle entered an invalid state; Loom will not infer safe exit",
+            false,
+        )
+    })
+}
+
+impl ApplicationCloseAttempt<'_> {
+    fn authorize(mut self, proof: ApplicationShutdownProof) -> ReadyToExit {
+        debug_assert_eq!(*self.phase, ApplicationPhase::Closing);
+        *self.phase = ApplicationPhase::ExitAuthorized;
+        self.state.exit_authorized.store(true, Ordering::Release);
+        self.authorized = true;
+        ReadyToExit { proof }
+    }
+}
+
+impl Drop for ApplicationCloseAttempt<'_> {
+    fn drop(&mut self) {
+        if self.authorized {
+            return;
+        }
+        if *self.phase == ApplicationPhase::Closing {
+            *self.phase = ApplicationPhase::Running;
+        }
+    }
+}
+
+fn exit_application<R: Runtime>(app: &AppHandle<R>, permit: ReadyToExit) {
+    let ReadyToExit { proof } = permit;
+    let _joined_worker_count = proof.joined_worker_count();
+    app.exit(0);
+}
+
+impl ApplicationShutdownProof {
+    fn joined_worker_count(&self) -> usize {
+        let native_workers = match &self.native_runtime {
+            ApplicationNativeShutdown::Graceful(proof) => proof.joined_worker_count(),
+            ApplicationNativeShutdown::ProcessExit(proof) => proof.joined_worker_count(),
+        };
+        native_workers.saturating_add(self.desktop_workers.joined_worker_count())
+    }
+
+    #[cfg(test)]
+    fn from_graceful(
+        native_runtime: JoinedLlamaRuntime,
+        desktop_workers: DesktopWorkersJoined,
+    ) -> Self {
+        Self {
+            native_runtime: ApplicationNativeShutdown::Graceful(native_runtime),
+            desktop_workers,
+        }
+    }
+
+    fn from_process_exit(
+        native_runtime: ProcessExitJoinedLlamaRuntime,
+        desktop_workers: DesktopWorkersJoined,
+    ) -> Self {
+        Self {
+            native_runtime: ApplicationNativeShutdown::ProcessExit(native_runtime),
+            desktop_workers,
+        }
+    }
+}
+
+impl DesktopWorkersJoined {
+    fn joined_worker_count(&self) -> usize {
+        self.model_loads
+            .count()
+            .saturating_add(self.generation_workers.joined_worker_count())
+            .saturating_add(self.download_workers.count())
+    }
+}
+
+impl PluginState {
+    fn join_desktop_workers(&self) -> Result<DesktopWorkersJoined, IpcFailure> {
+        let model_loads = self.model_loads.close_and_drain();
+        self.downloads
+            .cancel_all_active(now_unix_ms())
+            .map_err(|error| IpcFailure::model_download_registry(&error))?;
+        let download_workers = self.download_workers.join_all()?;
+        let active_downloads = self
+            .downloads
+            .active_count()
+            .map_err(|error| IpcFailure::model_download_registry(&error))?;
+        if active_downloads != 0 {
+            return Err(IpcFailure::new(
+                "model_download_terminal_missing",
+                format!(
+                    "{active_downloads} joined model download worker(s) failed to record terminal state"
+                ),
+                false,
+            ));
+        }
+        let generation_workers = self.generation_workers.join_all()?;
+        if !model_loads.belongs_to(&self.model_loads)
+            || !generation_workers.belongs_to(&self.generation_workers)
+            || !download_workers.belongs_to(&self.download_workers)
+        {
+            return Err(IpcFailure::new(
+                "desktop_worker_identity_mismatch",
+                "desktop worker shutdown authority came from a different registry instance",
+                false,
+            ));
+        }
+        Ok(DesktopWorkersJoined {
+            model_loads,
+            generation_workers,
+            download_workers,
+        })
+    }
+
+    /// Infallible final event-loop drain. Every worker owning a `JoinHandle` is
+    /// removed under a poison-recovering registry lock, cancelled, and joined
+    /// before the returned exact-registry facts are assembled.
+    fn join_desktop_workers_for_exit(&self) -> DesktopWorkersJoined {
+        let model_loads = self.model_loads.close_and_drain();
+        // Running worker slots retain the authoritative cancellation handles.
+        // Avoid fallible semantic registries at this unpreventable boundary.
+        let download_workers = self.download_workers.join_all_for_exit();
+        let generation_workers = self.generation_workers.join_all_for_exit();
+        DesktopWorkersJoined {
+            model_loads,
+            generation_workers,
+            download_workers,
+        }
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 fn application_close<R: Runtime>(
-    window: WebviewWindow<R>,
+    app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
+    let close_attempt = begin_application_close(&state)?;
     if state
         .generations
         .active_branch_count()
@@ -3940,22 +6649,110 @@ fn application_close<R: Runtime>(
             true,
         ));
     }
-    let session = lock_session(&state)?;
-    if session.phase != SessionPhase::Closed {
-        return Err(IpcFailure::new(
-            "project_must_close_first",
-            "Loom refuses to close the window while a project session is active",
-            false,
-        ));
+    {
+        let session = lock_session(&state)?;
+        if session.phase != SessionPhase::Closed {
+            return Err(IpcFailure::new(
+                "project_must_close_first",
+                "Loom refuses to close the window while a project session is active",
+                false,
+            ));
+        }
     }
-    drop(session);
-    window.destroy().map_err(|error| {
-        IpcFailure::new(
-            "window_close_failed",
-            format!("the native Loom window could not close: {error}"),
+    let desktop_workers = state.join_desktop_workers()?;
+    let _model_lifecycle = lock_model_lifecycle(&state)?;
+    let mut model_registry = lock_model_registry(&state)?;
+    ensure_model_registry_ready_for_application_shutdown(&model_registry)?;
+    let native_runtime = match state.native_runtime.shutdown_joined() {
+        Ok(joined) => ApplicationNativeShutdown::Graceful(joined),
+        Err(error) => {
+            eprintln!("Loom graceful native shutdown required the process-exit drain: {error}");
+            ApplicationNativeShutdown::ProcessExit(state.native_runtime.shutdown_for_process_exit())
+        }
+    };
+    *model_registry = ModelRegistry::Empty;
+    let proof = ApplicationShutdownProof {
+        native_runtime,
+        desktop_workers,
+    };
+    let permit = close_attempt.authorize(proof);
+    exit_application(&app, permit);
+    Ok(())
+}
+
+fn ensure_model_registry_ready_for_application_shutdown(
+    registry: &ModelRegistry,
+) -> Result<(), IpcFailure> {
+    match registry {
+        ModelRegistry::Empty | ModelRegistry::Loaded(_) => Ok(()),
+        ModelRegistry::Loading { .. } => Err(IpcFailure::new(
+            "model_load_in_progress",
+            "wait for local model verification before closing Loom",
             true,
-        )
-    })
+        )),
+        ModelRegistry::Unloading(_) => Err(IpcFailure::new(
+            "model_unload_in_progress",
+            "wait for local model teardown before closing Loom",
+            true,
+        )),
+        ModelRegistry::ResidencyUnknown { reason } => Err(model_residency_unknown(reason)),
+    }
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn application_close_abort(state: State<'_, PluginState>) -> Result<(), IpcFailure> {
+    abort_application_close(&state)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn application_close_pending(state: State<'_, PluginState>) -> Result<bool, IpcFailure> {
+    application_close_is_pending(&state)
+}
+
+fn application_close_is_pending(state: &PluginState) -> Result<bool, IpcFailure> {
+    if state.close_requested.load(Ordering::Acquire) {
+        return Ok(true);
+    }
+    Ok(*lock_application_phase(state)? != ApplicationPhase::Running)
+}
+
+fn abort_application_close(state: &PluginState) -> Result<(), IpcFailure> {
+    let phase = match state.application.try_lock() {
+        Ok(phase) => phase,
+        Err(TryLockError::WouldBlock) => {
+            return Err(IpcFailure::new(
+                "application_close_in_progress",
+                "wait for the current native close proof before resuming Loom",
+                true,
+            ));
+        }
+        Err(TryLockError::Poisoned(_)) => {
+            return Err(IpcFailure::new(
+                "application_state_poisoned",
+                "the application lifecycle entered an invalid state; Loom will not infer safe exit",
+                false,
+            ));
+        }
+    };
+    match *phase {
+        ApplicationPhase::Running => {
+            state.model_loads.reopen_after_aborted_close()?;
+            state.close_requested.store(false, Ordering::Release);
+            Ok(())
+        }
+        ApplicationPhase::Closing => Err(IpcFailure::new(
+            "application_close_in_progress",
+            "wait for the current native close proof before resuming Loom",
+            true,
+        )),
+        ApplicationPhase::ExitAuthorized => Err(IpcFailure::new(
+            "application_exit_authorized",
+            "native process exit has already been authorized",
+            false,
+        )),
+    }
 }
 
 #[tauri::command]
@@ -4196,9 +6993,9 @@ fn lock_session_internal(
     })
 }
 
-fn lock_model_registry<'a>(
-    state: &'a State<'_, PluginState>,
-) -> Result<std::sync::MutexGuard<'a, ModelRegistry>, IpcFailure> {
+fn lock_model_registry(
+    state: &PluginState,
+) -> Result<std::sync::MutexGuard<'_, ModelRegistry>, IpcFailure> {
     state.model.try_lock().map_err(|error| match error {
         TryLockError::WouldBlock => IpcFailure::new(
             "model_registry_busy",
@@ -4213,9 +7010,7 @@ fn lock_model_registry<'a>(
     })
 }
 
-fn lock_model_lifecycle<'a>(
-    state: &'a State<'_, PluginState>,
-) -> Result<std::sync::MutexGuard<'a, ()>, IpcFailure> {
+fn lock_model_lifecycle(state: &PluginState) -> Result<std::sync::MutexGuard<'_, ()>, IpcFailure> {
     state
         .model_lifecycle
         .try_lock()
@@ -4360,6 +7155,12 @@ impl From<ExternalReconciliationOutcome> for Receipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    use loom_backend_llama::{
+        CapabilitySupport, NativeEvidenceCapabilities, VerifiedCapabilitySet,
+    };
+    use loom_types::ModelEnvironmentId;
 
     #[derive(Debug, Default)]
     struct RecordingCancellation {
@@ -4378,6 +7179,826 @@ mod tests {
             }
             true
         }
+    }
+
+    #[derive(Debug)]
+    struct NoopGenerationWorkerCancellation;
+
+    impl FixtureGenerationWorkerCancellation for NoopGenerationWorkerCancellation {
+        fn cancel_all(&self) {}
+    }
+
+    fn fixture_generation_worker_owner(
+        cancellation: Arc<dyn FixtureGenerationWorkerCancellation>,
+    ) -> GenerationWorkerOwner {
+        GenerationWorkerOwner::fixture(cancellation, std::thread::spawn(|| {}))
+    }
+
+    fn noop_generation_worker_owner() -> GenerationWorkerOwner {
+        fixture_generation_worker_owner(Arc::new(NoopGenerationWorkerCancellation))
+    }
+
+    #[derive(Debug)]
+    struct FlagGenerationWorkerCancellation {
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl FixtureGenerationWorkerCancellation for FlagGenerationWorkerCancellation {
+        fn cancel_all(&self) {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanickingGenerationWorkerCancellation;
+
+    impl FixtureGenerationWorkerCancellation for PanickingGenerationWorkerCancellation {
+        fn cancel_all(&self) {
+            panic!("fixture cancellation panic");
+        }
+    }
+
+    fn empty_application_shutdown_proof(state: &PluginState) -> ApplicationShutdownProof {
+        let desktop_workers = state
+            .join_desktop_workers()
+            .expect("join empty desktop runtime");
+        let native_runtime = state
+            .native_runtime
+            .shutdown_joined()
+            .expect("join empty native runtime");
+        ApplicationShutdownProof::from_graceful(native_runtime, desktop_workers)
+    }
+
+    #[test]
+    fn model_load_lifetime_outlives_a_cancelled_async_command_until_worker_return() {
+        let registry = Arc::new(ModelLoadRegistry::default());
+        let application = Mutex::new(ApplicationPhase::Running);
+        let admission = application.lock().expect("application admission");
+        let command = registry.reserve(&admission).expect("model load permit");
+        let worker = command.worker_guard();
+        drop(admission);
+        drop(command);
+
+        assert_eq!(registry.state.lock().expect("model load state").active, 1);
+        drop(worker);
+        assert_eq!(registry.state.lock().expect("model load state").active, 0);
+    }
+
+    #[test]
+    fn native_exit_request_quiesces_until_a_private_permit_authorizes_exit() {
+        let state = PluginState::default();
+
+        assert!(!record_application_exit_request(&state));
+        assert_eq!(
+            *state.application.lock().expect("application phase"),
+            ApplicationPhase::Running
+        );
+        assert_eq!(
+            ensure_application_running(&state, "new work")
+                .expect_err("quiescence must close admission")
+                .code,
+            "application_quiescing"
+        );
+
+        let attempt = begin_application_close(&state).expect("begin close proof");
+        assert_eq!(*attempt.phase, ApplicationPhase::Closing);
+        let proof = empty_application_shutdown_proof(&state);
+        let _permit = attempt.authorize(proof);
+        assert_eq!(
+            *state.application.lock().expect("application phase"),
+            ApplicationPhase::ExitAuthorized
+        );
+        assert!(record_application_exit_request(&state));
+    }
+
+    #[test]
+    fn failed_close_attempt_restores_admission_and_explicit_abort_is_idempotent() {
+        let state = PluginState::default();
+        {
+            let _attempt = begin_application_close(&state).expect("begin close proof");
+            assert_eq!(
+                abort_application_close(&state)
+                    .expect_err("an executing proof cannot be aborted concurrently")
+                    .code,
+                "application_close_in_progress"
+            );
+        }
+        assert_eq!(
+            ensure_application_running(&state, "new work")
+                .expect_err("failed proof remains quiesced until explicit abort")
+                .code,
+            "application_quiescing"
+        );
+        abort_application_close(&state).expect("abort failed proof");
+        ensure_application_running(&state, "new work").expect("abort restores running");
+
+        assert!(!record_application_exit_request(&state));
+        abort_application_close(&state).expect("abort quiescence");
+        abort_application_close(&state).expect("abort replay");
+        ensure_application_running(&state, "new work").expect("abort restores running");
+    }
+
+    #[test]
+    fn pending_close_handshake_covers_an_exit_request_before_renderer_listener_installation() {
+        let state = PluginState::default();
+        assert!(!application_close_is_pending(&state).expect("running query"));
+
+        assert!(!record_application_exit_request(&state));
+        assert!(application_close_is_pending(&state).expect("quiescing query"));
+
+        abort_application_close(&state).expect("abort quiescence");
+        assert!(!application_close_is_pending(&state).expect("resumed query"));
+    }
+
+    #[test]
+    fn final_runtime_exit_path_is_not_optional_plugin_drop_cleanup() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("if let RunEvent::Exit = event"));
+        assert!(source.contains("quiesce_unpreventable_runtime_exit(app)"));
+        assert!(source.contains("cleanup_before_exit"));
+    }
+
+    #[test]
+    fn native_exit_recording_never_blocks_on_an_owned_application_admission_boundary() {
+        let state = Arc::new(PluginState::default());
+        let admission =
+            lock_application_admission(&state, "fixture work").expect("admit fixture work");
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            sent.send(record_application_exit_request(&worker_state))
+                .expect("send exit disposition");
+        });
+
+        assert!(
+            !received
+                .recv_timeout(Duration::from_millis(20))
+                .expect("event-thread exit recording must be nonblocking")
+        );
+        worker.join().expect("join exit-request worker");
+        drop(admission);
+        assert_eq!(
+            *state.application.lock().expect("application phase"),
+            ApplicationPhase::Running
+        );
+        assert_eq!(
+            ensure_application_running(&state, "new work")
+                .expect_err("recorded close intent must stop later admission")
+                .code,
+            "application_quiescing"
+        );
+    }
+
+    #[test]
+    fn generation_worker_reservation_prevents_exit_race_and_join_is_owned() {
+        let application = Mutex::new(ApplicationPhase::Running);
+        let admission = application.lock().expect("application admission");
+        let workers = GenerationWorkerRegistry::default();
+        let reservation = workers
+            .reserve("request-one", &admission)
+            .expect("reserve worker");
+        assert_eq!(
+            workers
+                .join_all()
+                .expect_err("reserved worker must block teardown")
+                .code,
+            "generation_worker_starting"
+        );
+        reservation
+            .attach(std::thread::spawn(|| {}), noop_generation_worker_owner())
+            .map_err(|error| error.failure)
+            .expect("attach worker");
+        assert_eq!(workers.join_all().expect("join owned worker").count(), 1);
+        assert_eq!(workers.join_all().expect("join replay").count(), 0);
+    }
+
+    #[test]
+    fn generation_worker_panic_latches_fail_closed_teardown() {
+        let application = Mutex::new(ApplicationPhase::Running);
+        let admission = application.lock().expect("application admission");
+        let workers = GenerationWorkerRegistry::default();
+        workers
+            .reserve("request-panic", &admission)
+            .expect("reserve worker")
+            .attach(
+                std::thread::spawn(|| panic!("fixture desktop panic")),
+                noop_generation_worker_owner(),
+            )
+            .map_err(|error| error.failure)
+            .expect("attach worker");
+
+        assert_eq!(
+            workers
+                .join_all()
+                .expect_err("worker panic must fail close")
+                .code,
+            "generation_worker_join_failed"
+        );
+        assert_eq!(
+            workers
+                .reserve("request-after-panic", &admission)
+                .expect_err("panic evidence remains latched")
+                .code,
+            "generation_worker_join_failed"
+        );
+    }
+
+    #[test]
+    fn download_worker_reservation_is_joined_and_bound_to_its_exact_registry() {
+        let application = Mutex::new(ApplicationPhase::Running);
+        let admission = application.lock().expect("application admission");
+        let workers = DownloadWorkerRegistry::default();
+        let other = DownloadWorkerRegistry::default();
+        let command_id = CommandId::new();
+        let reservation = workers
+            .reserve(command_id, &admission)
+            .expect("reserve download worker");
+        assert_eq!(
+            workers
+                .join_all()
+                .expect_err("reserved download must block teardown")
+                .code,
+            "download_worker_starting"
+        );
+        reservation
+            .attach(std::thread::spawn(|| {}), DownloadCancellation::default())
+            .map_err(|error| error.failure)
+            .expect("attach download worker");
+        let joined = workers.join_all().expect("join download worker");
+        assert_eq!(joined.count(), 1);
+        assert!(joined.belongs_to(&workers));
+        assert!(!joined.belongs_to(&other));
+    }
+
+    #[test]
+    fn plugin_drop_joins_every_owned_desktop_worker_before_state_destruction() {
+        let state = PluginState::default();
+        let generation_stopped = Arc::new(AtomicBool::new(false));
+        let download_stopped = Arc::new(AtomicBool::new(false));
+
+        let generation_signal = Arc::clone(&generation_stopped);
+        {
+            let admission =
+                lock_application_admission(&state, "fixture generation").expect("admission");
+            state
+                .generation_workers
+                .reserve("drop-generation", &admission)
+                .expect("reserve generation worker")
+                .attach(
+                    std::thread::spawn(move || {
+                        generation_signal.store(true, Ordering::Release);
+                    }),
+                    noop_generation_worker_owner(),
+                )
+                .map_err(|error| error.failure)
+                .expect("attach generation worker");
+        }
+        let download_signal = Arc::clone(&download_stopped);
+        {
+            let admission =
+                lock_application_admission(&state, "fixture download").expect("admission");
+            state
+                .download_workers
+                .reserve(CommandId::new(), &admission)
+                .expect("reserve download worker")
+                .attach(
+                    std::thread::spawn(move || {
+                        download_signal.store(true, Ordering::Release);
+                    }),
+                    DownloadCancellation::default(),
+                )
+                .map_err(|error| error.failure)
+                .expect("attach download worker");
+        }
+
+        drop(state);
+        assert!(generation_stopped.load(Ordering::Acquire));
+        assert!(download_stopped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn unpreventable_exit_retains_cancellation_and_joins_every_desktop_worker() {
+        let state = PluginState::default();
+        let generation_cancelled = Arc::new(AtomicBool::new(false));
+        let generation_finished = Arc::new(AtomicBool::new(false));
+        let backend_forwarder_finished = Arc::new(AtomicBool::new(false));
+        let panicking_cancellation_worker_finished = Arc::new(AtomicBool::new(false));
+        let release_panicking_outer = Arc::new(AtomicBool::new(false));
+        let download_finished = Arc::new(AtomicBool::new(false));
+        let download_cancellation = DownloadCancellation::default();
+
+        {
+            let admission =
+                lock_application_admission(&state, "fixture workers").expect("admission");
+            let finished = Arc::clone(&panicking_cancellation_worker_finished);
+            let release_outer = Arc::clone(&release_panicking_outer);
+            state
+                .generation_workers
+                .reserve("exit-generation-panicking-cancellation", &admission)
+                .expect("reserve generation with panicking cancellation")
+                .attach(
+                    std::thread::spawn(move || {
+                        while !release_outer.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        finished.store(true, Ordering::Release);
+                    }),
+                    fixture_generation_worker_owner(Arc::new(
+                        PanickingGenerationWorkerCancellation,
+                    )),
+                )
+                .map_err(|error| error.failure)
+                .expect("attach generation with panicking cancellation");
+
+            let finished = Arc::clone(&generation_finished);
+            let backend_wait_cancelled = Arc::clone(&generation_cancelled);
+            let backend_finished = Arc::clone(&backend_forwarder_finished);
+            state
+                .generation_workers
+                .reserve("exit-generation", &admission)
+                .expect("reserve generation")
+                .attach(
+                    std::thread::spawn(move || {
+                        finished.store(true, Ordering::Release);
+                    }),
+                    GenerationWorkerOwner::fixture(
+                        Arc::new(FlagGenerationWorkerCancellation {
+                            cancelled: Arc::clone(&generation_cancelled),
+                        }),
+                        std::thread::spawn(move || {
+                            while !backend_wait_cancelled.load(Ordering::Acquire) {
+                                std::thread::yield_now();
+                            }
+                            backend_finished.store(true, Ordering::Release);
+                        }),
+                    ),
+                )
+                .map_err(|error| error.failure)
+                .expect("attach generation");
+
+            let wait_cancelled = download_cancellation.clone();
+            let finished = Arc::clone(&download_finished);
+            state
+                .download_workers
+                .reserve(CommandId::new(), &admission)
+                .expect("reserve download")
+                .attach(
+                    std::thread::spawn(move || {
+                        while !wait_cancelled.is_cancelled() {
+                            std::thread::yield_now();
+                        }
+                        finished.store(true, Ordering::Release);
+                    }),
+                    download_cancellation,
+                )
+                .map_err(|error| error.failure)
+                .expect("attach download");
+        }
+
+        release_panicking_outer.store(true, Ordering::Release);
+        let joined = state.join_desktop_workers_for_exit();
+        assert_eq!(joined.joined_worker_count(), 5);
+        assert!(generation_cancelled.load(Ordering::Acquire));
+        assert!(generation_finished.load(Ordering::Acquire));
+        assert!(backend_forwarder_finished.load(Ordering::Acquire));
+        assert!(panicking_cancellation_worker_finished.load(Ordering::Acquire));
+        assert!(download_finished.load(Ordering::Acquire));
+    }
+
+    fn test_policy_expectation(expected_bytes: &[u8]) -> PolicyWriterExpectation {
+        PolicyWriterExpectation {
+            profile_id: "test-writer".to_owned(),
+            rank: 0,
+            role: ModelRole::Writer,
+            prompt_mode: PromptMode::Completion,
+            model_sha256: BlobId::digest(expected_bytes),
+            model_file_bytes: u64::try_from(expected_bytes.len()).expect("fixture byte length"),
+        }
+    }
+
+    fn test_capabilities() -> VerifiedCapabilitySet {
+        VerifiedCapabilitySet {
+            chat: CapabilitySupport::Unsupported,
+            completion_text: CapabilitySupport::Supported,
+            completion_token_ids: CapabilitySupport::Supported,
+            fill_in_middle_contract_id: None,
+            generated_token_ids: CapabilitySupport::Supported,
+            token_observations: CapabilitySupport::Unsupported,
+            probability_stages: Vec::new(),
+            log_probability_stages: Vec::new(),
+            max_cases: 4,
+            ordered_outputs: CapabilitySupport::Supported,
+            per_case_sampling: CapabilitySupport::Supported,
+            per_case_cancellation: CapabilitySupport::Supported,
+            sequence_snapshot: CapabilitySupport::Unsupported,
+            sequence_restore: CapabilitySupport::Unsupported,
+            per_case_restore: CapabilitySupport::Unsupported,
+            token_exact_shared_prefix: CapabilitySupport::Unsupported,
+            evidence: NativeEvidenceCapabilities::default(),
+            media: Vec::new(),
+        }
+    }
+
+    fn test_descriptor(
+        path: &Path,
+        expectation: &PolicyWriterExpectation,
+        stable_model_id: &str,
+    ) -> VerifiedModelDescriptor {
+        VerifiedModelDescriptor {
+            model_environment_id: ModelEnvironmentId::digest(stable_model_id.as_bytes()),
+            stable_model_id: stable_model_id.to_owned(),
+            local_model_id: stable_model_id.to_owned(),
+            model_path: path.to_path_buf(),
+            display_name: stable_model_id.to_owned(),
+            architecture: Some("test".to_owned()),
+            parameter_count: None,
+            model_file_bytes: expectation.model_file_bytes,
+            model_sha256: expectation.model_sha256.to_string(),
+            tokenizer_sha256: BlobId::digest(b"test-tokenizer").to_string(),
+            chat_template_sha256: BlobId::digest(b"no-chat-template").to_string(),
+            projector_sha256: None,
+            binding_version: "test-binding".to_owned(),
+            build_id: "test-build".to_owned(),
+            backend: "test-backend".to_owned(),
+            context_tokens: 4_096,
+            batch_tokens: 512,
+            max_parallel_cases: 4,
+            rope_config_sha256: BlobId::digest(b"test-rope").to_string(),
+            kv_layout_sha256: BlobId::digest(b"test-kv").to_string(),
+            capabilities: test_capabilities(),
+        }
+    }
+
+    fn test_loaded_model(path: &Path, stable_model_id: &str) -> LoadedModel {
+        let expectation = test_policy_expectation(stable_model_id.as_bytes());
+        LoadedModel {
+            profile: LocalModelProfile::for_gguf(path),
+            descriptor: test_descriptor(path, &expectation, stable_model_id),
+        }
+    }
+
+    fn test_policy_loaded_model(policy: &BuildModelPolicy, path: &Path) -> LoadedModel {
+        let writer = policy.writers().first().expect("writer policy");
+        let expectation =
+            policy_writer_expectation(policy, writer.profile_id()).expect("known writer policy");
+        LoadedModel {
+            profile: LocalModelProfile::for_gguf(path),
+            descriptor: test_descriptor(path, &expectation, "policy-writer"),
+        }
+    }
+
+    fn test_automatic_model_authority() -> AuthorizedWeaveModel {
+        let policy = BuildModelPolicy::writer_gemma4_base_v2();
+        AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            test_policy_loaded_model(&policy, Path::new("/tmp/policy-writer.gguf")),
+            &policy,
+        )
+        .expect("exact policy writer authority")
+    }
+
+    fn assert_loaded_model_id(state: &PluginState, expected: &str) {
+        let registry = state.model.lock().expect("model registry");
+        let ModelRegistry::Loaded(loaded) = &*registry else {
+            panic!("expected the previous model to remain loaded");
+        };
+        assert_eq!(loaded.descriptor.stable_model_id, expected);
+    }
+
+    #[test]
+    fn loaded_registry_latches_unknown_residency_when_native_slot_access_is_absent() {
+        let state = PluginState::default();
+        *state.model.lock().expect("model registry") = ModelRegistry::Loaded(Box::new(
+            test_loaded_model(Path::new("/tmp/not-resident.gguf"), "not-resident"),
+        ));
+
+        let error = unload_registered_model(&state)
+            .expect_err("loaded authority requires a proved native slot release");
+
+        assert_eq!(error.code, "model_residency_unknown");
+        assert!(matches!(
+            &*state.model.lock().expect("model registry"),
+            ModelRegistry::ResidencyUnknown { .. }
+        ));
+        assert_eq!(
+            unload_registered_model(&state)
+                .expect_err("unknown residency must remain fail closed")
+                .code,
+            "model_residency_unknown"
+        );
+    }
+
+    #[test]
+    fn unknown_native_residency_blocks_inference_and_application_teardown() {
+        let state = PluginState::default();
+        *state.model.lock().expect("model registry") = ModelRegistry::ResidencyUnknown {
+            reason: "fixture cleanup failure".to_owned(),
+        };
+
+        assert_eq!(
+            loaded_model_for_state(&state)
+                .expect_err("unknown residency cannot mint generation authority")
+                .code,
+            "model_residency_unknown"
+        );
+        assert_eq!(
+            unload_registered_model(&state)
+                .expect_err("unknown residency cannot mint exit authority")
+                .code,
+            "model_residency_unknown"
+        );
+    }
+
+    #[test]
+    fn same_size_wrong_policy_digest_never_reaches_native_inspection() {
+        let temporary = tempfile::tempdir().expect("temporary model directory");
+        let path = temporary.path().join("writer.gguf");
+        let expected = b"correct identity";
+        let wrong = b"incorrect idents";
+        assert_eq!(expected.len(), wrong.len());
+        std::fs::write(&path, wrong).expect("write same-size wrong model");
+        let canonical = path.canonicalize().expect("canonical model path");
+        let expectation = test_policy_expectation(expected);
+        let inspected = Cell::new(false);
+
+        let error = inspect_preverified_policy_file(&canonical, &expectation, || {
+            inspected.set(true);
+            Ok(())
+        })
+        .expect_err("wrong digest must fail before native inspection");
+
+        assert_eq!(error.failure.code, "policy_model_digest_mismatch");
+        assert!(!error.native_inspection_started);
+        assert!(!inspected.get());
+    }
+
+    #[test]
+    fn unknown_policy_profile_is_rejected_without_path_resolution() {
+        let error = policy_writer_expectation(&BuildModelPolicy::none_v1(), "not-present")
+            .expect_err("unknown profile must fail closed");
+        assert_eq!(error.code, "unknown_policy_model_profile");
+    }
+
+    #[test]
+    fn read_only_build_policy_identity_preserves_versioned_activation_and_digest() {
+        let v1 = BuildModelPolicy::writer_gemma4_base_v1().identity();
+        let v2 = BuildModelPolicy::writer_gemma4_base_v2().identity();
+
+        assert_eq!(
+            v1.name(),
+            loom_types::BuildModelPolicyName::WriterGemma4BaseV1
+        );
+        assert_eq!(
+            v1.activation(),
+            loom_types::SuggestionActivation::ProjectOptIn
+        );
+        assert_eq!(
+            v1.canonical_sha256().to_string(),
+            "c0492fb2285ad0922f89ab7288d63ef68fd17f5133f00ea4276622a15c2dc4e6"
+        );
+        assert_eq!(
+            v2.name(),
+            loom_types::BuildModelPolicyName::WriterGemma4BaseV2
+        );
+        assert_eq!(
+            v2.activation(),
+            loom_types::SuggestionActivation::QuietDefault
+        );
+        assert_eq!(
+            v2.canonical_sha256().to_string(),
+            "2d402d213b60ba65c4d018907e9eba67ccfbc1e97081cc0505f9713ae2dd89d2"
+        );
+    }
+
+    #[test]
+    fn automatic_writer_authority_rejects_none_and_arbitrary_resident_models() {
+        let writer_policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let exact_writer =
+            test_policy_loaded_model(&writer_policy, Path::new("/tmp/policy-writer.gguf"));
+        let none_error = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            exact_writer,
+            &BuildModelPolicy::none_v1(),
+        )
+        .expect_err("none-v1 cannot authorize automatic generation");
+        assert_eq!(none_error.code, "automatic_writer_not_in_build_policy");
+
+        let arbitrary = test_loaded_model(
+            Path::new("/tmp/arbitrary-completion-model.gguf"),
+            "arbitrary-completion-model",
+        );
+        let arbitrary_error = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            arbitrary,
+            &writer_policy,
+        )
+        .expect_err("an arbitrary capable resident model is not a build writer");
+        assert_eq!(arbitrary_error.code, "automatic_writer_not_in_build_policy");
+    }
+
+    #[test]
+    fn automatic_writer_authority_requires_raw_completion_and_generated_tokens() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let mut without_completion =
+            test_policy_loaded_model(&policy, Path::new("/tmp/incapable-policy-writer.gguf"));
+        without_completion.descriptor.capabilities.completion_text = CapabilitySupport::Unsupported;
+        let completion_error = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            without_completion,
+            &policy,
+        )
+        .expect_err("automatic writer must prove raw completion support");
+        assert_eq!(completion_error.code, "policy_model_capability_mismatch");
+
+        let mut without_tokens =
+            test_policy_loaded_model(&policy, Path::new("/tmp/incapable-policy-writer.gguf"));
+        without_tokens.descriptor.capabilities.generated_token_ids = CapabilitySupport::Unsupported;
+
+        let token_error =
+            AuthorizedWeaveModel::bind(ValidatedWeavePolicy::AutomaticV2, without_tokens, &policy)
+                .expect_err("automatic writer capability proof must fail closed");
+
+        assert_eq!(token_error.code, "policy_model_capability_mismatch");
+    }
+
+    #[test]
+    fn exact_policy_writer_mints_typed_automatic_authority() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let authorized = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            test_policy_loaded_model(&policy, Path::new("/tmp/policy-writer.gguf")),
+            &policy,
+        )
+        .expect("exact writer must be admitted");
+
+        assert_eq!(
+            authorized.automatic_binding(),
+            Some((
+                BuildWriterProfileId::Gemma4E2bBaseQ8LoomV1,
+                0,
+                policy.identity(),
+            ))
+        );
+    }
+
+    #[test]
+    fn manual_weave_authority_remains_independent_of_build_writer_policy() {
+        let authorized = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::ManualV2 {
+                branch_count: 1,
+                max_tokens: 32,
+                temperature: 0.8,
+            },
+            test_loaded_model(
+                Path::new("/tmp/arbitrary-manual-model.gguf"),
+                "arbitrary-manual-model",
+            ),
+            &BuildModelPolicy::none_v1(),
+        )
+        .expect("manual requests may use an explicitly loaded model");
+
+        assert_eq!(authorized.automatic_binding(), None);
+    }
+
+    #[test]
+    fn rejected_automatic_writers_leave_budget_ledger_untouched() {
+        let authority = AutomaticBudgetAuthority::default();
+        let writer_policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let arbitrary_rejection = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            test_loaded_model(Path::new("/tmp/arbitrary.gguf"), "arbitrary"),
+            &writer_policy,
+        );
+        assert_eq!(
+            arbitrary_rejection
+                .expect_err("arbitrary model cannot mint the opaque request authority")
+                .code,
+            "automatic_writer_not_in_build_policy"
+        );
+
+        let none_rejection = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            test_policy_loaded_model(&writer_policy, Path::new("/tmp/policy-writer.gguf")),
+            &BuildModelPolicy::none_v1(),
+        );
+        assert_eq!(
+            none_rejection
+                .expect_err("none-v1 cannot mint the opaque request authority")
+                .code,
+            "automatic_writer_not_in_build_policy"
+        );
+
+        let ledger = authority.ledger.lock().expect("automatic budget ledger");
+        assert_eq!(ledger.active_session, None);
+        assert!(ledger.families_by_scope.is_empty());
+    }
+
+    #[test]
+    fn policy_candidate_and_exact_match_preserve_source_order_rank() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v1();
+        let writer = policy.writers().first().expect("writer policy");
+        let expected =
+            policy_writer_expectation(&policy, writer.profile_id()).expect("known writer profile");
+        let candidate = policy_candidate_summary(&policy, writer.model_file_bytes())
+            .expect("unique size candidate");
+
+        assert_eq!(expected.rank, 0);
+        assert_eq!(candidate.rank, expected.rank);
+        assert_eq!(candidate.profile_id, expected.profile_id);
+    }
+
+    #[test]
+    fn pre_native_policy_failure_restores_the_previous_model() {
+        let state = PluginState::default();
+        let staged_path = PathBuf::from("/tmp/new-writer.gguf");
+        let staged_profile = LocalModelProfile::for_gguf(&staged_path);
+        let previous = test_loaded_model(Path::new("/tmp/previous.gguf"), "previous-model");
+        *state.model.lock().expect("model registry") = ModelRegistry::Loading {
+            path: staged_path.clone(),
+            previous: Some(Box::new(previous)),
+        };
+
+        let error = resolve_policy_model_inspection(
+            &state,
+            &staged_path,
+            &staged_profile,
+            Err(PolicyInspectionFailure {
+                failure: IpcFailure::new("policy_model_digest_mismatch", "wrong digest", false),
+                native_inspection_started: false,
+            }),
+        )
+        .expect_err("failed verification must not replace the previous model");
+
+        assert_eq!(error.code, "policy_model_digest_mismatch");
+        assert_loaded_model_id(&state, "previous-model");
+    }
+
+    #[test]
+    fn capability_mismatch_with_unproved_cleanup_latches_unknown_residency() {
+        let state = PluginState::default();
+        let staged_path = PathBuf::from("/tmp/incapable-writer.gguf");
+        let staged_profile = LocalModelProfile::for_gguf(&staged_path);
+        let expectation = test_policy_expectation(b"incapable-writer");
+        let mut descriptor = test_descriptor(&staged_path, &expectation, "staged-model");
+        descriptor.capabilities.generated_token_ids = CapabilitySupport::Unsupported;
+        let validation = validate_policy_model_descriptor(&descriptor, &staged_path, &expectation)
+            .expect_err("policy capabilities must be proven");
+        assert_eq!(validation.code, "policy_model_capability_mismatch");
+
+        let previous = test_loaded_model(Path::new("/tmp/previous.gguf"), "previous-model");
+        *state.model.lock().expect("model registry") = ModelRegistry::Loading {
+            path: staged_path.clone(),
+            previous: Some(Box::new(previous)),
+        };
+        let error = resolve_policy_model_inspection(
+            &state,
+            &staged_path,
+            &staged_profile,
+            Err(PolicyInspectionFailure {
+                failure: validation,
+                native_inspection_started: true,
+            }),
+        )
+        .expect_err("capability failure must not commit the staged model");
+
+        assert_eq!(error.code, "model_residency_unknown");
+        assert!(matches!(
+            &*state.model.lock().expect("model registry"),
+            ModelRegistry::ResidencyUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn changed_registry_and_absent_staged_release_latches_unknown_residency() {
+        let state = PluginState::default();
+        *state.model.lock().expect("model registry") = ModelRegistry::Loaded(Box::new(
+            test_loaded_model(Path::new("/tmp/other.gguf"), "other-model"),
+        ));
+        let staged_path = PathBuf::from("/tmp/staged.gguf");
+        let staged_profile = LocalModelProfile::for_gguf(&staged_path);
+
+        let error = release_staged_model(&state, &staged_path, &staged_profile)
+            .expect_err("an absent staged slot cannot prove cleanup after authority changed");
+
+        assert_eq!(error.code, "model_residency_unknown");
+        assert!(matches!(
+            &*state.model.lock().expect("model registry"),
+            ModelRegistry::ResidencyUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn loaded_identity_mismatch_has_no_unverified_size_hint() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v1();
+        let writer = policy.writers().first().expect("writer policy");
+        let path = Path::new("/tmp/same-size-wrong-identity.gguf");
+        let mut mismatch = test_loaded_model(path, "same-size-wrong-identity");
+        mismatch.descriptor.model_file_bytes = writer.model_file_bytes();
+        let summary = model_summary(&mismatch, true, &policy);
+
+        assert!(summary.policy_candidate.is_none());
+        assert!(summary.policy_verified.is_none());
+        assert!(summary.tested_profile.is_none());
     }
 
     fn start_persisted_test_generation(
@@ -4553,12 +8174,234 @@ mod tests {
     fn generation_seeds_are_deterministic_and_branch_specific() {
         let command_id = CommandId::new();
         assert_eq!(
-            generation_seed(command_id, 0),
-            generation_seed(command_id, 0)
+            generation_seed(command_id, 0, WeavePreset::AutomaticProseV2),
+            generation_seed(command_id, 0, WeavePreset::AutomaticProseV2)
         );
         assert_ne!(
-            generation_seed(command_id, 0),
-            generation_seed(command_id, 1)
+            generation_seed(command_id, 0, WeavePreset::AutomaticProseV2),
+            generation_seed(command_id, 1, WeavePreset::AutomaticProseV2)
+        );
+        assert_ne!(
+            generation_seed(command_id, 0, WeavePreset::AutomaticProseV2),
+            generation_seed(command_id, 0, WeavePreset::AutomaticVerseV2)
+        );
+        assert_ne!(
+            generation_seed(command_id, 0, WeavePreset::AutomaticVerseV2),
+            generation_seed(command_id, 0, WeavePreset::ManualV2)
+        );
+    }
+
+    #[test]
+    fn automatic_budget_reservations_are_affine_and_revision_bounded() {
+        let authority = AutomaticBudgetAuthority::default();
+        let automatic = test_automatic_model_authority();
+        let writer = automatic
+            .automatic_writer()
+            .expect("automatic writer witness");
+        let scope = AutomaticBudgetScope {
+            project: ProjectId::new(),
+            session: CommandId::new(),
+            document: DocumentId::new(),
+            source_revision: RevisionId::new(),
+        };
+        authority
+            .reserve(writer, scope)
+            .expect("first family")
+            .commit();
+        authority
+            .reserve(writer, scope)
+            .expect("replacement family")
+            .commit();
+        assert_eq!(
+            authority
+                .reserve(writer, scope)
+                .expect_err("revision budget exhausted"),
+            AutomaticBudgetError::Exhausted
+        );
+        assert_eq!(AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2, 288);
+    }
+
+    #[test]
+    fn uncommitted_automatic_budget_reservation_refunds_on_drop() {
+        let authority = AutomaticBudgetAuthority::default();
+        let automatic = test_automatic_model_authority();
+        let writer = automatic
+            .automatic_writer()
+            .expect("automatic writer witness");
+        let scope = AutomaticBudgetScope {
+            project: ProjectId::new(),
+            session: CommandId::new(),
+            document: DocumentId::new(),
+            source_revision: RevisionId::new(),
+        };
+        let abandoned = authority.reserve(writer, scope).expect("pending family");
+        let committed = authority
+            .reserve(writer, scope)
+            .expect("second pending family");
+        assert_eq!(
+            authority
+                .reserve(writer, scope)
+                .expect_err("pending slots count"),
+            AutomaticBudgetError::Exhausted
+        );
+        drop(abandoned);
+        authority
+            .reserve(writer, scope)
+            .expect("refunded family")
+            .commit();
+        committed.commit();
+        assert_eq!(
+            authority
+                .reserve(writer, scope)
+                .expect_err("committed work remains spent"),
+            AutomaticBudgetError::Exhausted
+        );
+    }
+
+    #[test]
+    fn automatic_budget_renews_only_for_new_authoritative_revision_or_session() {
+        let authority = AutomaticBudgetAuthority::default();
+        let automatic = test_automatic_model_authority();
+        let writer = automatic
+            .automatic_writer()
+            .expect("automatic writer witness");
+        let project_id = ProjectId::new();
+        let session_id = CommandId::new();
+        let document_id = DocumentId::new();
+        let first = AutomaticBudgetScope {
+            project: project_id,
+            session: session_id,
+            document: document_id,
+            source_revision: RevisionId::new(),
+        };
+        authority
+            .reserve(writer, first)
+            .expect("first revision")
+            .commit();
+        authority
+            .reserve(writer, first)
+            .expect("first replacement")
+            .commit();
+
+        let next_revision = AutomaticBudgetScope {
+            source_revision: RevisionId::new(),
+            ..first
+        };
+        authority
+            .reserve(writer, next_revision)
+            .expect("new revision renews")
+            .commit();
+        let next_session = AutomaticBudgetScope {
+            session: CommandId::new(),
+            ..next_revision
+        };
+        authority
+            .reserve(writer, next_session)
+            .expect("new project session renews")
+            .commit();
+    }
+
+    #[test]
+    fn automatic_sampling_is_typed_and_repetition_resistant() {
+        let command_id = CommandId::new();
+        let automatic =
+            sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::AutomaticProseV2);
+        let verse = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::AutomaticVerseV2);
+        let manual = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::ManualV2);
+
+        assert_ne!(automatic.seed, verse.seed);
+        assert_ne!(verse.seed, manual.seed);
+        assert_eq!(automatic.max_tokens, 48);
+        assert_eq!(automatic.temperature.to_bits(), 0.8_f32.to_bits());
+        assert_eq!(automatic.repeat_penalty.to_bits(), 1.08_f32.to_bits());
+        assert_eq!(automatic.dry_multiplier.to_bits(), 0.8_f32.to_bits());
+        assert_eq!(automatic.dry_allowed_length, 4);
+        assert_eq!(automatic.dry_penalty_last_n, 256);
+        assert_eq!(verse.repeat_penalty.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(verse.dry_multiplier.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(
+            manual.repeat_penalty.to_bits(),
+            SamplingConfig::default().repeat_penalty.to_bits()
+        );
+        assert_eq!(
+            manual.dry_multiplier.to_bits(),
+            SamplingConfig::default().dry_multiplier.to_bits()
+        );
+    }
+
+    #[test]
+    fn weave_v2_sampling_has_stable_exact_bit_fingerprints() {
+        let command_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            .parse::<CommandId>()
+            .expect("fixed command ID");
+        let prose = sampling_for_weave_case(
+            command_id,
+            0,
+            AUTOMATIC_WEAVE_MAX_TOKENS_V2,
+            AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            WeavePreset::AutomaticProseV2,
+        );
+        let verse = sampling_for_weave_case(
+            command_id,
+            0,
+            AUTOMATIC_WEAVE_MAX_TOKENS_V2,
+            AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            WeavePreset::AutomaticVerseV2,
+        );
+        let manual = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::ManualV2);
+        assert_eq!(
+            prose.fingerprint().sha256_hex(),
+            "8958697e23818dd62c364f46d14d12e977a10b2428be17d255954a25bd3d529c"
+        );
+        assert_eq!(
+            verse.fingerprint().sha256_hex(),
+            "60bf288ce682c665732d7975bca0722a8f9d8e71fdfa59e453e0c4c0734feef9"
+        );
+        assert_eq!(
+            manual.fingerprint().sha256_hex(),
+            "7db5d3b7e3450e90f85074910b816dbce5b102adff36ebf6d62beb4e800bf0bc"
+        );
+    }
+
+    #[test]
+    fn automatic_policy_has_no_runtime_budget_fields() {
+        let parsed: WeavePolicySnapshot =
+            serde_json::from_str(r#"{"kind":"automatic_v2"}"#).expect("automatic policy");
+        assert_eq!(
+            validate_weave_policy(parsed).expect("validate automatic"),
+            ValidatedWeavePolicy::AutomaticV2
+        );
+        assert!(
+            serde_json::from_str::<WeavePolicySnapshot>(
+                r#"{"kind":"automatic_v2","max_tokens":2048}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn automatic_policy_is_bound_by_rust_to_the_authoritative_document_kind() {
+        let policy = ValidatedWeavePolicy::AutomaticV2;
+        assert_eq!(
+            policy
+                .bind_document_kind(DocumentKind::Prose)
+                .expect("prose")
+                .preset,
+            WeavePreset::AutomaticProseV2
+        );
+        assert_eq!(
+            policy
+                .bind_document_kind(DocumentKind::Verse)
+                .expect("verse")
+                .preset,
+            WeavePreset::AutomaticVerseV2
+        );
+        assert_eq!(
+            policy
+                .bind_document_kind(DocumentKind::Hybrid)
+                .expect_err("hybrid has no authoritative caret block")
+                .code,
+            "automatic_hybrid_boundary_unresolved"
         );
     }
 

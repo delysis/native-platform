@@ -1,6 +1,6 @@
 # Loom Native implementation status
 
-Status date: 2026-08-08.
+Status date: 2026-08-10.
 
 This document audits the checked-out source tree. It separates implemented behavior from local evidence and from deferred work. It is not a release declaration, performance claim, or substitute for platform acceptance.
 
@@ -12,16 +12,16 @@ This document audits the checked-out source tree. It separates implemented behav
 
 ## Verification snapshot
 
-The following was observed on one Apple-silicon macOS development machine with Rust/Cargo 1.95.0, Node.js 26.0.0, and pnpm 11.16.0. The full workspace also passed `cargo check --workspace --all-targets` with the declared Rust 1.88 minimum. This remains a local macOS result, not a cross-platform MSRV job, and does not cover Windows or Linux.
+The following was observed on one Apple-silicon macOS development machine with Rust/Cargo 1.95.0, Node.js 26.0.0, and pnpm 11.16.0. The full workspace also passed `cargo check --workspace --all-targets` with the declared Rust 1.88 minimum. The checked-in CI now repeats the current-toolchain workspace gates on Linux, macOS, and Windows and runs a dedicated Linux Rust 1.88 job; those remote results remain distinct from this local snapshot.
 
 | Check | Observed result |
 | --- | --- |
-| `cargo test --workspace --all-targets` | Passed: 202 Rust tests; 2 real-GGUF tests ignored by default; no failures |
-| `pnpm --filter @delysis/loom test` | Passed: 9 files, 33 tests |
+| `cargo test --workspace --all-targets` | Passed: 610 Rust tests; 4 explicitly environment-bound tests ignored by default; no failures |
+| `pnpm --filter @delysis/loom test` | Passed: 29 files, 166 tests |
 | `pnpm --filter @delysis/loom check` | Passed with 0 errors and 0 warnings |
 | `pnpm --filter @delysis/loom build` | Passed; Vite produced the static frontend bundle |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed with no warnings |
-| Real GGUF ignored tests | Generic Loom raw-family smoke, pinned Gemma 4 E2B base Loom acceptance, and the companion native-kit raw batch/cancellation acceptance passed separately as qualified below |
+| Real GGUF ignored tests | The generic Loom raw-family smoke and the feature-gated native writer bridge passed against the exact 484,220,320-byte Qwen artifact on the final native pin; the pinned Gemma 4 E2B base Loom acceptance and companion native-kit raw batch/cancellation acceptance remain separately qualified below |
 | Native macOS development smoke | An unsigned debug `.app` bundle built and launched. Native accessibility interaction exercised project opening, the source/visual editor, autosave, the model manager, keyboard Escape/focus restoration, and the visual-editor trailing-space regression below. The later quiet-shell/automatic-suggestion redesign passed frontend and Rust gates but was not re-exercised through native accessibility because the running window was in active user use. It did not exercise real-model suggestions end to end |
 
 Not run as part of this snapshot: signed packaging, updater tests, Windows/Linux builds, Metal/CUDA/Vulkan certification, Playwright/Tauri end-to-end workflows, screen-reader certification, exhaustive IME matrices, fuzzing, forced termination at every filesystem phase, full large-project latency measurement, and adapter-overhead benchmarking.
@@ -37,7 +37,7 @@ LOOM_GGUF_MODEL_PATH=/absolute/path/to/model.gguf \
   -- --ignored --exact --nocapture
 ```
 
-Two earlier local development runs passed 1/1 using `Qwen_Qwen3-0.6B-Q4_K_M.gguf` (Qwen3 0.6B, Q4_K_M) on the CPU path and returned two candidates labeled by the adapter as live inference. Observed wall times were 81.47 seconds and 206.43 seconds; the slower rerun shared the machine with concurrent build/test work, so neither duration is a throughput claim. This remains generic smoke evidence rather than the base-model gate.
+The final pinned stack passed this test 1/1 using the independently rehashed 484,220,320-byte `Qwen_Qwen3-0.6B-Q4_K_M.gguf` (SHA-256 `9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14`) on the CPU path and returned two candidates labeled by the adapter as live inference. The feature-gated `loom-inference` bridge then passed its disabled-control, embedding, and multi-call lineage proof against the same artifact. These remain generic smoke evidence rather than the base-model gate or throughput claims.
 
 The stricter ignored test is:
 
@@ -71,6 +71,8 @@ Those results establish the local CPU backend gates described above. They do **n
 - Artifact, operation, revision-segment, document-revision, and command-receipt DTOs.
 - Generation model/environment, authority, prompt/context recipe, token trace, generated-span, attestation, selection, terminal, command, and event DTOs.
 - Explicit probability stages and inference-evidence classes; absence remains representable instead of being converted to confidence.
+- Closed build-model policies with typed names, activations, writer profile identities, exact model digests/sizes, and source-order rank. The default desktop selection is the immutable `writer-gemma4-base-v2`/`quiet_default` contract; v1 retains `project_opt_in` semantics. Build artifacts contain the canonical policy and digest but no builder-local model path. A read-only IPC exposes the bound name/activation/digest identity; the renderer decoder rejects anything outside the exact checked-in triples, and preference derivation defaults off until a verified activation is supplied. Rust admits automatic generation only through a private move-only witness bound to the exact resident model and policy capabilities; automatic budget reservation borrows that proof, request construction preserves it, and native submission consumes the opaque authorized request. Arbitrary loaded models remain manual-only.
+- The quiet writing surface presents exact cursor-bound continuations as non-document ProseMirror ghost decorations. Selection requires an exact UTF-8 Markdown witness, a flattened visible-text grapheme boundary, faithful parse/serialize projection, an onscreen caret and first fragment, and a renderer-side SHA-256 proof for the immutable branch body and run. Tab consumes only the currently visible presentation identity; Escape, editing, IME composition, blur, and caret movement fail closed without changing manuscript bytes. Contextually unpresentable candidates are skipped so later exact alternatives or one bounded retry can proceed. Alternatives use a temporary bounded dialog rather than a persistent rail, and technical evidence stays collapsed until requested.
 
 **Deferred:** a frozen public compatibility promise beyond the checked-in v1 project/generation golden fixtures. The DTO set does not yet cover the entire planned search, evaluation, retrieval, source, replay-witness, and export domain.
 
@@ -93,7 +95,7 @@ Those results establish the local CPU backend gates described above. They do **n
 **Implemented and automated:**
 
 - Project initialization/open and manifest schema v1.
-- Additive SQLite store migrations 1-6, `STRICT` semantic tables, foreign keys, WAL, `synchronous=FULL`, `trusted_schema=OFF`, and immutable-row triggers. Manifest schema remains v1; migrations 5-6 add idempotent generation-command evidence and a bounded monotonic branch index.
+- Additive SQLite store migrations 1-9, `STRICT` semantic tables, foreign keys, WAL, `synchronous=FULL`, `trusted_schema=OFF`, and immutable-row triggers. Manifest schema remains v1; migrations 5-6 add idempotent generation-command evidence and a bounded monotonic branch index, while migrations 7-9 add fail-closed research admission, verified inference batches, and the research execution ledger.
 - SHA-256 content-addressed blobs verified on read.
 - Document registration, initial creation without clobbering an existing visible file, import, checkpoint, open, export, and command receipts.
 - Source-bound and idempotent saves. The caller names source revision, source visible blob, and command ID; stale or ambiguous writes fail closed.
@@ -141,13 +143,13 @@ Those results establish the local CPU backend gates described above. They do **n
 
 **Implemented and automated:** bounded job queues, cooperative cancellation, project-level automation opt-in, a focus gate that blocks both manual and automatic generation admission, and bounded generation-family registration/status/cancellation bookkeeping for the desktop lifecycle.
 
-**Implemented, limited evidence:** the desktop can explicitly enable the project automation gate and uses it for idle nearby suggestions; turning Suggestions off or entering Focus cancels active session generations. **Deferred:** a complete background-garden lifecycle, persisted scheduler/restart state, thermal and resource arbitration, native decoding pause/resume, and dependency injection for all planned adapters.
+**Implemented, limited evidence:** after verifying the build-policy identity, the default desktop policy quietly enables the project automation gate when no explicit preference exists and uses it for idle nearby suggestions. The prior policy still requires explicit opt-in; an explicit opt-out persists. Turning Suggestions off cancels active session generations. The ordinary editor is already the distraction-free surface, so there is no separate locking Focus-mode control in the primary UI. **Deferred:** a complete background-garden lifecycle, persisted scheduler/restart state, thermal and resource arbitration, native decoding pause/resume, and dependency injection for all planned adapters.
 
 ### `loom-backend-llama`
 
 **Implemented and automated or locally smoke-tested:**
 
-- Direct in-process use of the raw batch API from pinned published `llama-native-kit` commit `c61692d48b0768bb242bcecb7a80c3318fc476b4`.
+- Direct in-process use of the raw and controlled batch APIs from pinned published `llama-native-kit` commit `f87f57a5beb986d234c3fb059c92940578c70b27`.
 - Exact `GenerationInput::Completion` construction with no Loom-added system prompt, chat template, instruction, or suffix after the manuscript boundary.
 - Multiple continuation cases with independent sampling records, bounded event forwarding, ordered output validation, branch-specific cancellation calls, and one Loom terminal event per branch.
 - Generated token IDs and optional typed probability observations mapped into Loom token traces.
@@ -268,7 +270,7 @@ Those results establish the local CPU backend gates described above. They do **n
 
 - [x] Created the Rust 2024 Loom workspace and kept project-owned Rust free of `unsafe`.
 - [x] Added a direct adapter against the product-neutral raw batch-family native-kit API.
-- [x] Pinned the three native-kit crates to published commit `c61692d48b0768bb242bcecb7a80c3318fc476b4`, including the reviewed host single-flight/cache-policy follow-up, and reran compatibility gates.
+- [x] Pinned every native-kit consumer to published commit `f87f57a5beb986d234c3fb059c92940578c70b27`, including controlled generation, executor-owned operation leases, immutable build identity, host residency policy, joined-shutdown authority, and the cross-platform invariant tests, and reran the complete workspace compatibility gates.
 - [ ] Complete and independently verify external Bloom credential revocation/rotation and any separately approved history remediation.
 - [x] Add SHA-pinned Loom Native full-history secret scanning and pull-request dependency-review automation. A successful remote run is not yet evidenced here.
 - [ ] Pin and integrate a verified `attachment-native-kit` release; no attachment dependency exists here.

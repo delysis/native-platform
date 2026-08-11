@@ -10,7 +10,10 @@
   import {
     clearGhostText,
     createGhostTextPlugin,
-    setGhostText
+    exactMarkdownByteOffsetAtSelection,
+    setGhostText,
+    visibleGhostWidgetPresentationKey,
+    visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
 
   export let value = '';
@@ -20,20 +23,78 @@
   export let ghostText = '';
   export let ghostCandidateId = '';
   export let ghostPresentationKey = '';
+  export let ghostAnchorByteOffset: number | null = null;
+  export let surfaceKey = '';
   export let onChange: (markdown: string) => void = () => {};
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onImmediateDocumentMutation: () => void = () => {};
-  export let onGhostAccept: (candidateId: string) => void = () => {};
-  export let onGhostDismiss: (candidateId: string) => void = () => {};
-  export let onSelectionChange: (atDocumentEnd: boolean) => void = () => {};
+  export let onGhostAccept: (candidateId: string, presentationKey: string) => boolean = () => false;
+  export let onGhostDismiss: (candidateId: string, presentationKey: string) => void = () => {};
+  export let onGhostPresentationRejected: (
+    candidateId: string,
+    presentationKey: string,
+    surfaceKey: string,
+    anchorByteOffset: number
+  ) => void;
+  export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
+  export let onSelectionChange: (markdownByteOffset: number | null) => void = () => {};
 
   let mount: HTMLDivElement;
+  let scrollViewport: HTMLElement | null = null;
   let view: EditorView | undefined;
   let lastEmitted = value;
   let projectionTimer: number | undefined;
   let localDocumentChanged = false;
   let composing = false;
   let suppressedGhostKey = '';
+  let reportedGhostPresentationKey = '';
+  let reportedRejectedPresentationIdentity = '';
+  let visibilityFrame: number | undefined;
+  let selectionReportTimer: number | undefined;
+  let boundaryCacheDocument: ProseMirrorNode | null = null;
+  let boundaryCacheCanonical = '';
+  let boundaryCacheFrom = -1;
+  let boundaryCacheTo = -1;
+  let boundaryCacheValue: number | null = null;
+
+  function clearBoundaryCache(): void {
+    boundaryCacheDocument = null;
+    boundaryCacheCanonical = '';
+    boundaryCacheFrom = -1;
+    boundaryCacheTo = -1;
+    boundaryCacheValue = null;
+  }
+
+  function selectionBoundary(state: EditorState): number | null {
+    if (
+      boundaryCacheDocument === state.doc &&
+      boundaryCacheCanonical === lastEmitted &&
+      boundaryCacheFrom === state.selection.from &&
+      boundaryCacheTo === state.selection.to
+    ) return boundaryCacheValue;
+    const boundary = exactMarkdownByteOffsetAtSelection(state, lastEmitted);
+    boundaryCacheDocument = state.doc;
+    boundaryCacheCanonical = lastEmitted;
+    boundaryCacheFrom = state.selection.from;
+    boundaryCacheTo = state.selection.to;
+    boundaryCacheValue = boundary;
+    return boundary;
+  }
+
+  function reportGhostVisibility(): void {
+    const presentationKey = view ? visibleGhostWidgetPresentationKey(view) : '';
+    if (reportedGhostPresentationKey === presentationKey) return;
+    reportedGhostPresentationKey = presentationKey;
+    onGhostVisibilityChange(presentationKey);
+  }
+
+  function scheduleGhostVisibilityReport(): void {
+    if (visibilityFrame !== undefined) window.cancelAnimationFrame(visibilityFrame);
+    visibilityFrame = window.requestAnimationFrame(() => {
+      visibilityFrame = undefined;
+      reportGhostVisibility();
+    });
+  }
 
   function projectDocument(): void {
     if (!view || composing || !localDocumentChanged) return;
@@ -43,7 +104,9 @@
     }
     localDocumentChanged = false;
     lastEmitted = defaultMarkdownSerializer.serialize(view.state.doc);
+    clearBoundaryCache();
     onChange(lastEmitted);
+    reportSelection(view.state);
   }
 
   function scheduleProjection(delay = 240): void {
@@ -94,20 +157,30 @@
         }),
         keymap(baseKeymap),
         createGhostTextPlugin({
-          accept: (candidateId) => onGhostAccept(candidateId),
-          dismiss: (candidateId) => onGhostDismiss(candidateId)
+          accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
+          dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
+          visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>
+            reportedGhostPresentationKey === presentationKey &&
+            Boolean(view) &&
+            expectedSurfaceKey === surfaceKey &&
+            anchorByteOffset === ghostAnchorByteOffset &&
+            selectionBoundary(view!.state) === anchorByteOffset &&
+            visibleGhostWidgetPresentationKey(view!) === presentationKey
         })
       ]
     });
   }
 
   function reportSelection(state: EditorState): void {
-    const documentEnd = Selection.atEnd(state.doc);
-    onSelectionChange(
-      state.selection.empty &&
-      state.selection.from === documentEnd.from &&
-      state.selection.to === documentEnd.to
-    );
+    onSelectionChange(selectionBoundary(state));
+  }
+
+  function scheduleSelectionReport(delay = 48): void {
+    if (selectionReportTimer !== undefined) window.clearTimeout(selectionReportTimer);
+    selectionReportTimer = window.setTimeout(() => {
+      selectionReportTimer = undefined;
+      if (view && !localDocumentChanged && !composing) reportSelection(view.state);
+    }, delay);
   }
 
   onMount(() => {
@@ -125,7 +198,22 @@
         if (!view) return;
         const next = view.state.apply(transaction);
         view.updateState(next);
-        reportSelection(next);
+        if (transaction.docChanged) {
+          clearBoundaryCache();
+          if (selectionReportTimer !== undefined) {
+            window.clearTimeout(selectionReportTimer);
+            selectionReportTimer = undefined;
+          }
+          onSelectionChange(null);
+        } else if (transaction.selectionSet) {
+          onSelectionChange(null);
+          scheduleSelectionReport();
+        }
+        if (transaction.docChanged || transaction.selectionSet) {
+          reportGhostVisibility();
+        } else {
+          scheduleGhostVisibilityReport();
+        }
         if (transaction.docChanged) {
           suppressedGhostKey = ghostPresentationKey;
           onImmediateDocumentMutation();
@@ -134,6 +222,14 @@
         }
       },
       handleDOMEvents: {
+        focus() {
+          scheduleGhostVisibilityReport();
+          return false;
+        },
+        blur() {
+          scheduleGhostVisibilityReport();
+          return false;
+        },
         compositionstart() {
           composing = true;
           suppressedGhostKey = ghostPresentationKey;
@@ -143,6 +239,11 @@
         },
         compositionend() {
           composing = false;
+          // A cancelled/no-op IME session must not permanently hide an
+          // otherwise exact candidate. A real mutation already invalidated
+          // its parent identity, and the exact-boundary proof still gates any
+          // transient redisplay before that update arrives.
+          suppressedGhostKey = '';
           onCompositionChange(false);
           scheduleProjection(0);
           return false;
@@ -150,6 +251,10 @@
       }
     });
     reportSelection(view.state);
+    scrollViewport = mount.closest<HTMLElement>('.editor-pane');
+    scheduleGhostVisibilityReport();
+    window.addEventListener('resize', reportGhostVisibility);
+    scrollViewport?.addEventListener('scroll', reportGhostVisibility, { passive: true });
     if (autofocus) view.focus();
   });
 
@@ -157,26 +262,71 @@
     lastEmitted = value;
     const next = stateFor(value);
     view.updateState(next);
+    clearBoundaryCache();
     reportSelection(next);
+    scheduleGhostVisibilityReport();
   }
 
   $: if (view) {
     view.setProps({ editable: () => !readonly });
-    const presentation = ghostPresentationKey && ghostPresentationKey !== suppressedGhostKey ? {
+    const anchorByteOffset = ghostAnchorByteOffset;
+    const exactAnchor = anchorByteOffset !== null &&
+      selectionBoundary(view.state) === anchorByteOffset;
+    const faithful = exactAnchor && visualGhostTextIsFaithfulAtSelection(
+        view.state,
+        lastEmitted,
+        anchorByteOffset!,
+        ghostText
+      );
+    const rejectionIdentity = anchorByteOffset === null
+      ? ''
+      : `${ghostPresentationKey}\u0000${surfaceKey}\u0000${anchorByteOffset}`;
+    if (
+      !readonly &&
+      !composing &&
+      ghostCandidateId &&
+      ghostPresentationKey &&
+      surfaceKey &&
+      exactAnchor &&
+      !faithful &&
+      reportedRejectedPresentationIdentity !== rejectionIdentity
+    ) {
+      reportedRejectedPresentationIdentity = rejectionIdentity;
+      onGhostPresentationRejected(
+        ghostCandidateId,
+        ghostPresentationKey,
+        surfaceKey,
+        anchorByteOffset!
+      );
+    }
+    const presentation = ghostPresentationKey &&
+      surfaceKey &&
+      faithful &&
+      ghostPresentationKey !== suppressedGhostKey ? {
       active: !readonly && !composing,
       candidateId: ghostCandidateId,
       presentationKey: ghostPresentationKey,
+      surfaceKey,
+      anchorByteOffset,
       text: ghostText
     } : null;
     setGhostText(view, presentation);
+    scheduleGhostVisibilityReport();
   }
 
   onDestroy(() => {
     if (projectionTimer !== undefined) window.clearTimeout(projectionTimer);
+    if (visibilityFrame !== undefined) window.cancelAnimationFrame(visibilityFrame);
+    if (selectionReportTimer !== undefined) window.clearTimeout(selectionReportTimer);
     if (composing) onCompositionChange(false);
-    onSelectionChange(false);
+    onSelectionChange(null);
+    if (reportedGhostPresentationKey) onGhostVisibilityChange('');
+    window.removeEventListener('resize', reportGhostVisibility);
+    scrollViewport?.removeEventListener('scroll', reportGhostVisibility);
     view?.destroy();
   });
 </script>
 
-<div class="editor-mount" bind:this={mount}></div>
+<div class="loom-editor-shell">
+  <div class="editor-mount" bind:this={mount}></div>
+</div>

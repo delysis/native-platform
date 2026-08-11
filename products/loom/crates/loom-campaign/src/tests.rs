@@ -8,7 +8,7 @@ use loom_search::UnitScore;
 use loom_store::{
     FrozenCampaignPersistence, FrozenCampaignTopologyPersistence,
     FrozenCampaignTrialTopologyPersistence, FrozenStagePersistence, FrozenTrialPersistence,
-    ProjectStore, ResearchBudgetMaximum, ResearchSessionKind, StoreError,
+    ProjectStore, ResearchBudgetMaximum, StoreError,
 };
 use loom_trial::{BudgetAmount, TrialBudgetLimits, canonical_stage_record_bytes};
 use loom_types::{ArtifactId, BlobId, ProjectId};
@@ -228,7 +228,7 @@ fn durable_campaign_resume_releases_reserved_trial_before_retry() {
 }
 
 #[test]
-fn durable_campaign_resume_interrupts_dispatch_at_full_charge() {
+fn durable_campaign_resume_reissues_dispatch_once_then_interrupts_at_full_charge() {
     let directory = tempdir().expect("temporary project");
     let project_path = directory.path().to_path_buf();
     let (mut store, _) =
@@ -266,8 +266,28 @@ fn durable_campaign_resume_interrupts_dispatch_at_full_charge() {
     let lease = reopened
         .acquire_campaign_session(fixture.spec.fingerprint())
         .expect("fresh lease");
-    let resumed = CampaignJournal::resume(fixture.spec, &reopened, lease)
-        .expect("resume and interrupt dispatch");
+    let mut resumed =
+        CampaignJournal::resume(fixture.spec, &reopened, lease).expect("resume dispatched trial");
+    assert_eq!(
+        resumed.attempt_status(attempt),
+        Some(CampaignTrialAttemptStatus::Dispatched)
+    );
+    assert_eq!(resumed.snapshot().active_attempt_count(), 1);
+    assert_eq!(resumed.snapshot().budget().reserved(), reservation);
+    assert_eq!(
+        resumed.snapshot().budget().charged(),
+        CampaignBudgetAmount::default()
+    );
+
+    let mut recovered = resumed.take_recovered_dispatches();
+    assert_eq!(recovered.len(), 1);
+    assert!(resumed.take_recovered_dispatches().is_empty());
+    resumed
+        .reconcile_interrupted(
+            recovered.pop().expect("one recovered dispatch"),
+            BlobId::digest(b"recovered executor did not produce terminal evidence"),
+        )
+        .expect("conservative interruption");
     assert_eq!(
         resumed.attempt_status(attempt),
         Some(CampaignTrialAttemptStatus::Interrupted)

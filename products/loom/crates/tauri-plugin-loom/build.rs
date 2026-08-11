@@ -11,9 +11,11 @@ const COMMANDS: &[&str] = &[
     "document_draft_clear",
     "document_reconciliation_preview",
     "document_reconcile_apply",
+    "build_model_policy_get",
     "model_list",
     "model_choose",
     "model_load",
+    "model_load_policy_candidate",
     "model_unload",
     "model_download_start",
     "model_download_cancel",
@@ -30,6 +32,8 @@ const COMMANDS: &[&str] = &[
     "suggestions_set",
     "focus_mode_set",
     "application_close",
+    "application_close_abort",
+    "application_close_pending",
 ];
 
 fn main() {

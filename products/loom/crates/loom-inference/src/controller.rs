@@ -22,6 +22,7 @@ pub const MAX_CRITIC_KEY_BYTES: usize = 128;
 pub const MAX_CHAT_TEMPLATE_BYTES: usize = 256 * 1024;
 
 const PROMPT_SPEC_DOMAIN: &str = "loom/controller-prompt-spec/v1";
+#[cfg(feature = "native-llama")]
 const COMPILED_PROMPT_DOMAIN: &str = "loom/compiled-controller-prompt/v1";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

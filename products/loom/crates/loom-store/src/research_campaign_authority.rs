@@ -533,11 +533,8 @@ mod tests {
         trial_fingerprint: BlobId,
     ) {
         let trial_run_id = TrialRunId::new();
-        let run_record = TrialRunRecord::new(
-            trial_run_id,
-            trial_fingerprint,
-            TrialRunOrigin::Standalone,
-        );
+        let run_record =
+            TrialRunRecord::new(trial_run_id, trial_fingerprint, TrialRunOrigin::Standalone);
         let run_bytes = run_record.canonical_bytes().expect("canonical run");
         store
             .persist_standalone_trial_run(StandaloneTrialRunPersistence {

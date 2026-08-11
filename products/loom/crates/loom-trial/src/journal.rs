@@ -480,6 +480,16 @@ struct AttemptRecord {
     state: InternalAttemptState,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CommandBuildContext {
+    trial_run_id: TrialRunId,
+    session_id: TrialSessionId,
+    attempt_id: StageAttemptId,
+    record: AttemptRecord,
+    command_fingerprint: BlobId,
+    start_event_fingerprint: BlobId,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ReplayState {
     initialized: bool,
@@ -848,13 +858,8 @@ impl TrialJournal {
             .stage(record.stage_id)
             .expect("recorded stage exists")
             .clone();
-        let command_fingerprint = fingerprint_command(
-            &self.spec,
-            self.trial_run_id,
-            &stage,
-            attempt_id,
-            record,
-        );
+        let command_fingerprint =
+            fingerprint_command(&self.spec, self.trial_run_id, &stage, attempt_id, record);
         self.append(TrialEventKind::AttemptStarted {
             attempt_id,
             command_fingerprint,
@@ -862,12 +867,14 @@ impl TrialJournal {
         Ok(build_command(
             &self.spec,
             &stage,
-            self.trial_run_id,
-            self.session_id,
-            attempt_id,
-            record,
-            command_fingerprint,
-            self.snapshot().last_event_fingerprint(),
+            &CommandBuildContext {
+                trial_run_id: self.trial_run_id,
+                session_id: self.session_id,
+                attempt_id,
+                record,
+                command_fingerprint,
+                start_event_fingerprint: self.snapshot().last_event_fingerprint(),
+            },
         ))
     }
 
@@ -1157,13 +1164,7 @@ impl TrialJournal {
             return Ok(());
         }
 
-        let (session_id, store_lease_fingerprint) = match &self.persistence {
-            TrialJournalPersistence::Store(writer) => {
-                (writer.session_id(), writer.lease_fingerprint())
-            }
-            #[cfg(test)]
-            TrialJournalPersistence::Diagnostic { .. } => unreachable!("returned above"),
-        };
+        let (session_id, store_lease_fingerprint) = self.store_persistence_identity();
         let event_bytes = canonical_trial_event_bytes(
             &self.spec,
             self.trial_run_id,
@@ -1240,14 +1241,7 @@ impl TrialJournal {
             }
             TrialEventKind::TrialClosed { .. } => TrialJournalMutation::TrialClosed,
         };
-        #[cfg(not(test))]
-        let TrialJournalPersistence::Store(writer) = &mut self.persistence;
-        #[cfg(test)]
-        let writer = match &mut self.persistence {
-            TrialJournalPersistence::Store(writer) => writer,
-            TrialJournalPersistence::Diagnostic { .. } => unreachable!("returned above"),
-        };
-        writer.append_trial_event(TrialJournalEventPersistence {
+        let persistence = TrialJournalEventPersistence {
             trial_run_id: self.trial_run_id,
             trial_fingerprint: self.spec.fingerprint(),
             event_index: event.sequence,
@@ -1255,8 +1249,27 @@ impl TrialJournal {
             event_fingerprint: event.fingerprint,
             canonical_event_bytes: &event_bytes,
             mutation,
-        })?;
+        };
+        self.store_writer().append_trial_event(persistence)?;
         Ok(())
+    }
+
+    fn store_persistence_identity(&self) -> (ArtifactId, BlobId) {
+        match &self.persistence {
+            TrialJournalPersistence::Store(writer) => {
+                (writer.session_id(), writer.lease_fingerprint())
+            }
+            #[cfg(test)]
+            TrialJournalPersistence::Diagnostic { .. } => unreachable!("diagnostic returned early"),
+        }
+    }
+
+    fn store_writer(&mut self) -> &mut ResearchJournalWriter {
+        match &mut self.persistence {
+            TrialJournalPersistence::Store(writer) => writer,
+            #[cfg(test)]
+            TrialJournalPersistence::Diagnostic { .. } => unreachable!("diagnostic returned early"),
+        }
     }
 
     fn reconcile_pre_crash_attempts(&mut self) -> Result<(), TrialError> {
@@ -1326,8 +1339,6 @@ pub enum TrialError {
     StageGraphMismatch,
     #[error("live trial session lease does not match the frozen trial")]
     SessionLeaseMismatch,
-    #[error("live trial session record does not match the frozen trial's canonical bytes")]
-    SessionRecordMismatch,
     #[error("persisted normalized trial or stage rows do not match the frozen trial")]
     SessionNormalizedSnapshotMismatch,
     #[error("durable trial journal storage failed")]
@@ -2139,13 +2150,16 @@ fn verify_terminal_lease(
 fn build_command(
     spec: &FrozenTrialSpec,
     stage: &FrozenStageSpec,
-    trial_run_id: TrialRunId,
-    session_id: TrialSessionId,
-    attempt_id: StageAttemptId,
-    record: AttemptRecord,
-    command_fingerprint: BlobId,
-    start_event_fingerprint: BlobId,
+    context: &CommandBuildContext,
 ) -> StageCommand {
+    let CommandBuildContext {
+        trial_run_id,
+        session_id,
+        attempt_id,
+        record,
+        command_fingerprint,
+        start_event_fingerprint,
+    } = *context;
     let is_writer = stage.stage() == FrozenTrialStage::Generate;
     StageCommand {
         trial_run_id,

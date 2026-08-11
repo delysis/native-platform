@@ -295,10 +295,10 @@
       "type": "string",
       "oneOf": [
         {
-          "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
+          "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
           "type": "string",
           "const": "local-generation",
-          "markdownDescription": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`"
+          "markdownDescription": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`"
         },
         {
           "description": "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command.\n#### This permission set includes:\n\n- `allow-candidate-promote`",
@@ -323,6 +323,30 @@
           "type": "string",
           "const": "deny-application-close",
           "markdownDescription": "Denies the application_close command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the application_close_abort command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-application-close-abort",
+          "markdownDescription": "Enables the application_close_abort command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the application_close_abort command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-application-close-abort",
+          "markdownDescription": "Denies the application_close_abort command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the application_close_pending command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-application-close-pending",
+          "markdownDescription": "Enables the application_close_pending command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the application_close_pending command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-application-close-pending",
+          "markdownDescription": "Denies the application_close_pending command without any pre-configured scope."
         },
         {
           "description": "Enables the branch_body command without any pre-configured scope.",
@@ -359,6 +383,18 @@
           "type": "string",
           "const": "deny-branch-page",
           "markdownDescription": "Denies the branch_page command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the build_model_policy_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-build-model-policy-get",
+          "markdownDescription": "Enables the build_model_policy_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the build_model_policy_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-build-model-policy-get",
+          "markdownDescription": "Denies the build_model_policy_get command without any pre-configured scope."
         },
         {
           "description": "Enables the candidate_keep command without any pre-configured scope.",
@@ -565,6 +601,18 @@
           "markdownDescription": "Denies the model_load command without any pre-configured scope."
         },
         {
+          "description": "Enables the model_load_policy_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-model-load-policy-candidate",
+          "markdownDescription": "Enables the model_load_policy_candidate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the model_load_policy_candidate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-model-load-policy-candidate",
+          "markdownDescription": "Denies the model_load_policy_candidate command without any pre-configured scope."
+        },
+        {
           "description": "Enables the model_unload command without any pre-configured scope.",
           "type": "string",
           "const": "allow-model-unload",
@@ -685,10 +733,10 @@
           "markdownDescription": "Denies the weave_status command without any pre-configured scope."
         },
         {
-          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`",
+          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`"
+          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
         }
       ]
     }

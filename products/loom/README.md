@@ -19,21 +19,21 @@ See [Implementation status](docs/implementation-status.md) for the exact verifie
 - Deterministic UTF-8 three-way merge primitives for prose and verse. Conflicts are structured and byte-ranged; hybrid text is held until block metadata is available.
 - An explicit external-change workflow across the store, CLI, typed Tauri IPC, and desktop: bounded three-way preview, structured conflicts, exact revision/blob binding, human resolution, and an idempotent provenance-preserving reconciliation receipt. Loom never chooses or applies a conflicting resolution automatically.
 - A Tauri 2/Svelte 5 shell that opens directly into an app-owned ordinary-file note on first launch. One-document projects show the page rather than an empty outline; folder switching, source mode, focus, model setup, and recovery stay secondary until needed.
-- Source editing, a lossless-subset ProseMirror visual editor, exact verse line-ending handling, IME-aware save boundaries, crash-draft recovery, external-change review, and a bounded collapsed branch shelf.
+- Source editing, a lossless-subset ProseMirror visual editor, exact verse line-ending handling, IME-aware save boundaries, crash-draft recovery, external-change review, and a temporary alternatives dialog that never resizes the manuscript.
 - A direct in-process `llama-native-kit` adapter for exact raw completion batches, model capability verification, bounded event forwarding, per-branch cancellation, and provenance conversion.
 - Desktop model choose/load/unload, bounded local GGUF discovery, native capability inspection, and conservative model-fit calculation. A GGUF header alone is never represented as proof that a model is loadable or completion-capable.
 - An explicit verified-download path with HTTPS-only transport, mandatory SHA-256, a hard byte ceiling, safe partial resume, cancellation/status recovery, cold hash and GGUF verification, and no-clobber installation.
-- After an explicit per-project Suggestions opt-in, idle autosave triggers local raw continuation from the exact Source caret or the verified Visual end boundary. Typing cancels stale work; Tab accepts only a candidate bound to the current caret, Escape dismisses it, and alternatives remain private and recoverable. There is no manual generation or checkpoint button on the writing surface. Fixture-backed tests cover the command contracts; a real-model desktop end-to-end run remains an acceptance item.
+- Under the verified quiet-default build policy, idle autosave triggers local raw continuation from the exact Source or Visual caret unless the author has turned Suggestions off. The earlier build policy retains explicit per-project opt-in. Typing cancels stale work; Tab accepts only ghost text bound to the current caret, immutable branch bytes, and visible editor presentation, while Escape dismisses it. Alternatives remain private and recoverable. There is no manual generation or checkpoint button on the writing surface. Fixture-backed tests cover the command contracts; a real-model desktop end-to-end run remains an acceptance item.
 - Bounded, deterministic retrieval and anti-copy library primitives over exact excerpt occurrences, plus search primitives for hard gates, exact/semantic grouping, evidence-bound rubric/pairwise evaluation, and quality-plus-seeded-novelty selection. These are not yet persisted or connected to desktop automation.
 - A JSON-emitting CLI for project initialization, open, import, checkpoint, recovery, export, read-only reconciliation preview, and identity-bound reconciliation apply.
 
 ## Pinned native dependency
 
-`loom-backend-llama` pins `llama-native-engine`, `llama-native-host`, and `llama-native-types` to published commit `c61692d48b0768bb242bcecb7a80c3318fc476b4` of `delysis/llama-native-kit`. Builds therefore require fetching that exact Git revision unless dependencies are already cached. The pin includes the product-neutral raw branch-family API and the reviewed NativeHost single-flight/cache-policy follow-up; changing it requires compatibility and real-GGUF revalidation.
+The inference, evaluation, and trial crates pin their `llama-native-kit` dependencies to published commit `f87f57a5beb986d234c3fb059c92940578c70b27`. Builds therefore require fetching that exact Git revision unless dependencies are already cached. The pin includes the product-neutral controlled-generation and embedding APIs, executor-owned operation leases, immutable build identity, exact artifact verification, NativeHost residency policy, and joined shutdown authority used by the desktop lifecycle. Changing it requires complete consumer compatibility and real-GGUF revalidation.
 
 ## Build and test
 
-The workspace declares Rust 1.88 as its minimum version. The full workspace check passed locally with Rust 1.88, and the full test/Clippy snapshot passed with Rust 1.95; a cross-platform MSRV job is still required. Node.js and pnpm are also required. From the repository root:
+The workspace declares Rust 1.88 as its minimum version. The full workspace check passed locally with Rust 1.88, and CI runs the same minimum-version check on Linux alongside current-toolchain Rust jobs on Linux, macOS, and Windows. Node.js and pnpm are also required. From the repository root:
 
 ```sh
 pnpm install --frozen-lockfile
@@ -67,6 +67,8 @@ Run the macOS development desktop app after the pinned native dependency has bee
 pnpm --filter @delysis/loom tauri dev
 ```
 
+The desktop build defaults to the checked-in `writer-gemma4-base-v2` policy: a local-only, raw-completion writer identity with quiet suggestions as the product default. `writer-gemma4-base-v1` preserves the earlier explicit project-opt-in behavior, and `none-v1` builds without an automatic writer preference. Select one of those exact allow-listed contracts with `LOOM_BUILD_MODEL_POLICY`; arbitrary policy files and model paths are rejected at build time. Model files are always discovered or selected at runtime, so release binaries do not contain paths from the machine that built them.
+
 ## Real GGUF acceptance tests
 
 The real-model test is ignored by the normal suite. Supply an absolute local GGUF path explicitly:
@@ -78,7 +80,7 @@ LOOM_GGUF_MODEL_PATH=/absolute/path/to/model.gguf \
   -- --ignored --exact --nocapture
 ```
 
-This generic developer smoke test is not a portable acceptance suite. Its historical local runs used a Qwen3 0.6B Q4 model on CPU; by itself it is not the Gemma 4 base-model gate, acceleration certification, cancellation certification, or cross-platform evidence. Details are in the implementation status document.
+This runtime-only variable is deliberately not a build input. The generic developer smoke test is not a portable acceptance suite. Its historical local runs used a Qwen3 0.6B Q4 model on CPU; by itself it is not the Gemma 4 base-model gate, acceleration certification, cancellation certification, or cross-platform evidence. Details are in the implementation status document.
 
 The stricter pinned Gemma 4 E2B base Q8 test binds the exact expected model digest and verifies raw completion capability, two independent branch seeds, generated token IDs, live-inference evidence, exact prompt identity, and measured shared-prefix reuse:
 

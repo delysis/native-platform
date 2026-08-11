@@ -26,8 +26,9 @@ use crate::paths::{
     normalize_document_path, reject_symlink_target,
 };
 use crate::research_session::{
-    ExclusiveResearchSessionLease, ResearchSessionKey, ResearchSessionRegistry,
-    ResearchSessionRegistryState, ResearchSubjectLocator, load_research_subject_snapshot,
+    ExclusiveResearchSessionLease, ExclusiveResearchSessionLeaseInput, ResearchSessionKey,
+    ResearchSessionRegistry, ResearchSessionRegistryState, ResearchSubjectLocator,
+    load_research_subject_snapshot,
 };
 use crate::schema::{CURRENT_SCHEMA_VERSION, configure, migrate};
 use crate::{Result, StoreError};
@@ -335,14 +336,16 @@ impl ProjectStore {
         drop(registry);
 
         Ok(ExclusiveResearchSessionLease::new(
-            key,
-            record_fingerprint,
-            self.manifest.project_id,
-            snapshot,
-            locator.trial_run_id(),
-            session_id,
-            lease_fingerprint,
-            Arc::clone(&self.research_sessions),
+            ExclusiveResearchSessionLeaseInput {
+                key,
+                record_fingerprint,
+                project_id: self.manifest.project_id,
+                snapshot,
+                trial_run_id: locator.trial_run_id(),
+                session_id,
+                lease_fingerprint,
+                registry: Arc::clone(&self.research_sessions),
+            },
         ))
     }
 

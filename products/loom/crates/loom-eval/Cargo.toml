@@ -23,8 +23,8 @@ thiserror.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
-llama-native-engine = { git = "https://github.com/delysis/llama-native-kit.git", rev = "6a82439ee449599f7a7e477e1150ae29efdb23d6" }
-llama-native-types = { git = "https://github.com/delysis/llama-native-kit.git", rev = "6a82439ee449599f7a7e477e1150ae29efdb23d6" }
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit.git", rev = "f87f57a5beb986d234c3fb059c92940578c70b27" }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit.git", rev = "f87f57a5beb986d234c3fb059c92940578c70b27" }
 
 [lints]
 workspace = true

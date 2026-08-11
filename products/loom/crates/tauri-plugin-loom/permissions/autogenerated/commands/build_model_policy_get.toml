@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-build-model-policy-get"
+description = "Enables the build_model_policy_get command without any pre-configured scope."
+commands.allow = ["build_model_policy_get"]
+
+[[permission]]
+identifier = "deny-build-model-policy-get"
+description = "Denies the build_model_policy_get command without any pre-configured scope."
+commands.deny = ["build_model_policy_get"]

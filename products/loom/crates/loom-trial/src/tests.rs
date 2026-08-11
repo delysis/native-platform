@@ -4,11 +4,12 @@ use loom_research_types::{
     CompletionPromptBlockRole, CompletionPromptTail, ExactPromptBlockBytes, ExactPromptSource,
     FrozenBaseCompletionPrompt, FrozenCompletionPromptBlock, FrozenStageSpec, FrozenTrialStage,
     ManifestDocument, NonEmptyByteRange, PromptBlockWitness, PromptSourceRange, PromptTopology,
-    StageAttemptId, StageGraph, StageGraphId, StageId, TrialCaseId, compile_manifest,
+    StageAttemptId, StageGraph, StageGraphId, StageId, TrialCaseId, TrialRunId, TrialRunOrigin,
+    TrialRunRecord, compile_manifest,
 };
 use loom_store::{
     FrozenCampaignPersistence, FrozenStagePersistence, FrozenTrialPersistence, ProjectStore,
-    ResearchBudgetMaximum, ResearchSessionKind, StoreError,
+    ResearchBudgetMaximum, StandaloneTrialRunPersistence, StoreError,
 };
 use loom_types::{BlobId, ProjectId, RevisionId};
 use tempfile::tempdir;
@@ -122,7 +123,7 @@ fn store_session_binds_trial_subject_record_project_and_live_exclusivity() {
     let canonical = spec
         .canonical_record_bytes()
         .expect("canonical trial record");
-    persist_trial(
+    let trial_run_id = persist_trial(
         &mut store,
         &spec,
         &fixture.graph,
@@ -130,19 +131,19 @@ fn store_session_binds_trial_subject_record_project_and_live_exclusivity() {
         &canonical,
     );
     let lease = store
-        .acquire_research_session(ResearchSessionKind::Trial, spec.fingerprint())
+        .acquire_trial_run_session(trial_run_id)
         .expect("matching trial lease");
     let lease_fingerprint = lease.lease_fingerprint();
     let journal = TrialJournal::new(spec.clone(), fixture.graph.clone(), &store, lease)
         .expect("live trial journal");
     assert_eq!(journal.store_lease_fingerprint(), lease_fingerprint);
     assert!(matches!(
-        store.acquire_research_session(ResearchSessionKind::Trial, spec.fingerprint()),
+        store.acquire_trial_run_session(trial_run_id),
         Err(StoreError::ResearchSessionAlreadyActive { .. })
     ));
     drop(journal);
     let reacquired = store
-        .acquire_research_session(ResearchSessionKind::Trial, spec.fingerprint())
+        .acquire_trial_run_session(trial_run_id)
         .expect("journal drop releases exact trial");
     drop(reacquired);
 }
@@ -156,7 +157,7 @@ fn durable_trial_resume_releases_reserved_attempt_before_retry_authority() {
     let fixture = Fixture::new_for_project(store.manifest().project_id);
     let spec = fixture.spec();
     let canonical = spec.canonical_record_bytes().expect("canonical trial");
-    persist_trial(
+    let trial_run_id = persist_trial(
         &mut store,
         &spec,
         &fixture.graph,
@@ -164,7 +165,7 @@ fn durable_trial_resume_releases_reserved_attempt_before_retry_authority() {
         &canonical,
     );
     let lease = store
-        .acquire_research_session(ResearchSessionKind::Trial, spec.fingerprint())
+        .acquire_trial_run_session(trial_run_id)
         .expect("initial lease");
     let first_lease = lease.lease_fingerprint();
     let mut journal = TrialJournal::new(spec.clone(), fixture.graph.clone(), &store, lease)
@@ -183,7 +184,7 @@ fn durable_trial_resume_releases_reserved_attempt_before_retry_authority() {
 
     let reopened = ProjectStore::open(&project_path).expect("reopen project");
     let lease = reopened
-        .acquire_research_session(ResearchSessionKind::Trial, spec.fingerprint())
+        .acquire_trial_run_session(trial_run_id)
         .expect("fresh lease");
     assert_ne!(lease.lease_fingerprint(), first_lease);
     let mut resumed = TrialJournal::resume(spec.clone(), fixture.graph.clone(), &reopened, lease)
@@ -224,7 +225,7 @@ fn durable_trial_resume_interrupts_running_attempt_at_full_charge() {
     let fixture = Fixture::new_for_project(store.manifest().project_id);
     let spec = fixture.spec();
     let canonical = spec.canonical_record_bytes().expect("canonical trial");
-    persist_trial(
+    let trial_run_id = persist_trial(
         &mut store,
         &spec,
         &fixture.graph,
@@ -232,7 +233,7 @@ fn durable_trial_resume_interrupts_running_attempt_at_full_charge() {
         &canonical,
     );
     let lease = store
-        .acquire_research_session(ResearchSessionKind::Trial, spec.fingerprint())
+        .acquire_trial_run_session(trial_run_id)
         .expect("initial lease");
     let mut journal = TrialJournal::new(spec.clone(), fixture.graph.clone(), &store, lease)
         .expect("durable trial");
@@ -251,7 +252,7 @@ fn durable_trial_resume_interrupts_running_attempt_at_full_charge() {
 
     let reopened = ProjectStore::open(&project_path).expect("reopen project");
     let lease = reopened
-        .acquire_research_session(ResearchSessionKind::Trial, spec.fingerprint())
+        .acquire_trial_run_session(trial_run_id)
         .expect("fresh lease");
     let resumed = TrialJournal::resume(spec, fixture.graph, &reopened, lease)
         .expect("resume and interrupt pre-crash call");
@@ -287,13 +288,13 @@ fn trial_session_rejects_relabel_fake_record_and_cross_project_laundering() {
         .canonical_record_bytes()
         .expect("canonical trial record");
     let relabeled = BlobId::digest(b"relabeled trial subject");
-    persist_trial(&mut store, &spec, &fixture.graph, relabeled, &canonical);
+    let relabeled_run_id = persist_trial(&mut store, &spec, &fixture.graph, relabeled, &canonical);
     let lease = store
-        .acquire_research_session(ResearchSessionKind::Trial, relabeled)
+        .acquire_trial_run_session(relabeled_run_id)
         .expect("persisted relabel claim");
     assert!(matches!(
         TrialJournal::new(spec.clone(), fixture.graph.clone(), &store, lease),
-        Err(TrialError::SessionLeaseMismatch)
+        Err(TrialError::SessionNormalizedSnapshotMismatch)
     ));
 
     let directory = tempdir().expect("temporary project");
@@ -301,7 +302,7 @@ fn trial_session_rejects_relabel_fake_record_and_cross_project_laundering() {
         ProjectStore::initialize(directory.path(), "fake record").expect("project store");
     let fixture = Fixture::new_for_project(store.manifest().project_id);
     let spec = fixture.spec();
-    persist_trial(
+    let fake_record_run_id = persist_trial(
         &mut store,
         &spec,
         &fixture.graph,
@@ -309,11 +310,11 @@ fn trial_session_rejects_relabel_fake_record_and_cross_project_laundering() {
         b"fake trial canonical record",
     );
     let lease = store
-        .acquire_research_session(ResearchSessionKind::Trial, spec.fingerprint())
+        .acquire_trial_run_session(fake_record_run_id)
         .expect("persisted fake record claim");
     assert!(matches!(
         TrialJournal::new(spec, fixture.graph, &store, lease),
-        Err(TrialError::SessionRecordMismatch)
+        Err(TrialError::SessionNormalizedSnapshotMismatch)
     ));
 
     let directory = tempdir().expect("temporary project");
@@ -325,7 +326,7 @@ fn trial_session_rejects_relabel_fake_record_and_cross_project_laundering() {
     let canonical = spec
         .canonical_record_bytes()
         .expect("canonical trial record");
-    persist_trial(
+    let cross_project_run_id = persist_trial(
         &mut store,
         &spec,
         &fixture.graph,
@@ -333,7 +334,7 @@ fn trial_session_rejects_relabel_fake_record_and_cross_project_laundering() {
         &canonical,
     );
     let lease = store
-        .acquire_research_session(ResearchSessionKind::Trial, spec.fingerprint())
+        .acquire_trial_run_session(cross_project_run_id)
         .expect("cross-project persisted claim");
     assert!(matches!(
         TrialJournal::new(spec, fixture.graph, &store, lease),
@@ -355,7 +356,7 @@ fn trial_session_rejects_exact_record_with_laundered_stage_rows() {
         let canonical = spec
             .canonical_record_bytes()
             .expect("canonical trial record");
-        persist_trial_with_stage_laundering(
+        let trial_run_id = persist_trial_with_stage_laundering(
             &mut store,
             &spec,
             &fixture.graph,
@@ -364,7 +365,7 @@ fn trial_session_rejects_exact_record_with_laundered_stage_rows() {
             laundering,
         );
         let lease = store
-            .acquire_research_session(ResearchSessionKind::Trial, spec.fingerprint())
+            .acquire_trial_run_session(trial_run_id)
             .expect("persisted laundered normalized rows");
         assert!(matches!(
             TrialJournal::new(spec, fixture.graph, &store, lease),
@@ -1481,7 +1482,7 @@ fn persist_trial(
     graph: &StageGraph,
     claimed_subject: BlobId,
     canonical_record_bytes: &[u8],
-) {
+) -> TrialRunId {
     persist_trial_with_stage_laundering(
         store,
         spec,
@@ -1489,7 +1490,7 @@ fn persist_trial(
         claimed_subject,
         canonical_record_bytes,
         StageLaundering::None,
-    );
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1506,7 +1507,7 @@ fn persist_trial_with_stage_laundering(
     claimed_subject: BlobId,
     canonical_record_bytes: &[u8],
     laundering: StageLaundering,
-) {
+) -> TrialRunId {
     let trial_maximum = research_budget_from_limits(spec.budget());
     store
         .persist_frozen_campaign(FrozenCampaignPersistence {
@@ -1591,6 +1592,18 @@ fn persist_trial_with_stage_laundering(
             stages: &stages,
         })
         .expect("persist frozen trial claim");
+
+    let trial_run_id = TrialRunId::new();
+    let run_record = TrialRunRecord::new(trial_run_id, claimed_subject, TrialRunOrigin::Standalone);
+    let run_record_bytes = run_record.canonical_bytes().expect("canonical trial run");
+    store
+        .persist_standalone_trial_run(StandaloneTrialRunPersistence {
+            trial_run_id,
+            trial_fingerprint: claimed_subject,
+            canonical_record_bytes: &run_record_bytes,
+        })
+        .expect("persist standalone trial run");
+    trial_run_id
 }
 
 fn research_budget_from_limits(limits: TrialBudgetLimits) -> ResearchBudgetMaximum {
@@ -1999,9 +2012,9 @@ mod real_native_runtime {
             .expect("initialize real trial store");
         let (spec, graph, prompt, binding) = build_real_trial(&store);
         let canonical = spec.canonical_record_bytes().expect("canonical real trial");
-        persist_trial(&mut store, &spec, &graph, spec.fingerprint(), &canonical);
+        let trial_run_id = persist_trial(&mut store, &spec, &graph, spec.fingerprint(), &canonical);
         let lease = store
-            .acquire_research_session(ResearchSessionKind::Trial, spec.fingerprint())
+            .acquire_trial_run_session(trial_run_id)
             .expect("real trial lease");
         let mut journal = TrialJournal::new(spec.clone(), graph.clone(), &store, lease)
             .expect("durable real trial journal");

@@ -16,6 +16,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-document-draft-clear`
 - `allow-document-reconciliation-preview`
 - `allow-document-reconcile-apply`
+- `allow-build-model-policy-get`
 - `allow-model-list`
 - `allow-model-choose`
 - `allow-model-download-status`
@@ -25,6 +26,8 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-branch-body`
 - `allow-weave-status`
 - `allow-application-close`
+- `allow-application-close-abort`
+- `allow-application-close-pending`
 
 ## Permission Table
 
@@ -103,6 +106,58 @@ Denies the application_close command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-application-close-abort`
+
+</td>
+<td>
+
+Enables the application_close_abort command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-application-close-abort`
+
+</td>
+<td>
+
+Denies the application_close_abort command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-application-close-pending`
+
+</td>
+<td>
+
+Enables the application_close_pending command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-application-close-pending`
+
+</td>
+<td>
+
+Denies the application_close_pending command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-branch-body`
 
 </td>
@@ -174,6 +229,32 @@ Enables the branch_page command without any pre-configured scope.
 <td>
 
 Denies the branch_page command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-build-model-policy-get`
+
+</td>
+<td>
+
+Enables the build_model_policy_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-build-model-policy-get`
+
+</td>
+<td>
+
+Denies the build_model_policy_get command without any pre-configured scope.
 
 </td>
 </tr>
@@ -616,6 +697,32 @@ Enables the model_load command without any pre-configured scope.
 <td>
 
 Denies the model_load command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-model-load-policy-candidate`
+
+</td>
+<td>
+
+Enables the model_load_policy_candidate command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-model-load-policy-candidate`
+
+</td>
+<td>
+
+Denies the model_load_policy_candidate command without any pre-configured scope.
 
 </td>
 </tr>

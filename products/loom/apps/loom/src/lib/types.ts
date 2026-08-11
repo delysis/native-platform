@@ -1,6 +1,26 @@
 export type DocumentKind = 'prose' | 'verse' | 'hybrid';
-export type EditorMode = 'visual' | 'source' | 'split';
+export type EditorMode = 'visual' | 'source';
 export type SaveState = 'clean' | 'dirty' | 'saving' | 'saved' | 'uncertain' | 'error';
+
+export type BuildModelPolicySummary =
+  | {
+      name: 'none-v1';
+      activation: 'project_opt_in';
+      canonical_sha256: string;
+    }
+  | {
+      name: 'writer-gemma4-base-v1';
+      activation: 'project_opt_in';
+      canonical_sha256: string;
+    }
+  | {
+      name: 'writer-gemma4-base-v2';
+      activation: 'quiet_default';
+      canonical_sha256: string;
+    };
+
+export type BuildModelPolicyName = BuildModelPolicySummary['name'];
+export type SuggestionActivation = BuildModelPolicySummary['activation'];
 
 export interface DocumentSummary {
   document_id: string;
@@ -103,7 +123,17 @@ export interface ModelCapabilitySummary {
   model_sha256: string | null;
   projector_present: boolean | null;
   media_kinds: Array<'image' | 'audio'>;
+  /** Size-only build-policy hint. It is never evidence that the file matches. */
+  policy_candidate: ModelPolicyProfile | null;
+  /** Exact policy identity established by native descriptor verification. */
+  policy_verified: ModelPolicyProfile | null;
+  /** Compatibility alias for policy_verified.profile_id. */
   tested_profile: string | null;
+}
+
+export interface ModelPolicyProfile {
+  profile_id: string;
+  rank: number;
 }
 
 export interface ModelUnloadOutcome {
@@ -161,6 +191,7 @@ export interface ModelDownloadSnapshot {
 export interface BranchCard {
   run_id: string;
   branch_id: string;
+  document_id: string;
   candidate_id: string | null;
   source_revision_id: string;
   target_start_byte: number;
@@ -194,6 +225,15 @@ export interface BranchPage {
 
 export interface BranchBody {
   run_id: string;
+  branch_id: string;
+  document_id: string;
+  candidate_id: string;
+  source_revision_id: string;
+  target_start_byte: number;
+  target_end_byte: number;
+  seed: string;
+  model_id: string;
+  created_at_unix_ms: number;
   output_blob_id: string;
   byte_len: number;
   text: string;

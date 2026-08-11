@@ -820,7 +820,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2222,7 +2222,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 [[package]]
 name = "llama-cpp-2"
 version = "0.1.154"
-source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f#01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=152dabbd3492d8e35fdf7112e556685c6c75ec9a#152dabbd3492d8e35fdf7112e556685c6c75ec9a"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2235,7 +2235,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.154"
-source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f#01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=152dabbd3492d8e35fdf7112e556685c6c75ec9a#152dabbd3492d8e35fdf7112e556685c6c75ec9a"
 dependencies = [
  "bindgen",
  "cc",
@@ -2249,7 +2249,7 @@ dependencies = [
 [[package]]
 name = "llama-native-cache"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=6a82439ee449599f7a7e477e1150ae29efdb23d6#6a82439ee449599f7a7e477e1150ae29efdb23d6"
+source = "git+https://github.com/delysis/llama-native-kit.git?rev=f87f57a5beb986d234c3fb059c92940578c70b27#f87f57a5beb986d234c3fb059c92940578c70b27"
 dependencies = [
  "llama-native-types",
  "serde",
@@ -2259,7 +2259,7 @@ dependencies = [
 [[package]]
 name = "llama-native-engine"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=6a82439ee449599f7a7e477e1150ae29efdb23d6#6a82439ee449599f7a7e477e1150ae29efdb23d6"
+source = "git+https://github.com/delysis/llama-native-kit.git?rev=f87f57a5beb986d234c3fb059c92940578c70b27#f87f57a5beb986d234c3fb059c92940578c70b27"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",
@@ -2273,7 +2273,7 @@ dependencies = [
 [[package]]
 name = "llama-native-host"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=6a82439ee449599f7a7e477e1150ae29efdb23d6#6a82439ee449599f7a7e477e1150ae29efdb23d6"
+source = "git+https://github.com/delysis/llama-native-kit.git?rev=f87f57a5beb986d234c3fb059c92940578c70b27#f87f57a5beb986d234c3fb059c92940578c70b27"
 dependencies = [
  "llama-native-cache",
  "llama-native-engine",
@@ -2283,7 +2283,7 @@ dependencies = [
 [[package]]
 name = "llama-native-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=6a82439ee449599f7a7e477e1150ae29efdb23d6#6a82439ee449599f7a7e477e1150ae29efdb23d6"
+source = "git+https://github.com/delysis/llama-native-kit.git?rev=f87f57a5beb986d234c3fb059c92940578c70b27#f87f57a5beb986d234c3fb059c92940578c70b27"
 dependencies = [
  "serde",
  "sha2",
@@ -2309,6 +2309,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 name = "loom-app"
 version = "0.1.0"
 dependencies = [
+ "loom-types",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -4595,8 +4596,10 @@ dependencies = [
  "loom-host",
  "loom-store",
  "loom-types",
+ "same-file",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-plugin",
  "tauri-plugin-dialog",

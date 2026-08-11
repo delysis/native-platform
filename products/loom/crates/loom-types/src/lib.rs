@@ -10,8 +10,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 mod generation;
+mod model_policy;
 
 pub use generation::*;
+pub use model_policy::*;
 
 macro_rules! ulid_id {
     ($name:ident) => {

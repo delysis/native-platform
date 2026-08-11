@@ -2,7 +2,10 @@
   import { onMount, tick } from 'svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
+  import SourceEditor from './lib/SourceEditor.svelte';
   import {
+    abortApplicationClose,
+    applicationClosePending,
     cancelGeneration,
     cancelModelDownload,
     checkpointDocument,
@@ -15,13 +18,15 @@
     getBranch,
     getBranchBody,
     getBranchPage,
+    getBuildModelPolicy,
     getModelDownloadStatus,
     getWeaveStatus,
     isDesktopRuntime,
-    keepCandidate,
+    listenForApplicationCloseRequests,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
     loadModel,
+    loadPolicyModelCandidate,
     listModels,
     listModelDownloads,
     openDefaultProject,
@@ -41,10 +46,35 @@
   import {
     decodeVerseForEditor,
     encodeVerseFromEditor,
-    type VerseEditorCodec
+    type VerseEditorCodec,
+    type VerseNewlineKind
   } from './lib/verseCodec';
   import { canRoundTripMarkdownExactly, canUseVisualMarkdown } from './lib/markdownSafety';
-  import { verifiedGhostSuggestion } from './lib/ghostSuggestion';
+  import {
+    autocompleteDisposition,
+    ghostReviewAffordance,
+    verifiedGhostSuggestion,
+    visibleVerifiedGhostSuggestion,
+    type AutocompleteDisposition
+  } from './lib/ghostSuggestion';
+  import {
+    emptyAutocompleteRetryLedger,
+    planAutocompleteRetry,
+    type AutocompleteRetryLedger
+  } from './lib/autocompleteRetry';
+  import {
+    candidateSurfaceReason,
+    candidateTextIsSurfaceable
+  } from './lib/candidateSurface';
+  import { sourceGhostPresentationCompatible } from './lib/sourceGhostText';
+  import { visualGhostTextMayBeInline } from './lib/ghostText';
+  import { isExtendedGraphemeBoundary } from './lib/graphemeBoundary';
+  import { branchIsActionableOnShelf } from './lib/branchShelf';
+  import {
+    verifyBranchBody,
+    verifiedBodyMatchesBranch,
+    type VerifiedBranchBody
+  } from './lib/branchBodyProof';
   import {
     appendUniquePage,
     branchBodyDisposition,
@@ -63,7 +93,27 @@
     closeResultMayHaveCommitted
   } from './lib/sessionSafety';
   import { drainGenerationsAndClose } from './lib/sessionCloseCoordinator';
-  import { restoreBeforeBackgroundWork, runCurrentWorkspaceStep } from './lib/startupSafety';
+  import {
+    ApplicationCloseCoordinator,
+    applicationAllowsModelPreparation,
+    applicationStartupDisposition,
+    isApplicationCloseAbortFailure,
+    type ApplicationCloseOutcome,
+    type ApplicationClosePhase,
+    type ProjectCloseOutcome
+  } from './lib/applicationCloseCoordinator';
+  import { ApplicationCloseRetryScheduler } from './lib/applicationCloseRetry';
+  import { suggestionsEnabledFromStoredPreference } from './lib/suggestionPreference';
+  import {
+    captureProjectCloseAgency,
+    restoreProjectCloseAgency,
+    type ProjectCloseAgencySnapshot
+  } from './lib/projectCloseAgency';
+  import {
+    restoreBeforeBackgroundWork,
+    runCurrentWorkspaceStep,
+    shouldDiscoverModelsOnStartup
+  } from './lib/startupSafety';
   import { newUlid } from './lib/ulid';
   import {
     DEFAULT_MODEL_DOWNLOAD_LIMIT_GIB,
@@ -77,10 +127,16 @@
     generationEventBelongsToScope,
     utf8ByteOffset
   } from './lib/weaveSafety';
+  import {
+    automaticWriterForBuildPolicy,
+    isVerifiedPolicyWriter,
+    orderedLocalWriterCandidates
+  } from './lib/modelPolicy';
   import type {
     BranchCard,
     BranchPageCursor,
     BranchSummary,
+    BuildModelPolicySummary,
     CommandReceipt,
     DesktopGenerationEnvelope,
     DocumentKind,
@@ -99,17 +155,22 @@
   } from './lib/types';
 
   let desktop = false;
+  let buildModelPolicy: BuildModelPolicySummary | null = null;
   let project: ProjectSnapshot | null = null;
   let document: OpenDocument | null = null;
   let documentText = '';
   let mode: EditorMode = 'visual';
+  let preferredProseMode: EditorMode = 'visual';
   let saveState: SaveState = 'clean';
   let saveMessage = 'No project open';
   let errorMessage = '';
   let lastFailure: LoomFailure | null = null;
   let opening = false;
-  let focusMode = false;
   let search = '';
+  let outlineOpen = false;
+  let outlineToggle: HTMLButtonElement | undefined;
+  let outlinePanel: HTMLElement | undefined;
+  let outlineSearch: HTMLInputElement | undefined;
   let models: ModelCapabilitySummary[] = [];
   let selectedModelPath = '';
   let modelLoading = false;
@@ -118,14 +179,20 @@
   let modelManagerOpen = false;
   let modelManagerPanel: HTMLElement | undefined;
   let modelManagerReturnFocus: HTMLElement | null = null;
+  let strandReviewDialog: HTMLDialogElement | undefined;
+  let strandReviewTrigger: HTMLButtonElement | undefined;
+  let strandReviewOpen = false;
+  let reviewCandidateId: string | null = null;
   let projectMenu: HTMLDetailsElement | undefined;
   let projectMenuTrigger: HTMLElement | undefined;
   let suggestionsEnabled = false;
   let suggestionsChanging = false;
   let suggestionsIdleTimer: number | undefined;
-  let suggestionTargetEditVersion: number | null = null;
+  let scheduledSuggestion: SuggestionSchedule | null = null;
   let suggestionIntentEpoch = 0;
+  let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
   let dismissedCandidateIds: string[] = [];
+  let unpresentableVisualGhostPresentationKeys: string[] = [];
   let announcedGhostPresentationKey = '';
   let modelDownloadUrl = '';
   let modelDownloadFileName = '';
@@ -153,10 +220,13 @@
   let branchFirstPageCursor: BranchPageCursor | null = null;
   let branchHasMore = false;
   let branchLoadingMore = false;
+  let branchLoadMoreOwner = 0;
   let branchLoadedPastFirstPage = false;
   let branchBodyBlobByRun: Record<string, string> = {};
+  let verifiedBranchBodyByRun: Record<string, VerifiedBranchBody> = {};
   let branchBodyErrorByRun: Record<string, string> = {};
   let branchRefreshSerial = 0;
+  let branchRefreshInFlightCount = 0;
   let sourceTextarea: HTMLTextAreaElement | undefined;
   let weaveStarting = false;
   let uncertainWeave: WeaveCapture | null = null;
@@ -171,8 +241,6 @@
   let generationSequenceByRun: Record<string, number> = {};
   let cancellingRunIds: string[] = [];
   let cancellationCommandByRun: Record<string, string> = {};
-  let keepingCandidateIds: string[] = [];
-  let keepCommandByCandidate: Record<string, string> = {};
   let promotionArmedCandidateId: string | null = null;
   let promotionInFlight = false;
   let uncertainPromotion: PromotionCapture | null = null;
@@ -188,7 +256,9 @@
   let sourceDisplayText = '';
   let sourceSelectionStart = 0;
   let sourceSelectionEnd = 0;
-  let visualSelectionAtEnd = false;
+  let visibleVisualGhostPresentationKey = '';
+  let visibleSourceGhostPresentationKey = '';
+  let visualSelectionByte: number | null = null;
   let visualMutationPending = false;
   let verseCodec: VerseEditorCodec | null = null;
   let compositionActive = false;
@@ -197,12 +267,21 @@
     flushPending: () => boolean;
     focusAtDocumentEnd: () => boolean;
   } | null = null;
+  let sourceEditor: {
+    focusAtDocumentEnd: () => boolean;
+  } | null = null;
   let componentMounted = false;
+  let desktopWorkspaceStarted = false;
+  let startupHeldForApplicationClose = false;
   let workspaceRestoreSerial = 0;
   let modelRefreshSerial = 0;
+  let modelRefreshInFlightCount = 0;
   let modelLoadSerial = 0;
-  let allowWindowClose = false;
-  let unlistenWindowClose: (() => void) | undefined;
+  let preferredWriterPending: WorkspaceRestoreCapture | null = null;
+  let preferredWriterEnsureInFlight: Promise<boolean> | null = null;
+  let preferredWriterWakeQueued = false;
+  let applicationClosePhase: ApplicationClosePhase = 'running';
+  let unlistenApplicationCloseRequest: (() => void) | undefined;
   let unlistenWindowFocus: (() => void) | undefined;
   let transition: 'idle' | 'navigation' | 'closing' = 'idle';
   let navigationSerial = 0;
@@ -219,7 +298,8 @@
   let uncertainDraft: DraftCapture | null = null;
   let pendingCloseCommandId: string | null = null;
   let pendingCloseMayHaveCommitted = false;
-  let closeInFlight: Promise<boolean> | null = null;
+  let pendingCloseAgency: ProjectCloseAgencySnapshot | null = null;
+  let closeInFlight: Promise<ProjectCloseOutcome> | null = null;
   let reconciliation: ReconciliationPreview | null = null;
   let reconciliationResolution = '';
   let pendingReconciliationApply: ReconciliationApplyCapture | null = null;
@@ -297,16 +377,55 @@
     sessionId: string;
     documentId: string;
     relativePath: string;
+    documentKind: DocumentKind;
     sourceRevisionId: string;
     visibleBlobId: string;
     cursorByte: number;
     editVersion: number;
     intentEpoch: number;
+    modelId: string;
   }
+
+  interface AutocompleteRetryTicket {
+    projectId: string;
+    sessionId: string;
+    documentId: string;
+    sourceRevisionId: string;
+    visibleBlobId: string;
+    documentEpoch: number;
+    editVersion: number;
+    intentEpoch: number;
+    mode: 'visual' | 'source';
+    targetByte: number;
+    modelId: string;
+    sourceNewline: VerseNewlineKind | null;
+    waitsRemaining: number;
+  }
+
+  type SuggestionSchedule =
+    | { kind: 'edit_pause'; editVersion: number }
+    | { kind: 'exhausted_retry'; ticket: AutocompleteRetryTicket };
 
   interface ModelDownloadCapture extends VerifiedDownloadForm {
     commandId: string;
   }
+
+  interface ModelLoadOptions {
+    expectedWorkspace?: WorkspaceRestoreCapture;
+    quiet?: boolean;
+  }
+
+  interface HydratedBranchBodies {
+    cards: BranchCard[];
+    bodyBlobByRun: Record<string, string>;
+    verifiedBodyByRun: Record<string, VerifiedBranchBody>;
+    bodyErrorByRun: Record<string, string>;
+  }
+
+  type WindowLifecycleInstallation =
+    | { status: 'ready' }
+    | { status: 'close_pending'; outcome: ApplicationCloseOutcome }
+    | { status: 'disposed' };
 
   type PromotionReloadOutcome = 'unchanged' | 'promoted' | 'source_changed' | 'reconciliation';
 
@@ -316,16 +435,69 @@
   const branchPollMaxMs = 4_000;
   const branchPageSize = 24;
   const branchShelfBodyMaxBytes = 1024 * 1024;
+  const applicationCloseRetry = new ApplicationCloseRetryScheduler({
+    schedule: (callback, delayMs) => window.setTimeout(callback, delayMs),
+    cancel: (handle) => window.clearTimeout(handle)
+  }, 300);
+
+  const applicationCloseCoordinator = new ApplicationCloseCoordinator({
+    begin: () => {
+      applicationClosePhase = 'closing';
+      clearPreferredWriterRequest();
+      cancelSuggestionTimer();
+      if (compositionActive) {
+        recordLocalFailure(
+          'composition_active',
+          'Finish the active text composition before closing Loom.'
+        );
+        announce(errorMessage);
+        return false;
+      }
+      return true;
+    },
+    closeProject: async () => project ? closeProject() : { status: 'closed' },
+    authorizeNativeClose: requestApplicationClose,
+    abortNativeClose: abortApplicationClose,
+    reset: () => {
+      applicationClosePhase = 'running';
+      if (transition === 'idle') requestPreferredWriterForCurrentWorkspace();
+    },
+    fail: (error) => {
+      recordFailure(error);
+      if (isApplicationCloseAbortFailure(error)) {
+        transition = 'closing';
+        cancelSuggestionTimer();
+        saveMessage = 'Application close state unknown';
+        announce('Loom could not confirm whether native closing was cancelled; editing remains locked');
+      }
+    }
+  });
   const modelDownloadPollBaseMs = 750;
   const modelDownloadPollMaxMs = 5_000;
   const suggestionsIdleDelayMs = 1_800;
+  const suggestionsRetryDelayMs = 350;
+  const maximumAutomaticSuggestionRetries = 1;
+  const maximumAutocompleteRetryWaits = 50;
 
   $: visibleDocuments = project?.documents.filter((candidate) => {
     const query = search.trim().toLocaleLowerCase();
     return !query || candidate.title.toLocaleLowerCase().includes(query) || candidate.relative_path.toLocaleLowerCase().includes(query);
   }) ?? [];
   $: loadedModel = models.find((model) => model.loaded) ?? null;
-  $: currentModel = models.find((model) => model.loaded && model.completion);
+  $: currentModel = automaticWriterForBuildPolicy(models, buildModelPolicy);
+  $: suggestionSetupNeeded = Boolean(
+    project &&
+    document &&
+    suggestionsEnabled &&
+    !currentModel &&
+    !modelLoading &&
+    !modelUnloading &&
+    !modelChoosing &&
+    modelRefreshInFlightCount === 0 &&
+    preferredWriterEnsureInFlight === null &&
+    preferredWriterPending === null &&
+    transition === 'idle'
+  );
   $: selectedModel = models.find((model) => model.model_path === selectedModelPath) ?? null;
   $: activeModelDownloads = modelDownloads.filter((download) => !modelDownloadIsTerminal(download));
   $: pendingModelDownloadSnapshot = pendingModelDownload
@@ -338,48 +510,143 @@
     branch.status === 'ready' &&
     branch.selection !== 'promote' &&
     branch.selection !== 'reject' &&
-    branch.source_revision_id === document?.summary.revision_id
+    branch.source_revision_id === document?.summary.revision_id &&
+    branch.model_id === currentModel?.model_id
   );
-  $: inlineSuggestion = suggestionsEnabled && !focusMode
-    ? currentReadyBranches.find((branch) =>
-      Boolean(branch.candidate_id) && !dismissedCandidateIds.includes(branch.candidate_id ?? '')
-    ) ?? null
+  $: shelfBranches = branches.filter((branch) =>
+    branchIsActionableOnShelf(branch, document?.summary.revision_id)
+  );
+  $: branchPromotionReady = Boolean(
+    project &&
+    document &&
+    document.summary.kind !== 'hybrid' &&
+    document.summary.active_blob_id === document.visible_blob_id &&
+    transition === 'idle' &&
+    editVersion === savedVersion &&
+    (saveState === 'clean' || saveState === 'saved') &&
+    !sourceDirty &&
+    !visualMutationPending &&
+    !compositionActive &&
+    !saveInFlight &&
+    !weaveStarting &&
+    !staleDraft &&
+    !uncertainDraft &&
+    !uncertainSave &&
+    !reconciliation &&
+    !promotionInFlight &&
+    !uncertainPromotion
+  );
+  $: visualGhostTargetByte = mode === 'visual' ? visualSelectionByte : null;
+  $: visualGhostSurfaceKey = project && document
+    ? `${project.session_id}:${document.summary.document_id}:${documentEpoch}:visual`
+    : '';
+  $: sourceGhostTargetByte = sourceGhostTargetByteFor(
+    mode,
+    Boolean(sourceTextarea),
+    sourceSelectionStart,
+    sourceSelectionEnd,
+    sourceDisplayText,
+    document,
+    documentText,
+    verseCodec
+  );
+  $: visualAutocompleteDisposition = autocompleteDisposition({
+    active: mode === 'visual' && suggestionsEnabled && !visualMutationPending && branchPromotionReady,
+    branches: currentReadyBranches,
+    verifiedBodyByRun: verifiedBranchBodyByRun,
+    dismissedCandidateIds,
+    unpresentablePresentationKeys: unpresentableVisualGhostPresentationKeys,
+    targetByte: visualGhostTargetByte,
+    presentationCompatible: visualGhostTextMayBeInline
+  });
+  $: ghostSuggestion = visualAutocompleteDisposition.kind === 'available'
+    ? visualAutocompleteDisposition.suggestion
     : null;
-  $: inlineSuggestionAtCaret = Boolean(
-    inlineSuggestion &&
-    (mode === 'visual' || mode === 'source') &&
-    sourceSelectionStart >= 0 &&
-    suggestionMatchesCurrentCaret(
-      inlineSuggestion,
-      visualSelectionAtEnd,
-      sourceSelectionStart,
-      sourceSelectionEnd
+  $: sourceGhostNewline = document?.summary.kind === 'verse'
+    ? verseCodec?.newline ?? 'mixed'
+    : null;
+  $: sourceAutocompleteDisposition = autocompleteDisposition({
+    active: mode === 'source' && suggestionsEnabled && !sourceDirty && !compositionActive && branchPromotionReady,
+    branches: currentReadyBranches,
+    verifiedBodyByRun: verifiedBranchBodyByRun,
+    dismissedCandidateIds,
+    unpresentablePresentationKeys: [],
+    targetByte: sourceGhostTargetByte,
+    presentationCompatible: (text) =>
+      sourceGhostPresentationCompatible(sourceDisplayText, text, sourceGhostNewline)
+  });
+  $: sourceGhostCandidate = sourceAutocompleteDisposition.kind === 'available'
+    ? sourceAutocompleteDisposition.suggestion
+    : null;
+  $: sourceGhostSuggestion = sourceGhostCandidate;
+  $: activeGhostSuggestion = mode === 'visual'
+    ? visibleVerifiedGhostSuggestion(
+      ghostSuggestion,
+      visibleVisualGhostPresentationKey
     )
+    : mode === 'source'
+      ? visibleVerifiedGhostSuggestion(
+        sourceGhostSuggestion,
+        visibleSourceGhostPresentationKey
+      )
+      : null;
+  $: reviewTargetByte = mode === 'visual'
+    ? visualGhostTargetByte
+    : mode === 'source'
+      ? sourceGhostTargetByte
+      : null;
+  $: exactReviewBranches = suggestionsEnabled && branchPromotionReady && reviewTargetByte !== null
+    ? shelfBranches.filter((branch) =>
+      branch.status === 'ready' &&
+      branch.target_start_byte === reviewTargetByte &&
+      branch.target_end_byte === reviewTargetByte &&
+      Boolean(verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[branch.run_id]))
+    )
+    : [];
+  $: reviewableBranches = exactReviewBranches.filter((branch) =>
+    candidateTextIsSurfaceable(branch.text)
   );
-  $: ghostSuggestion = findVisualGhostSuggestion();
+  $: suppressedReviewBranches = exactReviewBranches.filter((branch) =>
+    !candidateTextIsSurfaceable(branch.text)
+  );
   $: if (
-    ghostSuggestion &&
-    ghostSuggestion.presentationKey !== announcedGhostPresentationKey
+    reviewableBranches.length > 0 &&
+    !reviewableBranches.some((branch) => branch.candidate_id === reviewCandidateId)
+  ) reviewCandidateId = reviewableBranches[0].candidate_id;
+  $: reviewBranch = reviewableBranches.find(
+    (branch) => branch.candidate_id === reviewCandidateId
+  ) ?? reviewableBranches[0] ?? null;
+  $: reviewBranchIndex = reviewBranch
+    ? reviewableBranches.findIndex((branch) => branch.run_id === reviewBranch.run_id)
+    : -1;
+  $: reviewAffordance = ghostReviewAffordance(
+    Boolean(activeGhostSuggestion),
+    reviewableBranches.length
+  );
+  $: if (
+    activeGhostSuggestion &&
+    activeGhostSuggestion.presentationKey !== announcedGhostPresentationKey
   ) {
-    announcedGhostPresentationKey = ghostSuggestion.presentationKey;
+    announcedGhostPresentationKey = activeGhostSuggestion.presentationKey;
     announce('Suggestion available. Tab accepts; Escape dismisses.');
   }
   $: automaticBoundaryIsExact = mode === 'visual'
-    ? visualSelectionAtEnd
+    ? visualSelectionByte !== null
     : mode === 'source' && Boolean(sourceTextarea) && sourceSelectionStart === sourceSelectionEnd;
   $: canUseVisual = Boolean(
     document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')
   );
   $: weaveCursorAtStart = mode === 'source'
     ? sourceSelectionStart === 0
-    : documentText.length === 0;
+    : visualSelectionByte === 0;
   $: canStartAutomaticSuggestions = Boolean(
       document &&
       document.summary.kind !== 'hybrid' &&
       currentModel &&
+      !modelLoading &&
+      !modelUnloading &&
       suggestionsEnabled &&
       !uncertainWeave &&
-      !focusMode &&
       !compositionActive &&
       !visualMutationPending &&
       !sourceDirty &&
@@ -396,8 +663,17 @@
       automaticBoundaryIsExact &&
       activeBranchCount === 0
   );
-  $: showVisual = mode === 'visual' || mode === 'split';
-  $: showSource = mode === 'source' || mode === 'split';
+  $: retryEvaluationSnapshot = {
+    enabled: desktop && branchPromotionReady && suggestionsEnabled && Boolean(currentModel) && activeBranchCount === 0,
+    disposition: mode === 'visual'
+      ? visualAutocompleteDisposition
+      : sourceAutocompleteDisposition
+  };
+  $: if (retryEvaluationSnapshot.enabled) {
+    maybeRetryExhaustedAutocomplete(retryEvaluationSnapshot.disposition);
+  }
+  $: showVisual = mode === 'visual';
+  $: showSource = mode === 'source';
   $: exactTextSurface = document?.summary.kind === 'verse';
   $: editorReadonly = transition !== 'idle' || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
   $: reconciliationResolutionLocked = reconciliationApplying || pendingReconciliationApply !== null;
@@ -414,17 +690,39 @@
     componentMounted = true;
     desktop = isDesktopRuntime();
     if (desktop) {
-      void installWindowLifecycleHandlers();
-      void installGenerationEventListener();
-      void restoreDesktopWorkspace();
+      void (async () => {
+        try {
+          const lifecycle = await installWindowLifecycleHandlers();
+          switch (lifecycle.status) {
+            case 'ready':
+              startDesktopWorkspace();
+              return;
+            case 'close_pending':
+              startupHeldForApplicationClose = true;
+              return;
+            case 'disposed':
+              return;
+            default: {
+              const unreachable: never = lifecycle;
+              return unreachable;
+            }
+          }
+        } catch (error) {
+          if (!componentMounted) return;
+          recordFailure(error);
+          announce('Loom could not install safe application close handling');
+        }
+      })();
     }
     window.addEventListener('keydown', handleGlobalKeydown);
     window.addEventListener('pointerdown', handleGlobalPointerdown);
     return () => {
       componentMounted = false;
+      startupHeldForApplicationClose = false;
       workspaceRestoreSerial += 1;
       modelRefreshSerial += 1;
       modelLoadSerial += 1;
+      clearPreferredWriterRequest();
       window.removeEventListener('keydown', handleGlobalKeydown);
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
       if (saveTimer !== undefined) window.clearTimeout(saveTimer);
@@ -438,14 +736,25 @@
       modelDownloadListenerDisposed = true;
       unlistenGenerationEvents?.();
       unlistenModelDownloadEvents?.();
+      const closeRequestListener = unlistenApplicationCloseRequest;
+      unlistenApplicationCloseRequest = undefined;
+      closeRequestListener?.();
       if (modelDownloadPollTimer !== undefined) window.clearTimeout(modelDownloadPollTimer);
       if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
+      applicationCloseRetry.dispose();
       for (const timer of staleWeaveCleanupTimers) window.clearTimeout(timer);
       staleWeaveCleanupTimers.clear();
-      unlistenWindowClose?.();
       unlistenWindowFocus?.();
     };
   });
+
+  function startDesktopWorkspace(): void {
+    if (!componentMounted || desktopWorkspaceStarted) return;
+    desktopWorkspaceStarted = true;
+    void installWindowFocusHandler();
+    void installGenerationEventListener();
+    void restoreDesktopWorkspace();
+  }
 
   function countWords(text: string): number {
     return text.match(/[\p{L}\p{N}]+(?:[’'-][\p{L}\p{N}]+)*/gu)?.length ?? 0;
@@ -477,21 +786,22 @@
 
   function resetLiveGenerationView(): void {
     stopBranchPolling();
+    unpresentableVisualGhostPresentationKeys = [];
     branchRefreshSerial += 1;
     branchNextCursor = null;
     branchFirstPageCursor = null;
     branchHasMore = false;
+    branchLoadMoreOwner += 1;
     branchLoadingMore = false;
     branchLoadedPastFirstPage = false;
     branchBodyBlobByRun = {};
+    verifiedBranchBodyByRun = {};
     branchBodyErrorByRun = {};
     liveBranchText = {};
     liveBranchState = {};
     generationSequenceByRun = {};
     cancellingRunIds = [];
     cancellationCommandByRun = {};
-    keepingCandidateIds = [];
-    keepCommandByCandidate = {};
     uncertainWeave = null;
   }
 
@@ -517,6 +827,7 @@
       sourceProjectionTimer = undefined;
     }
     if (document) documentEpoch += 1;
+    closeStrandReview();
     document = null;
     documentText = '';
     sourceDisplayText = '';
@@ -717,19 +1028,60 @@
     announce('The resolution is in history; a newer external change now needs review');
   }
 
-  async function installWindowLifecycleHandlers(): Promise<void> {
-    const appWindow = getCurrentWindow();
-    unlistenWindowFocus = await appWindow.onFocusChanged(({ payload: focused }) => {
-      if (!focused && !compositionActive && !reconciliation) {
-        flushEditors();
-        void saveNow();
-      }
-    });
-    unlistenWindowClose = await appWindow.onCloseRequested((event) => {
-      if (allowWindowClose) return;
-      event.preventDefault();
+  async function installWindowLifecycleHandlers(): Promise<WindowLifecycleInstallation> {
+    const unlisten = await listenForApplicationCloseRequests(() => {
       void closeWindowGracefully();
     });
+    if (!componentMounted) {
+      unlisten();
+      return { status: 'disposed' };
+    }
+    const previousListener = unlistenApplicationCloseRequest;
+    unlistenApplicationCloseRequest = unlisten;
+    previousListener?.();
+    let closePending: boolean;
+    try {
+      closePending = await applicationClosePending();
+    } catch (error) {
+      if (unlistenApplicationCloseRequest === unlisten) {
+        unlistenApplicationCloseRequest = undefined;
+        unlisten();
+      }
+      throw error;
+    }
+    if (!componentMounted) {
+      if (unlistenApplicationCloseRequest === unlisten) {
+        unlistenApplicationCloseRequest = undefined;
+        unlisten();
+      }
+      return { status: 'disposed' };
+    }
+    if (!closePending) return { status: 'ready' };
+
+    const outcome = await closeWindowGracefully();
+    if (!componentMounted) return { status: 'disposed' };
+    return applicationStartupDisposition(outcome) === 'continue'
+      ? { status: 'ready' }
+      : { status: 'close_pending', outcome };
+  }
+
+  async function installWindowFocusHandler(): Promise<void> {
+    try {
+      const unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+        if (!focused && !compositionActive && !reconciliation) {
+          flushEditors();
+          void saveNow();
+        }
+      });
+      if (!componentMounted) {
+        unlisten();
+        return;
+      }
+      unlistenWindowFocus?.();
+      unlistenWindowFocus = unlisten;
+    } catch (error) {
+      if (componentMounted) recordFailure(error);
+    }
   }
 
   async function installGenerationEventListener(): Promise<void> {
@@ -875,7 +1227,7 @@
       ...handledModelDownloadCompletions,
       snapshot.command_id
     ];
-    await refreshModels();
+    await refreshCurrentModelsAndEnsureWriter();
     const downloaded = models.find((model) => model.model_path === snapshot.target_path);
     if (downloaded) {
       selectedModelPath = downloaded.model_path;
@@ -890,7 +1242,7 @@
     snapshot: ModelDownloadSnapshot
   ): Promise<void> {
     modelDownloadError = '';
-    await refreshModels();
+    await refreshCurrentModelsAndEnsureWriter();
     const discovered = models.find((model) => model.model_path === snapshot.target_path);
     if (!discovered) {
       modelDownloadError = 'The verified file is installed, but model discovery did not return it.';
@@ -1098,7 +1450,7 @@
       }));
       cancellingRunIds = cancellingRunIds.filter((runId) => runId !== generation.run_id);
       scheduleBranchRefresh();
-      announce(status === 'ready' ? 'A private strand is ready' : `A private strand ${status}`);
+      if (status !== 'ready') announce(`A private strand ${status}`);
       return;
     }
 
@@ -1212,8 +1564,14 @@
     if (matched) branches = next;
   }
 
-  function validateBranchSnapshots(snapshots: BranchSummary[]): void {
+  function validateBranchSnapshots(
+    snapshots: BranchSummary[],
+    expectedDocumentId: string
+  ): void {
     for (const branch of snapshots) {
+      if (branch.document_id !== expectedDocumentId) {
+        throw new Error('The desktop returned a branch for a different manuscript.');
+      }
       if (
         !Number.isSafeInteger(branch.target_start_byte) ||
         !Number.isSafeInteger(branch.target_end_byte) ||
@@ -1256,16 +1614,10 @@
   }
 
   function cardsFromSummaries(summaries: BranchSummary[]): BranchCard[] {
-    const existingByRun = new Map(branches.map((branch) => [branch.run_id, branch]));
     return summaries.map((summary) => {
-      const existing = existingByRun.get(summary.run_id);
-      const bodyIsCached = branchBodyDisposition(
-        summary,
-        branchBodyBlobByRun[summary.run_id],
-        branchShelfBodyMaxBytes
-      ) === 'cached';
-      const text = bodyIsCached
-        ? existing?.text ?? ''
+      const verifiedBody = verifiedBranchBodyByRun[summary.run_id];
+      const text = verifiedBodyMatchesBranch(verifiedBody, summary)
+        ? verifiedBody.text
         : liveBranchText[summary.run_id] ?? '';
       return applyLiveBranchState({ ...summary, text }, true);
     });
@@ -1278,9 +1630,10 @@
     cards: BranchCard[],
     expectedViewEpoch: number,
     refreshSerial: number
-  ): Promise<BranchCard[]> {
+  ): Promise<HydratedBranchBodies | null> {
     const hydrated = [...cards];
     const bodyBlobByRun = { ...branchBodyBlobByRun };
+    const verifiedBodyByRun = { ...verifiedBranchBodyByRun };
     const bodyErrorByRun = { ...branchBodyErrorByRun };
     for (let index = 0; index < hydrated.length; index += 1) {
       const branch = hydrated[index];
@@ -1290,14 +1643,27 @@
         bodyBlobByRun[branch.run_id],
         branchShelfBodyMaxBytes
       );
-      if (disposition === 'absent' || disposition === 'cached') continue;
+      if (disposition === 'absent') continue;
       if (!outputBlobId) throw new Error('The desktop omitted the branch body identity.');
       if (branch.output_byte_len === null) {
         throw new Error('The desktop omitted the indexed branch body length.');
       }
+      if (disposition === 'cached') {
+        const verifiedBody = verifiedBodyByRun[branch.run_id];
+        if (
+          verifiedBodyMatchesBranch(verifiedBody, branch) &&
+          branch.text === verifiedBody.text
+        ) continue;
+        if (bodyErrorByRun[branch.run_id]) {
+          hydrated[index] = { ...branch, text: '' };
+          delete verifiedBodyByRun[branch.run_id];
+          continue;
+        }
+      }
       if (disposition === 'too_large') {
         hydrated[index] = { ...branch, text: '' };
         bodyBlobByRun[branch.run_id] = outputBlobId;
+        delete verifiedBodyByRun[branch.run_id];
         bodyErrorByRun[branch.run_id] = `Candidate text is ${branch.output_byte_len.toLocaleString()} bytes; the shelf preview limit is ${branchShelfBodyMaxBytes.toLocaleString()} bytes.`;
         continue;
       }
@@ -1314,31 +1680,27 @@
         documentId,
         expectedViewEpoch,
         refreshSerial
-      )) return hydrated;
-      if (
-        !body ||
-        body.run_id !== branch.run_id ||
-        body.output_blob_id !== outputBlobId ||
-        body.byte_len !== branch.output_byte_len ||
-        new TextEncoder().encode(body.text).byteLength !== body.byte_len
-      ) {
+      )) return null;
+      if (!body) {
         throw new Error('The desktop returned a branch body that does not match its immutable metadata.');
       }
-      hydrated[index] = { ...branch, text: body.text };
+      const verifiedBody = await verifyBranchBody(body, branch);
+      if (!verifiedBody) {
+        throw new Error('The desktop returned branch text that does not match its immutable SHA-256 identity.');
+      }
+      hydrated[index] = { ...branch, text: verifiedBody.text };
       bodyBlobByRun[branch.run_id] = outputBlobId;
+      verifiedBodyByRun[branch.run_id] = verifiedBody;
       delete bodyErrorByRun[branch.run_id];
     }
-    if (branchScopeMatches(
+    if (!branchScopeMatches(
       projectId,
       sessionId,
       documentId,
       expectedViewEpoch,
       refreshSerial
-    )) {
-      branchBodyBlobByRun = bodyBlobByRun;
-      branchBodyErrorByRun = bodyErrorByRun;
-    }
-    return hydrated;
+    )) return null;
+    return { cards: hydrated, bodyBlobByRun, verifiedBodyByRun, bodyErrorByRun };
   }
 
   function reconcileBranchActionState(): void {
@@ -1351,21 +1713,64 @@
       if (!activeRunIds.has(runId)) delete nextCancellationCommands[runId];
     }
     cancellationCommandByRun = nextCancellationCommands;
-    const selectableCandidateIds = new Set(
-      branches
-        .filter((branch) => branch.candidate_id && branch.selection === null)
-        .map((branch) => branch.candidate_id as string)
-    );
-    const nextKeepCommands = { ...keepCommandByCandidate };
-    for (const candidateId of Object.keys(nextKeepCommands)) {
-      if (!selectableCandidateIds.has(candidateId)) delete nextKeepCommands[candidateId];
-    }
-    keepCommandByCandidate = nextKeepCommands;
     if (
       promotionArmedCandidateId &&
       !branches.some((branch) => branch.candidate_id === promotionArmedCandidateId)
     ) {
       promotionArmedCandidateId = null;
+    }
+  }
+
+  function maybeRetryExhaustedAutocomplete(
+    disposition: AutocompleteDisposition
+  ): void {
+    if (
+      !desktop ||
+      !project ||
+      !document ||
+      !currentModel ||
+      !suggestionsEnabled ||
+      !branchPromotionReady
+    ) return;
+    const sourceRevisionId = document.summary.revision_id;
+    if (!sourceRevisionId) return;
+    const retryMode = mode === 'visual' || mode === 'source' ? mode : null;
+    if (!retryMode) return;
+    const targetByte = retryMode === 'visual'
+      ? visualGhostTargetByte
+      : sourceGhostTargetByte;
+    if (targetByte === null) return;
+    const budgetKey = [
+      project.project_id,
+      project.session_id,
+      document.summary.document_id,
+      sourceRevisionId,
+      editVersion
+    ].join(':');
+    const decision = planAutocompleteRetry(autocompleteRetryLedger, {
+      disposition,
+      budgetKey,
+      activeBranchCount: branches.filter(isBranchActive).length,
+      weaveStarting,
+      maximumRetries: maximumAutomaticSuggestionRetries
+    });
+    autocompleteRetryLedger = decision.ledger;
+    if (decision.kind === 'schedule') {
+      scheduleAutocompleteRetry({
+        projectId: project.project_id,
+        sessionId: project.session_id,
+        documentId: document.summary.document_id,
+        sourceRevisionId,
+        visibleBlobId: document.visible_blob_id,
+        documentEpoch,
+        editVersion,
+        intentEpoch: suggestionIntentEpoch,
+        mode: retryMode,
+        targetByte,
+        modelId: currentModel.model_id,
+        sourceNewline: retryMode === 'source' ? sourceGhostNewline : null,
+        waitsRemaining: maximumAutocompleteRetryWaits
+      });
     }
   }
 
@@ -1377,6 +1782,7 @@
     expectedViewEpoch = branchPollEpoch
   ): Promise<boolean> {
     const refreshSerial = ++branchRefreshSerial;
+    branchRefreshInFlightCount += 1;
     try {
       const page = await getBranchPage(
         projectId,
@@ -1392,7 +1798,7 @@
         expectedViewEpoch,
         refreshSerial
       )) return false;
-      validateBranchSnapshots(page.branches);
+      validateBranchSnapshots(page.branches, documentId);
       validateBranchCursor(page.next_cursor);
       if (page.has_more !== (page.next_cursor !== null)) {
         throw new Error('The desktop returned inconsistent branch page metadata.');
@@ -1408,7 +1814,7 @@
         branchLoadedPastFirstPage = false;
       }
       branchFirstPageCursor = page.next_cursor;
-      const hydrated = await hydrateBranchBodies(
+      const hydration = await hydrateBranchBodies(
         projectId,
         sessionId,
         documentId,
@@ -1416,14 +1822,17 @@
         expectedViewEpoch,
         refreshSerial
       );
-      if (!branchScopeMatches(
+      if (!hydration || !branchScopeMatches(
         projectId,
         sessionId,
         documentId,
         expectedViewEpoch,
         refreshSerial
       )) return false;
-      const hydratedByRun = new Map(hydrated.map((branch) => [branch.run_id, branch]));
+      const hydratedByRun = new Map(hydration.cards.map((branch) => [branch.run_id, branch]));
+      branchBodyBlobByRun = hydration.bodyBlobByRun;
+      verifiedBranchBodyByRun = hydration.verifiedBodyByRun;
+      branchBodyErrorByRun = hydration.bodyErrorByRun;
       branches = branches.map((branch) => hydratedByRun.get(branch.run_id) ?? branch);
       reconcileBranchActionState();
       if (branches.some(isBranchActive)) scheduleActiveBranchPoll();
@@ -1439,6 +1848,8 @@
         announce('Stored strands could not be refreshed');
       }
       return false;
+    } finally {
+      branchRefreshInFlightCount = Math.max(0, branchRefreshInFlightCount - 1);
     }
   }
 
@@ -1456,7 +1867,14 @@
   }
 
   async function loadMoreBranches(): Promise<void> {
-    if (!project || !document || !branchNextCursor || !branchHasMore || branchLoadingMore) return;
+    if (
+      !project ||
+      !document ||
+      !branchNextCursor ||
+      !branchHasMore ||
+      branchLoadingMore ||
+      branchRefreshInFlightCount > 0
+    ) return;
     const scope = {
       projectId: project.project_id,
       sessionId: project.session_id,
@@ -1465,6 +1883,7 @@
       cursor: branchNextCursor
     };
     const refreshSerial = ++branchRefreshSerial;
+    const loadOwner = ++branchLoadMoreOwner;
     branchLoadingMore = true;
     try {
       const page = await getBranchPage(
@@ -1481,7 +1900,7 @@
         scope.viewEpoch,
         refreshSerial
       )) return;
-      validateBranchSnapshots(page.branches);
+      validateBranchSnapshots(page.branches, scope.documentId);
       validateBranchCursor(page.next_cursor);
       if (page.has_more !== (page.next_cursor !== null)) {
         throw new Error('The desktop returned inconsistent branch page metadata.');
@@ -1491,7 +1910,7 @@
       branchNextCursor = page.next_cursor;
       branchHasMore = page.has_more;
       branchLoadedPastFirstPage = true;
-      const hydrated = await hydrateBranchBodies(
+      const hydration = await hydrateBranchBodies(
         scope.projectId,
         scope.sessionId,
         scope.documentId,
@@ -1499,14 +1918,17 @@
         scope.viewEpoch,
         refreshSerial
       );
-      if (!branchScopeMatches(
+      if (!hydration || !branchScopeMatches(
         scope.projectId,
         scope.sessionId,
         scope.documentId,
         scope.viewEpoch,
         refreshSerial
       )) return;
-      const hydratedByRun = new Map(hydrated.map((branch) => [branch.run_id, branch]));
+      const hydratedByRun = new Map(hydration.cards.map((branch) => [branch.run_id, branch]));
+      branchBodyBlobByRun = hydration.bodyBlobByRun;
+      verifiedBranchBodyByRun = hydration.verifiedBodyByRun;
+      branchBodyErrorByRun = hydration.bodyErrorByRun;
       branches = branches.map((branch) => hydratedByRun.get(branch.run_id) ?? branch);
       reconcileBranchActionState();
     } catch (error) {
@@ -1519,7 +1941,7 @@
         announce('Older strands could not be loaded');
       }
     } finally {
-      branchLoadingMore = false;
+      if (branchLoadMoreOwner === loadOwner) branchLoadingMore = false;
     }
   }
 
@@ -1607,20 +2029,20 @@
     }, 150);
   }
 
-  async function closeWindowGracefully(): Promise<void> {
-    if (compositionActive) {
-      recordLocalFailure('composition_active', 'Finish the active text composition before closing Loom.');
-      announce(errorMessage);
-      return;
+  async function closeWindowGracefully(): Promise<ApplicationCloseOutcome> {
+    const attemptEpoch = applicationCloseRetry.beginAttempt();
+    const outcome = await applicationCloseCoordinator.request();
+    applicationCloseRetry.settle(attemptEpoch, outcome, () => {
+      if (componentMounted) void closeWindowGracefully();
+    });
+    if (
+      startupHeldForApplicationClose &&
+      applicationStartupDisposition(outcome) === 'continue'
+    ) {
+      startupHeldForApplicationClose = false;
+      startDesktopWorkspace();
     }
-    if (project && !(await closeProject())) return;
-    try {
-      await requestApplicationClose();
-      allowWindowClose = true;
-    } catch (error) {
-      allowWindowClose = false;
-      recordFailure(error);
-    }
+    return outcome;
   }
 
   function workspaceRestoreIsCurrent(captured: WorkspaceRestoreCapture): boolean {
@@ -1632,8 +2054,142 @@
     );
   }
 
+  function workspaceCapturesMatch(
+    left: WorkspaceRestoreCapture | null,
+    right: WorkspaceRestoreCapture | null
+  ): boolean {
+    return Boolean(
+      left &&
+      right &&
+      left.restoreSerial === right.restoreSerial &&
+      left.projectId === right.projectId &&
+      left.sessionId === right.sessionId
+    );
+  }
+
+  function currentWorkspaceCapture(): WorkspaceRestoreCapture | null {
+    if (!project) return null;
+    return {
+      restoreSerial: workspaceRestoreSerial,
+      projectId: project.project_id,
+      sessionId: project.session_id
+    };
+  }
+
+  function clearPreferredWriterRequest(captured?: WorkspaceRestoreCapture): void {
+    if (!captured || workspaceCapturesMatch(preferredWriterPending, captured)) {
+      preferredWriterPending = null;
+    }
+  }
+
+  function queuePreferredWriterRequest(captured: WorkspaceRestoreCapture): void {
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !suggestionsEnabled ||
+      !workspaceRestoreIsCurrent(captured)
+    ) return;
+    preferredWriterPending = { ...captured };
+  }
+
+  function wakePreferredWriterEnsure(): void {
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      preferredWriterWakeQueued ||
+      !preferredWriterPending
+    ) return;
+    preferredWriterWakeQueued = true;
+    queueMicrotask(() => {
+      preferredWriterWakeQueued = false;
+      void drainPreferredWriterEnsure();
+    });
+  }
+
+  function requestPreferredWriterEnsure(captured: WorkspaceRestoreCapture): void {
+    queuePreferredWriterRequest(captured);
+    wakePreferredWriterEnsure();
+  }
+
+  function requestPreferredWriterForCurrentWorkspace(): void {
+    const captured = currentWorkspaceCapture();
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !captured ||
+      !suggestionsEnabled ||
+      currentModel
+    ) return;
+    requestPreferredWriterEnsure(captured);
+  }
+
+  function drainPreferredWriterEnsure(): Promise<boolean> {
+    if (preferredWriterEnsureInFlight) return preferredWriterEnsureInFlight;
+    const captured = preferredWriterPending;
+    if (!captured) return Promise.resolve(Boolean(currentModel));
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !suggestionsEnabled ||
+      !workspaceRestoreIsCurrent(captured)
+    ) {
+      clearPreferredWriterRequest(captured);
+      return Promise.resolve(false);
+    }
+    if (
+      modelLoading ||
+      modelUnloading ||
+      modelRefreshInFlightCount > 0 ||
+      transition !== 'idle' ||
+      !document
+    ) return Promise.resolve(false);
+
+    preferredWriterPending = null;
+    const task = ensurePreferredWriterOnce(captured).catch(() => false);
+    preferredWriterEnsureInFlight = task;
+    void task.finally(() => {
+      if (preferredWriterEnsureInFlight !== task) return;
+      preferredWriterEnsureInFlight = null;
+      wakePreferredWriterEnsure();
+    });
+    return task;
+  }
+
+  async function ensurePreferredWriterOnce(
+    captured: WorkspaceRestoreCapture
+  ): Promise<boolean> {
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !suggestionsEnabled ||
+      !workspaceRestoreIsCurrent(captured)
+    ) return false;
+    if (currentModel) {
+      if (document) scheduleAutomaticSuggestions(editVersion);
+      return true;
+    }
+
+    const refreshed = await refreshModels(captured);
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !suggestionsEnabled ||
+      !workspaceRestoreIsCurrent(captured)
+    ) return false;
+    if (!refreshed && modelRefreshInFlightCount > 0) {
+      queuePreferredWriterRequest(captured);
+      return false;
+    }
+    await tick();
+    if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
+    if (currentModel) {
+      if (document) scheduleAutomaticSuggestions(editVersion);
+      return true;
+    }
+    if (modelLoading || modelUnloading || transition !== 'idle' || !document) {
+      queuePreferredWriterRequest(captured);
+      return false;
+    }
+    return loadPreferredSuggestionModel(captured);
+  }
+
   async function refreshModels(expectedWorkspace?: WorkspaceRestoreCapture): Promise<boolean> {
     const refreshSerial = ++modelRefreshSerial;
+    modelRefreshInFlightCount += 1;
     try {
       const discovered = await listModels();
       if (
@@ -1663,11 +2219,37 @@
       models = [];
       selectedModelPath = '';
       return false;
+    } finally {
+      modelRefreshInFlightCount = Math.max(0, modelRefreshInFlightCount - 1);
+      if (
+        applicationAllowsModelPreparation(applicationClosePhase) &&
+        modelRefreshInFlightCount === 0
+      ) wakePreferredWriterEnsure();
     }
+  }
+
+  async function refreshCurrentModelsAndEnsureWriter(): Promise<boolean> {
+    const captured = currentWorkspaceCapture();
+    const refreshed = await refreshModels(captured ?? undefined);
+    if (
+      applicationAllowsModelPreparation(applicationClosePhase) &&
+      captured &&
+      workspaceRestoreIsCurrent(captured)
+    ) {
+      requestPreferredWriterForCurrentWorkspace();
+    }
+    return refreshed;
   }
 
   function closeProjectMenu(): void {
     if (projectMenu) projectMenu.open = false;
+  }
+
+  async function setOutlineOpen(open: boolean): Promise<void> {
+    outlineOpen = open;
+    await tick();
+    if (open) outlineSearch?.focus();
+    else outlineToggle?.focus();
   }
 
   function openModelManager(trigger: HTMLElement): void {
@@ -1676,15 +2258,31 @@
     modelManagerOpen = true;
     modelDownloadError = '';
     void recoverModelDownloads();
-    void refreshModels();
-    void tick().then(() => modelManagerPanel?.focus());
+    void refreshCurrentModelsAndEnsureWriter();
+    void tick().then(() => {
+      if (!modelManagerPanel) return;
+      const preferred = modelManagerPanel.querySelector<HTMLElement>(
+        '[data-model-manager-initial-focus]:not([disabled])'
+      );
+      (preferred ?? focusableElementsWithin(modelManagerPanel)[0] ?? modelManagerPanel).focus();
+    });
   }
 
   function closeModelManager(): void {
     modelManagerOpen = false;
     const trigger = modelManagerReturnFocus;
     modelManagerReturnFocus = null;
-    void tick().then(() => trigger?.focus());
+    void tick().then(() => {
+      if (focusConnectedControl(trigger)) return;
+      if (focusConnectedControl(projectMenuTrigger)) return;
+      focusCurrentWritingSurfaceAtEnd();
+    });
+  }
+
+  function focusConnectedControl(target: HTMLElement | null | undefined): boolean {
+    if (!target?.isConnected || target.hidden || target.getClientRects().length === 0) return false;
+    target.focus();
+    return window.document.activeElement === target;
   }
 
   function suggestionPreferenceKey(projectId: string): string {
@@ -1711,7 +2309,10 @@
 
   function loadSuggestionPreference(projectId: string): boolean {
     try {
-      return window.localStorage.getItem(suggestionPreferenceKey(projectId)) === 'on';
+      return suggestionsEnabledFromStoredPreference(
+        window.localStorage.getItem(suggestionPreferenceKey(projectId)),
+        buildModelPolicy?.activation ?? null
+      );
     } catch {
       return false;
     }
@@ -1720,19 +2321,36 @@
   function cancelSuggestionTimer(): void {
     if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
     suggestionsIdleTimer = undefined;
-    suggestionTargetEditVersion = null;
+    scheduledSuggestion = null;
     suggestionIntentEpoch += 1;
   }
 
   async function setSuggestionsEnabled(enabled: boolean, persist = true): Promise<void> {
-    if (!project || suggestionsChanging) return;
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !project ||
+      suggestionsChanging
+    ) return;
+    if (enabled && !buildModelPolicy) {
+      announce('Suggestions remain off because this build could not verify its local writer policy');
+      return;
+    }
     const boundProject = project;
+    const previousEnabled = suggestionsEnabled;
+    const previousDismissedCandidateIds = dismissedCandidateIds;
     suggestionsChanging = true;
     suggestionIntentEpoch += 1;
-    if (!enabled) cancelSuggestionTimer();
+    if (!enabled) {
+      suggestionsEnabled = false;
+      cancelSuggestionTimer();
+      dismissedCandidateIds = currentReadyBranches
+        .map((branch) => branch.candidate_id)
+        .filter((candidateId): candidateId is string => Boolean(candidateId));
+    }
     try {
       await setSuggestionsPolicy(boundProject.project_id, boundProject.session_id, enabled);
       if (
+        !applicationAllowsModelPreparation(applicationClosePhase) ||
         project?.project_id !== boundProject.project_id ||
         project.session_id !== boundProject.session_id
       ) return;
@@ -1745,22 +2363,31 @@
         }
       }
       if (!enabled) {
-        cancelSuggestionTimer();
-        dismissedCandidateIds = currentReadyBranches
-          .map((branch) => branch.candidate_id)
-          .filter((candidateId): candidateId is string => Boolean(candidateId));
+        clearPreferredWriterRequest();
         scheduleActiveBranchPoll();
       }
+      let writerReady = Boolean(currentModel);
+      if (enabled && !writerReady) {
+        const captured: WorkspaceRestoreCapture = {
+          restoreSerial: workspaceRestoreSerial,
+          projectId: boundProject.project_id,
+          sessionId: boundProject.session_id
+        };
+        requestPreferredWriterEnsure(captured);
+        writerReady = Boolean(currentModel);
+      }
       announce(enabled
-        ? currentModel
+        ? writerReady
           ? 'Suggestions on; Loom will quietly prepare private strands when typing pauses'
-          : 'Suggestions on; choose a local completion model before Loom can prepare strands'
+          : 'Suggestions on; Loom is preparing a tested local writer'
         : 'Suggestions off');
-      if (enabled && currentModel && document) {
+      if (enabled && writerReady && document) {
         scheduleAutomaticSuggestions(editVersion);
       }
     } catch (error) {
-      suggestionsEnabled = false;
+      suggestionsEnabled = previousEnabled;
+      dismissedCandidateIds = previousDismissedCandidateIds;
+      clearPreferredWriterRequest();
       cancelSuggestionTimer();
       if (!enabled && activeBranchCount > 0) void cancelActiveBranches();
       recordFailure(error);
@@ -1770,34 +2397,76 @@
     }
   }
 
-  function trapModelManagerFocus(event: KeyboardEvent): void {
-    if (event.key !== 'Tab' || !modelManagerPanel) return;
-    const focusable = Array.from(modelManagerPanel.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
-    )).filter((element) => !element.hasAttribute('hidden'));
+  function focusableElementsWithin(container: HTMLElement): HTMLElement[] {
+    return Array.from(container.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [href], [tabindex]:not([tabindex="-1"])'
+    )).filter((element) => !element.hasAttribute('hidden') && element.getClientRects().length > 0);
+  }
+
+  function trapFocusWithin(event: KeyboardEvent, container: HTMLElement | undefined): void {
+    if (event.key !== 'Tab' || !container) return;
+    const focusable = focusableElementsWithin(container);
     if (focusable.length === 0) {
       event.preventDefault();
-      modelManagerPanel.focus();
+      container.focus();
       return;
     }
     const first = focusable[0];
     const last = focusable.at(-1);
     if (!first || !last) return;
-    if (event.shiftKey && (window.document.activeElement === first || !modelManagerPanel.contains(window.document.activeElement))) {
+    const active = window.document.activeElement;
+    const activeIsContainer = active === container;
+    const activeIsOutside = !active || !container.contains(active);
+    if (event.shiftKey && (activeIsContainer || activeIsOutside || active === first)) {
       event.preventDefault();
       last.focus();
-    } else if (!event.shiftKey && window.document.activeElement === last) {
+    } else if (!event.shiftKey && (activeIsContainer || activeIsOutside || active === last)) {
       event.preventDefault();
       first.focus();
     }
   }
 
-  async function loadSelectedModel(expectedWorkspace?: WorkspaceRestoreCapture): Promise<void> {
-    if (!selectedModelPath || modelLoading) return;
+  function trapModelManagerFocus(event: KeyboardEvent): void {
+    trapFocusWithin(event, modelManagerPanel);
+  }
+
+  async function installLoadedModel(
+    loaded: ModelCapabilitySummary,
+    quiet: boolean,
+    expectedWorkspace?: WorkspaceRestoreCapture
+  ): Promise<boolean> {
+    if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
+    if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+    models = [
+      loaded,
+      ...models
+        .filter((model) => model.model_path !== loaded.model_path)
+        .map((model) => ({ ...model, loaded: false }))
+    ];
+    selectedModelPath = loaded.model_path;
+    rememberLastLocalModelPath(loaded.model_path);
+    if (!quiet) {
+      announce(`${loaded.display_name} is verified for exact local completion`);
+    }
+    if (suggestionsEnabled && loaded.completion && document) {
+      await tick();
+      if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
+      scheduleAutomaticSuggestions(editVersion);
+    }
+    return true;
+  }
+
+  async function loadSelectedModel(options: ModelLoadOptions = {}): Promise<boolean> {
+    const { expectedWorkspace, quiet = false } = options;
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !selectedModelPath ||
+      modelLoading
+    ) return false;
     const modelPath = selectedModelPath;
     const loadSerial = ++modelLoadSerial;
     modelLoading = true;
-    if (!expectedWorkspace) {
+    if (!quiet) {
       clearFailure();
       announce('Verifying the selected local model');
     }
@@ -1805,40 +2474,75 @@
       const loaded = await loadModel(modelPath);
       if (
         !componentMounted ||
-        loadSerial !== modelLoadSerial ||
-        (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
-      ) return;
-      models = [
-        loaded,
-        ...models
-          .filter((model) => model.model_path !== loaded.model_path)
-          .map((model) => ({ ...model, loaded: false }))
-      ];
-      selectedModelPath = loaded.model_path;
-      rememberLastLocalModelPath(loaded.model_path);
-      if (!expectedWorkspace) {
-        announce(`${loaded.display_name} is verified for exact local completion`);
-      }
-      if (suggestionsEnabled && loaded.completion && document) {
-        await tick();
-        scheduleAutomaticSuggestions(editVersion);
-      }
+        !applicationAllowsModelPreparation(applicationClosePhase) ||
+        loadSerial !== modelLoadSerial
+      ) return false;
+      return await installLoadedModel(loaded, quiet, expectedWorkspace);
     } catch (error) {
       if (
         !componentMounted ||
+        !applicationAllowsModelPreparation(applicationClosePhase) ||
         loadSerial !== modelLoadSerial ||
         (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
-      ) return;
-      if (expectedWorkspace) {
+      ) return false;
+      if (quiet) {
         await refreshModels(expectedWorkspace);
-        return;
+        return false;
       }
       recordFailure(error);
       announce('The local model could not be verified');
       await refreshModels();
+      return false;
     } finally {
-      if (loadSerial === modelLoadSerial) modelLoading = false;
+      if (loadSerial === modelLoadSerial) {
+        modelLoading = false;
+        wakePreferredWriterEnsure();
+      }
     }
+  }
+
+  async function loadPreferredSuggestionModel(
+    expectedWorkspace?: WorkspaceRestoreCapture
+  ): Promise<boolean> {
+    if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
+    if (currentModel) return true;
+    if (!document || transition !== 'idle' || modelLoading || modelUnloading) return false;
+    if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+    const candidates = orderedLocalWriterCandidates(models);
+    for (const candidate of candidates) {
+      if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
+      if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+      const loadSerial = ++modelLoadSerial;
+      modelLoading = true;
+      try {
+        const loaded = await loadPolicyModelCandidate(candidate.profileId, candidate.modelPath);
+        if (
+          !componentMounted ||
+          !applicationAllowsModelPreparation(applicationClosePhase) ||
+          loadSerial !== modelLoadSerial ||
+          (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
+        ) return false;
+        if (!isVerifiedPolicyWriter(loaded, candidate.profileId)) {
+          await refreshModels(expectedWorkspace);
+          continue;
+        }
+        return await installLoadedModel(loaded, true, expectedWorkspace);
+      } catch {
+        if (
+          !componentMounted ||
+          !applicationAllowsModelPreparation(applicationClosePhase) ||
+          loadSerial !== modelLoadSerial ||
+          (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
+        ) return false;
+        await refreshModels(expectedWorkspace);
+      } finally {
+        if (loadSerial === modelLoadSerial) {
+          modelLoading = false;
+          wakePreferredWriterEnsure();
+        }
+      }
+    }
+    return false;
   }
 
   async function chooseExistingModel(): Promise<void> {
@@ -1854,12 +2558,104 @@
       }
       models = [selected, ...models.filter((model) => model.model_path !== selected.model_path)];
       selectedModelPath = selected.model_path;
+      requestPreferredWriterForCurrentWorkspace();
       announce(`${selected.display_name} added; load it to inspect exact capabilities`);
     } catch (error) {
       recordFailure(error);
       announce('The selected model could not be added safely');
     } finally {
       modelChoosing = false;
+    }
+  }
+
+  function expectedPolicyWriterName(): string {
+    switch (buildModelPolicy?.name) {
+      case 'writer-gemma4-base-v1':
+      case 'writer-gemma4-base-v2':
+        return 'the tested Gemma 4 base writing model';
+      case 'none-v1':
+      case undefined:
+        return 'the tested writing model for this version of Loom';
+    }
+  }
+
+  async function choosePolicyWriterModel(): Promise<void> {
+    if (modelChoosing || modelLoading || modelUnloading) return;
+    const captured = currentWorkspaceCapture();
+    if (!captured || !buildModelPolicy || buildModelPolicy.name === 'none-v1') {
+      recordLocalFailure(
+        'writing_model_policy_unavailable',
+        'This version of Loom does not have a verified writing-model setup. Suggestions remain off.'
+      );
+      announce('Suggestions remain off because no verified writing model is configured');
+      return;
+    }
+
+    modelChoosing = true;
+    clearFailure();
+    announce('Choose the supported writing model stored on this computer');
+    let loadSerial: number | null = null;
+    try {
+      const selected = await chooseModel();
+      if (!selected) {
+        announce('Writing model choice cancelled');
+        return;
+      }
+      if (!workspaceRestoreIsCurrent(captured)) return;
+
+      const policyCandidate = selected.policy_candidate;
+      if (!policyCandidate) {
+        recordLocalFailure(
+          'writing_model_not_supported',
+          `That file is not ${expectedPolicyWriterName()}. Loom did not enable suggestions. Other GGUF files can still be inspected under Advanced.`
+        );
+        announce('That file cannot power suggestions in this version of Loom');
+        return;
+      }
+
+      models = [selected, ...models.filter((model) => model.model_path !== selected.model_path)];
+      selectedModelPath = selected.model_path;
+      loadSerial = ++modelLoadSerial;
+      modelLoading = true;
+      const loaded = await loadPolicyModelCandidate(
+        policyCandidate.profile_id,
+        selected.model_path
+      );
+      if (
+        !componentMounted ||
+        !applicationAllowsModelPreparation(applicationClosePhase) ||
+        loadSerial !== modelLoadSerial ||
+        !workspaceRestoreIsCurrent(captured)
+      ) return;
+      if (!isVerifiedPolicyWriter(loaded, policyCandidate.profile_id)) {
+        throw new Error('Native verification did not return the exact writer capabilities required by this build.');
+      }
+      if (!(await installLoadedModel(loaded, false, captured))) {
+        throw new Error('The verified writer could not be attached to the current writing session.');
+      }
+      clearFailure();
+      announce(`${loaded.display_name} is ready to suggest writing`);
+    } catch (error) {
+      if (
+        componentMounted &&
+        applicationAllowsModelPreparation(applicationClosePhase) &&
+        workspaceRestoreIsCurrent(captured) &&
+        (loadSerial === null || loadSerial === modelLoadSerial)
+      ) {
+        const failure = normalizeFailure(error);
+        recordLocalFailure(
+          'writing_model_verification_failed',
+          `That file could not be verified as ${expectedPolicyWriterName()}. Loom did not enable suggestions. ${failure.message}`
+        );
+        announce('The chosen file failed exact writing-model verification');
+        await refreshModels(captured);
+      }
+    } finally {
+      modelChoosing = false;
+      if (loadSerial !== null && loadSerial === modelLoadSerial) {
+        modelLoading = false;
+        wakePreferredWriterEnsure();
+      }
     }
   }
 
@@ -1880,6 +2676,7 @@
       await refreshModels();
     } finally {
       modelUnloading = false;
+      wakePreferredWriterEnsure();
     }
   }
 
@@ -1928,6 +2725,7 @@
       if (!componentMounted) return false;
       project = current;
       if (!(await finishOpeningProject(current, restoreSerial))) return false;
+      wakePreferredWriterEnsure();
       announce(`Reattached ${current.title}`);
       return true;
     } catch {
@@ -1995,6 +2793,12 @@
     });
   }
 
+  function focusCurrentWritingSurfaceAtEnd(): boolean {
+    return mode === 'source'
+      ? sourceEditor?.focusAtDocumentEnd() ?? false
+      : visualEditor?.focusAtDocumentEnd() ?? false;
+  }
+
   async function restoreDesktopWorkspace(): Promise<void> {
     const restoreSerial = ++workspaceRestoreSerial;
     await restoreBeforeBackgroundWork({
@@ -2002,37 +2806,16 @@
       present: async () => {
         await tick();
         await waitForWritingSurfacePaint();
-        if (mode === 'source' && sourceTextarea) {
-          sourceTextarea.focus({ preventScroll: true });
-          const end = sourceTextarea.value.length;
-          sourceTextarea.setSelectionRange(end, end);
-        } else {
-          visualEditor?.focusAtDocumentEnd();
-        }
+        focusCurrentWritingSurfaceAtEnd();
       },
       isCurrent: workspaceRestoreIsCurrent,
       background: async (captured) => {
         await recoverModelDownloads();
         if (!workspaceRestoreIsCurrent(captured)) return;
-        if (!(await refreshModels(captured)) || !workspaceRestoreIsCurrent(captured)) return;
-        if (suggestionsEnabled && !currentModel) {
-          await loadRememberedSuggestionModel(captured);
-        }
+        if (!shouldDiscoverModelsOnStartup(suggestionsEnabled)) return;
+        requestPreferredWriterEnsure(captured);
       }
     });
-  }
-
-  async function loadRememberedSuggestionModel(
-    expectedWorkspace?: WorkspaceRestoreCapture
-  ): Promise<void> {
-    if (currentModel || !document || transition !== 'idle') return;
-    if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return;
-    const rememberedPath = loadLastLocalModelPath();
-    if (!rememberedPath || !models.some((model) =>
-      model.model_path === rememberedPath && model.header_verified
-    )) return;
-    selectedModelPath = rememberedPath;
-    await loadSelectedModel(expectedWorkspace);
   }
 
   async function doOpenProject(): Promise<void> {
@@ -2045,6 +2828,7 @@
       if (!componentMounted || restoreSerial !== workspaceRestoreSerial) return;
       project = opened;
       if (await finishOpeningProject(opened, restoreSerial)) {
+        wakePreferredWriterEnsure();
         announce(`Opened ${opened.title}`);
       }
     } catch (error) {
@@ -2064,7 +2848,18 @@
       sessionId: opened.session_id
     };
     if (!workspaceRestoreIsCurrent(captured)) return false;
+    outlineOpen = false;
+    clearPreferredWriterRequest();
     cancelSuggestionTimer();
+    try {
+      const identity = await getBuildModelPolicy();
+      if (!workspaceRestoreIsCurrent(captured)) return false;
+      buildModelPolicy = identity;
+    } catch {
+      if (!workspaceRestoreIsCurrent(captured)) return false;
+      buildModelPolicy = null;
+      announce('Suggestions are off because this build could not verify its local writer policy');
+    }
     const storedSuggestionsPreference = loadSuggestionPreference(captured.projectId);
     suggestionsEnabled = false;
     try {
@@ -2136,12 +2931,15 @@
       saveMessage = 'Project is ready';
     }
     if (storedSuggestionsPreference && suggestionsEnabled && !currentModel) {
-      void loadRememberedSuggestionModel(captured);
+      queuePreferredWriterRequest(captured);
     }
     return true;
   }
 
-  async function selectDocument(summary: DocumentSummary): Promise<void> {
+  async function selectDocument(
+    summary: DocumentSummary,
+    focusWritingSurface = false
+  ): Promise<void> {
     if (transition !== 'idle' || !project) return;
     const requestedScope: ProjectRestoreScope = {
       projectId: project.project_id,
@@ -2284,7 +3082,9 @@
         saveMessage = 'All changes saved';
         announce(`Opened ${summary.title}`);
       }
-      if (summary.kind !== 'prose' || !canRoundTripMarkdownExactly(effectiveText)) mode = 'source';
+      mode = summary.kind === 'prose' && canRoundTripMarkdownExactly(effectiveText)
+        ? preferredProseMode
+        : 'source';
       await refreshBranchesFor(
         source.projectId,
         source.sessionId,
@@ -2308,7 +3108,14 @@
       if (
         requestSerial === navigationSerial &&
         projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source)
-      ) transition = 'idle';
+      ) {
+        transition = 'idle';
+        wakePreferredWriterEnsure();
+        if (focusWritingSurface && document?.summary.document_id === summary.document_id) {
+          await tick();
+          focusCurrentWritingSurfaceAtEnd();
+        }
+      }
     }
   }
 
@@ -2325,6 +3132,7 @@
     saveMessage = saveInFlight ? 'Saving earlier changes…' : 'Unsaved changes';
     promotionArmedCandidateId = null;
     dismissedCandidateIds = [];
+    unpresentableVisualGhostPresentationKeys = [];
     if (activeBranchCount > 0) void cancelActiveBranches();
     scheduleDraftJournal();
     scheduleSave();
@@ -2338,6 +3146,7 @@
     uncertainWeave = null;
     promotionArmedCandidateId = null;
     dismissedCandidateIds = [];
+    unpresentableVisualGhostPresentationKeys = [];
     if (activeBranchCount > 0) void cancelActiveBranches();
   }
 
@@ -2349,8 +3158,11 @@
     sourceDirty = false;
     sourceSelectionStart = 0;
     sourceSelectionEnd = 0;
-    visualSelectionAtEnd = false;
+    visibleVisualGhostPresentationKey = '';
+    visibleSourceGhostPresentationKey = '';
+    visualSelectionByte = null;
     visualMutationPending = false;
+    unpresentableVisualGhostPresentationKeys = [];
     if (kind === 'verse') {
       const decoded = decodeVerseForEditor(text);
       verseCodec = decoded.codec;
@@ -2372,11 +3184,11 @@
     compositionActive = true;
   }
 
-  function finishSourceComposition(event: CompositionEvent & { currentTarget: HTMLTextAreaElement }): void {
+  function finishSourceComposition(textarea: HTMLTextAreaElement): void {
     sourceComposing = false;
     compositionActive = false;
-    updateSourceSelection(event.currentTarget);
-    updateFromSource(event.currentTarget.value);
+    updateSourceSelection(textarea);
+    updateFromSource(textarea.value);
     scheduleSourceProjection(0);
     announce('Text composition committed');
   }
@@ -2393,8 +3205,8 @@
     sourceSelectionEnd = textarea.selectionEnd;
   }
 
-  function updateVisualSelection(atDocumentEnd: boolean): void {
-    visualSelectionAtEnd = atDocumentEnd;
+  function updateVisualSelection(markdownByteOffset: number | null): void {
+    visualSelectionByte = markdownByteOffset;
   }
 
   function scheduleSourceProjection(delay = 240): void {
@@ -2433,42 +3245,136 @@
     targetEditVersion: number,
     delay = suggestionsIdleDelayMs
   ): void {
+    armSuggestionSchedule({ kind: 'edit_pause', editVersion: targetEditVersion }, delay);
+  }
+
+  function scheduleAutocompleteRetry(ticket: AutocompleteRetryTicket): void {
+    armSuggestionSchedule(
+      { kind: 'exhausted_retry', ticket },
+      suggestionsRetryDelayMs
+    );
+  }
+
+  function armSuggestionSchedule(schedule: SuggestionSchedule, delay: number): void {
     if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
     suggestionsIdleTimer = undefined;
-    suggestionTargetEditVersion = null;
+    scheduledSuggestion = null;
     if (
       !desktop ||
       !suggestionsEnabled ||
       !currentModel ||
       !project ||
       !document ||
-      focusMode ||
       document.summary.kind === 'hybrid'
     ) return;
-    suggestionTargetEditVersion = targetEditVersion;
+    scheduledSuggestion = schedule;
     suggestionsIdleTimer = window.setTimeout(() => {
       suggestionsIdleTimer = undefined;
-      void tryStartAutomaticSuggestions(targetEditVersion);
+      void tryStartAutomaticSuggestions(schedule);
     }, delay);
   }
 
-  async function tryStartAutomaticSuggestions(targetEditVersion: number): Promise<void> {
+  function rearmBoundedSuggestionSchedule(
+    schedule: SuggestionSchedule,
+    delay: number
+  ): boolean {
+    if (schedule.kind === 'edit_pause') {
+      armSuggestionSchedule(schedule, delay);
+      return true;
+    }
+    if (schedule.ticket.waitsRemaining <= 0) {
+      scheduledSuggestion = null;
+      return false;
+    }
+    armSuggestionSchedule({
+      kind: 'exhausted_retry',
+      ticket: {
+        ...schedule.ticket,
+        waitsRemaining: schedule.ticket.waitsRemaining - 1
+      }
+    }, delay);
+    return true;
+  }
+
+  function retryTicketDisposition(
+    ticket: AutocompleteRetryTicket
+  ): AutocompleteDisposition | null {
     if (
-      suggestionTargetEditVersion !== targetEditVersion ||
+      !project ||
+      !document ||
+      !currentModel ||
+      !suggestionsEnabled ||
+      project.project_id !== ticket.projectId ||
+      project.session_id !== ticket.sessionId ||
+      document.summary.document_id !== ticket.documentId ||
+      document.summary.revision_id !== ticket.sourceRevisionId ||
+      document.visible_blob_id !== ticket.visibleBlobId ||
+      documentEpoch !== ticket.documentEpoch ||
+      editVersion !== ticket.editVersion ||
+      suggestionIntentEpoch !== ticket.intentEpoch ||
+      mode !== ticket.mode ||
+      currentModel.model_id !== ticket.modelId ||
+      sourceGhostNewline !== ticket.sourceNewline ||
+      !branchPromotionReady
+    ) return null;
+    const targetByte = mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte;
+    if (targetByte !== ticket.targetByte) return null;
+    return autocompleteDisposition({
+      active: true,
+      branches: currentReadyBranches,
+      verifiedBodyByRun: verifiedBranchBodyByRun,
+      dismissedCandidateIds,
+      unpresentablePresentationKeys: mode === 'visual'
+        ? unpresentableVisualGhostPresentationKeys
+        : [],
+      targetByte,
+      presentationCompatible: mode === 'source'
+        ? (text) => sourceGhostPresentationCompatible(
+          sourceDisplayText,
+          text,
+          ticket.sourceNewline
+        )
+        : undefined
+    });
+  }
+
+  async function tryStartAutomaticSuggestions(schedule: SuggestionSchedule): Promise<void> {
+    const targetEditVersion = schedule.kind === 'edit_pause'
+      ? schedule.editVersion
+      : schedule.ticket.editVersion;
+    if (
+      scheduledSuggestion !== schedule ||
       targetEditVersion !== editVersion ||
       !suggestionsEnabled ||
       !currentModel ||
       !project ||
       !document ||
-      focusMode ||
       compositionActive ||
       transition !== 'idle'
     ) {
-      suggestionTargetEditVersion = null;
+      scheduledSuggestion = null;
       return;
     }
+    if (schedule.kind === 'exhausted_retry') {
+      const disposition = retryTicketDisposition(schedule.ticket);
+      if (!disposition) {
+        scheduledSuggestion = null;
+        return;
+      }
+      if (disposition.kind === 'available' || disposition.kind === 'inactive') {
+        scheduledSuggestion = null;
+        return;
+      }
+      if (
+        disposition.kind === 'awaiting_candidates' ||
+        disposition.kind === 'awaiting_hydration'
+      ) {
+        rearmBoundedSuggestionSchedule(schedule, 200);
+        return;
+      }
+    }
     if (activeBranchCount > 0 || weaveStarting) {
-      scheduleAutomaticSuggestions(targetEditVersion, 450);
+      rearmBoundedSuggestionSchedule(schedule, 450);
       return;
     }
     if (!canStartAutomaticSuggestions) {
@@ -2477,11 +3383,11 @@
         saveInFlight ||
         saveState === 'dirty' ||
         saveState === 'saving'
-      ) scheduleAutomaticSuggestions(targetEditVersion, 350);
-      else suggestionTargetEditVersion = null;
+      ) rearmBoundedSuggestionSchedule(schedule, 350);
+      else scheduledSuggestion = null;
       return;
     }
-    suggestionTargetEditVersion = null;
+    scheduledSuggestion = null;
     await startAutomaticWeave();
   }
 
@@ -2838,90 +3744,63 @@
     return false;
   }
 
-  async function toggleFocusMode(): Promise<void> {
-    if (!project) return;
-    const enabling = !focusMode;
-    if (enabling) cancelSuggestionTimer();
-    focusMode = enabling;
-    if (desktop) {
-      try {
-        await setFocusMode(project.project_id, project.session_id, focusMode);
-      } catch (error) {
-        focusMode = !focusMode;
-        recordFailure(error);
-      }
-    }
-    if (focusMode) {
-      scheduleActiveBranchPoll();
-    } else if (suggestionsEnabled && currentModel && document) {
-      scheduleAutomaticSuggestions(editVersion);
-    }
-    announce(focusMode ? 'Focus mode on' : 'Focus mode off');
-  }
-
-  function eventComesFromWritingSurface(event: KeyboardEvent): boolean {
-    return event.target instanceof HTMLElement && Boolean(
-      event.target.closest('.loom-prosemirror, .source-pane textarea')
-    );
-  }
-
-  function suggestionMatchesCurrentCaret(
-    branch: BranchCard,
-    visualAtEnd: boolean,
-    sourceStart: number,
-    sourceEnd: number
-  ): boolean {
-    if (mode === 'visual') {
-      const endByte = utf8ByteOffset(documentText, documentText.length);
-      return visualAtEnd &&
-        branch.target_start_byte === endByte &&
-        branch.target_end_byte === endByte;
-    }
+  function sourceGhostTargetByteFor(
+    currentMode: EditorMode,
+    editorAvailable: boolean,
+    selectionStart: number,
+    selectionEnd: number,
+    displayText: string,
+    currentDocument: OpenDocument | null,
+    manuscriptText: string,
+    codec: VerseEditorCodec | null
+  ): number | null {
     if (
-      mode !== 'source' ||
-      !sourceTextarea ||
-      sourceStart !== sourceEnd
-    ) return false;
-    try {
-      const cursorByte = captureWeaveCursorByte();
-      return branch.target_start_byte === cursorByte && branch.target_end_byte === cursorByte;
-    } catch {
-      return false;
-    }
-  }
-
-  function findVisualGhostSuggestion() {
-    if (
-      mode !== 'visual' ||
-      !suggestionsEnabled ||
-      focusMode ||
-      visualMutationPending
+      currentMode !== 'source' ||
+      !editorAvailable ||
+      selectionStart !== selectionEnd ||
+      !isExtendedGraphemeBoundary(displayText, selectionStart) ||
+      !currentDocument
     ) return null;
-    for (const branch of currentReadyBranches) {
+    try {
+      const displayPrefix = displayText.slice(0, selectionStart);
       if (
-        !branch.candidate_id ||
-        dismissedCandidateIds.includes(branch.candidate_id) ||
-        !suggestionMatchesCurrentCaret(
-          branch,
-          visualSelectionAtEnd,
-          sourceSelectionStart,
-          sourceSelectionEnd
-        ) ||
-        !canPromoteBranch(branch)
-      ) continue;
-      const verified = verifiedGhostSuggestion(
-        branch,
-        branchBodyBlobByRun[branch.run_id]
-      );
-      if (verified) return verified;
+        currentDocument.summary.kind === 'verse' &&
+        (!codec || !codec.editable)
+      ) return null;
+      const manuscriptPrefix = currentDocument.summary.kind === 'verse' && codec
+        ? encodeVerseFromEditor(displayPrefix, codec)
+        : displayPrefix;
+      if (!manuscriptText.startsWith(manuscriptPrefix)) return null;
+      return utf8ByteOffset(manuscriptPrefix, manuscriptPrefix.length);
+    } catch {
+      return null;
     }
-    return null;
   }
 
-  function dismissInlineSuggestion(candidateId = inlineSuggestion?.candidate_id): void {
+  function dismissInlineSuggestion(candidateId: string | null | undefined): void {
     if (!candidateId || dismissedCandidateIds.includes(candidateId)) return;
     dismissedCandidateIds = [...dismissedCandidateIds, candidateId];
     announce('Suggestion dismissed; its private strand remains recoverable');
+  }
+
+  function rejectVisualGhostPresentation(
+    candidateId: string,
+    presentationKey: string,
+    surfaceKey: string,
+    anchorByteOffset: number
+  ): void {
+    if (
+      mode !== 'visual' ||
+      ghostSuggestion?.candidateId !== candidateId ||
+      ghostSuggestion.presentationKey !== presentationKey ||
+      ghostSuggestion.targetByte !== anchorByteOffset ||
+      surfaceKey !== visualGhostSurfaceKey ||
+      unpresentableVisualGhostPresentationKeys.includes(presentationKey)
+    ) return;
+    unpresentableVisualGhostPresentationKeys = [
+      ...unpresentableVisualGhostPresentationKeys,
+      presentationKey
+    ].slice(-64);
   }
 
   async function acceptInlineSuggestion(branch: BranchCard): Promise<void> {
@@ -2930,15 +3809,70 @@
     await confirmPromotion(branch);
   }
 
-  function acceptVisualGhost(candidateId: string): void {
-    const branch = branches.find((candidate) => candidate.candidate_id === candidateId);
-    if (!branch || ghostSuggestion?.candidateId !== candidateId) return;
-    void acceptInlineSuggestion(branch);
+  function eligibleGhostForCurrentMode() {
+    return mode === 'visual'
+      ? ghostSuggestion
+      : mode === 'source'
+        ? sourceGhostSuggestion
+        : null;
   }
 
-  function dismissVisualGhost(candidateId: string): void {
-    if (ghostSuggestion?.candidateId !== candidateId) return;
+  function acceptActiveGhost(candidateId: string, presentationKey: string): boolean {
+    const eligible = eligibleGhostForCurrentMode();
+    const branch = branches.find((candidate) => candidate.candidate_id === candidateId);
+    const visiblePresentationKey = mode === 'visual'
+      ? visibleVisualGhostPresentationKey
+      : mode === 'source'
+        ? visibleSourceGhostPresentationKey
+        : '';
+    if (
+      !branch ||
+      eligible?.candidateId !== candidateId ||
+      eligible.presentationKey !== presentationKey ||
+      visiblePresentationKey !== presentationKey
+    ) return false;
+    void acceptInlineSuggestion(branch);
+    return true;
+  }
+
+  function dismissActiveGhost(candidateId: string, presentationKey: string): void {
+    const eligible = eligibleGhostForCurrentMode();
+    if (
+      eligible?.candidateId !== candidateId ||
+      eligible.presentationKey !== presentationKey
+    ) return;
     dismissInlineSuggestion(candidateId);
+  }
+
+  async function openStrandReview(): Promise<void> {
+    if (reviewableBranches.length === 0) return;
+    reviewCandidateId = activeGhostSuggestion?.candidateId ??
+      reviewableBranches[0].candidate_id;
+    promotionArmedCandidateId = null;
+    strandReviewOpen = true;
+    await tick();
+    if (!strandReviewDialog) return;
+    if (!strandReviewDialog.open) strandReviewDialog.showModal();
+    strandReviewDialog.querySelector<HTMLElement>('[data-review-close]')?.focus();
+  }
+
+  function closeStrandReview(): void {
+    promotionArmedCandidateId = null;
+    if (strandReviewDialog?.open) {
+      strandReviewDialog.close();
+    } else {
+      strandReviewOpen = false;
+    }
+  }
+
+  function moveStrandReview(offset: number): void {
+    if (reviewableBranches.length < 2 || reviewBranchIndex < 0) return;
+    const nextIndex = (
+      reviewBranchIndex + offset + reviewableBranches.length
+    ) % reviewableBranches.length;
+    reviewCandidateId = reviewableBranches[nextIndex].candidate_id;
+    promotionArmedCandidateId = null;
+    announce(`Alternative ${nextIndex + 1} of ${reviewableBranches.length}`);
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
@@ -2953,32 +3887,9 @@
       projectMenuTrigger?.focus();
       return;
     }
-    if (
-      event.key === 'Escape' &&
-      inlineSuggestion &&
-      inlineSuggestionAtCaret &&
-      !compositionActive &&
-      mode === 'source' &&
-      eventComesFromWritingSurface(event)
-    ) {
+    if (event.key === 'Escape' && outlineOpen) {
       event.preventDefault();
-      dismissInlineSuggestion();
-      return;
-    }
-    if (
-      event.key === 'Tab' &&
-      !event.shiftKey &&
-      !event.metaKey &&
-      !event.ctrlKey &&
-      !event.altKey &&
-      inlineSuggestion &&
-      inlineSuggestionAtCaret &&
-      mode === 'source' &&
-      eventComesFromWritingSurface(event) &&
-      canPromoteBranch(inlineSuggestion)
-    ) {
-      event.preventDefault();
-      void acceptInlineSuggestion(inlineSuggestion);
+      void setOutlineOpen(false);
       return;
     }
     const modifier = event.metaKey || event.ctrlKey;
@@ -2997,10 +3908,6 @@
       flushEditors();
       void saveNow();
     }
-    if (modifier && event.shiftKey && event.key.toLocaleLowerCase() === 'l') {
-      event.preventDefault();
-      void toggleFocusMode();
-    }
   }
 
   function handleGlobalPointerdown(event: PointerEvent): void {
@@ -3014,9 +3921,10 @@
   function captureWeaveCursorByte(): number {
     if (!document) throw new Error('Open a manuscript before weaving.');
     if (mode !== 'source') {
-      // ProseMirror positions address its document tree, not the canonical
-      // Markdown bytes. EOF is the only honest visual-mode mapping in v1.
-      return utf8ByteOffset(documentText, documentText.length);
+      if (visualSelectionByte === null) {
+        throw new Error('The visual caret does not map exactly to the saved Markdown bytes.');
+      }
+      return visualSelectionByte;
     }
     if (!sourceTextarea) throw new Error('The source editor is not available.');
     const selectionStart = sourceTextarea.selectionStart;
@@ -3046,11 +3954,12 @@
     ) {
       throw new Error('The desktop returned a branch family for different source identities.');
     }
-    validateBranchSnapshots(started.branches);
+    validateBranchSnapshots(started.branches, captured.documentId);
     if (started.branches.some((branch) =>
       branch.source_revision_id !== captured.sourceRevisionId ||
       branch.target_start_byte !== captured.cursorByte ||
-      branch.target_end_byte !== captured.cursorByte
+      branch.target_end_byte !== captured.cursorByte ||
+      branch.model_id !== captured.modelId
     )) {
       throw new Error('The desktop returned a branch outside the requested manuscript boundary.');
     }
@@ -3060,6 +3969,9 @@
       ...started.branches.map((branch) => applyLiveBranchState(branch, false)),
       ...branches.filter((branch) => !runIds.has(branch.run_id))
     ];
+    // A lost-reply replay may already be terminal. Only the authoritative body
+    // endpoint can certify immutable blob identity for presentation.
+    scheduleBranchRefresh();
     scheduleActiveBranchPoll();
     return true;
   }
@@ -3069,13 +3981,14 @@
       project?.project_id === captured.projectId &&
       project.session_id === captured.sessionId &&
       document?.summary.document_id === captured.documentId &&
+      document.summary.kind === captured.documentKind &&
       document.summary.revision_id === captured.sourceRevisionId &&
       document.visible_blob_id === captured.visibleBlobId &&
       documentEpoch === captured.epoch &&
       editVersion === captured.editVersion &&
       suggestionIntentEpoch === captured.intentEpoch &&
-      suggestionsEnabled &&
-      !focusMode
+      currentModel?.model_id === captured.modelId &&
+      suggestionsEnabled
     );
   }
 
@@ -3156,7 +4069,7 @@
   }
 
   async function startAutomaticWeave(): Promise<void> {
-    if (weaveStarting || !project || !document) return;
+    if (weaveStarting || !project || !document || !currentModel) return;
     const startingEditVersion = editVersion;
     if (compositionActive || !flushEditors() || editVersion !== startingEditVersion) return;
     if (!canStartAutomaticSuggestions || uncertainWeave) return;
@@ -3178,11 +4091,13 @@
       sessionId: project.session_id,
       documentId: document.summary.document_id,
       relativePath: document.summary.relative_path,
+      documentKind: document.summary.kind,
       sourceRevisionId,
       visibleBlobId: document.visible_blob_id,
       cursorByte,
       editVersion,
-      intentEpoch: suggestionIntentEpoch
+      intentEpoch: suggestionIntentEpoch,
+      modelId: currentModel.model_id
     };
     weaveStarting = true;
     clearFailure();
@@ -3196,10 +4111,7 @@
         sourceRevisionId: captured.sourceRevisionId,
         expectedVisibleBlobId: captured.visibleBlobId,
         cursorByte: captured.cursorByte,
-        branchCount: 3,
-        maxTokens: 128,
-        temperature: 0.8,
-        automatic: true
+        policy: { kind: 'automatic_v2' }
       });
       if (installWeaveSnapshot(started, captured)) {
         uncertainWeave = null;
@@ -3307,95 +4219,16 @@
     await Promise.all(active.map((branch) => cancelBranch(branch)));
   }
 
-  async function keepBranch(branch: BranchCard): Promise<void> {
-    if (
-      !project ||
-      !document ||
-      branch.status !== 'ready' ||
-      !branch.candidate_id ||
-      branch.selection !== null ||
-      keepingCandidateIds.includes(branch.candidate_id)
-    ) return;
-    const candidateId = branch.candidate_id;
-    const captured = {
-      projectId: project.project_id,
-      sessionId: project.session_id,
-      documentId: document.summary.document_id,
-      commandId: keepCommandByCandidate[candidateId] ?? newUlid(),
-      candidateId
-    };
-    keepCommandByCandidate = {
-      ...keepCommandByCandidate,
-      [candidateId]: captured.commandId
-    };
-    keepingCandidateIds = [...keepingCandidateIds, candidateId];
-    try {
-      const receipt = await keepCandidate(
-        captured.projectId,
-        captured.sessionId,
-        captured.commandId,
-        captured.candidateId
-      );
-      if (
-        receipt.command_id !== captured.commandId ||
-        receipt.project_id !== captured.projectId
-      ) {
-        throw new Error('The desktop returned a keep receipt for another command.');
-      }
-      announce('Private strand kept as an alternative');
-    } catch (error) {
-      if (
-        project?.project_id === captured.projectId &&
-        project.session_id === captured.sessionId
-      ) recordFailure(error);
-    } finally {
-      keepingCandidateIds = keepingCandidateIds.filter((id) => id !== candidateId);
-      await refreshBranchesFor(
-        captured.projectId,
-        captured.sessionId,
-        captured.documentId,
-        false
-      );
-    }
-  }
-
   function canPromoteBranch(branch: BranchCard): boolean {
     return Boolean(
-      project &&
+      branchPromotionReady &&
       document &&
-      document.summary.kind !== 'hybrid' &&
       branch.status === 'ready' &&
       branch.candidate_id &&
       branch.selection !== 'promote' &&
       branch.selection !== 'reject' &&
-      branch.source_revision_id === document.summary.revision_id &&
-      document.summary.active_blob_id === document.visible_blob_id &&
-      transition === 'idle' &&
-      editVersion === savedVersion &&
-      (saveState === 'clean' || saveState === 'saved') &&
-      !sourceDirty &&
-      !visualMutationPending &&
-      !compositionActive &&
-      !saveInFlight &&
-      !weaveStarting &&
-      !staleDraft &&
-      !uncertainDraft &&
-      !uncertainSave &&
-      !reconciliation &&
-      !promotionInFlight &&
-      !uncertainPromotion
+      branch.source_revision_id === document.summary.revision_id
     );
-  }
-
-  function armPromotion(branch: BranchCard): void {
-    if (!canPromoteBranch(branch) || !branch.candidate_id) return;
-    promotionArmedCandidateId = branch.candidate_id;
-    announce('Confirm promotion to change the active manuscript');
-  }
-
-  function cancelPromotion(): void {
-    promotionArmedCandidateId = null;
-    announce('Promotion cancelled; the manuscript is unchanged');
   }
 
   async function confirmPromotion(branch: BranchCard): Promise<void> {
@@ -3452,6 +4285,7 @@
         throw new Error('The promoted revision was not visible in the project snapshot.');
       }
       uncertainPromotion = null;
+      closeStrandReview();
       announce(outcome === 'reconciliation'
         ? 'Promotion is durable; an external file change now needs review'
         : 'Strand promoted from authoritative manuscript bytes');
@@ -3463,12 +4297,15 @@
         clearFailure();
         switch (outcome) {
           case 'promoted':
+            closeStrandReview();
             announce('Promotion had committed; Loom reopened the authoritative manuscript');
             break;
           case 'source_changed':
+            closeStrandReview();
             announce('The manuscript changed independently; Loom reopened it without attributing the change to this strand');
             break;
           case 'reconciliation':
+            closeStrandReview();
             announce('An external manuscript change needs review before promotion can be attributed');
             break;
           case 'unchanged':
@@ -3577,7 +4414,7 @@
         captured.documentId,
         captured.runId
       );
-      if (candidate) validateBranchSnapshots([candidate]);
+      if (candidate) validateBranchSnapshots([candidate], captured.documentId);
       outcome = candidate?.candidate_id === captured.candidateId &&
         candidate.source_revision_id === captured.sourceRevisionId &&
         candidate.selection === 'promote'
@@ -3633,9 +4470,9 @@
     uncertainSave = null;
     branches = [];
     resetLiveGenerationView();
-    if (opened.summary.kind !== 'prose' || !canRoundTripMarkdownExactly(opened.text)) {
-      mode = 'source';
-    }
+    mode = opened.summary.kind === 'prose' && canRoundTripMarkdownExactly(opened.text)
+      ? preferredProseMode
+      : 'source';
     if (opened.transient_draft) {
       saveState = 'error';
       saveMessage = promotionConfirmed
@@ -3941,13 +4778,12 @@
       announce('Finish composing text before changing editor modes');
       return;
     }
-    if (next === 'split') {
-      announce('Split mode is disabled until cross-view edits preserve history exactly');
-      return;
-    }
     if (next === 'visual' && !canUseVisual) return;
     flushEditors();
     if (next === 'source' && document) setSourceDocument(documentText, document.summary.kind);
+    if (document?.summary.kind === 'prose' && canRoundTripMarkdownExactly(documentText)) {
+      preferredProseMode = next;
+    }
     mode = next;
     announce(`${next} editor mode`);
   }
@@ -3957,7 +4793,7 @@
     window.setTimeout(() => (liveRegion = message), 0);
   }
 
-  async function closeProject(): Promise<boolean> {
+  async function closeProject(): Promise<ProjectCloseOutcome> {
     if (closeInFlight) return closeInFlight;
     const operation = performCloseProject();
     closeInFlight = operation;
@@ -3968,22 +4804,72 @@
     }
   }
 
-  async function performCloseProject(): Promise<boolean> {
-    if (!project) return true;
+  async function resumeProjectAfterDefinitiveClose(
+    closing: Pick<ProjectSnapshot, 'project_id' | 'session_id'>
+  ): Promise<ProjectCloseOutcome> {
+    const sameSession = Boolean(
+      project?.project_id === closing.project_id &&
+      project.session_id === closing.session_id
+    );
+    const agency = pendingCloseAgency;
+    const restoreSuggestions = agency?.suggestionsEnabled ?? suggestionsEnabled;
+    if (agency && sameSession) {
+      try {
+        await restoreProjectCloseAgency(agency, {
+          setFocusMode: (enabled) => setFocusMode(
+            closing.project_id,
+            closing.session_id,
+            enabled
+          ),
+          setSuggestionsEnabled: (enabled) => setSuggestionsPolicy(
+            closing.project_id,
+            closing.session_id,
+            enabled
+          )
+        });
+      } catch (error) {
+        pendingCloseMayHaveCommitted = false;
+        transition = 'closing';
+        recordFailure(error);
+        saveMessage = 'Close recovery is still settling';
+        announce('The project remains safely locked until its writing policy can be restored');
+        return { status: 'quiesced' };
+      }
+    }
+
+    if (sameSession) suggestionsEnabled = restoreSuggestions;
+    pendingCloseCommandId = null;
+    pendingCloseMayHaveCommitted = false;
+    pendingCloseAgency = null;
+    transition = 'idle';
+    scheduleActiveBranchPoll();
+    if (
+      sameSession &&
+      restoreSuggestions &&
+      applicationAllowsModelPreparation(applicationClosePhase)
+    ) {
+      requestPreferredWriterForCurrentWorkspace();
+      if (currentModel && document) scheduleAutomaticSuggestions(editVersion);
+    }
+    return { status: 'resume' };
+  }
+
+  async function performCloseProject(): Promise<ProjectCloseOutcome> {
+    if (!project) return { status: 'closed' };
     const retryingPreparedClose = transition === 'closing' && pendingCloseCommandId !== null;
     if (compositionActive && !retryingPreparedClose) {
       announce('Finish composing text before closing the project');
-      return false;
+      return { status: 'resume' };
     }
     if (!retryingPreparedClose) {
-      if (!flushEditors()) return false;
+      if (!flushEditors()) return { status: 'resume' };
       transition = 'closing';
       announce('Closing project; editing is briefly locked');
       stopBranchPolling();
       if (!(await flushCurrentDocument())) {
         transition = 'idle';
         scheduleActiveBranchPoll();
-        return false;
+        return { status: 'resume' };
       }
     } else {
       stopBranchPolling();
@@ -4028,18 +4914,16 @@
           transition = 'closing';
           saveMessage = 'Close result uncertain — retry safely';
           announce('Close result uncertain; editing remains locked until the same close command is retried');
+          return { status: 'quiesced' };
         } else {
-          pendingCloseCommandId = null;
-          pendingCloseMayHaveCommitted = false;
-          transition = 'idle';
-          scheduleActiveBranchPoll();
+          return await resumeProjectAfterDefinitiveClose(closing);
         }
-        return false;
       }
     } else {
       // Stop new automatic admission before native close drains any reserved
       // startup already in flight. Keep the persisted preference unchanged so
       // a later reopen can restore the author's choice deliberately.
+      pendingCloseAgency ??= captureProjectCloseAgency(suggestionsEnabled);
       suggestionsEnabled = false;
       cancelSuggestionTimer();
       const outcome = await drainGenerationsAndClose({
@@ -4056,46 +4940,43 @@
         isCurrent: closeCaptureIsCurrent
       });
 
-      if (outcome.status === 'stale') {
-        if (
-          componentMounted &&
-          project?.project_id === closing.project_id &&
-          project.session_id === closing.session_id
-        ) {
-          pendingCloseCommandId = null;
-          transition = 'idle';
-          recordLocalFailure('close_race', 'The manuscript changed while Loom prepared to close it.');
-          scheduleActiveBranchPoll();
+      switch (outcome.status) {
+        case 'closed':
+          break;
+        case 'stale':
+          if (
+            componentMounted &&
+            project?.project_id === closing.project_id &&
+            project.session_id === closing.session_id
+          ) {
+            recordLocalFailure('close_race', 'The manuscript changed while Loom prepared to close it.');
+          }
+          return await resumeProjectAfterDefinitiveClose(closing);
+        case 'uncertain':
+          recordFailure(outcome.failure);
+          pendingCloseMayHaveCommitted = true;
+          transition = 'closing';
+          saveMessage = 'Close result uncertain — retry safely';
+          announce('Close result uncertain; editing remains locked until the same close command is retried');
+          return { status: 'quiesced' };
+        case 'waiting':
+          pendingCloseMayHaveCommitted = false;
+          transition = 'closing';
+          if (outcome.failure) recordFailure(outcome.failure);
+          else recordLocalFailure(
+            'generation_cancellation_in_progress',
+            'Private strands are still preserving their terminal evidence. Loom kept the project open; retry close safely.'
+          );
+          saveMessage = 'Private strands are still stopping — retry close';
+          announce('The project remains open while private strands stop; retry close safely');
+          return { status: 'quiesced' };
+        case 'refused':
+          recordFailure(outcome.failure);
+          return await resumeProjectAfterDefinitiveClose(closing);
+        default: {
+          const unreachable: never = outcome;
+          return unreachable;
         }
-        return false;
-      }
-      if (outcome.status === 'uncertain') {
-        recordFailure(outcome.failure);
-        pendingCloseMayHaveCommitted = true;
-        transition = 'closing';
-        saveMessage = 'Close result uncertain — retry safely';
-        announce('Close result uncertain; editing remains locked until the same close command is retried');
-        return false;
-      }
-      if (outcome.status === 'waiting') {
-        pendingCloseMayHaveCommitted = false;
-        transition = 'closing';
-        if (outcome.failure) recordFailure(outcome.failure);
-        else recordLocalFailure(
-          'generation_cancellation_in_progress',
-          'Private strands are still preserving their terminal evidence. Loom kept the project open; retry close safely.'
-        );
-        saveMessage = 'Private strands are still stopping — retry close';
-        announce('The project remains open while private strands stop; retry close safely');
-        return false;
-      }
-      if (outcome.status === 'refused') {
-        recordFailure(outcome.failure);
-        pendingCloseCommandId = null;
-        pendingCloseMayHaveCommitted = false;
-        transition = 'idle';
-        scheduleActiveBranchPoll();
-        return false;
       }
     }
 
@@ -4103,6 +4984,7 @@
     modelRefreshSerial += 1;
     modelLoadSerial += 1;
     documentEpoch += 1;
+    closeStrandReview();
     project = null;
     document = null;
     documentText = '';
@@ -4116,12 +4998,14 @@
     resetLiveGenerationView();
     saveState = 'clean';
     saveMessage = 'No project open';
-    focusMode = false;
+    outlineOpen = false;
     suggestionsEnabled = false;
+    clearPreferredWriterRequest();
     cancelSuggestionTimer();
     dismissedCandidateIds = [];
     pendingCloseCommandId = null;
     pendingCloseMayHaveCommitted = false;
+    pendingCloseAgency = null;
     uncertainSave = null;
     draftVersion = '0';
     draftSavedEditVersion = 0;
@@ -4134,35 +5018,13 @@
     }
     modelLoading = false;
     transition = 'idle';
-    return true;
+    return { status: 'closed' };
   }
 
   function kindLabel(kind: DocumentKind): string {
     if (kind === 'verse') return 'Poem';
     if (kind === 'hybrid') return 'Hybrid';
     return 'Prose';
-  }
-
-  function branchStatusLabel(branch: BranchCard): string {
-    if (branch.selection === 'promote') return 'Promoted';
-    if (branch.selection === 'keep_alternative') return 'Kept';
-    if (branch.selection === 'reject') return 'Rejected';
-    switch (branch.status) {
-      case 'queued': return 'Queued';
-      case 'generating': return cancellingRunIds.includes(branch.run_id) ? 'Cancelling' : 'Writing';
-      case 'ready': return 'Ready';
-      case 'failed': return 'Failed';
-      case 'cancelled': return 'Cancelled';
-      case 'pruned': return 'Pruned';
-      case 'rejected': return 'Rejected';
-      case 'interrupted': return 'Interrupted';
-    }
-  }
-
-  function branchBoundaryLabel(branch: BranchCard): string {
-    return branch.target_start_byte === branch.target_end_byte
-      ? `byte ${branch.target_start_byte.toLocaleString()}`
-      : `bytes ${branch.target_start_byte.toLocaleString()}–${branch.target_end_byte.toLocaleString()}`;
   }
 
   function promotionUnavailableReason(branch: BranchCard): string {
@@ -4184,19 +5046,49 @@
   <meta name="description" content="Loom — a local-first writing environment for prose and poetry" />
 </svelte:head>
 
-<div class:focus-mode={focusMode} class="app-shell">
+<div class="app-shell">
   <a class="skip-link" href="#manuscript">Skip to manuscript</a>
 
   {#if project}
     <header class="topbar" aria-label="Writing controls">
+      {#if project.documents.length > 1}
+        <button
+          bind:this={outlineToggle}
+          class="outline-toggle"
+          type="button"
+          aria-controls="project-outline"
+          aria-expanded={outlineOpen}
+          aria-label={outlineOpen ? 'Close manuscript outline' : 'Open manuscript outline'}
+          on:click={() => void setOutlineOpen(!outlineOpen)}
+        >☰</button>
+      {/if}
       <h1 class="context-title" title={document?.summary.title ?? project.title}>
         {document?.summary.title ?? project.title}
       </h1>
       <div class="topbar-spacer"></div>
-      {#if document && saveState !== 'clean' && saveState !== 'saved'}
+      {#if document && (saveState === 'error' || saveState === 'uncertain')}
         <div class="save-status state-{saveState}" role="status" aria-live="polite">
           <span class="status-dot"></span>{saveMessage}
         </div>
+      {/if}
+      {#if document && reviewAffordance.visible}
+        <button
+          class="alternatives-button"
+          bind:this={strandReviewTrigger}
+          type="button"
+          aria-haspopup="dialog"
+          aria-label={reviewAffordance.ariaLabel}
+          on:click={() => void openStrandReview()}
+        >
+          {reviewAffordance.label}
+        </button>
+      {/if}
+      {#if suggestionSetupNeeded}
+        <button
+          class="suggestion-setup-button"
+          type="button"
+          on:click={(event) => openModelManager(event.currentTarget)}
+        >Set up suggestions</button>
       {/if}
       <details class="project-menu" bind:this={projectMenu}>
         <summary class="more-button" bind:this={projectMenuTrigger} title="Writing options">
@@ -4215,22 +5107,24 @@
             </button>
             <div class="project-menu-separator"></div>
           {/if}
+          <button
+            class:active={suggestionsEnabled}
+            type="button"
+            aria-pressed={suggestionsEnabled}
+            disabled={suggestionsChanging}
+            on:click={() => {
+              closeProjectMenu();
+              void setSuggestionsEnabled(!suggestionsEnabled);
+            }}
+          >
+            <span>Suggestions</span>
+            <span class:ready={suggestionsEnabled} class="menu-state">
+              {suggestionsChanging ? '…' : suggestionsEnabled ? 'On' : 'Off'}
+            </span>
+          </button>
           <button type="button" on:click={(event) => openModelManager(projectMenuTrigger ?? event.currentTarget)}>
-            <span>Writing assistance…</span>
+            <span>Suggestion settings…</span>
           </button>
-          <button class:active={focusMode} type="button" aria-pressed={focusMode} disabled={editorReadonly} on:click={() => { closeProjectMenu(); void toggleFocusMode(); }}>
-            <span>Focus mode</span><span aria-hidden="true">{focusMode ? '✓' : ''}</span>
-          </button>
-          {#if ghostSuggestion}
-            <div class="project-menu-separator"></div>
-            <div class="project-menu-label">Suggestion</div>
-            <button type="button" on:click={() => { closeProjectMenu(); acceptVisualGhost(ghostSuggestion.candidateId); }}>
-              <span>Accept suggestion</span><kbd>Tab</kbd>
-            </button>
-            <button type="button" on:click={() => { closeProjectMenu(); dismissVisualGhost(ghostSuggestion.candidateId); }}>
-              <span>Dismiss suggestion</span><kbd>Esc</kbd>
-            </button>
-          {/if}
           <div class="project-menu-separator"></div>
           <button type="button" disabled={reconciliationResolutionLocked || (editorReadonly && transition !== 'closing' && !(reconciliation && !document))} on:click={() => { closeProjectMenu(); void closeProject(); }}>
             {transition === 'closing' ? 'Retry closing project' : 'Close project'}
@@ -4241,15 +5135,34 @@
   {/if}
 
   {#if project}
+    {#if outlineOpen}
+      <button class="outline-scrim" type="button" aria-label="Close manuscript outline" on:click={() => void setOutlineOpen(false)}></button>
+    {/if}
     <div class:single-document={project.documents.length === 1} class="workspace-grid">
-      <aside class="outline-panel" aria-label="Project outline">
+      <div
+        bind:this={outlinePanel}
+        id="project-outline"
+        class:open={outlineOpen}
+        class="outline-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Manuscript outline"
+        tabindex="-1"
+        on:keydown={(event) => trapFocusWithin(event, outlinePanel)}
+      >
         <div class="panel-heading">
           <span>Manuscript</span>
+          <button
+            class="dialog-close"
+            type="button"
+            aria-label="Close manuscript outline"
+            on:click={() => void setOutlineOpen(false)}
+          >×</button>
         </div>
         <label class="search-field">
           <span class="sr-only">Search project</span>
           <span aria-hidden="true">⌕</span>
-          <input bind:value={search} type="search" placeholder="Find in project" />
+          <input bind:this={outlineSearch} bind:value={search} type="search" placeholder="Find in project" />
         </label>
         <nav class="document-list" aria-label="Documents">
           {#each visibleDocuments as candidate (candidate.document_id)}
@@ -4257,7 +5170,10 @@
               class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}
               type="button"
               disabled={editorReadonly}
-              on:click={() => selectDocument(candidate)}
+              on:click={() => void (async () => {
+                await setOutlineOpen(false);
+                await selectDocument(candidate, true);
+              })()}
             >
               <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
               <span class="document-label">
@@ -4269,11 +5185,7 @@
             <p class="empty-copy">No notes.</p>
           {/each}
         </nav>
-        <div class="outline-footer">
-          <span title={project.root}>Offline project</span>
-          <span>{project.documents.length} {project.documents.length === 1 ? 'piece' : 'pieces'}</span>
-        </div>
-      </aside>
+      </div>
 
       <main id="manuscript" class="manuscript-area" tabindex="-1">
         {#if reconciliation}
@@ -4375,7 +5287,7 @@
             </div>
           {/if}
 
-          <section class:split={mode === 'split'} class="editor-stage" aria-label="Writing surface">
+          <section class="editor-stage" aria-label="Writing surface">
             {#if showVisual}
               <div class="editor-pane visual-pane" aria-label="Visual editor pane">
                 {#if exactTextSurface}
@@ -4389,11 +5301,17 @@
                       ghostText={ghostSuggestion?.text ?? ''}
                       ghostCandidateId={ghostSuggestion?.candidateId ?? ''}
                       ghostPresentationKey={ghostSuggestion?.presentationKey ?? ''}
+                      ghostAnchorByteOffset={ghostSuggestion?.targetByte ?? null}
+                      surfaceKey={visualGhostSurfaceKey}
                       onChange={updateText}
                       onCompositionChange={setVisualComposition}
                       onImmediateDocumentMutation={invalidateVisualSuggestionImmediately}
-                      onGhostAccept={acceptVisualGhost}
-                      onGhostDismiss={dismissVisualGhost}
+                      onGhostAccept={acceptActiveGhost}
+                      onGhostDismiss={dismissActiveGhost}
+                      onGhostPresentationRejected={rejectVisualGhostPresentation}
+                      onGhostVisibilityChange={(presentationKey) => {
+                        visibleVisualGhostPresentationKey = presentationKey;
+                      }}
                       onSelectionChange={updateVisualSelection}
                       readonly={editorReadonly}
                       autofocus={true}
@@ -4412,80 +5330,112 @@
                 {#if document.summary.kind === 'hybrid'}
                   <div class="verse-notice" role="alert">Hybrid source editing is locked until its prose/verse block manifest can cross the IPC boundary losslessly.</div>
                 {/if}
-                <textarea
-                  bind:this={sourceTextarea}
-                  class:verse={exactTextSurface}
+                <SourceEditor
+                  bind:this={sourceEditor}
+                  bind:element={sourceTextarea}
                   value={sourceDisplayText}
                   readonly={editorReadonly || document.summary.kind === 'hybrid' || Boolean(exactTextSurface && verseCodec && !verseCodec.editable)}
-                  on:compositionstart={beginSourceComposition}
-                  on:compositionend={finishSourceComposition}
-                  on:input={(event) => {
-                    updateSourceSelection(event.currentTarget);
-                    updateFromSource(event.currentTarget.value);
+                  verse={exactTextSurface}
+                  verseNewline={exactTextSurface ? verseCodec?.newline ?? 'mixed' : null}
+                  surfaceKey={`${project.session_id}:${document.summary.document_id}:${documentEpoch}:${mode}`}
+                  ghostText={sourceGhostSuggestion?.text ?? ''}
+                  ghostCandidateId={sourceGhostSuggestion?.candidateId ?? ''}
+                  ghostPresentationKey={sourceGhostSuggestion?.presentationKey ?? ''}
+                  onCompositionStart={beginSourceComposition}
+                  onCompositionEnd={finishSourceComposition}
+                  onValueInput={(textarea) => {
+                    updateSourceSelection(textarea);
+                    updateFromSource(textarea.value);
                   }}
-                  on:select={(event) => updateSourceSelection(event.currentTarget)}
-                  on:click={(event) => updateSourceSelection(event.currentTarget)}
-                  on:keyup={(event) => updateSourceSelection(event.currentTarget)}
-                  aria-label={exactTextSurface ? 'Exact-whitespace verse editor' : 'Markdown source editor'}
-                  spellcheck="true"
-                  wrap={exactTextSurface ? 'off' : 'soft'}
-                ></textarea>
+                  onSelectionChange={updateSourceSelection}
+                  onGhostAccept={acceptActiveGhost}
+                  onGhostDismiss={dismissActiveGhost}
+                  onGhostVisibilityChange={(presentationKey) => {
+                    visibleSourceGhostPresentationKey = presentationKey;
+                  }}
+                  label={exactTextSurface ? 'Exact-whitespace verse editor' : 'Markdown source editor'}
+                />
               </div>
             {/if}
           </section>
 
-          {#if branches.length > 0}
-            <details class="branch-shelf">
-              <summary>
-                <span class:ready={currentReadyBranches.length > 0} class="status-dot"></span>
-                <span>{activeBranchCount > 0 ? 'Suggestions growing' : currentReadyBranches.length > 0 ? `${currentReadyBranches.length} ${currentReadyBranches.length === 1 ? 'strand' : 'strands'} ready` : 'Earlier strands'}</span>
-              </summary>
-              <div class="branch-shelf-body" aria-label="Private strands">
-                {#each branches as branch (branch.branch_id)}
-                  <article class="branch-card status-{branch.status}">
-                    <header>
-                      <span class="branch-status">{branchStatusLabel(branch)}</span>
-                      <span>{branchBoundaryLabel(branch)}</span>
-                    </header>
-                    {#if branch.text}
-                      <p>{branch.text}</p>
-                    {:else if branchBodyErrorByRun[branch.run_id]}
-                      <p class="branch-placeholder">{branchBodyErrorByRun[branch.run_id]}</p>
-                    {:else}
-                      <p class="branch-placeholder">{isBranchActive(branch) ? 'Waiting for local model text…' : 'No candidate text was produced.'}</p>
-                    {/if}
-                    {#if branch.error}
-                      <div class="branch-error" role={branch.status === 'failed' ? 'alert' : 'status'}>{branch.error}{branch.error_truncated ? '…' : ''}</div>
-                    {/if}
-                    <footer><span title={branch.model_id ?? 'Model identity is available in immutable provenance'}>{branch.model_id ?? 'Recorded model'}</span><span>{branch.seed ? `seed ${branch.seed}` : 'seed in provenance'}</span></footer>
-                    <div class="branch-actions">
-                      {#if isBranchActive(branch)}
-                        <button class="secondary-button compact" type="button" on:click={() => void cancelBranch(branch)} disabled={cancellingRunIds.includes(branch.run_id)}>
-                          {cancellingRunIds.includes(branch.run_id) ? 'Cancelling…' : 'Cancel'}
-                        </button>
-                      {:else if branch.status === 'ready' && branch.candidate_id && branch.selection !== 'promote' && branch.selection !== 'reject'}
-                        {#if branch.selection === null}
-                          <button class="secondary-button compact" type="button" on:click={() => void keepBranch(branch)} disabled={keepingCandidateIds.includes(branch.candidate_id)}>
-                            {keepingCandidateIds.includes(branch.candidate_id) ? 'Keeping…' : 'Keep'}
-                          </button>
-                        {/if}
-                        <button class="primary-button compact" type="button" on:click={() => promotionArmedCandidateId === branch.candidate_id ? void confirmPromotion(branch) : armPromotion(branch)} disabled={!canPromoteBranch(branch)} title={canPromoteBranch(branch) ? (promotionArmedCandidateId === branch.candidate_id ? 'Confirm promotion through the immutable store' : 'Promote through the immutable store') : promotionUnavailableReason(branch)}>
-                          {promotionArmedCandidateId === branch.candidate_id ? 'Confirm promotion' : 'Promote…'}
-                        </button>
-                        {#if promotionArmedCandidateId === branch.candidate_id}
-                          <button class="bare-button compact" type="button" on:click={cancelPromotion}>Cancel</button>
-                        {/if}
-                      {/if}
-                    </div>
-                  </article>
-                {/each}
-                {#if branchHasMore}
-                  <button class="secondary-button compact branch-load-more" type="button" on:click={() => void loadMoreBranches()} disabled={branchLoadingMore}>
-                    {branchLoadingMore ? 'Loading…' : 'Load older strands'}
-                  </button>
+          {#if strandReviewOpen}
+            <dialog
+              class="strand-review"
+              bind:this={strandReviewDialog}
+              aria-labelledby="strand-review-title"
+              on:click={(event) => {
+                if (event.target === strandReviewDialog) closeStrandReview();
+              }}
+              on:close={() => {
+                strandReviewOpen = false;
+                promotionArmedCandidateId = null;
+                strandReviewTrigger?.focus();
+              }}
+              on:cancel={() => {
+                strandReviewOpen = false;
+                promotionArmedCandidateId = null;
+              }}
+            >
+              <div class="strand-review-shell">
+              <header class="strand-review-header">
+                <div>
+                  <h2 id="strand-review-title">Alternatives</h2>
+                  {#if reviewBranchIndex >= 0}
+                    <span>{reviewBranchIndex + 1} of {reviewableBranches.length}</span>
+                  {/if}
+                </div>
+                <button
+                  class="dialog-close"
+                  data-review-close
+                  type="button"
+                  aria-label="Close alternatives"
+                  on:click={closeStrandReview}
+                >×</button>
+              </header>
+
+              {#if reviewBranch}
+                <div class="strand-review-prose">{reviewBranch.text}</div>
+
+                {#if reviewableBranches.length > 1}
+                  <nav class="strand-review-navigation" aria-label="Alternative navigation">
+                    <button type="button" on:click={() => moveStrandReview(-1)}>Previous</button>
+                    <button type="button" on:click={() => moveStrandReview(1)}>Next</button>
+                  </nav>
                 {/if}
+
+                <details class="strand-evidence">
+                  <summary>Evidence</summary>
+                  <dl>
+                    <div><dt>Model</dt><dd>{reviewBranch.model_id ?? 'Recorded model'}</dd></div>
+                    <div><dt>Seed</dt><dd>{reviewBranch.seed ?? 'Recorded in provenance'}</dd></div>
+                    <div><dt>Boundary</dt><dd>{reviewBranch.target_start_byte}</dd></div>
+                    <div><dt>Output</dt><dd>{reviewBranch.output_blob_id ?? 'Pending immutable body'}</dd></div>
+                    <div><dt>Run</dt><dd>{reviewBranch.run_id}</dd></div>
+                  </dl>
+                  {#if suppressedReviewBranches.length > 0}
+                    <details class="suppressed-output">
+                      <summary>{suppressedReviewBranches.length} malformed {suppressedReviewBranches.length === 1 ? 'output' : 'outputs'} held back</summary>
+                      {#each suppressedReviewBranches as suppressed (suppressed.run_id)}
+                        <div>
+                          <strong>{candidateSurfaceReason(suppressed.text) ?? 'Held back'}</strong>
+                          <pre>{suppressed.text}</pre>
+                        </div>
+                      {/each}
+                    </details>
+                  {/if}
+                </details>
+
+                <footer class="strand-review-actions">
+                  <button class="primary-button" type="button" on:click={() => void acceptInlineSuggestion(reviewBranch)} disabled={!canPromoteBranch(reviewBranch)} title={promotionUnavailableReason(reviewBranch)}>
+                    Use this
+                  </button>
+                </footer>
+              {:else}
+                <p class="strand-review-empty">No suitable alternative remains at this caret.</p>
+              {/if}
               </div>
-            </details>
+            </dialog>
           {/if}
 
           {#if uncertainPromotion}
@@ -4513,9 +5463,9 @@
   {:else}
     <main class="welcome" id="manuscript">
       <section class="welcome-note" aria-labelledby="welcome-title">
-        <h1 id="welcome-title">Open a Loom.</h1>
+        <h1 id="welcome-title">{errorMessage ? 'Your writing did not open.' : desktop ? 'Opening your writing…' : 'Desktop app required.'}</h1>
         {#if !desktop}
-          <div class="runtime-note" role="note">Open the desktop app to write.</div>
+          <div class="runtime-note" role="note">Writing and local models are available in the desktop app.</div>
         {/if}
         {#if errorMessage}
           <div class="error-banner" role="alert">
@@ -4524,7 +5474,7 @@
         {/if}
         <div class="welcome-actions">
           <button class="secondary-button" type="button" on:click={doOpenProject} disabled={!desktop || opening}>
-            {opening ? 'Opening…' : 'Open a Loom folder…'}
+            {opening ? 'Opening…' : 'Choose another folder…'}
           </button>
         </div>
       </section>
@@ -4549,41 +5499,68 @@
         on:keydown={trapModelManagerFocus}
       >
         <header class="model-manager-header">
-          <div>
-            <h2 id="model-manager-title">Suggestions</h2>
-            <p>Private continuations from a local model, only when you choose to enable them.</p>
-          </div>
-          <button class="icon-button" type="button" on:click={closeModelManager} aria-label="Close model manager">×</button>
+          <h2 id="model-manager-title">Suggestions</h2>
+          <button class="icon-button" type="button" on:click={closeModelManager} aria-label="Close suggestions">×</button>
         </header>
 
         <div class="model-manager-body">
-          <section class="model-library" aria-labelledby="model-library-title">
+          <section class="model-manager-summary" aria-label="Suggestion settings">
             <label class="suggestions-setting">
               <input
+                data-model-manager-initial-focus
                 type="checkbox"
                 checked={suggestionsEnabled}
                 disabled={!project || suggestionsChanging}
                 on:change={(event) => void setSuggestionsEnabled(event.currentTarget.checked)}
               />
               <span>
-                <strong>Suggest while I pause</strong>
-                <small>{project ? currentModel ? 'Strands stay private until you accept one.' : 'Load a raw-completion model below.' : 'Open a note first.'}</small>
+                <strong>Suggestions</strong>
               </span>
             </label>
+
+            <div class="model-readiness" role="status" aria-live="polite">
+              <span
+                class:ready={Boolean(currentModel) && !modelLoading && !modelUnloading}
+                class:preparing={modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0}
+                class="status-dot"
+              ></span>
+              <strong>
+                {modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0
+                  ? 'Preparing'
+                  : currentModel
+                    ? 'Ready'
+                    : 'Needs setup'}
+              </strong>
+            </div>
+          </section>
+
+          {#if suggestionSetupNeeded}
+            <section class="model-setup-callout">
+              <p>To suggest words while you write, Loom needs {expectedPolicyWriterName()} stored on this computer.</p>
+              <button
+                class="primary-button"
+                type="button"
+                on:click={() => void choosePolicyWriterModel()}
+                disabled={!desktop || modelChoosing || modelLoading || modelUnloading}
+              >{modelChoosing ? 'Choosing…' : 'Choose a writing model…'}</button>
+            </section>
+          {/if}
+
+          <details class="model-advanced-panel">
+            <summary>Advanced</summary>
+            <div class="model-advanced-content">
+              <section class="model-library" aria-labelledby="model-library-title">
             <div class="section-heading">
-              <div>
-                <h3 id="model-library-title">On this computer</h3>
-                <p>GGUF files are inspected before Loom claims a capability.</p>
-              </div>
+              <h3 id="model-library-title">Model</h3>
               <div class="model-library-actions">
-                <button class="bare-button compact" type="button" on:click={() => void chooseExistingModel()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>{modelChoosing ? 'Choosing…' : 'Choose GGUF…'}</button>
-                <button class="bare-button compact" type="button" on:click={() => void refreshModels()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>Refresh</button>
+                <button class="bare-button compact" type="button" on:click={() => void chooseExistingModel()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>{modelChoosing ? 'Choosing…' : 'Choose model file…'}</button>
+                <button class="bare-button compact" type="button" on:click={() => void refreshCurrentModelsAndEnsureWriter()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>Refresh</button>
               </div>
             </div>
 
             {#if models.length > 0}
               <label class="model-manager-picker">
-                <span>Model file</span>
+                <span>Writer model</span>
                 <select bind:value={selectedModelPath} disabled={modelChoosing || modelLoading || modelUnloading}>
                   {#each models as model (model.model_path)}
                     <option value={model.model_path} disabled={!model.header_verified}>
@@ -4594,37 +5571,27 @@
               </label>
             {:else}
               <div class="model-empty-state">
-                <strong>No GGUF model discovered yet.</strong>
-                <span>You can keep writing without one, choose an existing cache file, or add a verified download below.</span>
+                <strong>No model found.</strong>
               </div>
             {/if}
 
             {#if selectedModel}
               <article class="model-facts">
-                <header>
-                  <div>
-                    <strong>{selectedModel.display_name}</strong>
-                    <span>{selectedModel.loaded ? 'Native inspection complete' : 'GGUF header verified · load for exact capabilities'}</span>
-                  </div>
-                  <span class:verified={selectedModel.header_verified} class="fact-chip">{selectedModel.header_verified ? 'GGUF verified' : 'Unavailable'}</span>
-                </header>
-                <dl>
-                  <div><dt>Prompt mode</dt><dd>{modelCapabilityMode(selectedModel)}</dd></div>
-                  <div><dt>Architecture</dt><dd>{selectedModel.architecture ?? 'Inspect on load'}</dd></div>
-                  <div><dt>Context</dt><dd>{selectedModel.context_tokens === null ? 'Inspect on load' : `${selectedModel.context_tokens.toLocaleString()} tokens`}</dd></div>
-                  <div><dt>Media</dt><dd>{modelMediaLabel(selectedModel)}</dd></div>
-                  <div><dt>Generated tokens</dt><dd>{selectedModel.loaded ? (selectedModel.output_tokens ? 'Available' : 'Unavailable') : 'Inspect on load'}</dd></div>
-                  <div><dt>Log probabilities</dt><dd>{selectedModel.loaded ? (selectedModel.logprobs ? 'Available' : 'Unavailable') : 'Inspect on load'}</dd></div>
-                  <div><dt>Fill in middle</dt><dd>{selectedModel.loaded ? (selectedModel.fill_in_middle ? 'Verified' : 'Unavailable') : 'Inspect on load'}</dd></div>
-                  <div><dt>Projector</dt><dd>{selectedModel.projector_present === null ? 'Inspect on load' : selectedModel.projector_present ? 'Present' : 'None'}</dd></div>
-                </dl>
-                {#if selectedModel.tested_profile}
-                  <p class="tested-profile"><span aria-hidden="true">✓</span> Loom acceptance profile: <code>{selectedModel.tested_profile}</code></p>
-                {/if}
-                <details>
-                  <summary>File and fingerprint evidence</summary>
+                <details class="model-technical">
+                  <summary>Technical details</summary>
+                  <dl>
+                    <div><dt>Compatibility</dt><dd>{selectedModel.tested_profile ? 'Tested for Loom' : selectedModel.header_verified ? 'File inspected' : 'Unavailable'}</dd></div>
+                    <div><dt>Prompt mode</dt><dd>{modelCapabilityMode(selectedModel)}</dd></div>
+                    <div><dt>Architecture</dt><dd>{selectedModel.architecture ?? 'Inspect on load'}</dd></div>
+                    <div><dt>Context</dt><dd>{selectedModel.context_tokens === null ? 'Inspect on load' : `${selectedModel.context_tokens.toLocaleString()} tokens`}</dd></div>
+                    <div><dt>Media</dt><dd>{modelMediaLabel(selectedModel)}</dd></div>
+                    <div><dt>Generated tokens</dt><dd>{selectedModel.loaded ? (selectedModel.output_tokens ? 'Available' : 'Unavailable') : 'Inspect on load'}</dd></div>
+                    <div><dt>Log probabilities</dt><dd>{selectedModel.loaded ? (selectedModel.logprobs ? 'Available' : 'Unavailable') : 'Inspect on load'}</dd></div>
+                    <div><dt>Fill in middle</dt><dd>{selectedModel.loaded ? (selectedModel.fill_in_middle ? 'Verified' : 'Unavailable') : 'Inspect on load'}</dd></div>
+                    <div><dt>Projector</dt><dd>{selectedModel.projector_present === null ? 'Inspect on load' : selectedModel.projector_present ? 'Present' : 'None'}</dd></div>
+                  </dl>
                   <dl class="model-evidence">
-                    <div><dt>Path</dt><dd><code>{selectedModel.model_path}</code></dd></div>
+                    <div><dt>File</dt><dd><code>{selectedModel.model_path}</code></dd></div>
                     <div><dt>SHA-256</dt><dd><code>{selectedModel.model_sha256 ?? 'Computed during native load'}</code></dd></div>
                   </dl>
                 </details>
@@ -4635,23 +5602,20 @@
                     </button>
                   {:else}
                     <button class="primary-button" type="button" on:click={() => void loadSelectedModel()} disabled={!selectedModel.header_verified || modelLoading || modelUnloading || activeBranchCount > 0}>
-                      {modelLoading ? 'Inspecting natively…' : 'Load and inspect locally'}
+                      {modelLoading ? 'Checking model…' : 'Use this model'}
                     </button>
                   {/if}
                 </div>
               </article>
             {/if}
+              </section>
 
-            <div class="model-language-note">
-              <strong>Base versus chat.</strong>
-              A base model continues the manuscript exactly where it ends. A chat model expects a conversation template. Loom never disguises one as the other or inserts a hidden chat prompt into raw continuation.
-            </div>
-          </section>
-
-          <section class="model-download-panel" aria-labelledby="model-download-title">
+              <details class="model-download-panel">
+            <summary>Add a model from a verified URL</summary>
+            <div class="model-download-content">
             <div class="section-heading">
               <div>
-                <h3 id="model-download-title">Add a verified GGUF</h3>
+                <h3>Add a verified GGUF</h3>
                 <p>Bring a publisher URL and its exact checksum. Loom will not guess either one.</p>
               </div>
               {#if activeModelDownloads.length > 0}
@@ -4772,7 +5736,10 @@
                 {/each}
               </div>
             {/if}
-          </section>
+            </div>
+              </details>
+            </div>
+          </details>
         </div>
       </div>
     </div>

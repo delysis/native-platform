@@ -180,6 +180,16 @@ fn raw_completion_compiles_exact_ordered_blocks_and_final_tail() {
     assert_eq!(compiled.project_id(), project_id);
     assert_eq!(compiled.scope(), call_scope);
     assert_eq!(compiled.treatment_recipe_fingerprint(), recipe);
+    assert_compiled_prompt_contract(&compiled, recompiled, &specification, &expected, tail_bytes);
+}
+
+fn assert_compiled_prompt_contract(
+    compiled: &CompiledBaseCompletionPrompt,
+    recompiled: CompiledBaseCompletionPrompt,
+    specification: &FrozenBaseCompletionPrompt,
+    expected: &[u8],
+    tail_bytes: &[u8],
+) {
     assert_eq!(compiled.exact_bytes(), expected);
     assert_eq!(compiled.exact_text().as_bytes(), expected);
     assert_eq!(compiled.fingerprint(), recompiled.fingerprint());
@@ -229,7 +239,7 @@ fn raw_completion_compiles_exact_ordered_blocks_and_final_tail() {
         preserved_content_fingerprint,
         preserved_fingerprint,
     ) = recompiled.into_parts();
-    assert_eq!(preserved_specification, specification);
+    assert_eq!(&preserved_specification, specification);
     assert_eq!(preserved_bytes, expected);
     assert_eq!(preserved_tail, compiled.tail_prompt_range());
     assert_eq!(

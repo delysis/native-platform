@@ -21,6 +21,10 @@ export async function restoreBeforeBackgroundWork<T>(operations: {
   await operations.background(restored);
 }
 
+export function shouldDiscoverModelsOnStartup(suggestionsEnabled: boolean): boolean {
+  return suggestionsEnabled;
+}
+
 export type CurrentAsyncResult<T> =
   | { status: 'current'; value: T }
   | { status: 'stale' };

@@ -30,6 +30,9 @@
     "targets": "all",
     "category": "Productivity",
     "shortDescription": "Local-first writing with private model branches",
-    "longDescription": "Loom is a local-first writing environment for prose and poetry, with immutable revisions and optional local base-model continuations."
+    "longDescription": "Loom is a local-first writing environment for prose and poetry, with immutable revisions and optional local base-model continuations.",
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    }
   }
 }

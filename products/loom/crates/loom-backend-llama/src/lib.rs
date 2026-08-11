@@ -27,12 +27,16 @@ pub use model::{
     ProbabilitySemantics, RuntimeModelInspection, VerifiedCapabilitySet, VerifiedMediaCapability,
     VerifiedMediaKind, VerifiedModelDescriptor, is_gguf_path, verify_model_inspection,
 };
-pub use runtime::{BatchExecution, BatchRuntime, NativeHostRuntime, RuntimeEvidenceClass};
+pub use runtime::{
+    BatchExecution, BatchRuntime, CompleteModelRelease, JoinedLlamaRuntime, ModelRelease,
+    NativeHostRuntime, ProcessExitJoinedLlamaRuntime, RuntimeEvidenceClass,
+};
 
 pub use adapter::{
     CandidateProvenanceRecord, ContinuationCase, DEFAULT_EVENT_CAPACITY, ExactContinuationRequest,
-    ExactContinuationResult, LlamaBackend, LlamaBackendError, LlamaGenerationHandle,
-    MAX_EVENT_CAPACITY, model_environment_from_verified, validate_candidate_receipt_binding,
+    ExactContinuationResult, JoinedLlamaGeneration, LlamaBackend, LlamaBackendError,
+    LlamaGenerationControl, LlamaGenerationHandle, MAX_EVENT_CAPACITY,
+    model_environment_from_verified, validate_candidate_receipt_binding,
 };
 pub use llama_native_host::JoinedHostSlot;
-pub use llama_native_types::{SamplerKind, SamplingConfig};
+pub use llama_native_types::{NativeEvidenceCapabilities, SamplerKind, SamplingConfig};

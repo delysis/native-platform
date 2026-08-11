@@ -1,2 +1,8 @@
 [net]
 git-fetch-with-cli = true
+
+[env]
+# llama.cpp uses C++ filesystem APIs introduced in macOS 10.15. Keep Rust,
+# Clang, and cached CMake dependency builds on the same explicit floor.
+MACOSX_DEPLOYMENT_TARGET = { value = "10.15", force = true }
+CMAKE_OSX_DEPLOYMENT_TARGET = { value = "10.15", force = true }

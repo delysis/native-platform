@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-application-close-abort"
+description = "Enables the application_close_abort command without any pre-configured scope."
+commands.allow = ["application_close_abort"]
+
+[[permission]]
+identifier = "deny-application-close-abort"
+description = "Denies the application_close_abort command without any pre-configured scope."
+commands.deny = ["application_close_abort"]

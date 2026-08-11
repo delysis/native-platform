@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
@@ -21,10 +22,14 @@ use thiserror::Error;
 use crate::model::{
     LocalModelProfile, ModelInspectionError, VerifiedModelDescriptor, verify_model_inspection,
 };
-use crate::runtime::{BatchExecution, BatchRuntime, NativeHostRuntime, RuntimeEvidenceClass};
+use crate::runtime::{
+    BatchExecution, BatchRuntime, JoinedLlamaRuntime, ModelRelease, NativeHostRuntime,
+    RuntimeEvidenceClass,
+};
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 256;
 pub const MAX_EVENT_CAPACITY: usize = 65_536;
+const _: () = assert!(DEFAULT_EVENT_CAPACITY > 0 && DEFAULT_EVENT_CAPACITY <= MAX_EVENT_CAPACITY);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContinuationCase {
@@ -98,56 +103,133 @@ pub enum LlamaBackendError {
     Fingerprint(#[from] loom_types::HashIdParseError),
     #[error("failed to start the Loom event forwarder: {0}")]
     WorkerSpawn(#[source] std::io::Error),
+    #[error("the Loom event forwarder panicked before it could be joined")]
+    WorkerPanicked,
     #[error("generation result channel disconnected")]
     ResultDisconnected,
     #[error("generation did not finish before the requested timeout")]
     ResultTimeout,
+    #[error("this backend was constructed without concrete native shutdown authority")]
+    NativeShutdownAuthorityUnavailable,
+}
+
+#[derive(Debug)]
+enum RuntimeBinding {
+    Native(Arc<NativeHostRuntime>),
+    Custom(Arc<dyn BatchRuntime>),
+}
+
+impl RuntimeBinding {
+    fn as_batch_runtime(&self) -> &dyn BatchRuntime {
+        match self {
+            Self::Native(runtime) => runtime.as_ref(),
+            Self::Custom(runtime) => runtime.as_ref(),
+        }
+    }
+
+    fn native(&self) -> Option<&NativeHostRuntime> {
+        match self {
+            Self::Native(runtime) => Some(runtime.as_ref()),
+            Self::Custom(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct LlamaBackend {
-    runtime: Arc<dyn BatchRuntime>,
+    runtime: RuntimeBinding,
     event_capacity: usize,
 }
 
 impl Default for LlamaBackend {
     fn default() -> Self {
-        Self::with_runtime(
-            Arc::new(NativeHostRuntime::default()),
-            DEFAULT_EVENT_CAPACITY,
-        )
-        .expect("the built-in event capacity is valid")
+        Self::with_default_native_runtime(Arc::new(NativeHostRuntime::default()))
     }
 }
 
 impl LlamaBackend {
+    /// Builds an exact native backend with the compile-time product default
+    /// event capacity. Unlike the configurable constructor, this cannot fail.
+    #[must_use]
+    pub fn with_default_native_runtime(runtime: Arc<NativeHostRuntime>) -> Self {
+        Self {
+            runtime: RuntimeBinding::Native(runtime),
+            event_capacity: DEFAULT_EVENT_CAPACITY,
+        }
+    }
+
+    /// Builds a backend around a custom runtime without granting it authority
+    /// to certify native host shutdown.
     pub fn with_runtime(
         runtime: Arc<dyn BatchRuntime>,
         event_capacity: usize,
     ) -> Result<Self, LlamaBackendError> {
+        Self::validate_event_capacity(event_capacity)?;
+        Ok(Self {
+            runtime: RuntimeBinding::Custom(runtime),
+            event_capacity,
+        })
+    }
+
+    /// Builds a backend around one concrete native runtime. Only this typed
+    /// path retains the exact instance needed to return joined-host evidence.
+    pub fn with_native_runtime(
+        runtime: Arc<NativeHostRuntime>,
+        event_capacity: usize,
+    ) -> Result<Self, LlamaBackendError> {
+        Self::validate_event_capacity(event_capacity)?;
+        Ok(Self {
+            runtime: RuntimeBinding::Native(runtime),
+            event_capacity,
+        })
+    }
+
+    fn validate_event_capacity(event_capacity: usize) -> Result<(), LlamaBackendError> {
         if event_capacity == 0 || event_capacity > MAX_EVENT_CAPACITY {
             return Err(LlamaBackendError::InvalidRequest(format!(
                 "event capacity must be in 1..={MAX_EVENT_CAPACITY}"
             )));
         }
-        Ok(Self {
-            runtime,
-            event_capacity,
-        })
+        Ok(())
     }
 
     pub fn inspect_model(
         &self,
         profile: &LocalModelProfile,
     ) -> Result<VerifiedModelDescriptor, LlamaBackendError> {
-        let inspection = self.runtime.inspect_model(profile)?;
+        let inspection = self.runtime.as_batch_runtime().inspect_model(profile)?;
         verify_model_inspection(profile, inspection).map_err(Into::into)
     }
 
     /// Releases native resident state for a model that is no longer selected.
     /// Callers must ensure no active generation still references the profile.
-    pub fn release_model(&self, profile: &LocalModelProfile) -> Result<bool, LlamaBackendError> {
-        self.runtime.release_model(profile).map_err(Into::into)
+    pub fn release_model(
+        &self,
+        profile: &LocalModelProfile,
+    ) -> Result<ModelRelease, LlamaBackendError> {
+        self.runtime
+            .as_batch_runtime()
+            .release_model(profile)
+            .map_err(Into::into)
+    }
+
+    /// Permanently closes the exact native runtime and returns only after all
+    /// of its resident native workers have been joined.
+    pub fn shutdown_joined(&self) -> Result<JoinedLlamaRuntime, LlamaBackendError> {
+        self.runtime
+            .native()
+            .ok_or(LlamaBackendError::NativeShutdownAuthorityUnavailable)?
+            .shutdown_joined()
+            .map_err(Into::into)
+    }
+
+    /// Checks that joined authority was minted by this backend's exact native
+    /// runtime rather than another same-typed backend instance.
+    #[must_use]
+    pub fn owns_joined_runtime(&self, joined: &JoinedLlamaRuntime) -> bool {
+        self.runtime
+            .native()
+            .is_some_and(|runtime| joined.belongs_to(runtime))
     }
 
     pub fn start_exact_continuation(
@@ -159,7 +241,10 @@ impl LlamaBackend {
         let exact_prompt_blob_id = BlobId::digest(request.exact_manuscript_prefix.as_bytes());
         let model_environment = model_environment_from_verified(&model)?;
         let native_request = build_native_request(&request);
-        let execution = self.runtime.start_batch(&request.model, native_request)?;
+        let execution = self
+            .runtime
+            .as_batch_runtime()
+            .start_batch(&request.model, native_request)?;
         let identities = request
             .cases
             .iter()
@@ -181,11 +266,11 @@ impl LlamaBackend {
         let worker_execution = Arc::clone(&execution);
         let worker_events = Arc::clone(&events);
         let worker_identities = identities.clone();
-        let runtime_evidence = self.runtime.evidence_class();
+        let runtime_evidence = self.runtime.as_batch_runtime().evidence_class();
         let worker_request = request.clone();
         let worker_model = model.clone();
         let worker_environment = model_environment.clone();
-        let spawn = std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("loom-llama-event-forwarder".to_string())
             .spawn(move || {
                 run_generation_worker(
@@ -199,27 +284,35 @@ impl LlamaBackend {
                     worker_environment,
                     &result_tx,
                 );
-            });
-        if let Err(error) = spawn {
-            for identity in &identities {
-                let _ = execution.cancel_case(&identity.case_id);
-            }
-            return Err(LlamaBackendError::WorkerSpawn(error));
-        }
+            })
+            .map_err(|error| {
+                for identity in &identities {
+                    let _ = execution.cancel_case(&identity.case_id);
+                }
+                LlamaBackendError::WorkerSpawn(error)
+            })?;
 
-        Ok(LlamaGenerationHandle {
+        let control = Arc::new(LlamaGenerationControl {
             request_id: request.request_id,
             identities,
             execution,
             events,
             event_rx,
             result_rx,
+        });
+
+        Ok(LlamaGenerationHandle {
+            control,
+            worker: Mutex::new(Some(worker)),
         })
     }
 }
 
+/// Cloneable generation control deliberately excludes thread-join authority.
+/// Registries and event consumers may share this value without gaining the
+/// ability to certify that the backend worker has stopped.
 #[derive(Debug)]
-pub struct LlamaGenerationHandle {
+pub struct LlamaGenerationControl {
     request_id: String,
     identities: Vec<CaseIdentity>,
     execution: Arc<dyn BatchExecution>,
@@ -228,7 +321,32 @@ pub struct LlamaGenerationHandle {
     result_rx: Receiver<Result<ExactContinuationResult, LlamaBackendError>>,
 }
 
-impl LlamaGenerationHandle {
+/// The sole owner of one Loom event-forwarder thread.
+///
+/// This type is intentionally neither `Clone` nor shareable through a trait
+/// object. Moving it transfers the only authority capable of returning a
+/// joined-worker proof.
+#[derive(Debug)]
+pub struct LlamaGenerationHandle {
+    control: Arc<LlamaGenerationControl>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Affine evidence that the exact event-forwarder owned by a generation
+/// handle has been joined (or had already been joined by that same owner).
+#[derive(Debug)]
+pub struct JoinedLlamaGeneration {
+    worker_was_present: bool,
+    worker_panicked: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkerJoinOutcome {
+    worker_was_present: bool,
+    worker_panicked: bool,
+}
+
+impl LlamaGenerationControl {
     #[must_use]
     pub fn request_id(&self) -> &str {
         &self.request_id
@@ -261,6 +379,21 @@ impl LlamaGenerationHandle {
         self.cancel_branch(identity.branch_id)
     }
 
+    /// Requests cancellation for every branch owned by this exact handle.
+    /// Returns the number of branches whose native cancellation route accepted
+    /// the request.
+    pub fn cancel_all(&self) -> usize {
+        self.identities
+            .iter()
+            .filter(|identity| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.cancel_branch(identity.branch_id)
+                }))
+                .unwrap_or(false)
+            })
+            .count()
+    }
+
     pub fn receive_event_timeout(
         &self,
         timeout: Duration,
@@ -272,13 +405,9 @@ impl LlamaGenerationHandle {
         }
     }
 
-    pub fn wait(self) -> Result<ExactContinuationResult, LlamaBackendError> {
-        self.result_rx
-            .recv()
-            .map_err(|_| LlamaBackendError::ResultDisconnected)?
-    }
-
-    pub fn wait_timeout(
+    /// Receives the backend result without joining the worker. Only the
+    /// non-cloneable owner may perform that join.
+    pub fn receive_result_timeout(
         &self,
         timeout: Duration,
     ) -> Result<ExactContinuationResult, LlamaBackendError> {
@@ -287,6 +416,134 @@ impl LlamaGenerationHandle {
             Err(RecvTimeoutError::Timeout) => Err(LlamaBackendError::ResultTimeout),
             Err(RecvTimeoutError::Disconnected) => Err(LlamaBackendError::ResultDisconnected),
         }
+    }
+}
+
+impl LlamaGenerationHandle {
+    /// Returns cancellation/event/result control without duplicating the
+    /// event-forwarder `JoinHandle`.
+    #[must_use]
+    pub fn control(&self) -> Arc<LlamaGenerationControl> {
+        Arc::clone(&self.control)
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        self.control.request_id()
+    }
+
+    pub fn cancel_branch(&self, branch_id: BranchId) -> bool {
+        self.control.cancel_branch(branch_id)
+    }
+
+    pub fn cancel_run(&self, run_id: GenerationRunId) -> bool {
+        self.control.cancel_run(run_id)
+    }
+
+    pub fn cancel_all(&self) -> usize {
+        self.control.cancel_all()
+    }
+
+    pub fn receive_event_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<LoomEvent>, LlamaBackendError> {
+        self.control.receive_event_timeout(timeout)
+    }
+
+    pub fn wait(self) -> Result<ExactContinuationResult, LlamaBackendError> {
+        let result = self
+            .control
+            .result_rx
+            .recv()
+            .map_err(|_| LlamaBackendError::ResultDisconnected);
+        self.join_worker()?;
+        result?
+    }
+
+    pub fn wait_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<ExactContinuationResult, LlamaBackendError> {
+        match self.control.receive_result_timeout(timeout) {
+            Ok(result) => {
+                self.join_worker()?;
+                Ok(result)
+            }
+            Err(LlamaBackendError::ResultTimeout) => Err(LlamaBackendError::ResultTimeout),
+            Err(LlamaBackendError::ResultDisconnected) => {
+                self.join_worker()?;
+                Err(LlamaBackendError::ResultDisconnected)
+            }
+            Err(error) => {
+                self.join_worker()?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Consumes the only worker owner, requests cancellation for every case,
+    /// and returns only after the exact event-forwarder has been joined.
+    #[must_use]
+    pub fn shutdown_joined(self) -> JoinedLlamaGeneration {
+        let _ = self.control.cancel_all();
+        let outcome = self.join_worker_outcome();
+        JoinedLlamaGeneration {
+            worker_was_present: outcome.worker_was_present,
+            worker_panicked: outcome.worker_panicked,
+        }
+    }
+
+    fn join_worker(&self) -> Result<(), LlamaBackendError> {
+        let outcome = self.join_worker_outcome();
+        if outcome.worker_panicked {
+            Err(LlamaBackendError::WorkerPanicked)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn join_worker_outcome(&self) -> WorkerJoinOutcome {
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        WorkerJoinOutcome {
+            worker_was_present: worker.is_some(),
+            worker_panicked: worker.is_some_and(|worker| worker.join().is_err()),
+        }
+    }
+}
+
+impl JoinedLlamaGeneration {
+    #[must_use]
+    pub const fn worker_was_present(&self) -> bool {
+        self.worker_was_present
+    }
+
+    #[must_use]
+    pub const fn worker_panicked(&self) -> bool {
+        self.worker_panicked
+    }
+
+    #[must_use]
+    pub const fn joined_worker_count(&self) -> usize {
+        self.worker_was_present as usize
+    }
+}
+
+impl Drop for LlamaGenerationHandle {
+    fn drop(&mut self) {
+        let worker_is_live = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        if worker_is_live {
+            let _ = self.control.cancel_all();
+        }
+        let _ = self.join_worker();
     }
 }
 
@@ -1056,12 +1313,15 @@ mod tests {
 
     use super::*;
     use crate::model::RuntimeModelInspection;
+    use crate::runtime::CompleteModelRelease;
 
     #[derive(Debug)]
     struct FakeExecution {
         event_rx: Receiver<NativeEvent>,
         result: Mutex<Option<Vec<GenerationOutput>>>,
         ready: AtomicBool,
+        complete_on_cancel: AtomicBool,
+        panic_on_receive: AtomicBool,
         cancelled: Mutex<Vec<String>>,
     }
 
@@ -1084,6 +1344,9 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(case_id.to_string());
+            if self.complete_on_cancel.load(Ordering::Acquire) {
+                self.set_ready();
+            }
             true
         }
 
@@ -1091,6 +1354,10 @@ mod tests {
             &self,
             timeout: Duration,
         ) -> Result<Option<NativeEvent>, NativeError> {
+            assert!(
+                !self.panic_on_receive.load(Ordering::Acquire),
+                "fixture event worker panic"
+            );
             match self.event_rx.recv_timeout(timeout) {
                 Ok(event) => Ok(Some(event)),
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Ok(None),
@@ -1142,8 +1409,14 @@ mod tests {
             Ok(self.execution.clone())
         }
 
-        fn release_model(&self, _profile: &LocalModelProfile) -> Result<bool, NativeError> {
-            Ok(!self.released.swap(true, Ordering::AcqRel))
+        fn release_model(&self, _profile: &LocalModelProfile) -> Result<ModelRelease, NativeError> {
+            Ok(if self.released.swap(true, Ordering::AcqRel) {
+                ModelRelease::AlreadyAbsent
+            } else {
+                ModelRelease::Released {
+                    proof: CompleteModelRelease::from_complete_count(std::num::NonZeroUsize::MIN),
+                }
+            })
         }
     }
 
@@ -1401,6 +1674,8 @@ mod tests {
                 event_rx,
                 result: Mutex::new(Some(outputs)),
                 ready: AtomicBool::new(ready),
+                complete_on_cancel: AtomicBool::new(false),
+                panic_on_receive: AtomicBool::new(false),
                 cancelled: Mutex::new(Vec::new()),
             }),
             captured: Mutex::new(None),
@@ -1521,6 +1796,21 @@ mod tests {
     }
 
     #[test]
+    fn only_the_typed_native_constructor_retains_shutdown_authority() {
+        let runtime = Arc::new(NativeHostRuntime::default());
+        let backend = LlamaBackend::with_native_runtime(runtime.clone(), 1).expect("backend");
+        let other_backend =
+            LlamaBackend::with_native_runtime(Arc::new(NativeHostRuntime::default()), 1)
+                .expect("other backend");
+        let joined = backend.shutdown_joined().expect("joined native runtime");
+
+        assert_eq!(joined.joined_worker_count(), 0);
+        assert!(joined.belongs_to(runtime.as_ref()));
+        assert!(backend.owns_joined_runtime(&joined));
+        assert!(!other_backend.owns_joined_runtime(&joined));
+    }
+
+    #[test]
     fn exact_prefix_batch_is_completion_only_and_fixture_evidence_stays_fixture() {
         let request = request_with_two_cases();
         let outputs = (0..request.cases.len())
@@ -1560,16 +1850,154 @@ mod tests {
             NativeEvidenceCapabilities::default(),
             "unreported additive capabilities must remain unreported"
         );
-        assert!(
+        drop(handle);
+        assert!(runtime.execution.cancelled_cases().is_empty());
+        let ModelRelease::Released { proof } = backend
+            .release_model(&request.model)
+            .expect("release fixture model")
+        else {
+            panic!("fixture model was unexpectedly absent");
+        };
+        assert_eq!(proof.released_slots(), std::num::NonZeroUsize::MIN);
+        assert!(matches!(
             backend
                 .release_model(&request.model)
-                .expect("release fixture model")
+                .expect("second release is idempotent"),
+            ModelRelease::AlreadyAbsent
+        ));
+        assert!(matches!(
+            backend.shutdown_joined(),
+            Err(LlamaBackendError::NativeShutdownAuthorityUnavailable)
+        ));
+    }
+
+    #[test]
+    fn timeout_retains_worker_until_later_completion_is_joined() {
+        let request = request_with_two_cases();
+        let outputs = (0..request.cases.len())
+            .map(|index| native_output(&request, index, GenerationState::Completed, true))
+            .collect();
+        let runtime = fake_runtime(
+            &request,
+            outputs,
+            Vec::new(),
+            false,
+            RuntimeEvidenceClass::TestFixture,
         );
-        assert!(
-            !backend
-                .release_model(&request.model)
-                .expect("second release is idempotent")
+        let backend = LlamaBackend::with_runtime(runtime.clone(), 32).expect("backend");
+        let handle = backend
+            .start_exact_continuation(request)
+            .expect("start generation");
+
+        assert!(matches!(
+            handle.wait_timeout(Duration::ZERO),
+            Err(LlamaBackendError::ResultTimeout)
+        ));
+        runtime.execution.set_ready();
+        handle
+            .wait_timeout(Duration::from_secs(2))
+            .expect("later generation result");
+        drop(handle);
+        assert!(runtime.execution.cancelled_cases().is_empty());
+    }
+
+    #[test]
+    fn early_drop_cancels_every_case_and_joins_the_worker() {
+        let request = request_with_two_cases();
+        let expected_cases = request
+            .cases
+            .iter()
+            .map(|case| case.generation.branch_id.to_string())
+            .collect::<Vec<_>>();
+        let outputs = (0..request.cases.len())
+            .map(|index| native_output(&request, index, GenerationState::Cancelled, true))
+            .collect();
+        let runtime = fake_runtime(
+            &request,
+            outputs,
+            Vec::new(),
+            false,
+            RuntimeEvidenceClass::TestFixture,
         );
+        runtime
+            .execution
+            .complete_on_cancel
+            .store(true, Ordering::Release);
+        let backend = LlamaBackend::with_runtime(runtime.clone(), 32).expect("backend");
+        let handle = backend
+            .start_exact_continuation(request)
+            .expect("start generation");
+
+        drop(handle);
+
+        assert_eq!(runtime.execution.cancelled_cases(), expected_cases);
+    }
+
+    #[test]
+    fn affine_owner_joins_while_cloneable_control_remains_retained() {
+        let request = request_with_two_cases();
+        let expected_cases = request
+            .cases
+            .iter()
+            .map(|case| case.generation.branch_id.to_string())
+            .collect::<Vec<_>>();
+        let outputs = (0..request.cases.len())
+            .map(|index| native_output(&request, index, GenerationState::Cancelled, true))
+            .collect();
+        let runtime = fake_runtime(
+            &request,
+            outputs,
+            Vec::new(),
+            false,
+            RuntimeEvidenceClass::TestFixture,
+        );
+        runtime
+            .execution
+            .complete_on_cancel
+            .store(true, Ordering::Release);
+        let backend = LlamaBackend::with_runtime(runtime.clone(), 32).expect("backend");
+        let owner = backend
+            .start_exact_continuation(request)
+            .expect("start generation");
+        let retained_control = owner.control();
+
+        let joined = owner.shutdown_joined();
+
+        assert!(joined.worker_was_present());
+        assert!(!joined.worker_panicked());
+        assert_eq!(joined.joined_worker_count(), 1);
+        assert_eq!(runtime.execution.cancelled_cases(), expected_cases);
+        assert!(!retained_control.request_id().is_empty());
+    }
+
+    #[test]
+    fn worker_panic_is_reported_by_the_join_boundary() {
+        let request = request_with_two_cases();
+        let outputs = (0..request.cases.len())
+            .map(|index| native_output(&request, index, GenerationState::Completed, true))
+            .collect();
+        let runtime = fake_runtime(
+            &request,
+            outputs,
+            Vec::new(),
+            false,
+            RuntimeEvidenceClass::TestFixture,
+        );
+        runtime
+            .execution
+            .panic_on_receive
+            .store(true, Ordering::Release);
+        let backend = LlamaBackend::with_runtime(runtime.clone(), 32).expect("backend");
+        let handle = backend
+            .start_exact_continuation(request)
+            .expect("start generation");
+
+        assert!(matches!(
+            handle.wait_timeout(Duration::from_secs(2)),
+            Err(LlamaBackendError::WorkerPanicked)
+        ));
+        drop(handle);
+        assert!(runtime.execution.cancelled_cases().is_empty());
     }
 
     #[test]
@@ -1732,6 +2160,50 @@ mod tests {
                     provenance.evidence_kind == InferenceEvidenceKind::LiveInference
                 })
         }));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires LOOM_GGUF_MODEL_PATH and a real local GGUF"]
+    fn real_gguf_cpu_cancellation_and_complete_release() -> Result<(), Box<dyn std::error::Error>> {
+        let model_path = std::env::var("LOOM_GGUF_MODEL_PATH")?;
+        let mut request = request_with_two_cases();
+        request.model = LocalModelProfile::for_gguf(&model_path);
+        request.model.device = crate::LocalDevicePreference::Cpu;
+        request.model.max_parallel_cases = 2;
+        request.request_id = "real-cancel-release".to_string();
+        request.exact_manuscript_prefix = "The lamp made a small island of light".to_string();
+        request.prompt_recipe.exact_prompt_blob_id =
+            BlobId::digest(request.exact_manuscript_prefix.as_bytes());
+        for case in &mut request.cases {
+            case.sampling.max_tokens = 2_048;
+            case.generation.sampling = serde_json::to_value(&case.sampling)?;
+        }
+        let profile = request.model.clone();
+        let branches = request
+            .cases
+            .iter()
+            .map(|case| case.generation.branch_id)
+            .collect::<Vec<_>>();
+        let backend = LlamaBackend::default();
+        let handle = backend.start_exact_continuation(request)?;
+        for branch_id in branches {
+            assert!(handle.cancel_branch(branch_id));
+        }
+        let result = handle.wait_timeout(Duration::from_secs(300))?;
+        assert!(
+            result.candidates.iter().all(|candidate| {
+                candidate.terminal.status == GenerationTerminalStatus::Cancelled
+            })
+        );
+        drop(handle);
+        let ModelRelease::Released { proof } = backend.release_model(&profile)? else {
+            return Err("loaded CPU model was already absent during release".into());
+        };
+        assert_eq!(proof.matched_slots(), proof.released_slots());
+        assert_eq!(proof.released_slots().get(), 1);
+        let shutdown = backend.shutdown_joined()?;
+        assert_eq!(shutdown.joined_worker_count(), 1);
         Ok(())
     }
 

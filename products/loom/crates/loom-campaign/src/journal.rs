@@ -1458,9 +1458,7 @@ impl CampaignJournal {
             return Ok(());
         }
 
-        let (session_id, store_lease_fingerprint) = self.persistence_identity();
-        let event_bytes =
-            canonical_campaign_event_bytes(&self.spec, event, session_id, store_lease_fingerprint)?;
+        let event_bytes = self.canonical_event_bytes(event)?;
 
         let attempt_bytes;
         let run_bytes;
@@ -1480,15 +1478,11 @@ impl CampaignJournal {
                 attempt_ordinal,
                 reservation,
             } => {
-                run_bytes = TrialRunRecord::new(
-                    attempt_id.as_trial_run_id(),
+                run_bytes = canonical_campaign_trial_run_bytes(
+                    &self.spec,
+                    *attempt_id,
                     *trial_fingerprint,
-                    TrialRunOrigin::Campaign {
-                        campaign_id: self.spec.campaign_id(),
-                        campaign_fingerprint: self.spec.fingerprint(),
-                    },
-                )
-                .canonical_bytes()?;
+                )?;
                 attempt_bytes = canonical_campaign_attempt_bytes(
                     self.spec.fingerprint(),
                     event.fingerprint,
@@ -1514,9 +1508,7 @@ impl CampaignJournal {
                 }
             }
             CampaignEventKind::TrialDispatched { attempt_id } => {
-                CampaignJournalMutation::TrialDispatched {
-                    attempt_id: attempt_id.as_trial_run_id(),
-                }
+                trial_dispatched_mutation(*attempt_id)
             }
             CampaignEventKind::TrialFinished {
                 attempt_id,
@@ -1539,9 +1531,7 @@ impl CampaignJournal {
                 }
             }
             CampaignEventKind::TrialReservationReleased { attempt_id, .. } => {
-                CampaignJournalMutation::TrialReservationReleased {
-                    attempt_id: attempt_id.as_trial_run_id(),
-                }
+                trial_reservation_released_mutation(*attempt_id)
             }
             CampaignEventKind::SearchDecisionRecorded { receipt } => {
                 let decision_index = u32::try_from(self.state.decision_ids.len())
@@ -1582,6 +1572,11 @@ impl CampaignJournal {
             #[cfg(test)]
             CampaignJournalPersistence::Diagnostic { .. } => unreachable!("checked by caller"),
         }
+    }
+
+    fn canonical_event_bytes(&self, event: &CampaignEvent) -> Result<Vec<u8>, CampaignError> {
+        let (session_id, store_lease_fingerprint) = self.persistence_identity();
+        canonical_campaign_event_bytes(&self.spec, event, session_id, store_lease_fingerprint)
     }
 
     fn append_persisted_event(
@@ -1653,6 +1648,37 @@ impl CampaignJournal {
             }
         }
         Ok(())
+    }
+}
+
+fn canonical_campaign_trial_run_bytes(
+    spec: &FrozenCampaignSpec,
+    attempt_id: TrialAttemptId,
+    trial_fingerprint: BlobId,
+) -> Result<Vec<u8>, CampaignError> {
+    TrialRunRecord::new(
+        attempt_id.as_trial_run_id(),
+        trial_fingerprint,
+        TrialRunOrigin::Campaign {
+            campaign_id: spec.campaign_id(),
+            campaign_fingerprint: spec.fingerprint(),
+        },
+    )
+    .canonical_bytes()
+    .map_err(CampaignError::from)
+}
+
+fn trial_dispatched_mutation(attempt_id: TrialAttemptId) -> CampaignJournalMutation<'static> {
+    CampaignJournalMutation::TrialDispatched {
+        attempt_id: attempt_id.as_trial_run_id(),
+    }
+}
+
+fn trial_reservation_released_mutation(
+    attempt_id: TrialAttemptId,
+) -> CampaignJournalMutation<'static> {
+    CampaignJournalMutation::TrialReservationReleased {
+        attempt_id: attempt_id.as_trial_run_id(),
     }
 }
 

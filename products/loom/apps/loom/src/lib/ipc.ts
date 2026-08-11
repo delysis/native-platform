@@ -5,6 +5,7 @@ import type {
   BranchPage,
   BranchPageCursor,
   BranchSummary,
+  BuildModelPolicySummary,
   CommandReceipt,
   DesktopGenerationEnvelope,
   DocumentKind,
@@ -21,6 +22,7 @@ import type {
   TransientDraftWriteReceipt,
   WeaveStarted
 } from './types';
+import { decodeBuildModelPolicy } from './buildModelPolicy';
 
 const PREFIX = 'plugin:loom|';
 
@@ -49,6 +51,11 @@ export function chooseAndOpenProject(): Promise<ProjectSnapshot> {
 
 export function currentProjectSession(): Promise<ProjectSnapshot> {
   return call('project_current');
+}
+
+export async function getBuildModelPolicy(): Promise<BuildModelPolicySummary> {
+  const value = await call<unknown>('build_model_policy_get');
+  return decodeBuildModelPolicy(value);
 }
 
 export function openDocument(
@@ -196,6 +203,13 @@ export function loadModel(modelPath: string): Promise<ModelCapabilitySummary> {
   return call('model_load', { modelPath });
 }
 
+export function loadPolicyModelCandidate(
+  profileId: string,
+  modelPath: string
+): Promise<ModelCapabilitySummary> {
+  return call('model_load_policy_candidate', { profileId, modelPath });
+}
+
 export function unloadModel(): Promise<ModelUnloadOutcome> {
   return call('model_unload');
 }
@@ -293,10 +307,14 @@ export interface WeaveStartArgs {
   sourceRevisionId: string;
   expectedVisibleBlobId: string;
   cursorByte: number;
-  branchCount: number;
-  maxTokens: number;
-  temperature: number;
-  automatic: boolean;
+  policy:
+    | { kind: 'automatic_v2' }
+    | {
+        kind: 'manual_v2';
+        branch_count: number;
+        max_tokens: number;
+        temperature: number;
+      };
 }
 
 export function startWeave(args: WeaveStartArgs): Promise<WeaveStarted> {
@@ -359,6 +377,18 @@ export function listenForGenerationEvents(
   return listen<DesktopGenerationEnvelope>('loom://generation', ({ payload }) => handler(payload));
 }
 
+export function listenForApplicationCloseRequests(
+  handler: () => void
+): Promise<UnlistenFn> {
+  if (!isDesktopRuntime()) {
+    return Promise.reject({
+      code: 'desktop_runtime_required',
+      message: 'Application close requests require the Loom desktop runtime.'
+    });
+  }
+  return listen('loom://application-close-requested', handler);
+}
+
 export function setFocusMode(
   projectId: string,
   sessionId: string,
@@ -377,6 +407,14 @@ export function setSuggestions(
 
 export function requestApplicationClose(): Promise<void> {
   return call('application_close');
+}
+
+export function abortApplicationClose(): Promise<void> {
+  return call('application_close_abort');
+}
+
+export function applicationClosePending(): Promise<boolean> {
+  return call('application_close_pending');
 }
 
 export function describeFailure(error: unknown): string {

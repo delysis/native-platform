@@ -1235,7 +1235,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{PersistedResearchSubjectSnapshot, ResearchSessionKind};
+    use crate::PersistedResearchSubjectSnapshot;
 
     #[test]
     fn canonical_records_are_content_addressed_idempotent_and_non_authorizing() {

@@ -359,17 +359,29 @@ pub struct ExclusiveResearchSessionLease {
     registry: ResearchSessionRegistry,
 }
 
+pub(crate) struct ExclusiveResearchSessionLeaseInput {
+    pub key: ResearchSessionKey,
+    pub record_fingerprint: BlobId,
+    pub project_id: ProjectId,
+    pub snapshot: PersistedResearchSubjectSnapshot,
+    pub trial_run_id: Option<TrialRunId>,
+    pub session_id: ArtifactId,
+    pub lease_fingerprint: BlobId,
+    pub registry: ResearchSessionRegistry,
+}
+
 impl ExclusiveResearchSessionLease {
-    pub(crate) const fn new(
-        key: ResearchSessionKey,
-        record_fingerprint: BlobId,
-        project_id: ProjectId,
-        snapshot: PersistedResearchSubjectSnapshot,
-        trial_run_id: Option<TrialRunId>,
-        session_id: ArtifactId,
-        lease_fingerprint: BlobId,
-        registry: ResearchSessionRegistry,
-    ) -> Self {
+    pub(crate) fn new(input: ExclusiveResearchSessionLeaseInput) -> Self {
+        let ExclusiveResearchSessionLeaseInput {
+            key,
+            record_fingerprint,
+            project_id,
+            snapshot,
+            trial_run_id,
+            session_id,
+            lease_fingerprint,
+            registry,
+        } = input;
         Self {
             key,
             record_fingerprint,
@@ -631,7 +643,16 @@ fn load_trial_snapshot(
     connection: &Connection,
     trial_run_id: TrialRunId,
 ) -> Result<Option<PersistedTrialSubjectSnapshot>> {
-    let raw = connection
+    query_trial_head(connection, trial_run_id)?
+        .map(|raw| decode_trial_snapshot(connection, trial_run_id, &raw))
+        .transpose()
+}
+
+fn query_trial_head(
+    connection: &Connection,
+    trial_run_id: TrialRunId,
+) -> Result<Option<RawTrialHead>> {
+    connection
         .query_row(
             "SELECT run.trial_fingerprint, run.origin_kind, run.origin_campaign_id,
                     origin_campaign.campaign_fingerprint,
@@ -677,10 +698,15 @@ fn load_trial_snapshot(
                 })
             },
         )
-        .optional()?;
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn decode_trial_snapshot(
+    connection: &Connection,
+    trial_run_id: TrialRunId,
+    raw: &RawTrialHead,
+) -> Result<PersistedTrialSubjectSnapshot> {
     let trial_fingerprint = parse_sql_digest(&raw.trial_fingerprint, "trial_fingerprint")?;
     let run_origin = match (
         raw.origin_kind.as_str(),
@@ -690,13 +716,15 @@ fn load_trial_snapshot(
         raw.origin_benchmark_seal_fingerprint.as_deref(),
         raw.origin_benchmark_assignment_fingerprint.as_deref(),
     ) {
-        ("campaign", Some(campaign_id), Some(campaign_fingerprint), None, None, None) => TrialRunOrigin::Campaign {
-            campaign_id: parse_sql_id(campaign_id, "run origin_campaign_id")?,
-            campaign_fingerprint: parse_sql_digest(
-                campaign_fingerprint,
-                "run origin campaign_fingerprint",
-            )?,
-        },
+        ("campaign", Some(campaign_id), Some(campaign_fingerprint), None, None, None) => {
+            TrialRunOrigin::Campaign {
+                campaign_id: parse_sql_id(campaign_id, "run origin_campaign_id")?,
+                campaign_fingerprint: parse_sql_digest(
+                    campaign_fingerprint,
+                    "run origin campaign_fingerprint",
+                )?,
+            }
+        }
         ("standalone", None, None, None, None, None) => TrialRunOrigin::Standalone,
         ("benchmark", None, None, Some(run_id), Some(seal), Some(assignment)) => {
             TrialRunOrigin::Benchmark {
@@ -710,7 +738,7 @@ fn load_trial_snapshot(
         }
         _ => return Err(corrupt_snapshot("invalid trial-run origin binding")),
     };
-    Ok(Some(PersistedTrialSubjectSnapshot {
+    Ok(PersistedTrialSubjectSnapshot {
         trial_run_id,
         run_origin,
         run_record_fingerprint: parse_sql_digest(
@@ -747,7 +775,7 @@ fn load_trial_snapshot(
             "trial record_fingerprint",
         )?,
         stages: load_trial_stages(connection, trial_fingerprint)?,
-    }))
+    })
 }
 
 fn load_trial_stages(
@@ -892,7 +920,6 @@ mod tests {
     use rusqlite::params;
     use tempfile::tempdir;
 
-    use super::*;
     use crate::{ProjectStore, StoreError};
 
     #[test]
