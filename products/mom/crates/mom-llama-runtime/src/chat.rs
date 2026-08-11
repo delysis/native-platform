@@ -25,7 +25,7 @@ use llama_native_types::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -49,6 +49,94 @@ impl Default for ChatSendOptions {
             timeout_s: 120.0,
             fake_fixture: false,
         }
+    }
+}
+
+/// Owns the stream interval after a caller has observed `started`.
+///
+/// All exits from generation, including `?`, early blocked results, and
+/// unwinding, cross this guard. Its destructor is deliberately best-effort:
+/// the original error remains authoritative, while the request registry and
+/// stream still receive a terminal failure whenever their stores are usable.
+struct ChatStreamLifecycle<'a, F>
+where
+    F: FnMut(ChatStreamEvent) -> Result<()>,
+{
+    request_id: String,
+    conversation_id: String,
+    data_dir: PathBuf,
+    options: ChatSendOptions,
+    on_event: &'a mut Option<F>,
+    terminal_emitted: bool,
+    real_engine_invoked: bool,
+}
+
+impl<'a, F> ChatStreamLifecycle<'a, F>
+where
+    F: FnMut(ChatStreamEvent) -> Result<()>,
+{
+    fn new(
+        request_id: &str,
+        conversation_id: &str,
+        data_dir: &Path,
+        options: ChatSendOptions,
+        on_event: &'a mut Option<F>,
+    ) -> Self {
+        Self {
+            request_id: request_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            data_dir: data_dir.to_path_buf(),
+            options,
+            on_event,
+            terminal_emitted: false,
+            real_engine_invoked: false,
+        }
+    }
+
+    fn callback(&mut self) -> &mut Option<F> {
+        self.on_event
+    }
+
+    fn mark_engine_invoked(&mut self) {
+        self.real_engine_invoked = true;
+    }
+
+    fn finish(&mut self, event: &'static str, message: Option<String>) -> Result<()> {
+        assert!(
+            matches!(event, "completed" | "cancelled" | "failed"),
+            "a chat stream lifecycle can finish only with a terminal event"
+        );
+        assert!(
+            !self.terminal_emitted,
+            "a chat stream lifecycle must emit exactly one terminal event"
+        );
+        self.terminal_emitted = true;
+        let mut terminal = stream_event(
+            &self.request_id,
+            &self.conversation_id,
+            event,
+            None,
+            message,
+            self.options,
+        );
+        terminal.real_engine_invoked = self.real_engine_invoked;
+        emit(self.on_event, terminal)
+    }
+}
+
+impl<F> Drop for ChatStreamLifecycle<'_, F>
+where
+    F: FnMut(ChatStreamEvent) -> Result<()>,
+{
+    fn drop(&mut self) {
+        if self.terminal_emitted {
+            return;
+        }
+        let _ = mark_request_state(&self.data_dir, &self.request_id, ChatRequestState::Failed);
+        let _ = self.finish(
+            "failed",
+            Some("Generation ended before producing a completed response.".to_string()),
+        );
     }
 }
 
@@ -498,6 +586,13 @@ where
             options,
         ),
     )?;
+    let mut stream = ChatStreamLifecycle::new(
+        &request_id,
+        &conversation.id,
+        &settings.data_dir,
+        options,
+        &mut on_event,
+    );
     let started = Instant::now();
     let model_path = settings.model_path.clone().unwrap_or_default();
     let (
@@ -593,6 +688,7 @@ where
         };
         let attempted_cache_id = cached_prefix.as_ref().map(|(id, _)| id.clone());
         let first_prefix = cached_prefix.as_ref().map(|(_, state)| state.clone());
+        stream.mark_engine_invoked();
         let first_ticket = handle
             .generate(build_request(first_prefix))
             .map_err(|error| anyhow::anyhow!(error))?;
@@ -602,7 +698,7 @@ where
             &conversation.id,
             options,
             parse_reasoning,
-            &mut on_event,
+            stream.callback(),
         ) {
             Ok(outputs) => (
                 outputs,
@@ -625,7 +721,7 @@ where
                         &conversation.id,
                         options,
                         parse_reasoning,
-                        &mut on_event,
+                        stream.callback(),
                     )
                     .map_err(chat_ticket_error)?,
                     false,
@@ -647,6 +743,10 @@ where
         };
         if output.state == GenerationState::Cancelled {
             mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Cancelled)?;
+            stream.finish(
+                "cancelled",
+                Some("The local model request was cancelled.".to_string()),
+            )?;
             return Ok(CommandResult::blocked(
                 "mom_llama.chat_send",
                 "stub_blocked",
@@ -770,17 +870,7 @@ where
         cache_id,
         cache_reused,
     };
-    emit(
-        &mut on_event,
-        stream_event(
-            &request_id,
-            &result.conversation_id,
-            "completed",
-            None,
-            Some(result.assistant_text.clone()),
-            options,
-        ),
-    )?;
+    stream.finish("completed", Some(result.assistant_text.clone()))?;
     Ok(CommandResult::passed(
         "mom_llama.chat_send",
         if options.fake_fixture {
@@ -1268,11 +1358,35 @@ fn mutate_active_requests(data_dir: &Path, mutation: impl FnOnce(&mut ActiveChat
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatAttachmentContext, Message, MessageRole, ReasoningStreamParser, ReasoningTarget,
-        build_native_messages, empty_native_response_result, native_context_messages,
-        parse_reasoning_output, user_turn_is_empty,
+        ActiveChatRequest, ChatAttachmentContext, ChatRequestState, ChatSendOptions,
+        ChatStreamLifecycle, Message, MessageRole, ReasoningStreamParser, ReasoningTarget,
+        build_native_messages, empty_native_response_result, load_active_requests,
+        native_context_messages, parse_reasoning_output, register_active_request,
+        user_turn_is_empty,
     };
     use crate::conversation_store::{MessageAttribution, MessageSpeakerKind};
+    use std::path::{Path, PathBuf};
+
+    struct TestDataDir(PathBuf);
+
+    impl TestDataDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("mom-llama-chat-{label}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).expect("create temporary runtime store");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn assistant_message(reasoning: Option<&str>, content: &str) -> Message {
         Message {
@@ -1355,6 +1469,72 @@ mod tests {
         let fixture = empty_native_response_result(Some("fixture reasoning"), true);
         assert!(!fixture.receipt.real_engine_invoked);
         assert!(fixture.receipt.fake_fixture);
+    }
+
+    #[test]
+    fn dropping_started_stream_emits_one_failed_terminal_and_closes_registry_state() {
+        let data_dir = TestDataDir::new("failed-terminal");
+        register_active_request(
+            data_dir.path(),
+            ActiveChatRequest {
+                request_id: "request".to_string(),
+                conversation_id: "conversation".to_string(),
+                pid: None,
+                started_at: "1".to_string(),
+                updated_at: "1".to_string(),
+                state: ChatRequestState::Running,
+                cancel_path: "native://request/request".to_string(),
+            },
+        )
+        .expect("register request");
+        let mut events = Vec::new();
+        let mut callback = Some(|event| {
+            events.push(event);
+            Ok(())
+        });
+        {
+            let mut stream = ChatStreamLifecycle::new(
+                "request",
+                "conversation",
+                data_dir.path(),
+                ChatSendOptions::default(),
+                &mut callback,
+            );
+            stream.mark_engine_invoked();
+        }
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "failed");
+        assert_eq!(events[0].request_id, "request");
+        assert!(events[0].real_engine_invoked);
+        let requests = load_active_requests(data_dir.path()).expect("load request registry");
+        assert_eq!(requests.requests[0].state, ChatRequestState::Failed);
+    }
+
+    #[test]
+    fn explicit_terminal_prevents_destructor_from_emitting_a_second_terminal() {
+        let data_dir = TestDataDir::new("completed-terminal");
+        let mut events = Vec::new();
+        let mut callback = Some(|event| {
+            events.push(event);
+            Ok(())
+        });
+        {
+            let mut stream = ChatStreamLifecycle::new(
+                "request",
+                "conversation",
+                data_dir.path(),
+                ChatSendOptions::default(),
+                &mut callback,
+            );
+            stream
+                .finish("completed", Some("answer".to_string()))
+                .expect("emit terminal");
+        }
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "completed");
+        assert!(!events[0].real_engine_invoked);
     }
 
     #[test]
