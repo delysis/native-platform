@@ -49,7 +49,7 @@ jq -e '
 
 cargo run -q -p mom-llama-app -- --dump-html > "$acceptance_dir/app.html"
 rg -q 'data-action="personas-open"' "$acceptance_dir/app.html"
-rg -q 'Start a private conversation with a saved Persona.' "$acceptance_dir/app.html"
+rg -q 'Open a saved Persona or start a new chat.' "$acceptance_dir/app.html"
 rg -q 'data-action="persona-open" data-conversation="persona-judith_herman"' \
   "$acceptance_dir/app.html"
 rg -q 'data-action="persona-instantiate" data-persona="persona-judith_herman"' \

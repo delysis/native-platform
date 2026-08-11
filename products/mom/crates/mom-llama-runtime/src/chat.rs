@@ -677,30 +677,9 @@ where
     };
     if assistant_text.trim().is_empty() {
         mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Failed)?;
-        let (code, message, actions) = if reasoning_content
-            .as_deref()
-            .is_some_and(|reasoning| !reasoning.trim().is_empty())
-        {
-            (
-                "native_response_reasoning_only",
-                "The native model exhausted its response before producing visible assistant text.",
-                vec![
-                    "Increase the response-token budget or skip reasoning during generation."
-                        .to_string(),
-                    "Try the request again with a more concise prompt.".to_string(),
-                ],
-            )
-        } else {
-            (
-                "native_response_empty",
-                "The native model returned no assistant text.",
-                vec!["Try a smaller prompt or another model.".to_string()],
-            )
-        };
-        return Ok(CommandResult::blocked(
-            "mom_llama.chat_send",
-            "blocked_native_runtime",
-            Blocker::new(code, message, actions),
+        return Ok(empty_native_response_result(
+            reasoning_content.as_deref(),
+            options.fake_fixture,
         ));
     }
     let user_message = regenerate_user_id.as_ref().map_or_else(
@@ -815,6 +794,39 @@ where
         !options.fake_fixture,
         options.fake_fixture,
     ))
+}
+
+fn empty_native_response_result(
+    reasoning_content: Option<&str>,
+    fake_fixture: bool,
+) -> CommandResult<ChatSendOutput> {
+    let emitted_reasoning = reasoning_content.is_some_and(|reasoning| !reasoning.trim().is_empty());
+    let (code, message, actions) = if emitted_reasoning {
+        (
+            "native_response_reasoning_only",
+            "The native model exhausted its response before producing visible assistant text.",
+            vec![
+                "Increase the response-token budget or skip reasoning during generation."
+                    .to_string(),
+                "Try the request again with a more concise prompt.".to_string(),
+            ],
+        )
+    } else {
+        (
+            "native_response_empty",
+            "The native model returned no assistant text.",
+            vec!["Try a smaller prompt or another model.".to_string()],
+        )
+    };
+    CommandResult::blocked_with_evidence(
+        "mom_llama.chat_send",
+        "blocked_native_runtime",
+        Blocker::new(code, message, actions),
+        Vec::new(),
+        Vec::new(),
+        emitted_reasoning && !fake_fixture,
+        fake_fixture,
+    )
 }
 
 fn user_turn_is_empty(message: &str, attachments: &ChatAttachmentContext) -> bool {
@@ -1257,7 +1269,8 @@ fn mutate_active_requests(data_dir: &Path, mutation: impl FnOnce(&mut ActiveChat
 mod tests {
     use super::{
         ChatAttachmentContext, Message, MessageRole, ReasoningStreamParser, ReasoningTarget,
-        build_native_messages, native_context_messages, parse_reasoning_output, user_turn_is_empty,
+        build_native_messages, empty_native_response_result, native_context_messages,
+        parse_reasoning_output, user_turn_is_empty,
     };
     use crate::conversation_store::{MessageAttribution, MessageSpeakerKind};
 
@@ -1321,6 +1334,27 @@ mod tests {
         assert_eq!(parsed.content, "<think>private</think>answer");
         assert_eq!(parsed.reasoning, "");
         assert!(!parsed.incomplete);
+    }
+
+    #[test]
+    fn reasoning_only_blocker_preserves_real_inference_evidence() {
+        let reasoning_only = empty_native_response_result(Some("private reasoning"), false);
+        assert_eq!(
+            reasoning_only
+                .blocker
+                .as_ref()
+                .map(|blocker| blocker.code.as_str()),
+            Some("native_response_reasoning_only")
+        );
+        assert!(reasoning_only.receipt.real_engine_invoked);
+        assert!(!reasoning_only.receipt.fake_fixture);
+
+        let empty = empty_native_response_result(None, false);
+        assert!(!empty.receipt.real_engine_invoked);
+
+        let fixture = empty_native_response_result(Some("fixture reasoning"), true);
+        assert!(!fixture.receipt.real_engine_invoked);
+        assert!(fixture.receipt.fake_fixture);
     }
 
     #[test]

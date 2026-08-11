@@ -655,7 +655,7 @@ fn skip_reasoning_is_typed_without_an_active_generation() -> Result<()> {
 
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
-fn real_native_cli_stream_uses_no_llama_executable() -> Result<()> {
+fn real_native_cli_stream_preserves_inference_evidence_without_executable() -> Result<()> {
     let Some(model) = std::env::var_os("MOM_LLAMA_MODEL_PATH").map(PathBuf::from) else {
         return Ok(());
     };
@@ -693,11 +693,12 @@ fn real_native_cli_stream_uses_no_llama_executable() -> Result<()> {
         .lines()
         .map(serde_json::from_str::<Value>)
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    assert!(
-        lines
-            .iter()
-            .any(|line| { line.get("event").and_then(Value::as_str) == Some("delta") })
-    );
+    assert!(lines.iter().any(|line| {
+        matches!(
+            line.get("event").and_then(Value::as_str),
+            Some("delta" | "reasoning_delta")
+        ) && line.get("real_engine_invoked").and_then(Value::as_bool) == Some(true)
+    }));
     let result = lines.last().ok_or_else(|| anyhow!("missing result"))?;
     assert_eq!(
         result

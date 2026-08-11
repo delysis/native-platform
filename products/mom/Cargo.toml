@@ -33,15 +33,15 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "
 uuid = { version = "1", features = ["v4", "serde"] }
 attachment-native-host = { git = "https://github.com/delysis/attachment-native-kit", rev = "472900732ded5bcfb5cc639c49b3a4f77feece27" }
 attachment-native-types = { git = "https://github.com/delysis/attachment-native-kit", rev = "472900732ded5bcfb5cc639c49b3a4f77feece27" }
-llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "4dd744209ff85886be9dce7df46cd65eaa19c804" }
-llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "4dd744209ff85886be9dce7df46cd65eaa19c804" }
-llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "4dd744209ff85886be9dce7df46cd65eaa19c804" }
-llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "4dd744209ff85886be9dce7df46cd65eaa19c804" }
-fte-backend-llama = { git = "https://github.com/delysis/free-token-energy", rev = "aa8ce2dab3baf46087f1cff68b8619f947647187" }
-fte-router = { git = "https://github.com/delysis/free-token-energy", rev = "aa8ce2dab3baf46087f1cff68b8619f947647187" }
-fte-store = { git = "https://github.com/delysis/free-token-energy", rev = "aa8ce2dab3baf46087f1cff68b8619f947647187" }
-fte-types = { git = "https://github.com/delysis/free-token-energy", rev = "aa8ce2dab3baf46087f1cff68b8619f947647187" }
-tauri-plugin-free-token-energy = { git = "https://github.com/delysis/free-token-energy", rev = "aa8ce2dab3baf46087f1cff68b8619f947647187" }
+llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "f87f57a5beb986d234c3fb059c92940578c70b27" }
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "f87f57a5beb986d234c3fb059c92940578c70b27" }
+llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "f87f57a5beb986d234c3fb059c92940578c70b27" }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "f87f57a5beb986d234c3fb059c92940578c70b27" }
+fte-backend-llama = { git = "https://github.com/delysis/free-token-energy", rev = "55ec90968cfa0fde30ac17cef62ea7ac82bc6b25" }
+fte-router = { git = "https://github.com/delysis/free-token-energy", rev = "55ec90968cfa0fde30ac17cef62ea7ac82bc6b25" }
+fte-store = { git = "https://github.com/delysis/free-token-energy", rev = "55ec90968cfa0fde30ac17cef62ea7ac82bc6b25" }
+fte-types = { git = "https://github.com/delysis/free-token-energy", rev = "55ec90968cfa0fde30ac17cef62ea7ac82bc6b25" }
+tauri-plugin-free-token-energy = { git = "https://github.com/delysis/free-token-energy", rev = "55ec90968cfa0fde30ac17cef62ea7ac82bc6b25" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

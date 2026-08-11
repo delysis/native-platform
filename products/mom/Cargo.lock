@@ -1250,7 +1250,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1460,7 +1460,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1633,7 +1633,7 @@ dependencies = [
 [[package]]
 name = "fte-backend-llama"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=aa8ce2dab3baf46087f1cff68b8619f947647187#aa8ce2dab3baf46087f1cff68b8619f947647187"
+source = "git+https://github.com/delysis/free-token-energy?rev=55ec90968cfa0fde30ac17cef62ea7ac82bc6b25#55ec90968cfa0fde30ac17cef62ea7ac82bc6b25"
 dependencies = [
  "async-trait",
  "fte-types",
@@ -1648,7 +1648,7 @@ dependencies = [
 [[package]]
 name = "fte-loopback"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=aa8ce2dab3baf46087f1cff68b8619f947647187#aa8ce2dab3baf46087f1cff68b8619f947647187"
+source = "git+https://github.com/delysis/free-token-energy?rev=55ec90968cfa0fde30ac17cef62ea7ac82bc6b25#55ec90968cfa0fde30ac17cef62ea7ac82bc6b25"
 dependencies = [
  "async-stream",
  "axum",
@@ -1669,7 +1669,7 @@ dependencies = [
 [[package]]
 name = "fte-protocols"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=aa8ce2dab3baf46087f1cff68b8619f947647187#aa8ce2dab3baf46087f1cff68b8619f947647187"
+source = "git+https://github.com/delysis/free-token-energy?rev=55ec90968cfa0fde30ac17cef62ea7ac82bc6b25#55ec90968cfa0fde30ac17cef62ea7ac82bc6b25"
 dependencies = [
  "fte-types",
  "serde",
@@ -1679,7 +1679,7 @@ dependencies = [
 [[package]]
 name = "fte-router"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=aa8ce2dab3baf46087f1cff68b8619f947647187#aa8ce2dab3baf46087f1cff68b8619f947647187"
+source = "git+https://github.com/delysis/free-token-energy?rev=55ec90968cfa0fde30ac17cef62ea7ac82bc6b25#55ec90968cfa0fde30ac17cef62ea7ac82bc6b25"
 dependencies = [
  "fte-types",
  "tokio",
@@ -1688,7 +1688,7 @@ dependencies = [
 [[package]]
 name = "fte-store"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=aa8ce2dab3baf46087f1cff68b8619f947647187#aa8ce2dab3baf46087f1cff68b8619f947647187"
+source = "git+https://github.com/delysis/free-token-energy?rev=55ec90968cfa0fde30ac17cef62ea7ac82bc6b25#55ec90968cfa0fde30ac17cef62ea7ac82bc6b25"
 dependencies = [
  "fte-types",
  "rusqlite",
@@ -1698,7 +1698,7 @@ dependencies = [
 [[package]]
 name = "fte-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=aa8ce2dab3baf46087f1cff68b8619f947647187#aa8ce2dab3baf46087f1cff68b8619f947647187"
+source = "git+https://github.com/delysis/free-token-energy?rev=55ec90968cfa0fde30ac17cef62ea7ac82bc6b25#55ec90968cfa0fde30ac17cef62ea7ac82bc6b25"
 dependencies = [
  "async-trait",
  "futures",
@@ -2555,7 +2555,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2914,7 +2914,7 @@ dependencies = [
 [[package]]
 name = "llama-native-cache"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=4dd744209ff85886be9dce7df46cd65eaa19c804#4dd744209ff85886be9dce7df46cd65eaa19c804"
+source = "git+https://github.com/delysis/llama-native-kit?rev=f87f57a5beb986d234c3fb059c92940578c70b27#f87f57a5beb986d234c3fb059c92940578c70b27"
 dependencies = [
  "llama-native-types",
  "serde",
@@ -2924,7 +2924,7 @@ dependencies = [
 [[package]]
 name = "llama-native-engine"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=4dd744209ff85886be9dce7df46cd65eaa19c804#4dd744209ff85886be9dce7df46cd65eaa19c804"
+source = "git+https://github.com/delysis/llama-native-kit?rev=f87f57a5beb986d234c3fb059c92940578c70b27#f87f57a5beb986d234c3fb059c92940578c70b27"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",
@@ -2938,7 +2938,7 @@ dependencies = [
 [[package]]
 name = "llama-native-host"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=4dd744209ff85886be9dce7df46cd65eaa19c804#4dd744209ff85886be9dce7df46cd65eaa19c804"
+source = "git+https://github.com/delysis/llama-native-kit?rev=f87f57a5beb986d234c3fb059c92940578c70b27#f87f57a5beb986d234c3fb059c92940578c70b27"
 dependencies = [
  "llama-native-cache",
  "llama-native-engine",
@@ -2948,7 +2948,7 @@ dependencies = [
 [[package]]
 name = "llama-native-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=4dd744209ff85886be9dce7df46cd65eaa19c804#4dd744209ff85886be9dce7df46cd65eaa19c804"
+source = "git+https://github.com/delysis/llama-native-kit?rev=f87f57a5beb986d234c3fb059c92940578c70b27#f87f57a5beb986d234c3fb059c92940578c70b27"
 dependencies = [
  "serde",
  "sha2 0.10.9",
@@ -4179,7 +4179,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4980,7 +4980,7 @@ dependencies = [
 [[package]]
 name = "tauri-plugin-free-token-energy"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=aa8ce2dab3baf46087f1cff68b8619f947647187#aa8ce2dab3baf46087f1cff68b8619f947647187"
+source = "git+https://github.com/delysis/free-token-energy?rev=55ec90968cfa0fde30ac17cef62ea7ac82bc6b25#55ec90968cfa0fde30ac17cef62ea7ac82bc6b25"
 dependencies = [
  "fte-loopback",
  "fte-router",
@@ -5099,10 +5099,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5975,7 +5975,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
