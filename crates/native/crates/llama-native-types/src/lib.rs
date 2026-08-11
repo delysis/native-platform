@@ -2963,6 +2963,8 @@ pub enum NativeErrorCode {
     Cancelled,
     #[error("queue_full")]
     QueueFull,
+    #[error("duplicate_active_request")]
+    DuplicateActiveRequest,
     #[error("worker_stopped")]
     WorkerStopped,
     #[error("cache_incompatible")]

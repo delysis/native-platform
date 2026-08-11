@@ -319,17 +319,16 @@ pub struct ControlledGenerationTicket {
     pub request_id: String,
     pub events: Receiver<GenerationEvent>,
     result: Receiver<NativeResult<ControlledGenerationCompletion>>,
-    cancellations: CancelRegistry,
-    owned_cancellations: Vec<(String, Arc<AtomicBool>)>,
+    control: Arc<ActiveRequest>,
 }
 
 impl ControlledGenerationTicket {
     pub fn cancel_case(&self, case_id: &str) -> bool {
-        set_owned_flag(&self.owned_cancellations, case_id)
+        self.control.cancel_named(case_id)
     }
 
     pub fn cancel_all(&self) -> usize {
-        set_all_owned_flags(&self.owned_cancellations)
+        self.control.cancel_all()
     }
 
     pub fn wait(self) -> NativeResult<ControlledGenerationBatchOutput> {
@@ -339,19 +338,23 @@ impl ControlledGenerationTicket {
                 format!("native worker stopped before returning controlled generation: {error}"),
             )
         })?;
-        self.cleanup_owned_registry_entries();
         result.map(ControlledGenerationCompletion::into_output)
     }
 
-    pub fn wait_timeout(&self, timeout: Duration) -> NativeResult<ControlledGenerationBatchOutput> {
-        let result = self.result.recv_timeout(timeout).map_err(|error| {
-            NativeError::new(
+    pub fn wait_timeout(
+        self,
+        timeout: Duration,
+    ) -> NativeResult<WaitOutcome<Self, ControlledGenerationBatchOutput>> {
+        match self.result.recv_timeout(timeout) {
+            Ok(result) => result
+                .map(ControlledGenerationCompletion::into_output)
+                .map(WaitOutcome::Ready),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(WaitOutcome::TimedOut(self)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
-                format!("controlled generation did not finish before the timeout: {error}"),
-            )
-        })?;
-        self.cleanup_owned_registry_entries();
-        result.map(ControlledGenerationCompletion::into_output)
+                "native worker stopped before returning controlled generation",
+            )),
+        }
     }
 
     pub fn wait_verified(self) -> NativeResult<VerifiedControlledGenerationBatch> {
@@ -363,39 +366,27 @@ impl ControlledGenerationTicket {
                 ),
             )
         })?;
-        self.cleanup_owned_registry_entries();
         result?.into_verified()
     }
 
     pub fn wait_verified_timeout(
-        &self,
+        self,
         timeout: Duration,
-    ) -> NativeResult<VerifiedControlledGenerationBatch> {
-        let result = self.result.recv_timeout(timeout).map_err(|error| {
-            NativeError::new(
+    ) -> NativeResult<WaitOutcome<Self, VerifiedControlledGenerationBatch>> {
+        match self.result.recv_timeout(timeout) {
+            Ok(result) => result?.into_verified().map(WaitOutcome::Ready),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(WaitOutcome::TimedOut(self)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
-                format!(
-                    "verified controlled generation did not finish before the timeout: {error}"
-                ),
-            )
-        })?;
-        self.cleanup_owned_registry_entries();
-        result?.into_verified()
-    }
-
-    fn cleanup_owned_registry_entries(&self) {
-        cleanup_owned_request_in_registry(
-            &self.cancellations,
-            &self.request_id,
-            &self.owned_cancellations,
-        );
+                "native worker stopped before returning verified controlled generation",
+            )),
+        }
     }
 }
 
 impl Drop for ControlledGenerationTicket {
     fn drop(&mut self) {
-        set_all_owned_flags(&self.owned_cancellations);
-        self.cleanup_owned_registry_entries();
+        self.control.cancel_all();
     }
 }
 
@@ -438,41 +429,12 @@ impl NativeModelHandle {
         &self,
         submission: ControlledGenerationSubmission,
     ) -> NativeResult<ControlledGenerationTicket> {
-        self.inner.ensure_accepting()?;
         preflight_submission(&submission, &self.status())?;
 
         let request_id = submission.request().request_id().to_string();
         let mut flags = Vec::with_capacity(submission.request().cases().len());
-        {
-            let mut registry = self.inner.cancellations.lock().map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "cancellation registry is poisoned",
-                )
-            })?;
-            let reasoning_registry = self.inner.reasoning_forces.lock().map_err(|_| {
-                NativeError::new(NativeErrorCode::Internal, "reasoning registry is poisoned")
-            })?;
-            if registry
-                .keys()
-                .any(|(active_request, _)| active_request == &request_id)
-                || reasoning_registry
-                    .keys()
-                    .any(|(active_request, _)| active_request == &request_id)
-            {
-                return Err(NativeError::new(
-                    NativeErrorCode::InvalidConfig,
-                    format!("generation request ID {request_id:?} is already active"),
-                ));
-            }
-            for case in submission.request().cases() {
-                let flag = Arc::new(AtomicBool::new(false));
-                registry.insert(
-                    (request_id.clone(), case.case_id().to_string()),
-                    Arc::clone(&flag),
-                );
-                flags.push(flag);
-            }
+        for _ in submission.request().cases() {
+            flags.push(Arc::new(AtomicBool::new(false)));
         }
 
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
@@ -485,29 +447,27 @@ impl NativeModelHandle {
             .zip(&flags)
             .map(|(case, flag)| (case.case_id().to_string(), Arc::clone(flag)))
             .collect::<Vec<_>>();
-        if let Err(error) = self.inner.send_command(
-            WorkerCommand::ControlledGenerate {
+        let control = self.inner.admit_command(
+            request_id.clone(),
+            RequestClass::ControlledGeneration,
+            RequestControls::ControlledGeneration {
+                cancellations: owned_cancellations,
+            },
+            |request_lease| WorkerCommand::ControlledGenerate {
                 submission: Box::new(submission),
                 admitted_request_sha256,
                 event_tx,
                 result_tx,
                 cancellations: flags,
+                request_lease,
             },
             "submitting controlled generation",
-        ) {
-            cleanup_owned_request_in_registry(
-                &self.inner.cancellations,
-                &request_id,
-                &owned_cancellations,
-            );
-            return Err(error);
-        }
+        )?;
         Ok(ControlledGenerationTicket {
             request_id,
             events: event_rx,
             result: result_rx,
-            cancellations: Arc::clone(&self.inner.cancellations),
-            owned_cancellations,
+            control,
         })
     }
 }
@@ -3732,47 +3692,57 @@ mod tests {
 
     #[test]
     fn stale_controlled_ticket_cannot_remove_reused_request_identity() {
-        let registry = Arc::new(Mutex::new(HashMap::new()));
         let old = Arc::new(AtomicBool::new(false));
-        registry.lock().expect("registry").insert(
-            ("request".to_string(), "case".to_string()),
-            Arc::clone(&old),
-        );
+        let old_registry = Arc::new(RequestRegistry::new());
+        let (old_control, old_lease) = old_registry
+            .reserve(
+                "request",
+                RequestClass::ControlledGeneration,
+                RequestControls::ControlledGeneration {
+                    cancellations: vec![("case".to_owned(), Arc::clone(&old))],
+                },
+            )
+            .expect("old request reserves");
+        drop(old_lease);
         let (_result_tx, result_rx) = bounded(1);
         let (_event_tx, event_rx) = bounded(1);
         let ticket = ControlledGenerationTicket {
             request_id: "request".to_string(),
             events: event_rx,
             result: result_rx,
-            cancellations: Arc::clone(&registry),
-            owned_cancellations: vec![("case".to_string(), old)],
+            control: old_control,
         };
         let replacement = Arc::new(AtomicBool::new(false));
-        registry.lock().expect("registry").insert(
-            ("request".to_string(), "case".to_string()),
-            Arc::clone(&replacement),
-        );
+        let replacement_registry = Arc::new(RequestRegistry::new());
+        let (_replacement_control, _replacement_lease) = replacement_registry
+            .reserve(
+                "request",
+                RequestClass::ControlledGeneration,
+                RequestControls::ControlledGeneration {
+                    cancellations: vec![("case".to_owned(), Arc::clone(&replacement))],
+                },
+            )
+            .expect("replacement request reserves");
         drop(ticket);
         assert!(!replacement.load(Ordering::Acquire));
-        assert!(Arc::ptr_eq(
-            registry
-                .lock()
-                .expect("registry")
-                .get(&("request".to_string(), "case".to_string()))
-                .expect("replacement remains"),
-            &replacement
-        ));
+        assert_eq!(replacement_registry.active_count(), 1);
     }
 
     #[test]
     fn controlled_submission_rejects_a_generation_namespace_duplicate_before_queueing() {
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
         let (shutdown_tx, _shutdown_rx) = bounded(1);
-        let cancellations = Arc::new(Mutex::new(HashMap::new()));
-        cancellations.lock().expect("registry").insert(
-            ("controlled-request".to_string(), "existing".to_string()),
-            Arc::new(AtomicBool::new(false)),
-        );
+        let requests = Arc::new(RequestRegistry::new());
+        let (_control, _lease) = requests
+            .reserve(
+                "controlled-request",
+                RequestClass::Generation,
+                RequestControls::Generation {
+                    cancellations: Vec::new(),
+                    reasoning_forces: Vec::new(),
+                },
+            )
+            .expect("existing request reserves");
         let handle = NativeModelHandle {
             inner: Arc::new(NativeModelInner {
                 worker_identity: Arc::new(WorkerIdentity),
@@ -3780,9 +3750,7 @@ mod tests {
                 shutdown_tx,
                 closing: AtomicBool::new(false),
                 admission: Mutex::new(()),
-                cancellations,
-                embedding_cancellations: Arc::new(Mutex::new(HashMap::new())),
-                reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
+                requests,
                 status: Arc::new(RwLock::new(ready_status())),
             }),
         };
@@ -3795,8 +3763,52 @@ mod tests {
                 .expect("submission"),
             )
             .expect_err("duplicate request IDs fail before queue admission");
-        assert_eq!(error.code, NativeErrorCode::InvalidConfig);
+        assert_eq!(error.code, NativeErrorCode::DuplicateActiveRequest);
         assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dropped_controlled_ticket_keeps_request_id_reserved_until_executor_terminal() {
+        let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let (shutdown_tx, _shutdown_rx) = bounded(1);
+        let handle = NativeModelHandle {
+            inner: Arc::new(NativeModelInner {
+                worker_identity: Arc::new(WorkerIdentity),
+                command_tx,
+                shutdown_tx,
+                closing: AtomicBool::new(false),
+                admission: Mutex::new(()),
+                requests: Arc::new(RequestRegistry::new()),
+                status: Arc::new(RwLock::new(ready_status())),
+            }),
+        };
+        let submission = || {
+            ControlledGenerationSubmission::new(request(Vec::new(), Vec::new(), Vec::new()), None)
+                .expect("submission")
+        };
+
+        let ticket = handle
+            .generate_controlled(submission())
+            .expect("first controlled request is admitted");
+        drop(ticket);
+        assert_eq!(handle.inner.requests.active_count(), 1);
+        assert_eq!(
+            handle
+                .generate_controlled(submission())
+                .expect_err("ticket drop cannot release executor identity")
+                .code,
+            NativeErrorCode::DuplicateActiveRequest
+        );
+
+        reject_queued_command(command_rx.recv().expect("executor owns controlled command"));
+        assert_eq!(handle.inner.requests.active_count(), 0);
+
+        let retry = handle
+            .generate_controlled(submission())
+            .expect("controlled identity is reusable after terminal");
+        reject_queued_command(command_rx.recv().expect("retry controlled command"));
+        drop(retry);
+        assert_eq!(handle.inner.requests.active_count(), 0);
     }
 
     #[test]

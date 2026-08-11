@@ -3,6 +3,7 @@ mod build_identity;
 pub mod control_math;
 mod controlled_runtime;
 mod embedding_runtime;
+mod operation_registry;
 mod state_buffer;
 
 pub use controlled_runtime::{
@@ -10,6 +11,10 @@ pub use controlled_runtime::{
     VerifiedControlledGenerationBatch, VerifiedControlledGenerationTerminal,
 };
 pub use embedding_runtime::{VerifiedEmbeddingBatch, VerifiedEmbeddingTerminal};
+
+use operation_registry::{
+    ActiveRequest, RequestClass, RequestControls, RequestLease, RequestRegistry,
+};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use encoding_rs::UTF_8;
@@ -54,7 +59,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const LLAMA_CPP_BINDING_VERSION: &str = "0.1.154";
-pub const LLAMA_CPP_BINDING_REV: &str = "01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f";
+pub const LLAMA_CPP_BINDING_REV: &str = "152dabbd3492d8e35fdf7112e556685c6c75ec9a";
 pub const LLAMA_CPP_REV: &str = "5f55650a78f92aff4d48d671423e888fac0469ff";
 /// SHA-256 of a private, domain-separated build-input accumulator. The raw
 /// inputs are deliberately neither compiled into this crate nor exposed.
@@ -69,10 +74,15 @@ const EVENT_CAPACITY: usize = 256;
 static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
 
 type NativeResult<T> = Result<T, NativeError>;
-type CancelKey = (String, String);
-type CancelRegistry = Arc<Mutex<HashMap<CancelKey, Arc<AtomicBool>>>>;
-type ReasoningForceRegistry = Arc<Mutex<HashMap<CancelKey, Arc<AtomicBool>>>>;
-type EmbeddingCancelRegistry = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+
+/// A bounded wait observes a running operation without discarding its only
+/// completion handle. Timeout is not an operation terminal.
+#[derive(Debug)]
+#[must_use]
+pub enum WaitOutcome<Ticket, Output> {
+    Ready(Output),
+    TimedOut(Ticket),
+}
 
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,19 +310,16 @@ pub struct GenerationTicket {
     pub request_id: String,
     pub events: Receiver<GenerationEvent>,
     result: Receiver<NativeResult<GenerationCompletion>>,
-    cancellations: CancelRegistry,
-    reasoning_forces: ReasoningForceRegistry,
-    owned_cancellations: Vec<(String, Arc<AtomicBool>)>,
-    owned_reasoning_forces: Vec<(String, Arc<AtomicBool>)>,
+    control: Arc<ActiveRequest>,
 }
 
 impl GenerationTicket {
     pub fn cancel_branch(&self, branch_id: &str) -> bool {
-        set_owned_flag(&self.owned_cancellations, branch_id)
+        self.control.cancel_named(branch_id)
     }
 
     pub fn cancel_all(&self) -> usize {
-        set_all_owned_flags(&self.owned_cancellations)
+        self.control.cancel_all()
     }
 
     pub fn wait(self) -> NativeResult<Vec<GenerationOutput>> {
@@ -322,27 +329,28 @@ impl GenerationTicket {
                 format!("native worker stopped before returning a result: {error}"),
             )
         })?;
-        self.cleanup_owned_registry_entries();
         result.map(GenerationCompletion::into_outputs)
     }
 
-    pub fn wait_timeout(&self, timeout: Duration) -> NativeResult<Vec<GenerationOutput>> {
-        let result = self.result.recv_timeout(timeout).map_err(|error| {
-            NativeError::new(
+    pub fn wait_timeout(
+        self,
+        timeout: Duration,
+    ) -> NativeResult<WaitOutcome<Self, Vec<GenerationOutput>>> {
+        match self.result.recv_timeout(timeout) {
+            Ok(result) => result
+                .map(GenerationCompletion::into_outputs)
+                .map(WaitOutcome::Ready),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(WaitOutcome::TimedOut(self)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
-                format!("native generation did not finish before the timeout: {error}"),
-            )
-        })?;
-        self.cleanup_owned_registry_entries();
-        result.map(GenerationCompletion::into_outputs)
+                "native worker stopped before returning a generation result",
+            )),
+        }
     }
 
     pub fn try_wait(&self) -> NativeResult<Option<Vec<GenerationOutput>>> {
         match self.result.try_recv() {
-            Ok(result) => {
-                self.cleanup_owned_registry_entries();
-                result.map(|completion| Some(completion.into_outputs()))
-            }
+            Ok(result) => result.map(|completion| Some(completion.into_outputs())),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
             Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
@@ -362,30 +370,26 @@ impl GenerationTicket {
                 format!("native worker stopped before returning a verified result: {error}"),
             )
         })?;
-        self.cleanup_owned_registry_entries();
         result?.into_verified()
     }
 
     pub fn wait_verified_timeout(
-        &self,
+        self,
         timeout: Duration,
-    ) -> NativeResult<VerifiedGenerationBatch> {
-        let result = self.result.recv_timeout(timeout).map_err(|error| {
-            NativeError::new(
+    ) -> NativeResult<WaitOutcome<Self, VerifiedGenerationBatch>> {
+        match self.result.recv_timeout(timeout) {
+            Ok(result) => result?.into_verified().map(WaitOutcome::Ready),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(WaitOutcome::TimedOut(self)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
-                format!("native verified generation did not finish before the timeout: {error}"),
-            )
-        })?;
-        self.cleanup_owned_registry_entries();
-        result?.into_verified()
+                "native worker stopped before returning a verified generation result",
+            )),
+        }
     }
 
     pub fn try_wait_verified(&self) -> NativeResult<Option<VerifiedGenerationBatch>> {
         match self.result.try_recv() {
-            Ok(result) => {
-                self.cleanup_owned_registry_entries();
-                result?.into_verified().map(Some)
-            }
+            Ok(result) => result?.into_verified().map(Some),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
             Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
@@ -393,25 +397,11 @@ impl GenerationTicket {
             )),
         }
     }
-
-    fn cleanup_owned_registry_entries(&self) {
-        cleanup_owned_request_in_registry(
-            &self.cancellations,
-            &self.request_id,
-            &self.owned_cancellations,
-        );
-        cleanup_owned_request_in_registry(
-            &self.reasoning_forces,
-            &self.request_id,
-            &self.owned_reasoning_forces,
-        );
-    }
 }
 
 impl Drop for GenerationTicket {
     fn drop(&mut self) {
-        set_all_owned_flags(&self.owned_cancellations);
-        self.cleanup_owned_registry_entries();
+        self.control.cancel_all();
     }
 }
 
@@ -420,15 +410,14 @@ impl Drop for GenerationTicket {
 pub struct EmbeddingTicket {
     pub request_id: String,
     result: Receiver<embedding_runtime::EmbeddingCompletion>,
-    cancellation: Arc<AtomicBool>,
-    cancellations: EmbeddingCancelRegistry,
+    control: Arc<ActiveRequest>,
 }
 
 impl EmbeddingTicket {
     /// Request cooperative cancellation. A decode already inside llama.cpp is
     /// allowed to finish, but its values are discarded before publication.
     pub fn cancel(&self) {
-        self.cancellation.store(true, Ordering::Release);
+        self.control.cancel_all();
     }
 
     pub fn wait(self) -> NativeResult<EmbeddingBatchOutput> {
@@ -438,39 +427,26 @@ impl EmbeddingTicket {
                 format!("native worker stopped before returning embeddings: {error}"),
             )
         })?;
-        cleanup_owned_embedding_in_registry(
-            &self.cancellations,
-            &self.request_id,
-            &self.cancellation,
-        );
         completion.into_output()
     }
 
-    pub fn wait_timeout(&self, timeout: Duration) -> NativeResult<EmbeddingBatchOutput> {
-        let completion = self.result.recv_timeout(timeout).map_err(|error| {
-            NativeError::new(
+    pub fn wait_timeout(
+        self,
+        timeout: Duration,
+    ) -> NativeResult<WaitOutcome<Self, EmbeddingBatchOutput>> {
+        match self.result.recv_timeout(timeout) {
+            Ok(completion) => completion.into_output().map(WaitOutcome::Ready),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(WaitOutcome::TimedOut(self)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
-                format!("native embeddings did not finish before the timeout: {error}"),
-            )
-        })?;
-        cleanup_owned_embedding_in_registry(
-            &self.cancellations,
-            &self.request_id,
-            &self.cancellation,
-        );
-        completion.into_output()
+                "native worker stopped before returning embeddings",
+            )),
+        }
     }
 
     pub fn try_wait(&self) -> NativeResult<Option<EmbeddingBatchOutput>> {
         match self.result.try_recv() {
-            Ok(completion) => {
-                cleanup_owned_embedding_in_registry(
-                    &self.cancellations,
-                    &self.request_id,
-                    &self.cancellation,
-                );
-                completion.into_output().map(Some)
-            }
+            Ok(completion) => completion.into_output().map(Some),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
             Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
@@ -489,39 +465,26 @@ impl EmbeddingTicket {
                 format!("native worker stopped before returning verified embeddings: {error}"),
             )
         })?;
-        cleanup_owned_embedding_in_registry(
-            &self.cancellations,
-            &self.request_id,
-            &self.cancellation,
-        );
         completion.into_verified()
     }
 
-    pub fn wait_verified_timeout(&self, timeout: Duration) -> NativeResult<VerifiedEmbeddingBatch> {
-        let completion = self.result.recv_timeout(timeout).map_err(|error| {
-            NativeError::new(
+    pub fn wait_verified_timeout(
+        self,
+        timeout: Duration,
+    ) -> NativeResult<WaitOutcome<Self, VerifiedEmbeddingBatch>> {
+        match self.result.recv_timeout(timeout) {
+            Ok(completion) => completion.into_verified().map(WaitOutcome::Ready),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(WaitOutcome::TimedOut(self)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
-                format!("verified native embeddings did not finish before the timeout: {error}"),
-            )
-        })?;
-        cleanup_owned_embedding_in_registry(
-            &self.cancellations,
-            &self.request_id,
-            &self.cancellation,
-        );
-        completion.into_verified()
+                "native worker stopped before returning verified embeddings",
+            )),
+        }
     }
 
     pub fn try_wait_verified(&self) -> NativeResult<Option<VerifiedEmbeddingBatch>> {
         match self.result.try_recv() {
-            Ok(completion) => {
-                cleanup_owned_embedding_in_registry(
-                    &self.cancellations,
-                    &self.request_id,
-                    &self.cancellation,
-                );
-                completion.into_verified().map(Some)
-            }
+            Ok(completion) => completion.into_verified().map(Some),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
             Err(crossbeam_channel::TryRecvError::Disconnected) => Err(NativeError::new(
                 NativeErrorCode::WorkerStopped,
@@ -533,12 +496,7 @@ impl EmbeddingTicket {
 
 impl Drop for EmbeddingTicket {
     fn drop(&mut self) {
-        self.cancellation.store(true, Ordering::Release);
-        cleanup_owned_embedding_in_registry(
-            &self.cancellations,
-            &self.request_id,
-            &self.cancellation,
-        );
+        self.control.cancel_all();
     }
 }
 
@@ -640,14 +598,16 @@ impl NativeModelOwner {
 
     fn join_worker(&mut self) -> NativeResult<()> {
         let Some(join) = self.join.take() else {
-            return Ok(());
+            return self.inner.requests.mark_closed();
         };
-        join.join().map_err(|_| {
+        let join_result = join.join().map_err(|_| {
             NativeError::new(
                 NativeErrorCode::WorkerStopped,
                 "native model owner worker panicked before it could be joined",
             )
-        })
+        });
+        let registry_result = self.inner.requests.mark_closed();
+        join_result.and(registry_result)
     }
 }
 
@@ -731,9 +691,7 @@ struct NativeModelInner {
     shutdown_tx: Sender<()>,
     closing: AtomicBool,
     admission: Mutex<()>,
-    cancellations: CancelRegistry,
-    embedding_cancellations: EmbeddingCancelRegistry,
-    reasoning_forces: ReasoningForceRegistry,
+    requests: Arc<RequestRegistry>,
     status: Arc<RwLock<ResidentModelStatus>>,
 }
 
@@ -773,20 +731,39 @@ impl NativeModelInner {
             })
     }
 
-    fn cancel_active_work(&self) {
-        if let Ok(registry) = self.cancellations.lock() {
-            for flag in registry.values() {
-                flag.store(true, Ordering::Release);
-            }
-        }
-        if let Ok(registry) = self.embedding_cancellations.lock() {
-            for flag in registry.values() {
-                flag.store(true, Ordering::Release);
-            }
-        }
-        if let Ok(registry) = self.reasoning_forces.lock() {
-            for flag in registry.values() {
-                flag.store(true, Ordering::Release);
+    fn admit_command(
+        &self,
+        request_id: String,
+        class: RequestClass,
+        controls: RequestControls,
+        build: impl FnOnce(RequestLease) -> WorkerCommand,
+        context: &str,
+    ) -> NativeResult<Arc<ActiveRequest>> {
+        let _admission = self.admission.lock().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "native model admission lock is poisoned",
+            )
+        })?;
+        self.ensure_accepting()?;
+        let (control, lease) = self.requests.reserve(request_id, class, controls)?;
+        match self.command_tx.try_send(build(lease)) {
+            Ok(()) => Ok(control),
+            Err(error) => {
+                let (code, message, command) = match error {
+                    crossbeam_channel::TrySendError::Full(command) => (
+                        NativeErrorCode::QueueFull,
+                        format!("native model command queue is full while {context}"),
+                        command,
+                    ),
+                    crossbeam_channel::TrySendError::Disconnected(command) => (
+                        NativeErrorCode::WorkerStopped,
+                        format!("native model worker stopped while {context}"),
+                        command,
+                    ),
+                };
+                drop(command);
+                Err(NativeError::new(code, message))
             }
         }
     }
@@ -797,7 +774,7 @@ impl NativeModelInner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.closing.store(true, Ordering::Release);
-        self.cancel_active_work();
+        self.requests.begin_quiesce_and_cancel_all();
         // This independent one-slot channel is the shutdown priority lane. A
         // full command queue cannot delay or lose the signal; an already-full
         // shutdown lane means the signal is already pending.
@@ -812,6 +789,7 @@ enum WorkerCommand {
         admitted_request_sha256: String,
         result: Sender<embedding_runtime::EmbeddingCompletion>,
         cancellation: Arc<AtomicBool>,
+        request_lease: RequestLease,
     },
     GenerateBatch {
         request: GenerationBatchRequest,
@@ -821,6 +799,7 @@ enum WorkerCommand {
         result_tx: Sender<NativeResult<GenerationCompletion>>,
         cancellations: Vec<Arc<AtomicBool>>,
         reasoning_forces: Vec<Arc<AtomicBool>>,
+        request_lease: RequestLease,
     },
     Generate {
         request: SharedPrefixBatchRequest,
@@ -828,6 +807,7 @@ enum WorkerCommand {
         result_tx: Sender<NativeResult<GenerationCompletion>>,
         cancellations: Vec<Arc<AtomicBool>>,
         reasoning_forces: Vec<Arc<AtomicBool>>,
+        request_lease: RequestLease,
     },
     GenerateMultimodal {
         request: GenerationRequest,
@@ -835,6 +815,7 @@ enum WorkerCommand {
         result_tx: Sender<NativeResult<GenerationCompletion>>,
         cancellation: Arc<AtomicBool>,
         reasoning_force: Arc<AtomicBool>,
+        request_lease: RequestLease,
     },
     ControlledGenerate {
         submission: Box<ControlledGenerationSubmission>,
@@ -842,6 +823,7 @@ enum WorkerCommand {
         event_tx: Sender<GenerationEvent>,
         result_tx: Sender<NativeResult<controlled_runtime::ControlledGenerationCompletion>>,
         cancellations: Vec<Arc<AtomicBool>>,
+        request_lease: RequestLease,
     },
     InspectControlledIdentity {
         participant_id: String,
@@ -885,8 +867,6 @@ impl NativeModelHandle {
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let (ready_tx, ready_rx) = bounded(1);
-        let cancellations = Arc::new(Mutex::new(HashMap::new()));
-        let reasoning_forces = Arc::new(Mutex::new(HashMap::new()));
         let status = Arc::new(RwLock::new(ResidentModelStatus {
             model_id: config.model_id.clone(),
             model_path: config.model_path.clone(),
@@ -956,9 +936,7 @@ impl NativeModelHandle {
                 shutdown_tx,
                 closing: AtomicBool::new(false),
                 admission: Mutex::new(()),
-                cancellations,
-                embedding_cancellations: Arc::new(Mutex::new(HashMap::new())),
-                reasoning_forces,
+                requests: Arc::new(RequestRegistry::new()),
                 status,
             }),
             worker,
@@ -993,48 +971,30 @@ impl NativeModelHandle {
     /// Submit exact token IDs for in-process embedding on this model's owner
     /// worker. No text tokenization or generation-context mutation occurs.
     pub fn embed_batch(&self, request: EmbeddingBatchRequest) -> NativeResult<EmbeddingTicket> {
-        self.inner.ensure_accepting()?;
         validate_embedding_batch_request(&request, &self.status())?;
         let cancellation = Arc::new(AtomicBool::new(false));
         let (result_tx, result_rx) = bounded(1);
         let request_id = request.request_id().to_string();
         let admitted_request_sha256 = embedding_runtime::embedding_request_sha256(&request);
-        {
-            let mut registry = self.inner.embedding_cancellations.lock().map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "cancellation registry is poisoned",
-                )
-            })?;
-            if registry.contains_key(&request_id) {
-                return Err(NativeError::new(
-                    NativeErrorCode::InvalidConfig,
-                    format!("embedding request ID {request_id:?} is already active"),
-                ));
-            }
-            registry.insert(request_id.clone(), Arc::clone(&cancellation));
-        }
-        if let Err(error) = self.inner.send_command(
-            WorkerCommand::EmbedBatch {
+        let control = self.inner.admit_command(
+            request_id.clone(),
+            RequestClass::Embedding,
+            RequestControls::Embedding {
+                cancellation: Arc::clone(&cancellation),
+            },
+            |request_lease| WorkerCommand::EmbedBatch {
                 request,
                 admitted_request_sha256,
                 result: result_tx,
                 cancellation: Arc::clone(&cancellation),
+                request_lease,
             },
             "submitting embeddings",
-        ) {
-            cleanup_owned_embedding_in_registry(
-                &self.inner.embedding_cancellations,
-                &request_id,
-                &cancellation,
-            );
-            return Err(error);
-        }
+        )?;
         Ok(EmbeddingTicket {
             request_id,
             result: result_rx,
-            cancellation,
-            cancellations: Arc::clone(&self.inner.embedding_cancellations),
+            control,
         })
     }
 
@@ -1113,51 +1073,14 @@ impl NativeModelHandle {
         request: GenerationBatchRequest,
         admission: GenerationBatchAdmission,
     ) -> NativeResult<GenerationTicket> {
-        self.inner.ensure_accepting()?;
         let status = self.status();
         validate_generation_batch_request(&request, &status)?;
         let exact_cell_budget = exact_token_budget_for_submission(&request, &status)?;
         let mut cancellations = Vec::with_capacity(request.cases.len());
         let mut reasoning_forces = Vec::with_capacity(request.cases.len());
-        {
-            let mut registry = self.inner.cancellations.lock().map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "cancellation registry is poisoned",
-                )
-            })?;
-            let mut reasoning_registry = self.inner.reasoning_forces.lock().map_err(|_| {
-                NativeError::new(NativeErrorCode::Internal, "reasoning registry is poisoned")
-            })?;
-            if registry
-                .keys()
-                .any(|(request_id, _)| request_id == &request.request_id)
-                || reasoning_registry
-                    .keys()
-                    .any(|(request_id, _)| request_id == &request.request_id)
-            {
-                return Err(NativeError::new(
-                    NativeErrorCode::InvalidConfig,
-                    format!(
-                        "generation request ID {:?} is already active",
-                        request.request_id
-                    ),
-                ));
-            }
-            for case in &request.cases {
-                let cancellation = Arc::new(AtomicBool::new(false));
-                let reasoning = Arc::new(AtomicBool::new(false));
-                registry.insert(
-                    (request.request_id.clone(), case.case_id.clone()),
-                    Arc::clone(&cancellation),
-                );
-                reasoning_registry.insert(
-                    (request.request_id.clone(), case.case_id.clone()),
-                    Arc::clone(&reasoning),
-                );
-                cancellations.push(cancellation);
-                reasoning_forces.push(reasoning);
-            }
+        for _ in &request.cases {
+            cancellations.push(Arc::new(AtomicBool::new(false)));
+            reasoning_forces.push(Arc::new(AtomicBool::new(false)));
         }
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
         let (result_tx, result_rx) = bounded(1);
@@ -1174,8 +1097,14 @@ impl NativeModelHandle {
             .zip(&reasoning_forces)
             .map(|(case, flag)| (case.case_id.clone(), Arc::clone(flag)))
             .collect();
-        if let Err(error) = self.inner.send_command(
-            WorkerCommand::GenerateBatch {
+        let control = self.inner.admit_command(
+            request_id.clone(),
+            RequestClass::Generation,
+            RequestControls::Generation {
+                cancellations: owned_cancellations,
+                reasoning_forces: owned_reasoning_forces,
+            },
+            |request_lease| WorkerCommand::GenerateBatch {
                 request,
                 exact_cell_budget,
                 admission,
@@ -1183,85 +1112,49 @@ impl NativeModelHandle {
                 result_tx,
                 cancellations,
                 reasoning_forces,
+                request_lease,
             },
             "submitting an exact generation batch",
-        ) {
-            cleanup_request_in_registry(&self.inner.cancellations, &request_id);
-            cleanup_request_in_registry(&self.inner.reasoning_forces, &request_id);
-            return Err(error);
-        }
+        )?;
         Ok(GenerationTicket {
             request_id,
             events: event_rx,
             result: result_rx,
-            cancellations: Arc::clone(&self.inner.cancellations),
-            reasoning_forces: Arc::clone(&self.inner.reasoning_forces),
-            owned_cancellations,
-            owned_reasoning_forces,
+            control,
         })
     }
 
     fn generate_multimodal(&self, request: GenerationRequest) -> NativeResult<GenerationTicket> {
-        self.inner.ensure_accepting()?;
         validate_generation_request(&request, &self.status())?;
         let cancellation = Arc::new(AtomicBool::new(false));
         let reasoning_force = Arc::new(AtomicBool::new(false));
-        {
-            let mut registry = self.inner.cancellations.lock().map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "cancellation registry is poisoned",
-                )
-            })?;
-            let mut reasoning_registry = self.inner.reasoning_forces.lock().map_err(|_| {
-                NativeError::new(NativeErrorCode::Internal, "reasoning registry is poisoned")
-            })?;
-            let key = (request.request_id.clone(), "assistant".to_string());
-            if registry
-                .keys()
-                .any(|(request_id, _)| request_id == &request.request_id)
-                || reasoning_registry
-                    .keys()
-                    .any(|(request_id, _)| request_id == &request.request_id)
-            {
-                return Err(NativeError::new(
-                    NativeErrorCode::InvalidConfig,
-                    format!(
-                        "generation request ID {:?} is already active",
-                        request.request_id
-                    ),
-                ));
-            }
-            registry.insert(key.clone(), Arc::clone(&cancellation));
-            reasoning_registry.insert(key, Arc::clone(&reasoning_force));
-        }
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
         let (result_tx, result_rx) = bounded(1);
         let request_id = request.request_id.clone();
         let owned_cancellations = vec![("assistant".to_owned(), Arc::clone(&cancellation))];
         let owned_reasoning_forces = vec![("assistant".to_owned(), Arc::clone(&reasoning_force))];
-        if let Err(error) = self.inner.send_command(
-            WorkerCommand::GenerateMultimodal {
+        let control = self.inner.admit_command(
+            request_id.clone(),
+            RequestClass::Generation,
+            RequestControls::Generation {
+                cancellations: owned_cancellations,
+                reasoning_forces: owned_reasoning_forces,
+            },
+            |request_lease| WorkerCommand::GenerateMultimodal {
                 request,
                 event_tx,
                 result_tx,
                 cancellation,
                 reasoning_force,
+                request_lease,
             },
             "submitting multimodal generation",
-        ) {
-            cleanup_request_in_registry(&self.inner.cancellations, &request_id);
-            cleanup_request_in_registry(&self.inner.reasoning_forces, &request_id);
-            return Err(error);
-        }
+        )?;
         Ok(GenerationTicket {
             request_id,
             events: event_rx,
             result: result_rx,
-            cancellations: Arc::clone(&self.inner.cancellations),
-            reasoning_forces: Arc::clone(&self.inner.reasoning_forces),
-            owned_cancellations,
-            owned_reasoning_forces,
+            control,
         })
     }
 
@@ -1269,49 +1162,12 @@ impl NativeModelHandle {
         &self,
         request: SharedPrefixBatchRequest,
     ) -> NativeResult<GenerationTicket> {
-        self.inner.ensure_accepting()?;
         validate_batch_request(&request, &self.status())?;
         let mut flags = Vec::with_capacity(request.branches.len());
         let mut reasoning_flags = Vec::with_capacity(request.branches.len());
-        {
-            let mut registry = self.inner.cancellations.lock().map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "cancellation registry is poisoned",
-                )
-            })?;
-            let mut reasoning_registry = self.inner.reasoning_forces.lock().map_err(|_| {
-                NativeError::new(NativeErrorCode::Internal, "reasoning registry is poisoned")
-            })?;
-            if registry
-                .keys()
-                .any(|(request_id, _)| request_id == &request.request_id)
-                || reasoning_registry
-                    .keys()
-                    .any(|(request_id, _)| request_id == &request.request_id)
-            {
-                return Err(NativeError::new(
-                    NativeErrorCode::InvalidConfig,
-                    format!(
-                        "generation request ID {:?} is already active",
-                        request.request_id
-                    ),
-                ));
-            }
-            for branch in &request.branches {
-                let flag = Arc::new(AtomicBool::new(false));
-                let reasoning = Arc::new(AtomicBool::new(false));
-                registry.insert(
-                    (request.request_id.clone(), branch.branch_id.clone()),
-                    Arc::clone(&flag),
-                );
-                reasoning_registry.insert(
-                    (request.request_id.clone(), branch.branch_id.clone()),
-                    Arc::clone(&reasoning),
-                );
-                flags.push(flag);
-                reasoning_flags.push(reasoning);
-            }
+        for _ in &request.branches {
+            flags.push(Arc::new(AtomicBool::new(false)));
+            reasoning_flags.push(Arc::new(AtomicBool::new(false)));
         }
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
         let (result_tx, result_rx) = bounded(1);
@@ -1328,50 +1184,56 @@ impl NativeModelHandle {
             .zip(&reasoning_flags)
             .map(|(branch, flag)| (branch.branch_id.clone(), Arc::clone(flag)))
             .collect();
-        if let Err(error) = self.inner.send_command(
-            WorkerCommand::Generate {
+        let control = self.inner.admit_command(
+            request_id.clone(),
+            RequestClass::Generation,
+            RequestControls::Generation {
+                cancellations: owned_cancellations,
+                reasoning_forces: owned_reasoning_forces,
+            },
+            |request_lease| WorkerCommand::Generate {
                 request,
                 event_tx,
                 result_tx,
                 cancellations: flags,
                 reasoning_forces: reasoning_flags,
+                request_lease,
             },
             "submitting shared-prefix generation",
-        ) {
-            cleanup_request_in_registry(&self.inner.cancellations, &request_id);
-            cleanup_request_in_registry(&self.inner.reasoning_forces, &request_id);
-            return Err(error);
-        }
+        )?;
         Ok(GenerationTicket {
             request_id,
             events: event_rx,
             result: result_rx,
-            cancellations: Arc::clone(&self.inner.cancellations),
-            reasoning_forces: Arc::clone(&self.inner.reasoning_forces),
-            owned_cancellations,
-            owned_reasoning_forces,
+            control,
         })
     }
 
     pub fn cancel(&self, request_id: &str, branch_id: Option<&str>) -> usize {
-        match branch_id {
-            Some(branch_id) => usize::from(cancel_in_registry(
-                &self.inner.cancellations,
-                request_id,
-                branch_id,
-            )),
-            None => cancel_request_in_registry(&self.inner.cancellations, request_id),
+        let Some(active) = self.inner.requests.active(request_id) else {
+            return 0;
+        };
+        match (active.class(), branch_id) {
+            (RequestClass::Generation | RequestClass::ControlledGeneration, Some(branch_id)) => {
+                usize::from(active.cancel_named(branch_id))
+            }
+            (RequestClass::Generation | RequestClass::ControlledGeneration, None) => {
+                active.cancel_all()
+            }
+            (RequestClass::Embedding, _) => 0,
         }
     }
 
     pub fn skip_reasoning(&self, request_id: &str, branch_id: Option<&str>) -> usize {
+        let Some(active) = self.inner.requests.active(request_id) else {
+            return 0;
+        };
+        if active.class() != RequestClass::Generation {
+            return 0;
+        }
         match branch_id {
-            Some(branch_id) => usize::from(set_flag_in_registry(
-                &self.inner.reasoning_forces,
-                request_id,
-                branch_id,
-            )),
-            None => set_request_flags_in_registry(&self.inner.reasoning_forces, request_id),
+            Some(branch_id) => usize::from(active.force_reasoning_exit(branch_id)),
+            None => active.force_all_reasoning_exits(),
         }
     }
 
@@ -2054,6 +1916,7 @@ fn run_worker(
                 admitted_request_sha256,
                 result,
                 cancellation,
+                request_lease: _request_lease,
             } => {
                 set_status_state(&status, ModelRuntimeState::Ready, 1);
                 let owner_call_sequence = embedding_call_sequence;
@@ -2145,6 +2008,7 @@ fn run_worker(
                 result_tx,
                 cancellations,
                 reasoning_forces,
+                request_lease: _request_lease,
             } => {
                 set_status_state(&status, ModelRuntimeState::Ready, request.cases.len());
                 let statically_sealable =
@@ -2239,6 +2103,7 @@ fn run_worker(
                 result_tx,
                 cancellations,
                 reasoning_forces,
+                request_lease: _request_lease,
             } => {
                 set_status_state(&status, ModelRuntimeState::Ready, request.branches.len());
                 let result = generate_batch(
@@ -2274,6 +2139,7 @@ fn run_worker(
                 result_tx,
                 cancellation,
                 reasoning_force,
+                request_lease: _request_lease,
             } => {
                 set_status_state(&status, ModelRuntimeState::Ready, 1);
                 let result = generate_multimodal(
@@ -2304,6 +2170,7 @@ fn run_worker(
                 event_tx,
                 result_tx,
                 cancellations,
+                request_lease: _request_lease,
             } => {
                 let owner_call_sequence = controlled_call_sequence;
                 let Some(next_call_sequence) = controlled_call_sequence.checked_add(1) else {
@@ -2467,6 +2334,7 @@ fn reject_queued_command(command: WorkerCommand) {
         WorkerCommand::EmbedBatch {
             result,
             cancellation,
+            request_lease: _request_lease,
             ..
         } => {
             cancellation.store(true, Ordering::Release);
@@ -2478,6 +2346,7 @@ fn reject_queued_command(command: WorkerCommand) {
             result_tx,
             cancellations,
             reasoning_forces: _,
+            request_lease: _request_lease,
             ..
         } => {
             for flag in cancellations {
@@ -2492,6 +2361,7 @@ fn reject_queued_command(command: WorkerCommand) {
             result_tx,
             cancellations,
             reasoning_forces: _,
+            request_lease: _request_lease,
         } => {
             for flag in cancellations {
                 flag.store(true, Ordering::Release);
@@ -2505,6 +2375,7 @@ fn reject_queued_command(command: WorkerCommand) {
             result_tx,
             cancellation,
             reasoning_force: _,
+            request_lease: _request_lease,
         } => {
             cancellation.store(true, Ordering::Release);
             emit_generation_state(&event_tx, &request, u64::MAX, GenerationState::Cancelled);
@@ -2516,6 +2387,7 @@ fn reject_queued_command(command: WorkerCommand) {
             event_tx,
             result_tx,
             cancellations,
+            request_lease: _request_lease,
         } => controlled_runtime::reject_queued_controlled(
             *submission,
             event_tx,
@@ -5505,105 +5377,6 @@ fn set_status_state(
     }
 }
 
-fn cancel_in_registry(registry: &CancelRegistry, request_id: &str, branch_id: &str) -> bool {
-    registry
-        .lock()
-        .ok()
-        .and_then(|entries| {
-            entries
-                .get(&(request_id.to_string(), branch_id.to_string()))
-                .cloned()
-        })
-        .map(|flag| {
-            flag.store(true, Ordering::Release);
-            true
-        })
-        .unwrap_or(false)
-}
-
-fn cancel_request_in_registry(registry: &CancelRegistry, request_id: &str) -> usize {
-    registry
-        .lock()
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|((candidate, _), _)| candidate == request_id)
-                .map(|(_, flag)| {
-                    flag.store(true, Ordering::Release);
-                    1_usize
-                })
-                .sum()
-        })
-        .unwrap_or_default()
-}
-
-fn set_flag_in_registry(
-    registry: &ReasoningForceRegistry,
-    request_id: &str,
-    branch_id: &str,
-) -> bool {
-    cancel_in_registry(registry, request_id, branch_id)
-}
-
-fn set_request_flags_in_registry(registry: &ReasoningForceRegistry, request_id: &str) -> usize {
-    cancel_request_in_registry(registry, request_id)
-}
-
-fn set_owned_flag(flags: &[(String, Arc<AtomicBool>)], branch_id: &str) -> bool {
-    flags
-        .iter()
-        .find(|(candidate, _)| candidate == branch_id)
-        .map(|(_, flag)| {
-            flag.store(true, Ordering::Release);
-            true
-        })
-        .unwrap_or(false)
-}
-
-fn set_all_owned_flags(flags: &[(String, Arc<AtomicBool>)]) -> usize {
-    for (_, flag) in flags {
-        flag.store(true, Ordering::Release);
-    }
-    flags.len()
-}
-
-fn cleanup_owned_request_in_registry(
-    registry: &CancelRegistry,
-    request_id: &str,
-    owned_flags: &[(String, Arc<AtomicBool>)],
-) {
-    if let Ok(mut entries) = registry.lock() {
-        entries.retain(|(candidate_request, candidate_branch), registered| {
-            if candidate_request != request_id {
-                return true;
-            }
-            !owned_flags.iter().any(|(owned_branch, owned)| {
-                owned_branch == candidate_branch && Arc::ptr_eq(owned, registered)
-            })
-        });
-    }
-}
-
-fn cleanup_request_in_registry(registry: &CancelRegistry, request_id: &str) {
-    if let Ok(mut entries) = registry.lock() {
-        entries.retain(|(candidate, _), _| candidate != request_id);
-    }
-}
-
-fn cleanup_owned_embedding_in_registry(
-    registry: &EmbeddingCancelRegistry,
-    request_id: &str,
-    owned: &Arc<AtomicBool>,
-) {
-    if let Ok(mut entries) = registry.lock()
-        && entries
-            .get(request_id)
-            .is_some_and(|registered| Arc::ptr_eq(registered, owned))
-    {
-        entries.remove(request_id);
-    }
-}
-
 fn native_decode_error(context: &str, error: impl std::fmt::Display) -> NativeError {
     NativeError::new(NativeErrorCode::DecodeFailed, format!("{context}: {error}"))
 }
@@ -5626,6 +5399,76 @@ mod tests {
     static TEST_ARTIFACT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
     static REAL_MODEL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    fn test_generation_reservation(
+        request_id: &str,
+        branches: &[&str],
+    ) -> (Arc<ActiveRequest>, RequestLease) {
+        let registry = Arc::new(RequestRegistry::new());
+        let cancellations = branches
+            .iter()
+            .map(|branch| ((*branch).to_owned(), Arc::new(AtomicBool::new(false))))
+            .collect();
+        let reasoning_forces = branches
+            .iter()
+            .map(|branch| ((*branch).to_owned(), Arc::new(AtomicBool::new(false))))
+            .collect();
+        registry
+            .reserve(
+                request_id,
+                RequestClass::Generation,
+                RequestControls::Generation {
+                    cancellations,
+                    reasoning_forces,
+                },
+            )
+            .expect("test request reserves")
+    }
+
+    fn test_embedding_reservation(
+        request_id: &str,
+        cancellation: Arc<AtomicBool>,
+    ) -> (Arc<ActiveRequest>, RequestLease) {
+        Arc::new(RequestRegistry::new())
+            .reserve(
+                request_id,
+                RequestClass::Embedding,
+                RequestControls::Embedding { cancellation },
+            )
+            .expect("test embedding request reserves")
+    }
+
+    fn require_ready<T, Output>(outcome: WaitOutcome<T, Output>) -> NativeResult<Output> {
+        match outcome {
+            WaitOutcome::Ready(output) => Ok(output),
+            WaitOutcome::TimedOut(_) => Err(NativeError::new(
+                NativeErrorCode::Internal,
+                "test operation exceeded its explicit evidence timeout",
+            )),
+        }
+    }
+
+    fn test_admission_handle(
+        status: ResidentModelStatus,
+        queue_capacity: usize,
+    ) -> (NativeModelHandle, Receiver<WorkerCommand>) {
+        let (command_tx, command_rx) = bounded(queue_capacity);
+        let (shutdown_tx, _shutdown_rx) = bounded(1);
+        (
+            NativeModelHandle {
+                inner: Arc::new(NativeModelInner {
+                    worker_identity: Arc::new(WorkerIdentity),
+                    command_tx,
+                    shutdown_tx,
+                    closing: AtomicBool::new(false),
+                    admission: Mutex::new(()),
+                    requests: Arc::new(RequestRegistry::new()),
+                    status: Arc::new(RwLock::new(status)),
+                }),
+            },
+            command_rx,
+        )
+    }
+
     fn test_worker_owner(
         model_id: &str,
         stopped: Arc<AtomicBool>,
@@ -5645,9 +5488,7 @@ mod tests {
             shutdown_tx,
             closing: AtomicBool::new(false),
             admission: Mutex::new(()),
-            cancellations: Arc::new(Mutex::new(HashMap::new())),
-            embedding_cancellations: Arc::new(Mutex::new(HashMap::new())),
-            reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
+            requests: Arc::new(RequestRegistry::new()),
             status: Arc::new(RwLock::new(ResidentModelStatus {
                 model_id: model_id.to_string(),
                 model_path: std::path::PathBuf::new(),
@@ -5699,6 +5540,12 @@ mod tests {
             .iter()
             .map(|_| Arc::new(AtomicBool::new(false)))
             .collect::<Vec<_>>();
+        let case_ids = request
+            .cases
+            .iter()
+            .map(|case| case.case_id.as_str())
+            .collect::<Vec<_>>();
+        let (_, request_lease) = test_generation_reservation(&request.request_id, &case_ids);
         reject_queued_command(WorkerCommand::GenerateBatch {
             request: request.clone(),
             exact_cell_budget: None,
@@ -5711,6 +5558,7 @@ mod tests {
                 .iter()
                 .map(|_| Arc::new(AtomicBool::new(false)))
                 .collect(),
+            request_lease,
         });
 
         assert!(
@@ -5738,6 +5586,146 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn queued_rejection_publishes_terminal_before_releasing_executor_identity() {
+        let (request, _, _, _, _, _) = seal_fixture();
+        let registry = Arc::new(RequestRegistry::new());
+        let (_, request_lease) = registry
+            .reserve(
+                request.request_id.clone(),
+                RequestClass::Generation,
+                RequestControls::Generation {
+                    cancellations: Vec::new(),
+                    reasoning_forces: Vec::new(),
+                },
+            )
+            .expect("request reserves");
+        let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
+        let (result_tx, result_rx) = bounded(0);
+        let cancellations = request
+            .cases
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect::<Vec<_>>();
+        let reasoning_forces = request
+            .cases
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect::<Vec<_>>();
+        let rejector = std::thread::spawn(move || {
+            reject_queued_command(WorkerCommand::GenerateBatch {
+                request,
+                exact_cell_budget: None,
+                admission: GenerationBatchAdmission::Compatibility,
+                event_tx,
+                result_tx,
+                cancellations,
+                reasoning_forces,
+                request_lease,
+            });
+        });
+
+        event_rx
+            .recv()
+            .expect("queued terminal event precedes final result publication");
+        assert_eq!(
+            registry.active_count(),
+            1,
+            "executor identity remains reserved while final publication is blocked"
+        );
+        assert_eq!(
+            result_rx
+                .recv()
+                .expect("queued final is published")
+                .expect_err("queued request is cancelled")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        rejector.join().expect("queued rejector joins");
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn dropped_generation_ticket_keeps_request_id_reserved_until_executor_terminal() {
+        let (request, fingerprint, _, _, _, _) = seal_fixture();
+        let status = ResidentModelStatus {
+            model_id: request.model_id.clone(),
+            model_path: PathBuf::new(),
+            state: ModelRuntimeState::Ready,
+            fingerprint: Some(fingerprint),
+            descriptor: None,
+            active_sequences: 0,
+            max_sequences: 4,
+        };
+        let (handle, command_rx) = test_admission_handle(status, COMMAND_CAPACITY);
+
+        let ticket = handle
+            .generate_batch(request.clone())
+            .expect("first request is admitted");
+        drop(ticket);
+        assert_eq!(handle.inner.requests.active_count(), 1);
+        assert_eq!(
+            handle
+                .generate_batch(request.clone())
+                .expect_err("ticket drop cannot release executor identity")
+                .code,
+            NativeErrorCode::DuplicateActiveRequest
+        );
+
+        reject_queued_command(command_rx.recv().expect("executor owns queued command"));
+        assert_eq!(handle.inner.requests.active_count(), 0);
+
+        let retry = handle
+            .generate_batch(request)
+            .expect("identity is reusable after executor terminal");
+        reject_queued_command(command_rx.recv().expect("retry command"));
+        drop(retry);
+        assert_eq!(handle.inner.requests.active_count(), 0);
+    }
+
+    #[test]
+    fn waiter_timeout_returns_live_ticket_without_releasing_executor_identity() {
+        let registry = Arc::new(RequestRegistry::new());
+        let (control, lease) = registry
+            .reserve(
+                "timeout-request",
+                RequestClass::Generation,
+                RequestControls::Generation {
+                    cancellations: Vec::new(),
+                    reasoning_forces: Vec::new(),
+                },
+            )
+            .expect("request reserves");
+        let (result_tx, result_rx) = bounded(1);
+        let (_event_tx, event_rx) = bounded(EVENT_CAPACITY);
+        let ticket = GenerationTicket {
+            request_id: "timeout-request".to_owned(),
+            events: event_rx,
+            result: result_rx,
+            control,
+        };
+
+        let ticket = match ticket
+            .wait_timeout(Duration::ZERO)
+            .expect("timeout is an observation, not an error")
+        {
+            WaitOutcome::TimedOut(ticket) => ticket,
+            WaitOutcome::Ready(_) => panic!("no executor result was published"),
+        };
+        assert_eq!(registry.active_count(), 1);
+        result_tx
+            .send(Ok(GenerationCompletion::unverified(Vec::new())))
+            .expect("executor terminal publication");
+        drop(lease);
+        assert!(
+            ticket
+                .wait()
+                .expect("later wait receives terminal")
+                .is_empty()
+        );
+        assert_eq!(registry.active_count(), 0);
     }
 
     #[test]
@@ -5772,9 +5760,7 @@ mod tests {
             shutdown_tx,
             closing: AtomicBool::new(false),
             admission: Mutex::new(()),
-            cancellations: Arc::new(Mutex::new(HashMap::new())),
-            embedding_cancellations: Arc::new(Mutex::new(HashMap::new())),
-            reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
+            requests: Arc::new(RequestRegistry::new()),
             status: Arc::new(RwLock::new(ResidentModelStatus {
                 model_id: "panicking-worker".to_string(),
                 model_path: std::path::PathBuf::new(),
@@ -6023,14 +6009,13 @@ mod tests {
             .send(Ok(completion))
             .expect("test result receiver remains live");
         let (_event_tx, event_rx) = bounded(EVENT_CAPACITY);
+        let (control, lease) = test_generation_reservation("verified-request", &[]);
+        drop(lease);
         GenerationTicket {
             request_id: "verified-request".to_string(),
             events: event_rx,
             result: result_rx,
-            cancellations: Arc::new(Mutex::new(HashMap::new())),
-            reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
-            owned_cancellations: Vec::new(),
-            owned_reasoning_forces: Vec::new(),
+            control,
         }
     }
 
@@ -6038,18 +6023,20 @@ mod tests {
     fn completed_ticket_drop_cannot_cancel_a_reused_request_identity() {
         let request_id = "reused-request".to_owned();
         let branch_id = "branch".to_owned();
-        let cancellations = Arc::new(Mutex::new(HashMap::new()));
-        let reasoning_forces = Arc::new(Mutex::new(HashMap::new()));
         let old_cancel = Arc::new(AtomicBool::new(false));
         let old_reasoning = Arc::new(AtomicBool::new(false));
-        cancellations.lock().expect("cancel lock").insert(
-            (request_id.clone(), branch_id.clone()),
-            Arc::clone(&old_cancel),
-        );
-        reasoning_forces.lock().expect("reasoning lock").insert(
-            (request_id.clone(), branch_id.clone()),
-            Arc::clone(&old_reasoning),
-        );
+        let old_registry = Arc::new(RequestRegistry::new());
+        let (old_control, old_lease) = old_registry
+            .reserve(
+                request_id.clone(),
+                RequestClass::Generation,
+                RequestControls::Generation {
+                    cancellations: vec![(branch_id.clone(), Arc::clone(&old_cancel))],
+                    reasoning_forces: vec![(branch_id.clone(), Arc::clone(&old_reasoning))],
+                },
+            )
+            .expect("old request reserves");
+        drop(old_lease);
         let (result_tx, result_rx) = bounded(1);
         result_tx
             .send(Ok(GenerationCompletion::unverified(Vec::new())))
@@ -6059,10 +6046,7 @@ mod tests {
             request_id: request_id.clone(),
             events: event_rx,
             result: result_rx,
-            cancellations: Arc::clone(&cancellations),
-            reasoning_forces: Arc::clone(&reasoning_forces),
-            owned_cancellations: vec![(branch_id.clone(), old_cancel)],
-            owned_reasoning_forces: vec![(branch_id.clone(), old_reasoning)],
+            control: old_control,
         };
 
         assert_eq!(
@@ -6072,41 +6056,29 @@ mod tests {
 
         let new_cancel = Arc::new(AtomicBool::new(false));
         let new_reasoning = Arc::new(AtomicBool::new(false));
-        cancellations.lock().expect("cancel lock").insert(
-            (request_id.clone(), branch_id.clone()),
-            Arc::clone(&new_cancel),
-        );
-        reasoning_forces.lock().expect("reasoning lock").insert(
-            (request_id.clone(), branch_id.clone()),
-            Arc::clone(&new_reasoning),
-        );
+        let new_registry = Arc::new(RequestRegistry::new());
+        let (_new_control, _new_lease) = new_registry
+            .reserve(
+                request_id,
+                RequestClass::Generation,
+                RequestControls::Generation {
+                    cancellations: vec![(branch_id.clone(), Arc::clone(&new_cancel))],
+                    reasoning_forces: vec![(branch_id, Arc::clone(&new_reasoning))],
+                },
+            )
+            .expect("new request reserves");
         drop(old_ticket);
 
         assert!(!new_cancel.load(Ordering::Acquire));
         assert!(!new_reasoning.load(Ordering::Acquire));
-        assert!(Arc::ptr_eq(
-            cancellations
-                .lock()
-                .expect("cancel lock")
-                .get(&(request_id.clone(), branch_id.clone()))
-                .expect("new cancellation remains"),
-            &new_cancel
-        ));
-        assert!(Arc::ptr_eq(
-            reasoning_forces
-                .lock()
-                .expect("reasoning lock")
-                .get(&(request_id, branch_id))
-                .expect("new reasoning flag remains"),
-            &new_reasoning
-        ));
+        assert_eq!(new_registry.active_count(), 1);
     }
 
     #[test]
     fn reported_binding_identity_matches_the_private_recipe_and_lock_pin() {
         assert_eq!(
             LLAMA_CPP_BINDING_REV,
-            "01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f"
+            "152dabbd3492d8e35fdf7112e556685c6c75ec9a"
         );
         assert_eq!(LLAMA_CPP_REV, "5f55650a78f92aff4d48d671423e888fac0469ff");
         let manifest = include_str!("../Cargo.toml");
@@ -6870,9 +6842,12 @@ mod tests {
         assert_eq!(verified.request().request_id, "verified-request");
 
         let ticket = completed_generation_ticket(verified_completion(test_verified_generation()));
-        let verified = ticket
-            .wait_verified_timeout(Duration::from_millis(1))
-            .expect("timed verified wait returns the opaque seal");
+        let verified = require_ready(
+            ticket
+                .wait_verified_timeout(Duration::from_millis(1))
+                .expect("timed verified wait returns the opaque seal"),
+        )
+        .expect("completed fixture cannot time out");
         assert_eq!(verified.outputs().len(), 2);
 
         let ticket = completed_generation_ticket(verified_completion(test_verified_generation()));
@@ -7053,11 +7028,13 @@ mod tests {
         let cancellation = Arc::new(AtomicBool::new(false));
         check_embedding_cancellation(&cancellation).expect("unset cancellation permits work");
         let (_result_tx, result_rx) = bounded::<embedding_runtime::EmbeddingCompletion>(1);
+        let (control, lease) =
+            test_embedding_reservation("embedding-request", Arc::clone(&cancellation));
+        drop(lease);
         let ticket = EmbeddingTicket {
             request_id: "embedding-request".to_string(),
             result: result_rx,
-            cancellation: Arc::clone(&cancellation),
-            cancellations: Arc::new(Mutex::new(HashMap::new())),
+            control,
         };
         ticket.cancel();
         assert!(cancellation.load(Ordering::Acquire));
@@ -7075,11 +7052,14 @@ mod tests {
         let admitted_request_sha256 = embedding_runtime::embedding_request_sha256(&request);
         let (result_tx, result_rx) = bounded(1);
         let cancellation = Arc::new(AtomicBool::new(false));
+        let (_, request_lease) =
+            test_embedding_reservation("embedding-request", Arc::clone(&cancellation));
         reject_queued_command(WorkerCommand::EmbedBatch {
             request,
             admitted_request_sha256,
             result: result_tx,
             cancellation: Arc::clone(&cancellation),
+            request_lease,
         });
         assert!(cancellation.load(Ordering::Acquire));
         let completion = result_rx.recv().expect("one shutdown completion");
@@ -7101,11 +7081,16 @@ mod tests {
     fn duplicate_embedding_request_id_fails_before_queue_admission() {
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
         let (shutdown_tx, _shutdown_rx) = bounded(1);
-        let embedding_cancellations = Arc::new(Mutex::new(HashMap::new()));
-        embedding_cancellations.lock().expect("registry").insert(
-            "embedding-request".to_string(),
-            Arc::new(AtomicBool::new(false)),
-        );
+        let requests = Arc::new(RequestRegistry::new());
+        let (_control, _lease) = requests
+            .reserve(
+                "embedding-request",
+                RequestClass::Embedding,
+                RequestControls::Embedding {
+                    cancellation: Arc::new(AtomicBool::new(false)),
+                },
+            )
+            .expect("existing embedding request reserves");
         let handle = NativeModelHandle {
             inner: Arc::new(NativeModelInner {
                 worker_identity: Arc::new(WorkerIdentity),
@@ -7113,9 +7098,7 @@ mod tests {
                 shutdown_tx,
                 closing: AtomicBool::new(false),
                 admission: Mutex::new(()),
-                cancellations: Arc::new(Mutex::new(HashMap::new())),
-                embedding_cancellations,
-                reasoning_forces: Arc::new(Mutex::new(HashMap::new())),
+                requests,
                 status: Arc::new(RwLock::new(ResidentModelStatus {
                     model_id: "model".to_string(),
                     model_path: PathBuf::new(),
@@ -7130,40 +7113,94 @@ mod tests {
         let error = handle
             .embed_batch(embedding_request("model", vec![1]))
             .expect_err("duplicate embedding IDs fail before queueing");
-        assert_eq!(error.code, NativeErrorCode::InvalidConfig);
+        assert_eq!(error.code, NativeErrorCode::DuplicateActiveRequest);
         assert!(command_rx.try_recv().is_err());
     }
 
     #[test]
+    fn dropped_embedding_ticket_keeps_request_id_reserved_until_executor_terminal() {
+        let fingerprint = test_model_fingerprint("model");
+        let status = ResidentModelStatus {
+            model_id: "model".to_owned(),
+            model_path: PathBuf::new(),
+            state: ModelRuntimeState::Ready,
+            fingerprint: Some(fingerprint),
+            descriptor: None,
+            active_sequences: 0,
+            max_sequences: 4,
+        };
+        let (handle, command_rx) = test_admission_handle(status, COMMAND_CAPACITY);
+        let request = embedding_request("model", vec![1]);
+
+        let ticket = handle
+            .embed_batch(request.clone())
+            .expect("first embedding request is admitted");
+        drop(ticket);
+        assert_eq!(handle.inner.requests.active_count(), 1);
+        assert_eq!(
+            handle
+                .embed_batch(request.clone())
+                .expect_err("ticket drop cannot release executor identity")
+                .code,
+            NativeErrorCode::DuplicateActiveRequest
+        );
+
+        reject_queued_command(command_rx.recv().expect("executor owns queued embedding"));
+        assert_eq!(handle.inner.requests.active_count(), 0);
+
+        let retry = handle
+            .embed_batch(request)
+            .expect("embedding identity is reusable after terminal");
+        reject_queued_command(command_rx.recv().expect("retry embedding command"));
+        drop(retry);
+        assert_eq!(handle.inner.requests.active_count(), 0);
+    }
+
+    #[test]
+    fn queue_full_releases_unstarted_request_reservation() {
+        let status = ResidentModelStatus {
+            model_id: "model".to_owned(),
+            model_path: PathBuf::new(),
+            state: ModelRuntimeState::Ready,
+            fingerprint: Some(test_model_fingerprint("model")),
+            descriptor: None,
+            active_sequences: 0,
+            max_sequences: 4,
+        };
+        let (handle, _command_rx) = test_admission_handle(status, 0);
+        let error = handle
+            .embed_batch(embedding_request("model", vec![1]))
+            .expect_err("zero-capacity queue rejects without a waiting worker");
+        assert_eq!(error.code, NativeErrorCode::QueueFull);
+        assert_eq!(handle.inner.requests.active_count(), 0);
+    }
+
+    #[test]
     fn stale_embedding_ticket_cannot_remove_or_cancel_reused_identity() {
-        let registry = Arc::new(Mutex::new(HashMap::new()));
         let old = Arc::new(AtomicBool::new(false));
-        registry
-            .lock()
-            .expect("registry")
-            .insert("embedding-request".to_string(), Arc::clone(&old));
+        let (old_control, old_lease) =
+            test_embedding_reservation("embedding-request", Arc::clone(&old));
+        drop(old_lease);
         let (_result_tx, result_rx) = bounded::<embedding_runtime::EmbeddingCompletion>(1);
         let ticket = EmbeddingTicket {
             request_id: "embedding-request".to_string(),
             result: result_rx,
-            cancellation: old,
-            cancellations: Arc::clone(&registry),
+            control: old_control,
         };
         let replacement = Arc::new(AtomicBool::new(false));
-        registry
-            .lock()
-            .expect("registry")
-            .insert("embedding-request".to_string(), Arc::clone(&replacement));
+        let replacement_registry = Arc::new(RequestRegistry::new());
+        let (_replacement_control, _replacement_lease) = replacement_registry
+            .reserve(
+                "embedding-request",
+                RequestClass::Embedding,
+                RequestControls::Embedding {
+                    cancellation: Arc::clone(&replacement),
+                },
+            )
+            .expect("replacement request reserves");
         drop(ticket);
         assert!(!replacement.load(Ordering::Acquire));
-        assert!(Arc::ptr_eq(
-            registry
-                .lock()
-                .expect("registry")
-                .get("embedding-request")
-                .expect("replacement remains"),
-            &replacement
-        ));
+        assert_eq!(replacement_registry.active_count(), 1);
     }
 
     #[test]
@@ -7450,18 +7487,23 @@ mod tests {
 
     #[test]
     fn reasoning_force_registry_is_separate_and_branch_scoped() {
-        let registry: ReasoningForceRegistry = Arc::new(Mutex::new(HashMap::new()));
         let first = Arc::new(AtomicBool::new(false));
         let second = Arc::new(AtomicBool::new(false));
-        registry.lock().expect("lock registry").insert(
-            ("request".to_string(), "first".to_string()),
-            Arc::clone(&first),
-        );
-        registry.lock().expect("lock registry").insert(
-            ("request".to_string(), "second".to_string()),
-            Arc::clone(&second),
-        );
-        assert!(set_flag_in_registry(&registry, "request", "first"));
+        let registry = Arc::new(RequestRegistry::new());
+        let (control, _lease) = registry
+            .reserve(
+                "request",
+                RequestClass::Generation,
+                RequestControls::Generation {
+                    cancellations: Vec::new(),
+                    reasoning_forces: vec![
+                        ("first".to_owned(), Arc::clone(&first)),
+                        ("second".to_owned(), Arc::clone(&second)),
+                    ],
+                },
+            )
+            .expect("request reserves");
+        assert!(control.force_reasoning_exit("first"));
         assert!(first.load(Ordering::Acquire));
         assert!(!second.load(Ordering::Acquire));
     }
@@ -7864,8 +7906,9 @@ mod tests {
             media: Vec::new(),
             cached_prefix: None,
         })?;
-        let outputs = ticket.wait_timeout(Duration::from_secs(120))?;
-        let events = ticket.events.try_iter().collect::<Vec<_>>();
+        let event_rx = ticket.events.clone();
+        let outputs = require_ready(ticket.wait_timeout(Duration::from_secs(120))?)?;
+        let events = event_rx.try_iter().collect::<Vec<_>>();
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].input_index, 0);
         assert_eq!(outputs[0].branch_id, "completion-0");
@@ -7921,8 +7964,10 @@ mod tests {
             ],
         };
         let family_ticket = handle.generate_batch(family_request.clone())?;
-        let verified = family_ticket.wait_verified_timeout(Duration::from_secs(120))?;
-        let family_events = family_ticket.events.try_iter().collect::<Vec<_>>();
+        let family_event_rx = family_ticket.events.clone();
+        let verified =
+            require_ready(family_ticket.wait_verified_timeout(Duration::from_secs(120))?)?;
+        let family_events = family_event_rx.try_iter().collect::<Vec<_>>();
         let family_outputs = verified.outputs();
         assert_eq!(verified.request(), &family_request);
         assert_eq!(verified.model_fingerprint().model_id, descriptor.model_id);
@@ -7992,9 +8037,11 @@ mod tests {
 
         let mut legacy_request = family_request;
         legacy_request.request_id = "native-raw-family-legacy".to_string();
-        let legacy_outputs = handle
-            .generate_batch(legacy_request)?
-            .wait_timeout(Duration::from_secs(120))?;
+        let legacy_outputs = require_ready(
+            handle
+                .generate_batch(legacy_request)?
+                .wait_timeout(Duration::from_secs(120))?,
+        )?;
         for (sealed, legacy) in family_outputs.iter().zip(&legacy_outputs) {
             assert_eq!(sealed.branch_id, legacy.branch_id);
             assert_eq!(sealed.generated_token_ids, legacy.generated_token_ids);
@@ -8030,9 +8077,11 @@ mod tests {
         );
         let mut legacy_default_seed_request = default_seed_request;
         legacy_default_seed_request.request_id = "native-default-seed-legacy".to_string();
-        let legacy_default_seed_outputs = handle
-            .generate_batch(legacy_default_seed_request)?
-            .wait_timeout(Duration::from_secs(120))?;
+        let legacy_default_seed_outputs = require_ready(
+            handle
+                .generate_batch(legacy_default_seed_request)?
+                .wait_timeout(Duration::from_secs(120))?,
+        )?;
         assert_eq!(legacy_default_seed_outputs.len(), 1);
         assert!(legacy_default_seed_outputs[0].real_engine_invoked);
 
@@ -8068,9 +8117,11 @@ mod tests {
                 cached_prefix: None,
             }],
         };
-        handle
-            .generate_batch(cache_source_request)?
-            .wait_timeout(Duration::from_secs(120))?;
+        require_ready(
+            handle
+                .generate_batch(cache_source_request)?
+                .wait_timeout(Duration::from_secs(120))?,
+        )?;
         let mut forged_cache = handle.snapshot_sequence(0)?;
         assert_eq!(forged_cache.token_count, 1);
         assert_eq!(forged_cache.token_ids, vec![source_token]);
@@ -8103,9 +8154,11 @@ mod tests {
 
         let mut legacy_forged_request = forged_request;
         legacy_forged_request.request_id = "native-forged-cache-legacy".to_string();
-        let legacy_forged_outputs = handle
-            .generate_batch(legacy_forged_request)?
-            .wait_timeout(Duration::from_secs(120))?;
+        let legacy_forged_outputs = require_ready(
+            handle
+                .generate_batch(legacy_forged_request)?
+                .wait_timeout(Duration::from_secs(120))?,
+        )?;
         assert_eq!(legacy_forged_outputs.len(), 1);
         assert!(legacy_forged_outputs[0].real_engine_invoked);
         assert_eq!(
@@ -8148,7 +8201,8 @@ mod tests {
             cached_prefix: None,
         })?;
         assert!(cancel_ticket.cancel_branch("completion-1"));
-        let cancelled_outputs = cancel_ticket.wait_timeout(Duration::from_secs(120))?;
+        let cancelled_outputs =
+            require_ready(cancel_ticket.wait_timeout(Duration::from_secs(120))?)?;
         assert_eq!(cancelled_outputs[0].state, GenerationState::Completed);
         assert_eq!(cancelled_outputs[1].state, GenerationState::Cancelled);
 
@@ -8244,7 +8298,7 @@ mod tests {
         assert!(budget.fits(512));
         let ticket = handle.generate_batch(request.clone())?;
         assert!(ticket.cancel_branch("cancelled"));
-        let verified = ticket.wait_verified_timeout(Duration::from_secs(120))?;
+        let verified = require_ready(ticket.wait_verified_timeout(Duration::from_secs(120))?)?;
 
         assert_eq!(verified.request(), &request);
         assert_eq!(verified.outputs().len(), 2);
@@ -8324,9 +8378,11 @@ mod tests {
             media: Vec::new(),
             cached_prefix: None,
         };
-        let before = handle
-            .generate(generation_request("embedding-baseline-before"))?
-            .wait_timeout(Duration::from_secs(120))?;
+        let before = require_ready(
+            handle
+                .generate(generation_request("embedding-baseline-before"))?
+                .wait_timeout(Duration::from_secs(120))?,
+        )?;
 
         let input_tokens = [exact_tokens.clone(), exact_tokens[..2].to_vec()];
         let cancelled_ticket = handle.embed_batch(EmbeddingBatchRequest::new(
@@ -8362,18 +8418,20 @@ mod tests {
             "failed authority must not publish embedding capability status"
         );
 
-        let verified_embedding = handle
-            .embed_batch(EmbeddingBatchRequest::new(
-                "real-per-token-embedding".to_string(),
-                model_id.clone(),
-                vec![
-                    EmbeddingInput::new("full".to_string(), input_tokens[0].clone())?,
-                    EmbeddingInput::new("prefix".to_string(), input_tokens[1].clone())?,
-                ],
-                EmbeddingPooling::None,
-                EmbeddingNormalization::None,
-            )?)?
-            .wait_verified_timeout(Duration::from_secs(120))?;
+        let verified_embedding = require_ready(
+            handle
+                .embed_batch(EmbeddingBatchRequest::new(
+                    "real-per-token-embedding".to_string(),
+                    model_id.clone(),
+                    vec![
+                        EmbeddingInput::new("full".to_string(), input_tokens[0].clone())?,
+                        EmbeddingInput::new("prefix".to_string(), input_tokens[1].clone())?,
+                    ],
+                    EmbeddingPooling::None,
+                    EmbeddingNormalization::None,
+                )?)?
+                .wait_verified_timeout(Duration::from_secs(120))?,
+        )?;
         let embedding = verified_embedding.output();
 
         assert_eq!(embedding.request_id(), "real-per-token-embedding");
@@ -8474,9 +8532,11 @@ mod tests {
             Some(embedding.config().dimensions())
         );
 
-        let after = handle
-            .generate(generation_request("embedding-baseline-after"))?
-            .wait_timeout(Duration::from_secs(120))?;
+        let after = require_ready(
+            handle
+                .generate(generation_request("embedding-baseline-after"))?
+                .wait_timeout(Duration::from_secs(120))?,
+        )?;
         assert_eq!(before.len(), 1);
         assert_eq!(after.len(), 1);
         assert_eq!(before[0].generated_token_ids, after[0].generated_token_ids);

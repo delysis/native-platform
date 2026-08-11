@@ -11,12 +11,12 @@ llama-native-types = { path = "../llama-native-types" }
 crossbeam-channel.workspace = true
 encoding_rs = "0.8"
 fs4 = "1.1.0"
-llama-cpp-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f", default-features = false, features = ["common", "sampler", "mtmd"] }
-llama-cpp-sys-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f", default-features = false }
+llama-cpp-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "152dabbd3492d8e35fdf7112e556685c6c75ec9a", default-features = false, features = ["common", "sampler", "mtmd"] }
+llama-cpp-sys-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "152dabbd3492d8e35fdf7112e556685c6c75ec9a", default-features = false }
 sha2.workspace = true
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-llama-cpp-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "01e48b7c1e7de39c3e5e8a67cd9efac498f8da1f", default-features = false, features = ["common", "sampler", "mtmd", "metal"] }
+llama-cpp-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "152dabbd3492d8e35fdf7112e556685c6c75ec9a", default-features = false, features = ["common", "sampler", "mtmd", "metal"] }
 
 [dev-dependencies]
 serde.workspace = true
