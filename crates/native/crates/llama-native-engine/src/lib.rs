@@ -127,7 +127,7 @@ struct ModelArtifactGuard {
     file: File,
     initial_state: ArtifactFileState,
     expected_sha256: String,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     payload_bytes_read: std::sync::atomic::AtomicU64,
     strict_binding_error: Option<String>,
 }
@@ -1398,11 +1398,11 @@ impl ModelArtifactGuard {
         let lock_error = Fs4FileExt::try_lock_shared(&file)
             .err()
             .map(|error| format!("cooperative shared lock unavailable: {error}"));
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         let payload_bytes_read = std::sync::atomic::AtomicU64::new(0);
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         let expected_sha256 = hash_open_artifact(&file, label, path, &payload_bytes_read)?;
-        #[cfg(not(test))]
+        #[cfg(not(all(test, unix)))]
         let expected_sha256 = hash_open_artifact(&file, label, path)?;
         let state_after_hash = file
             .metadata()
@@ -1451,7 +1451,7 @@ impl ModelArtifactGuard {
             file,
             initial_state,
             expected_sha256,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             payload_bytes_read,
             strict_binding_error,
         })
@@ -1499,7 +1499,7 @@ impl ModelArtifactGuard {
         self.verify_identity()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn payload_bytes_read(&self) -> u64 {
         self.payload_bytes_read.load(Ordering::Relaxed)
     }
@@ -1677,12 +1677,12 @@ fn read_artifact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Res
     reader.read(buffer)
 }
 
-#[cfg(not(test))]
+#[cfg(not(all(test, unix)))]
 fn hash_open_artifact(file: &File, label: &str, path: &std::path::Path) -> NativeResult<String> {
     hash_open_artifact_with_read_observer(file, label, path, |_| {})
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn hash_open_artifact(
     file: &File,
     label: &str,

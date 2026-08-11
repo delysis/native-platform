@@ -588,8 +588,10 @@ impl EmbeddingEvidenceDigest {
 mod tests {
     use super::*;
     use llama_native_types::{EmbeddingInput, EmbeddingVectorOutput};
+    #[cfg(unix)]
     use std::sync::atomic::AtomicU64;
 
+    #[cfg(unix)]
     static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
     fn resident_fingerprint(model_sha256: &str) -> ModelFingerprint {
@@ -1045,10 +1047,12 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     struct TestDirectory {
         path: std::path::PathBuf,
     }
 
+    #[cfg(unix)]
     impl TestDirectory {
         fn new() -> Self {
             let id = TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
@@ -1063,6 +1067,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
