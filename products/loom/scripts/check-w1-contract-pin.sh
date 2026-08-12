@@ -8,7 +8,8 @@ w1_vertical_rev='fc24ffff08c52690390b4460f44617d5d9732563'
 w1_contract_url='https://github.com/delysis/w1-platform-contracts.git'
 w1_manifest='crates/loom-host/Cargo.toml'
 w1_vertical_manifests='crates/loom-backend-llama/Cargo.toml
-crates/loom-store/Cargo.toml'
+crates/loom-store/Cargo.toml
+crates/tauri-plugin-loom/Cargo.toml'
 
 contract_manifests="$(rg -l 'w1-platform-contracts' Cargo.toml crates/*/Cargo.toml | sort || true)"
 expected_manifests="$(printf '%s\n' "$w1_manifest" "$w1_vertical_manifests" | sort)"
@@ -36,7 +37,7 @@ done <<EOF
 $w1_vertical_manifests
 EOF
 
-if [[ "$(rg -o 'w1-platform-contracts' Cargo.toml crates/*/Cargo.toml | wc -l | tr -d ' ')" -ne 4 ]]; then
+if [[ "$(rg -o 'w1-platform-contracts' Cargo.toml crates/*/Cargo.toml | wc -l | tr -d ' ')" -ne 6 ]]; then
   printf '%s\n' 'unexpected W1 dependency declaration count' >&2
   exit 1
 fi
