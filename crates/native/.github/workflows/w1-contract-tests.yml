@@ -32,5 +32,8 @@ jobs:
       - name: Test complete native lifecycle manifest
         run: cargo test --locked -p llama-native-engine --features unstable-w1-contract-tests operation_registry::w1_contract_adapter
 
-      - name: Lint native lifecycle implementation
-        run: cargo clippy --locked -p llama-native-engine --features unstable-w1-contract-tests --all-targets -- -D warnings
+      - name: Authenticate exact-Qwen vertical manifest
+        run: cargo test --locked -p llama-native-engine --features unstable-w1-vertical-tests w1_vertical_fixture::w1_current_exact_qwen_manifest_is_authenticated -- --exact
+
+      - name: Lint native lifecycle and vertical implementations
+        run: cargo clippy --locked -p llama-native-engine --features unstable-w1-contract-tests,unstable-w1-vertical-tests --all-targets -- -D warnings

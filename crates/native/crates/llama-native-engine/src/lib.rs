@@ -50,6 +50,9 @@ use llama_native_types::{
     exact_token_batch_cell_budget,
 };
 use sha2::{Digest, Sha256};
+
+#[cfg(all(test, feature = "unstable-w1-vertical-tests"))]
+mod w1_vertical_fixture;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, Metadata};
 use std::num::NonZeroU32;
