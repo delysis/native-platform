@@ -88,5 +88,32 @@ jobs:
         with:
           toolchain: nightly-2026-07-26
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
-      - run: cargo fuzz run inspect -- -max_total_time=60 -timeout=5
-      - run: cargo fuzz run pipeline -- -max_total_time=60 -timeout=5
+      - name: Prepare retained evidence
+        run: mkdir -p bounded-fuzz-logs fuzz/artifacts/inspect fuzz/artifacts/pipeline
+      - name: Fuzz inspect for 60 seconds
+        run: cargo fuzz run inspect -- -max_total_time=60 -timeout=5 2>&1 | tee bounded-fuzz-logs/inspect.log
+      - name: Fuzz pipeline for 60 seconds
+        run: cargo fuzz run pipeline -- -max_total_time=60 -timeout=5 2>&1 | tee bounded-fuzz-logs/pipeline.log
+      - name: Record scheduled-run identity
+        if: always()
+        run: |
+          printf '%s\n' \
+            "repository=$GITHUB_REPOSITORY" \
+            "sha=$GITHUB_SHA" \
+            "event=$GITHUB_EVENT_NAME" \
+            "run_id=$GITHUB_RUN_ID" \
+            "run_attempt=$GITHUB_RUN_ATTEMPT" \
+            "runner_os=$RUNNER_OS" \
+            "cargo_fuzz=0.13.2" \
+            "nightly=nightly-2026-07-26" \
+            > bounded-fuzz-logs/run-identity.txt
+      - name: Upload scheduled bounded-fuzz evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scheduled-bounded-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            bounded-fuzz-logs/
+            fuzz/artifacts/
+          if-no-files-found: error
+          retention-days: 30
