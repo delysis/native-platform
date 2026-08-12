@@ -10,7 +10,7 @@
         "repository_id": "delysis/free-token-energy",
         "commit": "797500060047ccd10f9810fb4d5c8f374e00eb08",
         "production_tree": {
-          "id": "fte.quit_relaunch.production.source.2db2d45",
+          "id": "fte.quit_relaunch.production.source.7975000",
           "digest": {
             "algorithm": "sha256",
             "hex": "d8578c94683fc597c5ce8bb4dec1898b379c40f450bc22a957c81513b54df0f3"
@@ -74,9 +74,9 @@
         "id": "fte.quit_relaunch.expected_projection",
         "digest": {
           "algorithm": "sha256",
-          "hex": "8106e7832093fb94f548dfe47de974bc5b897c7e7c6b0950f14f9c1e88226b76"
+          "hex": "c55756ac4aaa63134ccf7e7f363d4de81d40677e54861d7ebbf3e4f7638560dc"
         },
-        "length": 5714
+        "length": 6170
       }
     }
   ],

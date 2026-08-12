@@ -11,19 +11,18 @@ The production baseline is commit
 `797500060047ccd10f9810fb4d5c8f374e00eb08`. It exposes an owner-level shutdown
 receipt only after Gateway closure and native-host join. The receipt carries
 the exact expected and joined backend worker IDs plus the retained task count.
-The projection canonicalizes the joined worker sets so scheduler completion
-order cannot make evidence flaky while the shared contract still observes real
-completion order.
+The projection freezes both the canonical joined-worker sets and the unsorted
+completion-order sequences returned by the production `JoinSet` receipt.
 The checked-in source descriptor authenticates the pre-test production prefixes
-of the router and desktop owner, plus exact Git blobs for the product database,
-desktop assembly, and credential store.
+of the router, desktop owner, and product database, plus exact Git blobs for the
+desktop assembly and credential store.
 
 The input corpus SHA-256 is
 `2692b9ddb4e2645e3d13b644e859463f7f46d770eb3d4ca1e4ea51b999e54014`;
 the expected projection SHA-256 is
-`8106e7832093fb94f548dfe47de974bc5b897c7e7c6b0950f14f9c1e88226b76`;
+`c55756ac4aaa63134ccf7e7f363d4de81d40677e54861d7ebbf3e4f7638560dc`;
 and the manifest SHA-256 is
-`94081e34420a407f167f80dcbd48e00c4d76b9dbb1a97427fa7ed22a8effa1a1`.
+`aa38fe3f5e9fb305751181ef3f0dfbc84d0043303629a8d239609a1adc7b529d`.
 
 ## Replay
 

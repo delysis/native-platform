@@ -39,7 +39,7 @@ request corpus and exact projected results.
 Both cases authenticate one checked-in production-source descriptor. It binds
 the exact pre-test prefixes of the two files that contain inline tests and the
 Git tree identities of `fte-router`, `fte-protocols`, `fte-store`, and
-`fte-types` at baseline commit `0ba33bb786f068830cf288c629d8eedc63e56029`.
+`fte-types` at baseline commit `797500060047ccd10f9810fb4d5c8f374e00eb08`.
 The replay verifies that the fixture revision descends from that commit and that
 every bound production root is unchanged. The generic projection makes no
 listener-worker-count claim because `LoopbackServer::shutdown` intentionally

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Command;
 
 pub const BYTES: &[u8] =
-    include_bytes!("../fixtures/w1/v0/fte-production-tree-0ba33bb.json");
+    include_bytes!("../fixtures/w1/v0/fte-production-tree-7975000.json");
 
 #[derive(Deserialize)]
 struct Descriptor {
@@ -53,7 +53,7 @@ pub fn verify() {
     assert_eq!(descriptor.repository_id, "delysis/free-token-energy");
     assert_eq!(
         descriptor.commit,
-        "0ba33bb786f068830cf288c629d8eedc63e56029"
+        "797500060047ccd10f9810fb4d5c8f374e00eb08"
     );
 
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -80,6 +80,8 @@ pub fn verify() {
     }
 
     for (path, expected_oid) in descriptor.git_trees {
+        let dirty = git_output(repository, &["status", "--porcelain", "--", &path]);
+        assert!(dirty.is_empty(), "working tree drift: {path}");
         for revision in [&descriptor.commit, "HEAD"] {
             let spec = format!("{revision}:{path}");
             let actual = String::from_utf8(git_output(repository, &["rev-parse", &spec]))

@@ -26,7 +26,7 @@ const INPUT_BYTES: &[u8] =
 const PROJECTION_BYTES: &[u8] =
     include_bytes!("../../tests/fixtures/w1/v0/fte-quit-relaunch-projection.json");
 const SOURCE_BYTES: &[u8] =
-    include_bytes!("../../tests/fixtures/w1/v0/fte-quit-relaunch-production-tree-2db2d45.json");
+    include_bytes!("../../tests/fixtures/w1/v0/fte-quit-relaunch-production-tree-7975000.json");
 static DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
 struct FixtureDirectory {
@@ -472,7 +472,8 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
         first_report.gateway.expected_worker_ids,
         input.expected_worker_ids
     );
-    let mut first_joined_worker_ids = first_report.gateway.joined_worker_ids.clone();
+    let first_completion_order = first_report.gateway.joined_worker_ids.clone();
+    let mut first_joined_worker_ids = first_completion_order.clone();
     first_joined_worker_ids.sort_unstable();
     assert_eq!(
         first_joined_worker_ids,
@@ -530,7 +531,8 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
         fresh_report.gateway.expected_worker_ids,
         input.expected_worker_ids
     );
-    let mut fresh_joined_worker_ids = fresh_report.gateway.joined_worker_ids.clone();
+    let fresh_completion_order = fresh_report.gateway.joined_worker_ids.clone();
+    let mut fresh_joined_worker_ids = fresh_completion_order.clone();
     fresh_joined_worker_ids.sort_unstable();
     assert_eq!(
         fresh_joined_worker_ids,
@@ -547,20 +549,38 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
     );
     assert_eq!(case.state_identities[0].baseline.identity, durable_identity);
     let joined_identity = sha256_identity(
-        "fte.runtime.first.joined_worker_ids",
+        "fte.runtime.first.joined_worker_set",
         format!(
             "{}\n{}",
             input.first_runtime_id,
-            input.expected_worker_ids.join("\n")
+            first_joined_worker_ids.join("\n")
+        )
+        .as_bytes(),
+    );
+    let completion_order_identity = sha256_identity(
+        "fte.runtime.first.joined_worker_completion_order",
+        format!(
+            "{}\n{}",
+            input.first_runtime_id,
+            first_completion_order.join("\n")
         )
         .as_bytes(),
     );
     let fresh_joined_identity = sha256_identity(
-        "fte.runtime.fresh.joined_worker_ids",
+        "fte.runtime.fresh.joined_worker_set",
         format!(
             "{}\n{}",
             input.fresh_runtime_id,
-            input.expected_worker_ids.join("\n")
+            fresh_joined_worker_ids.join("\n")
+        )
+        .as_bytes(),
+    );
+    let fresh_completion_order_identity = sha256_identity(
+        "fte.runtime.fresh.joined_worker_completion_order",
+        format!(
+            "{}\n{}",
+            input.fresh_runtime_id,
+            fresh_completion_order.join("\n")
         )
         .as_bytes(),
     );
@@ -570,9 +590,9 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
             {"sequence": 1, "operation_id": "fte.owner.1", "attempt_id": "owner.1.quit", "correlation_id": "fte.quit_relaunch.w1", "kind": "cancel_requested", "payload": null},
             {"sequence": 2, "operation_id": input.rejected_request_id, "attempt_id": "owner.1.rejected", "correlation_id": "fte.quit_relaunch.w1", "kind": "failed", "payload": null},
             {"sequence": 3, "operation_id": input.active_request_id, "attempt_id": "owner.1.active", "correlation_id": "fte.quit_relaunch.w1", "kind": "cancelled", "payload": null},
-            {"sequence": 4, "operation_id": "fte.owner.1", "attempt_id": "owner.1.quit", "correlation_id": "fte.quit_relaunch.w1", "kind": "completed", "payload": joined_identity},
+            {"sequence": 4, "operation_id": "fte.owner.1", "attempt_id": "owner.1.quit", "correlation_id": "fte.quit_relaunch.w1", "kind": "completed", "payload": completion_order_identity},
             {"sequence": 5, "operation_id": "fte.database.profile", "attempt_id": "owner.2.reopen", "correlation_id": "fte.quit_relaunch.w1", "kind": "completed", "payload": durable_identity},
-            {"sequence": 6, "operation_id": input.fresh_request_id, "attempt_id": "owner.2.fresh", "correlation_id": "fte.quit_relaunch.w1", "kind": "completed", "payload": fresh_joined_identity}
+            {"sequence": 6, "operation_id": input.fresh_request_id, "attempt_id": "owner.2.fresh", "correlation_id": "fte.quit_relaunch.w1", "kind": "completed", "payload": fresh_completion_order_identity}
         ],
         "durable_state": [{
             "state_id": "fte.runtime.profile",
@@ -600,8 +620,10 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
             "authoritative_terminal_released_before_shutdown_receipt": {"kind": "boolean", "value": true},
             "first_runtime_id": {"kind": "text", "value": input.first_runtime_id},
             "fresh_runtime_id": {"kind": "text", "value": input.fresh_runtime_id},
-            "first_exact_joined_worker_ids": {"kind": "digest", "value": joined_identity.digest},
-            "fresh_exact_joined_worker_ids": {"kind": "digest", "value": fresh_joined_identity.digest},
+            "first_exact_joined_worker_set": {"kind": "digest", "value": joined_identity.digest},
+            "first_joined_worker_completion_order": {"kind": "digest", "value": completion_order_identity.digest},
+            "fresh_exact_joined_worker_set": {"kind": "digest", "value": fresh_joined_identity.digest},
+            "fresh_joined_worker_completion_order": {"kind": "digest", "value": fresh_completion_order_identity.digest},
             "native_owner_joined": {"kind": "boolean", "value": first_report.native_host_joined},
             "same_product_database_reopened": {"kind": "boolean", "value": true},
             "fresh_owner_distinct": {"kind": "boolean", "value": true},

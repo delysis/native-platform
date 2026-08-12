@@ -39,7 +39,7 @@
       "correlation_id": "fte.quit_relaunch.w1",
       "kind": "completed",
       "payload": {
-        "id": "fte.runtime.first.joined_worker_ids",
+        "id": "fte.runtime.first.joined_worker_completion_order",
         "digest": {
           "algorithm": "sha256",
           "hex": "eedb673b24eff986a0600a310424f7c390e5f643b6d2f1c313849f86166a7e19"
@@ -69,7 +69,7 @@
       "correlation_id": "fte.quit_relaunch.w1",
       "kind": "completed",
       "payload": {
-        "id": "fte.runtime.fresh.joined_worker_ids",
+        "id": "fte.runtime.fresh.joined_worker_completion_order",
         "digest": {
           "algorithm": "sha256",
           "hex": "e40d6028fa7b011bfbbf6eb8e64f9753a0b8802763e74eff0fc5f549e41358e2"
@@ -150,14 +150,28 @@
     "authoritative_terminal_released_before_shutdown_receipt": { "kind": "boolean", "value": true },
     "first_runtime_id": { "kind": "text", "value": "fte-w1-runtime-owner-1" },
     "fresh_runtime_id": { "kind": "text", "value": "fte-w1-runtime-owner-2" },
-    "first_exact_joined_worker_ids": {
+    "first_exact_joined_worker_set": {
       "kind": "digest",
       "value": {
         "algorithm": "sha256",
         "hex": "eedb673b24eff986a0600a310424f7c390e5f643b6d2f1c313849f86166a7e19"
       }
     },
-    "fresh_exact_joined_worker_ids": {
+    "first_joined_worker_completion_order": {
+      "kind": "digest",
+      "value": {
+        "algorithm": "sha256",
+        "hex": "eedb673b24eff986a0600a310424f7c390e5f643b6d2f1c313849f86166a7e19"
+      }
+    },
+    "fresh_exact_joined_worker_set": {
+      "kind": "digest",
+      "value": {
+        "algorithm": "sha256",
+        "hex": "e40d6028fa7b011bfbbf6eb8e64f9753a0b8802763e74eff0fc5f549e41358e2"
+      }
+    },
+    "fresh_joined_worker_completion_order": {
       "kind": "digest",
       "value": {
         "algorithm": "sha256",
