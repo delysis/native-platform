@@ -384,16 +384,17 @@ async fn full_app_runtime_quit_joins_fake_owner_and_reopens_same_store() -> Resu
     ensure!(fixture.schema == "mom_llama.w1.quit_relaunch_fixture.v1");
 
     let runtime = w1_fixture_runtime();
-    runtime
+    let write_lease = runtime
         .admit(command_spec("mom_llama_draft_update"))
-        .map_err(anyhow::Error::msg)?
-        .finish(TerminalClass::Completed)
         .map_err(anyhow::Error::msg)?;
     mom_llama_runtime::draft_update(
         Some(&fixture.conversation_id),
         fixture.draft.clone(),
         Vec::new(),
     )?;
+    write_lease
+        .finish(TerminalClass::Completed)
+        .map_err(anyhow::Error::msg)?;
 
     let supervisor = runtime.w1_operation_supervisor();
     let owner = supervisor.spawn_controlled(&fixture.active_operation_id)?;
