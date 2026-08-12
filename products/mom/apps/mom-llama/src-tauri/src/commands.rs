@@ -1227,9 +1227,16 @@ fn command_value<T: serde::Serialize>(result: anyhow::Result<T>) -> Result<Value
 async fn blocking_command<T, F>(lease: AppWorkLease, operation: F) -> Result<Value, String>
 where
     T: serde::Serialize + Send + 'static,
-    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    F: FnOnce() -> anyhow::Result<mom_llama_runtime::CommandResult<T>> + Send + 'static,
 {
-    lease.run_blocking(move || command_value(operation())).await
+    lease
+        .run_blocking_with_cancellation_evidence(move || {
+            let result = operation().map_err(to_error)?;
+            let authoritative_cancellation = result.has_authoritative_cancellation_evidence();
+            let value = command_value(Ok(result))?;
+            Ok((value, authoritative_cancellation))
+        })
+        .await
 }
 
 async fn blocking_response<F>(lease: AppWorkLease, operation: F) -> Result<Response, String>

@@ -3,6 +3,8 @@ mod command_registry;
 mod commands;
 mod operation_supervisor;
 mod view;
+#[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+mod w1_vertical_fixtures;
 
 use anyhow::Result;
 use app_runtime::AppRuntimeHandle;
@@ -23,6 +25,9 @@ use tauri::{AppHandle, Manager, Runtime, State};
 
 const APPLICATION_QUIT_MENU_ID: &str = "mom-llama.application.quit";
 const APPLICATION_QUIT_ACCELERATOR: &str = "CmdOrCtrl+Q";
+
+#[cfg(test)]
+pub(crate) static APP_DATA_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
 struct StartupController {

@@ -1,0 +1,85 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "mom.cache.native-prefix-corruption",
+      "attempt_id": "quarantine.once",
+      "correlation_id": null,
+      "kind": "quarantined",
+      "payload": null
+    },
+    {
+      "sequence": 1,
+      "operation_id": "mom.cache.session-kv-corruption",
+      "attempt_id": "invalidate.once",
+      "correlation_id": null,
+      "kind": "recovered",
+      "payload": null
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "mom.cache.native-prefix",
+      "schema_id": "native-host-prefix-cache.mom-llama",
+      "before": {
+        "id": "mom.cache.native-prefix.fixture",
+        "digest": { "algorithm": "sha256", "hex": "787f58b20bbfe28415acb4721b3293e5af42bdd056368b1cac14fe8aec3dd3b8" },
+        "length": 1113
+      },
+      "after": {
+        "id": "mom.cache.native-prefix.cold-miss",
+        "digest": { "algorithm": "sha256", "hex": "38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed" },
+        "length": 5
+      },
+      "disposition": "quarantined"
+    },
+    {
+      "state_id": "mom.cache.session-kv",
+      "schema_id": "kv-cache.v3",
+      "before": {
+        "id": "mom.cache.session-kv.fixture",
+        "digest": { "algorithm": "sha256", "hex": "4bfc026b7b842e4ef65d6b0993fa6eb13f0d33e0573296aba6b48c04da34425a" },
+        "length": 1142
+      },
+      "after": {
+        "id": "mom.cache.session-kv.cold-miss",
+        "digest": { "algorithm": "sha256", "hex": "1885429208d88d71764bef9f98d867f16e5c54e7672226734a137201978fab9b" },
+        "length": 1059
+      },
+      "disposition": "recovered"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "mom.cache.native-prefix-corruption",
+      "attempt_id": "quarantine.once",
+      "correlation_id": null,
+      "terminal": "completed",
+      "released": true
+    },
+    {
+      "operation_id": "mom.cache.session-kv-corruption",
+      "attempt_id": "invalidate.once",
+      "correlation_id": null,
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 0,
+    "joined_workers": 0
+  },
+  "output_facts": {
+    "authoritative_state_preserved": { "kind": "boolean", "value": true },
+    "native_prefix_cold_after_reopen": { "kind": "boolean", "value": true },
+    "native_prefix_quarantine_rows": { "kind": "integer", "value": 1 },
+    "session_blob_deleted": { "kind": "boolean", "value": true },
+    "session_metadata_invalidated": { "kind": "boolean", "value": true }
+  },
+  "fail_closed_facts": [
+    "only disposable cache namespaces were quarantined or invalidated",
+    "authoritative conversation state was not defaulted or deleted"
+  ]
+}

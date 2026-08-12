@@ -25,4 +25,8 @@ jobs:
       - run: brew install ripgrep
       - run: cargo test --locked -p mom-llama-app --features unstable-w1-contracts
       - run: cargo clippy --locked -p mom-llama-app --all-targets --features unstable-w1-contracts -- -D warnings
+      - run: cargo test --locked -p mom-llama-runtime --features unstable-w1-vertical-fixtures
+      - run: cargo test --locked -p mom-llama-app --features unstable-w1-vertical-fixtures
+      - run: cargo clippy --locked -p mom-llama-runtime --all-targets --features unstable-w1-vertical-fixtures -- -D warnings
+      - run: cargo clippy --locked -p mom-llama-app --all-targets --features unstable-w1-vertical-fixtures -- -D warnings
       - run: ./scripts/check-architecture.sh

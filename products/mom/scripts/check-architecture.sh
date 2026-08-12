@@ -81,18 +81,35 @@ then
 fi
 
 contract_rev=cbab33555ab9355a6ac453d659c55ec9e0666821
+vertical_rev=fc24ffff08c52690390b4460f44617d5d9732563
 contract_url=https://github.com/delysis/w1-platform-contracts
 contract_tomls=$(rg -l 'w1-platform-contracts' . --glob 'Cargo.toml' --glob '!target/**')
 if [ "$(printf '%s\n' "$contract_tomls" | sed '/^$/d' | wc -l | tr -d ' ')" -ne 1 ]; then
   echo "Wave 1 contract source must be declared once at the workspace boundary" >&2
   exit 1
 fi
-if ! rg -F "git = \"$contract_url\", rev = \"$contract_rev\"" Cargo.toml >/dev/null; then
-  echo "Wave 1 contract dependency must use the accepted exact revision" >&2
+if [ "$(rg -F "git = \"$contract_url\", rev = \"$contract_rev\"" Cargo.toml | wc -l | tr -d ' ')" -ne 2 ]; then
+  echo "Wave 1 lifecycle contract and testkit must use the accepted exact revision exactly twice" >&2
+  exit 1
+fi
+if [ "$(rg -F "git = \"$contract_url\", rev = \"$vertical_rev\"" Cargo.toml | wc -l | tr -d ' ')" -ne 2 ]; then
+  echo "Wave 1 vertical contract and fixture adapter must use the accepted exact revision exactly twice" >&2
   exit 1
 fi
 if rg -n 'w1-platform-contracts.*(branch|tag)[[:space:]]*=' . --glob 'Cargo.toml'; then
   echo "moving Wave 1 contract dependency found" >&2
+  exit 1
+fi
+if [ "$(rg -F "source = \"git+$contract_url?rev=$contract_rev#$contract_rev\"" Cargo.lock | wc -l | tr -d ' ')" -ne 2 ]; then
+  echo "Wave 1 lifecycle lock must contain exactly the contract and testkit packages at the accepted revision" >&2
+  exit 1
+fi
+if [ "$(rg -F "source = \"git+$contract_url?rev=$vertical_rev#$vertical_rev\"" Cargo.lock | wc -l | tr -d ' ')" -ne 2 ]; then
+  echo "Wave 1 vertical lock must contain exactly the contract and fixture packages at the accepted revision" >&2
+  exit 1
+fi
+if rg 'w1-platform-contracts.*rev[[:space:]]*=' Cargo.toml | rg -v "$contract_rev|$vertical_rev"; then
+  echo "unreviewed Wave 1 contract revision found" >&2
   exit 1
 fi
 

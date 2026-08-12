@@ -3883,13 +3883,12 @@ fn human_bytes(size: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static VIEW_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn rendered_app_controls_have_contract_metadata() -> Result<()> {
-        let _guard = VIEW_TEST_LOCK.lock().expect("lock view test state");
+        let _guard = crate::APP_DATA_DIR_TEST_LOCK
+            .lock()
+            .expect("lock app data-dir test state");
         let data_dir = std::env::temp_dir().join(format!(
             "mom-llama-view-test-{}",
             mom_llama_runtime::now_ms()
@@ -4271,7 +4270,9 @@ mod tests {
 
     #[test]
     fn corrupt_product_storage_never_projects_an_empty_default_chat() {
-        let _guard = VIEW_TEST_LOCK.lock().expect("lock view test state");
+        let _guard = crate::APP_DATA_DIR_TEST_LOCK
+            .lock()
+            .expect("lock app data-dir test state");
         let data_dir = std::env::temp_dir().join(format!(
             "mom-llama-corrupt-view-test-{}-{}",
             std::process::id(),

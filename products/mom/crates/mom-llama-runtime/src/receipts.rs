@@ -71,6 +71,22 @@ impl<T> CommandResult<T>
 where
     T: Serialize,
 {
+    /// True only for the closed product result emitted after the native chat
+    /// owner has reported an actual cancelled terminal. Generic blockers and
+    /// caller-supplied errors are not lifecycle cancellation evidence.
+    pub fn has_authoritative_cancellation_evidence(&self) -> bool {
+        self.command == "mom_llama.chat_send"
+            && self.status == "blocked"
+            && self.result.is_none()
+            && self.receipt.command == self.command
+            && self.receipt.status == self.status
+            && self.receipt.readiness == self.readiness
+            && self.blocker.as_ref().is_some_and(|blocker| {
+                blocker.code == "chat_cancelled"
+                    && self.receipt.blockers.as_slice() == std::slice::from_ref(blocker)
+            })
+    }
+
     pub fn passed(
         command: &str,
         readiness: &str,
@@ -217,5 +233,38 @@ fn receipt(input: ReceiptInput<'_>) -> CommandReceipt {
         real_engine_invoked: input.real_engine_invoked,
         fake_fixture: input.fake_fixture,
         created_at: now_ms().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_closed_chat_cancel_result_is_authoritative_cancellation_evidence() {
+        let cancelled = CommandResult::<()>::blocked(
+            "mom_llama.chat_send",
+            "stub_blocked",
+            Blocker::new("chat_cancelled", "cancelled", Vec::new()),
+        );
+        assert!(cancelled.has_authoritative_cancellation_evidence());
+
+        let ordinary_blocker = CommandResult::<()>::blocked(
+            "mom_llama.chat_send",
+            "stub_blocked",
+            Blocker::new("native_response_empty", "empty", Vec::new()),
+        );
+        assert!(!ordinary_blocker.has_authoritative_cancellation_evidence());
+
+        let foreign_command = CommandResult::<()>::blocked(
+            "mom_llama.tool_loop_run",
+            "cancelled",
+            Blocker::new("chat_cancelled", "cancelled", Vec::new()),
+        );
+        assert!(!foreign_command.has_authoritative_cancellation_evidence());
+
+        let mut inconsistent_receipt = cancelled;
+        inconsistent_receipt.receipt.status = "passed".to_string();
+        assert!(!inconsistent_receipt.has_authoritative_cancellation_evidence());
     }
 }

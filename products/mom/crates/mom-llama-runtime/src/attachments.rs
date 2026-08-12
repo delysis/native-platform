@@ -138,6 +138,23 @@ pub(crate) struct ChatAttachmentContext {
     pub media: Vec<MediaInput>,
 }
 
+/// Stable, product-local projection used only by the checked-in W1 replay.
+/// It exposes the exact bounded text that the ordinary attachment pipeline
+/// would hand to chat without granting the fixture a second ingestion path.
+#[cfg(feature = "unstable-w1-vertical-fixtures")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct W1AttachmentPromptProjection {
+    pub schema: String,
+    pub conversation_id: String,
+    pub attachment_ids: Vec<String>,
+    pub canonical_text: String,
+    pub canonical_text_sha256: String,
+    pub media_count: usize,
+    pub manifest_namespace: String,
+    pub policy_fingerprint: String,
+    pub artifact_processors: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AttachmentContextBlocker {
     pub readiness: String,
@@ -218,6 +235,32 @@ pub fn attachment_import(
     conversation_id: &str,
     path: &Path,
 ) -> Result<CommandResult<AttachmentImportOutput>> {
+    attachment_import_with_identity(conversation_id, path, None)
+}
+
+#[cfg(feature = "unstable-w1-vertical-fixtures")]
+pub fn attachment_import_with_fixture_identity(
+    conversation_id: &str,
+    path: &Path,
+    attachment_id: &str,
+) -> Result<CommandResult<AttachmentImportOutput>> {
+    if attachment_id.is_empty()
+        || !attachment_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(anyhow!(
+            "fixture attachment identity must be safe nonempty ASCII"
+        ));
+    }
+    attachment_import_with_identity(conversation_id, path, Some(attachment_id))
+}
+
+fn attachment_import_with_identity(
+    conversation_id: &str,
+    path: &Path,
+    attachment_id: Option<&str>,
+) -> Result<CommandResult<AttachmentImportOutput>> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(_) => {
@@ -269,6 +312,7 @@ pub fn attachment_import(
         provided,
         "mom_llama.attachment_import",
         &host,
+        attachment_id,
     )
 }
 
@@ -314,6 +358,7 @@ pub fn attachment_import_pasted_text(
         provided,
         "mom_llama.attachment_import_paste",
         &host,
+        None,
     )
 }
 
@@ -323,6 +368,7 @@ fn canonicalize_and_stage(
     provided: ProvidedAttachment,
     command: &str,
     host: &AttachmentHost,
+    attachment_id: Option<&str>,
 ) -> Result<CommandResult<AttachmentImportOutput>> {
     let file_name = provided.display_name.clone();
     let canonicalized = match host.inspect_and_canonicalize(provided) {
@@ -338,7 +384,9 @@ fn canonicalize_and_stage(
         .find(|object| object.id == root_id)
         .ok_or_else(|| anyhow!("canonical attachment graph has no root object"))?;
     let detected_format = root.detection.selected;
-    let id = Uuid::new_v4().to_string();
+    let id = attachment_id
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let manifest_namespace = format!("attachment.manifest.{id}");
     let stored_path = object_storage_uri(&root_id);
     let record = AttachmentRecord {
@@ -577,6 +625,91 @@ pub(crate) fn prepare_chat_attachments(
         current_text: current.text,
         media,
     }))
+}
+
+#[cfg(feature = "unstable-w1-vertical-fixtures")]
+pub fn attachment_prompt_projection_for_fixture(
+    conversation_id: &str,
+) -> Result<W1AttachmentPromptProjection> {
+    if conversation_id.trim().is_empty() {
+        return Err(anyhow!("fixture conversation identity must not be empty"));
+    }
+    let active_messages = load_db()?
+        .conversations
+        .into_iter()
+        .find(|conversation| conversation.id == conversation_id)
+        .map(|conversation| crate::conversation_store::active_path_messages(&conversation))
+        .unwrap_or_default();
+    let context =
+        prepare_chat_attachments(conversation_id, &active_messages, None)?.map_err(|blocked| {
+            anyhow!(
+                "attachment fixture projection was blocked: {}: {}",
+                blocked.readiness,
+                blocked.blocker.message
+            )
+        })?;
+    let attachment_db = load_attachment_db()?;
+    let attachment_ids = if context.staged_ids.is_empty() {
+        active_messages
+            .iter()
+            .flat_map(|message| message.attachment_ids.iter().cloned())
+            .collect::<Vec<_>>()
+    } else {
+        context.staged_ids.clone()
+    };
+    let attachment_id = attachment_ids
+        .first()
+        .ok_or_else(|| anyhow!("fixture projection has no attachment"))?;
+    let record = attachment_db
+        .attachments
+        .iter()
+        .find(|record| &record.id == attachment_id)
+        .ok_or_else(|| anyhow!("fixture projection attachment record is missing"))?;
+    let manifest_namespace = record
+        .manifest_namespace
+        .clone()
+        .ok_or_else(|| anyhow!("fixture projection manifest namespace is missing"))?;
+    let manifest = RuntimeStore::current()?
+        .get::<AttachmentManifest>(&manifest_namespace)?
+        .ok_or_else(|| anyhow!("fixture projection manifest is missing"))?;
+    manifest.graph.validate()?;
+    for artifact in &manifest.artifacts {
+        artifact.validate()?;
+    }
+    let artifact_processors = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            format!(
+                "{}@{}:{}",
+                artifact.processor.name,
+                artifact.processor.version,
+                artifact.processor.policy_fingerprint
+            )
+        })
+        .collect();
+    let canonical_text = if context.current_text.is_empty() {
+        active_messages
+            .iter()
+            .filter_map(|message| context.text_by_message_id.get(&message.id))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    } else {
+        context.current_text
+    };
+    let canonical_text_sha256 = format!("{:x}", Sha256::digest(canonical_text.as_bytes()));
+    Ok(W1AttachmentPromptProjection {
+        schema: "mom_llama.w1.attachment_prompt_projection.v1".to_string(),
+        conversation_id: conversation_id.to_string(),
+        attachment_ids,
+        canonical_text,
+        canonical_text_sha256,
+        media_count: context.media.len(),
+        manifest_namespace,
+        policy_fingerprint: manifest.policy_fingerprint,
+        artifact_processors,
+    })
 }
 
 pub(crate) fn commit_generated_exchange(
@@ -1429,6 +1562,8 @@ mod tests {
     use super::*;
     use crate::config::set_data_dir_override_for_tests;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    use std::time::Duration;
 
     const VALID_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\
         \x00\x00\x00\x0dIHDR\x00\x00\x00\x02\x00\x00\x00\x04\x08\x02\x00\x00\x00\x2b\x8d\x79\x6e\
@@ -2431,5 +2566,399 @@ mod tests {
             .expect("preparation must return a typed result")
             .expect_err("content mismatch must block");
         assert_eq!(blocked.blocker.code, "attachment_content_mismatch");
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    #[derive(Clone, Debug, Deserialize)]
+    struct W1ChatFixture {
+        schema: String,
+        store_identity: String,
+        store_schema: String,
+        conversation_id: String,
+        cancelled_request_id: String,
+        retry_request_id: String,
+        message: String,
+        initial_draft: String,
+        assistant_text: String,
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    #[derive(Debug, Deserialize)]
+    struct W1AttachmentProjectionFixture {
+        schema: String,
+        conversation_id: String,
+        attachment_id: String,
+        request_id: String,
+        root_object_id: String,
+        content_sha256: String,
+        detected_format: String,
+        coverage: String,
+        canonical_text: String,
+        canonical_text_sha256: String,
+        media_count: usize,
+        manifest_namespace: String,
+        policy_fingerprint: String,
+        artifact_processors: Vec<String>,
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    fn w1_chat_fixture() -> W1ChatFixture {
+        serde_json::from_str(include_str!("../fixtures/w1/chat-cancel-retry-v1.json"))
+            .expect("parse checked-in chat fixture")
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    #[test]
+    fn w1_cancel_retry_reopens_exact_durable_chat_without_laundering_cancellation() {
+        let session = TestDataDir::new("w1-chat-cancel-retry");
+        let fixture = w1_chat_fixture();
+        assert_eq!(fixture.schema, "mom_llama.w1.chat_cancel_retry_fixture.v1");
+        assert_eq!(fixture.store_identity, "mom-fixture-store-v1");
+        assert_eq!(
+            fixture.store_schema,
+            "runtime.sqlite3/encrypted_documents.v1"
+        );
+        crate::draft_update(
+            Some(&fixture.conversation_id),
+            fixture.initial_draft.clone(),
+            Vec::new(),
+        )
+        .expect("persist initial draft");
+
+        let store = RuntimeStore::current().expect("open encrypted product store");
+        let connection = rusqlite::Connection::open(store.path()).expect("open store schema");
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'encrypted_documents'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect encrypted store table");
+        assert_eq!(table_count, 1);
+        let raw_store = std::fs::read(store.path()).expect("read encrypted fixture store");
+        assert!(
+            !raw_store
+                .windows(fixture.initial_draft.len())
+                .any(|window| window == fixture.initial_draft.as_bytes()),
+            "the initial draft must not occur as plaintext in runtime.sqlite3"
+        );
+
+        let cancelled_events = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let cancelled_worker = {
+            let fixture = fixture.clone();
+            let cancelled_events = std::sync::Arc::clone(&cancelled_events);
+            std::thread::spawn(move || {
+                crate::chat_send_stream_waiting_for_fixture_cancel(
+                    crate::ChatSendInput {
+                        conversation_id: fixture.conversation_id,
+                        message: fixture.message,
+                    },
+                    &fixture.cancelled_request_id,
+                    |event| {
+                        if event.event == "started" {
+                            started_tx
+                                .send(())
+                                .map_err(|_| anyhow!("fixture start observer disappeared"))?;
+                        }
+                        cancelled_events
+                            .lock()
+                            .map_err(|_| anyhow!("fixture event log is unavailable"))?
+                            .push(event);
+                        Ok(())
+                    },
+                )
+            })
+        };
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fixture request reached the started boundary");
+        let cancelled = crate::chat_cancel(&fixture.conversation_id)
+            .expect("cancel through Mom chat_cancel")
+            .result
+            .expect("chat_cancel result");
+        assert_eq!(cancelled.request_id, fixture.cancelled_request_id);
+        let cancelled_send = cancelled_worker
+            .join()
+            .expect("cancelled fixture worker")
+            .expect("cancelled fixture command result");
+        assert_eq!(
+            cancelled_send
+                .blocker
+                .as_ref()
+                .map(|blocker| blocker.code.as_str()),
+            Some("chat_cancelled")
+        );
+        let cancelled_events = cancelled_events.lock().expect("cancelled event log");
+        assert_eq!(
+            cancelled_events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            ["started", "cancelled"]
+        );
+        assert!(cancelled_events.iter().all(|event| {
+            event.request_id == fixture.cancelled_request_id
+                && event.fake_fixture
+                && !event.real_engine_invoked
+        }));
+        assert_eq!(
+            crate::draft_get(Some(&fixture.conversation_id))
+                .expect("reopen draft after cancellation")
+                .result
+                .expect("draft result")
+                .message,
+            fixture.initial_draft
+        );
+        assert_eq!(
+            crate::active_chat_request_count_for_fixture().expect("active fixture count"),
+            0
+        );
+
+        let mut retry_events = Vec::new();
+        let retry = crate::chat_send_stream_with_fixture_identity(
+            crate::ChatSendInput {
+                conversation_id: fixture.conversation_id.clone(),
+                message: fixture.message.clone(),
+            },
+            &fixture.retry_request_id,
+            |event| {
+                retry_events.push(event);
+                Ok(())
+            },
+        )
+        .expect("run deterministic retry")
+        .result
+        .expect("retry output");
+        assert_ne!(retry.request_id, cancelled.request_id);
+        assert_eq!(retry.request_id, fixture.retry_request_id);
+        assert_eq!(retry.assistant_text, fixture.assistant_text);
+        assert_eq!(
+            retry_events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            ["started", "completed"]
+        );
+        assert!(retry_events.iter().all(|event| {
+            event.request_id == fixture.retry_request_id
+                && event.fake_fixture
+                && !event.real_engine_invoked
+        }));
+        assert_eq!(
+            crate::active_chat_request_count_for_fixture().expect("active fixture count"),
+            0
+        );
+
+        set_data_dir_override_for_tests(None);
+        set_data_dir_override_for_tests(Some(session.path.clone()));
+        let conversations = crate::conversation_list()
+            .expect("reopen conversations")
+            .result
+            .expect("conversation list result");
+        let conversation = conversations
+            .iter()
+            .find(|conversation| conversation.id == fixture.conversation_id)
+            .expect("reopened fixture conversation");
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(conversation.messages[0].content, fixture.message);
+        assert_eq!(conversation.messages[1].content, fixture.assistant_text);
+        assert_eq!(
+            conversation.messages[1].receipt_id.as_deref(),
+            Some("mom_llama.chat_send:mom-w1-request-retry")
+        );
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    #[test]
+    fn w1_ordinary_markdown_round_trips_through_attachment_native_projection_and_reopen() {
+        let session = TestDataDir::new("w1-ordinary-markdown");
+        let expected: W1AttachmentProjectionFixture = serde_json::from_str(include_str!(
+            "../fixtures/w1/ordinary-notes-projection-v1.json"
+        ))
+        .expect("parse expected attachment projection");
+        let conversation_id = expected.conversation_id.as_str();
+        let fixture_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/w1/ordinary-notes.md");
+        let fixture_bytes = std::fs::read(&fixture_path).expect("read ordinary Markdown fixture");
+        let imported = attachment_import_with_fixture_identity(
+            conversation_id,
+            &fixture_path,
+            &expected.attachment_id,
+        )
+        .expect("import ordinary Markdown")
+        .result
+        .expect("attachment import output")
+        .attachment;
+        assert_eq!(imported.state, AttachmentState::Staged);
+        assert_eq!(imported.bytes, fixture_bytes.len() as u64);
+        assert_eq!(
+            imported.sha256,
+            format!("{:x}", Sha256::digest(&fixture_bytes))
+        );
+        assert_eq!(imported.sha256, expected.content_sha256);
+        assert_eq!(
+            imported.root_object_id.as_deref(),
+            Some(expected.root_object_id.as_str())
+        );
+        assert_eq!(expected.detected_format, "markdown");
+        assert_eq!(expected.coverage, "complete");
+        assert_eq!(imported.detected_format, Some(DetectedFormat::Markdown));
+        assert_eq!(imported.coverage, Some(Coverage::Complete));
+        assert!(imported.canonical_text_bytes > 0);
+
+        let projection = attachment_prompt_projection_for_fixture(conversation_id)
+            .expect("project canonical attachment prompt");
+        assert_eq!(projection.schema, expected.schema);
+        assert_eq!(
+            projection.attachment_ids.as_slice(),
+            std::slice::from_ref(&imported.id)
+        );
+        assert_eq!(projection.media_count, expected.media_count);
+        assert_eq!(projection.manifest_namespace, expected.manifest_namespace);
+        assert_eq!(projection.policy_fingerprint, expected.policy_fingerprint);
+        assert_eq!(projection.artifact_processors, expected.artifact_processors);
+        assert_eq!(projection.canonical_text, expected.canonical_text);
+        assert_eq!(
+            projection.canonical_text_sha256,
+            expected.canonical_text_sha256
+        );
+        assert_eq!(
+            projection.canonical_text_sha256,
+            format!("{:x}", Sha256::digest(projection.canonical_text.as_bytes()))
+        );
+
+        let sent = crate::chat_send_stream_with_fixture_identity(
+            crate::ChatSendInput {
+                conversation_id: conversation_id.to_string(),
+                message: "Use the attached ordinary Markdown exactly.".to_string(),
+            },
+            &expected.request_id,
+            |_| Ok(()),
+        )
+        .expect("send attachment fixture")
+        .result
+        .expect("attachment chat output");
+        let committed = attachment_list(Some(conversation_id))
+            .expect("list committed attachment")
+            .result
+            .expect("attachment list output")
+            .into_iter()
+            .next()
+            .expect("committed attachment");
+        assert_eq!(committed.id, imported.id);
+        assert_eq!(committed.root_object_id, imported.root_object_id);
+        assert_eq!(committed.sha256, imported.sha256);
+        assert_eq!(committed.state, AttachmentState::Committed);
+        assert_eq!(committed.message_id, sent.user_message_id);
+        let preview = attachment_preview(&committed.id, true)
+            .expect("preview committed attachment")
+            .result
+            .expect("attachment preview output");
+        assert_eq!(preview.bytes.as_deref(), Some(fixture_bytes.as_slice()));
+
+        set_data_dir_override_for_tests(None);
+        set_data_dir_override_for_tests(Some(session.path.clone()));
+        let reopened = attachment_list(Some(conversation_id))
+            .expect("reopen committed attachment")
+            .result
+            .expect("reopened attachment list")
+            .into_iter()
+            .next()
+            .expect("reopened attachment");
+        assert_eq!(reopened.id, committed.id);
+        assert_eq!(reopened.root_object_id, committed.root_object_id);
+        assert_eq!(reopened.sha256, committed.sha256);
+        let reopened_projection = attachment_prompt_projection_for_fixture(conversation_id)
+            .expect("recompute canonical projection after reopen");
+        assert_eq!(reopened_projection, projection);
+        let conversation = crate::conversation_list()
+            .expect("reopen attachment conversation")
+            .result
+            .expect("conversation list")
+            .into_iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .expect("attachment conversation");
+        assert_eq!(conversation.messages[0].attachment_ids, [committed.id]);
+        assert_eq!(
+            conversation.messages[1].receipt_id.as_deref(),
+            Some("mom_llama.chat_send:mom-w1-attachment-request")
+        );
+
+        use platform_contracts_v0_vertical::TerminalClass;
+        use platform_vertical_fixtures_v0::{
+            DurableStateFactV0, EquivalenceProjectionV0, EventFactV0, FactValueV0, LifecycleFactV0,
+            OwnershipFactsV0, StateDispositionV0, VerticalIdV0, sha256_identity,
+        };
+        let root_identity = sha256_identity("attachment.root_object", &fixture_bytes);
+        crate::validate_w1_fixture_projection(
+            VerticalIdV0::MomAttachment,
+            EquivalenceProjectionV0 {
+                ordered_events: vec![EventFactV0 {
+                    sequence: 0,
+                    operation_id: "mom.attachment.import-send-reopen".to_owned(),
+                    attempt_id: Some(expected.request_id.clone()),
+                    correlation_id: Some(conversation_id.to_owned()),
+                    kind: "completed".to_owned(),
+                    payload: Some(root_identity.clone()),
+                }],
+                durable_state: vec![DurableStateFactV0 {
+                    state_id: "mom.attachment.store".to_owned(),
+                    schema_id: "mom_llama.attachments.v3".to_owned(),
+                    before: None,
+                    after: Some(root_identity),
+                    disposition: StateDispositionV0::Created,
+                }],
+                lifecycle: vec![LifecycleFactV0 {
+                    operation_id: "mom.attachment.import-send-reopen".to_owned(),
+                    attempt_id: Some(expected.request_id),
+                    correlation_id: Some(conversation_id.to_owned()),
+                    terminal: TerminalClass::Completed,
+                    released: true,
+                }],
+                ownership: OwnershipFactsV0 {
+                    active_operations: 0,
+                    retained_tasks: 0,
+                    expected_workers: 0,
+                    joined_workers: 0,
+                },
+                output_facts: std::collections::BTreeMap::from([
+                    (
+                        "artifact_processor_provenance_exact".to_owned(),
+                        FactValueV0::Boolean(
+                            reopened_projection.artifact_processors == expected.artifact_processors,
+                        ),
+                    ),
+                    (
+                        "canonical_prompt_recomputed_after_reopen".to_owned(),
+                        FactValueV0::Boolean(reopened_projection == projection),
+                    ),
+                    (
+                        "manifest_namespace_exact".to_owned(),
+                        FactValueV0::Boolean(
+                            reopened_projection.manifest_namespace == expected.manifest_namespace,
+                        ),
+                    ),
+                    (
+                        "object_bytes_exact".to_owned(),
+                        FactValueV0::Boolean(
+                            preview.bytes.as_deref() == Some(fixture_bytes.as_slice()),
+                        ),
+                    ),
+                    (
+                        "policy_fingerprint_exact".to_owned(),
+                        FactValueV0::Boolean(
+                            reopened_projection.policy_fingerprint == expected.policy_fingerprint,
+                        ),
+                    ),
+                ]),
+                fail_closed_facts: vec![
+                    "attachment text remained inside the explicit untrusted-data boundary"
+                        .to_owned(),
+                    "content-address mismatch blocks before prompt projection".to_owned(),
+                ],
+            },
+        )
+        .expect("authenticated Mom attachment W1 projection");
     }
 }
