@@ -153,11 +153,7 @@ pub fn manifest_and_projection(vertical_id: VerticalIdV0) -> (VerticalFixtureMan
     } else {
         NetworkBoundaryV0::Denied
     };
-    let omitted_claims = if vertical_id == VerticalIdV0::FteHostedFixtureLoopback {
-        vec!["live hosted-provider behavior".to_owned()]
-    } else {
-        Vec::new()
-    };
+    let omitted_claims = omitted_claims(vertical_id);
     let prerequisites = prerequisites(vertical_id);
     let state_identities =
         if vertical_id.class() == platform_vertical_fixtures_v0::FixtureClassV0::State {
@@ -276,10 +272,18 @@ pub fn observation(vertical_id: VerticalIdV0) -> ObservationEnvelopeV0 {
                 platform_vertical_fixtures_v0::FixtureClassV0::ModelFree
                 | platform_vertical_fixtures_v0::FixtureClassV0::State => ExecutionKind::Fixture,
             },
-            omitted_claims: Vec::new(),
+            omitted_claims: omitted_claims(vertical_id),
             negative_evidence: Vec::new(),
         },
         projection: projection(vertical_id),
+    }
+}
+
+fn omitted_claims(vertical_id: VerticalIdV0) -> Vec<String> {
+    if vertical_id == VerticalIdV0::FteHostedFixtureLoopback {
+        vec!["live hosted-provider behavior".to_owned()]
+    } else {
+        Vec::new()
     }
 }
 
