@@ -6,34 +6,25 @@
 //! shared envelope.
 
 use crate::{AcquireError, PublicationReceipt, VerifiedFetch};
+use information_native_types::ArtifactId;
 use platform_contracts_v0::error::SERVICE_ERROR_SCHEMA_V0;
 use platform_contracts_v0::publication::PUBLICATION_RECEIPT_SCHEMA_V0;
 use platform_contracts_v0::{
     ArtifactIdentityV0, ContractError, DestinationIdentityV0, ErrorClass, PublicationOutcomeV0,
     PublicationReceiptV0, RetryAdvice, ServiceErrorV0, ServiceId,
 };
+use sha2::{Digest, Sha256};
+
+const INFORMATION_ACQUIRE_SERVICE: &str = "information-acquire";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicationContractContext {
-    pub artifact_id: String,
-    pub filesystem_id: String,
-    pub path_id: String,
-    pub service: ServiceId,
+    artifact_id: ArtifactId,
 }
 
 impl PublicationContractContext {
-    pub fn new(
-        artifact_id: impl Into<String>,
-        filesystem_id: impl Into<String>,
-        path_id: impl Into<String>,
-        service: ServiceId,
-    ) -> Self {
-        Self {
-            artifact_id: artifact_id.into(),
-            filesystem_id: filesystem_id.into(),
-            path_id: path_id.into(),
-            service,
-        }
+    pub const fn new(artifact_id: ArtifactId) -> Self {
+        Self { artifact_id }
     }
 }
 
@@ -48,7 +39,6 @@ pub fn publication_outcome_v0(
         Ok(fetch) => PublicationOutcomeV0::PublishedDurabilityUnknown {
             receipt: receipt_v0(&fetch.publication, context)?,
             error: publication_error(
-                context,
                 "information.publish.directory_sync_unavailable",
                 "verified bytes are visible but parent-directory durability is unavailable",
             ),
@@ -57,14 +47,13 @@ pub fn publication_outcome_v0(
             PublicationOutcomeV0::PublishedDurabilityUnknown {
                 receipt: receipt_v0(&receipt, context)?,
                 error: publication_error(
-                    context,
                     "information.publish.durability_unknown",
                     "verified bytes are visible but publication durability is unknown",
                 ),
             }
         }
         Err(error) => PublicationOutcomeV0::NotPublished {
-            error: not_published_error(context, &error),
+            error: not_published_error(&error),
         },
     };
     outcome.validate()?;
@@ -75,10 +64,18 @@ fn receipt_v0(
     receipt: &PublicationReceipt,
     context: &PublicationContractContext,
 ) -> Result<PublicationReceiptV0, ContractError> {
+    let attributed_artifact = receipt.artifact_id.as_ref().ok_or(ContractError::Invalid {
+        field: "publication.artifact_id",
+    })?;
+    if attributed_artifact != &context.artifact_id {
+        return Err(ContractError::Inconsistent {
+            field: "publication.artifact_id",
+        });
+    }
     let receipt = PublicationReceiptV0 {
         schema: PUBLICATION_RECEIPT_SCHEMA_V0.to_owned(),
         artifact: ArtifactIdentityV0 {
-            id: context.artifact_id.clone(),
+            id: attributed_artifact.as_str().to_owned(),
             digest: platform_contracts_v0::ContentDigest::sha256(receipt.sha256.clone()).map_err(
                 |_| ContractError::Invalid {
                     field: "artifact.digest",
@@ -86,10 +83,7 @@ fn receipt_v0(
             )?,
             length: receipt.bytes,
         },
-        destination: DestinationIdentityV0 {
-            filesystem_id: context.filesystem_id.clone(),
-            path_id: context.path_id.clone(),
-        },
+        destination: destination_identity_v0(receipt),
         visible: receipt.visible,
         file_synced: receipt.file_synced,
         directory_synced: receipt.directory_synced,
@@ -99,26 +93,59 @@ fn receipt_v0(
     Ok(receipt)
 }
 
-fn publication_error(
-    context: &PublicationContractContext,
-    code: &str,
-    safe_detail: &str,
-) -> ServiceErrorV0 {
+fn destination_identity_v0(receipt: &PublicationReceipt) -> DestinationIdentityV0 {
+    match receipt.destination_identity {
+        #[cfg(unix)]
+        crate::PublicationDestinationIdentity::Unix { device, inode } => DestinationIdentityV0 {
+            filesystem_id: format!("unix-device:{device}"),
+            path_id: format!("unix-inode:{inode}"),
+        },
+        crate::PublicationDestinationIdentity::Unavailable => DestinationIdentityV0 {
+            filesystem_id: "platform-filesystem-identity:unavailable".to_owned(),
+            path_id: format!(
+                "destination-path-sha256:{}",
+                destination_path_digest(&receipt.destination)
+            ),
+        },
+    }
+}
+
+fn destination_path_digest(path: &std::path::Path) -> String {
+    let mut digest = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        digest.update(path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in path.as_os_str().encode_wide() {
+            digest.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    digest.update(path.to_string_lossy().as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn information_acquire_service() -> ServiceId {
+    ServiceId::new(INFORMATION_ACQUIRE_SERVICE).expect("fixed service ID is valid")
+}
+
+fn publication_error(code: &str, safe_detail: &str) -> ServiceErrorV0 {
     ServiceErrorV0 {
         schema: SERVICE_ERROR_SCHEMA_V0.to_owned(),
         code: code.to_owned(),
         class: ErrorClass::Publication,
         retry: RetryAdvice::Immediate,
         operation_id: None,
-        service: context.service.clone(),
+        service: information_acquire_service(),
         safe_detail: safe_detail.to_owned(),
     }
 }
 
-fn not_published_error(
-    context: &PublicationContractContext,
-    error: &AcquireError,
-) -> ServiceErrorV0 {
+fn not_published_error(error: &AcquireError) -> ServiceErrorV0 {
     let (code, class, retry, safe_detail) = match error {
         AcquireError::StagingPathExists => (
             "information.publish.destination_conflict",
@@ -159,7 +186,7 @@ fn not_published_error(
         class,
         retry,
         operation_id: None,
-        service: context.service.clone(),
+        service: information_acquire_service(),
         safe_detail: safe_detail.to_owned(),
     }
 }
@@ -167,7 +194,11 @@ fn not_published_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AcquireClient, PublicationDestinationIdentity};
+    use crate::{
+        AcquireClient, AcquisitionPolicy, ArtifactFetchOptions, PublicationDestinationIdentity,
+        ResumePolicy,
+    };
+    use information_native_types::{ArtifactId, PlannedArtifact};
     use platform_contracts_v0::PublicationOutcomeV0;
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -179,17 +210,12 @@ mod tests {
     }
 
     fn context() -> PublicationContractContext {
-        PublicationContractContext::new(
-            "artifact.fixture",
-            "filesystem.fixture",
-            "destination.fixture",
-            ServiceId::new("information-acquire").expect("service ID"),
-        )
+        PublicationContractContext::new(ArtifactId::parse("artifact.fixture").expect("artifact ID"))
     }
 
     fn synthetic_receipt(directory_synced: bool) -> PublicationReceipt {
         PublicationReceipt {
-            artifact_id: None,
+            artifact_id: Some(ArtifactId::parse("artifact.fixture").expect("artifact ID")),
             sha256: digest(b"payload"),
             bytes: 7,
             destination: "not-serialized".into(),
@@ -208,8 +234,32 @@ mod tests {
         let destination = directory.path().join("destination.bin");
         fs::write(&source, b"payload").expect("source bytes");
         let client = AcquireClient::with_defaults().expect("client");
+        let mut policy = AcquisitionPolicy::restricted();
+        policy
+            .grant_file_root(directory.path())
+            .expect("grant fixture directory");
+        let options = ArtifactFetchOptions {
+            acquisition_policy: policy,
+            resume: ResumePolicy::Disabled,
+        };
+        let planned = PlannedArtifact {
+            artifact_id: ArtifactId::parse("artifact.fixture").expect("artifact ID"),
+            file_name: "destination.bin".to_owned(),
+            source_uri: url::Url::from_file_path(&source)
+                .expect("fixture file URI")
+                .to_string(),
+            expected_bytes: 7,
+            sha256: digest(b"payload"),
+        };
 
-        let first = client.fetch_file_artifact(&source, &destination, 7, &digest(b"payload"), 1024);
+        let mut progress = |_progress| crate::ProgressControl::Continue;
+        let first = client.fetch_planned_artifact_with_options(
+            &planned,
+            &destination,
+            1024,
+            &options,
+            &mut progress,
+        );
         let first = publication_outcome_v0(first, &context()).expect("canonical outcome");
         if cfg!(unix) {
             assert!(matches!(first, PublicationOutcomeV0::Published { .. }));
@@ -224,12 +274,12 @@ mod tests {
         }
 
         fs::remove_file(source).expect("remove source to prove destination recovery");
-        let recovered = client.fetch_file_artifact(
-            &directory.path().join("missing-source.bin"),
+        let recovered = client.fetch_planned_artifact_with_options(
+            &planned,
             &destination,
-            7,
-            &digest(b"payload"),
             1024,
+            &options,
+            &mut progress,
         );
         let recovered = publication_outcome_v0(recovered, &context()).expect("canonical recovery");
         assert!(!matches!(
@@ -287,6 +337,41 @@ mod tests {
         assert!(matches!(
             outcome,
             PublicationOutcomeV0::PublishedDurabilityUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn visible_receipts_require_product_attribution_and_reject_context_mismatch() {
+        let mut receipt = synthetic_receipt(true);
+        receipt.artifact_id = None;
+        assert!(matches!(
+            publication_outcome_v0(
+                Ok(VerifiedFetch {
+                    bytes: receipt.bytes,
+                    sha256: receipt.sha256.clone(),
+                    network_used: false,
+                    final_source_uri: None,
+                    redirects: 0,
+                    source_attestation: None,
+                    source_attestations: Vec::new(),
+                    started_at_unix_ms: 0,
+                    finished_at_unix_ms: 0,
+                    resumed_bytes: 0,
+                    publication: receipt.clone(),
+                }),
+                &context(),
+            ),
+            Err(ContractError::Invalid {
+                field: "publication.artifact_id"
+            })
+        ));
+
+        receipt.artifact_id = Some(ArtifactId::parse("different").expect("artifact ID"));
+        assert!(matches!(
+            receipt_v0(&receipt, &context()),
+            Err(ContractError::Inconsistent {
+                field: "publication.artifact_id"
+            })
         ));
     }
 }
