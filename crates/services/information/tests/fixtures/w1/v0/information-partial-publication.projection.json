@@ -1,0 +1,172 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "information.acquire-cancel",
+      "attempt_id": null,
+      "correlation_id": null,
+      "kind": "cancelled_before_publication",
+      "payload": null
+    },
+    {
+      "sequence": 1,
+      "operation_id": "information.acquire-retry",
+      "attempt_id": null,
+      "correlation_id": null,
+      "kind": "published_exact_bytes",
+      "payload": null
+    },
+    {
+      "sequence": 2,
+      "operation_id": "information.store-staged",
+      "attempt_id": null,
+      "correlation_id": null,
+      "kind": "activated_from_staging",
+      "payload": null
+    },
+    {
+      "sequence": 3,
+      "operation_id": "information.store-activated",
+      "attempt_id": null,
+      "correlation_id": null,
+      "kind": "recovered_activated_unregistered",
+      "payload": null
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "information.partial_acquisition",
+      "schema_id": "information.w1.partial_acquisition.v0",
+      "before": {
+        "id": "information.partial.acquisition.before",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "067b57cfa5e48bd10f76072a9c2d9dd52d2f8589dba3d69813c632173edc0be9"
+        },
+        "length": 172
+      },
+      "after": {
+        "id": "information.partial.acquisition.after",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "53004adb5d0226060003f34340f88625d97766fa9cc446529d12f9ccf065c4f2"
+        },
+        "length": 248
+      },
+      "disposition": "recovered"
+    },
+    {
+      "state_id": "information.partial_staged",
+      "schema_id": "information.w1.partial_staged.v0",
+      "before": {
+        "id": "information.partial.staged.before",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "2c7bc9b362f31e563332f12391181695fd3eb7abe14c2ad9cf0ea5cba5a7ee79"
+        },
+        "length": 209
+      },
+      "after": {
+        "id": "information.partial.staged.after",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "1b2b3769743520202cc977073ea5adcca339c2d91371760b1744ea62396e2d4b"
+        },
+        "length": 1316
+      },
+      "disposition": "recovered"
+    },
+    {
+      "state_id": "information.partial_activated",
+      "schema_id": "information.w1.partial_activated.v0",
+      "before": {
+        "id": "information.partial.activated.before",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "d694ed91022619eb10af5a3b9edbdbf2f56be6ce30c37835564c90ca419a9e33"
+        },
+        "length": 228
+      },
+      "after": {
+        "id": "information.partial.activated.after",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "8b4e6c38096c158ede2525a24630aece6e8e34ad8ce4a42c65d990eb2626c41b"
+        },
+        "length": 1319
+      },
+      "disposition": "recovered"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "information.acquire-cancel",
+      "attempt_id": null,
+      "correlation_id": null,
+      "terminal": "cancelled",
+      "released": true
+    },
+    {
+      "operation_id": "information.acquire-retry",
+      "attempt_id": null,
+      "correlation_id": null,
+      "terminal": "completed",
+      "released": true
+    },
+    {
+      "operation_id": "information.store-staged",
+      "attempt_id": null,
+      "correlation_id": null,
+      "terminal": "completed",
+      "released": true
+    },
+    {
+      "operation_id": "information.store-activated",
+      "attempt_id": null,
+      "correlation_id": null,
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 0,
+    "joined_workers": 0
+  },
+  "output_facts": {
+    "acquisition_partial_distinct": {
+      "kind": "boolean",
+      "value": true
+    },
+    "activated_unregistered_distinct": {
+      "kind": "boolean",
+      "value": true
+    },
+    "allowed_transitions_completed": {
+      "kind": "integer",
+      "value": 3
+    },
+    "caller_owned_bytes_preserved": {
+      "kind": "boolean",
+      "value": true
+    },
+    "network_used": {
+      "kind": "boolean",
+      "value": false
+    },
+    "partials_hidden_until_ready": {
+      "kind": "boolean",
+      "value": true
+    },
+    "staged_install_distinct": {
+      "kind": "boolean",
+      "value": true
+    }
+  },
+  "fail_closed_facts": [
+    "cancelled acquisition never publishes destination bytes",
+    "competing caller-owned destination is never clobbered",
+    "staged and activated-unregistered packages are never listed ready"
+  ]
+}

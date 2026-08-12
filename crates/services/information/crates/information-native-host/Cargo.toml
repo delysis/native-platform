@@ -7,6 +7,11 @@ license.workspace = true
 readme.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Test-only adapter for immutable Wave 1 vertical fixtures.
+unstable-w1-vertical-tests = ["dep:platform-contracts-fixture-v0", "dep:platform-vertical-fixtures-v0"]
+
 [dependencies]
 chrono.workspace = true
 hex.workspace = true
@@ -19,6 +24,8 @@ information-native-catalog.workspace = true
 information-native-retrieval.workspace = true
 information-native-store.workspace = true
 information-native-types.workspace = true
+platform-vertical-fixtures-v0 = { workspace = true, optional = true }
+platform-contracts-fixture-v0 = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

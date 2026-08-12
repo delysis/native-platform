@@ -1,0 +1,6 @@
+{
+  "schema": "information.w1.partial_acquisition.before.v0",
+  "destination": "absent",
+  "unpublished_temporary_files": 0,
+  "terminal": "cancelled_before_publication"
+}

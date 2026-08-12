@@ -1,0 +1,80 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "information.resource-store",
+      "attempt_id": null,
+      "correlation_id": null,
+      "kind": "reopened_and_queried",
+      "payload": null
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "information.resource_store",
+      "schema_id": "information.w1.resource_store.v0",
+      "before": {
+        "id": "information.resource_store.before",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "49377330d0f4b601c8846cf695012a34708f8ab32155f3219a3a3a74e679fb3e"
+        },
+        "length": 110
+      },
+      "after": {
+        "id": "information.resource_store.after",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "ff26078a5b8ca9c0bc9c8e341f17b78657f2e65b85fb2da7f635b1847f99bbd1"
+        },
+        "length": 2530
+      },
+      "disposition": "updated"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "information.resource-store",
+      "attempt_id": null,
+      "correlation_id": null,
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 0,
+    "joined_workers": 0
+  },
+  "output_facts": {
+    "external_identity_stable": {
+      "kind": "boolean",
+      "value": true
+    },
+    "external_immutable": {
+      "kind": "boolean",
+      "value": true
+    },
+    "managed_ready": {
+      "kind": "boolean",
+      "value": true
+    },
+    "mounted_after_reopen": {
+      "kind": "integer",
+      "value": 2
+    },
+    "network_used": {
+      "kind": "boolean",
+      "value": false
+    },
+    "queryable_after_reopen": {
+      "kind": "boolean",
+      "value": true
+    }
+  },
+  "fail_closed_facts": [
+    "external immutable source rejects non-empty SQLite sidecars",
+    "external source remains outside the managed root and is never migrated"
+  ]
+}
