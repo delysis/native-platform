@@ -4,7 +4,7 @@
   "gateway_unification_revision": "311b4bdede7d29828fb63e838fe7d3c7d826f829",
   "native_shutdown_revision": "372a0883364bc86f2c2f41f2cf7940e5cdfd28a4",
   "source_receipt_revision": "5fbd8b823bce30cfc9c213530f612cd9e35e106b",
-  "decision": "single_production_gateway_authority_with_launched_local_acceptance_and_live_hosted_and_os_credential_gates_open",
+  "decision": "single_production_gateway_authority_with_launched_local_and_real_os_credential_acceptance_and_live_hosted_gate_open",
   "completed_command_families": [
     "models",
     "provider_inventory_and_readiness",
@@ -22,7 +22,8 @@
     "source_receipts": [
       "receipts/R7-FTE-UNIFY-PARTIAL.json",
       "receipts/R7-FTE-CMDQ-METAL-SHUTDOWN.json",
-      "receipts/R7-FTE-ATTACHED-EXIT.json"
+      "receipts/R7-FTE-ATTACHED-EXIT.json",
+      "receipts/R7-FTE-OS-CREDENTIAL-ACCEPTANCE.json"
     ],
     "portable_and_product_gates": {
       "workspace_tests": "102_passed_2_ignored",
@@ -99,22 +100,22 @@
     "full_r7_promotable": false,
     "local_model_launched_bundle_exercised": true,
     "real_hosted_provider_exercised": false,
-    "real_os_credential_migration_and_readback_exercised": false,
+    "real_os_credential_migration_and_readback_exercised": true,
     "process_exit_code_observed": true,
     "signed_release_certified": false,
-    "reason": "launched local inference and Cmd-Q evidence does not exercise a live hosted credential or a disposable real OS credential migration"
+    "reason": "launched local inference, Cmd-Q, and disposable real OS credential migration/readback pass; no user-owned hosted credential is configured for the live chat and completion gate"
   },
   "claim_reconciliation": {
     "superseded_claim": "receipts/R7-FTE-UNIFY-PARTIAL.json recorded local_model_launched_bundle_exercised as false",
     "current_claim": "the exact 372a088 acceptance bundle passed two visible real-Qwen local/default generations separated by Cmd-Q and immediate saved-model restoration",
+    "closed_live_gate": "legacy_plaintext_migration_and_exact_readback_against_the_real_platform_credential_store",
     "unchanged_open_gates": [
-      "live_hosted_provider_request_with_user_owned_credential",
-      "legacy_plaintext_migration_and_exact_readback_against_the_real_platform_credential_store"
+      "live_hosted_provider_request_with_user_owned_credential"
     ]
   },
   "micro_goal": "R7-FTE-UNIFY",
   "receipt_schema": "delysis-remediation-receipt.v1",
-  "recorded_on": "2026-08-11",
+  "recorded_on": "2026-08-12",
   "repository": "delysis/free-token-energy",
   "status": "partial_live_acceptance_pending"
 }

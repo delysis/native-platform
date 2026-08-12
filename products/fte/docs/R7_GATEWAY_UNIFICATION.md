@@ -2,8 +2,8 @@
 
 Audited base: `d86edfef40771589af4cd8cd72907fa6d3ce6e96`  
 Working disposition: production authority unified; exact launched real-Qwen
-Cmd+Q/relaunch acceptance passed; promotion remains gated on live hosted-provider
-and real platform credential-migration evidence.
+Cmd+Q/relaunch acceptance and real macOS Keychain migration/readback passed;
+promotion remains gated on live hosted-provider evidence.
 
 ## Production authority
 
@@ -94,16 +94,13 @@ semantics and silently ignoring it would claim false compatibility. Callers
 must omit `task_hint`; a future replacement requires an explicit typed Gateway
 evaluation signal and fixtures.
 
-## Remaining promotion gates
+## Remaining promotion gate
 
-- Exercise migration and exact readback against the real platform credential
-  store on a legacy installation. Deterministic fake-store fixtures pass, but
-  they are not OS-keychain acceptance evidence.
 - Exercise at least one real hosted credential through chat and completion.
 
 The exact `372a088` acceptance bundle has now exercised the launched local route
 and restart/shutdown boundary. That closes the prior launched-bundle gate; it
-does not supply either of the two live credential gates above.
+does not supply the hosted credential gate above.
 
 ## Verified on 2026-08-11
 
@@ -139,5 +136,13 @@ does not supply either of the two live credential gates above.
   `ready`; an uninterrupted Cmd+Q observation awaited PID 92660 and recorded
   normal process exit code 0 with no signal or new diagnostic report.
 
-No live hosted request or real OS-keychain acceptance run has been performed.
-The launched evidence is not signed-release certification.
+On 2026-08-12, an isolated current-head build migrated a random synthetic
+legacy plaintext row to the real macOS Keychain service, dropped the plaintext
+table, and passed an independently authorized hash-only exact readback. The
+isolated process then exited code 0 through Cmd+Q. No credential bytes were
+recorded. The exact evidence is preserved in
+`receipts/R7-FTE-OS-CREDENTIAL-ACCEPTANCE.json`.
+
+No live hosted request has been performed because no supported provider
+credential is configured. The launched evidence is not signed-release
+certification.
