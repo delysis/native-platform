@@ -59,8 +59,9 @@ fn find_exact_lock() -> Option<PathBuf> {
         .iter()
         .find(|package| package["name"].as_str() == Some("platform-vertical-fixtures-v0"))?;
     let manifest = PathBuf::from(package["manifest_path"].as_str()?);
-    let source_root = manifest.parent()?.parent()?.parent()?;
-    let lock_path = source_root.join("verticals/v0/W1-VERTICALS.lock.json");
-    let bytes = fs::read(&lock_path).ok()?;
-    (format!("{:x}", Sha256::digest(bytes)) == LOCK_SHA256).then_some(lock_path)
+    manifest.ancestors().find_map(|ancestor| {
+        let lock_path = ancestor.join("verticals/v0/W1-VERTICALS.lock.json");
+        let bytes = fs::read(&lock_path).ok()?;
+        (format!("{:x}", Sha256::digest(bytes)) == LOCK_SHA256).then_some(lock_path)
+    })
 }
