@@ -2060,16 +2060,40 @@
   };
 
   const boot = async () => {
-    try {
-      const root = document.getElementById("app");
-      root.innerHTML = await invokeMarkup("mom_llama_render_app");
-      applyCustomCss(shell()?.dataset.customCss || "");
-      await hydrateAttachmentPreviews(root);
-      restoreChatViewport(null, chat());
-      const alwaysShowSidebar = shell()?.dataset.alwaysShowSidebar === "true";
-      if (window.innerWidth >= 1180 && alwaysShowSidebar) shell()?.classList.add("sidebar-open");
-      await listen();
-    } catch (error) { reportError(error); }
+    const status = document.getElementById("startup-status");
+    const retry = document.getElementById("startup-retry");
+    const initialize = async () => {
+      if (status) {
+        status.classList.remove("startup-error");
+        status.textContent = "Unlocking Mom Llama's encrypted local data…";
+      }
+      if (retry) {
+        retry.hidden = true;
+        retry.disabled = true;
+      }
+      try {
+        await invoke("mom_llama_runtime_initialize");
+        const root = document.getElementById("app");
+        root.innerHTML = await invokeMarkup("mom_llama_render_app");
+        applyCustomCss(shell()?.dataset.customCss || "");
+        await hydrateAttachmentPreviews(root);
+        restoreChatViewport(null, chat());
+        const alwaysShowSidebar = shell()?.dataset.alwaysShowSidebar === "true";
+        if (window.innerWidth >= 1180 && alwaysShowSidebar) shell()?.classList.add("sidebar-open");
+        await listen();
+      } catch (error) {
+        if (status) {
+          status.classList.add("startup-error");
+          status.textContent = `${String(error)} Approve Keychain access, then retry.`;
+        }
+        if (retry) {
+          retry.hidden = false;
+          retry.disabled = false;
+        }
+      }
+    };
+    retry?.addEventListener("click", initialize);
+    await initialize();
   };
 
   boot();

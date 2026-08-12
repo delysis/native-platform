@@ -68,7 +68,6 @@ impl std::error::Error for AppShutdownError {}
 struct AppRuntime {
     lifecycle: Mutex<AppLifecycle>,
     work_drained: Notify,
-    gateway: Arc<Gateway>,
     gateway_finalizer: Arc<dyn GatewayFinalizer>,
     native_backend: Arc<LlamaNativeBackend>,
     native_host: Arc<NativeHost>,
@@ -177,7 +176,6 @@ impl AppRuntimeHandle {
         let native_host = native_owner.host();
         let gateway_finalizer = Arc::new(ProductGatewayFinalizer(Arc::clone(&gateway)));
         Self::with_finalizers(
-            gateway,
             gateway_finalizer,
             native_backend,
             native_host,
@@ -188,7 +186,6 @@ impl AppRuntimeHandle {
     }
 
     fn with_finalizers(
-        gateway: Arc<Gateway>,
         gateway_finalizer: Arc<dyn GatewayFinalizer>,
         native_backend: Arc<LlamaNativeBackend>,
         native_host: Arc<NativeHost>,
@@ -203,7 +200,6 @@ impl AppRuntimeHandle {
                 active_work: BTreeMap::new(),
             }),
             work_drained: Notify::new(),
-            gateway,
             gateway_finalizer,
             native_backend,
             native_host,
@@ -214,10 +210,6 @@ impl AppRuntimeHandle {
             joined_native_host: Mutex::new(None),
             native_finalizer,
         }))
-    }
-
-    pub fn gateway(&self) -> Arc<Gateway> {
-        Arc::clone(&self.0.gateway)
     }
 
     pub fn admit(&self, command: &'static CommandSpec) -> Result<AppWorkLease, String> {
@@ -426,7 +418,6 @@ mod tests {
             catalog_version: "test".to_string(),
         }));
         AppRuntimeHandle::with_finalizers(
-            Arc::clone(&gateway),
             Arc::new(ProductGatewayFinalizer(gateway)),
             Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host))),
             host,
@@ -592,11 +583,7 @@ mod tests {
         let gateway_release = Arc::new(Notify::new());
         let finalizer_called = Arc::new(AtomicBool::new(false));
         let host = Arc::new(NativeHost::new(NativeHostConfig::default()));
-        let gateway = Arc::new(Gateway::new(GatewayDefaults {
-            catalog_version: "test".to_string(),
-        }));
         let runtime = AppRuntimeHandle::with_finalizers(
-            Arc::clone(&gateway),
             Arc::new(BlockingGatewayFinalizer {
                 entered: Arc::clone(&gateway_entered),
                 release: Arc::clone(&gateway_release),

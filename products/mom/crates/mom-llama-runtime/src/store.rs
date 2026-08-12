@@ -576,6 +576,37 @@ fn cached_installation_key(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn clear_cached_installation_key_failure(
+    account: &str,
+    cache: &OnceLock<Mutex<HashMap<String, CachedInstallationKey>>>,
+) -> Result<bool> {
+    let Some(cache) = cache.get() else {
+        return Ok(false);
+    };
+    let mut keys = cache
+        .lock()
+        .map_err(|_| anyhow!("installation-key memory cache is poisoned"))?;
+    let failed = matches!(
+        keys.get(account),
+        Some(CachedInstallationKey::Unavailable(_))
+    );
+    if failed {
+        keys.remove(account);
+    }
+    Ok(failed)
+}
+
+pub(crate) fn prepare_secure_store_retry() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let data_dir = crate::config::resolve_data_dir();
+        let account = keychain_account(&data_dir);
+        clear_cached_installation_key_failure(&account, &INSTALLATION_KEYS)?;
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn load_or_create_macos_key(account: &str) -> Result<[u8; 32]> {
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
@@ -843,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn denied_installation_key_is_not_retried_until_relaunch() {
+    fn denied_installation_key_retries_only_after_explicit_cache_clear() -> Result<()> {
         use std::cell::Cell;
 
         let cache = OnceLock::new();
@@ -857,5 +888,20 @@ mod tests {
             assert!(error.to_string().contains("denied Keychain access"));
         }
         assert_eq!(calls.get(), 1);
+        assert!(clear_cached_installation_key_failure(
+            "denied-account",
+            &cache
+        )?);
+        let key = cached_installation_key("denied-account", &cache, || {
+            calls.set(calls.get() + 1);
+            Ok([31_u8; 32])
+        })?;
+        assert_eq!(key, [31_u8; 32]);
+        assert_eq!(calls.get(), 2);
+        assert!(
+            !clear_cached_installation_key_failure("denied-account", &cache)?,
+            "a successful cached key must never be evicted by retry preparation"
+        );
+        Ok(())
     }
 }

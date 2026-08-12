@@ -182,7 +182,9 @@ fn is_gguf(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_cached_models, hugging_face_hub_cache_dir};
+    #[cfg(unix)]
+    use super::collect_cached_models;
+    use super::hugging_face_hub_cache_dir;
 
     #[test]
     fn default_hugging_face_cache_uses_the_shared_desktop_location() {

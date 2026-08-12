@@ -11,15 +11,247 @@ use fte_store::ResponseStore;
 use fte_types::{GatewayError, GatewayResponse, RequestId};
 use serde_json::json;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::menu::{
     AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID,
 };
 use tauri::plugin::TauriPlugin;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime, State};
 
 const APPLICATION_QUIT_MENU_ID: &str = "mom-llama.application.quit";
 const APPLICATION_QUIT_ACCELERATOR: &str = "CmdOrCtrl+Q";
+
+#[derive(Clone)]
+struct StartupController {
+    gateway: Arc<Gateway>,
+    state: Arc<Mutex<StartupState>>,
+}
+
+enum StartupState {
+    Idle,
+    Unlocking,
+    Building,
+    Ready(AppRuntimeHandle),
+    Failed,
+    QuiescingSafe(Option<AppRuntimeHandle>),
+    QuiescingDuringBuild,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupAction {
+    AlreadyReady,
+    Initialize { retry_cached_failure: bool },
+}
+
+enum StartupShutdownAction {
+    Start(AppRuntimeHandle),
+    AlreadyQuiescing,
+    WaitForBuild,
+    NoRuntime,
+}
+
+impl StartupController {
+    fn new(gateway: Arc<Gateway>) -> Self {
+        Self {
+            gateway,
+            state: Arc::new(Mutex::new(StartupState::Idle)),
+        }
+    }
+
+    fn begin_initialization(&self) -> Result<StartupAction, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Mom Llama startup state is unavailable".to_string())?;
+        match &*state {
+            StartupState::Ready(_) => Ok(StartupAction::AlreadyReady),
+            StartupState::Unlocking | StartupState::Building => {
+                Err("Mom Llama is already unlocking its encrypted local data".to_string())
+            }
+            StartupState::QuiescingSafe(_) | StartupState::QuiescingDuringBuild => {
+                Err("Mom Llama is shutting down".to_string())
+            }
+            StartupState::Idle => {
+                *state = StartupState::Unlocking;
+                Ok(StartupAction::Initialize {
+                    retry_cached_failure: false,
+                })
+            }
+            StartupState::Failed => {
+                *state = StartupState::Unlocking;
+                Ok(StartupAction::Initialize {
+                    retry_cached_failure: true,
+                })
+            }
+        }
+    }
+
+    fn begin_runtime_build(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Mom Llama startup state is unavailable".to_string())?;
+        match &*state {
+            StartupState::Unlocking => {
+                *state = StartupState::Building;
+                Ok(())
+            }
+            StartupState::QuiescingSafe(_) => Err("Mom Llama is shutting down".to_string()),
+            _ => Err("Mom Llama startup changed phase unexpectedly".to_string()),
+        }
+    }
+
+    fn install<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        runtime: AppRuntimeHandle,
+    ) -> Result<(), AppRuntimeHandle> {
+        let Ok(mut state) = self.state.lock() else {
+            return Err(runtime);
+        };
+        if !matches!(&*state, StartupState::Building) || !app.manage(runtime.clone()) {
+            return Err(runtime);
+        }
+        *state = StartupState::Ready(runtime);
+        Ok(())
+    }
+
+    fn record_failure(&self) {
+        if let Ok(mut state) = self.state.lock()
+            && matches!(&*state, StartupState::Unlocking | StartupState::Building)
+        {
+            *state = StartupState::Failed;
+        }
+    }
+
+    fn begin_shutdown(&self) -> StartupShutdownAction {
+        let Ok(mut state) = self.state.lock() else {
+            return StartupShutdownAction::AlreadyQuiescing;
+        };
+        match &*state {
+            StartupState::Ready(runtime) => {
+                let runtime = runtime.clone();
+                *state = StartupState::QuiescingSafe(Some(runtime.clone()));
+                StartupShutdownAction::Start(runtime)
+            }
+            StartupState::Building | StartupState::QuiescingDuringBuild => {
+                *state = StartupState::QuiescingDuringBuild;
+                StartupShutdownAction::WaitForBuild
+            }
+            StartupState::QuiescingSafe(_) => StartupShutdownAction::AlreadyQuiescing,
+            _ => {
+                *state = StartupState::QuiescingSafe(None);
+                StartupShutdownAction::NoRuntime
+            }
+        }
+    }
+
+    fn finish_rejected_build(&self) {
+        if let Ok(mut state) = self.state.lock()
+            && matches!(&*state, StartupState::QuiescingDuringBuild)
+        {
+            *state = StartupState::QuiescingSafe(None);
+        }
+    }
+
+    async fn wait_for_build(&self) {
+        loop {
+            let still_building = self
+                .state
+                .lock()
+                .map(|state| matches!(&*state, StartupState::QuiescingDuringBuild))
+                .unwrap_or(false);
+            if !still_building {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    fn ready_runtime(&self) -> Option<AppRuntimeHandle> {
+        let state = self.state.lock().ok()?;
+        match &*state {
+            StartupState::Ready(runtime) | StartupState::QuiescingSafe(Some(runtime)) => {
+                Some(runtime.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
+#[tauri::command]
+async fn mom_llama_runtime_initialize(
+    app: AppHandle,
+    startup: State<'_, StartupController>,
+) -> Result<(), String> {
+    let retry_cached_failure = match startup.begin_initialization()? {
+        StartupAction::AlreadyReady => return Ok(()),
+        StartupAction::Initialize {
+            retry_cached_failure,
+        } => retry_cached_failure,
+    };
+
+    let settings = match tauri::async_runtime::spawn_blocking(move || {
+        if retry_cached_failure {
+            mom_llama_runtime::prepare_secure_store_retry().map_err(|error| {
+                anyhow::anyhow!("secure-store retry preparation failed: {error}")
+            })?;
+        }
+        mom_llama_runtime::config::resolve_settings()
+    })
+    .await
+    {
+        Ok(settings) => settings,
+        Err(error) => {
+            startup.record_failure();
+            return Err(format!("Mom Llama startup worker failed: {error}"));
+        }
+    };
+
+    let settings = match settings {
+        Ok(settings) => settings,
+        Err(error) => {
+            startup.record_failure();
+            return Err(format!(
+                "Mom Llama could not unlock its encrypted local data: {error:#}"
+            ));
+        }
+    };
+    startup.begin_runtime_build()?;
+
+    let gateway = Arc::clone(&startup.gateway);
+    let built = match tauri::async_runtime::spawn_blocking(move || build_runtime(gateway, settings))
+        .await
+    {
+        Ok(built) => built,
+        Err(error) => {
+            startup.record_failure();
+            startup.finish_rejected_build();
+            return Err(format!("Mom Llama startup worker failed: {error}"));
+        }
+    };
+
+    match built {
+        Ok(runtime) => match startup.install(&app, runtime) {
+            Ok(()) => Ok(()),
+            Err(runtime) => {
+                runtime.begin_quiesce();
+                let _ = runtime.shutdown().await;
+                startup.record_failure();
+                startup.finish_rejected_build();
+                Err("Mom Llama stopped before encrypted runtime startup completed".to_string())
+            }
+        },
+        Err(error) => {
+            startup.record_failure();
+            startup.finish_rejected_build();
+            Err(format!(
+                "Mom Llama could not initialize its local runtime: {error:#}"
+            ))
+        }
+    }
+}
 
 fn main() {
     if std::env::args().any(|arg| arg == "--dump-html") {
@@ -43,14 +275,15 @@ fn main() {
         return;
     }
 
-    let (runtime, gateway_plugin) = match build_runtime() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("failed to initialize Mom Llama runtime: {error:#}");
-            std::process::exit(1);
-        }
-    };
-    let event_runtime = runtime.clone();
+    // Constructing the product runtime opens the encrypted store and may ask
+    // macOS Keychain for authorization. The webview invokes the initializer
+    // only after this visible window and AppKit's event loop are live.
+    let gateway = Arc::new(Gateway::new(GatewayDefaults {
+        catalog_version: "mom-llama-local-v1".to_string(),
+    }));
+    let startup = StartupController::new(Arc::clone(&gateway));
+    let event_startup = startup.clone();
+    let gateway_plugin = build_gateway_plugin(gateway);
     let exit_allowed = Arc::new(AtomicBool::new(false));
     let event_exit_allowed = Arc::clone(&exit_allowed);
     let app = tauri::Builder::default()
@@ -59,9 +292,10 @@ fn main() {
         // command so graceful quit always enters the composed shutdown path.
         .enable_macos_default_menu(false)
         .menu(build_desktop_menu)
-        .manage(runtime)
+        .manage(startup)
         .plugin(gateway_plugin)
         .invoke_handler(tauri::generate_handler![
+            mom_llama_runtime_initialize,
             commands::mom_llama_render_app,
             commands::mom_llama_render_chat_fragment,
             commands::mom_llama_render_sidebar_fragment,
@@ -154,7 +388,7 @@ fn main() {
             if let tauri::RunEvent::MenuEvent(menu_event) = &event
                 && menu_event.id() == APPLICATION_QUIT_MENU_ID
             {
-                request_graceful_exit(app_handle, &event_runtime, &event_exit_allowed, 0);
+                request_startup_aware_exit(app_handle, &event_startup, &event_exit_allowed, 0);
                 return;
             }
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
@@ -162,9 +396,9 @@ fn main() {
                     return;
                 }
                 api.prevent_exit();
-                request_graceful_exit(
+                request_startup_aware_exit(
                     app_handle,
-                    &event_runtime,
+                    &event_startup,
                     &event_exit_allowed,
                     code.unwrap_or(0),
                 );
@@ -176,8 +410,11 @@ fn main() {
                 // Dock Quit and AppleEvent Quit may reach this final boundary
                 // without an interceptable ExitRequested. Do not let AppKit
                 // or static teardown proceed while Metal owns live resources.
-                let result = tauri::async_runtime::block_on(event_runtime.shutdown());
-                log_shutdown_result(&result);
+                if let Some(runtime) = event_startup.ready_runtime() {
+                    runtime.begin_quiesce();
+                    let result = tauri::async_runtime::block_on(runtime.shutdown());
+                    log_shutdown_result(&result);
+                }
             }
         }),
         Err(error) => {
@@ -316,6 +553,36 @@ fn request_graceful_exit<R: Runtime>(
     });
 }
 
+fn request_startup_aware_exit<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    startup: &StartupController,
+    exit_allowed: &Arc<AtomicBool>,
+    exit_code: i32,
+) {
+    match startup.begin_shutdown() {
+        StartupShutdownAction::Start(runtime) => {
+            request_graceful_exit(app_handle, &runtime, exit_allowed, exit_code);
+        }
+        StartupShutdownAction::AlreadyQuiescing => {}
+        StartupShutdownAction::WaitForBuild => {
+            let startup = startup.clone();
+            let app_handle = app_handle.clone();
+            let exit_allowed = Arc::clone(exit_allowed);
+            tauri::async_runtime::spawn(async move {
+                startup.wait_for_build().await;
+                exit_allowed.store(true, Ordering::Release);
+                app_handle.exit(exit_code);
+            });
+        }
+        StartupShutdownAction::NoRuntime => {
+            // Unlocking owns no native resources. A late Keychain result cannot
+            // advance to native construction after this state transition.
+            exit_allowed.store(true, Ordering::Release);
+            app_handle.exit(exit_code);
+        }
+    }
+}
+
 fn log_shutdown_result(
     result: &Result<app_runtime::AppShutdownSummary, app_runtime::AppShutdownError>,
 ) {
@@ -325,11 +592,10 @@ fn log_shutdown_result(
     }
 }
 
-fn build_runtime() -> Result<(AppRuntimeHandle, TauriPlugin<tauri::Wry>)> {
-    let gateway = Arc::new(Gateway::new(GatewayDefaults {
-        catalog_version: "mom-llama-local-v1".to_string(),
-    }));
-    let settings = mom_llama_runtime::config::resolve_settings()?;
+fn build_runtime(
+    gateway: Arc<Gateway>,
+    settings: mom_llama_runtime::config::Settings,
+) -> Result<AppRuntimeHandle> {
     let native_owner =
         mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(&settings)?;
     let (host, model) = mom_llama_runtime::gateway_native_configuration()?;
@@ -340,13 +606,15 @@ fn build_runtime() -> Result<(AppRuntimeHandle, TauriPlugin<tauri::Wry>)> {
     gateway
         .register_backend(backend.clone())
         .map_err(anyhow::Error::msg)?;
-    let runtime = AppRuntimeHandle::new(Arc::clone(&gateway), backend, native_owner);
-    let plugin = tauri_plugin_free_token_energy::Builder::new()
-        .with_gateway(runtime.gateway())
+    Ok(AppRuntimeHandle::new(gateway, backend, native_owner))
+}
+
+fn build_gateway_plugin(gateway: Arc<Gateway>) -> TauriPlugin<tauri::Wry> {
+    tauri_plugin_free_token_energy::Builder::new()
+        .with_gateway(gateway)
         .with_store(Arc::new(MomGatewayStore))
         .with_default_loopback()
-        .build();
-    Ok((runtime, plugin))
+        .build()
 }
 
 struct MomGatewayStore;
@@ -422,7 +690,74 @@ fn smoke_receipt(rendered_html_bytes: usize) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::smoke_receipt;
+    use super::{StartupAction, StartupController, StartupShutdownAction, smoke_receipt};
+    use fte_router::{Gateway, GatewayDefaults};
+    use std::sync::Arc;
+
+    fn startup_controller() -> StartupController {
+        StartupController::new(Arc::new(Gateway::new(GatewayDefaults {
+            catalog_version: "startup-test".to_string(),
+        })))
+    }
+
+    #[test]
+    fn startup_controller_serializes_initialization_retry_and_shutdown() {
+        let startup = startup_controller();
+        assert_eq!(
+            startup.begin_initialization(),
+            Ok(StartupAction::Initialize {
+                retry_cached_failure: false
+            })
+        );
+        assert!(startup.begin_initialization().is_err());
+
+        startup.record_failure();
+        assert_eq!(
+            startup.begin_initialization(),
+            Ok(StartupAction::Initialize {
+                retry_cached_failure: true
+            })
+        );
+        assert!(matches!(
+            startup.begin_shutdown(),
+            StartupShutdownAction::NoRuntime
+        ));
+        assert!(matches!(
+            startup.begin_shutdown(),
+            StartupShutdownAction::AlreadyQuiescing
+        ));
+        assert!(startup.begin_initialization().is_err());
+    }
+
+    #[test]
+    fn shutdown_waits_when_native_runtime_construction_has_started() {
+        let startup = startup_controller();
+        assert!(startup.begin_initialization().is_ok());
+        assert!(startup.begin_runtime_build().is_ok());
+        assert!(matches!(
+            startup.begin_shutdown(),
+            StartupShutdownAction::WaitForBuild
+        ));
+        startup.finish_rejected_build();
+        assert!(matches!(
+            startup.begin_shutdown(),
+            StartupShutdownAction::AlreadyQuiescing
+        ));
+    }
+
+    #[test]
+    fn encrypted_runtime_initialization_is_renderer_driven_and_blocking_pool_bound() {
+        let main = include_str!("main.rs");
+        let index = include_str!("../../ui/index.html");
+        let script = include_str!("../../ui/coop-hx.js");
+
+        assert!(main.contains("async fn mom_llama_runtime_initialize"));
+        assert!(main.contains("tauri::async_runtime::spawn_blocking"));
+        assert!(main.contains("mom_llama_runtime::prepare_secure_store_retry"));
+        assert!(index.contains("startup-status"));
+        assert!(index.contains("startup-retry"));
+        assert!(script.contains("await invoke(\"mom_llama_runtime_initialize\")"));
+    }
 
     #[test]
     fn macos_quit_source_cannot_reintroduce_appkit_terminate_bypass() {

@@ -103,6 +103,13 @@ pub fn request_product_cancellation() -> usize {
         .saturating_add(tool_loop::request_all_tool_loop_cancellation())
 }
 
+/// Allows an explicit startup retry to ask the OS credential store again after
+/// a denied or cancelled first attempt. Successfully cached installation keys
+/// are retained, and encrypted data remains bound to the same store identity.
+pub fn prepare_secure_store_retry() -> anyhow::Result<()> {
+    store::prepare_secure_store_retry()
+}
+
 pub fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
