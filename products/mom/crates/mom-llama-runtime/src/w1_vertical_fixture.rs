@@ -8,7 +8,10 @@ use platform_vertical_fixtures_v0::{
     validate_baseline,
 };
 
-const BASELINE_TREE_BYTES: &[u8] = b"eeb82598e65f1dea397d20a5159856167f9a48a6";
+const INITIAL_BASELINE_COMMIT: &str = "097da612140c6479f9d40e7816f0500271464ca9";
+const INITIAL_BASELINE_TREE_BYTES: &[u8] = b"eeb82598e65f1dea397d20a5159856167f9a48a6";
+const QUIT_RELAUNCH_BASELINE_COMMIT: &str = "b5a276c6152e9bf1d6d1f2b5cf9c199871c45778";
+const QUIT_RELAUNCH_BASELINE_TREE_BYTES: &[u8] = b"71db4c79a072cfce2f72f34494531264933d9892";
 
 /// Authenticates one checked-in Mom fixture bundle and compares product facts
 /// against its frozen W1 projection.
@@ -35,9 +38,16 @@ pub fn validate_w1_fixture_projection(
         .cases
         .first()
         .context("W1 manifest must contain its product case")?;
+    let production_tree_bytes = match case.source.commit.as_str() {
+        INITIAL_BASELINE_COMMIT => INITIAL_BASELINE_TREE_BYTES,
+        QUIT_RELAUNCH_BASELINE_COMMIT => QUIT_RELAUNCH_BASELINE_TREE_BYTES,
+        commit => anyhow::bail!("unrecognized Mom W1 production baseline commit: {commit}"),
+    };
     ensure!(
-        sha256_identity(case.source.production_tree.id.clone(), BASELINE_TREE_BYTES,)
-            == case.source.production_tree,
+        sha256_identity(
+            case.source.production_tree.id.clone(),
+            production_tree_bytes
+        ) == case.source.production_tree,
         "baseline production-tree identity is not authenticated"
     );
     authenticate_inputs(case)?;
@@ -118,6 +128,9 @@ fn checked_in_input(relative_path: &str) -> Result<&'static [u8]> {
         "crates/mom-llama-runtime/fixtures/w1/cache-session-after-state-v1.json" => Ok(
             include_bytes!("../fixtures/w1/cache-session-after-state-v1.json"),
         ),
+        "crates/mom-llama-runtime/fixtures/w1/quit-relaunch-v1.json" => {
+            Ok(include_bytes!("../fixtures/w1/quit-relaunch-v1.json"))
+        }
         _ => anyhow::bail!("unrecognized checked-in Mom W1 input: {relative_path}"),
     }
 }
@@ -139,6 +152,10 @@ fn bundle(vertical_id: VerticalIdV0) -> Result<(&'static [u8], &'static [u8])> {
         VerticalIdV0::CorruptedDisposableCaches => Ok((
             include_bytes!("../fixtures/w1/cache-corruption-manifest-v0.json"),
             include_bytes!("../fixtures/w1/cache-corruption-projection-v0.json"),
+        )),
+        VerticalIdV0::QuitRelaunchFakeOwners => Ok((
+            include_bytes!("../fixtures/w1/quit-relaunch-manifest-v0.json"),
+            include_bytes!("../fixtures/w1/quit-relaunch-projection-v0.json"),
         )),
         _ => anyhow::bail!("Mom does not own a product case for {vertical_id:?}"),
     }

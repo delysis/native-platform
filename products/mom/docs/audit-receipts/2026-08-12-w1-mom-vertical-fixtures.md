@@ -29,6 +29,7 @@ accepted lifecycle contract/testkit pin remains exactly `cbab335...`.
 | `fixtures/w1/cache-session-state-v1.json` | `4bfc026b7b842e4ef65d6b0993fa6eb13f0d33e0573296aba6b48c04da34425a` | Exact logical session-KV metadata and blob identity before ciphertext corruption |
 | `fixtures/w1/cache-native-prefix-after-state-v1.json` | `38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed` | Exact typed absent native-prefix cache state after quarantine and reopen |
 | `fixtures/w1/cache-session-after-state-v1.json` | `1885429208d88d71764bef9f98d867f16e5c54e7672226734a137201978fab9b` | Exact invalidated session-KV metadata and absent blob state after reopen |
+| `fixtures/w1/quit-relaunch-v1.json` | `0a036918787fd4aa7a1455140196e0c0ab37a5caff56a28bb82332a48f553a8b` | Deterministic fake-owner identity and durable draft for the full application-runtime quit/relaunch case |
 | `fixtures/w1/chat-cancel-retry-manifest-v0.json` | `d5e78f687cb8d06c823e91cdaa46c7564e042e7f118194dcd2c5a1042d24375d` | Authenticated central-protocol case for Mom chat/cancel/retry |
 | `fixtures/w1/chat-cancel-retry-projection-v0.json` | `5089d654ffc27ce2b2ce34d102a98cd0160a074cb2f9c458dd7fbdacac2bb441` | Frozen product-derived stream, lifecycle, durable-state, and ownership facts |
 | `fixtures/w1/attachment-manifest-v0.json` | `01c8701dc70b586bf3cbe9ad069b4fb97f2fe2719ce8a1b43e7b66d179c9cdb0` | Authenticated central-protocol case for Mom attachment |
@@ -37,6 +38,8 @@ accepted lifecycle contract/testkit pin remains exactly `cbab335...`.
 | `fixtures/w1/prior-store-projection-v0.json` | `2c7bd3fcd1e93ee5bc70ab8c3cf0be6a7f33b71bf03dbff9cd971306bf01b136` | Frozen logical recovery and plaintext-cleanup facts |
 | `fixtures/w1/cache-corruption-manifest-v0.json` | `83dccd2453e26fcaf175fbbf4fa5fdfe7c0b1d14020f7cbc350dcfffea580b61` | Mom-owned cases within the cross-product corrupted-cache row |
 | `fixtures/w1/cache-corruption-projection-v0.json` | `d2e03c9923dd36837c1b13b9a47b2426bf3730652338362417d60a7da420cbe7` | Frozen native-prefix quarantine and session-KV invalidation projection bound to their exact logical before and after states |
+| `fixtures/w1/quit-relaunch-manifest-v0.json` | `1b75ff433d813b26d40c0058273bec574c62dccb09254bc1f584c6bb6ddb6ef8` | Authenticated Mom case within the cross-product fake-owner quit/relaunch row |
+| `fixtures/w1/quit-relaunch-projection-v0.json` | `732a31c376d00a7a34977c27e25be0065cfefe59900cb3c7232d54d3eaea022e` | Frozen full-AppRuntime cancellation, terminal, join, zero-orphan, same-store reopen, and fresh-admission facts |
 
 ## Product evidence
 
@@ -79,11 +82,16 @@ accepted lifecycle contract/testkit pin remains exactly `cbab335...`.
   reopen are independently frozen and hashed. In both cases the authoritative `conversations.v2` value is
   loaded through the production store as a typed `ConversationDb` before and
   after corruption and after reopen.
-- Supporting-only evidence: a controlled Mom operation owner receives
-  cancellation during quiesce,
-  reaches an authoritative cancelled terminal, releases, exits, joins, and
-  leaves zero active operations or retained workers. A fresh supervisor starts
-  in `running` with zero active operations and shuts down cleanly.
+- The row-8 case runs a controlled fake owner inside the full `AppRuntime`.
+  Application quit closes admission and publishes cancellation before the owner
+  publishes its authoritative cancelled terminal; the runtime then releases and
+  joins its retained worker, drains the gateway and application work, joins the
+  empty native host, and reports exact expected/joined worker equality with zero
+  active operations or retained tasks. A new `AppRuntime` over the same encrypted
+  durable store reopens the exact draft, admits and joins a fresh successful
+  operation, and shuts down without reusing the closed supervisor lifetime.
+- A smaller raw-supervisor test remains supporting evidence only. It is not the
+  source of the row-8 projection.
 
 ## Verification
 
@@ -92,6 +100,7 @@ Passed locally on 2026-08-12:
 - `cargo fmt --all -- --check`
 - `cargo test -p mom-llama-runtime --features unstable-w1-vertical-fixtures w1_ --no-fail-fast` — 5 passed
 - `cargo test -p mom-llama-app --features unstable-w1-vertical-fixtures w1_ --no-fail-fast` — 2 passed
+- `cargo test -p mom-llama-app --features unstable-w1-vertical-fixtures w1_vertical_fixtures::full_app_runtime_quit_joins_fake_owner_and_reopens_same_store -- --exact` — 1 passed
 - `cargo test -p mom-llama-runtime --features unstable-w1-vertical-fixtures --no-fail-fast` — 97 unit tests passed; 38 integration tests passed; 13 real-model tests ignored by their existing hardware/model gates
 - `cargo test -p mom-llama-app --features unstable-w1-vertical-fixtures --no-fail-fast` — 44 passed
 - `cargo clippy -p mom-llama-runtime --features unstable-w1-vertical-fixtures --all-targets -- -D warnings`
@@ -105,7 +114,7 @@ This slice does not claim real-model inference, a personal Keychain unlock, a
 historical database-schema migration, a native GUI relaunch, or hosted-provider
 coverage. The prior-store row is therefore an honest redacted logical
 import/recovery baseline, not a claim about old physical bytes. The
-raw-supervisor quit/relaunch check is supporting-only; it is not an AppRuntime
-same-durable-state relaunch acceptance. The four Mom-owned cases are validated
+full-AppRuntime row-8 case intentionally uses a deterministic fake owner and
+does not claim that a native GUI process was relaunched. The five Mom-owned cases are validated
 through authenticated central-protocol manifests and exact projections, but
 they do not accept the cross-product row or the final eighteen-row lock.
