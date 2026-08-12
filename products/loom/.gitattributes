@@ -1,2 +1,4 @@
 /fixtures/w1/*.json text eol=lf
 /fixtures/w1/MANIFEST.sha256 text eol=lf
+/fixtures/w1/state/loom-prior-v10/.loom/project.json text eol=lf
+/crates/loom-store/migrations/*.sql text eol=lf
