@@ -160,3 +160,28 @@ fn schemas_require_real_prerequisites_state_identity_and_fail_closed_facts() {
     observation_json["projection"]["fail_closed_facts"] = serde_json::json!([]);
     assert!(!validator(OBSERVATION_SCHEMA_ID).is_valid(&observation_json));
 }
+
+#[test]
+fn observation_schema_requires_prerequisite_correlation_and_state_schema_fields() {
+    let observation = support::observation(VerticalIdV0::MomChatCancelRetry);
+    let json = serde_json::to_value(observation).expect("observation JSON");
+
+    for pointer in [
+        "/observed_prerequisites",
+        "/projection/ordered_events/0/correlation_id",
+        "/projection/lifecycle/0/correlation_id",
+        "/projection/durable_state/0/schema_id",
+    ] {
+        let mut changed = json.clone();
+        let (parent, field) = pointer.rsplit_once('/').expect("object field pointer");
+        changed
+            .pointer_mut(parent)
+            .and_then(Value::as_object_mut)
+            .expect("pointer parent must be an object")
+            .remove(field);
+        assert!(
+            !validator(OBSERVATION_SCHEMA_ID).is_valid(&changed),
+            "schema must require {pointer}"
+        );
+    }
+}

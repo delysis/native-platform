@@ -57,7 +57,12 @@ Each real case carries closed row-specific prerequisites: exact Qwen or Gemma
 model bytes, exact Parakeet model and input-audio bytes, or an exact Apple
 installed-voice inventory. Every state case carries at least one exact
 state/schema identity, and its projection binds each declared baseline to the
-corresponding before-state.
+corresponding before-state and schema ID. An observation repeats every
+prerequisite kind and identity exactly. Baseline and candidate comparison also
+receive caller-supplied bytes for every `exact_external_artifact` prerequisite
+and authenticate them; platform-inventory and local-runtime prerequisites are
+bound by exact observed identity without pretending that this pure crate can
+inspect the platform.
 
 ## Replay and equivalence
 
@@ -70,18 +75,21 @@ secret- or credential-shaped names are rejected.
 digest, authenticates the expected projection bytes, and compares the observed
 projection exactly. `compare_candidate` permits a later implementation
 revision, but authenticates caller-supplied candidate production-tree bytes,
-binds their `GitSourceV0` revision and digest to the candidate observation, and
-requires the same observable projection. The projection includes
+binds their `GitSourceV0` revision and digest to the candidate observation,
+requires its repository ID to equal the baseline repository ID, and requires
+the same observable projection. The projection includes
 ordered events, durable-state effects, terminal and release facts, worker
 ownership, invariant-level output facts, and fail-closed facts. Volatile time,
 temporary paths, and nondeterministic prose or audio bytes do not belong in the
 projection.
 
 Every event identity has exactly one lifecycle identity and vice versa;
-duplicate or contradictory lifecycle rows fail. Mom chat cancellation and
-retry additionally require a cancelled attempt and a completed, distinct retry
-attempt under the same operation. Every projection records at least one
-fail-closed fact.
+duplicate or contradictory lifecycle rows fail. Events and lifecycle facts may
+carry a correlation ID without conflating distinct admission identities. Mom
+chat cancellation and retry require a cancelled admission followed by a
+completed admission with distinct operation and attempt IDs under the same
+nonempty correlation ID. Every projection records at least one fail-closed
+fact.
 
 Passing comparison is not acceptance. Negative evidence remains reviewable but
 cannot pass baseline validation. Only a later steward receipt can accept

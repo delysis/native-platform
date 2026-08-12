@@ -1,16 +1,16 @@
 use crate::model::{
     ALL_VERTICAL_IDS, ArtifactAvailabilityV0, EquivalenceProjectionV0, FactValueV0,
     FixtureArtifactV0, FixtureCaseV0, FixtureClassV0, GitSourceV0, NegativeEvidenceV0,
-    ObservationEnvelopeV0, PrerequisiteKindV0, ReplayProgramV0, ReplayRecipeV0, StateIdentityV0,
-    VERTICAL_FIXTURE_LOCK_SCHEMA_V0, VERTICAL_FIXTURE_MANIFEST_SCHEMA_V0,
-    VERTICAL_OBSERVATION_SCHEMA_V0, VerticalFixtureLockV0, VerticalFixtureManifestV0, VerticalIdV0,
-    W1_CONTRACT_REVISION,
+    ObservationEnvelopeV0, PrerequisiteArtifactBytesV0, PrerequisiteKindV0, PrerequisiteV0,
+    ReplayProgramV0, ReplayRecipeV0, StateIdentityV0, VERTICAL_FIXTURE_LOCK_SCHEMA_V0,
+    VERTICAL_FIXTURE_MANIFEST_SCHEMA_V0, VERTICAL_OBSERVATION_SCHEMA_V0, VerticalFixtureLockV0,
+    VerticalFixtureManifestV0, VerticalIdV0, W1_CONTRACT_REVISION,
 };
 use platform_contracts_v0::{
     ArtifactIdentityV0, ContentDigest, EvidenceTier, ExecutionKind, TerminalClass,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_ID_BYTES: usize = 256;
 const MAX_TEXT_BYTES: usize = 4096;
@@ -130,6 +130,12 @@ pub fn validate_observation(observation: &ObservationEnvelopeV0) -> Result<(), V
     validate_git_commit(
         "implementation_revision",
         &observation.implementation_revision,
+    )?;
+    validate_unique_by_id(
+        "observed_prerequisites.prerequisite_id",
+        &observation.observed_prerequisites,
+        |prerequisite| prerequisite.prerequisite_id.as_str(),
+        validate_prerequisite,
     )?;
     observation
         .evidence
@@ -266,18 +272,21 @@ pub fn validate_lock<'a>(
 /// # Errors
 ///
 /// Returns [`ValidationError`] when any envelope is invalid, the named case is
-/// absent, source identity differs, expected bytes fail authentication, or the
-/// observable projection differs.
+/// absent, source or prerequisite identity differs, expected projection or
+/// exact-external prerequisite bytes fail authentication, or the observable
+/// projection differs.
 pub fn validate_baseline(
     manifest: &VerticalFixtureManifestV0,
     case_id: &str,
     expected_projection_bytes: &[u8],
+    prerequisite_bytes: &[PrerequisiteArtifactBytesV0<'_>],
     observation: &ObservationEnvelopeV0,
 ) -> Result<(), ValidationError> {
     validate_manifest(manifest)?;
     validate_observation(observation)?;
     let case = find_case(manifest, case_id)?;
     validate_case_binding(manifest, case, observation)?;
+    authenticate_exact_prerequisites(case, prerequisite_bytes)?;
     if observation.implementation_revision != case.source.commit {
         return Err(ValidationError::Inconsistent {
             field: "implementation_revision",
@@ -301,20 +310,23 @@ pub fn validate_baseline(
 /// # Errors
 ///
 /// Returns [`ValidationError`] when any envelope is invalid, the named case is
-/// absent, expected or candidate-source bytes fail authentication, source
-/// identity differs, or the projection differs.
+/// absent, expected, prerequisite, or candidate-source bytes fail
+/// authentication, source or prerequisite identity differs, or the projection
+/// differs.
 pub fn compare_candidate(
     manifest: &VerticalFixtureManifestV0,
     case_id: &str,
     expected_projection_bytes: &[u8],
     candidate_source: &GitSourceV0,
     candidate_production_tree_bytes: &[u8],
+    prerequisite_bytes: &[PrerequisiteArtifactBytesV0<'_>],
     candidate: &ObservationEnvelopeV0,
 ) -> Result<(), ValidationError> {
     validate_manifest(manifest)?;
     validate_observation(candidate)?;
     let case = find_case(manifest, case_id)?;
     validate_case_binding(manifest, case, candidate)?;
+    authenticate_exact_prerequisites(case, prerequisite_bytes)?;
     validate_source(candidate_source)?;
     verify_artifact_bytes(
         "candidate_source.production_tree",
@@ -324,6 +336,11 @@ pub fn compare_candidate(
     if candidate.implementation_revision != candidate_source.commit {
         return Err(ValidationError::Inconsistent {
             field: "implementation_revision",
+        });
+    }
+    if candidate_source.repository_id != case.source.repository_id {
+        return Err(ValidationError::Inconsistent {
+            field: "candidate_source.repository_id",
         });
     }
     if candidate.evidence.exact_source != candidate_source.production_tree.digest {
@@ -375,24 +392,35 @@ fn validate_case_binding(
     if observation.case_id != case.case_id {
         return Err(ValidationError::Inconsistent { field: "case_id" });
     }
+    bind_observed_prerequisites(case, observation)?;
     if manifest.class == FixtureClassV0::State {
         let declared = case
             .state_identities
             .iter()
-            .map(|state| (state.state_id.as_str(), &state.baseline.identity))
-            .collect::<std::collections::BTreeMap<_, _>>();
+            .map(|state| {
+                (
+                    state.state_id.as_str(),
+                    (state.schema_id.as_str(), &state.baseline.identity),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         if declared.len() != observation.projection.durable_state.len() {
             return Err(ValidationError::Inconsistent {
                 field: "projection.durable_state",
             });
         }
         for state in &observation.projection.durable_state {
-            let baseline =
+            let (schema_id, baseline) =
                 declared
                     .get(state.state_id.as_str())
                     .ok_or(ValidationError::Inconsistent {
                         field: "projection.durable_state.state_id",
                     })?;
+            if state.schema_id != *schema_id {
+                return Err(ValidationError::Inconsistent {
+                    field: "projection.durable_state.schema_id",
+                });
+            }
             if state.before.as_ref() != Some(*baseline) {
                 return Err(ValidationError::Inconsistent {
                     field: "projection.durable_state.before",
@@ -445,11 +473,7 @@ fn validate_case(vertical_id: VerticalIdV0, case: &FixtureCaseV0) -> Result<(), 
         "prerequisites.prerequisite_id",
         &case.prerequisites,
         |prerequisite| prerequisite.prerequisite_id.as_str(),
-        |prerequisite| {
-            validate_safe_id("prerequisite_id", &prerequisite.prerequisite_id)?;
-            validate_artifact("prerequisite.identity", &prerequisite.identity)?;
-            reject_authority_name("prerequisite_id", &prerequisite.prerequisite_id)
-        },
+        validate_prerequisite,
     )?;
     if case.replay.is_empty() {
         return Err(ValidationError::Empty { field: "replay" });
@@ -551,6 +575,9 @@ fn validate_events(events: &[crate::EventFactV0]) -> Result<(), ValidationError>
         if let Some(attempt_id) = &event.attempt_id {
             validate_safe_id("event.attempt_id", attempt_id)?;
         }
+        if let Some(correlation_id) = &event.correlation_id {
+            validate_safe_id("event.correlation_id", correlation_id)?;
+        }
         validate_safe_id("event.kind", &event.kind)?;
         if let Some(payload) = &event.payload {
             validate_artifact("event.payload", payload)?;
@@ -570,6 +597,7 @@ fn validate_durable_state(
     let mut state_ids = BTreeSet::new();
     for state in durable_state {
         validate_safe_id("durable_state.state_id", &state.state_id)?;
+        validate_safe_id("durable_state.schema_id", &state.schema_id)?;
         if !state_ids.insert(state.state_id.as_str()) {
             return Err(ValidationError::Duplicate {
                 field: "projection.durable_state.state_id",
@@ -615,6 +643,9 @@ fn validate_lifecycle(lifecycle: &[crate::LifecycleFactV0]) -> Result<(), Valida
         if let Some(attempt_id) = &fact.attempt_id {
             validate_safe_id("lifecycle.attempt_id", attempt_id)?;
         }
+        if let Some(correlation_id) = &fact.correlation_id {
+            validate_safe_id("lifecycle.correlation_id", correlation_id)?;
+        }
         if !fact.released {
             return Err(ValidationError::Invalid {
                 field: "lifecycle.released",
@@ -635,12 +666,24 @@ fn validate_event_lifecycle_binding(
     let event_identities = projection
         .ordered_events
         .iter()
-        .map(|event| (event.operation_id.as_str(), event.attempt_id.as_deref()))
+        .map(|event| {
+            (
+                event.operation_id.as_str(),
+                event.attempt_id.as_deref(),
+                event.correlation_id.as_deref(),
+            )
+        })
         .collect::<BTreeSet<_>>();
     let lifecycle_identities = projection
         .lifecycle
         .iter()
-        .map(|fact| (fact.operation_id.as_str(), fact.attempt_id.as_deref()))
+        .map(|fact| {
+            (
+                fact.operation_id.as_str(),
+                fact.attempt_id.as_deref(),
+                fact.correlation_id.as_deref(),
+            )
+        })
         .collect::<BTreeSet<_>>();
     if event_identities != lifecycle_identities {
         return Err(ValidationError::Inconsistent {
@@ -656,11 +699,13 @@ fn validate_mom_chat_retry_projection(
     let proves_cancel_retry = projection.lifecycle.iter().any(|cancelled| {
         cancelled.terminal == TerminalClass::Cancelled
             && cancelled.attempt_id.is_some()
+            && cancelled.correlation_id.is_some()
             && projection.lifecycle.iter().any(|completed| {
                 completed.terminal == TerminalClass::Completed
-                    && completed.operation_id == cancelled.operation_id
+                    && completed.operation_id != cancelled.operation_id
                     && completed.attempt_id.is_some()
                     && completed.attempt_id != cancelled.attempt_id
+                    && completed.correlation_id == cancelled.correlation_id
                     && matches!(
                         (
                             event_position(projection, cancelled),
@@ -684,8 +729,82 @@ fn event_position(
     lifecycle: &crate::LifecycleFactV0,
 ) -> Option<usize> {
     projection.ordered_events.iter().position(|event| {
-        event.operation_id == lifecycle.operation_id && event.attempt_id == lifecycle.attempt_id
+        event.operation_id == lifecycle.operation_id
+            && event.attempt_id == lifecycle.attempt_id
+            && event.correlation_id == lifecycle.correlation_id
     })
+}
+
+fn bind_observed_prerequisites(
+    case: &FixtureCaseV0,
+    observation: &ObservationEnvelopeV0,
+) -> Result<(), ValidationError> {
+    if case.prerequisites.len() != observation.observed_prerequisites.len() {
+        return Err(ValidationError::Inconsistent {
+            field: "observed_prerequisites",
+        });
+    }
+    let observed = observation
+        .observed_prerequisites
+        .iter()
+        .map(|prerequisite| (prerequisite.prerequisite_id.as_str(), prerequisite))
+        .collect::<BTreeMap<_, _>>();
+    if case
+        .prerequisites
+        .iter()
+        .any(|expected| observed.get(expected.prerequisite_id.as_str()).copied() != Some(expected))
+    {
+        return Err(ValidationError::Inconsistent {
+            field: "observed_prerequisites",
+        });
+    }
+    Ok(())
+}
+
+fn authenticate_exact_prerequisites(
+    case: &FixtureCaseV0,
+    prerequisite_bytes: &[PrerequisiteArtifactBytesV0<'_>],
+) -> Result<(), ValidationError> {
+    let mut supplied = BTreeMap::new();
+    for artifact in prerequisite_bytes {
+        validate_safe_id(
+            "prerequisite_bytes.prerequisite_id",
+            artifact.prerequisite_id,
+        )?;
+        if supplied
+            .insert(artifact.prerequisite_id, artifact.bytes)
+            .is_some()
+        {
+            return Err(ValidationError::Duplicate {
+                field: "prerequisite_bytes.prerequisite_id",
+            });
+        }
+    }
+    let exact = case
+        .prerequisites
+        .iter()
+        .filter(|prerequisite| prerequisite.kind == PrerequisiteKindV0::ExactExternalArtifact)
+        .collect::<Vec<_>>();
+    if exact.len() != supplied.len() {
+        return Err(ValidationError::Inconsistent {
+            field: "prerequisite_bytes",
+        });
+    }
+    for prerequisite in exact {
+        let bytes = supplied.get(prerequisite.prerequisite_id.as_str()).ok_or(
+            ValidationError::Inconsistent {
+                field: "prerequisite_bytes",
+            },
+        )?;
+        verify_artifact_bytes("prerequisite_bytes", &prerequisite.identity, bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_prerequisite(prerequisite: &PrerequisiteV0) -> Result<(), ValidationError> {
+    validate_safe_id("prerequisite_id", &prerequisite.prerequisite_id)?;
+    validate_artifact("prerequisite.identity", &prerequisite.identity)?;
+    reject_authority_name("prerequisite_id", &prerequisite.prerequisite_id)
 }
 
 fn validate_row_prerequisites(

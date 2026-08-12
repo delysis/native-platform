@@ -9,6 +9,7 @@
     "vertical_id",
     "case_id",
     "implementation_revision",
+    "observed_prerequisites",
     "evidence",
     "projection"
   ],
@@ -17,6 +18,11 @@
     "vertical_id": { "$ref": "#/$defs/vertical_id" },
     "case_id": { "$ref": "#/$defs/safe_id" },
     "implementation_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "observed_prerequisites": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/prerequisite" }
+    },
     "evidence": { "$ref": "https://schemas.delysis.dev/w1/v0/evidence.schema.json" },
     "projection": { "$ref": "#/$defs/projection" }
   },
@@ -68,14 +74,34 @@
         "length": { "type": "integer", "minimum": 0 }
       }
     },
+    "prerequisite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prerequisite_id", "kind", "identity"],
+      "properties": {
+        "prerequisite_id": { "$ref": "#/$defs/safe_id" },
+        "kind": { "enum": ["exact_external_artifact", "platform_inventory", "local_runtime"] },
+        "identity": { "$ref": "#/$defs/artifact" }
+      }
+    },
     "event": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sequence", "operation_id", "attempt_id", "kind", "payload"],
+      "required": [
+        "sequence",
+        "operation_id",
+        "attempt_id",
+        "correlation_id",
+        "kind",
+        "payload"
+      ],
       "properties": {
         "sequence": { "type": "integer", "minimum": 0 },
         "operation_id": { "$ref": "#/$defs/safe_id" },
         "attempt_id": {
+          "oneOf": [{ "$ref": "#/$defs/safe_id" }, { "type": "null" }]
+        },
+        "correlation_id": {
           "oneOf": [{ "$ref": "#/$defs/safe_id" }, { "type": "null" }]
         },
         "kind": { "$ref": "#/$defs/safe_id" },
@@ -87,9 +113,10 @@
     "durable_state": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["state_id", "before", "after", "disposition"],
+      "required": ["state_id", "schema_id", "before", "after", "disposition"],
       "properties": {
         "state_id": { "$ref": "#/$defs/safe_id" },
+        "schema_id": { "$ref": "#/$defs/safe_id" },
         "before": {
           "oneOf": [{ "$ref": "#/$defs/artifact" }, { "type": "null" }]
         },
@@ -104,10 +131,13 @@
     "lifecycle": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["operation_id", "attempt_id", "terminal", "released"],
+      "required": ["operation_id", "attempt_id", "correlation_id", "terminal", "released"],
       "properties": {
         "operation_id": { "$ref": "#/$defs/safe_id" },
         "attempt_id": {
+          "oneOf": [{ "$ref": "#/$defs/safe_id" }, { "type": "null" }]
+        },
+        "correlation_id": {
           "oneOf": [{ "$ref": "#/$defs/safe_id" }, { "type": "null" }]
         },
         "terminal": { "enum": ["completed", "cancelled", "failed"] },

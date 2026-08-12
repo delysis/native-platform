@@ -205,6 +205,7 @@ pub struct EventFactV0 {
     pub sequence: u64,
     pub operation_id: String,
     pub attempt_id: Option<String>,
+    pub correlation_id: Option<String>,
     pub kind: String,
     pub payload: Option<ArtifactIdentityV0>,
 }
@@ -224,6 +225,7 @@ pub enum StateDispositionV0 {
 #[serde(deny_unknown_fields)]
 pub struct DurableStateFactV0 {
     pub state_id: String,
+    pub schema_id: String,
     pub before: Option<ArtifactIdentityV0>,
     pub after: Option<ArtifactIdentityV0>,
     pub disposition: StateDispositionV0,
@@ -234,6 +236,7 @@ pub struct DurableStateFactV0 {
 pub struct LifecycleFactV0 {
     pub operation_id: String,
     pub attempt_id: Option<String>,
+    pub correlation_id: Option<String>,
     pub terminal: TerminalClass,
     pub released: bool,
 }
@@ -279,8 +282,18 @@ pub struct ObservationEnvelopeV0 {
     pub vertical_id: VerticalIdV0,
     pub case_id: String,
     pub implementation_revision: String,
+    pub observed_prerequisites: Vec<PrerequisiteV0>,
     pub evidence: EvidenceClaimV0,
     pub projection: EquivalenceProjectionV0,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Caller-owned bytes for one exact-external prerequisite.
+pub struct PrerequisiteArtifactBytesV0<'a> {
+    /// Matches [`PrerequisiteV0::prerequisite_id`] in the selected case.
+    pub prerequisite_id: &'a str,
+    /// Bytes authenticated against the manifest identity; never retained.
+    pub bytes: &'a [u8],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

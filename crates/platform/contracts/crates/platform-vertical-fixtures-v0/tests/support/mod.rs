@@ -80,28 +80,36 @@ pub fn projection(vertical_id: VerticalIdV0) -> EquivalenceProjectionV0 {
         sequence: 0,
         operation_id: "operation.primary".to_owned(),
         attempt_id: Some("attempt.1".to_owned()),
+        correlation_id: None,
         kind: "completed".to_owned(),
         payload: Some(artifact("event.payload", '1')),
     }];
     let mut lifecycle = vec![LifecycleFactV0 {
         operation_id: "operation.primary".to_owned(),
         attempt_id: Some("attempt.1".to_owned()),
+        correlation_id: None,
         terminal: TerminalClass::Completed,
         released: true,
     }];
     if vertical_id == VerticalIdV0::MomChatCancelRetry {
+        "operation.cancelled".clone_into(&mut ordered_events[0].operation_id);
+        ordered_events[0].correlation_id = Some("chat.retry.journey".to_owned());
         "cancelled".clone_into(&mut ordered_events[0].kind);
+        "operation.cancelled".clone_into(&mut lifecycle[0].operation_id);
+        lifecycle[0].correlation_id = Some("chat.retry.journey".to_owned());
         lifecycle[0].terminal = TerminalClass::Cancelled;
         ordered_events.push(EventFactV0 {
             sequence: 1,
-            operation_id: "operation.primary".to_owned(),
+            operation_id: "operation.retry".to_owned(),
             attempt_id: Some("attempt.2".to_owned()),
+            correlation_id: Some("chat.retry.journey".to_owned()),
             kind: "completed".to_owned(),
             payload: Some(artifact("event.payload", '1')),
         });
         lifecycle.push(LifecycleFactV0 {
-            operation_id: "operation.primary".to_owned(),
+            operation_id: "operation.retry".to_owned(),
             attempt_id: Some("attempt.2".to_owned()),
+            correlation_id: Some("chat.retry.journey".to_owned()),
             terminal: TerminalClass::Completed,
             released: true,
         });
@@ -111,6 +119,7 @@ pub fn projection(vertical_id: VerticalIdV0) -> EquivalenceProjectionV0 {
         ordered_events,
         durable_state: vec![DurableStateFactV0 {
             state_id: "state.primary".to_owned(),
+            schema_id: "state.schema.v0".to_owned(),
             before: Some(artifact("state.before", '2')),
             after: Some(artifact("state.after", '3')),
             disposition: StateDispositionV0::Updated,
@@ -141,41 +150,7 @@ pub fn manifest_and_projection(vertical_id: VerticalIdV0) -> (VerticalFixtureMan
     } else {
         Vec::new()
     };
-    let prerequisites = match vertical_id {
-        VerticalIdV0::CurrentExactQwen => vec![prerequisite(
-            "model.qwen.gguf",
-            PrerequisiteKindV0::ExactExternalArtifact,
-            "model.qwen.bytes",
-            '4',
-        )],
-        VerticalIdV0::CurrentExactGemma => vec![prerequisite(
-            "model.gemma.gguf",
-            PrerequisiteKindV0::ExactExternalArtifact,
-            "model.gemma.bytes",
-            '5',
-        )],
-        VerticalIdV0::CurrentParakeetModelAudio => vec![
-            prerequisite(
-                "model.parakeet",
-                PrerequisiteKindV0::ExactExternalArtifact,
-                "model.parakeet.bytes",
-                '6',
-            ),
-            prerequisite(
-                "audio.input",
-                PrerequisiteKindV0::ExactExternalArtifact,
-                "audio.input.bytes",
-                '7',
-            ),
-        ],
-        VerticalIdV0::AppleInstalledVoice => vec![prerequisite(
-            "voice.apple.installed",
-            PrerequisiteKindV0::PlatformInventory,
-            "voice.apple.inventory",
-            '8',
-        )],
-        _ => Vec::new(),
-    };
+    let prerequisites = prerequisites(vertical_id);
     let state_identities =
         if vertical_id.class() == platform_vertical_fixtures_v0::FixtureClassV0::State {
             vec![StateIdentityV0 {
@@ -229,17 +204,50 @@ pub fn manifest_and_projection(vertical_id: VerticalIdV0) -> (VerticalFixtureMan
     )
 }
 
-fn prerequisite(
-    prerequisite_id: &str,
-    kind: PrerequisiteKindV0,
-    artifact_id: &str,
-    byte: char,
-) -> PrerequisiteV0 {
-    PrerequisiteV0 {
-        prerequisite_id: prerequisite_id.to_owned(),
-        kind,
-        identity: artifact(artifact_id, byte),
+pub fn prerequisite_bytes(vertical_id: VerticalIdV0) -> Vec<(String, Vec<u8>)> {
+    match vertical_id {
+        VerticalIdV0::CurrentExactQwen => vec![(
+            "model.qwen.gguf".to_owned(),
+            b"exact qwen gguf fixture bytes".to_vec(),
+        )],
+        VerticalIdV0::CurrentExactGemma => vec![(
+            "model.gemma.gguf".to_owned(),
+            b"exact gemma gguf fixture bytes".to_vec(),
+        )],
+        VerticalIdV0::CurrentParakeetModelAudio => vec![
+            (
+                "model.parakeet".to_owned(),
+                b"exact parakeet model fixture bytes".to_vec(),
+            ),
+            (
+                "audio.input".to_owned(),
+                b"exact parakeet audio fixture bytes".to_vec(),
+            ),
+        ],
+        VerticalIdV0::AppleInstalledVoice => vec![(
+            "voice.apple.installed".to_owned(),
+            b"exact installed Apple voice inventory".to_vec(),
+        )],
+        _ => Vec::new(),
     }
+}
+
+fn prerequisites(vertical_id: VerticalIdV0) -> Vec<PrerequisiteV0> {
+    prerequisite_bytes(vertical_id)
+        .into_iter()
+        .map(|(prerequisite_id, bytes)| {
+            let kind = if vertical_id == VerticalIdV0::AppleInstalledVoice {
+                PrerequisiteKindV0::PlatformInventory
+            } else {
+                PrerequisiteKindV0::ExactExternalArtifact
+            };
+            PrerequisiteV0 {
+                identity: sha256_identity(format!("{prerequisite_id}.bytes"), &bytes),
+                prerequisite_id,
+                kind,
+            }
+        })
+        .collect()
 }
 
 pub fn observation(vertical_id: VerticalIdV0) -> ObservationEnvelopeV0 {
@@ -248,6 +256,7 @@ pub fn observation(vertical_id: VerticalIdV0) -> ObservationEnvelopeV0 {
         vertical_id,
         case_id: "primary".to_owned(),
         implementation_revision: BASELINE_REVISION.to_owned(),
+        observed_prerequisites: prerequisites(vertical_id),
         evidence: EvidenceClaimV0 {
             schema: EVIDENCE_SCHEMA_V0.to_owned(),
             tier: EvidenceTier::Reproducible,

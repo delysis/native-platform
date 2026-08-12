@@ -2,9 +2,9 @@ mod support;
 
 use platform_contracts_v0::ExecutionKind;
 use platform_vertical_fixtures_v0::{
-    NegativeEvidenceV0, NetworkBoundaryV0, PrerequisiteKindV0, PrerequisiteV0, ValidationError,
-    VerticalFixtureManifestV0, VerticalIdV0, validate_baseline, validate_manifest,
-    validate_observation,
+    NegativeEvidenceV0, NetworkBoundaryV0, PrerequisiteArtifactBytesV0, PrerequisiteKindV0,
+    PrerequisiteV0, ValidationError, VerticalFixtureManifestV0, VerticalIdV0, validate_baseline,
+    validate_manifest, validate_observation,
 };
 
 #[test]
@@ -112,7 +112,7 @@ fn negative_evidence_is_preserved_but_cannot_pass() {
         .negative_evidence
         .push("cancelled attempt was laundered".to_owned());
     assert_eq!(
-        validate_baseline(&manifest, "primary", &expected, &observation),
+        validate_baseline(&manifest, "primary", &expected, &[], &observation),
         Err(ValidationError::Invalid {
             field: "evidence.negative_evidence"
         })
@@ -175,9 +175,97 @@ fn state_rows_require_and_bind_exact_state_identities() {
     let mut observation = support::observation(VerticalIdV0::FteLegacyDatabase);
     observation.projection.durable_state[0].before = Some(support::artifact("wrong.before", '9'));
     assert_eq!(
-        validate_baseline(&manifest, "primary", &expected, &observation),
+        validate_baseline(&manifest, "primary", &expected, &[], &observation),
         Err(ValidationError::Inconsistent {
             field: "projection.durable_state.before"
+        })
+    );
+
+    let mut wrong_schema = support::observation(VerticalIdV0::FteLegacyDatabase);
+    wrong_schema.projection.durable_state[0].schema_id = "state.schema.other".to_owned();
+    assert_eq!(
+        validate_baseline(&manifest, "primary", &expected, &[], &wrong_schema),
+        Err(ValidationError::Inconsistent {
+            field: "projection.durable_state.schema_id"
+        })
+    );
+}
+
+#[test]
+fn exact_external_prerequisite_bytes_and_observed_identity_are_bound() {
+    let vertical_id = VerticalIdV0::CurrentExactQwen;
+    let (manifest, expected) = support::manifest_and_projection(vertical_id);
+    let observation = support::observation(vertical_id);
+    let stored = support::prerequisite_bytes(vertical_id);
+    let supplied = stored
+        .iter()
+        .map(|(prerequisite_id, bytes)| PrerequisiteArtifactBytesV0 {
+            prerequisite_id,
+            bytes,
+        })
+        .collect::<Vec<_>>();
+    validate_baseline(&manifest, "primary", &expected, &supplied, &observation)
+        .expect("exact Qwen prerequisite bytes");
+
+    let mut substituted_bytes = stored[0].1.clone();
+    substituted_bytes[0] ^= 1;
+    let substituted = [PrerequisiteArtifactBytesV0 {
+        prerequisite_id: stored[0].0.as_str(),
+        bytes: &substituted_bytes,
+    }];
+    assert!(matches!(
+        validate_baseline(&manifest, "primary", &expected, &substituted, &observation,),
+        Err(ValidationError::DigestMismatch {
+            field: "prerequisite_bytes"
+        })
+    ));
+
+    let mut substituted_observation = observation;
+    substituted_observation.observed_prerequisites[0].identity =
+        support::artifact("substituted.model", '9');
+    assert_eq!(
+        validate_baseline(
+            &manifest,
+            "primary",
+            &expected,
+            &supplied,
+            &substituted_observation,
+        ),
+        Err(ValidationError::Inconsistent {
+            field: "observed_prerequisites"
+        })
+    );
+
+    let mut substituted_kind = support::observation(vertical_id);
+    substituted_kind.observed_prerequisites[0].kind = PrerequisiteKindV0::PlatformInventory;
+    assert_eq!(
+        validate_baseline(
+            &manifest,
+            "primary",
+            &expected,
+            &supplied,
+            &substituted_kind,
+        ),
+        Err(ValidationError::Inconsistent {
+            field: "observed_prerequisites"
+        })
+    );
+}
+
+#[test]
+fn platform_inventory_prerequisite_requires_exact_observed_identity() {
+    let vertical_id = VerticalIdV0::AppleInstalledVoice;
+    let (manifest, expected) = support::manifest_and_projection(vertical_id);
+    let observation = support::observation(vertical_id);
+    validate_baseline(&manifest, "primary", &expected, &[], &observation)
+        .expect("exact installed-voice inventory identity");
+
+    let mut substituted = observation;
+    substituted.observed_prerequisites[0].identity = support::artifact("other.voice", '8');
+    assert_eq!(
+        validate_baseline(&manifest, "primary", &expected, &[], &substituted),
+        Err(ValidationError::Inconsistent {
+            field: "observed_prerequisites"
         })
     );
 }
