@@ -54,10 +54,11 @@ evidence.
 
 ## Remaining acceptance boundary
 
-- A launched desktop bundle has not yet exercised the native picker or visually
-  confirmed restart restoration. Picker IPC/frontend behavior, durable owner
-  restart, and real in-process GGUF execution are tested separately below that
-  acceptance boundary.
+- Exact bundle `FTE R7 372a088.app` produced two visible real-Qwen
+  `local/default` generations around Cmd+Q and immediate relaunch, which
+  visibly restored the saved provider as `ready`. A later attached launch of
+  the same executable observed native Cmd+Q exit with code 0 and no signal.
+  The acceptance did not separately observe a native-picker click.
 - A real legacy installation has not yet exercised migration and exact readback
   against the platform keychain. Deterministic fake-store crash, conflict, and
   all-or-nothing database retirement fixtures pass.
@@ -72,7 +73,6 @@ evidence.
 
 ## Next safe slice
 
-Launch the exact built bundle, choose and invoke `local/default`, restart it,
-and record the visible restored behavior plus executable identity. Then run the legacy
-credential importer against a disposable real keychain entry and one authorized
-hosted-provider request without weakening the fixture gates.
+Run the legacy credential importer against a disposable real keychain entry and
+one authorized hosted-provider chat and completion request without weakening
+the fixture gates.

@@ -21,7 +21,8 @@
   "evidence": {
     "source_receipts": [
       "receipts/R7-FTE-UNIFY-PARTIAL.json",
-      "receipts/R7-FTE-CMDQ-METAL-SHUTDOWN.json"
+      "receipts/R7-FTE-CMDQ-METAL-SHUTDOWN.json",
+      "receipts/R7-FTE-ATTACHED-EXIT.json"
     ],
     "portable_and_product_gates": {
       "workspace_tests": "102_passed_2_ignored",
@@ -74,6 +75,16 @@
         "pid": 11792,
         "process_exited": true,
         "new_diagnostic_report": false
+      },
+      "attached_process_exit_observation": {
+        "pid": 92660,
+        "launch_identity_visible_in_accessibility_state": "FTE R7 372a088",
+        "restored_local_provider_status": "ready",
+        "quit_action": "Cmd+Q",
+        "exit_code": 0,
+        "signal": null,
+        "new_diagnostic_report": false,
+        "observation_boundary": "launch, accessibility inspection, native Cmd+Q, and child-process await occurred in one uninterrupted Computer Use observation"
       }
     },
     "withdrawn_failure": {
@@ -89,7 +100,7 @@
     "local_model_launched_bundle_exercised": true,
     "real_hosted_provider_exercised": false,
     "real_os_credential_migration_and_readback_exercised": false,
-    "process_exit_code_observed": false,
+    "process_exit_code_observed": true,
     "signed_release_certified": false,
     "reason": "launched local inference and Cmd-Q evidence does not exercise a live hosted credential or a disposable real OS credential migration"
   },

@@ -134,8 +134,10 @@ does not supply either of the two live credential gates above.
   saved model as `ready`, a second visible request passed, and a second Cmd+Q
   again exited without a new diagnostic report. The consolidated current
   record is `receipts/R7-FTE-UNIFY-CURRENT.json`; the exact shutdown record is
-  preserved as `receipts/R7-FTE-CMDQ-METAL-SHUTDOWN.json`.
+  preserved as `receipts/R7-FTE-CMDQ-METAL-SHUTDOWN.json`. A later attached
+  launch of the same exact executable visibly restored the local provider as
+  `ready`; an uninterrupted Cmd+Q observation awaited PID 92660 and recorded
+  normal process exit code 0 with no signal or new diagnostic report.
 
 No live hosted request or real OS-keychain acceptance run has been performed.
-The launched evidence did not observe a process exit code and is not signed-
-release certification.
+The launched evidence is not signed-release certification.
