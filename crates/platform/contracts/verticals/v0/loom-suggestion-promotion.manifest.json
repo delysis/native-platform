@@ -1,0 +1,54 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "loom_suggestion_promotion",
+  "class": "model_free",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [
+    {
+      "case_id": "loom.suggestion.promotion.v1",
+      "source": {
+        "repository_id": "delysis/loom-native",
+        "commit": "a733508adcb1ef1e689e90ed0c8e410160cb602a",
+        "production_tree": {
+          "id": "loom.production.source_roots.a733508",
+          "digest": { "algorithm": "sha256", "hex": "30e5e03b1e18c71d6f9feeb78f0f2eb524402a13f3f57b835680db9d6f52c4cd" },
+          "length": 1632
+        }
+      },
+      "inputs": [
+        {
+          "identity": {
+            "id": "loom.suggestion.input.v1",
+            "digest": { "algorithm": "sha256", "hex": "e5944a5bebbda765b816be78b7d7acfd42b1d4b64486601b646cf43649b3de62" },
+            "length": 1447
+          },
+          "availability": "checked_in",
+          "relative_path": "fixtures/w1/loom-suggestion-promotion-v1.json"
+        }
+      ],
+      "state_identities": [],
+      "prerequisites": [],
+      "replay": [
+        {
+          "program": { "kind": "cargo" },
+          "argv": ["test", "-p", "loom-store", "w1_exact_boundary_suggestion_promotion_survives_store_reopen"],
+          "required_environment": [],
+          "network": "denied"
+        },
+        {
+          "program": { "kind": "npm" },
+          "argv": ["--prefix", "apps/loom", "test", "--", "--run", "w1SuggestionVertical.test.ts", "w1StaleTabEvidence.test.ts"],
+          "required_environment": [],
+          "network": "denied"
+        }
+      ],
+      "expected_projection": {
+        "id": "loom.suggestion.expected_projection.v1",
+        "digest": { "algorithm": "sha256", "hex": "ad46d122d9317107081fe379b7b6e05347bf5ab58621ac00615b388d50141a03" },
+        "length": 2407
+      }
+    }
+  ],
+  "omitted_claims": ["live model inference"],
+  "negative_evidence": []
+}

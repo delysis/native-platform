@@ -1,0 +1,42 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "mom_chat_cancel_retry",
+  "class": "model_free",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [{
+    "case_id": "mom.chat-cancel-retry",
+    "source": {
+      "repository_id": "delysis/mom-llama",
+      "commit": "097da612140c6479f9d40e7816f0500271464ca9",
+      "production_tree": {
+        "id": "git.tree.097da612",
+        "digest": { "algorithm": "sha256", "hex": "d19d539b144d121a0dd1b90f2387616c42874722b8feeeb09dc9584c7ed413c4" },
+        "length": 40
+      }
+    },
+    "inputs": [{
+      "identity": {
+        "id": "mom.chat-cancel-retry.input",
+        "digest": { "algorithm": "sha256", "hex": "e4ef9e79f8289a0e050b916b606b227baf97de334181d4f368ec4fb4c04ba8c8" },
+        "length": 724
+      },
+      "availability": "checked_in",
+      "relative_path": "crates/mom-llama-runtime/fixtures/w1/chat-cancel-retry-v1.json"
+    }],
+    "state_identities": [],
+    "prerequisites": [],
+    "replay": [{
+      "program": { "kind": "cargo" },
+      "argv": ["test", "-p", "mom-llama-app", "--features", "unstable-w1-vertical-fixtures", "w1_vertical_fixtures::app_admission_chat_cancel_native_control_and_retry_form_one_transcript", "--", "--exact"],
+      "required_environment": [],
+      "network": "denied"
+    }],
+    "expected_projection": {
+      "id": "mom.chat-cancel-retry.projection",
+      "digest": { "algorithm": "sha256", "hex": "5089d654ffc27ce2b2ce34d102a98cd0160a074cb2f9c458dd7fbdacac2bb441" },
+      "length": 2739
+    }
+  }],
+  "omitted_claims": ["real model inference", "personal Keychain access", "native GUI relaunch"],
+  "negative_evidence": []
+}

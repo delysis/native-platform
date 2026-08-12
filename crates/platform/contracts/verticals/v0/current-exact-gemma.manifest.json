@@ -1,0 +1,114 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "current_exact_gemma",
+  "class": "real",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [
+    {
+      "case_id": "loom-current-exact-gemma",
+      "source": {
+        "repository_id": "delysis/loom-native",
+        "commit": "949c0006b57f416190e2ae8ab84dc3a944d6b4d1",
+        "production_tree": {
+          "id": "loom-gemma-production-source-tree",
+          "digest": {
+            "algorithm": "sha256",
+            "hex": "d0bccd87485a2edf80d1fc8a6abbf794139e7f4d1db06a8b51a439c3262a0d77"
+          },
+          "length": 913
+        }
+      },
+      "inputs": [
+        {
+          "identity": {
+            "id": "loom-current-gemma-input",
+            "digest": {
+              "algorithm": "sha256",
+              "hex": "dc45daeb63765f80c441da528d4f67279dfc691b6c42d2581b9b7136adc793e1"
+            },
+            "length": 421
+          },
+          "availability": "checked_in",
+          "relative_path": "fixtures/w1/gemma-current-input-v0.json"
+        },
+        {
+          "identity": {
+            "id": "loom-gemma-production-source-tree",
+            "digest": {
+              "algorithm": "sha256",
+              "hex": "d0bccd87485a2edf80d1fc8a6abbf794139e7f4d1db06a8b51a439c3262a0d77"
+            },
+            "length": 913
+          },
+          "availability": "checked_in",
+          "relative_path": "fixtures/w1/gemma-current-source-tree-v0.txt"
+        }
+      ],
+      "state_identities": [],
+      "prerequisites": [
+        {
+          "prerequisite_id": "model.gemma.gguf",
+          "kind": "exact_external_artifact",
+          "identity": {
+            "id": "gemma-4-e2b-base-q8-0.gguf",
+            "digest": {
+              "algorithm": "sha256",
+              "hex": "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670"
+            },
+            "length": 4954576032
+          }
+        }
+      ],
+      "replay": [
+        {
+          "program": { "kind": "cargo" },
+          "argv": [
+            "test",
+            "--locked",
+            "-p",
+            "loom-backend-llama",
+            "--features",
+            "unstable-w1-vertical-tests",
+            "--test",
+            "w1_current_exact_gemma",
+            "w1_current_exact_gemma_baseline",
+            "--",
+            "--ignored",
+            "--exact"
+          ],
+          "required_environment": ["LOOM_GEMMA4_E2B_BASE_PATH"],
+          "network": "denied"
+        }
+      ],
+      "expected_projection": {
+        "id": "loom-current-gemma-projection",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "0d25e333083024eeae32be5223681dc8e155406c7c006b061b10a7395ca49754"
+        },
+        "length": 2891
+      }
+    }
+  ],
+  "omitted_claims": [
+    "exact generated prose bytes",
+    "current desktop rendering, promotion, persistence, or relaunch behavior",
+    "Metal acceleration or performance",
+    "other hardware or operating systems"
+  ],
+  "negative_evidence": [
+    {
+      "evidence_id": "historical-gemma-desktop-receipt",
+      "disposition": "superseded",
+      "artifact": {
+        "id": "2026-08-11-real-gemma-desktop-receipt",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "6d0b1002b36d01617d2d5ffd5a1868dc0f2fb9d718ce323230ce1020c1cfe20e"
+        },
+        "length": 3305
+      },
+      "reason": "retained as historical desktop evidence but not used as current-code executable baseline authority"
+    }
+  ]
+}

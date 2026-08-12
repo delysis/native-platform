@@ -48,8 +48,9 @@ authoritative state remains byte-identical.
 
 Together, the accepted Mom case and two accepted Information cases cover every
 product-owned persistent disposable format identified for row 17. Row 17 is
-complete, though it cannot enter the final eighteen-row lock until every other
-row exists and the later seal step is authorized.
+complete and present in the complete eighteen-row catalogue. The catalogue is
+still unsealed; a later, separately authorized change must create the final
+lock.
 
 The staged slice deliberately has no invented case for:
 
@@ -108,6 +109,6 @@ platform, credential, hosted-provider, native-worker, and downstream-store
 boundary they disclaim.
 
 Information has no resident worker owner for this row and is intentionally not
-given an invented case. Row 8 is staged but is not a final W1 acceptance seal.
-No eighteen-row lock is created by this change; the later lock remains blocked
-until all other rows exist and the seal step is separately authorized.
+given an invented case. Row 8 is present in the complete catalogue but is not a
+final W1 acceptance seal. No eighteen-row lock is created by this change; the
+seal remains a separate, explicitly authorized step.

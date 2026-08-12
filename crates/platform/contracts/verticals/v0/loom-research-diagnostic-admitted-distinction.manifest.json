@@ -1,0 +1,48 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "loom_research_diagnostic_admitted_distinction",
+  "class": "model_free",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [
+    {
+      "case_id": "loom.research.authority.v1",
+      "source": {
+        "repository_id": "delysis/loom-native",
+        "commit": "a733508adcb1ef1e689e90ed0c8e410160cb602a",
+        "production_tree": {
+          "id": "loom.production.source_roots.a733508",
+          "digest": { "algorithm": "sha256", "hex": "30e5e03b1e18c71d6f9feeb78f0f2eb524402a13f3f57b835680db9d6f52c4cd" },
+          "length": 1632
+        }
+      },
+      "inputs": [
+        {
+          "identity": {
+            "id": "loom.research.authority.input.v1",
+            "digest": { "algorithm": "sha256", "hex": "ccf6b5f661b879db0a198939b048a752907cb4f6c11507791ba1c885a6805fc0" },
+            "length": 537
+          },
+          "availability": "checked_in",
+          "relative_path": "fixtures/w1/loom-research-authority-v1.json"
+        }
+      ],
+      "state_identities": [],
+      "prerequisites": [],
+      "replay": [
+        {
+          "program": { "kind": "cargo" },
+          "argv": ["test", "-p", "loom-store", "w1_reopened_research_bytes_remain_diagnostic_without_live_authority"],
+          "required_environment": [],
+          "network": "denied"
+        }
+      ],
+      "expected_projection": {
+        "id": "loom.research.authority.expected_projection.v1",
+        "digest": { "algorithm": "sha256", "hex": "03483d304b0f57833ac777740b0cde400b5d86331357f08ce4dc5b98f28a4f24" },
+        "length": 2188
+      }
+    }
+  ],
+  "omitted_claims": ["live model inference", "reusable authority after reopen"],
+  "negative_evidence": []
+}
