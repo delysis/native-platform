@@ -261,6 +261,11 @@ impl AppWorkLease {
             .map(|reservation| reservation.lease.identity())
     }
 
+    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+    pub fn w1_cancellation_signal(&self) -> Option<Arc<AtomicBool>> {
+        self.cancellation.clone()
+    }
+
     fn finish_supervised(&mut self, class: TerminalClass) -> Result<(), String> {
         let Some(reservation) = self.supervised.take() else {
             return Ok(());
@@ -595,6 +600,11 @@ impl AppRuntimeHandle {
 
 #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
 pub(crate) fn w1_fixture_runtime() -> AppRuntimeHandle {
+    w1_fixture_runtime_with_sequence(41)
+}
+
+#[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+pub(crate) fn w1_fixture_runtime_with_sequence(next_sequence: u64) -> AppRuntimeHandle {
     let host = Arc::new(NativeHost::new(
         llama_native_host::NativeHostConfig::default(),
     ));
@@ -608,7 +618,7 @@ pub(crate) fn w1_fixture_runtime() -> AppRuntimeHandle {
         None,
         Arc::new(RuntimeProductCanceller),
         Arc::new(W1FixtureNativeFinalizer),
-        OperationSupervisor::with_config(41, 4),
+        OperationSupervisor::with_config(next_sequence, 4),
     )
 }
 
