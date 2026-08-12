@@ -63,6 +63,12 @@ jobs:
           cargo test --locked -p free-token-energy
           --features unstable-w1-vertical-tests --lib
           db::w1_tests::w1_legacy_database_is_explicitly_unsupported
+      - name: Test product-owner quit and relaunch
+        run: >-
+          cargo test --locked -p free-token-energy
+          --features unstable-w1-vertical-tests --lib
+          gateway_runtime::w1_quit_relaunch_tests::w1_product_owner_quit_relaunch_is_quiescent_and_fresh
+          -- --exact
       - name: Lint explicit legacy-database rejection
         run: >-
           cargo clippy --locked -p free-token-energy

@@ -8,12 +8,12 @@
       "case_id": "hosted.contract",
       "source": {
         "repository_id": "delysis/free-token-energy",
-        "commit": "0ba33bb786f068830cf288c629d8eedc63e56029",
+        "commit": "797500060047ccd10f9810fb4d5c8f374e00eb08",
         "production_tree": {
-          "id": "fte.production.source_roots.0ba33bb",
+          "id": "fte.production.source_roots.7975000",
           "digest": {
             "algorithm": "sha256",
-            "hex": "8cd035ad709fe8bb82687e54d09fecdef7b6cbfd202fbf6121e20501f192ac47"
+            "hex": "2ef89c926486e705c5ebb1ce87b61d2aeba80d54a715d88902e280beec54be6a"
           },
           "length": 906
         }
@@ -63,12 +63,12 @@
       "case_id": "loopback.roundtrip",
       "source": {
         "repository_id": "delysis/free-token-energy",
-        "commit": "0ba33bb786f068830cf288c629d8eedc63e56029",
+        "commit": "797500060047ccd10f9810fb4d5c8f374e00eb08",
         "production_tree": {
-          "id": "fte.production.source_roots.0ba33bb",
+          "id": "fte.production.source_roots.7975000",
           "digest": {
             "algorithm": "sha256",
-            "hex": "8cd035ad709fe8bb82687e54d09fecdef7b6cbfd202fbf6121e20501f192ac47"
+            "hex": "2ef89c926486e705c5ebb1ce87b61d2aeba80d54a715d88902e280beec54be6a"
           },
           "length": 906
         }

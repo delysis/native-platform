@@ -95,11 +95,11 @@ enum ShutdownDisposition {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct GatewayShutdownReport {
-    result: Result<(), GatewayError>,
-    expected_worker_ids: Vec<String>,
-    joined_worker_ids: Vec<String>,
-    retained_tasks: usize,
+pub struct GatewayShutdownReport {
+    pub result: Result<(), GatewayError>,
+    pub expected_worker_ids: Vec<String>,
+    pub joined_worker_ids: Vec<String>,
+    pub retained_tasks: usize,
 }
 
 impl LifecycleControl {
@@ -627,10 +627,12 @@ impl Gateway {
     }
 
     pub async fn shutdown(&self) -> Result<(), GatewayError> {
-        self.shutdown_report().await.result
+        self.shutdown_with_report().await.result
     }
 
-    async fn shutdown_report(&self) -> GatewayShutdownReport {
+    /// Closes admission, cancels active requests, joins every registered
+    /// backend worker, and returns the exact retained/joined shutdown facts.
+    pub async fn shutdown_with_report(&self) -> GatewayShutdownReport {
         match self.lifecycle.begin_shutdown() {
             Err(error) => return failed_shutdown_report(error),
             Ok(ShutdownDisposition::Complete(report)) => return report,
@@ -1456,7 +1458,7 @@ mod tests {
         ModelCapabilities, PromptForm, RouteObservations, RoutingPolicy, SamplingOptions,
         StoragePolicy, StreamPolicy, TicketCancellation, ToolPolicy,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use tokio::sync::{mpsc, oneshot};
 
@@ -2423,10 +2425,22 @@ mod tests {
         let ticket = gateway.execute(request).await.expect("start request");
         assert_eq!(gateway.status().active_requests, 1);
 
-        tokio::time::timeout(Duration::from_secs(1), gateway.shutdown())
+        let report = tokio::time::timeout(Duration::from_secs(1), gateway.shutdown_with_report())
             .await
-            .expect("gateway shutdown must not hang")
-            .expect("gateway shutdown");
+            .expect("gateway shutdown must not hang");
+        report.result.expect("gateway shutdown");
+        assert_eq!(
+            report.expected_worker_ids,
+            vec!["backend-shutdown:draining"]
+        );
+        assert_eq!(
+            report
+                .joined_worker_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            report.expected_worker_ids.into_iter().collect()
+        );
+        assert_eq!(report.retained_tasks, 0);
         assert_eq!(cancellations.load(AtomicOrdering::Acquire), 1);
         assert_eq!(shutdowns.load(AtomicOrdering::Acquire), 1);
         assert_eq!(gateway.status().active_requests, 0);

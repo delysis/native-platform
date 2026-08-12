@@ -9,7 +9,7 @@ use fte_protocols::{
     openai_completion_json,
 };
 use fte_providers::{HostedProviderBackend, HostedProviderConfig};
-use fte_router::{Gateway, GatewayDefaults};
+use fte_router::{Gateway, GatewayDefaults, GatewayShutdownReport};
 use fte_store::SecretResolver;
 use fte_types::{
     BackendLocation, BackendReadiness, BackendSnapshot, GatewayError, Modality, ModelCapabilities,
@@ -166,6 +166,7 @@ impl SecretResolver for StoreSecretResolver {
 }
 
 pub struct GatewayRuntimeOwner {
+    runtime_id: RequestId,
     gateway: Arc<Gateway>,
     native_host: Arc<llama_native_host::NativeHost>,
     native_backend: Arc<LlamaNativeBackend>,
@@ -177,6 +178,13 @@ pub struct GatewayRuntimeOwner {
     catalog: Vec<ModelCatalogEntry>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayRuntimeShutdownReport {
+    pub runtime_id: RequestId,
+    pub gateway: GatewayShutdownReport,
+    pub native_host_joined: bool,
+}
+
 impl GatewayRuntimeOwner {
     pub fn new() -> Result<Self, GatewayError> {
         Self::new_with_store(Arc::new(OsCredentialStore::new()))
@@ -184,6 +192,13 @@ impl GatewayRuntimeOwner {
 
     pub(crate) fn new_with_store(
         credential_store: Arc<dyn CredentialStore>,
+    ) -> Result<Self, GatewayError> {
+        Self::new_with_store_and_runtime_id(credential_store, RequestId::new())
+    }
+
+    pub(crate) fn new_with_store_and_runtime_id(
+        credential_store: Arc<dyn CredentialStore>,
+        runtime_id: RequestId,
     ) -> Result<Self, GatewayError> {
         let gateway = Arc::new(Gateway::new(GatewayDefaults {
             catalog_version: "free-token-energy-desktop-v2".to_string(),
@@ -198,6 +213,7 @@ impl GatewayRuntimeOwner {
         let native_backend = Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&native_host)));
         gateway.register_backend(native_backend.clone())?;
         Ok(Self {
+            runtime_id,
             gateway,
             native_host,
             native_backend,
@@ -309,6 +325,19 @@ impl GatewayRuntimeOwner {
         shutdown
             .as_ref()
             .is_some_and(|fact| fact.belongs_to(&self.native_host))
+    }
+
+    /// Drains the Gateway before joining the application-owned native host.
+    /// The returned report is suitable for process-exit diagnostics and
+    /// acceptance evidence; callers do not need access to either owner.
+    pub async fn shutdown_with_report(&self) -> GatewayRuntimeShutdownReport {
+        let gateway = self.gateway.shutdown_with_report().await;
+        let native_host_joined = self.shutdown_native_for_process_exit();
+        GatewayRuntimeShutdownReport {
+            runtime_id: self.runtime_id.clone(),
+            gateway,
+            native_host_joined,
+        }
     }
 
     pub fn bind_database(&self, database: Arc<Database>) -> Result<(), GatewayError> {
@@ -1277,6 +1306,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn runtime_shutdown_reports_every_owned_worker_and_native_join() {
+        let runtime_id = RequestId("runtime-shutdown-report-test".to_string());
+        let runtime = GatewayRuntimeOwner::new_with_store_and_runtime_id(
+            Arc::new(FakeCredentialStore::default()),
+            runtime_id.clone(),
+        )
+        .expect("gateway");
+        let report = runtime.shutdown_with_report().await;
+        assert_eq!(report.runtime_id, runtime_id);
+        report.gateway.result.expect("Gateway shutdown");
+        assert_eq!(
+            report.gateway.expected_worker_ids,
+            vec![
+                "backend-shutdown:anthropic",
+                "backend-shutdown:cerebras",
+                "backend-shutdown:gemini",
+                "backend-shutdown:groq",
+                "backend-shutdown:llama-native",
+                "backend-shutdown:mistral",
+                "backend-shutdown:nvidia",
+                "backend-shutdown:openrouter",
+            ]
+        );
+        assert_eq!(
+            report
+                .gateway
+                .joined_worker_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            report.gateway.expected_worker_ids.into_iter().collect()
+        );
+        assert_eq!(report.gateway.retained_tasks, 0);
+        assert!(report.native_host_joined);
+    }
+
     #[test]
     fn desktop_native_backend_uses_the_shared_gateway_and_local_only_route() {
         let runtime = GatewayRuntimeOwner::new().expect("gateway");
@@ -1767,3 +1832,7 @@ mod tests {
         std::fs::write(path, b"GGUF").expect("write minimal GGUF fixture");
     }
 }
+
+#[cfg(all(test, feature = "unstable-w1-vertical-tests"))]
+#[path = "w1_quit_relaunch_tests.rs"]
+mod w1_quit_relaunch_tests;

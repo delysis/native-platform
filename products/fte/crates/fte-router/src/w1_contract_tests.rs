@@ -647,7 +647,8 @@ fn gateway_shutdown_witness(
     let thread = thread::spawn(move || {
         runtime.block_on(async move {
             let shutdown_gateway = Arc::clone(&gateway);
-            let shutdown = tokio::spawn(async move { shutdown_gateway.shutdown_report().await });
+            let shutdown =
+                tokio::spawn(async move { shutdown_gateway.shutdown_with_report().await });
             loop {
                 if gateway.status().lifecycle != GatewayLifecycle::Running {
                     break;
@@ -1059,7 +1060,7 @@ impl AdmissionQuiesceShutdownBridgeAdapter for GatewayAdmissionBridgeAdapter {
         let report = self
             .inner
             .runtime
-            .block_on(self.inner.gateway.shutdown_report());
+            .block_on(self.inner.gateway.shutdown_with_report());
         report
             .result
             .expect("Gateway repeated shutdown remains successful");
@@ -1476,7 +1477,7 @@ impl TaskReapingAdapter for GatewayTaskReapingAdapter {
         let report = self
             .inner
             .runtime
-            .block_on(self.inner.gateway.shutdown_report());
+            .block_on(self.inner.gateway.shutdown_with_report());
         report.result.expect("Gateway task-owner shutdown succeeds");
         let status = self.inner.gateway.status();
         ClosedFacts {

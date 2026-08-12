@@ -39,7 +39,7 @@ request corpus and exact projected results.
 Both cases authenticate one checked-in production-source descriptor. It binds
 the exact pre-test prefixes of the two files that contain inline tests and the
 Git tree identities of `fte-router`, `fte-protocols`, `fte-store`, and
-`fte-types` at baseline commit `0ba33bb786f068830cf288c629d8eedc63e56029`.
+`fte-types` at baseline commit `797500060047ccd10f9810fb4d5c8f374e00eb08`.
 The replay verifies that the fixture revision descends from that commit and that
 every bound production root is unchanged. The generic projection makes no
 listener-worker-count claim because `LoopbackServer::shutdown` intentionally
@@ -64,14 +64,14 @@ W1 row freezes this explicit unsupported-input contract rather than
 manufacturing a state migration baseline.
 
 The row-15 manifest is now complete. It binds production baseline
-`bea75f007f1a42041255600486d246c383238e68`, policy input SHA-256
+`797500060047ccd10f9810fb4d5c8f374e00eb08`, policy input SHA-256
 `49e1517e829213c7ab7ca70a2a60410068ed00c123d90b4f094d28a10957ec92`,
 expected projection SHA-256
 `846b0d8e11a1408f0094b2b277d582591e2c0a315e9f22b11b40aa5cb795bb3b`,
 and manifest SHA-256
-`2b197fe34633215f483e026310fb1715d39ad9fdddce08b1b5a8b20295c1f933`.
-The source descriptor authenticates the production database prefix, exact
-desktop/secret/runtime blobs, and absence of the retired importer.
+`7d5478edd7523fd24401d0d6b4643fa4d9a2a3e1ebf9db2a7a025ff2106eb768`.
+The source descriptor authenticates the production database and runtime
+prefixes, exact desktop/secret blobs, and absence of the retired importer.
 
 The runtime replay creates only adversarial unsupported-input sentinels. They
 are labeled generated, contain no credential, and are not presented as prior
