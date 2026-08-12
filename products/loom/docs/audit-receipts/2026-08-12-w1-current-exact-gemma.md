@@ -32,7 +32,7 @@ The authenticated portable test, strict test-target clippy, fixture SHA-256 ledg
 
 Loom's post-merge Linux CI exposed a transient `ETXTBSY` while launching a newly copied fake Codex CLI. Command spawning now retries only Linux raw OS error 26, at most eight times with a 5 ms delay. All other spawn errors remain immediate failures. A Linux-only regression holds a test executable open for writing, releases it after 10 ms, verifies successful bounded recovery, and separately verifies that a missing executable still fails.
 
-The first W1 pull-request run also exposed a separate pre-existing test-adapter race: its deliberately panicking worker could publish terminal state before its worker reservation was attached. The adapter now gates worker execution until attachment succeeds, so the test follows the production ownership order it claims to exercise. Ten consecutive focused lifecycle runs passed locally; remote Linux remains the required cross-platform gate.
+The first W1 pull-request run also exposed an ownership race: a fast desktop worker could publish terminal state before its worker reservation was attached. Production generation and the deliberately panicking lifecycle adapter now gate worker execution until attachment succeeds. An attachment failure cancels the native owner, opens the gate, joins the returned desktop worker, and joins the native backend before returning the failure. The focused production-order and contract lifecycle regressions each passed ten consecutive local runs; remote Linux remains the required cross-platform gate.
 
 ## Boundaries
 
