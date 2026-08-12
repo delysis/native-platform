@@ -89,8 +89,8 @@ outside the reusable backend adapter.
 
 ## Remaining roadmap
 
-1. Live-provider end-to-end tests with user-owned credentials
-2. Disposable real-OS credential migration/readback acceptance
-3. Real evaluation-result ingestion and display
-4. Usage visualizations sourced from request logs
-5. Additional explicitly contracted transports such as Ollama and Bedrock
+1. Optional operator-run live-provider interoperability smoke when a revocable
+   credential is already available; this is not a phase-one promotion gate
+2. Real evaluation-result ingestion and display
+3. Usage visualizations sourced from request logs
+4. Additional explicitly contracted transports such as Ollama and Bedrock

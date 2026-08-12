@@ -2,8 +2,9 @@
 
 Audited base: `d86edfef40771589af4cd8cd72907fa6d3ce6e96`  
 Working disposition: production authority unified; exact launched real-Qwen
-Cmd+Q/relaunch acceptance and real macOS Keychain migration/readback passed;
-promotion remains gated on live hosted-provider evidence.
+Cmd+Q/relaunch acceptance and real macOS Keychain migration/readback passed.
+The repository owner removed a live paid-provider smoke from phase-one
+promotion; no live hosted execution claim is made.
 
 ## Production authority
 
@@ -94,13 +95,20 @@ semantics and silently ignoring it would claim false compatibility. Callers
 must omit `task_hint`; a future replacement requires an explicit typed Gateway
 evaluation signal and fixtures.
 
-## Remaining promotion gate
+## Steward disposition of the hosted smoke
 
-- Exercise at least one real hosted credential through chat and completion.
+On 2026-08-12 the repository owner removed the live chat/raw-completion smoke
+with a user-owned Cerebras credential from the phase-one promotion contract as
+unnecessary. This is a risk acceptance, not simulated evidence: no live hosted
+request is claimed. The accepted boundary is the strict provider catalog and
+protocol implementation plus 14 deterministic hosted-provider fixtures,
+including raw-completion byte preservation, provider-extension rejection,
+provider-specific sampling preservation, typed tools/responses, bounded errors,
+and shutdown behavior.
 
-The exact `372a088` acceptance bundle has now exercised the launched local route
-and restart/shutdown boundary. That closes the prior launched-bundle gate; it
-does not supply the hosted credential gate above.
+The exact `372a088` acceptance bundle exercised the launched local route and
+restart/shutdown boundary. Together with the real OS credential receipt and the
+explicit steward disposition above, R7 is promotable for phase one.
 
 ## Verified on 2026-08-11
 
@@ -144,5 +152,5 @@ recorded. The exact evidence is preserved in
 `receipts/R7-FTE-OS-CREDENTIAL-ACCEPTANCE.json`.
 
 No live hosted request has been performed because no supported provider
-credential is configured. The launched evidence is not signed-release
-certification.
+credential is configured, and none is required by the revised phase-one
+contract. The launched evidence is not signed-release certification.

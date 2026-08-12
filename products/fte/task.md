@@ -32,7 +32,7 @@
 - [x] Frontend syntax check and dependency audit
 - [x] Continuous-integration workflow
 - [x] Security and threat-model documentation
-- [ ] Live-provider smoke tests with user-owned credentials
+- [ ] Optional live-provider interoperability smoke when a revocable credential is available; not a phase-one promotion gate
 - [ ] Signed release packaging
 
 ## Deliberate next steps

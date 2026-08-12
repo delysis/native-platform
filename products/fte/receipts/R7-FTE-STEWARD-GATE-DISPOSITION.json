@@ -1,0 +1,30 @@
+{
+  "receipt_schema": "delysis-remediation-receipt.v1",
+  "micro_goal": "R7-FTE-UNIFY",
+  "repository": "delysis/free-token-energy",
+  "recorded_on": "2026-08-12",
+  "candidate_head_before_receipt": "d3bb2f295db301a56aa2c5d1fd7c92daaf198c32",
+  "authority": "repository_owner_and_phase_one_steward",
+  "decision": {
+    "removed_gate": "live_chat_and_raw_completion_with_a_user_owned_cerebras_credential",
+    "reason": "the live paid-provider smoke was judged unnecessary for phase-one promotion; protocol documentation and deterministic contract fixtures are accepted for this gate",
+    "scope": "phase_one_promotion_only",
+    "does_not_claim_live_execution": true,
+    "does_not_claim_provider_availability_or_quota": true
+  },
+  "retained_evidence": {
+    "hosted_provider_fixture_tests": 14,
+    "raw_completion_whitespace_and_tokens_fixture": true,
+    "strict_provider_extension_validation": true,
+    "provider_specific_sampling_preservation": true,
+    "typed_tool_and_response_fixtures": true,
+    "real_os_credential_migration_and_exact_readback": true,
+    "real_local_qwen_and_attached_exit": true
+  },
+  "promotion_disposition": {
+    "full_r7_promotable": true,
+    "live_hosted_provider_exercised": false,
+    "signed_release_certified": false,
+    "remaining_phase_one_gate": null
+  }
+}

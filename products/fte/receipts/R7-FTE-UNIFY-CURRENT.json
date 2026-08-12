@@ -23,7 +23,8 @@
       "receipts/R7-FTE-UNIFY-PARTIAL.json",
       "receipts/R7-FTE-CMDQ-METAL-SHUTDOWN.json",
       "receipts/R7-FTE-ATTACHED-EXIT.json",
-      "receipts/R7-FTE-OS-CREDENTIAL-ACCEPTANCE.json"
+      "receipts/R7-FTE-OS-CREDENTIAL-ACCEPTANCE.json",
+      "receipts/R7-FTE-STEWARD-GATE-DISPOSITION.json"
     ],
     "portable_and_product_gates": {
       "workspace_tests": "102_passed_2_ignored",
@@ -97,25 +98,24 @@
     }
   },
   "evidence_limits": {
-    "full_r7_promotable": false,
+    "full_r7_promotable": true,
     "local_model_launched_bundle_exercised": true,
     "real_hosted_provider_exercised": false,
     "real_os_credential_migration_and_readback_exercised": true,
     "process_exit_code_observed": true,
     "signed_release_certified": false,
-    "reason": "launched local inference, Cmd-Q, and disposable real OS credential migration/readback pass; no user-owned hosted credential is configured for the live chat and completion gate"
+    "reason": "launched local inference, Cmd-Q, and disposable real OS credential migration/readback pass; the repository owner removed the live paid-provider smoke from phase-one promotion without claiming it ran"
   },
   "claim_reconciliation": {
     "superseded_claim": "receipts/R7-FTE-UNIFY-PARTIAL.json recorded local_model_launched_bundle_exercised as false",
     "current_claim": "the exact 372a088 acceptance bundle passed two visible real-Qwen local/default generations separated by Cmd-Q and immediate saved-model restoration",
     "closed_live_gate": "legacy_plaintext_migration_and_exact_readback_against_the_real_platform_credential_store",
-    "unchanged_open_gates": [
-      "live_hosted_provider_request_with_user_owned_credential"
-    ]
+    "steward_removed_gate": "live_hosted_provider_request_with_user_owned_credential",
+    "unchanged_open_gates": []
   },
   "micro_goal": "R7-FTE-UNIFY",
   "receipt_schema": "delysis-remediation-receipt.v1",
   "recorded_on": "2026-08-12",
   "repository": "delysis/free-token-energy",
-  "status": "partial_live_acceptance_pending"
+  "status": "accepted_for_phase_one_promotion"
 }
