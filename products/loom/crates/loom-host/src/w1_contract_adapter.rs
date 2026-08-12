@@ -1,23 +1,353 @@
-use super::*;
-use platform_contract_testkit::compositional_lifecycle::{
-    WaiterControlAdapter, run_waiter_control_suite,
+use super::{
+    Arc, BranchCancellation, BranchId, CommandId, DocumentId, Duration, GenerationAttemptIdentity,
+    GenerationConsumerTicket, GenerationFamilyIdentity, GenerationFamilyRegistration,
+    GenerationOperationLease, GenerationOperationPhase, GenerationOperationSnapshot,
+    GenerationRegistry, GenerationRegistryError, GenerationRunId, GenerationSupervisor,
+    GenerationSupervisorError, GenerationTerminalClass, Mutex, ProjectId,
 };
+use platform_contract_testkit::compositional_lifecycle::{
+    AttemptHierarchyAdapter, ConsumerCancellationAdapter, RegistryIdentityAdapter,
+    TerminalAuthorityAdapter, TransitionChainAdapter, WaiterControlAdapter,
+    run_attempt_hierarchy_suite, run_consumer_cancellation_suite, run_registry_identity_suite,
+    run_terminal_authority_suite, run_transition_chain_suite, run_waiter_control_suite,
+};
+use platform_contract_testkit::{
+    AttemptIdentity, LifecycleImplementation, OperationPhase, OperationSnapshot, TerminalClass,
+    TerminalRecord, WaitObservation,
+};
+
+#[cfg(test)]
 use platform_contract_testkit::contracts::privacy::PRIVACY_POLICY_SCHEMA_V0;
+#[cfg(test)]
 use platform_contract_testkit::contracts::{
     DataHandlingV0, DataTierV0, LoggingPolicyV0, NetworkPolicyV0, PayloadRedactionV0,
     PrivacyDecisionV0, PrivacyDenialV0, PrivacyPolicyV0, ProviderId, RedactionStateV0,
     RoutePrivacyContextV0, RouteTargetV0,
 };
-use platform_contract_testkit::{
-    AcceptanceError, AttemptIdentity, LifecycleCoverageManifest, LifecycleImplementation,
-    LifecycleInvariant, OperationPhase, OperationSnapshot, TerminalRecord, WaitObservation,
-};
+#[cfg(test)]
+use platform_contract_testkit::{AcceptanceError, LifecycleCoverageManifest, LifecycleInvariant};
 
-enum LoomInteractiveLifecycle {}
+#[derive(Debug)]
+pub enum LoomInteractiveLifecycle {}
 
 impl LifecycleImplementation for LoomInteractiveLifecycle {
     const PRODUCT: &'static str = "loom";
     const IMPLEMENTATION: &'static str = "interactive-generation-registry";
+}
+
+fn contract_identity(identity: &GenerationAttemptIdentity) -> AttemptIdentity {
+    AttemptIdentity {
+        operation_id: identity.operation_id.clone(),
+        attempt_id: identity.attempt_id.clone(),
+        sequence: identity.sequence,
+    }
+}
+
+const fn contract_phase(phase: GenerationOperationPhase) -> OperationPhase {
+    match phase {
+        GenerationOperationPhase::Reserved => OperationPhase::Reserved,
+        GenerationOperationPhase::Queued => OperationPhase::Queued,
+        GenerationOperationPhase::Running => OperationPhase::Running,
+        GenerationOperationPhase::Terminal => OperationPhase::Terminal,
+        GenerationOperationPhase::Released => OperationPhase::Released,
+    }
+}
+
+const fn contract_terminal(class: GenerationTerminalClass) -> TerminalClass {
+    match class {
+        GenerationTerminalClass::Completed => TerminalClass::Completed,
+        GenerationTerminalClass::Cancelled => TerminalClass::Cancelled,
+        GenerationTerminalClass::Failed => TerminalClass::Failed,
+    }
+}
+
+const fn product_terminal(class: TerminalClass) -> GenerationTerminalClass {
+    match class {
+        TerminalClass::Completed => GenerationTerminalClass::Completed,
+        TerminalClass::Cancelled => GenerationTerminalClass::Cancelled,
+        TerminalClass::Failed => GenerationTerminalClass::Failed,
+    }
+}
+
+fn contract_snapshot(snapshot: GenerationOperationSnapshot) -> OperationSnapshot {
+    OperationSnapshot {
+        identity: contract_identity(&snapshot.identity),
+        phase: contract_phase(snapshot.phase),
+        cancellation_requested: snapshot.cancellation_requested,
+        authoritative_terminal: snapshot
+            .authoritative_terminal
+            .map(|terminal| TerminalRecord {
+                class: contract_terminal(terminal.class),
+                sequence: terminal.identity.sequence,
+            }),
+        final_projection: snapshot.final_projection.map(|terminal| TerminalRecord {
+            class: contract_terminal(terminal.class),
+            sequence: terminal.identity.sequence,
+        }),
+        progress_projection: snapshot.progress_projection,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LoomSupervisorAdapter {
+    supervisor: GenerationSupervisor,
+}
+
+pub fn owned_lifecycle_evidence()
+-> Vec<platform_contract_testkit::CoverageEvidence<LoomInteractiveLifecycle>> {
+    vec![
+        run_transition_chain_suite::<LoomSupervisorAdapter>("operation-supervisor"),
+        run_registry_identity_suite::<LoomSupervisorAdapter>("operation-supervisor"),
+        run_attempt_hierarchy_suite::<LoomSupervisorAdapter>("operation-supervisor"),
+        run_consumer_cancellation_suite::<LoomSupervisorAdapter>("operation-supervisor"),
+        run_terminal_authority_suite::<LoomSupervisorAdapter>("operation-supervisor"),
+        run_waiter_control_suite::<LoomWaiterAdapter>("generation-registry"),
+    ]
+}
+
+impl LoomSupervisorAdapter {
+    fn new(next_sequence: u64, progress_capacity: usize) -> Self {
+        Self {
+            supervisor: GenerationSupervisor::with_next_sequence(progress_capacity, next_sequence)
+                .expect("valid deterministic supervisor configuration"),
+        }
+    }
+
+    fn start_running(
+        &self,
+        operation_id: &str,
+    ) -> Result<(GenerationConsumerTicket, GenerationOperationLease), GenerationSupervisorError>
+    {
+        let (ticket, lease) = self.supervisor.reserve(operation_id)?;
+        self.supervisor.queue(&lease)?;
+        self.supervisor.start(&lease)?;
+        Ok((ticket, lease))
+    }
+}
+
+impl TransitionChainAdapter for LoomSupervisorAdapter {
+    type Implementation = LoomInteractiveLifecycle;
+    type Error = GenerationSupervisorError;
+    type Operation = GenerationOperationLease;
+
+    fn deterministic() -> Self {
+        Self::new(1, 4)
+    }
+
+    fn reserve(&self, operation_id: &str) -> Result<Self::Operation, Self::Error> {
+        let (ticket, lease) = self.supervisor.reserve(operation_id)?;
+        ticket.detach();
+        Ok(lease)
+    }
+
+    fn phase(&self, operation: &Self::Operation) -> Option<OperationPhase> {
+        self.supervisor
+            .snapshot(operation)
+            .expect("transition operation snapshot")
+            .map(|snapshot| contract_phase(snapshot.phase))
+    }
+
+    fn queue(&self, operation: &Self::Operation) -> Result<(), Self::Error> {
+        self.supervisor.queue(operation)
+    }
+
+    fn start(&self, operation: &Self::Operation) -> Result<(), Self::Error> {
+        self.supervisor.start(operation)
+    }
+
+    fn terminal(
+        &self,
+        operation: &Self::Operation,
+        class: TerminalClass,
+    ) -> Result<(), Self::Error> {
+        self.supervisor.terminal(operation, product_terminal(class))
+    }
+
+    fn release(&self, operation: &Self::Operation) -> Result<(), Self::Error> {
+        self.supervisor.release(operation)
+    }
+}
+
+impl RegistryIdentityAdapter for LoomSupervisorAdapter {
+    type Implementation = LoomInteractiveLifecycle;
+    type Error = GenerationSupervisorError;
+    type Guard = GenerationConsumerTicket;
+    type Lease = GenerationOperationLease;
+
+    fn deterministic(next_sequence: u64) -> Self {
+        Self::new(next_sequence, 4)
+    }
+
+    fn reserve(&self, operation_id: &str) -> Result<(Self::Guard, Self::Lease), Self::Error> {
+        self.start_running(operation_id)
+    }
+
+    fn lease_identity(&self, lease: &Self::Lease) -> AttemptIdentity {
+        contract_identity(lease.identity())
+    }
+
+    fn complete_and_release(&self, lease: &Self::Lease) -> Result<(), Self::Error> {
+        self.supervisor
+            .terminal_and_release(lease, GenerationTerminalClass::Completed)
+    }
+
+    fn active_count(&self) -> usize {
+        self.supervisor
+            .active_count()
+            .expect("registry active count")
+    }
+
+    fn current_identity(&self, operation_id: &str) -> Option<AttemptIdentity> {
+        self.supervisor
+            .current_lease(operation_id)
+            .expect("registry current identity")
+            .map(|lease| contract_identity(lease.identity()))
+    }
+}
+
+impl AttemptHierarchyAdapter for LoomSupervisorAdapter {
+    type Implementation = LoomInteractiveLifecycle;
+    type Error = GenerationSupervisorError;
+    type Operation = GenerationOperationLease;
+    type Attempt = GenerationOperationLease;
+
+    fn deterministic() -> Self {
+        Self::new(1, 4)
+    }
+
+    fn create_operation(&self, operation_id: &str) -> Result<Self::Operation, Self::Error> {
+        self.supervisor.create_operation(operation_id)
+    }
+
+    fn start_attempt(&self, operation: &Self::Operation) -> Result<Self::Attempt, Self::Error> {
+        self.supervisor.start_attempt(operation)
+    }
+
+    fn attempt_identity(&self, attempt: &Self::Attempt) -> AttemptIdentity {
+        contract_identity(attempt.identity())
+    }
+
+    fn operation_active(&self, operation: &Self::Operation) -> bool {
+        self.supervisor
+            .current_lease(&operation.identity().operation_id)
+            .expect("attempt operation state")
+            .is_some()
+    }
+
+    fn active_attempts(&self, operation: &Self::Operation) -> Vec<AttemptIdentity> {
+        self.supervisor
+            .active_attempts(operation)
+            .expect("active attempts")
+            .iter()
+            .map(contract_identity)
+            .collect()
+    }
+
+    fn request_operation_cancel(&self, operation: &Self::Operation) -> Result<(), Self::Error> {
+        self.supervisor.request_cancel(operation.identity())
+    }
+
+    fn cancellation_requested(&self, attempt: &Self::Attempt) -> bool {
+        self.supervisor
+            .attempt_cancelled(attempt)
+            .expect("attempt cancellation state")
+    }
+
+    fn finish_attempt(&self, attempt: Self::Attempt) -> Result<(), Self::Error> {
+        self.supervisor.finish_attempt(&attempt)
+    }
+
+    fn finish_operation(&self, operation: &Self::Operation) -> Result<(), Self::Error> {
+        self.supervisor.finish_operation(operation)
+    }
+}
+
+impl ConsumerCancellationAdapter for LoomSupervisorAdapter {
+    type Implementation = LoomInteractiveLifecycle;
+    type Error = GenerationSupervisorError;
+    type Ticket = GenerationConsumerTicket;
+    type Lease = GenerationOperationLease;
+
+    fn deterministic() -> Self {
+        Self::new(1, 4)
+    }
+
+    fn start(&self, operation_id: &str) -> Result<(Self::Ticket, Self::Lease), Self::Error> {
+        self.start_running(operation_id)
+    }
+
+    fn ticket_identity(&self, ticket: &Self::Ticket) -> AttemptIdentity {
+        contract_identity(ticket.identity())
+    }
+
+    fn lease_identity(&self, lease: &Self::Lease) -> AttemptIdentity {
+        contract_identity(lease.identity())
+    }
+
+    fn active_count(&self) -> usize {
+        self.supervisor
+            .active_count()
+            .expect("consumer active count")
+    }
+
+    fn current_snapshot(&self, operation_id: &str) -> Option<OperationSnapshot> {
+        self.supervisor
+            .current_snapshot(operation_id)
+            .expect("consumer current snapshot")
+            .map(contract_snapshot)
+    }
+
+    fn lease_snapshot(&self, lease: &Self::Lease) -> Option<OperationSnapshot> {
+        self.supervisor
+            .snapshot(lease)
+            .expect("consumer lease snapshot")
+            .map(contract_snapshot)
+    }
+
+    fn cancellation_requested(&self, lease: &Self::Lease) -> bool {
+        self.supervisor
+            .cancellation_requested(lease)
+            .expect("consumer cancellation state")
+    }
+
+    fn explicit_consumer_drop(&self, ticket: Self::Ticket) -> Result<(), Self::Error> {
+        ticket.cancel()
+    }
+
+    fn finish_cancelled(&self, lease: &Self::Lease) -> Result<(), Self::Error> {
+        self.supervisor
+            .terminal_and_release(lease, GenerationTerminalClass::Cancelled)
+    }
+}
+
+impl TerminalAuthorityAdapter for LoomSupervisorAdapter {
+    type Implementation = LoomInteractiveLifecycle;
+    type Error = GenerationSupervisorError;
+    type Guard = GenerationConsumerTicket;
+    type Lease = GenerationOperationLease;
+
+    fn deterministic() -> Self {
+        Self::new(1, 4)
+    }
+
+    fn start(&self, operation_id: &str) -> Result<(Self::Guard, Self::Lease), Self::Error> {
+        self.start_running(operation_id)
+    }
+
+    fn terminal(&self, lease: &Self::Lease, class: TerminalClass) -> Result<(), Self::Error> {
+        self.supervisor.terminal(lease, product_terminal(class))
+    }
+
+    fn snapshot(&self, lease: &Self::Lease) -> Option<OperationSnapshot> {
+        self.supervisor
+            .snapshot(lease)
+            .expect("terminal operation snapshot")
+            .map(contract_snapshot)
+    }
+
+    fn release(&self, lease: &Self::Lease) -> Result<(), Self::Error> {
+        self.supervisor.release(lease)
+    }
 }
 
 /// Test-only view of facts owned by Loom's production generation registry.
@@ -28,17 +358,20 @@ impl LifecycleImplementation for LoomInteractiveLifecycle {
 /// transitions, terminal or progress publication, retained tasks, worker
 /// joins, or a global quiesce phase. Supplying those fields here would create
 /// a shadow lifecycle instead of testing Loom.
+#[cfg(test)]
 #[derive(Debug)]
 struct LoomRegistryContractAdapter {
     registry: Arc<GenerationRegistry>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LoomRegistryFacts {
     active_branches: usize,
     session_active: bool,
 }
 
+#[cfg(test)]
 impl LoomRegistryContractAdapter {
     fn new(max_active_branches: usize) -> Self {
         Self {
@@ -236,6 +569,20 @@ fn real_registry_satisfies_waiter_control_suite_without_shadow_lifecycle_state()
     ));
 }
 
+#[test]
+fn production_supervisor_satisfies_its_six_owned_compositional_suites() {
+    let evidence = owned_lifecycle_evidence();
+    for item in &evidence {
+        assert_eq!(item.product(), "loom");
+        assert_eq!(item.implementation(), "interactive-generation-registry");
+    }
+    assert!(matches!(
+        LifecycleCoverageManifest::<LoomInteractiveLifecycle>::accept(evidence),
+        Err(AcceptanceError::MissingSuites(_))
+    ));
+}
+
+#[cfg(test)]
 fn local_only_contract(policy: &loom_types::BuildModelPolicy) -> PrivacyPolicyV0 {
     assert_eq!(
         policy.as_v1().inference_boundary(),

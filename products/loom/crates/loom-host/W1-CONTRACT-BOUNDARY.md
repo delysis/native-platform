@@ -2,61 +2,56 @@
 
 The `unstable-w1-contract-tests` feature is pinned to immutable contract commit
 `cbab33555ab9355a6ac453d659c55ec9e0666821`
-(`w1-contracts-v0-2026-08-12-r3`). It binds only facts owned by Loom production
-types. It does not satisfy the full W1 lifecycle manifest.
+(`w1-contracts-v0-2026-08-12-r3`). The dependency has one manifest owner,
+`loom-host`, and is re-exported only while the test feature is enabled so the
+Tauri composition test cannot drift to another contract revision.
 
-## Compositional lifecycle coverage
+## Accepted lifecycle manifest
 
 Declared implementation: `loom / interactive-generation-registry`.
 
-| Suite | Status | Production owner |
-| --- | --- | --- |
-| waiter control | passing | `GenerationRegistry` |
-| transition chain | gap | no one owner exposes the contract's five phases |
-| registry identity | gap | no checked attempt-sequence allocator or stale lease |
-| attempt hierarchy | gap | branches are admitted atomically, not started through an attempt owner |
-| consumer cancellation | gap | no consumer ticket whose `Drop` cancels while an executor lease survives |
-| terminal authority | gap | durable terminal authority belongs to `loom-store`, outside this registry |
-| admission/quiesce/shutdown | gap | process quiescence and worker joins belong to the Tauri application owner |
-| progress/shutdown | gap | registry owns no progress receiver or supervised task handle |
-| panic/shutdown | gap | registry owns no executor catch/join boundary |
-| stable shutdown | gap | registry has no worker-owning shutdown operation |
-| task reaping | gap | registry tracks routes, not retained task handles |
+One `LifecycleCoverageManifest<LoomInteractiveLifecycle>` is accepted from
+eleven passing compositional suites and all eighteen required invariants. The
+evidence is assembled from the production owners below; the adapters do not
+store a second lifecycle state machine.
 
-The passing waiter suite exercises a real `GenerationRegistry` family. Its
-bounded zero-duration wait returns without mutating the active route; the same
-ticket then routes cancellation through `cancel_run`; and `complete_family`
-releases the real route after the simulated worker-side terminal-persistence
-boundary. `OperationSnapshot` is only a projection of those production facts.
-It does not store or advance lifecycle state in the adapter.
+| Suites | Production owner |
+| --- | --- |
+| transition chain, registry identity, attempt hierarchy, consumer cancellation, terminal authority | `loom_host::GenerationSupervisor` |
+| waiter control | `loom_host::GenerationRegistry` |
+| admission/quiesce/shutdown, progress/shutdown, panic/shutdown, stable shutdown, task reaping | Tauri `ApplicationPhase`, the shared `GenerationSupervisor`, and `GenerationWorkerRegistry` owning the actual outer `JoinHandle`s |
 
-The test also feeds its single typed evidence item to
-`LifecycleCoverageManifest::accept` and requires rejection as incomplete. This
-prevents the PR from accidentally claiming all eleven suites or all eighteen
-normative invariants.
+`start_weave` reserves the real family registry and the shared supervisor while
+holding application admission, advances Reserved -> Queued -> Running, and
+attaches the executor to the same supervisor. Pre-executor failures record an
+explicit Failed terminal and Released projection. Poisoned lifecycle state is
+returned as an error; it is never projected as a successful empty or Closed
+state.
 
-## Other bound production facts
+`loom-store` remains the durable terminal authority. The Tauri release boundary
+requires exactly one persisted terminal for every run before releasing the
+family registry and atomically recording the supervisor's matching terminal
+and Released projection. Canonical store event sequence numbers feed the
+supervisor's bounded lossy progress projection. A missing or poisoned
+supervisor operation is an error, not permission to skip lifecycle release.
 
-Additional focused tests retain evidence for:
+Worker evidence comes from request IDs captured when real outer workers are
+attached and from the actual order in which `GenerationWorkerRegistry` joins
+them. Panic tests use the same retained outer `JoinHandle` path as the native
+Llama owner. Shutdown quiesces admission, cancels operations, joins every owned
+worker, closes the supervisor only after its operation and worker sets drain,
+and returns the same canonical shutdown facts on replay.
 
-- bounded family and branch reservation;
-- duplicate live request, run, and branch rejection;
-- project/session cancellation routing, including cancellation retained before
-  a backend handle is attached;
-- active route and branch counts;
-- terminal-persistence failure visibility; and
-- family release after durable terminal persistence.
+## Privacy boundary
 
 `BuildModelPolicy` remains a closed allow-list whose real policies all declare
 `InferenceBoundary::LocalOnly` and `HostedFallback::Forbidden`. The adapter
 maps those declarations to the W1 local-only privacy envelope. It performs no
 hosted call, carries no credentials, and grants no network authority.
 
-## Required production refactors for full acceptance
+## Verification
 
-Full lifecycle acceptance requires an application-level supervisor adopted by
-the real interactive generation path. It must own distinct consumer and
-executor identities, exact phase transitions, one authoritative terminal/final
-projection, bounded progress, task handles, quiescence, panic conversion, and
-actual worker joins. A test-only state machine or a wrapper that merely assigns
-the Loom marker would be shadow state and is explicitly rejected.
+The dedicated workflow checks the immutable pin, runs the full `loom-host`
+feature suite, runs the full `tauri-plugin-loom` feature suite containing the
+accepted cross-crate manifest, and applies strict clippy to both crates and all
+targets.

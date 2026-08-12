@@ -8,6 +8,14 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+mod generation_supervisor;
+pub use generation_supervisor::{
+    GenerationAttemptIdentity, GenerationConsumerTicket, GenerationOperationLease,
+    GenerationOperationPhase, GenerationOperationSnapshot, GenerationSupervisor,
+    GenerationSupervisorClosedFacts, GenerationSupervisorError, GenerationSupervisorPhase,
+    GenerationTerminalClass, GenerationTerminalRecord,
+};
+
 use loom_types::{
     BlobId, BranchId, CommandId, DocumentId, GenerationRunId, ProjectId, now_unix_ms,
 };
@@ -21,8 +29,10 @@ pub const MAX_NATIVE_FOCUS_SAMPLE_AGE: Duration = Duration::from_secs(1);
 pub const MAX_FOREGROUND_WINDOWS: usize = 64;
 pub const MAX_PENDING_FOREGROUND_COMMANDS: usize = 1_024;
 
-#[cfg(all(test, feature = "unstable-w1-contract-tests"))]
-mod w1_contract_adapter;
+#[cfg(feature = "unstable-w1-contract-tests")]
+pub mod w1_contract_adapter;
+#[cfg(feature = "unstable-w1-contract-tests")]
+pub use platform_contract_testkit;
 
 /// Native window identity used by one foreground-command challenge.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]

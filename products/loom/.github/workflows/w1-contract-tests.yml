@@ -33,8 +33,11 @@ jobs:
       - name: Check immutable contract pin
         run: ./scripts/check-w1-contract-pin.sh
 
-      - name: Test Loom contract adapter
-        run: cargo test --locked -p loom-host --features unstable-w1-contract-tests w1_contract_adapter
+      - name: Test Loom host contract owners
+        run: cargo test --locked -p loom-host --features unstable-w1-contract-tests
 
-      - name: Lint Loom contract adapter
-        run: cargo clippy --locked -p loom-host --features unstable-w1-contract-tests --all-targets -- -D warnings
+      - name: Test accepted cross-crate lifecycle manifest
+        run: cargo test --locked -p tauri-plugin-loom --features unstable-w1-contract-tests
+
+      - name: Lint Loom lifecycle owners and adapters
+        run: cargo clippy --locked -p loom-host -p tauri-plugin-loom --features tauri-plugin-loom/unstable-w1-contract-tests --all-targets -- -D warnings

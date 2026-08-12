@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+unstable-w1-contract-tests = [
+    "loom-host/unstable-w1-contract-tests",
+]
+
 [dependencies]
 loom-document = { path = "../loom-document" }
 loom-backend-llama = { path = "../loom-backend-llama" }
