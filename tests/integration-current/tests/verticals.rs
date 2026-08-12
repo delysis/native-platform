@@ -51,14 +51,13 @@ fn find_exact_lock() -> Option<PathBuf> {
         return None;
     }
     let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    let package = metadata["packages"].as_array()?.iter().find(|package| {
-        package["name"].as_str() == Some("platform-vertical-fixtures-v0")
-            && package["source"].as_str().is_some_and(|source| {
-                source.ends_with(
-                    "?rev=3ed1f3235edb6d481c324f05fe83b2379e3431e6#3ed1f3235edb6d481c324f05fe83b2379e3431e6",
-                )
-            })
-    })?;
+    // `source` URL normalization is platform-dependent (`.git` may be
+    // inserted). The root-lock test separately proves the exact Git revision;
+    // this lookup proves the checkout bytes by the accepted lock digest.
+    let package = metadata["packages"]
+        .as_array()?
+        .iter()
+        .find(|package| package["name"].as_str() == Some("platform-vertical-fixtures-v0"))?;
     let manifest = PathBuf::from(package["manifest_path"].as_str()?);
     let source_root = manifest.parent()?.parent()?.parent()?;
     let lock_path = source_root.join("verticals/v0/W1-VERTICALS.lock.json");
