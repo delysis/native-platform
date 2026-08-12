@@ -2,7 +2,8 @@
 
 Audited base: `d86edfef40771589af4cd8cd72907fa6d3ce6e96`  
 Working disposition: production authority unified; exact launched real-Qwen
-Cmd+Q/relaunch acceptance and real macOS Keychain migration/readback passed.
+Cmd+Q/relaunch acceptance passed. The earlier synthetic Keychain migration
+acceptance is retained as historical evidence but is no longer a product path.
 The repository owner removed a live paid-provider smoke from phase-one
 promotion; no live hosted execution claim is made.
 
@@ -12,7 +13,7 @@ promotion; no live hosted execution claim is made.
 |---|---|---|
 | Models | `GatewayRuntimeOwner` projects the hosted product catalog and configured local descriptors from the same `Gateway` | hosted parity plus `desktop_native_backend_uses_the_shared_gateway_and_local_only_route` |
 | Provider inventory/readiness | Gateway backend snapshots plus nonsecret request-log aggregates | `provider_inventory_matches_the_promoted_golden_fixture` |
-| Secrets | OS credential store selected by `keyring` 4.1.6 | exact-readback save path and credential migration crash fixtures |
+| Secrets | OS credential store selected by `keyring` 4.1.6 | exact-readback save path and explicit legacy-database rejection |
 | Playground chat | strict OpenAI chat codec to `Gateway::execute`; allowlisted Anthropic/Gemini compatibility fields become typed canonical state | desktop typed-field/tool-history fixtures plus `fte-providers` emission fixtures |
 | Raw completions | strict OpenAI completion codec to `Gateway::execute` | exact prompt/token protocol fixtures and full desktop suite |
 | Responses | plugin loopback over the same `Arc<Gateway>` | Responses protocol fixtures and real loopback socket fixture |
@@ -54,25 +55,19 @@ an alias, and the Gateway scores all matching candidates. Public aliases that
 contain `/` are therefore not misread as backend-qualified routes by the
 desktop compatibility edge.
 
-## Credential migration invariant
+## Database identity and legacy rejection
 
-Fresh databases never create `api_keys`. Startup first detects whether an
-upgraded database actually contains the legacy table, then processes its rows
-as follows:
+Fresh databases never create `api_keys` and are stamped with an FTE
+`application_id` plus schema version. Reopen accepts only that exact current
+identity and table set. A database with the plaintext `api_keys` table, any
+unversioned populated database, a foreign application ID, an unsupported schema
+version, or an unexpected table is rejected before product schema mutation.
 
-1. Read the legacy value.
-2. Refuse to overwrite a different existing OS credential.
-3. Write when absent.
-4. Read back and compare exact bytes.
-5. Recheck the complete ordered source set inside a SQLite transaction.
-6. Delete all rows and drop the table in that same transaction.
-
-Fixtures interrupt before write, after write, after readback, before retirement,
-and before table drop. Every interruption retains the complete plaintext table
-and rows. A later-row failure, readback mismatch, concurrent source change, or
-OS-store conflict fails closed and also retains the source. Empty preexisting
-tables are retired; a fresh database remains a no-op. Normal credential reads,
-writes, and deletes never use SQLite.
+No independently produced prior `gateway.db` or `gateway-v2.db` corpus was
+available to authenticate. Backward compatibility was explicitly waived, so
+the former synthetic importer and its synthetic crash fixtures were deleted
+instead of being promoted into a false historical migration claim. Normal
+credential reads, writes, and deletes use only the OS credential store.
 
 ## Intentional parity difference
 

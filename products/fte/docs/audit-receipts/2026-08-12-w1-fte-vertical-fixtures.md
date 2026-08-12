@@ -48,7 +48,7 @@ does not expose an authoritative joined-task receipt.
 The Wave 1 workflow checks out full Git history so the baseline ancestry and
 Git object identities are available on GitHub Actions as well as local clones.
 
-## Partial supporting row
+## Subsequent row-15 disposition
 
 ### FTE legacy database
 
@@ -56,13 +56,12 @@ The earlier draft created a current database and then added a test-only legacy
 table. That is not an independently produced prior database and has been
 removed from this change.
 
-Existing production-path tests still support the credential behavior: exact
-write/readback precedes plaintext retirement, every crash boundary preserves
-recoverability, stale stores fail closed, and reopen observes retirement. They
-do not freeze a redacted historical `gateway.db`/`gateway-v2.db` corpus from an
-independent prior release. Because backward compatibility was explicitly
-waived, this row remains partial/supporting rather than manufacturing a state
-baseline.
+No redacted historical `gateway.db`/`gateway-v2.db` corpus from an independent
+prior release exists. Because backward compatibility was explicitly waived,
+the product now rejects legacy and foreign stores before schema mutation and
+the synthetic credential importer has been deleted. A subsequent product-owned
+W1 row freezes this explicit unsupported-input contract rather than
+manufacturing a state migration baseline.
 
 The repository pin policy independently hard-codes both accepted revisions;
 changing `w1-contracts.env` and the manifests/lock together cannot move either

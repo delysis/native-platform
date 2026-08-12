@@ -5,17 +5,15 @@ Free Token Energy is local-first, but local-first is not the same as encrypted.
 ## Local data
 
 - Provider API keys are stored through the platform credential service. Fresh
-  SQLite databases never create plaintext key storage. On upgrade, the app
-  refuses conflicts, requires an exact credential-store readback for every
-  legacy value, and then deletes the rows and drops the legacy table in one
-  SQLite transaction.
+  SQLite databases never create plaintext key storage. The app does not import
+  legacy plaintext stores: it rejects them before schema mutation and tells the
+  operator to move or remove the unsupported database.
 - Use revocable, least-privilege provider keys. Platform credential storage
   reduces exposure but does not make a compromised signed-in account safe.
 - Request logs contain provider ID, public model ID, token count, latency,
   status, and timestamp. Prompts, responses, profile values, and API keys are
   not logged.
 - The signup profile accepts only name, email, and a non-secret password hint.
-  Startup removes the reusable-password field written by older builds.
 - Local GGUF configuration stores the canonical model path and optional
   expected SHA-256 in the private application database. The webview receives
   only the filename and readiness detail, not the full path.

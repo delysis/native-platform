@@ -39,9 +39,9 @@ provider, routing, streaming, and persistence components.
 - SQLite in `src-tauri/src/db.rs` stores only non-secret profile, bounded
   request-log state, and the selected local-model path plus optional expected
   digest; provider credentials live in the OS credential store
-- `src-tauri/src/credential_migration.rs` is the sole compatibility-window
-  reader for a pre-existing legacy plaintext credential table and retires it
-  only after exact OS-store readback
+- the desktop database accepts only a fresh store or the exact current
+  application/schema identity; legacy and foreign databases fail closed before
+  schema mutation, and no plaintext credential importer exists
 - model and provider presentation metadata lives in `src-tauri/src/catalog.rs`;
   protocol codecs, routing, hosted adapters, loopback, and native inference
   remain in their respective reusable workspace crates

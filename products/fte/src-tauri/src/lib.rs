@@ -1,6 +1,5 @@
 pub mod catalog;
 pub mod commands;
-pub mod credential_migration;
 pub mod db;
 pub mod gateway_runtime;
 pub mod secrets;
@@ -33,11 +32,6 @@ pub fn run() {
 
             let db_path = app_data_dir.join("gateway.db");
             let db = Arc::new(Database::new(db_path)?);
-            credential_migration::migrate_legacy_credentials(
-                &db,
-                desktop_gateway_runtime.credential_store().as_ref(),
-                |_| Ok(()),
-            )?;
             desktop_gateway_runtime.bind_database(Arc::clone(&db))?;
             desktop_gateway_runtime.restore_local_model_configuration()?;
 

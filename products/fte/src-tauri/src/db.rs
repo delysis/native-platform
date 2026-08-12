@@ -1,10 +1,18 @@
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 const MAX_REQUEST_LOG_ROWS: i64 = 10_000;
+const APPLICATION_ID: i64 = 0x4654_4531;
+const SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_OBJECTS: [(&str, &str); 4] = [
+    ("index", "idx_request_log_provider"),
+    ("table", "local_model_configuration"),
+    ("table", "master_profile"),
+    ("table", "request_log"),
+];
 
 #[derive(Debug, serde::Serialize)]
 pub struct LogEntry {
@@ -49,6 +57,8 @@ impl Database {
             .with_context(|| format!("failed to open database at {}", db_path.display()))?;
         harden_file_permissions(&db_path)?;
 
+        let state = classify_database(&conn, &db_path)?;
+
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "
@@ -63,7 +73,9 @@ impl Database {
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
-        db.init_schema()?;
+        if state == DatabaseState::Fresh {
+            db.init_schema()?;
+        }
         Ok(db)
     }
 
@@ -101,11 +113,8 @@ impl Database {
                 expected_sha256 TEXT
             );
 
-            DROP TABLE IF EXISTS quota_state;
-
-            -- Older builds asked users to store a reusable password. The app
-            -- now stores only a non-secret hint and removes the unsafe field.
-            DELETE FROM master_profile WHERE key = 'password';
+            PRAGMA application_id = 0x46544531;
+            PRAGMA user_version = 1;
             ",
         )?;
         Ok(())
@@ -306,89 +315,54 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
-
-    /// Compatibility-window input for the OS-secret migration only.
-    pub(crate) fn legacy_api_keys(&self) -> Result<Vec<(String, String)>> {
-        let conn = self.connection()?;
-        if !table_exists(&conn, "api_keys")? {
-            return Ok(Vec::new());
-        }
-        let mut statement =
-            conn.prepare("SELECT provider_id, key_value FROM api_keys ORDER BY provider_id")?;
-        statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
-    }
-
-    /// Retires the plaintext source in one SQLite transaction, but only when
-    /// every row is byte-for-byte identical to the externally verified set.
-    pub(crate) fn retire_legacy_api_keys_if_exact(
-        &self,
-        expected: &[(String, String)],
-    ) -> Result<bool> {
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        if !table_exists(&tx, "api_keys")? {
-            return Ok(expected.is_empty());
-        }
-
-        let current = {
-            let mut statement =
-                tx.prepare("SELECT provider_id, key_value FROM api_keys ORDER BY provider_id")?;
-            statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        if current != expected {
-            return Ok(false);
-        }
-
-        tx.execute("DELETE FROM api_keys", [])?;
-        tx.execute("DROP TABLE api_keys", [])?;
-        tx.commit()?;
-        Ok(true)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn create_legacy_api_key_table(&self) -> Result<()> {
-        let conn = self.connection()?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS api_keys (
-                provider_id TEXT PRIMARY KEY,
-                key_value TEXT NOT NULL
-            );",
-        )
-        .map_err(Into::into)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn seed_legacy_api_key(&self, provider_id: &str, secret: &str) -> Result<()> {
-        self.create_legacy_api_key_table()?;
-        let conn = self.connection()?;
-        conn.execute(
-            "INSERT INTO api_keys (provider_id, key_value) VALUES (?1, ?2)
-             ON CONFLICT(provider_id) DO UPDATE SET key_value=excluded.key_value",
-            params![provider_id, secret],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn legacy_api_key_table_exists(&self) -> Result<bool> {
-        let conn = self.connection()?;
-        table_exists(&conn, "api_keys")
-    }
 }
 
-fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
-        )",
-        params![table],
-        |row| row.get(0),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DatabaseState {
+    Fresh,
+    Current,
+}
+
+fn classify_database(conn: &Connection, path: &Path) -> Result<DatabaseState> {
+    let application_id = conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))?;
+    let schema_version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    let mut statement = conn.prepare(
+        "SELECT type, name FROM sqlite_schema
+         WHERE name NOT LIKE 'sqlite_%'
+         ORDER BY type, name",
+    )?;
+    let schema_objects = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+
+    if application_id == 0 && schema_version == 0 && schema_objects.is_empty() {
+        return Ok(DatabaseState::Fresh);
+    }
+
+    if schema_objects.contains(&("table".to_owned(), "api_keys".to_owned())) {
+        anyhow::bail!(
+            "unsupported legacy database at {}: plaintext api_keys storage is not imported; move or remove this database and start with a fresh FTE store",
+            path.display()
+        );
+    }
+
+    let expected_schema_objects = CURRENT_SCHEMA_OBJECTS
+        .into_iter()
+        .map(|(kind, name)| (kind.to_owned(), name.to_owned()))
+        .collect();
+    if application_id == APPLICATION_ID
+        && schema_version == SCHEMA_VERSION
+        && schema_objects == expected_schema_objects
+    {
+        return Ok(DatabaseState::Current);
+    }
+
+    anyhow::bail!(
+        "unsupported database at {}: expected FTE application_id {APPLICATION_ID:#x}, schema version {SCHEMA_VERSION}, and the exact current schema object set; legacy and foreign databases are not imported",
+        path.display()
     )
-    .map_err(Into::into)
 }
 
 fn nonnegative_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
@@ -463,20 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn reopening_database_removes_legacy_password_field() {
-        let path = test_database_path("password-migration");
-        {
-            let db = Database::new(path.clone()).unwrap();
-            db.save_profile_field("password", "reusable-secret")
-                .unwrap();
-            assert!(db.get_profile_field("password").unwrap().is_some());
-        }
-
-        let reopened = Database::new(path).unwrap();
-        assert!(reopened.get_profile_field("password").unwrap().is_none());
-    }
-
-    #[test]
     fn local_model_configuration_survives_database_reopen() {
         let path = test_database_path("local-model-reopen");
         let configuration = LocalModelConfiguration {
@@ -496,11 +456,92 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_never_creates_the_retired_plaintext_secret_table() {
-        let db = Database::new(test_database_path("no-plaintext-table")).unwrap();
+    fn fresh_database_is_versioned_and_reopens_only_as_the_current_schema() {
+        let path = test_database_path("current-schema");
+        {
+            let db = Database::new(path.clone()).unwrap();
+            let conn = db.connection().unwrap();
+            assert_eq!(
+                conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                APPLICATION_ID
+            );
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+        }
+        Database::new(path).expect("exact current database reopens");
+    }
 
-        assert!(!db.legacy_api_key_table_exists().unwrap());
-        assert!(db.legacy_api_keys().unwrap().is_empty());
+    #[test]
+    fn synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation() {
+        let path = test_database_path("prohibited-plaintext-sentinel");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE api_keys (
+                    provider_id TEXT PRIMARY KEY,
+                    key_value TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        let error = match Database::new(path.clone()) {
+            Ok(_) => panic!("legacy schema must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("unsupported legacy database"));
+        assert!(error.to_string().contains("not imported"));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn unversioned_populated_database_is_rejected_without_schema_adoption() {
+        let path = test_database_path("unversioned-populated");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE operator_data (value TEXT NOT NULL);")
+                .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        let error = match Database::new(path.clone()) {
+            Ok(_) => panic!("unversioned populated database must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("unsupported database"));
+        assert!(error.to_string().contains("not imported"));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn wrong_version_or_unexpected_schema_object_is_rejected() {
+        for (label, mutation) in [
+            ("future-version", "PRAGMA user_version = 2;"),
+            ("unexpected-table", "CREATE TABLE unexpected(value TEXT);"),
+            (
+                "unexpected-view",
+                "CREATE VIEW unexpected_view AS SELECT 1 AS value;",
+            ),
+        ] {
+            let path = test_database_path(label);
+            {
+                let db = Database::new(path.clone()).unwrap();
+                db.connection().unwrap().execute_batch(mutation).unwrap();
+            }
+
+            let error = match Database::new(path) {
+                Ok(_) => panic!("unsupported current-schema mutation must fail closed"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("unsupported database"));
+        }
     }
 
     fn test_database_path(label: &str) -> PathBuf {
@@ -513,5 +554,362 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+}
+
+#[cfg(any())]
+mod w1_tests {
+    use super::*;
+    use platform_vertical_fixtures_v0::{
+        EquivalenceProjectionV0, ObservationEnvelopeV0, VerticalFixtureManifestV0, sha256_identity,
+        validate_baseline, validate_manifest,
+    };
+    use serde::Deserialize;
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const BASELINE_COMMIT: &str = "d022e36cfef1cd6aefcf42a4991d716c936dcb6b";
+    const MANIFEST_BYTES: &[u8] =
+        include_bytes!("../../tests/fixtures/w1/v0/fte-database-rejection.manifest.json");
+    const POLICY_BYTES: &[u8] =
+        include_bytes!("../../tests/fixtures/w1/v0/fte-database-policy-v1.json");
+    const PROJECTION_BYTES: &[u8] =
+        include_bytes!("../../tests/fixtures/w1/v0/fte-database-rejection-projection.json");
+    const SOURCE_BYTES: &[u8] =
+        include_bytes!("../../tests/fixtures/w1/v0/fte-database-production-tree-d022e36.json");
+    const SUPERSEDED_RECEIPT_BYTES: &[u8] =
+        include_bytes!("../../receipts/R7-FTE-OS-CREDENTIAL-ACCEPTANCE.json");
+    static W1_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Deserialize)]
+    struct SourceDescriptor {
+        schema: String,
+        repository_id: String,
+        commit: String,
+        prefixes: Vec<SourcePrefix>,
+        git_blobs: BTreeMap<String, String>,
+        absent_paths: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct SourcePrefix {
+        path: String,
+        boundary: String,
+        sha256: String,
+        byte_len: u64,
+    }
+
+    fn repository_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .to_owned()
+    }
+
+    fn git_output(repository: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repository)
+            .output()
+            .expect("execute source identity command");
+        assert!(
+            output.status.success(),
+            "source identity command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn production_prefix(bytes: &[u8]) -> &[u8] {
+        let boundary = b"\n#[cfg(test)]";
+        let position = bytes
+            .windows(boundary.len())
+            .position(|window| window == boundary)
+            .expect("production/test source boundary");
+        &bytes[..position + 1]
+    }
+
+    fn verify_production_source() {
+        let descriptor: SourceDescriptor =
+            serde_json::from_slice(SOURCE_BYTES).expect("source descriptor");
+        assert_eq!(descriptor.schema, "delysis.production_source_roots.v0");
+        assert_eq!(descriptor.repository_id, "delysis/free-token-energy");
+        assert_eq!(descriptor.commit, BASELINE_COMMIT);
+        let repository = repository_root();
+        let ancestry = Command::new("git")
+            .args(["merge-base", "--is-ancestor", BASELINE_COMMIT, "HEAD"])
+            .current_dir(&repository)
+            .status()
+            .expect("execute baseline ancestry check");
+        assert!(
+            ancestry.success(),
+            "fixture commit must descend from baseline"
+        );
+
+        for prefix in descriptor.prefixes {
+            assert_eq!(prefix.boundary, "first_cfg_test");
+            let current = std::fs::read(repository.join(&prefix.path)).expect("read source");
+            let baseline = git_output(
+                &repository,
+                &["show", &format!("{}:{}", descriptor.commit, prefix.path)],
+            );
+            for bytes in [production_prefix(&current), production_prefix(&baseline)] {
+                let identity = sha256_identity("fte.database.production.prefix", bytes);
+                assert_eq!(identity.digest.hex, prefix.sha256);
+                assert_eq!(identity.length, prefix.byte_len);
+            }
+        }
+
+        for (path, expected_oid) in descriptor.git_blobs {
+            for revision in [&descriptor.commit, "HEAD"] {
+                let actual = git_output(&repository, &["rev-parse", &format!("{revision}:{path}")]);
+                assert_eq!(String::from_utf8(actual).unwrap().trim(), expected_oid);
+            }
+        }
+
+        for path in descriptor.absent_paths {
+            assert!(
+                !repository.join(&path).exists(),
+                "retired path returned: {path}"
+            );
+            for revision in [&descriptor.commit, "HEAD"] {
+                let status = Command::new("git")
+                    .args(["cat-file", "-e", &format!("{revision}:{path}")])
+                    .current_dir(&repository)
+                    .stderr(Stdio::null())
+                    .status()
+                    .expect("check retired source path");
+                assert!(
+                    !status.success(),
+                    "retired path exists at {revision}:{path}"
+                );
+            }
+        }
+    }
+
+    fn temporary_database(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fte-w1-database-{label}-{}-{}.sqlite",
+            std::process::id(),
+            W1_DATABASE_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn tables(conn: &Connection) -> BTreeSet<String> {
+        let mut statement = conn
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .expect("prepare table inventory");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query table inventory")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect table inventory")
+    }
+
+    #[test]
+    fn w1_legacy_database_is_explicitly_unsupported() {
+        let manifest: VerticalFixtureManifestV0 =
+            serde_json::from_slice(MANIFEST_BYTES).expect("parse database manifest");
+        validate_manifest(&manifest).expect("valid database manifest");
+        let case = &manifest.cases[0];
+        assert_eq!(case.source.commit, BASELINE_COMMIT);
+        assert_eq!(
+            sha256_identity(case.source.production_tree.id.clone(), SOURCE_BYTES),
+            case.source.production_tree
+        );
+        assert_eq!(
+            sha256_identity(case.inputs[0].identity.id.clone(), POLICY_BYTES),
+            case.inputs[0].identity
+        );
+        assert_eq!(
+            sha256_identity(case.expected_projection.id.clone(), PROJECTION_BYTES),
+            case.expected_projection
+        );
+        assert_eq!(
+            sha256_identity(
+                manifest.negative_evidence[0].artifact.id.clone(),
+                SUPERSEDED_RECEIPT_BYTES
+            ),
+            manifest.negative_evidence[0].artifact
+        );
+        verify_production_source();
+
+        let policy: Value = serde_json::from_slice(POLICY_BYTES).expect("parse database policy");
+        assert_eq!(policy["historical_database_available"], false);
+        assert_eq!(policy["backward_compatibility_required"], false);
+        assert_eq!(
+            policy["legacy_sentinel"]["purpose"],
+            "adversarial unsupported-input sentinel, not a historical database fixture"
+        );
+
+        let legacy_schema = policy["legacy_sentinel"]["schema_sql"]
+            .as_str()
+            .expect("legacy sentinel schema");
+        let legacy_identity = sha256_identity(
+            "fte.database.legacy_sentinel.schema",
+            legacy_schema.as_bytes(),
+        );
+        assert_eq!(case.state_identities[0].baseline.identity, legacy_identity);
+        let legacy_path = temporary_database("legacy-sentinel");
+        {
+            let conn = Connection::open(&legacy_path).expect("create unsupported sentinel");
+            conn.execute_batch(legacy_schema)
+                .expect("create unsupported schema");
+            conn.execute(
+                "INSERT INTO api_keys (provider_id, key_value) VALUES (?1, ?2)",
+                params![
+                    "sentinel",
+                    policy["legacy_sentinel"]["secret_value"].as_str()
+                ],
+            )
+            .expect("insert noncredential sentinel");
+        }
+        let legacy_before = std::fs::read(&legacy_path).expect("read sentinel before rejection");
+        let legacy_error = match Database::new(legacy_path.clone()) {
+            Ok(_) => panic!("legacy sentinel must not open"),
+            Err(error) => error,
+        };
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("unsupported legacy database")
+        );
+        assert_eq!(
+            std::fs::read(&legacy_path).expect("read sentinel after rejection"),
+            legacy_before,
+            "rejection must not mutate the unsupported database"
+        );
+
+        let unversioned_path = temporary_database("unversioned-sentinel");
+        {
+            let conn = Connection::open(&unversioned_path).expect("create unversioned sentinel");
+            conn.execute_batch(
+                policy["unversioned_sentinel"]["schema_sql"]
+                    .as_str()
+                    .expect("unversioned sentinel schema"),
+            )
+            .expect("create unversioned schema");
+        }
+        let unversioned_before =
+            std::fs::read(&unversioned_path).expect("read unversioned sentinel");
+        let unversioned_error = match Database::new(unversioned_path.clone()) {
+            Ok(_) => panic!("unversioned populated database must not open"),
+            Err(error) => error,
+        };
+        assert!(
+            unversioned_error
+                .to_string()
+                .contains("unsupported database")
+        );
+        assert_eq!(
+            std::fs::read(&unversioned_path).expect("reread unversioned sentinel"),
+            unversioned_before
+        );
+
+        let fresh_path = temporary_database("fresh-current");
+        let (application_id, schema_version, current_tables) = {
+            let db = Database::new(fresh_path.clone()).expect("open fresh database");
+            let conn = db.connection().expect("lock fresh database");
+            let application_id = conn
+                .query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
+                .expect("read application ID");
+            let schema_version = conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("read schema version");
+            (application_id, schema_version, tables(&conn))
+        };
+        assert_eq!(application_id, APPLICATION_ID);
+        assert_eq!(schema_version, SCHEMA_VERSION);
+        let expected_tables = policy["fresh_database"]["tables"]
+            .as_array()
+            .expect("current table policy")
+            .iter()
+            .map(|value| value.as_str().expect("table name").to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(current_tables, expected_tables);
+        let signature = format!(
+            "application_id={application_id:#010x};user_version={schema_version};tables={}",
+            current_tables.iter().cloned().collect::<Vec<_>>().join(",")
+        );
+        assert_eq!(
+            signature,
+            policy["fresh_database"]["signature"]
+                .as_str()
+                .expect("current schema signature")
+        );
+        Database::new(fresh_path).expect("exact current database reopens");
+
+        let projection: EquivalenceProjectionV0 = serde_json::from_value(json!({
+            "ordered_events": [
+                {"sequence": 0, "operation_id": "fte.database.unsupported_legacy", "attempt_id": "database.open.legacy.1", "correlation_id": "fte.database.policy.w1", "kind": "failed", "payload": null},
+                {"sequence": 1, "operation_id": "fte.database.fresh_current", "attempt_id": "database.open.fresh.1", "correlation_id": "fte.database.policy.w1", "kind": "completed", "payload": null}
+            ],
+            "durable_state": [{
+                "state_id": "fte.database.legacy_sentinel_schema",
+                "schema_id": "delysis.w1.fte.unsupported_legacy_sentinel.v1",
+                "before": legacy_identity,
+                "after": legacy_identity,
+                "disposition": "unchanged"
+            }],
+            "lifecycle": [
+                {"operation_id": "fte.database.unsupported_legacy", "attempt_id": "database.open.legacy.1", "correlation_id": "fte.database.policy.w1", "terminal": "failed", "released": true},
+                {"operation_id": "fte.database.fresh_current", "attempt_id": "database.open.fresh.1", "correlation_id": "fte.database.policy.w1", "terminal": "completed", "released": true}
+            ],
+            "ownership": {"active_operations": 0, "retained_tasks": 0, "expected_workers": 0, "joined_workers": 0},
+            "output_facts": {
+                "historical_database_available": {"kind": "boolean", "value": false},
+                "legacy_opened": {"kind": "boolean", "value": false},
+                "legacy_bytes_unchanged": {"kind": "boolean", "value": true},
+                "legacy_import_module_present": {"kind": "boolean", "value": false},
+                "unversioned_database_rejected": {"kind": "boolean", "value": true},
+                "fresh_database_opened": {"kind": "boolean", "value": true},
+                "current_database_reopened": {"kind": "boolean", "value": true},
+                "application_id": {"kind": "integer", "value": application_id},
+                "schema_version": {"kind": "integer", "value": schema_version}
+            },
+            "fail_closed_facts": [
+                "plaintext legacy schema was rejected before product schema mutation",
+                "unversioned populated schema was rejected before adoption",
+                "unsupported input was not represented as historical migration evidence",
+                "no credential store or hosted network authority was required"
+            ]
+        }))
+        .expect("construct production-derived database projection");
+        let expected: EquivalenceProjectionV0 =
+            serde_json::from_slice(PROJECTION_BYTES).expect("parse expected database projection");
+        assert_eq!(projection, expected);
+        let observation: ObservationEnvelopeV0 = serde_json::from_value(json!({
+            "schema": "delysis.vertical_observation.v0",
+            "vertical_id": manifest.vertical_id,
+            "case_id": case.case_id,
+            "implementation_revision": case.source.commit,
+            "observed_prerequisites": [],
+            "evidence": {
+                "schema": "delysis.evidence_claim.v0",
+                "tier": "reproducible",
+                "threat_model": "production database opening rejects generated unsupported-input sentinels without claiming historical migration equivalence",
+                "exact_source": case.source.production_tree.digest,
+                "exact_runtime_or_artifact": case.inputs[0].identity.digest,
+                "execution_kind": "fixture",
+                "omitted_claims": manifest.omitted_claims,
+                "negative_evidence": []
+            },
+            "projection": projection
+        }))
+        .expect("construct database observation");
+        validate_baseline(
+            &manifest,
+            &case.case_id,
+            PROJECTION_BYTES,
+            &[],
+            &observation,
+        )
+        .expect("central protocol accepts the explicit no-legacy contract");
     }
 }
