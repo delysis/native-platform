@@ -12,4 +12,5 @@ rustup run 1.92.0 cargo run --locked -p xtask -- policy
 ./crates/native/scripts/check-architecture.sh
 ./crates/native/scripts/check-workflow-policy.sh .
 ./crates/native/tests/workflow_policy.sh
+./scripts/check-native-import-history.sh
 pnpm install --lockfile-only --frozen-lockfile --offline

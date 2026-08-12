@@ -52,6 +52,9 @@ jobs:
         run: |
           ./crates/native/scripts/check-workflow-policy.sh .
           ./crates/native/tests/workflow_policy.sh
+      - name: Native import history
+        if: runner.os == 'Linux'
+        run: ./scripts/check-native-import-history.sh
       - name: Shell policy
         run: rustup run 1.92.0 cargo run --locked -p xtask -- policy
       - name: pnpm lock

@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
-  "goal": "W2-INTEGRATION",
-  "status": "integration_candidate_no_imports",
-  "production_source_imported": false,
-  "source_history_imported": false,
+  "goal": "W3-IMPORT-NATIVE",
+  "status": "native_import_candidate_local_not_pushed",
+  "production_source_imported": true,
+  "source_history_imported": true,
   "integration_candidate": {
-    "accepted": false,
+    "accepted": true,
     "pushed": true,
     "product_releases_modified": false,
-    "source_imported": false,
-    "history_imported": false,
+    "source_imported": true,
+    "history_imported": true,
     "manifest": "tests/integration-current/Cargo.toml",
     "coverage": "tests/integration-current/COVERAGE.md"
   },
@@ -44,8 +44,8 @@
         }
       ],
       "destination_prefix": "crates/native",
-      "import_commit": null,
-      "path_dependency_cutover_commit": null,
+      "import_commit": "152a0dda9ba0d1096022d11ddbd08489f524ab31",
+      "path_dependency_cutover_commit": "c35c6b2d42f60939f3a3478212743c9c82f28b80",
       "old_repo_status": "active",
       "migration_role": "first_party_import"
     },
