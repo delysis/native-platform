@@ -8,20 +8,22 @@ terminalization, shutdown coordination, native-host ownership, and durable
 storage are production code.
 
 The production baseline is commit
-`2db2d4568b277f6829b3b8e3623fce59435847c2`. It exposes an owner-level shutdown
+`797500060047ccd10f9810fb4d5c8f374e00eb08`. It exposes an owner-level shutdown
 receipt only after Gateway closure and native-host join. The receipt carries
 the exact expected and joined backend worker IDs plus the retained task count.
-Joined IDs are canonicalized so scheduling order cannot make evidence flaky.
+The projection canonicalizes the joined worker sets so scheduler completion
+order cannot make evidence flaky while the shared contract still observes real
+completion order.
 The checked-in source descriptor authenticates the pre-test production prefixes
 of the router and desktop owner, plus exact Git blobs for the product database,
 desktop assembly, and credential store.
 
 The input corpus SHA-256 is
-`8a2308edc6fe670b60a28329b4dc621e3e094fdbc75bb77fbba92e7821dc13ec`;
+`2692b9ddb4e2645e3d13b644e859463f7f46d770eb3d4ca1e4ea51b999e54014`;
 the expected projection SHA-256 is
-`15c79a6a156efa06e2ed6e9adcf77d0eb7e0840bd30326e07a0fc23d1061fcd7`;
+`8106e7832093fb94f548dfe47de974bc5b897c7e7c6b0950f14f9c1e88226b76`;
 and the manifest SHA-256 is
-`172597b6ba3127b885dc3410cf03abdb093dc66fa94d499bf8ac4ee9cf9f2dd2`.
+`94081e34420a407f167f80dcbd48e00c4d76b9dbb1a97427fa7ed22a8effa1a1`.
 
 ## Replay
 
@@ -33,13 +35,14 @@ owner shutdown begins. The fixture observes the production cancellation call,
 proves that a second request is rejected with `gateway_quiescing`, then releases
 the backend's authoritative cancelled result.
 
-The shutdown receipt is awaited only after that terminal is observed. It proves
-all nine registered backend worker IDs were joined, zero tasks were retained,
-the Gateway is closed with zero active operations, and the application-owned
-native host joined. The original owner is dropped. A distinct production owner
-then reopens the same product database, reads the exact marker, registers a
-fresh deterministic backend instance, accepts and completes new work, and
-returns its own zero-retention shutdown receipt.
+The fixture proves shutdown remains unfinished while the authoritative backend
+final is withheld. After release, the receipt proves all nine registered
+backend worker IDs were joined, zero tasks were retained, the Gateway is closed
+with zero active operations, and the application-owned native host joined. The
+original owner is dropped. A distinct production owner with a separately frozen
+runtime ID then reopens the same product database, reads the exact marker,
+registers a fresh deterministic backend instance, accepts and completes new
+work, and returns its own exact 9/9 zero-retention shutdown receipt.
 
 The counting credential store asserts zero reads, writes, and deletes. The
 fixture executes an exact local route and never starts a listener or hosted

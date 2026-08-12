@@ -39,12 +39,12 @@
       "correlation_id": "fte.quit_relaunch.w1",
       "kind": "completed",
       "payload": {
-        "id": "fte.runtime.joined_worker_ids",
+        "id": "fte.runtime.first.joined_worker_ids",
         "digest": {
           "algorithm": "sha256",
-          "hex": "485b82ee99d5a74b01399c8a5ebdf83bd01dccf0ec69387dc36ee717b33ead4d"
+          "hex": "eedb673b24eff986a0600a310424f7c390e5f643b6d2f1c313849f86166a7e19"
         },
-        "length": 245
+        "length": 268
       }
     },
     {
@@ -68,7 +68,14 @@
       "attempt_id": "owner.2.fresh",
       "correlation_id": "fte.quit_relaunch.w1",
       "kind": "completed",
-      "payload": null
+      "payload": {
+        "id": "fte.runtime.fresh.joined_worker_ids",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "e40d6028fa7b011bfbbf6eb8e64f9753a0b8802763e74eff0fc5f549e41358e2"
+        },
+        "length": 268
+      }
     }
   ],
   "durable_state": [
@@ -134,18 +141,27 @@
   "ownership": {
     "active_operations": 0,
     "retained_tasks": 0,
-    "expected_workers": 9,
-    "joined_workers": 9
+    "expected_workers": 18,
+    "joined_workers": 18
   },
   "output_facts": {
     "admission_closed_during_quit": { "kind": "boolean", "value": true },
     "active_request_cancelled": { "kind": "boolean", "value": true },
-    "authoritative_terminal_observed_before_shutdown_receipt": { "kind": "boolean", "value": true },
-    "exact_joined_worker_ids": {
+    "authoritative_terminal_released_before_shutdown_receipt": { "kind": "boolean", "value": true },
+    "first_runtime_id": { "kind": "text", "value": "fte-w1-runtime-owner-1" },
+    "fresh_runtime_id": { "kind": "text", "value": "fte-w1-runtime-owner-2" },
+    "first_exact_joined_worker_ids": {
       "kind": "digest",
       "value": {
         "algorithm": "sha256",
-        "hex": "485b82ee99d5a74b01399c8a5ebdf83bd01dccf0ec69387dc36ee717b33ead4d"
+        "hex": "eedb673b24eff986a0600a310424f7c390e5f643b6d2f1c313849f86166a7e19"
+      }
+    },
+    "fresh_exact_joined_worker_ids": {
+      "kind": "digest",
+      "value": {
+        "algorithm": "sha256",
+        "hex": "e40d6028fa7b011bfbbf6eb8e64f9753a0b8802763e74eff0fc5f549e41358e2"
       }
     },
     "native_owner_joined": { "kind": "boolean", "value": true },

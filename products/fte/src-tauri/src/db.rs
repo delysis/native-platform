@@ -636,7 +636,7 @@ mod w1_tests {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    const BASELINE_COMMIT: &str = "2db2d4568b277f6829b3b8e3623fce59435847c2";
+    const BASELINE_COMMIT: &str = "797500060047ccd10f9810fb4d5c8f374e00eb08";
     const MANIFEST_BYTES: &[u8] =
         include_bytes!("../../tests/fixtures/w1/v0/fte-database-rejection.manifest.json");
     const POLICY_BYTES: &[u8] =
@@ -729,6 +729,12 @@ mod w1_tests {
         }
 
         for (path, expected_oid) in descriptor.git_blobs {
+            let working_tree =
+                git_output(&repository, &["hash-object", "--no-filters", "--", &path]);
+            assert_eq!(
+                String::from_utf8(working_tree).unwrap().trim(),
+                expected_oid
+            );
             for revision in [&descriptor.commit, "HEAD"] {
                 let actual = git_output(&repository, &["rev-parse", &format!("{revision}:{path}")]);
                 assert_eq!(String::from_utf8(actual).unwrap().trim(), expected_oid);

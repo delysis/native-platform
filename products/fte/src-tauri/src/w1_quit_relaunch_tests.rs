@@ -18,7 +18,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-const BASELINE_COMMIT: &str = "2db2d4568b277f6829b3b8e3623fce59435847c2";
+const BASELINE_COMMIT: &str = "797500060047ccd10f9810fb4d5c8f374e00eb08";
 const MANIFEST_BYTES: &[u8] =
     include_bytes!("../../tests/fixtures/w1/v0/fte-quit-relaunch.manifest.json");
 const INPUT_BYTES: &[u8] =
@@ -29,8 +29,41 @@ const SOURCE_BYTES: &[u8] =
     include_bytes!("../../tests/fixtures/w1/v0/fte-quit-relaunch-production-tree-2db2d45.json");
 static DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
+struct FixtureDirectory {
+    path: PathBuf,
+}
+
+impl FixtureDirectory {
+    fn new() -> Self {
+        loop {
+            let path = std::env::temp_dir().join(format!(
+                "fte-w1-quit-relaunch-{}-{}",
+                std::process::id(),
+                DATABASE_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Self { path },
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create isolated fixture directory: {error}"),
+            }
+        }
+    }
+
+    fn database_path(&self) -> PathBuf {
+        self.path.join("gateway.db")
+    }
+}
+
+impl Drop for FixtureDirectory {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).expect("remove isolated fixture directory");
+    }
+}
+
 #[derive(Deserialize)]
 struct FixtureInput {
+    first_runtime_id: String,
+    fresh_runtime_id: String,
     active_request_id: String,
     rejected_request_id: String,
     fresh_request_id: String,
@@ -339,19 +372,16 @@ fn verify_production_source() {
     }
 
     for (path, expected_oid) in descriptor.git_blobs {
+        let working_tree = git_output(&repository, &["hash-object", "--no-filters", "--", &path]);
+        assert_eq!(
+            String::from_utf8(working_tree).unwrap().trim(),
+            expected_oid
+        );
         for revision in [&descriptor.commit, "HEAD"] {
             let actual = git_output(&repository, &["rev-parse", &format!("{revision}:{path}")]);
             assert_eq!(String::from_utf8(actual).unwrap().trim(), expected_oid);
         }
     }
-}
-
-fn database_path() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "fte-w1-quit-relaunch-{}-{}.sqlite",
-        std::process::id(),
-        DATABASE_ID.fetch_add(1, Ordering::Relaxed)
-    ))
 }
 
 #[tokio::test]
@@ -378,12 +408,19 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
 
     let credentials = Arc::new(CountingCredentialStore::default());
     let store: Arc<dyn CredentialStore> = credentials.clone();
-    let database_path = database_path();
+    let fixture_directory = FixtureDirectory::new();
+    let database_path = fixture_directory.database_path();
     let database = Arc::new(Database::new(database_path.clone()).expect("product database"));
     database
         .save_profile_field(&input.durable_profile_key, &input.durable_profile_value)
         .expect("persist product profile state");
-    let owner = Arc::new(GatewayRuntimeOwner::new_with_store(store).expect("first owner"));
+    let owner = Arc::new(
+        GatewayRuntimeOwner::new_with_store_and_runtime_id(
+            store,
+            RequestId(input.first_runtime_id.clone()),
+        )
+        .expect("first owner"),
+    );
     owner
         .bind_database(Arc::clone(&database))
         .expect("bind product database");
@@ -407,6 +444,10 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
         .await
         .expect("observe cancellation")
         .forget();
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown receipt cannot precede authoritative backend final release"
+    );
     assert_eq!(controlled.cancellations.load(Ordering::Acquire), 1);
     let rejected = first_gateway
         .execute(fixture_request(&input.rejected_request_id, &input))
@@ -421,6 +462,7 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
         .expect_err("quit cancels active work");
     assert_eq!(cancelled.code, "fixture_quit_cancelled");
     let first_report = shutdown.await.expect("shutdown task");
+    assert_eq!(first_report.runtime_id.0, input.first_runtime_id);
     first_report
         .gateway
         .result
@@ -430,8 +472,10 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
         first_report.gateway.expected_worker_ids,
         input.expected_worker_ids
     );
+    let mut first_joined_worker_ids = first_report.gateway.joined_worker_ids.clone();
+    first_joined_worker_ids.sort_unstable();
     assert_eq!(
-        first_report.gateway.joined_worker_ids,
+        first_joined_worker_ids,
         first_report.gateway.expected_worker_ids
     );
     assert_eq!(first_report.gateway.retained_tasks, 0);
@@ -452,7 +496,11 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
         Some(input.durable_profile_value.clone())
     );
     let store: Arc<dyn CredentialStore> = credentials.clone();
-    let fresh_owner = GatewayRuntimeOwner::new_with_store(store).expect("fresh owner");
+    let fresh_owner = GatewayRuntimeOwner::new_with_store_and_runtime_id(
+        store,
+        RequestId(input.fresh_runtime_id.clone()),
+    )
+    .expect("fresh owner");
     fresh_owner
         .bind_database(reopened)
         .expect("bind reopened product database");
@@ -472,18 +520,26 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
     assert_eq!(response.status, TerminalStatus::Completed);
     assert_eq!(response.request_id.0, input.fresh_request_id);
     let fresh_report = fresh_owner.shutdown_with_report().await;
+    assert_eq!(fresh_report.runtime_id.0, input.fresh_runtime_id);
     fresh_report
         .gateway
         .result
         .clone()
         .expect("fresh Gateway shutdown");
     assert_eq!(
-        fresh_report.gateway.joined_worker_ids,
+        fresh_report.gateway.expected_worker_ids,
         input.expected_worker_ids
+    );
+    let mut fresh_joined_worker_ids = fresh_report.gateway.joined_worker_ids.clone();
+    fresh_joined_worker_ids.sort_unstable();
+    assert_eq!(
+        fresh_joined_worker_ids,
+        fresh_report.gateway.expected_worker_ids
     );
     assert_eq!(fresh_report.gateway.retained_tasks, 0);
     assert!(fresh_report.native_host_joined);
     assert_eq!(credentials.accesses(), 0);
+    drop(fresh_owner);
 
     let durable_identity = sha256_identity(
         "fte.runtime.profile.marker",
@@ -491,8 +547,22 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
     );
     assert_eq!(case.state_identities[0].baseline.identity, durable_identity);
     let joined_identity = sha256_identity(
-        "fte.runtime.joined_worker_ids",
-        input.expected_worker_ids.join("\n").as_bytes(),
+        "fte.runtime.first.joined_worker_ids",
+        format!(
+            "{}\n{}",
+            input.first_runtime_id,
+            input.expected_worker_ids.join("\n")
+        )
+        .as_bytes(),
+    );
+    let fresh_joined_identity = sha256_identity(
+        "fte.runtime.fresh.joined_worker_ids",
+        format!(
+            "{}\n{}",
+            input.fresh_runtime_id,
+            input.expected_worker_ids.join("\n")
+        )
+        .as_bytes(),
     );
     let projection: EquivalenceProjectionV0 = serde_json::from_value(json!({
         "ordered_events": [
@@ -502,7 +572,7 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
             {"sequence": 3, "operation_id": input.active_request_id, "attempt_id": "owner.1.active", "correlation_id": "fte.quit_relaunch.w1", "kind": "cancelled", "payload": null},
             {"sequence": 4, "operation_id": "fte.owner.1", "attempt_id": "owner.1.quit", "correlation_id": "fte.quit_relaunch.w1", "kind": "completed", "payload": joined_identity},
             {"sequence": 5, "operation_id": "fte.database.profile", "attempt_id": "owner.2.reopen", "correlation_id": "fte.quit_relaunch.w1", "kind": "completed", "payload": durable_identity},
-            {"sequence": 6, "operation_id": input.fresh_request_id, "attempt_id": "owner.2.fresh", "correlation_id": "fte.quit_relaunch.w1", "kind": "completed", "payload": null}
+            {"sequence": 6, "operation_id": input.fresh_request_id, "attempt_id": "owner.2.fresh", "correlation_id": "fte.quit_relaunch.w1", "kind": "completed", "payload": fresh_joined_identity}
         ],
         "durable_state": [{
             "state_id": "fte.runtime.profile",
@@ -520,15 +590,18 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
         ],
         "ownership": {
             "active_operations": 0,
-            "retained_tasks": first_report.gateway.retained_tasks,
-            "expected_workers": first_report.gateway.expected_worker_ids.len(),
-            "joined_workers": first_report.gateway.joined_worker_ids.len()
+            "retained_tasks": first_report.gateway.retained_tasks + fresh_report.gateway.retained_tasks,
+            "expected_workers": first_report.gateway.expected_worker_ids.len() + fresh_report.gateway.expected_worker_ids.len(),
+            "joined_workers": first_report.gateway.joined_worker_ids.len() + fresh_report.gateway.joined_worker_ids.len()
         },
         "output_facts": {
             "admission_closed_during_quit": {"kind": "boolean", "value": true},
             "active_request_cancelled": {"kind": "boolean", "value": true},
-            "authoritative_terminal_observed_before_shutdown_receipt": {"kind": "boolean", "value": true},
-            "exact_joined_worker_ids": {"kind": "digest", "value": joined_identity.digest},
+            "authoritative_terminal_released_before_shutdown_receipt": {"kind": "boolean", "value": true},
+            "first_runtime_id": {"kind": "text", "value": input.first_runtime_id},
+            "fresh_runtime_id": {"kind": "text", "value": input.fresh_runtime_id},
+            "first_exact_joined_worker_ids": {"kind": "digest", "value": joined_identity.digest},
+            "fresh_exact_joined_worker_ids": {"kind": "digest", "value": fresh_joined_identity.digest},
             "native_owner_joined": {"kind": "boolean", "value": first_report.native_host_joined},
             "same_product_database_reopened": {"kind": "boolean", "value": true},
             "fresh_owner_distinct": {"kind": "boolean", "value": true},

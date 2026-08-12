@@ -1,19 +1,19 @@
 {
   "schema": "delysis.production_source_roots.v0",
   "repository_id": "delysis/free-token-energy",
-  "commit": "2db2d4568b277f6829b3b8e3623fce59435847c2",
+  "commit": "797500060047ccd10f9810fb4d5c8f374e00eb08",
   "prefixes": [
     {
       "path": "crates/fte-router/src/lib.rs",
       "boundary": "first_cfg_test",
-      "sha256": "7301a69a9c20d10c263849a40882ec63cff48c1aa058c203e3bf31f7041afc48",
-      "byte_len": 53715
+      "sha256": "9d402ebdda2f6fedcb0f35b6778854db1c835c7d6f3cd931e8154ec6c6853dfa",
+      "byte_len": 53660
     },
     {
       "path": "src-tauri/src/gateway_runtime.rs",
       "boundary": "first_cfg_test",
-      "sha256": "d3a934075edabdf37b102421404de5407462eaa812986836f9ae886dbbc1d436",
-      "byte_len": 45144
+      "sha256": "8851d5671be048401ab918ee4ae539c38d621248451b80f870b798915919f838",
+      "byte_len": 45532
     },
     {
       "path": "src-tauri/src/db.rs",

@@ -8,12 +8,12 @@
       "case_id": "gateway_owner.quit_relaunch",
       "source": {
         "repository_id": "delysis/free-token-energy",
-        "commit": "2db2d4568b277f6829b3b8e3623fce59435847c2",
+        "commit": "797500060047ccd10f9810fb4d5c8f374e00eb08",
         "production_tree": {
           "id": "fte.quit_relaunch.production.source.2db2d45",
           "digest": {
             "algorithm": "sha256",
-            "hex": "20789e5f36f63fe558ffe8b9e047ebbb019e0b9c11accd9583909db23f42ec2b"
+            "hex": "d8578c94683fc597c5ce8bb4dec1898b379c40f450bc22a957c81513b54df0f3"
           },
           "length": 950
         }
@@ -24,9 +24,9 @@
             "id": "fte.quit_relaunch.input.v1",
             "digest": {
               "algorithm": "sha256",
-              "hex": "8a2308edc6fe670b60a28329b4dc621e3e094fdbc75bb77fbba92e7821dc13ec"
+              "hex": "2692b9ddb4e2645e3d13b644e859463f7f46d770eb3d4ca1e4ea51b999e54014"
             },
-            "length": 1009
+            "length": 1105
           },
           "availability": "checked_in",
           "relative_path": "tests/fixtures/w1/v0/fte-quit-relaunch-input-v1.json"
@@ -74,9 +74,9 @@
         "id": "fte.quit_relaunch.expected_projection",
         "digest": {
           "algorithm": "sha256",
-          "hex": "15c79a6a156efa06e2ed6e9adcf77d0eb7e0840bd30326e07a0fc23d1061fcd7"
+          "hex": "8106e7832093fb94f548dfe47de974bc5b897c7e7c6b0950f14f9c1e88226b76"
         },
-        "length": 5106
+        "length": 5714
       }
     }
   ],

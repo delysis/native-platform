@@ -64,12 +64,12 @@ W1 row freezes this explicit unsupported-input contract rather than
 manufacturing a state migration baseline.
 
 The row-15 manifest is now complete. It binds production baseline
-`2db2d4568b277f6829b3b8e3623fce59435847c2`, policy input SHA-256
+`797500060047ccd10f9810fb4d5c8f374e00eb08`, policy input SHA-256
 `49e1517e829213c7ab7ca70a2a60410068ed00c123d90b4f094d28a10957ec92`,
 expected projection SHA-256
 `846b0d8e11a1408f0094b2b277d582591e2c0a315e9f22b11b40aa5cb795bb3b`,
 and manifest SHA-256
-`941f4f46515b3ac68f936270723c1d52b12a433a71194699e1a2c6fd8f1cb46a`.
+`7d5478edd7523fd24401d0d6b4643fa4d9a2a3e1ebf9db2a7a025ff2106eb768`.
 The source descriptor authenticates the production database and runtime
 prefixes, exact desktop/secret blobs, and absence of the retired importer.
 
