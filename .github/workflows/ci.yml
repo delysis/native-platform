@@ -26,6 +26,9 @@ jobs:
           rustup run 1.92.0 rustc --version --verbose
           rustup run 1.92.0 cargo --version
           pnpm --version
+      - name: Enable long Git paths on Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
       - name: Rust format
         run: rustup run 1.92.0 cargo fmt --all -- --check
       - name: Rust tests
