@@ -821,9 +821,11 @@ pub trait TicketCancellation: Send + Sync {
 /// Executor-owned lifecycle authority retained until the backend publishes its
 /// authoritative result. Implementations must terminalize and release their
 /// production operation record from this callback; consumer ticket drops do
-/// not own release.
-pub trait TicketLifecycleLease: Send {
-    fn finish(self: Box<Self>, result: &Result<GatewayResponse, GatewayError>);
+/// not own release. A callback error replaces the backend result so lifecycle
+/// failure can never be reported to the consumer as successful completion.
+pub trait TicketLifecycleLease: Send + Sync {
+    fn terminal(&self, result: &Result<GatewayResponse, GatewayError>) -> Result<(), GatewayError>;
+    fn release(&self) -> Result<(), GatewayError>;
 }
 
 pub struct GatewayTicket {
@@ -831,6 +833,7 @@ pub struct GatewayTicket {
     pub events: mpsc::Receiver<GatewayEvent>,
     final_response: Option<oneshot::Receiver<Result<GatewayResponse, GatewayError>>>,
     cancellation: Arc<dyn TicketCancellation>,
+    lifecycle_lease: Option<Arc<dyn TicketLifecycleLease>>,
     terminal_observed: Arc<AtomicBool>,
     cancel_on_drop: bool,
 }
@@ -858,6 +861,7 @@ impl GatewayTicket {
             events,
             final_response: Some(final_response),
             cancellation,
+            lifecycle_lease: None,
             terminal_observed,
             cancel_on_drop: true,
         }
@@ -882,11 +886,30 @@ impl GatewayTicket {
                     "the backend stopped before returning an authoritative result",
                 ))
             });
-            lease.finish(&result);
+            let result = match lease.terminal(&result) {
+                Ok(()) => result,
+                Err(lifecycle_error) => Err(lifecycle_error),
+            };
+            let result = match lease.release() {
+                Ok(()) => result,
+                Err(lifecycle_error) => Err(lifecycle_error),
+            };
             let _ = final_tx.send(result);
         });
         self.final_response = Some(final_rx);
         self
+    }
+
+    #[must_use]
+    pub fn with_admission_lease_and_deadlines(
+        mut self,
+        lease: Box<dyn TicketLifecycleLease>,
+        policy: DeadlinePolicy,
+        elapsed: Duration,
+        event_capacity: usize,
+    ) -> Self {
+        self.lifecycle_lease = Some(Arc::from(lease));
+        self.with_deadlines(policy, elapsed, event_capacity)
     }
 
     /// Applies request deadlines to the ticket itself, so embedded Rust and
@@ -902,7 +925,8 @@ impl GatewayTicket {
         elapsed: Duration,
         event_capacity: usize,
     ) -> Self {
-        if policy.first_token_ms.is_none()
+        if self.lifecycle_lease.is_none()
+            && policy.first_token_ms.is_none()
             && policy.idle_stream_ms.is_none()
             && policy.total_ms.is_none()
         {
@@ -913,6 +937,7 @@ impl GatewayTicket {
         let Some(mut upstream_final) = self.final_response.take() else {
             return self;
         };
+        let lifecycle_lease = self.lifecycle_lease.take();
         let (placeholder_tx, placeholder_rx) = mpsc::channel(1);
         drop(placeholder_tx);
         let mut upstream_events = std::mem::replace(&mut self.events, placeholder_rx);
@@ -928,8 +953,39 @@ impl GatewayTicket {
         let cancellation_for_task = Arc::clone(&cancellation);
 
         tokio::spawn(async move {
+            struct ExecutorRelease {
+                lease: Option<Arc<dyn TicketLifecycleLease>>,
+            }
+
+            impl ExecutorRelease {
+                fn terminal(
+                    &self,
+                    result: &Result<GatewayResponse, GatewayError>,
+                ) -> Result<(), GatewayError> {
+                    self.lease
+                        .as_ref()
+                        .map_or(Ok(()), |lease| lease.terminal(result))
+                }
+
+                fn release(&self) -> Result<(), GatewayError> {
+                    self.lease.as_ref().map_or(Ok(()), |lease| lease.release())
+                }
+            }
+
+            let release = ExecutorRelease {
+                lease: lifecycle_lease,
+            };
+            let retains_executor = release.lease.is_some();
             let Ok(terminal_permit) = event_tx.clone().reserve_owned().await else {
-                let _ = cancellation_for_task.cancel(CancelTarget::Request);
+                let result = upstream_final.await.unwrap_or_else(|_| {
+                    Err(GatewayError::unavailable(
+                        &request_for_task,
+                        "backend_result_channel_closed",
+                        "the backend stopped before returning an authoritative result",
+                    ))
+                });
+                let _ = release.terminal(&result);
+                let _ = release.release();
                 return;
             };
             let mut terminal_permit = Some(terminal_permit);
@@ -962,11 +1018,6 @@ impl GatewayTicket {
                         }
                         let is_terminal = event.is_terminal();
                         if is_terminal {
-                            enqueue_reserved_terminal(
-                                &mut terminal_permit,
-                                event,
-                                &terminal_for_task,
-                            );
                             upstream_terminal_observed = true;
                             continue;
                         }
@@ -990,15 +1041,21 @@ impl GatewayTicket {
                                     total_deadline,
                                 );
                                 let _ = cancellation_for_task.cancel(CancelTarget::Request);
+                                let result = Err(error);
+                                let result = match release.terminal(&result) {
+                                    Ok(()) => result,
+                                    Err(lifecycle_error) => Err(lifecycle_error),
+                                };
                                 enqueue_reserved_terminal(
                                     &mut terminal_permit,
-                                    GatewayEvent::Failed {
-                                        request_id: request_for_task.clone(),
-                                        error: error.clone(),
-                                    },
+                                    terminal_event_from_result(&request_for_task, &result),
                                     &terminal_for_task,
                                 );
-                                let _ = final_tx.send(Err(error));
+                                let _ = final_tx.send(result);
+                                if retains_executor {
+                                    let _ = upstream_final.await;
+                                    let _ = release.release();
+                                }
                                 return;
                             }
                         }
@@ -1011,14 +1068,20 @@ impl GatewayTicket {
                                 "the backend stopped before returning an authoritative result",
                             ))
                         });
-                        if !upstream_terminal_observed {
-                            let terminal = terminal_event_from_result(&request_for_task, &result);
-                            enqueue_reserved_terminal(
-                                &mut terminal_permit,
-                                terminal,
-                                &terminal_for_task,
-                            );
-                        }
+                        let result = match release.terminal(&result) {
+                            Ok(()) => result,
+                            Err(lifecycle_error) => Err(lifecycle_error),
+                        };
+                        let terminal = terminal_event_from_result(&request_for_task, &result);
+                        enqueue_reserved_terminal(
+                            &mut terminal_permit,
+                            terminal,
+                            &terminal_for_task,
+                        );
+                        let result = match release.release() {
+                            Ok(()) => result,
+                            Err(lifecycle_error) => Err(lifecycle_error),
+                        };
                         let _ = final_tx.send(result);
                         return;
                     }
@@ -1030,17 +1093,21 @@ impl GatewayTicket {
                             total_deadline,
                         );
                         let _ = cancellation_for_task.cancel(CancelTarget::Request);
-                        if !upstream_terminal_observed {
-                            enqueue_reserved_terminal(
-                                &mut terminal_permit,
-                                GatewayEvent::Failed {
-                                    request_id: request_for_task.clone(),
-                                    error: error.clone(),
-                                },
-                                &terminal_for_task,
-                            );
+                        let result = Err(error);
+                        let result = match release.terminal(&result) {
+                            Ok(()) => result,
+                            Err(lifecycle_error) => Err(lifecycle_error),
+                        };
+                        enqueue_reserved_terminal(
+                            &mut terminal_permit,
+                            terminal_event_from_result(&request_for_task, &result),
+                            &terminal_for_task,
+                        );
+                        let _ = final_tx.send(result);
+                        if retains_executor {
+                            let _ = upstream_final.await;
+                            let _ = release.release();
                         }
-                        let _ = final_tx.send(Err(error));
                         return;
                     }
                 }
@@ -1052,6 +1119,7 @@ impl GatewayTicket {
             events: event_rx,
             final_response: Some(final_rx),
             cancellation,
+            lifecycle_lease: None,
             terminal_observed,
             cancel_on_drop: true,
         }

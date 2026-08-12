@@ -104,7 +104,7 @@ struct GatewayShutdownReport {
 
 impl LifecycleControl {
     fn ensure_running(&self, request_id: &RequestId) -> Result<(), GatewayError> {
-        let state = self.lock_state();
+        let state = self.lock_state(request_id)?;
         if state.phase == GatewayLifecycle::Running {
             Ok(())
         } else {
@@ -117,7 +117,7 @@ impl LifecycleControl {
         request_id: &RequestId,
         operation: impl FnOnce() -> Result<T, GatewayError>,
     ) -> Result<T, GatewayError> {
-        let state = self.lock_state();
+        let state = self.lock_state(request_id)?;
         if state.phase != GatewayLifecycle::Running {
             return Err(gateway_closed_error(request_id, state.phase));
         }
@@ -129,24 +129,20 @@ impl LifecycleControl {
         request_id: &RequestId,
         progress_capacity: usize,
     ) -> Result<operation_lifecycle::OperationLease, GatewayError> {
-        let state = self.lock_state();
+        let state = self.lock_state(request_id)?;
         if state.phase != GatewayLifecycle::Running {
             return Err(gateway_closed_error(request_id, state.phase));
         }
         let (guard, lease) = self
             .operations
             .reserve_with_capacity(&request_id.0, progress_capacity)
-            .map_err(|_| GatewayError {
-                code: "request_already_active".to_string(),
-                class: ErrorClass::Unavailable,
-                retryable: false,
-                http_status: 409,
-                request_id: request_id.clone(),
-                provider: None,
-                safe_detail: "a request with this identifier is already active".to_string(),
-            })?;
-        lease.queue().expect("newly reserved request queues");
-        lease.start().expect("newly queued request starts");
+            .map_err(|error| operation_registry_error(request_id, error))?;
+        lease
+            .queue()
+            .map_err(|error| operation_registry_error(request_id, error))?;
+        lease
+            .start()
+            .map_err(|error| operation_registry_error(request_id, error))?;
         guard.disarm();
         Ok(lease)
     }
@@ -155,75 +151,155 @@ impl LifecycleControl {
         &self,
         lease: &operation_lifecycle::OperationLease,
         terminal: operation_lifecycle::TerminalClass,
-    ) {
-        let _ = lease.terminal(terminal);
-        let _ = lease.release();
-        self.changed.notify_waiters();
+    ) -> Result<(), GatewayError> {
+        self.terminal_request(lease, terminal)?;
+        self.release_terminalized_request(lease)
     }
 
-    fn begin_shutdown(&self) -> ShutdownDisposition {
-        let mut state = self.lock_state();
+    fn terminal_request(
+        &self,
+        lease: &operation_lifecycle::OperationLease,
+        terminal: operation_lifecycle::TerminalClass,
+    ) -> Result<(), GatewayError> {
+        let request_id = RequestId(lease.identity().operation_id);
+        let result = lease
+            .terminal(terminal)
+            .map_err(|error| operation_registry_error(&request_id, error));
+        let recorded = result
+            .as_ref()
+            .err()
+            .map(|error| self.record_lifecycle_error(error.clone()))
+            .transpose();
+        self.changed.notify_waiters();
+        recorded.and(result)
+    }
+
+    fn release_terminalized_request(
+        &self,
+        lease: &operation_lifecycle::OperationLease,
+    ) -> Result<(), GatewayError> {
+        let request_id = RequestId(lease.identity().operation_id);
+        let result = lease
+            .release()
+            .map_err(|error| operation_registry_error(&request_id, error));
+        let recorded = result
+            .as_ref()
+            .err()
+            .map(|error| self.record_lifecycle_error(error.clone()))
+            .transpose();
+        self.changed.notify_waiters();
+        recorded.and(result)
+    }
+
+    fn begin_shutdown(&self) -> Result<ShutdownDisposition, GatewayError> {
+        let request_id = RequestId::new();
+        let (mut state, state_error) = self.lock_state_for_shutdown(&request_id);
+        if let Some(error) = state_error {
+            state.shutdown_error.get_or_insert(error);
+        }
         match state.phase {
             GatewayLifecycle::Running => {
                 state.phase = GatewayLifecycle::Quiescing;
-                let active = self
-                    .operations
-                    .request_cancel_all()
-                    .into_iter()
-                    .map(RequestId)
-                    .collect();
+                let (active, registry_error) = self.operations.request_cancel_all_for_shutdown();
+                if let Some(error) = registry_error {
+                    state
+                        .shutdown_error
+                        .get_or_insert_with(|| operation_registry_error(&request_id, error));
+                }
+                let active = active.into_iter().map(RequestId).collect();
                 self.changed.notify_waiters();
-                ShutdownDisposition::Lead(active)
+                Ok(ShutdownDisposition::Lead(active))
             }
-            GatewayLifecycle::Quiescing => ShutdownDisposition::Wait,
+            GatewayLifecycle::Quiescing => Ok(ShutdownDisposition::Wait),
             GatewayLifecycle::Closed => {
-                ShutdownDisposition::Complete(Self::shutdown_report(&state))
+                Ok(ShutdownDisposition::Complete(Self::shutdown_report(&state)))
             }
         }
     }
 
     fn snapshot(&self) -> (GatewayLifecycle, usize, Option<GatewayError>) {
-        let state = self.lock_state();
-        (
-            state.phase,
-            self.operations.active_count(),
-            state.shutdown_error.clone(),
-        )
+        let request_id = RequestId::new();
+        let (active_requests, registry_poisoned) = self.operations.diagnostic_active_count();
+        match self.state.lock() {
+            Ok(state) => {
+                let shutdown_error = state.shutdown_error.clone().or_else(|| {
+                    registry_poisoned.then(|| {
+                        operation_registry_error(
+                            &request_id,
+                            operation_lifecycle::RegistryError::Poisoned,
+                        )
+                    })
+                });
+                (state.phase, active_requests, shutdown_error)
+            }
+            Err(poisoned) => (
+                poisoned.get_ref().phase,
+                active_requests,
+                Some(lifecycle_state_poisoned(&request_id)),
+            ),
+        }
     }
 
-    async fn wait_until_drained(&self) {
+    async fn wait_until_drained(&self) -> Result<(), GatewayError> {
         loop {
-            let changed = self.changed.notified();
-            let drained = self.operations.active_count() == 0;
+            let mut changed = Box::pin(self.changed.notified());
+            changed.as_mut().enable();
+            let request_id = RequestId::new();
+            let lifecycle_error = {
+                let (state, state_error) = self.lock_state_for_shutdown(&request_id);
+                state_error.or_else(|| state.shutdown_error.clone())
+            };
+            if let Some(error) = lifecycle_error {
+                return Err(error);
+            }
+            let drained = self
+                .operations
+                .active_count()
+                .map_err(|error| operation_registry_error(&request_id, error))?
+                == 0;
             if drained {
-                return;
+                return Ok(());
             }
             changed.await;
         }
     }
 
-    async fn wait_until_closed_report(&self) -> GatewayShutdownReport {
+    async fn wait_until_closed_report(&self) -> Result<GatewayShutdownReport, GatewayError> {
         loop {
-            let changed = self.changed.notified();
+            let mut changed = Box::pin(self.changed.notified());
+            changed.as_mut().enable();
             let report = {
-                let state = self.lock_state();
-                (state.phase == GatewayLifecycle::Closed).then(|| Self::shutdown_report(&state))
+                let request_id = RequestId::new();
+                let (state, state_error) = self.lock_state_for_shutdown(&request_id);
+                (state.phase == GatewayLifecycle::Closed).then(|| {
+                    let mut report = Self::shutdown_report(&state);
+                    if let Some(error) = state_error {
+                        report.result = Err(error);
+                    }
+                    report
+                })
             };
             if let Some(report) = report {
-                return report;
+                return Ok(report);
             }
             changed.await;
         }
     }
 
-    fn finish_shutdown(&self, report: &GatewayShutdownReport) {
-        let mut state = self.lock_state();
+    fn finish_shutdown(&self, report: &GatewayShutdownReport) -> Result<(), GatewayError> {
+        let request_id = RequestId::new();
+        let (mut state, state_error) = self.lock_state_for_shutdown(&request_id);
         state.phase = GatewayLifecycle::Closed;
-        state.shutdown_error = report.result.as_ref().err().cloned();
+        if let Some(error) = &state_error {
+            state.shutdown_error.get_or_insert_with(|| error.clone());
+        } else if state.shutdown_error.is_none() {
+            state.shutdown_error = report.result.as_ref().err().cloned();
+        }
         state.shutdown_expected_worker_ids = report.expected_worker_ids.clone();
         state.shutdown_joined_worker_ids = report.joined_worker_ids.clone();
         state.shutdown_retained_tasks = report.retained_tasks;
         self.changed.notify_waiters();
+        state_error.map_or(Ok(()), Err)
     }
 
     fn shutdown_report(state: &LifecycleState) -> GatewayShutdownReport {
@@ -235,10 +311,36 @@ impl LifecycleControl {
         }
     }
 
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, LifecycleState> {
+    fn record_lifecycle_error(&self, error: GatewayError) -> Result<(), GatewayError> {
+        let mut state = self.lock_state(&error.request_id)?;
+        state.shutdown_error.get_or_insert(error);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    fn lock_state(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<std::sync::MutexGuard<'_, LifecycleState>, GatewayError> {
         self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map_err(|_| lifecycle_state_poisoned(request_id))
+    }
+
+    fn lock_state_for_shutdown(
+        &self,
+        request_id: &RequestId,
+    ) -> (
+        std::sync::MutexGuard<'_, LifecycleState>,
+        Option<GatewayError>,
+    ) {
+        match self.state.lock() {
+            Ok(state) => (state, None),
+            Err(poisoned) => (
+                poisoned.into_inner(),
+                Some(lifecycle_state_poisoned(request_id)),
+            ),
+        }
     }
 }
 
@@ -388,16 +490,22 @@ impl Gateway {
                 BackendLocation::Hosted => deadline.connect_ms,
             };
             let backend_id = route.backend_id.clone();
-            let execution = backend.execute(BackendRequest {
-                request: request.clone(),
-                route,
-            });
-            let (startup_limit, total_is_limit) = stage_deadline(
+            let (startup_limit, total_is_limit) = match stage_deadline(
                 startup_ms,
                 deadline.total_ms,
                 started_at.elapsed(),
                 &request_id,
-            )?;
+            ) {
+                Ok(limit) => limit,
+                Err(error) => {
+                    lease.finish_error(&error)?;
+                    return Err(error);
+                }
+            };
+            let execution = backend.execute(BackendRequest {
+                request: request.clone(),
+                route,
+            });
             let result = if let Some(startup_limit) = startup_limit {
                 match tokio::time::timeout(startup_limit, execution).await {
                     Ok(result) => result,
@@ -409,22 +517,32 @@ impl Gateway {
             };
             match result {
                 Ok(ticket) => {
-                    self.record_backend_success(&backend_id)?;
-                    return Ok(ticket.with_admission_lease(Box::new(lease)).with_deadlines(
+                    if let Err(error) = self.record_backend_success(&backend_id) {
+                        lease.finish_error(&error)?;
+                        return Err(error);
+                    }
+                    return Ok(ticket.with_admission_lease_and_deadlines(
+                        Box::new(lease),
                         deadline,
                         started_at.elapsed(),
                         event_capacity,
                     ));
                 }
-                Err(error) if retryable_setup_failure(fallback_allowed, &error) => {
-                    self.record_backend_failure(&backend_id)?;
-                    last_error = Some(error);
-                }
                 Err(error) => {
-                    if error.retryable && error.code != "request_total_deadline_exceeded" {
-                        self.record_backend_failure(&backend_id)?;
+                    let retry = retryable_setup_failure(fallback_allowed, &error);
+                    if error.retryable
+                        && error.code != "request_total_deadline_exceeded"
+                        && let Err(state_error) = self.record_backend_failure(&backend_id)
+                    {
+                        lease.finish_error(&state_error)?;
+                        return Err(state_error);
                     }
-                    return Err(error);
+                    lease.finish_error(&error)?;
+                    if retry {
+                        last_error = Some(error);
+                    } else {
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -446,7 +564,7 @@ impl Gateway {
         request.validate()?;
         self.lifecycle.ensure_running(&request.request_id)?;
         let (backend, route, admission) = self.resolve(&request)?;
-        let _lease = self
+        let lease = self
             .admit(
                 &request.request_id,
                 &request,
@@ -467,7 +585,7 @@ impl Gateway {
             &request_id,
         )?;
         let count = backend.count_tokens(BackendRequest { request, route });
-        if let Some(limit) = limit {
+        let result = if let Some(limit) = limit {
             tokio::time::timeout(limit, count).await.map_err(|_| {
                 if total_is_limit {
                     total_timeout(&request_id)
@@ -477,7 +595,8 @@ impl Gateway {
             })?
         } else {
             count.await
-        }
+        };
+        lease.finish_result(result)
     }
 
     pub fn cancel(&self, request_id: &RequestId, target: CancelTarget) -> usize {
@@ -499,9 +618,16 @@ impl Gateway {
 
     async fn shutdown_report(&self) -> GatewayShutdownReport {
         match self.lifecycle.begin_shutdown() {
-            ShutdownDisposition::Complete(report) => return report,
-            ShutdownDisposition::Wait => return self.lifecycle.wait_until_closed_report().await,
-            ShutdownDisposition::Lead(active_request_ids) => {
+            Err(error) => return failed_shutdown_report(error),
+            Ok(ShutdownDisposition::Complete(report)) => return report,
+            Ok(ShutdownDisposition::Wait) => {
+                return self
+                    .lifecycle
+                    .wait_until_closed_report()
+                    .await
+                    .unwrap_or_else(failed_shutdown_report);
+            }
+            Ok(ShutdownDisposition::Lead(active_request_ids)) => {
                 let (backends, admissions, state_error) = match self.state.read() {
                     Ok(state) => (
                         state
@@ -588,9 +714,11 @@ impl Gateway {
                         }
                     }
                     let retained_tasks = tasks.len();
-                    lifecycle.wait_until_drained().await;
+                    if let Err(error) = lifecycle.wait_until_drained().await {
+                        first_error.get_or_insert(error);
+                    }
                     let result = first_error.map_or(Ok(()), Err);
-                    lifecycle.finish_shutdown(&GatewayShutdownReport {
+                    let _ = lifecycle.finish_shutdown(&GatewayShutdownReport {
                         result,
                         expected_worker_ids,
                         joined_worker_ids,
@@ -599,7 +727,10 @@ impl Gateway {
                 });
             }
         }
-        self.lifecycle.wait_until_closed_report().await
+        self.lifecycle
+            .wait_until_closed_report()
+            .await
+            .unwrap_or_else(failed_shutdown_report)
     }
 
     #[must_use]
@@ -746,7 +877,7 @@ impl Gateway {
             .register_request(request_id, progress_capacity)?;
         Ok(AdmissionLease {
             _permit: permit,
-            operation: Some(operation),
+            operation: Mutex::new(Some(operation)),
             lifecycle: Arc::clone(&self.lifecycle),
         })
     }
@@ -912,21 +1043,64 @@ impl Gateway {
 
 struct AdmissionLease {
     _permit: OwnedSemaphorePermit,
-    operation: Option<operation_lifecycle::OperationLease>,
+    operation: Mutex<Option<operation_lifecycle::OperationLease>>,
     lifecycle: Arc<LifecycleControl>,
+}
+
+impl AdmissionLease {
+    fn terminal_for_result<T>(
+        result: &Result<T, GatewayError>,
+    ) -> operation_lifecycle::TerminalClass {
+        match result {
+            Ok(_) => operation_lifecycle::TerminalClass::Completed,
+            Err(error) if error.class == ErrorClass::Cancelled => {
+                operation_lifecycle::TerminalClass::Cancelled
+            }
+            Err(_) => operation_lifecycle::TerminalClass::Failed,
+        }
+    }
+
+    fn release_with_terminal(
+        &self,
+        terminal: operation_lifecycle::TerminalClass,
+    ) -> Result<(), GatewayError> {
+        let mut operation = self
+            .operation
+            .lock()
+            .map_err(|_| lifecycle_state_poisoned(&RequestId::new()))?;
+        let Some(operation) = operation.take() else {
+            return Ok(());
+        };
+        self.lifecycle.release_request(&operation, terminal)
+    }
+
+    fn finish_result<T>(self, result: Result<T, GatewayError>) -> Result<T, GatewayError> {
+        let terminal = Self::terminal_for_result(&result);
+        self.release_with_terminal(terminal)?;
+        result
+    }
+
+    fn finish_error(self, error: &GatewayError) -> Result<(), GatewayError> {
+        let terminal = if error.class == ErrorClass::Cancelled {
+            operation_lifecycle::TerminalClass::Cancelled
+        } else {
+            operation_lifecycle::TerminalClass::Failed
+        };
+        self.release_with_terminal(terminal)
+    }
 }
 
 impl Drop for AdmissionLease {
     fn drop(&mut self) {
-        if let Some(operation) = self.operation.take() {
-            self.lifecycle
-                .release_request(&operation, operation_lifecycle::TerminalClass::Failed);
-        }
+        let _ = self.release_with_terminal(operation_lifecycle::TerminalClass::Failed);
     }
 }
 
 impl TicketLifecycleLease for AdmissionLease {
-    fn finish(mut self: Box<Self>, result: &Result<fte_types::GatewayResponse, GatewayError>) {
+    fn terminal(
+        &self,
+        result: &Result<fte_types::GatewayResponse, GatewayError>,
+    ) -> Result<(), GatewayError> {
         let terminal = match result {
             Ok(response) => match response.status {
                 TerminalStatus::Completed => operation_lifecycle::TerminalClass::Completed,
@@ -938,9 +1112,75 @@ impl TicketLifecycleLease for AdmissionLease {
             }
             Err(_) => operation_lifecycle::TerminalClass::Failed,
         };
-        if let Some(operation) = self.operation.take() {
-            self.lifecycle.release_request(&operation, terminal);
-        }
+        let operation = self
+            .operation
+            .lock()
+            .map_err(|_| lifecycle_state_poisoned(&RequestId::new()))?;
+        let Some(operation) = operation.as_ref() else {
+            return Ok(());
+        };
+        self.lifecycle.terminal_request(operation, terminal)
+    }
+
+    fn release(&self) -> Result<(), GatewayError> {
+        let mut operation = self
+            .operation
+            .lock()
+            .map_err(|_| lifecycle_state_poisoned(&RequestId::new()))?;
+        let Some(operation) = operation.take() else {
+            return Ok(());
+        };
+        self.lifecycle.release_terminalized_request(&operation)
+    }
+}
+
+fn failed_shutdown_report(error: GatewayError) -> GatewayShutdownReport {
+    GatewayShutdownReport {
+        result: Err(error),
+        expected_worker_ids: Vec::new(),
+        joined_worker_ids: Vec::new(),
+        retained_tasks: 0,
+    }
+}
+
+fn lifecycle_state_poisoned(request_id: &RequestId) -> GatewayError {
+    GatewayError::unavailable(
+        request_id,
+        "gateway_lifecycle_state_poisoned",
+        "gateway lifecycle state is unavailable",
+    )
+}
+
+fn operation_registry_error(
+    request_id: &RequestId,
+    error: operation_lifecycle::RegistryError,
+) -> GatewayError {
+    match error {
+        operation_lifecycle::RegistryError::Duplicate => GatewayError {
+            code: "request_already_active".to_string(),
+            class: ErrorClass::Unavailable,
+            retryable: false,
+            http_status: 409,
+            request_id: request_id.clone(),
+            provider: None,
+            safe_detail: "a request with this identifier is already active".to_string(),
+        },
+        operation_lifecycle::RegistryError::Poisoned => GatewayError::unavailable(
+            request_id,
+            "gateway_operation_registry_poisoned",
+            "gateway operation lifecycle state is unavailable",
+        ),
+        operation_lifecycle::RegistryError::Exhausted => GatewayError::unavailable(
+            request_id,
+            "gateway_operation_identity_exhausted",
+            "gateway operation identity space is exhausted",
+        ),
+        operation_lifecycle::RegistryError::Stale
+        | operation_lifecycle::RegistryError::InvalidTransition => GatewayError::unavailable(
+            request_id,
+            "gateway_operation_lifecycle_failed",
+            "gateway operation lifecycle rejected the transition",
+        ),
     }
 }
 
@@ -1180,9 +1420,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use fte_types::{
-        BackendReadiness, ContentBlock, GenerationInput, InputItem, MessageRole, ModelCapabilities,
-        PromptForm, RouteObservations, RoutingPolicy, SamplingOptions, StoragePolicy, StreamPolicy,
-        TicketCancellation, ToolPolicy,
+        BackendReadiness, ContentBlock, GatewayEvent, GenerationInput, InputItem, MessageRole,
+        ModelCapabilities, PromptForm, RouteObservations, RoutingPolicy, SamplingOptions,
+        StoragePolicy, StreamPolicy, TicketCancellation, ToolPolicy,
     };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -1218,6 +1458,18 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    enum LifecycleSabotage {
+        Terminalize,
+        Poison,
+    }
+
+    struct LifecycleSabotageBackend {
+        descriptor: BackendDescriptor,
+        registry: operation_lifecycle::OperationRegistry,
+        sabotage: LifecycleSabotage,
+        calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl GatewayBackend for CountingFailureBackend {
         fn descriptor(&self) -> BackendDescriptor {
@@ -1230,6 +1482,40 @@ mod tests {
 
         async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
             self.calls.fetch_add(1, AtomicOrdering::AcqRel);
+            Err(GatewayError::unavailable(
+                &request.request.request_id,
+                "fixture_provider_unavailable",
+                "fixture provider setup failed",
+            ))
+        }
+
+        fn cancel(&self, _request_id: &RequestId, _target: CancelTarget) -> usize {
+            0
+        }
+    }
+
+    #[async_trait]
+    impl GatewayBackend for LifecycleSabotageBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn readiness(&self) -> BackendReadiness {
+            BackendReadiness::Ready
+        }
+
+        async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
+            self.calls.fetch_add(1, AtomicOrdering::AcqRel);
+            match self.sabotage {
+                LifecycleSabotage::Terminalize => self
+                    .registry
+                    .current_lease(&request.request.request_id.0)
+                    .expect("registry remains available")
+                    .expect("admitted operation exists")
+                    .terminal(operation_lifecycle::TerminalClass::Failed)
+                    .expect("sabotage terminal transition"),
+                LifecycleSabotage::Poison => self.registry.poison_for_test(),
+            }
             Err(GatewayError::unavailable(
                 &request.request.request_id,
                 "fixture_provider_unavailable",
@@ -1476,6 +1762,30 @@ mod tests {
         cancellations: Arc<AtomicUsize>,
     }
 
+    struct EarlyCompletedEventBackend {
+        completion: Arc<Mutex<Option<FixtureFinalSender>>>,
+        cancellations: Arc<AtomicUsize>,
+    }
+
+    fn completed_response(request_id: RequestId, backend_id: &str) -> fte_types::GatewayResponse {
+        fte_types::GatewayResponse {
+            id: "fixture-response".to_string(),
+            request_id,
+            model: format!("{backend_id}-model"),
+            route: fte_types::ResolvedRoute {
+                backend_id: backend_id.to_string(),
+                model_id: format!("{backend_id}-model"),
+                display_name: backend_id.to_string(),
+                location: BackendLocation::LocalEmbedded,
+                catalog_version: "test".to_string(),
+            },
+            output: Vec::new(),
+            usage: fte_types::GatewayUsage::default(),
+            status: TerminalStatus::Completed,
+            previous_response_id: None,
+        }
+    }
+
     #[async_trait]
     impl GatewayBackend for DelayedFinalBackend {
         fn descriptor(&self) -> BackendDescriptor {
@@ -1495,6 +1805,48 @@ mod tests {
                 event_rx,
                 final_rx,
                 Arc::new(NoopCancellation),
+                Arc::new(AtomicBool::new(false)),
+            ))
+        }
+
+        fn cancel(&self, _request_id: &RequestId, _target: CancelTarget) -> usize {
+            self.cancellations.fetch_add(1, AtomicOrdering::AcqRel);
+            1
+        }
+    }
+
+    #[async_trait]
+    impl GatewayBackend for EarlyCompletedEventBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            descriptor("early-terminal", BackendLocation::LocalEmbedded)
+        }
+
+        fn readiness(&self) -> BackendReadiness {
+            BackendReadiness::Ready
+        }
+
+        async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
+            let (event_tx, event_rx) = mpsc::channel(1);
+            let (final_tx, final_rx) = oneshot::channel();
+            *self.completion.lock().expect("completion state") = Some(final_tx);
+            event_tx
+                .send(GatewayEvent::Completed {
+                    request_id: request.request.request_id.clone(),
+                    response: Box::new(completed_response(
+                        request.request.request_id.clone(),
+                        "early-terminal",
+                    )),
+                })
+                .await
+                .expect("publish premature completed event");
+            Ok(GatewayTicket::new(
+                request.request.request_id,
+                event_rx,
+                final_rx,
+                Arc::new(CountCancellation {
+                    count: Arc::clone(&self.cancellations),
+                    completion: Mutex::new(None),
+                }),
                 Arc::new(AtomicBool::new(false)),
             ))
         }
@@ -1627,6 +1979,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poisoned_operation_registry_replaces_backend_success_and_shutdown_success() {
+        let completion = Arc::new(Mutex::new(None));
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let gateway = Gateway::new(GatewayDefaults::default());
+        gateway
+            .register_backend(Arc::new(DelayedFinalBackend {
+                completion: Arc::clone(&completion),
+                cancellations,
+            }))
+            .expect("register delayed-final backend");
+        let mut request = request();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "delayed-final".to_string(),
+            model_id: "delayed-final-model".to_string(),
+        };
+        let request_id = request.request_id.clone();
+        let ticket = gateway.execute(request).await.expect("start request");
+
+        gateway.lifecycle.operations.poison_for_test();
+        completion
+            .lock()
+            .expect("completion state")
+            .take()
+            .expect("pending backend final")
+            .send(Ok(completed_response(request_id, "delayed-final")))
+            .expect("publish backend success");
+
+        let error = ticket
+            .final_response()
+            .await
+            .expect_err("lifecycle poison must replace backend success");
+        assert_eq!(error.code, "gateway_operation_registry_poisoned");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), gateway.shutdown())
+            .await
+            .expect("poisoned shutdown must terminate")
+            .expect_err("poisoned lifecycle cannot report shutdown success");
+        assert_eq!(error.code, "gateway_operation_registry_poisoned");
+        let status = gateway.status();
+        assert_eq!(status.lifecycle, GatewayLifecycle::Closed);
+        assert_eq!(status.active_requests, 1);
+        assert_eq!(
+            status
+                .shutdown_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("gateway_operation_registry_poisoned")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_operation_release_replaces_backend_success() {
+        let gateway = Gateway::new(GatewayDefaults::default());
+        let request_id = RequestId::new();
+        let operation = gateway
+            .lifecycle
+            .register_request(&request_id, 1)
+            .expect("register operation");
+        let retained_operation = operation.clone();
+        let attempt = operation.start_attempt().expect("start active attempt");
+        let permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("admission permit");
+        let lease = AdmissionLease {
+            _permit: permit,
+            operation: Mutex::new(Some(operation)),
+            lifecycle: Arc::clone(&gateway.lifecycle),
+        };
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let (final_tx, final_rx) = oneshot::channel();
+        let ticket = GatewayTicket::new(
+            request_id.clone(),
+            event_rx,
+            final_rx,
+            Arc::new(NoopCancellation),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_admission_lease(Box::new(lease));
+
+        final_tx
+            .send(Ok(completed_response(request_id, "fixture")))
+            .expect("publish backend success");
+        let error = ticket
+            .final_response()
+            .await
+            .expect_err("failed release must replace backend success");
+        assert_eq!(error.code, "gateway_operation_lifecycle_failed");
+        assert_eq!(
+            retained_operation
+                .snapshot()
+                .expect("registry remains valid")
+                .expect("operation remains registered")
+                .phase,
+            operation_lifecycle::OperationPhase::Terminal
+        );
+
+        let shutdown_error = gateway
+            .shutdown()
+            .await
+            .expect_err("failed release must also fail shutdown");
+        assert_eq!(shutdown_error.code, "gateway_operation_lifecycle_failed");
+
+        attempt.finish().expect("finish retained attempt");
+        retained_operation
+            .release()
+            .expect("release retained operation after test");
+    }
+
+    #[tokio::test]
+    async fn poisoned_lifecycle_state_cannot_report_closed_shutdown_success() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+        gateway
+            .register_backend(Arc::new(BlockingShutdownBackend {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                shutdowns: Arc::clone(&shutdowns),
+            }))
+            .expect("register blocking backend");
+        let gateway_for_poison = Arc::clone(&gateway);
+        let _ = std::thread::spawn(move || {
+            let _state = gateway_for_poison
+                .lifecycle
+                .state
+                .lock()
+                .expect("lifecycle state");
+            panic!("poison lifecycle state for deterministic coverage");
+        })
+        .join();
+
+        let status = gateway.status();
+        assert_eq!(status.lifecycle, GatewayLifecycle::Running);
+        assert_eq!(
+            status
+                .shutdown_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("gateway_lifecycle_state_poisoned")
+        );
+
+        let gateway_for_shutdown = Arc::clone(&gateway);
+        let shutdown = tokio::spawn(async move { gateway_for_shutdown.shutdown().await });
+        entered
+            .acquire()
+            .await
+            .expect("backend shutdown entered")
+            .forget();
+        assert!(!shutdown.is_finished());
+        release.add_permits(1);
+        let error = shutdown
+            .await
+            .expect("shutdown task")
+            .expect_err("poisoned lifecycle state cannot close successfully");
+        assert_eq!(error.code, "gateway_lifecycle_state_poisoned");
+        assert_eq!(shutdowns.load(AtomicOrdering::Acquire), 1);
+        let status = gateway.status();
+        assert_eq!(status.lifecycle, GatewayLifecycle::Closed);
+        assert_eq!(
+            status
+                .shutdown_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("gateway_lifecycle_state_poisoned")
+        );
+    }
+
+    #[tokio::test]
     async fn dropped_consumer_ticket_keeps_admission_until_backend_final() {
         let completion = Arc::new(Mutex::new(None));
         let cancellations = Arc::new(AtomicUsize::new(0));
@@ -1718,6 +2240,7 @@ mod tests {
             backend_id: "delayed-final".to_string(),
             model_id: "delayed-final-model".to_string(),
         };
+        let request_id = request.request_id.clone();
         request.deadline.first_token_ms = Some(5);
         let ticket = gateway
             .execute(request)
@@ -1729,6 +2252,24 @@ mod tests {
             .expect_err("consumer observes first-output deadline");
         assert_eq!(error.code, "first_output_deadline_exceeded");
         assert_eq!(gateway.status().active_requests, 1);
+        let lifecycle = gateway
+            .lifecycle
+            .operations
+            .current_lease(&request_id.0)
+            .expect("registry remains valid")
+            .expect("timed-out operation remains retained");
+        let snapshot = lifecycle
+            .snapshot()
+            .expect("registry remains valid")
+            .expect("timed-out operation remains visible");
+        assert_eq!(
+            snapshot.phase,
+            operation_lifecycle::OperationPhase::Terminal
+        );
+        assert_eq!(
+            snapshot.terminal,
+            Some(operation_lifecycle::TerminalClass::Failed)
+        );
 
         let shutdown_gateway = Arc::clone(&gateway);
         let shutdown = tokio::spawn(async move { shutdown_gateway.shutdown().await });
@@ -1741,16 +2282,139 @@ mod tests {
             .expect("completion state")
             .take()
             .expect("pending backend final");
-        let _ = final_tx.send(Err(GatewayError::unavailable(
-            &RequestId::new(),
-            "fixture_backend_stopped",
-            "the delayed backend has now terminated",
-        )));
+        let _ = final_tx.send(Ok(completed_response(request_id, "delayed-final")));
         tokio::time::timeout(Duration::from_secs(1), shutdown)
             .await
             .expect("shutdown waits only until raw backend final")
             .expect("shutdown task")
             .expect("gateway shutdown");
+        assert_eq!(gateway.status().active_requests, 0);
+        let snapshot = lifecycle
+            .snapshot()
+            .expect("registry remains valid")
+            .expect("released timeout projection remains visible");
+        assert_eq!(
+            snapshot.phase,
+            operation_lifecycle::OperationPhase::Released
+        );
+        assert_eq!(
+            snapshot.terminal,
+            Some(operation_lifecycle::TerminalClass::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_release_failure_after_timeout_is_observable_to_shutdown() {
+        let completion = Arc::new(Mutex::new(None));
+        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+        gateway
+            .register_backend(Arc::new(DelayedFinalBackend {
+                completion: Arc::clone(&completion),
+                cancellations: Arc::new(AtomicUsize::new(0)),
+            }))
+            .expect("register delayed-final backend");
+        let mut request = request();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "delayed-final".to_string(),
+            model_id: "delayed-final-model".to_string(),
+        };
+        let request_id = request.request_id.clone();
+        request.deadline.first_token_ms = Some(5);
+        let ticket = gateway.execute(request).await.expect("start request");
+        let error = ticket
+            .final_response()
+            .await
+            .expect_err("consumer observes authoritative timeout");
+        assert_eq!(error.class, ErrorClass::Timeout);
+        gateway.lifecycle.operations.poison_for_test();
+
+        completion
+            .lock()
+            .expect("completion state")
+            .take()
+            .expect("pending backend final")
+            .send(Ok(completed_response(request_id, "delayed-final")))
+            .expect("publish raw backend completion");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), gateway.shutdown())
+            .await
+            .expect("poisoned deferred release cannot hang shutdown")
+            .expect_err("deferred release failure must fail shutdown");
+        assert_eq!(error.code, "gateway_operation_registry_poisoned");
+    }
+
+    #[tokio::test]
+    async fn premature_completed_event_cannot_outrun_authoritative_timeout() {
+        let completion = Arc::new(Mutex::new(None));
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+        gateway
+            .register_backend(Arc::new(EarlyCompletedEventBackend {
+                completion: Arc::clone(&completion),
+                cancellations: Arc::clone(&cancellations),
+            }))
+            .expect("register early-terminal backend");
+        let mut request = request();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "early-terminal".to_string(),
+            model_id: "early-terminal-model".to_string(),
+        };
+        let request_id = request.request_id.clone();
+        request.deadline.total_ms = Some(5);
+        let mut ticket = gateway.execute(request).await.expect("start request");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), ticket.events.recv())
+            .await
+            .expect("terminal event arrives")
+            .expect("terminal event exists");
+        let GatewayEvent::Failed { error, .. } = event else {
+            panic!("premature backend completion must not outrun timeout: {event:?}");
+        };
+        assert_eq!(error.code, "request_total_deadline_exceeded");
+        assert_eq!(error.class, ErrorClass::Timeout);
+
+        let lifecycle = gateway
+            .lifecycle
+            .operations
+            .current_lease(&request_id.0)
+            .expect("registry remains valid")
+            .expect("executor still retains release authority");
+        let snapshot = lifecycle
+            .snapshot()
+            .expect("registry remains valid")
+            .expect("operation remains visible");
+        assert_eq!(
+            snapshot.phase,
+            operation_lifecycle::OperationPhase::Terminal
+        );
+        assert_eq!(
+            snapshot.terminal,
+            Some(operation_lifecycle::TerminalClass::Failed)
+        );
+        assert!(cancellations.load(AtomicOrdering::Acquire) >= 1);
+
+        let shutdown_gateway = Arc::clone(&gateway);
+        let shutdown = tokio::spawn(async move { shutdown_gateway.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        completion
+            .lock()
+            .expect("completion state")
+            .take()
+            .expect("pending backend final")
+            .send(Ok(completed_response(request_id, "early-terminal")))
+            .expect("publish raw backend completion");
+        assert!(ticket.events.recv().await.is_none());
+        let error = ticket
+            .final_response()
+            .await
+            .expect_err("final result matches timeout event");
+        assert_eq!(error.code, "request_total_deadline_exceeded");
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown completes after raw final")
+            .expect("shutdown task")
+            .expect("clean shutdown");
         assert_eq!(gateway.status().active_requests, 0);
     }
 
@@ -1814,6 +2478,57 @@ mod tests {
             .await
             .expect_err("closed gateways reject new requests");
         assert_eq!(error.code, "gateway_closed");
+    }
+
+    #[tokio::test]
+    async fn concurrent_shutdown_followers_never_miss_closed_notification() {
+        const ROUNDS: usize = 32;
+        const FOLLOWERS: usize = 8;
+
+        for _ in 0..ROUNDS {
+            let entered = Arc::new(Semaphore::new(0));
+            let release = Arc::new(Semaphore::new(0));
+            let shutdowns = Arc::new(AtomicUsize::new(0));
+            let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+            gateway
+                .register_backend(Arc::new(BlockingShutdownBackend {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                    shutdowns: Arc::clone(&shutdowns),
+                }))
+                .expect("register blocking backend");
+
+            let leader_gateway = Arc::clone(&gateway);
+            let leader = tokio::spawn(async move { leader_gateway.shutdown().await });
+            entered
+                .acquire()
+                .await
+                .expect("backend shutdown entered")
+                .forget();
+
+            let mut followers = JoinSet::new();
+            for _ in 0..FOLLOWERS {
+                let follower_gateway = Arc::clone(&gateway);
+                followers.spawn(async move { follower_gateway.shutdown().await });
+            }
+            tokio::task::yield_now().await;
+            release.add_permits(1);
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                leader
+                    .await
+                    .expect("leader shutdown task")
+                    .expect("leader shutdown");
+                while let Some(result) = followers.join_next().await {
+                    result
+                        .expect("follower shutdown task")
+                        .expect("follower shutdown");
+                }
+            })
+            .await
+            .expect("all shutdown waiters observe closure");
+            assert_eq!(shutdowns.load(AtomicOrdering::Acquire), 1);
+        }
     }
 
     #[tokio::test]
@@ -1918,6 +2633,42 @@ mod tests {
         assert_eq!(gateway.status().active_requests, 1);
         drop(ticket);
         assert_eq!(cancelled.load(AtomicOrdering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_stops_when_setup_error_cannot_finalize_poisoned_lifecycle() {
+        let sabotaged_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let gateway = Gateway::new(GatewayDefaults::default());
+        gateway
+            .register_backend(Arc::new(LifecycleSabotageBackend {
+                descriptor: descriptor("a-sabotage", BackendLocation::LocalEmbedded),
+                registry: gateway.lifecycle.operations.clone(),
+                sabotage: LifecycleSabotage::Poison,
+                calls: Arc::clone(&sabotaged_calls),
+            }))
+            .expect("register sabotaged route");
+        gateway
+            .register_backend(Arc::new(CountingFailureBackend {
+                descriptor: descriptor("z-fallback", BackendLocation::LocalEmbedded),
+                calls: Arc::clone(&fallback_calls),
+            }))
+            .expect("register fallback route");
+        let mut request = request();
+        request.routing.retry_before_output = true;
+
+        let error = gateway
+            .execute(request)
+            .await
+            .expect_err("lifecycle failure must stop provider fallback");
+        assert_eq!(error.code, "gateway_operation_registry_poisoned");
+        assert_eq!(sabotaged_calls.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(fallback_calls.load(AtomicOrdering::Acquire), 0);
+        let shutdown_error = tokio::time::timeout(Duration::from_secs(1), gateway.shutdown())
+            .await
+            .expect("poisoned shutdown terminates")
+            .expect_err("poisoned lifecycle cannot report shutdown success");
+        assert_eq!(shutdown_error.code, "gateway_operation_registry_poisoned");
     }
 
     #[tokio::test]
@@ -2026,6 +2777,38 @@ mod tests {
         assert_eq!(error.code, "not_executed");
         assert_eq!(cancelled.load(AtomicOrdering::Acquire), 0);
         assert_eq!(gateway.status().active_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn exact_setup_error_is_replaced_when_lifecycle_was_already_terminalized() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gateway = Gateway::new(GatewayDefaults::default());
+        gateway
+            .register_backend(Arc::new(LifecycleSabotageBackend {
+                descriptor: descriptor("sabotage", BackendLocation::LocalEmbedded),
+                registry: gateway.lifecycle.operations.clone(),
+                sabotage: LifecycleSabotage::Terminalize,
+                calls: Arc::clone(&calls),
+            }))
+            .expect("register sabotaged route");
+        let mut request = request();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "sabotage".to_string(),
+            model_id: "sabotage-model".to_string(),
+        };
+
+        let error = gateway
+            .execute(request)
+            .await
+            .expect_err("lifecycle failure must replace setup error");
+        assert_eq!(error.code, "gateway_operation_lifecycle_failed");
+        assert_eq!(calls.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(gateway.status().active_requests, 1);
+        let shutdown_error = tokio::time::timeout(Duration::from_secs(1), gateway.shutdown())
+            .await
+            .expect("failed lifecycle shutdown terminates")
+            .expect_err("failed lifecycle cannot report shutdown success");
+        assert_eq!(shutdown_error.code, "gateway_operation_lifecycle_failed");
     }
 
     #[tokio::test]

@@ -127,6 +127,10 @@ fn registry_terminal(terminal: TerminalClass) -> operation_lifecycle::TerminalCl
     }
 }
 
+fn observed<T>(result: Result<T, operation_lifecycle::RegistryError>) -> T {
+    result.expect("the deterministic contract registry remains unpoisoned")
+}
+
 impl TransitionChainAdapter for GatewayRegistryAdapter {
     type Implementation = FteGatewayLifecycle;
     type Error = operation_lifecycle::RegistryError;
@@ -148,6 +152,7 @@ impl TransitionChainAdapter for GatewayRegistryAdapter {
         operation
             .lease
             .snapshot()
+            .expect("contract registry snapshot")
             .map(contract_snapshot)
             .map(|s| s.phase)
     }
@@ -199,12 +204,13 @@ impl RegistryIdentityAdapter for GatewayRegistryAdapter {
     }
 
     fn active_count(&self) -> usize {
-        self.registry.active_count()
+        observed(self.registry.active_count())
     }
 
     fn current_identity(&self, operation_id: &str) -> Option<AttemptIdentity> {
         self.registry
             .current(operation_id)
+            .expect("contract registry current operation")
             .map(|snapshot| contract_identity(snapshot.identity))
     }
 }
@@ -232,7 +238,7 @@ impl AttemptHierarchyAdapter for GatewayRegistryAdapter {
     }
 
     fn operation_active(&self, operation: &Self::Operation) -> bool {
-        operation.lease.is_active()
+        observed(operation.lease.is_active())
     }
 
     fn active_attempts(&self, operation: &Self::Operation) -> Vec<AttemptIdentity> {
@@ -293,20 +299,21 @@ impl ConsumerCancellationAdapter for GatewayRegistryAdapter {
     }
 
     fn active_count(&self) -> usize {
-        self.registry.active_count()
+        observed(self.registry.active_count())
     }
 
     fn current_snapshot(&self, operation_id: &str) -> Option<OperationSnapshot> {
-        self.registry.current(operation_id).map(contract_snapshot)
+        observed(self.registry.current(operation_id)).map(contract_snapshot)
     }
 
     fn lease_snapshot(&self, lease: &Self::Lease) -> Option<OperationSnapshot> {
-        lease.snapshot().map(contract_snapshot)
+        observed(lease.snapshot()).map(contract_snapshot)
     }
 
     fn cancellation_requested(&self, lease: &Self::Lease) -> bool {
         lease
             .snapshot()
+            .expect("contract registry snapshot")
             .is_some_and(|snapshot| snapshot.cancellation_requested)
     }
 
@@ -341,7 +348,7 @@ impl TerminalAuthorityAdapter for GatewayRegistryAdapter {
     }
 
     fn snapshot(&self, lease: &Self::Lease) -> Option<OperationSnapshot> {
-        lease.snapshot().map(contract_snapshot)
+        observed(lease.snapshot()).map(contract_snapshot)
     }
 
     fn release(&self, lease: &Self::Lease) -> Result<(), Self::Error> {
@@ -364,7 +371,7 @@ impl WaiterControlAdapter for GatewayRegistryAdapter {
     }
 
     fn snapshot(&self, lease: &Self::Lease) -> Option<OperationSnapshot> {
-        lease.snapshot().map(contract_snapshot)
+        observed(lease.snapshot()).map(contract_snapshot)
     }
 
     fn waiter_timeout(&self, _ticket: &Self::Ticket) -> Result<WaitObservation, Self::Error> {
@@ -751,6 +758,7 @@ impl StableShutdownAdapter for GatewayStableShutdownAdapter {
             .lifecycle
             .operations
             .current_lease(operation_id)
+            .map_err(|error| registry_gateway_error(&request_id, error))?
             .ok_or_else(|| {
                 GatewayError::unavailable(
                     &request_id,
@@ -825,13 +833,17 @@ impl StableShutdownAdapter for GatewayStableShutdownAdapter {
             TerminalStatus::Cancelled => TerminalClass::Cancelled,
             TerminalStatus::Failed => TerminalClass::Failed,
         };
-        let snapshot = operation.lifecycle.snapshot().ok_or_else(|| {
-            GatewayError::unavailable(
-                &operation.request_id,
-                "contract_release_snapshot_missing",
-                "the Gateway production registry lost its released operation snapshot",
-            )
-        })?;
+        let snapshot = operation
+            .lifecycle
+            .snapshot()
+            .map_err(|error| registry_gateway_error(&operation.request_id, error))?
+            .ok_or_else(|| {
+                GatewayError::unavailable(
+                    &operation.request_id,
+                    "contract_release_snapshot_missing",
+                    "the Gateway production registry lost its released operation snapshot",
+                )
+            })?;
         let snapshot = contract_snapshot(snapshot);
         if snapshot
             .authoritative_terminal
@@ -1089,6 +1101,7 @@ impl ProgressShutdownBridgeAdapter for GatewayProgressBridgeAdapter {
             .controlled
             .lifecycle
             .snapshot()
+            .expect("contract registry snapshot")
             .map(contract_snapshot)
     }
 
@@ -1114,7 +1127,12 @@ impl ProgressShutdownBridgeAdapter for GatewayProgressBridgeAdapter {
                 &operation.controlled,
                 timeout,
             )?;
-        if let Some(snapshot) = operation.controlled.lifecycle.snapshot() {
+        if let Some(snapshot) = operation
+            .controlled
+            .lifecycle
+            .snapshot()
+            .map_err(|error| registry_gateway_error(&operation.controlled.request_id, error))?
+        {
             final_snapshot.progress_projection = snapshot.progress;
         }
         Ok(final_snapshot)
@@ -1270,6 +1288,7 @@ impl PanicShutdownBridgeAdapter for GatewayPanicBridgeAdapter {
             .lifecycle
             .operations
             .current_lease(operation_id)
+            .map_err(|error| registry_gateway_error(&request_id, error))?
             .ok_or_else(|| {
                 GatewayError::unavailable(
                     &request_id,
@@ -1321,6 +1340,7 @@ impl PanicShutdownBridgeAdapter for GatewayPanicBridgeAdapter {
         operation
             .lifecycle
             .snapshot()
+            .map_err(|error| registry_gateway_error(&operation.request_id, error))?
             .map(contract_snapshot)
             .ok_or_else(|| {
                 GatewayError::unavailable(
