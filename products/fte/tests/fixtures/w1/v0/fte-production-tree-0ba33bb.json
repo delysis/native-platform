@@ -1,0 +1,25 @@
+{
+  "schema": "delysis.production_source_roots.v0",
+  "repository_id": "delysis/free-token-energy",
+  "commit": "0ba33bb786f068830cf288c629d8eedc63e56029",
+  "prefixes": [
+    {
+      "path": "crates/fte-providers/src/hosted.rs",
+      "boundary": "first_cfg_test",
+      "sha256": "1500541d643c8c91716b5616e80554287b81611b2eb3a391b4355a8750f54f1e",
+      "byte_len": 130013
+    },
+    {
+      "path": "crates/fte-loopback/src/lib.rs",
+      "boundary": "first_cfg_test",
+      "sha256": "1b86f9d334704ce9d1cfff0b8e77aae4e83c67d4c7c35295ab0d7810e87a7fee",
+      "byte_len": 34577
+    }
+  ],
+  "git_trees": {
+    "crates/fte-protocols/src": "e1cf09cd5f84c1f812227718473320228caf0179",
+    "crates/fte-router/src": "a3a99ab10179d7f83b0952eedf70dbd8cd2449c0",
+    "crates/fte-store/src": "7144ba9d82aef3fd670a150e3ec18a23da2a429f",
+    "crates/fte-types/src": "fdce1645f27c7da3c5283c6044579cfbdbe99a1d"
+  }
+}

@@ -1009,6 +1009,14 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    mod w1_source_tree {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/w1_source_tree.rs"
+        ));
+    }
+
     use super::*;
     use async_trait::async_trait;
     use axum::http::HeaderValue;
@@ -1058,6 +1066,7 @@ mod tests {
         chat: &'a Value,
         completion: &'a Value,
         stored_response_id: &'a str,
+        stored_response_reopened: bool,
         continuation: &'a Value,
     }
 
@@ -1078,20 +1087,15 @@ mod tests {
             "manifest must authenticate the complete loopback corpus"
         );
 
-        let source = include_str!("lib.rs");
-        let production_prefix = source
-            .split_once("\n#[cfg(test)]")
-            .expect("production/test boundary")
-            .0;
-        let production_prefix = format!("{production_prefix}\n");
         assert_eq!(
             sha256_identity(
                 case.source.production_tree.id.clone(),
-                production_prefix.as_bytes(),
+                w1_source_tree::BYTES
             ),
             case.source.production_tree,
-            "current production prefix must equal the frozen baseline source"
+            "manifest must authenticate the complete production source descriptor"
         );
+        w1_source_tree::verify();
 
         let requests = serde_json::to_vec(&fixture["loopback"]["requests"])
             .expect("loopback request corpus bytes");
@@ -1144,8 +1148,8 @@ mod tests {
             "ownership": {
                 "active_operations": 0,
                 "retained_tasks": 0,
-                "expected_workers": 2,
-                "joined_workers": 2,
+                "expected_workers": 0,
+                "joined_workers": 0,
             },
             "output_facts": {
                 "request_corpus_digest": {"kind": "digest", "value": digest_json(&requests)},
@@ -1155,7 +1159,7 @@ mod tests {
                 "chat_roundtrip": {"kind": "boolean", "value": chat_roundtrip},
                 "raw_completion_roundtrip": {"kind": "boolean", "value": raw_roundtrip},
                 "responses_stream_completed": {"kind": "boolean", "value": stream_completed},
-                "stored_response_reopened": {"kind": "boolean", "value": actual.stored_response_id == fixture["loopback"]["expected"]["stored_response_id"]},
+                "stored_response_reopened": {"kind": "boolean", "value": actual.stored_response_reopened},
                 "continuation_after_restart": {"kind": "boolean", "value": continuation_after_restart},
                 "loopback_only": {"kind": "boolean", "value": true},
             },
@@ -1566,10 +1570,12 @@ mod tests {
         gateway
             .register_backend(Arc::new(StreamingTestBackend))
             .expect("register backend");
-        let store = Arc::new(SqliteStore::in_memory().expect("in-memory store"));
         let token_directory =
             std::env::temp_dir().join(format!("fte-loopback-test-{}", random::<u64>()));
         let token_path = token_directory.join("token");
+        let database_path =
+            std::env::temp_dir().join(format!("fte-loopback-store-{}.sqlite3", random::<u64>()));
+        let store = Arc::new(SqliteStore::open(&database_path).expect("file-backed store"));
         let mut config = LoopbackConfig::app_private(token_path.clone());
         config.max_concurrent_requests = 1;
         let server = LoopbackServer::start(gateway, store.clone(), config.clone())
@@ -1732,16 +1738,17 @@ mod tests {
             stored["id"],
             fixture["loopback"]["expected"]["stored_response_id"]
         );
-        #[cfg(feature = "unstable-w1-vertical-tests")]
-        let stored_response_id = stored["id"].as_str().expect("stored response ID");
-
         server.shutdown().await;
+        drop(store);
 
         let restarted_gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
         restarted_gateway
             .register_backend(Arc::new(StreamingTestBackend))
             .expect("register backend after restart");
-        let restarted = LoopbackServer::start(restarted_gateway, store, config)
+        let reopened_store = Arc::new(
+            SqliteStore::open(&database_path).expect("reopen file-backed store after shutdown"),
+        );
+        let restarted = LoopbackServer::start(restarted_gateway, reopened_store, config)
             .await
             .expect("restart loopback");
         let restarted_address = restarted
@@ -1750,8 +1757,25 @@ mod tests {
             .find(|address| address.is_ipv4())
             .copied()
             .expect("restarted IPv4 listener");
+        let restarted_base = format!("http://{restarted_address}");
+        let reopened_stored = client
+            .get(format!("{restarted_base}/v1/responses/resp_socket_test"))
+            .header("x-api-key", &token)
+            .send()
+            .await
+            .expect("stored response after database reopen");
+        assert_eq!(reopened_stored.status(), StatusCode::OK);
+        let reopened_stored = reopened_stored
+            .json::<Value>()
+            .await
+            .expect("reopened stored response JSON");
+        assert_eq!(reopened_stored, stored);
+        #[cfg(feature = "unstable-w1-vertical-tests")]
+        let stored_response_id = reopened_stored["id"]
+            .as_str()
+            .expect("reopened stored response ID");
         let continuation = client
-            .post(format!("http://{restarted_address}/v1/responses"))
+            .post(format!("{restarted_base}/v1/responses"))
             .bearer_auth(&token)
             .json(&fixture["loopback"]["requests"]["continuation"])
             .send()
@@ -1783,10 +1807,14 @@ mod tests {
                 chat: &chat,
                 completion: &completion,
                 stored_response_id,
+                stored_response_reopened: reopened_stored == stored,
                 continuation: &continuation,
             },
         );
         let _ = fs::remove_dir_all(token_directory);
+        let _ = fs::remove_file(&database_path);
+        let _ = fs::remove_file(database_path.with_extension("sqlite3-shm"));
+        let _ = fs::remove_file(database_path.with_extension("sqlite3-wal"));
     }
 
     #[tokio::test]

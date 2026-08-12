@@ -10,12 +10,12 @@
         "repository_id": "delysis/free-token-energy",
         "commit": "0ba33bb786f068830cf288c629d8eedc63e56029",
         "production_tree": {
-          "id": "fte.hosted.production.prefix",
+          "id": "fte.production.source_roots.0ba33bb",
           "digest": {
             "algorithm": "sha256",
-            "hex": "1500541d643c8c91716b5616e80554287b81611b2eb3a391b4355a8750f54f1e"
+            "hex": "8cd035ad709fe8bb82687e54d09fecdef7b6cbfd202fbf6121e20501f192ac47"
           },
-          "length": 130013
+          "length": 906
         }
       },
       "inputs": [
@@ -24,9 +24,9 @@
             "id": "fte.hosted.loopback.corpus",
             "digest": {
               "algorithm": "sha256",
-              "hex": "cd9d3745ad720c590f75d402008dead2b8f9fae203c9fcdc147da102fa1bf332"
+              "hex": "7ada6db941edfe3a62f1ecb7acd63c7bd16fe8aa08f0bff3a00c5d2dce83db4d"
             },
-            "length": 3571
+            "length": 3607
           },
           "availability": "checked_in",
           "relative_path": "tests/fixtures/w1/v0/fte-hosted-loopback.json"
@@ -54,7 +54,7 @@
         "id": "fte.hosted.expected_projection",
         "digest": {
           "algorithm": "sha256",
-          "hex": "98ea75de05a3872f4ae1e58ccf690bb234e7f158acee6528370dedb7381f6e87"
+          "hex": "58046a475c4cfbe67c3bf39f2d7390bb8076f29837e22dcadf8b660b5ea9bef3"
         },
         "length": 3461
       }
@@ -65,12 +65,12 @@
         "repository_id": "delysis/free-token-energy",
         "commit": "0ba33bb786f068830cf288c629d8eedc63e56029",
         "production_tree": {
-          "id": "fte.loopback.production.prefix",
+          "id": "fte.production.source_roots.0ba33bb",
           "digest": {
             "algorithm": "sha256",
-            "hex": "1b86f9d334704ce9d1cfff0b8e77aae4e83c67d4c7c35295ab0d7810e87a7fee"
+            "hex": "8cd035ad709fe8bb82687e54d09fecdef7b6cbfd202fbf6121e20501f192ac47"
           },
-          "length": 34577
+          "length": 906
         }
       },
       "inputs": [
@@ -79,9 +79,9 @@
             "id": "fte.hosted.loopback.corpus",
             "digest": {
               "algorithm": "sha256",
-              "hex": "cd9d3745ad720c590f75d402008dead2b8f9fae203c9fcdc147da102fa1bf332"
+              "hex": "7ada6db941edfe3a62f1ecb7acd63c7bd16fe8aa08f0bff3a00c5d2dce83db4d"
             },
-            "length": 3571
+            "length": 3607
           },
           "availability": "checked_in",
           "relative_path": "tests/fixtures/w1/v0/fte-hosted-loopback.json"
@@ -109,7 +109,7 @@
         "id": "fte.loopback.expected_projection",
         "digest": {
           "algorithm": "sha256",
-          "hex": "4ac7418ff6c76931bb1962ea6285a5dc42c71a75c1215f4828ef3e0c94a0f444"
+          "hex": "8997157aaeca90c6fec3c0078110dd61a77182e05f4c3f2f00e63b22b8564b9b"
         },
         "length": 2240
       }

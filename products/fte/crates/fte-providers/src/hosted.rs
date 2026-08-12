@@ -3696,6 +3696,14 @@ fn apply_anthropic_request_headers(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    mod w1_source_tree {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/w1_source_tree.rs"
+        ));
+    }
+
     use super::*;
     use fte_types::{
         CachePolicy, DeadlinePolicy, GenerationInput, ModelSelector, PrivacyPolicy, ResponseFormat,
@@ -3971,20 +3979,15 @@ mod tests {
             "manifest must authenticate the complete hosted corpus"
         );
 
-        let source = include_str!("hosted.rs");
-        let production_prefix = source
-            .split_once("\n#[cfg(test)]")
-            .expect("production/test boundary")
-            .0;
-        let production_prefix = format!("{production_prefix}\n");
         assert_eq!(
             sha256_identity(
                 case.source.production_tree.id.clone(),
-                production_prefix.as_bytes(),
+                w1_source_tree::BYTES
             ),
             case.source.production_tree,
-            "current production prefix must equal the frozen baseline source"
+            "manifest must authenticate the complete production source descriptor"
         );
+        w1_source_tree::verify();
 
         let response = &fixture["hosted"]["response_projection"];
         let stream_bytes = response["stream_frames"]

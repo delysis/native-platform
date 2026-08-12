@@ -75,9 +75,12 @@
         }
       },
       "stream_frames": [
-        "event: message\ndata: {\"choices\":[{\"index\":0,\"text\":\" exact\"}]}\n\n",
-        "event: message\ndata: {\"choices\":[{\"index\":0,\"text\":\" stream\\n\",\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4}}\n\n",
-        "data: [DONE]\n\n"
+        "event: message\ndata: {\"cho",
+        "ices\":[{\"index\":0,\"text\":\" exact\"}]}\n",
+        "\nevent: message\ndata: {\"choices\":[{\"index\":0,\"text\":\" stre",
+        "am\\n\",\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4}}\n\n",
+        "data: [DO",
+        "NE]\n\n"
       ],
       "stream_text": " exact stream\n",
       "error": {

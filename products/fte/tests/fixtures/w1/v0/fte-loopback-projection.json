@@ -44,8 +44,8 @@
   "ownership": {
     "active_operations": 0,
     "retained_tasks": 0,
-    "expected_workers": 2,
-    "joined_workers": 2
+    "expected_workers": 0,
+    "joined_workers": 0
   },
   "output_facts": {
     "request_corpus_digest": {

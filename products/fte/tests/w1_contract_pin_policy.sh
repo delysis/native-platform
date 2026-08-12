@@ -25,11 +25,21 @@ write_fixture() {
     > "$fixture/Cargo.lock"
 }
 
-exact="platform-contract-testkit = { git = \"$repository\", rev = \"$lifecycle_revision\" }
+exact="platform-contract-testkit = { git = \"$repository\", rev = \"$lifecycle_revision\", optional = true }
 platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }
 platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }"
 write_fixture "$exact"
 "$checker" "$fixture"
+
+printf '%s\n' \
+  "W1_PLATFORM_CONTRACTS_REV=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  "W1_VERTICAL_FIXTURES_REV=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+  > "$fixture/w1-contracts.env"
+if "$checker" "$fixture" >/dev/null 2>&1; then
+  echo "self-consistent but unaccepted revisions unexpectedly passed" >&2
+  exit 1
+fi
+write_fixture "$exact"
 
 write_fixture "${exact/ rev = \"$lifecycle_revision\"/ branch = \"main\", rev = \"$lifecycle_revision\"}"
 if "$checker" "$fixture" >/dev/null 2>&1; then
@@ -40,6 +50,20 @@ fi
 write_fixture "${exact/ rev = \"$lifecycle_revision\"/ tag = \"v0\", rev = \"$lifecycle_revision\"}"
 if "$checker" "$fixture" >/dev/null 2>&1; then
   echo "tag contract dependency unexpectedly passed" >&2
+  exit 1
+fi
+
+write_fixture "${exact/, optional = true/}"
+if "$checker" "$fixture" >/dev/null 2>&1; then
+  echo "non-optional contract dependency unexpectedly passed" >&2
+  exit 1
+fi
+
+write_fixture "# platform-contract-testkit = { git = \"$repository\", rev = \"$lifecycle_revision\", optional = true }
+# platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }
+# platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }"
+if "$checker" "$fixture" >/dev/null 2>&1; then
+  echo "commented dependency declarations unexpectedly passed" >&2
   exit 1
 fi
 
