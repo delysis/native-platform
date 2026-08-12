@@ -1,0 +1,124 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "fte_hosted_fixture_loopback",
+  "class": "model_free",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [
+    {
+      "case_id": "hosted.contract",
+      "source": {
+        "repository_id": "delysis/free-token-energy",
+        "commit": "0ba33bb786f068830cf288c629d8eedc63e56029",
+        "production_tree": {
+          "id": "fte.hosted.production.prefix",
+          "digest": {
+            "algorithm": "sha256",
+            "hex": "1500541d643c8c91716b5616e80554287b81611b2eb3a391b4355a8750f54f1e"
+          },
+          "length": 130013
+        }
+      },
+      "inputs": [
+        {
+          "identity": {
+            "id": "fte.hosted.loopback.corpus",
+            "digest": {
+              "algorithm": "sha256",
+              "hex": "cd9d3745ad720c590f75d402008dead2b8f9fae203c9fcdc147da102fa1bf332"
+            },
+            "length": 3571
+          },
+          "availability": "checked_in",
+          "relative_path": "tests/fixtures/w1/v0/fte-hosted-loopback.json"
+        }
+      ],
+      "state_identities": [],
+      "prerequisites": [],
+      "replay": [
+        {
+          "program": { "kind": "cargo" },
+          "argv": [
+            "test",
+            "--locked",
+            "-p",
+            "fte-providers",
+            "--features",
+            "unstable-w1-vertical-tests",
+            "w1_hosted_fixture"
+          ],
+          "required_environment": [],
+          "network": "denied"
+        }
+      ],
+      "expected_projection": {
+        "id": "fte.hosted.expected_projection",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "98ea75de05a3872f4ae1e58ccf690bb234e7f158acee6528370dedb7381f6e87"
+        },
+        "length": 3461
+      }
+    },
+    {
+      "case_id": "loopback.roundtrip",
+      "source": {
+        "repository_id": "delysis/free-token-energy",
+        "commit": "0ba33bb786f068830cf288c629d8eedc63e56029",
+        "production_tree": {
+          "id": "fte.loopback.production.prefix",
+          "digest": {
+            "algorithm": "sha256",
+            "hex": "1b86f9d334704ce9d1cfff0b8e77aae4e83c67d4c7c35295ab0d7810e87a7fee"
+          },
+          "length": 34577
+        }
+      },
+      "inputs": [
+        {
+          "identity": {
+            "id": "fte.hosted.loopback.corpus",
+            "digest": {
+              "algorithm": "sha256",
+              "hex": "cd9d3745ad720c590f75d402008dead2b8f9fae203c9fcdc147da102fa1bf332"
+            },
+            "length": 3571
+          },
+          "availability": "checked_in",
+          "relative_path": "tests/fixtures/w1/v0/fte-hosted-loopback.json"
+        }
+      ],
+      "state_identities": [],
+      "prerequisites": [],
+      "replay": [
+        {
+          "program": { "kind": "cargo" },
+          "argv": [
+            "test",
+            "--locked",
+            "-p",
+            "fte-loopback",
+            "--features",
+            "unstable-w1-vertical-tests",
+            "real_loopback_socket_enforces_security_stream_state_and_storage"
+          ],
+          "required_environment": [],
+          "network": "loopback_only"
+        }
+      ],
+      "expected_projection": {
+        "id": "fte.loopback.expected_projection",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "4ac7418ff6c76931bb1962ea6285a5dc42c71a75c1215f4828ef3e0c94a0f444"
+        },
+        "length": 2240
+      }
+    }
+  ],
+  "omitted_claims": [
+    "live hosted-provider behavior",
+    "provider availability",
+    "provider billing or quota"
+  ],
+  "negative_evidence": []
+}

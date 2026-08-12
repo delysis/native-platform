@@ -3701,6 +3701,21 @@ mod tests {
         CachePolicy, DeadlinePolicy, GenerationInput, ModelSelector, PrivacyPolicy, ResponseFormat,
         RoutingPolicy, SamplingOptions, StoragePolicy, StreamPolicy, ToolPolicy,
     };
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    use platform_vertical_fixtures_v0::{
+        EquivalenceProjectionV0, ObservationEnvelopeV0, VerticalFixtureManifestV0, sha256_identity,
+        validate_baseline, validate_manifest,
+    };
+
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    const W1_CORPUS_BYTES: &[u8] =
+        include_bytes!("../../../tests/fixtures/w1/v0/fte-hosted-loopback.json");
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    const W1_MANIFEST_BYTES: &[u8] =
+        include_bytes!("../../../tests/fixtures/w1/v0/fte-hosted-loopback.manifest.json");
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    const W1_HOSTED_PROJECTION_BYTES: &[u8] =
+        include_bytes!("../../../tests/fixtures/w1/v0/fte-hosted-projection.json");
 
     fn request(input: GenerationInput) -> BackendRequest {
         BackendRequest {
@@ -3883,6 +3898,334 @@ mod tests {
         });
         let body = openai_completion_body(&token_request).expect("body");
         assert_eq!(body["prompt"], json!([1, 2, 3]));
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    fn w1_hosted_request_bodies(fixture: &Value) -> (Value, Value, Value) {
+        let chat_text = fixture["hosted"]["chat"]["text"]
+            .as_str()
+            .expect("chat fixture text");
+        let chat = request(GenerationInput::Chat {
+            items: vec![fte_types::InputItem::Message {
+                id: None,
+                role: fte_types::MessageRole::User,
+                content: vec![fte_types::ContentBlock::Text {
+                    text: chat_text.to_string(),
+                }],
+            }],
+        });
+        let chat_body = openai_chat_body(&chat).expect("fixture chat body");
+
+        let raw_text = fixture["hosted"]["raw_text"]["prompt"]
+            .as_str()
+            .expect("raw text fixture");
+        let raw = request(GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Text {
+                text: raw_text.to_string(),
+                add_bos: false,
+            }],
+        });
+        let raw_body = openai_completion_body(&raw).expect("fixture raw body");
+
+        let token_ids = fixture["hosted"]["raw_tokens"]["prompt"]
+            .as_array()
+            .expect("token fixture")
+            .iter()
+            .map(|value| {
+                i32::try_from(value.as_i64().expect("integer token"))
+                    .expect("token fixture must fit i32")
+            })
+            .collect();
+        let raw_tokens = request(GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Tokens { token_ids }],
+        });
+        let token_body = openai_completion_body(&raw_tokens).expect("fixture token body");
+
+        (chat_body, raw_body, token_body)
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    fn digest_json(bytes: &[u8]) -> Value {
+        serde_json::to_value(sha256_identity("fact", bytes).digest).expect("digest JSON")
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    fn validate_w1_hosted_projection(
+        fixture: &Value,
+        chat_body: &Value,
+        raw_body: &Value,
+        token_body: &Value,
+    ) {
+        let manifest: VerticalFixtureManifestV0 =
+            serde_json::from_slice(W1_MANIFEST_BYTES).expect("W1 vertical manifest");
+        validate_manifest(&manifest).expect("valid W1 vertical manifest");
+        let case = manifest
+            .cases
+            .iter()
+            .find(|case| case.case_id == "hosted.contract")
+            .expect("hosted contract case");
+        let input = &case.inputs[0].identity;
+        assert_eq!(
+            sha256_identity(input.id.clone(), W1_CORPUS_BYTES),
+            *input,
+            "manifest must authenticate the complete hosted corpus"
+        );
+
+        let source = include_str!("hosted.rs");
+        let production_prefix = source
+            .split_once("\n#[cfg(test)]")
+            .expect("production/test boundary")
+            .0;
+        let production_prefix = format!("{production_prefix}\n");
+        assert_eq!(
+            sha256_identity(
+                case.source.production_tree.id.clone(),
+                production_prefix.as_bytes(),
+            ),
+            case.source.production_tree,
+            "current production prefix must equal the frozen baseline source"
+        );
+
+        let response = &fixture["hosted"]["response_projection"];
+        let stream_bytes = response["stream_frames"]
+            .as_array()
+            .expect("stream frames")
+            .iter()
+            .map(|frame| frame.as_str().expect("stream frame"))
+            .collect::<String>();
+        let corpus_identity = serde_json::to_value(input).expect("corpus identity JSON");
+        let actual_projection: EquivalenceProjectionV0 = serde_json::from_value(json!({
+            "ordered_events": [{
+                "sequence": 0,
+                "operation_id": "fte.hosted.contract",
+                "attempt_id": "fixture.attempt.1",
+                "correlation_id": "fixture.request.w1",
+                "kind": "completed",
+                "payload": corpus_identity,
+            }],
+            "durable_state": [{
+                "state_id": "hosted.fixture.corpus",
+                "schema_id": "delysis.w1.fte.hosted.corpus.v0",
+                "before": corpus_identity,
+                "after": corpus_identity,
+                "disposition": "unchanged",
+            }],
+            "lifecycle": [{
+                "operation_id": "fte.hosted.contract",
+                "attempt_id": "fixture.attempt.1",
+                "correlation_id": "fixture.request.w1",
+                "terminal": "completed",
+                "released": true,
+            }],
+            "ownership": {
+                "active_operations": 0,
+                "retained_tasks": 0,
+                "expected_workers": 0,
+                "joined_workers": 0,
+            },
+            "output_facts": {
+                "chat_request_digest": {"kind": "digest", "value": digest_json(&serde_json::to_vec(chat_body).expect("chat bytes"))},
+                "raw_text_request_digest": {"kind": "digest", "value": digest_json(&serde_json::to_vec(raw_body).expect("raw bytes"))},
+                "raw_token_request_digest": {"kind": "digest", "value": digest_json(&serde_json::to_vec(token_body).expect("token bytes"))},
+                "chat_response_digest": {"kind": "digest", "value": digest_json(&serde_json::to_vec(&response["chat"]).expect("chat response bytes"))},
+                "completion_response_digest": {"kind": "digest", "value": digest_json(&serde_json::to_vec(&response["completion"]).expect("completion response bytes"))},
+                "stream_frames_digest": {"kind": "digest", "value": digest_json(stream_bytes.as_bytes())},
+                "error_fixture_digest": {"kind": "digest", "value": digest_json(&serde_json::to_vec(&response["error"]).expect("error bytes"))},
+                "request_identity_digest": {"kind": "digest", "value": digest_json(response["request_id"].as_str().expect("request ID").as_bytes())},
+                "credential_required": {"kind": "boolean", "value": false},
+                "hosted_request_sent": {"kind": "boolean", "value": false},
+                "raw_completion_distinct": {"kind": "boolean", "value": true},
+                "request_identity_bound": {"kind": "boolean", "value": true},
+                "unsafe_error_redacted": {"kind": "boolean", "value": true},
+            },
+            "fail_closed_facts": [
+                "no credential was resolved",
+                "no hosted network request was sent",
+                "unsupported raw completion mutation was rejected",
+                "provider error detail did not escape",
+            ],
+        }))
+        .expect("actual hosted projection");
+        let expected_projection: EquivalenceProjectionV0 =
+            serde_json::from_slice(W1_HOSTED_PROJECTION_BYTES).expect("expected projection");
+        assert_eq!(
+            actual_projection, expected_projection,
+            "hosted projection drift"
+        );
+        let observation: ObservationEnvelopeV0 = serde_json::from_value(json!({
+            "schema": "delysis.vertical_observation.v0",
+            "vertical_id": "fte_hosted_fixture_loopback",
+            "case_id": case.case_id,
+            "implementation_revision": case.source.commit,
+            "observed_prerequisites": [],
+            "evidence": {
+                "schema": "delysis.evidence_claim.v0",
+                "tier": "reproducible",
+                "threat_model": "deterministic hosted protocol translation only; no credential or hosted request",
+                "exact_source": case.source.production_tree.digest,
+                "exact_runtime_or_artifact": input.digest,
+                "execution_kind": "fixture",
+                "omitted_claims": ["live hosted-provider behavior"],
+                "negative_evidence": [],
+            },
+            "projection": actual_projection,
+        }))
+        .expect("hosted observation");
+        validate_baseline(
+            &manifest,
+            &case.case_id,
+            W1_HOSTED_PROJECTION_BYTES,
+            &[],
+            &observation,
+        )
+        .expect("hosted production behavior matches authenticated W1 projection");
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    #[test]
+    fn w1_hosted_fixture_preserves_chat_and_raw_without_live_authority() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/w1/v0/fte-hosted-loopback.json"
+        ))
+        .expect("parse W1 hosted fixture");
+        assert_eq!(fixture["execution"]["kind"], "deterministic_fixture");
+        assert_eq!(fixture["execution"]["network"], "loopback_only");
+        assert_eq!(fixture["execution"]["hosted_request_sent"], false);
+        assert_eq!(fixture["execution"]["credential_required"], false);
+
+        let (chat_body, raw_body, token_body) = w1_hosted_request_bodies(&fixture);
+        assert_eq!(chat_body, fixture["hosted"]["chat"]["expected_body"]);
+
+        let raw_text = fixture["hosted"]["raw_text"]["prompt"]
+            .as_str()
+            .expect("raw text fixture");
+        assert_eq!(raw_body, fixture["hosted"]["raw_text"]["expected_body"]);
+        assert_eq!(token_body, fixture["hosted"]["raw_tokens"]["expected_body"]);
+
+        let add_bos = request(GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Text {
+                text: raw_text.to_string(),
+                add_bos: true,
+            }],
+        });
+        assert_eq!(
+            openai_completion_body(&add_bos)
+                .expect_err("unsupported prompt mutation must fail")
+                .code,
+            fixture["hosted"]["unsupported_add_bos_error"]
+        );
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    #[tokio::test]
+    async fn w1_hosted_fixture_projects_responses_streams_errors_and_request_identity() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/w1/v0/fte-hosted-loopback.json"
+        ))
+        .expect("parse W1 hosted fixture");
+        let projection = &fixture["hosted"]["response_projection"];
+        let request_id = RequestId(
+            projection["request_id"]
+                .as_str()
+                .expect("request ID fixture")
+                .to_string(),
+        );
+        let response_id = projection["response_id"]
+            .as_str()
+            .expect("response ID fixture");
+        let route = request(GenerationInput::Chat { items: Vec::new() }).route;
+
+        let chat = parse_provider_response(
+            WireProtocol::OpenAiChat,
+            &projection["chat"],
+            &request_id,
+            response_id,
+            route.clone(),
+            None,
+        )
+        .expect("fixture chat response");
+        assert_eq!(chat.request_id, request_id);
+        assert_eq!(chat.id, response_id);
+        let [fte_types::OutputItem::Message { content, .. }] = chat.output.as_slice() else {
+            panic!("fixture chat response must contain one message")
+        };
+        assert_eq!(
+            content,
+            &[fte_types::ContentBlock::Text {
+                text: "exact chat output".to_string()
+            }]
+        );
+
+        let completion = parse_provider_response(
+            WireProtocol::OpenAiCompletion,
+            &projection["completion"],
+            &request_id,
+            response_id,
+            route.clone(),
+            None,
+        )
+        .expect("fixture completion response");
+        assert_eq!(completion.request_id, request_id);
+        assert_eq!(completion.id, response_id);
+        let [fte_types::OutputItem::Message { content, .. }] = completion.output.as_slice() else {
+            panic!("fixture completion response must contain one message")
+        };
+        assert_eq!(
+            content,
+            &[fte_types::ContentBlock::Text {
+                text: " exact raw output\n".to_string()
+            }]
+        );
+
+        let (events, mut receiver) = mpsc::channel(16);
+        let mut state = ProviderStreamState::new(
+            WireProtocol::OpenAiCompletion,
+            request_id.clone(),
+            response_id.to_string(),
+            route,
+            None,
+            CancellationToken::new(),
+        );
+        let mut parser = SseParser::default();
+        let mut finished = false;
+        for bytes in projection["stream_frames"]
+            .as_array()
+            .expect("stream frame fixtures")
+        {
+            for frame in parser
+                .push(bytes.as_str().expect("stream fixture bytes").as_bytes())
+                .expect("parse stream fixture")
+            {
+                finished |= state
+                    .consume_frame(frame, &events)
+                    .await
+                    .expect("consume stream fixture");
+            }
+        }
+        assert!(finished, "[DONE] must terminate the fixture stream");
+        drop(events);
+        let mut deltas = String::new();
+        while let Some(event) = receiver.recv().await {
+            if let GatewayEvent::TextDelta {
+                request_id: event_request,
+                delta,
+                ..
+            } = event
+            {
+                assert_eq!(event_request, request_id);
+                deltas.push_str(&delta);
+            }
+        }
+        assert_eq!(deltas, projection["stream_text"]);
+
+        let error = provider_event_error(&request_id, "provider", &projection["error"]);
+        assert_eq!(error.request_id, request_id);
+        assert_eq!(error.code, projection["expected_error_code"]);
+        assert_eq!(error.safe_detail, projection["expected_safe_detail"]);
+        assert!(!error.safe_detail.contains("must never escape"));
+
+        let (chat_body, raw_body, token_body) = w1_hosted_request_bodies(&fixture);
+        validate_w1_hosted_projection(&fixture, &chat_body, &raw_body, &token_body);
     }
 
     #[test]

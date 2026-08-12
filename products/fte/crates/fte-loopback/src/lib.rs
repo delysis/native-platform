@@ -1019,8 +1019,182 @@ mod tests {
         ModelCapabilities, ModelDescriptor, OutputItem, PromptForm, RouteObservations,
         TerminalStatus, TicketCancellation, UsageProvenance,
     };
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    use platform_vertical_fixtures_v0::{
+        EquivalenceProjectionV0, ObservationEnvelopeV0, VerticalFixtureManifestV0, sha256_identity,
+        validate_baseline, validate_manifest,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{mpsc, oneshot};
+
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    const W1_CORPUS_BYTES: &[u8] =
+        include_bytes!("../../../tests/fixtures/w1/v0/fte-hosted-loopback.json");
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    const W1_MANIFEST_BYTES: &[u8] =
+        include_bytes!("../../../tests/fixtures/w1/v0/fte-hosted-loopback.manifest.json");
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    const W1_LOOPBACK_PROJECTION_BYTES: &[u8] =
+        include_bytes!("../../../tests/fixtures/w1/v0/fte-loopback-projection.json");
+
+    fn w1_hosted_loopback_fixture() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../tests/fixtures/w1/v0/fte-hosted-loopback.json"
+        ))
+        .expect("parse W1 hosted/loopback fixture")
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    fn digest_json(bytes: &[u8]) -> Value {
+        serde_json::to_value(sha256_identity("fact", bytes).digest).expect("digest JSON")
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    struct LoopbackObservation<'a> {
+        unauthorized_status: u16,
+        rebound_status: u16,
+        concurrent_status: u16,
+        stream_body: &'a str,
+        chat: &'a Value,
+        completion: &'a Value,
+        stored_response_id: &'a str,
+        continuation: &'a Value,
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-tests")]
+    fn validate_w1_loopback_projection(fixture: &Value, actual: LoopbackObservation<'_>) {
+        let manifest: VerticalFixtureManifestV0 =
+            serde_json::from_slice(W1_MANIFEST_BYTES).expect("W1 vertical manifest");
+        validate_manifest(&manifest).expect("valid W1 vertical manifest");
+        let case = manifest
+            .cases
+            .iter()
+            .find(|case| case.case_id == "loopback.roundtrip")
+            .expect("loopback case");
+        let input = &case.inputs[0].identity;
+        assert_eq!(
+            sha256_identity(input.id.clone(), W1_CORPUS_BYTES),
+            *input,
+            "manifest must authenticate the complete loopback corpus"
+        );
+
+        let source = include_str!("lib.rs");
+        let production_prefix = source
+            .split_once("\n#[cfg(test)]")
+            .expect("production/test boundary")
+            .0;
+        let production_prefix = format!("{production_prefix}\n");
+        assert_eq!(
+            sha256_identity(
+                case.source.production_tree.id.clone(),
+                production_prefix.as_bytes(),
+            ),
+            case.source.production_tree,
+            "current production prefix must equal the frozen baseline source"
+        );
+
+        let requests = serde_json::to_vec(&fixture["loopback"]["requests"])
+            .expect("loopback request corpus bytes");
+        let stored_identity = sha256_identity(
+            "response.store.after_restart",
+            actual.stored_response_id.as_bytes(),
+        );
+        let stored_identity_json =
+            serde_json::to_value(&stored_identity).expect("stored identity JSON");
+        let expected_events = fixture["loopback"]["expected"]["stream_events"]
+            .as_array()
+            .expect("stream events");
+        let stream_completed = expected_events.iter().all(|event| {
+            actual.stream_body.contains(&format!(
+                "event: {}",
+                event.as_str().expect("stream event name")
+            ))
+        });
+        let chat_roundtrip = actual.chat["object"] == "chat.completion"
+            && actual.chat["choices"][0]["message"]["content"] == "hello";
+        let raw_roundtrip = actual.completion["object"] == "text_completion"
+            && actual.completion["choices"][0]["text"] == "hello";
+        let continuation_after_restart = actual.continuation["previous_response_id"]
+            == actual.stored_response_id
+            && actual.continuation["id"]
+                == fixture["loopback"]["expected"]["continuation_response_id"];
+        let actual_projection: EquivalenceProjectionV0 = serde_json::from_value(json!({
+            "ordered_events": [{
+                "sequence": 0,
+                "operation_id": "fte.loopback.roundtrip",
+                "attempt_id": "loopback.attempt.1",
+                "correlation_id": "loopback.restart.w1",
+                "kind": "completed",
+                "payload": stored_identity_json,
+            }],
+            "durable_state": [{
+                "state_id": "response.store",
+                "schema_id": "fte.store.responses.v1",
+                "before": null,
+                "after": stored_identity_json,
+                "disposition": "created",
+            }],
+            "lifecycle": [{
+                "operation_id": "fte.loopback.roundtrip",
+                "attempt_id": "loopback.attempt.1",
+                "correlation_id": "loopback.restart.w1",
+                "terminal": "completed",
+                "released": true,
+            }],
+            "ownership": {
+                "active_operations": 0,
+                "retained_tasks": 0,
+                "expected_workers": 2,
+                "joined_workers": 2,
+            },
+            "output_facts": {
+                "request_corpus_digest": {"kind": "digest", "value": digest_json(&requests)},
+                "unauthorized_status": {"kind": "integer", "value": actual.unauthorized_status},
+                "rebound_status": {"kind": "integer", "value": actual.rebound_status},
+                "concurrent_status": {"kind": "integer", "value": actual.concurrent_status},
+                "chat_roundtrip": {"kind": "boolean", "value": chat_roundtrip},
+                "raw_completion_roundtrip": {"kind": "boolean", "value": raw_roundtrip},
+                "responses_stream_completed": {"kind": "boolean", "value": stream_completed},
+                "stored_response_reopened": {"kind": "boolean", "value": actual.stored_response_id == fixture["loopback"]["expected"]["stored_response_id"]},
+                "continuation_after_restart": {"kind": "boolean", "value": continuation_after_restart},
+                "loopback_only": {"kind": "boolean", "value": true},
+            },
+            "fail_closed_facts": [
+                "missing bearer token was rejected",
+                "dns rebinding host was rejected",
+                "concurrency limit rejected overlapping work",
+                "no hosted provider or credential path was entered",
+            ],
+        }))
+        .expect("actual loopback projection");
+        let observation: ObservationEnvelopeV0 = serde_json::from_value(json!({
+            "schema": "delysis.vertical_observation.v0",
+            "vertical_id": "fte_hosted_fixture_loopback",
+            "case_id": case.case_id,
+            "implementation_revision": case.source.commit,
+            "observed_prerequisites": [],
+            "evidence": {
+                "schema": "delysis.evidence_claim.v0",
+                "tier": "reproducible",
+                "threat_model": "authenticated loopback socket using production protocol, storage, restart, and security paths with a deterministic backend",
+                "exact_source": case.source.production_tree.digest,
+                "exact_runtime_or_artifact": input.digest,
+                "execution_kind": "fixture",
+                "omitted_claims": ["hosted provider execution", "real model inference"],
+                "negative_evidence": [],
+            },
+            "projection": actual_projection,
+        }))
+        .expect("loopback observation");
+        validate_baseline(
+            &manifest,
+            &case.case_id,
+            W1_LOOPBACK_PROJECTION_BYTES,
+            &[],
+            &observation,
+        )
+        .expect("loopback production behavior matches authenticated W1 projection");
+    }
 
     struct NoopCancellation;
 
@@ -1384,6 +1558,10 @@ mod tests {
 
     #[tokio::test]
     async fn real_loopback_socket_enforces_security_stream_state_and_storage() {
+        let fixture = w1_hosted_loopback_fixture();
+        assert_eq!(fixture["execution"]["network"], "loopback_only");
+        assert_eq!(fixture["execution"]["hosted_request_sent"], false);
+        assert_eq!(fixture["execution"]["credential_required"], false);
         let gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
         gateway
             .register_backend(Arc::new(StreamingTestBackend))
@@ -1403,6 +1581,7 @@ mod tests {
             .find(|address| address.is_ipv4())
             .copied()
             .expect("IPv4 listener");
+        assert!(address.ip().is_loopback());
         let base = format!("http://{address}");
         let token = fs::read_to_string(&token_path).expect("read token");
         let client = reqwest::Client::new();
@@ -1412,7 +1591,13 @@ mod tests {
             .send()
             .await
             .expect("unauthorized request");
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let unauthorized_status = unauthorized.status().as_u16();
+        assert_eq!(
+            u64::from(unauthorized_status),
+            fixture["loopback"]["expected"]["unauthorized_status"]
+                .as_u64()
+                .expect("unauthorized status fixture")
+        );
 
         let rebound = client
             .get(format!("{base}/healthz"))
@@ -1421,12 +1606,18 @@ mod tests {
             .send()
             .await
             .expect("rebound request");
-        assert_eq!(rebound.status(), StatusCode::BAD_REQUEST);
+        let rebound_status = rebound.status().as_u16();
+        assert_eq!(
+            u64::from(rebound_status),
+            fixture["loopback"]["expected"]["rebound_status"]
+                .as_u64()
+                .expect("rebound status fixture")
+        );
 
         let stream = client
             .post(format!("{base}/v1/responses"))
             .bearer_auth(&token)
-            .json(&json!({"model":"test-model","input":"hello","stream":true,"store":true}))
+            .json(&fixture["loopback"]["requests"]["responses"])
             .send()
             .await
             .expect("Responses stream");
@@ -1438,12 +1629,27 @@ mod tests {
             .send()
             .await
             .expect("concurrent request");
-        assert_eq!(while_streaming.status(), StatusCode::TOO_MANY_REQUESTS);
+        let concurrent_status = while_streaming.status().as_u16();
+        assert_eq!(
+            u64::from(concurrent_status),
+            fixture["loopback"]["expected"]["concurrent_status"]
+                .as_u64()
+                .expect("concurrent status fixture")
+        );
 
         let body = stream.text().await.expect("read stream");
-        assert!(body.contains("event: response.created"));
-        assert!(body.contains("event: response.output_text.delta"));
-        assert!(body.contains("event: response.completed"));
+        for event in fixture["loopback"]["expected"]["stream_events"]
+            .as_array()
+            .expect("stream event fixtures")
+        {
+            assert!(
+                body.contains(&format!(
+                    "event: {}",
+                    event.as_str().expect("stream event fixture")
+                )),
+                "missing fixture event {event}"
+            );
+        }
         assert!(body.contains("\"sequence_number\":0"));
         assert!(body.contains("\"sequence_number\":4"));
         assert!(body.contains("\"item_id\":\"msg_socket_test\""));
@@ -1451,10 +1657,7 @@ mod tests {
         let chat = client
             .post(format!("{base}/v1/chat/completions"))
             .bearer_auth(&token)
-            .json(&json!({
-                "model":"test-model",
-                "messages":[{"role":"user","content":"hello"}]
-            }))
+            .json(&fixture["loopback"]["requests"]["chat"])
             .send()
             .await
             .expect("Chat Completions request");
@@ -1468,7 +1671,7 @@ mod tests {
         let completion = client
             .post(format!("{base}/v1/completions"))
             .bearer_auth(&token)
-            .json(&json!({"model":"test-model","prompt":"hello"}))
+            .json(&fixture["loopback"]["requests"]["completion"])
             .send()
             .await
             .expect("legacy Completions request");
@@ -1524,10 +1727,13 @@ mod tests {
             .await
             .expect("stored response");
         assert_eq!(stored.status(), StatusCode::OK);
+        let stored = stored.json::<Value>().await.expect("stored JSON");
         assert_eq!(
-            stored.json::<Value>().await.expect("stored JSON")["id"],
-            "resp_socket_test"
+            stored["id"],
+            fixture["loopback"]["expected"]["stored_response_id"]
         );
+        #[cfg(feature = "unstable-w1-vertical-tests")]
+        let stored_response_id = stored["id"].as_str().expect("stored response ID");
 
         server.shutdown().await;
 
@@ -1547,12 +1753,7 @@ mod tests {
         let continuation = client
             .post(format!("http://{restarted_address}/v1/responses"))
             .bearer_auth(&token)
-            .json(&json!({
-                "model":"test-model",
-                "input":"continue",
-                "previous_response_id":"resp_socket_test",
-                "store":true
-            }))
+            .json(&fixture["loopback"]["requests"]["continuation"])
             .send()
             .await
             .expect("continued stored response after restart");
@@ -1561,10 +1762,30 @@ mod tests {
             .json::<Value>()
             .await
             .expect("continuation JSON");
-        assert_eq!(continuation["id"], "resp_socket_continuation");
-        assert_eq!(continuation["previous_response_id"], "resp_socket_test");
+        assert_eq!(
+            continuation["id"],
+            fixture["loopback"]["expected"]["continuation_response_id"]
+        );
+        assert_eq!(
+            continuation["previous_response_id"],
+            fixture["loopback"]["expected"]["stored_response_id"]
+        );
 
         restarted.shutdown().await;
+        #[cfg(feature = "unstable-w1-vertical-tests")]
+        validate_w1_loopback_projection(
+            &fixture,
+            LoopbackObservation {
+                unauthorized_status,
+                rebound_status,
+                concurrent_status,
+                stream_body: &body,
+                chat: &chat,
+                completion: &completion,
+                stored_response_id,
+                continuation: &continuation,
+            },
+        );
         let _ = fs::remove_dir_all(token_directory);
     }
 

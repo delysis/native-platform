@@ -30,3 +30,15 @@ jobs:
         run: >-
           cargo clippy --locked -p fte-router
           --features unstable-w1-contract-tests --all-targets -- -D warnings
+      - name: Test authenticated FTE vertical fixtures
+        run: >-
+          cargo test --locked
+          -p fte-providers --features unstable-w1-vertical-tests
+          -p fte-loopback --features unstable-w1-vertical-tests
+          --all-targets
+      - name: Lint authenticated FTE vertical fixtures
+        run: >-
+          cargo clippy --locked
+          -p fte-providers --features unstable-w1-vertical-tests
+          -p fte-loopback --features unstable-w1-vertical-tests
+          --all-targets -- -D warnings
