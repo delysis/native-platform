@@ -4,7 +4,8 @@ This test-only descendant freezes the Native owner-thread slice of W1 row 9
 against production source `b36e6e9ed9efde020515f66611daeeb6f7bfc84a`.
 The source identity is the exact `git ls-tree -r` byte listing for
 `crates/llama-native-engine` at that commit. The vertical dependency is pinned
-to merged protocol `9fd803f5efcc46ac0256dab876e7c0b1f03bb448`; the accepted lifecycle-contract
+to corrected merged protocol `fc24ffff08c52690390b4460f44617d5d9732563`
+(`w1-vertical-protocol-v0-2026-08-12-r2`); the accepted lifecycle-contract
 pin remains `cbab33555ab9355a6ac453d659c55ec9e0666821`.
 `fixtures/w1/MANIFEST.sha256` authenticates every bundle member and itself has
 SHA-256 `14c195d4ae97990f705ac8d8386a2d50fb6622083c633c4b3bc79dd10a251d5a`.
