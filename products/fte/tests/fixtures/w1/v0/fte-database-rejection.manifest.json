@@ -8,14 +8,14 @@
       "case_id": "legacy_database.explicitly_unsupported",
       "source": {
         "repository_id": "delysis/free-token-energy",
-        "commit": "bea75f007f1a42041255600486d246c383238e68",
+        "commit": "2db2d4568b277f6829b3b8e3623fce59435847c2",
         "production_tree": {
           "id": "fte.database.production.source.d022e36",
           "digest": {
             "algorithm": "sha256",
-            "hex": "5adcd7d278b125482f5c42e09593d67bbf1a390100dc4d586aaa0f3800616248"
+              "hex": "ca400f66ea430b357caaf9c21e5f7821ea588947cf34c4d7db0353a481bfbd09"
           },
-          "length": 693
+            "length": 816
         }
       },
       "inputs": [

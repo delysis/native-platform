@@ -1272,6 +1272,7 @@ name = "free-token-energy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "fte-backend-llama",
  "fte-protocols",
  "fte-providers",

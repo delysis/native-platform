@@ -1,0 +1,90 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "quit_relaunch_fake_owners",
+  "class": "model_free",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [
+    {
+      "case_id": "gateway_owner.quit_relaunch",
+      "source": {
+        "repository_id": "delysis/free-token-energy",
+        "commit": "2db2d4568b277f6829b3b8e3623fce59435847c2",
+        "production_tree": {
+          "id": "fte.quit_relaunch.production.source.2db2d45",
+          "digest": {
+            "algorithm": "sha256",
+            "hex": "20789e5f36f63fe558ffe8b9e047ebbb019e0b9c11accd9583909db23f42ec2b"
+          },
+          "length": 950
+        }
+      },
+      "inputs": [
+        {
+          "identity": {
+            "id": "fte.quit_relaunch.input.v1",
+            "digest": {
+              "algorithm": "sha256",
+              "hex": "8a2308edc6fe670b60a28329b4dc621e3e094fdbc75bb77fbba92e7821dc13ec"
+            },
+            "length": 1009
+          },
+          "availability": "checked_in",
+          "relative_path": "tests/fixtures/w1/v0/fte-quit-relaunch-input-v1.json"
+        }
+      ],
+      "state_identities": [
+        {
+          "state_id": "fte.runtime.profile",
+          "schema_id": "fte.database.master_profile.v1",
+          "baseline": {
+            "identity": {
+              "id": "fte.runtime.profile.marker",
+              "digest": {
+                "algorithm": "sha256",
+                "hex": "3c685d4fd0e247dfdcd65f95f50575b2d96930dda96ce2d79932eedcd03078e4"
+              },
+              "length": 40
+            },
+            "availability": "generated_fixture",
+            "relative_path": null
+          }
+        }
+      ],
+      "prerequisites": [],
+      "replay": [
+        {
+          "program": { "kind": "cargo" },
+          "argv": [
+            "test",
+            "--locked",
+            "-p",
+            "free-token-energy",
+            "--features",
+            "unstable-w1-vertical-tests",
+            "--lib",
+            "gateway_runtime::w1_quit_relaunch_tests::w1_product_owner_quit_relaunch_is_quiescent_and_fresh",
+            "--",
+            "--exact"
+          ],
+          "required_environment": [],
+          "network": "denied"
+        }
+      ],
+      "expected_projection": {
+        "id": "fte.quit_relaunch.expected_projection",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "15c79a6a156efa06e2ed6e9adcf77d0eb7e0840bd30326e07a0fc23d1061fcd7"
+        },
+        "length": 5106
+      }
+    }
+  ],
+  "omitted_claims": [
+    "live Tauri window event dispatch",
+    "real model inference during the lifecycle probe",
+    "live hosted-provider behavior",
+    "operating-system process enumeration outside product-owned join receipts"
+  ],
+  "negative_evidence": []
+}

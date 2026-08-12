@@ -1,0 +1,28 @@
+{
+  "schema": "fte.w1.quit_relaunch.input.v1",
+  "active_request_id": "fte-w1-active-before-quit",
+  "rejected_request_id": "fte-w1-rejected-during-quit",
+  "fresh_request_id": "fte-w1-fresh-after-relaunch",
+  "backend_id": "w1-deterministic-owner",
+  "model_id": "w1-deterministic-model",
+  "durable_profile_key": "w1.quit_relaunch.marker",
+  "durable_profile_value": "product-state-survives-owner-replacement",
+  "expected_worker_ids": [
+    "backend-shutdown:anthropic",
+    "backend-shutdown:cerebras",
+    "backend-shutdown:gemini",
+    "backend-shutdown:groq",
+    "backend-shutdown:llama-native",
+    "backend-shutdown:mistral",
+    "backend-shutdown:nvidia",
+    "backend-shutdown:openrouter",
+    "backend-shutdown:w1-deterministic-owner"
+  ],
+  "fixture_boundaries": {
+    "backend_execution": "deterministic generated fixture",
+    "gateway_owner": "production GatewayRuntimeOwner",
+    "durable_state": "production Database master_profile",
+    "network": "denied",
+    "credential": "none"
+  }
+}

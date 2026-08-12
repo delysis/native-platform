@@ -636,7 +636,7 @@ mod w1_tests {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    const BASELINE_COMMIT: &str = "bea75f007f1a42041255600486d246c383238e68";
+    const BASELINE_COMMIT: &str = "2db2d4568b277f6829b3b8e3623fce59435847c2";
     const MANIFEST_BYTES: &[u8] =
         include_bytes!("../../tests/fixtures/w1/v0/fte-database-rejection.manifest.json");
     const POLICY_BYTES: &[u8] =
