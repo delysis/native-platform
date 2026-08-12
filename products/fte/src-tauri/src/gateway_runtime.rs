@@ -9,7 +9,7 @@ use fte_protocols::{
     openai_completion_json,
 };
 use fte_providers::{HostedProviderBackend, HostedProviderConfig};
-use fte_router::{Gateway, GatewayDefaults};
+use fte_router::{Gateway, GatewayDefaults, GatewayShutdownReport};
 use fte_store::SecretResolver;
 use fte_types::{
     BackendLocation, BackendReadiness, BackendSnapshot, GatewayError, Modality, ModelCapabilities,
@@ -177,6 +177,12 @@ pub struct GatewayRuntimeOwner {
     catalog: Vec<ModelCatalogEntry>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayRuntimeShutdownReport {
+    pub gateway: GatewayShutdownReport,
+    pub native_host_joined: bool,
+}
+
 impl GatewayRuntimeOwner {
     pub fn new() -> Result<Self, GatewayError> {
         Self::new_with_store(Arc::new(OsCredentialStore::new()))
@@ -309,6 +315,18 @@ impl GatewayRuntimeOwner {
         shutdown
             .as_ref()
             .is_some_and(|fact| fact.belongs_to(&self.native_host))
+    }
+
+    /// Drains the Gateway before joining the application-owned native host.
+    /// The returned report is suitable for process-exit diagnostics and
+    /// acceptance evidence; callers do not need access to either owner.
+    pub async fn shutdown_with_report(&self) -> GatewayRuntimeShutdownReport {
+        let gateway = self.gateway.shutdown_with_report().await;
+        let native_host_joined = self.shutdown_native_for_process_exit();
+        GatewayRuntimeShutdownReport {
+            gateway,
+            native_host_joined,
+        }
     }
 
     pub fn bind_database(&self, database: Arc<Database>) -> Result<(), GatewayError> {
@@ -1275,6 +1293,32 @@ mod tests {
                 "openrouter".to_string(),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_shutdown_reports_every_owned_worker_and_native_join() {
+        let runtime = GatewayRuntimeOwner::new().expect("gateway");
+        let report = runtime.shutdown_with_report().await;
+        report.gateway.result.expect("Gateway shutdown");
+        assert_eq!(
+            report.gateway.expected_worker_ids,
+            vec![
+                "backend-shutdown:anthropic",
+                "backend-shutdown:cerebras",
+                "backend-shutdown:gemini",
+                "backend-shutdown:groq",
+                "backend-shutdown:llama-native",
+                "backend-shutdown:mistral",
+                "backend-shutdown:nvidia",
+                "backend-shutdown:openrouter",
+            ]
+        );
+        assert_eq!(
+            report.gateway.joined_worker_ids,
+            report.gateway.expected_worker_ids
+        );
+        assert_eq!(report.gateway.retained_tasks, 0);
+        assert!(report.native_host_joined);
     }
 
     #[test]
