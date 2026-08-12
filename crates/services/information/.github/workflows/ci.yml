@@ -32,6 +32,9 @@ jobs:
         with:
           toolchain: "1.92.0"
           components: rustfmt,clippy
+      - name: Install boundary-check tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes ripgrep
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all --check
