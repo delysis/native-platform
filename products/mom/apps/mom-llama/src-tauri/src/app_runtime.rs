@@ -19,6 +19,19 @@ use crate::operation_supervisor::{
 #[cfg(all(test, feature = "unstable-w1-contracts"))]
 mod w1_contract;
 
+#[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+struct W1FixtureNativeFinalizer;
+
+#[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+impl NativeFinalizer for W1FixtureNativeFinalizer {
+    fn shutdown(
+        &self,
+        host: &Arc<NativeHost>,
+    ) -> Result<ProcessExitJoinedNativeHost, mom_llama_runtime::ProductShutdownError> {
+        Ok(host.shutdown_for_process_exit())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppPhase {
     Running,
@@ -589,7 +602,7 @@ pub(crate) fn w1_fixture_runtime() -> AppRuntimeHandle {
         host,
         None,
         Arc::new(RuntimeProductCanceller),
-        Arc::new(ProductNativeFinalizer),
+        Arc::new(W1FixtureNativeFinalizer),
         OperationSupervisor::with_config(41, 4),
     )
 }
