@@ -38,6 +38,9 @@ jobs:
       - name: Test portable packages
         shell: bash
         run: ./scripts/run-portable-cargo.sh test
+      - name: Test Wave 1 publication adapter
+        shell: bash
+        run: cargo test --locked -p information-native-acquire --features unstable-w1-contracts
       - name: Lint portable packages
         shell: bash
         run: ./scripts/run-portable-cargo.sh clippy

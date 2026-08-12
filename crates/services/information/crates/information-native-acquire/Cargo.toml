@@ -7,6 +7,9 @@ license.workspace = true
 readme.workspace = true
 rust-version.workspace = true
 
+[features]
+unstable-w1-contracts = ["dep:platform-contracts-v0"]
+
 [dependencies]
 fs2.workspace = true
 hex.workspace = true
@@ -20,6 +23,10 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio = { version = "1.53.1", features = ["net", "rt", "time"] }
 url.workspace = true
+platform-contracts-v0 = { workspace = true, optional = true }
+
+[dev-dependencies]
+platform-contracts-v0.workspace = true
 
 [lints]
 workspace = true

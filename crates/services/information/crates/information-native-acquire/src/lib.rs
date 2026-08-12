@@ -29,6 +29,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::{Host, Url};
 
+#[cfg(feature = "unstable-w1-contracts")]
+pub mod w1_contract;
+
 #[cfg(unix)]
 use fs2::FileExt;
 #[cfg(unix)]
