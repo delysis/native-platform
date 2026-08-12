@@ -8,12 +8,12 @@
       "case_id": "legacy_database.explicitly_unsupported",
       "source": {
         "repository_id": "delysis/free-token-energy",
-        "commit": "e774eb2b4853dd5f3b0aad8edbb359e6f6d7c228",
+        "commit": "bea75f007f1a42041255600486d246c383238e68",
         "production_tree": {
           "id": "fte.database.production.source.d022e36",
           "digest": {
             "algorithm": "sha256",
-            "hex": "d784f6afac69181b8d287a652c0edaa8e0ca7d6194549ab29fe61f51c403245f"
+            "hex": "5adcd7d278b125482f5c42e09593d67bbf1a390100dc4d586aaa0f3800616248"
           },
           "length": 693
         }
@@ -24,9 +24,9 @@
             "id": "fte.database.policy.v1",
             "digest": {
               "algorithm": "sha256",
-              "hex": "d43c3d6ee990263804063c699096bdb995b5c1df84b6369411f62b1344adc03d"
+              "hex": "49e1517e829213c7ab7ca70a2a60410068ed00c123d90b4f094d28a10957ec92"
             },
-            "length": 1162
+            "length": 1504
           },
           "availability": "checked_in",
           "relative_path": "tests/fixtures/w1/v0/fte-database-policy-v1.json"
@@ -72,9 +72,9 @@
         "id": "fte.database.rejection.expected_projection",
         "digest": {
           "algorithm": "sha256",
-          "hex": "0ee90d2e1c4588cfb63011a6f8ee535859b9509c1b95f9829d61b67bbb651d33"
+          "hex": "846b0d8e11a1408f0094b2b277d582591e2c0a315e9f22b11b40aa5cb795bb3b"
         },
-        "length": 2796
+        "length": 2946
       }
     }
   ],

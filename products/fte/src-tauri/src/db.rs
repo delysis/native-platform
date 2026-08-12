@@ -636,7 +636,7 @@ mod w1_tests {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    const BASELINE_COMMIT: &str = "e774eb2b4853dd5f3b0aad8edbb359e6f6d7c228";
+    const BASELINE_COMMIT: &str = "bea75f007f1a42041255600486d246c383238e68";
     const MANIFEST_BYTES: &[u8] =
         include_bytes!("../../tests/fixtures/w1/v0/fte-database-rejection.manifest.json");
     const POLICY_BYTES: &[u8] =
@@ -929,6 +929,28 @@ mod w1_tests {
                 .contains("unsupported database")
         );
 
+        let wrong_definition_path = temporary_database("wrong-definition");
+        {
+            let db = Database::new(wrong_definition_path.clone()).expect("open current database");
+            db.connection()
+                .expect("lock current database")
+                .execute_batch(
+                    policy["same_name_wrong_definition_sentinel"]["schema_sql"]
+                        .as_str()
+                        .expect("same-name wrong-definition sentinel schema"),
+                )
+                .expect("replace canonical definition with sentinel");
+        }
+        let wrong_definition_error = match Database::new(wrong_definition_path) {
+            Ok(_) => panic!("same-name wrong-definition schema must not be adopted"),
+            Err(error) => error,
+        };
+        assert!(
+            wrong_definition_error
+                .to_string()
+                .contains("unsupported database")
+        );
+
         let projection: EquivalenceProjectionV0 = serde_json::from_value(json!({
             "ordered_events": [
                 {"sequence": 0, "operation_id": "fte.database.unsupported_legacy", "attempt_id": "database.open.legacy.1", "correlation_id": "fte.database.policy.w1", "kind": "failed", "payload": null},
@@ -953,6 +975,7 @@ mod w1_tests {
                 "legacy_import_module_present": {"kind": "boolean", "value": false},
                 "unversioned_database_rejected": {"kind": "boolean", "value": true},
                 "unexpected_schema_object_rejected": {"kind": "boolean", "value": true},
+                "same_name_wrong_definition_rejected": {"kind": "boolean", "value": true},
                 "fresh_database_opened": {"kind": "boolean", "value": true},
                 "current_database_reopened": {"kind": "boolean", "value": true},
                 "application_id": {"kind": "integer", "value": application_id},
@@ -961,6 +984,7 @@ mod w1_tests {
             "fail_closed_facts": [
                 "plaintext legacy schema was rejected before product schema mutation",
                 "unversioned populated schema was rejected before adoption",
+                "same-name foreign schema definitions were rejected before use",
                 "unsupported input was not represented as historical migration evidence",
                 "no credential store or hosted network authority was required"
             ]

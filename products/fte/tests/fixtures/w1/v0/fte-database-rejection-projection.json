@@ -69,6 +69,7 @@
     "legacy_import_module_present": { "kind": "boolean", "value": false },
     "unversioned_database_rejected": { "kind": "boolean", "value": true },
     "unexpected_schema_object_rejected": { "kind": "boolean", "value": true },
+    "same_name_wrong_definition_rejected": { "kind": "boolean", "value": true },
     "fresh_database_opened": { "kind": "boolean", "value": true },
     "current_database_reopened": { "kind": "boolean", "value": true },
     "application_id": { "kind": "integer", "value": 1179927857 },
@@ -77,6 +78,7 @@
   "fail_closed_facts": [
     "plaintext legacy schema was rejected before product schema mutation",
     "unversioned populated schema was rejected before adoption",
+    "same-name foreign schema definitions were rejected before use",
     "unsupported input was not represented as historical migration evidence",
     "no credential store or hosted network authority was required"
   ]

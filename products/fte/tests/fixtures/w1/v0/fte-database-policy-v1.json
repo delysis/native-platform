@@ -27,5 +27,9 @@
   "unexpected_object_sentinel": {
     "schema_sql": "CREATE VIEW unexpected_view AS SELECT 1 AS value;",
     "expected": "reject_noncanonical_schema_object_set"
+  },
+  "same_name_wrong_definition_sentinel": {
+    "schema_sql": "DROP INDEX idx_request_log_provider; DROP TABLE request_log; CREATE TABLE request_log (id INTEGER PRIMARY KEY, provider_id TEXT NOT NULL); CREATE INDEX idx_request_log_provider ON request_log (provider_id, id DESC);",
+    "expected": "reject_noncanonical_schema_definitions"
   }
 }
