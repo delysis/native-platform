@@ -1,0 +1,21 @@
+{
+  "schema": "delysis.production_source_roots.v0",
+  "repository_id": "delysis/free-token-energy",
+  "commit": "e774eb2b4853dd5f3b0aad8edbb359e6f6d7c228",
+  "prefixes": [
+    {
+      "path": "src-tauri/src/db.rs",
+      "boundary": "first_cfg_test",
+      "sha256": "8f01d12666213194cedfc410ef8b213a4bb66f40815403e2accf66f11d847ebc",
+      "byte_len": 13286
+    }
+  ],
+  "git_blobs": {
+    "src-tauri/src/gateway_runtime.rs": "b2f65e5a3b8097e961fda954118971c516e679b1",
+    "src-tauri/src/lib.rs": "ead83faf9954053f1d789ede586e258054e3ff11",
+    "src-tauri/src/secrets.rs": "9558c5193e7f93e7862ae423fe58980956f7a660"
+  },
+  "absent_paths": [
+    "src-tauri/src/credential_migration.rs"
+  ]
+}

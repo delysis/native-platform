@@ -63,6 +63,32 @@ the synthetic credential importer has been deleted. A subsequent product-owned
 W1 row freezes this explicit unsupported-input contract rather than
 manufacturing a state migration baseline.
 
+The row-15 manifest is now complete. It binds production baseline
+`e774eb2b4853dd5f3b0aad8edbb359e6f6d7c228`, policy input SHA-256
+`d43c3d6ee990263804063c699096bdb995b5c1df84b6369411f62b1344adc03d`,
+expected projection SHA-256
+`0ee90d2e1c4588cfb63011a6f8ee535859b9509c1b95f9829d61b67bbb651d33`,
+and manifest SHA-256
+`96706a3ad8c3aac4ed3b46adb9bc3c6d9c9bde382807d1fcae2c8a122e497211`.
+The source descriptor authenticates the production database prefix, exact
+desktop/secret/runtime blobs, and absence of the retired importer.
+
+The runtime replay creates only adversarial unsupported-input sentinels. They
+are labeled generated, contain no credential, and are not presented as prior
+release databases. The production `Database::new` rejects the plaintext legacy
+schema and an unversioned populated schema without byte changes; a fresh store
+is stamped with `application_id=0x46544531`, `user_version=1`, and the exact
+current schema object set, then reopens. The central `fc24ffff` validator accepts
+the resulting state projection. The earlier real-Keychain receipt is retained
+in the manifest as superseded negative evidence because its SQLite input was
+synthetic.
+
+```sh
+cargo test --locked -p free-token-energy \
+  --features unstable-w1-vertical-tests --lib \
+  db::w1_tests::w1_legacy_database_is_explicitly_unsupported -- --exact
+```
+
 The repository pin policy independently hard-codes both accepted revisions;
 changing `w1-contracts.env` and the manifests/lock together cannot move either
 authority. Only exact, uncommented, optional dependency declarations pass.

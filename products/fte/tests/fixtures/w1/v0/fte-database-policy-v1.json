@@ -1,0 +1,31 @@
+{
+  "schema": "delysis.w1.fte_database_policy.v1",
+  "disposition": "reject_unsupported_legacy",
+  "historical_database_available": false,
+  "backward_compatibility_required": false,
+  "fresh_database": {
+    "application_id": 1179927857,
+    "application_id_hex": "0x46544531",
+    "user_version": 1,
+    "tables": [
+      "local_model_configuration",
+      "master_profile",
+      "request_log"
+    ],
+    "signature": "application_id=0x46544531;user_version=1;tables=local_model_configuration,master_profile,request_log"
+  },
+  "legacy_sentinel": {
+    "purpose": "adversarial unsupported-input sentinel, not a historical database fixture",
+    "schema_sql": "CREATE TABLE api_keys (provider_id TEXT PRIMARY KEY, key_value TEXT NOT NULL);",
+    "secret_value": "noncredential-sentinel",
+    "expected": "reject_before_schema_mutation"
+  },
+  "unversioned_sentinel": {
+    "schema_sql": "CREATE TABLE operator_data (value TEXT NOT NULL);",
+    "expected": "reject_before_schema_adoption"
+  },
+  "unexpected_object_sentinel": {
+    "schema_sql": "CREATE VIEW unexpected_view AS SELECT 1 AS value;",
+    "expected": "reject_noncanonical_schema_object_set"
+  }
+}

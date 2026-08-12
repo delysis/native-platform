@@ -557,7 +557,7 @@ mod tests {
     }
 }
 
-#[cfg(any())]
+#[cfg(all(test, feature = "unstable-w1-vertical-tests"))]
 mod w1_tests {
     use super::*;
     use platform_vertical_fixtures_v0::{
@@ -570,7 +570,7 @@ mod w1_tests {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    const BASELINE_COMMIT: &str = "d022e36cfef1cd6aefcf42a4991d716c936dcb6b";
+    const BASELINE_COMMIT: &str = "e774eb2b4853dd5f3b0aad8edbb359e6f6d7c228";
     const MANIFEST_BYTES: &[u8] =
         include_bytes!("../../tests/fixtures/w1/v0/fte-database-rejection.manifest.json");
     const POLICY_BYTES: &[u8] =
@@ -843,7 +843,25 @@ mod w1_tests {
                 .as_str()
                 .expect("current schema signature")
         );
-        Database::new(fresh_path).expect("exact current database reopens");
+        Database::new(fresh_path.clone()).expect("exact current database reopens");
+        {
+            let conn = Connection::open(&fresh_path).expect("open current database sentinel");
+            conn.execute_batch(
+                policy["unexpected_object_sentinel"]["schema_sql"]
+                    .as_str()
+                    .expect("unexpected object sentinel schema"),
+            )
+            .expect("add unexpected schema object sentinel");
+        }
+        let unexpected_error = match Database::new(fresh_path) {
+            Ok(_) => panic!("unexpected schema object must not be adopted"),
+            Err(error) => error,
+        };
+        assert!(
+            unexpected_error
+                .to_string()
+                .contains("unsupported database")
+        );
 
         let projection: EquivalenceProjectionV0 = serde_json::from_value(json!({
             "ordered_events": [
@@ -868,6 +886,7 @@ mod w1_tests {
                 "legacy_bytes_unchanged": {"kind": "boolean", "value": true},
                 "legacy_import_module_present": {"kind": "boolean", "value": false},
                 "unversioned_database_rejected": {"kind": "boolean", "value": true},
+                "unexpected_schema_object_rejected": {"kind": "boolean", "value": true},
                 "fresh_database_opened": {"kind": "boolean", "value": true},
                 "current_database_reopened": {"kind": "boolean", "value": true},
                 "application_id": {"kind": "integer", "value": application_id},

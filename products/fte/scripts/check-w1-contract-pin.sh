@@ -36,8 +36,8 @@ manifest_lines="$({
     -exec grep -H -F "$repository" {} +
 } 2>/dev/null || true)"
 manifest_count="$(printf '%s\n' "$manifest_lines" | grep -c . || true)"
-if [[ "$manifest_count" -ne 3 ]]; then
-  echo "expected three Wave 1 test-only dependency declarations, found $manifest_count" >&2
+if [[ "$manifest_count" -ne 4 ]]; then
+  echo "expected four Wave 1 test-only dependency declarations, found $manifest_count" >&2
   exit 1
 fi
 if printf '%s\n' "$manifest_lines" | grep -Eq 'branch[[:space:]]*=|tag[[:space:]]*='; then
@@ -54,8 +54,8 @@ if [[ "$(printf '%s\n' "$manifest_lines" | grep -Fc "$lifecycle_declaration")" -
   echo "Wave 1 lifecycle dependency does not use its accepted revision exactly once" >&2
   exit 1
 fi
-if [[ "$(printf '%s\n' "$manifest_lines" | grep -Fc "$vertical_declaration")" -ne 2 ]]; then
-  echo "Wave 1 vertical dependency does not use its protocol revision exactly twice" >&2
+if [[ "$(printf '%s\n' "$manifest_lines" | grep -Fc "$vertical_declaration")" -ne 3 ]]; then
+  echo "Wave 1 vertical dependency does not use its protocol revision exactly three times" >&2
   exit 1
 fi
 if printf '%s\n' "$manifest_lines" \

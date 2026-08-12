@@ -44,3 +44,12 @@ jobs:
           -p fte-providers --features unstable-w1-vertical-tests
           -p fte-loopback --features unstable-w1-vertical-tests
           --all-targets -- -D warnings
+      - name: Test explicit legacy-database rejection
+        run: >-
+          cargo test --locked -p free-token-energy
+          --features unstable-w1-vertical-tests --lib
+          db::w1_tests::w1_legacy_database_is_explicitly_unsupported
+      - name: Lint explicit legacy-database rejection
+        run: >-
+          cargo clippy --locked -p free-token-energy
+          --features unstable-w1-vertical-tests --all-targets -- -D warnings
