@@ -45,6 +45,9 @@ every bound production root is unchanged. The generic projection makes no
 listener-worker-count claim because `LoopbackServer::shutdown` intentionally
 does not expose an authoritative joined-task receipt.
 
+The Wave 1 workflow checks out full Git history so the baseline ancestry and
+Git object identities are available on GitHub Actions as well as local clones.
+
 ## Partial supporting row
 
 ### FTE legacy database
@@ -70,6 +73,8 @@ authority. Only exact, uncommented, optional dependency declarations pass.
 - `cargo fmt --all -- --check`
 - `./scripts/check-w1-contract-pin.sh`
 - `./tests/w1_contract_pin_policy.sh`
+- `./scripts/check-workflow-policy.sh`
+- `./tests/workflow_policy.sh`
 - Rust 1.92 vertical tests: 23 passed
 - Rust 1.92 vertical Clippy with `-D warnings`
 - Rust 1.92 contract-router tests: 42 passed
