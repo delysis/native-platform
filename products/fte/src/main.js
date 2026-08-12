@@ -22,7 +22,7 @@ const PROVIDER_DETAILS = {
     url: 'https://aistudio.google.com/app/apikey',
   },
   mistral: {
-    description: 'Mistral chat models plus native Codestral fill-in-the-middle completion.',
+    description: 'Mistral chat models through the modern Gateway.',
     url: 'https://console.mistral.ai/api-keys/',
   },
   cerebras: {
@@ -136,6 +136,12 @@ function renderPreviewState() {
   proxyPill.className = 'status-pill status-muted';
   proxyPill.textContent = 'Offline';
 
+  setText('local-model-name', 'Desktop application required');
+  setText('local-model-detail', 'Local model selection is available when the desktop application is running.');
+  const localModelPill = document.getElementById('local-model-status-pill');
+  localModelPill.className = 'status-pill status-muted';
+  localModelPill.textContent = 'Offline';
+
   const logsEmpty = document.getElementById('logs-empty');
   logsEmpty.textContent = 'Activity is available when the desktop application is running.';
   logsEmpty.hidden = false;
@@ -154,7 +160,9 @@ function statusLabel(status) {
   const labels = {
     ready: 'Ready',
     needs_key: 'Needs key',
+    needs_model: 'Needs model',
     not_configured: 'Not configured',
+    invalid: 'Needs attention',
     loading: 'Loading',
     unavailable: 'Unavailable',
     quota_exhausted: 'Quota exhausted',
@@ -167,7 +175,9 @@ function statusClass(status) {
   const classes = {
     ready: 'status-ready',
     needs_key: 'status-muted',
+    needs_model: 'status-muted',
     not_configured: 'status-muted',
+    invalid: 'status-error',
     loading: 'status-warn',
     unavailable: 'status-error',
     quota_exhausted: 'status-warn',
@@ -181,6 +191,58 @@ function makeStatusPill(status) {
   pill.className = `status-pill ${statusClass(status)}`;
   pill.textContent = statusLabel(status);
   return pill;
+}
+
+function renderLocalModelStatus(status) {
+  const state = status?.state || 'invalid';
+  const pill = document.getElementById('local-model-status-pill');
+  pill.className = `status-pill ${statusClass(state)}`;
+  pill.textContent = state === 'ready' ? 'Configured' : statusLabel(state);
+  setText('local-model-name', status?.display_name || 'No model selected');
+  setText(
+    'local-model-detail',
+    status?.detail || 'The desktop did not return a local model status.',
+  );
+}
+
+async function refreshLocalModelStatus() {
+  try {
+    renderLocalModelStatus(await invoke('get_local_model_status'));
+  } catch (error) {
+    renderLocalModelStatus({
+      state: 'invalid',
+      detail: `Could not read local model status: ${errorMessage(error)}`,
+    });
+  }
+}
+
+async function chooseLocalModel() {
+  const button = document.getElementById('choose-local-model');
+  const digestInput = document.getElementById('local-model-sha256');
+  const expectedSha256 = digestInput.value.trim().toLowerCase();
+  if (expectedSha256 && !/^[0-9a-f]{64}$/.test(expectedSha256)) {
+    showToast('Expected SHA-256 must be exactly 64 hexadecimal characters.', 'error');
+    digestInput.focus();
+    return;
+  }
+
+  setButtonPending(button, true, 'Choosing…', 'Choose GGUF file');
+  try {
+    const status = await invoke('choose_local_model', {
+      expectedSha256: expectedSha256 || null,
+    });
+    renderLocalModelStatus(status);
+    if (status.state === 'ready') {
+      digestInput.value = '';
+      showToast(`${status.display_name || 'Local model'} is configured.`);
+      await Promise.all([renderProviderGrid(), refreshDashboard(), loadModels()]);
+    }
+  } catch (error) {
+    showToast(`Could not configure local model: ${errorMessage(error)}`, 'error');
+    await refreshLocalModelStatus();
+  } finally {
+    setButtonPending(button, false, 'Choosing…', 'Choose GGUF file');
+  }
 }
 
 async function refreshDashboard() {
@@ -748,7 +810,7 @@ function showView(viewName) {
   setText('workspace-context', activeItem?.dataset.label || 'Workspace');
   if (!isDesktopRuntime) return;
   if (viewName === 'dashboard') refreshDashboard();
-  if (viewName === 'setup') renderProviderGrid();
+  if (viewName === 'setup') Promise.all([renderProviderGrid(), refreshLocalModelStatus()]);
   if (viewName === 'logs') refreshLogs();
   if (viewName === 'settings') refreshProxyStatus();
 }
@@ -763,6 +825,7 @@ function bindEvents() {
   }
   document.getElementById('refresh-dashboard').addEventListener('click', refreshDashboard);
   document.getElementById('refresh-logs').addEventListener('click', refreshLogs);
+  document.getElementById('choose-local-model').addEventListener('click', chooseLocalModel);
   document.getElementById('chat-form').addEventListener('submit', (event) => {
     event.preventDefault();
     sendMessage();
@@ -788,7 +851,12 @@ async function bootstrap() {
     renderPreviewState();
     return;
   }
-  await Promise.all([refreshDashboard(), loadModels(), refreshProxyStatus()]);
+  await Promise.all([
+    refreshDashboard(),
+    loadModels(),
+    refreshProxyStatus(),
+    refreshLocalModelStatus(),
+  ]);
 }
 
 bootstrap();

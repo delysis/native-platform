@@ -18,10 +18,9 @@ repository. FTE may consume it through optional provider/protocol bridges, but
 does not compile, install, or authorize speech by default. See
 [Module and Repository Map](docs/MODULE_MAP.md).
 
-The reusable gateway is substantially ahead of the historical desktop UI
-runtime. [Robustness and unification audit](docs/ROBUSTNESS_AUDIT.md) states
-the verified boundary and the remaining breaking migration work; the two paths
-are not represented as unified until that migration is complete.
+The desktop commands, Rust-only plugin, and optional loopback API now share one
+application-owned `Gateway`. [Robustness and unification audit](docs/ROBUSTNESS_AUDIT.md)
+records the verified boundary and the live acceptance work still required.
 
 ## What works
 
@@ -30,10 +29,10 @@ are not represented as unified until that migration is complete.
   `generateContent`
 - OpenAI-compatible chat, native legacy text completions, responses, model
   listing, and SSE
-- Atomic sliding-window request reservations that survive application restarts
 - Measured local request totals, token usage, latency, and provider outcomes
-- A desktop dashboard, provider setup, chat playground, activity log, and
-  persistent proxy-port settings
+- A desktop dashboard, provider setup, chat playground, and activity log
+- A native file picker for selecting a local GGUF, with restart-safe local
+  configuration and explicit missing-file status
 - A transport-neutral backend boundary that distinguishes authenticated remote
   APIs from credentialless embedded or companion-process inference runtimes
 
@@ -53,8 +52,9 @@ npm test
 npm run dev
 ```
 
-The proxy starts on `127.0.0.1:1337` by default. Its port can be changed from
-Settings without restarting the desktop application.
+The authenticated loopback API is disabled until explicitly started. By
+default it binds an OS-assigned loopback port; callers may request a fixed port
+through the plugin command and should read the returned address.
 
 ## API surface
 
@@ -85,15 +85,13 @@ Current native transports are:
 
 - Cerebras `/v1/completions` for documented direct continuation with
   `gpt-oss-120b`
-- OpenRouter `/api/v1/completions` is implemented in the provider adapter, but
-  the dynamic `openrouter/free` catalog alias is deliberately excluded from raw
-  routing because it cannot guarantee stable model or template semantics
-- Anthropic's legacy `/v1/complete` transport is implemented and fixture-tested,
-  but current Claude catalog models are deliberately excluded because Anthropic
-  now directs integrations to Messages and does not document those models for
-  the legacy endpoint
-- Mistral `/v1/fim/completions` with `codestral-latest`, marked as FIM
-  continuation
+- OpenRouter's dynamic `openrouter/free` alias is deliberately excluded from raw
+  completion routing because it cannot guarantee stable model or template
+  semantics
+- Current Claude catalog models are excluded because they do not have a
+  supported prompt-completion contract
+- Codestral FIM is not advertised. It may return only with a dedicated typed
+  request, response, and streaming contract on the sole production route.
 
 Groq, Gemini, hosted NVIDIA NIM, and `mistral-small-latest` are chat-only in the
 catalog. They are never used as fallbacks for `/v1/completions`. Model objects
@@ -102,23 +100,11 @@ and prompt semantics.
 
 ## Routing
 
-Eligible routes must have a configured key, support the requested model and
-capabilities, and have local quota remaining. They are ranked with:
-
-```text
-0.35 × documented-limit headroom
-+ 0.30 × measured evaluation score
-+ 0.20 × declared capability breadth
-+ 0.15 × observed latency
-```
-
-Unknown quota, evaluation, and latency inputs are neutral rather than
-fabricated. Request counts are reserved atomically before dispatch; token usage
-is recorded when it becomes available.
-
-Only finite documented quota windows are reserved and persisted. Local or
-otherwise unmetered backends still contribute measured request, token, and
-latency observations without being assigned invented quota limits.
+Eligible routes must satisfy privacy, model, capability, and backend-readiness
+requirements. The Gateway uses only descriptor observations that actually
+exist; missing quota, evaluation, and latency inputs remain unknown rather than
+being fabricated. Request outcomes and usage are recorded in the bounded
+nonsecret activity log.
 
 ## Native llama.cpp integration
 
@@ -127,6 +113,13 @@ llama-native host. Chat, raw text Completion, exact token Completion,
 streaming, cancellation, resident-model reuse, and fingerprinted prefix caches
 run in process. There is no `llama-cli`, `llama-server`, subprocess, or
 loopback hop between the router and local inference.
+
+In the desktop app, open **Providers** and choose a GGUF file. The sole
+application-owned Gateway validates and registers the file, while SQLite keeps
+only its non-secret canonical path and optional expected SHA-256 for startup
+restoration. The webview receives the filename and readiness state, not the
+full local path. A moved or deleted file is reported as needing attention and
+is never presented as a usable route.
 
 The real-GGUF integration test distinguishes actual in-process evidence from
 fixtures and proves both cold checkpoint creation and a second-request stable
@@ -147,11 +140,13 @@ contracts; neither core owns the other.
 
 ## Privacy and security
 
-There is no telemetry. The reusable loopback edge is disabled until explicitly
+There is no telemetry. The loopback edge is disabled until explicitly
 started, binds only loopback, validates Host/Origin, and requires an app-private
 256-bit token. Hosted keys never cross that interface and are loaded through an
-injected secret resolver. The older desktop proxy remains a separate migration
-surface; read [SECURITY.md](SECURITY.md) before using valuable credentials.
+injected OS credential-store resolver. Fresh databases never create plaintext
+credential storage; an exact-readback, fail-closed compatibility importer
+atomically retires the table on upgraded installations. Read
+[SECURITY.md](SECURITY.md) before using valuable credentials.
 
 ## Development
 

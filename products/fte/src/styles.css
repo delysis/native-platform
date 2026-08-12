@@ -569,6 +569,33 @@ textarea.input-field {
   gap: 0.75rem;
 }
 
+.local-model-card {
+  margin-bottom: 0.75rem;
+}
+
+.local-model-heading {
+  align-items: flex-start;
+}
+
+.local-model-heading h2 {
+  margin-bottom: 0.25rem;
+}
+
+.local-model-controls {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(280px, 1fr) auto;
+  align-items: end;
+  gap: 0.85rem;
+}
+
+.local-model-controls > div {
+  align-self: center;
+}
+
+.local-model-digest {
+  min-width: 0;
+}
+
 .provider-grid > .empty-state {
   grid-column: 1 / -1;
 }
@@ -961,6 +988,11 @@ code {
 
   .master-grid {
     grid-template-columns: 1fr;
+  }
+
+  .local-model-controls {
+    grid-template-columns: 1fr;
+    align-items: stretch;
   }
 }
 

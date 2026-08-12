@@ -541,6 +541,25 @@ impl Gateway {
             .unwrap_or_default()
     }
 
+    /// Returns the registered provider/model inventory and current readiness
+    /// without exposing backend execution authority.
+    #[must_use]
+    pub fn backend_snapshots(&self) -> Vec<fte_types::BackendSnapshot> {
+        self.state
+            .read()
+            .map(|state| {
+                state
+                    .backends
+                    .values()
+                    .map(|backend| fte_types::BackendSnapshot {
+                        descriptor: backend.descriptor(),
+                        readiness: backend.readiness(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[must_use]
     pub fn status(&self) -> GatewayStatus {
         let (lifecycle, active_requests, shutdown_error) = self.lifecycle.snapshot();
@@ -916,7 +935,9 @@ fn candidate_allowed(
         } if backend_id != &backend.id || model_id != &model.id => {
             return Err("exact_route_mismatch");
         }
-        ModelSelector::ExactModel { model_id } if model_id != &model.id => {
+        ModelSelector::ExactModel { model_id }
+            if model_id != &model.id && !model.aliases.contains(model_id) =>
+        {
             return Err("exact_model_mismatch");
         }
         ModelSelector::Profile { name }
@@ -1122,6 +1143,7 @@ mod tests {
             location,
             models: vec![ModelDescriptor {
                 id: format!("{id}-model"),
+                aliases: Vec::new(),
                 display_name: id.to_string(),
                 backend_id: id.to_string(),
                 location,
@@ -1202,6 +1224,32 @@ mod tests {
         };
         let (_, route, _) = gateway.resolve(&request).expect("exact route");
         assert_eq!(route.backend_id, "local");
+    }
+
+    #[test]
+    fn public_model_aliases_are_resolved_inside_the_gateway() {
+        let gateway = Gateway::new(GatewayDefaults::default());
+        let mut first = descriptor("first", BackendLocation::LocalEmbedded);
+        first.models[0].aliases = vec!["public/model".to_string()];
+        let mut second = descriptor("second", BackendLocation::LocalEmbedded);
+        second.models[0].aliases = vec!["public/model".to_string()];
+        second.models[0].observed.quality = Some(1.0);
+        first.models[0].observed.quality = Some(0.0);
+        gateway
+            .register_backend(Arc::new(NeverExecuteBackend(first)))
+            .expect("register first alias");
+        gateway
+            .register_backend(Arc::new(NeverExecuteBackend(second)))
+            .expect("register second alias");
+
+        let mut request = request();
+        request.model = ModelSelector::ExactModel {
+            model_id: "public/model".to_string(),
+        };
+        let (_, route, _) = gateway.resolve(&request).expect("resolve public alias");
+
+        assert_eq!(route.backend_id, "second");
+        assert_eq!(route.model_id, "second-model");
     }
 
     #[test]

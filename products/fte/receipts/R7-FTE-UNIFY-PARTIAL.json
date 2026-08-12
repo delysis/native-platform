@@ -1,0 +1,121 @@
+{
+  "base_sha": "d86edfef40771589af4cd8cd72907fa6d3ce6e96",
+  "implementation_revision": "311b4bdede7d29828fb63e838fe7d3c7d826f829",
+  "completed_command_families": [
+    "models",
+    "provider_inventory_and_readiness",
+    "provider_configuration_metadata",
+    "secrets",
+    "playground_chat",
+    "raw_completions",
+    "responses",
+    "usage_and_activity",
+    "proxy_and_loopback",
+    "nonsecret_profile_and_settings",
+    "local_model_selection_and_restart_restoration"
+  ],
+  "decision": "single_production_gateway_authority_with_live_acceptance_gates_open",
+  "evidence": {
+    "baseline_workspace": {
+      "ignored": 1,
+      "passed": 124,
+      "result": "pass"
+    },
+    "credential_migration_tests": [
+      "migration_writes_reads_back_exact_bytes_then_deletes_plaintext",
+      "every_crash_boundary_preserves_the_current_plaintext_row",
+      "mismatched_readback_never_deletes_plaintext",
+      "a_different_existing_os_secret_is_never_overwritten",
+      "a_later_failure_retains_every_plaintext_row_for_safe_retry",
+      "fresh_database_is_a_noop_without_creating_plaintext_storage",
+      "empty_preexisting_plaintext_table_is_retired",
+      "fresh_database_never_creates_the_retired_plaintext_secret_table"
+    ],
+    "final_product_gate": {
+      "clippy_warnings_denied": "pass",
+      "desktop_rust_tests_passed": 29,
+      "format_check": "pass",
+      "frontend_preview_tests_passed": 2,
+      "frontend_syntax": "pass"
+    },
+    "final_workspace": {
+      "ignored": 2,
+      "passed": 102,
+      "result": "pass"
+    },
+    "fixture_and_real_gates": {
+      "hosted_provider_fixture_tests_passed": 14,
+      "loopback_tests_passed": 7,
+      "real_loopback_socket_test": "pass",
+      "model_free_native_adapter_tests_passed": 11,
+      "model_free_desktop_native_route": "pass",
+      "local_model_database_reopen": "pass",
+      "local_model_gateway_owner_restart_restore": "pass",
+      "local_model_invalid_replacement_preserves_working_selection": "pass",
+      "local_model_missing_saved_file_reports_invalid": "pass",
+      "local_model_native_failure_persistence_rollback": "pass",
+      "local_model_frontend_ready_and_invalid_states": "pass",
+      "real_gguf": {
+        "adapter_command": "MOM_LLAMA_MODEL_PATH=/Users/george/Documents/llama-native-kit/target/test-models/Qwen_Qwen3-0.6B-Q4_K_M.gguf cargo test -p fte-backend-llama --test real real_chat_completion_and_stable_prefix_hit_are_in_process -- --ignored --nocapture",
+        "adapter_result": "pass_in_process_cpu_stable_prefix_second_request_29.37s",
+        "desktop_command": "MOM_LLAMA_MODEL_PATH=/Users/george/Documents/llama-native-kit/target/test-models/Qwen_Qwen3-0.6B-Q4_K_M.gguf cargo test -p free-token-energy real_desktop_local_route_runs_in_process_and_joins_on_shutdown --all-features -- --ignored --nocapture",
+        "desktop_result": "pass_apple_m4_max_metal_shared_gateway_drain_and_native_join_28.81s",
+        "model_bytes": 484220320,
+        "model_sha256": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14"
+      },
+      "real_hosted_provider": "not_run_credentials_unavailable",
+      "real_os_credential_store": "not_run_no_disposable_legacy_installation_fixture"
+    },
+    "golden_parity_tests": [
+      "gateway_runtime::tests::public_model_catalog_matches_the_promoted_golden_fixture",
+      "gateway_runtime::tests::provider_inventory_matches_the_promoted_golden_fixture",
+      "gateway_runtime::tests::desktop_chat_edge_preserves_public_alias_and_message_content",
+      "gateway_runtime::tests::desktop_completion_edge_preserves_exact_token_batches",
+      "gateway_runtime::tests::desktop_anthropic_edge_preserves_only_typed_provider_fields",
+      "gateway_runtime::tests::desktop_gemini_edge_preserves_nested_provider_fields_and_tool_history",
+      "gateway_runtime::tests::desktop_native_backend_uses_the_shared_gateway_and_local_only_route",
+      "gateway_runtime::tests::local_model_configuration_restores_through_a_new_gateway_owner",
+      "gateway_runtime::tests::invalid_replacement_does_not_overwrite_working_local_model_configuration",
+      "gateway_runtime::tests::missing_saved_model_restores_as_invalid_without_deleting_the_selection",
+      "gateway_runtime::tests::native_configuration_failure_rolls_back_the_persisted_replacement",
+      "commands::tests::legacy_task_hint_is_explicitly_rejected_instead_of_ignored",
+      "fte_protocols::tests::chat_assistant_tool_history_remains_typed_items",
+      "fte_protocols::tests::openai_chat_json_preserves_tool_calls_for_replay",
+      "fte_providers::hosted::tests::assistant_text_and_multiple_calls_stay_in_one_provider_turn",
+      "fte_router::tests::public_model_aliases_are_resolved_inside_the_gateway"
+    ],
+    "policy_gates": {
+      "module_boundaries": "pass",
+      "native_pins": "pass",
+      "workflow_policy": "pass"
+    },
+    "test_first_failure": "Credential migration tests first failed before the OS secret abstraction existed; the review regressions then failed on rejected assistant tool history and dropped Anthropic/Gemini fields before the strict compatibility codecs were implemented."
+  },
+  "evidence_limits": {
+    "full_r7_promotable": false,
+    "legacy_router_production_authority_deleted": true,
+    "legacy_router_source_deleted": true,
+    "legacy_provider_and_fim_source_deleted": true,
+    "native_local_runtime_exercised": true,
+    "native_local_route_wired_and_model_free_exercised": true,
+    "local_model_frontend_picker_wired": true,
+    "local_model_configuration_persisted_and_restored": true,
+    "local_model_launched_bundle_exercised": false,
+    "legacy_task_hint_explicitly_rejected": true,
+    "plaintext_secret_writable_authority_deleted": true,
+    "real_os_secret_migration_exercised": false,
+    "request_execution_migrated": true
+  },
+  "git_actions": {
+    "commit": true,
+    "pull_request": false,
+    "push": false
+  },
+  "intentional_parity_difference": "Provider quota headroom is unknown until the modern Gateway has a measured observation; the retired second QuotaTracker is not authority. Codestral FIM and its retired adapter are absent because the sole modern hosted route has no verified typed FIM contract. Legacy task_hint is explicitly rejected because the modern Gateway has no equivalent typed routing or evaluation signal; it is not silently ignored and does not resurrect the retired router.",
+  "micro_goal": "R7-FTE-UNIFY",
+  "receipt_schema": "delysis-remediation-receipt.v1",
+  "recorded_on": "2026-08-11",
+  "repository": "delysis/free-token-energy",
+  "status": "partial_live_acceptance_pending",
+  "worktree": "/Users/george/.codex/worktrees/phase1-r7-fte"
+}

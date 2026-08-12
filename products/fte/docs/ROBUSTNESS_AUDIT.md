@@ -33,20 +33,37 @@ evidence.
   application to close with joined process-exit authority.
 - The native prefix cache binds exact token and runtime fingerprints. A mismatch
   is a normal miss; required caching fails closed.
+- Desktop commands and plugin loopback share one application-owned `Gateway`.
+  The retired desktop Router, proxy, quota tracker/eval store, and hosted/FIM
+  adapters have been deleted rather than retained as a test-only second path.
+- Hosted credentials are read through the OS credential store. Fresh databases
+  never create `api_keys`; upgraded installations migrate all exact values and
+  delete the rows plus table in one SQLite transaction only after every OS-store
+  readback succeeds.
+- The desktop registers the borrowed native llama backend and exposes the stable
+  `local/default` identity. A real Qwen GGUF has passed the in-process desktop
+  route, Gateway drain, and application-owned host join test.
+- The Providers view has a native GGUF picker. The sole Gateway owner validates
+  and registers the selection, persists only the canonical path and optional
+  digest, and restores it at startup. Portable tests cover database reopen,
+  owner restart, a missing saved file, an invalid replacement, registration
+  failure rollback, and visible `ready`/`invalid` frontend states.
+- Legacy `task_hint` is explicitly rejected because no equivalent modern typed
+  routing/evaluation contract exists; it is neither silently dropped nor used
+  to resurrect the retired router.
 
-## Still a breaking migration, not release evidence
+## Remaining acceptance boundary
 
-- The desktop window still serves its historical UI through the legacy
-  `Router` and `gateway.db`, while the plugin and reusable loopback use the new
-  `Gateway`. Provider configuration is shared only through a deferred database
-  secret resolver. The UI is not yet proof that the reusable gateway is the
-  sole authority.
-- Legacy provider secrets remain plaintext in the permission-restricted SQLite
-  database. Moving them to an injected OS credential store requires a
-  transactional migration with verified read-back before deleting old rows.
-- The desktop does not yet discover and register local GGUF descriptors. The
-  `fte-backend-llama` adapter is real and is consumed by Mom Llama, but the FTE
-  desktop currently registers hosted routes only.
+- Exact bundle `FTE R7 372a088.app` produced two visible real-Qwen
+  `local/default` generations around Cmd+Q and immediate relaunch, which
+  visibly restored the saved provider as `ready`. A later attached launch of
+  the same executable observed native Cmd+Q exit with code 0 and no signal.
+  The acceptance did not separately observe a native-picker click.
+- A real legacy installation has not yet exercised migration and exact readback
+  against the platform keychain. Deterministic fake-store crash, conflict, and
+  all-or-nothing database retirement fixtures pass.
+- No live hosted credential was used for a provider request. Hosted protocol
+  transformations remain fixture-tested rather than live-service evidence.
 - IPv6 listener failure does not yet have a structured status field. IPv4 is
   authoritative and IPv6 is best effort.
 - The proposed `fte-core-2026-08` compatibility manifest and SDK conformance
@@ -56,8 +73,6 @@ evidence.
 
 ## Next safe slice
 
-Create one `GatewayRuntime` in the desktop application and migrate one command
-family at a time behind golden old/new parity tests. Migrate credentials only
-after the new resolver writes to the OS store and reads the exact value back.
-Once every desktop command and the playground use that runtime, remove the old
-router, proxy and database in one explicit pre-1.0 migration commit.
+Run the legacy credential importer against a disposable real keychain entry and
+one authorized hosted-provider chat and completion request without weakening
+the fixture gates.

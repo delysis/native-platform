@@ -1043,6 +1043,7 @@ mod tests {
                 location: BackendLocation::LocalEmbedded,
                 models: vec![ModelDescriptor {
                     id: "test-model".to_string(),
+                    aliases: Vec::new(),
                     display_name: "Test model".to_string(),
                     backend_id: "test-local".to_string(),
                     location: BackendLocation::LocalEmbedded,

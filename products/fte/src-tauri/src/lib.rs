@@ -1,34 +1,24 @@
-pub mod api_server;
-pub mod backend;
 pub mod catalog;
 pub mod commands;
+pub mod credential_migration;
 pub mod db;
-pub mod eval_store;
-pub mod gateway_v2;
-pub mod providers;
-pub mod rate_limiter;
-pub mod router;
+pub mod gateway_runtime;
+pub mod secrets;
 use crate::db::Database;
-use crate::eval_store::EvalStore;
-use crate::providers::Capability;
-use crate::providers::anthropic;
-use crate::providers::completions::CompletionProtocol;
-use crate::providers::gemini;
-use crate::providers::groq;
-use crate::providers::openai_compatible::OpenAiCompatibleProvider;
-use crate::providers::openrouter;
-use crate::rate_limiter::QuotaTracker;
-use crate::router::Router;
 use std::sync::Arc;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let gateway_v2 = gateway_v2::GatewayV2::new()
-        .unwrap_or_else(|error| panic!("Free Token Energy gateway setup failed: {error}"));
-    let plugin_gateway = gateway_v2.gateway();
-    let plugin_secrets = gateway_v2.secrets();
-    tauri::Builder::default()
+    let gateway_runtime = Arc::new(
+        gateway_runtime::GatewayRuntimeOwner::new()
+            .unwrap_or_else(|error| panic!("Free Token Energy gateway setup failed: {error}")),
+    );
+    let plugin_gateway = gateway_runtime.gateway();
+    let desktop_gateway_runtime = Arc::clone(&gateway_runtime);
+    let event_gateway_runtime = Arc::clone(&gateway_runtime);
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_free_token_energy::Builder::new()
@@ -43,24 +33,25 @@ pub fn run() {
 
             let db_path = app_data_dir.join("gateway.db");
             let db = Arc::new(Database::new(db_path)?);
-            plugin_secrets.bind(Arc::clone(&db))?;
+            credential_migration::migrate_legacy_credentials(
+                &db,
+                desktop_gateway_runtime.credential_store().as_ref(),
+                |_| Ok(()),
+            )?;
+            desktop_gateway_runtime.bind_database(Arc::clone(&db))?;
+            desktop_gateway_runtime.restore_local_model_configuration()?;
 
-            let quota_tracker = Arc::new(QuotaTracker::new());
-            let eval_store = Arc::new(EvalStore::new());
-
-            let mut router = Router::new(quota_tracker.clone(), eval_store.clone(), db.clone());
-
-            register_default_backends(&mut router)?;
-
-            let router = Arc::new(router);
             app.manage(db);
-            app.manage(router);
+            app.manage(desktop_gateway_runtime);
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::chat_request,
             commands::completion_request,
+            commands::configure_local_model,
+            commands::choose_local_model,
+            commands::get_local_model_status,
             commands::save_key,
             commands::delete_key,
             commands::get_providers,
@@ -70,46 +61,23 @@ pub fn run() {
             commands::get_dashboard_stats,
             commands::get_recent_logs,
         ])
-        .run(tauri::generate_context!())
-        .unwrap_or_else(|error| eprintln!("Free Token Energy could not start: {error}"));
-}
-
-fn register_default_backends(router: &mut Router) -> anyhow::Result<()> {
-    router.add_backend(Box::new(openrouter::provider()))?;
-    router.add_backend(Box::new(groq::provider()))?;
-    router.add_backend(Box::new(anthropic::provider()))?;
-    router.add_backend(Box::new(gemini::provider()))?;
-    router.add_backend(Box::new(
-        OpenAiCompatibleProvider::new(
-            "mistral",
-            "Mistral AI",
-            "https://api.mistral.ai/v1/chat/completions",
-            vec![Capability::Streaming, Capability::Tools],
-        )
-        .with_completion_endpoint(
-            "https://api.mistral.ai/v1/fim/completions",
-            CompletionProtocol::MistralFim,
-        ),
-    ))?;
-    router.add_backend(Box::new(OpenAiCompatibleProvider::new(
-        "nvidia",
-        "NVIDIA NIM",
-        "https://integrate.api.nvidia.com/v1/chat/completions",
-        vec![Capability::Streaming, Capability::Tools],
-    )))?;
-    router.add_backend(Box::new(
-        OpenAiCompatibleProvider::new(
-            "cerebras",
-            "Cerebras",
-            "https://api.cerebras.ai/v1/chat/completions",
-            vec![Capability::Streaming, Capability::Tools],
-        )
-        .with_completion_endpoint(
-            "https://api.cerebras.ai/v1/completions",
-            CompletionProtocol::OpenAi,
-        ),
-    ))?;
-    Ok(())
+        .build(tauri::generate_context!());
+    match app {
+        Ok(app) => app.run(move |_app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Tauri dispatches plugin events before this callback. The FTE
+                // plugin has therefore drained the Gateway and its borrowed
+                // adapter before the application-owned native host is joined.
+                // This callback must run inside App::run: Builder::run never
+                // returns before AppKit begins process-global Metal teardown.
+                assert!(
+                    event_gateway_runtime.shutdown_native_for_process_exit(),
+                    "the application-owned native host did not return process-exit join evidence"
+                );
+            }
+        }),
+        Err(error) => eprintln!("Free Token Energy could not start: {error}"),
+    }
 }
 
 #[cfg(unix)]
@@ -121,41 +89,4 @@ fn secure_app_data_directory(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn secure_app_data_directory(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bundled_backends_conform_to_the_model_catalog() {
-        let path = std::env::temp_dir().join(format!(
-            "free-token-energy-backend-catalog-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = Arc::new(Database::new(path).unwrap());
-        let mut router = Router::new(
-            Arc::new(QuotaTracker::new()),
-            Arc::new(EvalStore::new()),
-            db,
-        );
-
-        register_default_backends(&mut router).unwrap();
-
-        for id in [
-            "openrouter",
-            "groq",
-            "anthropic",
-            "gemini",
-            "mistral",
-            "nvidia",
-            "cerebras",
-        ] {
-            assert!(router.supports_provider(id), "missing backend {id}");
-        }
-    }
 }

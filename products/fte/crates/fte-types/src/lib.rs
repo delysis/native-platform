@@ -494,6 +494,10 @@ pub struct BackendDescriptor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelDescriptor {
     pub id: String,
+    /// Stable public model names which may select this provider-specific
+    /// model. The backend still receives `id`; aliases are routing metadata.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub display_name: String,
     pub backend_id: String,
     pub location: BackendLocation,
@@ -546,6 +550,15 @@ pub enum BackendReadiness {
     Loading,
     NotConfigured { reason: String },
     Unavailable { reason: String },
+}
+
+/// One non-secret, point-in-time view of a registered backend.
+///
+/// Product shells use this instead of maintaining a second provider registry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackendSnapshot {
+    pub descriptor: BackendDescriptor,
+    pub readiness: BackendReadiness,
 }
 
 impl BackendReadiness {

@@ -1263,6 +1263,7 @@ fn build_response(
 fn map_model_descriptor(native: &llama_native_types::NativeModelDescriptor) -> ModelDescriptor {
     ModelDescriptor {
         id: native.model_id.clone(),
+        aliases: Vec::new(),
         display_name: native.display_name.clone(),
         backend_id: BACKEND_ID.to_string(),
         location: BackendLocation::LocalEmbedded,
@@ -1297,12 +1298,8 @@ fn map_model_descriptor(native: &llama_native_types::NativeModelDescriptor) -> M
 fn configured_model_descriptor(config: &NativeModelConfig) -> ModelDescriptor {
     ModelDescriptor {
         id: config.model_id.clone(),
-        display_name: config
-            .model_path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or(&config.model_id)
-            .to_string(),
+        aliases: Vec::new(),
+        display_name: config.model_id.clone(),
         backend_id: BACKEND_ID.to_string(),
         location: BackendLocation::LocalEmbedded,
         capabilities: ModelCapabilities {

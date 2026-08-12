@@ -143,6 +143,27 @@
             </div>
           </article>
 
+          <article class="card local-model-card">
+            <div class="section-heading local-model-heading">
+              <div>
+                <h2>Local GGUF model</h2>
+                <p>Select a model file for private, on-device inference. The file stays where it is; only its non-secret local configuration is saved.</p>
+              </div>
+              <span class="status-pill status-muted" id="local-model-status-pill">Checking…</span>
+            </div>
+            <div class="local-model-controls">
+              <div>
+                <strong id="local-model-name">No model selected</strong>
+                <p class="muted" id="local-model-detail" aria-live="polite">Choose a local GGUF file to enable private on-device inference.</p>
+              </div>
+              <label class="local-model-digest">
+                <span>Expected SHA-256 (optional)</span>
+                <input type="text" id="local-model-sha256" class="input-field" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="64 lowercase hexadecimal characters" maxlength="64">
+              </label>
+              <button class="btn-primary" id="choose-local-model" type="button">Choose GGUF file</button>
+            </div>
+          </article>
+
           <div class="provider-grid" id="onboarding-grid" aria-live="polite">
             <p class="empty-state">Loading provider configuration…</p>
           </div>

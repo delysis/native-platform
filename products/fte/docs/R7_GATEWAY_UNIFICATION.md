@@ -1,0 +1,156 @@
+# R7 Gateway unification ledger
+
+Audited base: `d86edfef40771589af4cd8cd72907fa6d3ce6e96`  
+Working disposition: production authority unified; exact launched real-Qwen
+Cmd+Q/relaunch acceptance and real macOS Keychain migration/readback passed.
+The repository owner removed a live paid-provider smoke from phase-one
+promotion; no live hosted execution claim is made.
+
+## Production authority
+
+| Command family | Current authority | Evidence |
+|---|---|---|
+| Models | `GatewayRuntimeOwner` projects the hosted product catalog and configured local descriptors from the same `Gateway` | hosted parity plus `desktop_native_backend_uses_the_shared_gateway_and_local_only_route` |
+| Provider inventory/readiness | Gateway backend snapshots plus nonsecret request-log aggregates | `provider_inventory_matches_the_promoted_golden_fixture` |
+| Secrets | OS credential store selected by `keyring` 4.1.6 | exact-readback save path and credential migration crash fixtures |
+| Playground chat | strict OpenAI chat codec to `Gateway::execute`; allowlisted Anthropic/Gemini compatibility fields become typed canonical state | desktop typed-field/tool-history fixtures plus `fte-providers` emission fixtures |
+| Raw completions | strict OpenAI completion codec to `Gateway::execute` | exact prompt/token protocol fixtures and full desktop suite |
+| Responses | plugin loopback over the same `Arc<Gateway>` | Responses protocol fixtures and real loopback socket fixture |
+| Usage/activity | Gateway response route/usage appended to the bounded nonsecret request log | database aggregate fixtures and desktop command path |
+| Proxy/loopback | `tauri-plugin-free-token-energy` loopback over the shared Gateway | authenticated real socket and shutdown fixtures |
+| Profile/settings | nonsecret desktop database only; dormant duplicate proxy settings commands removed | desktop database/frontend tests |
+| Local model selection | native desktop file picker into the sole `GatewayRuntimeOwner`; nonsecret path/digest persisted in SQLite and restored at startup | reopen, owner-restart, invalid-path, rollback, and frontend-state fixtures |
+
+`run()` constructs one `GatewayRuntimeOwner`. Its `Arc<Gateway>` is passed to
+the plugin loopback, while desktop commands receive the owner. The production
+app no longer constructs or manages the legacy `Router` or `ProxyManager`.
+The retired Router, proxy server, quota tracker/eval store, and old hosted/FIM
+provider implementations have been deleted. Duplicate desktop provider wire
+DTOs are also gone: Tauri JSON crosses immediately into strict canonical
+protocol types and canonical response emitters. Durable contract coverage is
+carried by explicit modern golden, protocol, provider, and socket fixtures.
+
+The same owner registers one borrowed `llama-native` adapter on that Gateway
+and owns the underlying `NativeHost`. `configure_local_model` accepts only an
+explicit absolute regular `.gguf` path and an optional lowercase SHA-256,
+publishes the stable `local/default` identity without exposing the filename,
+and leaves loading lazy until the first request. Exact local requests are
+`LocalOnly`; hosted and `auto` requests remain `HostedOnly`. The Providers view
+opens a native `.gguf` picker and receives only the basename plus a typed
+readiness state. The canonical path and optional expected digest are stored as
+non-secret local configuration in the private SQLite database. Startup restores
+that record through the same owner. A missing or invalid saved file leaves the
+record available for diagnosis/replacement, publishes no local route, and is
+shown as `invalid`; an invalid replacement leaves the last working selection
+unchanged. A native registration failure rolls the database record back. After
+the plugin drains the Gateway on application exit, the desktop retains
+process-exit join evidence from its application-owned host.
+
+## Public model aliases
+
+Provider descriptors retain exact upstream model IDs and carry public aliases
+as routing metadata. `ModelSelector::ExactModel` matches either the exact ID or
+an alias, and the Gateway scores all matching candidates. Public aliases that
+contain `/` are therefore not misread as backend-qualified routes by the
+desktop compatibility edge.
+
+## Credential migration invariant
+
+Fresh databases never create `api_keys`. Startup first detects whether an
+upgraded database actually contains the legacy table, then processes its rows
+as follows:
+
+1. Read the legacy value.
+2. Refuse to overwrite a different existing OS credential.
+3. Write when absent.
+4. Read back and compare exact bytes.
+5. Recheck the complete ordered source set inside a SQLite transaction.
+6. Delete all rows and drop the table in that same transaction.
+
+Fixtures interrupt before write, after write, after readback, before retirement,
+and before table drop. Every interruption retains the complete plaintext table
+and rows. A later-row failure, readback mismatch, concurrent source change, or
+OS-store conflict fails closed and also retains the source. Empty preexisting
+tables are retired; a fresh database remains a no-op. Normal credential reads,
+writes, and deletes never use SQLite.
+
+## Intentional parity difference
+
+The retired router calculated quota headroom from a second `QuotaTracker`.
+Modern provider projection reports only observations present on Gateway model
+descriptors. Until such observations exist, headroom is unknown rather than a
+fabricated full quota; the dashboard renders a zero aggregate while individual
+providers retain `null`.
+
+The product catalog does not advertise `codestral-latest`, and the retired FIM
+adapter has been deleted. The modern hosted backend has no strict FIM
+request/response/streaming contract, and sending a generic
+Completion request to `/v1/fim/completions` would be false compatibility. FIM
+may return only with a dedicated typed codec and modern backend fixtures.
+
+The legacy desktop `task_hint` argument is rejected whenever it is supplied.
+The retired task router's evaluation store had no modern typed ingestion or
+Gateway request contract, so translating the string would invent routing
+semantics and silently ignoring it would claim false compatibility. Callers
+must omit `task_hint`; a future replacement requires an explicit typed Gateway
+evaluation signal and fixtures.
+
+## Steward disposition of the hosted smoke
+
+On 2026-08-12 the repository owner removed the live chat/raw-completion smoke
+with a user-owned Cerebras credential from the phase-one promotion contract as
+unnecessary. This is a risk acceptance, not simulated evidence: no live hosted
+request is claimed. The accepted boundary is the strict provider catalog and
+protocol implementation plus 14 deterministic hosted-provider fixtures,
+including raw-completion byte preservation, provider-extension rejection,
+provider-specific sampling preservation, typed tools/responses, bounded errors,
+and shutdown behavior.
+
+The exact `372a088` acceptance bundle exercised the launched local route and
+restart/shutdown boundary. Together with the real OS credential receipt and the
+explicit steward disposition above, R7 is promotable for phase one.
+
+## Verified on 2026-08-11
+
+- Portable workspace gate: 102 passed, 2 ignored (the two real-GGUF tests).
+- Product gate: 29 desktop Rust tests and 2 frontend tests passed.
+- New local-model coverage passed for SQLite reopen, a fresh-owner restart,
+  missing saved files, invalid replacements, native-registration rollback, and
+  frontend `invalid` to `ready` state rendering. The compatibility test also
+  proves supplied `task_hint` values are rejected rather than ignored.
+- Both ignored real-GGUF tests passed with
+  `Qwen_Qwen3-0.6B-Q4_K_M.gguf` (484,220,320 bytes, SHA-256
+  `9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14`).
+  The desktop test exercised Metal inference, the shared Gateway route, drain,
+  and retained native-host join; the adapter test exercised a second-request
+  stable prefix hit in process.
+- Clippy with warnings denied and rustfmt check passed.
+- Module-boundary, native-pin, and workflow-policy gates passed.
+- Hosted provider fixture tests: 14 passed.
+- Loopback tests: 7 passed, including the real loopback socket fixture.
+- Model-free native adapter tests: 11 passed, plus the desktop shared-Gateway,
+  local-only routing, stable identity, and idempotent host-drain fixture.
+- Exact launched bundle `FTE R7 372a088.app` used identifier
+  `com.delysis.fte.r7.372a088.acceptance`; its 26,377,952-byte executable had
+  SHA-256
+  `afffd51f731c8bd9fc01125bdd37ab9bad1323b919d9952c10f9bfd531181381`.
+  A real Qwen `local/default` request returned a visible continuation, Cmd+Q
+  exited without a new diagnostic report, immediate relaunch restored the
+  saved model as `ready`, a second visible request passed, and a second Cmd+Q
+  again exited without a new diagnostic report. The consolidated current
+  record is `receipts/R7-FTE-UNIFY-CURRENT.json`; the exact shutdown record is
+  preserved as `receipts/R7-FTE-CMDQ-METAL-SHUTDOWN.json`. A later attached
+  launch of the same exact executable visibly restored the local provider as
+  `ready`; an uninterrupted Cmd+Q observation awaited PID 92660 and recorded
+  normal process exit code 0 with no signal or new diagnostic report.
+
+On 2026-08-12, an isolated current-head build migrated a random synthetic
+legacy plaintext row to the real macOS Keychain service, dropped the plaintext
+table, and passed an independently authorized hash-only exact readback. The
+isolated process then exited code 0 through Cmd+Q. No credential bytes were
+recorded. The exact evidence is preserved in
+`receipts/R7-FTE-OS-CREDENTIAL-ACCEPTANCE.json`.
+
+No live hosted request has been performed because no supported provider
+credential is configured, and none is required by the revised phase-one
+contract. The launched evidence is not signed-release certification.
