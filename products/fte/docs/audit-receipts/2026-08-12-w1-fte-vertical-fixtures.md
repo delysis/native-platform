@@ -3,8 +3,8 @@
 This change retains `platform-contract-testkit` at accepted lifecycle revision
 `cbab33555ab9355a6ac453d659c55ec9e0666821` and separately consumes
 `platform-vertical-fixtures-v0` from exact commit
-`9fd803f5efcc46ac0256dab876e7c0b1f03bb448`, tagged
-`w1-vertical-protocol-v0-2026-08-12`. The dependency is optional and exercised
+`fc24ffff08c52690390b4460f44617d5d9732563`, tagged
+`w1-vertical-protocol-v0-2026-08-12-r2`. The dependency is optional and exercised
 only by the Rust 1.92 Wave 1 job, preserving FTE's ordinary Rust 1.88 lane.
 
 ## Complete product-owned cases

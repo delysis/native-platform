@@ -6,7 +6,7 @@ repo_root="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 source "$repo_root/w1-contracts.env"
 
 accepted_lifecycle_revision="cbab33555ab9355a6ac453d659c55ec9e0666821"
-accepted_vertical_revision="9fd803f5efcc46ac0256dab876e7c0b1f03bb448"
+accepted_vertical_revision="fc24ffff08c52690390b4460f44617d5d9732563"
 lifecycle_revision="$W1_PLATFORM_CONTRACTS_REV"
 vertical_revision="$W1_VERTICAL_FIXTURES_REV"
 repository="https://github.com/delysis/w1-platform-contracts"

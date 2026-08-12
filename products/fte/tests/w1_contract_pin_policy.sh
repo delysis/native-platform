@@ -6,7 +6,7 @@ checker="$repo_root/scripts/check-w1-contract-pin.sh"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 lifecycle_revision="cbab33555ab9355a6ac453d659c55ec9e0666821"
-vertical_revision="9fd803f5efcc46ac0256dab876e7c0b1f03bb448"
+vertical_revision="fc24ffff08c52690390b4460f44617d5d9732563"
 repository="https://github.com/delysis/w1-platform-contracts"
 
 write_fixture() {
