@@ -645,6 +645,10 @@ impl Clone for NativeModelHandle {
 pub struct JoinedNativeModel {
     model_id: String,
     worker_identity: Arc<WorkerIdentity>,
+    expected_workers: usize,
+    joined_workers: usize,
+    expected_worker_ids: Vec<String>,
+    joined_worker_ids: Vec<String>,
 }
 
 impl JoinedNativeModel {
@@ -656,6 +660,26 @@ impl JoinedNativeModel {
     #[must_use]
     pub fn belongs_to(&self, handle: &NativeModelHandle) -> bool {
         Arc::ptr_eq(&self.worker_identity, &handle.inner.worker_identity)
+    }
+
+    #[must_use]
+    pub fn expected_worker_count(&self) -> usize {
+        self.expected_workers
+    }
+
+    #[must_use]
+    pub fn joined_worker_count(&self) -> usize {
+        self.joined_workers
+    }
+
+    #[must_use]
+    pub fn expected_worker_ids(&self) -> &[String] {
+        &self.expected_worker_ids
+    }
+
+    #[must_use]
+    pub fn joined_worker_ids(&self) -> &[String] {
+        &self.joined_worker_ids
     }
 }
 
@@ -704,9 +728,14 @@ impl NativeModelOwner {
         let worker_identity = Arc::clone(&self.inner.worker_identity);
         self.inner.begin_shutdown();
         self.join_worker()?;
+        let lifecycle = self.inner.requests.shutdown();
         Ok(JoinedNativeModel {
             model_id,
             worker_identity,
+            expected_workers: lifecycle.expected_workers,
+            joined_workers: lifecycle.joined_workers,
+            expected_worker_ids: lifecycle.expected_worker_ids,
+            joined_worker_ids: lifecycle.joined_worker_ids,
         })
     }
 
@@ -720,6 +749,9 @@ impl NativeModelOwner {
                 "native model owner worker panicked before it could be joined",
             )
         });
+        self.inner
+            .requests
+            .record_external_worker_joined(&self.inner.worker_id);
         let registry_result = self.inner.requests.mark_closed();
         join_result.and(registry_result)
     }
@@ -801,6 +833,7 @@ impl Drop for WorkerBootstrapGuard {
 #[derive(Debug)]
 struct NativeModelInner {
     worker_identity: Arc<WorkerIdentity>,
+    worker_id: String,
     command_tx: Sender<WorkerCommand>,
     shutdown_tx: Sender<()>,
     closing: AtomicBool,
@@ -861,6 +894,7 @@ impl NativeModelInner {
         })?;
         self.ensure_accepting()?;
         let (control, lease) = self.requests.reserve(request_id, class, controls)?;
+        lease.queued()?;
         match self.command_tx.try_send(build(lease)) {
             Ok(()) => Ok(control),
             Err(error) => {
@@ -993,8 +1027,10 @@ impl NativeModelHandle {
         let worker_status = Arc::clone(&status);
         let worker_identity = Arc::new(WorkerIdentity);
         let owner_worker_identity = Arc::clone(&worker_identity);
+        let worker_id = format!("llama-model-{}", config.model_id);
+        let requests = Arc::new(RequestRegistry::with_external_worker(worker_id.clone()));
         let worker = thread::Builder::new()
-            .name(format!("llama-model-{}", config.model_id))
+            .name(worker_id.clone())
             .spawn(move || {
                 run_worker(
                     config,
@@ -1046,11 +1082,12 @@ impl NativeModelHandle {
         Ok((
             Arc::new(NativeModelInner {
                 worker_identity,
+                worker_id,
                 command_tx,
                 shutdown_tx,
                 closing: AtomicBool::new(false),
                 admission: Mutex::new(()),
-                requests: Arc::new(RequestRegistry::new()),
+                requests,
                 status,
             }),
             worker,
@@ -2031,8 +2068,13 @@ fn run_worker(
                 admitted_request_sha256,
                 result,
                 cancellation,
-                request_lease: _request_lease,
+                request_lease,
             } => {
+                if let Err(error) = request_lease.running() {
+                    let _ = result.send(embedding_runtime::EmbeddingCompletion::failed(error));
+                    continue;
+                }
+                let _ = request_lease.progress(0);
                 set_status_state(&status, ModelRuntimeState::Ready, 1);
                 let owner_call_sequence = embedding_call_sequence;
                 let Some(next_call_sequence) = embedding_call_sequence.checked_add(1) else {
@@ -2043,6 +2085,7 @@ fn run_worker(
                         ),
                     ));
                     set_status_state(&status, ModelRuntimeState::Ready, 0);
+                    let _ = request_lease.completed_or_failed(false);
                     continue;
                 };
                 embedding_call_sequence = next_call_sequence;
@@ -2056,6 +2099,7 @@ fn run_worker(
                     &request,
                     &cancellation,
                 );
+                let completion_succeeded = embedding_result.is_ok();
                 let completion = match embedding_result {
                     Ok(output) => {
                         let captured_output_bits_sha256 =
@@ -2113,6 +2157,7 @@ fn run_worker(
                     Err(error) => embedding_runtime::EmbeddingCompletion::failed(error),
                 };
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = request_lease.completed_or_failed(completion_succeeded);
                 let _ = result.send(completion);
             }
             WorkerCommand::GenerateBatch {
@@ -2123,8 +2168,13 @@ fn run_worker(
                 result_tx,
                 cancellations,
                 reasoning_forces,
-                request_lease: _request_lease,
+                request_lease,
             } => {
+                if let Err(error) = request_lease.running() {
+                    let _ = result_tx.send(Err(error));
+                    continue;
+                }
+                let _ = request_lease.progress(0);
                 set_status_state(&status, ModelRuntimeState::Ready, request.cases.len());
                 let statically_sealable =
                     is_statically_sealable_generation_batch(&request, admission);
@@ -2215,6 +2265,7 @@ fn run_worker(
                     }
                 });
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = request_lease.completed_or_failed(result.is_ok());
                 let _ = result_tx.send(result);
             }
             WorkerCommand::Generate {
@@ -2223,8 +2274,13 @@ fn run_worker(
                 result_tx,
                 cancellations,
                 reasoning_forces,
-                request_lease: _request_lease,
+                request_lease,
             } => {
+                if let Err(error) = request_lease.running() {
+                    let _ = result_tx.send(Err(error));
+                    continue;
+                }
+                let _ = request_lease.progress(0);
                 set_status_state(&status, ModelRuntimeState::Ready, request.branches.len());
                 let result = generate_batch(
                     &model,
@@ -2250,6 +2306,7 @@ fn run_worker(
                     emit_failed_branch_events(&event_tx, &request);
                 }
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = request_lease.completed_or_failed(result.is_ok());
                 let _ = result_tx.send(
                     result.map(|execution| GenerationCompletion::unverified(execution.outputs)),
                 );
@@ -2260,8 +2317,13 @@ fn run_worker(
                 result_tx,
                 cancellation,
                 reasoning_force,
-                request_lease: _request_lease,
+                request_lease,
             } => {
+                if let Err(error) = request_lease.running() {
+                    let _ = result_tx.send(Err(error));
+                    continue;
+                }
+                let _ = request_lease.progress(0);
                 set_status_state(&status, ModelRuntimeState::Ready, 1);
                 let result = generate_multimodal(
                     &model,
@@ -2282,6 +2344,7 @@ fn run_worker(
                     emit_generation_state(&event_tx, &request, u64::MAX, GenerationState::Failed);
                 }
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = request_lease.completed_or_failed(result.is_ok());
                 let _ = result_tx
                     .send(result.map(|output| GenerationCompletion::unverified(vec![output])));
             }
@@ -2291,14 +2354,20 @@ fn run_worker(
                 event_tx,
                 result_tx,
                 cancellations,
-                request_lease: _request_lease,
+                request_lease,
             } => {
+                if let Err(error) = request_lease.running() {
+                    let _ = result_tx.send(Err(error));
+                    continue;
+                }
+                let _ = request_lease.progress(0);
                 let owner_call_sequence = controlled_call_sequence;
                 let Some(next_call_sequence) = controlled_call_sequence.checked_add(1) else {
                     let _ = result_tx.send(Err(NativeError::new(
                         NativeErrorCode::Internal,
                         "native controlled-generation owner call sequence overflowed",
                     )));
+                    let _ = request_lease.completed_or_failed(false);
                     continue;
                 };
                 controlled_call_sequence = next_call_sequence;
@@ -2365,6 +2434,7 @@ fn run_worker(
                     )
                 });
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = request_lease.completed_or_failed(result.is_ok());
                 let _ = result_tx.send(result);
             }
             WorkerCommand::InspectControlledIdentity {
@@ -2455,10 +2525,11 @@ fn reject_queued_command(command: WorkerCommand) {
         WorkerCommand::EmbedBatch {
             result,
             cancellation,
-            request_lease: _request_lease,
+            request_lease,
             ..
         } => {
             cancellation.store(true, Ordering::Release);
+            let _ = request_lease.cancel_queued();
             let _ = result.send(embedding_runtime::EmbeddingCompletion::failed(cancelled()));
         }
         WorkerCommand::GenerateBatch {
@@ -2467,13 +2538,14 @@ fn reject_queued_command(command: WorkerCommand) {
             result_tx,
             cancellations,
             reasoning_forces: _,
-            request_lease: _request_lease,
+            request_lease,
             ..
         } => {
             for flag in cancellations {
                 flag.store(true, Ordering::Release);
             }
             emit_cancelled_case_events(&event_tx, &request);
+            let _ = request_lease.cancel_queued();
             let _ = result_tx.send(Err(cancelled()));
         }
         WorkerCommand::Generate {
@@ -2482,12 +2554,13 @@ fn reject_queued_command(command: WorkerCommand) {
             result_tx,
             cancellations,
             reasoning_forces: _,
-            request_lease: _request_lease,
+            request_lease,
         } => {
             for flag in cancellations {
                 flag.store(true, Ordering::Release);
             }
             emit_cancelled_branch_events(&event_tx, &request);
+            let _ = request_lease.cancel_queued();
             let _ = result_tx.send(Err(cancelled()));
         }
         WorkerCommand::GenerateMultimodal {
@@ -2496,10 +2569,11 @@ fn reject_queued_command(command: WorkerCommand) {
             result_tx,
             cancellation,
             reasoning_force: _,
-            request_lease: _request_lease,
+            request_lease,
         } => {
             cancellation.store(true, Ordering::Release);
             emit_generation_state(&event_tx, &request, u64::MAX, GenerationState::Cancelled);
+            let _ = request_lease.cancel_queued();
             let _ = result_tx.send(Err(cancelled()));
         }
         WorkerCommand::ControlledGenerate {
@@ -2508,13 +2582,16 @@ fn reject_queued_command(command: WorkerCommand) {
             event_tx,
             result_tx,
             cancellations,
-            request_lease: _request_lease,
-        } => controlled_runtime::reject_queued_controlled(
-            *submission,
-            event_tx,
-            result_tx,
-            cancellations,
-        ),
+            request_lease,
+        } => {
+            let _ = request_lease.cancel_queued();
+            controlled_runtime::reject_queued_controlled(
+                *submission,
+                event_tx,
+                result_tx,
+                cancellations,
+            );
+        }
         WorkerCommand::InspectControlledIdentity { response, .. } => {
             let _ = response.send(Err(cancelled()));
         }
@@ -5719,6 +5796,7 @@ mod tests {
             NativeModelHandle {
                 inner: Arc::new(NativeModelInner {
                     worker_identity: Arc::new(WorkerIdentity),
+                    worker_id: "admission-test-worker".to_owned(),
                     command_tx,
                     shutdown_tx,
                     closing: AtomicBool::new(false),
@@ -5737,6 +5815,7 @@ mod tests {
     ) -> (NativeModelOwner, NativeModelHandle) {
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
         let (shutdown_tx, shutdown_rx) = bounded(1);
+        let worker_id = format!("test-worker-{model_id}");
         let join = std::thread::spawn(move || {
             crossbeam_channel::select_biased! {
                 recv(shutdown_rx) -> _ => {},
@@ -5746,11 +5825,12 @@ mod tests {
         });
         let inner = Arc::new(NativeModelInner {
             worker_identity: Arc::new(WorkerIdentity),
+            worker_id: worker_id.clone(),
             command_tx,
             shutdown_tx,
             closing: AtomicBool::new(false),
             admission: Mutex::new(()),
-            requests: Arc::new(RequestRegistry::new()),
+            requests: Arc::new(RequestRegistry::with_external_worker(worker_id)),
             status: Arc::new(RwLock::new(ResidentModelStatus {
                 model_id: model_id.to_string(),
                 model_path: std::path::PathBuf::new(),
@@ -5782,6 +5862,9 @@ mod tests {
             .shutdown_joined()
             .expect("unique owner joins despite live command client");
         assert!(joined.belongs_to(&client));
+        assert_eq!(joined.expected_worker_count(), 1);
+        assert_eq!(joined.joined_worker_count(), 1);
+        assert_eq!(joined.expected_worker_ids(), joined.joined_worker_ids());
         assert!(stopped.load(Ordering::Acquire));
         assert_eq!(
             client
@@ -6018,6 +6101,7 @@ mod tests {
         });
         let inner = Arc::new(NativeModelInner {
             worker_identity: Arc::new(WorkerIdentity),
+            worker_id: "panicking-owner-test-worker".to_owned(),
             command_tx,
             shutdown_tx,
             closing: AtomicBool::new(false),
@@ -7574,6 +7658,7 @@ mod tests {
         let handle = NativeModelHandle {
             inner: Arc::new(NativeModelInner {
                 worker_identity: Arc::new(WorkerIdentity),
+                worker_id: "embedding-duplicate-test-worker".to_owned(),
                 command_tx,
                 shutdown_tx,
                 closing: AtomicBool::new(false),

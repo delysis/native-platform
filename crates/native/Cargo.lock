@@ -336,6 +336,7 @@ dependencies = [
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "llama-native-types",
+ "platform-contract-testkit",
  "serde",
  "serde_json",
  "sha2",
@@ -399,6 +400,24 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "platform-contract-testkit"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts.git?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
+dependencies = [
+ "platform-contracts-v0",
+ "thiserror",
+]
+
+[[package]]
+name = "platform-contracts-v0"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts.git?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
+dependencies = [
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "prettyplease"
