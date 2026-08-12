@@ -39,7 +39,7 @@ named production owner rather than fixture-owned shadow state.
 
 This two-revision sequence avoids a manifest referring circularly to the commit
 that contains that manifest. No final lock exists yet. The currently staged,
-Mom-only and incomplete row 17 slice and the intentionally absent row 8 are
+The incomplete Mom-plus-Information row 17 slice and intentionally absent row 8 are
 documented in [`CROSS-PRODUCT-ROWS.md`](CROSS-PRODUCT-ROWS.md).
 
 ## Exact row catalogue

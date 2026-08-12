@@ -9,10 +9,11 @@ requires every observation to repeat the manifest's exact omitted-claim list.
 
 ## Corrupted disposable caches
 
-The currently staged Mom slice of the incomplete row 17 bundle is:
+The currently staged, still-incomplete row 17 bundle is:
 
 - `verticals/v0/corrupted-disposable-caches.manifest.json`
 - `verticals/v0/corrupted-disposable-caches.mom.projection.json`
+- `verticals/v0/corrupted-disposable-caches.information.projection.json`
 
 It contains one Mom-owned case from accepted adapter commit
 `764b4cc1790709a23ecae74e746ca6b4ecb7321f`. The product manifest at that
@@ -23,26 +24,38 @@ native-prefix cache and encrypted session-KV cache. Both before and after
 logical states are typed, frozen, and authenticated; the production
 `ConversationDb` remains unchanged through corruption and reopen.
 
-This is not the complete row. Information owns durable resumable acquisition
-staging: its partial artifact and identity-bound resume sidecar can be invalid,
-discarded, and restarted from a cold state without publishing unverified
-bytes. That production-derived corruption case remains to be frozen. The
-current manifest records that missing case as an explicit incompleteness claim;
-it must not enter the final eighteen-row lock.
+The Information case is copied exactly from accepted adapter merge
+`68bcf2c554da810b9b3fa8cda279822e810f56c9`. Its product manifest is
+SHA-256 `e47353752cfe262686abfd0a132750c2c5033297377529142c5d72761bfd4911`.
+That manifest binds unchanged production source trees at
+`750e27e5ad27b6040e7ab7b66f7a2acb910b613a`, and its exact replay proves
+that `ManagedStore::prepare_install` removes a malformed disposable
+`.journal-*.tmp` acquisition-journal publication temporary while preserving
+the valid staging manifest and artifact target. The package remains partial
+and never becomes ready.
+
+This is still not the complete row. Information also owns a distinct durable
+HTTP-resume pair: a partial artifact and identity-bound resume sidecar can be
+malformed, discarded, and restarted from cold state without publishing
+unverified bytes. The accepted row-17 projection does not exercise that path;
+its own fail-closed facts expressly limit removal to `.journal-*.tmp`. The
+manifest therefore retains an explicit incompleteness claim and must not enter
+the final eighteen-row lock yet.
 
 The staged slice deliberately has no invented case for:
 
 - FTE provider-owned remote caches;
-- the still-missing Information resumable-staging corruption replay;
+- the still-missing Information HTTP resume-sidecar and partial-artifact
+  corruption replay;
 - Loom, which explicitly owns no disposable cache in its accepted adapter;
 - Native, which owns cache value types but no persistent cache store;
 - Speech's externally owned Hugging Face model cache.
 
-The Information entry is a required gap, not a non-applicability decision.
-Replace it with the exact Information case before row 17 can be complete. The
-other boundaries are omissions, not passing product claims; a later product may
-add a case only after it owns a persistent disposable format and supplies a
-production-derived observation.
+The remaining Information entry is a required gap, not a non-applicability
+decision. Add its exact production-derived projection before row 17 can be
+complete. The other boundaries are omissions, not passing product claims; a
+later product may add a case only after it owns a persistent disposable format
+and supplies a production-derived observation.
 
 ## Quit and relaunch using fake owners
 

@@ -101,12 +101,59 @@
       "digest": { "algorithm": "sha256", "hex": "d2e03c9923dd36837c1b13b9a47b2426bf3730652338362417d60a7da420cbe7" },
       "length": 2712
     }
+  }, {
+    "case_id": "information.corrupted-disposable-acquisition-cache.v0",
+    "source": {
+      "repository_id": "delysis/information-native-kit",
+      "commit": "750e27e5ad27b6040e7ab7b66f7a2acb910b613a",
+      "production_tree": {
+        "id": "information.production.source_roots.750e27e",
+        "digest": { "algorithm": "sha256", "hex": "e2eca746d04228ee806344d7c40c43723777b3c2ea4ffbe7056c554dbfe08a62" },
+        "length": 808
+      }
+    },
+    "inputs": [{
+      "identity": {
+        "id": "information.partial.payload",
+        "digest": { "algorithm": "sha256", "hex": "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5" },
+        "length": 7
+      },
+      "availability": "generated_fixture",
+      "relative_path": null
+    }],
+    "state_identities": [{
+      "state_id": "information.corrupted_disposable_cache",
+      "schema_id": "information.w1.corrupted_disposable_cache.v0",
+      "baseline": {
+        "identity": {
+          "id": "information.corrupted_disposable_cache.before",
+          "digest": { "algorithm": "sha256", "hex": "d3f3d718079be28ea426bcbf7eb1dc1722788e62c7b51a92242dda4b85fd3f94" },
+          "length": 243
+        },
+        "availability": "checked_in",
+        "relative_path": "tests/fixtures/w1/v0/information-corrupted-disposable-cache-before.json"
+      }
+    }],
+    "prerequisites": [],
+    "replay": [{
+      "program": { "kind": "cargo" },
+      "argv": ["test", "--locked", "-p", "information-native-host", "--features", "unstable-w1-vertical-tests", "--test", "w1_vertical", "corrupted_disposable_acquisition_cache_is_cold_reset", "--", "--exact"],
+      "required_environment": [],
+      "network": "denied"
+    }],
+    "expected_projection": {
+      "id": "information.corrupted_disposable_cache.projection",
+      "digest": { "algorithm": "sha256", "hex": "1552cdd5164f71addb107249c095a3f0a13db2250b4e8c32f0de30c3bdca77bd" },
+      "length": 1513
+    }
   }],
   "omitted_claims": [
     "FTE provider-owned remote caches",
-    "required Information resumable-staging corruption case is not yet frozen; row incomplete",
+    "Information identity-bound HTTP resume sidecar and partial-artifact corruption are not yet frozen as a vertical projection; row incomplete",
     "Loom disposable caches because none are product-owned",
     "Native persistent cache storage because native-kit owns only cache values",
+    "No authoritative staging manifest, artifact target, or ready receipt is malformed or discarded.",
+    "No live network acquisition is exercised.",
     "Speech Hugging Face model cache because it is externally owned"
   ],
   "negative_evidence": []
