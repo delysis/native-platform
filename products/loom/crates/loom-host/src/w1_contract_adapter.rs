@@ -1,10 +1,24 @@
 use super::*;
+use platform_contract_testkit::compositional_lifecycle::{
+    WaiterControlAdapter, run_waiter_control_suite,
+};
 use platform_contract_testkit::contracts::privacy::PRIVACY_POLICY_SCHEMA_V0;
 use platform_contract_testkit::contracts::{
     DataHandlingV0, DataTierV0, LoggingPolicyV0, NetworkPolicyV0, PayloadRedactionV0,
     PrivacyDecisionV0, PrivacyDenialV0, PrivacyPolicyV0, ProviderId, RedactionStateV0,
     RoutePrivacyContextV0, RouteTargetV0,
 };
+use platform_contract_testkit::{
+    AcceptanceError, AttemptIdentity, LifecycleCoverageManifest, LifecycleImplementation,
+    LifecycleInvariant, OperationPhase, OperationSnapshot, TerminalRecord, WaitObservation,
+};
+
+enum LoomInteractiveLifecycle {}
+
+impl LifecycleImplementation for LoomInteractiveLifecycle {
+    const PRODUCT: &'static str = "loom";
+    const IMPLEMENTATION: &'static str = "interactive-generation-registry";
+}
 
 /// Test-only view of facts owned by Loom's production generation registry.
 ///
@@ -82,6 +96,144 @@ impl BranchCancellation for RecordingCancellation {
             .push(branch_id);
         true
     }
+}
+
+#[derive(Clone, Debug)]
+struct LoomWaiterAdapter {
+    registry: Arc<GenerationRegistry>,
+}
+
+#[derive(Debug)]
+struct LoomWaitTicket {
+    project: ProjectId,
+    session: CommandId,
+    run: GenerationRunId,
+}
+
+#[derive(Debug)]
+struct LoomWaitLease {
+    request_id: String,
+    run_id: GenerationRunId,
+    branch_id: BranchId,
+    cancellation: Arc<RecordingCancellation>,
+}
+
+impl LoomWaiterAdapter {
+    fn attempt_identity(lease: &LoomWaitLease) -> AttemptIdentity {
+        let bytes = lease.branch_id.as_ulid().to_bytes();
+        AttemptIdentity {
+            operation_id: lease.request_id.clone(),
+            attempt_id: lease.branch_id.to_string(),
+            sequence: u64::from_be_bytes(bytes[..8].try_into().expect("eight-byte prefix")),
+        }
+    }
+}
+
+impl WaiterControlAdapter for LoomWaiterAdapter {
+    type Implementation = LoomInteractiveLifecycle;
+    type Error = GenerationRegistryError;
+    type Ticket = LoomWaitTicket;
+    type Lease = LoomWaitLease;
+
+    fn deterministic() -> Self {
+        Self {
+            registry: Arc::new(GenerationRegistry::new(1).expect("one live branch")),
+        }
+    }
+
+    fn start(&self, operation_id: &str) -> Result<(Self::Ticket, Self::Lease), Self::Error> {
+        let project_id = ProjectId::new();
+        let session_id = CommandId::new();
+        let run_id = GenerationRunId::new();
+        let branch_id = BranchId::new();
+        let cancellation = Arc::new(RecordingCancellation::default());
+        let authority: Arc<dyn BranchCancellation> = cancellation.clone();
+        self.registry.register(GenerationFamilyRegistration {
+            identity: GenerationFamilyIdentity {
+                request_id: operation_id.to_owned(),
+                project_id,
+                session_id,
+                document_id: DocumentId::new(),
+            },
+            branches: vec![(run_id, branch_id)],
+            cancellation: authority,
+        })?;
+        Ok((
+            LoomWaitTicket {
+                project: project_id,
+                session: session_id,
+                run: run_id,
+            },
+            LoomWaitLease {
+                request_id: operation_id.to_owned(),
+                run_id,
+                branch_id,
+                cancellation,
+            },
+        ))
+    }
+
+    fn snapshot(&self, lease: &Self::Lease) -> Option<OperationSnapshot> {
+        let route = self.registry.route_for_run(lease.run_id).ok()??;
+        if route.branch_id != lease.branch_id || route.identity.request_id != lease.request_id {
+            return None;
+        }
+        Some(OperationSnapshot {
+            identity: Self::attempt_identity(lease),
+            phase: OperationPhase::Running,
+            cancellation_requested: lease.cancellation.cancelled().contains(&lease.branch_id),
+            authoritative_terminal: None::<TerminalRecord>,
+            final_projection: None,
+            progress_projection: Vec::new(),
+        })
+    }
+
+    fn waiter_timeout(&self, ticket: &Self::Ticket) -> Result<WaitObservation, Self::Error> {
+        if self.registry.route_for_run(ticket.run)?.is_none() {
+            return Err(GenerationRegistryError::RunNotActive(ticket.run));
+        }
+        if self
+            .registry
+            .wait_for_session_idle(ticket.project, ticket.session, Duration::ZERO)?
+        {
+            return Err(GenerationRegistryError::CorruptRegistry);
+        }
+        Ok(WaitObservation::TimedOut)
+    }
+
+    fn request_cancel(&self, ticket: &Self::Ticket) -> Result<(), Self::Error> {
+        if !self
+            .registry
+            .cancel_run(ticket.project, ticket.session, ticket.run)?
+        {
+            return Err(GenerationRegistryError::CorruptRegistry);
+        }
+        Ok(())
+    }
+
+    fn finish_cancelled(&self, lease: &Self::Lease) -> Result<(), Self::Error> {
+        self.registry
+            .complete_family(&lease.request_id)?
+            .ok_or_else(|| GenerationRegistryError::RequestNotActive(lease.request_id.clone()))?;
+        Ok(())
+    }
+}
+
+#[test]
+fn real_registry_satisfies_waiter_control_suite_without_shadow_lifecycle_state() {
+    let evidence = run_waiter_control_suite::<LoomWaiterAdapter>("generation-registry");
+    assert_eq!(evidence.product(), "loom");
+    assert_eq!(evidence.implementation(), "interactive-generation-registry");
+    assert_eq!(evidence.component(), "generation-registry");
+    assert_eq!(evidence.suite(), "waiter-control");
+    assert_eq!(
+        evidence.invariants().collect::<Vec<_>>(),
+        [LifecycleInvariant::WaiterTimeoutIsObservational]
+    );
+    assert!(matches!(
+        LifecycleCoverageManifest::<LoomInteractiveLifecycle>::accept([evidence]),
+        Err(AcceptanceError::MissingSuites(_))
+    ));
 }
 
 fn local_only_contract(policy: &loom_types::BuildModelPolicy) -> PrivacyPolicyV0 {

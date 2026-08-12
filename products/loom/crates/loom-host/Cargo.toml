@@ -13,7 +13,7 @@ unstable-w1-contract-tests = ["dep:platform-contract-testkit"]
 
 [dependencies]
 loom-types = { path = "../loom-types" }
-platform-contract-testkit = { git = "https://github.com/delysis/w1-platform-contracts.git", rev = "da22fa893ac183c5d9df972a7e67215c0d92b383", optional = true }
+platform-contract-testkit = { git = "https://github.com/delysis/w1-platform-contracts.git", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821", optional = true }
 tauri = { version = "2.11.5", default-features = false, optional = true }
 thiserror.workspace = true
 

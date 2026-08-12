@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-w1_contract_rev='da22fa893ac183c5d9df972a7e67215c0d92b383'
+w1_contract_rev='cbab33555ab9355a6ac453d659c55ec9e0666821'
 w1_contract_url='https://github.com/delysis/w1-platform-contracts.git'
 w1_manifest='crates/loom-host/Cargo.toml'
 
