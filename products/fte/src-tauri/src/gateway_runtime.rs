@@ -166,6 +166,7 @@ impl SecretResolver for StoreSecretResolver {
 }
 
 pub struct GatewayRuntimeOwner {
+    runtime_id: RequestId,
     gateway: Arc<Gateway>,
     native_host: Arc<llama_native_host::NativeHost>,
     native_backend: Arc<LlamaNativeBackend>,
@@ -179,6 +180,7 @@ pub struct GatewayRuntimeOwner {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayRuntimeShutdownReport {
+    pub runtime_id: RequestId,
     pub gateway: GatewayShutdownReport,
     pub native_host_joined: bool,
 }
@@ -190,6 +192,13 @@ impl GatewayRuntimeOwner {
 
     pub(crate) fn new_with_store(
         credential_store: Arc<dyn CredentialStore>,
+    ) -> Result<Self, GatewayError> {
+        Self::new_with_store_and_runtime_id(credential_store, RequestId::new())
+    }
+
+    pub(crate) fn new_with_store_and_runtime_id(
+        credential_store: Arc<dyn CredentialStore>,
+        runtime_id: RequestId,
     ) -> Result<Self, GatewayError> {
         let gateway = Arc::new(Gateway::new(GatewayDefaults {
             catalog_version: "free-token-energy-desktop-v2".to_string(),
@@ -204,6 +213,7 @@ impl GatewayRuntimeOwner {
         let native_backend = Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&native_host)));
         gateway.register_backend(native_backend.clone())?;
         Ok(Self {
+            runtime_id,
             gateway,
             native_host,
             native_backend,
@@ -324,6 +334,7 @@ impl GatewayRuntimeOwner {
         let gateway = self.gateway.shutdown_with_report().await;
         let native_host_joined = self.shutdown_native_for_process_exit();
         GatewayRuntimeShutdownReport {
+            runtime_id: self.runtime_id.clone(),
             gateway,
             native_host_joined,
         }
@@ -1297,8 +1308,14 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_shutdown_reports_every_owned_worker_and_native_join() {
-        let runtime = GatewayRuntimeOwner::new().expect("gateway");
+        let runtime_id = RequestId("runtime-shutdown-report-test".to_string());
+        let runtime = GatewayRuntimeOwner::new_with_store_and_runtime_id(
+            Arc::new(FakeCredentialStore::default()),
+            runtime_id.clone(),
+        )
+        .expect("gateway");
         let report = runtime.shutdown_with_report().await;
+        assert_eq!(report.runtime_id, runtime_id);
         report.gateway.result.expect("Gateway shutdown");
         assert_eq!(
             report.gateway.expected_worker_ids,
