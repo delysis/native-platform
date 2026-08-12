@@ -21,8 +21,8 @@ ownership facts from the seal, live status, and `JoinedNativeModel`; proves
 nonempty text, real-engine evidence, non-fixture evidence, and in-process
 transport; and rejects unverified fill-in-middle.
 
-Local verification on an Apple M4 Max passed twice using the exact GGUF. The
-final strict-seal projection run passed 1/1 in 3.78 seconds. It selected the CPU
+Local verification on an Apple M4 Max passed repeatedly using the exact GGUF;
+the two strict-seal projection runs passed 1/1 in 3.78 and 3.88 seconds. They selected the CPU
 runtime as requested by the fixture; llama.cpp also inventoried the host's
 Metal device during process initialization. Accelerator availability,
 performance, and exact generated prose are intentionally omitted claims.
