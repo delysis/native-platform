@@ -8,8 +8,8 @@ permissions:
   contents: read
 
 jobs:
-  native-registry-contract:
-    name: Native registry contract (Rust 1.92)
+  native-lifecycle-contract:
+    name: Native lifecycle contract (Rust 1.92)
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -29,8 +29,8 @@ jobs:
       - name: Check immutable contract architecture
         run: ./scripts/check-architecture.sh
 
-      - name: Test native registry contract adapter
+      - name: Test complete native lifecycle manifest
         run: cargo test --locked -p llama-native-engine --features unstable-w1-contract-tests operation_registry::w1_contract_adapter
 
-      - name: Lint native registry contract adapter
+      - name: Lint native lifecycle implementation
         run: cargo clippy --locked -p llama-native-engine --features unstable-w1-contract-tests --all-targets -- -D warnings

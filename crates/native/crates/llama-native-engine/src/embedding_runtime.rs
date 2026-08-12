@@ -984,10 +984,18 @@ mod tests {
         let joined = JoinedNativeModel {
             model_id: "embedding-model".to_string(),
             worker_identity,
+            expected_workers: 0,
+            joined_workers: 0,
+            expected_worker_ids: Vec::new(),
+            joined_worker_ids: Vec::new(),
         };
         let other = JoinedNativeModel {
             model_id: "embedding-model".to_string(),
             worker_identity: Arc::new(WorkerIdentity),
+            expected_workers: 0,
+            joined_workers: 0,
+            expected_worker_ids: Vec::new(),
+            joined_worker_ids: Vec::new(),
         };
         assert!(verified.belongs_to_joined_model(&joined));
         assert!(!verified.belongs_to_joined_model(&other));
