@@ -1,0 +1,293 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.delysis.dev/w1/v0/vertical-fixture-manifest.schema.json",
+  "title": "Delysis vertical fixture manifest v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "vertical_id",
+    "class",
+    "contract_revision",
+    "cases",
+    "omitted_claims",
+    "negative_evidence"
+  ],
+  "properties": {
+    "schema": { "const": "delysis.vertical_fixture_manifest.v0" },
+    "vertical_id": { "$ref": "#/$defs/vertical_id" },
+    "class": { "enum": ["model_free", "real", "state"] },
+    "contract_revision": { "const": "cbab33555ab9355a6ac453d659c55ec9e0666821" },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/case" }
+    },
+    "omitted_claims": { "$ref": "#/$defs/text_set" },
+    "negative_evidence": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/negative_evidence" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "vertical_id": {
+            "enum": [
+              "mom_chat_cancel_retry",
+              "mom_attachment",
+              "fte_hosted_fixture_loopback",
+              "speech_peer_cancellation",
+              "information_install_query",
+              "loom_suggestion_promotion",
+              "loom_research_diagnostic_admitted_distinction",
+              "quit_relaunch_fake_owners"
+            ]
+          }
+        }
+      },
+      "then": { "properties": { "class": { "const": "model_free" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "vertical_id": {
+            "enum": [
+              "current_exact_qwen",
+              "current_exact_gemma",
+              "current_parakeet_model_audio",
+              "apple_installed_voice"
+            ]
+          }
+        }
+      },
+      "then": { "properties": { "class": { "const": "real" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "vertical_id": {
+            "enum": [
+              "mom_prior_release_store",
+              "loom_prior_project_store",
+              "fte_legacy_database",
+              "information_resource_store",
+              "corrupted_disposable_caches",
+              "partial_publication_states"
+            ]
+          }
+        }
+      },
+      "then": { "properties": { "class": { "const": "state" } } }
+    }
+  ],
+  "$defs": {
+    "vertical_id": {
+      "enum": [
+        "mom_chat_cancel_retry",
+        "mom_attachment",
+        "fte_hosted_fixture_loopback",
+        "speech_peer_cancellation",
+        "information_install_query",
+        "loom_suggestion_promotion",
+        "loom_research_diagnostic_admitted_distinction",
+        "quit_relaunch_fake_owners",
+        "current_exact_qwen",
+        "current_exact_gemma",
+        "current_parakeet_model_audio",
+        "apple_installed_voice",
+        "mom_prior_release_store",
+        "loom_prior_project_store",
+        "fte_legacy_database",
+        "information_resource_store",
+        "corrupted_disposable_caches",
+        "partial_publication_states"
+      ]
+    },
+    "git_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "safe_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[!#-\\[\\]-~]+$"
+    },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^[^/\\\\](?:[^\\\\]*[^/\\\\])?$"
+    },
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "hex"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "hex": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "digest", "length"],
+      "properties": {
+        "id": { "$ref": "#/$defs/safe_id" },
+        "digest": { "$ref": "#/$defs/digest" },
+        "length": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "fixture_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "availability", "relative_path"],
+      "properties": {
+        "identity": { "$ref": "#/$defs/artifact" },
+        "availability": {
+          "enum": ["checked_in", "external_exact", "runtime_inventory", "generated_fixture"]
+        },
+        "relative_path": {
+          "oneOf": [{ "$ref": "#/$defs/relative_path" }, { "type": "null" }]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "availability": { "const": "checked_in" } } },
+          "then": { "properties": { "relative_path": { "$ref": "#/$defs/relative_path" } } },
+          "else": { "properties": { "relative_path": { "type": "null" } } }
+        }
+      ]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository_id", "commit", "production_tree"],
+      "properties": {
+        "repository_id": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "commit": { "$ref": "#/$defs/git_commit" },
+        "production_tree": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "state_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state_id", "schema_id", "baseline"],
+      "properties": {
+        "state_id": { "$ref": "#/$defs/safe_id" },
+        "schema_id": { "$ref": "#/$defs/safe_id" },
+        "baseline": { "$ref": "#/$defs/fixture_artifact" }
+      }
+    },
+    "prerequisite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prerequisite_id", "kind", "identity"],
+      "properties": {
+        "prerequisite_id": { "$ref": "#/$defs/safe_id" },
+        "kind": { "enum": ["exact_external_artifact", "platform_inventory", "local_runtime"] },
+        "identity": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "program": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "cargo" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "npm" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "relative_path"],
+          "properties": {
+            "kind": { "const": "repository_script" },
+            "relative_path": { "$ref": "#/$defs/relative_path" }
+          }
+        }
+      ]
+    },
+    "replay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["program", "argv", "required_environment", "network"],
+      "properties": {
+        "program": { "$ref": "#/$defs/program" },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "required_environment": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]{0,127}$" }
+        },
+        "network": { "enum": ["denied", "loopback_only"] }
+      }
+    },
+    "negative_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_id", "disposition", "artifact", "reason"],
+      "properties": {
+        "evidence_id": { "$ref": "#/$defs/safe_id" },
+        "disposition": { "enum": ["rejected", "unavailable", "superseded"] },
+        "artifact": { "$ref": "#/$defs/artifact" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 4096 }
+      }
+    },
+    "text_set": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "source",
+        "inputs",
+        "state_identities",
+        "prerequisites",
+        "replay",
+        "expected_projection"
+      ],
+      "properties": {
+        "case_id": { "$ref": "#/$defs/safe_id" },
+        "source": { "$ref": "#/$defs/source" },
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/fixture_artifact" }
+        },
+        "state_identities": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/state_identity" }
+        },
+        "prerequisites": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/prerequisite" }
+        },
+        "replay": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/replay" }
+        },
+        "expected_projection": { "$ref": "#/$defs/artifact" }
+      }
+    }
+  }
+}

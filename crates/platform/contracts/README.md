@@ -43,3 +43,11 @@ Every golden fixture is validated against its JSON Schema using only an
 in-memory schema registry. `fixtures/v0/MANIFEST.sha256` authenticates the exact
 checked-in bytes; typed round trips assert semantic JSON shape. The suite does
 not claim a canonical JSON byte format.
+
+`platform-vertical-fixtures-v0` is an additive, test-only protocol for freezing
+the eighteen Wave 1 vertical rows after contract acceptance. It validates only
+caller-supplied bytes and observations, never executes replay recipes, and
+cannot access files, processes, networks, models, credentials, or platform
+state. See [VERTICAL-FIXTURE-PROTOCOL.md](VERTICAL-FIXTURE-PROTOCOL.md). This
+protocol revision contains no product fixture manifests and does not accept
+`W1-VERTICALS`.

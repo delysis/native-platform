@@ -580,6 +580,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "platform-vertical-fixtures-v0"
+version = "0.0.0"
+dependencies = [
+ "jsonschema",
+ "platform-contracts-v0",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

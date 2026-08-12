@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.delysis.dev/w1/v0/vertical-lock.schema.json",
+  "title": "Delysis vertical fixture lock v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "protocol_commit", "contract_revision", "entries"],
+  "properties": {
+    "schema": { "const": "delysis.vertical_fixture_lock.v0" },
+    "protocol_commit": { "$ref": "#/$defs/git_commit" },
+    "contract_revision": { "const": "cbab33555ab9355a6ac453d659c55ec9e0666821" },
+    "entries": {
+      "type": "array",
+      "minItems": 18,
+      "maxItems": 18,
+      "items": { "$ref": "#/$defs/entry" }
+    }
+  },
+  "$defs": {
+    "git_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "vertical_id": {
+      "enum": [
+        "mom_chat_cancel_retry",
+        "mom_attachment",
+        "fte_hosted_fixture_loopback",
+        "speech_peer_cancellation",
+        "information_install_query",
+        "loom_suggestion_promotion",
+        "loom_research_diagnostic_admitted_distinction",
+        "quit_relaunch_fake_owners",
+        "current_exact_qwen",
+        "current_exact_gemma",
+        "current_parakeet_model_audio",
+        "apple_installed_voice",
+        "mom_prior_release_store",
+        "loom_prior_project_store",
+        "fte_legacy_database",
+        "information_resource_store",
+        "corrupted_disposable_caches",
+        "partial_publication_states"
+      ]
+    },
+    "safe_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[!#-\\[\\]-~]+$"
+    },
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "hex"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "hex": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "digest", "length"],
+      "properties": {
+        "id": { "$ref": "#/$defs/safe_id" },
+        "digest": { "$ref": "#/$defs/digest" },
+        "length": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vertical_id", "class", "manifest"],
+      "properties": {
+        "vertical_id": { "$ref": "#/$defs/vertical_id" },
+        "class": { "enum": ["model_free", "real", "state"] },
+        "manifest": { "$ref": "#/$defs/artifact" }
+      }
+    }
+  }
+}
