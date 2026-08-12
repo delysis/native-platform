@@ -1,4 +1,4 @@
-# W3 native import candidate
+# W3 native import evidence
 
 This candidate imports the accepted `delysis/llama-native-kit` main at
 `16168bd76a09f74fdee41d0e2fb0441e79ac1005` beneath `crates/native` without
@@ -60,9 +60,17 @@ explicitly and passed:
 - `tests::real_strict_batch_retains_a_pre_cancelled_case_under_exact_model_binding`;
 - `tests::real_joined_shutdown_revokes_live_clients_then_joins_and_stops_admission`.
 
-These local results do not substitute for the three-OS PR run or post-merge
-CI. The source freeze and retirement gates remain deliberately downstream of
-those remote results.
+These local results did not substitute for remote evidence. Exact-head pull
+request runs `31639279377` and `31639347952` passed on Ubuntu, macOS, and
+Windows. The ancestry-preserving merge `691832f2af8f4b6ba291dd18380a776b7d387343`
+has parents `68b4f87c331d9ea887713201d4ee479c3445226a` and
+`6e94d4dd377fd9e970999ff6a090fadbf5c16cb2`; post-merge run `31641542839`
+passed the same three-platform matrix.
+
+The protected annotated candidate tag
+`w3-native-import-candidate-v0-2026-08-12` has tag object
+`1e5e9ea1c6232fb36184e9b50cf7a50e03ede125` and peels to that merge. Ruleset
+`20768300` prevents deletion or retargeting.
 
 Candidate run `31636166161` later passed tests, both locked graph probes, and
 strict Clippy on macOS before failing the native architecture step because the
@@ -70,11 +78,27 @@ runner did not provide the nonstandard `rg` utility. The check was made
 portable with POSIX `grep`; the failure is retained rather than counted as
 architecture evidence.
 
+## Source freeze
+
+The protected annotated source tag
+`native-platform-v2-horizon-b-2026-08-12` has tag object
+`58779c13f64c49732e881109edb7da4862541599` and peels to the imported source
+head `16168bd76a09f74fdee41d0e2fb0441e79ac1005`. Ruleset `20768308` prevents
+deletion or retargeting.
+
+The README redirect was committed directly to source `main` as
+`c3fe09b782469c88c6a3e0bf3a35f38394ce6569`, with sole parent the imported
+source head. Push runs `31643435710` and `31643435779` passed the lifecycle,
+workflow-policy, Linux, macOS, and Windows jobs. No-bypass ruleset `20768363`
+then froze creation, updates, deletion, and non-fast-forward changes for every
+source branch. Issues remain enabled and the repository remains unarchived.
+The README-only freeze descendant was not imported; the preserved import still
+binds exactly to `16168bd76a09f74fdee41d0e2fb0441e79ac1005`.
+
 ## Limits
 
-This candidate does not alter the source repository, its tags, or its GitHub
-settings. It does not modify a product repository or released product
-manifest. It does not import `llama-cpp-rs`. Source freezing is intentionally
-deferred until the imported path has merged, passed post-merge CI, and received
-an immutable candidate tag. The source repository must not be archived until
-two native-platform releases.
+This evidence-only candidate does not modify production Rust, dependencies,
+locks, product repositories, or released product manifests. It does not import
+`llama-cpp-rs`. The source repository must not be archived until two accepted
+native-platform releases. W3 acceptance still requires this evidence candidate
+to pass pull-request and post-merge CI and receive its protected final tag.
