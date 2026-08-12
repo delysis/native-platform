@@ -1,0 +1,15 @@
+[package]
+name = "command-evidence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Typed, fingerprint-bound command readiness evidence for native apps"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

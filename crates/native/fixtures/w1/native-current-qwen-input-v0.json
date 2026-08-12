@@ -1,0 +1,8 @@
+{
+  "schema": "delysis.native.current_qwen_input.v0",
+  "prompt": "Reply with one short word confirming readiness.",
+  "seed": 1,
+  "temperature": 0.0,
+  "max_tokens": 16,
+  "required_model_sha256": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14"
+}

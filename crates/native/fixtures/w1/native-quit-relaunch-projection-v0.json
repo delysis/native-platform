@@ -1,0 +1,108 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "native-quit-operation",
+      "attempt_id": null,
+      "correlation_id": "native-quit-relaunch",
+      "kind": "quit_terminal",
+      "payload": null
+    },
+    {
+      "sequence": 1,
+      "operation_id": "native-quit-operation",
+      "attempt_id": null,
+      "correlation_id": "native-quit-relaunch",
+      "kind": "owner_joined",
+      "payload": null
+    },
+    {
+      "sequence": 2,
+      "operation_id": "native-relaunch-operation",
+      "attempt_id": null,
+      "correlation_id": "native-quit-relaunch",
+      "kind": "relaunch_completed",
+      "payload": null
+    },
+    {
+      "sequence": 3,
+      "operation_id": "native-relaunch-operation",
+      "attempt_id": null,
+      "correlation_id": "native-quit-relaunch",
+      "kind": "owner_joined",
+      "payload": null
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "receipt-store-after-quit",
+      "schema_id": "delysis.native.fake_owner_receipt_store.v0",
+      "before": null,
+      "after": {
+        "id": "native-fake-owner-store-after-quit",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "ed08959fda1a0699d803369c7ed6c23e7dcbe395a3913ed5eeb2b07efe524f9d"
+        },
+        "length": 476
+      },
+      "disposition": "created"
+    },
+    {
+      "state_id": "receipt-store-after-relaunch",
+      "schema_id": "delysis.native.fake_owner_receipt_store.v0",
+      "before": {
+        "id": "native-fake-owner-store-after-quit",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "ed08959fda1a0699d803369c7ed6c23e7dcbe395a3913ed5eeb2b07efe524f9d"
+        },
+        "length": 476
+      },
+      "after": {
+        "id": "native-fake-owner-store-after-relaunch",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "22c09f5d9269b50e342f873bff427bc9cc00d15b020a0f5c2b63a12a2efaac93"
+        },
+        "length": 968
+      },
+      "disposition": "updated"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "native-quit-operation",
+      "attempt_id": null,
+      "correlation_id": "native-quit-relaunch",
+      "terminal": "cancelled",
+      "released": true
+    },
+    {
+      "operation_id": "native-relaunch-operation",
+      "attempt_id": null,
+      "correlation_id": "native-quit-relaunch",
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 4,
+    "joined_workers": 4
+  },
+  "output_facts": {
+    "durable_receipts": { "kind": "integer", "value": 4 },
+    "fake_model_owners": { "kind": "integer", "value": 2 },
+    "fresh_owner_identity": { "kind": "boolean", "value": true },
+    "real_model_loaded": { "kind": "boolean", "value": false },
+    "relaunch_operation_completed": { "kind": "boolean", "value": true },
+    "same_durable_store_reopened": { "kind": "boolean", "value": true },
+    "worker_id_sets_match": { "kind": "boolean", "value": true }
+  },
+  "fail_closed_facts": [
+    "quit closes model command admission before joining workers",
+    "joined evidence requires exact expected and joined worker ID sets"
+  ]
+}
