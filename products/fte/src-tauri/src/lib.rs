@@ -16,7 +16,8 @@ pub fn run() {
     );
     let plugin_gateway = gateway_runtime.gateway();
     let desktop_gateway_runtime = Arc::clone(&gateway_runtime);
-    let run_result = tauri::Builder::default()
+    let event_gateway_runtime = Arc::clone(&gateway_runtime);
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(
@@ -60,13 +61,22 @@ pub fn run() {
             commands::get_dashboard_stats,
             commands::get_recent_logs,
         ])
-        .run(tauri::generate_context!());
-    assert!(
-        gateway_runtime.shutdown_native_for_process_exit(),
-        "the application-owned native host did not return process-exit join evidence"
-    );
-    if let Err(error) = run_result {
-        eprintln!("Free Token Energy could not start: {error}");
+        .build(tauri::generate_context!());
+    match app {
+        Ok(app) => app.run(move |_app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Tauri dispatches plugin events before this callback. The FTE
+                // plugin has therefore drained the Gateway and its borrowed
+                // adapter before the application-owned native host is joined.
+                // This callback must run inside App::run: Builder::run never
+                // returns before AppKit begins process-global Metal teardown.
+                assert!(
+                    event_gateway_runtime.shutdown_native_for_process_exit(),
+                    "the application-owned native host did not return process-exit join evidence"
+                );
+            }
+        }),
+        Err(error) => eprintln!("Free Token Energy could not start: {error}"),
     }
 }
 
