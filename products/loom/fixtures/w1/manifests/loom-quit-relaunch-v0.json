@@ -8,14 +8,14 @@
       "case_id": "loom.full-application-close-and-fresh-runtime",
       "source": {
         "repository_id": "delysis/loom-native",
-        "commit": "a210de57a5a289db74a9cc280839e75fdf5f90db",
+        "commit": "5b0d81ebbf0f7561f81829a34ef84b50412c17b1",
         "production_tree": {
-          "id": "loom.row8.production.source_objects.a210de5",
+          "id": "loom.row8.production.source_objects.5b0d81e",
           "digest": {
             "algorithm": "sha256",
-              "hex": "14ccf97adc90941db7b9dddcbc9e3de4f11b257bb9dfba55e9a3f1d90c8071cc"
+            "hex": "f35be5a9fe9e43dae2980814f25c4520bff5cb88b943ec682f12e813d7c36ea3"
           },
-          "length": 482
+          "length": 651
         }
       },
       "inputs": [
@@ -24,9 +24,9 @@
             "id": "loom.quit-relaunch.input",
             "digest": {
               "algorithm": "sha256",
-              "hex": "6d47cc78a65c81541df067e750ce99bb3dd33d07b1baf7ba06af2560ece3765c"
+              "hex": "bea75b3e3ea5774b8ae3c490681a212dc2879bf5508598f75b9025d834eba512"
             },
-            "length": 159
+            "length": 246
           },
           "availability": "checked_in",
           "relative_path": "fixtures/w1/loom-quit-relaunch-v1.json"
@@ -55,14 +55,13 @@
         "id": "loom.quit-relaunch.projection",
         "digest": {
           "algorithm": "sha256",
-          "hex": "c9e49ebd295e40e475e9979744286c8e4a9712ded19f9c9e8c341334900222f5"
+          "hex": "84a3b6f5b0258955cd3a4696a7a693b660b9036cb619206b4c9555b2f61fd616"
         },
-        "length": 2877
+        "length": 2627
       }
     }
   ],
   "omitted_claims": [
-    "durable project store reopen",
     "native GUI process relaunch",
     "real model inference"
   ],

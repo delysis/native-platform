@@ -113,8 +113,8 @@ fn evidence_bytes(relative_path: &str) -> &'static [u8] {
             include_bytes!("../../../fixtures/w1/projections/loom-suggestion-promotion-v1.json")
         }
         "source/loom-production-tree-a733508.json" => PRODUCTION_TREE,
-        "source/loom-row8-production-tree-a210de5.json" => {
-            include_bytes!("../../../fixtures/w1/source/loom-row8-production-tree-a210de5.json")
+        "source/loom-row8-production-objects-5b0d81e.json" => {
+            include_bytes!("../../../fixtures/w1/source/loom-row8-production-objects-5b0d81e.json")
         }
         "state/loom-prior-v10-migrated-summary-v1.json" => {
             fixture_bytes("fixtures/w1/state/loom-prior-v10-migrated-summary-v1.json")

@@ -16,14 +16,14 @@ use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const BASELINE_COMMIT: &str = "a210de57a5a289db74a9cc280839e75fdf5f90db";
+const BASELINE_COMMIT: &str = "5b0d81ebbf0f7561f81829a34ef84b50412c17b1";
 const INPUT_BYTES: &[u8] = include_bytes!("../../../fixtures/w1/loom-quit-relaunch-v1.json");
 const MANIFEST_BYTES: &[u8] =
     include_bytes!("../../../fixtures/w1/manifests/loom-quit-relaunch-v0.json");
 const PROJECTION_BYTES: &[u8] =
     include_bytes!("../../../fixtures/w1/projections/loom-quit-relaunch-v1.json");
 const SOURCE_DESCRIPTOR_BYTES: &[u8] =
-    include_bytes!("../../../fixtures/w1/source/loom-row8-production-tree-a210de5.json");
+    include_bytes!("../../../fixtures/w1/source/loom-row8-production-objects-5b0d81e.json");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +31,7 @@ struct FixtureInput {
     schema: String,
     cancelled_request_id: String,
     relaunched_request_id: String,
+    manuscript: String,
 }
 
 #[derive(Debug)]
@@ -89,6 +90,61 @@ struct CloseEvidence {
     joined_worker_ids: Vec<String>,
     joined_worker_count: usize,
     admission_closed: bool,
+}
+
+struct DurableReopenEvidence {
+    before: Vec<u8>,
+    after: Vec<u8>,
+}
+
+struct QuitRelaunchEvidence<'a> {
+    input: &'a FixtureInput,
+    durable: &'a DurableReopenEvidence,
+    cancelled: &'a WorkerEvidence,
+    first_close: &'a CloseEvidence,
+    completed: &'a WorkerEvidence,
+    fresh_close: &'a CloseEvidence,
+    fresh_runtime_running: bool,
+    distinct_registry_identity: bool,
+}
+
+fn prepare_durable_project(input: &FixtureInput) -> (tempfile::TempDir, DurableReopenEvidence) {
+    let temporary = tempfile::tempdir().expect("temporary Loom row-8 project parent");
+    let root = temporary.path().join("W1 Quit Relaunch");
+    let mut store = initialize_project(&root, "W1 Quit Relaunch".to_owned())
+        .expect("initialize durable Loom row-8 project");
+    let initial = store
+        .read_document(INITIAL_DOCUMENT)
+        .expect("read initial row-8 manuscript");
+    store
+        .save_document_if_source(
+            INITIAL_DOCUMENT,
+            DocumentContent::Prose(input.manuscript.clone()),
+            "establish durable row-8 manuscript",
+            initial.revision_id,
+            initial.blob_id,
+        )
+        .expect("persist row-8 manuscript");
+    let before = store
+        .read_document(INITIAL_DOCUMENT)
+        .expect("read persisted row-8 manuscript")
+        .text
+        .into_bytes();
+    store.record_close().expect("record first project close");
+    drop(store);
+
+    let mut reopened = ProjectStore::open(&root).expect("reopen same durable Loom project");
+    let after = reopened
+        .read_document(INITIAL_DOCUMENT)
+        .expect("read reopened row-8 manuscript")
+        .text
+        .into_bytes();
+    reopened
+        .record_close()
+        .expect("record reopened project close");
+    drop(reopened);
+    assert_eq!(before, after, "same durable manuscript must reopen exactly");
+    (temporary, DurableReopenEvidence { before, after })
 }
 
 fn attach_fixture_worker(
@@ -208,8 +264,10 @@ fn close_runtime(state: &PluginState, worker: &WorkerEvidence) -> CloseEvidence 
 fn full_application_close_joins_fake_generation_owner_and_fresh_runtime_admits_work() {
     let input: FixtureInput = serde_json::from_slice(INPUT_BYTES).expect("parse fixture input");
     assert_eq!(input.schema, "delysis.loom.quit_relaunch_fixture.v1");
+    let (_project, durable) = prepare_durable_project(&input);
 
     let first = PluginState::default();
+    let first_registry_identity = Arc::clone(&first.generation_workers.identity);
     let cancelled = attach_fixture_worker(
         &first,
         &input.cancelled_request_id,
@@ -234,8 +292,23 @@ fn full_application_close_joins_fake_generation_owner_and_fresh_runtime_admits_w
         first_close.joined_worker_ids
     );
     assert_eq!(first_close.joined_worker_count, 1);
+    assert_eq!(
+        first_close.expected_worker_ids,
+        vec![input.cancelled_request_id.clone()]
+    );
+    assert_eq!(
+        first_close.joined_worker_ids,
+        vec![input.cancelled_request_id.clone()]
+    );
 
     let fresh = PluginState::default();
+    let fresh_registry_identity = Arc::clone(&fresh.generation_workers.identity);
+    let distinct_registry_identity =
+        !Arc::ptr_eq(&first_registry_identity, &fresh_registry_identity);
+    assert!(
+        distinct_registry_identity,
+        "fresh runtime must own a new worker registry"
+    );
     let fresh_runtime_running = fresh
         .generation_lifecycle
         .phase()
@@ -267,23 +340,36 @@ fn full_application_close_joins_fake_generation_owner_and_fresh_runtime_admits_w
         fresh_close.joined_worker_ids
     );
     assert_eq!(fresh_close.joined_worker_count, 1);
+    assert_eq!(
+        fresh_close.expected_worker_ids,
+        vec![input.relaunched_request_id.clone()]
+    );
+    assert_eq!(
+        fresh_close.joined_worker_ids,
+        vec![input.relaunched_request_id.clone()]
+    );
 
-    validate_projection(quit_relaunch_projection(
-        &cancelled,
-        &first_close,
-        &completed,
-        &fresh_close,
+    validate_projection(quit_relaunch_projection(&QuitRelaunchEvidence {
+        input: &input,
+        durable: &durable,
+        cancelled: &cancelled,
+        first_close: &first_close,
+        completed: &completed,
+        fresh_close: &fresh_close,
         fresh_runtime_running,
-    ));
+        distinct_registry_identity,
+    }));
 }
 
-fn quit_relaunch_projection(
-    cancelled: &WorkerEvidence,
-    first_close: &CloseEvidence,
-    completed: &WorkerEvidence,
-    fresh_close: &CloseEvidence,
-    fresh_runtime_running: bool,
-) -> EquivalenceProjectionV0 {
+fn quit_relaunch_projection(evidence: &QuitRelaunchEvidence<'_>) -> EquivalenceProjectionV0 {
+    let QuitRelaunchEvidence {
+        durable,
+        cancelled,
+        first_close,
+        completed,
+        fresh_close,
+        ..
+    } = evidence;
     let correlation_id = Some("loom-w1-quit-relaunch".to_owned());
     EquivalenceProjectionV0 {
         ordered_events: vec![
@@ -304,22 +390,19 @@ fn quit_relaunch_projection(
                 payload: None,
             },
         ],
-        durable_state: vec![
-            DurableStateFactV0 {
-                state_id: "loom.application.lifecycle.first".to_owned(),
-                schema_id: "loom.application_lifecycle.v1".to_owned(),
-                before: Some(sha256_identity("loom.lifecycle.running", b"running")),
-                after: Some(sha256_identity("loom.lifecycle.closed", b"closed")),
-                disposition: StateDispositionV0::Updated,
-            },
-            DurableStateFactV0 {
-                state_id: "loom.application.lifecycle.fresh".to_owned(),
-                schema_id: "loom.application_lifecycle.v1".to_owned(),
-                before: Some(sha256_identity("loom.lifecycle.running", b"running")),
-                after: Some(sha256_identity("loom.lifecycle.closed", b"closed")),
-                disposition: StateDispositionV0::Updated,
-            },
-        ],
+        durable_state: vec![DurableStateFactV0 {
+            state_id: "loom.project.manuscript".to_owned(),
+            schema_id: "loom.project_store.document.v1".to_owned(),
+            before: Some(sha256_identity(
+                "loom.quit-relaunch.manuscript",
+                &durable.before,
+            )),
+            after: Some(sha256_identity(
+                "loom.quit-relaunch.manuscript",
+                &durable.after,
+            )),
+            disposition: StateDispositionV0::Unchanged,
+        }],
         lifecycle: vec![
             LifecycleFactV0 {
                 operation_id: cancelled.lease.identity().operation_id.clone(),
@@ -345,13 +428,7 @@ fn quit_relaunch_projection(
             joined_workers: first_close.joined_worker_ids.len()
                 + fresh_close.joined_worker_ids.len(),
         },
-        output_facts: quit_relaunch_output_facts(
-            cancelled,
-            first_close,
-            completed,
-            fresh_close,
-            fresh_runtime_running,
-        ),
+        output_facts: quit_relaunch_output_facts(evidence),
         fail_closed_facts: vec![
             "application admission closed before fake-owner cancellation and join".to_owned(),
             "fresh runtime did not reuse the closed generation supervisor".to_owned(),
@@ -360,12 +437,18 @@ fn quit_relaunch_projection(
 }
 
 fn quit_relaunch_output_facts(
-    cancelled: &WorkerEvidence,
-    first_close: &CloseEvidence,
-    completed: &WorkerEvidence,
-    fresh_close: &CloseEvidence,
-    fresh_runtime_running: bool,
+    evidence: &QuitRelaunchEvidence<'_>,
 ) -> BTreeMap<String, FactValueV0> {
+    let QuitRelaunchEvidence {
+        input,
+        durable,
+        cancelled,
+        first_close,
+        completed,
+        fresh_close,
+        fresh_runtime_running,
+        distinct_registry_identity,
+    } = evidence;
     BTreeMap::from([
         (
             "first_admission_closed".to_owned(),
@@ -380,6 +463,10 @@ fn quit_relaunch_output_facts(
             FactValueV0::Boolean(first_close.expected_worker_ids == first_close.joined_worker_ids),
         ),
         (
+            "first_worker_id".to_owned(),
+            FactValueV0::Text(input.cancelled_request_id.clone()),
+        ),
+        (
             "first_lifecycle_closed".to_owned(),
             FactValueV0::Boolean(first_close.closed.lifecycle == GenerationSupervisorPhase::Closed),
         ),
@@ -392,8 +479,20 @@ fn quit_relaunch_output_facts(
             FactValueV0::Boolean(fresh_close.expected_worker_ids == fresh_close.joined_worker_ids),
         ),
         (
+            "fresh_registry_distinct".to_owned(),
+            FactValueV0::Boolean(*distinct_registry_identity),
+        ),
+        (
             "fresh_runtime_running".to_owned(),
-            FactValueV0::Boolean(fresh_runtime_running),
+            FactValueV0::Boolean(*fresh_runtime_running),
+        ),
+        (
+            "fresh_worker_id".to_owned(),
+            FactValueV0::Text(input.relaunched_request_id.clone()),
+        ),
+        (
+            "same_durable_manuscript_reopened".to_owned(),
+            FactValueV0::Boolean(durable.before == durable.after),
         ),
     ])
 }
@@ -431,6 +530,12 @@ fn validate_projection(projection: EquivalenceProjectionV0) {
     assert_eq!(
         sha256_identity("loom.quit-relaunch.projection", PROJECTION_BYTES),
         case.expected_projection
+    );
+    let expected_projection: EquivalenceProjectionV0 =
+        serde_json::from_slice(PROJECTION_BYTES).expect("parse exact row-8 projection");
+    assert_eq!(
+        projection, expected_projection,
+        "row-8 product facts drifted"
     );
     authenticate_production_root();
     let observation = ObservationEnvelopeV0 {

@@ -19,34 +19,19 @@
   ],
   "durable_state": [
     {
-      "state_id": "loom.application.lifecycle.first",
-      "schema_id": "loom.application_lifecycle.v1",
+      "state_id": "loom.project.manuscript",
+      "schema_id": "loom.project_store.document.v1",
       "before": {
-        "id": "loom.lifecycle.running",
-        "digest": { "algorithm": "sha256", "hex": "c071cf5f5ed6f884cc70155b6f05f755fd46a302d05e4261b7e92ce878bbfed8" },
-        "length": 7
+        "id": "loom.quit-relaunch.manuscript",
+        "digest": { "algorithm": "sha256", "hex": "5f1c7556cae03a20990b5e9b6c5a07c5c8f00ff0c589a326a61d6ad8d152cb1c" },
+        "length": 67
       },
       "after": {
-        "id": "loom.lifecycle.closed",
-        "digest": { "algorithm": "sha256", "hex": "c3eefb58d7c42440a9d4abec51d629544d635a6d936ff3c4d3fca96d611b3cf3" },
-        "length": 6
+        "id": "loom.quit-relaunch.manuscript",
+        "digest": { "algorithm": "sha256", "hex": "5f1c7556cae03a20990b5e9b6c5a07c5c8f00ff0c589a326a61d6ad8d152cb1c" },
+        "length": 67
       },
-      "disposition": "updated"
-    },
-    {
-      "state_id": "loom.application.lifecycle.fresh",
-      "schema_id": "loom.application_lifecycle.v1",
-      "before": {
-        "id": "loom.lifecycle.running",
-        "digest": { "algorithm": "sha256", "hex": "c071cf5f5ed6f884cc70155b6f05f755fd46a302d05e4261b7e92ce878bbfed8" },
-        "length": 7
-      },
-      "after": {
-        "id": "loom.lifecycle.closed",
-        "digest": { "algorithm": "sha256", "hex": "c3eefb58d7c42440a9d4abec51d629544d635a6d936ff3c4d3fca96d611b3cf3" },
-        "length": 6
-      },
-      "disposition": "updated"
+      "disposition": "unchanged"
     }
   ],
   "lifecycle": [
@@ -76,9 +61,13 @@
     "first_cancellation_observed": { "kind": "boolean", "value": true },
     "first_expected_joined_exact": { "kind": "boolean", "value": true },
     "first_lifecycle_closed": { "kind": "boolean", "value": true },
+    "first_worker_id": { "kind": "text", "value": "loom-w1-quit-active" },
     "fresh_completed": { "kind": "boolean", "value": true },
     "fresh_expected_joined_exact": { "kind": "boolean", "value": true },
-    "fresh_runtime_running": { "kind": "boolean", "value": true }
+    "fresh_registry_distinct": { "kind": "boolean", "value": true },
+    "fresh_runtime_running": { "kind": "boolean", "value": true },
+    "fresh_worker_id": { "kind": "text", "value": "loom-w1-relaunch-active" },
+    "same_durable_manuscript_reopened": { "kind": "boolean", "value": true }
   },
   "fail_closed_facts": [
     "application admission closed before fake-owner cancellation and join",
