@@ -8,10 +8,10 @@
       "case_id": "loom.suggestion.promotion.v1",
       "source": {
         "repository_id": "delysis/loom-native",
-        "commit": "e32d0697f6b5e28716e34c6b051d47d5031d010c",
+        "commit": "a733508adcb1ef1e689e90ed0c8e410160cb602a",
         "production_tree": {
-          "id": "loom.production.source_roots.e32d069",
-          "digest": { "algorithm": "sha256", "hex": "f19edc9caf22807a4d11f716a921445bf5c407b4e3ad85e7842a5fd8f2fc0f00" },
+          "id": "loom.production.source_roots.a733508",
+          "digest": { "algorithm": "sha256", "hex": "30e5e03b1e18c71d6f9feeb78f0f2eb524402a13f3f57b835680db9d6f52c4cd" },
           "length": 1632
         }
       },

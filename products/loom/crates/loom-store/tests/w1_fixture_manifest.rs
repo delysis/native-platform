@@ -12,9 +12,9 @@ use platform_vertical_fixtures_v0::{
 use serde::Deserialize;
 use serde_json::json;
 
-const BASELINE_COMMIT: &str = "e32d0697f6b5e28716e34c6b051d47d5031d010c";
+const BASELINE_COMMIT: &str = "a733508adcb1ef1e689e90ed0c8e410160cb602a";
 const PRODUCTION_TREE: &[u8] =
-    include_bytes!("../../../fixtures/w1/source/loom-production-tree-e32d069.json");
+    include_bytes!("../../../fixtures/w1/source/loom-production-tree-a733508.json");
 
 #[derive(Deserialize)]
 struct ProductionTreeDescriptor {
@@ -103,7 +103,7 @@ fn evidence_bytes(relative_path: &str) -> &'static [u8] {
         "projections/loom-suggestion-promotion-v1.json" => {
             include_bytes!("../../../fixtures/w1/projections/loom-suggestion-promotion-v1.json")
         }
-        "source/loom-production-tree-e32d069.json" => PRODUCTION_TREE,
+        "source/loom-production-tree-a733508.json" => PRODUCTION_TREE,
         "state/loom-prior-v10-migrated-summary-v1.json" => {
             fixture_bytes("fixtures/w1/state/loom-prior-v10-migrated-summary-v1.json")
         }

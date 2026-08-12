@@ -1,6 +1,6 @@
 # W1 Loom model-free and state vertical receipt — 2026-08-12
 
-Production baseline: `loom-native@e32d0697f6b5e28716e34c6b051d47d5031d010c`.
+Production baseline: `loom-native@a733508adcb1ef1e689e90ed0c8e410160cb602a`.
 
 Vertical protocol: `w1-platform-contracts@fc24ffff08c52690390b4460f44617d5d9732563`
 (`w1-vertical-protocol-v0-2026-08-12-r2`). The accepted lifecycle contract remains
@@ -13,11 +13,13 @@ calls `validate_baseline` for rows 6, 7, and 14. No later production candidate
 exists in this two-commit freeze, so `compare_candidate` is intentionally not
 used.
 
-`fixtures/w1/source/loom-production-tree-e32d069.json` is the SHA-256-bound
+`fixtures/w1/source/loom-production-tree-a733508.json` is the SHA-256-bound
 production-tree byte artifact. It records the Git tree identity of every
 application and crate `src` root at the production baseline. The fixture
 descendant test proves the baseline is an ancestor and every current source-root
-identity remains exact; the evidence commit changes no production source file.
+identity remains exact. This baseline includes the bounded Linux `ETXTBSY`
+retry and the production attach-before-execution ordering repair; the following
+fixture-rebinding commit changes no production source file.
 
 ## Row 6 — suggestion and promotion
 
