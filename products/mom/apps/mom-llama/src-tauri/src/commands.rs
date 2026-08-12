@@ -98,6 +98,12 @@ pub async fn mom_llama_pick_file(
         file = dialog.pick_file() => file.map(|file| file.path().to_path_buf()),
         () = lease.cancelled() => None,
     };
+    let terminal = if lease.cancellation_requested() {
+        crate::operation_supervisor::TerminalClass::Cancelled
+    } else {
+        crate::operation_supervisor::TerminalClass::Completed
+    };
+    lease.finish(terminal)?;
     command_value(mom_llama_runtime::path_select(path_kind, path))
 }
 
@@ -1223,34 +1229,14 @@ where
     T: serde::Serialize + Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(move || {
-        if lease.cancellation_requested() {
-            return Err(
-                "Mom Llama cancelled the operation during application shutdown".to_string(),
-            );
-        }
-        let _lease = lease;
-        command_value(operation())
-    })
-    .await
-    .map_err(to_error)?
+    lease.run_blocking(move || command_value(operation())).await
 }
 
 async fn blocking_response<F>(lease: AppWorkLease, operation: F) -> Result<Response, String>
 where
     F: FnOnce() -> Result<Response, String> + Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(move || {
-        if lease.cancellation_requested() {
-            return Err(
-                "Mom Llama cancelled the operation during application shutdown".to_string(),
-            );
-        }
-        let _lease = lease;
-        operation()
-    })
-    .await
-    .map_err(to_error)?
+    lease.run_blocking(operation).await
 }
 
 fn to_error(error: impl std::fmt::Display) -> String {

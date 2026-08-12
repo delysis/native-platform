@@ -1,6 +1,7 @@
 mod app_runtime;
 mod command_registry;
 mod commands;
+mod operation_supervisor;
 mod view;
 
 use anyhow::Result;
@@ -1190,11 +1191,20 @@ mod tests {
             elapsed_ms: 1,
             gateway_drained: true,
             native_host_joined: false,
+            operation_supervisor_phase: crate::operation_supervisor::LifecyclePhase::Closed,
+            active_operation_count: 0,
+            retained_operation_task_count: 0,
+            expected_operation_worker_count: 0,
+            joined_operation_worker_count: 0,
+            expected_native_worker_count: 0,
             joined_native_worker_count: 0,
+            expected_worker_ids: Vec::new(),
+            joined_worker_ids: Vec::new(),
             application_work_drained: true,
         };
         let failure = Err(AppShutdownError {
             summary: summary.clone(),
+            operation_error: None,
             gateway_error: None,
             native_error: Some("native join failed".to_string()),
         });
@@ -1205,6 +1215,7 @@ mod tests {
                 native_host_joined: true,
                 ..summary
             },
+            operation_error: None,
             gateway_error: Some("gateway drain failed".to_string()),
             native_error: None,
         });

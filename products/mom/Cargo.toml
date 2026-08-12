@@ -42,6 +42,8 @@ fte-router = { git = "https://github.com/delysis/free-token-energy", rev = "1b4c
 fte-store = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
 fte-types = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
 tauri-plugin-free-token-energy = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
+platform-contracts-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821" }
+platform-contract-testkit = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -3168,12 +3168,15 @@ dependencies = [
  "llama-native-types",
  "maud",
  "mom-llama-runtime",
+ "platform-contract-testkit",
+ "platform-contracts-v0",
  "rfd",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-free-token-energy",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -3730,6 +3733,24 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "platform-contract-testkit"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
+dependencies = [
+ "platform-contracts-v0",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "platform-contracts-v0"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "plist"
