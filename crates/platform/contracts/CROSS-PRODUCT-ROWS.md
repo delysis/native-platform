@@ -9,11 +9,12 @@ requires every observation to repeat the manifest's exact omitted-claim list.
 
 ## Corrupted disposable caches
 
-The currently staged, still-incomplete row 17 bundle is:
+The complete row 17 bundle is:
 
 - `verticals/v0/corrupted-disposable-caches.manifest.json`
 - `verticals/v0/corrupted-disposable-caches.mom.projection.json`
 - `verticals/v0/corrupted-disposable-caches.information.projection.json`
+- `verticals/v0/corrupted-disposable-caches.information-resume.projection.json`
 
 It contains one Mom-owned case from accepted adapter commit
 `764b4cc1790709a23ecae74e746ca6b4ecb7321f`. The product manifest at that
@@ -24,7 +25,7 @@ native-prefix cache and encrypted session-KV cache. Both before and after
 logical states are typed, frozen, and authenticated; the production
 `ConversationDb` remains unchanged through corruption and reopen.
 
-The Information case is copied exactly from accepted adapter merge
+The first Information case is copied exactly from accepted adapter merge
 `68bcf2c554da810b9b3fa8cda279822e810f56c9`. Its product manifest is
 SHA-256 `e47353752cfe262686abfd0a132750c2c5033297377529142c5d72761bfd4911`.
 That manifest binds unchanged production source trees at
@@ -34,28 +35,34 @@ that `ManagedStore::prepare_install` removes a malformed disposable
 the valid staging manifest and artifact target. The package remains partial
 and never becomes ready.
 
-This is still not the complete row. Information also owns a distinct durable
-HTTP-resume pair: a partial artifact and identity-bound resume sidecar can be
-malformed, discarded, and restarted from cold state without publishing
-unverified bytes. The accepted row-17 projection does not exercise that path;
-its own fail-closed facts expressly limit removal to `.journal-*.tmp`. The
-manifest therefore retains an explicit incompleteness claim and must not enter
-the final eighteen-row lock yet.
+The second Information case is copied exactly from accepted adapter merge
+`7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe`. Its product manifest is
+SHA-256 `2972dd6fb8eefc0e0b31d6d87ce44b3118ca6c1cf6439684b8fcdb57afe4e66d`.
+That manifest binds the same unchanged production source trees and its
+loopback-only replay exercises Information's distinct durable HTTP-resume
+pair. A cancelled identity-bound partial artifact is retained, its sidecar is
+made malformed, and the production `AcquireClient` discards that state and
+restarts from byte zero without a `Range` request. Only the exact verified
+artifact is published; the malformed sidecar is removed and caller-owned
+authoritative state remains byte-identical.
+
+Together, the accepted Mom case and two accepted Information cases cover every
+product-owned persistent disposable format identified for row 17. Row 17 is
+complete, though it cannot enter the final eighteen-row lock until every other
+row exists and the later seal step is authorized.
 
 The staged slice deliberately has no invented case for:
 
 - FTE provider-owned remote caches;
-- the still-missing Information HTTP resume-sidecar and partial-artifact
-  corruption replay;
 - Loom, which explicitly owns no disposable cache in its accepted adapter;
 - Native, which owns cache value types but no persistent cache store;
 - Speech's externally owned Hugging Face model cache.
 
-The remaining Information entry is a required gap, not a non-applicability
-decision. Add its exact production-derived projection before row 17 can be
-complete. The other boundaries are omissions, not passing product claims; a
-later product may add a case only after it owns a persistent disposable format
-and supplies a production-derived observation.
+These boundaries are omissions, not passing product claims; a later product
+may add a case only after it owns a persistent disposable format and supplies
+a production-derived observation. Durable resume remains unavailable on
+non-Unix platforms, and the accepted replay makes no hosted-network or
+credential claim.
 
 ## Quit and relaunch using fake owners
 

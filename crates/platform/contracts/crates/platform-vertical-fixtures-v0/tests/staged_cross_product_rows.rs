@@ -11,6 +11,36 @@ const MOM_CACHE_PROJECTION: &[u8] =
     include_bytes!("../../../verticals/v0/corrupted-disposable-caches.mom.projection.json");
 const INFORMATION_CACHE_PROJECTION: &[u8] =
     include_bytes!("../../../verticals/v0/corrupted-disposable-caches.information.projection.json");
+const INFORMATION_RESUME_PROJECTION: &[u8] = include_bytes!(
+    "../../../verticals/v0/corrupted-disposable-caches.information-resume.projection.json"
+);
+
+fn observation(
+    manifest: &VerticalFixtureManifestV0,
+    case_index: usize,
+    threat_model: &str,
+    projection: EquivalenceProjectionV0,
+) -> ObservationEnvelopeV0 {
+    let case = &manifest.cases[case_index];
+    ObservationEnvelopeV0 {
+        schema: VERTICAL_OBSERVATION_SCHEMA_V0.to_owned(),
+        vertical_id: manifest.vertical_id,
+        case_id: case.case_id.clone(),
+        implementation_revision: case.source.commit.clone(),
+        observed_prerequisites: Vec::new(),
+        evidence: EvidenceClaimV0 {
+            schema: EVIDENCE_SCHEMA_V0.to_owned(),
+            tier: EvidenceTier::Reproducible,
+            threat_model: threat_model.to_owned(),
+            exact_source: case.source.production_tree.digest.clone(),
+            exact_runtime_or_artifact: case.expected_projection.digest.clone(),
+            execution_kind: ExecutionKind::Fixture,
+            omitted_claims: manifest.omitted_claims.clone(),
+            negative_evidence: Vec::new(),
+        },
+        projection,
+    }
+}
 
 #[test]
 fn staged_cache_bundle_preserves_each_exact_claim_boundary() {
@@ -21,11 +51,14 @@ fn staged_cache_bundle_preserves_each_exact_claim_boundary() {
     let information_projection: EquivalenceProjectionV0 =
         serde_json::from_slice(INFORMATION_CACHE_PROJECTION)
             .expect("staged Information cache projection JSON");
+    let information_resume_projection: EquivalenceProjectionV0 =
+        serde_json::from_slice(INFORMATION_RESUME_PROJECTION)
+            .expect("staged Information resume projection JSON");
     assert_eq!(
         manifest.vertical_id,
         VerticalIdV0::CorruptedDisposableCaches
     );
-    assert_eq!(manifest.cases.len(), 2);
+    assert_eq!(manifest.cases.len(), 3);
     assert_eq!(manifest.cases[0].case_id, "mom.disposable-cache-corruption");
     assert_eq!(
         manifest.cases[1].case_id,
@@ -36,57 +69,44 @@ fn staged_cache_bundle_preserves_each_exact_claim_boundary() {
         "delysis/information-native-kit"
     );
     assert_eq!(
+        manifest.cases[2].case_id,
+        "information.malformed-identity-bound-resume-cache.v0"
+    );
+    assert_eq!(
+        manifest.cases[2].source.repository_id,
+        "delysis/information-native-kit"
+    );
+    assert_eq!(
         manifest.omitted_claims,
         [
+            "Durable resume is unavailable on non-Unix platforms.",
             "FTE provider-owned remote caches",
-            "Information identity-bound HTTP resume sidecar and partial-artifact corruption are not yet frozen as a vertical projection; row incomplete",
             "Loom disposable caches because none are product-owned",
             "Native persistent cache storage because native-kit owns only cache values",
             "No authoritative staging manifest, artifact target, or ready receipt is malformed or discarded.",
-            "No live network acquisition is exercised.",
+            "No hosted network or credential is exercised.",
             "Speech Hugging Face model cache because it is externally owned",
         ]
     );
 
-    let mom_case = &manifest.cases[0];
-    let mom_observation = ObservationEnvelopeV0 {
-        schema: VERTICAL_OBSERVATION_SCHEMA_V0.to_owned(),
-        vertical_id: manifest.vertical_id,
-        case_id: mom_case.case_id.clone(),
-        implementation_revision: mom_case.source.commit.clone(),
-        observed_prerequisites: Vec::new(),
-        evidence: EvidenceClaimV0 {
-            schema: EVIDENCE_SCHEMA_V0.to_owned(),
-            tier: EvidenceTier::Reproducible,
-            threat_model: "accepted Mom feature-gated cache replay; no non-Mom cache claim"
-                .to_owned(),
-            exact_source: mom_case.source.production_tree.digest.clone(),
-            exact_runtime_or_artifact: mom_case.expected_projection.digest.clone(),
-            execution_kind: ExecutionKind::Fixture,
-            omitted_claims: manifest.omitted_claims.clone(),
-            negative_evidence: Vec::new(),
-        },
+    let mom_observation = observation(
+        &manifest,
+        0,
+        "accepted Mom feature-gated cache replay; no non-Mom cache claim",
         projection,
-    };
-    let information_case = &manifest.cases[1];
-    let information_observation = ObservationEnvelopeV0 {
-        schema: VERTICAL_OBSERVATION_SCHEMA_V0.to_owned(),
-        vertical_id: manifest.vertical_id,
-        case_id: information_case.case_id.clone(),
-        implementation_revision: information_case.source.commit.clone(),
-        observed_prerequisites: Vec::new(),
-        evidence: EvidenceClaimV0 {
-            schema: EVIDENCE_SCHEMA_V0.to_owned(),
-            tier: EvidenceTier::Reproducible,
-            threat_model: "accepted Information acquisition-journal temporary cleanup; no resumable HTTP sidecar claim".to_owned(),
-            exact_source: information_case.source.production_tree.digest.clone(),
-            exact_runtime_or_artifact: information_case.expected_projection.digest.clone(),
-            execution_kind: ExecutionKind::Fixture,
-            omitted_claims: manifest.omitted_claims.clone(),
-            negative_evidence: Vec::new(),
-        },
-        projection: information_projection,
-    };
+    );
+    let information_observation = observation(
+        &manifest,
+        1,
+        "accepted Information acquisition-journal temporary cleanup",
+        information_projection,
+    );
+    let information_resume_observation = observation(
+        &manifest,
+        2,
+        "accepted Information identity-bound durable resume cold restart",
+        information_resume_projection,
+    );
 
     validate_row_baselines(
         &manifest,
@@ -101,9 +121,14 @@ fn staged_cache_bundle_preserves_each_exact_claim_boundary() {
                 verified_prerequisites: &[],
                 observation: &information_observation,
             },
+            CaseBaselineV0 {
+                expected_projection_bytes: INFORMATION_RESUME_PROJECTION,
+                verified_prerequisites: &[],
+                observation: &information_resume_observation,
+            },
         ],
     )
-    .expect("staged Mom and Information corrupted-cache bundle");
+    .expect("complete Mom and Information corrupted-cache bundle");
 }
 
 #[test]
@@ -142,5 +167,27 @@ fn staged_cache_replays_are_fully_qualified_exact_product_tests() {
             "--",
             "--exact",
         ]
+    );
+    let information_resume_replay = &manifest.cases[2].replay;
+    assert_eq!(information_resume_replay.len(), 1);
+    assert_eq!(
+        information_resume_replay[0].argv,
+        [
+            "test",
+            "--locked",
+            "-p",
+            "information-native-host",
+            "--features",
+            "unstable-w1-vertical-tests",
+            "--test",
+            "w1_vertical",
+            "malformed_identity_bound_resume_cache_cold_restarts_without_publication",
+            "--",
+            "--exact",
+        ]
+    );
+    assert_eq!(
+        information_resume_replay[0].network,
+        platform_vertical_fixtures_v0::NetworkBoundaryV0::LoopbackOnly
     );
 }
