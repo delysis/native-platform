@@ -3,8 +3,7 @@ name: ci
 on:
   push:
   pull_request:
-  schedule:
-    - cron: "17 5 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -78,8 +77,8 @@ jobs:
       - run: cargo fuzz build pipeline
 
   bounded-fuzz:
-    name: Scheduled bounded fuzz
-    if: github.event_name == 'schedule'
+    name: Manual bounded fuzz
+    if: github.event_name == 'workflow_dispatch'
     needs: fuzz-build
     runs-on: ubuntu-latest
     steps:
@@ -94,7 +93,7 @@ jobs:
         run: cargo fuzz run inspect -- -max_total_time=60 -timeout=5 2>&1 | tee bounded-fuzz-logs/inspect.log
       - name: Fuzz pipeline for 60 seconds
         run: cargo fuzz run pipeline -- -max_total_time=60 -timeout=5 2>&1 | tee bounded-fuzz-logs/pipeline.log
-      - name: Record scheduled-run identity
+      - name: Record bounded-run identity
         if: always()
         run: |
           printf '%s\n' \
@@ -107,11 +106,11 @@ jobs:
             "cargo_fuzz=0.13.2" \
             "nightly=nightly-2026-07-26" \
             > bounded-fuzz-logs/run-identity.txt
-      - name: Upload scheduled bounded-fuzz evidence
+      - name: Upload bounded-fuzz evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: scheduled-bounded-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
+          name: bounded-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             bounded-fuzz-logs/
             fuzz/artifacts/

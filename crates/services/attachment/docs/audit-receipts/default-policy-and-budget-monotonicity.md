@@ -39,6 +39,6 @@ git diff --check
 ## Deferred evidence
 
 The existing hostile archive/parser regressions remain enabled and green. The
-successor workflow now exposes the cross-OS matrix, cargo-audit, fuzz-build,
-and scheduled bounded-fuzz gates; only their public GitHub runs can establish
-cross-platform evidence.
+successor workflow exposes the cross-OS matrix, cargo-audit, and fuzz-target
+build gates. An optional manual bounded-fuzz campaign can retain artifacts, but
+the repository owner removed calendar execution from phase-one promotion.
