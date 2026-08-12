@@ -7,6 +7,13 @@ license.workspace = true
 repository.workspace = true
 description = "Direct in-process llama.cpp adapter for Loom"
 
+[features]
+default = []
+unstable-w1-vertical-tests = [
+    "dep:platform-contracts-v0-vertical",
+    "dep:platform-vertical-fixtures-v0",
+]
+
 [dependencies]
 crossbeam-channel = "0.5.15"
 fs4.workspace = true
@@ -15,6 +22,8 @@ llama-native-engine = { git = "https://github.com/delysis/llama-native-kit.git",
 llama-native-host = { git = "https://github.com/delysis/llama-native-kit.git", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
 llama-native-types = { git = "https://github.com/delysis/llama-native-kit.git", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
 loom-types = { path = "../loom-types" }
+platform-contracts-v0-vertical = { package = "platform-contracts-v0", git = "https://github.com/delysis/w1-platform-contracts.git", rev = "fc24ffff08c52690390b4460f44617d5d9732563", optional = true }
+platform-vertical-fixtures-v0 = { git = "https://github.com/delysis/w1-platform-contracts.git", rev = "fc24ffff08c52690390b4460f44617d5d9732563", optional = true }
 reqwest.workspace = true
 same-file.workspace = true
 serde.workspace = true

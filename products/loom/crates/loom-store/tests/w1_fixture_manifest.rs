@@ -12,9 +12,9 @@ use platform_vertical_fixtures_v0::{
 use serde::Deserialize;
 use serde_json::json;
 
-const BASELINE_COMMIT: &str = "e32d0697f6b5e28716e34c6b051d47d5031d010c";
+const BASELINE_COMMIT: &str = "a733508adcb1ef1e689e90ed0c8e410160cb602a";
 const PRODUCTION_TREE: &[u8] =
-    include_bytes!("../../../fixtures/w1/source/loom-production-tree-e32d069.json");
+    include_bytes!("../../../fixtures/w1/source/loom-production-tree-a733508.json");
 
 #[derive(Deserialize)]
 struct ProductionTreeDescriptor {
@@ -66,6 +66,18 @@ fn fixture_bytes(relative_path: &str) -> &'static [u8] {
 
 fn evidence_bytes(relative_path: &str) -> &'static [u8] {
     match relative_path {
+        "gemma-current-input-v0.json" => {
+            include_bytes!("../../../fixtures/w1/gemma-current-input-v0.json")
+        }
+        "gemma-current-manifest-v0.json" => {
+            include_bytes!("../../../fixtures/w1/gemma-current-manifest-v0.json")
+        }
+        "gemma-current-projection-v0.json" => {
+            include_bytes!("../../../fixtures/w1/gemma-current-projection-v0.json")
+        }
+        "gemma-current-source-tree-v0.txt" => {
+            include_bytes!("../../../fixtures/w1/gemma-current-source-tree-v0.txt")
+        }
         "loom-prior-store-v10-v1.json" => fixture_bytes("fixtures/w1/loom-prior-store-v10-v1.json"),
         "loom-research-authority-v1.json" => {
             fixture_bytes("fixtures/w1/loom-research-authority-v1.json")
@@ -91,7 +103,7 @@ fn evidence_bytes(relative_path: &str) -> &'static [u8] {
         "projections/loom-suggestion-promotion-v1.json" => {
             include_bytes!("../../../fixtures/w1/projections/loom-suggestion-promotion-v1.json")
         }
-        "source/loom-production-tree-e32d069.json" => PRODUCTION_TREE,
+        "source/loom-production-tree-a733508.json" => PRODUCTION_TREE,
         "state/loom-prior-v10-migrated-summary-v1.json" => {
             fixture_bytes("fixtures/w1/state/loom-prior-v10-migrated-summary-v1.json")
         }

@@ -851,6 +851,37 @@ struct GenerationWorkerAttachError {
     owner: GenerationWorkerOwner,
 }
 
+#[derive(Debug, Default)]
+struct GenerationWorkerStartGate {
+    attached: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl GenerationWorkerStartGate {
+    fn wait(&self) {
+        let mut attached = self
+            .attached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*attached {
+            attached = self
+                .changed
+                .wait(attached)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release(&self) {
+        let mut attached = self
+            .attached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *attached = true;
+        drop(attached);
+        self.changed.notify_all();
+    }
+}
+
 impl Default for ModelLoadRegistry {
     fn default() -> Self {
         Self {
@@ -6089,9 +6120,12 @@ async fn weave_start<R: Runtime>(
     let worker_runs = runs.clone();
     let worker_binding = result_binding.clone();
     let worker_handle = Arc::clone(&handle);
+    let worker_start = Arc::new(GenerationWorkerStartGate::default());
+    let admitted_worker_start = Arc::clone(&worker_start);
     let worker = match std::thread::Builder::new()
         .name("loom-desktop-generation".to_string())
         .spawn(move || {
+            admitted_worker_start.wait();
             run_desktop_generation(
                 &worker_app,
                 &worker_identity,
@@ -6127,6 +6161,7 @@ async fn weave_start<R: Runtime>(
     }) = worker_reservation.attach(worker, GenerationWorkerOwner::Llama(generation_owner))
     {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.cancel_all()));
+        worker_start.release();
         let desktop_panicked = worker.join().is_err();
         let backend_joined = owner.shutdown_joined();
         let failure = if desktop_panicked || backend_joined.worker_panicked() {
@@ -6144,6 +6179,7 @@ async fn weave_start<R: Runtime>(
         }
         return Err(failure);
     }
+    worker_start.release();
 
     // The native worker now retains executor authority independently. The
     // command ticket may detach without requesting cancellation.
@@ -8557,15 +8593,24 @@ mod tests {
                 .code,
             "generation_worker_starting"
         );
+        let start = Arc::new(GenerationWorkerStartGate::default());
+        let worker_start = Arc::clone(&start);
+        let worker_lifecycle = workers.lifecycle.clone();
+        let worker_lease = lifecycle.clone();
         reservation
-            .attach(std::thread::spawn(|| {}), noop_generation_worker_owner())
+            .attach(
+                std::thread::spawn(move || {
+                    worker_start.wait();
+                    worker_lifecycle
+                        .terminal_and_release(&worker_lease, GenerationTerminalClass::Completed)
+                        .expect("fast terminal follows worker attachment");
+                }),
+                noop_generation_worker_owner(),
+            )
             .map_err(|error| error.failure)
             .expect("attach worker");
+        start.release();
         assert_eq!(workers.join_all().expect("join owned worker").count(), 1);
-        workers
-            .lifecycle
-            .terminal_and_release(&lifecycle, GenerationTerminalClass::Completed)
-            .expect("complete lifecycle");
         assert_eq!(workers.join_all().expect("join replay").count(), 0);
     }
 

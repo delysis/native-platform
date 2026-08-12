@@ -1,0 +1,91 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "loom-current-exact-gemma-seed-41",
+      "attempt_id": null,
+      "correlation_id": "loom-current-exact-gemma",
+      "kind": "completed",
+      "payload": null
+    },
+    {
+      "sequence": 1,
+      "operation_id": "loom-current-exact-gemma-seed-42",
+      "attempt_id": null,
+      "correlation_id": "loom-current-exact-gemma",
+      "kind": "completed",
+      "payload": null
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "exact-model-artifact",
+      "schema_id": "gguf-v3",
+      "before": {
+        "id": "gemma-4-e2b-base-q8-0.gguf",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670"
+        },
+        "length": 4954576032
+      },
+      "after": {
+        "id": "gemma-4-e2b-base-q8-0.gguf",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670"
+        },
+        "length": 4954576032
+      },
+      "disposition": "unchanged"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "loom-current-exact-gemma-seed-41",
+      "attempt_id": null,
+      "correlation_id": "loom-current-exact-gemma",
+      "terminal": "completed",
+      "released": true
+    },
+    {
+      "operation_id": "loom-current-exact-gemma-seed-42",
+      "attempt_id": null,
+      "correlation_id": "loom-current-exact-gemma",
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 1,
+    "joined_workers": 1
+  },
+  "output_facts": {
+    "architecture": { "kind": "text", "value": "gemma4" },
+    "backend": { "kind": "text", "value": "cpu" },
+    "candidate_count": { "kind": "integer", "value": 2 },
+    "chat_supported": { "kind": "boolean", "value": false },
+    "completion_text_supported": { "kind": "boolean", "value": true },
+    "distinct_branch_ids": { "kind": "boolean", "value": true },
+    "exact_model_sha256": {
+      "kind": "digest",
+      "value": {
+        "algorithm": "sha256",
+        "hex": "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670"
+      }
+    },
+    "exact_prompt_bound": { "kind": "boolean", "value": true },
+    "generated_token_ids_nonempty": { "kind": "boolean", "value": true },
+    "live_inference": { "kind": "boolean", "value": true },
+    "lexical_output_tokens_at_least_four": { "kind": "boolean", "value": true },
+    "seed_41_observed": { "kind": "boolean", "value": true },
+    "seed_42_observed": { "kind": "boolean", "value": true },
+    "shared_prefix_tokens_positive": { "kind": "boolean", "value": true }
+  },
+  "fail_closed_facts": [
+    "exact model digest is verified before runtime admission",
+    "raw continuation rejects non-completion prompt modes before inference"
+  ]
+}
