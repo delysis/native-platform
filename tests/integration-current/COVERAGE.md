@@ -1,8 +1,10 @@
 # W2 current-revision integration coverage
 
-This diagnostic harness has one exact Cargo resolver graph and no path
-dependencies to product repositories. It does not import source or history and
-does not modify a product release.
+The default diagnostic harness has one exact Cargo resolver graph and no path
+dependencies to product repositories. Loom's incompatible SQLite dependency
+line is covered by a separately materialized, authenticated, locked graph as
+described below. The harness does not import source or history and does not
+modify a product release.
 
 ## Default portable graph
 

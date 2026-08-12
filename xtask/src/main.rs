@@ -271,7 +271,7 @@ fn check_ledger(root: &Path) -> Result<()> {
         source_history_imported: false,
         integration_candidate: IntegrationCandidate {
             accepted: false,
-            pushed: false,
+            pushed: true,
             product_releases_modified: false,
             source_imported: false,
             history_imported: false,
