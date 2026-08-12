@@ -48,7 +48,7 @@ does not expose an authoritative joined-task receipt.
 The Wave 1 workflow checks out full Git history so the baseline ancestry and
 Git object identities are available on GitHub Actions as well as local clones.
 
-## Partial supporting row
+## Subsequent row-15 disposition
 
 ### FTE legacy database
 
@@ -56,13 +56,39 @@ The earlier draft created a current database and then added a test-only legacy
 table. That is not an independently produced prior database and has been
 removed from this change.
 
-Existing production-path tests still support the credential behavior: exact
-write/readback precedes plaintext retirement, every crash boundary preserves
-recoverability, stale stores fail closed, and reopen observes retirement. They
-do not freeze a redacted historical `gateway.db`/`gateway-v2.db` corpus from an
-independent prior release. Because backward compatibility was explicitly
-waived, this row remains partial/supporting rather than manufacturing a state
-baseline.
+No redacted historical `gateway.db`/`gateway-v2.db` corpus from an independent
+prior release exists. Because backward compatibility was explicitly waived,
+the product now rejects legacy and foreign stores before schema mutation and
+the synthetic credential importer has been deleted. A subsequent product-owned
+W1 row freezes this explicit unsupported-input contract rather than
+manufacturing a state migration baseline.
+
+The row-15 manifest is now complete. It binds production baseline
+`bea75f007f1a42041255600486d246c383238e68`, policy input SHA-256
+`49e1517e829213c7ab7ca70a2a60410068ed00c123d90b4f094d28a10957ec92`,
+expected projection SHA-256
+`846b0d8e11a1408f0094b2b277d582591e2c0a315e9f22b11b40aa5cb795bb3b`,
+and manifest SHA-256
+`2b197fe34633215f483e026310fb1715d39ad9fdddce08b1b5a8b20295c1f933`.
+The source descriptor authenticates the production database prefix, exact
+desktop/secret/runtime blobs, and absence of the retired importer.
+
+The runtime replay creates only adversarial unsupported-input sentinels. They
+are labeled generated, contain no credential, and are not presented as prior
+release databases. The production `Database::new` rejects the plaintext legacy
+schema and an unversioned populated schema without byte changes; a fresh store
+is stamped with `application_id=0x46544531`, `user_version=1`, and the exact
+current schema object names and definitions, then reopens. A same-name foreign
+schema with incompatible definitions is rejected before use. The central
+`fc24ffff` validator accepts the resulting state projection. The earlier
+real-Keychain receipt is retained in the manifest as superseded negative
+evidence because its SQLite input was synthetic.
+
+```sh
+cargo test --locked -p free-token-energy \
+  --features unstable-w1-vertical-tests --lib \
+  db::w1_tests::w1_legacy_database_is_explicitly_unsupported -- --exact
+```
 
 The repository pin policy independently hard-codes both accepted revisions;
 changing `w1-contracts.env` and the manifests/lock together cannot move either

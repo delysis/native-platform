@@ -144,8 +144,9 @@ There is no telemetry. The loopback edge is disabled until explicitly
 started, binds only loopback, validates Host/Origin, and requires an app-private
 256-bit token. Hosted keys never cross that interface and are loaded through an
 injected OS credential-store resolver. Fresh databases never create plaintext
-credential storage; an exact-readback, fail-closed compatibility importer
-atomically retires the table on upgraded installations. Read
+credential storage. The database has an explicit application/schema identity;
+unversioned, foreign, and legacy plaintext stores are rejected before schema
+mutation and are never imported. Read
 [SECURITY.md](SECURITY.md) before using valuable credentials.
 
 ## Development

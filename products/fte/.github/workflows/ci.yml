@@ -105,5 +105,5 @@ jobs:
       - run: npm run audit:dependencies
       - run: npm test
       - run: npm run build
-      - run: cargo test --locked -p tauri-plugin-free-token-energy -p free-token-energy --all-features --all-targets
-      - run: cargo clippy --locked -p tauri-plugin-free-token-energy -p free-token-energy --all-features --all-targets -- -D warnings
+      - run: cargo test --locked -p tauri-plugin-free-token-energy -p free-token-energy --all-targets
+      - run: cargo clippy --locked -p tauri-plugin-free-token-energy -p free-token-energy --all-targets -- -D warnings

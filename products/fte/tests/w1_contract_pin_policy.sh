@@ -27,6 +27,7 @@ write_fixture() {
 
 exact="platform-contract-testkit = { git = \"$repository\", rev = \"$lifecycle_revision\", optional = true }
 platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }
+platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }
 platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }"
 write_fixture "$exact"
 "$checker" "$fixture"
@@ -60,6 +61,7 @@ if "$checker" "$fixture" >/dev/null 2>&1; then
 fi
 
 write_fixture "# platform-contract-testkit = { git = \"$repository\", rev = \"$lifecycle_revision\", optional = true }
+# platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }
 # platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }
 # platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }"
 if "$checker" "$fixture" >/dev/null 2>&1; then

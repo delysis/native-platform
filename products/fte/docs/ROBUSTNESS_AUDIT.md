@@ -37,9 +37,9 @@ evidence.
   The retired desktop Router, proxy, quota tracker/eval store, and hosted/FIM
   adapters have been deleted rather than retained as a test-only second path.
 - Hosted credentials are read through the OS credential store. Fresh databases
-  never create `api_keys`; upgraded installations migrate all exact values and
-  delete the rows plus table in one SQLite transaction only after every OS-store
-  readback succeeds.
+  never create `api_keys`; databases with that plaintext table and all other
+  unversioned or foreign schemas are rejected before schema mutation. The
+  compatibility importer has been deleted.
 - The desktop registers the borrowed native llama backend and exposes the stable
   `local/default` identity. A real Qwen GGUF has passed the in-process desktop
   route, Gateway drain, and application-owned host join test.
@@ -59,9 +59,9 @@ evidence.
   visibly restored the saved provider as `ready`. A later attached launch of
   the same executable observed native Cmd+Q exit with code 0 and no signal.
   The acceptance did not separately observe a native-picker click.
-- A real legacy installation has not yet exercised migration and exact readback
-  against the platform keychain. Deterministic fake-store crash, conflict, and
-  all-or-nothing database retirement fixtures pass.
+- No independently produced legacy database was available to authenticate.
+  Backward compatibility was waived, so no synthetic database is presented as
+  migration evidence; legacy schema is an explicit unsupported input.
 - No live hosted credential was used for a provider request. Hosted protocol
   transformations remain fixture-tested rather than live-service evidence.
 - IPv6 listener failure does not yet have a structured status field. IPv4 is
@@ -73,6 +73,5 @@ evidence.
 
 ## Next safe slice
 
-Run the legacy credential importer against a disposable real keychain entry and
-one authorized hosted-provider chat and completion request without weakening
-the fixture gates.
+Run one authorized hosted-provider chat and completion request when a revocable
+credential is already available, without weakening the fixture gates.
