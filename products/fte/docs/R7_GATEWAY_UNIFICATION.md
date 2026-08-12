@@ -1,8 +1,9 @@
 # R7 Gateway unification ledger
 
 Audited base: `d86edfef40771589af4cd8cd72907fa6d3ce6e96`  
-Working disposition: production authority unified; promotion remains gated on live
-credential/keychain, hosted-provider, and local-GGUF evidence.
+Working disposition: production authority unified; exact launched real-Qwen
+Cmd+Q/relaunch acceptance passed; promotion remains gated on live hosted-provider
+and real platform credential-migration evidence.
 
 ## Production authority
 
@@ -99,10 +100,10 @@ evaluation signal and fixtures.
   store on a legacy installation. Deterministic fake-store fixtures pass, but
   they are not OS-keychain acceptance evidence.
 - Exercise at least one real hosted credential through chat and completion.
-- Exercise the native picker and restored model from a launched desktop bundle;
-  the picker IPC, honest UI states, durable owner restart, and real model load
-  are covered on their respective sides of the GUI boundary, but no launched-
-  bundle interaction occurred here.
+
+The exact `372a088` acceptance bundle has now exercised the launched local route
+and restart/shutdown boundary. That closes the prior launched-bundle gate; it
+does not supply either of the two live credential gates above.
 
 ## Verified on 2026-08-11
 
@@ -124,6 +125,17 @@ evaluation signal and fixtures.
 - Loopback tests: 7 passed, including the real loopback socket fixture.
 - Model-free native adapter tests: 11 passed, plus the desktop shared-Gateway,
   local-only routing, stable identity, and idempotent host-drain fixture.
+- Exact launched bundle `FTE R7 372a088.app` used identifier
+  `com.delysis.fte.r7.372a088.acceptance`; its 26,377,952-byte executable had
+  SHA-256
+  `afffd51f731c8bd9fc01125bdd37ab9bad1323b919d9952c10f9bfd531181381`.
+  A real Qwen `local/default` request returned a visible continuation, Cmd+Q
+  exited without a new diagnostic report, immediate relaunch restored the
+  saved model as `ready`, a second visible request passed, and a second Cmd+Q
+  again exited without a new diagnostic report. The consolidated current
+  record is `receipts/R7-FTE-UNIFY-CURRENT.json`; the exact shutdown record is
+  preserved as `receipts/R7-FTE-CMDQ-METAL-SHUTDOWN.json`.
 
-No commit, push, pull request, live hosted request, real OS-keychain acceptance
-run, or launched desktop-bundle acceptance was performed in this worktree.
+No live hosted request or real OS-keychain acceptance run has been performed.
+The launched evidence did not observe a process exit code and is not signed-
+release certification.
