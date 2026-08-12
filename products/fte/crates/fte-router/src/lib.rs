@@ -1,13 +1,15 @@
 //! Privacy-first route planning and backend orchestration.
 
+pub mod operation_lifecycle;
+
 use fte_types::{
     BackendDescriptor, BackendLocation, BackendRequest, CancelTarget, ErrorClass, GatewayBackend,
     GatewayError, GatewayLifecycle, GatewayRequest, GatewayStatus, GatewayTicket, GatewayUsage,
     ModelDescriptor, ModelSelector, PrivacyPolicy, RequestId, ResolvedRoute, ResponseFormat,
-    RouteProfile,
+    RouteProfile, TerminalStatus, TicketLifecycleLease,
 };
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -73,20 +75,31 @@ impl BackendCircuit {
 #[derive(Default)]
 struct LifecycleState {
     phase: GatewayLifecycle,
-    active_requests: BTreeSet<RequestId>,
     shutdown_error: Option<GatewayError>,
+    shutdown_expected_worker_ids: Vec<String>,
+    shutdown_joined_worker_ids: Vec<String>,
+    shutdown_retained_tasks: usize,
 }
 
 #[derive(Default)]
 struct LifecycleControl {
     state: Mutex<LifecycleState>,
+    operations: operation_lifecycle::OperationRegistry,
     changed: Notify,
 }
 
 enum ShutdownDisposition {
     Lead(Vec<RequestId>),
     Wait,
-    Complete(Result<(), GatewayError>),
+    Complete(GatewayShutdownReport),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GatewayShutdownReport {
+    result: Result<(), GatewayError>,
+    expected_worker_ids: Vec<String>,
+    joined_worker_ids: Vec<String>,
+    retained_tasks: usize,
 }
 
 impl LifecycleControl {
@@ -111,13 +124,19 @@ impl LifecycleControl {
         operation()
     }
 
-    fn register_request(&self, request_id: &RequestId) -> Result<(), GatewayError> {
-        let mut state = self.lock_state();
+    fn register_request(
+        &self,
+        request_id: &RequestId,
+        progress_capacity: usize,
+    ) -> Result<operation_lifecycle::OperationLease, GatewayError> {
+        let state = self.lock_state();
         if state.phase != GatewayLifecycle::Running {
             return Err(gateway_closed_error(request_id, state.phase));
         }
-        if !state.active_requests.insert(request_id.clone()) {
-            return Err(GatewayError {
+        let (guard, lease) = self
+            .operations
+            .reserve_with_capacity(&request_id.0, progress_capacity)
+            .map_err(|_| GatewayError {
                 code: "request_already_active".to_string(),
                 class: ErrorClass::Unavailable,
                 retryable: false,
@@ -125,14 +144,20 @@ impl LifecycleControl {
                 request_id: request_id.clone(),
                 provider: None,
                 safe_detail: "a request with this identifier is already active".to_string(),
-            });
-        }
-        Ok(())
+            })?;
+        lease.queue().expect("newly reserved request queues");
+        lease.start().expect("newly queued request starts");
+        guard.disarm();
+        Ok(lease)
     }
 
-    fn release_request(&self, request_id: &RequestId) {
-        let mut state = self.lock_state();
-        state.active_requests.remove(request_id);
+    fn release_request(
+        &self,
+        lease: &operation_lifecycle::OperationLease,
+        terminal: operation_lifecycle::TerminalClass,
+    ) {
+        let _ = lease.terminal(terminal);
+        let _ = lease.release();
         self.changed.notify_waiters();
     }
 
@@ -141,13 +166,18 @@ impl LifecycleControl {
         match state.phase {
             GatewayLifecycle::Running => {
                 state.phase = GatewayLifecycle::Quiescing;
-                let active = state.active_requests.iter().cloned().collect();
+                let active = self
+                    .operations
+                    .request_cancel_all()
+                    .into_iter()
+                    .map(RequestId)
+                    .collect();
                 self.changed.notify_waiters();
                 ShutdownDisposition::Lead(active)
             }
             GatewayLifecycle::Quiescing => ShutdownDisposition::Wait,
             GatewayLifecycle::Closed => {
-                ShutdownDisposition::Complete(state.shutdown_error.clone().map_or(Ok(()), Err))
+                ShutdownDisposition::Complete(Self::shutdown_report(&state))
             }
         }
     }
@@ -156,7 +186,7 @@ impl LifecycleControl {
         let state = self.lock_state();
         (
             state.phase,
-            state.active_requests.len(),
+            self.operations.active_count(),
             state.shutdown_error.clone(),
         )
     }
@@ -164,7 +194,7 @@ impl LifecycleControl {
     async fn wait_until_drained(&self) {
         loop {
             let changed = self.changed.notified();
-            let drained = self.lock_state().active_requests.is_empty();
+            let drained = self.operations.active_count() == 0;
             if drained {
                 return;
             }
@@ -172,26 +202,37 @@ impl LifecycleControl {
         }
     }
 
-    async fn wait_until_closed(&self) -> Result<(), GatewayError> {
+    async fn wait_until_closed_report(&self) -> GatewayShutdownReport {
         loop {
             let changed = self.changed.notified();
-            let result = {
+            let report = {
                 let state = self.lock_state();
-                (state.phase == GatewayLifecycle::Closed)
-                    .then(|| state.shutdown_error.clone().map_or(Ok(()), Err))
+                (state.phase == GatewayLifecycle::Closed).then(|| Self::shutdown_report(&state))
             };
-            if let Some(result) = result {
-                return result;
+            if let Some(report) = report {
+                return report;
             }
             changed.await;
         }
     }
 
-    fn finish_shutdown(&self, result: &Result<(), GatewayError>) {
+    fn finish_shutdown(&self, report: &GatewayShutdownReport) {
         let mut state = self.lock_state();
         state.phase = GatewayLifecycle::Closed;
-        state.shutdown_error = result.as_ref().err().cloned();
+        state.shutdown_error = report.result.as_ref().err().cloned();
+        state.shutdown_expected_worker_ids = report.expected_worker_ids.clone();
+        state.shutdown_joined_worker_ids = report.joined_worker_ids.clone();
+        state.shutdown_retained_tasks = report.retained_tasks;
         self.changed.notify_waiters();
+    }
+
+    fn shutdown_report(state: &LifecycleState) -> GatewayShutdownReport {
+        GatewayShutdownReport {
+            result: state.shutdown_error.clone().map_or(Ok(()), Err),
+            expected_worker_ids: state.shutdown_expected_worker_ids.clone(),
+            joined_worker_ids: state.shutdown_joined_worker_ids.clone(),
+            retained_tasks: state.shutdown_retained_tasks,
+        }
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, LifecycleState> {
@@ -453,13 +494,26 @@ impl Gateway {
     }
 
     pub async fn shutdown(&self) -> Result<(), GatewayError> {
+        self.shutdown_report().await.result
+    }
+
+    async fn shutdown_report(&self) -> GatewayShutdownReport {
         match self.lifecycle.begin_shutdown() {
-            ShutdownDisposition::Complete(result) => return result,
-            ShutdownDisposition::Wait => return self.lifecycle.wait_until_closed().await,
+            ShutdownDisposition::Complete(report) => return report,
+            ShutdownDisposition::Wait => return self.lifecycle.wait_until_closed_report().await,
             ShutdownDisposition::Lead(active_request_ids) => {
                 let (backends, admissions, state_error) = match self.state.read() {
                     Ok(state) => (
-                        state.backends.values().cloned().collect::<Vec<_>>(),
+                        state
+                            .backends
+                            .iter()
+                            .map(|(backend_id, backend)| {
+                                (
+                                    format!("backend-shutdown:{backend_id}"),
+                                    Arc::clone(backend),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
                         state.all_admission.clone(),
                         None,
                     ),
@@ -470,7 +524,16 @@ impl Gateway {
                         // backend before reporting the failure.
                         let state = poisoned.into_inner();
                         (
-                            state.backends.values().cloned().collect::<Vec<_>>(),
+                            state
+                                .backends
+                                .iter()
+                                .map(|(backend_id, backend)| {
+                                    (
+                                        format!("backend-shutdown:{backend_id}"),
+                                        Arc::clone(backend),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
                             state.all_admission.clone(),
                             Some(GatewayError::unavailable(
                                 &RequestId::new(),
@@ -484,7 +547,7 @@ impl Gateway {
                     admission.close();
                 }
                 for request_id in active_request_ids {
-                    for backend in &backends {
+                    for (_, backend) in &backends {
                         let _ = backend.cancel(&request_id, CancelTarget::Request);
                     }
                 }
@@ -494,15 +557,21 @@ impl Gateway {
                 // gateway forever or leave backend tasks alive.
                 let lifecycle = Arc::clone(&self.lifecycle);
                 tokio::spawn(async move {
+                    let expected_worker_ids = backends
+                        .iter()
+                        .map(|(worker_id, _)| worker_id.clone())
+                        .collect::<Vec<_>>();
                     let mut tasks = JoinSet::new();
-                    for backend in backends {
-                        tasks.spawn(async move { backend.shutdown().await });
+                    for (worker_id, backend) in backends {
+                        tasks.spawn(async move { (worker_id, backend.shutdown().await) });
                     }
                     let mut first_error = state_error;
+                    let mut joined_worker_ids = Vec::with_capacity(expected_worker_ids.len());
                     while let Some(result) = tasks.join_next().await {
                         match result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
+                            Ok((worker_id, Ok(()))) => joined_worker_ids.push(worker_id),
+                            Ok((worker_id, Err(error))) => {
+                                joined_worker_ids.push(worker_id);
                                 first_error.get_or_insert(error);
                             }
                             Err(error) => {
@@ -518,13 +587,19 @@ impl Gateway {
                             }
                         }
                     }
+                    let retained_tasks = tasks.len();
                     lifecycle.wait_until_drained().await;
                     let result = first_error.map_or(Ok(()), Err);
-                    lifecycle.finish_shutdown(&result);
+                    lifecycle.finish_shutdown(&GatewayShutdownReport {
+                        result,
+                        expected_worker_ids,
+                        joined_worker_ids,
+                        retained_tasks,
+                    });
                 });
             }
         }
-        self.lifecycle.wait_until_closed().await
+        self.lifecycle.wait_until_closed_report().await
     }
 
     #[must_use]
@@ -662,10 +737,16 @@ impl Gateway {
                     )
                 })?
         };
-        self.lifecycle.register_request(request_id)?;
+        let progress_capacity = request
+            .stream
+            .event_capacity
+            .unwrap_or(fte_types::DEFAULT_EVENT_CAPACITY);
+        let operation = self
+            .lifecycle
+            .register_request(request_id, progress_capacity)?;
         Ok(AdmissionLease {
             _permit: permit,
-            request_id: request_id.clone(),
+            operation: Some(operation),
             lifecycle: Arc::clone(&self.lifecycle),
         })
     }
@@ -831,13 +912,35 @@ impl Gateway {
 
 struct AdmissionLease {
     _permit: OwnedSemaphorePermit,
-    request_id: RequestId,
+    operation: Option<operation_lifecycle::OperationLease>,
     lifecycle: Arc<LifecycleControl>,
 }
 
 impl Drop for AdmissionLease {
     fn drop(&mut self) {
-        self.lifecycle.release_request(&self.request_id);
+        if let Some(operation) = self.operation.take() {
+            self.lifecycle
+                .release_request(&operation, operation_lifecycle::TerminalClass::Failed);
+        }
+    }
+}
+
+impl TicketLifecycleLease for AdmissionLease {
+    fn finish(mut self: Box<Self>, result: &Result<fte_types::GatewayResponse, GatewayError>) {
+        let terminal = match result {
+            Ok(response) => match response.status {
+                TerminalStatus::Completed => operation_lifecycle::TerminalClass::Completed,
+                TerminalStatus::Cancelled => operation_lifecycle::TerminalClass::Cancelled,
+                TerminalStatus::Failed => operation_lifecycle::TerminalClass::Failed,
+            },
+            Err(error) if error.class == ErrorClass::Cancelled => {
+                operation_lifecycle::TerminalClass::Cancelled
+            }
+            Err(_) => operation_lifecycle::TerminalClass::Failed,
+        };
+        if let Some(operation) = self.operation.take() {
+            self.lifecycle.release_request(&operation, terminal);
+        }
     }
 }
 
@@ -1068,6 +1171,9 @@ fn valid_backend_id(id: &str) -> bool {
                 || matches!(character, '.' | '-' | '_')
         })
 }
+
+#[cfg(all(test, feature = "unstable-w1-contract-tests"))]
+mod w1_contract_tests;
 
 #[cfg(test)]
 mod tests {

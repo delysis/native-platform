@@ -818,6 +818,14 @@ pub trait TicketCancellation: Send + Sync {
     fn cancel(&self, target: CancelTarget) -> usize;
 }
 
+/// Executor-owned lifecycle authority retained until the backend publishes its
+/// authoritative result. Implementations must terminalize and release their
+/// production operation record from this callback; consumer ticket drops do
+/// not own release.
+pub trait TicketLifecycleLease: Send {
+    fn finish(self: Box<Self>, result: &Result<GatewayResponse, GatewayError>);
+}
+
 pub struct GatewayTicket {
     pub request_id: RequestId,
     pub events: mpsc::Receiver<GatewayEvent>,
@@ -860,7 +868,7 @@ impl GatewayTicket {
     /// it does not falsely report the backend task as drained before that task
     /// has actually terminated.
     #[must_use]
-    pub fn with_admission_lease(mut self, lease: Box<dyn Send>) -> Self {
+    pub fn with_admission_lease(mut self, lease: Box<dyn TicketLifecycleLease>) -> Self {
         let request_id = self.request_id.clone();
         let Some(upstream_final) = self.final_response.take() else {
             return self;
@@ -874,7 +882,7 @@ impl GatewayTicket {
                     "the backend stopped before returning an authoritative result",
                 ))
             });
-            drop(lease);
+            lease.finish(&result);
             let _ = final_tx.send(result);
         });
         self.final_response = Some(final_rx);
