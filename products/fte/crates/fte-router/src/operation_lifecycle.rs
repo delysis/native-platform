@@ -46,6 +46,7 @@ pub enum RegistryError {
     Exhausted,
     Stale,
     InvalidTransition,
+    Poisoned,
 }
 
 #[derive(Clone)]
@@ -113,7 +114,7 @@ impl OperationRegistry {
         operation_id: &str,
         progress_capacity: usize,
     ) -> Result<(ConsumerGuard, OperationLease), RegistryError> {
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         if state.operations.contains_key(operation_id) {
             return Err(RegistryError::Duplicate);
         }
@@ -153,34 +154,62 @@ impl OperationRegistry {
         ))
     }
 
-    pub fn active_count(&self) -> usize {
-        self.lock().operations.len()
+    pub fn active_count(&self) -> Result<usize, RegistryError> {
+        Ok(self.lock()?.operations.len())
     }
 
-    pub fn current(&self, operation_id: &str) -> Option<OperationSnapshot> {
-        self.lock().operations.get(operation_id).map(snapshot)
+    pub fn current(&self, operation_id: &str) -> Result<Option<OperationSnapshot>, RegistryError> {
+        Ok(self.lock()?.operations.get(operation_id).map(snapshot))
     }
 
-    pub fn current_lease(&self, operation_id: &str) -> Option<OperationLease> {
-        let state = self.lock();
-        let record = state.operations.get(operation_id)?;
+    pub fn current_lease(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<OperationLease>, RegistryError> {
+        let state = self.lock()?;
+        let Some(record) = state.operations.get(operation_id) else {
+            return Ok(None);
+        };
         let identity = record.identity.clone();
         let released = Arc::clone(&record.released);
         drop(state);
-        Some(OperationLease {
+        Ok(Some(OperationLease {
             registry: self.clone(),
             identity,
             released,
-        })
+        }))
     }
 
-    pub fn request_cancel_all(&self) -> Vec<String> {
-        let mut state = self.lock();
+    pub fn request_cancel_all(&self) -> Result<Vec<String>, RegistryError> {
+        let mut state = self.lock()?;
         let ids = state.operations.keys().cloned().collect::<Vec<_>>();
         for record in state.operations.values_mut() {
             record.cancellation_requested = true;
         }
-        ids
+        Ok(ids)
+    }
+
+    /// Best-effort cancellation used only after shutdown has already decided
+    /// that the registry is poisoned. The caller must surface the returned
+    /// integrity error; recovered data is never acceptance evidence.
+    pub(crate) fn request_cancel_all_for_shutdown(&self) -> (Vec<String>, Option<RegistryError>) {
+        match self.inner.lock() {
+            Ok(mut state) => {
+                let ids = state.operations.keys().cloned().collect::<Vec<_>>();
+                for record in state.operations.values_mut() {
+                    record.cancellation_requested = true;
+                }
+                (ids, None)
+            }
+            Err(mut poisoned) => {
+                let state = poisoned.get_mut();
+                let ids = state.operations.keys().cloned().collect::<Vec<_>>();
+                for record in state.operations.values_mut() {
+                    record.cancellation_requested = true;
+                }
+                (ids, Some(RegistryError::Poisoned))
+            }
+        }
     }
 
     fn record_mut<'a>(
@@ -197,10 +226,25 @@ impl OperationRegistry {
         Ok(record)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, RegistryState> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, RegistryState>, RegistryError> {
+        self.inner.lock().map_err(|_| RegistryError::Poisoned)
+    }
+
+    pub(crate) fn diagnostic_active_count(&self) -> (usize, bool) {
+        match self.inner.lock() {
+            Ok(state) => (state.operations.len(), false),
+            Err(poisoned) => (poisoned.get_ref().operations.len(), true),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let inner = Arc::clone(&self.inner);
+        let _ = std::thread::spawn(move || {
+            let _state = inner.lock().expect("operation registry state");
+            panic!("poison operation registry for deterministic coverage");
+        })
+        .join();
     }
 }
 
@@ -215,22 +259,24 @@ impl OperationLease {
         self.identity.clone()
     }
 
-    pub fn snapshot(&self) -> Option<OperationSnapshot> {
-        let state = self.registry.lock();
+    pub fn snapshot(&self) -> Result<Option<OperationSnapshot>, RegistryError> {
+        let state = self.registry.lock()?;
         if let Some(record) = state.operations.get(&self.identity.operation_id) {
-            return (record.identity == self.identity).then(|| snapshot(record));
+            return Ok((record.identity == self.identity).then(|| snapshot(record)));
         }
         drop(state);
-        self.released
+        Ok(self
+            .released
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .map_err(|_| RegistryError::Poisoned)?
+            .clone())
     }
 
-    pub fn is_active(&self) -> bool {
-        self.registry
-            .current(&self.identity.operation_id)
-            .is_some_and(|snapshot| snapshot.identity == self.identity)
+    pub fn is_active(&self) -> Result<bool, RegistryError> {
+        Ok(self
+            .registry
+            .current(&self.identity.operation_id)?
+            .is_some_and(|snapshot| snapshot.identity == self.identity))
     }
 
     pub fn queue(&self) -> Result<(), RegistryError> {
@@ -242,7 +288,7 @@ impl OperationLease {
     }
 
     pub fn terminal(&self, terminal: TerminalClass) -> Result<(), RegistryError> {
-        let mut state = self.registry.lock();
+        let mut state = self.registry.lock()?;
         let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
         if record.phase != OperationPhase::Running || record.terminal.is_some() {
             return Err(RegistryError::InvalidTransition);
@@ -252,8 +298,27 @@ impl OperationLease {
         Ok(())
     }
 
+    pub fn terminal_and_release(&self, terminal: TerminalClass) -> Result<(), RegistryError> {
+        let mut state = self.registry.lock()?;
+        let mut released_slot = self.released.lock().map_err(|_| RegistryError::Poisoned)?;
+        let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
+        if record.phase != OperationPhase::Running
+            || record.terminal.is_some()
+            || !record.attempts.is_empty()
+        {
+            return Err(RegistryError::InvalidTransition);
+        }
+        record.terminal = Some(terminal);
+        record.phase = OperationPhase::Released;
+        let released = snapshot(record);
+        state.operations.remove(&self.identity.operation_id);
+        *released_slot = Some(released);
+        Ok(())
+    }
+
     pub fn release(&self) -> Result<(), RegistryError> {
-        let mut state = self.registry.lock();
+        let mut state = self.registry.lock()?;
+        let mut released_slot = self.released.lock().map_err(|_| RegistryError::Poisoned)?;
         let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
         if record.phase != OperationPhase::Terminal || !record.attempts.is_empty() {
             return Err(RegistryError::InvalidTransition);
@@ -261,21 +326,18 @@ impl OperationLease {
         record.phase = OperationPhase::Released;
         let released = snapshot(record);
         state.operations.remove(&self.identity.operation_id);
-        *self
-            .released
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(released);
+        *released_slot = Some(released);
         Ok(())
     }
 
     pub fn request_cancel(&self) -> Result<(), RegistryError> {
-        let mut state = self.registry.lock();
+        let mut state = self.registry.lock()?;
         OperationRegistry::record_mut(&mut state, &self.identity)?.cancellation_requested = true;
         Ok(())
     }
 
     pub fn publish_progress(&self, sequence: u64) -> Result<(), RegistryError> {
-        let mut state = self.registry.lock();
+        let mut state = self.registry.lock()?;
         let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
         if record.phase != OperationPhase::Running || record.terminal.is_some() {
             return Err(RegistryError::InvalidTransition);
@@ -290,7 +352,7 @@ impl OperationLease {
     }
 
     pub fn start_attempt(&self) -> Result<AttemptLease, RegistryError> {
-        let mut state = self.registry.lock();
+        let mut state = self.registry.lock()?;
         let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
         if record.phase != OperationPhase::Running {
             return Err(RegistryError::InvalidTransition);
@@ -311,7 +373,7 @@ impl OperationLease {
     }
 
     pub fn active_attempts(&self) -> Result<Vec<OperationIdentity>, RegistryError> {
-        let mut state = self.registry.lock();
+        let mut state = self.registry.lock()?;
         Ok(OperationRegistry::record_mut(&mut state, &self.identity)?
             .attempts
             .values()
@@ -324,13 +386,23 @@ impl OperationLease {
         expected: OperationPhase,
         next: OperationPhase,
     ) -> Result<(), RegistryError> {
-        let mut state = self.registry.lock();
+        let mut state = self.registry.lock()?;
         let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
         if record.phase != expected {
             return Err(RegistryError::InvalidTransition);
         }
         record.phase = next;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_released_for_test(&self) {
+        let released = Arc::clone(&self.released);
+        let _ = std::thread::spawn(move || {
+            let _slot = released.lock().expect("released operation snapshot");
+            panic!("poison released operation snapshot for deterministic coverage");
+        })
+        .join();
     }
 }
 
@@ -362,12 +434,12 @@ impl AttemptLease {
     }
 
     pub fn cancellation_requested(&self) -> Result<bool, RegistryError> {
-        let mut state = self.registry.lock();
+        let mut state = self.registry.lock()?;
         Ok(OperationRegistry::record_mut(&mut state, &self.operation)?.cancellation_requested)
     }
 
     pub fn finish(self) -> Result<(), RegistryError> {
-        let mut state = self.registry.lock();
+        let mut state = self.registry.lock()?;
         let record = OperationRegistry::record_mut(&mut state, &self.operation)?;
         record
             .attempts
