@@ -12,6 +12,9 @@ use tokio::sync::{Notify, OnceCell};
 
 use crate::command_registry::{CommandClass, CommandSpec};
 
+#[cfg(all(test, feature = "unstable-w1-contracts"))]
+mod w1_contract;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppPhase {
     Running,

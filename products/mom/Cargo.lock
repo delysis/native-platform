@@ -3168,6 +3168,7 @@ dependencies = [
  "llama-native-types",
  "maud",
  "mom-llama-runtime",
+ "platform-contracts-v0",
  "rfd",
  "serde",
  "serde_json",
@@ -3730,6 +3731,15 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "platform-contracts-v0"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts?rev=da22fa893ac183c5d9df972a7e67215c0d92b383#da22fa893ac183c5d9df972a7e67215c0d92b383"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "plist"
