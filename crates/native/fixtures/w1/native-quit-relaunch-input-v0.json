@@ -1,0 +1,8 @@
+{
+  "schema": "delysis.native.quit_relaunch_input.v0",
+  "quit_model_id": "native-fake-owner-before-quit",
+  "quit_operation_id": "native-quit-operation",
+  "relaunch_model_id": "native-fake-owner-after-relaunch",
+  "relaunch_operation_id": "native-relaunch-operation",
+  "receipt_file_name": "native-fake-owner-receipts.jsonl"
+}
