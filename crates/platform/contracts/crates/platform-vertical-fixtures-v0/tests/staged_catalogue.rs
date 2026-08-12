@@ -2,7 +2,6 @@ use platform_vertical_fixtures_v0::{
     ALL_VERTICAL_IDS, FixtureClassV0, VerticalFixtureManifestV0, validate_manifest,
 };
 use std::collections::BTreeSet;
-use std::path::Path;
 
 const MANIFESTS: [(&str, &[u8]); 18] = [
     (
@@ -82,11 +81,7 @@ const MANIFESTS: [(&str, &[u8]); 18] = [
 ];
 
 #[test]
-fn staged_catalogue_is_complete_ordered_and_unsealed() {
-    let lock_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../verticals/v0/W1-VERTICALS.lock.json");
-    assert!(!lock_path.exists(), "catalogue must remain unsealed");
-
+fn staged_catalogue_is_complete_and_ordered() {
     let manifests = MANIFESTS
         .iter()
         .map(|(name, bytes)| {

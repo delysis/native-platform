@@ -1,0 +1,169 @@
+{
+  "schema": "delysis.vertical_fixture_lock.v0",
+  "protocol_commit": "fc24ffff08c52690390b4460f44617d5d9732563",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "entries": [
+    {
+      "vertical_id": "mom_chat_cancel_retry",
+      "class": "model_free",
+      "manifest": {
+        "id": "verticals/v0/mom-chat-cancel-retry.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "d5e78f687cb8d06c823e91cdaa46c7564e042e7f118194dcd2c5a1042d24375d" },
+        "length": 1681
+      }
+    },
+    {
+      "vertical_id": "mom_attachment",
+      "class": "model_free",
+      "manifest": {
+        "id": "verticals/v0/mom-attachment.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "01c8701dc70b586bf3cbe9ad069b4fb97f2fe2719ce8a1b43e7b66d179c9cdb0" },
+        "length": 2078
+      }
+    },
+    {
+      "vertical_id": "fte_hosted_fixture_loopback",
+      "class": "model_free",
+      "manifest": {
+        "id": "verticals/v0/fte-hosted-fixture-loopback.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "679a45f7f9f3aa30e9d25d7972666bc7617594e16e0b5596dcc1527887276c54" },
+        "length": 3621
+      }
+    },
+    {
+      "vertical_id": "speech_peer_cancellation",
+      "class": "model_free",
+      "manifest": {
+        "id": "verticals/v0/speech-peer-cancellation.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "195fb1aea788c2b93180f853e90acaa19b087544e48773fe4656a0d8bedfe7e9" },
+        "length": 1600
+      }
+    },
+    {
+      "vertical_id": "information_install_query",
+      "class": "model_free",
+      "manifest": {
+        "id": "verticals/v0/information-install-query.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "985840309c819bfec476a608d4ef6df5a560e73831b7098fe99ec9fead31a091" },
+        "length": 1847
+      }
+    },
+    {
+      "vertical_id": "loom_suggestion_promotion",
+      "class": "model_free",
+      "manifest": {
+        "id": "verticals/v0/loom-suggestion-promotion.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "28d3590c91ea0880e19e71cea55d44c4a831ada2f7e4a9374d2d9557cb5feb5c" },
+        "length": 1943
+      }
+    },
+    {
+      "vertical_id": "loom_research_diagnostic_admitted_distinction",
+      "class": "model_free",
+      "manifest": {
+        "id": "verticals/v0/loom-research-diagnostic-admitted-distinction.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "b8eff4377dd738708f2362d812a9f3163ee02a540c23d1d82e506ac2fcdfb604" },
+        "length": 1757
+      }
+    },
+    {
+      "vertical_id": "quit_relaunch_fake_owners",
+      "class": "model_free",
+      "manifest": {
+        "id": "verticals/v0/quit-relaunch-fake-owners.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "4f3e0c13b9413a48a56a16c4cd08422288856c2dd03ee484f9186e089a6deb08" },
+        "length": 10662
+      }
+    },
+    {
+      "vertical_id": "current_exact_qwen",
+      "class": "real",
+      "manifest": {
+        "id": "verticals/v0/current-exact-qwen.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "7bb63e536356a476ae0070bf08d89b5b4e167fa69669c3f1d0fd5625d091da3c" },
+        "length": 2944
+      }
+    },
+    {
+      "vertical_id": "current_exact_gemma",
+      "class": "real",
+      "manifest": {
+        "id": "verticals/v0/current-exact-gemma.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "4082161db92d4c48567a0b177bbeccf7504faf61dd60260038f7a3964d2316f9" },
+        "length": 3510
+      }
+    },
+    {
+      "vertical_id": "current_parakeet_model_audio",
+      "class": "real",
+      "manifest": {
+        "id": "verticals/v0/current-parakeet-model-audio.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "b181cc24a624deb1e9ea9348b55bfc58fa920faf571ee6c2ae48e791eb96d103" },
+        "length": 2619
+      }
+    },
+    {
+      "vertical_id": "apple_installed_voice",
+      "class": "real",
+      "manifest": {
+        "id": "verticals/v0/apple-installed-voice.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "cc6fe0586f95f373025568a071147d2aa27d6d276939acc3600005263a8cbbc7" },
+        "length": 2077
+      }
+    },
+    {
+      "vertical_id": "mom_prior_release_store",
+      "class": "state",
+      "manifest": {
+        "id": "verticals/v0/mom-prior-release-store.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "8259231ba399eabb0f087be4f80f45a1b5986da98b0c1558387b86545e764e86" },
+        "length": 2631
+      }
+    },
+    {
+      "vertical_id": "loom_prior_project_store",
+      "class": "state",
+      "manifest": {
+        "id": "verticals/v0/loom-prior-project-store.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "5279dc90d5d5f1321dec1b65c1937459267b7bc81bf12c07236afb57a0343ee2" },
+        "length": 3810
+      }
+    },
+    {
+      "vertical_id": "fte_legacy_database",
+      "class": "state",
+      "manifest": {
+        "id": "verticals/v0/fte-legacy-database.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "7d5478edd7523fd24401d0d6b4643fa4d9a2a3e1ebf9db2a7a025ff2106eb768" },
+        "length": 3255
+      }
+    },
+    {
+      "vertical_id": "information_resource_store",
+      "class": "state",
+      "manifest": {
+        "id": "verticals/v0/information-resource-store.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "f5b103301fd26a0d2d49411f127e5cac7666d923187d04728a436876a2793c12" },
+        "length": 1846
+      }
+    },
+    {
+      "vertical_id": "corrupted_disposable_caches",
+      "class": "state",
+      "manifest": {
+        "id": "verticals/v0/corrupted-disposable-caches.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "b26948b02cf17903b02948ac00fc9eadf59f1c142db9a7b869de0104362c7325" },
+        "length": 9421
+      }
+    },
+    {
+      "vertical_id": "partial_publication_states",
+      "class": "state",
+      "manifest": {
+        "id": "verticals/v0/partial-publication-states.manifest.json",
+        "digest": { "algorithm": "sha256", "hex": "5e18a0a58ae6174c0f53838ebf70d2cf2d952df336596ca7a0747b0d4ac61c8d" },
+        "length": 2591
+      }
+    }
+  ]
+}
