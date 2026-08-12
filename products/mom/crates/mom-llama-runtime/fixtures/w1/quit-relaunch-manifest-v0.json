@@ -1,0 +1,69 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "quit_relaunch_fake_owners",
+  "class": "model_free",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [
+    {
+      "case_id": "mom.full-app-runtime-quit-relaunch",
+      "source": {
+        "repository_id": "delysis/mom-llama",
+        "commit": "b5a276c6152e9bf1d6d1f2b5cf9c199871c45778",
+        "production_tree": {
+          "id": "git.tree.b5a276c",
+          "digest": {
+            "algorithm": "sha256",
+            "hex": "71936dceb3b7e0268597ae848899dadbb4f83cff20b2885a8de5dac8c28a4635"
+          },
+          "length": 40
+        }
+      },
+      "inputs": [
+        {
+          "identity": {
+            "id": "mom.quit-relaunch.input",
+            "digest": {
+              "algorithm": "sha256",
+              "hex": "0a036918787fd4aa7a1455140196e0c0ab37a5caff56a28bb82332a48f553a8b"
+            },
+            "length": 222
+          },
+          "availability": "checked_in",
+          "relative_path": "crates/mom-llama-runtime/fixtures/w1/quit-relaunch-v1.json"
+        }
+      ],
+      "state_identities": [],
+      "prerequisites": [],
+      "replay": [
+        {
+          "program": { "kind": "cargo" },
+          "argv": [
+            "test",
+            "-p",
+            "mom-llama-app",
+            "--features",
+            "unstable-w1-vertical-fixtures",
+            "w1_vertical_fixtures::full_app_runtime_quit_joins_fake_owner_and_reopens_same_store",
+            "--",
+            "--exact"
+          ],
+          "required_environment": [],
+          "network": "denied"
+        }
+      ],
+      "expected_projection": {
+        "id": "mom.quit-relaunch.projection",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "732a31c376d00a7a34977c27e25be0065cfefe59900cb3c7232d54d3eaea022e"
+        },
+        "length": 2330
+      }
+    }
+  ],
+  "omitted_claims": [
+    "real model inference",
+    "native GUI process relaunch"
+  ],
+  "negative_evidence": []
+}

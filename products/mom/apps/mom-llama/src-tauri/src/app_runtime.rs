@@ -586,6 +586,11 @@ impl AppRuntimeHandle {
     pub fn w1_retained_task_count(&self) -> usize {
         self.0.operation_supervisor.retained_task_count()
     }
+
+    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+    pub fn w1_operation_supervisor(&self) -> OperationSupervisor {
+        self.0.operation_supervisor.clone()
+    }
 }
 
 #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]

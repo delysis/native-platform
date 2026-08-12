@@ -25,11 +25,26 @@ struct ChatFixture {
     assistant_text: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct QuitRelaunchFixture {
+    schema: String,
+    conversation_id: String,
+    active_operation_id: String,
+    draft: String,
+}
+
 fn chat_fixture() -> Result<ChatFixture> {
     serde_json::from_str(include_str!(
         "../../../../crates/mom-llama-runtime/fixtures/w1/chat-cancel-retry-v1.json"
     ))
     .context("parse checked-in Mom chat fixture")
+}
+
+fn quit_relaunch_fixture() -> Result<QuitRelaunchFixture> {
+    serde_json::from_str(include_str!(
+        "../../../../crates/mom-llama-runtime/fixtures/w1/quit-relaunch-v1.json"
+    ))
+    .context("parse checked-in Mom quit/relaunch fixture")
 }
 
 struct TestDataDir {
@@ -359,5 +374,212 @@ fn quit_drains_fake_owner_and_a_fresh_supervisor_relaunches_cleanly() -> Result<
     let outcome = relaunched.shutdown();
     ensure!(outcome.phase == LifecyclePhase::Closed);
     ensure!(validate_worker_sets(&outcome));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_app_runtime_quit_joins_fake_owner_and_reopens_same_store() -> Result<()> {
+    let session = TestDataDir::new()?;
+    let fixture = quit_relaunch_fixture()?;
+    ensure!(fixture.schema == "mom_llama.w1.quit_relaunch_fixture.v1");
+
+    let runtime = w1_fixture_runtime();
+    runtime
+        .admit(command_spec("mom_llama_draft_update"))
+        .map_err(anyhow::Error::msg)?
+        .finish(TerminalClass::Completed)
+        .map_err(anyhow::Error::msg)?;
+    mom_llama_runtime::draft_update(
+        Some(&fixture.conversation_id),
+        fixture.draft.clone(),
+        Vec::new(),
+    )?;
+
+    let supervisor = runtime.w1_operation_supervisor();
+    let owner = supervisor.spawn_controlled(&fixture.active_operation_id)?;
+    supervisor.publish_controlled_progress(&owner, 1)?;
+    let cancelled_identity = supervisor
+        .controlled_snapshot(&owner)
+        .context("controlled owner snapshot")?
+        .identity;
+    let shutdown = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.shutdown().await })
+    };
+    while supervisor.phase() == LifecyclePhase::Running {
+        tokio::task::yield_now().await;
+    }
+    ensure!(supervisor.phase() == LifecyclePhase::Quiescing);
+    ensure!(
+        supervisor.cancellation_requested_by_id(&fixture.active_operation_id),
+        "AppRuntime quit must publish cancellation before owner terminalization"
+    );
+    supervisor.request_controlled_terminal(&owner, TerminalClass::Cancelled)?;
+    let released = supervisor.wait_controlled_released(&owner, Duration::from_secs(2))?;
+    ensure!(
+        released
+            .authoritative_terminal
+            .is_some_and(|terminal| terminal.class == TerminalClass::Cancelled)
+    );
+    supervisor.allow_controlled_exit(&owner)?;
+    let first_summary = shutdown
+        .await
+        .context("first AppRuntime shutdown task")?
+        .map_err(anyhow::Error::msg)?;
+    ensure!(first_summary.operation_supervisor_phase == LifecyclePhase::Closed);
+    ensure!(first_summary.active_operation_count == 0);
+    ensure!(first_summary.retained_operation_task_count == 0);
+    ensure!(first_summary.application_work_drained);
+    ensure!(first_summary.gateway_drained);
+    ensure!(first_summary.native_host_joined);
+    ensure!(first_summary.expected_worker_ids == first_summary.joined_worker_ids);
+    ensure!(first_summary.expected_operation_worker_count == 1);
+    ensure!(first_summary.joined_operation_worker_count == 1);
+    let first_terminals = runtime.w1_terminal_facts();
+    ensure!(first_terminals.len() == 1);
+    ensure!(first_terminals[0].identity == cancelled_identity);
+    ensure!(first_terminals[0].terminal.class == TerminalClass::Cancelled);
+
+    mom_llama_runtime::config::set_data_dir_override_for_tests(None);
+    mom_llama_runtime::config::set_data_dir_override_for_tests(Some(session.path.clone()));
+    let relaunched = w1_fixture_runtime();
+    let read_lease = relaunched
+        .admit(command_spec("mom_llama_draft_get"))
+        .map_err(anyhow::Error::msg)?;
+    let reopened = mom_llama_runtime::draft_get(Some(&fixture.conversation_id))?
+        .result
+        .context("reopened draft")?;
+    drop(read_lease);
+    ensure!(reopened.message == fixture.draft);
+
+    let completed_lease = relaunched
+        .admit(command_spec("mom_llama_chat_send"))
+        .map_err(anyhow::Error::msg)?;
+    let completed_identity = completed_lease
+        .w1_attempt_identity()
+        .context("relaunched operation identity")?;
+    completed_lease
+        .run_blocking(|| Ok(()))
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let second_summary = relaunched.shutdown().await.map_err(anyhow::Error::msg)?;
+    ensure!(second_summary.operation_supervisor_phase == LifecyclePhase::Closed);
+    ensure!(second_summary.active_operation_count == 0);
+    ensure!(second_summary.retained_operation_task_count == 0);
+    ensure!(second_summary.application_work_drained);
+    ensure!(second_summary.gateway_drained);
+    ensure!(second_summary.native_host_joined);
+    ensure!(second_summary.expected_worker_ids == second_summary.joined_worker_ids);
+    ensure!(second_summary.expected_operation_worker_count == 1);
+    ensure!(second_summary.joined_operation_worker_count == 1);
+    let second_terminals = relaunched.w1_terminal_facts();
+    ensure!(second_terminals.len() == 1);
+    ensure!(second_terminals[0].identity == completed_identity);
+    ensure!(second_terminals[0].terminal.class == TerminalClass::Completed);
+
+    use platform_contracts_v0_vertical::TerminalClass as ContractTerminalClass;
+    use platform_vertical_fixtures_v0::{
+        DurableStateFactV0, EquivalenceProjectionV0, EventFactV0, FactValueV0, LifecycleFactV0,
+        OwnershipFactsV0, StateDispositionV0, VerticalIdV0, sha256_identity,
+    };
+    let correlation_id = Some(fixture.conversation_id.clone());
+    let projection = EquivalenceProjectionV0 {
+        ordered_events: vec![
+            EventFactV0 {
+                sequence: 0,
+                operation_id: cancelled_identity.operation_id.clone(),
+                attempt_id: Some(cancelled_identity.attempt_id.clone()),
+                correlation_id: correlation_id.clone(),
+                kind: "cancelled".to_owned(),
+                payload: None,
+            },
+            EventFactV0 {
+                sequence: 1,
+                operation_id: completed_identity.operation_id.clone(),
+                attempt_id: Some(completed_identity.attempt_id.clone()),
+                correlation_id: correlation_id.clone(),
+                kind: "completed".to_owned(),
+                payload: None,
+            },
+        ],
+        durable_state: vec![DurableStateFactV0 {
+            state_id: "mom.drafts.store".to_owned(),
+            schema_id: "runtime.sqlite3/encrypted_documents.v1".to_owned(),
+            before: Some(sha256_identity(
+                "mom.quit-relaunch.draft",
+                fixture.draft.as_bytes(),
+            )),
+            after: Some(sha256_identity(
+                "mom.quit-relaunch.draft",
+                reopened.message.as_bytes(),
+            )),
+            disposition: StateDispositionV0::Unchanged,
+        }],
+        lifecycle: vec![
+            LifecycleFactV0 {
+                operation_id: cancelled_identity.operation_id,
+                attempt_id: Some(cancelled_identity.attempt_id),
+                correlation_id: correlation_id.clone(),
+                terminal: ContractTerminalClass::Cancelled,
+                released: true,
+            },
+            LifecycleFactV0 {
+                operation_id: completed_identity.operation_id,
+                attempt_id: Some(completed_identity.attempt_id),
+                correlation_id,
+                terminal: ContractTerminalClass::Completed,
+                released: true,
+            },
+        ],
+        ownership: OwnershipFactsV0 {
+            active_operations: first_summary.active_operation_count
+                + second_summary.active_operation_count,
+            retained_tasks: first_summary.retained_operation_task_count
+                + second_summary.retained_operation_task_count,
+            expected_workers: first_summary.expected_worker_ids.len()
+                + second_summary.expected_worker_ids.len(),
+            joined_workers: first_summary.joined_worker_ids.len()
+                + second_summary.joined_worker_ids.len(),
+        },
+        output_facts: BTreeMap::from([
+            (
+                "first_application_work_drained".to_owned(),
+                FactValueV0::Boolean(first_summary.application_work_drained),
+            ),
+            (
+                "first_gateway_drained".to_owned(),
+                FactValueV0::Boolean(first_summary.gateway_drained),
+            ),
+            (
+                "first_native_host_joined".to_owned(),
+                FactValueV0::Boolean(first_summary.native_host_joined),
+            ),
+            (
+                "fresh_runtime_admitted_work".to_owned(),
+                FactValueV0::Boolean(
+                    second_terminals[0].terminal.class == TerminalClass::Completed,
+                ),
+            ),
+            (
+                "same_durable_state_reopened".to_owned(),
+                FactValueV0::Boolean(reopened.message == fixture.draft),
+            ),
+            (
+                "zero_orphan_workers".to_owned(),
+                FactValueV0::Boolean(
+                    first_summary.expected_worker_ids == first_summary.joined_worker_ids
+                        && second_summary.expected_worker_ids == second_summary.joined_worker_ids,
+                ),
+            ),
+        ]),
+        fail_closed_facts: vec![
+            "quit closed admission before the active owner published its terminal".to_owned(),
+            "fresh runtime did not reuse the closed supervisor lifetime".to_owned(),
+        ],
+    };
+    mom_llama_runtime::validate_w1_fixture_projection(
+        VerticalIdV0::QuitRelaunchFakeOwners,
+        projection,
+    )?;
     Ok(())
 }
