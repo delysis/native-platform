@@ -5,6 +5,7 @@ import {
   insertionPreservesExtendedGraphemeEdges,
   isExtendedGraphemeBoundary
 } from './graphemeBoundary';
+import { parseVisualMarkdown } from './markdownSafety';
 
 export interface GhostTextPresentation {
   active: boolean;
@@ -27,7 +28,7 @@ export interface GhostTextPlan {
 export interface GhostTextHandlers {
   /**
    * Synchronously consume the exact visible presentation. A false result
-   * leaves both the presentation and Tab's ordinary browser meaning intact.
+   * falls back to inserting an ordinary tab into the manuscript.
    */
   accept: (candidateId: string, presentationKey: string) => boolean;
   dismiss: (candidateId: string, presentationKey: string) => void;
@@ -50,6 +51,7 @@ type GhostTextMeta =
   | { kind: 'clear' };
 
 export const ghostTextPluginKey = new PluginKey<GhostTextPresentation | null>('loom-ghost-text');
+export const VISUAL_TAB_INDENT = '\t';
 
 // Private-use code points make the witness extremely unlikely to occur in a
 // manuscript while remaining literal text under the CommonMark serializer.
@@ -256,12 +258,12 @@ export function visualGhostTextIsFaithfulAtSelection(
     const promotedMarkdown =
       canonicalMarkdown.slice(0, boundary) + text + canonicalMarkdown.slice(boundary);
     if (text.includes('\n')) {
-      const promotedDocument = defaultMarkdownParser.parse(promotedMarkdown);
+      const promotedDocument = parseVisualMarkdown(promotedMarkdown);
       return defaultMarkdownSerializer.serialize(promotedDocument) === promotedMarkdown;
     }
     const literalDocument = state.tr.insertText(text).doc;
     return defaultMarkdownSerializer.serialize(literalDocument) === promotedMarkdown &&
-      defaultMarkdownParser.parse(promotedMarkdown).eq(literalDocument);
+      parseVisualMarkdown(promotedMarkdown).eq(literalDocument);
   } catch {
     return false;
   }
@@ -433,8 +435,8 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
       },
       handleKeyDown(view, event) {
         const plan = planGhostText(view.state, ghostTextPluginKey.getState(view.state) ?? null);
-        if (!plan || event.isComposing || event.keyCode === 229) return false;
-        if (event.key === 'Escape' && !event.metaKey && !event.ctrlKey && !event.altKey) {
+        if (event.isComposing || event.keyCode === 229) return false;
+        if (plan && event.key === 'Escape' && !event.metaKey && !event.ctrlKey && !event.altKey) {
           view.dispatch(clearTransaction(view));
           handlers.dismiss(plan.candidateId, plan.presentationKey);
           return true;
@@ -446,17 +448,25 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           !event.ctrlKey &&
           !event.altKey
         ) {
-          if (!handlers.visible(
+          if (plan && handlers.visible(
             plan.presentationKey,
             plan.surfaceKey,
             plan.anchorByteOffset
-          )) return false;
-          // Claim parent authority while its exact visibility witness still
-          // exists. Clearing first would invalidate every legitimate
-          // acceptance before the parent can bind it to durable authority.
-          const accepted = handlers.accept(plan.candidateId, plan.presentationKey);
-          if (!accepted) return false;
-          view.dispatch(clearTransaction(view));
+          )) {
+            // Claim parent authority while its exact visibility witness still
+            // exists. Clearing first would invalidate every legitimate
+            // acceptance before the parent can bind it to durable authority.
+            const accepted = handlers.accept(plan.candidateId, plan.presentationKey);
+            if (accepted) {
+              view.dispatch(clearTransaction(view));
+              return true;
+            }
+          }
+          if (view.editable === false) return false;
+          // Tab is a writing key in Loom. When no exact visible completion can
+          // consume it, insert the literal tab byte; never
+          // hand focus traversal to surrounding application chrome.
+          view.dispatch(view.state.tr.insertText(VISUAL_TAB_INDENT));
           return true;
         }
         return false;

@@ -23,8 +23,8 @@ native-llama = [
 test-support = ["native-evidence"]
 
 [dependencies]
-llama-native-engine = { git = "https://github.com/delysis/llama-native-kit.git", rev = "2d69f086e922ed7bdfd6236baf5a1ad0ed568360", optional = true }
-llama-native-types = { git = "https://github.com/delysis/llama-native-kit.git", rev = "2d69f086e922ed7bdfd6236baf5a1ad0ed568360", optional = true }
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit.git", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4", optional = true }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit.git", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4", optional = true }
 loom-research-types = { path = "../loom-research-types" }
 loom-types = { path = "../loom-types" }
 serde.workspace = true

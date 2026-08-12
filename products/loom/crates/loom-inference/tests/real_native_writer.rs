@@ -416,6 +416,8 @@ fn assert_real_evidence_strictly_replays(envelope: &VerifiedInferenceEnvelope) {
                 model_call: call.model_call(),
                 raw_output: call.raw_output(),
                 generated_token_ids: call.generated_token_ids(),
+                raw_token_piece_bytes: call.raw_token_piece_bytes(),
+                token_byte_boundaries: call.token_byte_boundaries(),
                 event_json: call.event_json(),
                 backend_audit_json: call.backend_audit_json(),
                 terminal_sampled_token_id: call.terminal_sampled_token_id(),

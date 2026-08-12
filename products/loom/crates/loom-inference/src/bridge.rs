@@ -1,6 +1,8 @@
 use std::{collections::HashSet, fmt, str::FromStr};
 
-use llama_native_engine::{GenerationTicket, NativeModelHandle, VerifiedGenerationBatch};
+use llama_native_engine::{
+    GenerationTicket, NativeModelHandle, TryWaitOutcome, VerifiedGenerationBatch,
+};
 use llama_native_types::{
     CompletionPrompt, GenerationBatchRequest, GenerationCase, GenerationEvent, GenerationEventKind,
     GenerationInput, GenerationMetrics, GenerationOutput, GenerationState, MAX_STOP_SEQUENCE_BYTES,
@@ -359,15 +361,17 @@ impl VerifiedInferenceTicket {
     }
 
     pub fn try_wait(&mut self) -> Result<Option<VerifiedInferenceOutcome>, InferenceError> {
-        let result = self
+        let ticket = self
             .native_ticket
-            .as_ref()
-            .ok_or(InferenceError::TicketAlreadyConsumed)?
-            .try_wait_verified();
+            .take()
+            .ok_or(InferenceError::TicketAlreadyConsumed)?;
+        let result = ticket.try_wait_verified();
         match result {
-            Ok(None) => Ok(None),
-            Ok(Some(seal)) => {
-                let _ = self.native_ticket.take();
+            Ok(TryWaitOutcome::Pending(ticket)) => {
+                self.native_ticket = Some(ticket);
+                Ok(None)
+            }
+            Ok(TryWaitOutcome::Ready(seal)) => {
                 let resident_handle = self
                     .handle
                     .take()
@@ -451,6 +455,10 @@ pub enum InferenceError {
     OutputMetricsMismatch { index: usize },
     #[error("sealed output {index} contains an invalid generated token ID")]
     InvalidGeneratedToken { index: usize },
+    #[error("sealed output {index} has no exact token-piece trace")]
+    MissingTokenPieceTrace { index: usize },
+    #[error("sealed output {index} has a malformed exact token-piece trace")]
+    MalformedTokenPieceTrace { index: usize },
     #[error("sealed event ledger for case {index} is malformed")]
     MalformedEventLedger { index: usize },
     #[error("sealed raw delta bytes for case {index} disagree with displayed output semantics")]
@@ -496,6 +504,10 @@ impl fmt::Debug for InferenceError {
             Self::OutputNotLive { .. } => "InferenceError::OutputNotLive { .. }",
             Self::OutputMetricsMismatch { .. } => "InferenceError::OutputMetricsMismatch { .. }",
             Self::InvalidGeneratedToken { .. } => "InferenceError::InvalidGeneratedToken { .. }",
+            Self::MissingTokenPieceTrace { .. } => "InferenceError::MissingTokenPieceTrace { .. }",
+            Self::MalformedTokenPieceTrace { .. } => {
+                "InferenceError::MalformedTokenPieceTrace { .. }"
+            }
             Self::MalformedEventLedger { .. } => "InferenceError::MalformedEventLedger { .. }",
             Self::OutputProjectionMismatch { .. } => {
                 "InferenceError::OutputProjectionMismatch { .. }"
@@ -615,6 +627,7 @@ trait SealView {
     fn outputs(&self) -> &[GenerationOutput];
     fn terminal_sampled_token_ids(&self) -> &[Option<i32>];
     fn events(&self) -> &[GenerationEvent];
+    fn token_piece_trace(&self, index: usize, fallback_raw: &[u8]) -> Option<(Vec<u8>, Vec<u64>)>;
 }
 
 impl SealView for VerifiedGenerationBatch {
@@ -636,6 +649,15 @@ impl SealView for VerifiedGenerationBatch {
 
     fn events(&self) -> &[GenerationEvent] {
         self.events()
+    }
+
+    fn token_piece_trace(&self, index: usize, _fallback_raw: &[u8]) -> Option<(Vec<u8>, Vec<u64>)> {
+        self.token_piece_traces().get(index).map(|trace| {
+            (
+                trace.raw_piece_bytes().to_vec(),
+                trace.cumulative_boundaries().to_vec(),
+            )
+        })
     }
 }
 
@@ -720,6 +742,9 @@ fn mint_envelope(
 struct CaseEvidence {
     raw_output: Vec<u8>,
     generated_token_ids: Vec<u32>,
+    raw_token_piece_bytes: Vec<u8>,
+    token_byte_boundaries: Vec<u64>,
+    token_piece_fingerprint: BlobId,
     event_json: Vec<u8>,
     event_blob_id: BlobId,
     backend_audit_json: Vec<u8>,
@@ -764,6 +789,17 @@ fn derive_case_evidence(
             u32::try_from(*token).map_err(|_| InferenceError::InvalidGeneratedToken { index })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let (raw_token_piece_bytes, token_byte_boundaries) = seal
+        .token_piece_trace(index, &raw_output)
+        .ok_or(InferenceError::MissingTokenPieceTrace { index })?;
+    validate_token_piece_trace(
+        &raw_token_piece_bytes,
+        &token_byte_boundaries,
+        generated_token_ids.len(),
+        index,
+    )?;
+    let token_piece_fingerprint =
+        token_piece_fingerprint(&raw_token_piece_bytes, &token_byte_boundaries);
     let compact_events = ledger
         .events
         .iter()
@@ -806,6 +842,10 @@ fn derive_case_evidence(
             sampling: &case.sampling,
             model_fingerprint: SanitizedModelFingerprint::from(seal.model_fingerprint()),
             output: SanitizedGenerationOutput::new(output, &raw_output, &generated_token_ids),
+            raw_token_piece_bytes_blob_id: BlobId::digest(&raw_token_piece_bytes),
+            raw_token_piece_byte_len: raw_token_piece_bytes.len(),
+            token_byte_boundaries: &token_byte_boundaries,
+            token_piece_fingerprint,
             terminal_sampled_token_id,
             event_stream_blob_id: event_blob_id,
         },
@@ -815,15 +855,22 @@ fn derive_case_evidence(
     let verification_fingerprint = call_verification_fingerprint(
         pending,
         case,
-        &raw_output,
-        &generated_token_ids,
-        event_blob_id,
-        backend_receipt_blob_id,
-        terminal_sampled_token_id,
+        CallFingerprintEvidence {
+            raw_output: &raw_output,
+            generated_token_ids: &generated_token_ids,
+            raw_token_piece_bytes: &raw_token_piece_bytes,
+            token_byte_boundaries: &token_byte_boundaries,
+            event_blob_id,
+            backend_receipt_blob_id,
+            terminal_sampled_token_id,
+        },
     );
     Ok(CaseEvidence {
         raw_output,
         generated_token_ids,
+        raw_token_piece_bytes,
+        token_byte_boundaries,
+        token_piece_fingerprint,
         event_json,
         event_blob_id,
         backend_audit_json,
@@ -883,6 +930,9 @@ fn mint_case(
                 model_call,
                 raw_output: evidence.raw_output,
                 generated_token_ids: evidence.generated_token_ids,
+                raw_token_piece_bytes: Some(evidence.raw_token_piece_bytes),
+                token_byte_boundaries: Some(evidence.token_byte_boundaries),
+                token_piece_fingerprint: Some(evidence.token_piece_fingerprint),
                 event_json: evidence.event_json,
                 backend_audit_json: evidence.backend_audit_json,
                 displayed_output,
@@ -904,6 +954,9 @@ fn mint_case(
                 model_call,
                 partial_raw_output: evidence.raw_output,
                 generated_token_ids: evidence.generated_token_ids,
+                raw_token_piece_bytes: Some(evidence.raw_token_piece_bytes),
+                token_byte_boundaries: Some(evidence.token_byte_boundaries),
+                token_piece_fingerprint: Some(evidence.token_piece_fingerprint),
                 event_json: evidence.event_json,
                 backend_audit_json: evidence.backend_audit_json,
                 verification_fingerprint: evidence.verification_fingerprint,
@@ -936,6 +989,10 @@ struct BackendAuditRecord<'a> {
     sampling: &'a SamplingConfig,
     model_fingerprint: SanitizedModelFingerprint<'a>,
     output: SanitizedGenerationOutput<'a>,
+    raw_token_piece_bytes_blob_id: BlobId,
+    raw_token_piece_byte_len: usize,
+    token_byte_boundaries: &'a [u64],
+    token_piece_fingerprint: BlobId,
     terminal_sampled_token_id: Option<i32>,
     event_stream_blob_id: BlobId,
 }
@@ -1282,14 +1339,21 @@ fn derive_request_id(material: &PreparedMaterial, cases: &[PendingCase]) -> Stri
     })
 }
 
-fn call_verification_fingerprint(
-    pending: &PendingBatch,
-    case: &PendingCase,
-    raw_output: &[u8],
-    generated_token_ids: &[u32],
+#[derive(Clone, Copy)]
+struct CallFingerprintEvidence<'a> {
+    raw_output: &'a [u8],
+    generated_token_ids: &'a [u32],
+    raw_token_piece_bytes: &'a [u8],
+    token_byte_boundaries: &'a [u64],
     event_blob_id: BlobId,
     backend_receipt_blob_id: BlobId,
     terminal_sampled_token_id: Option<i32>,
+}
+
+fn call_verification_fingerprint(
+    pending: &PendingBatch,
+    case: &PendingCase,
+    evidence: CallFingerprintEvidence<'_>,
 ) -> BlobId {
     derive_call_verification_fingerprint(&CallVerificationCommitment {
         project_id: pending.material.project_id,
@@ -1307,12 +1371,45 @@ fn call_verification_fingerprint(
         prompt_token_fingerprint: pending.material.prompt_evidence.token_fingerprint(),
         sampler_fingerprint: case.sampler_fingerprint,
         control_program_fingerprint: uncontrolled_program_fingerprint(),
-        raw_output,
-        generated_token_ids,
-        event_blob_id,
-        backend_receipt_blob_id,
-        terminal_sampled_token_id,
+        raw_output: evidence.raw_output,
+        generated_token_ids: evidence.generated_token_ids,
+        raw_token_piece_bytes: evidence.raw_token_piece_bytes,
+        token_byte_boundaries: evidence.token_byte_boundaries,
+        event_blob_id: evidence.event_blob_id,
+        backend_receipt_blob_id: evidence.backend_receipt_blob_id,
+        terminal_sampled_token_id: evidence.terminal_sampled_token_id,
     })
+}
+
+fn validate_token_piece_trace(
+    raw_piece_bytes: &[u8],
+    boundaries: &[u64],
+    token_count: usize,
+    index: usize,
+) -> Result<(), InferenceError> {
+    let expected = token_count
+        .checked_add(1)
+        .ok_or(InferenceError::MalformedTokenPieceTrace { index })?;
+    if boundaries.len() != expected
+        || boundaries.first() != Some(&0)
+        || boundaries.last().copied() != u64::try_from(raw_piece_bytes.len()).ok()
+        || boundaries.windows(2).any(|pair| pair[0] > pair[1])
+    {
+        return Err(InferenceError::MalformedTokenPieceTrace { index });
+    }
+    Ok(())
+}
+
+fn token_piece_fingerprint(raw_piece_bytes: &[u8], boundaries: &[u64]) -> BlobId {
+    let mut digest = Sha256::new();
+    digest.update(b"loom/token-piece-trace/v1\0");
+    digest.update((raw_piece_bytes.len() as u64).to_be_bytes());
+    digest.update(raw_piece_bytes);
+    digest.update((boundaries.len() as u64).to_be_bytes());
+    for boundary in boundaries {
+        digest.update(boundary.to_be_bytes());
+    }
+    BlobId::from_bytes(digest.finalize().into())
 }
 
 pub fn no_control_program_fingerprint() -> BlobId {
@@ -1443,6 +1540,19 @@ mod tests {
 
         fn events(&self) -> &[GenerationEvent] {
             &self.events
+        }
+
+        fn token_piece_trace(
+            &self,
+            index: usize,
+            fallback_raw: &[u8],
+        ) -> Option<(Vec<u8>, Vec<u64>)> {
+            let token_count = self.outputs.get(index)?.generated_token_ids.len();
+            let mut boundaries = vec![0; token_count.saturating_add(1)];
+            if let Some(last) = boundaries.last_mut() {
+                *last = fallback_raw.len() as u64;
+            }
+            Some((fallback_raw.to_vec(), boundaries))
         }
     }
 
@@ -1786,6 +1896,9 @@ adapters = []
                             |model_call,
                              raw_output,
                              token_ids,
+                             raw_token_piece_bytes,
+                             token_byte_boundaries,
+                             token_piece_fingerprint,
                              event_json,
                              backend_audit_json,
                              displayed_output,
@@ -1795,6 +1908,9 @@ adapters = []
                                 assert_eq!(model_call.id(), call_id);
                                 assert_eq!(raw_output, b" a model sentence");
                                 assert_eq!(token_ids, vec![10, 11, 12]);
+                                assert!(raw_token_piece_bytes.is_some());
+                                assert!(token_byte_boundaries.is_some());
+                                assert!(token_piece_fingerprint.is_some());
                                 assert!(!event_json.is_empty());
                                 assert!(!backend_audit_json.is_empty());
                                 assert_eq!(displayed_output, b" a model sentence");
@@ -1848,7 +1964,7 @@ adapters = []
         assert_eq!(call.displayed_output(), b" a model sentence");
         assert_eq!(call.generated_token_ids(), &[10, 11, 12]);
         assert!(call.output_projection().is_some());
-        assert_eq!(call.token_boundaries_fingerprint(), None);
+        assert!(call.token_boundaries_fingerprint().is_some());
         assert_eq!(call.terminal_sampled_token_id(), Some(99));
         let audit: serde_json::Value =
             serde_json::from_slice(call.backend_audit_json()).expect("audit is exact JSON");
@@ -1904,6 +2020,8 @@ adapters = []
             model_call: call.model_call(),
             raw_output: call.raw_output(),
             generated_token_ids: call.generated_token_ids(),
+            raw_token_piece_bytes: call.raw_token_piece_bytes(),
+            token_byte_boundaries: call.token_byte_boundaries(),
             event_json: call.event_json(),
             backend_audit_json: call.backend_audit_json(),
             terminal_sampled_token_id: call.terminal_sampled_token_id(),
@@ -1972,6 +2090,8 @@ adapters = []
                 model_call: call.model_call(),
                 raw_output: call.raw_output(),
                 generated_token_ids: call.generated_token_ids(),
+                raw_token_piece_bytes: call.raw_token_piece_bytes(),
+                token_byte_boundaries: call.token_byte_boundaries(),
                 event_json: call.event_json(),
                 backend_audit_json,
                 terminal_sampled_token_id: call.terminal_sampled_token_id(),
@@ -2001,6 +2121,8 @@ adapters = []
                 model_call: call.model_call(),
                 raw_output: call.raw_output(),
                 generated_token_ids: call.generated_token_ids(),
+                raw_token_piece_bytes: call.raw_token_piece_bytes(),
+                token_byte_boundaries: call.token_byte_boundaries(),
                 event_json,
                 backend_audit_json: call.backend_audit_json(),
                 terminal_sampled_token_id: call.terminal_sampled_token_id(),
@@ -2277,6 +2399,8 @@ adapters = []
                 model_call: completed.model_call(),
                 raw_output: completed.raw_output(),
                 generated_token_ids: completed.generated_token_ids(),
+                raw_token_piece_bytes: completed.raw_token_piece_bytes(),
+                token_byte_boundaries: completed.token_byte_boundaries(),
                 event_json: completed.event_json(),
                 backend_audit_json: completed.backend_audit_json(),
                 terminal_sampled_token_id: completed.terminal_sampled_token_id(),
@@ -2291,6 +2415,8 @@ adapters = []
                 model_call: diagnostic.model_call(),
                 raw_output: diagnostic.partial_raw_output(),
                 generated_token_ids: diagnostic.generated_token_ids(),
+                raw_token_piece_bytes: diagnostic.raw_token_piece_bytes.as_deref(),
+                token_byte_boundaries: diagnostic.token_byte_boundaries.as_deref(),
                 event_json: diagnostic.event_json(),
                 backend_audit_json: diagnostic.backend_audit_json(),
                 terminal_sampled_token_id: None,
@@ -2357,7 +2483,15 @@ adapters = []
                     |input_index, diagnostic| {
                         assert_eq!(input_index, 0);
                         diagnostic.consume(
-                            |model_call, partial, tokens, event_json, audit_json, _| {
+                            |model_call,
+                             partial,
+                             tokens,
+                             _raw_token_piece_bytes,
+                             _token_byte_boundaries,
+                             _token_piece_fingerprint,
+                             event_json,
+                             audit_json,
+                             _| {
                                 assert!(matches!(
                                     model_call.terminal(),
                                     CallTerminal::Cancelled { .. }
@@ -2508,5 +2642,45 @@ adapters = []
                 maximum,
             }) if actual == exact.len() && maximum + 1 == exact.len()
         ));
+    }
+
+    #[test]
+    fn exact_trace_round_trip() {
+        let raw = b"alpha";
+        let boundaries = [0, 2, 5];
+        validate_token_piece_trace(raw, &boundaries, 2, 0).expect("exact trace");
+        assert_eq!(
+            token_piece_fingerprint(raw, &boundaries),
+            token_piece_fingerprint(raw, &boundaries)
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_trace_round_trip() {
+        let raw = [0xf0, 0x9f, 0x92];
+        validate_token_piece_trace(&raw, &[0, 1, 3], 2, 0)
+            .expect("piece bytes are not required to be UTF-8");
+    }
+
+    #[test]
+    fn zero_byte_piece_round_trip() {
+        validate_token_piece_trace(b"x", &[0, 0, 1], 2, 0)
+            .expect("zero-byte token piece remains exact evidence");
+    }
+
+    #[test]
+    fn tampered_boundary_fails() {
+        assert!(matches!(
+            validate_token_piece_trace(b"abc", &[0, 4], 1, 7),
+            Err(InferenceError::MalformedTokenPieceTrace { index: 7 })
+        ));
+    }
+
+    #[test]
+    fn retokenized_boundary_rejected_by_fingerprint() {
+        assert_ne!(
+            token_piece_fingerprint(b"ab", &[0, 1, 2]),
+            token_piece_fingerprint(b"ab", &[0, 2])
+        );
     }
 }

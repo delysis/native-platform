@@ -2,11 +2,12 @@
   import { baseKeymap, setBlockType, toggleMark, wrapIn } from 'prosemirror-commands';
   import { history, redo, undo } from 'prosemirror-history';
   import { keymap } from 'prosemirror-keymap';
-  import { defaultMarkdownParser, defaultMarkdownSerializer, schema } from 'prosemirror-markdown';
+  import { defaultMarkdownSerializer, schema } from 'prosemirror-markdown';
   import type { Node as ProseMirrorNode } from 'prosemirror-model';
   import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
   import { onDestroy, onMount } from 'svelte';
+  import { parseVisualMarkdown } from './markdownSafety';
   import {
     clearGhostText,
     createGhostTextPlugin,
@@ -131,7 +132,7 @@
   }
 
   function parse(markdown: string): ProseMirrorNode {
-    return defaultMarkdownParser.parse(markdown);
+    return parseVisualMarkdown(markdown);
   }
 
   function stateFor(markdown: string): EditorState {
@@ -160,7 +161,6 @@
           accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
           visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>
-            reportedGhostPresentationKey === presentationKey &&
             Boolean(view) &&
             expectedSurfaceKey === surfaceKey &&
             anchorByteOffset === ghostAnchorByteOffset &&

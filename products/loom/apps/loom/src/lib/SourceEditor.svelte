@@ -7,6 +7,7 @@
     sourceGhostAnchorMatches,
     sourceGhostKeyAction,
     sourceGhostRectIntersectsViewport,
+    sourceTabEdit,
     sourceGhostVisibilityWitnessMatches,
     sourceMirrorDirectionIsSupported,
     sourceMirrorGeometry,
@@ -320,28 +321,47 @@
         candidate.presentationKey &&
       sourceGhostVisibilityWitnessMatches(
         candidate.presentationKey,
-        reportedVisiblePresentationKey,
         livePresentationKey
       )
       ? candidate
       : null;
     const action = sourceGhostKeyAction(event, Boolean(visible));
-    if (!visible || !action) return;
+    if (!action) return;
     if (action === 'dismiss') {
+      if (!visible) return;
       event.preventDefault();
       event.stopPropagation();
       suppressCurrentGhost();
       onGhostDismiss(visible.candidateId, visible.presentationKey);
       return;
     }
-    // The parent must consume the exact visibility witness before this
-    // component clears it. Its boolean result is the authority to consume
-    // Tab; a rejected stale suggestion leaves keyboard navigation ordinary.
-    const accepted = onGhostAccept(visible.candidateId, visible.presentationKey);
-    suppressCurrentGhost();
-    if (!accepted) return;
+    if (action === 'accept' && visible) {
+      // The parent must consume the exact visibility witness before this
+      // component clears it. Its boolean result is the authority to promote.
+      const accepted = onGhostAccept(visible.candidateId, visible.presentationKey);
+      suppressCurrentGhost();
+      if (accepted) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+    }
+    if (!element || readonly) return;
     event.preventDefault();
     event.stopPropagation();
+    const edit = sourceTabEdit(
+      element.value,
+      element.selectionStart,
+      element.selectionEnd
+    );
+    if (!edit) return;
+    // Preserve source bytes exactly. setRangeText also keeps the native caret
+    // and selection semantics of an ordinary textarea edit.
+    suppressCurrentGhost();
+    element.setRangeText('\t', element.selectionStart, element.selectionEnd, 'end');
+    if (element.value !== edit.value || element.selectionStart !== edit.caret) return;
+    readSelection(false, false);
+    onValueInput(element);
   }
 
   function handleDocumentSelectionChange(): void {

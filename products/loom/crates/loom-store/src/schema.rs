@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use crate::{Result, StoreError};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
-pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 9;
+pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 10;
 
 pub(crate) fn configure(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -93,6 +93,13 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<()> {
             [loom_types::now_unix_ms()],
         )?;
     }
+    if version < 10 {
+        transaction.execute_batch(include_str!("../migrations/0010_token_piece_evidence.sql"))?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (10, ?1)",
+            [loom_types::now_unix_ms()],
+        )?;
+    }
     transaction.pragma_update(
         None,
         "user_version",
@@ -126,6 +133,58 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read version");
         assert_eq!(version, CURRENT_STORE_SCHEMA_VERSION + 1);
+    }
+
+    #[test]
+    fn version_ten_adds_immutable_token_piece_evidence_without_rewriting_version_nine() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure(&connection).expect("configure SQLite");
+        for migration in [
+            include_str!("../migrations/0001_initial.sql"),
+            include_str!("../migrations/0002_generation_provenance.sql"),
+            include_str!("../migrations/0003_transient_drafts.sql"),
+            include_str!("../migrations/0004_draft_generations.sql"),
+            include_str!("../migrations/0005_generation_command_hardening.sql"),
+            include_str!("../migrations/0006_bounded_branch_index.sql"),
+            include_str!("../migrations/0007_research_admission.sql"),
+            include_str!("../migrations/0008_verified_inference_batches.sql"),
+            include_str!("../migrations/0009_research_execution_ledger.sql"),
+        ] {
+            connection
+                .execute_batch(migration)
+                .expect("apply through v9");
+        }
+        connection
+            .pragma_update(None, "user_version", 9_i64)
+            .expect("mark version nine");
+
+        migrate(&mut connection).expect("migrate token-piece evidence");
+
+        let (strict, columns): (i64, i64) = connection
+            .query_row(
+                "SELECT strict, (SELECT COUNT(*) FROM pragma_table_info('research_token_piece_evidence'))
+                 FROM pragma_table_list
+                 WHERE schema = 'main' AND name = 'research_token_piece_evidence'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read v10 table metadata");
+        assert_eq!(strict, 1);
+        assert_eq!(columns, 7);
+        for trigger in [
+            "research_token_piece_evidence_validate_insert",
+            "research_token_piece_evidence_immutable_update",
+            "research_token_piece_evidence_immutable_delete",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                    [trigger],
+                    |row| row.get(0),
+                )
+                .expect("read v10 trigger");
+            assert_eq!(count, 1, "{trigger} must exist");
+        }
     }
 
     #[test]

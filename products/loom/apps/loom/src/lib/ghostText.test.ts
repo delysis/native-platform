@@ -9,9 +9,10 @@ import {
   planGhostText,
   renderedGhostPresentationKey,
   setGhostText,
+  VISUAL_TAB_INDENT,
   visualGhostInsertionIsVisible,
   visualGhostTextIsFaithfulAtSelection,
-    visualGhostTextMayBePlainProse,
+  visualGhostTextMayBePlainProse,
   type GhostTextPresentation
 } from './ghostText';
 
@@ -350,7 +351,7 @@ describe('ghost-text plugin state', () => {
     });
   });
 
-  it('accepts with unmodified Tab only while the exact ghost is rendered', () => {
+  it('accepts a rendered ghost and otherwise inserts visual indentation', () => {
     let accepted = '';
     let wasInstalledWhenClaimed = false;
     let visible = false;
@@ -386,10 +387,18 @@ describe('ghost-text plugin state', () => {
       ctrlKey: false,
       altKey: false
     } as KeyboardEvent;
-    expect(plugin.props.handleKeyDown?.call(plugin, view, tab)).toBe(false);
+    expect(plugin.props.handleKeyDown?.call(plugin, view, tab)).toBe(true);
     expect(accepted).toBe('');
-    expect(ghostTextPluginKey.getState(state)).not.toBeNull();
+    expect(state.doc.textContent).toBe(`The sentence waits${VISUAL_TAB_INDENT}`);
+    expect(ghostTextPluginKey.getState(state)).toBeNull();
 
+    const resetDoc = defaultMarkdownParser.parse('The sentence waits');
+    state = EditorState.create({
+      doc: resetDoc,
+      selection: Selection.atEnd(resetDoc),
+      plugins: [plugin]
+    });
+    setGhostText(view, suggestion);
     visible = true;
     const handled = plugin.props.handleKeyDown?.call(plugin, view, tab);
     expect(handled).toBe(true);
@@ -398,7 +407,7 @@ describe('ghost-text plugin state', () => {
     expect(ghostTextPluginKey.getState(state)).toBeNull();
   });
 
-  it('retains a parent-rejected ghost without consuming ordinary Tab', () => {
+  it('falls back to visual indentation when the parent rejects a stale ghost', () => {
     const plugin = createGhostTextPlugin({
       accept: () => false,
       dismiss() {},
@@ -428,8 +437,53 @@ describe('ghost-text plugin state', () => {
       altKey: false
     } as KeyboardEvent);
 
-    expect(handled).toBe(false);
-    expect(ghostTextPluginKey.getState(state)).not.toBeNull();
+    expect(handled).toBe(true);
+    expect(state.doc.textContent).toBe(`The sentence waits${VISUAL_TAB_INDENT}`);
+    expect(ghostTextPluginKey.getState(state)).toBeNull();
+  });
+
+  it('handles Tab without a ghost while modified Tab remains navigation', () => {
+    const plugin = createGhostTextPlugin({
+      accept: () => false,
+      dismiss() {},
+      visible: () => false
+    });
+    const doc = defaultMarkdownParser.parse('The sentence waits');
+    let state = EditorState.create({
+      doc,
+      selection: Selection.atEnd(doc),
+      plugins: [plugin]
+    });
+    const view = {
+      get state() { return state; },
+      dispatch(transaction: Parameters<EditorView['dispatch']>[0]) {
+        state = state.apply(transaction);
+      }
+    } as unknown as EditorView;
+    const key = (overrides: Partial<KeyboardEvent> = {}) => ({
+      key: 'Tab', keyCode: 9, isComposing: false,
+      shiftKey: false, metaKey: false, ctrlKey: false, altKey: false,
+      ...overrides
+    } as KeyboardEvent);
+
+    expect(plugin.props.handleKeyDown?.call(plugin, view, key({ shiftKey: true }))).toBe(false);
+    expect(plugin.props.handleKeyDown?.call(plugin, view, key({ metaKey: true }))).toBe(false);
+    expect(plugin.props.handleKeyDown?.call(plugin, view, key())).toBe(true);
+    expect(state.doc.textContent).toBe(`The sentence waits${VISUAL_TAB_INDENT}`);
+  });
+
+  it('inserts the same literal tab byte at visual paragraph edges', () => {
+    const positions = [1, Selection.atEnd(defaultMarkdownParser.parse('A paragraph.')).from];
+    for (const position of positions) {
+      const doc = defaultMarkdownParser.parse('A paragraph.');
+      let state = EditorState.create({ doc, selection: TextSelection.create(doc, position) });
+      state = state.apply(state.tr.insertText(VISUAL_TAB_INDENT));
+      const markdown = defaultMarkdownSerializer.serialize(state.doc);
+      expect(markdown).toContain('\t');
+    }
+    // Stock CommonMark loses this edge tab; Loom's guarded visual parser has
+    // a separate regression in markdownSafety.test.ts.
+    expect(defaultMarkdownParser.parse('A paragraph.\t').textContent).toBe('A paragraph.');
   });
 
   it('dismisses with Escape and ignores IME or modified acceptance keys', () => {
