@@ -64,6 +64,12 @@ These local results do not substitute for the three-OS PR run or post-merge
 CI. The source freeze and retirement gates remain deliberately downstream of
 those remote results.
 
+Candidate run `31636166161` later passed tests, both locked graph probes, and
+strict Clippy on macOS before failing the native architecture step because the
+runner did not provide the nonstandard `rg` utility. The check was made
+portable with POSIX `grep`; the failure is retained rather than counted as
+architecture evidence.
+
 ## Limits
 
 This candidate does not alter the source repository, its tags, or its GitHub
