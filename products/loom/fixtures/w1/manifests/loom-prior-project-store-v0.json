@@ -45,6 +45,15 @@
         },
         {
           "identity": {
+            "id": "loom.prior.project.content_blob.v10",
+            "digest": { "algorithm": "sha256", "hex": "834c141212ac3cf23062a3864b45cdf630ae8fc8029092807602fffce1b70739" },
+            "length": 50
+          },
+          "availability": "checked_in",
+          "relative_path": "fixtures/w1/state/loom-prior-v10/.loom/blobs/sha256/83/4c141212ac3cf23062a3864b45cdf630ae8fc8029092807602fffce1b70739"
+        },
+        {
+          "identity": {
             "id": "loom.prior.project.migrated_summary.v1",
             "digest": { "algorithm": "sha256", "hex": "95b14846e2f2869c7be973d059b47a95fb69ba9140cf54d4c2155267a81f0256" },
             "length": 464

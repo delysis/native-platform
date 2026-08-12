@@ -23,8 +23,10 @@ identity remains exact; the evidence commit changes no production source file.
 
 The product replay starts from one exact 61-byte revision and three verified
 candidate bodies. It proves one caret-local ghost, hidden additional candidates
-behind explicit review, exact-boundary Tab promotion, ordinary Tab otherwise,
-and no manuscript mutation on dismissal or stale presentation. It also proves
+behind explicit review, exact-boundary Tab promotion, and ordinary Tab otherwise.
+It proves that dismissal does not mutate the manuscript and that a stale
+suggestion cannot promote its bytes; ordinary Tab still inserts its literal tab.
+It also proves
 the absence of persistent candidate-count chrome, `Skip to manuscript`, and a
 primary `Use this` control. The store replay promotes the primary candidate,
 classifies all three terminal records as fixture evidence, and verifies the
@@ -57,7 +59,9 @@ The checked-in baseline is an actual 1,101,824-byte SQLite v10 database plus its
 exact project manifest, content blob, and visible manuscript. Fixed ULIDs and
 the ten authenticated migrations from accepted v10 source
 `d0aca6ff4883ac51514fea5e5fb75ffbb3c8c264` reproduce the frozen database
-byte-for-byte. The migration replay starts from those checked-in pre-open bytes;
+byte-for-byte. The manifest and complete fixture ledger independently
+authenticate the matching checked-in content blob. The migration replay starts
+from those checked-in pre-open bytes;
 it never initializes a current store or reverse-deletes v11 objects.
 
 Current code applies migration 11. Project ID, active revision ID, exact visible

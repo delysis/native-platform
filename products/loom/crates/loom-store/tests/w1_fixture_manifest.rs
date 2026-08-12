@@ -28,6 +28,12 @@ struct VerticalCase {
     runtime_artifact: &'static [u8],
 }
 
+fn frozen_content_blob_bytes() -> &'static [u8] {
+    include_bytes!(
+        "../../../fixtures/w1/state/loom-prior-v10/.loom/blobs/sha256/83/4c141212ac3cf23062a3864b45cdf630ae8fc8029092807602fffce1b70739"
+    )
+}
+
 fn fixture_bytes(relative_path: &str) -> &'static [u8] {
     match relative_path {
         "fixtures/w1/loom-suggestion-promotion-v1.json" => {
@@ -44,6 +50,9 @@ fn fixture_bytes(relative_path: &str) -> &'static [u8] {
         }
         "fixtures/w1/state/loom-prior-v10/manuscript/001.md" => {
             include_bytes!("../../../fixtures/w1/state/loom-prior-v10/manuscript/001.md")
+        }
+        "fixtures/w1/state/loom-prior-v10/.loom/blobs/sha256/83/4c141212ac3cf23062a3864b45cdf630ae8fc8029092807602fffce1b70739" => {
+            frozen_content_blob_bytes()
         }
         "fixtures/w1/state/loom-prior-v10-migrated-summary-v1.json" => {
             include_bytes!("../../../fixtures/w1/state/loom-prior-v10-migrated-summary-v1.json")
@@ -95,6 +104,11 @@ fn evidence_bytes(relative_path: &str) -> &'static [u8] {
         "state/loom-prior-v10/manuscript/001.md" => {
             fixture_bytes("fixtures/w1/state/loom-prior-v10/manuscript/001.md")
         }
+        "state/loom-prior-v10/.loom/blobs/sha256/83/4c141212ac3cf23062a3864b45cdf630ae8fc8029092807602fffce1b70739" => {
+            fixture_bytes(
+                "fixtures/w1/state/loom-prior-v10/.loom/blobs/sha256/83/4c141212ac3cf23062a3864b45cdf630ae8fc8029092807602fffce1b70739",
+            )
+        }
         _ => panic!("unmapped W1 evidence artifact: {relative_path}"),
     }
 }
@@ -145,7 +159,7 @@ fn w1_sha256_ledger_authenticates_every_checked_in_byte_artifact() {
         let (expected_digest, relative_path) =
             line.split_once("  ").expect("ledger uses sha256sum format");
         assert!(
-            paths.insert(relative_path),
+            paths.insert(relative_path.to_owned()),
             "duplicate ledger path: {relative_path}"
         );
         let identity = sha256_identity("ledger.artifact", evidence_bytes(relative_path));
@@ -154,7 +168,27 @@ fn w1_sha256_ledger_authenticates_every_checked_in_byte_artifact() {
             "artifact drifted: {relative_path}"
         );
     }
-    assert_eq!(paths.len(), 14);
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let tracked = Command::new("git")
+        .args(["ls-files", "fixtures/w1"])
+        .current_dir(repository)
+        .output()
+        .expect("enumerate tracked W1 fixture artifacts");
+    assert!(
+        tracked.status.success(),
+        "enumerate tracked W1 fixture artifacts"
+    );
+    let tracked_paths = String::from_utf8(tracked.stdout)
+        .expect("tracked fixture paths are UTF-8")
+        .lines()
+        .filter_map(|path| path.strip_prefix("fixtures/w1/"))
+        .filter(|path| *path != "MANIFEST.sha256")
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(paths, tracked_paths, "fixture ledger must be complete");
 }
 
 #[test]

@@ -11,8 +11,8 @@
   "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
   "fixture_ledger": {
     "path": "fixtures/w1/MANIFEST.sha256",
-    "sha256": "57c03eddfee36825be8a1db6b1c7cb153793c83fe6fa63c5d32abf0b435b9389",
-    "artifact_count": 14
+    "sha256": "48389ebd98d9408196d3c540ee91f54ba355c019be48d11eda9dbb9455b141de",
+    "artifact_count": 15
   },
   "rows": [
     {
@@ -20,9 +20,9 @@
       "vertical_id": "loom_suggestion_promotion",
       "status": "canonical_baseline_validated",
       "manifest": "fixtures/w1/manifests/loom-suggestion-promotion-v0.json",
-      "manifest_sha256": "47fc85d1496a345e6820062b9894cccd4c8f0984fc40dcb6ffc384e57f236c49",
+      "manifest_sha256": "fa608f1fb95cd2656f55a5af463525cfc3d37046d14ea9badf74124201e1b5f4",
       "projection": "fixtures/w1/projections/loom-suggestion-promotion-v1.json",
-      "projection_sha256": "aa3e39cd72c9085f437c7b448da517857449424e12783a9d55a2282548448542",
+      "projection_sha256": "3c82cae97aaa54d2aaaa5820838a90f67b761590b58c6fea0172c53362c1b9de",
       "product_replays": [
         "generation::tests::w1_exact_boundary_suggestion_promotion_survives_store_reopen",
         "apps/loom/src/lib/w1SuggestionVertical.test.ts"
@@ -45,7 +45,7 @@
       "vertical_id": "loom_prior_project_store",
       "status": "canonical_baseline_validated",
       "manifest": "fixtures/w1/manifests/loom-prior-project-store-v0.json",
-      "manifest_sha256": "1e7205041489daeb3fa2510a4430589b62eee487939c28f10fa8cc71a526c34a",
+      "manifest_sha256": "1d1750428d2cd27bd82568483e692ddb24c07f988d1a4eb5cbe4587a22cb5785",
       "projection": "fixtures/w1/projections/loom-prior-project-store-v10-v1.json",
       "projection_sha256": "e207e171dc3a3ab8d5ea5de6b160bd0cf0409a3f0f15d5413c38d96225404b82",
       "state_identity": {
