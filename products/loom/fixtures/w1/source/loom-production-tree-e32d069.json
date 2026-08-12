@@ -1,0 +1,27 @@
+{
+  "schema": "delysis.production_source_roots.v0",
+  "repository_id": "delysis/loom-native",
+  "commit": "e32d0697f6b5e28716e34c6b051d47d5031d010c",
+  "git_object_format": "sha1",
+  "source_roots": {
+    "apps/loom/src": "42a54cd69b93a36a03ccc33334f9a166b9a5916e",
+    "apps/loom/src-tauri/src": "1b4ee1a06858b1dc243f853ece0a67487537c765",
+    "crates/loom-backend-llama/src": "760f37e87792677b84272c71eaf1f4e4e26df52a",
+    "crates/loom-benchmark/src": "5f3fea65fb282cf9ff85f7b45e8eb66c1d04ee10",
+    "crates/loom-campaign/src": "c48af65d3bd2a55d3105b98de4e9fa35972dd91c",
+    "crates/loom-cli/src": "8886a75cf68febb97b2ecb3aa87c52792b079f26",
+    "crates/loom-context/src": "963d9a06526721e5b60a99549114eb940890fb42",
+    "crates/loom-document/src": "d0d2c7793280ba877b6fe5e1c75ee92f685e13c2",
+    "crates/loom-eval-codex/src": "6012c30e227707e28fda552875ffbcbc15a2173e",
+    "crates/loom-eval/src": "86a62f7273c1f378da6f2a7c30503a0950557315",
+    "crates/loom-host/src": "a68cb4ac61576ab64cab6a85878f2f3d215e33c7",
+    "crates/loom-inference/src": "d5b5fc3af0487f042462e00e883a41cd8409c660",
+    "crates/loom-learning/src": "9a2f6ecbcc7d1bb7f6b2d82ec77414ce85229bcd",
+    "crates/loom-research-types/src": "1309b414acb70ac8b13c66293768a96f168a81fc",
+    "crates/loom-search/src": "4e54e614c3d4c2994dbf6523a7b5782d56d0a64d",
+    "crates/loom-store/src": "366cbba1d5e746210774d0cab12af303db41f487",
+    "crates/loom-trial/src": "fb237b37f4e50493e48d3ffed8bdb42f9dd9bd8c",
+    "crates/loom-types/src": "404fadace65254d4beed0ebb5159d31c6548e72c",
+    "crates/tauri-plugin-loom/src": "65e6d2a06ba4520a86a7fd608247eb78c1dfedf8"
+  }
+}

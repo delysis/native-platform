@@ -84,6 +84,35 @@ export function verifiedGhostSuggestion(
   };
 }
 
+export interface ExactSuggestionFamilySelection {
+  active: boolean;
+  branches: readonly BranchCard[];
+  verifiedBodyByRun: Readonly<Record<string, VerifiedBranchBody>>;
+  targetByte: number | null;
+}
+
+/**
+ * Returns the complete immutable candidate family for explicit review at one
+ * exact caret boundary. Inline autocomplete intentionally consumes only the
+ * first displayable member; this separate projection is the progressive-
+ * disclosure boundary for the remaining verified alternatives.
+ */
+export function exactVerifiedSuggestionFamily(
+  selection: ExactSuggestionFamilySelection
+): BranchCard[] {
+  if (
+    !selection.active ||
+    selection.targetByte === null ||
+    !Number.isSafeInteger(selection.targetByte) ||
+    selection.targetByte < 0
+  ) return [];
+  return selection.branches.filter((branch) =>
+    branch.target_start_byte === selection.targetByte &&
+    branch.target_end_byte === selection.targetByte &&
+    Boolean(verifiedGhostSuggestion(branch, selection.verifiedBodyByRun[branch.run_id]))
+  );
+}
+
 /**
  * Select the first displayable continuation from an explicit reactive snapshot.
  *

@@ -6666,6 +6666,32 @@ pub(crate) mod tests {
         source_blob_id: BlobId,
     }
 
+    #[derive(Deserialize)]
+    struct W1ResearchAuthorityFixture {
+        schema_version: u32,
+        fixture_id: String,
+        source_text: String,
+        source_sha256: BlobId,
+        output_text: String,
+        output_sha256: BlobId,
+        expected: W1ResearchAuthorityExpected,
+    }
+
+    #[derive(Deserialize)]
+    struct W1ResearchAuthorityExpected {
+        live_session: W1ResearchAuthorityDisposition,
+        reopened_session: W1ResearchAuthorityDisposition,
+        persisted_diagnostic: W1ResearchAuthorityDisposition,
+    }
+
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    #[serde(rename_all = "snake_case")]
+    enum W1ResearchAuthorityDisposition {
+        SingleUseAuthorityAllowed,
+        BytesReplayOnly,
+        NoCallLease,
+    }
+
     #[derive(Clone, Copy)]
     struct PresenceSpec<'a> {
         authority_actor: &'a str,
@@ -6676,17 +6702,28 @@ pub(crate) mod tests {
     }
 
     fn mixed_promotion_fixture(store: &mut ProjectStore) -> MixedPromotionFixture {
+        mixed_promotion_fixture_with_bytes(
+            store,
+            "Pinned source manuscript.",
+            b"Human-authored continuation.",
+        )
+    }
+
+    fn mixed_promotion_fixture_with_bytes(
+        store: &mut ProjectStore,
+        source_text: &str,
+        exact_output: &[u8],
+    ) -> MixedPromotionFixture {
         store
             .save_document(
                 "manuscript/source.md",
-                DocumentContent::Prose("Pinned source manuscript.".into()),
+                DocumentContent::Prose(source_text.into()),
                 "promotion source",
             )
             .expect("save promotion source");
         let source = store
             .read_document("manuscript/source.md")
             .expect("read promotion source");
-        let exact_output = b"Human-authored continuation.";
         let output_operation_id = PipelineOperationId::new();
         let operation_graph = OperationGraph::new(
             vec![
@@ -6795,12 +6832,49 @@ pub(crate) mod tests {
         }
     }
 
+    fn w1_research_authority_fixture() -> W1ResearchAuthorityFixture {
+        let spec: W1ResearchAuthorityFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/w1/loom-research-authority-v1.json"
+        ))
+        .expect("parse W1 research-authority fixture");
+        assert_eq!(spec.schema_version, 1);
+        assert_eq!(spec.fixture_id, "loom-research-authority-v1");
+        assert_eq!(
+            BlobId::digest(spec.source_text.as_bytes()),
+            spec.source_sha256
+        );
+        assert_eq!(
+            BlobId::digest(spec.output_text.as_bytes()),
+            spec.output_sha256
+        );
+        assert_eq!(
+            spec.expected.live_session,
+            W1ResearchAuthorityDisposition::SingleUseAuthorityAllowed
+        );
+        assert_eq!(
+            spec.expected.reopened_session,
+            W1ResearchAuthorityDisposition::BytesReplayOnly
+        );
+        assert_eq!(
+            spec.expected.persisted_diagnostic,
+            W1ResearchAuthorityDisposition::NoCallLease
+        );
+        spec
+    }
+
     fn store_prompt_fixture(store: &mut ProjectStore) -> StorePromptEvidence {
+        store_prompt_fixture_with_source(store, "CHAPTER ONE\n\nThe rain stopped at the gate.")
+    }
+
+    fn store_prompt_fixture_with_source(
+        store: &mut ProjectStore,
+        source_text: &str,
+    ) -> StorePromptEvidence {
         let path = format!("manuscript/prompt-{}.md", RevisionId::new());
         store
             .save_document(
                 &path,
-                DocumentContent::Prose("CHAPTER ONE\n\nThe rain stopped at the gate.".into()),
+                DocumentContent::Prose(source_text.into()),
                 "prompt fixture source",
             )
             .expect("save exact prompt source");
@@ -7241,6 +7315,31 @@ adapters = []
                 },
             )
             .expect("research adoption counts")
+    }
+
+    fn research_authority_footprint(store: &ProjectStore) -> (i64, i64, i64, i64, i64) {
+        store
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM research_candidate_assemblies),
+                    (SELECT COUNT(*) FROM research_admission_records),
+                    (SELECT COUNT(*) FROM research_benchmark_journals
+                        WHERE journal_namespace = 'qualification'),
+                    (SELECT COUNT(*) FROM research_promotion_command_requests),
+                    (SELECT COUNT(*) FROM research_promotion_authorities)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("research authority footprint")
     }
 
     fn admit_single_call_assembly(
@@ -8603,6 +8702,165 @@ adapters = []
             )
             .expect("authority count");
         assert_eq!(authority_count, 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn w1_reopened_research_bytes_remain_diagnostic_without_live_authority() {
+        let spec = w1_research_authority_fixture();
+
+        let directory = tempdir().expect("temporary project");
+        let admitted_root = directory.path().join("Admitted");
+        let diagnostic_root = directory.path().join("DiagnosticSnapshot");
+        let (mut store, _) =
+            ProjectStore::initialize(&admitted_root, "Admitted").expect("initialize admitted");
+        let fixture = mixed_promotion_fixture_with_bytes(
+            &mut store,
+            &spec.source_text,
+            spec.output_text.as_bytes(),
+        );
+        assert_eq!(fixture.source_blob_id, spec.source_sha256);
+        assert_eq!(
+            fixture.admission.record().output_blob_id(),
+            spec.output_sha256
+        );
+
+        let request = promotion_request(&store, &fixture, CommandId::new());
+        store
+            .connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint exact pre-authority snapshot");
+        copy_tree(&admitted_root, &diagnostic_root);
+        let mut diagnostic_store =
+            ProjectStore::open(&diagnostic_root).expect("open persisted diagnostic snapshot");
+        let diagnostic_source = diagnostic_store
+            .read_document("manuscript/source.md")
+            .expect("read exact diagnostic source bytes");
+        assert_eq!(diagnostic_source.blob_id, spec.source_sha256);
+        assert_eq!(diagnostic_source.text, spec.source_text);
+        assert_eq!(
+            diagnostic_store
+                .read_blob(fixture.admission.record().output_blob_id())
+                .expect("read exact diagnostic output bytes"),
+            spec.output_text.as_bytes()
+        );
+        assert!(
+            diagnostic_store
+                .record_promotion_command_request(
+                    PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                    &request,
+                )
+                .is_err(),
+            "persisted rows without the live admission domain cannot mint a request"
+        );
+        assert_eq!(
+            research_authority_footprint(&diagnostic_store),
+            (0, 1, 0, 0, 0),
+            "the paired diagnostic snapshot must mint no assembly, qualification, request, or promotion authority"
+        );
+        drop(diagnostic_store);
+        let mut diagnostic_reopened =
+            ProjectStore::open(&diagnostic_root).expect("reopen persisted diagnostic snapshot");
+        assert!(
+            diagnostic_reopened
+                .record_promotion_command_request(
+                    PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                    &request,
+                )
+                .is_err(),
+            "reopen must not recreate the missing live admission domain"
+        );
+        assert_eq!(
+            research_authority_footprint(&diagnostic_reopened),
+            (0, 1, 0, 0, 0)
+        );
+
+        let recorded_request = store
+            .record_promotion_command_request(
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                &request,
+            )
+            .expect("live admission records its exact request");
+        let (authority, presence) = authority_and_presence(
+            &store,
+            &recorded_request,
+            &request,
+            PresenceSpec {
+                authority_actor: "foreground reviewer",
+                host_actor: "foreground reviewer",
+                session_fingerprint: BlobId::digest(b"w1 authority session"),
+                monotonic_event_index: 1,
+                event_receipt_bytes: b"w1 exact foreground gesture",
+            },
+        );
+        let duplicate_request = RecordedPromotionRequest {
+            session_nonce: recorded_request.session_nonce,
+            command_id: recorded_request.command_id,
+            request_fingerprint: recorded_request.request_fingerprint,
+            recorded_at_ms: recorded_request.recorded_at_ms,
+        };
+        let duplicate_presence = VerifiedUserPresence {
+            session_nonce: presence.session_nonce,
+            command_id: presence.command_id,
+            command_request_fingerprint: presence.command_request_fingerprint,
+            kind: presence.kind,
+            session_fingerprint: presence.session_fingerprint,
+            event_receipt_blob_id: presence.event_receipt_blob_id,
+            event_receipt_bytes: presence.event_receipt_bytes.clone(),
+            monotonic_event_index: presence.monotonic_event_index,
+            occurred_at_ms: presence.occurred_at_ms,
+            actor: presence.actor.clone(),
+        };
+        store
+            .record_promotion_authority(
+                recorded_request,
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                presence,
+                &authority,
+            )
+            .expect("live admitted bytes mint one exact authority");
+        assert!(
+            store
+                .record_promotion_authority(
+                    duplicate_request,
+                    PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                    duplicate_presence,
+                    &authority,
+                )
+                .is_err(),
+            "the admitted request and user-presence capability are single use"
+        );
+        assert_eq!(research_authority_footprint(&store), (0, 1, 0, 1, 1));
+        drop(store);
+
+        let mut reopened = ProjectStore::open(&admitted_root).expect("reopen admitted project");
+        let source = reopened
+            .read_document("manuscript/source.md")
+            .expect("replay exact source bytes");
+        assert_eq!(source.blob_id, spec.source_sha256);
+        assert_eq!(source.text, spec.source_text);
+        assert_eq!(
+            reopened
+                .read_blob(fixture.admission.record().output_blob_id())
+                .expect("replay exact output bytes"),
+            spec.output_text.as_bytes()
+        );
+
+        let second_request = promotion_request(&reopened, &fixture, CommandId::new());
+        assert!(
+            reopened
+                .record_promotion_command_request(
+                    PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                    &second_request,
+                )
+                .is_err(),
+            "the old admission lease must not mint a new request after reopen"
+        );
+        assert_eq!(
+            research_authority_footprint(&reopened),
+            (0, 1, 0, 1, 1),
+            "persisted authority remains an audit fact, not a reusable capability"
+        );
     }
 
     #[test]

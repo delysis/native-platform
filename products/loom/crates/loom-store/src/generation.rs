@@ -3656,20 +3656,76 @@ mod tests {
         policy: ArtifactId,
     }
 
+    #[derive(Deserialize)]
+    struct W1SuggestionFixture {
+        schema_version: u32,
+        fixture_id: String,
+        source: W1SuggestionSource,
+        candidate_family: Vec<W1SuggestionOutput>,
+        expected: W1SuggestionExpected,
+    }
+
+    #[derive(Deserialize)]
+    struct W1SuggestionSource {
+        relative_path: String,
+        revision_text: String,
+        caret_byte: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct W1SuggestionOutput {
+        text: String,
+        sha256: BlobId,
+        seed: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct W1SuggestionExpected {
+        primary_candidate_index: usize,
+        result_text: String,
+        result_sha256: BlobId,
+        visible_ghost_count: u64,
+        hidden_candidate_count: usize,
+        explicit_review_candidate_count: usize,
+        ordinary_tab: String,
+        forbidden_primary_chrome: Vec<String>,
+    }
+
+    struct W1FamilyReopenWitness {
+        run_id: GenerationRunId,
+        output_blob_id: BlobId,
+        selected: bool,
+    }
+
+    struct W1PromotionReopenWitness {
+        command_id: CommandId,
+        source_revision_id: RevisionId,
+        result_revision_id: RevisionId,
+        run_id: GenerationRunId,
+        document_id: DocumentId,
+        generated_span_artifact_id: ArtifactId,
+        receipt: CommandReceipt,
+        family: Vec<W1FamilyReopenWitness>,
+    }
+
     impl Fixture {
         fn new() -> Self {
+            Self::with_source("manuscript/001.md", "Once ")
+        }
+
+        fn with_source(relative_path: &str, source: &str) -> Self {
             let directory = tempdir().expect("temporary project");
             let root = directory.path().join("Novel");
             let (mut store, _) = ProjectStore::initialize(&root, "Novel").expect("initialize");
             store
                 .save_document(
-                    "manuscript/001.md",
-                    DocumentContent::Prose("Once ".into()),
+                    relative_path,
+                    DocumentContent::Prose(source.into()),
                     "initial",
                 )
                 .expect("initial save");
             let loaded = store
-                .read_document("manuscript/001.md")
+                .read_document(relative_path)
                 .expect("load initial document");
             let writer_environment = store
                 .record_model_environment(&environment("writer"))
@@ -3721,6 +3777,18 @@ mod tests {
             }
         }
 
+        fn reopen(self) -> (tempfile::TempDir, ProjectStore) {
+            let root = self.store.root().to_path_buf();
+            let Self {
+                _directory: directory,
+                store,
+                ..
+            } = self;
+            drop(store);
+            let reopened = ProjectStore::open(root).expect("reopen fixture project");
+            (directory, reopened)
+        }
+
         fn start(&mut self, environment: ArtifactId) -> GenerationStarted {
             let end = u64::try_from(self.loaded.text.len()).expect("document length");
             self.start_at(environment, ByteRange { start: end, end })
@@ -3758,6 +3826,15 @@ mod tests {
         }
 
         fn finish(&mut self, run_id: GenerationRunId, output: &str) -> TerminalCandidateOutcome {
+            self.finish_with_evidence_kind(run_id, output, InferenceEvidenceKind::LiveInference)
+        }
+
+        fn finish_with_evidence_kind(
+            &mut self,
+            run_id: GenerationRunId,
+            output: &str,
+            evidence_kind: InferenceEvidenceKind,
+        ) -> TerminalCandidateOutcome {
             let raw_event_stream_blob_id = self
                 .store
                 .store_provenance_blob(b"recorded event stream")
@@ -3772,7 +3849,7 @@ mod tests {
                             observations: Vec::new(),
                             raw_event_stream_blob_id,
                             provenance: Some(GenerationProvenance {
-                                evidence_kind: InferenceEvidenceKind::LiveInference,
+                                evidence_kind,
                                 metrics: GenerationMetrics::default(),
                                 backend_receipt_blob_id: None,
                                 sequence_state_blob_id: None,
@@ -3792,6 +3869,91 @@ mod tests {
             tokenizer_fingerprint: BlobId::digest(format!("tokenizer-{name}").as_bytes()),
             backend_identifier: "test-backend".into(),
             capabilities: json!({"completion": true}),
+        }
+    }
+
+    fn assert_w1_promotion_survives_reopen(
+        fixture: Fixture,
+        spec: &W1SuggestionFixture,
+        witness: W1PromotionReopenWitness,
+    ) {
+        let (_directory, reopened) = fixture.reopen();
+        let reopened_document = reopened
+            .read_document(&spec.source.relative_path)
+            .expect("read promoted manuscript after reopen");
+        assert_eq!(reopened_document.revision_id, witness.result_revision_id);
+        assert_ne!(reopened_document.revision_id, witness.source_revision_id);
+        assert_eq!(reopened_document.blob_id, spec.expected.result_sha256);
+        assert_eq!(reopened_document.text, spec.expected.result_text);
+        assert_eq!(reopened.pending_outbox_count().expect("reopened outbox"), 0);
+        assert_eq!(
+            reopened
+                .load_receipt(witness.command_id)
+                .expect("reopened receipt"),
+            Some(witness.receipt)
+        );
+        let branch = reopened
+            .branch_record(witness.document_id, witness.run_id, MAX_BRANCH_BODY_BYTES)
+            .expect("reopened branch record")
+            .expect("durable branch");
+        assert_eq!(branch.source_revision_id, witness.source_revision_id);
+        assert_eq!(branch.target_range.start, spec.source.caret_byte);
+        assert_eq!(branch.target_range.end, spec.source.caret_byte);
+        let primary = &spec.candidate_family[spec.expected.primary_candidate_index];
+        assert_eq!(branch.output_blob_id, Some(primary.sha256));
+        assert_eq!(branch.selection, Some(SelectionDecision::Promote));
+        let provenance = reopened
+            .revision_provenance(witness.result_revision_id)
+            .expect("reopened promotion provenance");
+        let generated_bytes: u64 = provenance
+            .segments
+            .iter()
+            .filter(|segment| {
+                segment.artifact_id == witness.generated_span_artifact_id
+                    && segment.contribution == ContributionKind::Generated
+            })
+            .map(|segment| segment.byte_range.len())
+            .sum();
+        assert_eq!(generated_bytes, primary.text.len() as u64);
+        assert_eq!(
+            reopened
+                .reconstruct_revision(witness.result_revision_id)
+                .expect("reconstruct promoted revision"),
+            spec.expected.result_text.as_bytes()
+        );
+        assert_eq!(witness.family.len(), spec.candidate_family.len());
+        for (family_witness, candidate_spec) in witness.family.iter().zip(&spec.candidate_family) {
+            let branch = reopened
+                .branch_record(
+                    witness.document_id,
+                    family_witness.run_id,
+                    MAX_BRANCH_BODY_BYTES,
+                )
+                .expect("reopen deterministic candidate family")
+                .expect("durable family branch");
+            assert_eq!(branch.output_blob_id, Some(family_witness.output_blob_id));
+            assert_eq!(
+                branch.output_text.as_deref(),
+                Some(candidate_spec.text.as_str())
+            );
+            assert_eq!(
+                branch.selection,
+                family_witness
+                    .selected
+                    .then_some(SelectionDecision::Promote)
+            );
+            let terminal = reopened
+                .generation_terminal_evidence(family_witness.run_id)
+                .expect("reopen family terminal evidence")
+                .expect("durable family terminal evidence");
+            assert_eq!(
+                terminal
+                    .token_trace
+                    .provenance
+                    .expect("model-free fixture provenance")
+                    .evidence_kind,
+                InferenceEvidenceKind::Fixture
+            );
         }
     }
 
@@ -4411,6 +4573,146 @@ mod tests {
             )
             .expect("count promotion selection");
         assert_eq!(revisions, 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn w1_exact_boundary_suggestion_promotion_survives_store_reopen() {
+        let spec: W1SuggestionFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/w1/loom-suggestion-promotion-v1.json"
+        ))
+        .expect("parse W1 suggestion fixture");
+        assert_eq!(spec.schema_version, 1);
+        assert_eq!(spec.fixture_id, "loom-suggestion-promotion-v1");
+        assert_eq!(spec.expected.visible_ghost_count, 1);
+        assert_eq!(spec.expected.primary_candidate_index, 0);
+        assert_eq!(
+            spec.expected.hidden_candidate_count + 1,
+            spec.candidate_family.len()
+        );
+        assert_eq!(
+            spec.expected.explicit_review_candidate_count,
+            spec.candidate_family.len()
+        );
+        assert_eq!(spec.expected.ordinary_tab, "\t");
+        assert_eq!(spec.expected.forbidden_primary_chrome.len(), 3);
+        assert!(spec.candidate_family.len() > 1);
+        for candidate in &spec.candidate_family {
+            assert_eq!(BlobId::digest(candidate.text.as_bytes()), candidate.sha256);
+        }
+        assert_eq!(
+            BlobId::digest(spec.expected.result_text.as_bytes()),
+            spec.expected.result_sha256
+        );
+
+        let mut fixture =
+            Fixture::with_source(&spec.source.relative_path, &spec.source.revision_text);
+        assert_eq!(
+            u64::try_from(spec.source.revision_text.len()).expect("bounded source"),
+            spec.source.caret_byte,
+            "the frozen caret must be the exact UTF-8 insertion boundary"
+        );
+        let mut family = Vec::with_capacity(spec.candidate_family.len());
+        for candidate in &spec.candidate_family {
+            let start = fixture
+                .store
+                .start_generation(fixture.generation_start(
+                    fixture.writer_environment,
+                    ByteRange {
+                        start: spec.source.caret_byte,
+                        end: spec.source.caret_byte,
+                    },
+                    candidate.seed,
+                ))
+                .expect("start deterministic W1 suggestion family member");
+            let terminal = fixture.finish_with_evidence_kind(
+                start.generation.run_id,
+                &candidate.text,
+                InferenceEvidenceKind::Fixture,
+            );
+            assert_eq!(terminal.candidate.output_blob_id, candidate.sha256);
+            family.push((start, terminal));
+        }
+        let (start, terminal) = &family[spec.expected.primary_candidate_index];
+
+        let command_id = CommandId::new();
+        let promoted = fixture
+            .store
+            .accept_diagnostic_candidate_with_command(
+                command_id,
+                PromoteCandidateCommand {
+                    candidate_id: terminal.candidate.candidate_id,
+                    expected_source_revision_id: fixture.loaded.revision_id,
+                    expected_visible_blob_id: fixture.loaded.blob_id,
+                },
+            )
+            .expect("promote exact rendered suggestion");
+        assert_eq!(promoted.visible_projection, VisibleProjectionState::Applied);
+        assert_eq!(promoted.save.blob_id, spec.expected.result_sha256);
+        assert_eq!(
+            fixture
+                .store
+                .read_document(&spec.source.relative_path)
+                .expect("read promoted manuscript")
+                .text,
+            spec.expected.result_text
+        );
+        assert_eq!(
+            fixture.store.pending_outbox_count().expect("outbox count"),
+            0
+        );
+        assert_eq!(
+            fixture
+                .store
+                .load_receipt(command_id)
+                .expect("promotion receipt"),
+            Some(promoted.save.receipt.clone())
+        );
+
+        let provenance = fixture
+            .store
+            .revision_provenance(promoted.save.revision_id)
+            .expect("promotion provenance");
+        let generated_bytes: u64 = provenance
+            .segments
+            .iter()
+            .filter(|segment| {
+                segment.artifact_id == terminal.candidate.generated_span_artifact_id
+                    && segment.contribution == ContributionKind::Generated
+            })
+            .map(|segment| segment.byte_range.len())
+            .sum();
+        assert_eq!(
+            generated_bytes,
+            spec.candidate_family[spec.expected.primary_candidate_index]
+                .text
+                .len() as u64
+        );
+
+        let family_witness = family
+            .iter()
+            .enumerate()
+            .map(|(index, (started, finished))| W1FamilyReopenWitness {
+                run_id: started.generation.run_id,
+                output_blob_id: finished.candidate.output_blob_id,
+                selected: index == spec.expected.primary_candidate_index,
+            })
+            .collect();
+
+        assert_w1_promotion_survives_reopen(
+            fixture,
+            &spec,
+            W1PromotionReopenWitness {
+                command_id,
+                source_revision_id: start.generation.source_revision_id,
+                result_revision_id: promoted.save.revision_id,
+                run_id: start.generation.run_id,
+                document_id: start.generation.document_id,
+                generated_span_artifact_id: terminal.candidate.generated_span_artifact_id,
+                receipt: promoted.save.receipt,
+                family: family_witness,
+            },
+        );
     }
 
     #[test]
