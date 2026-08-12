@@ -179,7 +179,7 @@ The original desktop slice is recorded in [audit-receipts/2026-08-11-real-gemma-
 
 **Implemented and automated:**
 
-- Allowlisted commands for direct app-owned default-project open plus secondary project choose/create/open/current/recover/close; document open/checkpoint and transient draft/reconciliation lifecycle; model list/choose/load/unload; verified model-download start/cancel/status/list; bounded branch page/get/body; Weave start/status; project Suggestions opt-in; per-generation cancellation; keep/promotion; focus mode; and application close.
+- Allowlisted commands for direct app-owned default-project open plus secondary project choose/create/open/current/recover/close; document open/checkpoint and transient draft/reconciliation lifecycle; model list/choose/load/unload; verified model-download start/cancel/status/list; bounded branch page/get/body; Weave start/status; project Suggestions opt-in; per-generation cancellation; keep/promotion; native reviewed-research packet import plus pending/confirm; focus mode; and application close.
 - A single explicit session state machine with project/session/document identity checks.
 - Source revision/blob and command-ID binding on checkpoints.
 - Draft-version binding and stale-draft handling.
@@ -190,7 +190,7 @@ The original desktop slice is recorded in [audit-receipts/2026-08-11-real-gemma-
 - Exact command replay/fingerprint validation for Weave and model downloads, bounded in-memory active-command registries, status recovery when event delivery is missed, and branch snapshots rebuilt from the durable store.
 - Source-revision/blob/cursor-bound raw Weave creation for one to four branches, independently derived seeds, private streaming events, per-run cancellation, immutable result/receipt validation, and fail-closed generation provenance checks before persistence.
 - Candidate keep and two-step UI promotion commands. Promotion is source-bound, conflict-preserving, and the only command in this group that may change the active manuscript.
-- Permission sets separate ordinary editing/status, local generation, verified network download, and manuscript promotion authority even though the desktop capability currently grants all four sets.
+- Permission sets separate ordinary editing/status, local generation, verified network download, and manuscript promotion authority even though the desktop capability currently grants all four sets. Research packet import stays inside the manuscript-promotion set and is available only to the main window.
 - Typed error codes crossing IPC.
 
 **Deferred:** document create/import UI commands, continuous file watching and rename/delete policy, source/retrieval/settings/search/evaluation commands, persisted model-download history across app restarts, and the background-automation command surface. No attachment, speech, FTE, or hosted-provider commands exist.

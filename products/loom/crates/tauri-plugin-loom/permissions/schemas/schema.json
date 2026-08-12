@@ -301,10 +301,10 @@
           "markdownDescription": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`"
         },
         {
-          "description": "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command.\n#### This permission set includes:\n\n- `allow-candidate-promote`",
+          "description": "Promote an explicitly selected private candidate or host-staged research result into the active manuscript through Loom's source-bound store commands.\n#### This permission set includes:\n\n- `allow-candidate-promote`\n- `allow-research-promotion-import`\n- `allow-research-promotion-pending`\n- `allow-research-promotion-confirm`",
           "type": "string",
           "const": "manuscript-promotion",
-          "markdownDescription": "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command.\n#### This permission set includes:\n\n- `allow-candidate-promote`"
+          "markdownDescription": "Promote an explicitly selected private candidate or host-staged research result into the active manuscript through Loom's source-bound store commands.\n#### This permission set includes:\n\n- `allow-candidate-promote`\n- `allow-research-promotion-import`\n- `allow-research-promotion-pending`\n- `allow-research-promotion-confirm`"
         },
         {
           "description": "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`",
@@ -695,6 +695,42 @@
           "type": "string",
           "const": "deny-project-recover",
           "markdownDescription": "Denies the project_recover command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the research_promotion_confirm command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-research-promotion-confirm",
+          "markdownDescription": "Enables the research_promotion_confirm command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the research_promotion_confirm command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-research-promotion-confirm",
+          "markdownDescription": "Denies the research_promotion_confirm command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the research_promotion_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-research-promotion-import",
+          "markdownDescription": "Enables the research_promotion_import command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the research_promotion_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-research-promotion-import",
+          "markdownDescription": "Denies the research_promotion_import command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the research_promotion_pending command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-research-promotion-pending",
+          "markdownDescription": "Enables the research_promotion_pending command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the research_promotion_pending command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-research-promotion-pending",
+          "markdownDescription": "Denies the research_promotion_pending command without any pre-configured scope."
         },
         {
           "description": "Enables the suggestions_set command without any pre-configured scope.",

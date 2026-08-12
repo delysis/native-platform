@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
+use loom_document::DocumentContent;
+use loom_host::VerifiedForegroundCommand;
 use loom_inference::{
     BaseWriterBinding, CancelledBaseWriterDiagnosticParts, ExactPromptEvidence,
     MAX_BASE_PROMPT_BYTES, PersistedBindingEvidenceRef, PersistedCaseOutcomeRef,
@@ -17,16 +19,25 @@ use loom_research_types::{
     MAX_BACKEND_EVIDENCE_BYTES, MAX_BASE_WRITER_BATCH_CASES, MAX_FROZEN_PROMPT_SPECIFICATION_BYTES,
     MAX_GENERATED_TOKENS, MAX_RAW_OUTPUT_BYTES, MixedAuthorshipAssemblyRecord, ModelCall,
     ModelRole, NonEmptyByteRange, OperationGraph, OutputProjection, PipelineEligibility,
-    PipelineOperationKind, PromotionAuthority, PromotionCommandRequest, PromotionSubject,
-    TokenEvidence, UserPresenceKind, compile_manifest,
+    PipelineOperationKind, PromotionCommandRequest, PromotionSubject, TokenEvidence,
+    compile_manifest,
 };
-use loom_types::{BlobId, CommandId, ProjectId, now_unix_ms};
+#[cfg(test)]
+use loom_research_types::{PromotionAuthority, UserPresenceKind};
+use loom_types::{
+    ArtifactId, ArtifactKind, BlobId, CommandId, CommandKind, CommandReceipt, ContributionKind,
+    DocumentId, DocumentKind, OperationId, ProjectId, RevisionId, now_unix_ms,
+};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 #[cfg(test)]
 use serde::Deserialize;
 
 use crate::provenance::insert_blob_row;
+use crate::provenance::{
+    StoredSegment, document_media_type, insert_revision_segments, validate_active_in_transaction,
+};
 use crate::store::StoreSessionNonce;
+use crate::store::{SaveOutcome, VisibleProjectionState, persist_receipt_in};
 use crate::{ProjectStore, Result, StoreError};
 
 #[cfg(test)]
@@ -438,7 +449,8 @@ impl fmt::Debug for MixedAuthorshipAdmission {
 /// There is intentionally no constructor in `loom-store`. A later host bridge
 /// will move this lease behind a native event seal; deserialized
 /// `UserPresenceEvidence` cannot manufacture it.
-pub struct VerifiedUserPresence {
+#[cfg(test)]
+struct VerifiedUserPresence {
     session_nonce: StoreSessionNonce,
     command_id: CommandId,
     command_request_fingerprint: BlobId,
@@ -451,6 +463,7 @@ pub struct VerifiedUserPresence {
     actor: loom_research_types::PromotionActor,
 }
 
+#[cfg(test)]
 impl fmt::Debug for VerifiedUserPresence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -474,6 +487,12 @@ pub struct RecordedPromotionRequest {
     command_id: CommandId,
     request_fingerprint: BlobId,
     recorded_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForegroundPromotionBindingParts {
+    pub document_id: DocumentId,
+    pub candidate_fingerprint: BlobId,
 }
 
 impl fmt::Debug for RecordedPromotionRequest {
@@ -512,7 +531,9 @@ impl fmt::Debug for PromotionSubjectLease<'_> {
 
 /// Opaque pre-mutation authority. It is intentionally neither `Clone` nor
 /// serializable and has no constructor or SQL reload path.
-pub struct RecordedPromotionAuthority {
+#[cfg(test)]
+#[allow(dead_code)]
+struct RecordedPromotionAuthority {
     session_nonce: StoreSessionNonce,
     command_id: CommandId,
     record_blob_id: BlobId,
@@ -522,6 +543,84 @@ pub struct RecordedPromotionAuthority {
     intended_result_byte_len: u64,
 }
 
+/// Durable result of consuming one move-only foreground command. The exact
+/// nonce is intentionally absent and there is no SQL reload path back to
+/// `VerifiedForegroundCommand`.
+pub struct RecordedForegroundPromotionReceipt {
+    session_nonce: StoreSessionNonce,
+    command_id: CommandId,
+    receipt_blob_id: BlobId,
+    document_id: DocumentId,
+    candidate_fingerprint: BlobId,
+}
+
+/// Complete result of one foreground-authorized research promotion.
+///
+/// The `SQLite` revision, command receipt, foreground audit receipt, and pending
+/// visible-file outbox row are committed together. Projection to the ordinary
+/// manuscript file is reported separately, as for every other store write.
+#[derive(Debug)]
+pub struct ForegroundPromotionOutcome {
+    pub save: SaveOutcome,
+    pub visible_projection: VisibleProjectionState,
+    pub foreground_receipt: RecordedForegroundPromotionReceipt,
+}
+
+impl fmt::Debug for RecordedForegroundPromotionReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecordedForegroundPromotionReceipt")
+            .field("command_id", &self.command_id)
+            .field("receipt_blob_id", &self.receipt_blob_id)
+            .field("document_id", &self.document_id)
+            .field("candidate_fingerprint", &self.candidate_fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecordedForegroundPromotionReceipt {
+    pub fn belongs_to(&self, store: &ProjectStore) -> bool {
+        self.session_nonce == store.session_nonce
+    }
+
+    pub const fn command_id(&self) -> CommandId {
+        self.command_id
+    }
+
+    pub const fn receipt_blob_id(&self) -> BlobId {
+        self.receipt_blob_id
+    }
+
+    pub const fn document_id(&self) -> DocumentId {
+        self.document_id
+    }
+
+    pub const fn candidate_fingerprint(&self) -> BlobId {
+        self.candidate_fingerprint
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ForegroundPromotionAuditReceipt<'a> {
+    schema: &'static str,
+    claim: &'static str,
+    command_id: CommandId,
+    command_request_fingerprint: BlobId,
+    process_session_fingerprint: BlobId,
+    application_session_id: CommandId,
+    window_id: &'a str,
+    document_id: DocumentId,
+    promotion_subject_kind: &'static str,
+    promotion_subject_id: String,
+    candidate_fingerprint: BlobId,
+    focus_epoch: u64,
+    monotonic_event_index: u64,
+    issued_at_ms: i64,
+    expires_at_ms: i64,
+    occurred_at_ms: i64,
+}
+
+#[cfg(test)]
 impl fmt::Debug for RecordedPromotionAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -536,35 +635,14 @@ impl fmt::Debug for RecordedPromotionAuthority {
     }
 }
 
+#[cfg(test)]
 impl RecordedPromotionAuthority {
-    /// Returns true only for the exact still-open store session that minted
-    /// this capability. This does not recreate or consume authority.
-    pub fn belongs_to(&self, store: &ProjectStore) -> bool {
-        self.session_nonce == store.session_nonce
-    }
-
     pub const fn command_id(&self) -> CommandId {
         self.command_id
     }
 
-    pub const fn record_blob_id(&self) -> BlobId {
-        self.record_blob_id
-    }
-
-    pub const fn source_revision_id(&self) -> loom_types::RevisionId {
-        self.source_revision_id
-    }
-
-    pub const fn source_blob_id(&self) -> BlobId {
-        self.source_blob_id
-    }
-
     pub const fn intended_result_blob_id(&self) -> BlobId {
         self.intended_result_blob_id
-    }
-
-    pub const fn intended_result_byte_len(&self) -> u64 {
-        self.intended_result_byte_len
     }
 }
 
@@ -5245,6 +5323,324 @@ impl ProjectStore {
         })
     }
 
+    /// Returns non-authorizing identities needed to bind a host challenge.
+    /// The live subject lease and recorded request are still required for the
+    /// eventual store transaction.
+    pub fn foreground_promotion_binding_parts(
+        &self,
+        request: &PromotionCommandRequest,
+    ) -> Result<ForegroundPromotionBindingParts> {
+        if request.project_id() != self.manifest.project_id
+            || !revision_blob_is_current(
+                self,
+                &request.source_revision_id().to_string(),
+                request.source_blob_id(),
+            )?
+        {
+            return Err(admission_error(
+                "foreground promotion request is not current in this project",
+            ));
+        }
+        Ok(ForegroundPromotionBindingParts {
+            document_id: self.source_document_id(request.source_revision_id())?,
+            candidate_fingerprint: promotion_candidate_fingerprint(request),
+        })
+    }
+
+    /// Atomically consumes one host-minted foreground command into a durable,
+    /// nonce-free audit receipt for the exact pending research promotion.
+    ///
+    /// This records the narrow claim the host can prove. It does not claim
+    /// physical user presence and persisted rows cannot mint another command.
+    // Keep the complete validation and mutation sequence together so review can
+    // verify the single transaction boundary without chasing split SQL helpers.
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+    pub fn record_foreground_promotion_command(
+        &mut self,
+        recorded_request: RecordedPromotionRequest,
+        subject_lease: PromotionSubjectLease<'_>,
+        request: &PromotionCommandRequest,
+        command: VerifiedForegroundCommand,
+    ) -> Result<ForegroundPromotionOutcome> {
+        let candidate_fingerprint = promotion_candidate_fingerprint(request);
+        let document_id = self.source_document_id(request.source_revision_id())?;
+        if !foreground_command_matches_pending(
+            self.session_nonce,
+            &recorded_request,
+            subject_lease,
+            request,
+            &command,
+            document_id,
+            candidate_fingerprint,
+        ) {
+            return Err(admission_error(
+                "foreground command is not bound to the pending promotion",
+            ));
+        }
+        if !revision_blob_is_current(
+            self,
+            &request.source_revision_id().to_string(),
+            request.source_blob_id(),
+        )? {
+            return Err(admission_error(
+                "foreground promotion source revision is no longer current",
+            ));
+        }
+
+        let (relative_path, document_kind): (String, String) = self.connection.query_row(
+            "SELECT relative_path, document_kind FROM documents WHERE document_id = ?1",
+            [document_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let document_kind = DocumentKind::from_str(&document_kind)
+            .map_err(|error| StoreError::CorruptDatabase(error.to_string()))?;
+        let active = self
+            .active_revision(document_id)?
+            .ok_or_else(|| StoreError::NoActiveRevision(relative_path.clone()))?;
+        if active.revision_id != request.source_revision_id()
+            || active.blob_id != request.source_blob_id()
+        {
+            return Err(admission_error(
+                "foreground promotion source revision is no longer active",
+            ));
+        }
+        let visible = self.read_document(&relative_path)?;
+        if visible.revision_id != request.source_revision_id()
+            || visible.blob_id != request.source_blob_id()
+        {
+            return Err(admission_error(
+                "foreground promotion visible manuscript changed before commit",
+            ));
+        }
+        let result_bytes = self.read_blob(request.intended_result_blob_id())?;
+        if u64::try_from(result_bytes.len()).unwrap_or(u64::MAX)
+            != request.intended_result_byte_len()
+            || BlobId::digest(&result_bytes) != request.intended_result_blob_id()
+        {
+            return Err(admission_error(
+                "foreground promotion result differs from its admitted bytes",
+            ));
+        }
+        let content = DocumentContent::from_visible(document_kind, result_bytes.clone())?;
+        if content.project_visible()?.bytes != result_bytes {
+            return Err(admission_error(
+                "foreground promotion result is not canonical for the document kind",
+            ));
+        }
+
+        let binding = command.binding();
+        let receipt = ForegroundPromotionAuditReceipt {
+            schema: "loom.verified-foreground-command-receipt.v1",
+            claim: "trusted_application_host_accepted_one_focused_command",
+            command_id: request.command_id(),
+            command_request_fingerprint: request.command_request_fingerprint(),
+            process_session_fingerprint: command.process_session_fingerprint(),
+            application_session_id: binding.application_session_id,
+            window_id: binding.window_id.as_str(),
+            document_id,
+            promotion_subject_kind: request.subject().kind_name(),
+            promotion_subject_id: request.subject().id_string(),
+            candidate_fingerprint,
+            focus_epoch: command.focus_epoch(),
+            monotonic_event_index: command.monotonic_event_index(),
+            issued_at_ms: command.issued_at_unix_ms(),
+            expires_at_ms: command.expires_at_unix_ms(),
+            occurred_at_ms: command.occurred_at_unix_ms(),
+        };
+        let receipt_bytes = serde_json::to_vec(&receipt)?;
+        let receipt_blob_id = self.put_blob(&receipt_bytes)?;
+        let recorded_at_ms = now_unix_ms().max(command.occurred_at_unix_ms());
+        let revision_artifact_id = ArtifactId::new();
+        let operation_id = OperationId::new();
+        let revision_id = RevisionId::new();
+        let command_receipt = CommandReceipt {
+            command_id: request.command_id(),
+            command: CommandKind::PromoteCandidate,
+            project_id: self.manifest.project_id,
+            project_schema_version: self.manifest.schema_version,
+            source_revision_id: Some(request.source_revision_id()),
+            resulting_artifact_ids: vec![revision_artifact_id],
+            resulting_operation_ids: vec![operation_id],
+            resulting_revision_ids: vec![revision_id],
+            started_at_ms: request.command_requested_at_ms(),
+            completed_at_ms: recorded_at_ms,
+        };
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !durable_foreground_promotion_request_matches(&transaction, &recorded_request, request)?
+            || !persisted_foreground_promotion_subject_matches(&transaction, request)?
+        {
+            return Err(admission_error(
+                "foreground command does not match durable promotion state",
+            ));
+        }
+        validate_active_in_transaction(&transaction, document_id, active)?;
+        insert_blob_row(
+            &transaction,
+            receipt_blob_id,
+            receipt_bytes.len(),
+            recorded_at_ms,
+        )?;
+        insert_blob_row(
+            &transaction,
+            request.intended_result_blob_id(),
+            result_bytes.len(),
+            recorded_at_ms,
+        )?;
+        transaction.execute(
+            "INSERT INTO artifacts(
+                artifact_id, blob_id, artifact_kind, media_type, metadata_json, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                revision_artifact_id.to_string(),
+                request.intended_result_blob_id().to_string(),
+                ArtifactKind::DocumentRevision.as_str(),
+                document_media_type(document_kind),
+                serde_json::to_string(&serde_json::json!({
+                    "workflow": "research_foreground_promotion",
+                    "source_revision_id": request.source_revision_id(),
+                    "promotion_subject_kind": request.subject().kind_name(),
+                    "promotion_subject_id": request.subject().id_string(),
+                    "foreground_receipt_blob_id": receipt_blob_id,
+                }))?,
+                recorded_at_ms,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO operations(operation_id, operation_kind, metadata_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                operation_id.to_string(),
+                loom_types::OperationKind::Select.as_str(),
+                serde_json::to_string(&serde_json::json!({
+                    "decision": "research_promote",
+                    "promotion_subject_kind": request.subject().kind_name(),
+                    "promotion_subject_id": request.subject().id_string(),
+                }))?,
+                recorded_at_ms,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO operation_inputs(operation_id, position, artifact_id)
+             VALUES (?1, 0, ?2)",
+            params![operation_id.to_string(), active.artifact_id.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO operation_outputs(operation_id, position, artifact_id)
+             VALUES (?1, 0, ?2)",
+            params![operation_id.to_string(), revision_artifact_id.to_string(),],
+        )?;
+        transaction.execute(
+            "INSERT INTO revisions(
+                revision_id, document_id, parent_revision_id, artifact_id, reason, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, 'foreground-authorized research promotion', ?5)",
+            params![
+                revision_id.to_string(),
+                document_id.to_string(),
+                request.source_revision_id().to_string(),
+                revision_artifact_id.to_string(),
+                recorded_at_ms,
+            ],
+        )?;
+        insert_revision_segments(
+            &transaction,
+            revision_id,
+            &[StoredSegment {
+                artifact_id: revision_artifact_id,
+                start: 0,
+                end: request.intended_result_byte_len(),
+                contribution: match request.subject() {
+                    PromotionSubject::CandidateProjection { .. } => ContributionKind::Generated,
+                    PromotionSubject::MixedAuthorship { .. } => ContributionKind::Mixed,
+                },
+            }],
+        )?;
+        transaction.execute(
+            "INSERT INTO visible_file_outbox(
+                revision_id, relative_path, target_blob_id, expected_visible_blob_id,
+                state, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+            params![
+                revision_id.to_string(),
+                &relative_path,
+                request.intended_result_blob_id().to_string(),
+                request.source_blob_id().to_string(),
+                recorded_at_ms,
+            ],
+        )?;
+        let outbox_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO research_foreground_command_receipts(
+                command_id, command_request_fingerprint,
+                process_session_fingerprint, application_session_id,
+                window_id, document_id, promotion_subject_id, candidate_fingerprint,
+                focus_epoch, monotonic_event_index,
+                issued_at_ms, expires_at_ms, occurred_at_ms,
+                receipt_blob_id, recorded_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                request.command_id().to_string(),
+                request.command_request_fingerprint().to_string(),
+                command.process_session_fingerprint().to_string(),
+                binding.application_session_id.to_string(),
+                binding.window_id.as_str(),
+                document_id.to_string(),
+                request.subject().id_string(),
+                candidate_fingerprint.to_string(),
+                checked_sql_u64(command.focus_epoch(), "foreground focus epoch")?,
+                checked_sql_u64(command.monotonic_event_index(), "foreground event index",)?,
+                command.issued_at_unix_ms(),
+                command.expires_at_unix_ms(),
+                command.occurred_at_unix_ms(),
+                receipt_blob_id.to_string(),
+                recorded_at_ms,
+            ],
+        )?;
+        persist_receipt_in(&transaction, &command_receipt)?;
+        transaction.execute(
+            "INSERT INTO command_requests(
+                command_id, request_fingerprint, command_kind, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                request.command_id().to_string(),
+                request.command_request_fingerprint().to_string(),
+                CommandKind::PromoteCandidate.as_str(),
+                request.command_requested_at_ms(),
+            ],
+        )?;
+        transaction.commit()?;
+        let visible_projection = self.settle_outbox_entry(outbox_id, &relative_path);
+        Ok(ForegroundPromotionOutcome {
+            save: SaveOutcome {
+                blob_id: request.intended_result_blob_id(),
+                artifact_id: revision_artifact_id,
+                operation_id,
+                revision_id,
+                receipt: command_receipt,
+            },
+            visible_projection,
+            foreground_receipt: RecordedForegroundPromotionReceipt {
+                session_nonce: self.session_nonce,
+                command_id: request.command_id(),
+                receipt_blob_id,
+                document_id,
+                candidate_fingerprint,
+            },
+        })
+    }
+
+    fn source_document_id(&self, source_revision_id: loom_types::RevisionId) -> Result<DocumentId> {
+        let value: String = self.connection.query_row(
+            "SELECT document_id FROM revisions WHERE revision_id = ?1",
+            [source_revision_id.to_string()],
+            |row| row.get(0),
+        )?;
+        value.parse().map_err(|_| {
+            StoreError::CorruptDatabase("source revision has an invalid document ID".into())
+        })
+    }
+
     /// Durably records promotion intent before any manuscript mutation.
     ///
     /// A completed command receipt must not exist yet. The non-serializable
@@ -5255,7 +5651,8 @@ impl ProjectStore {
     // Passing these opaque tokens by value is intentional: one host presence
     // gesture and one recorded request may authorize at most one attempt.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn record_promotion_authority(
+    #[cfg(test)]
+    fn record_promotion_authority(
         &mut self,
         recorded_request: RecordedPromotionRequest,
         subject_lease: PromotionSubjectLease<'_>,
@@ -5297,6 +5694,7 @@ impl ProjectStore {
         self.persist_promotion_authority(&recorded_request, &lease, authority)
     }
 
+    #[cfg(test)]
     fn persist_promotion_authority(
         &mut self,
         recorded_request: &RecordedPromotionRequest,
@@ -5804,6 +6202,7 @@ const fn join_before_name(join: JoinBefore) -> &'static str {
     }
 }
 
+#[cfg(test)]
 const fn user_presence_kind_name(kind: UserPresenceKind) -> &'static str {
     match kind {
         UserPresenceKind::EditorGesture => "editor_gesture",
@@ -5813,6 +6212,7 @@ const fn user_presence_kind_name(kind: UserPresenceKind) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn insert_promotion_presence(
     transaction: &Transaction<'_>,
     lease: &VerifiedUserPresence,
@@ -5849,6 +6249,7 @@ fn insert_promotion_presence(
     Ok(())
 }
 
+#[cfg(test)]
 fn insert_promotion_authority_record(
     transaction: &Transaction<'_>,
     lease: &VerifiedUserPresence,
@@ -5904,6 +6305,150 @@ fn insert_promotion_authority_record(
     Ok(())
 }
 
+fn promotion_candidate_fingerprint(request: &PromotionCommandRequest) -> BlobId {
+    let mut bytes = Vec::with_capacity(256);
+    bytes.extend_from_slice(b"loom/research-promotion-candidate/v1\0");
+    bytes.extend_from_slice(request.subject().kind_name().as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(request.subject().id_string().as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(request.admission_record_id().as_bytes());
+    bytes.extend_from_slice(request.intended_result_blob_id().as_bytes());
+    BlobId::digest(&bytes)
+}
+
+fn foreground_command_matches_pending(
+    expected_session: StoreSessionNonce,
+    recorded: &RecordedPromotionRequest,
+    subject_lease: PromotionSubjectLease<'_>,
+    request: &PromotionCommandRequest,
+    command: &VerifiedForegroundCommand,
+    document_id: DocumentId,
+    candidate_fingerprint: BlobId,
+) -> bool {
+    let binding = command.binding();
+    recorded.session_nonce == expected_session
+        && recorded.command_id == request.command_id()
+        && recorded.request_fingerprint == request.command_request_fingerprint()
+        && promotion_subject_lease_matches(expected_session, subject_lease, request)
+        && binding.command_id == request.command_id()
+        && binding.promotion_fingerprint == request.command_request_fingerprint()
+        && binding.document_id == document_id
+        && binding.candidate_fingerprint == candidate_fingerprint
+        && recorded.recorded_at_ms <= command.issued_at_unix_ms()
+        && command.occurred_at_unix_ms() >= command.issued_at_unix_ms()
+        && command.occurred_at_unix_ms() <= command.expires_at_unix_ms()
+}
+
+fn durable_foreground_promotion_request_matches(
+    connection: &Connection,
+    recorded: &RecordedPromotionRequest,
+    request: &PromotionCommandRequest,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM research_promotion_command_requests
+                WHERE command_id = ?1
+                  AND command_request_fingerprint = ?2
+                  AND canonical_request_blob_id = ?2
+                  AND canonical_request_byte_len = ?3
+                  AND project_id = ?4
+                  AND source_revision_id = ?5
+                  AND source_blob_id = ?6
+                  AND subject_kind = ?7
+                  AND subject_id = ?8
+                  AND admission_record_id = ?9
+                  AND intended_result_blob_id = ?10
+                  AND intended_result_byte_len = ?11
+                  AND requested_at_ms = ?12
+                  AND recorded_at_ms = ?13
+             )",
+            params![
+                request.command_id().to_string(),
+                request.command_request_fingerprint().to_string(),
+                checked_sql_usize(
+                    request.canonical_request_bytes().len(),
+                    "canonical promotion request length",
+                )?,
+                request.project_id().to_string(),
+                request.source_revision_id().to_string(),
+                request.source_blob_id().to_string(),
+                request.subject().kind_name(),
+                request.subject().id_string(),
+                request.admission_record_id().to_string(),
+                request.intended_result_blob_id().to_string(),
+                checked_sql_u64(
+                    request.intended_result_byte_len(),
+                    "intended promotion result length",
+                )?,
+                request.command_requested_at_ms(),
+                recorded.recorded_at_ms,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
+fn persisted_foreground_promotion_subject_matches(
+    connection: &Connection,
+    request: &PromotionCommandRequest,
+) -> Result<bool> {
+    let subject_id = request.subject().id_string();
+    let query = match request.subject() {
+        PromotionSubject::CandidateProjection { .. } => {
+            "SELECT EXISTS(
+                SELECT 1
+                FROM research_admission_records admission
+                JOIN research_candidate_projections projection
+                  ON projection.projection_id = admission.subject_id
+                WHERE admission.admission_record_id = ?1
+                  AND admission.subject_kind = 'candidate_projection'
+                  AND admission.subject_id = ?2
+                  AND projection.source_revision_id = ?3
+                  AND projection.source_blob_id = ?4
+                  AND projection.resulting_blob_id = ?5
+                  AND projection.resulting_byte_len = ?6
+             )"
+        }
+        PromotionSubject::MixedAuthorship { .. } => {
+            "SELECT EXISTS(
+                SELECT 1
+                FROM research_admission_records admission
+                JOIN research_mixed_authorship_assemblies mixed
+                  ON mixed.mixed_assembly_id = admission.subject_id
+                JOIN revisions source_revision ON source_revision.revision_id = ?3
+                JOIN artifacts source_artifact
+                  ON source_artifact.artifact_id = source_revision.artifact_id
+                WHERE admission.admission_record_id = ?1
+                  AND admission.subject_kind = 'mixed_authorship'
+                  AND admission.subject_id = ?2
+                  AND source_artifact.blob_id = ?4
+                  AND mixed.output_blob_id = ?5
+                  AND mixed.output_byte_len = ?6
+             )"
+        }
+    };
+    connection
+        .query_row(
+            query,
+            params![
+                request.admission_record_id().to_string(),
+                subject_id,
+                request.source_revision_id().to_string(),
+                request.source_blob_id().to_string(),
+                request.intended_result_blob_id().to_string(),
+                checked_sql_u64(
+                    request.intended_result_byte_len(),
+                    "intended promotion result length",
+                )?,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
+#[cfg(test)]
 fn durable_promotion_request_matches(
     connection: &Connection,
     recorded: &RecordedPromotionRequest,
@@ -5954,6 +6499,7 @@ fn durable_promotion_request_matches(
         .map_err(StoreError::from)
 }
 
+#[cfg(test)]
 fn persisted_promotion_subject_matches(
     connection: &Connection,
     authority: &PromotionAuthority,
@@ -6112,7 +6658,6 @@ pub(crate) mod tests {
         PipelineOperationId, PromotionActor, StageAttemptId, StageId, TerminalMessage,
         TokenEvidence, TrialCaseId, UserPresenceEvidence,
     };
-    use loom_types::RevisionId;
     use tempfile::tempdir;
 
     struct MixedPromotionFixture {
@@ -8640,6 +9185,133 @@ adapters = []
                 .expect("receipt lookup")
                 .is_none(),
             "authority must not depend on a completed command receipt"
+        );
+    }
+
+    #[test]
+    // This intentionally exercises the complete capability lifecycle, including
+    // restart, in one regression so no persisted field is mistaken for authority.
+    #[allow(clippy::too_many_lines)]
+    fn database_cannot_reconstruct() {
+        let directory = tempdir().expect("temporary project");
+        let root = directory.path().join("Novel");
+        let (mut store, _) = ProjectStore::initialize(&root, "Novel").expect("initialize");
+        let fixture = mixed_promotion_fixture(&mut store);
+        let request = promotion_request(&store, &fixture, CommandId::new());
+        let recorded_request = store
+            .record_promotion_command_request(
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                &request,
+            )
+            .expect("record pending promotion");
+        let document_id = store
+            .source_document_id(request.source_revision_id())
+            .expect("source document");
+        let candidate_fingerprint = promotion_candidate_fingerprint(&request);
+        let window_id = loom_host::ForegroundWindowId::new("main").expect("window identity");
+        let registry = loom_host::ForegroundCommandRegistry::default();
+        registry
+            .observe_window_focus(window_id.clone(), true)
+            .expect("focused fixture window");
+        let binding = loom_host::ForegroundCommandBinding {
+            application_session_id: CommandId::new(),
+            window_id,
+            document_id,
+            candidate_fingerprint,
+            command_id: request.command_id(),
+            promotion_fingerprint: request.command_request_fingerprint(),
+        };
+        let challenge = registry
+            .issue(binding.clone(), std::time::Duration::from_secs(30))
+            .expect("issue foreground challenge");
+        let native_focus =
+            registry.bind_test_native_window_focus_sample(binding.window_id.clone(), true);
+        let command = registry
+            .consume_with_native_focus(
+                loom_host::ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding: binding.clone(),
+                },
+                native_focus,
+            )
+            .expect("consume native-edge command");
+        let outcome = store
+            .record_foreground_promotion_command(
+                recorded_request,
+                PromotionSubjectLease::MixedAuthorship(&fixture.admission),
+                &request,
+                command,
+            )
+            .expect("complete foreground-authorized promotion transaction");
+        assert!(outcome.foreground_receipt.belongs_to(&store));
+        assert_eq!(outcome.save.blob_id, request.intended_result_blob_id());
+        assert_eq!(outcome.save.receipt.command_id, request.command_id());
+        assert_eq!(
+            store
+                .read_document("manuscript/source.md")
+                .expect("read promoted manuscript")
+                .blob_id,
+            request.intended_result_blob_id()
+        );
+
+        let columns = store
+            .connection
+            .prepare("PRAGMA table_info(research_foreground_command_receipts)")
+            .expect("prepare column inventory")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query receipt columns")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("receipt columns");
+        assert!(columns.iter().all(|column| !column.contains("nonce")));
+        let receipt_bytes = store
+            .read_blob(outcome.foreground_receipt.receipt_blob_id())
+            .expect("read derived receipt");
+        let receipt_json: serde_json::Value =
+            serde_json::from_slice(&receipt_bytes).expect("receipt JSON");
+        assert_eq!(
+            receipt_json["claim"],
+            "trusted_application_host_accepted_one_focused_command"
+        );
+        assert!(receipt_json.get("nonce").is_none());
+        let counts: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM research_foreground_command_receipts),
+                    (SELECT COUNT(*) FROM research_user_presence_events),
+                    (SELECT COUNT(*) FROM research_promotion_authorities)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("promotion receipt counts");
+        assert_eq!(counts, (1, 0, 0));
+
+        drop(store);
+        let reopened = ProjectStore::open(&root).expect("reopen project");
+        let durable_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM research_foreground_command_receipts",
+                [],
+                |row| row.get(0),
+            )
+            .expect("durable receipt count");
+        assert_eq!(durable_count, 1);
+        let restarted_registry = loom_host::ForegroundCommandRegistry::default();
+        restarted_registry
+            .observe_window_focus(binding.window_id.clone(), true)
+            .expect("focus after restart");
+        let restarted_focus = restarted_registry
+            .bind_test_native_window_focus_sample(binding.window_id.clone(), true);
+        assert_eq!(
+            restarted_registry.consume_with_native_focus(
+                loom_host::ForegroundCommandAttempt {
+                    nonce: challenge.nonce,
+                    binding,
+                },
+                restarted_focus,
+            ),
+            Err(loom_host::ForegroundCommandError::StaleNonce)
         );
     }
 }

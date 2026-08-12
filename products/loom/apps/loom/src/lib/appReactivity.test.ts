@@ -49,4 +49,19 @@ describe('App ghost reactivity wiring', () => {
     expect(reviewAction).toBeGreaterThan(menuStart);
     expect(reviewAction).toBeLessThan(menuEnd);
   });
+
+  it('keeps research promotion behind explicit progressive disclosure', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const menuStart = source.indexOf('<div class="project-menu-popover"');
+    const menuEnd = source.indexOf('</details>', menuStart);
+    const importAction = source.indexOf('<span>Import reviewed research…</span>');
+    const researchAction = source.indexOf('<span>Review research selection</span>');
+    expect(importAction).toBeGreaterThan(menuStart);
+    expect(importAction).toBeLessThan(menuEnd);
+    expect(researchAction).toBeGreaterThan(menuStart);
+    expect(researchAction).toBeLessThan(menuEnd);
+    expect(source).toContain('Promote the reviewed research result?');
+    expect(source).toContain('confirmActiveResearchPromotion()');
+    expect(source).toContain('importReviewedResearchPromotion()');
+  });
 });

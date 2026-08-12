@@ -13,6 +13,7 @@ loom-document = { path = "../loom-document" }
 loom-benchmark = { path = "../loom-benchmark" }
 loom-eval = { path = "../loom-eval" }
 loom-inference = { path = "../loom-inference", features = ["native-evidence"] }
+loom-host = { path = "../loom-host" }
 loom-research-types = { path = "../loom-research-types" }
 loom-types = { path = "../loom-types" }
 rusqlite.workspace = true
@@ -29,6 +30,7 @@ libc = "0.2.189"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+loom-host = { path = "../loom-host", features = ["test-fixtures"] }
 loom-inference = { path = "../loom-inference", features = ["test-support"] }
 loom-search = { path = "../loom-search" }
 tempfile.workspace = true

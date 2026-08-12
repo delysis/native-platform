@@ -5,8 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+tauri-native-focus = ["dep:tauri"]
+test-fixtures = []
+
 [dependencies]
 loom-types = { path = "../loom-types" }
+tauri = { version = "2.11.5", default-features = false, optional = true }
 thiserror.workspace = true
 
 [lints]

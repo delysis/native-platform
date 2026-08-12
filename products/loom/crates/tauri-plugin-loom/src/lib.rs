@@ -25,14 +25,20 @@ use loom_backend_llama::{
 use loom_document::{DocumentContent, MergeError, MergeOutcome, three_way_merge};
 use loom_host::{
     AgencyGate, BranchCancellation, DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES,
-    GenerationFamilyIdentity, GenerationRegistry, GenerationRegistryError,
+    ForegroundCommandBinding, ForegroundCommandChallenge, ForegroundCommandRegistry,
+    ForegroundWindowId, GenerationFamilyIdentity, GenerationRegistry, GenerationRegistryError,
+    MAX_PENDING_FOREGROUND_COMMANDS, NativeWindowFocusSample,
+};
+use loom_research_types::{
+    MixedAuthorshipAssemblyRecord, PromotionCommandRequest, PromotionSubject,
 };
 use loom_store::{
-    BranchPageCursor, DocumentReconciliationSnapshot, ExternalReconciliationOutcome,
-    ExternalReconciliationRequest, IdempotentSaveOutcome, LoadedDocument, MAX_BRANCH_BODY_BYTES,
-    ProjectStore, StoredBranchBody, StoredBranchRecord, StoredBranchStatus, StoredBranchSummary,
-    TerminalCandidateInput, TerminalEvidenceInput, TerminalGenerationInput, TransientDraft,
-    VisibleProjectionState,
+    AdmittedCandidateProjection, BranchPageCursor, DocumentReconciliationSnapshot,
+    ExternalReconciliationOutcome, ExternalReconciliationRequest, IdempotentSaveOutcome,
+    LoadedDocument, MAX_BRANCH_BODY_BYTES, MixedAuthorshipAdmission, ProjectStore,
+    PromotionSubjectLease, RecordedPromotionRequest, StoredBranchBody, StoredBranchRecord,
+    StoredBranchStatus, StoredBranchSummary, TerminalCandidateInput, TerminalEvidenceInput,
+    TerminalGenerationInput, TransientDraft, VisibleProjectionState,
 };
 use loom_types::{
     AuthorityPolicy, BlobId, BranchId, BuildModelPolicy, BuildModelPolicyIdentity,
@@ -59,7 +65,42 @@ const PROJECT_CLOSE_GENERATION_WAIT: Duration = Duration::from_secs(3);
 const MAX_MODEL_DOWNLOAD_URL_BYTES: usize = 16 * 1024;
 const POLICY_MODEL_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_TRACKED_GENERATION_WORKERS: usize = DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES;
+const FOREGROUND_PROMOTION_TTL: Duration = Duration::from_secs(30);
+const MAX_RESEARCH_PROMOTION_PREVIEW_BYTES: usize = 64 * 1024;
+const MAX_RESEARCH_PROMOTION_PACKET_BYTES: usize = 256 * 1024;
+const RESEARCH_PROMOTION_PACKET_SCHEMA: &str = "loom.research-promotion-packet.v1";
 pub const APPLICATION_QUIT_MENU_ID: &str = "loom.application.quit";
+
+#[derive(Debug)]
+pub enum PendingPromotionSubject {
+    CandidateProjection(AdmittedCandidateProjection),
+    MixedAuthorship(MixedAuthorshipAdmission),
+}
+
+impl PendingPromotionSubject {
+    fn lease(&self) -> PromotionSubjectLease<'_> {
+        match self {
+            Self::CandidateProjection(value) => PromotionSubjectLease::CandidateProjection(value),
+            Self::MixedAuthorship(value) => PromotionSubjectLease::MixedAuthorship(value),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingResearchPromotion {
+    project_id: ProjectId,
+    session_id: CommandId,
+    request: PromotionCommandRequest,
+    recorded_request: RecordedPromotionRequest,
+    subject: PendingPromotionSubject,
+    challenge: ForegroundCommandChallenge,
+    result_text: String,
+}
+
+#[derive(Debug, Default)]
+struct PendingResearchPromotions {
+    by_command: BTreeMap<CommandId, PendingResearchPromotion>,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ApplicationPhase {
@@ -240,6 +281,8 @@ pub struct PluginState {
     model_lifecycle: Mutex<()>,
     user_model_paths: Mutex<BTreeSet<PathBuf>>,
     automatic_budget: AutomaticBudgetAuthority,
+    foreground_commands: ForegroundCommandRegistry,
+    research_promotions: Mutex<PendingResearchPromotions>,
     generations: GenerationRegistry,
     generation_workers: GenerationWorkerRegistry,
     model_loads: Arc<ModelLoadRegistry>,
@@ -275,6 +318,8 @@ impl PluginState {
             model_lifecycle: Mutex::new(()),
             user_model_paths: Mutex::new(BTreeSet::new()),
             automatic_budget: AutomaticBudgetAuthority::default(),
+            foreground_commands: ForegroundCommandRegistry::default(),
+            research_promotions: Mutex::new(PendingResearchPromotions::default()),
             generations: GenerationRegistry::default(),
             generation_workers: GenerationWorkerRegistry::default(),
             model_loads: Arc::new(ModelLoadRegistry::default()),
@@ -284,12 +329,112 @@ impl PluginState {
             build_model_policy,
         }
     }
+
+    fn stage_research_promotion(
+        &self,
+        project_id: ProjectId,
+        session_id: CommandId,
+        window_label: &str,
+        subject: PendingPromotionSubject,
+        request: PromotionCommandRequest,
+    ) -> Result<ResearchPromotionPrompt, IpcFailure> {
+        let mut session = lock_session(self)?;
+        let store = require_bound_store(
+            &mut session,
+            &project_id.to_string(),
+            &session_id.to_string(),
+        )?;
+        let mut pending = self.research_promotions.lock().map_err(|_| {
+            IpcFailure::new(
+                "research_promotion_state_unavailable",
+                "the pending research-promotion registry is unavailable",
+                false,
+            )
+        })?;
+        let now = now_unix_ms();
+        pending.by_command.retain(|_, value| {
+            value.challenge.expires_at_unix_ms >= now
+                && value.project_id == project_id
+                && value.session_id == session_id
+        });
+        if pending.by_command.len() >= MAX_PENDING_FOREGROUND_COMMANDS {
+            return Err(IpcFailure::new(
+                "research_promotion_capacity",
+                "too many research promotions are awaiting a foreground decision",
+                true,
+            ));
+        }
+        if pending.by_command.contains_key(&request.command_id()) {
+            return Err(IpcFailure::new(
+                "research_promotion_duplicate",
+                "this research promotion is already awaiting a decision",
+                false,
+            ));
+        }
+        let binding_parts = store
+            .foreground_promotion_binding_parts(&request)
+            .map_err(IpcFailure::store)?;
+        let result_bytes = store
+            .read_blob(request.intended_result_blob_id())
+            .map_err(IpcFailure::store)?;
+        if result_bytes.len() > MAX_RESEARCH_PROMOTION_PREVIEW_BYTES {
+            return Err(IpcFailure::new(
+                "research_promotion_preview_too_large",
+                "the research result exceeds the bounded foreground review surface",
+                false,
+            ));
+        }
+        let result_text = String::from_utf8(result_bytes).map_err(|_| {
+            IpcFailure::new(
+                "research_promotion_preview_not_utf8",
+                "the research result is not valid manuscript UTF-8",
+                false,
+            )
+        })?;
+        let recorded_request = store
+            .record_promotion_command_request(subject.lease(), &request)
+            .map_err(IpcFailure::store)?;
+        let binding = ForegroundCommandBinding {
+            application_session_id: session_id,
+            window_id: ForegroundWindowId::new(window_label).map_err(|error| {
+                IpcFailure::new("invalid_foreground_window", error.to_string(), false)
+            })?,
+            document_id: binding_parts.document_id,
+            candidate_fingerprint: binding_parts.candidate_fingerprint,
+            command_id: request.command_id(),
+            promotion_fingerprint: request.command_request_fingerprint(),
+        };
+        let challenge = self
+            .foreground_commands
+            .issue(binding, FOREGROUND_PROMOTION_TTL)
+            .map_err(|error| {
+                IpcFailure::new("foreground_command_rejected", error.to_string(), false)
+            })?;
+        let prompt = ResearchPromotionPrompt::from_parts(&request, &challenge, &result_text);
+        pending.by_command.insert(
+            request.command_id(),
+            PendingResearchPromotion {
+                project_id,
+                session_id,
+                request,
+                recorded_request,
+                subject,
+                challenge,
+                result_text,
+            },
+        );
+        Ok(prompt)
+    }
 }
 
 impl Drop for PluginState {
     fn drop(&mut self) {
         self.close_requested.store(true, Ordering::Release);
         self.exit_authorized.store(false, Ordering::Release);
+        let _ = self.foreground_commands.revoke_all();
+        if let Ok(pending) = self.research_promotions.get_mut() {
+            pending.by_command.clear();
+        }
         if let Ok(phase) = self.application.get_mut() {
             *phase = ApplicationPhase::Closing;
         }
@@ -1503,6 +1648,9 @@ impl Builder {
                 generation_cancel,
                 candidate_keep,
                 candidate_promote,
+                research_promotion_import,
+                research_promotion_pending,
+                research_promotion_confirm,
                 suggestions_set,
                 focus_mode_set,
                 application_close,
@@ -1522,14 +1670,33 @@ impl Builder {
                     return;
                 }
                 let app = window.app_handle().clone();
+                let event_app = app.clone();
+                let window_id = ForegroundWindowId::new(window.label())
+                    .expect("Tauri window labels are bounded application constants");
+                let event_window_id = window_id.clone();
                 window.on_window_event(move |event| {
+                    if let WindowEvent::Focused(focused) = event {
+                        let _ = event_app
+                            .state::<PluginState>()
+                            .foreground_commands
+                            .observe_window_focus(event_window_id.clone(), *focused);
+                    }
                     if let WindowEvent::CloseRequested { api, .. } = event
-                        && !prepare_application_exit_request(&app)
+                        && !prepare_application_exit_request(&event_app)
                     {
                         api.prevent_close();
-                        emit_application_close_request(&app);
+                        emit_application_close_request(&event_app);
                     }
                 });
+                // Install the event listener first, then sample native state.
+                // This closes the registration/sampling window: a transition
+                // is either observed by the callback or by this later sample.
+                if let Ok(focused) = window.is_focused() {
+                    let _ = app
+                        .state::<PluginState>()
+                        .foreground_commands
+                        .observe_window_focus(window_id, focused);
+                }
             })
             .on_event(|app, event| {
                 if let RunEvent::Exit = event {
@@ -1846,6 +2013,66 @@ pub struct Receipt {
     visible_projection: Option<VisibleProjectionState>,
     artifact_ids: Vec<String>,
     completed_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ResearchPromotionPrompt {
+    command_id: String,
+    nonce: String,
+    document_id: String,
+    candidate_fingerprint: String,
+    promotion_fingerprint: String,
+    subject_kind: &'static str,
+    expires_at_unix_ms: i64,
+    result_text: String,
+}
+
+/// A controller-produced, non-authorizing research packet selected through the
+/// native file picker. Deserialization validates the mixed-authorship graph;
+/// the host still has to admit the exact output into the live project store
+/// before it can issue a foreground challenge.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResearchPromotionPacket {
+    schema: String,
+    document_id: String,
+    record: MixedAuthorshipAssemblyRecord,
+    result_text: String,
+}
+
+impl ResearchPromotionPrompt {
+    fn from_parts(
+        request: &PromotionCommandRequest,
+        challenge: &ForegroundCommandChallenge,
+        result_text: &str,
+    ) -> Self {
+        Self {
+            command_id: request.command_id().to_string(),
+            nonce: challenge.nonce.to_string(),
+            document_id: challenge.binding.document_id.to_string(),
+            candidate_fingerprint: challenge.binding.candidate_fingerprint.to_string(),
+            promotion_fingerprint: request.command_request_fingerprint().to_string(),
+            subject_kind: request.subject().kind_name(),
+            expires_at_unix_ms: challenge.expires_at_unix_ms,
+            result_text: result_text.to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResearchPromotionConfirmInput {
+    command_id: String,
+    nonce: String,
+    document_id: String,
+    candidate_fingerprint: String,
+    promotion_fingerprint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResearchPromotionResult {
+    receipt: Receipt,
+    foreground_receipt_blob_id: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2375,6 +2602,9 @@ fn project_close(
     )
 }
 
+// Keep the close ordering visible in one routine: revoke authority, cancel,
+// drain, repair, close, and only then release the session.
+#[allow(clippy::too_many_lines)]
 fn close_project_with_wait(
     state: &PluginState,
     project_id: String,
@@ -2419,6 +2649,31 @@ fn close_project_with_wait(
         session.agency.set_focus_mode(true);
         (typed_project_id, typed_session_id)
     };
+
+    // Project close removes command authority before waiting for inference.
+    // A slow or failed drain must never leave a promotion nonce usable.
+    state
+        .foreground_commands
+        .revoke_application_session(typed_session_id)
+        .map_err(|error| {
+            IpcFailure::new(
+                "foreground_command_state_unavailable",
+                error.to_string(),
+                false,
+            )
+        })?;
+    state
+        .research_promotions
+        .lock()
+        .map_err(|_| {
+            IpcFailure::new(
+                "research_promotion_state_unavailable",
+                "the pending research-promotion registry is unavailable",
+                false,
+            )
+        })?
+        .by_command
+        .retain(|_, pending| pending.session_id != typed_session_id);
 
     cancel_and_drain_generation_session(
         state,
@@ -6359,6 +6614,467 @@ async fn candidate_promote(
     Ok(receipt)
 }
 
+/// Imports one controller-produced research packet through a native picker,
+/// admits its exact mixed-authorship record into the current store, and stages
+/// the resulting live lease for a separate foreground confirmation. The
+/// renderer can request the picker but cannot provide packet bytes, a path, a
+/// source revision, a command ID, or a live admission lease.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+async fn research_promotion_import<R: Runtime>(
+    project_id: String,
+    session_id: String,
+    window: tauri::Window<R>,
+    state: State<'_, PluginState>,
+) -> Result<Option<ResearchPromotionPrompt>, IpcFailure> {
+    let Some(path) = choose_research_promotion_packet(window.app_handle())? else {
+        return Ok(None);
+    };
+    let focused = window.is_focused().map_err(|error| {
+        IpcFailure::new(
+            "foreground_focus_unavailable",
+            format!("could not verify native window focus after packet selection: {error}"),
+            true,
+        )
+    })?;
+    if !focused {
+        return Err(IpcFailure::new(
+            "foreground_window_not_focused",
+            "return focus to the manuscript window before importing a research selection",
+            true,
+        ));
+    }
+    let packet = read_research_promotion_packet(&path)?;
+    stage_imported_research_promotion(&state, &project_id, &session_id, window.label(), packet)
+        .map(Some)
+}
+
+fn choose_research_promotion_packet<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<Option<PathBuf>, IpcFailure> {
+    app.dialog()
+        .file()
+        .add_filter("Loom research promotion", &["json"])
+        .blocking_pick_file()
+        .map(|selected| {
+            selected.into_path().map_err(|error| {
+                IpcFailure::new(
+                    "selected_research_packet_unavailable",
+                    format!("the selected research packet is not a local filesystem path: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
+}
+
+fn read_research_promotion_packet(path: &Path) -> Result<ResearchPromotionPacket, IpcFailure> {
+    let link_metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        IpcFailure::new(
+            "research_packet_unavailable",
+            format!("could not inspect the selected research packet: {error}"),
+            false,
+        )
+    })?;
+    if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+        return Err(IpcFailure::new(
+            "research_packet_not_regular_file",
+            "the selected research packet must be a regular file, not a symbolic link",
+            false,
+        ));
+    }
+    let file = File::open(path).map_err(|error| {
+        IpcFailure::new(
+            "research_packet_unavailable",
+            format!("could not open the selected research packet: {error}"),
+            false,
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        IpcFailure::new(
+            "research_packet_unavailable",
+            format!("could not inspect the opened research packet: {error}"),
+            false,
+        )
+    })?;
+    if !metadata.is_file()
+        || metadata.len() > u64::try_from(MAX_RESEARCH_PROMOTION_PACKET_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(IpcFailure::new(
+            "research_packet_too_large",
+            format!(
+                "the selected research packet exceeds the {MAX_RESEARCH_PROMOTION_PACKET_BYTES} byte limit"
+            ),
+            false,
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_RESEARCH_PROMOTION_PACKET_BYTES)
+            .min(MAX_RESEARCH_PROMOTION_PACKET_BYTES),
+    );
+    file.take(
+        u64::try_from(MAX_RESEARCH_PROMOTION_PACKET_BYTES)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+    )
+    .read_to_end(&mut bytes)
+    .map_err(|error| {
+        IpcFailure::new(
+            "research_packet_unavailable",
+            format!("could not read the selected research packet: {error}"),
+            false,
+        )
+    })?;
+    if bytes.len() > MAX_RESEARCH_PROMOTION_PACKET_BYTES {
+        return Err(IpcFailure::new(
+            "research_packet_too_large",
+            format!(
+                "the selected research packet exceeds the {MAX_RESEARCH_PROMOTION_PACKET_BYTES} byte limit"
+            ),
+            false,
+        ));
+    }
+    let packet: ResearchPromotionPacket = serde_json::from_slice(&bytes).map_err(|error| {
+        IpcFailure::new(
+            "research_packet_invalid",
+            format!("the selected research packet is not valid Loom research JSON: {error}"),
+            false,
+        )
+    })?;
+    if packet.schema != RESEARCH_PROMOTION_PACKET_SCHEMA {
+        return Err(IpcFailure::new(
+            "research_packet_schema",
+            "the selected research packet uses an unsupported schema",
+            false,
+        ));
+    }
+    if packet.result_text.len() > MAX_RESEARCH_PROMOTION_PREVIEW_BYTES {
+        return Err(IpcFailure::new(
+            "research_promotion_preview_too_large",
+            "the research result exceeds the bounded foreground review surface",
+            false,
+        ));
+    }
+    Ok(packet)
+}
+
+fn stage_imported_research_promotion(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    trusted_window_label: &str,
+    packet: ResearchPromotionPacket,
+) -> Result<ResearchPromotionPrompt, IpcFailure> {
+    let document_id = parse_document_id(&packet.document_id)?;
+    let result_bytes = packet.result_text.as_bytes();
+    let mixed_assembly_id = packet.record.id();
+    let output_blob_id = packet.record.output_blob_id();
+    let output_byte_len = packet.record.output_byte_len();
+    let (typed_project_id, typed_session_id, source_revision_id, source_blob_id, admission) = {
+        let mut session = lock_session(state)?;
+        let store = require_bound_store(&mut session, project_id, session_id)?;
+        let typed_project_id = store.manifest().project_id;
+        let typed_session_id = parse_command_id(session_id)?;
+        let summary = store
+            .list_documents()
+            .map_err(IpcFailure::store)?
+            .into_iter()
+            .find(|summary| summary.document_id == document_id)
+            .ok_or_else(|| {
+                IpcFailure::new(
+                    "research_promotion_document_missing",
+                    "the research packet names a document outside the active project",
+                    false,
+                )
+            })?;
+        let source = store
+            .read_document(&summary.relative_path)
+            .map_err(IpcFailure::store)?;
+        let admission = store
+            .record_mixed_authorship_assembly(packet.record, result_bytes)
+            .map_err(IpcFailure::store)?;
+        (
+            typed_project_id,
+            typed_session_id,
+            source.revision_id,
+            source.blob_id,
+            admission,
+        )
+    };
+    let request = PromotionCommandRequest::new(
+        typed_project_id,
+        source_revision_id,
+        source_blob_id,
+        PromotionSubject::MixedAuthorship { mixed_assembly_id },
+        admission.admission_record_id().as_blob_id(),
+        output_blob_id,
+        output_byte_len,
+        CommandId::new(),
+        now_unix_ms().max(1),
+    )
+    .map_err(|error| {
+        IpcFailure::new(
+            "research_promotion_request_invalid",
+            error.to_string(),
+            false,
+        )
+    })?;
+    state.stage_research_promotion(
+        typed_project_id,
+        typed_session_id,
+        trusted_window_label,
+        PendingPromotionSubject::MixedAuthorship(admission),
+        request,
+    )
+}
+
+// Tauri owns these deserialized command arguments and requires value parameters.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+fn research_promotion_pending(
+    project_id: String,
+    session_id: String,
+    state: State<'_, PluginState>,
+) -> Result<Vec<ResearchPromotionPrompt>, IpcFailure> {
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    let project_id = store.manifest().project_id;
+    let session_id = parse_command_id(&session_id)?;
+    let now = now_unix_ms();
+    let mut pending = state.research_promotions.lock().map_err(|_| {
+        IpcFailure::new(
+            "research_promotion_state_unavailable",
+            "the pending research-promotion registry is unavailable",
+            false,
+        )
+    })?;
+    pending.by_command.retain(|_, value| {
+        value.challenge.expires_at_unix_ms >= now
+            && value.project_id == project_id
+            && value.session_id == session_id
+    });
+    Ok(pending
+        .by_command
+        .values()
+        .map(|value| {
+            ResearchPromotionPrompt::from_parts(
+                &value.request,
+                &value.challenge,
+                &value.result_text,
+            )
+        })
+        .collect())
+}
+
+// Tauri owns these deserialized command arguments and requires value parameters.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+fn research_promotion_confirm<R: Runtime>(
+    project_id: String,
+    session_id: String,
+    input: ResearchPromotionConfirmInput,
+    window: tauri::Window<R>,
+    state: State<'_, PluginState>,
+) -> Result<ResearchPromotionResult, IpcFailure> {
+    let native_focus = state
+        .foreground_commands
+        .sample_tauri_window_focus(&window)
+        .map_err(|error| {
+            IpcFailure::new("foreground_focus_unavailable", error.to_string(), true)
+        })?;
+    confirm_research_promotion(&state, &project_id, &session_id, native_focus, &input)
+}
+
+fn confirm_research_promotion(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    native_focus: NativeWindowFocusSample,
+    input: &ResearchPromotionConfirmInput,
+) -> Result<ResearchPromotionResult, IpcFailure> {
+    let command_id = parse_command_id(&input.command_id)?;
+    let typed_session_id = parse_command_id(session_id)?;
+    let mut session = lock_session(state)?;
+    let store = require_bound_store(&mut session, project_id, session_id)?;
+    let typed_project_id = store.manifest().project_id;
+    let pending = state
+        .research_promotions
+        .lock()
+        .map_err(|_| {
+            IpcFailure::new(
+                "research_promotion_state_unavailable",
+                "the pending research-promotion registry is unavailable",
+                false,
+            )
+        })?
+        .by_command
+        .remove(&command_id)
+        .ok_or_else(|| {
+            IpcFailure::new(
+                "research_promotion_not_pending",
+                "this research promotion is no longer awaiting confirmation",
+                false,
+            )
+        })?;
+    if pending.project_id != typed_project_id || pending.session_id != typed_session_id {
+        return Err(IpcFailure::new(
+            "stale_project_session",
+            "the research promotion belongs to another project session",
+            false,
+        ));
+    }
+    let binding = ForegroundCommandBinding {
+        application_session_id: typed_session_id,
+        window_id: native_focus.window_id().clone(),
+        document_id: parse_document_id(&input.document_id)?,
+        candidate_fingerprint: input.candidate_fingerprint.parse().map_err(|_| {
+            IpcFailure::new(
+                "invalid_candidate_fingerprint",
+                "candidate fingerprint is not a valid SHA-256 digest",
+                false,
+            )
+        })?,
+        command_id,
+        promotion_fingerprint: input.promotion_fingerprint.parse().map_err(|_| {
+            IpcFailure::new(
+                "invalid_promotion_fingerprint",
+                "promotion fingerprint is not a valid SHA-256 digest",
+                false,
+            )
+        })?,
+    };
+    let command = state
+        .foreground_commands
+        .consume_with_native_focus(
+            loom_host::ForegroundCommandAttempt {
+                nonce: parse_command_id(&input.nonce)?,
+                binding,
+            },
+            native_focus,
+        )
+        .map_err(|error| {
+            IpcFailure::new("foreground_command_rejected", error.to_string(), false)
+        })?;
+    let PendingResearchPromotion {
+        request,
+        recorded_request,
+        subject,
+        ..
+    } = pending;
+    let outcome = store
+        .record_foreground_promotion_command(recorded_request, subject.lease(), &request, command)
+        .map_err(IpcFailure::store)?;
+    let foreground_receipt_blob_id = outcome.foreground_receipt.receipt_blob_id().to_string();
+    let mut receipt = Receipt::from(outcome.save.receipt);
+    receipt.result_revision_id = Some(outcome.save.revision_id.to_string());
+    receipt.result_blob_id = Some(outcome.save.blob_id.to_string());
+    receipt.request_fingerprint = Some(request.command_request_fingerprint().to_string());
+    receipt.visible_projection = Some(outcome.visible_projection);
+    Ok(ResearchPromotionResult {
+        receipt,
+        foreground_receipt_blob_id,
+    })
+}
+
+/// Test-only narrow edge used to prove that renderer bytes alone cannot mint
+/// foreground authority. The production research command above additionally
+/// consumes the live research lease and commits the selected manuscript.
+#[cfg(test)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureForegroundCommandInput {
+    nonce: String,
+    application_session_id: String,
+    document_id: String,
+    candidate_fingerprint: String,
+    command_id: String,
+    promotion_fingerprint: String,
+}
+
+#[cfg(test)]
+#[derive(Debug, Serialize)]
+struct FixtureForegroundCommandReceipt {
+    claim: &'static str,
+    monotonic_event_index: u64,
+}
+
+#[cfg(test)]
+#[tauri::command]
+#[allow(dead_code, clippy::needless_pass_by_value)]
+fn fixture_foreground_command_consume<R: Runtime>(
+    input: FixtureForegroundCommandInput,
+    window: tauri::Window<R>,
+    state: State<'_, PluginState>,
+) -> Result<FixtureForegroundCommandReceipt, IpcFailure> {
+    let native_focus = state
+        .foreground_commands
+        .sample_tauri_window_focus(&window)
+        .map_err(|error| {
+            IpcFailure::new("foreground_focus_unavailable", error.to_string(), true)
+        })?;
+    consume_fixture_foreground_command(&state, native_focus, &input)
+}
+
+#[cfg(test)]
+fn consume_fixture_foreground_command(
+    state: &PluginState,
+    native_focus: NativeWindowFocusSample,
+    input: &FixtureForegroundCommandInput,
+) -> Result<FixtureForegroundCommandReceipt, IpcFailure> {
+    let application_session_id = parse_command_id(&input.application_session_id)?;
+    let active_session_id = lock_session_internal(state)?.active_session_id;
+    if active_session_id != Some(application_session_id) {
+        return Err(IpcFailure::new(
+            "stale_project_session",
+            "the foreground command belongs to another project session",
+            false,
+        ));
+    }
+    let binding = loom_host::ForegroundCommandBinding {
+        application_session_id,
+        window_id: native_focus.window_id().clone(),
+        document_id: input.document_id.parse().map_err(|_| {
+            IpcFailure::new(
+                "invalid_document_id",
+                "document ID is not a valid ULID",
+                false,
+            )
+        })?,
+        candidate_fingerprint: input.candidate_fingerprint.parse().map_err(|_| {
+            IpcFailure::new(
+                "invalid_candidate_fingerprint",
+                "candidate fingerprint is not a valid SHA-256 digest",
+                false,
+            )
+        })?,
+        command_id: parse_command_id(&input.command_id)?,
+        promotion_fingerprint: input.promotion_fingerprint.parse().map_err(|_| {
+            IpcFailure::new(
+                "invalid_promotion_fingerprint",
+                "promotion fingerprint is not a valid SHA-256 digest",
+                false,
+            )
+        })?,
+    };
+    let command = state
+        .foreground_commands
+        .consume_with_native_focus(
+            loom_host::ForegroundCommandAttempt {
+                nonce: parse_command_id(&input.nonce)?,
+                binding,
+            },
+            native_focus,
+        )
+        .map_err(|error| {
+            IpcFailure::new("foreground_command_rejected", error.to_string(), false)
+        })?;
+    Ok(FixtureForegroundCommandReceipt {
+        claim: "trusted_application_host_accepted_one_focused_command",
+        monotonic_event_index: command.monotonic_event_index(),
+    })
+}
+
 fn parse_command_id(value: &str) -> Result<CommandId, IpcFailure> {
     value.parse::<CommandId>().map_err(|_| {
         IpcFailure::new(
@@ -6452,6 +7168,12 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
     }
     *phase = ApplicationPhase::Closing;
 
+    // Close authority before any potentially slow worker or model drain.
+    let _ = state.foreground_commands.revoke_all();
+    if let Ok(mut pending) = state.research_promotions.lock() {
+        pending.by_command.clear();
+    }
+
     // Owning `phase` is an application-wide admission barrier. Worker
     // reservations borrow an admission guard until their JoinHandle and
     // cancellation authority are attached, making a detached start
@@ -6495,6 +7217,29 @@ fn begin_application_close(state: &PluginState) -> Result<ApplicationCloseAttemp
     match *phase {
         ApplicationPhase::Running => {
             *phase = ApplicationPhase::Closing;
+            if let Err(error) = state.foreground_commands.revoke_all() {
+                *phase = ApplicationPhase::Running;
+                state.close_requested.store(false, Ordering::Release);
+                return Err(IpcFailure::new(
+                    "foreground_command_state_unavailable",
+                    error.to_string(),
+                    false,
+                ));
+            }
+            state
+                .research_promotions
+                .lock()
+                .map_err(|_| {
+                    *phase = ApplicationPhase::Running;
+                    state.close_requested.store(false, Ordering::Release);
+                    IpcFailure::new(
+                        "research_promotion_state_unavailable",
+                        "the pending research-promotion registry is unavailable",
+                        false,
+                    )
+                })?
+                .by_command
+                .clear();
             Ok(ApplicationCloseAttempt {
                 state,
                 phase,
@@ -7204,11 +7949,34 @@ impl From<ExternalReconciliationOutcome> for Receipt {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::future::Future;
 
     use loom_backend_llama::{
         CapabilitySupport, NativeEvidenceCapabilities, VerifiedCapabilitySet,
     };
     use loom_types::ModelEnvironmentId;
+
+    #[test]
+    fn research_promotion_import_runs_as_an_async_command() {
+        fn assert_async_handler<R: Runtime>() {
+            fn assert_future<F>(_: &F)
+            where
+                F: Future<Output = Result<Option<ResearchPromotionPrompt>, IpcFailure>> + Send,
+            {
+            }
+
+            let handler = |project_id: String,
+                           session_id: String,
+                           window: tauri::Window<R>,
+                           state: State<'_, PluginState>| {
+                let future = research_promotion_import(project_id, session_id, window, state);
+                assert_future(&future);
+            };
+            let _ = handler;
+        }
+
+        assert_async_handler::<tauri::test::MockRuntime>();
+    }
 
     #[derive(Debug, Default)]
     struct RecordingCancellation {
@@ -8844,6 +9612,23 @@ mod tests {
                 cancellation: cancellation.clone(),
             })
             .expect("register active family");
+        let window_id = ForegroundWindowId::new("main").expect("window identity");
+        state
+            .foreground_commands
+            .observe_window_focus(window_id.clone(), true)
+            .expect("focus fixture window");
+        let foreground_binding = ForegroundCommandBinding {
+            application_session_id: session_id,
+            window_id,
+            document_id: DocumentId::new(),
+            candidate_fingerprint: BlobId::digest(b"close-timeout-candidate"),
+            command_id: CommandId::new(),
+            promotion_fingerprint: BlobId::digest(b"close-timeout-promotion"),
+        };
+        let foreground_challenge = state
+            .foreground_commands
+            .issue(foreground_binding.clone(), FOREGROUND_PROMOTION_TTL)
+            .expect("issue foreground challenge before close");
 
         let error = close_project_with_wait(
             &state,
@@ -8860,6 +9645,20 @@ mod tests {
         assert!(session.agency.focus_mode());
         assert!(!session.agency.automation_enabled());
         drop(session);
+        let native_focus = state
+            .foreground_commands
+            .bind_test_native_window_focus_sample(foreground_binding.window_id.clone(), true);
+        assert_eq!(
+            state.foreground_commands.consume_with_native_focus(
+                loom_host::ForegroundCommandAttempt {
+                    nonce: foreground_challenge.nonce,
+                    binding: foreground_binding,
+                },
+                native_focus,
+            ),
+            Err(loom_host::ForegroundCommandError::StaleNonce),
+            "close must revoke authority before a generation drain can time out",
+        );
         assert_eq!(
             *cancellation.branches.lock().expect("cancelled branches"),
             vec![branch_id]
@@ -9327,5 +10126,221 @@ mod tests {
             value["visible_projection"]["relative_path"],
             "manuscript/001-opening.md"
         );
+    }
+
+    #[test]
+    fn fixture_tauri_command_consumes_authority_at_native_edge() {
+        let state = PluginState::default();
+        let application_session_id = CommandId::new();
+        state
+            .session
+            .lock()
+            .expect("session lock")
+            .active_session_id = Some(application_session_id);
+        let window_id = ForegroundWindowId::new("main").expect("fixture window");
+        state
+            .foreground_commands
+            .observe_window_focus(window_id.clone(), true)
+            .expect("focus fixture window");
+        let binding = loom_host::ForegroundCommandBinding {
+            application_session_id,
+            window_id: window_id.clone(),
+            document_id: DocumentId::new(),
+            candidate_fingerprint: BlobId::digest(b"fixture candidate"),
+            command_id: CommandId::new(),
+            promotion_fingerprint: BlobId::digest(b"fixture pending promotion"),
+        };
+        let challenge = state
+            .foreground_commands
+            .issue(binding.clone(), Duration::from_secs(30))
+            .expect("issue fixture challenge");
+        let input = FixtureForegroundCommandInput {
+            nonce: challenge.nonce.to_string(),
+            application_session_id: binding.application_session_id.to_string(),
+            document_id: binding.document_id.to_string(),
+            candidate_fingerprint: binding.candidate_fingerprint.to_string(),
+            command_id: binding.command_id.to_string(),
+            promotion_fingerprint: binding.promotion_fingerprint.to_string(),
+        };
+        let native_focus = state
+            .foreground_commands
+            .bind_test_native_window_focus_sample(window_id.clone(), true);
+        let receipt = consume_fixture_foreground_command(&state, native_focus, &input)
+            .expect("consume at fixture Tauri edge");
+        assert_eq!(
+            receipt.claim,
+            "trusted_application_host_accepted_one_focused_command"
+        );
+        assert_eq!(receipt.monotonic_event_index, 1);
+        let replay_focus = state
+            .foreground_commands
+            .bind_test_native_window_focus_sample(window_id, true);
+        let replay = consume_fixture_foreground_command(&state, replay_focus, &input)
+            .expect_err("replayed IPC payload must fail");
+        assert_eq!(replay.code, "foreground_command_rejected");
+    }
+
+    #[test]
+    fn production_research_packet_reader_admits_only_bounded_regular_files() {
+        use loom_research_types::{
+            MixedAuthorshipAssemblyId, MixedAuthorshipAssemblyRecord, OperationGraph,
+            PipelineOperation, PipelineOperationId, PipelineOperationKind,
+        };
+
+        let temporary = tempfile::tempdir().expect("temporary packet directory");
+        let packet_path = temporary.path().join("reviewed-research.json");
+        let result_text = "Reviewed controller result";
+        let output_operation_id = PipelineOperationId::new();
+        let graph = OperationGraph::new(
+            vec![
+                PipelineOperation::new(
+                    output_operation_id,
+                    PipelineOperationKind::LiteralText {
+                        content_blob_id: BlobId::digest(result_text.as_bytes()),
+                    },
+                    Vec::new(),
+                )
+                .expect("literal output"),
+            ],
+            output_operation_id,
+        )
+        .expect("operation graph");
+        let record = MixedAuthorshipAssemblyRecord::new(
+            MixedAuthorshipAssemblyId::new(),
+            result_text.as_bytes(),
+            graph,
+        )
+        .expect("mixed-authorship record");
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": RESEARCH_PROMOTION_PACKET_SCHEMA,
+            "document_id": DocumentId::new(),
+            "record": record,
+            "result_text": result_text,
+        }))
+        .expect("packet JSON");
+        std::fs::write(&packet_path, bytes).expect("write packet fixture");
+
+        let packet = read_research_promotion_packet(&packet_path).expect("read bounded packet");
+        assert_eq!(packet.schema, RESEARCH_PROMOTION_PACKET_SCHEMA);
+        assert_eq!(packet.result_text, result_text);
+
+        let directory_error = read_research_promotion_packet(temporary.path())
+            .expect_err("directories cannot be promotion packets");
+        assert_eq!(directory_error.code, "research_packet_not_regular_file");
+    }
+
+    #[test]
+    // One end-to-end regression keeps lease staging, native consumption,
+    // manuscript mutation, and replay rejection in the same proof.
+    #[allow(clippy::too_many_lines)]
+    fn production_research_confirmation_promotes_in_one_store_contract() {
+        use loom_research_types::{
+            MixedAuthorshipAssemblyId, MixedAuthorshipAssemblyRecord, OperationGraph,
+            PipelineOperation, PipelineOperationId, PipelineOperationKind,
+        };
+
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Research Promotion Novel");
+        let store =
+            initialize_project(&root, "Research Promotion Novel".to_owned()).expect("initialize");
+        let source = store
+            .read_document(INITIAL_DOCUMENT)
+            .expect("read source manuscript");
+        let result_bytes = b"Foreground-authorized research result.";
+        let output_operation_id = PipelineOperationId::new();
+        let graph = OperationGraph::new(
+            vec![
+                PipelineOperation::new(
+                    output_operation_id,
+                    PipelineOperationKind::LiteralText {
+                        content_blob_id: BlobId::digest(result_bytes),
+                    },
+                    Vec::new(),
+                )
+                .expect("literal output"),
+            ],
+            output_operation_id,
+        )
+        .expect("operation graph");
+        let record = MixedAuthorshipAssemblyRecord::new(
+            MixedAuthorshipAssemblyId::new(),
+            result_bytes,
+            graph,
+        )
+        .expect("mixed-authorship record");
+        let project_id = store.manifest().project_id;
+        let session_id = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+        let window_id = ForegroundWindowId::new("main").expect("window ID");
+        state
+            .foreground_commands
+            .observe_window_focus(window_id.clone(), true)
+            .expect("focus main window");
+        let prompt = stage_imported_research_promotion(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            "main",
+            ResearchPromotionPacket {
+                schema: RESEARCH_PROMOTION_PACKET_SCHEMA.to_owned(),
+                document_id: source.document_id.to_string(),
+                record,
+                result_text: String::from_utf8(result_bytes.to_vec()).expect("UTF-8 result"),
+            },
+        )
+        .expect("import, admit, and stage production prompt");
+        let input = ResearchPromotionConfirmInput {
+            command_id: prompt.command_id,
+            nonce: prompt.nonce,
+            document_id: prompt.document_id,
+            candidate_fingerprint: prompt.candidate_fingerprint,
+            promotion_fingerprint: prompt.promotion_fingerprint,
+        };
+        let native_focus = state
+            .foreground_commands
+            .bind_test_native_window_focus_sample(window_id.clone(), true);
+        let result = confirm_research_promotion(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            native_focus,
+            &input,
+        )
+        .expect("confirm production promotion");
+        assert_eq!(
+            result.receipt.result_blob_id,
+            Some(BlobId::digest(result_bytes).to_string())
+        );
+        assert_eq!(
+            result.receipt.visible_projection,
+            Some(VisibleProjectionState::Applied)
+        );
+        let mut session = state.session.lock().expect("session lock");
+        let promoted = session
+            .store
+            .as_mut()
+            .expect("store")
+            .read_document(INITIAL_DOCUMENT)
+            .expect("read promoted manuscript");
+        assert_eq!(promoted.text, "Foreground-authorized research result.");
+        drop(session);
+        let replay_focus = state
+            .foreground_commands
+            .bind_test_native_window_focus_sample(window_id, true);
+        let replay = confirm_research_promotion(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            replay_focus,
+            &input,
+        )
+        .expect_err("the same command cannot be replayed");
+        assert_eq!(replay.code, "research_promotion_not_pending");
     }
 }
