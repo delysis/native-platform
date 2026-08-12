@@ -6621,7 +6621,7 @@ async fn candidate_promote(
 /// source revision, a command ID, or a live admission lease.
 #[allow(clippy::needless_pass_by_value)]
 #[tauri::command]
-fn research_promotion_import<R: Runtime>(
+async fn research_promotion_import<R: Runtime>(
     project_id: String,
     session_id: String,
     window: tauri::Window<R>,
@@ -7949,11 +7949,34 @@ impl From<ExternalReconciliationOutcome> for Receipt {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::future::Future;
 
     use loom_backend_llama::{
         CapabilitySupport, NativeEvidenceCapabilities, VerifiedCapabilitySet,
     };
     use loom_types::ModelEnvironmentId;
+
+    #[test]
+    fn research_promotion_import_runs_as_an_async_command() {
+        fn assert_async_handler<R: Runtime>() {
+            fn assert_future<F>(_: &F)
+            where
+                F: Future<Output = Result<Option<ResearchPromotionPrompt>, IpcFailure>> + Send,
+            {
+            }
+
+            let handler = |project_id: String,
+                           session_id: String,
+                           window: tauri::Window<R>,
+                           state: State<'_, PluginState>| {
+                let future = research_promotion_import(project_id, session_id, window, state);
+                assert_future(&future);
+            };
+            let _ = handler;
+        }
+
+        assert_async_handler::<tauri::test::MockRuntime>();
+    }
 
     #[derive(Debug, Default)]
     struct RecordingCancellation {
