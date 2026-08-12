@@ -7,11 +7,27 @@ use std::sync::{Arc, Mutex, MutexGuard};
 const MAX_REQUEST_LOG_ROWS: i64 = 10_000;
 const APPLICATION_ID: i64 = 0x4654_4531;
 const SCHEMA_VERSION: i64 = 1;
-const CURRENT_SCHEMA_OBJECTS: [(&str, &str); 4] = [
-    ("index", "idx_request_log_provider"),
-    ("table", "local_model_configuration"),
-    ("table", "master_profile"),
-    ("table", "request_log"),
+const CURRENT_SCHEMA_OBJECTS: [(&str, &str, &str); 4] = [
+    (
+        "index",
+        "idx_request_log_provider",
+        "CREATE INDEX idx_request_log_provider ON request_log (provider_id, id DESC)",
+    ),
+    (
+        "table",
+        "local_model_configuration",
+        "CREATE TABLE local_model_configuration (slot INTEGER PRIMARY KEY CHECK(slot = 1), model_path TEXT NOT NULL CHECK(length(model_path) > 0), expected_sha256 TEXT)",
+    ),
+    (
+        "table",
+        "master_profile",
+        "CREATE TABLE master_profile (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    ),
+    (
+        "table",
+        "request_log",
+        "CREATE TABLE request_log (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, provider_id TEXT NOT NULL, model_id TEXT NOT NULL, tokens_used INTEGER NOT NULL CHECK(tokens_used >= 0), latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0), status_code INTEGER NOT NULL)",
+    ),
 ];
 
 #[derive(Debug, serde::Serialize)]
@@ -57,6 +73,7 @@ impl Database {
             .with_context(|| format!("failed to open database at {}", db_path.display()))?;
         harden_file_permissions(&db_path)?;
 
+        conn.pragma_update(None, "trusted_schema", false)?;
         let state = classify_database(&conn, &db_path)?;
 
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -66,7 +83,6 @@ impl Database {
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA secure_delete = ON;
-            PRAGMA trusted_schema = OFF;
             ",
         )?;
 
@@ -327,13 +343,17 @@ fn classify_database(conn: &Connection, path: &Path) -> Result<DatabaseState> {
     let application_id = conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))?;
     let schema_version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
     let mut statement = conn.prepare(
-        "SELECT type, name FROM sqlite_schema
+        "SELECT type, name, sql FROM sqlite_schema
          WHERE name NOT LIKE 'sqlite_%'
          ORDER BY type, name",
     )?;
     let schema_objects = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<BTreeSet<_>>>()?;
 
@@ -341,7 +361,10 @@ fn classify_database(conn: &Connection, path: &Path) -> Result<DatabaseState> {
         return Ok(DatabaseState::Fresh);
     }
 
-    if schema_objects.contains(&("table".to_owned(), "api_keys".to_owned())) {
+    if schema_objects
+        .iter()
+        .any(|(kind, name, _)| kind == "table" && name == "api_keys")
+    {
         anyhow::bail!(
             "unsupported legacy database at {}: plaintext api_keys storage is not imported; move or remove this database and start with a fresh FTE store",
             path.display()
@@ -350,8 +373,18 @@ fn classify_database(conn: &Connection, path: &Path) -> Result<DatabaseState> {
 
     let expected_schema_objects = CURRENT_SCHEMA_OBJECTS
         .into_iter()
-        .map(|(kind, name)| (kind.to_owned(), name.to_owned()))
-        .collect();
+        .map(|(kind, name, sql)| {
+            (
+                kind.to_owned(),
+                name.to_owned(),
+                Some(normalize_schema_sql(sql)),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let schema_objects = schema_objects
+        .into_iter()
+        .map(|(kind, name, sql)| (kind, name, sql.map(|sql| normalize_schema_sql(&sql))))
+        .collect::<BTreeSet<_>>();
     if application_id == APPLICATION_ID
         && schema_version == SCHEMA_VERSION
         && schema_objects == expected_schema_objects
@@ -363,6 +396,12 @@ fn classify_database(conn: &Connection, path: &Path) -> Result<DatabaseState> {
         "unsupported database at {}: expected FTE application_id {APPLICATION_ID:#x}, schema version {SCHEMA_VERSION}, and the exact current schema object set; legacy and foreign databases are not imported",
         path.display()
     )
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
 }
 
 fn nonnegative_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
@@ -542,6 +581,33 @@ mod tests {
             };
             assert!(error.to_string().contains("unsupported database"));
         }
+    }
+
+    #[test]
+    fn same_schema_names_with_wrong_definitions_are_rejected() {
+        let path = test_database_path("same-names-wrong-definitions");
+        {
+            let db = Database::new(path.clone()).unwrap();
+            db.connection()
+                .unwrap()
+                .execute_batch(
+                    "DROP INDEX idx_request_log_provider;
+                     DROP TABLE request_log;
+                     CREATE TABLE request_log (
+                         id INTEGER PRIMARY KEY,
+                         provider_id TEXT NOT NULL
+                     );
+                     CREATE INDEX idx_request_log_provider
+                         ON request_log (provider_id, id DESC);",
+                )
+                .unwrap();
+        }
+
+        let error = match Database::new(path) {
+            Ok(_) => panic!("same-name foreign schema must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unsupported database"));
     }
 
     fn test_database_path(label: &str) -> PathBuf {
