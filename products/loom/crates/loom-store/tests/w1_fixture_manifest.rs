@@ -79,6 +79,9 @@ fn evidence_bytes(relative_path: &str) -> &'static [u8] {
             include_bytes!("../../../fixtures/w1/gemma-current-source-tree-v0.txt")
         }
         "loom-prior-store-v10-v1.json" => fixture_bytes("fixtures/w1/loom-prior-store-v10-v1.json"),
+        "loom-quit-relaunch-v1.json" => {
+            include_bytes!("../../../fixtures/w1/loom-quit-relaunch-v1.json")
+        }
         "loom-research-authority-v1.json" => {
             fixture_bytes("fixtures/w1/loom-research-authority-v1.json")
         }
@@ -87,6 +90,9 @@ fn evidence_bytes(relative_path: &str) -> &'static [u8] {
         }
         "manifests/loom-prior-project-store-v0.json" => {
             include_bytes!("../../../fixtures/w1/manifests/loom-prior-project-store-v0.json")
+        }
+        "manifests/loom-quit-relaunch-v0.json" => {
+            include_bytes!("../../../fixtures/w1/manifests/loom-quit-relaunch-v0.json")
         }
         "manifests/loom-research-diagnostic-admitted-v0.json" => include_bytes!(
             "../../../fixtures/w1/manifests/loom-research-diagnostic-admitted-v0.json"
@@ -97,6 +103,9 @@ fn evidence_bytes(relative_path: &str) -> &'static [u8] {
         "projections/loom-prior-project-store-v10-v1.json" => {
             include_bytes!("../../../fixtures/w1/projections/loom-prior-project-store-v10-v1.json")
         }
+        "projections/loom-quit-relaunch-v1.json" => {
+            include_bytes!("../../../fixtures/w1/projections/loom-quit-relaunch-v1.json")
+        }
         "projections/loom-research-authority-v1.json" => {
             include_bytes!("../../../fixtures/w1/projections/loom-research-authority-v1.json")
         }
@@ -104,6 +113,9 @@ fn evidence_bytes(relative_path: &str) -> &'static [u8] {
             include_bytes!("../../../fixtures/w1/projections/loom-suggestion-promotion-v1.json")
         }
         "source/loom-production-tree-a733508.json" => PRODUCTION_TREE,
+        "source/loom-row8-production-objects-5b0d81e.json" => {
+            include_bytes!("../../../fixtures/w1/source/loom-row8-production-objects-5b0d81e.json")
+        }
         "state/loom-prior-v10-migrated-summary-v1.json" => {
             fixture_bytes("fixtures/w1/state/loom-prior-v10-migrated-summary-v1.json")
         }
@@ -315,9 +327,67 @@ fn w1_fixture_descendant_preserves_every_bound_production_source_root() {
             .expect("git object id is UTF-8")
             .trim()
             .to_owned();
-        assert_eq!(
-            actual_oid, expected_oid,
-            "production source changed: {source_root}"
-        );
+        if source_root == "crates/tauri-plugin-loom/src" {
+            assert_tauri_plugin_delta_is_test_only(repository, &actual_oid, &expected_oid);
+        } else {
+            assert_eq!(
+                actual_oid, expected_oid,
+                "production source changed: {source_root}"
+            );
+        }
     }
+}
+
+fn assert_tauri_plugin_delta_is_test_only(repository: &Path, actual_oid: &str, expected_oid: &str) {
+    if actual_oid == expected_oid {
+        return;
+    }
+    let baseline = git_blob(
+        repository,
+        &format!("{BASELINE_COMMIT}:crates/tauri-plugin-loom/src/lib.rs"),
+    );
+    let current = git_blob(repository, "HEAD:crates/tauri-plugin-loom/src/lib.rs");
+    let test_module = concat!(
+        "#[cfg(all(test, feature = \"unstable-w1-vertical-tests\"))]\n",
+        "mod w1_vertical_fixture;\n",
+    );
+    assert_eq!(
+        current.replacen(test_module, "", 1),
+        baseline,
+        "tauri-plugin production module changed outside the feature-gated W1 fixture"
+    );
+    let changed = Command::new("git")
+        .args([
+            "diff",
+            "--name-only",
+            BASELINE_COMMIT,
+            "HEAD",
+            "--",
+            "crates/tauri-plugin-loom/src",
+        ])
+        .current_dir(repository)
+        .output()
+        .expect("enumerate tauri-plugin source delta");
+    assert!(changed.status.success(), "enumerate test-only source delta");
+    assert_eq!(
+        String::from_utf8(changed.stdout).expect("changed paths are UTF-8"),
+        concat!(
+            "crates/tauri-plugin-loom/src/lib.rs\n",
+            "crates/tauri-plugin-loom/src/w1_vertical_fixture.rs\n",
+        ),
+        "tauri-plugin source delta must remain confined to the W1 test module"
+    );
+}
+
+fn git_blob(repository: &Path, revision_path: &str) -> String {
+    let output = Command::new("git")
+        .args(["show", revision_path])
+        .current_dir(repository)
+        .output()
+        .expect("read source blob");
+    assert!(
+        output.status.success(),
+        "source blob exists: {revision_path}"
+    );
+    String::from_utf8(output.stdout).expect("source blob is UTF-8")
 }

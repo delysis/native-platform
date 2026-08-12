@@ -4645,6 +4645,8 @@ dependencies = [
  "loom-research-types",
  "loom-store",
  "loom-types",
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts.git?rev=fc24ffff08c52690390b4460f44617d5d9732563)",
+ "platform-vertical-fixtures-v0",
  "same-file",
  "serde",
  "serde_json",

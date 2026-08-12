@@ -4,6 +4,8 @@ mod model_download;
 
 #[cfg(all(test, feature = "unstable-w1-contract-tests"))]
 mod w1_contract_adapter;
+#[cfg(all(test, feature = "unstable-w1-vertical-tests"))]
+mod w1_vertical_fixture;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, Metadata};
