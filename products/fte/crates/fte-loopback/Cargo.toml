@@ -6,6 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Test-only adapter for the immutable Wave 1 vertical fixture protocol.
+unstable-w1-vertical-tests = ["dep:platform-vertical-fixtures-v0"]
+
 [dependencies]
 axum.workspace = true
 async-stream.workspace = true
@@ -16,6 +21,7 @@ fte-types = { path = "../fte-types" }
 futures.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+platform-vertical-fixtures-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "fc24ffff08c52690390b4460f44617d5d9732563", optional = true }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
