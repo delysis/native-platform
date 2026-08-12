@@ -441,6 +441,17 @@ fn assert_checked_in_value(id: &str, relative_path: &str, actual: &Value) {
     assert_eq!(checked_in_identity(id, relative_path), identity(id, actual));
 }
 
+fn assert_manifest_input(manifest_bytes: &[u8], id: &str, bytes: &[u8]) -> TestResult {
+    let manifest: VerticalFixtureManifestV0 = serde_json::from_slice(manifest_bytes)?;
+    let input = manifest.cases[0]
+        .inputs
+        .iter()
+        .find(|artifact| artifact.identity.id == id)
+        .ok_or_else(|| std::io::Error::other(format!("generated input {id} is missing")))?;
+    assert_eq!(input.identity, sha256_identity(id, bytes));
+    Ok(())
+}
+
 fn resource_store_state(snapshot: &StoreSnapshot) -> Value {
     json!({
         "schema": "information.w1.resource_store.before.v0",
@@ -638,16 +649,7 @@ fn information_install_query_replays_through_production_paths() -> TestResult {
     let temporary = tempfile::tempdir()?;
     let (host, plan, receipt, database_bytes) =
         install_database(&temporary, "information-w1-install")?;
-    let manifest: VerticalFixtureManifestV0 = serde_json::from_slice(INSTALL_MANIFEST)?;
-    let database_input = manifest.cases[0]
-        .inputs
-        .iter()
-        .find(|artifact| artifact.identity.id == "information.database")
-        .ok_or_else(|| std::io::Error::other("generated database input is missing"))?;
-    assert_eq!(
-        database_input.identity,
-        sha256_identity("information.database", &database_bytes)
-    );
+    assert_manifest_input(INSTALL_MANIFEST, "information.database", &database_bytes)?;
     let normalized_plan = normalized_plan_bytes(&plan)?;
     assert_eq!(receipt.state, InstallationState::Ready);
     assert!(!receipt.network_used);
@@ -915,6 +917,11 @@ fn partial_state_value(schema: &str, state: &str, bytes: &[u8]) -> Value {
 fn corrupted_disposable_acquisition_cache_is_cold_reset() -> TestResult {
     let temporary = tempfile::tempdir()?;
     let payload = b"payload";
+    assert_manifest_input(
+        CORRUPT_CACHE_MANIFEST,
+        "information.partial.payload",
+        payload,
+    )?;
     let store = ManagedStore::open(temporary.path().join("cache-store"))?;
     let plan = partial_plan(temporary.path(), "information-w1-corrupt-cache", payload)?;
     let prepared = store.prepare_install(&plan)?;
@@ -992,6 +999,7 @@ fn partial_publication_states_recover_without_clobber_or_network() -> TestResult
     fs::create_dir(&publication)?;
     let destination = publication.join("acquire-destination.bin");
     fs::write(&source, b"payload")?;
+    assert_manifest_input(PARTIAL_MANIFEST, "information.partial.payload", b"payload")?;
     let mut cancel = |progress: TransferProgress| {
         if progress.phase == TransferPhase::Publishing {
             ProgressControl::Cancel
