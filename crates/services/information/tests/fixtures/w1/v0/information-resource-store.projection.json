@@ -17,9 +17,9 @@
         "id": "information.resource_store.before",
         "digest": {
           "algorithm": "sha256",
-          "hex": "49377330d0f4b601c8846cf695012a34708f8ab32155f3219a3a3a74e679fb3e"
+          "hex": "cc281477226d34e4729c550d10d359098f3470d1c7ad70ae9f62f571037a2a25"
         },
-        "length": 110
+        "length": 93
       },
       "after": {
         "id": "information.resource_store.after",
@@ -67,6 +67,10 @@
     "network_used": {
       "kind": "boolean",
       "value": false
+    },
+    "nonempty_wal_rejected": {
+      "kind": "boolean",
+      "value": true
     },
     "queryable_after_reopen": {
       "kind": "boolean",

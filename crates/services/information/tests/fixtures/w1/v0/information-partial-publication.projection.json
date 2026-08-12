@@ -41,9 +41,9 @@
         "id": "information.partial.acquisition.before",
         "digest": {
           "algorithm": "sha256",
-          "hex": "067b57cfa5e48bd10f76072a9c2d9dd52d2f8589dba3d69813c632173edc0be9"
+          "hex": "d23fce4ef3befb2fa04d26d15dbfc371197b14d44457fb7245e76cf4863d3cc2"
         },
-        "length": 172
+        "length": 80
       },
       "after": {
         "id": "information.partial.acquisition.after",

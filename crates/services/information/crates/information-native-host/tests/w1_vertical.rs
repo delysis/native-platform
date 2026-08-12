@@ -9,8 +9,8 @@ use information_native_host::{InformationHost, MountInstallationOptions};
 use information_native_retrieval::RetrievalRouter;
 use information_native_store::{
     ExternalRegistrationRequest, IdentityStrength, ManagedStore, PartialInstallState,
-    RegisteredInstallation, RemovalKind, TransferSummary, capture_source_identity,
-    check_source_identity,
+    RegisteredInstallation, RemovalKind, StoreError, StoreSnapshot, TransferSummary,
+    capture_source_identity, check_source_identity, reject_nonempty_sqlite_sidecars,
 };
 use information_native_types::*;
 use platform_contracts_fixture_v0::ArtifactIdentityV0;
@@ -66,6 +66,14 @@ const PARTIAL_MANIFEST: &[u8] = include_bytes!(concat!(
 const PARTIAL_PROJECTION: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/w1/v0/information-partial-publication.projection.json"
+));
+const CORRUPT_CACHE_MANIFEST: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/w1/v0/information-corrupted-disposable-cache.manifest.json"
+));
+const CORRUPT_CACHE_PROJECTION: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/w1/v0/information-corrupted-disposable-cache.projection.json"
 ));
 
 #[derive(Deserialize)]
@@ -429,6 +437,37 @@ fn checked_in_identity(id: &str, relative_path: &str) -> ArtifactIdentityV0 {
     sha256_identity(id.to_owned(), &bytes)
 }
 
+fn assert_checked_in_value(id: &str, relative_path: &str, actual: &Value) {
+    assert_eq!(checked_in_identity(id, relative_path), identity(id, actual));
+}
+
+fn resource_store_state(snapshot: &StoreSnapshot) -> Value {
+    json!({
+        "schema": "information.w1.resource_store.before.v0",
+        "managed": snapshot.managed,
+        "external": snapshot.external,
+    })
+}
+
+fn directory_state(schema: &str, directory: &Path) -> Result<Value, Box<dyn Error>> {
+    let mut entries = Vec::new();
+    if directory.exists() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                let bytes = fs::read(entry.path())?;
+                entries.push(json!({
+                    "name": entry.file_name().to_string_lossy(),
+                    "bytes": bytes.len(),
+                    "sha256": sha256(&bytes),
+                }));
+            }
+        }
+    }
+    entries.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    Ok(json!({"schema": schema, "entries": entries}))
+}
+
 fn projection(
     events: Vec<EventFactV0>,
     durable_state: Vec<DurableStateFactV0>,
@@ -599,6 +638,16 @@ fn information_install_query_replays_through_production_paths() -> TestResult {
     let temporary = tempfile::tempdir()?;
     let (host, plan, receipt, database_bytes) =
         install_database(&temporary, "information-w1-install")?;
+    let manifest: VerticalFixtureManifestV0 = serde_json::from_slice(INSTALL_MANIFEST)?;
+    let database_input = manifest.cases[0]
+        .inputs
+        .iter()
+        .find(|artifact| artifact.identity.id == "information.database")
+        .ok_or_else(|| std::io::Error::other("generated database input is missing"))?;
+    assert_eq!(
+        database_input.identity,
+        sha256_identity("information.database", &database_bytes)
+    );
     let normalized_plan = normalized_plan_bytes(&plan)?;
     assert_eq!(receipt.state, InstallationState::Ready);
     assert!(!receipt.network_used);
@@ -689,11 +738,18 @@ fn information_install_query_replays_through_production_paths() -> TestResult {
 #[test]
 fn information_resource_store_reopens_managed_and_external_state() -> TestResult {
     let temporary = tempfile::tempdir()?;
+    let empty_store = ManagedStore::open(temporary.path().join("managed"))?;
+    let before_value = resource_store_state(&empty_store.list()?);
+    assert_checked_in_value(
+        "information.resource_store.before",
+        "tests/fixtures/w1/v0/information-resource-store-before.json",
+        &before_value,
+    );
     let (host, plan, receipt, database_bytes) =
         install_database(&temporary, "information-w1-managed")?;
     let source = temporary.path().join("information-w1-managed.sqlite");
     let before_identity = capture_source_identity(&source, IdentityStrength::Sha256)?;
-    let external = host.register_external(&ExternalRegistrationRequest {
+    let external_request = ExternalRegistrationRequest {
         installation_id: InstallationId::parse("information-w1-external")?,
         resource_id: ResourceId::parse("org.delysis.w1.fixture.external")?,
         release_id: ReleaseId::parse("2026-08-12")?,
@@ -711,7 +767,16 @@ fn information_resource_store_reopens_managed_and_external_state() -> TestResult
         },
         rights: rights(),
         use_policy: use_policy(),
-    })?;
+    };
+    let wal = source.with_file_name("information-w1-managed.sqlite-wal");
+    fs::write(&wal, b"pending transaction")?;
+    assert!(matches!(
+        reject_nonempty_sqlite_sidecars(&source),
+        Err(StoreError::NonEmptySqliteWal(path)) if path == wal
+    ));
+    assert_eq!(fs::read(&source)?, database_bytes);
+    fs::remove_file(&wal)?;
+    let external = host.register_external(&external_request)?;
     let database_sha256 = sha256(&database_bytes);
     assert_eq!(
         external.identity.sha256.as_deref(),
@@ -801,6 +866,10 @@ fn information_resource_store_reopens_managed_and_external_state() -> TestResult
                 FactValueV0::Boolean(true),
             ),
             ("network_used".to_owned(), FactValueV0::Boolean(false)),
+            (
+                "nonempty_wal_rejected".to_owned(),
+                FactValueV0::Boolean(true),
+            ),
         ]),
         vec![
             "external immutable source rejects non-empty SQLite sidecars".to_owned(),
@@ -843,10 +912,85 @@ fn partial_state_value(schema: &str, state: &str, bytes: &[u8]) -> Value {
 }
 
 #[test]
+fn corrupted_disposable_acquisition_cache_is_cold_reset() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let payload = b"payload";
+    let store = ManagedStore::open(temporary.path().join("cache-store"))?;
+    let plan = partial_plan(temporary.path(), "information-w1-corrupt-cache", payload)?;
+    let prepared = store.prepare_install(&plan)?;
+    let acquisitions = prepared.directory.join("acquisitions");
+    fs::write(acquisitions.join(".journal-malformed.tmp"), b"malformed")?;
+    let before_value = directory_state(
+        "information.w1.corrupted_disposable_cache.before.v0",
+        &acquisitions,
+    )?;
+    assert_checked_in_value(
+        "information.corrupted_disposable_cache.before",
+        "tests/fixtures/w1/v0/information-corrupted-disposable-cache-before.json",
+        &before_value,
+    );
+
+    let recovered = store.prepare_install(&plan)?;
+    assert_eq!(recovered.directory, prepared.directory);
+    let after_value = directory_state(
+        "information.w1.corrupted_disposable_cache.after.v0",
+        &acquisitions,
+    )?;
+    assert_eq!(after_value["entries"], json!([]));
+    assert_eq!(store.list_partial_installs()?.len(), 1);
+    assert!(store.list()?.managed.is_empty());
+
+    let actual = projection(
+        vec![event(
+            1,
+            "information.corrupted-cache-reset",
+            "malformed_acquisition_temporary_removed",
+        )],
+        vec![DurableStateFactV0 {
+            state_id: "information.corrupted_disposable_cache".to_owned(),
+            schema_id: "information.w1.corrupted_disposable_cache.v0".to_owned(),
+            before: Some(checked_in_identity(
+                "information.corrupted_disposable_cache.before",
+                "tests/fixtures/w1/v0/information-corrupted-disposable-cache-before.json",
+            )),
+            after: None,
+            disposition: StateDispositionV0::Removed,
+        }],
+        vec![completed("information.corrupted-cache-reset")],
+        BTreeMap::from([
+            (
+                "malformed_temporary_removed".to_owned(),
+                FactValueV0::Boolean(true),
+            ),
+            (
+                "authoritative_state_preserved".to_owned(),
+                FactValueV0::Boolean(true),
+            ),
+            ("network_used".to_owned(), FactValueV0::Boolean(false)),
+        ]),
+        vec![
+            "only disposable .journal-*.tmp acquisition state is removed".to_owned(),
+            "the valid staging manifest and authoritative artifact target remain".to_owned(),
+        ],
+    );
+    if maybe_dump("corrupt-cache", &actual, &after_value) {
+        return Ok(());
+    }
+    validate_fixture(
+        CORRUPT_CACHE_MANIFEST,
+        CORRUPT_CACHE_PROJECTION,
+        VerticalIdV0::CorruptedDisposableCaches,
+        actual,
+    )
+}
+
+#[test]
 fn partial_publication_states_recover_without_clobber_or_network() -> TestResult {
     let temporary = tempfile::tempdir()?;
     let source = temporary.path().join("acquire-source.bin");
-    let destination = temporary.path().join("acquire-destination.bin");
+    let publication = temporary.path().join("publication");
+    fs::create_dir(&publication)?;
+    let destination = publication.join("acquire-destination.bin");
     fs::write(&source, b"payload")?;
     let mut cancel = |progress: TransferProgress| {
         if progress.phase == TransferPhase::Publishing {
@@ -868,6 +1012,13 @@ fn partial_publication_states_recover_without_clobber_or_network() -> TestResult
         Err(information_native_acquire::AcquireError::Cancelled { .. })
     ));
     assert!(!destination.exists());
+    let acquisition_before_value =
+        directory_state("information.w1.partial_acquisition.before.v0", &publication)?;
+    assert_checked_in_value(
+        "information.partial.acquisition.before",
+        "tests/fixtures/w1/v0/information-partial-acquisition-before.json",
+        &acquisition_before_value,
+    );
     let acquisition_before = checked_in_identity(
         "information.partial.acquisition.before",
         "tests/fixtures/w1/v0/information-partial-acquisition-before.json",
