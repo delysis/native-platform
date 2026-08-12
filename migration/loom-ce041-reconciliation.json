@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "source_repository": "delysis/loom-native",
+  "autoresearch_source": "ce041eb76919f2568c91912b7317eca287a80866",
+  "common_ancestor": "1e39e05b31d04f70af50721f2225631b68587106",
+  "quiet_editor_parent": "5c4e0a8ff9be37b448552f9d26e22a35770f5312",
+  "reconciliation_merge": "72465d22b0cbfd9d914d02e0167d759bb73460b4",
+  "phase_one_r4_r5_lineage": "d0aca6ff4883ac51514fea5e5fb75ffbb3c8c264",
+  "accepted_current_main": "223110bee4be72386d79306b444517371e4a9930",
+  "path_classification": {
+    "source_changed_paths": 130,
+    "byte_identical_paths": 96,
+    "evolved_descendant_paths": 34,
+    "absent_paths": 0
+  },
+  "resolution": "reconciled_in_source_history",
+  "native_platform_history_imported": false,
+  "native_platform_source_imported": false,
+  "claims_not_established": [
+    "No source or history has been imported into native-platform.",
+    "This ledger does not replay or independently reimplement ce041.",
+    "This ledger makes no branch-retirement or remote-deletion claim."
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "section_goal": "phase-one-section-19-single-current-graph",
+  "result": "falsified_at_immutable_current_revisions",
+  "conflict": {
+    "native_link": "sqlite3",
+    "loom_path": "loom-campaign -> loom-store -> rusqlite 0.39.0 -> libsqlite3-sys 0.37.0",
+    "loom_revision": "223110bee4be72386d79306b444517371e4a9930",
+    "mom_path": "mom-llama-runtime -> rusqlite 0.32.1 -> libsqlite3-sys 0.30.1",
+    "mom_revision": "3cf57941af6d523378e7fa8b24f5c24c8e50363f",
+    "cargo_result": "failed to select a version because only one package may link sqlite3"
+  },
+  "inventory": {
+    "first_party_workspace_members": 62,
+    "portable_library_members": 51,
+    "excluded_members": 11,
+    "external_llama_cpp_boundary_is_additional": true
+  },
+  "split_probes": [
+    {
+      "name": "current-product-graph",
+      "portable_first_party_members": 36,
+      "includes": [
+        "llama-native-host + command-evidence",
+        "fte-backend-llama + fte-loopback + fte-providers",
+        "mom-llama-runtime",
+        "attachment-native-host",
+        "speech-native-host + speech-native-platform + speech-native-backend-parakeet",
+        "information-native-host",
+        "platform-contract-testkit + platform-vertical-fixtures-v0",
+        "llama-cpp-2 external boundary"
+      ]
+    },
+    {
+      "name": "current-loom-graph",
+      "portable_first_party_members": 15,
+      "includes": [
+        "loom-campaign + loom-backend-llama + loom-context + loom-eval-codex + loom-learning",
+        "platform-contract-testkit + platform-vertical-fixtures-v0 compatible peers"
+      ]
+    }
+  ],
+  "excluded_member_names": [
+    "tauri-plugin-free-token-energy",
+    "free-token-energy",
+    "mom-llama-cli",
+    "mom-llama-app",
+    "attachment-native-cli",
+    "tauri-plugin-speech-native",
+    "information-native-cli",
+    "tauri-plugin-information-native",
+    "loom-cli",
+    "tauri-plugin-loom",
+    "loom-app"
+  ],
+  "nonclaims": [
+    "The split probes establish exact-revision coexistence, not current-sibling rebinding inside source repositories.",
+    "The probes do not import production source or history.",
+    "The probes do not modify product releases."
+  ]
+}

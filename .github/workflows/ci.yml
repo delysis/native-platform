@@ -26,10 +26,17 @@ jobs:
           rustup run 1.92.0 rustc --version --verbose
           rustup run 1.92.0 cargo --version
           pnpm --version
+      - name: Enable long Git paths on Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
       - name: Rust format
         run: rustup run 1.92.0 cargo fmt --all -- --check
       - name: Rust tests
         run: rustup run 1.92.0 cargo test --locked --workspace --all-targets
+      - name: Exact current non-Loom product graph
+        run: rustup run 1.92.0 cargo check --locked -p integration-current --features current-product-graph
+      - name: Exact current Loom product graph
+        run: rustup run 1.92.0 cargo run --locked -p xtask -- loom-probe
       - name: Strict Clippy
         run: rustup run 1.92.0 cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Shell policy

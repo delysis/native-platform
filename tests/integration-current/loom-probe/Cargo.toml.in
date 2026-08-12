@@ -1,0 +1,21 @@
+[package]
+name = "integration-current-loom-probe"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.92"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+loom-backend-llama-current = { package = "loom-backend-llama", git = "https://github.com/delysis/loom-native", rev = "223110bee4be72386d79306b444517371e4a9930" }
+loom-campaign-current = { package = "loom-campaign", git = "https://github.com/delysis/loom-native", rev = "223110bee4be72386d79306b444517371e4a9930" }
+loom-context-current = { package = "loom-context", git = "https://github.com/delysis/loom-native", rev = "223110bee4be72386d79306b444517371e4a9930" }
+loom-eval-codex-current = { package = "loom-eval-codex", git = "https://github.com/delysis/loom-native", rev = "223110bee4be72386d79306b444517371e4a9930" }
+loom-learning-current = { package = "loom-learning", git = "https://github.com/delysis/loom-native", rev = "223110bee4be72386d79306b444517371e4a9930" }
+platform-contract-testkit-current = { package = "platform-contract-testkit", git = "https://github.com/delysis/w1-platform-contracts", rev = "3ed1f3235edb6d481c324f05fe83b2379e3431e6" }
+platform-vertical-fixtures-v0-current = { package = "platform-vertical-fixtures-v0", git = "https://github.com/delysis/w1-platform-contracts", rev = "3ed1f3235edb6d481c324f05fe83b2379e3431e6" }
+
+[lints.rust]
+unsafe_code = "forbid"

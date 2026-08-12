@@ -25,5 +25,8 @@ Run the local gates with:
 ./scripts/check-shell-policy.sh
 ```
 
-The next authorized phase is W2 integration. Production import and history
-movement remain later, separately reviewed operations.
+`tests/integration-current` is the local W2 integration candidate. It consumes
+accepted product revisions through exact Git dependencies, runs shared contract
+and vertical-authentication checks, and records its precise compile boundary in
+`tests/integration-current/COVERAGE.md`. It is not yet accepted. Production
+import and history movement remain later, separately reviewed operations.
