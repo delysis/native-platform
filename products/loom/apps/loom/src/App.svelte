@@ -54,6 +54,7 @@
   import { canRoundTripMarkdownExactly, canUseVisualMarkdown } from './lib/markdownSafety';
   import {
     autocompleteDisposition,
+    exactVerifiedSuggestionFamily,
     verifiedGhostSuggestion,
     visibleVerifiedGhostSuggestion,
     type AutocompleteDisposition
@@ -609,14 +610,12 @@
     : mode === 'source'
       ? sourceGhostTargetByte
       : null;
-  $: exactReviewBranches = suggestionsEnabled && branchPromotionReady && reviewTargetByte !== null
-    ? shelfBranches.filter((branch) =>
-      branch.status === 'ready' &&
-      branch.target_start_byte === reviewTargetByte &&
-      branch.target_end_byte === reviewTargetByte &&
-      Boolean(verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[branch.run_id]))
-    )
-    : [];
+  $: exactReviewBranches = exactVerifiedSuggestionFamily({
+    active: suggestionsEnabled && branchPromotionReady,
+    branches: shelfBranches,
+    verifiedBodyByRun: verifiedBranchBodyByRun,
+    targetByte: reviewTargetByte
+  });
   $: reviewableBranches = exactReviewBranches.filter((branch) => {
     if (!candidateTextIsSurfaceable(branch.text)) return false;
     const suggestion = verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[branch.run_id]);

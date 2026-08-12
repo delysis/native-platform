@@ -3,6 +3,7 @@ import type { BranchCard } from './types';
 import { verifyBranchBody, type VerifiedBranchBody } from './branchBodyProof';
 import {
   autocompleteDisposition,
+  exactVerifiedSuggestionFamily,
   selectVerifiedGhostSuggestion,
   verifiedGhostSuggestion,
   visibleVerifiedGhostSuggestion
@@ -106,6 +107,42 @@ describe('visibleVerifiedGhostSuggestion', () => {
       suggestion,
       `candidate-1:${hydrated.body.blobId}`
     )).toBe(suggestion);
+  });
+});
+
+describe('exactVerifiedSuggestionFamily', () => {
+  it('returns only verified candidates at the active caret boundary', async () => {
+    const first = await hydratedBranch();
+    const second = await hydratedBranch({
+      run_id: 'run-2',
+      branch_id: 'branch-2',
+      candidate_id: 'candidate-2',
+      text: ' rain came softly.'
+    });
+    const otherBoundary = await hydratedBranch({
+      run_id: 'run-3',
+      branch_id: 'branch-3',
+      candidate_id: 'candidate-3',
+      target_start_byte: 10,
+      target_end_byte: 10
+    });
+
+    const selection = {
+      active: true,
+      branches: [first.branch, second.branch, otherBoundary.branch],
+      verifiedBodyByRun: {
+        'run-1': first.body,
+        'run-2': second.body,
+        'run-3': otherBoundary.body
+      },
+      targetByte: 9
+    };
+    expect(exactVerifiedSuggestionFamily(selection)).toEqual([
+      first.branch,
+      second.branch
+    ]);
+    expect(exactVerifiedSuggestionFamily({ ...selection, active: false })).toEqual([]);
+    expect(exactVerifiedSuggestionFamily({ ...selection, targetByte: null })).toEqual([]);
   });
 });
 

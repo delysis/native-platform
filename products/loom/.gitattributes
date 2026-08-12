@@ -1,0 +1,2 @@
+/fixtures/w1/*.json text eol=lf
+/fixtures/w1/MANIFEST.sha256 text eol=lf

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "fixture_id": "loom-prior-store-v10-v1",
+  "evidence_class": "state",
+  "prior_store_schema_version": 10,
+  "current_store_schema_version": 11,
+  "producer": {
+    "source_commit": "d0aca6ff4883ac51514fea5e5fb75ffbb3c8c264",
+    "migration_sha256": [
+      "941e24729a4f3bfb3aeac9e3110012bb38df66e1c7b1d140935506af7a3e9646",
+      "ab17455e593cdc89b90e7582370d3092ff7e4cb7e2f71fbd06b1f592c4c24c8b",
+      "0a21c6ed89132641f0212f3617d74ca08cbeb12fbe6b5e15359b66d88534e4ec",
+      "5e3e627810548fa15712a8c73110713d6845ff8a7b9587bed2dbf39b9fef93c5",
+      "143f281748a0efddc93a2e32adbd3abb344a5b95921081d989f9fc96a9afc5c1",
+      "af09156dcbaa17ad22b15052ac3d9d6bdcbcc142d57a1c724957c60b941f1ed8",
+      "162799d6bae4a4a93c1494a2fa3623a7a32d60b2ffe45398f54195c8ce1afd23",
+      "f7296d7c950a806c73c70e29587325174d5e741b1d12398566c4c5191bf261ea",
+      "ea1dd803828b94bfe314e0d063aabdf213e50df8b36b81b5bf12d2fbf07f2a39",
+      "854067850b2571a0edae3cbfa2b7d022378ec81673a4e794445e750ac4c756a0"
+    ]
+  },
+  "document": {
+    "relative_path": "manuscript/001.md",
+    "text": "CHAPTER ONE\n\nThe prior store remembered the rain.\n",
+    "sha256": "834c141212ac3cf23062a3864b45cdf630ae8fc8029092807602fffce1b70739"
+  },
+  "identities": {
+    "project_id": "00000000000000000000000001",
+    "document_id": "00000000000000000000000002",
+    "artifact_id": "00000000000000000000000003",
+    "operation_id": "00000000000000000000000004",
+    "revision_id": "00000000000000000000000005"
+  },
+  "frozen_corpus": {
+    "project_manifest_sha256": "46a6d67417f00a3391b7a2100d27a4b1720e3c4811f658456472647e49f731a7",
+    "project_manifest_byte_len": 167,
+    "database_sha256": "0514089b057e509d34c72f0731cd3ffb89d8ff7b5dd42edd5888edc94e78e9c8",
+    "database_byte_len": 1101824
+  },
+  "expected": {
+    "preserve_project_identity": true,
+    "preserve_revision_identity": true,
+    "preserve_visible_bytes": true,
+    "pending_outbox_count": 0,
+    "revision_count": 1,
+    "selection_count": 0,
+    "added_table": "research_foreground_command_receipts"
+  }
+}

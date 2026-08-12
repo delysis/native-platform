@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "fixture_id": "loom-research-authority-v1",
+  "evidence_class": "model_free",
+  "source_text": "Pinned source manuscript.",
+  "source_sha256": "840043a30b4fa9abe497e3c477b577fa43c6efba6d22a15e0b2825251f5dc019",
+  "output_text": "Human-authored continuation.",
+  "output_sha256": "3aedbcff1c11ea03a41c5c3d5bb0bafb0a4f5685b7b0f4cf40475cb39788ffa4",
+  "expected": {
+    "live_session": "single_use_authority_allowed",
+    "reopened_session": "bytes_replay_only",
+    "persisted_diagnostic": "no_call_lease"
+  }
+}
