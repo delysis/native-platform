@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "successful_github_actions_runs_at_accepted_source_heads",
+  "entries": [
+    {
+      "source_repository": "delysis/llama-native-kit",
+      "source_main": "16168bd76a09f74fdee41d0e2fb0441e79ac1005",
+      "successful_run_ids": [31614258802, 31614258731]
+    },
+    {
+      "source_repository": "delysis/free-token-energy",
+      "source_main": "67814e76659688fef61f311db588d17eddee0a66",
+      "successful_run_ids": [31622783227, 31622783323]
+    },
+    {
+      "source_repository": "delysis/mom-llama",
+      "source_main": "3cf57941af6d523378e7fa8b24f5c24c8e50363f",
+      "successful_run_ids": [31616953676, 31616953624]
+    },
+    {
+      "source_repository": "delysis/attachment-native-kit",
+      "source_main": "2a8d3a9a1828162a51185d207822ceb1ba6283a8",
+      "successful_run_ids": [31568084080]
+    },
+    {
+      "source_repository": "delysis/speech-native-kit",
+      "source_main": "b836318f10a7e11f433ec3ea8dfa48707adc9b06",
+      "successful_run_ids": [31617113042, 31617113326]
+    },
+    {
+      "source_repository": "delysis/information-native-kit",
+      "source_main": "7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe",
+      "successful_run_ids": [31611824253]
+    },
+    {
+      "source_repository": "delysis/loom-native",
+      "source_main": "223110bee4be72386d79306b444517371e4a9930",
+      "successful_run_ids": [31616501762, 31616501741]
+    },
+    {
+      "source_repository": "delysis/w1-platform-contracts",
+      "source_main": "3ed1f3235edb6d481c324f05fe83b2379e3431e6",
+      "successful_run_ids": [31624614299]
+    }
+  ]
+}

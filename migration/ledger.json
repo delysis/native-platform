@@ -1,9 +1,18 @@
 {
   "schema_version": 1,
-  "goal": "W2-SHELL",
-  "status": "shell_no_imports",
+  "goal": "W2-INTEGRATION",
+  "status": "integration_candidate_no_imports",
   "production_source_imported": false,
   "source_history_imported": false,
+  "integration_candidate": {
+    "accepted": false,
+    "pushed": false,
+    "product_releases_modified": false,
+    "source_imported": false,
+    "history_imported": false,
+    "manifest": "tests/integration-current/Cargo.toml",
+    "coverage": "tests/integration-current/COVERAGE.md"
+  },
   "accepted_w1_receipt": {
     "goal": "W1-VERTICALS",
     "decision": "accepted",

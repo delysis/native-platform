@@ -1,0 +1,59 @@
+[package]
+name = "integration-current"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+current-product-graph = [
+    "dep:attachment-native-host-current",
+    "dep:command-evidence-current",
+    "dep:fte-backend-llama-current",
+    "dep:fte-loopback-current",
+    "dep:fte-providers-current",
+    "dep:information-native-host-current",
+    "dep:llama-cpp-2-current",
+    "dep:llama-native-host-current",
+    "dep:mom-llama-runtime-current",
+    "dep:speech-native-backend-parakeet-current",
+    "dep:speech-native-host-current",
+    "dep:speech-native-platform-current",
+]
+
+[dependencies]
+attachment-native-host-current = { workspace = true, optional = true }
+attachment-native-types-current.workspace = true
+command-evidence-current = { workspace = true, optional = true }
+fte-backend-llama-current = { workspace = true, optional = true }
+fte-loopback-current = { workspace = true, optional = true }
+fte-providers-current = { workspace = true, optional = true }
+fte-types-current.workspace = true
+information-native-host-current = { workspace = true, optional = true }
+information-native-types-current.workspace = true
+llama-cpp-2-current = { workspace = true, optional = true }
+llama-native-host-current = { workspace = true, optional = true }
+llama-native-types-current.workspace = true
+loom-types-current = { workspace = true, optional = true }
+mom-llama-runtime-current = { workspace = true, optional = true }
+platform-contract-testkit-current.workspace = true
+platform-contracts-v0-current.workspace = true
+platform-vertical-fixtures-v0-current.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+speech-native-backend-parakeet-current = { workspace = true, optional = true }
+speech-native-host-current = { workspace = true, optional = true }
+speech-native-platform-current = { workspace = true, optional = true }
+speech-native-types-current.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.native-platform]
+group = "diagnostic"
+claim = "exact-revision compatibility candidate; not product acceptance"

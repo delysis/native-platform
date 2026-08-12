@@ -30,6 +30,10 @@ jobs:
         run: rustup run 1.92.0 cargo fmt --all -- --check
       - name: Rust tests
         run: rustup run 1.92.0 cargo test --locked --workspace --all-targets
+      - name: Exact current non-Loom product graph
+        run: rustup run 1.92.0 cargo check --locked -p integration-current --features current-product-graph
+      - name: Exact current Loom product graph
+        run: rustup run 1.92.0 cargo run --locked -p xtask -- loom-probe
       - name: Strict Clippy
         run: rustup run 1.92.0 cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Shell policy
