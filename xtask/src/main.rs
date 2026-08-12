@@ -176,7 +176,7 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     )?;
     check_sha256(
         &root.join("migration/native-import.json"),
-        "9c5d8d09611fb5e7a62529a4cd6888860cb9c0c3458a3be98872fb913077dbd5",
+        "028d4c6703c8acf6b96b681095ddeef035a6200c425a5421190635b8717795b6",
     )
 }
 
@@ -315,7 +315,7 @@ fn check_ledger(root: &Path) -> Result<()> {
     let mut expected = Ledger {
         schema_version: 1,
         goal: "W3-IMPORT-NATIVE".into(),
-        status: "native_import_candidate_pending_remote_ci".into(),
+        status: "native_import_final_evidence_candidate".into(),
         production_source_imported: true,
         source_history_imported: true,
         integration_candidate: IntegrationCandidate {
@@ -447,6 +447,11 @@ fn check_ledger(root: &Path) -> Result<()> {
         .context("expected native migration entry")?;
     native.import_commit = Some("152a0dda9ba0d1096022d11ddbd08489f524ab31".into());
     native.path_dependency_cutover_commit = Some("c35c6b2d42f60939f3a3478212743c9c82f28b80".into());
+    native.source_tags.push(SourceTag {
+        name: "native-platform-v2-horizon-b-2026-08-12".into(),
+        peeled_commit: "16168bd76a09f74fdee41d0e2fb0441e79ac1005".into(),
+    });
+    native.old_repo_status = "frozen_unarchived_two_release_retirement".into();
     ensure!(ledger == expected, "migration ledger drift");
     Ok(())
 }

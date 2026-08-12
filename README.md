@@ -1,8 +1,8 @@
 # native-platform
 
 This repository is the Delysis first-party Rust platform monorepo. Wave 3
-imports the accepted `llama-native-kit` history beneath `crates/native` and
-rebinds current integration graphs to those path packages.
+imported the accepted `llama-native-kit` history beneath `crates/native` and
+rebound current integration graphs to those path packages.
 
 The native import preserves all 45 accepted source commits without squashing.
 `migration/ledger.json`, `migration/native-import.json`, and

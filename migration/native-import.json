@@ -1,12 +1,13 @@
 {
   "schema_version": 1,
   "goal": "W3-IMPORT-NATIVE",
-  "status": "candidate_pending_remote_ci",
+  "status": "final_evidence_candidate",
   "source": {
     "repository": "https://github.com/delysis/llama-native-kit.git",
     "accepted_main": "16168bd76a09f74fdee41d0e2fb0441e79ac1005",
     "accepted_tree": "65f8d97c178188de8e44188b5a6adf0195cdc57f",
     "phase_one_tag": "phase1-audit-2026-08-11",
+    "phase_one_tag_object": "2862a1bd631a38436b1e65bec53e8a7ac6c5a4c6",
     "phase_one_tag_peeled_commit": "7ad18cdd616d97145564ee925235d27e2369319f"
   },
   "rewrite": {
@@ -26,7 +27,26 @@
       "68b4f87c331d9ea887713201d4ee479c3445226a",
       "9e6d8c49887b8691a0836158f2c3ea68715e11e5"
     ],
-    "path_dependency_cutover": "c35c6b2d42f60939f3a3478212743c9c82f28b80"
+    "path_dependency_cutover": "c35c6b2d42f60939f3a3478212743c9c82f28b80",
+    "candidate": "6e94d4dd377fd9e970999ff6a090fadbf5c16cb2",
+    "candidate_tree": "cc8847a56e10c5795186d70a20445615c146f980",
+    "pull_request": "https://github.com/delysis/native-platform/pull/3",
+    "initial_merge": "691832f2af8f4b6ba291dd18380a776b7d387343",
+    "initial_merge_tree": "cc8847a56e10c5795186d70a20445615c146f980",
+    "initial_merge_parents": [
+      "68b4f87c331d9ea887713201d4ee479c3445226a",
+      "6e94d4dd377fd9e970999ff6a090fadbf5c16cb2"
+    ],
+    "candidate_tag": "w3-native-import-candidate-v0-2026-08-12",
+    "candidate_tag_object": "1e5e9ea1c6232fb36184e9b50cf7a50e03ede125",
+    "candidate_tag_ruleset": 20768300,
+    "candidate_runs": [31639279377, 31639347952],
+    "post_merge_run": 31641542839,
+    "post_merge_jobs": {
+      "ubuntu": 94264964305,
+      "macos": 94264964242,
+      "windows": 94264964399
+    }
   },
   "dependency_cutover": {
     "native_git_sources_in_root_lock": 0,
@@ -39,12 +59,25 @@
     ]
   },
   "path_decision": "The machine-readable W2 ledger destination crates/native supersedes the older prose example crates/imported/llama-native-kit.",
-  "source_repository_status": "active_not_modified",
+  "source_freeze": {
+    "source_boundary_tag": "native-platform-v2-horizon-b-2026-08-12",
+    "source_boundary_tag_object": "58779c13f64c49732e881109edb7da4862541599",
+    "source_boundary_tag_ruleset": 20768308,
+    "freeze_commit": "c3fe09b782469c88c6a3e0bf3a35f38394ce6569",
+    "freeze_tree": "96d21368246c1179dce674c3ab2c2fd508d8a40f",
+    "freeze_parent": "16168bd76a09f74fdee41d0e2fb0441e79ac1005",
+    "push_runs": [31643435710, 31643435779],
+    "all_branch_freeze_ruleset": 20768363,
+    "archived": false,
+    "issues_enabled": true,
+    "archive_after_native_platform_releases": 2
+  },
+  "source_repository_status": "frozen_unarchived_two_release_retirement",
   "nonclaims": [
-    "The llama-native-kit remote, tags, settings, and working tree were not modified by this candidate.",
+    "The source repository is frozen and redirected, but remains unarchived for provenance and the two-release retirement window.",
     "No product repository or released product manifest was modified.",
     "The external llama-cpp-rs history was not imported.",
     "The separate Loom probe remains necessary because the accepted product heads have incompatible sqlite3 links dependencies.",
-    "Source-repository freeze and final W3 acceptance require later steward actions after merge and post-merge CI."
+    "The final evidence merge, its post-merge CI, and the protected final W3 tag remain pending."
   ]
 }
