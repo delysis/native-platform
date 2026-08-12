@@ -7,8 +7,9 @@ use platform_contracts_v0::{
 use platform_vertical_fixtures_v0::{
     ALL_VERTICAL_IDS, ArtifactAvailabilityV0, DurableStateFactV0, EquivalenceProjectionV0,
     EventFactV0, FactValueV0, FixtureArtifactV0, FixtureCaseV0, GitSourceV0, LifecycleFactV0,
-    NetworkBoundaryV0, ObservationEnvelopeV0, OwnershipFactsV0, ReplayProgramV0, ReplayRecipeV0,
-    StateDispositionV0, VERTICAL_FIXTURE_LOCK_SCHEMA_V0, VERTICAL_FIXTURE_MANIFEST_SCHEMA_V0,
+    NetworkBoundaryV0, ObservationEnvelopeV0, OwnershipFactsV0, PrerequisiteKindV0, PrerequisiteV0,
+    ReplayProgramV0, ReplayRecipeV0, StateDispositionV0, StateIdentityV0,
+    VERTICAL_FIXTURE_LOCK_SCHEMA_V0, VERTICAL_FIXTURE_MANIFEST_SCHEMA_V0,
     VERTICAL_OBSERVATION_SCHEMA_V0, VerticalFixtureLockEntryV0, VerticalFixtureLockV0,
     VerticalFixtureManifestV0, VerticalIdV0, sha256_identity,
 };
@@ -75,26 +76,46 @@ pub fn projection(vertical_id: VerticalIdV0) -> EquivalenceProjectionV0 {
         ]);
     }
 
-    EquivalenceProjectionV0 {
-        ordered_events: vec![EventFactV0 {
-            sequence: 0,
+    let mut ordered_events = vec![EventFactV0 {
+        sequence: 0,
+        operation_id: "operation.primary".to_owned(),
+        attempt_id: Some("attempt.1".to_owned()),
+        kind: "completed".to_owned(),
+        payload: Some(artifact("event.payload", '1')),
+    }];
+    let mut lifecycle = vec![LifecycleFactV0 {
+        operation_id: "operation.primary".to_owned(),
+        attempt_id: Some("attempt.1".to_owned()),
+        terminal: TerminalClass::Completed,
+        released: true,
+    }];
+    if vertical_id == VerticalIdV0::MomChatCancelRetry {
+        "cancelled".clone_into(&mut ordered_events[0].kind);
+        lifecycle[0].terminal = TerminalClass::Cancelled;
+        ordered_events.push(EventFactV0 {
+            sequence: 1,
             operation_id: "operation.primary".to_owned(),
-            attempt_id: Some("attempt.1".to_owned()),
+            attempt_id: Some("attempt.2".to_owned()),
             kind: "completed".to_owned(),
             payload: Some(artifact("event.payload", '1')),
-        }],
+        });
+        lifecycle.push(LifecycleFactV0 {
+            operation_id: "operation.primary".to_owned(),
+            attempt_id: Some("attempt.2".to_owned()),
+            terminal: TerminalClass::Completed,
+            released: true,
+        });
+    }
+
+    EquivalenceProjectionV0 {
+        ordered_events,
         durable_state: vec![DurableStateFactV0 {
             state_id: "state.primary".to_owned(),
             before: Some(artifact("state.before", '2')),
             after: Some(artifact("state.after", '3')),
             disposition: StateDispositionV0::Updated,
         }],
-        lifecycle: vec![LifecycleFactV0 {
-            operation_id: "operation.primary".to_owned(),
-            attempt_id: Some("attempt.1".to_owned()),
-            terminal: TerminalClass::Completed,
-            released: true,
-        }],
+        lifecycle,
         ownership: OwnershipFactsV0 {
             active_operations: 0,
             retained_tasks: 0,
@@ -120,6 +141,55 @@ pub fn manifest_and_projection(vertical_id: VerticalIdV0) -> (VerticalFixtureMan
     } else {
         Vec::new()
     };
+    let prerequisites = match vertical_id {
+        VerticalIdV0::CurrentExactQwen => vec![prerequisite(
+            "model.qwen.gguf",
+            PrerequisiteKindV0::ExactExternalArtifact,
+            "model.qwen.bytes",
+            '4',
+        )],
+        VerticalIdV0::CurrentExactGemma => vec![prerequisite(
+            "model.gemma.gguf",
+            PrerequisiteKindV0::ExactExternalArtifact,
+            "model.gemma.bytes",
+            '5',
+        )],
+        VerticalIdV0::CurrentParakeetModelAudio => vec![
+            prerequisite(
+                "model.parakeet",
+                PrerequisiteKindV0::ExactExternalArtifact,
+                "model.parakeet.bytes",
+                '6',
+            ),
+            prerequisite(
+                "audio.input",
+                PrerequisiteKindV0::ExactExternalArtifact,
+                "audio.input.bytes",
+                '7',
+            ),
+        ],
+        VerticalIdV0::AppleInstalledVoice => vec![prerequisite(
+            "voice.apple.installed",
+            PrerequisiteKindV0::PlatformInventory,
+            "voice.apple.inventory",
+            '8',
+        )],
+        _ => Vec::new(),
+    };
+    let state_identities =
+        if vertical_id.class() == platform_vertical_fixtures_v0::FixtureClassV0::State {
+            vec![StateIdentityV0 {
+                state_id: "state.primary".to_owned(),
+                schema_id: "state.schema.v0".to_owned(),
+                baseline: FixtureArtifactV0 {
+                    identity: artifact("state.before", '2'),
+                    availability: ArtifactAvailabilityV0::CheckedIn,
+                    relative_path: Some("tests/fixtures/state.before".to_owned()),
+                },
+            }]
+        } else {
+            Vec::new()
+        };
     (
         VerticalFixtureManifestV0 {
             schema: VERTICAL_FIXTURE_MANIFEST_SCHEMA_V0.to_owned(),
@@ -138,8 +208,8 @@ pub fn manifest_and_projection(vertical_id: VerticalIdV0) -> (VerticalFixtureMan
                     availability: ArtifactAvailabilityV0::CheckedIn,
                     relative_path: Some("tests/fixtures/request.json".to_owned()),
                 }],
-                state_identities: Vec::new(),
-                prerequisites: Vec::new(),
+                state_identities,
+                prerequisites,
                 replay: vec![ReplayRecipeV0 {
                     program: ReplayProgramV0::Cargo,
                     argv: vec![
@@ -157,6 +227,19 @@ pub fn manifest_and_projection(vertical_id: VerticalIdV0) -> (VerticalFixtureMan
         },
         projection_bytes,
     )
+}
+
+fn prerequisite(
+    prerequisite_id: &str,
+    kind: PrerequisiteKindV0,
+    artifact_id: &str,
+    byte: char,
+) -> PrerequisiteV0 {
+    PrerequisiteV0 {
+        prerequisite_id: prerequisite_id.to_owned(),
+        kind,
+        identity: artifact(artifact_id, byte),
+    }
 }
 
 pub fn observation(vertical_id: VerticalIdV0) -> ObservationEnvelopeV0 {
@@ -183,19 +266,32 @@ pub fn observation(vertical_id: VerticalIdV0) -> ObservationEnvelopeV0 {
     }
 }
 
-pub fn complete_lock() -> VerticalFixtureLockV0 {
-    VerticalFixtureLockV0 {
-        schema: VERTICAL_FIXTURE_LOCK_SCHEMA_V0.to_owned(),
-        protocol_commit: "f".repeat(40),
-        contract_revision: CONTRACT_REVISION.to_owned(),
-        entries: ALL_VERTICAL_IDS
-            .iter()
-            .copied()
-            .map(|vertical_id| VerticalFixtureLockEntryV0 {
-                vertical_id,
-                class: vertical_id.class(),
-                manifest: artifact(&format!("manifest.{vertical_id:?}"), '9'),
-            })
-            .collect(),
-    }
+pub fn complete_lock() -> (VerticalFixtureLockV0, Vec<Vec<u8>>) {
+    let manifests = ALL_VERTICAL_IDS
+        .iter()
+        .copied()
+        .map(|vertical_id| {
+            let (manifest, _) = manifest_and_projection(vertical_id);
+            serde_json::to_vec(&manifest).expect("manifest JSON")
+        })
+        .collect::<Vec<_>>();
+    let entries = ALL_VERTICAL_IDS
+        .iter()
+        .copied()
+        .zip(&manifests)
+        .map(|(vertical_id, bytes)| VerticalFixtureLockEntryV0 {
+            vertical_id,
+            class: vertical_id.class(),
+            manifest: sha256_identity(format!("manifest.{vertical_id:?}"), bytes),
+        })
+        .collect();
+    (
+        VerticalFixtureLockV0 {
+            schema: VERTICAL_FIXTURE_LOCK_SCHEMA_V0.to_owned(),
+            protocol_commit: "f".repeat(40),
+            contract_revision: CONTRACT_REVISION.to_owned(),
+            entries,
+        },
+        manifests,
+    )
 }

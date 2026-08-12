@@ -13,6 +13,7 @@
       "type": "array",
       "minItems": 18,
       "maxItems": 18,
+      "uniqueItems": true,
       "items": { "$ref": "#/$defs/entry" }
     }
   },

@@ -81,7 +81,7 @@ fn validator(schema_id: &str) -> Validator {
 fn schemas_compile_offline_and_accept_typed_examples() {
     let (manifest, _) = support::manifest_and_projection(VerticalIdV0::MomChatCancelRetry);
     let observation = support::observation(VerticalIdV0::MomChatCancelRetry);
-    let lock = support::complete_lock();
+    let (lock, _) = support::complete_lock();
 
     for (schema_id, value) in [
         (
@@ -118,7 +118,7 @@ fn schemas_and_serde_reject_authority_inflation() {
     assert!(!validator(OBSERVATION_SCHEMA_ID).is_valid(&observation_json));
     assert!(serde_json::from_value::<ObservationEnvelopeV0>(observation_json).is_err());
 
-    let lock = support::complete_lock();
+    let (lock, _) = support::complete_lock();
     let mut lock_json = serde_json::to_value(lock).expect("lock JSON");
     lock_json["accepted"] = serde_json::json!(true);
     assert!(!validator(LOCK_SCHEMA_ID).is_valid(&lock_json));
@@ -131,4 +131,32 @@ fn manifest_schema_rejects_wrong_section_16_class() {
     let mut json = serde_json::to_value(manifest).expect("manifest JSON");
     json["class"] = serde_json::json!("model_free");
     assert!(!validator(MANIFEST_SCHEMA_ID).is_valid(&json));
+}
+
+#[test]
+fn schemas_require_real_prerequisites_state_identity_and_fail_closed_facts() {
+    for vertical_id in [
+        VerticalIdV0::CurrentExactQwen,
+        VerticalIdV0::CurrentExactGemma,
+        VerticalIdV0::CurrentParakeetModelAudio,
+        VerticalIdV0::AppleInstalledVoice,
+    ] {
+        let (manifest, _) = support::manifest_and_projection(vertical_id);
+        let mut json = serde_json::to_value(manifest).expect("real manifest JSON");
+        json["cases"][0]["prerequisites"] = serde_json::json!([]);
+        assert!(
+            !validator(MANIFEST_SCHEMA_ID).is_valid(&json),
+            "{vertical_id:?} schema must require exact prerequisites"
+        );
+    }
+
+    let (state, _) = support::manifest_and_projection(VerticalIdV0::FteLegacyDatabase);
+    let mut state_json = serde_json::to_value(state).expect("state manifest JSON");
+    state_json["cases"][0]["state_identities"] = serde_json::json!([]);
+    assert!(!validator(MANIFEST_SCHEMA_ID).is_valid(&state_json));
+
+    let observation = support::observation(VerticalIdV0::SpeechPeerCancellation);
+    let mut observation_json = serde_json::to_value(observation).expect("observation JSON");
+    observation_json["projection"]["fail_closed_facts"] = serde_json::json!([]);
+    assert!(!validator(OBSERVATION_SCHEMA_ID).is_valid(&observation_json));
 }

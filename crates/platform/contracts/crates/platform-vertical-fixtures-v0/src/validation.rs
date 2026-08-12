@@ -1,18 +1,25 @@
 use crate::model::{
     ALL_VERTICAL_IDS, ArtifactAvailabilityV0, EquivalenceProjectionV0, FactValueV0,
     FixtureArtifactV0, FixtureCaseV0, FixtureClassV0, GitSourceV0, NegativeEvidenceV0,
-    ObservationEnvelopeV0, ReplayProgramV0, ReplayRecipeV0, StateIdentityV0,
+    ObservationEnvelopeV0, PrerequisiteKindV0, ReplayProgramV0, ReplayRecipeV0, StateIdentityV0,
     VERTICAL_FIXTURE_LOCK_SCHEMA_V0, VERTICAL_FIXTURE_MANIFEST_SCHEMA_V0,
     VERTICAL_OBSERVATION_SCHEMA_V0, VerticalFixtureLockV0, VerticalFixtureManifestV0, VerticalIdV0,
     W1_CONTRACT_REVISION,
 };
-use platform_contracts_v0::{ArtifactIdentityV0, ContentDigest, EvidenceTier, ExecutionKind};
+use platform_contracts_v0::{
+    ArtifactIdentityV0, ContentDigest, EvidenceTier, ExecutionKind, TerminalClass,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 const MAX_ID_BYTES: usize = 256;
 const MAX_TEXT_BYTES: usize = 4096;
 const LIVE_HOSTED_PROVIDER_OMISSION: &str = "live hosted-provider behavior";
+const QWEN_MODEL_PREREQUISITE: &str = "model.qwen.gguf";
+const GEMMA_MODEL_PREREQUISITE: &str = "model.gemma.gguf";
+const PARAKEET_MODEL_PREREQUISITE: &str = "model.parakeet";
+const PARAKEET_AUDIO_PREREQUISITE: &str = "audio.input";
+const APPLE_VOICE_PREREQUISITE: &str = "voice.apple.installed";
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
@@ -31,6 +38,8 @@ pub enum ValidationError {
     LengthMismatch { field: &'static str },
     #[error("expected projection is not valid JSON: {0}")]
     InvalidProjectionJson(String),
+    #[error("locked manifest is not valid JSON: {0}")]
+    InvalidManifestJson(String),
     #[error("observed projection does not equal the frozen projection")]
     ProjectionMismatch,
     #[error("manifest does not contain case {0}")]
@@ -64,7 +73,7 @@ pub fn validate_manifest(manifest: &VerticalFixtureManifestV0) -> Result<(), Val
 
     let mut cases = BTreeSet::new();
     for case in &manifest.cases {
-        validate_case(case)?;
+        validate_case(manifest.vertical_id, case)?;
         if !cases.insert(case.case_id.as_str()) {
             return Err(ValidationError::Duplicate {
                 field: "cases.case_id",
@@ -156,16 +165,22 @@ pub fn validate_observation(observation: &ObservationEnvelopeV0) -> Result<(), V
     if observation.vertical_id == VerticalIdV0::LoomSuggestionPromotion {
         validate_loom_projection(&observation.projection)?;
     }
+    if observation.vertical_id == VerticalIdV0::MomChatCancelRetry {
+        validate_mom_chat_retry_projection(&observation.projection)?;
+    }
     Ok(())
 }
 
-/// Validates that a lock covers all eighteen section-16 rows exactly once.
+/// Authenticates and validates that a lock covers all eighteen section-16 rows exactly once.
 ///
 /// # Errors
 ///
-/// Returns [`ValidationError`] for missing, duplicate, malformed, or
-/// incorrectly classified lock entries.
-pub fn validate_lock(lock: &VerticalFixtureLockV0) -> Result<(), ValidationError> {
+/// Returns [`ValidationError`] for missing, duplicate, malformed, unauthenticated,
+/// or incorrectly classified lock entries and manifests.
+pub fn validate_lock<'a>(
+    lock: &VerticalFixtureLockV0,
+    manifest_bytes: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<(), ValidationError> {
     if lock.schema != VERTICAL_FIXTURE_LOCK_SCHEMA_V0 {
         return Err(ValidationError::Invalid { field: "schema" });
     }
@@ -178,6 +193,7 @@ pub fn validate_lock(lock: &VerticalFixtureLockV0) -> Result<(), ValidationError
     }
 
     let mut present = BTreeSet::new();
+    let mut manifest_digests = BTreeSet::new();
     for entry in &lock.entries {
         if entry.class != entry.vertical_id.class() {
             return Err(ValidationError::Inconsistent {
@@ -185,6 +201,11 @@ pub fn validate_lock(lock: &VerticalFixtureLockV0) -> Result<(), ValidationError
             });
         }
         validate_artifact("entries.manifest", &entry.manifest)?;
+        if !manifest_digests.insert(entry.manifest.digest.hex.as_str()) {
+            return Err(ValidationError::Duplicate {
+                field: "entries.manifest.digest",
+            });
+        }
         if !present.insert(entry.vertical_id) {
             return Err(ValidationError::Duplicate {
                 field: "entries.vertical_id",
@@ -202,6 +223,40 @@ pub fn validate_lock(lock: &VerticalFixtureLockV0) -> Result<(), ValidationError
     }
     if lock.entries.len() != ALL_VERTICAL_IDS.len() {
         return Err(ValidationError::Invalid { field: "entries" });
+    }
+
+    let mut authenticated = BTreeSet::new();
+    for bytes in manifest_bytes {
+        let manifest: VerticalFixtureManifestV0 = serde_json::from_slice(bytes)
+            .map_err(|error| ValidationError::InvalidManifestJson(error.to_string()))?;
+        validate_manifest(&manifest)?;
+        if !authenticated.insert(manifest.vertical_id) {
+            return Err(ValidationError::Duplicate {
+                field: "manifests.vertical_id",
+            });
+        }
+        let entry = lock
+            .entries
+            .iter()
+            .find(|entry| entry.vertical_id == manifest.vertical_id)
+            .ok_or(ValidationError::Invalid {
+                field: "manifests.vertical_id",
+            })?;
+        if entry.class != manifest.class || lock.contract_revision != manifest.contract_revision {
+            return Err(ValidationError::Inconsistent {
+                field: "entries.manifest",
+            });
+        }
+        verify_artifact_bytes("entries.manifest", &entry.manifest, bytes)?;
+    }
+
+    let missing_manifests = ALL_VERTICAL_IDS
+        .iter()
+        .copied()
+        .filter(|vertical_id| !authenticated.contains(vertical_id))
+        .collect::<Vec<_>>();
+    if !missing_manifests.is_empty() {
+        return Err(ValidationError::MissingVerticals(missing_manifests));
     }
     Ok(())
 }
@@ -238,23 +293,44 @@ pub fn validate_baseline(
 
 /// Compares a later implementation observation with the frozen projection.
 ///
-/// The candidate revision may differ from the baseline. Its complete
-/// observable projection may not.
+/// The candidate revision may differ from the baseline. The supplied candidate
+/// source identifies that revision and its production-tree bytes; both are
+/// authenticated and bound to the observation. Its complete observable
+/// projection may not differ.
 ///
 /// # Errors
 ///
 /// Returns [`ValidationError`] when any envelope is invalid, the named case is
-/// absent, expected bytes fail authentication, or the projection differs.
+/// absent, expected or candidate-source bytes fail authentication, source
+/// identity differs, or the projection differs.
 pub fn compare_candidate(
     manifest: &VerticalFixtureManifestV0,
     case_id: &str,
     expected_projection_bytes: &[u8],
+    candidate_source: &GitSourceV0,
+    candidate_production_tree_bytes: &[u8],
     candidate: &ObservationEnvelopeV0,
 ) -> Result<(), ValidationError> {
     validate_manifest(manifest)?;
     validate_observation(candidate)?;
     let case = find_case(manifest, case_id)?;
     validate_case_binding(manifest, case, candidate)?;
+    validate_source(candidate_source)?;
+    verify_artifact_bytes(
+        "candidate_source.production_tree",
+        &candidate_source.production_tree,
+        candidate_production_tree_bytes,
+    )?;
+    if candidate.implementation_revision != candidate_source.commit {
+        return Err(ValidationError::Inconsistent {
+            field: "implementation_revision",
+        });
+    }
+    if candidate.evidence.exact_source != candidate_source.production_tree.digest {
+        return Err(ValidationError::Inconsistent {
+            field: "evidence.exact_source",
+        });
+    }
     compare_projection(case, expected_projection_bytes, candidate)
 }
 
@@ -299,6 +375,31 @@ fn validate_case_binding(
     if observation.case_id != case.case_id {
         return Err(ValidationError::Inconsistent { field: "case_id" });
     }
+    if manifest.class == FixtureClassV0::State {
+        let declared = case
+            .state_identities
+            .iter()
+            .map(|state| (state.state_id.as_str(), &state.baseline.identity))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if declared.len() != observation.projection.durable_state.len() {
+            return Err(ValidationError::Inconsistent {
+                field: "projection.durable_state",
+            });
+        }
+        for state in &observation.projection.durable_state {
+            let baseline =
+                declared
+                    .get(state.state_id.as_str())
+                    .ok_or(ValidationError::Inconsistent {
+                        field: "projection.durable_state.state_id",
+                    })?;
+            if state.before.as_ref() != Some(*baseline) {
+                return Err(ValidationError::Inconsistent {
+                    field: "projection.durable_state.before",
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -321,7 +422,7 @@ fn compare_projection(
     Ok(())
 }
 
-fn validate_case(case: &FixtureCaseV0) -> Result<(), ValidationError> {
+fn validate_case(vertical_id: VerticalIdV0, case: &FixtureCaseV0) -> Result<(), ValidationError> {
     validate_safe_id("case_id", &case.case_id)?;
     validate_source(&case.source)?;
     if case.inputs.is_empty() {
@@ -333,6 +434,7 @@ fn validate_case(case: &FixtureCaseV0) -> Result<(), ValidationError> {
         |input| input.identity.id.as_str(),
         validate_fixture_artifact,
     )?;
+    validate_row_prerequisites(vertical_id, case)?;
     validate_unique_by_id(
         "state_identities.state_id",
         &case.state_identities,
@@ -419,8 +521,14 @@ fn validate_projection(projection: &EquivalenceProjectionV0) -> Result<(), Valid
     validate_events(&projection.ordered_events)?;
     validate_durable_state(&projection.durable_state)?;
     validate_lifecycle(&projection.lifecycle)?;
+    validate_event_lifecycle_binding(projection)?;
     validate_ownership(&projection.ownership)?;
     validate_output_facts(&projection.output_facts)?;
+    if projection.fail_closed_facts.is_empty() {
+        return Err(ValidationError::Empty {
+            field: "projection.fail_closed_facts",
+        });
+    }
     validate_unique_text(
         "projection.fail_closed_facts",
         &projection.fail_closed_facts,
@@ -501,6 +609,7 @@ fn validate_lifecycle(lifecycle: &[crate::LifecycleFactV0]) -> Result<(), Valida
             field: "projection.lifecycle",
         });
     }
+    let mut identities = BTreeSet::new();
     for fact in lifecycle {
         validate_safe_id("lifecycle.operation_id", &fact.operation_id)?;
         if let Some(attempt_id) = &fact.attempt_id {
@@ -511,6 +620,135 @@ fn validate_lifecycle(lifecycle: &[crate::LifecycleFactV0]) -> Result<(), Valida
                 field: "lifecycle.released",
             });
         }
+        if !identities.insert((fact.operation_id.as_str(), fact.attempt_id.as_deref())) {
+            return Err(ValidationError::Duplicate {
+                field: "projection.lifecycle.identity",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_event_lifecycle_binding(
+    projection: &EquivalenceProjectionV0,
+) -> Result<(), ValidationError> {
+    let event_identities = projection
+        .ordered_events
+        .iter()
+        .map(|event| (event.operation_id.as_str(), event.attempt_id.as_deref()))
+        .collect::<BTreeSet<_>>();
+    let lifecycle_identities = projection
+        .lifecycle
+        .iter()
+        .map(|fact| (fact.operation_id.as_str(), fact.attempt_id.as_deref()))
+        .collect::<BTreeSet<_>>();
+    if event_identities != lifecycle_identities {
+        return Err(ValidationError::Inconsistent {
+            field: "projection.event_lifecycle_identity",
+        });
+    }
+    Ok(())
+}
+
+fn validate_mom_chat_retry_projection(
+    projection: &EquivalenceProjectionV0,
+) -> Result<(), ValidationError> {
+    let proves_cancel_retry = projection.lifecycle.iter().any(|cancelled| {
+        cancelled.terminal == TerminalClass::Cancelled
+            && cancelled.attempt_id.is_some()
+            && projection.lifecycle.iter().any(|completed| {
+                completed.terminal == TerminalClass::Completed
+                    && completed.operation_id == cancelled.operation_id
+                    && completed.attempt_id.is_some()
+                    && completed.attempt_id != cancelled.attempt_id
+                    && matches!(
+                        (
+                            event_position(projection, cancelled),
+                            event_position(projection, completed)
+                        ),
+                        (Some(cancelled_position), Some(completed_position))
+                            if cancelled_position < completed_position
+                    )
+            })
+    });
+    if !proves_cancel_retry {
+        return Err(ValidationError::Invalid {
+            field: "mom_chat_cancel_retry.lifecycle",
+        });
+    }
+    Ok(())
+}
+
+fn event_position(
+    projection: &EquivalenceProjectionV0,
+    lifecycle: &crate::LifecycleFactV0,
+) -> Option<usize> {
+    projection.ordered_events.iter().position(|event| {
+        event.operation_id == lifecycle.operation_id && event.attempt_id == lifecycle.attempt_id
+    })
+}
+
+fn validate_row_prerequisites(
+    vertical_id: VerticalIdV0,
+    case: &FixtureCaseV0,
+) -> Result<(), ValidationError> {
+    match vertical_id {
+        VerticalIdV0::CurrentExactQwen => require_prerequisite(
+            case,
+            QWEN_MODEL_PREREQUISITE,
+            PrerequisiteKindV0::ExactExternalArtifact,
+        ),
+        VerticalIdV0::CurrentExactGemma => require_prerequisite(
+            case,
+            GEMMA_MODEL_PREREQUISITE,
+            PrerequisiteKindV0::ExactExternalArtifact,
+        ),
+        VerticalIdV0::CurrentParakeetModelAudio => {
+            require_prerequisite(
+                case,
+                PARAKEET_MODEL_PREREQUISITE,
+                PrerequisiteKindV0::ExactExternalArtifact,
+            )?;
+            require_prerequisite(
+                case,
+                PARAKEET_AUDIO_PREREQUISITE,
+                PrerequisiteKindV0::ExactExternalArtifact,
+            )
+        }
+        VerticalIdV0::AppleInstalledVoice => require_prerequisite(
+            case,
+            APPLE_VOICE_PREREQUISITE,
+            PrerequisiteKindV0::PlatformInventory,
+        ),
+        vertical_id if vertical_id.class() == FixtureClassV0::State => {
+            if case.state_identities.is_empty() {
+                Err(ValidationError::Empty {
+                    field: "state_identities",
+                })
+            } else {
+                Ok(())
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn require_prerequisite(
+    case: &FixtureCaseV0,
+    prerequisite_id: &'static str,
+    kind: PrerequisiteKindV0,
+) -> Result<(), ValidationError> {
+    let prerequisite = case
+        .prerequisites
+        .iter()
+        .find(|prerequisite| prerequisite.prerequisite_id == prerequisite_id)
+        .ok_or(ValidationError::Invalid {
+            field: "prerequisites.required",
+        })?;
+    if prerequisite.kind != kind || prerequisite.identity.length == 0 {
+        return Err(ValidationError::Inconsistent {
+            field: "prerequisites.required",
+        });
     }
     Ok(())
 }

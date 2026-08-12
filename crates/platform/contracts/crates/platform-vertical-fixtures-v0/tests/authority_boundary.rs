@@ -118,3 +118,66 @@ fn negative_evidence_is_preserved_but_cannot_pass() {
         })
     );
 }
+
+#[test]
+fn real_rows_require_their_closed_exact_prerequisites() {
+    for vertical_id in [
+        VerticalIdV0::CurrentExactQwen,
+        VerticalIdV0::CurrentExactGemma,
+        VerticalIdV0::CurrentParakeetModelAudio,
+        VerticalIdV0::AppleInstalledVoice,
+    ] {
+        let (mut manifest, _) = support::manifest_and_projection(vertical_id);
+        manifest.cases[0].prerequisites.clear();
+        assert_eq!(
+            validate_manifest(&manifest),
+            Err(ValidationError::Invalid {
+                field: "prerequisites.required"
+            }),
+            "{vertical_id:?} must not validate by name alone"
+        );
+    }
+
+    let (mut parakeet, _) =
+        support::manifest_and_projection(VerticalIdV0::CurrentParakeetModelAudio);
+    parakeet.cases[0]
+        .prerequisites
+        .retain(|prerequisite| prerequisite.prerequisite_id != "audio.input");
+    assert_eq!(
+        validate_manifest(&parakeet),
+        Err(ValidationError::Invalid {
+            field: "prerequisites.required"
+        })
+    );
+
+    let (mut apple, _) = support::manifest_and_projection(VerticalIdV0::AppleInstalledVoice);
+    apple.cases[0].prerequisites[0].kind = PrerequisiteKindV0::ExactExternalArtifact;
+    assert_eq!(
+        validate_manifest(&apple),
+        Err(ValidationError::Inconsistent {
+            field: "prerequisites.required"
+        })
+    );
+}
+
+#[test]
+fn state_rows_require_and_bind_exact_state_identities() {
+    let (mut manifest, _) = support::manifest_and_projection(VerticalIdV0::FteLegacyDatabase);
+    manifest.cases[0].state_identities.clear();
+    assert_eq!(
+        validate_manifest(&manifest),
+        Err(ValidationError::Empty {
+            field: "state_identities"
+        })
+    );
+
+    let (manifest, expected) = support::manifest_and_projection(VerticalIdV0::FteLegacyDatabase);
+    let mut observation = support::observation(VerticalIdV0::FteLegacyDatabase);
+    observation.projection.durable_state[0].before = Some(support::artifact("wrong.before", '9'));
+    assert_eq!(
+        validate_baseline(&manifest, "primary", &expected, &observation),
+        Err(ValidationError::Inconsistent {
+            field: "projection.durable_state.before"
+        })
+    );
+}

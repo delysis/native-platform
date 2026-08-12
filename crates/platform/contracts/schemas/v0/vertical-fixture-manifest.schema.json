@@ -80,6 +80,54 @@
         }
       },
       "then": { "properties": { "class": { "const": "state" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "vertical_id": {
+            "enum": [
+              "mom_prior_release_store",
+              "loom_prior_project_store",
+              "fte_legacy_database",
+              "information_resource_store",
+              "corrupted_disposable_caches",
+              "partial_publication_states"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "cases": {
+            "items": {
+              "properties": { "state_identities": { "minItems": 1 } }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "vertical_id": { "const": "current_exact_qwen" } } },
+      "then": { "$ref": "#/$defs/requires_qwen_model" }
+    },
+    {
+      "if": { "properties": { "vertical_id": { "const": "current_exact_gemma" } } },
+      "then": { "$ref": "#/$defs/requires_gemma_model" }
+    },
+    {
+      "if": {
+        "properties": { "vertical_id": { "const": "current_parakeet_model_audio" } }
+      },
+      "then": {
+        "allOf": [
+          { "$ref": "#/$defs/requires_parakeet_model" },
+          { "$ref": "#/$defs/requires_parakeet_audio" }
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "vertical_id": { "const": "apple_installed_voice" } } },
+      "then": { "$ref": "#/$defs/requires_apple_voice" }
     }
   ],
   "$defs": {
@@ -191,6 +239,121 @@
         "prerequisite_id": { "$ref": "#/$defs/safe_id" },
         "kind": { "enum": ["exact_external_artifact", "platform_inventory", "local_runtime"] },
         "identity": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "requires_qwen_model": {
+      "$ref": "#/$defs/requires_prerequisite_qwen"
+    },
+    "requires_gemma_model": {
+      "$ref": "#/$defs/requires_prerequisite_gemma"
+    },
+    "requires_parakeet_model": {
+      "$ref": "#/$defs/requires_prerequisite_parakeet_model"
+    },
+    "requires_parakeet_audio": {
+      "$ref": "#/$defs/requires_prerequisite_parakeet_audio"
+    },
+    "requires_apple_voice": {
+      "$ref": "#/$defs/requires_prerequisite_apple_voice"
+    },
+    "requires_prerequisite_qwen": {
+      "properties": {
+        "cases": {
+          "items": {
+            "properties": {
+              "prerequisites": {
+                "contains": {
+                  "properties": {
+                    "prerequisite_id": { "const": "model.qwen.gguf" },
+                    "kind": { "const": "exact_external_artifact" },
+                    "identity": { "properties": { "length": { "minimum": 1 } } }
+                  },
+                  "required": ["prerequisite_id", "kind", "identity"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "requires_prerequisite_gemma": {
+      "properties": {
+        "cases": {
+          "items": {
+            "properties": {
+              "prerequisites": {
+                "contains": {
+                  "properties": {
+                    "prerequisite_id": { "const": "model.gemma.gguf" },
+                    "kind": { "const": "exact_external_artifact" },
+                    "identity": { "properties": { "length": { "minimum": 1 } } }
+                  },
+                  "required": ["prerequisite_id", "kind", "identity"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "requires_prerequisite_parakeet_model": {
+      "properties": {
+        "cases": {
+          "items": {
+            "properties": {
+              "prerequisites": {
+                "contains": {
+                  "properties": {
+                    "prerequisite_id": { "const": "model.parakeet" },
+                    "kind": { "const": "exact_external_artifact" },
+                    "identity": { "properties": { "length": { "minimum": 1 } } }
+                  },
+                  "required": ["prerequisite_id", "kind", "identity"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "requires_prerequisite_parakeet_audio": {
+      "properties": {
+        "cases": {
+          "items": {
+            "properties": {
+              "prerequisites": {
+                "contains": {
+                  "properties": {
+                    "prerequisite_id": { "const": "audio.input" },
+                    "kind": { "const": "exact_external_artifact" },
+                    "identity": { "properties": { "length": { "minimum": 1 } } }
+                  },
+                  "required": ["prerequisite_id", "kind", "identity"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "requires_prerequisite_apple_voice": {
+      "properties": {
+        "cases": {
+          "items": {
+            "properties": {
+              "prerequisites": {
+                "contains": {
+                  "properties": {
+                    "prerequisite_id": { "const": "voice.apple.installed" },
+                    "kind": { "const": "platform_inventory" },
+                    "identity": { "properties": { "length": { "minimum": 1 } } }
+                  },
+                  "required": ["prerequisite_id", "kind", "identity"]
+                }
+              }
+            }
+          }
+        }
       }
     },
     "program": {

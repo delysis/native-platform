@@ -2,9 +2,33 @@ mod support;
 
 use platform_contracts_v0::TerminalClass;
 use platform_vertical_fixtures_v0::{
-    StateDispositionV0, ValidationError, VerticalIdV0, compare_candidate, validate_baseline,
-    validate_observation,
+    GitSourceV0, StateDispositionV0, ValidationError, VerticalIdV0, compare_candidate,
+    sha256_identity, validate_baseline, validate_observation,
 };
+
+fn authenticated_candidate(
+    vertical_id: VerticalIdV0,
+) -> (
+    platform_vertical_fixtures_v0::ObservationEnvelopeV0,
+    GitSourceV0,
+    Vec<u8>,
+) {
+    let bytes = b"candidate production tree".to_vec();
+    let source = GitSourceV0 {
+        repository_id: "delysis/product".to_owned(),
+        commit: support::CANDIDATE_REVISION.to_owned(),
+        production_tree: sha256_identity("candidate.production.tree", &bytes),
+    };
+    let mut observation = support::observation(vertical_id);
+    observation
+        .implementation_revision
+        .clone_from(&source.commit);
+    observation
+        .evidence
+        .exact_source
+        .clone_from(&source.production_tree.digest);
+    (observation, source, bytes)
+}
 
 #[test]
 fn baseline_binds_source_and_exact_projection_bytes() {
@@ -56,15 +80,83 @@ fn durable_state_dispositions_must_match_their_before_after_shapes() {
 fn candidate_revision_may_change_but_observable_behavior_may_not() {
     let vertical_id = VerticalIdV0::InformationInstallQuery;
     let (manifest, expected) = support::manifest_and_projection(vertical_id);
-    let mut candidate = support::observation(vertical_id);
-    candidate.implementation_revision = support::CANDIDATE_REVISION.to_owned();
-    candidate.evidence.exact_source = support::digest('e');
-    compare_candidate(&manifest, "primary", &expected, &candidate).expect("equivalent candidate");
+    let (mut candidate, source, source_bytes) = authenticated_candidate(vertical_id);
+    compare_candidate(
+        &manifest,
+        "primary",
+        &expected,
+        &source,
+        &source_bytes,
+        &candidate,
+    )
+    .expect("equivalent authenticated candidate");
 
     candidate.projection.ordered_events[0].kind = "failed".to_owned();
     assert_eq!(
-        compare_candidate(&manifest, "primary", &expected, &candidate),
+        compare_candidate(
+            &manifest,
+            "primary",
+            &expected,
+            &source,
+            &source_bytes,
+            &candidate,
+        ),
         Err(ValidationError::ProjectionMismatch)
+    );
+}
+
+#[test]
+fn candidate_source_claim_is_authenticated_and_revision_bound() {
+    let vertical_id = VerticalIdV0::InformationInstallQuery;
+    let (manifest, expected) = support::manifest_and_projection(vertical_id);
+    let (candidate, source, source_bytes) = authenticated_candidate(vertical_id);
+
+    let mut wrong_claim = candidate.clone();
+    wrong_claim.evidence.exact_source = support::digest('e');
+    assert_eq!(
+        compare_candidate(
+            &manifest,
+            "primary",
+            &expected,
+            &source,
+            &source_bytes,
+            &wrong_claim,
+        ),
+        Err(ValidationError::Inconsistent {
+            field: "evidence.exact_source"
+        })
+    );
+
+    let mut tampered_bytes = source_bytes.clone();
+    tampered_bytes.push(0);
+    assert!(matches!(
+        compare_candidate(
+            &manifest,
+            "primary",
+            &expected,
+            &source,
+            &tampered_bytes,
+            &candidate,
+        ),
+        Err(ValidationError::LengthMismatch {
+            field: "candidate_source.production_tree"
+        })
+    ));
+
+    let mut wrong_revision = candidate;
+    wrong_revision.implementation_revision = support::BASELINE_REVISION.to_owned();
+    assert_eq!(
+        compare_candidate(
+            &manifest,
+            "primary",
+            &expected,
+            &source,
+            &source_bytes,
+            &wrong_revision,
+        ),
+        Err(ValidationError::Inconsistent {
+            field: "implementation_revision"
+        })
     );
 }
 
@@ -72,20 +164,106 @@ fn candidate_revision_may_change_but_observable_behavior_may_not() {
 fn event_state_lifecycle_and_fail_closed_drift_are_detected() {
     let vertical_id = VerticalIdV0::SpeechPeerCancellation;
     let (manifest, expected) = support::manifest_and_projection(vertical_id);
-    let base = support::observation(vertical_id);
+    let (base, source, source_bytes) = authenticated_candidate(vertical_id);
 
     let mut state = base.clone();
     state.projection.durable_state[0].after = Some(support::artifact("state.after", 'f'));
-    assert!(compare_candidate(&manifest, "primary", &expected, &state).is_err());
+    assert!(
+        compare_candidate(
+            &manifest,
+            "primary",
+            &expected,
+            &source,
+            &source_bytes,
+            &state,
+        )
+        .is_err()
+    );
 
     let mut terminal = base.clone();
     terminal.projection.lifecycle[0].terminal = TerminalClass::Cancelled;
-    assert!(compare_candidate(&manifest, "primary", &expected, &terminal).is_err());
+    assert!(
+        compare_candidate(
+            &manifest,
+            "primary",
+            &expected,
+            &source,
+            &source_bytes,
+            &terminal,
+        )
+        .is_err()
+    );
 
     let mut fail_closed = base;
     fail_closed.projection.fail_closed_facts.clear();
     assert_eq!(
-        compare_candidate(&manifest, "primary", &expected, &fail_closed),
-        Err(ValidationError::ProjectionMismatch)
+        compare_candidate(
+            &manifest,
+            "primary",
+            &expected,
+            &source,
+            &source_bytes,
+            &fail_closed,
+        ),
+        Err(ValidationError::Empty {
+            field: "projection.fail_closed_facts"
+        })
+    );
+}
+
+#[test]
+fn projection_rejects_unbound_or_duplicate_lifecycle_and_empty_fail_closed_facts() {
+    let mut unrelated = support::observation(VerticalIdV0::SpeechPeerCancellation);
+    unrelated.projection.lifecycle[0].operation_id = "operation.unrelated".to_owned();
+    assert_eq!(
+        validate_observation(&unrelated),
+        Err(ValidationError::Inconsistent {
+            field: "projection.event_lifecycle_identity"
+        })
+    );
+
+    let mut duplicate = support::observation(VerticalIdV0::SpeechPeerCancellation);
+    duplicate
+        .projection
+        .lifecycle
+        .push(duplicate.projection.lifecycle[0].clone());
+    assert_eq!(
+        validate_observation(&duplicate),
+        Err(ValidationError::Duplicate {
+            field: "projection.lifecycle.identity"
+        })
+    );
+
+    let mut fail_closed = support::observation(VerticalIdV0::SpeechPeerCancellation);
+    fail_closed.projection.fail_closed_facts.clear();
+    assert_eq!(
+        validate_observation(&fail_closed),
+        Err(ValidationError::Empty {
+            field: "projection.fail_closed_facts"
+        })
+    );
+}
+
+#[test]
+fn mom_cancel_retry_requires_distinct_attempt_identities() {
+    let mut observation = support::observation(VerticalIdV0::MomChatCancelRetry);
+    observation.projection.ordered_events.pop();
+    observation.projection.lifecycle.pop();
+    assert_eq!(
+        validate_observation(&observation),
+        Err(ValidationError::Invalid {
+            field: "mom_chat_cancel_retry.lifecycle"
+        })
+    );
+
+    let mut reversed = support::observation(VerticalIdV0::MomChatCancelRetry);
+    reversed.projection.ordered_events.swap(0, 1);
+    reversed.projection.ordered_events[0].sequence = 0;
+    reversed.projection.ordered_events[1].sequence = 1;
+    assert_eq!(
+        validate_observation(&reversed),
+        Err(ValidationError::Invalid {
+            field: "mom_chat_cancel_retry.lifecycle"
+        })
     );
 }

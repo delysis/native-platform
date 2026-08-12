@@ -32,7 +32,10 @@ production owner rather than fixture-owned shadow state.
    superseded evidence separately.
 4. Create `verticals/v0/W1-VERTICALS.lock.json` only after all rows exist. The
    lock names all eighteen manifest byte identities exactly once. Seal it in a
-   later central commit and steward receipt.
+   later central commit and steward receipt. Lock validation consumes all
+   eighteen manifest byte streams, authenticates each digest and length, parses
+   and validates each manifest, binds its row/class/contract revision to its
+   lock entry, and rejects a reused manifest digest.
 
 This two-revision sequence avoids a manifest referring circularly to the commit
 that contains that manifest. This protocol PR deliberately contains no final
@@ -50,6 +53,12 @@ One row may contain multiple repository-owned cases. Cross-product rows such
 as quit/relaunch and corrupted caches therefore remain one locked requirement
 without creating a cross-repository executable before W2.
 
+Each real case carries closed row-specific prerequisites: exact Qwen or Gemma
+model bytes, exact Parakeet model and input-audio bytes, or an exact Apple
+installed-voice inventory. Every state case carries at least one exact
+state/schema identity, and its projection binds each declared baseline to the
+corresponding before-state.
+
 ## Replay and equivalence
 
 A replay recipe is inert data: a closed program kind, argv values, names of
@@ -60,11 +69,19 @@ secret- or credential-shaped names are rejected.
 `validate_baseline` requires the baseline source revision and production-tree
 digest, authenticates the expected projection bytes, and compares the observed
 projection exactly. `compare_candidate` permits a later implementation
-revision but requires the same observable projection. The projection includes
+revision, but authenticates caller-supplied candidate production-tree bytes,
+binds their `GitSourceV0` revision and digest to the candidate observation, and
+requires the same observable projection. The projection includes
 ordered events, durable-state effects, terminal and release facts, worker
 ownership, invariant-level output facts, and fail-closed facts. Volatile time,
 temporary paths, and nondeterministic prose or audio bytes do not belong in the
 projection.
+
+Every event identity has exactly one lifecycle identity and vice versa;
+duplicate or contradictory lifecycle rows fail. Mom chat cancellation and
+retry additionally require a cancelled attempt and a completed, distinct retry
+attempt under the same operation. Every projection records at least one
+fail-closed fact.
 
 Passing comparison is not acceptance. Negative evidence remains reviewable but
 cannot pass baseline validation. Only a later steward receipt can accept
