@@ -177,7 +177,7 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     )?;
     check_sha256(
         &root.join("migration/native-import.json"),
-        "3881e83f2ef69f4fd6bb58d0e17376083ec3dfab7343aba963f10f453d1959c9",
+        "9c5d8d09611fb5e7a62529a4cd6888860cb9c0c3458a3be98872fb913077dbd5",
     )
 }
 
@@ -314,7 +314,7 @@ fn check_ledger(root: &Path) -> Result<()> {
     let mut expected = Ledger {
         schema_version: 1,
         goal: "W3-IMPORT-NATIVE".into(),
-        status: "native_import_candidate_local_not_pushed".into(),
+        status: "native_import_candidate_pending_remote_ci".into(),
         production_source_imported: true,
         source_history_imported: true,
         integration_candidate: IntegrationCandidate {

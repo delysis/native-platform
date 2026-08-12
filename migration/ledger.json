@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "goal": "W3-IMPORT-NATIVE",
-  "status": "native_import_candidate_local_not_pushed",
+  "status": "native_import_candidate_pending_remote_ci",
   "production_source_imported": true,
   "source_history_imported": true,
   "integration_candidate": {
