@@ -97,6 +97,12 @@ struct DurableReopenEvidence {
     after: Vec<u8>,
 }
 
+struct DurableProject {
+    _temporary: tempfile::TempDir,
+    root: std::path::PathBuf,
+    before: Vec<u8>,
+}
+
 struct QuitRelaunchEvidence<'a> {
     input: &'a FixtureInput,
     durable: &'a DurableReopenEvidence,
@@ -108,7 +114,7 @@ struct QuitRelaunchEvidence<'a> {
     distinct_registry_identity: bool,
 }
 
-fn prepare_durable_project(input: &FixtureInput) -> (tempfile::TempDir, DurableReopenEvidence) {
+fn prepare_durable_project(input: &FixtureInput) -> DurableProject {
     let temporary = tempfile::tempdir().expect("temporary Loom row-8 project parent");
     let root = temporary.path().join("W1 Quit Relaunch");
     let mut store = initialize_project(&root, "W1 Quit Relaunch".to_owned())
@@ -132,8 +138,16 @@ fn prepare_durable_project(input: &FixtureInput) -> (tempfile::TempDir, DurableR
         .into_bytes();
     store.record_close().expect("record first project close");
     drop(store);
+    DurableProject {
+        _temporary: temporary,
+        root,
+        before,
+    }
+}
 
-    let mut reopened = ProjectStore::open(&root).expect("reopen same durable Loom project");
+fn reopen_durable_project(project: &DurableProject) -> DurableReopenEvidence {
+    let mut reopened =
+        ProjectStore::open(&project.root).expect("reopen same durable Loom project after quit");
     let after = reopened
         .read_document(INITIAL_DOCUMENT)
         .expect("read reopened row-8 manuscript")
@@ -143,8 +157,14 @@ fn prepare_durable_project(input: &FixtureInput) -> (tempfile::TempDir, DurableR
         .record_close()
         .expect("record reopened project close");
     drop(reopened);
-    assert_eq!(before, after, "same durable manuscript must reopen exactly");
-    (temporary, DurableReopenEvidence { before, after })
+    assert_eq!(
+        project.before, after,
+        "same durable manuscript must reopen exactly after quit"
+    );
+    DurableReopenEvidence {
+        before: project.before.clone(),
+        after,
+    }
 }
 
 fn attach_fixture_worker(
@@ -264,7 +284,7 @@ fn close_runtime(state: &PluginState, worker: &WorkerEvidence) -> CloseEvidence 
 fn full_application_close_joins_fake_generation_owner_and_fresh_runtime_admits_work() {
     let input: FixtureInput = serde_json::from_slice(INPUT_BYTES).expect("parse fixture input");
     assert_eq!(input.schema, "delysis.loom.quit_relaunch_fixture.v1");
-    let (_project, durable) = prepare_durable_project(&input);
+    let project = prepare_durable_project(&input);
 
     let first = PluginState::default();
     let first_registry_identity = Arc::clone(&first.generation_workers.identity);
@@ -302,6 +322,7 @@ fn full_application_close_joins_fake_generation_owner_and_fresh_runtime_admits_w
     );
 
     let fresh = PluginState::default();
+    let durable = reopen_durable_project(&project);
     let fresh_registry_identity = Arc::clone(&fresh.generation_workers.identity);
     let distinct_registry_identity =
         !Arc::ptr_eq(&first_registry_identity, &fresh_registry_identity);
