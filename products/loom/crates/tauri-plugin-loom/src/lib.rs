@@ -2,6 +2,9 @@
 
 mod model_download;
 
+#[cfg(all(test, feature = "unstable-w1-contract-tests"))]
+mod w1_contract_adapter;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, Metadata};
 use std::io::Read as _;
@@ -27,7 +30,8 @@ use loom_host::{
     AgencyGate, BranchCancellation, DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES,
     ForegroundCommandBinding, ForegroundCommandChallenge, ForegroundCommandRegistry,
     ForegroundWindowId, GenerationFamilyIdentity, GenerationRegistry, GenerationRegistryError,
-    MAX_PENDING_FOREGROUND_COMMANDS, NativeWindowFocusSample,
+    GenerationSupervisor, GenerationTerminalClass, MAX_PENDING_FOREGROUND_COMMANDS,
+    NativeWindowFocusSample,
 };
 use loom_research_types::{
     MixedAuthorshipAssemblyRecord, PromotionCommandRequest, PromotionSubject,
@@ -284,6 +288,7 @@ pub struct PluginState {
     foreground_commands: ForegroundCommandRegistry,
     research_promotions: Mutex<PendingResearchPromotions>,
     generations: GenerationRegistry,
+    generation_lifecycle: GenerationSupervisor,
     generation_workers: GenerationWorkerRegistry,
     model_loads: Arc<ModelLoadRegistry>,
     downloads: Arc<ModelDownloadRegistry>,
@@ -307,6 +312,8 @@ impl PluginState {
         let backend = Arc::new(LlamaBackend::with_default_native_runtime(Arc::clone(
             &native_runtime,
         )));
+        let generation_lifecycle = GenerationSupervisor::new(64)
+            .expect("the production generation progress capacity is valid");
         Self {
             close_requested: AtomicBool::new(false),
             exit_authorized: AtomicBool::new(false),
@@ -321,7 +328,8 @@ impl PluginState {
             foreground_commands: ForegroundCommandRegistry::default(),
             research_promotions: Mutex::new(PendingResearchPromotions::default()),
             generations: GenerationRegistry::default(),
-            generation_workers: GenerationWorkerRegistry::default(),
+            generation_workers: GenerationWorkerRegistry::new(generation_lifecycle.clone()),
+            generation_lifecycle,
             model_loads: Arc::new(ModelLoadRegistry::default()),
             downloads: Arc::new(ModelDownloadRegistry::default()),
             download_workers: DownloadWorkerRegistry::default(),
@@ -438,8 +446,14 @@ impl Drop for PluginState {
         if let Ok(phase) = self.application.get_mut() {
             *phase = ApplicationPhase::Closing;
         }
+        if let Err(error) = self.generation_lifecycle.quiesce() {
+            eprintln!("Loom could not quiesce generation lifecycle during plugin drop: {error}");
+        }
         let _desktop_workers = self.join_desktop_workers_for_exit();
         let _native_runtime = self.native_runtime.shutdown_for_process_exit();
+        if let Err(error) = self.generation_lifecycle.close() {
+            eprintln!("Loom generation lifecycle did not close during plugin drop: {error}");
+        }
     }
 }
 
@@ -691,40 +705,39 @@ enum GenerationWorkerSlot {
     Running {
         worker: JoinHandle<()>,
         owner: GenerationWorkerOwner,
+        lifecycle_worker_id: u64,
     },
 }
 
-/// Product builds have exactly one owner kind. The test-only fixture variant
-/// exercises hostile cancellation and nested-worker schedules without adding
-/// an erasable production authority surface.
+/// Product builds have exactly one owner kind. The test-only controlled owner
+/// exercises hostile cancellation while retaining the same outer `JoinHandle`
+/// and registry lifecycle as the native owner.
 #[derive(Debug)]
 enum GenerationWorkerOwner {
     Llama(LlamaGenerationHandle),
     #[cfg(test)]
-    Fixture(FixtureGenerationWorkerOwner),
+    Controlled(Arc<dyn ControlledGenerationWorkerCancellation>),
 }
 
 #[cfg(test)]
-trait FixtureGenerationWorkerCancellation: std::fmt::Debug + Send + Sync {
+trait ControlledGenerationWorkerCancellation: std::fmt::Debug + Send + Sync {
     fn cancel_all(&self);
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct FixtureGenerationWorkerOwner {
-    cancellation: Arc<dyn FixtureGenerationWorkerCancellation>,
-    backend_worker: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug)]
 enum GenerationBackendWorkerJoined {
     Llama(JoinedLlamaGeneration),
     #[cfg(test)]
-    Fixture {
-        worker_was_present: bool,
-        worker_panicked: bool,
-    },
+    Controlled,
 }
+
+type GenerationWorkerJoinTarget = (String, JoinHandle<()>, GenerationWorkerOwner, u64);
+type GenerationWorkerJoinParts = (
+    usize,
+    Vec<GenerationBackendWorkerJoined>,
+    Vec<String>,
+    Vec<String>,
+);
 
 #[derive(Debug, Default)]
 struct GenerationWorkerState {
@@ -736,6 +749,7 @@ struct GenerationWorkerState {
 struct GenerationWorkerRegistry {
     identity: Arc<WorkerRegistryIdentity>,
     state: Mutex<GenerationWorkerState>,
+    lifecycle: GenerationSupervisor,
 }
 
 #[derive(Debug)]
@@ -777,6 +791,8 @@ struct GenerationWorkersJoined {
     registry_identity: Arc<WorkerRegistryIdentity>,
     family_count: usize,
     backend_workers: Vec<GenerationBackendWorkerJoined>,
+    expected_worker_ids: Vec<String>,
+    joined_worker_ids: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -965,7 +981,7 @@ impl GenerationWorkerOwner {
                 let _ = owner.cancel_all();
             }
             #[cfg(test)]
-            Self::Fixture(owner) => owner.cancellation.cancel_all(),
+            Self::Controlled(cancellation) => cancellation.cancel_all(),
         }
     }
 
@@ -977,29 +993,18 @@ impl GenerationWorkerOwner {
         match self {
             Self::Llama(owner) => GenerationBackendWorkerJoined::Llama(owner.shutdown_joined()),
             #[cfg(test)]
-            Self::Fixture(mut owner) => {
+            Self::Controlled(cancellation) => {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    owner.cancellation.cancel_all();
+                    cancellation.cancel_all();
                 }));
-                let backend_worker = owner.backend_worker.take();
-                GenerationBackendWorkerJoined::Fixture {
-                    worker_was_present: backend_worker.is_some(),
-                    worker_panicked: backend_worker
-                        .is_some_and(|backend_worker| backend_worker.join().is_err()),
-                }
+                GenerationBackendWorkerJoined::Controlled
             }
         }
     }
 
     #[cfg(test)]
-    fn fixture(
-        cancellation: Arc<dyn FixtureGenerationWorkerCancellation>,
-        backend_worker: JoinHandle<()>,
-    ) -> Self {
-        Self::Fixture(FixtureGenerationWorkerOwner {
-            cancellation,
-            backend_worker: Some(backend_worker),
-        })
+    fn controlled(cancellation: Arc<dyn ControlledGenerationWorkerCancellation>) -> Self {
+        Self::Controlled(cancellation)
     }
 }
 
@@ -1008,9 +1013,7 @@ impl GenerationBackendWorkerJoined {
         match self {
             Self::Llama(joined) => joined.worker_panicked(),
             #[cfg(test)]
-            Self::Fixture {
-                worker_panicked, ..
-            } => *worker_panicked,
+            Self::Controlled => false,
         }
     }
 
@@ -1018,9 +1021,7 @@ impl GenerationBackendWorkerJoined {
         match self {
             Self::Llama(joined) => joined.joined_worker_count(),
             #[cfg(test)]
-            Self::Fixture {
-                worker_was_present, ..
-            } => *worker_was_present as usize,
+            Self::Controlled => 0,
         }
     }
 }
@@ -1090,12 +1091,45 @@ impl GenerationWorkerRegistry {
             finished_ids
                 .into_iter()
                 .filter_map(|request_id| match state.workers.remove(&request_id) {
-                    Some(GenerationWorkerSlot::Running { worker, owner }) => Some((worker, owner)),
+                    Some(GenerationWorkerSlot::Running {
+                        worker,
+                        owner,
+                        lifecycle_worker_id,
+                    }) => Some((request_id, worker, owner, lifecycle_worker_id)),
                     Some(GenerationWorkerSlot::Reserved) | None => None,
                 })
                 .collect::<Vec<_>>()
         };
-        self.join_workers(finished).map(|(count, _)| count)
+        self.join_workers(finished).map(|(count, _, _, _)| count)
+    }
+
+    #[cfg(all(test, feature = "unstable-w1-contract-tests"))]
+    fn join_request(&self, request_id: &str) -> Result<(), IpcFailure> {
+        let worker = {
+            let mut state = self.lock()?;
+            match state.workers.remove(request_id) {
+                Some(GenerationWorkerSlot::Running {
+                    worker,
+                    owner,
+                    lifecycle_worker_id,
+                }) => (request_id.to_owned(), worker, owner, lifecycle_worker_id),
+                Some(GenerationWorkerSlot::Reserved) => {
+                    return Err(IpcFailure::new(
+                        "generation_worker_starting",
+                        "the generation worker has not attached its JoinHandle",
+                        true,
+                    ));
+                }
+                None => {
+                    return Err(IpcFailure::new(
+                        "generation_worker_not_owned",
+                        "the generation worker is not retained by this registry",
+                        false,
+                    ));
+                }
+            }
+        };
+        self.join_workers(vec![worker]).map(|_| ())
     }
 
     fn join_all(&self) -> Result<GenerationWorkersJoined, IpcFailure> {
@@ -1120,18 +1154,25 @@ impl GenerationWorkerRegistry {
                 ));
             }
             std::mem::take(&mut state.workers)
-                .into_values()
-                .filter_map(|slot| match slot {
-                    GenerationWorkerSlot::Running { worker, owner } => Some((worker, owner)),
+                .into_iter()
+                .filter_map(|(request_id, slot)| match slot {
+                    GenerationWorkerSlot::Running {
+                        worker,
+                        owner,
+                        lifecycle_worker_id,
+                    } => Some((request_id, worker, owner, lifecycle_worker_id)),
                     GenerationWorkerSlot::Reserved => None,
                 })
                 .collect::<Vec<_>>()
         };
-        let (family_count, backend_workers) = self.join_workers(workers)?;
+        let (family_count, backend_workers, expected_worker_ids, joined_worker_ids) =
+            self.join_workers(workers)?;
         Ok(GenerationWorkersJoined {
             registry_identity: Arc::clone(&self.identity),
             family_count,
             backend_workers,
+            expected_worker_ids,
+            joined_worker_ids,
         })
     }
 
@@ -1146,37 +1187,55 @@ impl GenerationWorkerRegistry {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::mem::take(&mut state.workers)
-                .into_values()
-                .filter_map(|slot| match slot {
-                    GenerationWorkerSlot::Running { worker, owner } => Some((worker, owner)),
+                .into_iter()
+                .filter_map(|(request_id, slot)| match slot {
+                    GenerationWorkerSlot::Running {
+                        worker,
+                        owner,
+                        lifecycle_worker_id,
+                    } => Some((request_id, worker, owner, lifecycle_worker_id)),
                     GenerationWorkerSlot::Reserved => None,
                 })
                 .collect::<Vec<_>>()
         };
         let family_count = workers.len();
         let mut backend_workers = Vec::with_capacity(family_count);
-        for (worker, owner) in workers {
+        let expected_worker_ids = workers
+            .iter()
+            .map(|(request_id, ..)| request_id.clone())
+            .collect::<Vec<_>>();
+        let mut joined_worker_ids = Vec::with_capacity(family_count);
+        for (request_id, worker, owner, lifecycle_worker_id) in workers.into_iter().rev() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 owner.cancel_all();
             }));
             let _ = worker.join();
             backend_workers.push(owner.shutdown_joined());
+            let _ = self.lifecycle.note_worker_joined(lifecycle_worker_id);
+            joined_worker_ids.push(request_id);
         }
         GenerationWorkersJoined {
             registry_identity: Arc::clone(&self.identity),
             family_count,
             backend_workers,
+            expected_worker_ids,
+            joined_worker_ids,
         }
     }
 
     fn join_workers(
         &self,
-        workers: Vec<(JoinHandle<()>, GenerationWorkerOwner)>,
-    ) -> Result<(usize, Vec<GenerationBackendWorkerJoined>), IpcFailure> {
+        workers: Vec<GenerationWorkerJoinTarget>,
+    ) -> Result<GenerationWorkerJoinParts, IpcFailure> {
         let family_count = workers.len();
         let mut panicked = false;
         let mut backend_workers = Vec::with_capacity(family_count);
-        for (worker, owner) in workers {
+        let expected_worker_ids = workers
+            .iter()
+            .map(|(request_id, ..)| request_id.clone())
+            .collect::<Vec<_>>();
+        let mut joined_worker_ids = Vec::with_capacity(family_count);
+        for (request_id, worker, owner, lifecycle_worker_id) in workers.into_iter().rev() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 owner.cancel_all();
             }));
@@ -1184,11 +1243,26 @@ impl GenerationWorkerRegistry {
             let backend_worker = owner.shutdown_joined();
             panicked |= backend_worker.worker_panicked();
             backend_workers.push(backend_worker);
+            self.lifecycle
+                .note_worker_joined(lifecycle_worker_id)
+                .map_err(|error| {
+                    IpcFailure::new(
+                        "generation_worker_lifecycle_failed",
+                        error.to_string(),
+                        false,
+                    )
+                })?;
+            joined_worker_ids.push(request_id);
         }
         if panicked {
             return Err(self.record_join_failure());
         }
-        Ok((family_count, backend_workers))
+        Ok((
+            family_count,
+            backend_workers,
+            expected_worker_ids,
+            joined_worker_ids,
+        ))
     }
 
     fn record_join_failure(&self) -> IpcFailure {
@@ -1215,13 +1289,30 @@ impl GenerationWorkerRegistry {
             )
         })
     }
+
+    #[cfg(all(test, feature = "unstable-w1-contract-tests"))]
+    fn retained_count(&self) -> usize {
+        self.state
+            .lock()
+            .map_or(usize::MAX, |state| state.workers.len())
+    }
 }
 
 impl Default for GenerationWorkerRegistry {
     fn default() -> Self {
+        Self::new(
+            GenerationSupervisor::new(64)
+                .expect("the fixture generation progress capacity is valid"),
+        )
+    }
+}
+
+impl GenerationWorkerRegistry {
+    fn new(lifecycle: GenerationSupervisor) -> Self {
         Self {
             identity: Arc::new(WorkerRegistryIdentity),
             state: Mutex::new(GenerationWorkerState::default()),
+            lifecycle,
         }
     }
 }
@@ -1237,6 +1328,8 @@ impl GenerationWorkersJoined {
     }
 
     fn joined_worker_count(&self) -> usize {
+        debug_assert_eq!(self.expected_worker_ids.len(), self.family_count);
+        debug_assert_eq!(self.joined_worker_ids.len(), self.family_count);
         self.family_count.saturating_add(
             self.backend_workers
                 .iter()
@@ -1489,9 +1582,53 @@ impl GenerationWorkerReservation<'_, '_> {
         worker: JoinHandle<()>,
         owner: GenerationWorkerOwner,
     ) -> Result<(), GenerationWorkerAttachError> {
+        let lifecycle_worker_id = match self.registry.lifecycle.current_lease(&self.request_id) {
+            Ok(Some(lease)) => lease.identity().sequence,
+            Ok(None) => {
+                return Err(GenerationWorkerAttachError {
+                    failure: IpcFailure::new(
+                        "generation_worker_lifecycle_missing",
+                        "the generation worker has no authoritative lifecycle reservation",
+                        false,
+                    ),
+                    worker,
+                    owner,
+                });
+            }
+            Err(error) => {
+                return Err(GenerationWorkerAttachError {
+                    failure: IpcFailure::new(
+                        "generation_worker_lifecycle_failed",
+                        error.to_string(),
+                        false,
+                    ),
+                    worker,
+                    owner,
+                });
+            }
+        };
+        if let Err(error) = self
+            .registry
+            .lifecycle
+            .note_worker_started(lifecycle_worker_id)
+        {
+            return Err(GenerationWorkerAttachError {
+                failure: IpcFailure::new(
+                    "generation_worker_lifecycle_failed",
+                    error.to_string(),
+                    false,
+                ),
+                worker,
+                owner,
+            });
+        }
         let mut state = match self.registry.lock() {
             Ok(state) => state,
             Err(failure) => {
+                let _ = self
+                    .registry
+                    .lifecycle
+                    .note_worker_joined(lifecycle_worker_id);
                 return Err(GenerationWorkerAttachError {
                     failure,
                     worker,
@@ -1501,19 +1638,29 @@ impl GenerationWorkerReservation<'_, '_> {
         };
         match state.workers.get_mut(&self.request_id) {
             Some(slot @ GenerationWorkerSlot::Reserved) => {
-                *slot = GenerationWorkerSlot::Running { worker, owner };
+                *slot = GenerationWorkerSlot::Running {
+                    worker,
+                    owner,
+                    lifecycle_worker_id,
+                };
                 self.attached = true;
                 Ok(())
             }
-            Some(GenerationWorkerSlot::Running { .. }) | None => Err(GenerationWorkerAttachError {
-                failure: IpcFailure::new(
-                    "generation_worker_state_changed",
-                    "the desktop generation worker reservation changed before attachment",
-                    false,
-                ),
-                worker,
-                owner,
-            }),
+            Some(GenerationWorkerSlot::Running { .. }) | None => {
+                let _ = self
+                    .registry
+                    .lifecycle
+                    .note_worker_joined(lifecycle_worker_id);
+                Err(GenerationWorkerAttachError {
+                    failure: IpcFailure::new(
+                        "generation_worker_state_changed",
+                        "the desktop generation worker reservation changed before attachment",
+                        false,
+                    ),
+                    worker,
+                    owner,
+                })
+            }
         }
     }
 }
@@ -2750,6 +2897,7 @@ fn cancel_and_drain_generation_session(
                         state,
                         &failure.identity,
                         &failure.runs,
+                        GenerationTerminalClass::Cancelled,
                     )
                 })
                 .map_err(|error| {
@@ -5538,7 +5686,16 @@ async fn weave_start<R: Runtime>(
         .map_err(|error| IpcFailure::backend(&error))?;
 
     let request_id = format!("weave-{command_id}");
-    let (identity, exact_prefix, prompt_recipe, cases, queued_branches, runs) = {
+    let (
+        identity,
+        exact_prefix,
+        prompt_recipe,
+        cases,
+        queued_branches,
+        runs,
+        lifecycle_ticket,
+        lifecycle_lease,
+    ) = {
         let mut session = lock_session(&state)?;
         authorized_model.admit(&session.agency)?;
         let active_session_id = session.active_session_id.ok_or_else(|| {
@@ -5715,13 +5872,93 @@ async fn weave_start<R: Runtime>(
             .generations
             .reserve(identity.clone(), runs.clone())
             .map_err(|error| IpcFailure::generation_registry(&error))?;
+        let (lifecycle_ticket, lifecycle_lease) =
+            match state.generation_lifecycle.reserve(request_id.clone()) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    let _ = state.generations.complete_family(&request_id);
+                    return Err(IpcFailure::new(
+                        "generation_lifecycle_admission_failed",
+                        error.to_string(),
+                        false,
+                    ));
+                }
+            };
+        if let Err(error) = state.generation_lifecycle.queue(&lifecycle_lease) {
+            let cleanup = state
+                .generation_lifecycle
+                .fail_and_release(&lifecycle_lease);
+            let registry_cleanup = state.generations.complete_family(&request_id);
+            if let Err(cleanup_error) = cleanup {
+                return Err(IpcFailure::new(
+                    "generation_lifecycle_cleanup_failed",
+                    format!("queue failed: {error}; lifecycle cleanup failed: {cleanup_error}"),
+                    false,
+                ));
+            }
+            match registry_cleanup {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(IpcFailure::new(
+                        "generation_registry_cleanup_failed",
+                        format!("queue failed: {error}; reserved family was already absent"),
+                        false,
+                    ));
+                }
+                Err(cleanup_error) => {
+                    return Err(IpcFailure::new(
+                        "generation_registry_cleanup_failed",
+                        format!("queue failed: {error}; registry cleanup failed: {cleanup_error}"),
+                        false,
+                    ));
+                }
+            }
+            return Err(IpcFailure::new(
+                "generation_lifecycle_queue_failed",
+                error.to_string(),
+                false,
+            ));
+        }
         let family = match store.start_generation_family_with_command(
             command_id,
             cases.iter().map(|case| case.generation.clone()).collect(),
         ) {
             Ok(family) => family,
             Err(error) => {
-                let _ = state.generations.complete_family(&request_id);
+                let lifecycle_cleanup = state
+                    .generation_lifecycle
+                    .fail_and_release(&lifecycle_lease);
+                let registry_cleanup = state.generations.complete_family(&request_id);
+                if let Err(cleanup_error) = lifecycle_cleanup {
+                    return Err(IpcFailure::new(
+                        "generation_lifecycle_cleanup_failed",
+                        format!(
+                            "durable generation admission failed: {error}; lifecycle cleanup failed: {cleanup_error}"
+                        ),
+                        false,
+                    ));
+                }
+                match registry_cleanup {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return Err(IpcFailure::new(
+                            "generation_registry_cleanup_failed",
+                            format!(
+                                "durable generation admission failed: {error}; reserved family was already absent"
+                            ),
+                            false,
+                        ));
+                    }
+                    Err(cleanup_error) => {
+                        return Err(IpcFailure::new(
+                            "generation_registry_cleanup_failed",
+                            format!(
+                                "durable generation admission failed: {error}; registry cleanup failed: {cleanup_error}"
+                            ),
+                            false,
+                        ));
+                    }
+                }
                 return Err(IpcFailure::store(error));
             }
         };
@@ -5758,6 +5995,8 @@ async fn weave_start<R: Runtime>(
             cases,
             queued_branches,
             runs,
+            lifecycle_ticket,
+            lifecycle_lease,
         )
     };
     let exact_prompt_blob_id = BlobId::digest(exact_prefix.as_bytes());
@@ -5776,6 +6015,21 @@ async fn weave_start<R: Runtime>(
         prompt_recipe,
         cases,
     );
+    if let Err(error) = state.generation_lifecycle.start(&lifecycle_lease) {
+        if let Err(cleanup) =
+            fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
+        {
+            let _ = state
+                .generations
+                .mark_terminal_persistence_failure(&request_id, cleanup.message.clone());
+            return Err(cleanup);
+        }
+        return Err(IpcFailure::new(
+            "generation_lifecycle_start_failed",
+            error.to_string(),
+            false,
+        ));
+    }
     let generation_owner = match native_request.submit(&state.backend) {
         Ok(owner) => owner,
         Err(error) => {
@@ -5890,6 +6144,10 @@ async fn weave_start<R: Runtime>(
         }
         return Err(failure);
     }
+
+    // The native worker now retains executor authority independently. The
+    // command ticket may detach without requesting cancellation.
+    lifecycle_ticket.detach();
 
     Ok(WeaveStarted {
         command_id: command_id.to_string(),
@@ -6109,12 +6367,33 @@ fn run_desktop_generation<R: Runtime>(
     };
 
     let state = app.state::<PluginState>();
-    let persistence = match result {
+    let (persistence, terminal_class) = match result {
         Ok(result) => {
+            let terminal_class =
+                if result
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.terminal.status == GenerationTerminalStatus::Failed)
+                {
+                    GenerationTerminalClass::Failed
+                } else if result.candidates.iter().all(|candidate| {
+                    candidate.terminal.status == GenerationTerminalStatus::Completed
+                }) {
+                    GenerationTerminalClass::Completed
+                } else {
+                    GenerationTerminalClass::Cancelled
+                };
             let drained = drain_backend_events(app, identity, handle);
-            drained.and_then(|()| persist_generation_result(app, identity, runs, binding, result))
+            (
+                drained
+                    .and_then(|()| persist_generation_result(app, identity, runs, binding, result)),
+                terminal_class,
+            )
         }
-        Err(error) => Err(IpcFailure::new("generation_runtime_failed", error, true)),
+        Err(error) => (
+            Err(IpcFailure::new("generation_runtime_failed", error, true)),
+            GenerationTerminalClass::Failed,
+        ),
     };
     let terminalized = match persistence {
         Ok(()) => Ok(()),
@@ -6131,8 +6410,9 @@ fn run_desktop_generation<R: Runtime>(
             },
         ),
     };
-    let finalized = terminalized
-        .and_then(|()| release_family_after_terminal_persistence(&state, identity, runs));
+    let finalized = terminalized.and_then(|()| {
+        release_family_after_terminal_persistence(&state, identity, runs, terminal_class)
+    });
     if let Err(error) = finalized {
         let _ = state
             .generations
@@ -6184,6 +6464,34 @@ fn persist_backend_event<R: Runtime>(
             .append_generation_event(event.run_id, event.kind)
             .map_err(IpcFailure::store)?
     };
+    let lease = app
+        .state::<PluginState>()
+        .generation_lifecycle
+        .current_lease(&identity.request_id)
+        .map_err(|error| {
+            IpcFailure::new(
+                "generation_lifecycle_progress_failed",
+                error.to_string(),
+                false,
+            )
+        })?
+        .ok_or_else(|| {
+            IpcFailure::new(
+                "generation_lifecycle_missing",
+                "canonical generation progress has no authoritative lifecycle operation",
+                false,
+            )
+        })?;
+    app.state::<PluginState>()
+        .generation_lifecycle
+        .publish_progress(&lease, canonical.sequence)
+        .map_err(|error| {
+            IpcFailure::new(
+                "generation_lifecycle_progress_failed",
+                error.to_string(),
+                false,
+            )
+        })?;
     emit_desktop_event(app, identity, LoomEvent::Generation(canonical))
 }
 
@@ -6384,7 +6692,12 @@ fn fail_and_release_open_runs<R: Runtime>(
     app: &AppHandle<R>,
 ) -> Result<(), IpcFailure> {
     fail_open_runs(state, identity, runs, error, app)?;
-    release_family_after_terminal_persistence(state, identity, runs)
+    release_family_after_terminal_persistence(
+        state,
+        identity,
+        runs,
+        GenerationTerminalClass::Failed,
+    )
 }
 
 fn terminalize_open_runs(
@@ -6438,6 +6751,7 @@ fn release_family_after_terminal_persistence(
     state: &PluginState,
     identity: &GenerationFamilyIdentity,
     runs: &[(GenerationRunId, BranchId)],
+    terminal_class: GenerationTerminalClass,
 ) -> Result<(), IpcFailure> {
     {
         let mut session = lock_session_internal(state)?;
@@ -6459,6 +6773,23 @@ fn release_family_after_terminal_persistence(
             }
         }
     }
+    let lease = state
+        .generation_lifecycle
+        .current_lease(&identity.request_id)
+        .map_err(|error| {
+            IpcFailure::new(
+                "generation_lifecycle_terminal_failed",
+                error.to_string(),
+                false,
+            )
+        })?
+        .ok_or_else(|| {
+            IpcFailure::new(
+                "generation_lifecycle_missing",
+                "durable generation terminal has no authoritative lifecycle operation",
+                false,
+            )
+        })?;
     state
         .generations
         .complete_family(&identity.request_id)
@@ -6470,6 +6801,20 @@ fn release_family_after_terminal_persistence(
                 false,
             )
         })?;
+    let lifecycle_result = if terminal_class == GenerationTerminalClass::Failed {
+        state.generation_lifecycle.fail_and_release(&lease)
+    } else {
+        state
+            .generation_lifecycle
+            .terminal_and_release(&lease, terminal_class)
+    };
+    lifecycle_result.map_err(|error| {
+        IpcFailure::new(
+            "generation_lifecycle_terminal_failed",
+            error.to_string(),
+            false,
+        )
+    })?;
     Ok(())
 }
 
@@ -7167,6 +7512,10 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
     *phase = ApplicationPhase::Closing;
+    if let Err(error) = state.generation_lifecycle.quiesce() {
+        eprintln!("Loom could not quiesce generation lifecycle before runtime exit: {error}");
+        return;
+    }
 
     // Close authority before any potentially slow worker or model drain.
     let _ = state.foreground_commands.revoke_all();
@@ -7191,6 +7540,10 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
     *model_registry = ModelRegistry::Empty;
     let proof = ApplicationShutdownProof::from_process_exit(native_runtime, desktop_workers);
     let joined = proof.joined_worker_count();
+    if let Err(error) = state.generation_lifecycle.close() {
+        eprintln!("Loom generation lifecycle did not close before runtime exit: {error}");
+        return;
+    }
     *phase = ApplicationPhase::ExitAuthorized;
     state.exit_authorized.store(true, Ordering::Release);
     eprintln!("Loom joined {joined} owned worker(s) before unpreventable runtime exit");
@@ -7316,7 +7669,9 @@ impl Drop for ApplicationCloseAttempt<'_> {
         if self.authorized {
             return;
         }
-        if *self.phase == ApplicationPhase::Closing {
+        if *self.phase == ApplicationPhase::Closing
+            && self.state.generation_lifecycle.resume().is_ok()
+        {
             *self.phase = ApplicationPhase::Running;
         }
     }
@@ -7452,6 +7807,13 @@ fn application_close<R: Runtime>(
             ));
         }
     }
+    state.generation_lifecycle.quiesce().map_err(|error| {
+        IpcFailure::new(
+            "generation_lifecycle_quiesce_failed",
+            error.to_string(),
+            true,
+        )
+    })?;
     let desktop_workers = state.join_desktop_workers()?;
     let _model_lifecycle = lock_model_lifecycle(&state)?;
     let mut model_registry = lock_model_registry(&state)?;
@@ -7468,6 +7830,9 @@ fn application_close<R: Runtime>(
         native_runtime,
         desktop_workers,
     };
+    state.generation_lifecycle.close().map_err(|error| {
+        IpcFailure::new("generation_lifecycle_not_drained", error.to_string(), true)
+    })?;
     let permit = close_attempt.authorize(proof);
     exit_application(&app, permit);
     Ok(())
@@ -8000,18 +8365,29 @@ mod tests {
     #[derive(Debug)]
     struct NoopGenerationWorkerCancellation;
 
-    impl FixtureGenerationWorkerCancellation for NoopGenerationWorkerCancellation {
+    impl ControlledGenerationWorkerCancellation for NoopGenerationWorkerCancellation {
         fn cancel_all(&self) {}
     }
 
     fn fixture_generation_worker_owner(
-        cancellation: Arc<dyn FixtureGenerationWorkerCancellation>,
+        cancellation: Arc<dyn ControlledGenerationWorkerCancellation>,
     ) -> GenerationWorkerOwner {
-        GenerationWorkerOwner::fixture(cancellation, std::thread::spawn(|| {}))
+        GenerationWorkerOwner::controlled(cancellation)
     }
 
     fn noop_generation_worker_owner() -> GenerationWorkerOwner {
         fixture_generation_worker_owner(Arc::new(NoopGenerationWorkerCancellation))
+    }
+
+    fn start_test_generation_lifecycle(
+        lifecycle: &GenerationSupervisor,
+        request_id: &str,
+    ) -> loom_host::GenerationOperationLease {
+        let (ticket, lease) = lifecycle.reserve(request_id).expect("reserve lifecycle");
+        lifecycle.queue(&lease).expect("queue lifecycle");
+        lifecycle.start(&lease).expect("start lifecycle");
+        ticket.detach();
+        lease
     }
 
     #[derive(Debug)]
@@ -8019,7 +8395,7 @@ mod tests {
         cancelled: Arc<AtomicBool>,
     }
 
-    impl FixtureGenerationWorkerCancellation for FlagGenerationWorkerCancellation {
+    impl ControlledGenerationWorkerCancellation for FlagGenerationWorkerCancellation {
         fn cancel_all(&self) {
             self.cancelled.store(true, Ordering::Release);
         }
@@ -8028,7 +8404,7 @@ mod tests {
     #[derive(Debug)]
     struct PanickingGenerationWorkerCancellation;
 
-    impl FixtureGenerationWorkerCancellation for PanickingGenerationWorkerCancellation {
+    impl ControlledGenerationWorkerCancellation for PanickingGenerationWorkerCancellation {
         fn cancel_all(&self) {
             panic!("fixture cancellation panic");
         }
@@ -8170,6 +8546,7 @@ mod tests {
         let application = Mutex::new(ApplicationPhase::Running);
         let admission = application.lock().expect("application admission");
         let workers = GenerationWorkerRegistry::default();
+        let lifecycle = start_test_generation_lifecycle(&workers.lifecycle, "request-one");
         let reservation = workers
             .reserve("request-one", &admission)
             .expect("reserve worker");
@@ -8185,6 +8562,10 @@ mod tests {
             .map_err(|error| error.failure)
             .expect("attach worker");
         assert_eq!(workers.join_all().expect("join owned worker").count(), 1);
+        workers
+            .lifecycle
+            .terminal_and_release(&lifecycle, GenerationTerminalClass::Completed)
+            .expect("complete lifecycle");
         assert_eq!(workers.join_all().expect("join replay").count(), 0);
     }
 
@@ -8193,6 +8574,7 @@ mod tests {
         let application = Mutex::new(ApplicationPhase::Running);
         let admission = application.lock().expect("application admission");
         let workers = GenerationWorkerRegistry::default();
+        let lifecycle = start_test_generation_lifecycle(&workers.lifecycle, "request-panic");
         workers
             .reserve("request-panic", &admission)
             .expect("reserve worker")
@@ -8210,6 +8592,10 @@ mod tests {
                 .code,
             "generation_worker_join_failed"
         );
+        workers
+            .lifecycle
+            .fail_and_release(&lifecycle)
+            .expect("fail panicked lifecycle");
         assert_eq!(
             workers
                 .reserve("request-after-panic", &admission)
@@ -8253,6 +8639,8 @@ mod tests {
         let download_stopped = Arc::new(AtomicBool::new(false));
 
         let generation_signal = Arc::clone(&generation_stopped);
+        let generation_lifecycle =
+            start_test_generation_lifecycle(&state.generation_lifecycle, "drop-generation");
         {
             let admission =
                 lock_application_admission(&state, "fixture generation").expect("admission");
@@ -8269,6 +8657,10 @@ mod tests {
                 .map_err(|error| error.failure)
                 .expect("attach generation worker");
         }
+        state
+            .generation_lifecycle
+            .terminal_and_release(&generation_lifecycle, GenerationTerminalClass::Completed)
+            .expect("complete drop generation lifecycle");
         let download_signal = Arc::clone(&download_stopped);
         {
             let admission =
@@ -8297,11 +8689,16 @@ mod tests {
         let state = PluginState::default();
         let generation_cancelled = Arc::new(AtomicBool::new(false));
         let generation_finished = Arc::new(AtomicBool::new(false));
-        let backend_forwarder_finished = Arc::new(AtomicBool::new(false));
         let panicking_cancellation_worker_finished = Arc::new(AtomicBool::new(false));
         let release_panicking_outer = Arc::new(AtomicBool::new(false));
         let download_finished = Arc::new(AtomicBool::new(false));
         let download_cancellation = DownloadCancellation::default();
+        let panicking_lifecycle = start_test_generation_lifecycle(
+            &state.generation_lifecycle,
+            "exit-generation-panicking-cancellation",
+        );
+        let generation_lifecycle =
+            start_test_generation_lifecycle(&state.generation_lifecycle, "exit-generation");
 
         {
             let admission =
@@ -8327,8 +8724,6 @@ mod tests {
                 .expect("attach generation with panicking cancellation");
 
             let finished = Arc::clone(&generation_finished);
-            let backend_wait_cancelled = Arc::clone(&generation_cancelled);
-            let backend_finished = Arc::clone(&backend_forwarder_finished);
             state
                 .generation_workers
                 .reserve("exit-generation", &admission)
@@ -8337,17 +8732,9 @@ mod tests {
                     std::thread::spawn(move || {
                         finished.store(true, Ordering::Release);
                     }),
-                    GenerationWorkerOwner::fixture(
-                        Arc::new(FlagGenerationWorkerCancellation {
-                            cancelled: Arc::clone(&generation_cancelled),
-                        }),
-                        std::thread::spawn(move || {
-                            while !backend_wait_cancelled.load(Ordering::Acquire) {
-                                std::thread::yield_now();
-                            }
-                            backend_finished.store(true, Ordering::Release);
-                        }),
-                    ),
+                    GenerationWorkerOwner::controlled(Arc::new(FlagGenerationWorkerCancellation {
+                        cancelled: Arc::clone(&generation_cancelled),
+                    })),
                 )
                 .map_err(|error| error.failure)
                 .expect("attach generation");
@@ -8371,12 +8758,20 @@ mod tests {
                 .expect("attach download");
         }
 
+        state
+            .generation_lifecycle
+            .fail_and_release(&panicking_lifecycle)
+            .expect("fail panicking cancellation lifecycle");
+        state
+            .generation_lifecycle
+            .fail_and_release(&generation_lifecycle)
+            .expect("fail exit generation lifecycle");
+
         release_panicking_outer.store(true, Ordering::Release);
         let joined = state.join_desktop_workers_for_exit();
-        assert_eq!(joined.joined_worker_count(), 5);
+        assert_eq!(joined.joined_worker_count(), 3);
         assert!(generation_cancelled.load(Ordering::Acquire));
         assert!(generation_finished.load(Ordering::Acquire));
-        assert!(backend_forwarder_finished.load(Ordering::Acquire));
         assert!(panicking_cancellation_worker_finished.load(Ordering::Acquire));
         assert!(download_finished.load(Ordering::Acquire));
     }
@@ -9515,6 +9910,7 @@ mod tests {
                 cancellation: cancellation.clone(),
             })
             .expect("register active family");
+        let _lifecycle = start_test_generation_lifecycle(&state.generation_lifecycle, &request_id);
         let completing_state = Arc::clone(&state);
         let completing_identity = GenerationFamilyIdentity {
             request_id: request_id.clone(),
@@ -9537,6 +9933,7 @@ mod tests {
                 &completing_state,
                 &completing_identity,
                 &[(run_id, branch_id)],
+                GenerationTerminalClass::Cancelled,
             )
             .expect("release terminal family");
         });
@@ -9700,6 +10097,7 @@ mod tests {
                 cancellation: Arc::new(RecordingCancellation::default()),
             })
             .expect("register failed-persistence family");
+        let _lifecycle = start_test_generation_lifecycle(&state.generation_lifecycle, request_id);
         state
             .generations
             .mark_terminal_persistence_failure(request_id, "simulated SQLite interruption")
