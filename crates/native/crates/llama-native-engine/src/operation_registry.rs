@@ -310,6 +310,9 @@ impl Drop for RequestLease {
     }
 }
 
+#[cfg(all(test, feature = "unstable-w1-contract-tests"))]
+mod w1_contract_adapter;
+
 #[cfg(test)]
 mod tests {
     use super::*;
