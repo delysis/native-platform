@@ -8,7 +8,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const GROUPS: [&str; 6] = [
     "portable",
@@ -189,14 +188,16 @@ fn check_sha256(path: &Path, expected: &str) -> Result<()> {
 
 fn run_loom_probe(root: &Path) -> Result<()> {
     check_evidence_files(root)?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock before Unix epoch")?
-        .as_nanos();
-    let probe = root.join("target").join(format!(
-        "native-platform-loom-probe-{}-{nonce}",
-        std::process::id()
-    ));
+    // Keep this deliberately short. llama.cpp's CMake/MSBuild scratch paths are
+    // deep enough to exceed Windows' legacy MAX_PATH limit when the probe name
+    // includes a descriptive prefix and timestamp.
+    let probe = root
+        .join("target")
+        .join(format!("lp-{}", std::process::id()));
+    if probe.exists() {
+        fs::remove_dir_all(&probe)
+            .with_context(|| format!("remove stale temporary probe {}", probe.display()))?;
+    }
     fs::create_dir_all(probe.join("src"))?;
     let fixture = root.join("tests/integration-current/loom-probe");
     fs::copy(fixture.join("Cargo.toml.in"), probe.join("Cargo.toml"))?;
