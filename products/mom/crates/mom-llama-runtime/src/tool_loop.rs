@@ -712,7 +712,7 @@ fn tool_loop_run_with_events(
             .generate(request)
             .map_err(|error| anyhow::anyhow!(error))?;
         let Some(outputs) = wait_for_tool_model(
-            &ticket,
+            ticket,
             ToolModelWaitContext {
                 data_dir: &settings.data_dir,
                 request_id: &request_id,
@@ -990,6 +990,23 @@ pub fn tool_loop_cancel(conversation_id: &str) -> Result<CommandResult<ToolLoopC
     ))
 }
 
+pub(crate) fn request_all_tool_loop_cancellation() -> usize {
+    let controls = tool_loop_controls()
+        .lock()
+        .map(|registry| registry.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    controls.iter().fold(0_usize, |total, control| {
+        control.cancel_requested.store(true, Ordering::Release);
+        let cancelled = control
+            .current_model_request_id
+            .lock()
+            .ok()
+            .and_then(|request_id| request_id.clone())
+            .map_or(0, |request_id| cancel_native_request(&request_id, None));
+        total.saturating_add(cancelled)
+    })
+}
+
 pub fn tool_loop_status(
     conversation_id: Option<&str>,
 ) -> Result<CommandResult<Vec<ActiveToolLoop>>> {
@@ -1034,7 +1051,7 @@ fn tool_loop_cancelled_result(
 }
 
 fn wait_for_tool_model(
-    ticket: &llama_native_engine::GenerationTicket,
+    ticket: llama_native_engine::GenerationTicket,
     context: ToolModelWaitContext<'_>,
     on_event: &mut Option<&mut dyn FnMut(ToolLoopStreamEvent) -> Result<()>>,
 ) -> Result<Option<Vec<GenerationOutput>>> {
@@ -1049,6 +1066,7 @@ fn wait_for_tool_model(
     } = context;
     let started = Instant::now();
     let mut cancelled = false;
+    let mut ticket = ticket;
     loop {
         while let Ok(event) = ticket.events.try_recv() {
             match event.event {
@@ -1094,8 +1112,11 @@ fn wait_for_tool_model(
             ticket.cancel_all();
             cancelled = true;
         }
-        if let Some(outputs) = ticket.try_wait().map_err(anyhow::Error::new)? {
-            return Ok((!cancelled).then_some(outputs));
+        match ticket.try_wait().map_err(anyhow::Error::new)? {
+            llama_native_engine::TryWaitOutcome::Ready(outputs) => {
+                return Ok((!cancelled).then_some(outputs));
+            }
+            llama_native_engine::TryWaitOutcome::Pending(pending) => ticket = pending,
         }
         if started.elapsed() >= timeout {
             ticket.cancel_all();

@@ -1633,7 +1633,7 @@ dependencies = [
 [[package]]
 name = "fte-backend-llama"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=d86edfef40771589af4cd8cd72907fa6d3ce6e96#d86edfef40771589af4cd8cd72907fa6d3ce6e96"
+source = "git+https://github.com/delysis/free-token-energy?rev=1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a#1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a"
 dependencies = [
  "async-trait",
  "fte-types",
@@ -1648,7 +1648,7 @@ dependencies = [
 [[package]]
 name = "fte-loopback"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=d86edfef40771589af4cd8cd72907fa6d3ce6e96#d86edfef40771589af4cd8cd72907fa6d3ce6e96"
+source = "git+https://github.com/delysis/free-token-energy?rev=1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a#1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a"
 dependencies = [
  "async-stream",
  "axum",
@@ -1669,7 +1669,7 @@ dependencies = [
 [[package]]
 name = "fte-protocols"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=d86edfef40771589af4cd8cd72907fa6d3ce6e96#d86edfef40771589af4cd8cd72907fa6d3ce6e96"
+source = "git+https://github.com/delysis/free-token-energy?rev=1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a#1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a"
 dependencies = [
  "fte-types",
  "serde",
@@ -1679,7 +1679,7 @@ dependencies = [
 [[package]]
 name = "fte-router"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=d86edfef40771589af4cd8cd72907fa6d3ce6e96#d86edfef40771589af4cd8cd72907fa6d3ce6e96"
+source = "git+https://github.com/delysis/free-token-energy?rev=1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a#1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a"
 dependencies = [
  "fte-types",
  "tokio",
@@ -1688,7 +1688,7 @@ dependencies = [
 [[package]]
 name = "fte-store"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=d86edfef40771589af4cd8cd72907fa6d3ce6e96#d86edfef40771589af4cd8cd72907fa6d3ce6e96"
+source = "git+https://github.com/delysis/free-token-energy?rev=1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a#1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a"
 dependencies = [
  "fte-types",
  "rusqlite",
@@ -1698,7 +1698,7 @@ dependencies = [
 [[package]]
 name = "fte-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=d86edfef40771589af4cd8cd72907fa6d3ce6e96#d86edfef40771589af4cd8cd72907fa6d3ce6e96"
+source = "git+https://github.com/delysis/free-token-energy?rev=1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a#1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a"
 dependencies = [
  "async-trait",
  "futures",
@@ -2914,7 +2914,7 @@ dependencies = [
 [[package]]
 name = "llama-native-cache"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=2d69f086e922ed7bdfd6236baf5a1ad0ed568360#2d69f086e922ed7bdfd6236baf5a1ad0ed568360"
+source = "git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"
 dependencies = [
  "llama-native-types",
  "serde",
@@ -2924,7 +2924,7 @@ dependencies = [
 [[package]]
 name = "llama-native-engine"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=2d69f086e922ed7bdfd6236baf5a1ad0ed568360#2d69f086e922ed7bdfd6236baf5a1ad0ed568360"
+source = "git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",
@@ -2938,7 +2938,7 @@ dependencies = [
 [[package]]
 name = "llama-native-host"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=2d69f086e922ed7bdfd6236baf5a1ad0ed568360#2d69f086e922ed7bdfd6236baf5a1ad0ed568360"
+source = "git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"
 dependencies = [
  "llama-native-cache",
  "llama-native-engine",
@@ -2948,7 +2948,7 @@ dependencies = [
 [[package]]
 name = "llama-native-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=2d69f086e922ed7bdfd6236baf5a1ad0ed568360#2d69f086e922ed7bdfd6236baf5a1ad0ed568360"
+source = "git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"
 dependencies = [
  "serde",
  "sha2 0.10.9",
@@ -4980,7 +4980,7 @@ dependencies = [
 [[package]]
 name = "tauri-plugin-free-token-energy"
 version = "0.1.0"
-source = "git+https://github.com/delysis/free-token-energy?rev=d86edfef40771589af4cd8cd72907fa6d3ce6e96#d86edfef40771589af4cd8cd72907fa6d3ce6e96"
+source = "git+https://github.com/delysis/free-token-energy?rev=1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a#1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a"
 dependencies = [
  "fte-loopback",
  "fte-router",

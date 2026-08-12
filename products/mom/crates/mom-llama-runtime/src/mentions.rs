@@ -430,6 +430,29 @@ pub fn mention_cancel(
     ))
 }
 
+pub(crate) fn request_all_mention_cancellation() -> usize {
+    let controls = mention_cancel_registry()
+        .lock()
+        .map(|registry| {
+            registry
+                .iter()
+                .map(|((invocation_id, target_id), control)| {
+                    control.store(true, Ordering::Release);
+                    (invocation_id.clone(), target_id.clone())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    controls
+        .iter()
+        .fold(0_usize, |total, (invocation_id, target_id)| {
+            total.saturating_add(cancel_native_request(
+                invocation_id,
+                Some(target_id.as_str()),
+            ))
+        })
+}
+
 pub fn mention_synthesize(invocation_id: &str) -> Result<CommandResult<MentionSynthesisOutput>> {
     let store = RuntimeStore::current()?;
     let invocation = store

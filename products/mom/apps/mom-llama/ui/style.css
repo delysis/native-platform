@@ -932,9 +932,11 @@ kbd { padding: 2px 6px; border-radius: 4px; color: #c5c5c5; background: #2a2a2a;
 .markdown-table { width: 100%; border-collapse: collapse; }
 .markdown-table th, .markdown-table td { padding: 8px 10px; border: 1px solid var(--border); text-align: left; }
 
-.boot { height: 100%; display: grid; place-content: center; text-align: center; }
+.boot { height: 100%; display: grid; place-content: center; gap: 12px; text-align: center; }
 .boot h1 { margin: 0 0 10px; }
 .boot p { margin: 0; color: var(--muted); }
+.boot .primary-button { justify-self: center; margin-top: 4px; }
+.boot .startup-error { max-width: 620px; color: var(--danger); }
 
 @media (min-width: 1180px) {
   .llama-ui-shell.sidebar-open .sidebar { transform: translateX(0); }

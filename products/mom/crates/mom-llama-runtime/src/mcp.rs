@@ -7,9 +7,11 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MCP_SERVERS_FILE: &str = "mcp-servers.json";
 const MCP_SERVERS_NAMESPACE: &str = "mcp-servers.v2";
+static MCP_PRODUCT_CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerConfig {
@@ -643,7 +645,9 @@ fn command_output_with_timeout_from_child(
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs_f64(timeout_s.max(0.001));
     loop {
-        if should_cancel.is_some_and(|should_cancel| should_cancel()) {
+        if MCP_PRODUCT_CANCELLATION_REQUESTED.load(Ordering::Acquire)
+            || should_cancel.is_some_and(|should_cancel| should_cancel())
+        {
             let _ = child.kill();
             let _ = child.wait();
             anyhow::bail!("MCP server pid {pid} was cancelled");
@@ -658,6 +662,10 @@ fn command_output_with_timeout_from_child(
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+pub(crate) fn request_all_mcp_cancellation() {
+    MCP_PRODUCT_CANCELLATION_REQUESTED.store(true, Ordering::Release);
 }
 
 fn write_mcp_message(writer: &mut impl Write, value: &Value) -> Result<()> {

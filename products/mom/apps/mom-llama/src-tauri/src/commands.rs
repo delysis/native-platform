@@ -4,7 +4,7 @@ use mom_llama_runtime::{
     PathSelection, PathSelectionKind, config::SettingsUpdate,
 };
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-use rfd::FileDialog;
+use rfd::AsyncFileDialog;
 use serde::Deserialize;
 use serde_json::{Value, to_value};
 use std::path::PathBuf;
@@ -12,31 +12,45 @@ use tauri::ipc::Response;
 use tauri::{Emitter, State, Window};
 
 use crate::app_runtime::{AppRuntimeHandle, AppWorkLease};
+use crate::command_registry::command_spec;
 
 const MAX_ATTACHMENT_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
 
 #[tauri::command]
-pub fn mom_llama_render_app() -> Result<Response, String> {
+pub fn mom_llama_render_app(runtime: State<'_, AppRuntimeHandle>) -> Result<Response, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_render_app"))?;
     markup_response(crate::view::render_app())
 }
 
 #[tauri::command]
-pub fn mom_llama_render_chat_fragment() -> Result<Response, String> {
+pub fn mom_llama_render_chat_fragment(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Response, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_render_chat_fragment"))?;
     markup_response(crate::view::render_chat_fragment())
 }
 
 #[tauri::command]
-pub fn mom_llama_render_sidebar_fragment() -> Result<Response, String> {
+pub fn mom_llama_render_sidebar_fragment(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Response, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_render_sidebar_fragment"))?;
     markup_response(crate::view::render_sidebar_fragment())
 }
 
 #[tauri::command]
-pub fn mom_llama_render_persona_picker_fragment() -> Result<Response, String> {
+pub fn mom_llama_render_persona_picker_fragment(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Response, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_render_persona_picker_fragment"))?;
     markup_response(crate::view::render_persona_picker_fragment())
 }
 
 #[tauri::command]
-pub fn mom_llama_render_settings_fragment() -> Result<Response, String> {
+pub fn mom_llama_render_settings_fragment(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Response, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_render_settings_fragment"))?;
     markup_response(crate::view::render_settings_fragment())
 }
 
@@ -46,46 +60,44 @@ pub async fn mom_llama_pick_file(
     runtime: State<'_, AppRuntimeHandle>,
     kind: String,
 ) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_pick_file"))?;
     let Some(path_kind) = PathSelectionKind::parse(&kind) else {
         return picker_blocked(
             "path_selection_kind_invalid",
             format!("Unsupported native file picker kind: {kind}"),
         );
     };
-    let lease = runtime.admit_work()?;
-    let path = tauri::async_runtime::spawn_blocking(move || {
-        let _lease = lease;
-        let dialog = match kind.as_str() {
-            "model" => {
-                let dialog = FileDialog::new().add_filter("GGUF model", &["gguf"]);
-                match mom_llama_runtime::hugging_face_hub_cache_dir() {
-                    Some(cache) if cache.is_dir() => dialog.set_directory(cache),
-                    _ => dialog,
-                }
+    let dialog = match kind.as_str() {
+        "model" => {
+            let dialog = AsyncFileDialog::new().add_filter("GGUF model", &["gguf"]);
+            match mom_llama_runtime::hugging_face_hub_cache_dir() {
+                Some(cache) if cache.is_dir() => dialog.set_directory(cache),
+                _ => dialog,
             }
-            "mmproj" => FileDialog::new().add_filter("GGUF projector", &["gguf"]),
-            "conversation" => FileDialog::new().add_filter("Conversation", &["json"]),
-            "attachment" => FileDialog::new().add_filter(
-                "Documents and media",
-                &[
-                    "txt", "md", "markdown", "rst", "rtf", "tex", "csv", "tsv", "json", "jsonl",
-                    "yaml", "yml", "toml", "ini", "cfg", "xml", "html", "htm", "css", "svg", "vtt",
-                    "srt", "ipynb", "log", "sql", "c", "h", "cpp", "hpp", "rs", "py", "js", "jsx",
-                    "ts", "tsx", "java", "go", "swift", "sh", "pdf", "doc", "docx", "xls", "xlsx",
-                    "ppt", "pptx", "odt", "ods", "odp", "pages", "numbers", "key", "epub", "eml",
-                    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "avif", "wav",
-                    "mp3", "flac", "ogg", "opus", "m4a", "aac", "aif", "aiff", "caf", "mp4", "m4v",
-                    "mov", "webm", "mkv", "avi", "zip", "tar", "gz", "tgz", "bz2", "tbz2", "xz",
-                    "txz", "zst", "7z",
-                ],
-            ),
-            "mcp" => FileDialog::new(),
-            _ => unreachable!("validated path selection kind"),
-        };
-        dialog.pick_file()
-    })
-    .await
-    .map_err(|error| format!("native file picker task failed: {error}"))?;
+        }
+        "mmproj" => AsyncFileDialog::new().add_filter("GGUF projector", &["gguf"]),
+        "conversation" => AsyncFileDialog::new().add_filter("Conversation", &["json"]),
+        "attachment" => AsyncFileDialog::new().add_filter(
+            "Documents and media",
+            &[
+                "txt", "md", "markdown", "rst", "rtf", "tex", "csv", "tsv", "json", "jsonl",
+                "yaml", "yml", "toml", "ini", "cfg", "xml", "html", "htm", "css", "svg", "vtt",
+                "srt", "ipynb", "log", "sql", "c", "h", "cpp", "hpp", "rs", "py", "js", "jsx",
+                "ts", "tsx", "java", "go", "swift", "sh", "pdf", "doc", "docx", "xls", "xlsx",
+                "ppt", "pptx", "odt", "ods", "odp", "pages", "numbers", "key", "epub", "eml",
+                "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "avif", "wav", "mp3",
+                "flac", "ogg", "opus", "m4a", "aac", "aif", "aiff", "caf", "mp4", "m4v", "mov",
+                "webm", "mkv", "avi", "zip", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "zst",
+                "7z",
+            ],
+        ),
+        "mcp" => AsyncFileDialog::new(),
+        _ => unreachable!("validated path selection kind"),
+    };
+    let path = tokio::select! {
+        file = dialog.pick_file() => file.map(|file| file.path().to_path_buf()),
+        () = lease.cancelled() => None,
+    };
     command_value(mom_llama_runtime::path_select(path_kind, path))
 }
 
@@ -95,7 +107,7 @@ pub async fn mom_llama_pick_file(
     runtime: State<'_, AppRuntimeHandle>,
     _kind: String,
 ) -> Result<Value, String> {
-    let _lease = runtime.admit_work()?;
+    let _lease = runtime.admit(command_spec("mom_llama_pick_file"))?;
     picker_blocked(
         "native_file_picker_unsupported",
         "The native file picker is unavailable on this build. Enter or paste an absolute path instead."
@@ -119,9 +131,10 @@ fn picker_blocked(code: &str, message: String) -> Result<Value, String> {
 
 #[tauri::command]
 pub async fn mom_llama_engine_check(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::engine_check(EngineCheckOptions::default())
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_engine_check"))?,
+        move || mom_llama_runtime::engine_check(EngineCheckOptions::default()),
+    )
     .await
 }
 
@@ -135,7 +148,7 @@ pub fn mom_llama_engine_configure(
     max_parallel_sequences: Option<u32>,
     memory_budget_mib: Option<u64>,
 ) -> Result<Value, String> {
-    runtime.ensure_running()?;
+    let lease = runtime.admit(command_spec("mom_llama_engine_configure"))?;
     let value = command_value(mom_llama_runtime::configure_engine(
         PathBuf::from(model_path),
         device.as_deref().map(native_device_from_str),
@@ -144,12 +157,13 @@ pub fn mom_llama_engine_configure(
         max_parallel_sequences,
         memory_budget_mib.map(mib_to_bytes),
     ))?;
-    runtime.refresh_native_model()?;
+    runtime.refresh_native_model(&lease)?;
     Ok(value)
 }
 
 #[tauri::command]
-pub fn mom_llama_model_list() -> Result<Value, String> {
+pub fn mom_llama_model_list(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_model_list"))?;
     command_value(mom_llama_runtime::model_list())
 }
 
@@ -158,9 +172,9 @@ pub fn mom_llama_model_select(
     runtime: State<'_, AppRuntimeHandle>,
     model_path: String,
 ) -> Result<Value, String> {
-    runtime.ensure_running()?;
+    let lease = runtime.admit(command_spec("mom_llama_model_select"))?;
     let value = command_value(mom_llama_runtime::model_select(PathBuf::from(model_path)))?;
-    runtime.refresh_native_model()?;
+    runtime.refresh_native_model(&lease)?;
     Ok(value)
 }
 
@@ -171,7 +185,7 @@ pub async fn mom_llama_chat_send(
     conversation: String,
     message: String,
 ) -> Result<Value, String> {
-    let lease = runtime.admit_work()?;
+    let lease = runtime.admit(command_spec("mom_llama_chat_send"))?;
     let events = window.clone();
     blocking_command(lease, move || {
         mom_llama_runtime::chat_send_stream(
@@ -198,7 +212,7 @@ pub async fn mom_llama_chat_dispatch(
     conversation: String,
     message: String,
 ) -> Result<Value, String> {
-    let lease = runtime.admit_work()?;
+    let lease = runtime.admit(command_spec("mom_llama_chat_dispatch"))?;
     let events = window.clone();
     blocking_command(lease, move || {
         mom_llama_runtime::chat_dispatch_stream(
@@ -225,7 +239,7 @@ pub async fn mom_llama_mention_dispatch(
     conversation: String,
     message: String,
 ) -> Result<Value, String> {
-    let lease = runtime.admit_work()?;
+    let lease = runtime.admit(command_spec("mom_llama_mention_dispatch"))?;
     let events = window.clone();
     blocking_command(lease, move || {
         let mut result = mom_llama_runtime::chat_dispatch_stream(
@@ -250,9 +264,11 @@ pub async fn mom_llama_mention_dispatch(
 
 #[tauri::command]
 pub fn mom_llama_mention_candidates(
+    runtime: State<'_, AppRuntimeHandle>,
     query: String,
     conversation: Option<String>,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_mention_candidates"))?;
     command_value(mom_llama_runtime::mention_candidates(
         &query,
         conversation.as_deref(),
@@ -261,9 +277,11 @@ pub fn mom_llama_mention_candidates(
 
 #[tauri::command]
 pub fn mom_llama_mention_cancel(
+    runtime: State<'_, AppRuntimeHandle>,
     invocation: String,
     target: Option<String>,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_mention_cancel"))?;
     command_value(mom_llama_runtime::mention_cancel(
         &invocation,
         target.as_deref(),
@@ -275,20 +293,23 @@ pub async fn mom_llama_mention_synthesize(
     runtime: State<'_, AppRuntimeHandle>,
     invocation: String,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::mention_synthesize(&invocation)
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_mention_synthesize"))?,
+        move || mom_llama_runtime::mention_synthesize(&invocation),
+    )
     .await
 }
 
 #[tauri::command]
 pub fn mom_llama_persona_freeze(
+    runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
     message: String,
     name: String,
     handle: String,
     history: String,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_persona_freeze"))?;
     command_value(mom_llama_runtime::persona_freeze(
         mom_llama_runtime::PersonaFreezeInput {
             conversation_id: conversation,
@@ -305,46 +326,65 @@ pub fn mom_llama_persona_freeze(
 }
 
 #[tauri::command]
-pub fn mom_llama_persona_list() -> Result<Value, String> {
+pub fn mom_llama_persona_list(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_persona_list"))?;
     command_value(mom_llama_runtime::persona_list())
 }
 
 #[tauri::command]
-pub fn mom_llama_persona_get(persona: String) -> Result<Value, String> {
+pub fn mom_llama_persona_get(
+    runtime: State<'_, AppRuntimeHandle>,
+    persona: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_persona_get"))?;
     command_value(mom_llama_runtime::persona_get(&persona))
 }
 
 #[tauri::command]
-pub fn mom_llama_persona_update(
+pub async fn mom_llama_persona_update(
+    runtime: State<'_, AppRuntimeHandle>,
     profile: mom_llama_runtime::PersonaUpdateInput,
 ) -> Result<Value, String> {
-    command_value(mom_llama_runtime::persona_update(profile))
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_persona_update"))?,
+        move || mom_llama_runtime::persona_update(profile),
+    )
+    .await
 }
 
 #[tauri::command]
-pub fn mom_llama_persona_delete(persona: String) -> Result<Value, String> {
+pub fn mom_llama_persona_delete(
+    runtime: State<'_, AppRuntimeHandle>,
+    persona: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_persona_delete"))?;
     command_value(mom_llama_runtime::persona_delete(&persona))
 }
 
 #[tauri::command]
 pub fn mom_llama_persona_instantiate(
+    runtime: State<'_, AppRuntimeHandle>,
     persona: String,
     title: Option<String>,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_persona_instantiate"))?;
     command_value(mom_llama_runtime::persona_instantiate(&persona, title))
 }
 
 #[tauri::command]
-pub fn mom_llama_persona_group_list() -> Result<Value, String> {
+pub fn mom_llama_persona_group_list(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_persona_group_list"))?;
     command_value(mom_llama_runtime::persona_group_list())
 }
 
 #[tauri::command]
 pub fn mom_llama_persona_group_create(
+    runtime: State<'_, AppRuntimeHandle>,
     name: String,
     handle: String,
     personas: Vec<String>,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_persona_group_create"))?;
     command_value(mom_llama_runtime::persona_group_create(
         name, handle, personas,
     ))
@@ -352,28 +392,42 @@ pub fn mom_llama_persona_group_create(
 
 #[tauri::command]
 pub fn mom_llama_persona_group_update(
+    runtime: State<'_, AppRuntimeHandle>,
     group: String,
     name: String,
     handle: String,
     personas: Vec<String>,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_persona_group_update"))?;
     command_value(mom_llama_runtime::persona_group_update(
         group, name, handle, personas,
     ))
 }
 
 #[tauri::command]
-pub fn mom_llama_persona_group_delete(group: String) -> Result<Value, String> {
+pub fn mom_llama_persona_group_delete(
+    runtime: State<'_, AppRuntimeHandle>,
+    group: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_persona_group_delete"))?;
     command_value(mom_llama_runtime::persona_group_delete(&group))
 }
 
 #[tauri::command]
-pub fn mom_llama_chat_cancel(conversation: String) -> Result<Value, String> {
+pub fn mom_llama_chat_cancel(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_chat_cancel"))?;
     command_value(mom_llama_runtime::chat_cancel(&conversation))
 }
 
 #[tauri::command]
-pub fn mom_llama_chat_skip_reasoning(conversation: String) -> Result<Value, String> {
+pub fn mom_llama_chat_skip_reasoning(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_chat_skip_reasoning"))?;
     command_value(mom_llama_runtime::chat_skip_reasoning(&conversation))
 }
 
@@ -382,9 +436,10 @@ pub async fn mom_llama_chat_regenerate(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::chat_regenerate(&conversation, ChatSendOptions::default())
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_chat_regenerate"))?,
+        move || mom_llama_runtime::chat_regenerate(&conversation, ChatSendOptions::default()),
+    )
     .await
 }
 
@@ -393,42 +448,63 @@ pub async fn mom_llama_chat_continue(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::chat_continue(&conversation, ChatSendOptions::default())
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_chat_continue"))?,
+        move || mom_llama_runtime::chat_continue(&conversation, ChatSendOptions::default()),
+    )
     .await
 }
 
 #[tauri::command]
-pub fn mom_llama_conversation_new(title: Option<String>) -> Result<Value, String> {
+pub fn mom_llama_conversation_new(
+    runtime: State<'_, AppRuntimeHandle>,
+    title: Option<String>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_new"))?;
     command_value(mom_llama_runtime::conversation_new(title))
 }
 
 #[tauri::command]
-pub fn mom_llama_conversation_list() -> Result<Value, String> {
+pub fn mom_llama_conversation_list(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_list"))?;
     command_value(mom_llama_runtime::conversation_list())
 }
 
 #[tauri::command]
-pub fn mom_llama_conversation_select(conversation: String) -> Result<Value, String> {
+pub fn mom_llama_conversation_select(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_select"))?;
     command_value(mom_llama_runtime::conversation_select(&conversation))
 }
 
 #[tauri::command]
-pub fn mom_llama_conversation_search(query: String) -> Result<Value, String> {
+pub fn mom_llama_conversation_search(
+    runtime: State<'_, AppRuntimeHandle>,
+    query: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_search"))?;
     command_value(mom_llama_runtime::conversation_search(&query))
 }
 
 #[tauri::command]
-pub fn mom_llama_conversation_rename(conversation: String, title: String) -> Result<Value, String> {
+pub fn mom_llama_conversation_rename(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    title: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_rename"))?;
     command_value(mom_llama_runtime::conversation_rename(&conversation, title))
 }
 
 #[tauri::command]
 pub fn mom_llama_conversation_system_message_update(
+    runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
     system_message: Option<String>,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_system_message_update"))?;
     command_value(mom_llama_runtime::conversation_system_message_update(
         &conversation,
         system_message,
@@ -436,12 +512,21 @@ pub fn mom_llama_conversation_system_message_update(
 }
 
 #[tauri::command]
-pub fn mom_llama_conversation_delete(conversation: String) -> Result<Value, String> {
+pub fn mom_llama_conversation_delete(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_delete"))?;
     command_value(mom_llama_runtime::conversation_delete(&conversation))
 }
 
 #[tauri::command]
-pub fn mom_llama_conversation_fork(conversation: String, message: String) -> Result<Value, String> {
+pub fn mom_llama_conversation_fork(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    message: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_fork"))?;
     command_value(mom_llama_runtime::conversation_fork(
         &conversation,
         &message,
@@ -449,21 +534,31 @@ pub fn mom_llama_conversation_fork(conversation: String, message: String) -> Res
 }
 
 #[tauri::command]
-pub fn mom_llama_conversation_siblings(conversation: String) -> Result<Value, String> {
+pub fn mom_llama_conversation_siblings(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_siblings"))?;
     command_value(mom_llama_runtime::conversation_siblings(&conversation))
 }
 
 #[tauri::command]
-pub fn mom_llama_draft_get(conversation: Option<String>) -> Result<Value, String> {
+pub fn mom_llama_draft_get(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: Option<String>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_draft_get"))?;
     command_value(mom_llama_runtime::draft_get(conversation.as_deref()))
 }
 
 #[tauri::command]
 pub fn mom_llama_draft_update(
+    runtime: State<'_, AppRuntimeHandle>,
     conversation: Option<String>,
     message: String,
     attachment_ids: Option<Vec<String>>,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_draft_update"))?;
     command_value(mom_llama_runtime::draft_update(
         conversation.as_deref(),
         message,
@@ -472,15 +567,21 @@ pub fn mom_llama_draft_update(
 }
 
 #[tauri::command]
-pub fn mom_llama_draft_clear(conversation: Option<String>) -> Result<Value, String> {
+pub fn mom_llama_draft_clear(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: Option<String>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_draft_clear"))?;
     command_value(mom_llama_runtime::draft_clear(conversation.as_deref()))
 }
 
 #[tauri::command]
 pub fn mom_llama_conversation_export(
+    runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
     format: Option<String>,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_export"))?;
     let format = match format.as_deref() {
         Some("markdown") => ConversationExportFormat::Markdown,
         _ => ConversationExportFormat::Json,
@@ -492,7 +593,11 @@ pub fn mom_llama_conversation_export(
 }
 
 #[tauri::command]
-pub fn mom_llama_conversation_import(path: String) -> Result<Value, String> {
+pub fn mom_llama_conversation_import(
+    runtime: State<'_, AppRuntimeHandle>,
+    path: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_import"))?;
     let content = std::fs::read_to_string(&path)
         .map_err(|error| format!("could not read conversation import {path}: {error}"))?;
     command_value(mom_llama_runtime::conversation_import_json(&content))
@@ -500,10 +605,12 @@ pub fn mom_llama_conversation_import(path: String) -> Result<Value, String> {
 
 #[tauri::command]
 pub fn mom_llama_message_edit(
+    runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
     message: String,
     content: String,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_message_edit"))?;
     command_value(mom_llama_runtime::message_edit(
         &conversation,
         &message,
@@ -512,25 +619,42 @@ pub fn mom_llama_message_edit(
 }
 
 #[tauri::command]
-pub fn mom_llama_message_delete(conversation: String, message: String) -> Result<Value, String> {
+pub fn mom_llama_message_delete(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    message: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_message_delete"))?;
     command_value(mom_llama_runtime::message_delete(&conversation, &message))
 }
 
 #[tauri::command]
-pub fn mom_llama_message_copy(conversation: String, message: String) -> Result<Value, String> {
+pub fn mom_llama_message_copy(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    message: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_message_copy"))?;
     command_value(mom_llama_runtime::message_copy(&conversation, &message))
 }
 
 #[tauri::command]
-pub fn mom_llama_message_branches(conversation: String, message: String) -> Result<Value, String> {
+pub fn mom_llama_message_branches(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    message: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_message_branches"))?;
     command_value(mom_llama_runtime::message_branches(&conversation, &message))
 }
 
 #[tauri::command]
 pub fn mom_llama_message_branch_select(
+    runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
     message: String,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_message_branch_select"))?;
     command_value(mom_llama_runtime::message_branch_select(
         &conversation,
         &message,
@@ -543,9 +667,10 @@ pub async fn mom_llama_attachment_import_text(
     conversation: String,
     path: String,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::text_attachment_import(&conversation, &PathBuf::from(path))
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_attachment_import_text"))?,
+        move || mom_llama_runtime::text_attachment_import(&conversation, &PathBuf::from(path)),
+    )
     .await
 }
 
@@ -555,9 +680,10 @@ pub async fn mom_llama_attachment_import_paste(
     conversation: String,
     text: String,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::attachment_import_pasted_text(&conversation, text)
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_attachment_import_paste"))?,
+        move || mom_llama_runtime::attachment_import_pasted_text(&conversation, text),
+    )
     .await
 }
 
@@ -567,14 +693,19 @@ pub async fn mom_llama_attachment_import(
     conversation: String,
     path: String,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::attachment_import(&conversation, &PathBuf::from(path))
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_attachment_import"))?,
+        move || mom_llama_runtime::attachment_import(&conversation, &PathBuf::from(path)),
+    )
     .await
 }
 
 #[tauri::command]
-pub fn mom_llama_attachment_list(conversation: Option<String>) -> Result<Value, String> {
+pub fn mom_llama_attachment_list(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: Option<String>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_attachment_list"))?;
     command_value(mom_llama_runtime::attachment_list(conversation.as_deref()))
 }
 
@@ -583,9 +714,10 @@ pub async fn mom_llama_attachment_preview(
     runtime: State<'_, AppRuntimeHandle>,
     attachment: String,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::attachment_preview(&attachment, false)
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_attachment_preview"))?,
+        move || mom_llama_runtime::attachment_preview(&attachment, false),
+    )
     .await
 }
 
@@ -594,9 +726,10 @@ pub async fn mom_llama_attachment_preview_bytes(
     runtime: State<'_, AppRuntimeHandle>,
     attachment: String,
 ) -> Result<Response, String> {
-    blocking_response(runtime.admit_work()?, move || {
-        attachment_preview_response(&attachment)
-    })
+    blocking_response(
+        runtime.admit(command_spec("mom_llama_attachment_preview_bytes"))?,
+        move || attachment_preview_response(&attachment),
+    )
     .await
 }
 
@@ -633,15 +766,16 @@ fn attachment_preview_response(attachment: &str) -> Result<Response, String> {
 }
 
 #[tauri::command]
-pub fn mom_llama_settings_get() -> Result<Value, String> {
+pub fn mom_llama_settings_get(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_settings_get"))?;
     command_value(mom_llama_runtime::settings_get())
 }
 
 #[tauri::command]
 pub fn mom_llama_settings_reset(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
-    runtime.ensure_running()?;
+    let lease = runtime.admit(command_spec("mom_llama_settings_reset"))?;
     let value = command_value(mom_llama_runtime::settings_reset())?;
-    runtime.refresh_native_model()?;
+    runtime.refresh_native_model(&lease)?;
     Ok(value)
 }
 
@@ -650,7 +784,7 @@ pub fn mom_llama_settings_update(
     runtime: State<'_, AppRuntimeHandle>,
     input: SettingsUpdateInput,
 ) -> Result<Value, String> {
-    runtime.ensure_running()?;
+    let lease = runtime.admit(command_spec("mom_llama_settings_update"))?;
     let value = command_value(mom_llama_runtime::settings_update(SettingsUpdate {
         model_path: input.model_path.map(PathBuf::from),
         mmproj_path: input.mmproj_path.map(PathBuf::from),
@@ -665,7 +799,7 @@ pub fn mom_llama_settings_update(
         kv_cache_policy: input.kv_cache_policy.as_deref().map(kv_policy_from_str),
         upstream_settings: input.upstream_settings.and_then(value_to_settings_map),
     }))?;
-    runtime.refresh_native_model()?;
+    runtime.refresh_native_model(&lease)?;
     Ok(value)
 }
 
@@ -688,12 +822,14 @@ pub struct SettingsUpdateInput {
 
 #[tauri::command]
 pub fn mom_llama_skill_create(
+    runtime: State<'_, AppRuntimeHandle>,
     name: String,
     description: Option<String>,
     prompt_template: String,
     usage_hint: Option<String>,
     cache_policy: Option<String>,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_skill_create"))?;
     command_value(mom_llama_runtime::skill_store::skill_create(
         name,
         description.unwrap_or_default(),
@@ -707,12 +843,14 @@ pub fn mom_llama_skill_create(
 }
 
 #[tauri::command]
-pub fn mom_llama_skill_list() -> Result<Value, String> {
+pub fn mom_llama_skill_list(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_skill_list"))?;
     command_value(mom_llama_runtime::skill_store::skill_list())
 }
 
 #[tauri::command]
 pub fn mom_llama_skill_update(
+    runtime: State<'_, AppRuntimeHandle>,
     skill: String,
     name: String,
     description: Option<String>,
@@ -720,6 +858,7 @@ pub fn mom_llama_skill_update(
     usage_hint: Option<String>,
     cache_policy: Option<String>,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_skill_update"))?;
     command_value(mom_llama_runtime::skill_store::skill_update(
         &skill,
         name,
@@ -734,7 +873,12 @@ pub fn mom_llama_skill_update(
 }
 
 #[tauri::command]
-pub fn mom_llama_skill_apply(conversation: String, skill: String) -> Result<Value, String> {
+pub fn mom_llama_skill_apply(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    skill: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_skill_apply"))?;
     command_value(mom_llama_runtime::skill_store::skill_apply(
         &conversation,
         &skill,
@@ -742,7 +886,8 @@ pub fn mom_llama_skill_apply(conversation: String, skill: String) -> Result<Valu
 }
 
 #[tauri::command]
-pub fn mom_llama_kv_cache_status() -> Result<Value, String> {
+pub fn mom_llama_kv_cache_status(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_kv_cache_status"))?;
     command_value(mom_llama_runtime::kv_cache_status())
 }
 
@@ -751,9 +896,10 @@ pub async fn mom_llama_kv_cache_save(
     runtime: State<'_, AppRuntimeHandle>,
     skill: Option<String>,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::kv_cache_save(skill)
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_kv_cache_save"))?,
+        move || mom_llama_runtime::kv_cache_save(skill),
+    )
     .await
 }
 
@@ -762,9 +908,10 @@ pub async fn mom_llama_kv_cache_restore(
     runtime: State<'_, AppRuntimeHandle>,
     cache: Option<String>,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::kv_cache_restore(cache)
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_kv_cache_restore"))?,
+        move || mom_llama_runtime::kv_cache_restore(cache),
+    )
     .await
 }
 
@@ -772,21 +919,28 @@ pub async fn mom_llama_kv_cache_restore(
 pub async fn mom_llama_kv_cache_clear(
     runtime: State<'_, AppRuntimeHandle>,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, mom_llama_runtime::kv_cache_clear).await
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_kv_cache_clear"))?,
+        mom_llama_runtime::kv_cache_clear,
+    )
+    .await
 }
 
 #[tauri::command]
-pub fn mom_llama_mcp_status() -> Result<Value, String> {
+pub fn mom_llama_mcp_status(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_mcp_status"))?;
     command_value(mom_llama_runtime::mcp_status())
 }
 
 #[tauri::command]
 pub fn mom_llama_mcp_configure(
+    runtime: State<'_, AppRuntimeHandle>,
     name: String,
     command: String,
     args: Vec<String>,
     enabled: Option<bool>,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_mcp_configure"))?;
     command_value(mom_llama_runtime::mcp_configure(
         name,
         PathBuf::from(command),
@@ -796,7 +950,8 @@ pub fn mom_llama_mcp_configure(
 }
 
 #[tauri::command]
-pub fn mom_llama_mcp_list_servers() -> Result<Value, String> {
+pub fn mom_llama_mcp_list_servers(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_mcp_list_servers"))?;
     command_value(mom_llama_runtime::mcp_list_servers())
 }
 
@@ -805,9 +960,10 @@ pub async fn mom_llama_mcp_list_tools(
     runtime: State<'_, AppRuntimeHandle>,
     server: String,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::mcp_list_tools(&server)
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_mcp_list_tools"))?,
+        move || mom_llama_runtime::mcp_list_tools(&server),
+    )
     .await
 }
 
@@ -818,9 +974,10 @@ pub async fn mom_llama_mcp_call_tool(
     tool: String,
     arguments: Value,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::mcp_call_tool(&server, &tool, arguments)
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_mcp_call_tool"))?,
+        move || mom_llama_runtime::mcp_call_tool(&server, &tool, arguments),
+    )
     .await
 }
 
@@ -829,9 +986,10 @@ pub async fn mom_llama_mcp_list_resources(
     runtime: State<'_, AppRuntimeHandle>,
     server: String,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::mcp_list_resources(&server)
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_mcp_list_resources"))?,
+        move || mom_llama_runtime::mcp_list_resources(&server),
+    )
     .await
 }
 
@@ -841,9 +999,10 @@ pub async fn mom_llama_mcp_read_resource(
     server: String,
     uri: String,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::mcp_read_resource(&server, &uri)
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_mcp_read_resource"))?,
+        move || mom_llama_runtime::mcp_read_resource(&server, &uri),
+    )
     .await
 }
 
@@ -852,9 +1011,10 @@ pub async fn mom_llama_mcp_list_prompts(
     runtime: State<'_, AppRuntimeHandle>,
     server: String,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::mcp_list_prompts(&server)
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_mcp_list_prompts"))?,
+        move || mom_llama_runtime::mcp_list_prompts(&server),
+    )
     .await
 }
 
@@ -865,14 +1025,16 @@ pub async fn mom_llama_mcp_get_prompt(
     prompt: String,
     arguments: Value,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::mcp_get_prompt(&server, &prompt, arguments)
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_mcp_get_prompt"))?,
+        move || mom_llama_runtime::mcp_get_prompt(&server, &prompt, arguments),
+    )
     .await
 }
 
 #[tauri::command]
 pub fn mom_llama_tool_loop_prepare(
+    runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
     prompt: String,
     server: String,
@@ -880,6 +1042,7 @@ pub fn mom_llama_tool_loop_prepare(
     arguments: Value,
     max_turns: Option<u32>,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_tool_loop_prepare"))?;
     command_value(mom_llama_runtime::tool_loop_prepare(
         &conversation,
         prompt,
@@ -908,7 +1071,7 @@ pub async fn mom_llama_tool_loop_run(
     window: Window,
     input: ToolLoopCommandInput,
 ) -> Result<Value, String> {
-    let lease = runtime.admit_work()?;
+    let lease = runtime.admit(command_spec("mom_llama_tool_loop_run"))?;
     let events = window.clone();
     blocking_command(lease, move || {
         mom_llama_runtime::tool_loop_run_stream(
@@ -933,26 +1096,39 @@ pub async fn mom_llama_tool_loop_run(
 }
 
 #[tauri::command]
-pub fn mom_llama_tool_loop_cancel(conversation: String) -> Result<Value, String> {
+pub fn mom_llama_tool_loop_cancel(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_tool_loop_cancel"))?;
     command_value(mom_llama_runtime::tool_loop_cancel(&conversation))
 }
 
 #[tauri::command]
-pub fn mom_llama_tool_loop_status(conversation: Option<String>) -> Result<Value, String> {
+pub fn mom_llama_tool_loop_status(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: Option<String>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_tool_loop_status"))?;
     command_value(mom_llama_runtime::tool_loop_status(conversation.as_deref()))
 }
 
 #[tauri::command]
-pub fn mom_llama_tool_permission_list() -> Result<Value, String> {
+pub fn mom_llama_tool_permission_list(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_tool_permission_list"))?;
     command_value(mom_llama_runtime::tool_permission_list())
 }
 
 #[tauri::command]
 pub fn mom_llama_tool_permission_set(
+    runtime: State<'_, AppRuntimeHandle>,
     server: String,
     tool: String,
     policy: String,
 ) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_tool_permission_set"))?;
     let policy = match policy.as_str() {
         "always_allow" => mom_llama_runtime::ToolPermissionPolicy::AlwaysAllow,
         "deny" => mom_llama_runtime::ToolPermissionPolicy::Deny,
@@ -962,12 +1138,18 @@ pub fn mom_llama_tool_permission_set(
 }
 
 #[tauri::command]
-pub fn mom_llama_tool_permission_revoke(server: String, tool: String) -> Result<Value, String> {
+pub fn mom_llama_tool_permission_revoke(
+    runtime: State<'_, AppRuntimeHandle>,
+    server: String,
+    tool: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_tool_permission_revoke"))?;
     command_value(mom_llama_runtime::tool_permission_revoke(&server, &tool))
 }
 
 #[tauri::command]
-pub fn mom_llama_model_slot_list() -> Result<Value, String> {
+pub fn mom_llama_model_slot_list(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_model_slot_list"))?;
     command_value(mom_llama_runtime::model_slot_list())
 }
 
@@ -977,9 +1159,10 @@ pub async fn mom_llama_model_slot_load(
     slot: usize,
     model_path: String,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::model_slot_load(slot, PathBuf::from(model_path))
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_model_slot_load"))?,
+        move || mom_llama_runtime::model_slot_load(slot, PathBuf::from(model_path)),
+    )
     .await
 }
 
@@ -988,9 +1171,10 @@ pub async fn mom_llama_model_slot_unload(
     runtime: State<'_, AppRuntimeHandle>,
     slot: usize,
 ) -> Result<Value, String> {
-    blocking_command(runtime.admit_work()?, move || {
-        mom_llama_runtime::model_slot_unload(slot)
-    })
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_model_slot_unload"))?,
+        move || mom_llama_runtime::model_slot_unload(slot),
+    )
     .await
 }
 
@@ -1040,6 +1224,11 @@ where
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
     tauri::async_runtime::spawn_blocking(move || {
+        if lease.cancellation_requested() {
+            return Err(
+                "Mom Llama cancelled the operation during application shutdown".to_string(),
+            );
+        }
         let _lease = lease;
         command_value(operation())
     })
@@ -1052,6 +1241,11 @@ where
     F: FnOnce() -> Result<Response, String> + Send + 'static,
 {
     tauri::async_runtime::spawn_blocking(move || {
+        if lease.cancellation_requested() {
+            return Err(
+                "Mom Llama cancelled the operation during application shutdown".to_string(),
+            );
+        }
         let _lease = lease;
         operation()
     })
@@ -1104,6 +1298,7 @@ mod tests {
             "mom_llama_attachment_import_paste",
             "mom_llama_attachment_import",
             "mom_llama_attachment_preview",
+            "mom_llama_persona_update",
             "mom_llama_kv_cache_save",
             "mom_llama_kv_cache_restore",
             "mom_llama_kv_cache_clear",

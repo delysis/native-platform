@@ -12,7 +12,8 @@
   <main id="app" data-runtime="tauri-maud-htmx" data-native-core-only="true">
     <section class="boot">
       <h1>llama.cpp</h1>
-      <p>Type a message or upload files to get started</p>
+      <p id="startup-status" role="status">Unlocking Mom Llama's encrypted local data…</p>
+      <button id="startup-retry" class="primary-button" type="button" hidden>Retry</button>
     </section>
   </main>
 </body>
