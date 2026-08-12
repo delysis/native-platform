@@ -1,51 +1,35 @@
-# Mom Wave 1 shutdown-envelope receipt
+# Mom Wave 1 lifecycle receipt
 
 Recorded: 2026-08-12
 
-This candidate consumes `platform-contracts-v0` at immutable revision
-`da22fa893ac183c5d9df972a7e67215c0d92b383`. Its test-only adapter converts
-the result returned by an actual `AppRuntimeHandle::shutdown` invocation into
-`ClosedSummaryV0`. The tests construct the real application handle, use its
-real application-work registry and gateway finalizer, invoke composed
-shutdown, and then convert the returned success or failure facts. They do not
-construct `AppShutdownSummary` or `AppShutdownError` literals.
+This candidate consumes `platform-contracts-v0` and
+`platform-contract-testkit` at immutable revision
+`cbab33555ab9355a6ac453d659c55ec9e0666821` (`w1-contracts-v0-2026-08-12-r3`).
 
-The application records the native host's resident slot count after app work
-and the gateway have drained but before final native shutdown. That is the
-expected worker count at the terminal drain boundary. The adapter preserves it
-separately from the joined-worker count returned by
-`ProcessExitJoinedNativeHost`; mismatches fail canonical validation. If the
-native finalizer fails, the pre-finalizer resident count remains visible rather
-than being replaced with the joined count.
+Mom now owns a production `OperationSupervisor` used by its long-running
+commands. Public operation IDs and monotonic attempt IDs identify registry
+entries; consumer tickets request cancellation on drop while executor leases
+retain lifecycle authority. The supervisor enforces the exact transition
+chain, one authoritative terminal/final record, bounded progress, stale-lease
+rejection, admission quiescence, and owned thread reaping. Executor panics are
+caught and published as failed terminals before release. Shutdown waits for
+both operation release and join and returns the exact admitted and joined
+worker-ID sets.
 
-## ADR-003 boundary
-
-This is not acceptance of the shared operation-lifecycle model. Mom's current
-application registry exposes admission directly as a live `AppWorkLease`, a
-command name, an internal occurrence number, and optional cancellation state.
-It does not expose:
-
-- distinct Reserved, Queued, Running, Terminal, and Released states;
-- public operation-ID uniqueness or a separate attempt identity;
-- a consumer ticket whose drop requests cancellation while an executor lease
-  retains identity;
-- executor-owned authoritative terminal and final/progress projections;
-- stale-release generation checks;
-- bounded progress capacity or waiter-timeout observations;
-- a retained-task count or panic terminal record.
-
-Implementing `OperationModelAdapter` over those missing facts would require a
-shadow lifecycle and would not test the real Mom registry. The full shared
-model suite therefore remains open. This candidate proves only the composed
-shutdown-envelope conversion and existing product-specific admission/drain
-tests.
-
-No `platform-contract-testkit` dependency or `OperationModelAdapter`
-implementation is added by this candidate.
+`AppRuntimeHandle::shutdown` preserves the production supervisor's actual
+phase, active-operation count, retained-task count, operation-worker counts,
+and worker identities in its cached shutdown result. The contract adapter
+converts those returned facts; it does not supply test-owned zeros or maintain
+a shadow lifecycle. Native-host worker counts remain separate and are composed
+only at the application shutdown boundary.
 
 ## Verification
 
-- exact Rust 1.92.0 Mom app tests with `unstable-w1-contracts`: 44 passed;
-- exact Rust 1.92.0 Mom app all-target Clippy with warnings denied: passed;
-- exact Rust 1.92.0 formatting: passed;
-- architecture, workflow-policy, and diff checks: passed.
+- immutable r3 compositional manifest: all 11 ownership suites and all 18
+  lifecycle invariants passed;
+- `cargo test --workspace --all-features --locked`: 188 passed, 14 ignored
+  because they require explicitly supplied real model assets;
+- `cargo clippy --locked -p mom-llama-app --features unstable-w1-contracts
+  --all-targets -- -D warnings`: passed;
+- formatting, architecture, contracts, persona/product UX, workflow policy,
+  JavaScript syntax, and diff checks: passed.

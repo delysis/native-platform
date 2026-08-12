@@ -11,6 +11,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, OnceCell};
 
 use crate::command_registry::{CommandClass, CommandSpec};
+use crate::operation_supervisor::{
+    LifecyclePhase as OperationLifecyclePhase, OperationReservation, OperationSupervisor,
+    TerminalClass, validate_worker_sets,
+};
 
 #[cfg(all(test, feature = "unstable-w1-contracts"))]
 mod w1_contract;
@@ -42,15 +46,26 @@ pub struct AppShutdownSummary {
     pub elapsed_ms: u64,
     pub gateway_drained: bool,
     pub native_host_joined: bool,
+    /// Product-owned operation-supervisor facts at the terminal boundary.
+    pub operation_supervisor_phase: OperationLifecyclePhase,
+    pub active_operation_count: usize,
+    pub retained_operation_task_count: usize,
+    pub expected_operation_worker_count: usize,
+    pub joined_operation_worker_count: usize,
     /// Resident native workers owned at the terminal drain boundary.
     pub expected_native_worker_count: usize,
     pub joined_native_worker_count: usize,
+    /// All operation and native workers owned by this application lifetime.
+    pub expected_worker_ids: Vec<String>,
+    /// Exact workers whose handles reached a joined terminal boundary.
+    pub joined_worker_ids: Vec<String>,
     pub application_work_drained: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AppShutdownError {
     pub summary: AppShutdownSummary,
+    pub operation_error: Option<String>,
     pub gateway_error: Option<String>,
     pub native_error: Option<String>,
 }
@@ -58,6 +73,9 @@ pub struct AppShutdownError {
 impl std::fmt::Display for AppShutdownError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Mom Llama shutdown did not fully succeed")?;
+        if let Some(error) = &self.operation_error {
+            write!(formatter, "; operation supervisor: {error}")?;
+        }
         if let Some(error) = &self.gateway_error {
             write!(formatter, "; gateway: {error}")?;
         }
@@ -82,6 +100,7 @@ struct AppRuntime {
     shutdown: OnceCell<Result<AppShutdownSummary, AppShutdownError>>,
     joined_native_host: Mutex<Option<ProcessExitJoinedNativeHost>>,
     native_finalizer: Arc<dyn NativeFinalizer>,
+    operation_supervisor: OperationSupervisor,
 }
 
 #[derive(Clone)]
@@ -91,6 +110,7 @@ pub struct AppWorkLease {
     runtime: Option<Arc<AppRuntime>>,
     occurrence: u64,
     cancellation: Option<Arc<AtomicBool>>,
+    supervised: Option<OperationReservation>,
 }
 
 trait NativeFinalizer: Send + Sync {
@@ -140,6 +160,12 @@ impl AppWorkLease {
         self.cancellation
             .as_ref()
             .is_some_and(|control| control.load(Ordering::Acquire))
+            || self.supervised.as_ref().is_some_and(|reservation| {
+                reservation
+                    .lease
+                    .supervisor()
+                    .is_some_and(|supervisor| supervisor.cancellation_requested(&reservation.lease))
+            })
     }
 
     pub async fn cancelled(&self) {
@@ -147,10 +173,63 @@ impl AppWorkLease {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+
+    pub fn finish(mut self, class: TerminalClass) -> Result<(), String> {
+        self.finish_supervised(class)
+    }
+
+    pub async fn run_blocking<T, F>(mut self, operation: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+    {
+        let reservation = self
+            .supervised
+            .take()
+            .ok_or_else(|| "Mom Llama's long operation has no supervisor reservation".to_owned())?;
+        let supervisor = reservation
+            .lease
+            .supervisor()
+            .ok_or_else(|| "Mom Llama's operation supervisor is unavailable".to_owned())?;
+        let task = supervisor
+            .spawn(reservation, move |lease| {
+                if lease.cancellation_requested() {
+                    return Err(
+                        "Mom Llama cancelled the operation during application shutdown".to_owned(),
+                    );
+                }
+                let _app_lease = self;
+                operation()
+            })
+            .map_err(|error| error.to_string())?;
+        task.wait().await
+    }
+
+    fn finish_supervised(&mut self, class: TerminalClass) -> Result<(), String> {
+        let Some(reservation) = self.supervised.take() else {
+            return Ok(());
+        };
+        let supervisor = reservation
+            .lease
+            .supervisor()
+            .ok_or_else(|| "Mom Llama's operation supervisor is unavailable".to_owned())?;
+        supervisor
+            .queue(&reservation.lease)
+            .and_then(|()| supervisor.start(&reservation.lease))
+            .and_then(|()| supervisor.terminal(&reservation.lease, class))
+            .and_then(|()| supervisor.release(&reservation.lease))
+            .map_err(|error| error.to_string())
+    }
 }
 
 impl Drop for AppWorkLease {
     fn drop(&mut self) {
+        let terminal = if self.cancellation_requested() {
+            TerminalClass::Cancelled
+        } else {
+            TerminalClass::Failed
+        };
+        let _ = self.finish_supervised(terminal);
         let Some(runtime) = self.runtime.take() else {
             return;
         };
@@ -198,6 +277,26 @@ impl AppRuntimeHandle {
         product_canceller: Arc<dyn ProductCanceller>,
         native_finalizer: Arc<dyn NativeFinalizer>,
     ) -> Self {
+        Self::with_operation_supervisor(
+            gateway_finalizer,
+            native_backend,
+            native_host,
+            native_owner,
+            product_canceller,
+            native_finalizer,
+            OperationSupervisor::new(),
+        )
+    }
+
+    fn with_operation_supervisor(
+        gateway_finalizer: Arc<dyn GatewayFinalizer>,
+        native_backend: Arc<LlamaNativeBackend>,
+        native_host: Arc<NativeHost>,
+        native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
+        product_canceller: Arc<dyn ProductCanceller>,
+        native_finalizer: Arc<dyn NativeFinalizer>,
+        operation_supervisor: OperationSupervisor,
+    ) -> Self {
         Self(Arc::new(AppRuntime {
             lifecycle: Mutex::new(AppLifecycle {
                 phase: AppPhase::Running,
@@ -214,6 +313,7 @@ impl AppRuntimeHandle {
             shutdown: OnceCell::new(),
             joined_native_host: Mutex::new(None),
             native_finalizer,
+            operation_supervisor,
         }))
     }
 
@@ -233,6 +333,17 @@ impl AppRuntimeHandle {
         lifecycle.next_occurrence = occurrence;
         let cancellation = (command.class == CommandClass::LongOperation)
             .then(|| Arc::new(AtomicBool::new(false)));
+        let supervised = if command.class == CommandClass::LongOperation {
+            let operation_id = format!("{}:{occurrence}", command.name);
+            Some(
+                self.0
+                    .operation_supervisor
+                    .reserve(&operation_id)
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
         let replaced = lifecycle.active_work.insert(
             occurrence,
             ActiveWork {
@@ -245,6 +356,7 @@ impl AppRuntimeHandle {
             runtime: Some(Arc::clone(&self.0)),
             occurrence,
             cancellation,
+            supervised,
         })
     }
 
@@ -267,6 +379,7 @@ impl AppRuntimeHandle {
         for cancellation in cancellations {
             cancellation.store(true, Ordering::Release);
         }
+        self.0.operation_supervisor.begin_quiesce();
         true
     }
 
@@ -295,11 +408,23 @@ impl AppRuntimeHandle {
                 let app_work_drain = self.wait_for_work_drained();
                 let (gateway_result, ()) = tokio::join!(gateway_shutdown, app_work_drain);
                 let gateway_error = gateway_result.err();
+                let supervisor = self.0.operation_supervisor.shutdown();
+                let operation_error = (!validate_worker_sets(&supervisor)).then(|| {
+                    "operation worker join identities did not match admitted worker identities"
+                        .to_owned()
+                });
                 // Admission is closed and every application lease plus the
                 // gateway has drained, so the resident set cannot grow after
                 // this observation. Preserve its cardinality even if the
                 // finalizer fails before returning joined evidence.
-                let expected_native_worker_count = self.0.native_host.slots().len();
+                let native_worker_ids = self
+                    .0
+                    .native_host
+                    .slots()
+                    .into_iter()
+                    .map(|slot| format!("mom-native-slot-{}", slot.slot_id))
+                    .collect::<Vec<_>>();
+                let expected_native_worker_count = native_worker_ids.len();
                 let joined = self.0.native_finalizer.shutdown(&self.0.native_host);
                 let (native_error, joined_native_worker_count) = match joined {
                     Ok(receipt) => {
@@ -313,6 +438,17 @@ impl AppRuntimeHandle {
                     }
                     Err(error) => (Some(error.to_string()), 0),
                 };
+                let operation_supervisor_phase = supervisor.phase;
+                let active_operation_count = supervisor.active_operations;
+                let retained_operation_task_count = supervisor.retained_tasks;
+                let expected_operation_worker_count = supervisor.expected_worker_ids.len();
+                let joined_operation_worker_count = supervisor.joined_worker_ids.len();
+                let mut expected_worker_ids = supervisor.expected_worker_ids;
+                expected_worker_ids.extend(native_worker_ids.iter().cloned());
+                let mut joined_worker_ids = supervisor.joined_worker_ids;
+                if joined_native_worker_count == native_worker_ids.len() {
+                    joined_worker_ids.extend(native_worker_ids);
+                }
                 self.0
                     .lifecycle
                     .lock()
@@ -324,15 +460,23 @@ impl AppRuntimeHandle {
                     elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     gateway_drained: gateway_error.is_none(),
                     native_host_joined: native_error.is_none(),
+                    operation_supervisor_phase,
+                    active_operation_count,
+                    retained_operation_task_count,
+                    expected_operation_worker_count,
+                    joined_operation_worker_count,
                     expected_native_worker_count,
                     joined_native_worker_count,
+                    expected_worker_ids,
+                    joined_worker_ids,
                     application_work_drained: true,
                 };
-                if gateway_error.is_none() && native_error.is_none() {
+                if operation_error.is_none() && gateway_error.is_none() && native_error.is_none() {
                     Ok(summary)
                 } else {
                     Err(AppShutdownError {
                         summary,
+                        operation_error,
                         gateway_error,
                         native_error,
                     })

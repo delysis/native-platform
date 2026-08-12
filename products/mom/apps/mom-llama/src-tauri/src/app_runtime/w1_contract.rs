@@ -4,9 +4,10 @@
 //! shutdown facts that `AppRuntimeHandle::shutdown` actually observes; it does
 //! not reconstruct worker state or serialize runtime authority.
 //!
-//! This is not the ADR-003 operation-lifecycle adapter. The current app
-//! registry does not expose the semantic states required to implement
-//! `OperationModelAdapter` without a shadow state machine.
+//! The compositional adapter below exercises the production operation
+//! supervisor directly; it does not maintain a test-owned shadow lifecycle.
+
+mod compositional;
 
 use super::{AppShutdownError, AppShutdownSummary};
 use platform_contracts_v0::error::SERVICE_ERROR_SCHEMA_V0;
@@ -18,6 +19,7 @@ use platform_contracts_v0::{
 };
 
 const APP_REGISTRY: &str = "mom.app.operation_registry";
+const OPERATION_TASKS: &str = "mom.app.operation_workers";
 const GATEWAY: &str = "mom.gateway.runtime";
 const NATIVE_HOST: &str = "mom.native.worker_pool";
 
@@ -39,11 +41,24 @@ pub fn closed_summary_v0(
         ServiceId::new("gateway").map_err(|_| ContractError::Invalid { field: "service" })?;
     let native = ServiceId::new("llama-native-host")
         .map_err(|_| ContractError::Invalid { field: "service" })?;
+    let operation_supervisor_stopped = summary.operation_supervisor_phase
+        == crate::operation_supervisor::LifecyclePhase::Closed
+        && summary.active_operation_count == 0
+        && summary.retained_operation_task_count == 0
+        && summary.expected_operation_worker_count == summary.joined_operation_worker_count;
 
     let resources = vec![
         resource(
+            OPERATION_TASKS,
+            app.clone(),
+            ShutdownResourceKind::TaskSupervisor,
+            operation_supervisor_stopped,
+            summary.expected_operation_worker_count,
+            summary.joined_operation_worker_count,
+        ),
+        resource(
             APP_REGISTRY,
-            app,
+            app.clone(),
             ShutdownResourceKind::OperationRegistry,
             true,
             0,
@@ -68,6 +83,15 @@ pub fn closed_summary_v0(
     ];
 
     let mut failures = Vec::new();
+    if !operation_supervisor_stopped {
+        failures.push(failure(
+            "mom.operation.shutdown",
+            OPERATION_TASKS,
+            app,
+            "mom.shutdown.operation_join",
+            "the operation supervisor did not reach a fully joined closed boundary",
+        ));
+    }
     if !summary.gateway_drained {
         failures.push(failure(
             "mom.gateway.shutdown",
@@ -103,9 +127,13 @@ pub fn closed_summary_v0(
     })?;
     let value = ClosedSummaryV0 {
         schema: CLOSED_SUMMARY_SCHEMA_V0.to_owned(),
-        phase: SupervisorPhase::Closed,
-        active_operations: 0,
-        retained_tasks: 0,
+        phase: match summary.operation_supervisor_phase {
+            crate::operation_supervisor::LifecyclePhase::Running => SupervisorPhase::Running,
+            crate::operation_supervisor::LifecyclePhase::Quiescing => SupervisorPhase::Quiescing,
+            crate::operation_supervisor::LifecyclePhase::Closed => SupervisorPhase::Closed,
+        },
+        active_operations: summary.active_operation_count,
+        retained_tasks: summary.retained_operation_task_count,
         expected_workers,
         joined_workers,
         resources,
@@ -228,7 +256,7 @@ mod tests {
         assert_eq!(closed.retained_tasks, 0);
         assert_eq!(closed.expected_workers, 0);
         assert_eq!(closed.joined_workers, 0);
-        assert_eq!(closed.resources.len(), 3);
+        assert_eq!(closed.resources.len(), 4);
         assert_eq!(runtime.shutdown().await, result);
     }
 

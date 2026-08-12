@@ -7,7 +7,7 @@ repository = "https://github.com/delysis/mom-llama"
 rust-version = "1.88"
 
 [features]
-unstable-w1-contracts = ["dep:platform-contracts-v0"]
+unstable-w1-contracts = ["dep:platform-contracts-v0", "dep:platform-contract-testkit"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -27,7 +27,9 @@ serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-free-token-energy.workspace = true
 tokio.workspace = true
+thiserror.workspace = true
 platform-contracts-v0 = { workspace = true, optional = true }
+platform-contract-testkit = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 rfd = { version = "=0.16.0", default-features = false }

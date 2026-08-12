@@ -80,7 +80,7 @@ then
   exit 1
 fi
 
-contract_rev=da22fa893ac183c5d9df972a7e67215c0d92b383
+contract_rev=cbab33555ab9355a6ac453d659c55ec9e0666821
 contract_url=https://github.com/delysis/w1-platform-contracts
 contract_tomls=$(rg -l 'w1-platform-contracts' . --glob 'Cargo.toml' --glob '!target/**')
 if [ "$(printf '%s\n' "$contract_tomls" | sed '/^$/d' | wc -l | tr -d ' ')" -ne 1 ]; then
