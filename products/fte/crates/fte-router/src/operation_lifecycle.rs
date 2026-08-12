@@ -298,8 +298,27 @@ impl OperationLease {
         Ok(())
     }
 
+    pub fn terminal_and_release(&self, terminal: TerminalClass) -> Result<(), RegistryError> {
+        let mut state = self.registry.lock()?;
+        let mut released_slot = self.released.lock().map_err(|_| RegistryError::Poisoned)?;
+        let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
+        if record.phase != OperationPhase::Running
+            || record.terminal.is_some()
+            || !record.attempts.is_empty()
+        {
+            return Err(RegistryError::InvalidTransition);
+        }
+        record.terminal = Some(terminal);
+        record.phase = OperationPhase::Released;
+        let released = snapshot(record);
+        state.operations.remove(&self.identity.operation_id);
+        *released_slot = Some(released);
+        Ok(())
+    }
+
     pub fn release(&self) -> Result<(), RegistryError> {
         let mut state = self.registry.lock()?;
+        let mut released_slot = self.released.lock().map_err(|_| RegistryError::Poisoned)?;
         let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
         if record.phase != OperationPhase::Terminal || !record.attempts.is_empty() {
             return Err(RegistryError::InvalidTransition);
@@ -307,7 +326,7 @@ impl OperationLease {
         record.phase = OperationPhase::Released;
         let released = snapshot(record);
         state.operations.remove(&self.identity.operation_id);
-        *self.released.lock().map_err(|_| RegistryError::Poisoned)? = Some(released);
+        *released_slot = Some(released);
         Ok(())
     }
 
@@ -374,6 +393,16 @@ impl OperationLease {
         }
         record.phase = next;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_released_for_test(&self) {
+        let released = Arc::clone(&self.released);
+        let _ = std::thread::spawn(move || {
+            let _slot = released.lock().expect("released operation snapshot");
+            panic!("poison released operation snapshot for deterministic coverage");
+        })
+        .join();
     }
 }
 

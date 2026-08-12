@@ -152,8 +152,17 @@ impl LifecycleControl {
         lease: &operation_lifecycle::OperationLease,
         terminal: operation_lifecycle::TerminalClass,
     ) -> Result<(), GatewayError> {
-        self.terminal_request(lease, terminal)?;
-        self.release_terminalized_request(lease)
+        let request_id = RequestId(lease.identity().operation_id);
+        let result = lease
+            .terminal_and_release(terminal)
+            .map_err(|error| operation_registry_error(&request_id, error));
+        let recorded = result
+            .as_ref()
+            .err()
+            .map(|error| self.record_lifecycle_error(error.clone()))
+            .transpose();
+        self.changed.notify_waiters();
+        recorded.and(result)
     }
 
     fn terminal_request(
@@ -578,21 +587,26 @@ impl Gateway {
         };
         let request_id = request.request_id.clone();
         let backend_id = route.backend_id.clone();
-        let (limit, total_is_limit) = stage_deadline(
+        let deadline = stage_deadline(
             stage_ms,
             request.deadline.total_ms,
             started_at.elapsed(),
             &request_id,
-        )?;
+        );
+        let (limit, total_is_limit) = match deadline {
+            Ok(deadline) => deadline,
+            Err(error) => return lease.finish_result(Err(error)),
+        };
         let count = backend.count_tokens(BackendRequest { request, route });
         let result = if let Some(limit) = limit {
-            tokio::time::timeout(limit, count).await.map_err(|_| {
-                if total_is_limit {
+            match tokio::time::timeout(limit, count).await {
+                Ok(result) => result,
+                Err(_) => Err(if total_is_limit {
                     total_timeout(&request_id)
                 } else {
                     startup_timeout(&request_id, &backend_id)
-                }
-            })?
+                }),
+            }
         } else {
             count.await
         };
@@ -1097,6 +1111,24 @@ impl Drop for AdmissionLease {
 }
 
 impl TicketLifecycleLease for AdmissionLease {
+    fn finish(
+        &self,
+        result: &Result<fte_types::GatewayResponse, GatewayError>,
+    ) -> Result<(), GatewayError> {
+        let terminal = match result {
+            Ok(response) => match response.status {
+                TerminalStatus::Completed => operation_lifecycle::TerminalClass::Completed,
+                TerminalStatus::Cancelled => operation_lifecycle::TerminalClass::Cancelled,
+                TerminalStatus::Failed => operation_lifecycle::TerminalClass::Failed,
+            },
+            Err(error) if error.class == ErrorClass::Cancelled => {
+                operation_lifecycle::TerminalClass::Cancelled
+            }
+            Err(_) => operation_lifecycle::TerminalClass::Failed,
+        };
+        self.release_with_terminal(terminal)
+    }
+
     fn terminal(
         &self,
         result: &Result<fte_types::GatewayResponse, GatewayError>,
@@ -1739,6 +1771,13 @@ mod tests {
         fn cancel(&self, _request_id: &RequestId, _target: CancelTarget) -> usize {
             0
         }
+
+        async fn count_tokens(
+            &self,
+            _request: BackendRequest,
+        ) -> Result<GatewayUsage, GatewayError> {
+            std::future::pending().await
+        }
     }
 
     struct NoopCancellation;
@@ -1763,6 +1802,11 @@ mod tests {
     }
 
     struct EarlyCompletedEventBackend {
+        completion: Arc<Mutex<Option<FixtureFinalSender>>>,
+        cancellations: Arc<AtomicUsize>,
+    }
+
+    struct ProgressThenDelayedFinalBackend {
         completion: Arc<Mutex<Option<FixtureFinalSender>>>,
         cancellations: Arc<AtomicUsize>,
     }
@@ -1804,7 +1848,10 @@ mod tests {
                 request.request.request_id,
                 event_rx,
                 final_rx,
-                Arc::new(NoopCancellation),
+                Arc::new(CountCancellation {
+                    count: Arc::clone(&self.cancellations),
+                    completion: Mutex::new(None),
+                }),
                 Arc::new(AtomicBool::new(false)),
             ))
         }
@@ -1839,6 +1886,47 @@ mod tests {
                 })
                 .await
                 .expect("publish premature completed event");
+            Ok(GatewayTicket::new(
+                request.request.request_id,
+                event_rx,
+                final_rx,
+                Arc::new(CountCancellation {
+                    count: Arc::clone(&self.cancellations),
+                    completion: Mutex::new(None),
+                }),
+                Arc::new(AtomicBool::new(false)),
+            ))
+        }
+
+        fn cancel(&self, _request_id: &RequestId, _target: CancelTarget) -> usize {
+            self.cancellations.fetch_add(1, AtomicOrdering::AcqRel);
+            1
+        }
+    }
+
+    #[async_trait]
+    impl GatewayBackend for ProgressThenDelayedFinalBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            descriptor("progress-delayed", BackendLocation::LocalEmbedded)
+        }
+
+        fn readiness(&self) -> BackendReadiness {
+            BackendReadiness::Ready
+        }
+
+        async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
+            let (event_tx, event_rx) = mpsc::channel(1);
+            let (final_tx, final_rx) = oneshot::channel();
+            *self.completion.lock().expect("completion state") = Some(final_tx);
+            event_tx
+                .send(GatewayEvent::TextDelta {
+                    request_id: request.request.request_id.clone(),
+                    output_index: 0,
+                    content_index: 0,
+                    delta: "progress".to_string(),
+                })
+                .await
+                .expect("publish progress event");
             Ok(GatewayTicket::new(
                 request.request.request_id,
                 event_rx,
@@ -2050,18 +2138,33 @@ mod tests {
         };
         let (_event_tx, event_rx) = mpsc::channel(1);
         let (final_tx, final_rx) = oneshot::channel();
-        let ticket = GatewayTicket::new(
+        let mut ticket = GatewayTicket::new(
             request_id.clone(),
             event_rx,
             final_rx,
             Arc::new(NoopCancellation),
             Arc::new(AtomicBool::new(false)),
         )
-        .with_admission_lease(Box::new(lease));
+        .with_admission_lease_and_deadlines(
+            Box::new(lease),
+            fte_types::DeadlinePolicy::default(),
+            Duration::ZERO,
+            32,
+        );
 
         final_tx
             .send(Ok(completed_response(request_id, "fixture")))
             .expect("publish backend success");
+        let event = ticket
+            .events
+            .recv()
+            .await
+            .expect("lifecycle failure terminal event");
+        let GatewayEvent::Failed { error, .. } = event else {
+            panic!("failed atomic lifecycle finish must project Failed: {event:?}");
+        };
+        assert_eq!(error.code, "gateway_operation_lifecycle_failed");
+        assert!(ticket.events.recv().await.is_none());
         let error = ticket
             .final_response()
             .await
@@ -2073,7 +2176,7 @@ mod tests {
                 .expect("registry remains valid")
                 .expect("operation remains registered")
                 .phase,
-            operation_lifecycle::OperationPhase::Terminal
+            operation_lifecycle::OperationPhase::Running
         );
 
         let shutdown_error = gateway
@@ -2084,8 +2187,115 @@ mod tests {
 
         attempt.finish().expect("finish retained attempt");
         retained_operation
-            .release()
+            .terminal_and_release(operation_lifecycle::TerminalClass::Failed)
             .expect("release retained operation after test");
+    }
+
+    #[tokio::test]
+    async fn count_token_deadlines_finalize_admission_explicitly() {
+        for deadline_ms in [1, 5] {
+            let gateway = Gateway::new(GatewayDefaults::default());
+            gateway
+                .register_backend(Arc::new(HangingBackend {
+                    cancelled: Arc::new(AtomicUsize::new(0)),
+                }))
+                .expect("register hanging backend");
+            let mut request = request();
+            request.model = ModelSelector::ExactRoute {
+                backend_id: "hanging".to_string(),
+                model_id: "hanging-model".to_string(),
+            };
+            request.deadline.total_ms = Some(deadline_ms);
+            let error = gateway
+                .count_tokens(request)
+                .await
+                .expect_err("count-token deadline must fail");
+            assert_eq!(error.code, "request_total_deadline_exceeded");
+            assert_eq!(gateway.status().active_requests, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn count_token_lifecycle_failure_replaces_timeout() {
+        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+        gateway
+            .register_backend(Arc::new(HangingBackend {
+                cancelled: Arc::new(AtomicUsize::new(0)),
+            }))
+            .expect("register hanging backend");
+        let mut request = request();
+        let request_id = request.request_id.clone();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "hanging".to_string(),
+            model_id: "hanging-model".to_string(),
+        };
+        request.deadline.total_ms = Some(50);
+        let count_gateway = Arc::clone(&gateway);
+        let count = tokio::spawn(async move { count_gateway.count_tokens(request).await });
+        let operation = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(operation) = gateway
+                    .lifecycle
+                    .operations
+                    .current_lease(&request_id.0)
+                    .expect("registry remains valid")
+                {
+                    break operation;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("count-token admission becomes active");
+        let attempt = operation.start_attempt().expect("sabotage active attempt");
+
+        let error = count
+            .await
+            .expect("count task")
+            .expect_err("lifecycle failure replaces timeout");
+        assert_eq!(error.code, "gateway_operation_lifecycle_failed");
+        assert_eq!(gateway.status().active_requests, 1);
+        let snapshot = operation
+            .snapshot()
+            .expect("registry remains valid")
+            .expect("failed finalization remains active");
+        assert_eq!(snapshot.phase, operation_lifecycle::OperationPhase::Running);
+        assert!(snapshot.terminal.is_none());
+
+        attempt.finish().expect("finish sabotage attempt");
+        operation
+            .terminal_and_release(operation_lifecycle::TerminalClass::Failed)
+            .expect("clean up sabotaged operation");
+    }
+
+    #[test]
+    fn poisoned_released_snapshot_cannot_partially_release_operation() {
+        let registry = operation_lifecycle::OperationRegistry::default();
+        let (guard, operation) = registry.reserve("atomic-release").expect("reserve");
+        guard.disarm();
+        operation.queue().expect("queue");
+        operation.start().expect("start");
+        operation
+            .terminal(operation_lifecycle::TerminalClass::Completed)
+            .expect("terminal");
+        operation.poison_released_for_test();
+
+        assert_eq!(
+            operation.release(),
+            Err(operation_lifecycle::RegistryError::Poisoned)
+        );
+        let snapshot = registry
+            .current("atomic-release")
+            .expect("registry remains valid")
+            .expect("failed release remains active");
+        assert_eq!(
+            snapshot.phase,
+            operation_lifecycle::OperationPhase::Terminal
+        );
+        assert_eq!(
+            snapshot.terminal,
+            Some(operation_lifecycle::TerminalClass::Completed)
+        );
     }
 
     #[tokio::test]
@@ -2410,6 +2620,99 @@ mod tests {
             .await
             .expect_err("final result matches timeout event");
         assert_eq!(error.code, "request_total_deadline_exceeded");
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown completes after raw final")
+            .expect("shutdown task")
+            .expect("clean shutdown");
+        assert_eq!(gateway.status().active_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_event_receiver_retains_executor_release_until_raw_final() {
+        let completion = Arc::new(Mutex::new(None));
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+        gateway
+            .register_backend(Arc::new(ProgressThenDelayedFinalBackend {
+                completion: Arc::clone(&completion),
+                cancellations: Arc::clone(&cancellations),
+            }))
+            .expect("register progress-delayed backend");
+        let mut request = request();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "progress-delayed".to_string(),
+            model_id: "progress-delayed-model".to_string(),
+        };
+        let request_id = request.request_id.clone();
+        let ticket = gateway.execute(request).await.expect("start request");
+        drop(ticket);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cancellations.load(AtomicOrdering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("event wrapper observes dropped receiver");
+        assert_eq!(gateway.status().active_requests, 1);
+        assert!(cancellations.load(AtomicOrdering::Acquire) >= 1);
+
+        let shutdown_gateway = Arc::clone(&gateway);
+        let shutdown = tokio::spawn(async move { shutdown_gateway.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        completion
+            .lock()
+            .expect("completion state")
+            .take()
+            .expect("pending backend final")
+            .send(Ok(completed_response(request_id, "progress-delayed")))
+            .expect("publish raw backend completion");
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown completes after raw final")
+            .expect("shutdown task")
+            .expect("clean shutdown");
+        assert_eq!(gateway.status().active_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_silent_deadline_ticket_cancels_but_retains_executor_release() {
+        let completion = Arc::new(Mutex::new(None));
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+        gateway
+            .register_backend(Arc::new(DelayedFinalBackend {
+                completion: Arc::clone(&completion),
+                cancellations: Arc::clone(&cancellations),
+            }))
+            .expect("register silent backend");
+        let mut request = request();
+        request.model = ModelSelector::ExactRoute {
+            backend_id: "delayed-final".to_string(),
+            model_id: "delayed-final-model".to_string(),
+        };
+        request.deadline.total_ms = Some(60_000);
+        let ticket = gateway.execute(request).await.expect("start request");
+        drop(ticket);
+        assert!(cancellations.load(AtomicOrdering::Acquire) >= 1);
+        assert_eq!(gateway.status().active_requests, 1);
+
+        let shutdown_gateway = Arc::clone(&gateway);
+        let shutdown = tokio::spawn(async move { shutdown_gateway.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        completion
+            .lock()
+            .expect("completion state")
+            .take()
+            .expect("pending backend final")
+            .send(Err(GatewayError::unavailable(
+                &RequestId::new(),
+                "fixture_backend_stopped",
+                "the delayed backend has now terminated",
+            )))
+            .expect("publish raw backend final");
         tokio::time::timeout(Duration::from_secs(1), shutdown)
             .await
             .expect("shutdown completes after raw final")

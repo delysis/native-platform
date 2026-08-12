@@ -891,6 +891,44 @@ impl StableShutdownAdapter for GatewayStableShutdownAdapter {
 struct GatewayAdmissionBridgeAdapter {
     inner: GatewayStableShutdownAdapter,
     pending_shutdown: Arc<Mutex<Option<GatewayShutdownWitness>>>,
+    phase_gate: Arc<Semaphore>,
+    phase_gate_released: Arc<AtomicBool>,
+}
+
+struct QuiescingObservationBackend {
+    phase_gate: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl GatewayBackend for QuiescingObservationBackend {
+    fn descriptor(&self) -> BackendDescriptor {
+        descriptor("w1-quiescing-observation", BackendLocation::LocalEmbedded)
+    }
+
+    fn readiness(&self) -> BackendReadiness {
+        BackendReadiness::Ready
+    }
+
+    async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
+        Err(GatewayError::unavailable(
+            &request.request.request_id,
+            "contract_observation_backend_not_executable",
+            "the shutdown observation backend is not an inference route",
+        ))
+    }
+
+    fn cancel(&self, _request_id: &RequestId, _target: CancelTarget) -> usize {
+        0
+    }
+
+    async fn shutdown(&self) -> Result<(), GatewayError> {
+        self.phase_gate
+            .acquire()
+            .await
+            .expect("quiescing observation gate remains open")
+            .forget();
+        Ok(())
+    }
 }
 
 impl AdmissionQuiesceShutdownBridgeAdapter for GatewayAdmissionBridgeAdapter {
@@ -900,9 +938,19 @@ impl AdmissionQuiesceShutdownBridgeAdapter for GatewayAdmissionBridgeAdapter {
     type ShutdownWitness = GatewayShutdownWitness;
 
     fn deterministic() -> Self {
+        let inner = <GatewayStableShutdownAdapter as StableShutdownAdapter>::deterministic();
+        let phase_gate = Arc::new(Semaphore::new(0));
+        inner
+            .gateway
+            .register_backend(Arc::new(QuiescingObservationBackend {
+                phase_gate: Arc::clone(&phase_gate),
+            }))
+            .expect("register quiescing observation backend");
         Self {
-            inner: <GatewayStableShutdownAdapter as StableShutdownAdapter>::deterministic(),
+            inner,
             pending_shutdown: Arc::new(Mutex::new(None)),
+            phase_gate,
+            phase_gate_released: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -923,7 +971,13 @@ impl AdmissionQuiesceShutdownBridgeAdapter for GatewayAdmissionBridgeAdapter {
     }
 
     fn phase(&self) -> LifecyclePhase {
-        lifecycle_phase(self.inner.gateway.status().lifecycle)
+        let phase = lifecycle_phase(self.inner.gateway.status().lifecycle);
+        if phase == LifecyclePhase::Quiescing
+            && !self.phase_gate_released.swap(true, Ordering::AcqRel)
+        {
+            self.phase_gate.add_permits(1);
+        }
+        phase
     }
 
     fn active_count(&self) -> usize {
@@ -1164,6 +1218,7 @@ fn registry_gateway_error(
 struct CatchingPanicBackend {
     descriptor: BackendDescriptor,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    release_panic: Arc<Semaphore>,
 }
 
 #[async_trait]
@@ -1183,7 +1238,13 @@ impl GatewayBackend for CatchingPanicBackend {
         let terminal = Arc::new(AtomicBool::new(false));
         let terminal_for_task = Arc::clone(&terminal);
         let request_for_task = request_id.clone();
+        let release_panic = Arc::clone(&self.release_panic);
         let task = tokio::spawn(async move {
+            release_panic
+                .acquire()
+                .await
+                .expect("panic release gate remains open")
+                .forget();
             let panic = tokio::spawn(async { panic!("controlled backend executor panic") }).await;
             let detail = match panic {
                 Ok(()) => "controlled executor unexpectedly returned".to_owned(),
@@ -1242,6 +1303,7 @@ impl GatewayBackend for CatchingPanicBackend {
 struct GatewayPanicBridgeAdapter {
     gateway: Arc<Gateway>,
     runtime: Arc<tokio::runtime::Runtime>,
+    release_panic: Arc<Semaphore>,
 }
 
 struct GatewayPanicOperation {
@@ -1258,15 +1320,18 @@ impl PanicShutdownBridgeAdapter for GatewayPanicBridgeAdapter {
 
     fn deterministic() -> Self {
         let gateway = Arc::new(Gateway::new(GatewayDefaults::default()));
+        let release_panic = Arc::new(Semaphore::new(0));
         gateway
             .register_backend(Arc::new(CatchingPanicBackend {
                 descriptor: descriptor("w1-panic-backend", BackendLocation::LocalEmbedded),
                 task: Mutex::new(None),
+                release_panic: Arc::clone(&release_panic),
             }))
             .expect("register panic-supervised backend");
         Self {
             gateway,
             runtime: Arc::new(tokio::runtime::Runtime::new().expect("contract-test runtime")),
+            release_panic,
         }
     }
 
@@ -1296,6 +1361,7 @@ impl PanicShutdownBridgeAdapter for GatewayPanicBridgeAdapter {
                     "the panic-supervised operation is missing from the Gateway registry",
                 )
             })?;
+        self.release_panic.add_permits(1);
         Ok(GatewayPanicOperation {
             request_id,
             ticket: Mutex::new(Some(ticket)),

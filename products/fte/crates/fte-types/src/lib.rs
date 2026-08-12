@@ -824,6 +824,7 @@ pub trait TicketCancellation: Send + Sync {
 /// not own release. A callback error replaces the backend result so lifecycle
 /// failure can never be reported to the consumer as successful completion.
 pub trait TicketLifecycleLease: Send + Sync {
+    fn finish(&self, result: &Result<GatewayResponse, GatewayError>) -> Result<(), GatewayError>;
     fn terminal(&self, result: &Result<GatewayResponse, GatewayError>) -> Result<(), GatewayError>;
     fn release(&self) -> Result<(), GatewayError>;
 }
@@ -886,11 +887,7 @@ impl GatewayTicket {
                     "the backend stopped before returning an authoritative result",
                 ))
             });
-            let result = match lease.terminal(&result) {
-                Ok(()) => result,
-                Err(lifecycle_error) => Err(lifecycle_error),
-            };
-            let result = match lease.release() {
+            let result = match lease.finish(&result) {
                 Ok(()) => result,
                 Err(lifecycle_error) => Err(lifecycle_error),
             };
@@ -942,6 +939,8 @@ impl GatewayTicket {
         drop(placeholder_tx);
         let mut upstream_events = std::mem::replace(&mut self.events, placeholder_rx);
         let cancellation = Arc::clone(&self.cancellation);
+        // Suppress cancellation from consuming this inner ticket while the
+        // returned wrapper remains the consumer-owned cancellation guard.
         self.cancel_on_drop = false;
 
         let capacity = event_capacity.clamp(32, 4096);
@@ -958,6 +957,15 @@ impl GatewayTicket {
             }
 
             impl ExecutorRelease {
+                fn finish(
+                    &self,
+                    result: &Result<GatewayResponse, GatewayError>,
+                ) -> Result<(), GatewayError> {
+                    self.lease
+                        .as_ref()
+                        .map_or(Ok(()), |lease| lease.finish(result))
+                }
+
                 fn terminal(
                     &self,
                     result: &Result<GatewayResponse, GatewayError>,
@@ -984,11 +992,32 @@ impl GatewayTicket {
                         "the backend stopped before returning an authoritative result",
                     ))
                 });
-                let _ = release.terminal(&result);
-                let _ = release.release();
+                let result = match release.finish(&result) {
+                    Ok(()) => result,
+                    Err(lifecycle_error) => Err(lifecycle_error),
+                };
+                terminal_for_task.store(true, Ordering::Release);
+                let _ = final_tx.send(result);
                 return;
             };
             let mut terminal_permit = Some(terminal_permit);
+            let Ok(gap_permit) = event_tx.clone().reserve_owned().await else {
+                let result = upstream_final.await.unwrap_or_else(|_| {
+                    Err(GatewayError::unavailable(
+                        &request_for_task,
+                        "backend_result_channel_closed",
+                        "the backend stopped before returning an authoritative result",
+                    ))
+                });
+                let result = match release.finish(&result) {
+                    Ok(()) => result,
+                    Err(lifecycle_error) => Err(lifecycle_error),
+                };
+                terminal_for_task.store(true, Ordering::Release);
+                let _ = final_tx.send(result);
+                return;
+            };
+            let mut gap_permit = Some(gap_permit);
             let now = tokio::time::Instant::now();
             let first_deadline = remaining_deadline(now, policy.first_token_ms, elapsed);
             let total_deadline = remaining_deadline(now, policy.total_ms, elapsed);
@@ -997,6 +1026,7 @@ impl GatewayTicket {
             let mut first_output_observed = false;
             let mut upstream_terminal_observed = false;
             let mut upstream_events_closed = false;
+            let mut progress_gap = false;
 
             loop {
                 let deadline = next_ticket_deadline(
@@ -1021,40 +1051,24 @@ impl GatewayTicket {
                             upstream_terminal_observed = true;
                             continue;
                         }
-                        let send_deadline = next_ticket_deadline(
-                            first_deadline.filter(|_| !first_output_observed),
-                            idle_deadline.filter(|_| !upstream_terminal_observed),
-                            total_deadline,
-                        );
-                        tokio::select! {
-                            result = event_tx.send(event) => {
-                                if result.is_err() {
-                                    let _ = cancellation_for_task.cancel(CancelTarget::Request);
-                                    return;
-                                }
-                            }
-                            () = sleep_until_optional(send_deadline), if send_deadline.is_some() => {
-                                let error = ticket_deadline_error(
-                                    &request_for_task,
-                                    first_output_observed,
-                                    first_deadline,
-                                    total_deadline,
-                                );
-                                let _ = cancellation_for_task.cancel(CancelTarget::Request);
-                                let result = Err(error);
-                                let result = match release.terminal(&result) {
-                                    Ok(()) => result,
-                                    Err(lifecycle_error) => Err(lifecycle_error),
-                                };
-                                enqueue_reserved_terminal(
-                                    &mut terminal_permit,
-                                    terminal_event_from_result(&request_for_task, &result),
-                                    &terminal_for_task,
-                                );
-                                let _ = final_tx.send(result);
+                        match event_tx.try_send(event) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => progress_gap = true,
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
                                 if retains_executor {
-                                    let _ = upstream_final.await;
-                                    let _ = release.release();
+                                    let result = upstream_final.await.unwrap_or_else(|_| {
+                                        Err(GatewayError::unavailable(
+                                            &request_for_task,
+                                            "backend_result_channel_closed",
+                                            "the backend stopped before returning an authoritative result",
+                                        ))
+                                    });
+                                    let result = match release.finish(&result) {
+                                        Ok(()) => result,
+                                        Err(lifecycle_error) => Err(lifecycle_error),
+                                    };
+                                    terminal_for_task.store(true, Ordering::Release);
+                                    let _ = final_tx.send(result);
                                 }
                                 return;
                             }
@@ -1068,20 +1082,43 @@ impl GatewayTicket {
                                 "the backend stopped before returning an authoritative result",
                             ))
                         });
-                        let result = match release.terminal(&result) {
+                        // A backend may publish its final result immediately
+                        // after queueing its terminal event. Drain every
+                        // already-queued progress event before projecting the
+                        // authoritative terminal so the wrapper cannot race
+                        // ahead of output the backend published first.
+                        let mut consumer_open = true;
+                        while let Ok(event) = upstream_events.try_recv() {
+                            if !event.is_terminal() {
+                                match event_tx.try_send(event) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => progress_gap = true,
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        consumer_open = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let result = match release.finish(&result) {
                             Ok(()) => result,
                             Err(lifecycle_error) => Err(lifecycle_error),
                         };
-                        let terminal = terminal_event_from_result(&request_for_task, &result);
-                        enqueue_reserved_terminal(
-                            &mut terminal_permit,
-                            terminal,
-                            &terminal_for_task,
-                        );
-                        let result = match release.release() {
-                            Ok(()) => result,
-                            Err(lifecycle_error) => Err(lifecycle_error),
-                        };
+                        if consumer_open {
+                            enqueue_reserved_gap(
+                                &mut gap_permit,
+                                &request_for_task,
+                                progress_gap,
+                            );
+                            let terminal = terminal_event_from_result(&request_for_task, &result);
+                            enqueue_reserved_terminal(
+                                &mut terminal_permit,
+                                terminal,
+                                &terminal_for_task,
+                            );
+                        } else {
+                            terminal_for_task.store(true, Ordering::Release);
+                        }
                         let _ = final_tx.send(result);
                         return;
                     }
@@ -1098,6 +1135,11 @@ impl GatewayTicket {
                             Ok(()) => result,
                             Err(lifecycle_error) => Err(lifecycle_error),
                         };
+                        enqueue_reserved_gap(
+                            &mut gap_permit,
+                            &request_for_task,
+                            progress_gap,
+                        );
                         enqueue_reserved_terminal(
                             &mut terminal_permit,
                             terminal_event_from_result(&request_for_task, &result),
@@ -1208,6 +1250,23 @@ fn enqueue_reserved_terminal(
     if let Some(permit) = permit.take() {
         permit.send(event);
         terminal_observed.store(true, Ordering::Release);
+    }
+}
+
+fn enqueue_reserved_gap(
+    permit: &mut Option<mpsc::OwnedPermit<GatewayEvent>>,
+    request_id: &RequestId,
+    progress_gap: bool,
+) {
+    let Some(permit) = permit.take() else {
+        return;
+    };
+    if progress_gap {
+        permit.send(GatewayEvent::Warning {
+            request_id: request_id.clone(),
+            code: "gateway_progress_truncated".to_string(),
+            message: "progress exceeded the bounded consumer buffer; the authoritative final response remains complete".to_string(),
+        });
     }
 }
 
@@ -1370,6 +1429,35 @@ mod tests {
         }
     }
 
+    struct CountingLifecycleLease {
+        terminals: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+    }
+
+    impl TicketLifecycleLease for CountingLifecycleLease {
+        fn finish(
+            &self,
+            _result: &Result<GatewayResponse, GatewayError>,
+        ) -> Result<(), GatewayError> {
+            self.terminals.fetch_add(1, Ordering::AcqRel);
+            self.releases.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn terminal(
+            &self,
+            _result: &Result<GatewayResponse, GatewayError>,
+        ) -> Result<(), GatewayError> {
+            self.terminals.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn release(&self) -> Result<(), GatewayError> {
+            self.releases.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
     #[test]
     fn request_validation_rejects_empty_chat_before_inference() {
         let request = GatewayRequest {
@@ -1461,6 +1549,175 @@ mod tests {
             Arc::new(NoopCancellation),
             terminal,
         );
+        assert_eq!(
+            ticket.final_response().await.expect("final response"),
+            response
+        );
+    }
+
+    #[tokio::test]
+    async fn final_result_cannot_overtake_already_queued_progress() {
+        for _ in 0..64 {
+            let request_id = RequestId::new();
+            let route = ResolvedRoute {
+                backend_id: "local".to_string(),
+                model_id: "model".to_string(),
+                display_name: "Model".to_string(),
+                location: BackendLocation::LocalEmbedded,
+                catalog_version: "test".to_string(),
+            };
+            let response = GatewayResponse {
+                id: "resp".to_string(),
+                request_id: request_id.clone(),
+                model: route.model_id.clone(),
+                route,
+                output: Vec::new(),
+                usage: GatewayUsage::default(),
+                status: TerminalStatus::Completed,
+                previous_response_id: None,
+            };
+            let (event_tx, event_rx) = mpsc::channel(4);
+            event_tx
+                .try_send(GatewayEvent::TextDelta {
+                    request_id: request_id.clone(),
+                    output_index: 0,
+                    content_index: 0,
+                    delta: "first".to_string(),
+                })
+                .expect("seed queued delta");
+            event_tx
+                .try_send(GatewayEvent::Warning {
+                    request_id: request_id.clone(),
+                    code: "second".to_string(),
+                    message: "queued before the final result".to_string(),
+                })
+                .expect("seed queued progress");
+            event_tx
+                .try_send(GatewayEvent::Completed {
+                    request_id: request_id.clone(),
+                    response: Box::new(response.clone()),
+                })
+                .expect("seed upstream terminal");
+            let (final_tx, final_rx) = oneshot::channel();
+            final_tx
+                .send(Ok(response.clone()))
+                .expect("seed authoritative final");
+            let mut ticket = GatewayTicket::new(
+                request_id,
+                event_rx,
+                final_rx,
+                Arc::new(NoopCancellation),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .with_deadlines(
+                DeadlinePolicy {
+                    total_ms: Some(60_000),
+                    ..DeadlinePolicy::default()
+                },
+                Duration::ZERO,
+                32,
+            );
+
+            let mut events = Vec::new();
+            while let Some(event) = ticket.events.recv().await {
+                events.push(event);
+            }
+            assert_eq!(events.len(), 3);
+            assert!(matches!(
+                &events[0],
+                GatewayEvent::TextDelta { delta, .. } if delta == "first"
+            ));
+            assert!(matches!(
+                &events[1],
+                GatewayEvent::Warning { code, .. } if code == "second"
+            ));
+            assert!(matches!(&events[2], GatewayEvent::Completed { .. }));
+            assert_eq!(
+                ticket.final_response().await.expect("final response"),
+                response
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unread_progress_cannot_block_terminalization_and_release() {
+        let request_id = RequestId::new();
+        let route = ResolvedRoute {
+            backend_id: "local".to_string(),
+            model_id: "model".to_string(),
+            display_name: "Model".to_string(),
+            location: BackendLocation::LocalEmbedded,
+            catalog_version: "test".to_string(),
+        };
+        let response = GatewayResponse {
+            id: "resp".to_string(),
+            request_id: request_id.clone(),
+            model: route.model_id.clone(),
+            route,
+            output: Vec::new(),
+            usage: GatewayUsage::default(),
+            status: TerminalStatus::Completed,
+            previous_response_id: None,
+        };
+        let (event_tx, event_rx) = mpsc::channel(256);
+        for index in 0..128 {
+            event_tx
+                .try_send(GatewayEvent::Warning {
+                    request_id: request_id.clone(),
+                    code: format!("progress_{index}"),
+                    message: "bounded progress".to_string(),
+                })
+                .expect("seed unread progress");
+        }
+        event_tx
+            .try_send(GatewayEvent::Completed {
+                request_id: request_id.clone(),
+                response: Box::new(response.clone()),
+            })
+            .expect("seed upstream terminal");
+        let (final_tx, final_rx) = oneshot::channel();
+        final_tx
+            .send(Ok(response.clone()))
+            .expect("seed authoritative final");
+        let terminals = Arc::new(AtomicUsize::new(0));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let mut ticket = GatewayTicket::new(
+            request_id,
+            event_rx,
+            final_rx,
+            Arc::new(NoopCancellation),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .with_admission_lease_and_deadlines(
+            Box::new(CountingLifecycleLease {
+                terminals: Arc::clone(&terminals),
+                releases: Arc::clone(&releases),
+            }),
+            DeadlinePolicy::default(),
+            Duration::ZERO,
+            32,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while releases.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unread progress cannot retain executor ownership");
+        assert_eq!(terminals.load(Ordering::Acquire), 1);
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+        assert!(ticket.terminal_observed());
+
+        let mut events = Vec::new();
+        while let Some(event) = ticket.events.recv().await {
+            events.push(event);
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GatewayEvent::Warning { code, .. } if code == "gateway_progress_truncated"
+        )));
+        assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
         assert_eq!(
             ticket.final_response().await.expect("final response"),
             response
