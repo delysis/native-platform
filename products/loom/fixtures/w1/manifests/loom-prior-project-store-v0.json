@@ -1,0 +1,89 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "loom_prior_project_store",
+  "class": "state",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [
+    {
+      "case_id": "loom.prior.project_store.v10.v1",
+      "source": {
+        "repository_id": "delysis/loom-native",
+        "commit": "e32d0697f6b5e28716e34c6b051d47d5031d010c",
+        "production_tree": {
+          "id": "loom.production.source_roots.e32d069",
+          "digest": { "algorithm": "sha256", "hex": "f19edc9caf22807a4d11f716a921445bf5c407b4e3ad85e7842a5fd8f2fc0f00" },
+          "length": 1632
+        }
+      },
+      "inputs": [
+        {
+          "identity": {
+            "id": "loom.prior.project.spec.v1",
+            "digest": { "algorithm": "sha256", "hex": "a33309008526f7defbd88dc39c4f9d177c2c976593c40b2b441db60ff7d5abdc" },
+            "length": 2072
+          },
+          "availability": "checked_in",
+          "relative_path": "fixtures/w1/loom-prior-store-v10-v1.json"
+        },
+        {
+          "identity": {
+            "id": "loom.prior.project.manifest.v10",
+            "digest": { "algorithm": "sha256", "hex": "46a6d67417f00a3391b7a2100d27a4b1720e3c4811f658456472647e49f731a7" },
+            "length": 167
+          },
+          "availability": "checked_in",
+          "relative_path": "fixtures/w1/state/loom-prior-v10/.loom/project.json"
+        },
+        {
+          "identity": {
+            "id": "loom.prior.project.manuscript.v10",
+            "digest": { "algorithm": "sha256", "hex": "834c141212ac3cf23062a3864b45cdf630ae8fc8029092807602fffce1b70739" },
+            "length": 50
+          },
+          "availability": "checked_in",
+          "relative_path": "fixtures/w1/state/loom-prior-v10/manuscript/001.md"
+        },
+        {
+          "identity": {
+            "id": "loom.prior.project.migrated_summary.v1",
+            "digest": { "algorithm": "sha256", "hex": "95b14846e2f2869c7be973d059b47a95fb69ba9140cf54d4c2155267a81f0256" },
+            "length": 464
+          },
+          "availability": "checked_in",
+          "relative_path": "fixtures/w1/state/loom-prior-v10-migrated-summary-v1.json"
+        }
+      ],
+      "state_identities": [
+        {
+          "state_id": "loom.prior.project.sqlite",
+          "schema_id": "loom.project_store.sqlite.user_version_10",
+          "baseline": {
+            "identity": {
+              "id": "loom.prior.v10.sqlite",
+              "digest": { "algorithm": "sha256", "hex": "0514089b057e509d34c72f0731cd3ffb89d8ff7b5dd42edd5888edc94e78e9c8" },
+              "length": 1101824
+            },
+            "availability": "checked_in",
+            "relative_path": "fixtures/w1/state/loom-prior-v10/.loom/loom.sqlite3"
+          }
+        }
+      ],
+      "prerequisites": [],
+      "replay": [
+        {
+          "program": { "kind": "cargo" },
+          "argv": ["test", "-p", "loom-store", "w1_prior_v10_"],
+          "required_environment": [],
+          "network": "denied"
+        }
+      ],
+      "expected_projection": {
+        "id": "loom.prior.project.expected_projection.v1",
+        "digest": { "algorithm": "sha256", "hex": "e207e171dc3a3ab8d5ea5de6b160bd0cf0409a3f0f15d5413c38d96225404b82" },
+        "length": 1993
+      }
+    }
+  ],
+  "omitted_claims": ["arbitrary historical project stores"],
+  "negative_evidence": []
+}

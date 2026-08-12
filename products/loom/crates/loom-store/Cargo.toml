@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+unstable-w1-vertical-tests = ["dep:platform-vertical-fixtures-v0"]
+
 [dependencies]
 atomic-write-file.workspace = true
 fs4.workspace = true
@@ -16,6 +20,7 @@ loom-inference = { path = "../loom-inference", features = ["native-evidence"] }
 loom-host = { path = "../loom-host" }
 loom-research-types = { path = "../loom-research-types" }
 loom-types = { path = "../loom-types" }
+platform-vertical-fixtures-v0 = { git = "https://github.com/delysis/w1-platform-contracts.git", rev = "9fd803f5efcc46ac0256dab876e7c0b1f03bb448", optional = true }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

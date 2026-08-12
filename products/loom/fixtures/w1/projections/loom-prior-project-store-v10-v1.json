@@ -1,0 +1,60 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "loom.store.open_migrate_reopen",
+      "attempt_id": "fixture.v10",
+      "correlation_id": "prior.project.store",
+      "kind": "migration_completed",
+      "payload": {
+        "id": "loom.prior.migrated.summary",
+        "digest": { "algorithm": "sha256", "hex": "95b14846e2f2869c7be973d059b47a95fb69ba9140cf54d4c2155267a81f0256" },
+        "length": 464
+      }
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "loom.prior.project.sqlite",
+      "schema_id": "loom.project_store.sqlite.user_version_10",
+      "before": {
+        "id": "loom.prior.v10.sqlite",
+        "digest": { "algorithm": "sha256", "hex": "0514089b057e509d34c72f0731cd3ffb89d8ff7b5dd42edd5888edc94e78e9c8" },
+        "length": 1101824
+      },
+      "after": {
+        "id": "loom.prior.migrated.summary",
+        "digest": { "algorithm": "sha256", "hex": "95b14846e2f2869c7be973d059b47a95fb69ba9140cf54d4c2155267a81f0256" },
+        "length": 464
+      },
+      "disposition": "updated"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "loom.store.open_migrate_reopen",
+      "attempt_id": "fixture.v10",
+      "correlation_id": "prior.project.store",
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 0,
+    "joined_workers": 0
+  },
+  "output_facts": {
+    "current_schema_version": { "kind": "integer", "value": 11 },
+    "pending_outbox_count": { "kind": "integer", "value": 0 },
+    "project_identity_preserved": { "kind": "boolean", "value": true },
+    "revision_identity_preserved": { "kind": "boolean", "value": true },
+    "selection_count": { "kind": "integer", "value": 0 },
+    "visible_bytes_preserved": { "kind": "boolean", "value": true }
+  },
+  "fail_closed_facts": [
+    "v11 schema was absent from the frozen pre-open database",
+    "first open and second reopen preserve zero selection events"
+  ]
+}

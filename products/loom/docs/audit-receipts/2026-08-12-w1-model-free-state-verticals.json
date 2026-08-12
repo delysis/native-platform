@@ -1,0 +1,84 @@
+{
+  "schema_version": 2,
+  "goal": "W1-LOOM-MODEL-FREE-STATE-VERTICALS",
+  "production_source_commit": "e32d0697f6b5e28716e34c6b051d47d5031d010c",
+  "production_tree": {
+    "path": "fixtures/w1/source/loom-production-tree-e32d069.json",
+    "sha256": "f19edc9caf22807a4d11f716a921445bf5c407b4e3ad85e7842a5fd8f2fc0f00",
+    "byte_len": 1632
+  },
+  "vertical_protocol_commit": "9fd803f5efcc46ac0256dab876e7c0b1f03bb448",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "fixture_ledger": {
+    "path": "fixtures/w1/MANIFEST.sha256",
+    "sha256": "57c03eddfee36825be8a1db6b1c7cb153793c83fe6fa63c5d32abf0b435b9389",
+    "artifact_count": 14
+  },
+  "rows": [
+    {
+      "row": 6,
+      "vertical_id": "loom_suggestion_promotion",
+      "status": "canonical_baseline_validated",
+      "manifest": "fixtures/w1/manifests/loom-suggestion-promotion-v0.json",
+      "manifest_sha256": "47fc85d1496a345e6820062b9894cccd4c8f0984fc40dcb6ffc384e57f236c49",
+      "projection": "fixtures/w1/projections/loom-suggestion-promotion-v1.json",
+      "projection_sha256": "aa3e39cd72c9085f437c7b448da517857449424e12783a9d55a2282548448542",
+      "product_replays": [
+        "generation::tests::w1_exact_boundary_suggestion_promotion_survives_store_reopen",
+        "apps/loom/src/lib/w1SuggestionVertical.test.ts"
+      ]
+    },
+    {
+      "row": 7,
+      "vertical_id": "loom_research_diagnostic_admitted_distinction",
+      "status": "canonical_baseline_validated",
+      "manifest": "fixtures/w1/manifests/loom-research-diagnostic-admitted-v0.json",
+      "manifest_sha256": "ef846ab4395e5e4c5b1b1110650b0518adabbc9e1b37e9b7adb0b5ba28041110",
+      "projection": "fixtures/w1/projections/loom-research-authority-v1.json",
+      "projection_sha256": "03483d304b0f57833ac777740b0cde400b5d86331357f08ce4dc5b98f28a4f24",
+      "product_replays": [
+        "research_admission::tests::w1_reopened_research_bytes_remain_diagnostic_without_live_authority"
+      ]
+    },
+    {
+      "row": 14,
+      "vertical_id": "loom_prior_project_store",
+      "status": "canonical_baseline_validated",
+      "manifest": "fixtures/w1/manifests/loom-prior-project-store-v0.json",
+      "manifest_sha256": "1e7205041489daeb3fa2510a4430589b62eee487939c28f10fa8cc71a526c34a",
+      "projection": "fixtures/w1/projections/loom-prior-project-store-v10-v1.json",
+      "projection_sha256": "e207e171dc3a3ab8d5ea5de6b160bd0cf0409a3f0f15d5413c38d96225404b82",
+      "state_identity": {
+        "path": "fixtures/w1/state/loom-prior-v10/.loom/loom.sqlite3",
+        "schema_id": "loom.project_store.sqlite.user_version_10",
+        "sha256": "0514089b057e509d34c72f0731cd3ffb89d8ff7b5dd42edd5888edc94e78e9c8",
+        "byte_len": 1101824
+      },
+      "product_replays": [
+        "store::tests::w1_prior_v10_producer_recreates_frozen_exact_corpus",
+        "store::tests::w1_prior_v10_project_store_migrates_and_reopens_without_identity_drift"
+      ]
+    }
+  ],
+  "verification": {
+    "status": "passed",
+    "commands": [
+      { "command": "cargo fmt --all -- --check", "result": "passed" },
+      { "command": "rustup run 1.88.0 cargo test -p loom-store --all-targets --features unstable-w1-vertical-tests", "result": "passed; 152 unit tests and all integration targets" },
+      { "command": "rustup run 1.88.0 cargo test -p loom-store --features unstable-w1-vertical-tests --test w1_fixture_manifest", "result": "passed; 3 of 3" },
+      { "command": "rustup run 1.88.0 cargo clippy -p loom-store --all-targets --features unstable-w1-vertical-tests -- -D warnings", "result": "passed" },
+      { "command": "rustup run 1.88.0 cargo test -p loom-host --features unstable-w1-contract-tests", "result": "passed; 29 of 29" },
+      { "command": "rustup run 1.88.0 cargo test -p tauri-plugin-loom --features unstable-w1-contract-tests", "result": "passed; 72 of 72" },
+      { "command": "pnpm --dir apps/loom test", "result": "passed; 31 files and 181 tests" },
+      { "command": "pnpm --dir apps/loom check", "result": "passed; 0 errors and 0 warnings" },
+      { "command": "pnpm --dir apps/loom build", "result": "passed; existing non-fatal chunk-size advisory" }
+    ]
+  },
+  "external_requirements": {
+    "hosted_provider": false,
+    "provider_credential": false,
+    "real_model": false,
+    "native_ui": false,
+    "scheduled_run": false
+  }
+}

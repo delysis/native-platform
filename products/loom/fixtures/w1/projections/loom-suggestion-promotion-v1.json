@@ -1,0 +1,65 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "loom.suggestion.promotion",
+      "attempt_id": "fixture.primary",
+      "correlation_id": "manuscript.001.caret.61",
+      "kind": "promoted",
+      "payload": {
+        "id": "suggestion.primary.bytes",
+        "digest": { "algorithm": "sha256", "hex": "e94bcffd1eb3f286191c378e69ff387918f696fea94e8072fbc01a0cf971d4f5" },
+        "length": 69
+      }
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "manuscript.001",
+      "schema_id": "loom.manuscript.utf8.v1",
+      "before": {
+        "id": "manuscript.before",
+        "digest": { "algorithm": "sha256", "hex": "74302905de694d4697a802bc63977d4b24b888176fca167e8dc33f14ecc2bfbd" },
+        "length": 61
+      },
+      "after": {
+        "id": "manuscript.after",
+        "digest": { "algorithm": "sha256", "hex": "d3602d33fd8503451d7572e2e78afa93a99cb7229f698e33575e07e29950fee1" },
+        "length": 130
+      },
+      "disposition": "updated"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "loom.suggestion.promotion",
+      "attempt_id": "fixture.primary",
+      "correlation_id": "manuscript.001.caret.61",
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 0,
+    "joined_workers": 0
+  },
+  "output_facts": {
+    "additional_candidates": { "kind": "text", "value": "hidden_until_explicit_review" },
+    "candidate_family_count": { "kind": "integer", "value": 3 },
+    "dismissed_manuscript_unchanged": { "kind": "boolean", "value": true },
+    "ghost_anchor": { "kind": "text", "value": "caret_local" },
+    "primary_use_this_control": { "kind": "boolean", "value": false },
+    "persistent_candidate_count": { "kind": "boolean", "value": false },
+    "skip_to_manuscript_control": { "kind": "boolean", "value": false },
+    "stale_manuscript_unchanged": { "kind": "boolean", "value": true },
+    "tab_exact_boundary": { "kind": "text", "value": "promote_visible_ghost" },
+    "tab_without_exact_boundary": { "kind": "text", "value": "ordinary_tab_or_indent" },
+    "visible_ghost_count": { "kind": "integer", "value": 1 }
+  },
+  "fail_closed_facts": [
+    "dismissal leaves manuscript bytes unchanged",
+    "stale suggestion cannot promote manuscript bytes"
+  ]
+}
