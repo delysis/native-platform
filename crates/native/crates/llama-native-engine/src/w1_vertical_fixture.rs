@@ -17,9 +17,9 @@ use platform_vertical_fixtures_v0::{
 use serde::Deserialize;
 
 use crate::{
-    ChatMessage, ChatRole, ChatTemplateChoice, GenerationInput, GenerationRequest, GenerationState,
-    NativeDevice, NativeErrorCode, NativeModelConfig, NativeModelOwner, NativeTransport,
-    SamplingConfig,
+    CompletionPrompt, GenerationBatchRequest, GenerationCase, GenerationEventKind, GenerationInput,
+    GenerationRequest, GenerationState, NativeDevice, NativeErrorCode, NativeModelConfig,
+    NativeModelOwner, NativeTransport, SamplingConfig, SpecialTokenPolicy,
 };
 
 const MANIFEST_BYTES: &[u8] =
@@ -162,17 +162,29 @@ fn w1_current_exact_qwen_baseline() -> Result<(), Box<dyn std::error::Error>> {
         .expect("an admitted real model has a fingerprint");
     assert_eq!(fingerprint.model_sha256, prerequisite.identity.digest.hex);
 
+    let prepared = handle.prepare_input(GenerationInput::Completion {
+        prompts: vec![CompletionPrompt::Text {
+            text: input.prompt,
+            special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+        }],
+    })?;
+    let prompt_tokens = prepared
+        .first()
+        .expect("one prepared exact-Qwen prompt")
+        .token_ids
+        .clone();
+    assert!(!prompt_tokens.is_empty());
+
     let operation_id = "native-current-qwen";
-    let output = handle
-        .generate(GenerationRequest {
-            request_id: operation_id.to_owned(),
-            model_id: status.model_id.clone(),
-            input: GenerationInput::Chat {
-                messages: vec![ChatMessage {
-                    role: ChatRole::User,
-                    content: input.prompt,
+    let request = GenerationBatchRequest {
+        request_id: operation_id.to_owned(),
+        model_id: status.model_id.clone(),
+        cases: vec![GenerationCase {
+            case_id: operation_id.to_owned(),
+            input: GenerationInput::Completion {
+                prompts: vec![CompletionPrompt::Tokens {
+                    token_ids: prompt_tokens,
                 }],
-                template: ChatTemplateChoice::ModelDefault,
             },
             sampling: SamplingConfig {
                 seed: input.seed,
@@ -180,16 +192,35 @@ fn w1_current_exact_qwen_baseline() -> Result<(), Box<dyn std::error::Error>> {
                 max_tokens: input.max_tokens,
                 ..SamplingConfig::default()
             },
-            media: Vec::new(),
             cached_prefix: None,
-        })?
-        .wait()?;
-    let result = output.first().expect("one exact-Qwen result");
+        }],
+    };
+    let verified = handle.generate_batch(request.clone())?.wait_verified()?;
+    assert_eq!(verified.request(), &request);
+    assert_eq!(verified.model_fingerprint(), fingerprint);
+    let result = verified.outputs().first().expect("one exact-Qwen result");
     assert_eq!(result.state, GenerationState::Completed);
     assert!(result.real_engine_invoked);
     assert!(!result.fake_fixture);
     assert_eq!(result.transport, NativeTransport::InProcess);
     assert!(!result.text.trim().is_empty());
+    let terminal_events = verified
+        .events()
+        .iter()
+        .filter(|event| {
+            event.request_id == operation_id
+                && event.branch_id == operation_id
+                && matches!(
+                    event.event,
+                    GenerationEventKind::State {
+                        state: GenerationState::Completed
+                    }
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_events.len(), 1);
+    let active_operations = handle.status().active_sequences;
+    assert_eq!(active_operations, 0);
 
     let fim_error = handle
         .generate(GenerationRequest {
@@ -205,7 +236,14 @@ fn w1_current_exact_qwen_baseline() -> Result<(), Box<dyn std::error::Error>> {
         })
         .expect_err("unverified fill-in-middle must fail closed");
     assert_eq!(fim_error.code, NativeErrorCode::UnsupportedPromptForm);
-    owner.shutdown_joined()?;
+    let joined = owner.shutdown_joined()?;
+    assert!(joined.belongs_to(&handle));
+    assert_eq!(joined.model_id(), request.model_id);
+    assert_eq!(joined.expected_worker_ids(), joined.joined_worker_ids());
+    assert_eq!(joined.expected_worker_count(), joined.joined_worker_count());
+    let retained_tasks = joined
+        .expected_worker_count()
+        .saturating_sub(joined.joined_worker_count());
 
     let mut output_facts = BTreeMap::new();
     output_facts.insert(
@@ -246,14 +284,17 @@ fn w1_current_exact_qwen_baseline() -> Result<(), Box<dyn std::error::Error>> {
             operation_id: operation_id.to_owned(),
             attempt_id: None,
             correlation_id: None,
-            terminal: TerminalClass::Completed,
-            released: true,
+            terminal: match result.state {
+                GenerationState::Completed => TerminalClass::Completed,
+                _ => unreachable!("the strict seal admitted one completed result"),
+            },
+            released: joined.expected_worker_ids() == joined.joined_worker_ids(),
         }],
         ownership: OwnershipFactsV0 {
-            active_operations: 0,
-            retained_tasks: 0,
-            expected_workers: 1,
-            joined_workers: 1,
+            active_operations,
+            retained_tasks,
+            expected_workers: joined.expected_worker_count(),
+            joined_workers: joined.joined_worker_count(),
         },
         output_facts,
         fail_closed_facts: vec![

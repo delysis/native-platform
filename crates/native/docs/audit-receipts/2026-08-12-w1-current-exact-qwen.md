@@ -13,13 +13,16 @@ The external prerequisite is exactly 484,220,320 bytes with SHA-256
 `9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14`.
 The ignored operational test streams those bytes independently through the W1
 verifier, then asks the production loader to enforce the same digest before
-admission. It executes a real in-process chat completion, proves nonempty text,
-real-engine evidence, non-fixture evidence, and in-process transport, rejects
-unverified fill-in-middle, and consumes joined owner shutdown before producing
-the canonical observation.
+admission. It tokenizes the checked-in prompt through the production model,
+submits those exact token IDs through `generate_batch`, and consumes the
+non-forgeable `wait_verified` seal. That seal performs the strict post-generation
+artifact identity check before it returns. The test derives completion and
+ownership facts from the seal, live status, and `JoinedNativeModel`; proves
+nonempty text, real-engine evidence, non-fixture evidence, and in-process
+transport; and rejects unverified fill-in-middle.
 
 Local verification on an Apple M4 Max passed twice using the exact GGUF. The
-final projection-bound run passed 1/1 in 16.29 seconds. It selected the CPU
+final strict-seal projection run passed 1/1 in 3.78 seconds. It selected the CPU
 runtime as requested by the fixture; llama.cpp also inventoried the host's
 Metal device during process initialization. Accelerator availability,
 performance, and exact generated prose are intentionally omitted claims.
