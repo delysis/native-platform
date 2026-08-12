@@ -39,8 +39,10 @@ named production owner rather than fixture-owned shadow state.
 
 This two-revision sequence avoids a manifest referring circularly to the commit
 that contains that manifest. No final lock exists yet. The completed
-Mom-plus-Information row 17 and intentionally absent row 8 are documented in
-[`CROSS-PRODUCT-ROWS.md`](CROSS-PRODUCT-ROWS.md).
+Mom-plus-Information row 17 and staged five-product row 8 are documented in
+[`CROSS-PRODUCT-ROWS.md`](CROSS-PRODUCT-ROWS.md). Staging row 8 authenticates
+the five already product-owned projections; it does not accept the full set of
+eighteen rows or authorize creation of `W1-VERTICALS.lock.json`.
 
 ## Exact row catalogue
 
