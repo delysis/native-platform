@@ -8,22 +8,25 @@ test adapter.
 | Suite | Normative proof | May be a component-local adapter? |
 | --- | --- | --- |
 | transition chain | exact Reserved -> Queued -> Running -> Terminal -> Released | yes |
-| registry identity | duplicate rejection, distinct attempts under one public identity, generation-safe stale release, checked sequence exhaustion | yes |
+| registry identity | duplicate rejection, generation-safe stale release, checked sequence exhaustion | yes |
+| attempt hierarchy | two concurrent attempt identities under one still-active public operation; status and cancellation remain operation-anchored | yes |
 | consumer cancellation | ticket drop and explicit drop request cancellation while executor identity remains | yes |
 | terminal authority | one terminal/final projection and cancel/complete linearization | yes |
 | waiter control | timeout is observational and control remains usable | yes |
-| admission/quiesce/shutdown | admission race linearizes with quiescence; late admission closes; shutdown waits for active release and join | bridge |
+| admission/quiesce/shutdown | admission race linearizes with quiescence; late admission closes; a nonblocking shutdown witness cannot complete before active release and join | bridge |
 | progress/shutdown | bounded unread progress cannot block terminal/release/shutdown; terminal wins concurrent progress | bridge |
 | panic/shutdown | panic becomes failed terminal and shutdown empties ownership | bridge |
 | stable shutdown | repeated shutdown is deterministic and empty | yes |
 | task reaping | retained task state returns to zero after each historical operation | yes |
 
-Each successful runner returns `CoverageEvidence`, whose constructor is private
-to the testkit. `LifecycleCoverageManifest::accept` requires one product and
-one lifecycle-implementation identity on all evidence, plus the complete
-invariant union. A passing local suite is not an implementation acceptance
-statement until that manifest accepts. Evidence for two independent
-implementations inside one product cannot be combined.
+Each adapter binds a `LifecycleImplementation` marker with fixed product and
+implementation constants. Successful runners derive typed `CoverageEvidence`
+from that associated type; callers provide only a component name and cannot
+relabel reference evidence as product evidence. `LifecycleCoverageManifest<I>`
+accepts only `CoverageEvidence<I>` and requires the complete invariant union.
+A passing local suite is not an implementation acceptance statement until that
+manifest accepts. Evidence for two independent implementations inside one
+product cannot be combined.
 
 Composition does not prove that an adapter is free of shadow state; code review
 must still confirm every method reads or exercises the named production owner.

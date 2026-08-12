@@ -4,7 +4,7 @@
 //! It is intentionally not a production runtime abstraction.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecyclePhase {
@@ -162,6 +162,7 @@ struct ReferenceState {
 #[derive(Debug)]
 struct ReferenceInner {
     state: Mutex<ReferenceState>,
+    state_changed: Condvar,
 }
 
 #[derive(Clone, Debug)]
@@ -239,6 +240,20 @@ impl ReferenceAdapter {
         operation.phase = OperationPhase::Terminal;
         Ok(())
     }
+
+    pub(crate) fn wait_for_shutdown(&self) -> ClosedFacts {
+        self.quiesce();
+        let mut state = self.state();
+        while !state.active.is_empty() || state.retained_tasks != 0 {
+            state = self
+                .inner
+                .state_changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.lifecycle = LifecyclePhase::Closed;
+        closed_facts(&state)
+    }
 }
 
 impl OperationModelAdapter for ReferenceAdapter {
@@ -262,6 +277,7 @@ impl OperationModelAdapter for ReferenceAdapter {
                     retained_tasks: 0,
                     joined_workers: 0,
                 }),
+                state_changed: Condvar::new(),
             }),
         }
     }
@@ -400,6 +416,7 @@ impl OperationModelAdapter for ReferenceAdapter {
             .joined_workers
             .checked_add(1)
             .expect("test joined-worker count exhausted");
+        self.inner.state_changed.notify_all();
         Ok(())
     }
 
@@ -423,16 +440,7 @@ impl OperationModelAdapter for ReferenceAdapter {
         if state.active.is_empty() && state.retained_tasks == 0 {
             state.lifecycle = LifecyclePhase::Closed;
         }
-        ClosedFacts {
-            lifecycle: state.lifecycle,
-            active_operations: state.active.len(),
-            retained_tasks: state.retained_tasks,
-            expected_workers: state
-                .joined_workers
-                .checked_add(state.retained_tasks)
-                .expect("test expected-worker count exhausted"),
-            joined_workers: state.joined_workers,
-        }
+        closed_facts(&state)
     }
 
     fn lifecycle_phase(&self) -> LifecyclePhase {
@@ -463,6 +471,19 @@ impl OperationModelAdapter for ReferenceAdapter {
             .get(&lease.identity.sequence)
             .filter(|operation| operation.identity == lease.identity)
             .map(Self::snapshot)
+    }
+}
+
+fn closed_facts(state: &ReferenceState) -> ClosedFacts {
+    ClosedFacts {
+        lifecycle: state.lifecycle,
+        active_operations: state.active.len(),
+        retained_tasks: state.retained_tasks,
+        expected_workers: state
+            .joined_workers
+            .checked_add(state.retained_tasks)
+            .expect("test expected-worker count exhausted"),
+        joined_workers: state.joined_workers,
     }
 }
 

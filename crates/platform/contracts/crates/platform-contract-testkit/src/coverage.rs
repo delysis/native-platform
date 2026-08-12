@@ -1,12 +1,28 @@
 //! Acceptance accounting for composable lifecycle suites.
 //!
-//! Evidence can only be minted by this crate after a suite returns. A manifest
-//! accepts evidence from several product components, but only for one product
-//! and only when the union covers every normative invariant.
+//! Evidence is typed by its lifecycle implementation and can only be minted by
+//! this crate after a suite returns. A manifest therefore cannot accept
+//! evidence from another product or implementation by relabeling strings.
 
 use std::collections::BTreeSet;
+use std::marker::PhantomData;
 
 const MAX_COVERAGE_ID_BYTES: usize = 128;
+
+/// Compile-time identity for one concrete product lifecycle implementation.
+///
+/// An adapter selects this identity as an associated type. The suite runners
+/// derive evidence identity from that type; callers provide only a component
+/// name.
+pub trait LifecycleImplementation: 'static {
+    const PRODUCT: &'static str;
+    const IMPLEMENTATION: &'static str;
+
+    fn validate() -> Result<(), AcceptanceError> {
+        validate_id("product", Self::PRODUCT)?;
+        validate_id("implementation", Self::IMPLEMENTATION)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
@@ -52,64 +68,39 @@ pub const REQUIRED_LIFECYCLE_INVARIANTS: [LifecycleInvariant; 18] = [
     LifecycleInvariant::SequenceExhaustion,
 ];
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CoverageBinding {
-    product: String,
-    implementation: String,
+pub struct CoverageEvidence<I: LifecycleImplementation> {
     component: String,
+    suite: &'static str,
+    invariants: BTreeSet<LifecycleInvariant>,
+    implementation: PhantomData<fn() -> I>,
 }
 
-impl CoverageBinding {
-    pub fn new(
-        product: &str,
-        implementation: &str,
+impl<I: LifecycleImplementation> CoverageEvidence<I> {
+    pub(crate) fn passed(
         component: &str,
-    ) -> Result<Self, AcceptanceError> {
-        validate_id("product", product)?;
-        validate_id("implementation", implementation)?;
-        validate_id("component", component)?;
-        Ok(Self {
-            product: product.to_owned(),
-            implementation: implementation.to_owned(),
+        suite: &'static str,
+        invariants: impl IntoIterator<Item = LifecycleInvariant>,
+    ) -> Self {
+        I::validate().expect("adapter lifecycle identity must be valid");
+        validate_id("component", component).expect("coverage component identity must be valid");
+        Self {
             component: component.to_owned(),
-        })
+            suite,
+            invariants: invariants.into_iter().collect(),
+            implementation: PhantomData,
+        }
     }
 
-    pub fn product(&self) -> &str {
-        &self.product
+    pub fn product(&self) -> &'static str {
+        I::PRODUCT
     }
 
     pub fn component(&self) -> &str {
         &self.component
     }
 
-    pub fn implementation(&self) -> &str {
-        &self.implementation
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CoverageEvidence {
-    binding: CoverageBinding,
-    suite: &'static str,
-    invariants: BTreeSet<LifecycleInvariant>,
-}
-
-impl CoverageEvidence {
-    pub(crate) fn passed(
-        binding: &CoverageBinding,
-        suite: &'static str,
-        invariants: impl IntoIterator<Item = LifecycleInvariant>,
-    ) -> Self {
-        Self {
-            binding: binding.clone(),
-            suite,
-            invariants: invariants.into_iter().collect(),
-        }
-    }
-
-    pub fn binding(&self) -> &CoverageBinding {
-        &self.binding
+    pub fn implementation(&self) -> &'static str {
+        I::IMPLEMENTATION
     }
 
     pub const fn suite(&self) -> &'static str {
@@ -121,22 +112,36 @@ impl CoverageEvidence {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LifecycleCoverageManifest {
-    product: String,
-    implementation: String,
+/// A complete manifest for exactly one compile-time lifecycle identity.
+///
+/// Evidence for another identity cannot be supplied:
+///
+/// ```compile_fail
+/// use platform_contract_testkit::{
+///     LifecycleCoverageManifest, LifecycleImplementation, ReferenceAdapter,
+///     compositional_lifecycle::run_transition_chain_suite,
+/// };
+///
+/// struct ForeignLifecycle;
+/// impl LifecycleImplementation for ForeignLifecycle {
+///     const PRODUCT: &'static str = "fte";
+///     const IMPLEMENTATION: &'static str = "gateway";
+/// }
+///
+/// let reference = run_transition_chain_suite::<ReferenceAdapter>("state-machine");
+/// let _ = LifecycleCoverageManifest::<ForeignLifecycle>::accept([reference]);
+/// ```
+pub struct LifecycleCoverageManifest<I: LifecycleImplementation> {
     components: BTreeSet<String>,
     covered: BTreeSet<LifecycleInvariant>,
+    implementation: PhantomData<fn() -> I>,
 }
 
-impl LifecycleCoverageManifest {
+impl<I: LifecycleImplementation> LifecycleCoverageManifest<I> {
     pub fn accept(
-        product: &str,
-        implementation: &str,
-        evidence: impl IntoIterator<Item = CoverageEvidence>,
+        evidence: impl IntoIterator<Item = CoverageEvidence<I>>,
     ) -> Result<Self, AcceptanceError> {
-        validate_id("product", product)?;
-        validate_id("implementation", implementation)?;
+        I::validate()?;
         let evidence = evidence.into_iter().collect::<Vec<_>>();
         if evidence.is_empty() {
             return Err(AcceptanceError::NoEvidence);
@@ -145,19 +150,7 @@ impl LifecycleCoverageManifest {
         let mut components = BTreeSet::new();
         let mut covered = BTreeSet::new();
         for item in evidence {
-            if item.binding.product != product {
-                return Err(AcceptanceError::WrongProduct {
-                    expected: product.to_owned(),
-                    actual: item.binding.product,
-                });
-            }
-            if item.binding.implementation != implementation {
-                return Err(AcceptanceError::WrongImplementation {
-                    expected: implementation.to_owned(),
-                    actual: item.binding.implementation,
-                });
-            }
-            components.insert(item.binding.component);
+            components.insert(item.component);
             covered.extend(item.invariants);
         }
         let missing = REQUIRED_LIFECYCLE_INVARIANTS
@@ -169,23 +162,22 @@ impl LifecycleCoverageManifest {
             return Err(AcceptanceError::MissingInvariants(missing));
         }
         Ok(Self {
-            product: product.to_owned(),
-            implementation: implementation.to_owned(),
             components,
             covered,
+            implementation: PhantomData,
         })
     }
 
-    pub fn product(&self) -> &str {
-        &self.product
+    pub fn product(&self) -> &'static str {
+        I::PRODUCT
     }
 
     pub fn components(&self) -> impl Iterator<Item = &str> {
         self.components.iter().map(String::as_str)
     }
 
-    pub fn implementation(&self) -> &str {
-        &self.implementation
+    pub fn implementation(&self) -> &'static str {
+        I::IMPLEMENTATION
     }
 
     pub fn covered(&self) -> impl Iterator<Item = LifecycleInvariant> + '_ {
@@ -201,10 +193,6 @@ pub enum AcceptanceError {
     InvalidIdentity { field: &'static str },
     #[error("lifecycle acceptance received no suite evidence")]
     NoEvidence,
-    #[error("coverage evidence names product {actual}, expected {expected}")]
-    WrongProduct { expected: String, actual: String },
-    #[error("coverage evidence names implementation {actual}, expected {expected}")]
-    WrongImplementation { expected: String, actual: String },
     #[error("lifecycle coverage is missing required invariants: {0:?}")]
     MissingInvariants(Vec<LifecycleInvariant>),
 }
@@ -225,15 +213,28 @@ fn validate_id(field: &'static str, value: &str) -> Result<(), AcceptanceError> 
 mod tests {
     use super::*;
 
+    struct ValidLifecycle;
+    impl LifecycleImplementation for ValidLifecycle {
+        const PRODUCT: &'static str = "loom";
+        const IMPLEMENTATION: &'static str = "interactive";
+    }
+
+    struct InvalidLifecycle;
+    impl LifecycleImplementation for InvalidLifecycle {
+        const PRODUCT: &'static str = "loom";
+        const IMPLEMENTATION: &'static str = "interactive generation";
+    }
+
     #[test]
-    fn coverage_bindings_reject_ambiguous_or_unsafe_identity() {
-        assert!(CoverageBinding::new("loom", "interactive", "host").is_ok());
+    fn lifecycle_and_component_identities_reject_ambiguous_or_unsafe_values() {
+        assert!(ValidLifecycle::validate().is_ok());
         assert!(matches!(
-            CoverageBinding::new("loom", "interactive generation", "host"),
+            InvalidLifecycle::validate(),
             Err(AcceptanceError::InvalidIdentity {
                 field: "implementation"
             })
         ));
-        assert!(CoverageBinding::new("loom", "interactive", "bad\\component").is_err());
+        assert!(validate_id("component", "host").is_ok());
+        assert!(validate_id("component", "bad\\component").is_err());
     }
 }

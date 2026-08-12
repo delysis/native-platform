@@ -10,11 +10,12 @@ test code. During W2 these bytes move into `delysis/native-platform`; the
 temporary copies are then retired.
 
 Lifecycle conformance also has an ownership-specific compositional surface.
-Its traits are grouped by proof obligation, not by product or runtime. Suites
-mint private coverage evidence only after their assertions return, and the
-coverage manifest rejects a named lifecycle implementation unless its union
-includes every ADR-003 invariant. Evidence cannot be mixed across products or
-across independent lifecycle implementations within one product. Cross-boundary obligations such as progress-to-shutdown and
+Its traits are grouped by proof obligation, not by product or runtime. Every
+adapter binds a compile-time product and implementation marker. Suites mint
+typed private coverage evidence only after their assertions return, and a
+manifest accepts only same-marker evidence whose union includes every ADR-003
+invariant. Callers cannot relabel reference evidence as product evidence.
+Cross-boundary obligations such as progress-to-shutdown and
 panic-to-shutdown remain bridge suites; unrelated component-local results
 cannot be combined into those claims. These are test traits only, never a new
 production runtime abstraction.

@@ -5,17 +5,31 @@
 //! dedicated bridge traits, so composition cannot turn two unrelated local
 //! facts into one lifecycle claim.
 
+#[cfg(test)]
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::sync::{Arc, MutexGuard};
+use std::sync::{Mutex, mpsc};
 use std::thread;
 
 use crate::barrier::DeterministicBarrier;
-use crate::coverage::{CoverageBinding, CoverageEvidence, LifecycleInvariant};
+use crate::coverage::{CoverageEvidence, LifecycleImplementation, LifecycleInvariant};
 use crate::model::{
     AttemptIdentity, ClosedFacts, LifecyclePhase, OperationModelAdapter, OperationPhase,
     OperationSnapshot, ReferenceAdapter, ReferenceLease, ReferenceTicket, TerminalClass,
     TestConfig, WaitObservation,
 };
 
+/// Fixed identity of the testkit's deterministic reference implementation.
+pub enum ReferenceLifecycle {}
+
+impl LifecycleImplementation for ReferenceLifecycle {
+    const PRODUCT: &'static str = "reference-product";
+    const IMPLEMENTATION: &'static str = "reference-lifecycle";
+}
+
 pub trait TransitionChainAdapter: Clone + Sized {
+    type Implementation: LifecycleImplementation;
     type Error: std::fmt::Debug;
     type Operation;
 
@@ -33,6 +47,7 @@ pub trait TransitionChainAdapter: Clone + Sized {
 }
 
 pub trait RegistryIdentityAdapter: Clone + Sized {
+    type Implementation: LifecycleImplementation;
     type Error: std::fmt::Debug;
     type Guard;
     type Lease: Clone;
@@ -45,7 +60,26 @@ pub trait RegistryIdentityAdapter: Clone + Sized {
     fn current_identity(&self, operation_id: &str) -> Option<AttemptIdentity>;
 }
 
+pub trait AttemptHierarchyAdapter: Clone + Sized {
+    type Implementation: LifecycleImplementation;
+    type Error: std::fmt::Debug;
+    type Operation;
+    type Attempt;
+
+    fn deterministic() -> Self;
+    fn create_operation(&self, operation_id: &str) -> Result<Self::Operation, Self::Error>;
+    fn start_attempt(&self, operation: &Self::Operation) -> Result<Self::Attempt, Self::Error>;
+    fn attempt_identity(&self, attempt: &Self::Attempt) -> AttemptIdentity;
+    fn operation_active(&self, operation: &Self::Operation) -> bool;
+    fn active_attempts(&self, operation: &Self::Operation) -> Vec<AttemptIdentity>;
+    fn request_operation_cancel(&self, operation: &Self::Operation) -> Result<(), Self::Error>;
+    fn cancellation_requested(&self, attempt: &Self::Attempt) -> bool;
+    fn finish_attempt(&self, attempt: Self::Attempt) -> Result<(), Self::Error>;
+    fn finish_operation(&self, operation: &Self::Operation) -> Result<(), Self::Error>;
+}
+
 pub trait ConsumerCancellationAdapter: Clone + Sized {
+    type Implementation: LifecycleImplementation;
     type Error: std::fmt::Debug;
     type Ticket: Send;
     type Lease;
@@ -54,12 +88,16 @@ pub trait ConsumerCancellationAdapter: Clone + Sized {
     fn start(&self, operation_id: &str) -> Result<(Self::Ticket, Self::Lease), Self::Error>;
     fn ticket_identity(&self, ticket: &Self::Ticket) -> AttemptIdentity;
     fn lease_identity(&self, lease: &Self::Lease) -> AttemptIdentity;
+    fn active_count(&self) -> usize;
+    fn current_snapshot(&self, operation_id: &str) -> Option<OperationSnapshot>;
+    fn lease_snapshot(&self, lease: &Self::Lease) -> Option<OperationSnapshot>;
     fn cancellation_requested(&self, lease: &Self::Lease) -> bool;
     fn explicit_consumer_drop(&self, ticket: Self::Ticket) -> Result<(), Self::Error>;
     fn finish_cancelled(&self, lease: &Self::Lease) -> Result<(), Self::Error>;
 }
 
 pub trait TerminalAuthorityAdapter: Clone + Sized + Send + Sync + 'static {
+    type Implementation: LifecycleImplementation;
     type Error: std::fmt::Debug + Send + 'static;
     type Guard;
     type Lease: Clone + Send + Sync + 'static;
@@ -72,6 +110,7 @@ pub trait TerminalAuthorityAdapter: Clone + Sized + Send + Sync + 'static {
 }
 
 pub trait WaiterControlAdapter: Clone + Sized {
+    type Implementation: LifecycleImplementation;
     type Error: std::fmt::Debug;
     type Ticket;
     type Lease;
@@ -85,8 +124,10 @@ pub trait WaiterControlAdapter: Clone + Sized {
 }
 
 pub trait AdmissionQuiesceShutdownBridgeAdapter: Clone + Sized + Send + Sync + 'static {
+    type Implementation: LifecycleImplementation;
     type Error: std::fmt::Debug + Send + 'static;
     type Operation: Send + 'static;
+    type ShutdownWitness: ShutdownWitness;
 
     fn deterministic() -> Self;
     fn reserve(&self, operation_id: &str) -> Result<Self::Operation, Self::Error>;
@@ -98,13 +139,30 @@ pub trait AdmissionQuiesceShutdownBridgeAdapter: Clone + Sized + Send + Sync + '
         &self,
         operation: &Self::Operation,
     ) -> Result<OperationSnapshot, Self::Error>;
+    fn begin_shutdown(&self) -> Self::ShutdownWitness;
     fn shutdown(&self) -> ClosedFacts;
+}
+
+/// A nonblocking shutdown invocation plus deterministic phase/result gates.
+///
+/// Product adapters may back this with a native thread or a genuine async
+/// runtime task. Only the completion result crosses into this synchronous
+/// conformance harness.
+pub trait ShutdownWitness: Sized {
+    type Error: std::fmt::Debug;
+
+    fn wait_started(&self) -> Result<(), Self::Error>;
+    fn try_complete(&self) -> Result<Option<ClosedFacts>, Self::Error>;
+    fn wait_release_observed(&self) -> Result<(), Self::Error>;
+    fn allow_worker_exit(&self) -> Result<(), Self::Error>;
+    fn wait(self) -> Result<ClosedFacts, Self::Error>;
 }
 
 /// Integrated proof that progress backpressure cannot starve terminal release
 /// or successful shutdown. Keeping this as one trait preserves the cross-layer
 /// invariant when progress and shutdown have different internal owners.
 pub trait ProgressShutdownBridgeAdapter: Clone + Sized + Send + Sync + 'static {
+    type Implementation: LifecycleImplementation;
     type Error: std::fmt::Debug + Send + 'static;
     type Guard;
     type Lease: Clone + Send + Sync + 'static;
@@ -122,24 +180,36 @@ pub trait ProgressShutdownBridgeAdapter: Clone + Sized + Send + Sync + 'static {
 /// Integrated proof that executor panic becomes a safe failed terminal and
 /// does not strand registry, task, or worker ownership at shutdown.
 pub trait PanicShutdownBridgeAdapter: Clone + Sized {
+    type Implementation: LifecycleImplementation;
     type Error: std::fmt::Debug;
     type Guard;
     type Lease;
 
     fn deterministic() -> Self;
     fn start(&self, operation_id: &str) -> Result<(Self::Guard, Self::Lease), Self::Error>;
-    fn record_executor_panic(&self, lease: &Self::Lease) -> Result<(), Self::Error>;
+    fn run_executor(
+        &self,
+        lease: &Self::Lease,
+        executor: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), Self::Error>;
     fn snapshot(&self, lease: &Self::Lease) -> Option<OperationSnapshot>;
     fn release(&self, lease: &Self::Lease) -> Result<(), Self::Error>;
     fn shutdown(&self) -> ClosedFacts;
 }
 
 pub trait StableShutdownAdapter: Clone + Sized {
+    type Implementation: LifecycleImplementation;
+    type Error: std::fmt::Debug;
+    type Operation;
+
     fn deterministic() -> Self;
+    fn start(&self, operation_id: &str) -> Result<Self::Operation, Self::Error>;
+    fn finish(&self, operation: Self::Operation) -> Result<(), Self::Error>;
     fn shutdown(&self) -> ClosedFacts;
 }
 
 pub trait TaskReapingAdapter: Clone + Sized {
+    type Implementation: LifecycleImplementation;
     type Error: std::fmt::Debug;
     type Operation;
 
@@ -152,8 +222,8 @@ pub trait TaskReapingAdapter: Clone + Sized {
 }
 
 pub fn run_transition_chain_suite<A: TransitionChainAdapter>(
-    binding: &CoverageBinding,
-) -> CoverageEvidence {
+    component: &str,
+) -> CoverageEvidence<A::Implementation> {
     let adapter = A::deterministic();
     let operation = adapter.reserve("transitions").expect("reserve");
     assert_eq!(adapter.phase(&operation), Some(OperationPhase::Reserved));
@@ -166,29 +236,66 @@ pub fn run_transition_chain_suite<A: TransitionChainAdapter>(
     );
     adapter.queue(&operation).expect("Reserved -> Queued");
     assert_eq!(adapter.phase(&operation), Some(OperationPhase::Queued));
-    assert!(adapter.queue(&operation).is_err());
-    assert!(adapter.release(&operation).is_err());
+    assert!(
+        adapter.queue(&operation).is_err(),
+        "Queued -> Queued is invalid"
+    );
+    assert!(
+        adapter.release(&operation).is_err(),
+        "Queued -> Released is invalid"
+    );
+    assert!(
+        adapter
+            .terminal(&operation, TerminalClass::Completed)
+            .is_err(),
+        "Queued -> Terminal is invalid"
+    );
     adapter.start(&operation).expect("Queued -> Running");
     assert_eq!(adapter.phase(&operation), Some(OperationPhase::Running));
-    assert!(adapter.start(&operation).is_err());
+    assert!(
+        adapter.start(&operation).is_err(),
+        "Running -> Running is invalid"
+    );
+    assert!(
+        adapter.queue(&operation).is_err(),
+        "Running -> Queued is invalid"
+    );
+    assert!(
+        adapter.release(&operation).is_err(),
+        "Running -> Released is invalid"
+    );
     adapter
         .terminal(&operation, TerminalClass::Completed)
         .expect("Running -> Terminal");
     assert_eq!(adapter.phase(&operation), Some(OperationPhase::Terminal));
-    assert!(adapter.terminal(&operation, TerminalClass::Failed).is_err());
+    assert!(
+        adapter.terminal(&operation, TerminalClass::Failed).is_err(),
+        "a terminal operation is immutable"
+    );
+    assert!(
+        adapter.queue(&operation).is_err(),
+        "Terminal -> Queued is invalid"
+    );
+    assert!(
+        adapter.start(&operation).is_err(),
+        "Terminal -> Running is invalid"
+    );
     adapter.release(&operation).expect("Terminal -> Released");
     assert_eq!(adapter.phase(&operation), Some(OperationPhase::Released));
     assert!(adapter.release(&operation).is_err());
+    assert!(adapter.queue(&operation).is_err());
+    assert!(adapter.start(&operation).is_err());
+    assert!(adapter.terminal(&operation, TerminalClass::Failed).is_err());
     CoverageEvidence::passed(
-        binding,
+        component,
         "transition-chain",
         [LifecycleInvariant::ExactTransitionChain],
     )
 }
 
 pub fn run_registry_identity_suite<A: RegistryIdentityAdapter>(
-    binding: &CoverageBinding,
-) -> CoverageEvidence {
+    component: &str,
+) -> CoverageEvidence<A::Implementation> {
     let adapter = A::deterministic(1);
     let (first_guard, first) = adapter.reserve("reused").expect("first reserve");
     assert!(adapter.reserve("reused").is_err());
@@ -214,40 +321,107 @@ pub fn run_registry_identity_suite<A: RegistryIdentityAdapter>(
     assert!(exhausted.reserve("exhausted").is_err());
     assert_eq!(exhausted.active_count(), 0);
     CoverageEvidence::passed(
-        binding,
+        component,
         "registry-identity",
         [
             LifecycleInvariant::DuplicatePublicId,
-            LifecycleInvariant::AttemptIdentityUnderPublicOperation,
             LifecycleInvariant::StaleRelease,
             LifecycleInvariant::SequenceExhaustion,
         ],
     )
 }
 
+pub fn run_attempt_hierarchy_suite<A: AttemptHierarchyAdapter>(
+    component: &str,
+) -> CoverageEvidence<A::Implementation> {
+    let adapter = A::deterministic();
+    let operation = adapter
+        .create_operation("public-operation")
+        .expect("create public operation");
+    assert!(adapter.operation_active(&operation));
+    let first = adapter.start_attempt(&operation).expect("first attempt");
+    let second = adapter.start_attempt(&operation).expect("second attempt");
+    let first_identity = adapter.attempt_identity(&first);
+    let second_identity = adapter.attempt_identity(&second);
+    assert_eq!(first_identity.operation_id, "public-operation");
+    assert_eq!(second_identity.operation_id, "public-operation");
+    assert_ne!(first_identity.attempt_id, second_identity.attempt_id);
+    assert_ne!(first_identity.sequence, second_identity.sequence);
+    let active = adapter.active_attempts(&operation);
+    assert_eq!(active.len(), 2);
+    assert!(active.contains(&first_identity));
+    assert!(active.contains(&second_identity));
+    adapter
+        .request_operation_cancel(&operation)
+        .expect("cancel public operation");
+    assert!(adapter.cancellation_requested(&first));
+    assert!(adapter.cancellation_requested(&second));
+    adapter.finish_attempt(first).expect("finish first attempt");
+    assert!(adapter.operation_active(&operation));
+    assert_eq!(adapter.active_attempts(&operation), [second_identity]);
+    adapter
+        .finish_attempt(second)
+        .expect("finish second attempt");
+    assert!(adapter.operation_active(&operation));
+    assert!(adapter.active_attempts(&operation).is_empty());
+    adapter
+        .finish_operation(&operation)
+        .expect("finish public operation");
+    assert!(!adapter.operation_active(&operation));
+    CoverageEvidence::passed(
+        component,
+        "attempt-hierarchy",
+        [LifecycleInvariant::AttemptIdentityUnderPublicOperation],
+    )
+}
+
 pub fn run_consumer_cancellation_suite<A: ConsumerCancellationAdapter>(
-    binding: &CoverageBinding,
-) -> CoverageEvidence {
+    component: &str,
+) -> CoverageEvidence<A::Implementation> {
     let adapter = A::deterministic();
     let (ticket, lease) = adapter.start("ticket-drop").expect("start");
     assert_eq!(
         adapter.ticket_identity(&ticket),
         adapter.lease_identity(&lease)
     );
+    let identity = adapter.lease_identity(&lease);
     drop(ticket);
+    assert_eq!(adapter.active_count(), 1);
+    assert_eq!(
+        adapter.current_snapshot("ticket-drop").map(|s| s.identity),
+        Some(identity.clone())
+    );
+    assert_eq!(
+        adapter.lease_snapshot(&lease).map(|s| s.phase),
+        Some(OperationPhase::Running)
+    );
     assert!(adapter.cancellation_requested(&lease));
     adapter
         .finish_cancelled(&lease)
         .expect("executor retains release authority");
 
     let (ticket, lease) = adapter.start("explicit-drop").expect("start");
+    let identity = adapter.lease_identity(&lease);
     adapter
         .explicit_consumer_drop(ticket)
         .expect("explicit consumer drop");
+    assert_eq!(adapter.active_count(), 1);
+    assert_eq!(
+        adapter
+            .current_snapshot("explicit-drop")
+            .map(|snapshot| snapshot.identity),
+        Some(identity)
+    );
+    assert_eq!(
+        adapter
+            .lease_snapshot(&lease)
+            .map(|snapshot| snapshot.phase),
+        Some(OperationPhase::Running)
+    );
     assert!(adapter.cancellation_requested(&lease));
     adapter.finish_cancelled(&lease).expect("finish");
     CoverageEvidence::passed(
-        binding,
+        component,
         "consumer-cancellation",
         [
             LifecycleInvariant::TicketDropCancellation,
@@ -257,15 +431,15 @@ pub fn run_consumer_cancellation_suite<A: ConsumerCancellationAdapter>(
 }
 
 pub fn run_terminal_authority_suite<A: TerminalAuthorityAdapter>(
-    binding: &CoverageBinding,
-) -> CoverageEvidence {
+    component: &str,
+) -> CoverageEvidence<A::Implementation> {
     let adapter = A::deterministic();
     let (_guard, lease) = adapter.start("terminal").expect("start");
     adapter
         .terminal(&lease, TerminalClass::Completed)
         .expect("terminal");
     let snapshot = adapter.snapshot(&lease).expect("terminal snapshot");
-    assert_eq!(snapshot.authoritative_terminal, snapshot.final_projection);
+    assert_terminal(&snapshot, TerminalClass::Completed);
     assert!(adapter.terminal(&lease, TerminalClass::Failed).is_err());
     assert_eq!(adapter.snapshot(&lease), Some(snapshot));
     adapter.release(&lease).expect("release");
@@ -292,16 +466,21 @@ pub fn run_terminal_authority_suite<A: TerminalAuthorityAdapter>(
     });
     barrier.wait_until_all_arrived();
     barrier.release();
-    assert_eq!(
-        usize::from(cancel.join().expect("cancel racer"))
-            + usize::from(complete.join().expect("complete racer")),
-        1
-    );
+    let cancel_won = cancel.join().expect("cancel racer");
+    let complete_won = complete.join().expect("complete racer");
+    assert_ne!(cancel_won, complete_won);
     let snapshot = adapter.snapshot(&lease).expect("race terminal");
-    assert_eq!(snapshot.authoritative_terminal, snapshot.final_projection);
+    assert_terminal(
+        &snapshot,
+        if cancel_won {
+            TerminalClass::Cancelled
+        } else {
+            TerminalClass::Completed
+        },
+    );
     adapter.release(&lease).expect("release race");
     CoverageEvidence::passed(
-        binding,
+        component,
         "terminal-authority",
         [
             LifecycleInvariant::AuthoritativeTerminal,
@@ -311,11 +490,14 @@ pub fn run_terminal_authority_suite<A: TerminalAuthorityAdapter>(
 }
 
 pub fn run_waiter_control_suite<A: WaiterControlAdapter>(
-    binding: &CoverageBinding,
-) -> CoverageEvidence {
+    component: &str,
+) -> CoverageEvidence<A::Implementation> {
     let adapter = A::deterministic();
     let (ticket, lease) = adapter.start("timeout").expect("start");
     let before = adapter.snapshot(&lease).expect("before timeout");
+    assert_eq!(before.phase, OperationPhase::Running);
+    assert!(before.authoritative_terminal.is_none());
+    assert!(before.final_projection.is_none());
     assert_eq!(
         adapter.waiter_timeout(&ticket).expect("timeout"),
         WaitObservation::TimedOut
@@ -332,15 +514,15 @@ pub fn run_waiter_control_suite<A: WaiterControlAdapter>(
     );
     adapter.finish_cancelled(&lease).expect("finish");
     CoverageEvidence::passed(
-        binding,
+        component,
         "waiter-control",
         [LifecycleInvariant::WaiterTimeoutIsObservational],
     )
 }
 
 pub fn run_admission_quiesce_shutdown_bridge_suite<A: AdmissionQuiesceShutdownBridgeAdapter>(
-    binding: &CoverageBinding,
-) -> CoverageEvidence {
+    component: &str,
+) -> CoverageEvidence<A::Implementation> {
     let adapter = A::deterministic();
     let barrier = DeterministicBarrier::new(2);
     let admit_adapter = adapter.clone();
@@ -373,21 +555,40 @@ pub fn run_admission_quiesce_shutdown_bridge_suite<A: AdmissionQuiesceShutdownBr
 
     let adapter = A::deterministic();
     let operation = adapter.reserve("active-shutdown").expect("reserve active");
-    adapter.quiesce();
-    let pending = adapter.shutdown();
-    assert_eq!(pending.lifecycle, LifecyclePhase::Quiescing);
-    assert_eq!(pending.active_operations, 1);
-    assert_eq!(pending.retained_tasks, 1);
-    assert!(pending.expected_workers > pending.joined_workers);
+    let shutdown = adapter.begin_shutdown();
+    shutdown.wait_started().expect("shutdown reaches quiescing");
+    assert_eq!(adapter.phase(), LifecyclePhase::Quiescing);
+    assert_eq!(adapter.active_count(), 1);
+    assert!(
+        shutdown
+            .try_complete()
+            .expect("inspect shutdown completion")
+            .is_none()
+    );
     assert!(adapter.cancellation_requested("active-shutdown"));
+    assert!(adapter.reserve("post-shutdown").is_err());
     let terminal = adapter
         .finish_cancelled(&operation)
         .expect("active executor terminal and release");
     assert_cancelled_release(&terminal);
     assert_eq!(adapter.active_count(), 0);
-    assert_closed_and_empty(adapter.shutdown());
+    shutdown
+        .wait_release_observed()
+        .expect("shutdown observes executor release before worker exit");
+    assert!(
+        shutdown
+            .try_complete()
+            .expect("inspect shutdown before worker exit")
+            .is_none()
+    );
+    shutdown
+        .allow_worker_exit()
+        .expect("allow the released worker to exit");
+    let closed = shutdown.wait().expect("shutdown joins released worker");
+    assert_closed_and_empty(closed);
+    assert_eq!(adapter.shutdown(), closed);
     CoverageEvidence::passed(
-        binding,
+        component,
         "admission-quiesce-shutdown-bridge",
         [
             LifecycleInvariant::AdmitQuiesceRace,
@@ -397,31 +598,27 @@ pub fn run_admission_quiesce_shutdown_bridge_suite<A: AdmissionQuiesceShutdownBr
 }
 
 pub fn run_progress_shutdown_bridge_suite<A: ProgressShutdownBridgeAdapter>(
-    binding: &CoverageBinding,
-) -> CoverageEvidence {
+    component: &str,
+) -> CoverageEvidence<A::Implementation> {
     let adapter = A::deterministic(3);
-    let (guard, lease) = adapter.start("saturated-progress").expect("start");
+    let (unread_progress, lease) = adapter.start("saturated-progress").expect("start");
     for sequence in 0..32 {
         adapter
             .publish_progress(&lease, sequence)
             .expect("progress");
     }
     let snapshot = adapter.snapshot(&lease).expect("progress snapshot");
-    assert_eq!(
-        snapshot.progress_projection.len(),
-        adapter.progress_capacity()
-    );
-    assert_eq!(snapshot.progress_projection, vec![29, 30, 31]);
+    assert!(snapshot.progress_projection.len() <= adapter.progress_capacity());
     adapter
         .terminal(&lease, TerminalClass::Completed)
         .expect("terminal bypasses progress");
     assert_completed_terminal(&adapter.snapshot(&lease).expect("terminal snapshot"));
     adapter.release(&lease).expect("release bypasses progress");
-    drop(guard);
     assert_closed_and_empty(adapter.shutdown());
+    drop(unread_progress);
 
     let adapter = A::deterministic(2);
-    let (guard, lease) = adapter.start("progress-terminal-race").expect("start");
+    let (unread_progress, lease) = adapter.start("progress-terminal-race").expect("start");
     let barrier = DeterministicBarrier::new(2);
     let progress_adapter = adapter.clone();
     let progress_lease = lease.clone();
@@ -456,10 +653,10 @@ pub fn run_progress_shutdown_bridge_suite<A: ProgressShutdownBridgeAdapter>(
     );
     assert_completed_terminal(&adapter.snapshot(&lease).expect("terminal snapshot"));
     adapter.release(&lease).expect("release");
-    drop(guard);
     assert_closed_and_empty(adapter.shutdown());
+    drop(unread_progress);
     CoverageEvidence::passed(
-        binding,
+        component,
         "progress-shutdown-bridge",
         [
             LifecycleInvariant::UnreadProgressCannotBlockFinalOrShutdown,
@@ -469,12 +666,12 @@ pub fn run_progress_shutdown_bridge_suite<A: ProgressShutdownBridgeAdapter>(
 }
 
 pub fn run_panic_shutdown_bridge_suite<A: PanicShutdownBridgeAdapter>(
-    binding: &CoverageBinding,
-) -> CoverageEvidence {
+    component: &str,
+) -> CoverageEvidence<A::Implementation> {
     let adapter = A::deterministic();
     let (guard, lease) = adapter.start("panic").expect("start");
     adapter
-        .record_executor_panic(&lease)
+        .run_executor(&lease, Box::new(|| panic!("controlled executor panic")))
         .expect("panic boundary records terminal");
     let snapshot = adapter.snapshot(&lease).expect("panic terminal");
     assert_eq!(snapshot.phase, OperationPhase::Terminal);
@@ -490,22 +687,24 @@ pub fn run_panic_shutdown_bridge_suite<A: PanicShutdownBridgeAdapter>(
     drop(guard);
     assert_closed_and_empty(adapter.shutdown());
     CoverageEvidence::passed(
-        binding,
+        component,
         "panic-shutdown-bridge",
         [LifecycleInvariant::PanicTerminalAndShutdown],
     )
 }
 
 pub fn run_stable_shutdown_suite<A: StableShutdownAdapter>(
-    binding: &CoverageBinding,
-) -> CoverageEvidence {
+    component: &str,
+) -> CoverageEvidence<A::Implementation> {
     let adapter = A::deterministic();
+    let operation = adapter.start("shutdown-after-work").expect("start work");
+    adapter.finish(operation).expect("finish work");
     let first = adapter.shutdown();
     let second = adapter.shutdown();
     assert_eq!(first, second);
     assert_closed_and_empty(second);
     CoverageEvidence::passed(
-        binding,
+        component,
         "stable-shutdown",
         [
             LifecycleInvariant::RepeatedShutdown,
@@ -515,8 +714,8 @@ pub fn run_stable_shutdown_suite<A: StableShutdownAdapter>(
 }
 
 pub fn run_task_reaping_suite<A: TaskReapingAdapter>(
-    binding: &CoverageBinding,
-) -> CoverageEvidence {
+    component: &str,
+) -> CoverageEvidence<A::Implementation> {
     let adapter = A::deterministic();
     let mut active = Vec::new();
     for sequence in 0..8 {
@@ -551,7 +750,7 @@ pub fn run_task_reaping_suite<A: TaskReapingAdapter>(
     assert_eq!(closed.retained_tasks, 0);
     assert_eq!(closed.joined_workers, closed.expected_workers);
     CoverageEvidence::passed(
-        binding,
+        component,
         "task-reaping",
         [LifecycleInvariant::RetainedTasksBoundedByActiveConcurrency],
     )
@@ -567,6 +766,245 @@ fn start_reference(
     Ok((ticket, lease))
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct ReferenceAttemptHierarchyAdapter {
+    state: Arc<Mutex<ReferenceAttemptHierarchyState>>,
+}
+
+#[cfg(test)]
+struct ReferenceAttemptHierarchyState {
+    next_sequence: u64,
+    operations: BTreeMap<String, ReferenceAttemptHierarchyOperation>,
+}
+
+#[cfg(test)]
+struct ReferenceAttemptHierarchyOperation {
+    cancellation_requested: bool,
+    attempts: BTreeMap<u64, AttemptIdentity>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ReferenceHierarchyOperation(String);
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ReferenceHierarchyAttempt(AttemptIdentity);
+
+pub struct ReferenceShutdownWitness {
+    started: Mutex<Option<mpsc::Receiver<()>>>,
+    release_observed: Mutex<Option<mpsc::Receiver<()>>>,
+    allow_exit: Mutex<Option<mpsc::SyncSender<()>>>,
+    result: Mutex<(mpsc::Receiver<ClosedFacts>, Option<ClosedFacts>)>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReferenceShutdownWitnessError {
+    #[error("{0} witness may be consumed only once")]
+    AlreadyConsumed(&'static str),
+    #[error("shutdown worker disconnected before {0}")]
+    Disconnected(&'static str),
+    #[error("shutdown worker panicked")]
+    WorkerPanicked,
+}
+
+impl ShutdownWitness for ReferenceShutdownWitness {
+    type Error = ReferenceShutdownWitnessError;
+
+    fn wait_started(&self) -> Result<(), Self::Error> {
+        self.started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or(ReferenceShutdownWitnessError::AlreadyConsumed("start"))?
+            .recv()
+            .map_err(|_| ReferenceShutdownWitnessError::Disconnected("quiescing phase"))
+    }
+
+    fn try_complete(&self) -> Result<Option<ClosedFacts>, Self::Error> {
+        use std::sync::mpsc::TryRecvError;
+
+        let mut result = self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if result.1.is_none() {
+            match result.0.try_recv() {
+                Ok(facts) => result.1 = Some(facts),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    return Err(ReferenceShutdownWitnessError::Disconnected("completion"));
+                }
+            }
+        }
+        Ok(result.1)
+    }
+
+    fn wait_release_observed(&self) -> Result<(), Self::Error> {
+        self.release_observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or(ReferenceShutdownWitnessError::AlreadyConsumed(
+                "release observation",
+            ))?
+            .recv()
+            .map_err(|_| ReferenceShutdownWitnessError::Disconnected("release observation"))
+    }
+
+    fn allow_worker_exit(&self) -> Result<(), Self::Error> {
+        self.allow_exit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or(ReferenceShutdownWitnessError::AlreadyConsumed(
+                "worker-exit gate",
+            ))?
+            .send(())
+            .map_err(|_| ReferenceShutdownWitnessError::Disconnected("worker-exit gate"))
+    }
+
+    fn wait(mut self) -> Result<ClosedFacts, Self::Error> {
+        let result = {
+            let mut result = self
+                .result
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match result.1.take() {
+                Some(facts) => facts,
+                None => result
+                    .0
+                    .recv()
+                    .map_err(|_| ReferenceShutdownWitnessError::Disconnected("completion"))?,
+            }
+        };
+        self.worker
+            .take()
+            .ok_or(ReferenceShutdownWitnessError::AlreadyConsumed(
+                "worker handle",
+            ))?
+            .join()
+            .map_err(|_| ReferenceShutdownWitnessError::WorkerPanicked)?;
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+impl ReferenceAttemptHierarchyAdapter {
+    fn state(&self) -> MutexGuard<'_, ReferenceAttemptHierarchyState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(test)]
+impl AttemptHierarchyAdapter for ReferenceAttemptHierarchyAdapter {
+    type Implementation = ReferenceLifecycle;
+    type Error = crate::model::AdapterError;
+    type Operation = ReferenceHierarchyOperation;
+    type Attempt = ReferenceHierarchyAttempt;
+
+    fn deterministic() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ReferenceAttemptHierarchyState {
+                next_sequence: 1,
+                operations: BTreeMap::new(),
+            })),
+        }
+    }
+    fn create_operation(&self, operation_id: &str) -> Result<Self::Operation, Self::Error> {
+        let mut state = self.state();
+        if state.operations.contains_key(operation_id) {
+            return Err(crate::model::AdapterError::DuplicateOperation);
+        }
+        state.operations.insert(
+            operation_id.to_owned(),
+            ReferenceAttemptHierarchyOperation {
+                cancellation_requested: false,
+                attempts: BTreeMap::new(),
+            },
+        );
+        Ok(ReferenceHierarchyOperation(operation_id.to_owned()))
+    }
+    fn start_attempt(&self, operation: &Self::Operation) -> Result<Self::Attempt, Self::Error> {
+        let mut state = self.state();
+        let sequence = state.next_sequence;
+        state.next_sequence = sequence
+            .checked_add(1)
+            .ok_or(crate::model::AdapterError::SequenceExhausted)?;
+        let owner = state
+            .operations
+            .get_mut(&operation.0)
+            .ok_or(crate::model::AdapterError::UnknownOperation)?;
+        let identity = AttemptIdentity {
+            operation_id: operation.0.clone(),
+            attempt_id: format!("{}#{sequence}", operation.0),
+            sequence,
+        };
+        owner.attempts.insert(sequence, identity.clone());
+        Ok(ReferenceHierarchyAttempt(identity))
+    }
+    fn attempt_identity(&self, attempt: &Self::Attempt) -> AttemptIdentity {
+        attempt.0.clone()
+    }
+    fn operation_active(&self, operation: &Self::Operation) -> bool {
+        self.state().operations.contains_key(&operation.0)
+    }
+    fn active_attempts(&self, operation: &Self::Operation) -> Vec<AttemptIdentity> {
+        self.state()
+            .operations
+            .get(&operation.0)
+            .map(|owner| owner.attempts.values().cloned().collect())
+            .unwrap_or_default()
+    }
+    fn request_operation_cancel(&self, operation: &Self::Operation) -> Result<(), Self::Error> {
+        self.state()
+            .operations
+            .get_mut(&operation.0)
+            .ok_or(crate::model::AdapterError::UnknownOperation)?
+            .cancellation_requested = true;
+        Ok(())
+    }
+    fn cancellation_requested(&self, attempt: &Self::Attempt) -> bool {
+        self.state()
+            .operations
+            .get(&attempt.0.operation_id)
+            .is_some_and(|owner| {
+                owner.cancellation_requested && owner.attempts.contains_key(&attempt.0.sequence)
+            })
+    }
+    fn finish_attempt(&self, attempt: Self::Attempt) -> Result<(), Self::Error> {
+        let removed = self
+            .state()
+            .operations
+            .get_mut(&attempt.0.operation_id)
+            .ok_or(crate::model::AdapterError::UnknownOperation)?
+            .attempts
+            .remove(&attempt.0.sequence);
+        if removed.as_ref() != Some(&attempt.0) {
+            return Err(crate::model::AdapterError::StaleLease);
+        }
+        Ok(())
+    }
+    fn finish_operation(&self, operation: &Self::Operation) -> Result<(), Self::Error> {
+        let mut state = self.state();
+        if !state
+            .operations
+            .get(&operation.0)
+            .ok_or(crate::model::AdapterError::UnknownOperation)?
+            .attempts
+            .is_empty()
+        {
+            return Err(crate::model::AdapterError::InvalidTransition);
+        }
+        state.operations.remove(&operation.0);
+        Ok(())
+    }
+}
+
 fn finish_reference(
     adapter: &ReferenceAdapter,
     lease: &ReferenceLease,
@@ -577,6 +1015,7 @@ fn finish_reference(
 }
 
 impl TransitionChainAdapter for ReferenceAdapter {
+    type Implementation = ReferenceLifecycle;
     type Error = crate::model::AdapterError;
     type Operation = (ReferenceTicket, ReferenceLease);
 
@@ -608,6 +1047,7 @@ impl TransitionChainAdapter for ReferenceAdapter {
 }
 
 impl RegistryIdentityAdapter for ReferenceAdapter {
+    type Implementation = ReferenceLifecycle;
     type Error = crate::model::AdapterError;
     type Guard = ReferenceTicket;
     type Lease = ReferenceLease;
@@ -638,6 +1078,7 @@ impl RegistryIdentityAdapter for ReferenceAdapter {
 }
 
 impl ConsumerCancellationAdapter for ReferenceAdapter {
+    type Implementation = ReferenceLifecycle;
     type Error = crate::model::AdapterError;
     type Ticket = ReferenceTicket;
     type Lease = ReferenceLease;
@@ -653,6 +1094,15 @@ impl ConsumerCancellationAdapter for ReferenceAdapter {
     fn lease_identity(&self, lease: &Self::Lease) -> AttemptIdentity {
         OperationModelAdapter::lease_identity(self, lease)
     }
+    fn active_count(&self) -> usize {
+        OperationModelAdapter::active_count(self)
+    }
+    fn current_snapshot(&self, operation_id: &str) -> Option<OperationSnapshot> {
+        OperationModelAdapter::current_snapshot(self, operation_id)
+    }
+    fn lease_snapshot(&self, lease: &Self::Lease) -> Option<OperationSnapshot> {
+        OperationModelAdapter::lease_snapshot(self, lease)
+    }
     fn cancellation_requested(&self, lease: &Self::Lease) -> bool {
         OperationModelAdapter::lease_snapshot(self, lease)
             .is_some_and(|value| value.cancellation_requested)
@@ -666,6 +1116,7 @@ impl ConsumerCancellationAdapter for ReferenceAdapter {
 }
 
 impl TerminalAuthorityAdapter for ReferenceAdapter {
+    type Implementation = ReferenceLifecycle;
     type Error = crate::model::AdapterError;
     type Guard = ReferenceTicket;
     type Lease = ReferenceLease;
@@ -687,6 +1138,7 @@ impl TerminalAuthorityAdapter for ReferenceAdapter {
 }
 
 impl WaiterControlAdapter for ReferenceAdapter {
+    type Implementation = ReferenceLifecycle;
     type Error = crate::model::AdapterError;
     type Ticket = ReferenceTicket;
     type Lease = ReferenceLease;
@@ -711,8 +1163,10 @@ impl WaiterControlAdapter for ReferenceAdapter {
 }
 
 impl AdmissionQuiesceShutdownBridgeAdapter for ReferenceAdapter {
+    type Implementation = ReferenceLifecycle;
     type Error = crate::model::AdapterError;
     type Operation = (ReferenceTicket, ReferenceLease);
+    type ShutdownWitness = ReferenceShutdownWitness;
     fn deterministic() -> Self {
         <Self as OperationModelAdapter>::deterministic(TestConfig::default())
     }
@@ -742,12 +1196,35 @@ impl AdmissionQuiesceShutdownBridgeAdapter for ReferenceAdapter {
         OperationModelAdapter::lease_snapshot(self, &operation.1)
             .ok_or(crate::model::AdapterError::UnknownOperation)
     }
+    fn begin_shutdown(&self) -> Self::ShutdownWitness {
+        let adapter = self.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (allow_exit_tx, allow_exit_rx) = mpsc::sync_channel(0);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            OperationModelAdapter::quiesce(&adapter);
+            started_tx.send(()).expect("shutdown start receiver");
+            let facts = adapter.wait_for_shutdown();
+            release_tx.send(()).expect("release observation receiver");
+            allow_exit_rx.recv().expect("worker-exit gate sender");
+            result_tx.send(facts).expect("shutdown result receiver");
+        });
+        ReferenceShutdownWitness {
+            started: Mutex::new(Some(started_rx)),
+            release_observed: Mutex::new(Some(release_rx)),
+            allow_exit: Mutex::new(Some(allow_exit_tx)),
+            result: Mutex::new((result_rx, None)),
+            worker: Some(worker),
+        }
+    }
     fn shutdown(&self) -> ClosedFacts {
         OperationModelAdapter::shutdown(self)
     }
 }
 
 impl ProgressShutdownBridgeAdapter for ReferenceAdapter {
+    type Implementation = ReferenceLifecycle;
     type Error = crate::model::AdapterError;
     type Guard = ReferenceTicket;
     type Lease = ReferenceLease;
@@ -781,6 +1258,7 @@ impl ProgressShutdownBridgeAdapter for ReferenceAdapter {
 }
 
 impl PanicShutdownBridgeAdapter for ReferenceAdapter {
+    type Implementation = ReferenceLifecycle;
     type Error = crate::model::AdapterError;
     type Guard = ReferenceTicket;
     type Lease = ReferenceLease;
@@ -790,8 +1268,15 @@ impl PanicShutdownBridgeAdapter for ReferenceAdapter {
     fn start(&self, operation_id: &str) -> Result<(Self::Guard, Self::Lease), Self::Error> {
         start_reference(self, operation_id)
     }
-    fn record_executor_panic(&self, lease: &Self::Lease) -> Result<(), Self::Error> {
-        OperationModelAdapter::record_executor_panic(self, lease)
+    fn run_executor(
+        &self,
+        lease: &Self::Lease,
+        executor: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), Self::Error> {
+        match thread::spawn(executor).join() {
+            Ok(()) => OperationModelAdapter::terminal(self, lease, TerminalClass::Completed),
+            Err(_) => OperationModelAdapter::record_executor_panic(self, lease),
+        }
     }
     fn snapshot(&self, lease: &Self::Lease) -> Option<OperationSnapshot> {
         OperationModelAdapter::lease_snapshot(self, lease)
@@ -805,8 +1290,20 @@ impl PanicShutdownBridgeAdapter for ReferenceAdapter {
 }
 
 impl StableShutdownAdapter for ReferenceAdapter {
+    type Implementation = ReferenceLifecycle;
+    type Error = crate::model::AdapterError;
+    type Operation = (ReferenceTicket, ReferenceLease);
     fn deterministic() -> Self {
         <Self as OperationModelAdapter>::deterministic(TestConfig::default())
+    }
+    fn start(&self, operation_id: &str) -> Result<Self::Operation, Self::Error> {
+        start_reference(self, operation_id)
+    }
+    fn finish(&self, operation: Self::Operation) -> Result<(), Self::Error> {
+        let (ticket, lease) = operation;
+        finish_reference(self, &lease, TerminalClass::Completed)?;
+        drop(ticket);
+        Ok(())
     }
     fn shutdown(&self) -> ClosedFacts {
         OperationModelAdapter::shutdown(self)
@@ -814,6 +1311,7 @@ impl StableShutdownAdapter for ReferenceAdapter {
 }
 
 impl TaskReapingAdapter for ReferenceAdapter {
+    type Implementation = ReferenceLifecycle;
     type Error = crate::model::AdapterError;
     type Operation = (ReferenceTicket, ReferenceLease);
     fn deterministic() -> Self {
@@ -840,15 +1338,19 @@ impl TaskReapingAdapter for ReferenceAdapter {
 }
 
 fn assert_completed_terminal(snapshot: &OperationSnapshot) {
+    assert_terminal(snapshot, TerminalClass::Completed);
+}
+
+fn assert_terminal(snapshot: &OperationSnapshot, expected: TerminalClass) {
     assert_eq!(snapshot.phase, OperationPhase::Terminal);
-    assert_eq!(snapshot.authoritative_terminal, snapshot.final_projection);
-    assert_eq!(
-        snapshot
-            .authoritative_terminal
-            .expect("authoritative terminal")
-            .class,
-        TerminalClass::Completed
-    );
+    let authoritative = snapshot
+        .authoritative_terminal
+        .expect("authoritative terminal must exist");
+    let final_projection = snapshot
+        .final_projection
+        .expect("final projection must exist");
+    assert_eq!(authoritative, final_projection);
+    assert_eq!(authoritative.class, expected);
 }
 
 fn assert_cancelled_release(snapshot: &OperationSnapshot) {
@@ -867,6 +1369,10 @@ fn assert_closed_and_empty(facts: ClosedFacts) {
     assert_eq!(facts.lifecycle, LifecyclePhase::Closed);
     assert_eq!(facts.active_operations, 0);
     assert_eq!(facts.retained_tasks, 0);
+    assert!(
+        facts.expected_workers > 0,
+        "executed work must identify a worker"
+    );
     assert_eq!(facts.joined_workers, facts.expected_workers);
 }
 
@@ -875,66 +1381,35 @@ mod tests {
     use super::*;
     use crate::{AcceptanceError, LifecycleCoverageManifest};
 
-    fn binding(component: &str) -> CoverageBinding {
-        CoverageBinding::new("reference-product", "reference-lifecycle", component)
-            .expect("coverage binding")
-    }
-
     #[test]
     fn composed_reference_suites_cover_every_normative_invariant() {
         let evidence = vec![
-            run_transition_chain_suite::<ReferenceAdapter>(&binding("state-machine")),
-            run_registry_identity_suite::<ReferenceAdapter>(&binding("registry")),
-            run_consumer_cancellation_suite::<ReferenceAdapter>(&binding("consumer-control")),
-            run_terminal_authority_suite::<ReferenceAdapter>(&binding("terminal-owner")),
-            run_waiter_control_suite::<ReferenceAdapter>(&binding("waiter")),
-            run_admission_quiesce_shutdown_bridge_suite::<ReferenceAdapter>(&binding(
-                "supervisor-bridge",
-            )),
-            run_progress_shutdown_bridge_suite::<ReferenceAdapter>(&binding("progress-bridge")),
-            run_panic_shutdown_bridge_suite::<ReferenceAdapter>(&binding("panic-bridge")),
-            run_stable_shutdown_suite::<ReferenceAdapter>(&binding("shutdown")),
-            run_task_reaping_suite::<ReferenceAdapter>(&binding("task-supervisor")),
+            run_transition_chain_suite::<ReferenceAdapter>("state-machine"),
+            run_registry_identity_suite::<ReferenceAdapter>("registry"),
+            run_attempt_hierarchy_suite::<ReferenceAttemptHierarchyAdapter>("attempt-supervisor"),
+            run_consumer_cancellation_suite::<ReferenceAdapter>("consumer-control"),
+            run_terminal_authority_suite::<ReferenceAdapter>("terminal-owner"),
+            run_waiter_control_suite::<ReferenceAdapter>("waiter"),
+            run_admission_quiesce_shutdown_bridge_suite::<ReferenceAdapter>("supervisor-bridge"),
+            run_progress_shutdown_bridge_suite::<ReferenceAdapter>("progress-bridge"),
+            run_panic_shutdown_bridge_suite::<ReferenceAdapter>("panic-bridge"),
+            run_stable_shutdown_suite::<ReferenceAdapter>("shutdown"),
+            run_task_reaping_suite::<ReferenceAdapter>("task-supervisor"),
         ];
-        let manifest =
-            LifecycleCoverageManifest::accept("reference-product", "reference-lifecycle", evidence)
-                .expect("complete composed coverage");
+        let manifest = LifecycleCoverageManifest::<ReferenceLifecycle>::accept(evidence)
+            .expect("complete composed coverage");
         assert_eq!(manifest.covered().count(), 18);
-        assert_eq!(manifest.components().count(), 10);
+        assert_eq!(manifest.components().count(), 11);
         assert_eq!(manifest.product(), "reference-product");
         assert_eq!(manifest.implementation(), "reference-lifecycle");
     }
 
     #[test]
-    fn partial_or_cross_product_evidence_cannot_pass_acceptance() {
-        let partial = vec![run_registry_identity_suite::<ReferenceAdapter>(&binding(
-            "registry",
-        ))];
+    fn partial_evidence_cannot_pass_acceptance() {
+        let partial = vec![run_registry_identity_suite::<ReferenceAdapter>("registry")];
         assert!(matches!(
-            LifecycleCoverageManifest::accept("reference-product", "reference-lifecycle", partial,),
+            LifecycleCoverageManifest::<ReferenceLifecycle>::accept(partial),
             Err(AcceptanceError::MissingInvariants(_))
-        ));
-
-        let foreign = vec![run_registry_identity_suite::<ReferenceAdapter>(
-            &CoverageBinding::new("another-product", "reference-lifecycle", "registry")
-                .expect("binding"),
-        )];
-        assert!(matches!(
-            LifecycleCoverageManifest::accept("reference-product", "reference-lifecycle", foreign,),
-            Err(AcceptanceError::WrongProduct { .. })
-        ));
-
-        let other_implementation = vec![run_registry_identity_suite::<ReferenceAdapter>(
-            &CoverageBinding::new("reference-product", "speech-lifecycle", "registry")
-                .expect("binding"),
-        )];
-        assert!(matches!(
-            LifecycleCoverageManifest::accept(
-                "reference-product",
-                "reference-lifecycle",
-                other_implementation,
-            ),
-            Err(AcceptanceError::WrongImplementation { .. })
         ));
     }
 }

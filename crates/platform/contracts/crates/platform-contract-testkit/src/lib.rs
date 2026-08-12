@@ -17,7 +17,7 @@ pub mod publication_suite;
 pub use platform_contracts_v0 as contracts;
 
 pub use coverage::{
-    AcceptanceError, CoverageBinding, CoverageEvidence, LifecycleCoverageManifest,
+    AcceptanceError, CoverageEvidence, LifecycleCoverageManifest, LifecycleImplementation,
     LifecycleInvariant,
 };
 pub use envelope_suite::{validate_capability_snapshot_v0, validate_service_error_v0};
