@@ -18,6 +18,11 @@ fn loom_projection_requires_the_quiet_caret_local_contract() {
         ("persistent_candidate_count", FactValueV0::Boolean(true)),
         ("skip_to_manuscript_control", FactValueV0::Boolean(true)),
         ("primary_use_this_control", FactValueV0::Boolean(true)),
+        ("stale_suggestion_promoted", FactValueV0::Boolean(true)),
+        (
+            "ordinary_tab_action",
+            FactValueV0::Text("tab_consumed_without_edit".to_owned()),
+        ),
         (
             "additional_candidates",
             FactValueV0::Text("always_visible".to_owned()),

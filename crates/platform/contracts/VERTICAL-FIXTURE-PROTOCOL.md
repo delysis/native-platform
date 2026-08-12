@@ -117,4 +117,7 @@ Tab performs ordinary editor tab or indentation behavior. Additional
 candidates remain hidden until explicit review. Persistent candidate-count
 chrome, a `Skip to manuscript` control, and a primary `Use this` control are
 forbidden. The ghost and exact-boundary Tab behavior are the ordinary
-autocomplete interaction.
+autocomplete interaction. A stale suggestion must not be promoted, but that
+does not make Tab inert: the same keypress performs the ordinary tab edit. The
+projection records those as separate facts and does not claim that the
+manuscript remains unchanged after an ordinary Tab insertion.
