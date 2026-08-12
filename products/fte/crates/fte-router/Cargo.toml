@@ -1,0 +1,25 @@
+[package]
+name = "fte-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Test-only adapter for the immutable Wave 1 platform contract snapshot.
+unstable-w1-contract-tests = ["dep:platform-contract-testkit"]
+
+[dependencies]
+fte-types = { path = "../fte-types" }
+platform-contract-testkit = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821", optional = true }
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

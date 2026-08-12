@@ -1,0 +1,15 @@
+[package]
+name = "fte-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+fte-types = { path = "../fte-types" }
+rusqlite.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

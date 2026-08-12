@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fte-types",
+    "crates/fte-protocols",
+    "crates/fte-router",
+    "crates/fte-providers",
+    "crates/fte-store",
+    "crates/fte-backend-llama",
+    "crates/fte-loopback",
+    "crates/tauri-plugin-free-token-energy",
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/delysis/free-token-energy"
+rust-version = "1.88"
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+async-stream = "0.3.6"
+axum = "0.8.9"
+bytes = "1.11.1"
+futures = "0.3.32"
+http = "1"
+http-body-util = "0.1"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1.52.1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["limit", "timeout"] }
+tracing = "0.1.44"
+uuid = { version = "1", features = ["v4", "serde"] }
+llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
+llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+undocumented_unsafe_blocks = "deny"

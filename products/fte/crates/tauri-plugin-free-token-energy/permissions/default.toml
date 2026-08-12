@@ -1,0 +1,12 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = "Read gateway state and use configured generation routes. Loopback listener control requires separate permissions."
+permissions = [
+  "allow-gateway-status",
+  "allow-gateway-models",
+  "allow-gateway-generate",
+  "allow-gateway-stream",
+  "allow-gateway-cancel",
+  "allow-loopback-status",
+]

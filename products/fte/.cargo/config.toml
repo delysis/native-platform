@@ -1,0 +1,8 @@
+[build]
+target-dir = "src-tauri/target"
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = "13.0"
+
+[net]
+git-fetch-with-cli = true

@@ -1,0 +1,520 @@
+{
+  "generated_at": "2026-05-17",
+  "policy_schema": {
+    "prompt_adapter": [
+      "openai_chat",
+      "anthropic_messages",
+      "gemini_generate_content",
+      "harmony",
+      "family_native_chat_template"
+    ],
+    "reasoning_modes": [
+      "none_exposed",
+      "optional",
+      "always",
+      "budgeted",
+      "interleaved",
+      "harmony_channels",
+      "api_reasoning_content"
+    ],
+    "history_policies": [
+      "drop",
+      "drop_thinking",
+      "preserve_on_tool",
+      "preserve_all",
+      "preserve_channels",
+      "preserve_thought_signatures"
+    ]
+  },
+  "endpoint_surfaces": {
+    "openai_chat_completions": {
+      "path": "/v1/chat/completions",
+      "stream_format": "openai_data_sse",
+      "tool_schema": "openai_tools",
+      "response_shape": "choices[].message"
+    },
+    "openai_completions": {
+      "path": "/v1/completions",
+      "stream_format": "openai_data_sse",
+      "tool_schema": "unsupported",
+      "response_shape": "choices[].text"
+    },
+    "openai_responses": {
+      "path": "/v1/responses",
+      "stream_format": "semantic_sse_events",
+      "tool_schema": "responses_function_tools",
+      "response_shape": "output[]"
+    },
+    "anthropic_messages": {
+      "path": "/v1/messages",
+      "stream_format": "anthropic_typed_sse",
+      "tool_schema": "anthropic_tools",
+      "response_shape": "content[]"
+    },
+    "gemini_generate_content": {
+      "path": "/v1beta/models/{model}:generateContent",
+      "stream_path": "/v1beta/models/{model}:streamGenerateContent",
+      "stream_format": "gemini_generate_content_sse",
+      "tool_schema": "gemini_function_declarations",
+      "response_shape": "candidates[]"
+    }
+  },
+  "providers": {
+    "anthropic": {
+      "native_endpoint": "https://api.anthropic.com/v1/messages",
+      "auth": {
+        "api_key_header": "x-api-key",
+        "required_headers": {
+          "anthropic-version": "2023-06-01"
+        },
+        "dynamic_headers": [
+          "anthropic-beta"
+        ]
+      },
+      "role_policy": {
+        "allowed_native_roles": [
+          "user",
+          "assistant"
+        ],
+        "system_mapping": "top_level_system",
+        "developer_mapping": "top_level_system_labeled",
+        "tool_result_mapping": "user.content[].tool_result",
+        "merge_consecutive_same_role_turns": true
+      },
+      "reasoning": {
+        "request_field": "thinking",
+        "manual_form": {
+          "type": "enabled",
+          "requires_budget_tokens": true
+        },
+        "adaptive_form": {
+          "type": "adaptive",
+          "supports_effort_when_model_supports": true
+        },
+        "response_blocks": [
+          "thinking",
+          "redacted_thinking"
+        ],
+        "history_policy": "preserve_on_tool",
+        "signature_policy": "opaque_round_trip"
+      },
+      "tools": {
+        "tool_use_block": "assistant.content[].tool_use",
+        "tool_result_block": "user.content[].tool_result",
+        "tool_results_must_immediately_follow_tool_use": true,
+        "tool_results_first_in_user_content": true,
+        "parallel_tool_results_single_user_message": true,
+        "stream_partial_arguments": "input_json_delta"
+      },
+      "streaming": {
+        "events": [
+          "message_start",
+          "content_block_start",
+          "content_block_delta",
+          "content_block_stop",
+          "message_delta",
+          "message_stop",
+          "ping",
+          "error"
+        ],
+        "delta_types": [
+          "text_delta",
+          "input_json_delta",
+          "thinking_delta",
+          "signature_delta",
+          "citations_delta"
+        ],
+        "unknown_event_policy": "ignore_but_log"
+      },
+      "multimodal": {
+        "image_sources": [
+          "base64",
+          "url",
+          "file"
+        ],
+        "image_media_types": [
+          "image/jpeg",
+          "image/png",
+          "image/gif",
+          "image/webp"
+        ],
+        "pdf_block_type": "document"
+      },
+      "citations": [
+        {
+          "url": "https://platform.claude.com/docs/en/api/messages/create",
+          "quote": "there is no \"system\" role"
+        },
+        {
+          "url": "https://platform.claude.com/docs/en/build-with-claude/streaming",
+          "quote": "new event types may be added"
+        },
+        {
+          "url": "https://platform.claude.com/docs/en/build-with-claude/extended-thinking",
+          "quote": "pass `thinking` blocks back"
+        },
+        {
+          "url": "https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls",
+          "quote": "Tool result blocks must immediately follow"
+        }
+      ]
+    },
+    "google_gemini": {
+      "native_endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+      "native_stream_endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse",
+      "auth": {
+        "api_key_header": "x-goog-api-key",
+        "openai_compatible_auth": "Authorization: Bearer GEMINI_API_KEY"
+      },
+      "role_policy": {
+        "system_mapping": "systemInstruction.parts[].text",
+        "assistant_role": "model",
+        "tool_result_mapping": "contents[].role=user parts[].functionResponse",
+        "preserve_model_parts_between_turns": true,
+        "preserve_thought_signatures": true,
+        "preserve_function_call_ids": true
+      },
+      "reasoning": {
+        "request_field": "generationConfig.thinkingConfig.thinkingBudget",
+        "reasoning_effort_map": {
+          "none": 0,
+          "low": 1024,
+          "minimal": 1024,
+          "medium": 8192,
+          "high": 24576
+        }
+      },
+      "model_policies": {
+        "gemini-2.5-pro": {
+          "thinking_budget": {
+            "disable": false,
+            "min": 128,
+            "max": 32768,
+            "default": "dynamic"
+          }
+        },
+        "gemini-2.5-flash": {
+          "thinking_budget": {
+            "disable_budget": 0,
+            "min": 1,
+            "max": 24576,
+            "default": "dynamic"
+          }
+        },
+        "gemini-2.5-flash-lite": {
+          "thinking_budget": {
+            "disable_budget": 0,
+            "min": 512,
+            "max": 24576,
+            "default": "off"
+          }
+        }
+      },
+      "tools": {
+        "function_call_part": "functionCall",
+        "function_response_part": "functionResponse",
+        "google_search_tool_modern": "googleSearch"
+      },
+      "citations": [
+        {
+          "url": "https://ai.google.dev/api/generate-content",
+          "quote": "contents[] Required"
+        },
+        {
+          "url": "https://ai.google.dev/gemini-api/docs/text-generation",
+          "quote": "streamGenerateContent?alt=sse"
+        },
+        {
+          "url": "https://ai.google.dev/gemini-api/docs/thinking",
+          "quote": "use `thinkingBudget` instead"
+        },
+        {
+          "url": "https://ai.google.dev/gemini-api/docs/function-calling",
+          "quote": "include the exact `id`"
+        }
+      ]
+    }
+  },
+  "model_families": {
+    "qwen3": {
+      "prompt_adapter": "family_native_chat_template",
+      "reasoning": {
+        "mode": "optional",
+        "request_field": "enable_thinking",
+        "inline_controls": [
+          "/think",
+          "/no_think"
+        ],
+        "response_field": "think_tags",
+        "history_policy": "drop_thinking"
+      },
+      "tools": {
+        "parser": "qwen_agent_or_qwen3",
+        "avoid_parsers": [
+          "react_stopword"
+        ]
+      },
+      "variants": {
+        "qwen3-instruct-2507": {
+          "reasoning_mode": "none_exposed"
+        },
+        "qwen3-thinking-2507": {
+          "reasoning_mode": "always"
+        },
+        "qwen3-coder": {
+          "reasoning_mode": "none_exposed",
+          "native_context_tokens": 262144,
+          "yarn_context_tokens": 1048576
+        }
+      },
+      "citations": [
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3-235B-A22B",
+          "quote": "switching between thinking mode"
+        },
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507",
+          "quote": "supports only non-thinking mode"
+        },
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3-235B-A22B-Thinking-2507",
+          "quote": "supports only thinking mode"
+        },
+        {
+          "url": "https://qwen.readthedocs.io/en/latest/framework/function_call.html",
+          "quote": "Function Calling"
+        }
+      ]
+    },
+    "deepseek": {
+      "prompt_adapter": "family_native_chat_template",
+      "reasoning": {
+        "mode": "api_reasoning_content",
+        "request_fields": [
+          "thinking.type",
+          "reasoning_effort"
+        ],
+        "response_field": "reasoning_content",
+        "history_policy": "preserve_on_tool"
+      },
+      "provider_aliases": {
+        "deepseek-chat": "non_thinking",
+        "deepseek-reasoner": "thinking"
+      },
+      "context_tokens": 131072,
+      "citations": [
+        {
+          "url": "https://api-docs.deepseek.com/guides/thinking_mode",
+          "quote": "must be fully passed back"
+        },
+        {
+          "url": "https://api-docs.deepseek.com/news/news250821",
+          "quote": "128K context for both"
+        },
+        {
+          "url": "https://huggingface.co/deepseek-ai/DeepSeek-R1",
+          "quote": "DeepSeek-R1"
+        }
+      ]
+    },
+    "gpt_oss": {
+      "prompt_adapter": "harmony",
+      "reasoning": {
+        "mode": "harmony_channels",
+        "request_field": "system_reasoning_effort",
+        "response_field": "analysis",
+        "history_policy": "preserve_channels",
+        "public_exposure": "do_not_show_hidden_cot"
+      },
+      "tools": {
+        "parser": "harmony",
+        "channels": [
+          "analysis",
+          "commentary",
+          "final"
+        ]
+      },
+      "context_tokens": 131072,
+      "citations": [
+        {
+          "url": "https://openai.com/index/gpt-oss-model-card/",
+          "quote": "designed to be used within agentic workflows"
+        },
+        {
+          "url": "https://cookbook.openai.com/articles/openai-harmony/",
+          "quote": "should not be used without using the harmony format"
+        },
+        {
+          "url": "https://github.com/openai/gpt-oss",
+          "quote": "Harmony format & tools"
+        }
+      ]
+    },
+    "minimax": {
+      "prompt_adapter": "family_native_chat_template",
+      "reasoning": {
+        "mode": "interleaved",
+        "response_field": "think_tags",
+        "history_policy": "preserve_all"
+      },
+      "tools": {
+        "parser": "minimax_xml",
+        "raw_tags": [
+          "tool_calls",
+          "minimax:tool_call"
+        ]
+      },
+      "sampling": {
+        "temperature": 1.0,
+        "top_p": 0.95
+      },
+      "citations": [
+        {
+          "url": "https://huggingface.co/MiniMaxAI/MiniMax-M2",
+          "quote": "interleaved thinking model"
+        },
+        {
+          "url": "https://huggingface.co/MiniMaxAI/MiniMax-M2/blob/main/docs/tool_calling_guide.md",
+          "quote": "tool calling"
+        },
+        {
+          "url": "https://github.com/MiniMax-AI/MiniMax-M1",
+          "quote": "MiniMax-M1"
+        }
+      ]
+    },
+    "kimi": {
+      "prompt_adapter": "family_native_chat_template",
+      "reasoning": {
+        "mode": "optional",
+        "request_fields": [
+          "thinking.type",
+          "chat_template_kwargs.thinking"
+        ],
+        "response_field": "reasoning_content",
+        "history_policy": "preserve_on_tool"
+      },
+      "tools": {
+        "parser": "kimi_native",
+        "stream_parser_required": true
+      },
+      "context_tokens": 262144,
+      "citations": [
+        {
+          "url": "https://huggingface.co/moonshotai/Kimi-K2-Thinking",
+          "quote": "consecutive tool invocations"
+        },
+        {
+          "url": "https://huggingface.co/moonshotai/Kimi-K2.5",
+          "quote": "Context Length 256K"
+        },
+        {
+          "url": "https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md",
+          "quote": "tool call"
+        }
+      ]
+    },
+    "glm": {
+      "prompt_adapter": "family_native_chat_template",
+      "reasoning": {
+        "mode": "interleaved",
+        "request_field": "thinking.type",
+        "response_field": "reasoning_content",
+        "history_policy": "preserve_all"
+      },
+      "tools": {
+        "parser": "glm47"
+      },
+      "context_tokens": 204800,
+      "output_tokens": 131072,
+      "citations": [
+        {
+          "url": "https://huggingface.co/zai-org/GLM-4.7",
+          "quote": "thinks before every response and tool calling"
+        },
+        {
+          "url": "https://docs.z.ai/guides/llm/glm-4.7",
+          "quote": "thinking.type"
+        }
+      ]
+    },
+    "seed_oss": {
+      "prompt_adapter": "family_native_chat_template",
+      "reasoning": {
+        "mode": "budgeted",
+        "request_field": "thinking_budget",
+        "budget_values": [
+          -1,
+          0,
+          512,
+          1024,
+          2048,
+          4096,
+          8192,
+          16384
+        ],
+        "history_policy": "preserve_all"
+      },
+      "tools": {
+        "parser": "seed_oss"
+      },
+      "context_tokens": 524288,
+      "citations": [
+        {
+          "url": "https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct",
+          "quote": "thinking budget set to 512"
+        }
+      ]
+    },
+    "llama4": {
+      "prompt_adapter": "family_native_chat_template",
+      "reasoning": {
+        "mode": "none_exposed"
+      },
+      "tools": {
+        "parser": "llama_pyjson",
+        "parallel_tool_calls": true
+      },
+      "citations": [
+        {
+          "url": "https://github.com/meta-llama/llama-models/blob/main/models/llama4/prompt_format.md",
+          "quote": "parallel tool calls natively"
+        }
+      ]
+    },
+    "mistral_magistral_devstral": {
+      "prompt_adapter": "mistral_common",
+      "reasoning": {
+        "mode": "optional",
+        "response_field": "visible_reasoning_trace"
+      },
+      "tools": {
+        "parser": "mistral"
+      },
+      "context_notes": {
+        "magistral_small_2506_quality_context": 40960
+      },
+      "citations": [
+        {
+          "url": "https://huggingface.co/mistralai/Magistral-Small-2506",
+          "quote": "performance might degrade past 40k"
+        }
+      ]
+    },
+    "gemma3": {
+      "prompt_adapter": "family_native_chat_template",
+      "reasoning": {
+        "mode": "none_exposed"
+      },
+      "tools": {
+        "parser": "provider_wrapper_or_none"
+      },
+      "citations": [
+        {
+          "url": "https://ai.google.dev/gemma/docs/core/model_card_3",
+          "quote": "large, 128K context window"
+        }
+      ]
+    }
+  }
+}

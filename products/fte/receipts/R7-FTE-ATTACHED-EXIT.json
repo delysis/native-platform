@@ -1,0 +1,36 @@
+{
+  "base_sha": "d86edfef40771589af4cd8cd72907fa6d3ce6e96",
+  "implementation_revision": "372a0883364bc86f2c2f41f2cf7940e5cdfd28a4",
+  "decision": "observe_exact_bundle_process_exit_as_an_attached_child",
+  "evidence": {
+    "exact_bundle": {
+      "bundle_path": "src-tauri/target/release/bundle/macos/FTE R7 372a088.app",
+      "bundle_identifier": "com.delysis.fte.r7.372a088.acceptance",
+      "executable_bytes": 26377952,
+      "executable_sha256": "afffd51f731c8bd9fc01125bdd37ab9bad1323b919d9952c10f9bfd531181381"
+    },
+    "attached_launch": {
+      "pid": 92660,
+      "accessibility_identity": "FTE R7 372a088",
+      "restored_local_provider": "Local llama.cpp",
+      "restored_local_provider_status": "ready",
+      "quit_action": "Cmd+Q",
+      "exit_code": 0,
+      "signal": null,
+      "new_diagnostic_report": false,
+      "observation_boundary": "launch, accessibility inspection, native Cmd+Q, and child-process await occurred in one uninterrupted Computer Use observation"
+    }
+  },
+  "evidence_limits": {
+    "generation_performed_in_this_run": false,
+    "native_picker_used_in_this_run": false,
+    "real_hosted_provider_exercised": false,
+    "real_os_credential_migration_and_readback_exercised": false,
+    "signed_release_certified": false
+  },
+  "micro_goal": "R7-FTE-ATTACHED-EXIT",
+  "receipt_schema": "delysis-remediation-receipt.v1",
+  "recorded_on": "2026-08-11",
+  "repository": "delysis/free-token-energy",
+  "status": "exact_bundle_process_exit_code_zero_observed"
+}

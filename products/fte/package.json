@@ -1,0 +1,23 @@
+{
+  "name": "free-token-energy",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "check:frontend": "node --check src/main.js",
+    "check:rust": "cargo check --manifest-path src-tauri/Cargo.toml",
+    "format:check": "cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check",
+    "lint:rust": "cargo clippy --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings",
+    "test:frontend": "node --test tests/frontend-preview.test.mjs",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "check": "npm run check:frontend && npm run format:check && npm run lint:rust",
+    "test": "npm run check && npm run test:frontend && npm run test:rust",
+    "audit:dependencies": "npm audit --audit-level=moderate",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

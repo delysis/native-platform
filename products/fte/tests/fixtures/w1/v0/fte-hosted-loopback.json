@@ -1,0 +1,143 @@
+{
+  "schema": "delysis.w1.fte-hosted-loopback.v0",
+  "vertical_id": "fte_hosted_fixture_loopback",
+  "execution": {
+    "kind": "deterministic_fixture",
+    "network": "loopback_only",
+    "hosted_request_sent": false,
+    "credential_required": false
+  },
+  "hosted": {
+    "chat": {
+      "text": "exact chat input",
+      "expected_body": {
+        "messages": [
+          {
+            "content": [
+              {
+                "text": "exact chat input",
+                "type": "text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "model",
+        "stream": false
+      }
+    },
+    "raw_text": {
+      "prompt": "  exact raw prompt\n",
+      "expected_body": {
+        "model": "model",
+        "prompt": "  exact raw prompt\n",
+        "stream": false
+      }
+    },
+    "raw_tokens": {
+      "prompt": [1, 2, 3],
+      "expected_body": {
+        "model": "model",
+        "prompt": [1, 2, 3],
+        "stream": false
+      }
+    },
+    "unsupported_add_bos_error": "completion_bos_policy_unsupported",
+    "response_projection": {
+      "request_id": "w1-hosted-request",
+      "response_id": "w1-hosted-response",
+      "chat": {
+        "model": "model",
+        "choices": [
+          {
+            "message": {
+              "content": "exact chat output"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 3,
+          "completion_tokens": 4,
+          "total_tokens": 7
+        }
+      },
+      "completion": {
+        "model": "model",
+        "choices": [
+          {
+            "text": " exact raw output\n"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 5,
+          "completion_tokens": 6,
+          "total_tokens": 11
+        }
+      },
+      "stream_frames": [
+        "event: message\ndata: {\"cho",
+        "ices\":[{\"index\":0,\"text\":\" exact\"}]}\n",
+        "\nevent: message\ndata: {\"choices\":[{\"index\":0,\"text\":\" stre",
+        "am\\n\",\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4}}\n\n",
+        "data: [DO",
+        "NE]\n\n"
+      ],
+      "stream_text": " exact stream\n",
+      "error": {
+        "error": {
+          "code": "fixture_rate_limited",
+          "message": "must never escape into safe detail"
+        }
+      },
+      "expected_error_code": "fixture_rate_limited",
+      "expected_safe_detail": "the hosted provider stream returned an error"
+    }
+  },
+  "loopback": {
+    "requests": {
+      "responses": {
+        "input": "hello",
+        "model": "test-model",
+        "store": true,
+        "stream": true
+      },
+      "chat": {
+        "messages": [
+          {
+            "content": "hello",
+            "role": "user"
+          }
+        ],
+        "model": "test-model"
+      },
+      "completion": {
+        "model": "test-model",
+        "prompt": "hello"
+      },
+      "continuation": {
+        "input": "continue",
+        "model": "test-model",
+        "previous_response_id": "resp_socket_test",
+        "store": true
+      }
+    },
+    "expected": {
+      "unauthorized_status": 401,
+      "rebound_status": 400,
+      "concurrent_status": 429,
+      "stream_events": [
+        "response.created",
+        "response.output_text.delta",
+        "response.completed"
+      ],
+      "stored_response_id": "resp_socket_test",
+      "continuation_response_id": "resp_socket_continuation"
+    }
+  },
+  "omitted_claims": [
+    "live hosted-provider interoperability",
+    "provider availability",
+    "provider billing or quota",
+    "real credential storage"
+  ]
+}
