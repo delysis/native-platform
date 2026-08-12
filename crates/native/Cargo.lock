@@ -337,6 +337,8 @@ dependencies = [
  "llama-cpp-sys-2",
  "llama-native-types",
  "platform-contract-testkit",
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts.git?rev=9fd803f5efcc46ac0256dab876e7c0b1f03bb448)",
+ "platform-vertical-fixtures-v0",
  "serde",
  "serde_json",
  "sha2",
@@ -406,7 +408,16 @@ name = "platform-contract-testkit"
 version = "0.0.0"
 source = "git+https://github.com/delysis/w1-platform-contracts.git?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
 dependencies = [
- "platform-contracts-v0",
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts.git?rev=cbab33555ab9355a6ac453d659c55ec9e0666821)",
+ "thiserror",
+]
+
+[[package]]
+name = "platform-contracts-v0"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts.git?rev=9fd803f5efcc46ac0256dab876e7c0b1f03bb448#9fd803f5efcc46ac0256dab876e7c0b1f03bb448"
+dependencies = [
+ "serde",
  "thiserror",
 ]
 
@@ -416,6 +427,18 @@ version = "0.0.0"
 source = "git+https://github.com/delysis/w1-platform-contracts.git?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
 dependencies = [
  "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "platform-vertical-fixtures-v0"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts.git?rev=9fd803f5efcc46ac0256dab876e7c0b1f03bb448#9fd803f5efcc46ac0256dab876e7c0b1f03bb448"
+dependencies = [
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts.git?rev=9fd803f5efcc46ac0256dab876e7c0b1f03bb448)",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror",
 ]
 
