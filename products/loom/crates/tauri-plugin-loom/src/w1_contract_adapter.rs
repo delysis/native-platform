@@ -116,11 +116,14 @@ impl LoomBridgeAdapter {
             .map_err(|error| BridgeError::ipc(&error))?;
         let gate = Arc::new(WorkerGate::default());
         let worker_gate = Arc::clone(&gate);
+        let admitted = Arc::new(WorkerGate::default());
+        let worker_admitted = Arc::clone(&admitted);
         let worker_lifecycle = self.core.lifecycle.clone();
         let worker_lease = lease.clone();
         let worker = std::thread::Builder::new()
             .name(format!("loom-contract-{operation_id}"))
             .spawn(move || {
+                worker_admitted.wait();
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     assert!(!panics, "controlled Loom executor panic");
                     worker_gate.wait();
@@ -131,12 +134,18 @@ impl LoomBridgeAdapter {
                 }
             })
             .map_err(|error| BridgeError::Message(error.to_string()))?;
-        reservation
-            .attach(
-                worker,
-                GenerationWorkerOwner::controlled(Arc::new(ContractCancellation)),
-            )
-            .map_err(|error| BridgeError::ipc(&error.failure))?;
+        let attached = reservation.attach(
+            worker,
+            GenerationWorkerOwner::controlled(Arc::new(ContractCancellation)),
+        );
+        if let Err(error) = attached {
+            gate.allow();
+            admitted.allow();
+            let failure = BridgeError::ipc(&error.failure);
+            let _ = error.worker.join();
+            return Err(failure);
+        }
+        admitted.allow();
         ticket.detach();
         drop(admission);
         Ok(BridgeOperation {

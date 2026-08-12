@@ -460,10 +460,9 @@ fn build_projection(
 }
 
 fn has_at_least_four_lexical_tokens(text: &str) -> bool {
-    let words = text
-        .split(|character: char| !character.is_alphanumeric())
+    text.split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
-        .collect::<Vec<_>>();
-    words.len() >= 4
+        .take(4)
+        .count()
+        >= 4
 }
