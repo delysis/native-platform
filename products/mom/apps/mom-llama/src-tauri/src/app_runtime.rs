@@ -42,6 +42,8 @@ pub struct AppShutdownSummary {
     pub elapsed_ms: u64,
     pub gateway_drained: bool,
     pub native_host_joined: bool,
+    /// Resident native workers owned at the terminal drain boundary.
+    pub expected_native_worker_count: usize,
     pub joined_native_worker_count: usize,
     pub application_work_drained: bool,
 }
@@ -293,6 +295,11 @@ impl AppRuntimeHandle {
                 let app_work_drain = self.wait_for_work_drained();
                 let (gateway_result, ()) = tokio::join!(gateway_shutdown, app_work_drain);
                 let gateway_error = gateway_result.err();
+                // Admission is closed and every application lease plus the
+                // gateway has drained, so the resident set cannot grow after
+                // this observation. Preserve its cardinality even if the
+                // finalizer fails before returning joined evidence.
+                let expected_native_worker_count = self.0.native_host.slots().len();
                 let joined = self.0.native_finalizer.shutdown(&self.0.native_host);
                 let (native_error, joined_native_worker_count) = match joined {
                     Ok(receipt) => {
@@ -317,6 +324,7 @@ impl AppRuntimeHandle {
                     elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     gateway_drained: gateway_error.is_none(),
                     native_host_joined: native_error.is_none(),
+                    expected_native_worker_count,
                     joined_native_worker_count,
                     application_work_drained: true,
                 };

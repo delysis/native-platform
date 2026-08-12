@@ -1190,6 +1190,7 @@ mod tests {
             elapsed_ms: 1,
             gateway_drained: true,
             native_host_joined: false,
+            expected_native_worker_count: 0,
             joined_native_worker_count: 0,
             application_work_drained: true,
         };

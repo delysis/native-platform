@@ -1,4 +1,4 @@
-name: Wave 1 contract adapter
+name: Wave 1 shutdown envelope
 
 on:
   push:
