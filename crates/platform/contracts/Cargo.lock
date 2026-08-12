@@ -565,6 +565,7 @@ name = "platform-contract-testkit"
 version = "0.0.0"
 dependencies = [
  "platform-contracts-v0",
+ "thiserror",
 ]
 
 [[package]]

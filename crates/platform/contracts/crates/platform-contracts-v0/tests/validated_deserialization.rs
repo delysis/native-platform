@@ -198,6 +198,16 @@ fn publication_components_and_outcomes_decode_only_when_semantically_valid() {
         serde_json::to_value(durability_with_storage_error).expect("serialize"),
         "a durability-unknown outcome with a non-publication error",
     );
+
+    let visible_file_sync_unknown = PublicationOutcomeV0::PublishedDurabilityUnknown {
+        receipt: receipt(false, false),
+        error: service_error(ErrorClass::Publication, None),
+    };
+    let decoded: PublicationOutcomeV0 = serde_json::from_value(
+        serde_json::to_value(&visible_file_sync_unknown).expect("serialize"),
+    )
+    .expect("visible file-sync failure must decode as typed durability-unknown");
+    assert_eq!(decoded, visible_file_sync_unknown);
 }
 
 #[test]

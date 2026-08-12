@@ -11,6 +11,7 @@ pub enum FaultPoint {
     BeforeFileSync,
     BeforeVisibility,
     AfterNoClobberVisibility,
+    BeforeVisibleFileSync,
     BeforeParentSync,
     AfterVisibilityBeforeParentSync,
 }

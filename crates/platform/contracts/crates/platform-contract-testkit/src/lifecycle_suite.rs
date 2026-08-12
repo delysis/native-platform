@@ -225,7 +225,7 @@ pub fn assert_unread_progress_cannot_block_terminal_release_or_shutdown<
         .release(&lease)
         .expect("release bypasses unread progress");
     drop(ticket);
-    assert_closed_and_empty(adapter.shutdown(), 1);
+    assert_closed_and_empty(adapter.shutdown());
 }
 
 pub fn assert_duplicate_ids_fail_without_partial_admission<A: OperationModelAdapter>() {
@@ -296,6 +296,7 @@ pub fn assert_quiesce_rejects_admission_and_shutdown_waits_for_release<A: Operat
     assert_eq!(pending.lifecycle, LifecyclePhase::Quiescing);
     assert_eq!(pending.active_operations, 1);
     assert_eq!(pending.retained_tasks, 1);
+    assert!(pending.expected_workers > pending.joined_workers);
     assert!(
         adapter
             .lease_snapshot(&lease)
@@ -307,7 +308,7 @@ pub fn assert_quiesce_rejects_admission_and_shutdown_waits_for_release<A: Operat
         .expect("terminal");
     adapter.release(&lease).expect("release");
     drop(ticket);
-    assert_closed_and_empty(adapter.shutdown(), 1);
+    assert_closed_and_empty(adapter.shutdown());
 }
 
 pub fn assert_executor_panic_records_terminal_and_releases<A: OperationModelAdapter>() {
@@ -327,7 +328,7 @@ pub fn assert_executor_panic_records_terminal_and_releases<A: OperationModelAdap
     );
     adapter.release(&lease).expect("panic path releases");
     drop(ticket);
-    assert_closed_and_empty(adapter.shutdown(), 1);
+    assert_closed_and_empty(adapter.shutdown());
 }
 
 pub fn assert_repeated_shutdown_is_stable_and_empty<A: OperationModelAdapter>() {
@@ -335,7 +336,7 @@ pub fn assert_repeated_shutdown_is_stable_and_empty<A: OperationModelAdapter>() 
     let first = adapter.shutdown();
     let second = adapter.shutdown();
     assert_eq!(first, second);
-    assert_closed_and_empty(second, 0);
+    assert_closed_and_empty(second);
 }
 
 pub fn assert_cancel_complete_race_has_one_terminal<A>()
@@ -460,14 +461,14 @@ where
     );
     adapter.release(&lease).expect("release");
     drop(ticket);
-    assert_closed_and_empty(adapter.shutdown(), 1);
+    assert_closed_and_empty(adapter.shutdown());
 }
 
-fn assert_closed_and_empty(facts: ClosedFacts, joined_workers: usize) {
+fn assert_closed_and_empty(facts: ClosedFacts) {
     assert_eq!(facts.lifecycle, LifecyclePhase::Closed);
     assert_eq!(facts.active_operations, 0);
     assert_eq!(facts.retained_tasks, 0);
-    assert_eq!(facts.joined_workers, joined_workers);
+    assert_eq!(facts.joined_workers, facts.expected_workers);
 }
 
 pub fn run_lifecycle_suite<A>()

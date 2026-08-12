@@ -7,4 +7,4 @@ publish = false
 
 [dependencies]
 platform-contracts-v0 = { path = "../platform-contracts-v0" }
-
+thiserror.workspace = true

@@ -103,7 +103,6 @@
             { "$ref": "#/$defs/receipt" },
             {
               "properties": {
-                "file_synced": { "const": true },
                 "directory_synced": { "const": false }
               }
             }

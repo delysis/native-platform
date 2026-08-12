@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 pub mod barrier;
+pub mod compositional_lifecycle;
+pub mod coverage;
 pub mod envelope_suite;
 pub mod fault;
 pub mod lifecycle_suite;
@@ -14,11 +16,16 @@ pub mod publication_suite;
 
 pub use platform_contracts_v0 as contracts;
 
+pub use coverage::{
+    AcceptanceError, CoverageEvidence, LifecycleCoverageManifest, LifecycleImplementation,
+    LifecycleInvariant,
+};
 pub use envelope_suite::{validate_capability_snapshot_v0, validate_service_error_v0};
 pub use model::{
     AdapterError, AttemptIdentity, ClosedFacts, LifecyclePhase, OperationModelAdapter,
     OperationPhase, OperationSnapshot, ReferenceAdapter, ReferenceLease, ReferenceTicket,
-    Reservation, TerminalClass, TerminalRecord, TestConfig, WaitObservation,
+    Reservation, ShutdownOutcome, ShutdownOutcomeError, TerminalClass, TerminalRecord, TestConfig,
+    WaitObservation,
 };
 pub use publication_suite::{
     PublicationErrorContext, PublicationModelAdapter, PublicationRequest, PublicationStep,

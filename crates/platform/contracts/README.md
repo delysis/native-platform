@@ -9,6 +9,20 @@ model tests. Current repositories consume an exact content hash only through
 test code. During W2 these bytes move into `delysis/native-platform`; the
 temporary copies are then retired.
 
+Lifecycle conformance also has an ownership-specific compositional surface.
+Its traits are grouped by proof obligation, not by product or runtime. Every
+adapter binds a compile-time product and implementation marker. Suites mint
+typed private coverage evidence only after their assertions return, and a
+manifest accepts only same-marker evidence whose union includes every ADR-003
+invariant and each required suite exactly once. This prevents accidental
+cross-implementation mixing; it cannot make a deliberately dishonest wrapper
+truthful. Source review must still prove that every adapter method and shutdown
+worker fact comes from the named production owner rather than shadow state.
+Cross-boundary obligations such as progress-to-shutdown and
+panic-to-shutdown remain bridge suites; unrelated component-local results
+cannot be combined into those claims. These are test traits only, never a new
+production runtime abstraction.
+
 The durable Wave 1 snapshot is temporarily hosted as
 `delysis/w1-platform-contracts`. Current repositories must consume one exact
 40-character commit revision for test code only; branches and tags are not

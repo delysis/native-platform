@@ -110,14 +110,14 @@ pub fn run_publication_model<A: PublicationModelAdapter>(
                 error: adapter.conflict_error(),
             });
         }
-        adapter
-            .sync_visible_file(&request.destination)
-            .expect("exact-match recovery must resync the visible file");
+        if let Err(error) = adapter.sync_visible_file(&request.destination) {
+            return durability_unknown(adapter, request, &error, true, false);
+        }
         return match adapter.sync_parent_directory(&request.destination) {
             Ok(()) => validated(PublicationOutcomeV0::Published {
-                receipt: receipt(request, true, true),
+                receipt: receipt(request, true, true, true),
             }),
-            Err(error) => durability_unknown(adapter, request, &error, true),
+            Err(error) => durability_unknown(adapter, request, &error, true, true),
         };
     }
 
@@ -144,7 +144,7 @@ pub fn run_publication_model<A: PublicationModelAdapter>(
         cleanup(adapter, stage);
         return match visible {
             Some(artifact) if same_content(&artifact, &request.artifact) => {
-                durability_unknown(adapter, request, &error, false)
+                durability_unknown(adapter, request, &error, false, true)
             }
             Some(_) => validated(PublicationOutcomeV0::NotPublished {
                 error: adapter.conflict_error(),
@@ -164,9 +164,9 @@ pub fn run_publication_model<A: PublicationModelAdapter>(
     cleanup(adapter, stage);
     match parent_result {
         Ok(()) => validated(PublicationOutcomeV0::Published {
-            receipt: receipt(request, false, true),
+            receipt: receipt(request, false, true, true),
         }),
-        Err(error) => durability_unknown(adapter, request, &error, false),
+        Err(error) => durability_unknown(adapter, request, &error, false, true),
     }
 }
 
@@ -258,6 +258,22 @@ where
         "each exact-match recovery must resync the visible file"
     );
 
+    let mut recovery_file_sync = factory();
+    recovery_file_sync.seed_visible(request.artifact.clone());
+    recovery_file_sync.inject_fault(FaultPoint::BeforeVisibleFileSync);
+    assert_durability_unknown_with_file_sync(
+        &run_publication_model(&mut recovery_file_sync, request),
+        true,
+        false,
+    );
+    assert!(same_content(
+        recovery_file_sync
+            .visible_artifact()
+            .expect("exact artifact remains visible"),
+        &request.artifact
+    ));
+    assert_eq!(recovery_file_sync.owned_staging_count(), 0);
+
     let mut conflict = factory();
     let conflicting = ArtifactIdentityV0 {
         id: "conflicting-artifact".to_owned(),
@@ -278,6 +294,7 @@ fn same_content(left: &ArtifactIdentityV0, right: &ArtifactIdentityV0) -> bool {
 fn receipt(
     request: &PublicationRequest,
     idempotent_recovery: bool,
+    file_synced: bool,
     directory_synced: bool,
 ) -> PublicationReceiptV0 {
     PublicationReceiptV0 {
@@ -285,7 +302,7 @@ fn receipt(
         artifact: request.artifact.clone(),
         destination: request.destination.clone(),
         visible: true,
-        file_synced: true,
+        file_synced,
         directory_synced,
         idempotent_recovery,
     }
@@ -305,9 +322,10 @@ fn durability_unknown<A: PublicationModelAdapter>(
     request: &PublicationRequest,
     error: &A::Error,
     idempotent_recovery: bool,
+    file_synced: bool,
 ) -> PublicationOutcomeV0 {
     validated(PublicationOutcomeV0::PublishedDurabilityUnknown {
-        receipt: receipt(request, idempotent_recovery, false),
+        receipt: receipt(request, idempotent_recovery, file_synced, false),
         error: adapter.service_error(error, PublicationErrorContext::VisibleDurabilityUnknown),
     })
 }
@@ -337,10 +355,19 @@ fn assert_published(outcome: &PublicationOutcomeV0, idempotent_recovery: bool) {
 }
 
 fn assert_durability_unknown(outcome: &PublicationOutcomeV0, idempotent_recovery: bool) {
+    assert_durability_unknown_with_file_sync(outcome, idempotent_recovery, true);
+}
+
+fn assert_durability_unknown_with_file_sync(
+    outcome: &PublicationOutcomeV0,
+    idempotent_recovery: bool,
+    file_synced: bool,
+) {
     let PublicationOutcomeV0::PublishedDurabilityUnknown { receipt, .. } = outcome else {
         panic!("expected durability-unknown outcome, got {outcome:?}");
     };
     assert_eq!(receipt.idempotent_recovery, idempotent_recovery);
+    assert_eq!(receipt.file_synced, file_synced);
     outcome
         .validate()
         .expect("valid durability-unknown outcome");
@@ -496,7 +523,7 @@ impl PublicationModelAdapter for ReferencePublicationAdapter {
     ) -> Result<(), Self::Error> {
         self.trace.push(PublicationStep::SyncVisibleFile);
         assert!(self.visible.is_some(), "visible file must exist");
-        Ok(())
+        self.hit(FaultPoint::BeforeVisibleFileSync)
     }
 
     fn sync_parent_directory(
@@ -526,7 +553,7 @@ impl PublicationModelAdapter for ReferencePublicationAdapter {
                 "publication.durability_unknown",
                 ErrorClass::Publication,
                 RetryAdvice::AfterRestart,
-                "the exact artifact is visible but parent durability is unknown",
+                "the exact artifact is visible but file or parent durability is unknown",
             ),
             PublicationErrorContext::NotPublished => match error {
                 ReferencePublicationError::VerificationMismatch => (
