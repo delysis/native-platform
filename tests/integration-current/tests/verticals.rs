@@ -42,6 +42,10 @@ fn exact_w1_git_checkout_authenticates_all_verticals() {
 }
 
 fn find_exact_lock() -> Option<PathBuf> {
+    find_exact_lock_from_metadata().or_else(find_exact_lock_from_cargo_home)
+}
+
+fn find_exact_lock_from_metadata() -> Option<PathBuf> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = Command::new(cargo)
         .args(["metadata", "--format-version", "1", "--locked", "--offline"])
@@ -61,7 +65,34 @@ fn find_exact_lock() -> Option<PathBuf> {
     let manifest = PathBuf::from(package["manifest_path"].as_str()?);
     manifest.ancestors().find_map(|ancestor| {
         let lock_path = ancestor.join("verticals/v0/W1-VERTICALS.lock.json");
-        let bytes = fs::read(&lock_path).ok()?;
-        (format!("{:x}", Sha256::digest(bytes)) == LOCK_SHA256).then_some(lock_path)
+        is_exact_lock(&lock_path).then_some(lock_path)
     })
+}
+
+fn find_exact_lock_from_cargo_home() -> Option<PathBuf> {
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".cargo")))?;
+    find_matching_lock(&cargo_home.join("git/checkouts"))
+}
+
+fn find_matching_lock(directory: &Path) -> Option<PathBuf> {
+    for entry in fs::read_dir(directory).ok()?.flatten() {
+        let path = entry.path();
+        if entry.file_type().ok()?.is_dir() {
+            if let Some(lock) = find_matching_lock(&path) {
+                return Some(lock);
+            }
+        } else if entry.file_name() == "W1-VERTICALS.lock.json" && is_exact_lock(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn is_exact_lock(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .is_some_and(|bytes| format!("{:x}", Sha256::digest(bytes)) == LOCK_SHA256)
 }
