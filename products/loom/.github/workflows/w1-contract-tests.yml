@@ -27,6 +27,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.8.1
 
+      - name: Install pin-check tooling
+        run: sudo apt-get update && sudo apt-get install --yes ripgrep
+
       - name: Check immutable contract pin
         run: ./scripts/check-w1-contract-pin.sh
 
