@@ -2,8 +2,8 @@
 
 Production baseline: `loom-native@e32d0697f6b5e28716e34c6b051d47d5031d010c`.
 
-Vertical protocol: `w1-platform-contracts@9fd803f5efcc46ac0256dab876e7c0b1f03bb448`
-(`w1-vertical-protocol-v0-2026-08-12`). The accepted lifecycle contract remains
+Vertical protocol: `w1-platform-contracts@fc24ffff08c52690390b4460f44617d5d9732563`
+(`w1-vertical-protocol-v0-2026-08-12-r2`). The accepted lifecycle contract remains
 pinned independently at `cbab33555ab9355a6ac453d659c55ec9e0666821`.
 
 The feature-gated `unstable-w1-vertical-tests` lane parses the canonical
@@ -25,7 +25,8 @@ The product replay starts from one exact 61-byte revision and three verified
 candidate bodies. It proves one caret-local ghost, hidden additional candidates
 behind explicit review, exact-boundary Tab promotion, and ordinary Tab otherwise.
 It proves that dismissal does not mutate the manuscript and that a stale
-suggestion cannot promote its bytes; ordinary Tab still inserts its literal tab.
+suggestion cannot promote its bytes; the same stale-Tab replay proves ordinary
+Tab still inserts its literal tab.
 It also proves
 the absence of persistent candidate-count chrome, `Skip to manuscript`, and a
 primary `Use this` control. The store replay promotes the primary candidate,

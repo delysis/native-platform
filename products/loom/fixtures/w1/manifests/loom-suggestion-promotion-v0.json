@@ -37,15 +37,15 @@
         },
         {
           "program": { "kind": "npm" },
-          "argv": ["--prefix", "apps/loom", "test", "--", "--run", "w1SuggestionVertical.test.ts"],
+          "argv": ["--prefix", "apps/loom", "test", "--", "--run", "w1SuggestionVertical.test.ts", "w1StaleTabEvidence.test.ts"],
           "required_environment": [],
           "network": "denied"
         }
       ],
       "expected_projection": {
         "id": "loom.suggestion.expected_projection.v1",
-        "digest": { "algorithm": "sha256", "hex": "3c82cae97aaa54d2aaaa5820838a90f67b761590b58c6fea0172c53362c1b9de" },
-        "length": 2476
+        "digest": { "algorithm": "sha256", "hex": "ad46d122d9317107081fe379b7b6e05347bf5ab58621ac00615b388d50141a03" },
+        "length": 2407
       }
     }
   ],

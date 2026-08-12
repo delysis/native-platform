@@ -215,7 +215,6 @@ describe('W1 model-free suggestion vertical', () => {
       plugins: [plugin]
     });
     visible = false;
-    accepted = '';
     setGhostText(view, {
       active: true,
       candidateId: disposition.suggestion.candidateId,
@@ -225,7 +224,6 @@ describe('W1 model-free suggestion vertical', () => {
       text: disposition.suggestion.text
     });
     expect(plugin.props.handleKeyDown?.call(plugin, view, key())).toBe(true);
-    expect(accepted).toBe('');
     expect(state.doc.textContent).toBe(`${fixture.source.revision_text}${VISUAL_TAB_INDENT}`);
     expect(VISUAL_TAB_INDENT).toBe(fixture.expected.ordinary_tab);
   });

@@ -53,9 +53,8 @@
     "primary_use_this_control": { "kind": "boolean", "value": false },
     "persistent_candidate_count": { "kind": "boolean", "value": false },
     "skip_to_manuscript_control": { "kind": "boolean", "value": false },
-    "stale_manuscript_unchanged": { "kind": "boolean", "value": true },
     "stale_suggestion_promoted": { "kind": "boolean", "value": false },
-    "stale_tab_action": { "kind": "text", "value": "ordinary_tab_inserted" },
+    "ordinary_tab_action": { "kind": "text", "value": "ordinary_tab_inserted" },
     "tab_exact_boundary": { "kind": "text", "value": "promote_visible_ghost" },
     "tab_without_exact_boundary": { "kind": "text", "value": "ordinary_tab_or_indent" },
     "visible_ghost_count": { "kind": "integer", "value": 1 }

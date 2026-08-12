@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 w1_contract_rev='cbab33555ab9355a6ac453d659c55ec9e0666821'
-w1_vertical_rev='9fd803f5efcc46ac0256dab876e7c0b1f03bb448'
+w1_vertical_rev='fc24ffff08c52690390b4460f44617d5d9732563'
 w1_contract_url='https://github.com/delysis/w1-platform-contracts.git'
 w1_manifest='crates/loom-host/Cargo.toml'
 w1_vertical_manifest='crates/loom-store/Cargo.toml'

@@ -7,11 +7,11 @@
     "sha256": "f19edc9caf22807a4d11f716a921445bf5c407b4e3ad85e7842a5fd8f2fc0f00",
     "byte_len": 1632
   },
-  "vertical_protocol_commit": "9fd803f5efcc46ac0256dab876e7c0b1f03bb448",
+  "vertical_protocol_commit": "fc24ffff08c52690390b4460f44617d5d9732563",
   "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
   "fixture_ledger": {
     "path": "fixtures/w1/MANIFEST.sha256",
-    "sha256": "48389ebd98d9408196d3c540ee91f54ba355c019be48d11eda9dbb9455b141de",
+    "sha256": "16c34a8d3a63d68326104732e6498001bb793e3cc7693dba72b122d01c03d863",
     "artifact_count": 15
   },
   "rows": [
@@ -20,12 +20,13 @@
       "vertical_id": "loom_suggestion_promotion",
       "status": "canonical_baseline_validated",
       "manifest": "fixtures/w1/manifests/loom-suggestion-promotion-v0.json",
-      "manifest_sha256": "fa608f1fb95cd2656f55a5af463525cfc3d37046d14ea9badf74124201e1b5f4",
+      "manifest_sha256": "246e0eab459712816e8b236428dc6c2e423aa783d9a031b0f1780771c56a4532",
       "projection": "fixtures/w1/projections/loom-suggestion-promotion-v1.json",
-      "projection_sha256": "3c82cae97aaa54d2aaaa5820838a90f67b761590b58c6fea0172c53362c1b9de",
+      "projection_sha256": "ad46d122d9317107081fe379b7b6e05347bf5ab58621ac00615b388d50141a03",
       "product_replays": [
         "generation::tests::w1_exact_boundary_suggestion_promotion_survives_store_reopen",
-        "apps/loom/src/lib/w1SuggestionVertical.test.ts"
+        "apps/loom/src/lib/w1SuggestionVertical.test.ts",
+        "apps/loom/tests/w1StaleTabEvidence.test.ts"
       ]
     },
     {

@@ -20,7 +20,7 @@ loom-inference = { path = "../loom-inference", features = ["native-evidence"] }
 loom-host = { path = "../loom-host" }
 loom-research-types = { path = "../loom-research-types" }
 loom-types = { path = "../loom-types" }
-platform-vertical-fixtures-v0 = { git = "https://github.com/delysis/w1-platform-contracts.git", rev = "9fd803f5efcc46ac0256dab876e7c0b1f03bb448", optional = true }
+platform-vertical-fixtures-v0 = { git = "https://github.com/delysis/w1-platform-contracts.git", rev = "fc24ffff08c52690390b4460f44617d5d9732563", optional = true }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
