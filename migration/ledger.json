@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "goal": "W2-SHELL",
+  "status": "shell_no_imports",
+  "production_source_imported": false,
+  "source_history_imported": false,
+  "accepted_w1_receipt": {
+    "goal": "W1-VERTICALS",
+    "decision": "accepted",
+    "accepted_at": "2026-08-12T17:50:09Z"
+  },
+  "entries": [
+    {
+      "source_repository": "delysis/llama-cpp-rs",
+      "source_main": "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
+      "source_tags": [
+        {
+          "name": "phase1-audit-2026-08-11",
+          "peeled_commit": "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"
+        }
+      ],
+      "destination_prefix": null,
+      "import_commit": null,
+      "path_dependency_cutover_commit": null,
+      "old_repo_status": "active",
+      "migration_role": "external_unsafe_upstream_boundary"
+    },
+    {
+      "source_repository": "delysis/llama-native-kit",
+      "source_main": "16168bd76a09f74fdee41d0e2fb0441e79ac1005",
+      "source_tags": [
+        {
+          "name": "phase1-audit-2026-08-11",
+          "peeled_commit": "7ad18cdd616d97145564ee925235d27e2369319f"
+        }
+      ],
+      "destination_prefix": "crates/native",
+      "import_commit": null,
+      "path_dependency_cutover_commit": null,
+      "old_repo_status": "active",
+      "migration_role": "first_party_import"
+    },
+    {
+      "source_repository": "delysis/free-token-energy",
+      "source_main": "67814e76659688fef61f311db588d17eddee0a66",
+      "source_tags": [
+        {
+          "name": "phase1-audit-2026-08-11",
+          "peeled_commit": "c451e23244787fc8de7646a88a4fd4ae10f16f94"
+        }
+      ],
+      "destination_prefix": "products/fte",
+      "import_commit": null,
+      "path_dependency_cutover_commit": null,
+      "old_repo_status": "active",
+      "migration_role": "first_party_import"
+    },
+    {
+      "source_repository": "delysis/mom-llama",
+      "source_main": "3cf57941af6d523378e7fa8b24f5c24c8e50363f",
+      "source_tags": [
+        {
+          "name": "phase1-audit-2026-08-11",
+          "peeled_commit": "00895a0762b463ac54b75911c59b7d10181e3a22"
+        }
+      ],
+      "destination_prefix": "products/mom",
+      "import_commit": null,
+      "path_dependency_cutover_commit": null,
+      "old_repo_status": "active",
+      "migration_role": "first_party_import"
+    },
+    {
+      "source_repository": "delysis/attachment-native-kit",
+      "source_main": "2a8d3a9a1828162a51185d207822ceb1ba6283a8",
+      "source_tags": [
+        {
+          "name": "phase1-audit-2026-08-11",
+          "peeled_commit": "2a8d3a9a1828162a51185d207822ceb1ba6283a8"
+        }
+      ],
+      "destination_prefix": "crates/services/attachment",
+      "import_commit": null,
+      "path_dependency_cutover_commit": null,
+      "old_repo_status": "active",
+      "migration_role": "first_party_import"
+    },
+    {
+      "source_repository": "delysis/speech-native-kit",
+      "source_main": "b836318f10a7e11f433ec3ea8dfa48707adc9b06",
+      "source_tags": [
+        {
+          "name": "phase1-audit-2026-08-11",
+          "peeled_commit": "c78f59fd9ee2c5a27baf89aea96946c6e3a79b97"
+        }
+      ],
+      "destination_prefix": "crates/services/speech",
+      "import_commit": null,
+      "path_dependency_cutover_commit": null,
+      "old_repo_status": "active",
+      "migration_role": "first_party_import"
+    },
+    {
+      "source_repository": "delysis/information-native-kit",
+      "source_main": "7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe",
+      "source_tags": [
+        {
+          "name": "phase1-audit-2026-08-11",
+          "peeled_commit": "028c63f5a77f158c56221736ae3cf10c8034edb4"
+        }
+      ],
+      "destination_prefix": "crates/services/information",
+      "import_commit": null,
+      "path_dependency_cutover_commit": null,
+      "old_repo_status": "active",
+      "migration_role": "first_party_import"
+    },
+    {
+      "source_repository": "delysis/loom-native",
+      "source_main": "223110bee4be72386d79306b444517371e4a9930",
+      "source_tags": [
+        {
+          "name": "phase1-audit-2026-08-11",
+          "peeled_commit": "41fb51b94f7a8fb2c0ee2aba1b4b3f047754dff4"
+        }
+      ],
+      "destination_prefix": "products/loom",
+      "import_commit": null,
+      "path_dependency_cutover_commit": null,
+      "old_repo_status": "active",
+      "migration_role": "first_party_import"
+    },
+    {
+      "source_repository": "delysis/w1-platform-contracts",
+      "source_main": "3ed1f3235edb6d481c324f05fe83b2379e3431e6",
+      "source_tags": [
+        {
+          "name": "w1-contracts-v0-2026-08-12-r3",
+          "peeled_commit": "cbab33555ab9355a6ac453d659c55ec9e0666821"
+        },
+        {
+          "name": "w1-verticals-v0-2026-08-12",
+          "peeled_commit": "3ed1f3235edb6d481c324f05fe83b2379e3431e6"
+        }
+      ],
+      "destination_prefix": "crates/platform/contracts",
+      "import_commit": null,
+      "path_dependency_cutover_commit": null,
+      "old_repo_status": "active",
+      "migration_role": "first_party_import"
+    }
+  ],
+  "excluded_repository": {
+    "source_repository": "delysis/fiction-autoresearch-harness",
+    "source_main": "1a9cf7c1e814b2831a8b358d00565d1b31605017",
+    "source_tag": "phase1-audit-2026-08-11",
+    "source_tag_peeled_commit": "1a9cf7c1e814b2831a8b358d00565d1b31605017",
+    "status": "archived",
+    "reason": "diagnostic historical input only; excluded from native-platform imports"
+  }
+}

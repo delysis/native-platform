@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "algorithm": "sha256",
+  "source_packet": "delysis-phase1-reaudit-2026-08-11/adrs",
+  "files": [
+    { "path": "ADR-001-first-party-monorepo.md", "length": 5363, "sha256": "a11a07899e2235c9adfcbbee943603b7e59c74db36fa077632c74b2a8ab144de" },
+    { "path": "ADR-002-owner-handle-and-shutdown-hierarchy.md", "length": 4782, "sha256": "0c38852ab80856665719489e5cdf38a7bd32bf907133bcbbfdcd4c79d576b4e4" },
+    { "path": "ADR-003-operation-lifecycle-v2.md", "length": 5049, "sha256": "d776f404aff0dd25e4ebf397ba5c0649aaadf62adf31afd6299e554fe78b42a9" },
+    { "path": "ADR-004-final-result-versus-progress.md", "length": 4134, "sha256": "c922b03c85bb93ef57bc1ffaa8415d8c14a16aefea294962b86762fb8624dcd8" },
+    { "path": "ADR-005-evidence-tiers-and-claim-naming.md", "length": 5769, "sha256": "13ccae4ba8bb6d44decaca41003d21039b5f70390863ddb2b0ba5dbe2a22e770" },
+    { "path": "ADR-006-artifact-publication-outcomes.md", "length": 4036, "sha256": "18979c30e3e75cf2bbd1ef37f04f4e65044aac809e2fb0576eb261544d936a2d" },
+    { "path": "ADR-007-one-modern-gateway.md", "length": 4109, "sha256": "4f3a1053fe858eee37c799961d9033b1adec3ce34f95cd5f61c5d004213a3fe2" },
+    { "path": "ADR-008-product-store-separation.md", "length": 3637, "sha256": "926a26e2f71bb10b5a575cd7921215b2d09bb3e778aac05e792bf5f497fe4738" },
+    { "path": "ADR-009-speech-sibling-service.md", "length": 3777, "sha256": "77445734b36d627411ba21f66a65724ce34fc227f8a9e373d597c02e6d7e6cea" },
+    { "path": "ADR-010-loom-writing-and-research-modes.md", "length": 4466, "sha256": "182c09c899a749da2d493f2c08e86bd49a76650107f800dee2908017dbddcd6e" },
+    { "path": "ADR-011-frontier-diagnostic-quarantine.md", "length": 5846, "sha256": "60406b40b2900234b486a3ea21acdbc091062ed6e3cb3dd776be537f88045879" },
+    { "path": "ADR-012-rust-baseline-and-resolver.md", "length": 4756, "sha256": "969ac84cb450f9841b6e97bd776231b6901566a27288ec169a408e2f6c60be12" },
+    { "path": "ADR-013-credential-storage.md", "length": 5813, "sha256": "8f4b5887e8cdc60901fe81c5835f695c4d11d8579ded7e4a1eded7f48e5562c9" },
+    { "path": "ADR-014-component-release-and-versioning.md", "length": 6563, "sha256": "d03ae4868df2f6519dd0b123167e08ac49d76046c0a3a99b142aa6ad8787a15a" },
+    { "path": "README.md", "length": 3237, "sha256": "c4a807e084c547cd12cd07badeb611d79316a147745d98ae7075037de20cee72" }
+  ]
+}

@@ -1,0 +1,6 @@
+* @delysis/core-maintainers
+/.github/ @delysis/core-maintainers
+/docs/architecture/adr/ @delysis/core-maintainers
+/migration/ @delysis/core-maintainers
+/Cargo.toml @delysis/core-maintainers
+/rust-toolchain.toml @delysis/core-maintainers

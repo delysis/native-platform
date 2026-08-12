@@ -1,0 +1,38 @@
+name: shell-policy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.92.0 --profile minimal --component clippy,rustfmt
+      - name: Install pinned pnpm
+        run: npm install --global pnpm@11.16.0
+      - name: Tool versions
+        run: |
+          rustup run 1.92.0 rustc --version --verbose
+          rustup run 1.92.0 cargo --version
+          pnpm --version
+      - name: Rust format
+        run: rustup run 1.92.0 cargo fmt --all -- --check
+      - name: Rust tests
+        run: rustup run 1.92.0 cargo test --locked --workspace --all-targets
+      - name: Strict Clippy
+        run: rustup run 1.92.0 cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Shell policy
+        run: rustup run 1.92.0 cargo run --locked -p xtask -- policy
+      - name: pnpm lock
+        run: pnpm install --lockfile-only --frozen-lockfile --offline
