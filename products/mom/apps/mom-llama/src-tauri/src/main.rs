@@ -13,6 +13,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{any::Any, panic::AssertUnwindSafe};
 use tauri::menu::{
     AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID,
 };
@@ -34,8 +35,11 @@ enum StartupState {
     Building,
     Ready(AppRuntimeHandle),
     Failed,
+    RestartRequired,
     QuiescingSafe(Option<AppRuntimeHandle>),
     QuiescingDuringBuild,
+    QuiescingBlocked(AppRuntimeHandle),
+    QuiescingBuildCleanupBlocked(mom_llama_runtime::native_runtime::ProductRuntimeOwner),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +53,109 @@ enum StartupShutdownAction {
     AlreadyQuiescing,
     WaitForBuild,
     NoRuntime,
+}
+
+enum FinalExitTarget {
+    NoRuntime,
+    Runtime(AppRuntimeHandle),
+    WaitForBuild,
+    AbortWithoutRustTeardown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalExitDecision {
+    ReturnToTauri,
+    AbortWithoutRustTeardown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedBuildDisposition {
+    Retryable,
+    RestartRequired,
+    ExitSafe,
+    RetainAndAbortOnFinalExit,
+}
+
+enum FailedBuildCompletion {
+    PreOwner,
+    PostOwnerCleaned,
+    PostOwnerCleanupBlocked(mom_llama_runtime::native_runtime::ProductRuntimeOwner),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedBuildKind {
+    PreOwner,
+    PostOwnerCleaned,
+    PostOwnerCleanupBlocked,
+}
+
+impl FailedBuildCompletion {
+    const fn kind(&self) -> FailedBuildKind {
+        match self {
+            Self::PreOwner => FailedBuildKind::PreOwner,
+            Self::PostOwnerCleaned => FailedBuildKind::PostOwnerCleaned,
+            Self::PostOwnerCleanupBlocked(_) => FailedBuildKind::PostOwnerCleanupBlocked,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeBuildCleanupEvidence {
+    native_host_joined: bool,
+    joined_native_worker_count: usize,
+    error: Option<String>,
+}
+
+struct NativeBuildCleanup {
+    evidence: NativeBuildCleanupEvidence,
+    blocked_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
+}
+
+#[derive(Debug)]
+enum PostOwnerBuildCause<E> {
+    Error(E),
+    Panic(String),
+}
+
+struct PostOwnerBuildFailure<E> {
+    cause: PostOwnerBuildCause<E>,
+    cleanup: NativeBuildCleanup,
+}
+
+struct RuntimeBuildError {
+    message: String,
+    cleanup: Option<NativeBuildCleanupEvidence>,
+    completion: FailedBuildCompletion,
+}
+
+impl std::fmt::Display for RuntimeBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)?;
+        if let Some(cleanup) = &self.cleanup {
+            write!(
+                formatter,
+                "; native cleanup: joined={}, workers={}",
+                cleanup.native_host_joined, cleanup.joined_native_worker_count
+            )?;
+            if let Some(error) = &cleanup.error {
+                write!(formatter, ", error={error}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RuntimeBuildError {}
+
+impl std::fmt::Debug for RuntimeBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeBuildError")
+            .field("message", &self.message)
+            .field("cleanup", &self.cleanup)
+            .field("completion", &self.completion.kind())
+            .finish()
+    }
 }
 
 impl StartupController {
@@ -69,9 +176,15 @@ impl StartupController {
             StartupState::Unlocking | StartupState::Building => {
                 Err("Mom Llama is already unlocking its encrypted local data".to_string())
             }
-            StartupState::QuiescingSafe(_) | StartupState::QuiescingDuringBuild => {
+            StartupState::QuiescingSafe(_)
+            | StartupState::QuiescingDuringBuild
+            | StartupState::QuiescingBlocked(_)
+            | StartupState::QuiescingBuildCleanupBlocked(_) => {
                 Err("Mom Llama is shutting down".to_string())
             }
+            StartupState::RestartRequired => Err(
+                "Mom Llama must be restarted before local runtime startup can retry".to_string(),
+            ),
             StartupState::Idle => {
                 *state = StartupState::Unlocking;
                 Ok(StartupAction::Initialize {
@@ -135,11 +248,16 @@ impl StartupController {
                 *state = StartupState::QuiescingSafe(Some(runtime.clone()));
                 StartupShutdownAction::Start(runtime)
             }
-            StartupState::Building | StartupState::QuiescingDuringBuild => {
+            StartupState::Building => {
                 *state = StartupState::QuiescingDuringBuild;
                 StartupShutdownAction::WaitForBuild
             }
-            StartupState::QuiescingSafe(_) => StartupShutdownAction::AlreadyQuiescing,
+            StartupState::QuiescingDuringBuild => StartupShutdownAction::AlreadyQuiescing,
+            StartupState::QuiescingSafe(_)
+            | StartupState::QuiescingBlocked(_)
+            | StartupState::QuiescingBuildCleanupBlocked(_) => {
+                StartupShutdownAction::AlreadyQuiescing
+            }
             _ => {
                 *state = StartupState::QuiescingSafe(None);
                 StartupShutdownAction::NoRuntime
@@ -147,36 +265,144 @@ impl StartupController {
         }
     }
 
-    fn finish_rejected_build(&self) {
-        if let Ok(mut state) = self.state.lock()
-            && matches!(&*state, StartupState::QuiescingDuringBuild)
-        {
-            *state = StartupState::QuiescingSafe(None);
+    fn finish_rejected_build(&self, runtime: AppRuntimeHandle, safe_to_exit: bool) {
+        let Ok(mut state) = self.state.lock() else {
+            if !safe_to_exit {
+                // Without the state lock there is nowhere to publish the
+                // failed join. Keep the live native runtime out of Drop so a
+                // poisoned bookkeeping lock cannot turn into unsafe teardown.
+                std::mem::forget(runtime);
+            }
+            return;
+        };
+        let disposition = rejected_build_disposition(
+            matches!(&*state, StartupState::QuiescingDuringBuild),
+            safe_to_exit,
+        );
+        *state = match disposition {
+            RejectedBuildDisposition::RestartRequired => StartupState::RestartRequired,
+            RejectedBuildDisposition::ExitSafe => StartupState::QuiescingSafe(Some(runtime)),
+            RejectedBuildDisposition::RetainAndAbortOnFinalExit => {
+                StartupState::QuiescingBlocked(runtime)
+            }
+        };
+    }
+
+    fn finish_failed_build(&self, completion: FailedBuildCompletion) {
+        let Ok(mut state) = self.state.lock() else {
+            if let FailedBuildCompletion::PostOwnerCleanupBlocked(owner) = completion {
+                // A poisoned state lock cannot safely publish join evidence.
+                // Intentionally retain the sole native owner for process life;
+                // dropping it would silently repeat the failed finalizer.
+                std::mem::forget(owner);
+            }
+            return;
+        };
+        let disposition = failed_build_disposition(
+            matches!(&*state, StartupState::QuiescingDuringBuild),
+            completion.kind(),
+        );
+        *state = match (disposition, completion) {
+            (FailedBuildDisposition::Retryable, FailedBuildCompletion::PreOwner) => {
+                StartupState::Failed
+            }
+            (FailedBuildDisposition::RestartRequired, FailedBuildCompletion::PostOwnerCleaned) => {
+                StartupState::RestartRequired
+            }
+            (FailedBuildDisposition::ExitSafe, _) => StartupState::QuiescingSafe(None),
+            (
+                FailedBuildDisposition::RetainAndAbortOnFinalExit,
+                FailedBuildCompletion::PostOwnerCleanupBlocked(owner),
+            ) => StartupState::QuiescingBuildCleanupBlocked(owner),
+            _ => unreachable!("failed-build disposition and completion must agree"),
         }
     }
 
-    async fn wait_for_build(&self) {
+    async fn wait_for_build(&self) -> bool {
         loop {
-            let still_building = self
-                .state
-                .lock()
-                .map(|state| matches!(&*state, StartupState::QuiescingDuringBuild))
-                .unwrap_or(false);
-            if !still_building {
-                return;
+            let disposition = {
+                let Ok(state) = self.state.lock() else {
+                    return false;
+                };
+                match &*state {
+                    StartupState::QuiescingDuringBuild => None,
+                    StartupState::QuiescingSafe(_) => Some(true),
+                    StartupState::QuiescingBlocked(_)
+                    | StartupState::QuiescingBuildCleanupBlocked(_) => Some(false),
+                    _ => Some(false),
+                }
+            };
+            if let Some(safe_to_exit) = disposition {
+                return safe_to_exit;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
-    fn ready_runtime(&self) -> Option<AppRuntimeHandle> {
-        let state = self.state.lock().ok()?;
+    fn final_exit_target(&self) -> FinalExitTarget {
+        let Ok(mut state) = self.state.lock() else {
+            return FinalExitTarget::WaitForBuild;
+        };
         match &*state {
-            StartupState::Ready(runtime) | StartupState::QuiescingSafe(Some(runtime)) => {
-                Some(runtime.clone())
+            StartupState::Ready(runtime) => {
+                let runtime = runtime.clone();
+                *state = StartupState::QuiescingSafe(Some(runtime.clone()));
+                FinalExitTarget::Runtime(runtime)
             }
-            _ => None,
+            StartupState::QuiescingSafe(Some(runtime))
+            | StartupState::QuiescingBlocked(runtime) => FinalExitTarget::Runtime(runtime.clone()),
+            StartupState::QuiescingBuildCleanupBlocked(owner) => {
+                let _keep_owner_alive = owner;
+                FinalExitTarget::AbortWithoutRustTeardown
+            }
+            StartupState::Building => {
+                *state = StartupState::QuiescingDuringBuild;
+                FinalExitTarget::WaitForBuild
+            }
+            StartupState::QuiescingDuringBuild => FinalExitTarget::WaitForBuild,
+            StartupState::Idle
+            | StartupState::Unlocking
+            | StartupState::Failed
+            | StartupState::RestartRequired => {
+                *state = StartupState::QuiescingSafe(None);
+                FinalExitTarget::NoRuntime
+            }
+            StartupState::QuiescingSafe(None) => FinalExitTarget::NoRuntime,
         }
+    }
+}
+
+const fn failed_build_disposition(
+    quit_waiting: bool,
+    completion: FailedBuildKind,
+) -> FailedBuildDisposition {
+    match (quit_waiting, completion) {
+        (_, FailedBuildKind::PostOwnerCleanupBlocked) => {
+            FailedBuildDisposition::RetainAndAbortOnFinalExit
+        }
+        (true, _) => FailedBuildDisposition::ExitSafe,
+        (false, FailedBuildKind::PreOwner) => FailedBuildDisposition::Retryable,
+        (false, FailedBuildKind::PostOwnerCleaned) => FailedBuildDisposition::RestartRequired,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectedBuildDisposition {
+    RestartRequired,
+    ExitSafe,
+    RetainAndAbortOnFinalExit,
+}
+
+const fn rejected_build_disposition(
+    quit_waiting: bool,
+    native_host_joined: bool,
+) -> RejectedBuildDisposition {
+    if !native_host_joined {
+        RejectedBuildDisposition::RetainAndAbortOnFinalExit
+    } else if quit_waiting {
+        RejectedBuildDisposition::ExitSafe
+    } else {
+        RejectedBuildDisposition::RestartRequired
     }
 }
 
@@ -226,8 +452,7 @@ async fn mom_llama_runtime_initialize(
     {
         Ok(built) => built,
         Err(error) => {
-            startup.record_failure();
-            startup.finish_rejected_build();
+            startup.finish_failed_build(FailedBuildCompletion::PreOwner);
             return Err(format!("Mom Llama startup worker failed: {error}"));
         }
     };
@@ -237,18 +462,17 @@ async fn mom_llama_runtime_initialize(
             Ok(()) => Ok(()),
             Err(runtime) => {
                 runtime.begin_quiesce();
-                let _ = runtime.shutdown().await;
-                startup.record_failure();
-                startup.finish_rejected_build();
+                let shutdown = runtime.shutdown().await;
+                let safe_to_exit = safe_to_exit_after_shutdown(&shutdown);
+                log_shutdown_result(&shutdown);
+                startup.finish_rejected_build(runtime, safe_to_exit);
                 Err("Mom Llama stopped before encrypted runtime startup completed".to_string())
             }
         },
         Err(error) => {
-            startup.record_failure();
-            startup.finish_rejected_build();
-            Err(format!(
-                "Mom Llama could not initialize its local runtime: {error:#}"
-            ))
+            let message = format!("Mom Llama could not initialize its local runtime: {error:#}");
+            startup.finish_failed_build(error.completion);
+            Err(message)
         }
     }
 }
@@ -410,10 +634,12 @@ fn main() {
                 // Dock Quit and AppleEvent Quit may reach this final boundary
                 // without an interceptable ExitRequested. Do not let AppKit
                 // or static teardown proceed while Metal owns live resources.
-                if let Some(runtime) = event_startup.ready_runtime() {
-                    runtime.begin_quiesce();
-                    let result = tauri::async_runtime::block_on(runtime.shutdown());
-                    log_shutdown_result(&result);
+                let decision = decide_final_exit(&event_startup);
+                if decision == FinalExitDecision::AbortWithoutRustTeardown {
+                    eprintln!(
+                        "Mom Llama aborts final exit because native shutdown lacks joined evidence"
+                    );
+                    std::process::abort();
                 }
             }
         }),
@@ -540,10 +766,7 @@ fn request_graceful_exit<R: Runtime>(
     tauri::async_runtime::spawn(async move {
         let result = runtime.shutdown().await;
         log_shutdown_result(&result);
-        let safe_to_exit = match &result {
-            Ok(_) => true,
-            Err(error) => error.summary.native_host_joined,
-        };
+        let safe_to_exit = safe_to_exit_after_shutdown(&result);
         if safe_to_exit {
             exit_allowed.store(true, Ordering::Release);
             app_handle.exit(exit_code);
@@ -551,6 +774,50 @@ fn request_graceful_exit<R: Runtime>(
             eprintln!("Mom Llama remains open because native shutdown failed: {error}");
         }
     });
+}
+
+fn safe_to_exit_after_shutdown(
+    result: &Result<app_runtime::AppShutdownSummary, app_runtime::AppShutdownError>,
+) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(error) => error.summary.native_host_joined,
+    }
+}
+
+fn decide_final_exit(startup: &StartupController) -> FinalExitDecision {
+    decide_final_exit_target(
+        startup.final_exit_target(),
+        |runtime| {
+            runtime.begin_quiesce();
+            let result = tauri::async_runtime::block_on(runtime.shutdown());
+            log_shutdown_result(&result);
+            safe_to_exit_after_shutdown(&result)
+        },
+        || tauri::async_runtime::block_on(startup.wait_for_build()),
+    )
+}
+
+fn decide_final_exit_target(
+    target: FinalExitTarget,
+    shutdown_runtime: impl FnOnce(AppRuntimeHandle) -> bool,
+    wait_for_build: impl FnOnce() -> bool,
+) -> FinalExitDecision {
+    let safe_to_return = match target {
+        FinalExitTarget::NoRuntime => true,
+        FinalExitTarget::Runtime(runtime) => shutdown_runtime(runtime),
+        FinalExitTarget::WaitForBuild => wait_for_build(),
+        FinalExitTarget::AbortWithoutRustTeardown => false,
+    };
+    final_exit_decision(safe_to_return)
+}
+
+const fn final_exit_decision(safe_to_return: bool) -> FinalExitDecision {
+    if safe_to_return {
+        FinalExitDecision::ReturnToTauri
+    } else {
+        FinalExitDecision::AbortWithoutRustTeardown
+    }
 }
 
 fn request_startup_aware_exit<R: Runtime>(
@@ -569,9 +836,12 @@ fn request_startup_aware_exit<R: Runtime>(
             let app_handle = app_handle.clone();
             let exit_allowed = Arc::clone(exit_allowed);
             tauri::async_runtime::spawn(async move {
-                startup.wait_for_build().await;
-                exit_allowed.store(true, Ordering::Release);
-                app_handle.exit(exit_code);
+                if startup.wait_for_build().await {
+                    exit_allowed.store(true, Ordering::Release);
+                    app_handle.exit(exit_code);
+                } else {
+                    eprintln!("Mom Llama remains open because startup native shutdown failed");
+                }
             });
         }
         StartupShutdownAction::NoRuntime => {
@@ -595,18 +865,106 @@ fn log_shutdown_result(
 fn build_runtime(
     gateway: Arc<Gateway>,
     settings: mom_llama_runtime::config::Settings,
-) -> Result<AppRuntimeHandle> {
-    let native_owner =
-        mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(&settings)?;
-    let (host, model) = mom_llama_runtime::gateway_native_configuration()?;
-    let backend = Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host)));
-    backend
-        .replace_configuration(Arc::clone(&host), model)
-        .map_err(anyhow::Error::msg)?;
-    gateway
-        .register_backend(backend.clone())
-        .map_err(anyhow::Error::msg)?;
+) -> std::result::Result<AppRuntimeHandle, RuntimeBuildError> {
+    let native_owner = mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(
+        &settings,
+    )
+    .map_err(|error| RuntimeBuildError {
+        message: format!("native runtime owner initialization failed: {error:#}"),
+        cleanup: None,
+        completion: FailedBuildCompletion::PreOwner,
+    })?;
+    let attempt = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<_> {
+        let (host, model) = mom_llama_runtime::gateway_native_configuration()?;
+        let backend = Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host)));
+        backend
+            .replace_configuration(Arc::clone(&host), model)
+            .map_err(anyhow::Error::msg)?;
+        gateway
+            .register_backend(backend.clone())
+            .map_err(anyhow::Error::msg)?;
+        Ok(backend)
+    }));
+    let (backend, native_owner) = finish_post_owner_build(attempt, native_owner, |owner| {
+        cleanup_rejected_native_owner(owner)
+    })
+    .map_err(|failure| {
+        let message = match failure.cause {
+            PostOwnerBuildCause::Error(error) => {
+                format!("native runtime composition failed: {error:#}")
+            }
+            PostOwnerBuildCause::Panic(message) => {
+                format!("native runtime composition panicked: {message}")
+            }
+        };
+        let NativeBuildCleanup {
+            evidence,
+            blocked_owner,
+        } = failure.cleanup;
+        let completion = match blocked_owner {
+            Some(owner) => FailedBuildCompletion::PostOwnerCleanupBlocked(owner),
+            None => FailedBuildCompletion::PostOwnerCleaned,
+        };
+        RuntimeBuildError {
+            message,
+            cleanup: Some(evidence),
+            completion,
+        }
+    })?;
     Ok(AppRuntimeHandle::new(gateway, backend, native_owner))
+}
+
+fn finish_post_owner_build<T, E, O>(
+    attempt: std::thread::Result<std::result::Result<T, E>>,
+    owner: O,
+    cleanup: impl FnOnce(O) -> NativeBuildCleanup,
+) -> std::result::Result<(T, O), PostOwnerBuildFailure<E>> {
+    match attempt {
+        Ok(Ok(value)) => Ok((value, owner)),
+        Ok(Err(error)) => Err(PostOwnerBuildFailure {
+            cause: PostOwnerBuildCause::Error(error),
+            cleanup: cleanup(owner),
+        }),
+        Err(payload) => Err(PostOwnerBuildFailure {
+            cause: PostOwnerBuildCause::Panic(panic_message(payload)),
+            cleanup: cleanup(owner),
+        }),
+    }
+}
+
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+fn cleanup_rejected_native_owner(
+    owner: mom_llama_runtime::native_runtime::ProductRuntimeOwner,
+) -> NativeBuildCleanup {
+    let host = owner.host();
+    match mom_llama_runtime::shutdown_product_runtime_for_process_exit(&host) {
+        Ok(receipt) => NativeBuildCleanup {
+            evidence: NativeBuildCleanupEvidence {
+                native_host_joined: true,
+                joined_native_worker_count: receipt.joined_worker_count(),
+                error: None,
+            },
+            blocked_owner: None,
+        },
+        Err(error) => NativeBuildCleanup {
+            evidence: NativeBuildCleanupEvidence {
+                native_host_joined: false,
+                joined_native_worker_count: 0,
+                error: Some(error.to_string()),
+            },
+            // Keep the sole owner and its strong host reference alive. Final
+            // Exit will abort without Rust teardown rather than dropping live
+            // native resources after a failed join.
+            blocked_owner: Some(owner),
+        },
+    }
 }
 
 fn build_gateway_plugin(gateway: Arc<Gateway>) -> TauriPlugin<tauri::Wry> {
@@ -690,7 +1048,14 @@ fn smoke_receipt(rendered_html_bytes: usize) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartupAction, StartupController, StartupShutdownAction, smoke_receipt};
+    use super::{
+        FailedBuildCompletion, FailedBuildKind, FinalExitDecision, FinalExitTarget,
+        NativeBuildCleanup, NativeBuildCleanupEvidence, PostOwnerBuildCause, StartupAction,
+        StartupController, StartupShutdownAction, decide_final_exit_target,
+        failed_build_disposition, final_exit_decision, finish_post_owner_build,
+        rejected_build_disposition, safe_to_exit_after_shutdown, smoke_receipt,
+    };
+    use crate::app_runtime::{AppShutdownError, AppShutdownSummary};
     use fte_router::{Gateway, GatewayDefaults};
     use std::sync::Arc;
 
@@ -729,8 +1094,8 @@ mod tests {
         assert!(startup.begin_initialization().is_err());
     }
 
-    #[test]
-    fn shutdown_waits_when_native_runtime_construction_has_started() {
+    #[tokio::test]
+    async fn shutdown_waits_when_native_runtime_construction_has_started() {
         let startup = startup_controller();
         assert!(startup.begin_initialization().is_ok());
         assert!(startup.begin_runtime_build().is_ok());
@@ -738,11 +1103,186 @@ mod tests {
             startup.begin_shutdown(),
             StartupShutdownAction::WaitForBuild
         ));
-        startup.finish_rejected_build();
         assert!(matches!(
             startup.begin_shutdown(),
             StartupShutdownAction::AlreadyQuiescing
         ));
+        startup.finish_failed_build(FailedBuildCompletion::PostOwnerCleaned);
+        assert!(startup.wait_for_build().await);
+        assert!(matches!(
+            startup.begin_shutdown(),
+            StartupShutdownAction::AlreadyQuiescing
+        ));
+    }
+
+    #[test]
+    fn only_pre_owner_failure_is_retryable() {
+        assert_eq!(
+            failed_build_disposition(false, FailedBuildKind::PreOwner),
+            super::FailedBuildDisposition::Retryable
+        );
+        assert_eq!(
+            failed_build_disposition(true, FailedBuildKind::PreOwner),
+            super::FailedBuildDisposition::ExitSafe
+        );
+        assert_eq!(
+            failed_build_disposition(false, FailedBuildKind::PostOwnerCleaned),
+            super::FailedBuildDisposition::RestartRequired
+        );
+        assert_eq!(
+            failed_build_disposition(true, FailedBuildKind::PostOwnerCleaned),
+            super::FailedBuildDisposition::ExitSafe
+        );
+        assert_eq!(
+            failed_build_disposition(false, FailedBuildKind::PostOwnerCleanupBlocked),
+            super::FailedBuildDisposition::RetainAndAbortOnFinalExit
+        );
+        assert_eq!(
+            failed_build_disposition(true, FailedBuildKind::PostOwnerCleanupBlocked),
+            super::FailedBuildDisposition::RetainAndAbortOnFinalExit
+        );
+
+        let pre_owner = startup_controller();
+        assert!(pre_owner.begin_initialization().is_ok());
+        assert!(pre_owner.begin_runtime_build().is_ok());
+        pre_owner.finish_failed_build(FailedBuildCompletion::PreOwner);
+        assert_eq!(
+            pre_owner.begin_initialization(),
+            Ok(StartupAction::Initialize {
+                retry_cached_failure: true
+            })
+        );
+
+        let post_owner = startup_controller();
+        assert!(post_owner.begin_initialization().is_ok());
+        assert!(post_owner.begin_runtime_build().is_ok());
+        post_owner.finish_failed_build(FailedBuildCompletion::PostOwnerCleaned);
+        assert!(
+            post_owner
+                .begin_initialization()
+                .expect_err("closed product lifecycle must not advertise retry")
+                .contains("restarted")
+        );
+
+        assert_eq!(
+            rejected_build_disposition(false, true),
+            super::RejectedBuildDisposition::RestartRequired
+        );
+        assert_eq!(
+            rejected_build_disposition(true, true),
+            super::RejectedBuildDisposition::ExitSafe
+        );
+        assert_eq!(
+            rejected_build_disposition(false, false),
+            super::RejectedBuildDisposition::RetainAndAbortOnFinalExit
+        );
+        assert_eq!(
+            rejected_build_disposition(true, false),
+            super::RejectedBuildDisposition::RetainAndAbortOnFinalExit
+        );
+    }
+
+    #[test]
+    fn failed_native_join_never_permits_process_exit() {
+        let summary = AppShutdownSummary {
+            started_at_unix_ms: 1,
+            completed_at_unix_ms: 2,
+            elapsed_ms: 1,
+            gateway_drained: true,
+            native_host_joined: false,
+            joined_native_worker_count: 0,
+            application_work_drained: true,
+        };
+        let failure = Err(AppShutdownError {
+            summary: summary.clone(),
+            gateway_error: None,
+            native_error: Some("native join failed".to_string()),
+        });
+        assert!(!safe_to_exit_after_shutdown(&failure));
+
+        let gateway_only_failure = Err(AppShutdownError {
+            summary: AppShutdownSummary {
+                native_host_joined: true,
+                ..summary
+            },
+            gateway_error: Some("gateway drain failed".to_string()),
+            native_error: None,
+        });
+        assert!(safe_to_exit_after_shutdown(&gateway_only_failure));
+        assert_eq!(
+            final_exit_decision(false),
+            FinalExitDecision::AbortWithoutRustTeardown
+        );
+        assert_eq!(final_exit_decision(true), FinalExitDecision::ReturnToTauri);
+        assert_eq!(
+            decide_final_exit_target(
+                FinalExitTarget::AbortWithoutRustTeardown,
+                |_| panic!("blocked final exit must not run a runtime finalizer"),
+                || panic!("blocked final exit must not wait for a build")
+            ),
+            FinalExitDecision::AbortWithoutRustTeardown
+        );
+        assert_eq!(
+            decide_final_exit_target(
+                FinalExitTarget::WaitForBuild,
+                |_| panic!("build wait target has no ready runtime"),
+                || false
+            ),
+            FinalExitDecision::AbortWithoutRustTeardown
+        );
+    }
+
+    #[test]
+    fn post_owner_error_and_panic_are_terminal_after_cleanup() {
+        let failed_cleanup = || NativeBuildCleanup {
+            evidence: NativeBuildCleanupEvidence {
+                native_host_joined: false,
+                joined_native_worker_count: 0,
+                error: Some("injected finalizer failure".to_string()),
+            },
+            blocked_owner: None,
+        };
+        let attempt: std::thread::Result<Result<(), &str>> = Ok(Err("post-owner error"));
+        let error = finish_post_owner_build(attempt, 7, |_| failed_cleanup())
+            .expect_err("post-owner error must fail the build");
+        assert!(matches!(
+            error.cause,
+            PostOwnerBuildCause::Error("post-owner error")
+        ));
+        assert!(!error.cleanup.evidence.native_host_joined);
+        assert_eq!(
+            error.cleanup.evidence.error.as_deref(),
+            Some("injected finalizer failure")
+        );
+
+        let panic =
+            finish_post_owner_build::<(), &str, _>(Err(Box::new("post-owner panic")), 9, |_| {
+                NativeBuildCleanup {
+                    evidence: NativeBuildCleanupEvidence {
+                        native_host_joined: true,
+                        joined_native_worker_count: 1,
+                        error: None,
+                    },
+                    blocked_owner: None,
+                }
+            })
+            .expect_err("post-owner panic must fail the build");
+        assert!(matches!(
+            panic.cause,
+            PostOwnerBuildCause::Panic(ref message) if message == "post-owner panic"
+        ));
+        assert!(panic.cleanup.evidence.native_host_joined);
+
+        let startup = startup_controller();
+        assert!(startup.begin_initialization().is_ok());
+        assert!(startup.begin_runtime_build().is_ok());
+        startup.finish_failed_build(FailedBuildCompletion::PostOwnerCleaned);
+        assert!(
+            startup
+                .begin_initialization()
+                .expect_err("a cleaned-up post-owner panic must require process restart")
+                .contains("restarted")
+        );
     }
 
     #[test]
