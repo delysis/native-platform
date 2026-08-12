@@ -29,7 +29,7 @@ accepted lifecycle contract/testkit pin remains exactly `cbab335...`.
 | `fixtures/w1/cache-session-state-v1.json` | `4bfc026b7b842e4ef65d6b0993fa6eb13f0d33e0573296aba6b48c04da34425a` | Exact logical session-KV metadata and blob identity before ciphertext corruption |
 | `fixtures/w1/cache-native-prefix-after-state-v1.json` | `38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed` | Exact typed absent native-prefix cache state after quarantine and reopen |
 | `fixtures/w1/cache-session-after-state-v1.json` | `1885429208d88d71764bef9f98d867f16e5c54e7672226734a137201978fab9b` | Exact invalidated session-KV metadata and absent blob state after reopen |
-| `fixtures/w1/quit-relaunch-v1.json` | `0a036918787fd4aa7a1455140196e0c0ab37a5caff56a28bb82332a48f553a8b` | Deterministic fake-owner identity and durable draft for the full application-runtime quit/relaunch case |
+| `fixtures/w1/quit-relaunch-v1.json` | `156aa56cad1e34731ce61a5ec8e25c8db154afe38593707a207986f7b8c7a487` | Deterministic application-operation identity and durable draft for the full runtime quit/relaunch case |
 | `fixtures/w1/chat-cancel-retry-manifest-v0.json` | `d5e78f687cb8d06c823e91cdaa46c7564e042e7f118194dcd2c5a1042d24375d` | Authenticated central-protocol case for Mom chat/cancel/retry |
 | `fixtures/w1/chat-cancel-retry-projection-v0.json` | `5089d654ffc27ce2b2ce34d102a98cd0160a074cb2f9c458dd7fbdacac2bb441` | Frozen product-derived stream, lifecycle, durable-state, and ownership facts |
 | `fixtures/w1/attachment-manifest-v0.json` | `01c8701dc70b586bf3cbe9ad069b4fb97f2fe2719ce8a1b43e7b66d179c9cdb0` | Authenticated central-protocol case for Mom attachment |
@@ -38,8 +38,8 @@ accepted lifecycle contract/testkit pin remains exactly `cbab335...`.
 | `fixtures/w1/prior-store-projection-v0.json` | `2c7bd3fcd1e93ee5bc70ab8c3cf0be6a7f33b71bf03dbff9cd971306bf01b136` | Frozen logical recovery and plaintext-cleanup facts |
 | `fixtures/w1/cache-corruption-manifest-v0.json` | `83dccd2453e26fcaf175fbbf4fa5fdfe7c0b1d14020f7cbc350dcfffea580b61` | Mom-owned cases within the cross-product corrupted-cache row |
 | `fixtures/w1/cache-corruption-projection-v0.json` | `d2e03c9923dd36837c1b13b9a47b2426bf3730652338362417d60a7da420cbe7` | Frozen native-prefix quarantine and session-KV invalidation projection bound to their exact logical before and after states |
-| `fixtures/w1/quit-relaunch-manifest-v0.json` | `1b75ff433d813b26d40c0058273bec574c62dccb09254bc1f584c6bb6ddb6ef8` | Authenticated Mom case within the cross-product fake-owner quit/relaunch row |
-| `fixtures/w1/quit-relaunch-projection-v0.json` | `732a31c376d00a7a34977c27e25be0065cfefe59900cb3c7232d54d3eaea022e` | Frozen full-AppRuntime cancellation, terminal, join, zero-orphan, same-store reopen, and fresh-admission facts |
+| `fixtures/w1/quit-relaunch-manifest-v0.json` | `120b31a7134ba884d0fe0e425fcf0322a5602709258c07d08c14ee3621459480` | Authenticated Mom case within the cross-product fake-owner quit/relaunch row |
+| `fixtures/w1/quit-relaunch-projection-v0.json` | `4f38c918a9f89768d0a5f5dd97647e9ce045d709f0b0b074e6af228c1b55077a` | Frozen full-AppRuntime admission-close, cancellation, terminal, exact worker epochs, join, zero-orphan, same-store reopen, and fresh-admission facts |
 
 ## Product evidence
 

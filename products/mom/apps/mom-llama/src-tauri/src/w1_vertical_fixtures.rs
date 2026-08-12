@@ -1,4 +1,4 @@
-use crate::app_runtime::w1_fixture_runtime;
+use crate::app_runtime::{w1_fixture_runtime, w1_fixture_runtime_with_sequence};
 use crate::command_registry::command_spec;
 use crate::operation_supervisor::{
     LifecyclePhase, OperationSupervisor, TerminalClass, validate_worker_sets,
@@ -7,6 +7,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -397,12 +398,41 @@ async fn full_app_runtime_quit_joins_fake_owner_and_reopens_same_store() -> Resu
         .map_err(anyhow::Error::msg)?;
 
     let supervisor = runtime.w1_operation_supervisor();
-    let owner = supervisor.spawn_controlled(&fixture.active_operation_id)?;
-    supervisor.publish_controlled_progress(&owner, 1)?;
-    let cancelled_identity = supervisor
-        .controlled_snapshot(&owner)
-        .context("controlled owner snapshot")?
-        .identity;
+    let active_lease = runtime
+        .admit(command_spec("mom_llama_chat_send"))
+        .map_err(anyhow::Error::msg)?;
+    let cancelled_identity = active_lease
+        .w1_attempt_identity()
+        .context("active application operation identity")?;
+    ensure!(cancelled_identity.operation_id == fixture.active_operation_id);
+    let cancellation = active_lease
+        .w1_cancellation_signal()
+        .context("long application operation cancellation signal")?;
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (cancel_seen_tx, cancel_seen_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let active_task = tokio::spawn(async move {
+        active_lease
+            .run_blocking(move || {
+                started_tx
+                    .send(())
+                    .map_err(|_| "fixture start observer disappeared".to_owned())?;
+                while !cancellation.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                cancel_seen_tx
+                    .send(())
+                    .map_err(|_| "fixture cancellation observer disappeared".to_owned())?;
+                release_rx
+                    .recv()
+                    .map_err(|_| "fixture release authority disappeared".to_owned())?;
+                Err::<(), _>("fixture owner observed application cancellation".to_owned())
+            })
+            .await
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .context("active application worker started")?;
     let shutdown = {
         let runtime = runtime.clone();
         tokio::spawn(async move { runtime.shutdown().await })
@@ -412,17 +442,26 @@ async fn full_app_runtime_quit_joins_fake_owner_and_reopens_same_store() -> Resu
     }
     ensure!(supervisor.phase() == LifecyclePhase::Quiescing);
     ensure!(
+        runtime.admit(command_spec("mom_llama_draft_get")).is_err(),
+        "application admission must be closed before the owner exits"
+    );
+    ensure!(
         supervisor.cancellation_requested_by_id(&fixture.active_operation_id),
         "AppRuntime quit must publish cancellation before owner terminalization"
     );
-    supervisor.request_controlled_terminal(&owner, TerminalClass::Cancelled)?;
-    let released = supervisor.wait_controlled_released(&owner, Duration::from_secs(2))?;
+    cancel_seen_rx
+        .recv_timeout(Duration::from_secs(2))
+        .context("application worker observed cancellation")?;
+    release_tx
+        .send(())
+        .context("release cancelled application worker")?;
     ensure!(
-        released
-            .authoritative_terminal
-            .is_some_and(|terminal| terminal.class == TerminalClass::Cancelled)
+        active_task
+            .await
+            .context("active application task")?
+            .is_err(),
+        "cancelled application worker must not report success"
     );
-    supervisor.allow_controlled_exit(&owner)?;
     let first_summary = shutdown
         .await
         .context("first AppRuntime shutdown task")?
@@ -436,6 +475,7 @@ async fn full_app_runtime_quit_joins_fake_owner_and_reopens_same_store() -> Resu
     ensure!(first_summary.expected_worker_ids == first_summary.joined_worker_ids);
     ensure!(first_summary.expected_operation_worker_count == 1);
     ensure!(first_summary.joined_operation_worker_count == 1);
+    ensure!(first_summary.expected_worker_ids == ["mom-operation-worker-41"]);
     let first_terminals = runtime.w1_terminal_facts();
     ensure!(first_terminals.len() == 1);
     ensure!(first_terminals[0].identity == cancelled_identity);
@@ -443,7 +483,7 @@ async fn full_app_runtime_quit_joins_fake_owner_and_reopens_same_store() -> Resu
 
     mom_llama_runtime::config::set_data_dir_override_for_tests(None);
     mom_llama_runtime::config::set_data_dir_override_for_tests(Some(session.path.clone()));
-    let relaunched = w1_fixture_runtime();
+    let relaunched = w1_fixture_runtime_with_sequence(42);
     let read_lease = relaunched
         .admit(command_spec("mom_llama_draft_get"))
         .map_err(anyhow::Error::msg)?;
@@ -473,6 +513,7 @@ async fn full_app_runtime_quit_joins_fake_owner_and_reopens_same_store() -> Resu
     ensure!(second_summary.expected_worker_ids == second_summary.joined_worker_ids);
     ensure!(second_summary.expected_operation_worker_count == 1);
     ensure!(second_summary.joined_operation_worker_count == 1);
+    ensure!(second_summary.expected_worker_ids == ["mom-operation-worker-42"]);
     let second_terminals = relaunched.w1_terminal_facts();
     ensure!(second_terminals.len() == 1);
     ensure!(second_terminals[0].identity == completed_identity);
@@ -491,15 +532,47 @@ async fn full_app_runtime_quit_joins_fake_owner_and_reopens_same_store() -> Resu
                 operation_id: cancelled_identity.operation_id.clone(),
                 attempt_id: Some(cancelled_identity.attempt_id.clone()),
                 correlation_id: correlation_id.clone(),
-                kind: "cancelled".to_owned(),
+                kind: "admission_closed".to_owned(),
                 payload: None,
             },
             EventFactV0 {
                 sequence: 1,
+                operation_id: cancelled_identity.operation_id.clone(),
+                attempt_id: Some(cancelled_identity.attempt_id.clone()),
+                correlation_id: correlation_id.clone(),
+                kind: "cancellation_requested".to_owned(),
+                payload: None,
+            },
+            EventFactV0 {
+                sequence: 2,
+                operation_id: cancelled_identity.operation_id.clone(),
+                attempt_id: Some(cancelled_identity.attempt_id.clone()),
+                correlation_id: correlation_id.clone(),
+                kind: "cancelled".to_owned(),
+                payload: None,
+            },
+            EventFactV0 {
+                sequence: 3,
+                operation_id: cancelled_identity.operation_id.clone(),
+                attempt_id: Some(cancelled_identity.attempt_id.clone()),
+                correlation_id: correlation_id.clone(),
+                kind: "worker_joined".to_owned(),
+                payload: None,
+            },
+            EventFactV0 {
+                sequence: 4,
                 operation_id: completed_identity.operation_id.clone(),
                 attempt_id: Some(completed_identity.attempt_id.clone()),
                 correlation_id: correlation_id.clone(),
                 kind: "completed".to_owned(),
+                payload: None,
+            },
+            EventFactV0 {
+                sequence: 5,
+                operation_id: completed_identity.operation_id.clone(),
+                attempt_id: Some(completed_identity.attempt_id.clone()),
+                correlation_id: correlation_id.clone(),
+                kind: "worker_joined".to_owned(),
                 payload: None,
             },
         ],
@@ -556,6 +629,14 @@ async fn full_app_runtime_quit_joins_fake_owner_and_reopens_same_store() -> Resu
                 FactValueV0::Boolean(first_summary.native_host_joined),
             ),
             (
+                "first_worker_id".to_owned(),
+                FactValueV0::Text(first_summary.expected_worker_ids[0].clone()),
+            ),
+            (
+                "fresh_worker_id".to_owned(),
+                FactValueV0::Text(second_summary.expected_worker_ids[0].clone()),
+            ),
+            (
                 "fresh_runtime_admitted_work".to_owned(),
                 FactValueV0::Boolean(
                     second_terminals[0].terminal.class == TerminalClass::Completed,
@@ -564,6 +645,12 @@ async fn full_app_runtime_quit_joins_fake_owner_and_reopens_same_store() -> Resu
             (
                 "same_durable_state_reopened".to_owned(),
                 FactValueV0::Boolean(reopened.message == fixture.draft),
+            ),
+            (
+                "worker_epochs_distinct".to_owned(),
+                FactValueV0::Boolean(
+                    first_summary.expected_worker_ids != second_summary.expected_worker_ids,
+                ),
             ),
             (
                 "zero_orphan_workers".to_owned(),

@@ -24,9 +24,9 @@
             "id": "mom.quit-relaunch.input",
             "digest": {
               "algorithm": "sha256",
-              "hex": "0a036918787fd4aa7a1455140196e0c0ab37a5caff56a28bb82332a48f553a8b"
+              "hex": "156aa56cad1e34731ce61a5ec8e25c8db154afe38593707a207986f7b8c7a487"
             },
-            "length": 222
+            "length": 225
           },
           "availability": "checked_in",
           "relative_path": "crates/mom-llama-runtime/fixtures/w1/quit-relaunch-v1.json"
@@ -55,15 +55,17 @@
         "id": "mom.quit-relaunch.projection",
         "digest": {
           "algorithm": "sha256",
-          "hex": "732a31c376d00a7a34977c27e25be0065cfefe59900cb3c7232d54d3eaea022e"
+          "hex": "4f38c918a9f89768d0a5f5dd97647e9ce045d709f0b0b074e6af228c1b55077a"
         },
-        "length": 2330
+        "length": 3532
       }
     }
   ],
   "omitted_claims": [
+    "personal Keychain credential authorization",
     "real model inference",
-    "native GUI process relaunch"
+    "native GUI process relaunch",
+    "loaded native-model worker shutdown"
   ],
   "negative_evidence": []
 }
