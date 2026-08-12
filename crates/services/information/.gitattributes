@@ -1,0 +1,2 @@
+tests/fixtures/w1/v0/*.json text eol=lf
+tests/fixtures/w1/v0/*.sql text eol=lf
