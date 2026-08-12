@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.delysis.dev/w1/v0/evidence.schema.json",
+  "title": "Delysis evidence claim v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "tier",
+    "threat_model",
+    "exact_source",
+    "exact_runtime_or_artifact",
+    "execution_kind",
+    "omitted_claims",
+    "negative_evidence"
+  ],
+  "properties": {
+    "schema": { "const": "delysis.evidence_claim.v0" },
+    "tier": {
+      "description": "Serializable v0 accepts only non-authorizing evidence tiers.",
+      "enum": ["operational", "reproducible"]
+    },
+    "threat_model": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "exact_source": { "$ref": "#/$defs/digest" },
+    "exact_runtime_or_artifact": { "$ref": "#/$defs/digest" },
+    "execution_kind": { "enum": ["fixture", "local_runtime", "hosted_network"] },
+    "omitted_claims": { "$ref": "#/$defs/claims" },
+    "negative_evidence": { "$ref": "#/$defs/claims" }
+  },
+  "$defs": {
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "hex"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "hex": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "claims": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+    }
+  }
+}

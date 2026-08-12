@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.delysis.dev/w1/v0/shutdown.schema.json",
+  "title": "Delysis closed supervisor summary v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "phase",
+    "active_operations",
+    "retained_tasks",
+    "joined_workers",
+    "failures"
+  ],
+  "properties": {
+    "schema": { "const": "delysis.closed_summary.v0" },
+    "phase": { "const": "closed" },
+    "active_operations": { "const": 0 },
+    "retained_tasks": { "const": 0 },
+    "joined_workers": { "type": "integer", "minimum": 0 },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["service", "error"],
+        "properties": {
+          "service": { "$ref": "#/$defs/identifier" },
+          "error": { "$ref": "service-error.schema.json" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[!#-\\[\\]-~]+$"
+    }
+  }
+}

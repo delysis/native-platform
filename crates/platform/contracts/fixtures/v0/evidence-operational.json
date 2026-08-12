@@ -1,0 +1,20 @@
+{
+  "schema": "delysis.evidence_claim.v0",
+  "tier": "operational",
+  "threat_model": "a fixture proves contract behavior but not live network or local-model execution",
+  "exact_source": {
+    "algorithm": "sha256",
+    "hex": "c451e23244787fc8de7646a88a4fd4ae10f16f94c451e23244787fc8de7646a8"
+  },
+  "exact_runtime_or_artifact": {
+    "algorithm": "sha256",
+    "hex": "7c5e2a8f859f949830b3b9446b43c62b237a40167b486d02b0983563f71d71e7"
+  },
+  "execution_kind": "fixture",
+  "omitted_claims": [
+    "live hosted-provider behavior",
+    "authenticated remote-model identity",
+    "external attestation"
+  ],
+  "negative_evidence": []
+}

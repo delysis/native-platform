@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.delysis.dev/w1/v0/publication.schema.json",
+  "title": "Delysis publication outcome v0",
+  "oneOf": [
+    { "$ref": "#/$defs/not_published" },
+    { "$ref": "#/$defs/published" },
+    { "$ref": "#/$defs/published_durability_unknown" }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "hex"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "hex": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "digest", "length"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "digest": { "$ref": "#/$defs/digest" },
+        "length": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "destination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filesystem_id", "path_id"],
+      "properties": {
+        "filesystem_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "path_id": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "artifact",
+        "destination",
+        "visible",
+        "file_synced",
+        "directory_synced",
+        "idempotent_recovery"
+      ],
+      "properties": {
+        "schema": { "const": "delysis.publication_receipt.v0" },
+        "artifact": { "$ref": "#/$defs/artifact" },
+        "destination": { "$ref": "#/$defs/destination" },
+        "visible": { "const": true },
+        "file_synced": { "type": "boolean" },
+        "directory_synced": { "type": "boolean" },
+        "idempotent_recovery": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "directory_synced": { "const": true } } },
+          "then": { "properties": { "file_synced": { "const": true } } }
+        }
+      ]
+    },
+    "not_published": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "error"],
+      "properties": {
+        "kind": { "const": "not_published" },
+        "error": { "$ref": "service-error.schema.json" }
+      }
+    },
+    "published": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "receipt"],
+      "properties": {
+        "kind": { "const": "published" },
+        "receipt": {
+          "allOf": [
+            { "$ref": "#/$defs/receipt" },
+            {
+              "properties": {
+                "file_synced": { "const": true },
+                "directory_synced": { "const": true }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "published_durability_unknown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "receipt", "error"],
+      "properties": {
+        "kind": { "const": "published_durability_unknown" },
+        "receipt": {
+          "allOf": [
+            { "$ref": "#/$defs/receipt" },
+            {
+              "properties": {
+                "file_synced": { "const": true },
+                "directory_synced": { "const": false }
+              }
+            }
+          ]
+        },
+        "error": {
+          "allOf": [
+            { "$ref": "service-error.schema.json" },
+            { "properties": { "class": { "const": "publication" } } }
+          ]
+        }
+      }
+    }
+  }
+}

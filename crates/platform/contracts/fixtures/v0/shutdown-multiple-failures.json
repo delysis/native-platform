@@ -1,0 +1,33 @@
+{
+  "schema": "delysis.closed_summary.v0",
+  "phase": "closed",
+  "active_operations": 0,
+  "retained_tasks": 0,
+  "joined_workers": 1,
+  "failures": [
+    {
+      "service": "gateway",
+      "error": {
+        "schema": "delysis.service_error.v0",
+        "code": "shutdown.drain_timeout",
+        "class": "timeout",
+        "retry": "after_restart",
+        "operation_id": null,
+        "service": "gateway",
+        "safe_detail": "gateway shutdown exceeded its bounded drain interval"
+      }
+    },
+    {
+      "service": "speech",
+      "error": {
+        "schema": "delysis.service_error.v0",
+        "code": "shutdown.worker_join",
+        "class": "worker",
+        "retry": "after_restart",
+        "operation_id": null,
+        "service": "speech",
+        "safe_detail": "speech worker join failed after admission closed"
+      }
+    }
+  ]
+}

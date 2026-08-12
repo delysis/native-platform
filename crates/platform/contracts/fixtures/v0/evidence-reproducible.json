@@ -1,0 +1,19 @@
+{
+  "schema": "delysis.evidence_claim.v0",
+  "tier": "reproducible",
+  "threat_model": "exact source and runtime digests permit repetition but do not establish research authority or external attestation",
+  "exact_source": {
+    "algorithm": "sha256",
+    "hex": "7ad18cdd616d97145564ee925235d27e2369319f7ad18cdd616d97145564ee92"
+  },
+  "exact_runtime_or_artifact": {
+    "algorithm": "sha256",
+    "hex": "c1d338ae69412b5f72b69e1bae6325b83af5a3ff6da73368bbcb31d6996c2fa4"
+  },
+  "execution_kind": "local_runtime",
+  "omitted_claims": [
+    "research eligibility",
+    "external attestation"
+  ],
+  "negative_evidence": []
+}

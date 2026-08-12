@@ -1,0 +1,10 @@
+[package]
+name = "platform-contract-testkit"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.92"
+publish = false
+
+[dependencies]
+platform-contracts-v0 = { path = "../platform-contracts-v0" }
+

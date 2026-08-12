@@ -1,0 +1,9 @@
+{
+  "schema": "delysis.service_error.v0",
+  "code": "provider.capability_unsupported",
+  "class": "unsupported",
+  "retry": "different_route",
+  "operation_id": "op_fixture_error_0001",
+  "service": "inference-gateway",
+  "safe_detail": "the selected provider does not support typed tool calls"
+}

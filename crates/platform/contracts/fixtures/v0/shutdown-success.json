@@ -1,0 +1,8 @@
+{
+  "schema": "delysis.closed_summary.v0",
+  "phase": "closed",
+  "active_operations": 0,
+  "retained_tasks": 0,
+  "joined_workers": 2,
+  "failures": []
+}
