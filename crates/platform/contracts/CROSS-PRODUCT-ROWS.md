@@ -4,11 +4,12 @@ This repository aggregates caller-owned observations; it does not execute a
 product, read another repository, or turn supporting lifecycle tests into a
 vertical baseline. `validate_row_baselines` requires every manifest case once
 and delegates each case to the existing exact baseline validator. It preserves
-each product's source, prerequisites, projection, and omissions independently.
+each product's source, prerequisites, and projection independently, and
+requires every observation to repeat the manifest's exact omitted-claim list.
 
 ## Corrupted disposable caches
 
-The canonical row 17 bundle is:
+The currently staged Mom slice of the incomplete row 17 bundle is:
 
 - `verticals/v0/corrupted-disposable-caches.manifest.json`
 - `verticals/v0/corrupted-disposable-caches.mom.projection.json`
@@ -22,17 +23,25 @@ native-prefix cache and encrypted session-KV cache. Both before and after
 logical states are typed, frozen, and authenticated; the production
 `ConversationDb` remains unchanged through corruption and reopen.
 
-The row deliberately has no invented case for:
+This is not the complete row. Information owns durable resumable acquisition
+staging: its partial artifact and identity-bound resume sidecar can be invalid,
+discarded, and restarted from a cold state without publishing unverified
+bytes. That production-derived corruption case remains to be frozen. The
+current manifest records that missing case as an explicit incompleteness claim;
+it must not enter the final eighteen-row lock.
+
+The staged slice deliberately has no invented case for:
 
 - FTE provider-owned remote caches;
-- Information acquisition or publication staging, which is authoritative
-  publication state rather than a disposable cache;
+- the still-missing Information resumable-staging corruption replay;
 - Loom, which explicitly owns no disposable cache in its accepted adapter;
 - Native, which owns cache value types but no persistent cache store;
 - Speech's externally owned Hugging Face model cache.
 
-Those boundaries are omissions, not passing product claims. A later product
-may add a case only after it owns a persistent disposable format and supplies a
+The Information entry is a required gap, not a non-applicability decision.
+Replace it with the exact Information case before row 17 can be complete. The
+other boundaries are omissions, not passing product claims; a later product may
+add a case only after it owns a persistent disposable format and supplies a
 production-derived observation.
 
 ## Quit and relaunch using fake owners

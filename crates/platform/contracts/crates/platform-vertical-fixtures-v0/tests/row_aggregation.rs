@@ -90,3 +90,52 @@ fn row_aggregation_does_not_merge_or_weaken_case_projections() {
         Err(ValidationError::ProjectionMismatch)
     );
 }
+
+#[test]
+fn every_observation_must_repeat_the_exact_manifest_omissions() {
+    let vertical_id = VerticalIdV0::FteHostedFixtureLoopback;
+    let (manifest, expected) = support::manifest_and_projection(vertical_id);
+    let observation = support::observation(vertical_id);
+
+    validate_row_baselines(
+        &manifest,
+        &[CaseBaselineV0 {
+            expected_projection_bytes: &expected,
+            verified_prerequisites: &[],
+            observation: &observation,
+        }],
+    )
+    .expect("exact omissions pass");
+
+    let mut cleared = observation.clone();
+    cleared.evidence.omitted_claims.clear();
+    assert_eq!(
+        validate_row_baselines(
+            &manifest,
+            &[CaseBaselineV0 {
+                expected_projection_bytes: &expected,
+                verified_prerequisites: &[],
+                observation: &cleared,
+            }],
+        ),
+        Err(ValidationError::Inconsistent {
+            field: "evidence.omitted_claims"
+        })
+    );
+
+    let mut changed = observation;
+    changed.evidence.omitted_claims = vec!["some other omission".to_owned()];
+    assert_eq!(
+        validate_row_baselines(
+            &manifest,
+            &[CaseBaselineV0 {
+                expected_projection_bytes: &expected,
+                verified_prerequisites: &[],
+                observation: &changed,
+            }],
+        ),
+        Err(ValidationError::Inconsistent {
+            field: "evidence.omitted_claims"
+        })
+    );
+}

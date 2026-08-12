@@ -11,11 +11,11 @@ const MOM_CACHE_PROJECTION: &[u8] =
     include_bytes!("../../../verticals/v0/corrupted-disposable-caches.mom.projection.json");
 
 #[test]
-fn canonical_corrupted_cache_row_preserves_the_exact_mom_claim_boundary() {
+fn staged_mom_cache_slice_preserves_its_exact_claim_boundary() {
     let manifest: VerticalFixtureManifestV0 =
-        serde_json::from_slice(CACHE_MANIFEST).expect("canonical cache manifest JSON");
+        serde_json::from_slice(CACHE_MANIFEST).expect("staged cache manifest JSON");
     let projection: EquivalenceProjectionV0 =
-        serde_json::from_slice(MOM_CACHE_PROJECTION).expect("canonical Mom cache projection JSON");
+        serde_json::from_slice(MOM_CACHE_PROJECTION).expect("staged Mom cache projection JSON");
     assert_eq!(
         manifest.vertical_id,
         VerticalIdV0::CorruptedDisposableCaches
@@ -26,7 +26,7 @@ fn canonical_corrupted_cache_row_preserves_the_exact_mom_claim_boundary() {
         manifest.omitted_claims,
         [
             "FTE provider-owned remote caches",
-            "Information acquisition and publication staging",
+            "required Information resumable-staging corruption case is not yet frozen; row incomplete",
             "Loom disposable caches because none are product-owned",
             "Native persistent cache storage because native-kit owns only cache values",
             "Speech Hugging Face model cache because it is externally owned",
@@ -62,13 +62,13 @@ fn canonical_corrupted_cache_row_preserves_the_exact_mom_claim_boundary() {
             observation: &observation,
         }],
     )
-    .expect("canonical Mom-scoped corrupted-cache row");
+    .expect("staged Mom-scoped corrupted-cache slice");
 }
 
 #[test]
-fn canonical_cache_replay_is_one_fully_qualified_exact_product_test() {
+fn staged_mom_cache_replay_is_one_fully_qualified_exact_product_test() {
     let manifest: VerticalFixtureManifestV0 =
-        serde_json::from_slice(CACHE_MANIFEST).expect("canonical cache manifest JSON");
+        serde_json::from_slice(CACHE_MANIFEST).expect("staged cache manifest JSON");
     let replay = &manifest.cases[0].replay;
     assert_eq!(replay.len(), 1);
     assert_eq!(

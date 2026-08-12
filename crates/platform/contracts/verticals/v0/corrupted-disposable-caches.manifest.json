@@ -104,7 +104,7 @@
   }],
   "omitted_claims": [
     "FTE provider-owned remote caches",
-    "Information acquisition and publication staging",
+    "required Information resumable-staging corruption case is not yet frozen; row incomplete",
     "Loom disposable caches because none are product-owned",
     "Native persistent cache storage because native-kit owns only cache values",
     "Speech Hugging Face model cache because it is externally owned"

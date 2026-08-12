@@ -308,9 +308,9 @@ pub fn validate_lock<'a>(
 /// # Errors
 ///
 /// Returns [`ValidationError`] when any envelope is invalid, the named case is
-/// absent, source or prerequisite identity differs, the expected projection
-/// fails authentication, an exact-external prerequisite lacks a matching
-/// stream-verified token, or the observable projection differs.
+/// absent, source, omission, or prerequisite identity differs, the expected
+/// projection fails authentication, an exact-external prerequisite lacks a
+/// matching stream-verified token, or the observable projection differs.
 pub fn validate_baseline(
     manifest: &VerticalFixtureManifestV0,
     case_id: &str,
@@ -341,7 +341,8 @@ pub fn validate_baseline(
 /// This is the cross-product aggregation boundary. It neither executes product
 /// adapters nor combines their claims: each caller-supplied observation is
 /// independently checked against its own case source, prerequisites, and
-/// projection before the row is considered complete.
+/// projection, and every observation must repeat the row's exact omissions,
+/// before the row is considered complete.
 ///
 /// # Errors
 ///
@@ -402,8 +403,8 @@ pub fn validate_row_baselines(
 ///
 /// Returns [`ValidationError`] when any envelope is invalid, the named case is
 /// absent, expected or candidate-source bytes fail authentication, an
-/// exact-external prerequisite lacks a matching stream-verified token, source
-/// or prerequisite identity differs, or the projection differs.
+/// exact-external prerequisite lacks a matching stream-verified token, source,
+/// omission, or prerequisite identity differs, or the projection differs.
 pub fn compare_candidate(
     manifest: &VerticalFixtureManifestV0,
     case_id: &str,
@@ -538,6 +539,11 @@ fn validate_case_binding(
     }
     if observation.case_id != case.case_id {
         return Err(ValidationError::Inconsistent { field: "case_id" });
+    }
+    if observation.evidence.omitted_claims != manifest.omitted_claims {
+        return Err(ValidationError::Inconsistent {
+            field: "evidence.omitted_claims",
+        });
     }
     bind_observed_prerequisites(case, observation)?;
     if manifest.class == FixtureClassV0::State {
