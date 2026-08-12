@@ -38,7 +38,7 @@
     "prerequisites": [],
     "replay": [{
       "program": { "kind": "cargo" },
-      "argv": ["test", "-p", "mom-llama-runtime", "--features", "unstable-w1-vertical-fixtures", "w1_ordinary_markdown_round_trips_through_attachment_native_projection_and_reopen", "--", "--exact"],
+      "argv": ["test", "-p", "mom-llama-runtime", "--features", "unstable-w1-vertical-fixtures", "attachments::tests::w1_ordinary_markdown_round_trips_through_attachment_native_projection_and_reopen", "--", "--exact"],
       "required_environment": [],
       "network": "denied"
     }],

@@ -650,8 +650,12 @@ fn decode_hex_key(input: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     use crate::conversation_store::{CONVERSATIONS_NAMESPACE, Conversation, ConversationDb};
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    use llama_native_cache::PrefixCacheValue;
     use serde::{Deserialize, Serialize};
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     use std::collections::BTreeMap;
 
     #[test]
@@ -665,6 +669,7 @@ mod tests {
         values: Vec<String>,
     }
 
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[derive(Debug, Deserialize)]
     struct W1PriorStoreFixture {
         schema: String,
@@ -676,19 +681,22 @@ mod tests {
         conversation: Conversation,
     }
 
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[derive(Debug, Deserialize)]
     struct W1CacheCorruptionFixture {
         schema: String,
         fixture_key_hex: String,
         native_prefix_namespace: String,
         authoritative_namespace: String,
-        authoritative_value: String,
+        authoritative_conversation: Conversation,
         tampered_ciphertext_hex: String,
         native_prefix_disposition: String,
     }
 
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     struct RemovePlaintextOnDrop(PathBuf);
 
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     impl Drop for RemovePlaintextOnDrop {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
@@ -864,6 +872,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[test]
     fn w1_redacted_logical_store_imports_cleans_plaintext_and_reopens_with_fixture_only_key()
     -> Result<()> {
@@ -1034,6 +1043,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[test]
     fn w1_native_prefix_corruption_quarantines_only_disposable_state_and_reopens_cold() -> Result<()>
     {
@@ -1050,14 +1060,13 @@ mod tests {
         let data_dir = test_dir("w1-native-prefix-corruption");
         let key = decode_hex_key(&fixture.fixture_key_hex)?;
         let store = RuntimeStore::open_with_key(&data_dir, key)?;
-        store.put(
-            &fixture.native_prefix_namespace,
-            &SecretDocument {
-                values: vec!["disposable fixture prefix".to_string()],
-            },
-        )?;
-        let authoritative = SecretDocument {
-            values: vec![fixture.authoritative_value],
+        let native_prefix: Vec<PrefixCacheValue> = serde_json::from_slice(include_bytes!(
+            "../fixtures/w1/cache-native-prefix-state-v1.json"
+        ))?;
+        store.put(&fixture.native_prefix_namespace, &native_prefix)?;
+        let authoritative = ConversationDb {
+            selected_conversation_id: Some(fixture.authoritative_conversation.id.clone()),
+            conversations: vec![fixture.authoritative_conversation],
         };
         store.put(&fixture.authoritative_namespace, &authoritative)?;
         assert_eq!(fixture.tampered_ciphertext_hex, "00");
@@ -1068,21 +1077,23 @@ mod tests {
         )?;
 
         assert_eq!(
-            store.get_disposable_cache::<SecretDocument>(&fixture.native_prefix_namespace)?,
+            store
+                .get_disposable_cache::<Vec<PrefixCacheValue>>(&fixture.native_prefix_namespace)?,
             None
         );
         assert_eq!(
-            store.get::<SecretDocument>(&fixture.authoritative_namespace)?,
+            store.get::<ConversationDb>(&fixture.authoritative_namespace)?,
             Some(authoritative.clone())
         );
         drop(store);
         let reopened = RuntimeStore::open_with_key(&data_dir, key)?;
         assert_eq!(
-            reopened.get_disposable_cache::<SecretDocument>(&fixture.native_prefix_namespace)?,
+            reopened
+                .get_disposable_cache::<Vec<PrefixCacheValue>>(&fixture.native_prefix_namespace)?,
             None
         );
         assert_eq!(
-            reopened.get::<SecretDocument>(&fixture.authoritative_namespace)?,
+            reopened.get::<ConversationDb>(&fixture.authoritative_namespace)?,
             Some(authoritative)
         );
         let connection = Connection::open(reopened.path())?;

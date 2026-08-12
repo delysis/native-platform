@@ -205,20 +205,13 @@ impl AppWorkLease {
         task.wait().await
     }
 
-    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-    pub fn w1_attempt_identity(&self) -> Option<crate::operation_supervisor::AttemptIdentity> {
-        self.supervised
-            .as_ref()
-            .map(|reservation| reservation.lease.identity())
-    }
-
-    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-    pub async fn run_blocking_w1<T, F>(mut self, operation: F) -> Result<T, String>
+    pub async fn run_blocking_with_cancellation_evidence<T, F>(
+        mut self,
+        operation: F,
+    ) -> Result<T, String>
     where
         T: Send + 'static,
-        F: FnOnce(&crate::operation_supervisor::OperationLease) -> Result<T, String>
-            + Send
-            + 'static,
+        F: FnOnce() -> Result<(T, bool), String> + Send + 'static,
     {
         let reservation = self
             .supervised
@@ -230,11 +223,29 @@ impl AppWorkLease {
             .ok_or_else(|| "Mom Llama's operation supervisor is unavailable".to_owned())?;
         let task = supervisor
             .spawn(reservation, move |lease| {
+                if lease.cancellation_requested() {
+                    return Err(
+                        "Mom Llama cancelled the operation during application shutdown".to_owned(),
+                    );
+                }
                 let _app_lease = self;
-                operation(lease)
+                let (value, authoritative_cancellation) = operation()?;
+                if authoritative_cancellation {
+                    lease
+                        .request_cancellation_from_executor()
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(value)
             })
             .map_err(|error| error.to_string())?;
         task.wait().await
+    }
+
+    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+    pub fn w1_attempt_identity(&self) -> Option<crate::operation_supervisor::AttemptIdentity> {
+        self.supervised
+            .as_ref()
+            .map(|reservation| reservation.lease.identity())
     }
 
     fn finish_supervised(&mut self, class: TerminalClass) -> Result<(), String> {
@@ -834,6 +845,45 @@ mod tests {
         let (first, second) = tokio::join!(runtime.shutdown(), runtime.shutdown());
         assert_eq!(first, second);
         assert!(finalizer_called.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    #[tokio::test]
+    async fn blocking_success_is_cancelled_only_with_authoritative_evidence() {
+        let runtime = super::w1_fixture_runtime();
+        let command = command_spec("mom_llama_chat_send");
+
+        runtime
+            .admit(command)
+            .expect("admit ordinary successful operation")
+            .run_blocking_with_cancellation_evidence(|| Ok(((), false)))
+            .await
+            .expect("ordinary successful operation");
+        assert_eq!(
+            runtime
+                .w1_terminal_facts()
+                .last()
+                .expect("ordinary terminal fact")
+                .terminal
+                .class,
+            crate::operation_supervisor::TerminalClass::Completed
+        );
+
+        runtime
+            .admit(command)
+            .expect("admit authoritatively cancelled operation")
+            .run_blocking_with_cancellation_evidence(|| Ok(((), true)))
+            .await
+            .expect("cancelled command result remains a successful transport result");
+        assert_eq!(
+            runtime
+                .w1_terminal_facts()
+                .last()
+                .expect("cancelled terminal fact")
+                .terminal
+                .class,
+            crate::operation_supervisor::TerminalClass::Cancelled
+        );
     }
 
     fn command_vs_quit_has_one_winner(command: &'static str) {

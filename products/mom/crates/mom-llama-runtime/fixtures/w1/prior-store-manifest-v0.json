@@ -39,7 +39,7 @@
     "prerequisites": [],
     "replay": [{
       "program": { "kind": "cargo" },
-      "argv": ["test", "-p", "mom-llama-runtime", "--features", "unstable-w1-vertical-fixtures", "w1_redacted_logical_store_imports_cleans_plaintext_and_reopens_with_fixture_only_key", "--", "--exact"],
+      "argv": ["test", "-p", "mom-llama-runtime", "--features", "unstable-w1-vertical-fixtures", "store::tests::w1_redacted_logical_store_imports_cleans_plaintext_and_reopens_with_fixture_only_key", "--", "--exact"],
       "required_environment": [],
       "network": "denied"
     }],

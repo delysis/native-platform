@@ -1562,6 +1562,7 @@ mod tests {
     use super::*;
     use crate::config::set_data_dir_override_for_tests;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     use std::time::Duration;
 
     const VALID_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\

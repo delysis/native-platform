@@ -27,7 +27,7 @@
     "prerequisites": [],
     "replay": [{
       "program": { "kind": "cargo" },
-      "argv": ["test", "-p", "mom-llama-app", "--features", "unstable-w1-vertical-fixtures", "app_admission_chat_cancel_native_control_and_retry_form_one_transcript", "--", "--exact"],
+      "argv": ["test", "-p", "mom-llama-app", "--features", "unstable-w1-vertical-fixtures", "w1_vertical_fixtures::app_admission_chat_cancel_native_control_and_retry_form_one_transcript", "--", "--exact"],
       "required_environment": [],
       "network": "denied"
     }],

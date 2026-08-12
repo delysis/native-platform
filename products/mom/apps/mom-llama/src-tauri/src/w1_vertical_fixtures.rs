@@ -91,7 +91,7 @@ async fn app_admission_chat_cancel_native_control_and_retry_form_one_transcript(
         let request_id = fixture.cancelled_request_id.clone();
         tokio::spawn(async move {
             cancelled_lease
-                .run_blocking_w1::<(), _>(move |operation_lease| {
+                .run_blocking_with_cancellation_evidence(move || {
                     let result = mom_llama_runtime::chat_send_stream_waiting_for_fixture_cancel(
                         mom_llama_runtime::ChatSendInput {
                             conversation_id,
@@ -119,10 +119,9 @@ async fn app_admission_chat_cancel_native_control_and_retry_form_one_transcript(
                     {
                         return Err("fixture chat did not reach cancelled terminal".to_string());
                     }
-                    operation_lease
-                        .request_cancellation_from_executor()
-                        .map_err(|error| error.to_string())?;
-                    Err("cancelled fixture attempt".to_string())
+                    let authoritative_cancellation =
+                        result.has_authoritative_cancellation_evidence();
+                    Ok(((), authoritative_cancellation))
                 })
                 .await
         })
@@ -138,7 +137,7 @@ async fn app_admission_chat_cancel_native_control_and_retry_form_one_transcript(
         .context("chat_cancel did not reach native cancellation")?;
     drop(cancel_lease);
     ensure!(cancel.request_id == fixture.cancelled_request_id);
-    ensure!(cancelled_task.await?.is_err());
+    cancelled_task.await?.map_err(anyhow::Error::msg)?;
     ensure!(
         mom_llama_runtime::draft_get(Some(&fixture.conversation_id))?
             .result
@@ -162,8 +161,8 @@ async fn app_admission_chat_cancel_native_control_and_retry_form_one_transcript(
     let retry_message = fixture.message.clone();
     let recorded_retry_events = Arc::clone(&retry_events);
     let retry = retry_lease
-        .run_blocking_w1(move |_| {
-            mom_llama_runtime::chat_send_stream_with_fixture_identity(
+        .run_blocking_with_cancellation_evidence(move || {
+            let result = mom_llama_runtime::chat_send_stream_with_fixture_identity(
                 mom_llama_runtime::ChatSendInput {
                     conversation_id: retry_conversation_id,
                     message: retry_message,
@@ -177,7 +176,9 @@ async fn app_admission_chat_cancel_native_control_and_retry_form_one_transcript(
                     Ok(())
                 },
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+            let authoritative_cancellation = result.has_authoritative_cancellation_evidence();
+            Ok((result, authoritative_cancellation))
         })
         .await
         .map_err(anyhow::Error::msg)?

@@ -4,8 +4,8 @@ Date: 2026-08-12
 
 Accepted base: `097da612140c6479f9d40e7816f0500271464ca9`
 
-Accepted vertical protocol: `9fd803f5efcc46ac0256dab876e7c0b1f03bb448`
-(`w1-vertical-protocol-v0-2026-08-12`)
+Accepted vertical protocol: `fc24ffff08c52690390b4460f44617d5d9732563`
+(`w1-vertical-protocol-v0-2026-08-12-r2`)
 
 Feature gate: `unstable-w1-vertical-fixtures`
 
@@ -24,15 +24,17 @@ accepted lifecycle contract/testkit pin remains exactly `cbab335...`.
 | `fixtures/w1/ordinary-notes.md` | `19b385128f4ee3d9e2a1a6f5adaabb73c46fea8463c8fb72f53b24966e75304c` | Ordinary user-authored Markdown entering the attachment-native host |
 | `fixtures/w1/ordinary-notes-projection-v1.json` | `500b0af87cefc0c2f60f02754376030befc085d409e5aae5bc57025761c7a792` | Exact attachment ID, content-addressed root, manifest namespace, policy fingerprint, artifact processor provenance, bounded prompt text, and prompt SHA-256 |
 | `fixtures/w1/prior-store-v1.json` | `7e44507f4ee444becf112ed1853e9cfb301618aadac19b1909a41cacf95c6ccf` | Redacted logical-store import baseline plus logical versions and deterministic fixture-only key |
-| `fixtures/w1/cache-corruption-v1.json` | `e66e5eed8a5a12029986e40d06c4829388c633855bc20326d1fc53738042a82e` | Exact Mom native-prefix and session-KV cache namespaces and their distinct cold-fallback dispositions |
-| `fixtures/w1/chat-cancel-retry-manifest-v0.json` | `01f9cb204007ea4b2a93c9fa875c1424e7c65886c8f6c76d4a25bafad40be790` | Authenticated central-protocol case for Mom chat/cancel/retry |
+| `fixtures/w1/cache-corruption-v1.json` | `b2c713869df2a75145af92b2f01993a77537e8d2bc08d5f92cc88871e87b2f8c` | Exact Mom native-prefix and session-KV cache namespaces, a typed authoritative conversation, and their distinct cold-fallback dispositions |
+| `fixtures/w1/cache-native-prefix-state-v1.json` | `787f58b20bbfe28415acb4721b3293e5af42bdd056368b1cac14fe8aec3dd3b8` | Exact typed logical native-prefix cache state before ciphertext corruption |
+| `fixtures/w1/cache-session-state-v1.json` | `4bfc026b7b842e4ef65d6b0993fa6eb13f0d33e0573296aba6b48c04da34425a` | Exact logical session-KV metadata and blob identity before ciphertext corruption |
+| `fixtures/w1/chat-cancel-retry-manifest-v0.json` | `d5e78f687cb8d06c823e91cdaa46c7564e042e7f118194dcd2c5a1042d24375d` | Authenticated central-protocol case for Mom chat/cancel/retry |
 | `fixtures/w1/chat-cancel-retry-projection-v0.json` | `5089d654ffc27ce2b2ce34d102a98cd0160a074cb2f9c458dd7fbdacac2bb441` | Frozen product-derived stream, lifecycle, durable-state, and ownership facts |
-| `fixtures/w1/attachment-manifest-v0.json` | `018f798211f864a12f1f1b7bb57cae94c0e830bf05258878ec70ec0863236ab5` | Authenticated central-protocol case for Mom attachment |
+| `fixtures/w1/attachment-manifest-v0.json` | `01c8701dc70b586bf3cbe9ad069b4fb97f2fe2719ce8a1b43e7b66d179c9cdb0` | Authenticated central-protocol case for Mom attachment |
 | `fixtures/w1/attachment-projection-v0.json` | `fc10bb8b589c1290e546a7ad0b936b47954d541070154843b1c0beb193d4cb7f` | Frozen import/send/reopen projection |
-| `fixtures/w1/prior-store-manifest-v0.json` | `e739e0b734551329543eb617df531b4f5a1b5389b0fe78698a15ddc299ed0b32` | Explicit redacted logical import/recovery case with historical DB evidence marked unavailable |
+| `fixtures/w1/prior-store-manifest-v0.json` | `8259231ba399eabb0f087be4f80f45a1b5986da98b0c1558387b86545e764e86` | Explicit redacted logical import/recovery case with historical DB evidence marked unavailable |
 | `fixtures/w1/prior-store-projection-v0.json` | `2c7bd3fcd1e93ee5bc70ab8c3cf0be6a7f33b71bf03dbff9cd971306bf01b136` | Frozen logical recovery and plaintext-cleanup facts |
-| `fixtures/w1/cache-corruption-manifest-v0.json` | `7f5b963a8674c06cf02409ed247adb468b85de52db70b9043e18618582f73d9c` | Mom-owned cases within the cross-product corrupted-cache row |
-| `fixtures/w1/cache-corruption-projection-v0.json` | `3778e2484ec9eb6c7cde1d286716fc3ffb98dfdfe9f981f58a63c24da3f381c3` | Frozen native-prefix quarantine and session-KV invalidation projection |
+| `fixtures/w1/cache-corruption-manifest-v0.json` | `5c6180e2359a8d1347456b5244940e8b442bfc6acc44b5b6698bfd1c9c737135` | Mom-owned cases within the cross-product corrupted-cache row |
+| `fixtures/w1/cache-corruption-projection-v0.json` | `e534d9fdd49139d701fc80154090ba49c1684dab60d95f18a93393137ecbf728` | Frozen native-prefix quarantine and session-KV invalidation projection bound to their exact logical before states |
 
 ## Product evidence
 
@@ -42,7 +44,9 @@ accepted lifecycle contract/testkit pin remains exactly `cbab335...`.
   through `cancel_native_request`; only that native cancellation boundary
   releases the fixture wait. The same lifecycle then emits `cancelled`, commits no
   messages, preserves the encrypted draft exactly, and leaves no active chat
-  request.
+  request. The ordinary production command result is classified as cancelled by
+  the operation supervisor only when its closed `chat_cancelled` blocker is also
+  present in the receipt; unrelated blocked results remain completed transports.
 - Retry uses the new request `mom-w1-request-retry` and the separately owned
   app-admitted attempt `mom_llama_chat_send:3#attempt-42`. The earlier
   `mom_llama_chat_send:1#attempt-41` remains an immutable retained terminal fact
@@ -69,8 +73,10 @@ accepted lifecycle contract/testkit pin remains exactly `cbab335...`.
 - Corrupt `native-host-prefix-cache.mom-llama` ciphertext is quarantined and
   becomes a cold miss after reopen. Corrupt `kv-cache.v3.blob.w1-tampered`
   ciphertext invalidates its metadata, deletes the unusable blob, and becomes a
-  cold miss. In both cases the authoritative `conversations.v2` fixture remains
-  byte-exact.
+  cold miss. The exact logical cache states before corruption are independently
+  frozen and hashed. In both cases the authoritative `conversations.v2` value is
+  loaded through the production store as a typed `ConversationDb` before and
+  after corruption and after reopen.
 - Supporting-only evidence: a controlled Mom operation owner receives
   cancellation during quiesce,
   reaches an authoritative cancelled terminal, releases, exits, joins, and
@@ -84,8 +90,8 @@ Passed locally on 2026-08-12:
 - `cargo fmt --all -- --check`
 - `cargo test -p mom-llama-runtime --features unstable-w1-vertical-fixtures w1_ --no-fail-fast` — 5 passed
 - `cargo test -p mom-llama-app --features unstable-w1-vertical-fixtures w1_ --no-fail-fast` — 2 passed
-- `cargo test -p mom-llama-runtime --features unstable-w1-vertical-fixtures --no-fail-fast` — 96 unit tests passed; 38 integration tests passed; 13 real-model tests ignored by their existing hardware/model gates
-- `cargo test -p mom-llama-app --features unstable-w1-vertical-fixtures --no-fail-fast` — 43 passed
+- `cargo test -p mom-llama-runtime --features unstable-w1-vertical-fixtures --no-fail-fast` — 97 unit tests passed; 38 integration tests passed; 13 real-model tests ignored by their existing hardware/model gates
+- `cargo test -p mom-llama-app --features unstable-w1-vertical-fixtures --no-fail-fast` — 44 passed
 - `cargo clippy -p mom-llama-runtime --features unstable-w1-vertical-fixtures --all-targets -- -D warnings`
 - `cargo clippy -p mom-llama-app --features unstable-w1-vertical-fixtures --all-targets -- -D warnings`
 - Rust 1.88 locked default checks for `mom-llama-runtime` and `mom-llama-app`;

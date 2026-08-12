@@ -14,15 +14,35 @@
         "length": 40
       }
     },
-    "inputs": [{
-      "identity": {
-        "id": "mom.cache-corruption.input",
-        "digest": { "algorithm": "sha256", "hex": "e66e5eed8a5a12029986e40d06c4829388c633855bc20326d1fc53738042a82e" },
-        "length": 618
+    "inputs": [
+      {
+        "identity": {
+          "id": "mom.cache-corruption.input",
+          "digest": { "algorithm": "sha256", "hex": "b2c713869df2a75145af92b2f01993a77537e8d2bc08d5f92cc88871e87b2f8c" },
+          "length": 1886
+        },
+        "availability": "checked_in",
+        "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-corruption-v1.json"
       },
-      "availability": "checked_in",
-      "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-corruption-v1.json"
-    }],
+      {
+        "identity": {
+          "id": "mom.cache.native-prefix.logical-state",
+          "digest": { "algorithm": "sha256", "hex": "787f58b20bbfe28415acb4721b3293e5af42bdd056368b1cac14fe8aec3dd3b8" },
+          "length": 1113
+        },
+        "availability": "checked_in",
+        "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-native-prefix-state-v1.json"
+      },
+      {
+        "identity": {
+          "id": "mom.cache.session-kv.logical-state",
+          "digest": { "algorithm": "sha256", "hex": "4bfc026b7b842e4ef65d6b0993fa6eb13f0d33e0573296aba6b48c04da34425a" },
+          "length": 1142
+        },
+        "availability": "checked_in",
+        "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-session-state-v1.json"
+      }
+    ],
     "state_identities": [
       {
         "state_id": "mom.cache.native-prefix",
@@ -30,11 +50,11 @@
         "baseline": {
           "identity": {
             "id": "mom.cache.native-prefix.fixture",
-            "digest": { "algorithm": "sha256", "hex": "e66e5eed8a5a12029986e40d06c4829388c633855bc20326d1fc53738042a82e" },
-            "length": 618
+                "digest": { "algorithm": "sha256", "hex": "787f58b20bbfe28415acb4721b3293e5af42bdd056368b1cac14fe8aec3dd3b8" },
+                "length": 1113
           },
           "availability": "checked_in",
-          "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-corruption-v1.json"
+              "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-native-prefix-state-v1.json"
         }
       },
       {
@@ -43,25 +63,25 @@
         "baseline": {
           "identity": {
             "id": "mom.cache.session-kv.fixture",
-            "digest": { "algorithm": "sha256", "hex": "e66e5eed8a5a12029986e40d06c4829388c633855bc20326d1fc53738042a82e" },
-            "length": 618
+                "digest": { "algorithm": "sha256", "hex": "4bfc026b7b842e4ef65d6b0993fa6eb13f0d33e0573296aba6b48c04da34425a" },
+                "length": 1142
           },
           "availability": "checked_in",
-          "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-corruption-v1.json"
+              "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-session-state-v1.json"
         }
       }
     ],
     "prerequisites": [],
     "replay": [{
       "program": { "kind": "cargo" },
-      "argv": ["test", "-p", "mom-llama-runtime", "--features", "unstable-w1-vertical-fixtures", "w1_", "--", "--nocapture"],
+      "argv": ["test", "-p", "mom-llama-runtime", "--features", "unstable-w1-vertical-fixtures", "kv_cache::tests::w1_authenticated_persistent_cache_corruption_invalidates_and_falls_back", "--", "--exact"],
       "required_environment": [],
       "network": "denied"
     }],
     "expected_projection": {
       "id": "mom.cache-corruption.projection",
-      "digest": { "algorithm": "sha256", "hex": "3778e2484ec9eb6c7cde1d286716fc3ffb98dfdfe9f981f58a63c24da3f381c3" },
-      "length": 2707
+      "digest": { "algorithm": "sha256", "hex": "e534d9fdd49139d701fc80154090ba49c1684dab60d95f18a93393137ecbf728" },
+      "length": 2709
     }
   }],
   "omitted_claims": ["non-Mom product cache formats"],

@@ -106,6 +106,12 @@ fn checked_in_input(relative_path: &str) -> Result<&'static [u8]> {
         "crates/mom-llama-runtime/fixtures/w1/cache-corruption-v1.json" => {
             Ok(include_bytes!("../fixtures/w1/cache-corruption-v1.json"))
         }
+        "crates/mom-llama-runtime/fixtures/w1/cache-native-prefix-state-v1.json" => Ok(
+            include_bytes!("../fixtures/w1/cache-native-prefix-state-v1.json"),
+        ),
+        "crates/mom-llama-runtime/fixtures/w1/cache-session-state-v1.json" => {
+            Ok(include_bytes!("../fixtures/w1/cache-session-state-v1.json"))
+        }
         _ => anyhow::bail!("unrecognized checked-in Mom W1 input: {relative_path}"),
     }
 }

@@ -919,7 +919,12 @@ fn encrypted_blob_uri(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    use crate::conversation_store::{Conversation, ConversationDb};
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    use sha2::{Digest, Sha256};
 
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[derive(Debug, Deserialize)]
     struct W1CacheCorruptionFixture {
         schema: String,
@@ -928,10 +933,18 @@ mod tests {
         session_metadata_namespace: String,
         session_blob_namespace: String,
         authoritative_namespace: String,
-        authoritative_value: String,
+        authoritative_conversation: Conversation,
         tampered_ciphertext_hex: String,
         native_prefix_disposition: String,
         session_blob_disposition: String,
+    }
+
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    #[derive(Serialize)]
+    struct W1SessionCacheLogicalState<'a> {
+        metadata: &'a KvCacheDb,
+        blob_sha256: String,
+        blob_length: usize,
     }
 
     fn test_cache_value(id: &str, model: &str) -> PrefixCacheValue {
@@ -1045,6 +1058,7 @@ mod tests {
         assert_eq!(byte_evicted, vec!["invalid", "oldest"]);
     }
 
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[test]
     fn w1_authenticated_persistent_cache_corruption_invalidates_and_falls_back() -> Result<()> {
         let fixture: W1CacheCorruptionFixture =
@@ -1082,14 +1096,34 @@ mod tests {
             blob_namespace(&value.metadata.id),
             fixture.session_blob_namespace
         );
-        store.put_bytes(
-            &fixture.authoritative_namespace,
-            fixture.authoritative_value.as_bytes(),
-        )?;
-        store.put(
-            &fixture.native_prefix_namespace,
-            &serde_json::json!({ "prefix": "disposable fixture state" }),
-        )?;
+        let authoritative = ConversationDb {
+            selected_conversation_id: Some(fixture.authoritative_conversation.id.clone()),
+            conversations: vec![fixture.authoritative_conversation.clone()],
+        };
+        store.put(&fixture.authoritative_namespace, &authoritative)?;
+        let native_prefix = vec![test_cache_value("native-prefix-fixture", "native-model")];
+        store.put(&fixture.native_prefix_namespace, &native_prefix)?;
+        let mut native_before = serde_json::to_vec_pretty(&native_prefix)?;
+        native_before.push(b'\n');
+        assert_eq!(
+            native_before,
+            include_bytes!("../fixtures/w1/cache-native-prefix-state-v1.json")
+        );
+        let metadata_before = store
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .ok_or_else(|| anyhow!("cache metadata missing before corruption"))?;
+        let mut session_before = serde_json::to_vec_pretty(&W1SessionCacheLogicalState {
+            metadata: &metadata_before,
+            blob_sha256: format!("{:x}", Sha256::digest(&value.sequence.bytes)),
+            blob_length: value.sequence.bytes.len(),
+        })?;
+        session_before.push(b'\n');
+        assert_eq!(
+            session_before,
+            include_bytes!("../fixtures/w1/cache-session-state-v1.json"),
+            "{}",
+            String::from_utf8_lossy(&session_before)
+        );
         let connection = rusqlite::Connection::open(store.path())?;
         connection.execute(
             "UPDATE encrypted_documents SET ciphertext = X'00' WHERE namespace = ?1",
@@ -1102,7 +1136,8 @@ mod tests {
 
         assert!(load_persistent_value_or_invalidate_from_store(&store, &value.metadata)?.is_none());
         assert_eq!(
-            store.get_disposable_cache::<serde_json::Value>(&fixture.native_prefix_namespace)?,
+            store
+                .get_disposable_cache::<Vec<PrefixCacheValue>>(&fixture.native_prefix_namespace)?,
             None
         );
         let db = store
@@ -1111,20 +1146,21 @@ mod tests {
         assert_eq!(db.entries[0].state, CacheEntryState::Invalidated);
         assert_eq!(store.get_bytes(&blob_namespace(&value.metadata.id))?, None);
         assert_eq!(
-            store.get_bytes(&fixture.authoritative_namespace)?,
-            Some(fixture.authoritative_value.as_bytes().to_vec())
+            store.get::<ConversationDb>(&fixture.authoritative_namespace)?,
+            Some(authoritative.clone())
         );
         drop(connection);
         drop(store);
         let store = RuntimeStore::open_with_key(&data_dir, [17_u8; 32])?;
         assert!(load_persistent_value_or_invalidate_from_store(&store, &value.metadata)?.is_none());
         assert_eq!(
-            store.get_disposable_cache::<serde_json::Value>(&fixture.native_prefix_namespace)?,
+            store
+                .get_disposable_cache::<Vec<PrefixCacheValue>>(&fixture.native_prefix_namespace)?,
             None
         );
         assert_eq!(
-            store.get_bytes(&fixture.authoritative_namespace)?,
-            Some(fixture.authoritative_value.as_bytes().to_vec())
+            store.get::<ConversationDb>(&fixture.authoritative_namespace)?,
+            Some(authoritative.clone())
         );
 
         let mut missing = test_cache_value("missing", "fingerprint");
@@ -1158,7 +1194,8 @@ mod tests {
             DurableStateFactV0, EquivalenceProjectionV0, EventFactV0, FactValueV0, LifecycleFactV0,
             OwnershipFactsV0, StateDispositionV0, VerticalIdV0, sha256_identity,
         };
-        let fixture_bytes = include_bytes!("../fixtures/w1/cache-corruption-v1.json");
+        let native_before = include_bytes!("../fixtures/w1/cache-native-prefix-state-v1.json");
+        let session_before = include_bytes!("../fixtures/w1/cache-session-state-v1.json");
         let cold_miss = b"cold_miss";
         crate::validate_w1_fixture_projection(
             VerticalIdV0::CorruptedDisposableCaches,
@@ -1187,7 +1224,7 @@ mod tests {
                         schema_id: fixture.native_prefix_namespace.clone(),
                         before: Some(sha256_identity(
                             "mom.cache.native-prefix.fixture",
-                            fixture_bytes,
+                            native_before,
                         )),
                         after: Some(sha256_identity(
                             "mom.cache.native-prefix.cold-miss",
@@ -1200,7 +1237,7 @@ mod tests {
                         schema_id: fixture.session_metadata_namespace.clone(),
                         before: Some(sha256_identity(
                             "mom.cache.session-kv.fixture",
-                            fixture_bytes,
+                            session_before,
                         )),
                         after: Some(sha256_identity("mom.cache.session-kv.cold-miss", cold_miss)),
                         disposition: StateDispositionV0::Recovered,
@@ -1232,15 +1269,15 @@ mod tests {
                     (
                         "authoritative_state_preserved".to_owned(),
                         FactValueV0::Boolean(
-                            store.get_bytes(&fixture.authoritative_namespace)?
-                                == Some(fixture.authoritative_value.as_bytes().to_vec()),
+                            store.get::<ConversationDb>(&fixture.authoritative_namespace)?
+                                == Some(authoritative),
                         ),
                     ),
                     (
                         "native_prefix_cold_after_reopen".to_owned(),
                         FactValueV0::Boolean(
                             store
-                                .get_disposable_cache::<serde_json::Value>(
+                                .get_disposable_cache::<Vec<PrefixCacheValue>>(
                                     &fixture.native_prefix_namespace,
                                 )?
                                 .is_none(),

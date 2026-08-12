@@ -653,6 +653,9 @@ impl OperationSupervisor {
                 }
                 let result = catch_unwind(AssertUnwindSafe(|| operation(&thread_lease)));
                 let published = match &result {
+                    Ok(Ok(_)) if thread_supervisor.cancellation_requested(&thread_lease) => {
+                        thread_supervisor.terminal(&thread_lease, TerminalClass::Cancelled)
+                    }
                     Ok(Ok(_)) => {
                         thread_supervisor.terminal(&thread_lease, TerminalClass::Completed)
                     }
@@ -1097,7 +1100,6 @@ impl OperationLease {
         self.attempt.cancellation_requested.load(Ordering::Acquire)
     }
 
-    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
     pub fn request_cancellation_from_executor(&self) -> Result<(), SupervisorError> {
         self.supervisor()
             .ok_or(SupervisorError::StaleLease)?
