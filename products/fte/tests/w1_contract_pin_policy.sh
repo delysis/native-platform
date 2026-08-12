@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 checker="$repo_root/scripts/check-w1-contract-pin.sh"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
-revision="da22fa893ac183c5d9df972a7e67215c0d92b383"
+revision="cbab33555ab9355a6ac453d659c55ec9e0666821"
 repository="https://github.com/delysis/w1-platform-contracts"
 
 write_fixture() {

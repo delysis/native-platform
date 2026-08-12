@@ -1,16 +1,21 @@
 //! Wave 1 contract checks over the real gateway surfaces.
 //!
-//! The lifecycle model is richer than FTE's public gateway API. This adapter
-//! therefore runs only the generic empty-shutdown assertion. It deliberately
-//! fails if a future test tries to infer reservations, attempt identities, or
-//! progress snapshots that the gateway does not expose.
+//! FTE currently binds only the stable-shutdown ownership slice. Ten real
+//! Gateway requests retain ten real backend tasks; the real Gateway shutdown
+//! coordinator waits for those tasks and reports the exact backend-shutdown
+//! worker identities it joined. The adapter does not claim the other ten
+//! lifecycle suites or construct a complete lifecycle manifest.
 
 use super::*;
 use async_trait::async_trait;
 use fte_types::{
-    BackendReadiness, CachePolicy, ContentBlock, DeadlinePolicy, GenerationInput, InputItem,
-    MessageRole, ModelCapabilities, PromptForm, RouteObservations, RoutingPolicy, SamplingOptions,
-    StoragePolicy, StreamPolicy, ToolPolicy,
+    BackendReadiness, BackendRequest, CachePolicy, CancelTarget, ContentBlock, DeadlinePolicy,
+    GatewayResponse, GatewayTicket, GatewayUsage, GenerationInput, InputItem, MessageRole,
+    ModelCapabilities, ModelSelector, PromptForm, RouteObservations, RoutingPolicy,
+    SamplingOptions, StoragePolicy, StreamPolicy, TerminalStatus, TicketCancellation, ToolPolicy,
+};
+use platform_contract_testkit::compositional_lifecycle::{
+    ShutdownWitness, StableShutdownAdapter, run_stable_shutdown_suite,
 };
 use platform_contract_testkit::contracts::{
     self, CapabilityEntryV0, CapabilitySnapshotV0, ContentDigest, DataHandlingV0, DataTierV0,
@@ -18,150 +23,422 @@ use platform_contract_testkit::contracts::{
     PrivacyDenialV0, PrivacyPolicyV0, ProviderId, Readiness, RedactionStateV0, RetryAdvice,
     RoutePrivacyContextV0, RouteTargetV0, ServiceErrorV0, ServiceId, TriState,
 };
-use platform_contract_testkit::lifecycle_suite::assert_repeated_shutdown_is_stable_and_empty;
 use platform_contract_testkit::{
-    ClosedFacts, LifecyclePhase, OperationModelAdapter, OperationSnapshot, Reservation,
-    TerminalClass, TestConfig, WaitObservation, validate_capability_snapshot_v0,
-    validate_service_error_v0,
+    AttemptIdentity, ClosedFacts, LifecycleImplementation, LifecyclePhase, OperationPhase,
+    OperationSnapshot, ShutdownOutcome, TerminalClass, TerminalRecord,
+    validate_capability_snapshot_v0, validate_service_error_v0,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::sync::MutexGuard;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
+use tokio::sync::{Semaphore, oneshot};
 
-#[derive(Debug)]
-enum UnsupportedOperation {}
+enum FteGatewayLifecycle {}
 
-#[derive(Debug)]
-struct UnsupportedTicket;
-
-#[derive(Clone, Debug)]
-struct UnsupportedLease;
+impl LifecycleImplementation for FteGatewayLifecycle {
+    const PRODUCT: &'static str = "free-token-energy";
+    const IMPLEMENTATION: &'static str = "gateway-v2";
+}
 
 #[derive(Clone)]
-struct EmptyGatewayShutdownAdapter {
+struct GatewayStableShutdownAdapter {
     gateway: Arc<Gateway>,
-    runtime: Arc<Mutex<tokio::runtime::Runtime>>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    next_sequence: Arc<AtomicU64>,
 }
 
-impl EmptyGatewayShutdownAdapter {
-    fn runtime(&self) -> MutexGuard<'_, tokio::runtime::Runtime> {
-        self.runtime
+struct ControlledGatewayOperation {
+    request_id: RequestId,
+    sequence: u64,
+    ticket: Mutex<Option<GatewayTicket>>,
+    complete: Mutex<Option<oneshot::Sender<()>>>,
+    allow_exit: Arc<Semaphore>,
+    shutdown_observed: Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+struct ControlledGatewayBackend {
+    descriptor: BackendDescriptor,
+    complete: Mutex<Option<oneshot::Receiver<()>>>,
+    allow_exit: Arc<Semaphore>,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    shutdown_observed: Mutex<Option<mpsc::SyncSender<()>>>,
+}
+
+struct NoopCancellation;
+
+impl TicketCancellation for NoopCancellation {
+    fn cancel(&self, _target: CancelTarget) -> usize {
+        0
+    }
+}
+
+#[async_trait]
+impl GatewayBackend for ControlledGatewayBackend {
+    fn descriptor(&self) -> BackendDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn readiness(&self) -> BackendReadiness {
+        BackendReadiness::Ready
+    }
+
+    async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
+        let complete = self
+            .complete
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                GatewayError::unavailable(
+                    &request.request.request_id,
+                    "contract_backend_already_executed",
+                    "the controlled contract backend accepts exactly one request",
+                )
+            })?;
+        let request_id = request.request.request_id.clone();
+        let route = request.route;
+        let response = GatewayResponse {
+            id: format!("contract-response-{request_id}"),
+            request_id: request_id.clone(),
+            model: route.model_id.clone(),
+            route: route.clone(),
+            output: Vec::new(),
+            usage: GatewayUsage {
+                selected_route: Some(route),
+                ..GatewayUsage::default()
+            },
+            status: TerminalStatus::Completed,
+            previous_response_id: None,
+        };
+        let (_events_tx, events_rx) = tokio::sync::mpsc::channel(1);
+        let (final_tx, final_rx) = oneshot::channel();
+        let terminal = Arc::new(AtomicBool::new(false));
+        let terminal_for_task = Arc::clone(&terminal);
+        let allow_exit = Arc::clone(&self.allow_exit);
+        let task = tokio::spawn(async move {
+            let _ = complete.await;
+            terminal_for_task.store(true, Ordering::Release);
+            let _ = final_tx.send(Ok(response));
+            let _permit = allow_exit
+                .acquire()
+                .await
+                .expect("worker-exit gate remains open");
+        });
+        *self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+        Ok(GatewayTicket::new(
+            request_id,
+            events_rx,
+            final_rx,
+            Arc::new(NoopCancellation),
+            terminal,
+        ))
     }
 
-    fn unsupported<T>() -> T {
-        panic!("the FTE Gateway does not expose the contract operation-model surface")
-    }
-}
-
-impl OperationModelAdapter for EmptyGatewayShutdownAdapter {
-    type Error = UnsupportedOperation;
-    type Ticket = UnsupportedTicket;
-    type Lease = UnsupportedLease;
-
-    fn deterministic(config: TestConfig) -> Self {
-        assert_eq!(config, TestConfig::default());
-        let runtime = tokio::runtime::Runtime::new().expect("construct contract-test runtime");
-        Self {
-            gateway: Arc::new(Gateway::new(GatewayDefaults::default())),
-            runtime: Arc::new(Mutex::new(runtime)),
-        }
-    }
-
-    fn reserve(
-        &self,
-        _operation_id: &str,
-    ) -> Result<Reservation<Self::Ticket, Self::Lease>, Self::Error> {
-        Self::unsupported()
-    }
-
-    fn ticket_identity(
-        &self,
-        _ticket: &Self::Ticket,
-    ) -> platform_contract_testkit::AttemptIdentity {
-        Self::unsupported()
-    }
-
-    fn lease_identity(&self, _lease: &Self::Lease) -> platform_contract_testkit::AttemptIdentity {
-        Self::unsupported()
-    }
-
-    fn queue(&self, _lease: &Self::Lease) -> Result<(), Self::Error> {
-        Self::unsupported()
-    }
-
-    fn start(&self, _lease: &Self::Lease) -> Result<(), Self::Error> {
-        Self::unsupported()
-    }
-
-    fn publish_progress(&self, _lease: &Self::Lease, _sequence: u64) -> Result<(), Self::Error> {
-        Self::unsupported()
-    }
-
-    fn request_cancel(&self, _ticket: &Self::Ticket) -> Result<(), Self::Error> {
-        Self::unsupported()
-    }
-
-    fn consumer_drop(&self, _ticket: Self::Ticket) -> Result<(), Self::Error> {
-        Self::unsupported()
-    }
-
-    fn waiter_timeout(&self, _ticket: &Self::Ticket) -> Result<WaitObservation, Self::Error> {
-        Self::unsupported()
-    }
-
-    fn terminal(&self, _lease: &Self::Lease, _terminal: TerminalClass) -> Result<(), Self::Error> {
-        Self::unsupported()
-    }
-
-    fn record_executor_panic(&self, _lease: &Self::Lease) -> Result<(), Self::Error> {
-        Self::unsupported()
-    }
-
-    fn release(&self, _lease: &Self::Lease) -> Result<(), Self::Error> {
-        Self::unsupported()
-    }
-
-    fn quiesce(&self) {
-        Self::unsupported()
-    }
-
-    fn shutdown(&self) -> ClosedFacts {
-        self.runtime()
-            .block_on(self.gateway.shutdown())
-            .expect("empty gateway shutdown must succeed");
-        let status = self.gateway.status();
-        ClosedFacts {
-            lifecycle: lifecycle_phase(status.lifecycle),
-            active_operations: status.active_requests,
-            retained_tasks: 0,
-            joined_workers: 0,
-        }
-    }
-
-    fn lifecycle_phase(&self) -> LifecyclePhase {
-        lifecycle_phase(self.gateway.status().lifecycle)
-    }
-
-    fn active_count(&self) -> usize {
-        self.gateway.status().active_requests
-    }
-
-    fn retained_task_count(&self) -> usize {
+    fn cancel(&self, _request_id: &RequestId, _target: CancelTarget) -> usize {
         0
     }
 
-    fn progress_capacity(&self) -> usize {
-        fte_types::DEFAULT_EVENT_CAPACITY
+    async fn shutdown(&self) -> Result<(), GatewayError> {
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.await.map_err(|error| GatewayError {
+                code: "contract_backend_task_failed".to_owned(),
+                class: ErrorClass::Internal,
+                retryable: false,
+                http_status: 500,
+                request_id: RequestId::new(),
+                provider: Some(self.descriptor.id.clone()),
+                safe_detail: format!("controlled backend task failed: {error}"),
+            })?;
+        }
+        if let Some(observed) = self
+            .shutdown_observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = observed.send(());
+        }
+        Ok(())
+    }
+}
+
+struct GatewayShutdownWitness {
+    started: Mutex<Option<mpsc::Receiver<()>>>,
+    result: Mutex<ShutdownWitnessResult>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+type ShutdownWitnessResult = (
+    mpsc::Receiver<Result<ShutdownOutcome, GatewayError>>,
+    Option<ShutdownOutcome>,
+);
+
+impl ShutdownWitness for GatewayShutdownWitness {
+    type Error = String;
+
+    fn wait_started(&self, timeout: Duration) -> Result<(), Self::Error> {
+        self.started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| "shutdown start was already observed".to_owned())?
+            .recv_timeout(timeout)
+            .map_err(|error| format!("shutdown did not start before the witness deadline: {error}"))
     }
 
-    fn current_snapshot(&self, _operation_id: &str) -> Option<OperationSnapshot> {
-        None
+    fn try_complete(&self) -> Result<Option<ShutdownOutcome>, Self::Error> {
+        let mut result = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if result.1.is_none() {
+            match result.0.try_recv() {
+                Ok(Ok(outcome)) => result.1 = Some(outcome),
+                Ok(Err(error)) => return Err(error.to_string()),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err("shutdown result channel disconnected".to_owned());
+                }
+            }
+        }
+        Ok(result.1.clone())
     }
 
-    fn lease_snapshot(&self, _lease: &Self::Lease) -> Option<OperationSnapshot> {
-        None
+    fn wait(mut self, timeout: Duration) -> Result<ShutdownOutcome, Self::Error> {
+        let outcome = {
+            let mut result = self
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match result.1.take() {
+                Some(outcome) => outcome,
+                None => result
+                    .0
+                    .recv_timeout(timeout)
+                    .map_err(|error| format!("shutdown did not finish before deadline: {error}"))?
+                    .map_err(|error| error.to_string())?,
+            }
+        };
+        self.thread
+            .take()
+            .ok_or_else(|| "shutdown thread was already joined".to_owned())?
+            .join()
+            .map_err(|_| "shutdown witness thread panicked".to_owned())?;
+        Ok(outcome)
+    }
+}
+
+impl GatewayStableShutdownAdapter {
+    fn request(sequence: u64, backend_id: &str, model_id: &str) -> GatewayRequest {
+        let mut request = local_request();
+        request.client_id = format!("w1-stable-shutdown-{sequence}");
+        request.model = ModelSelector::ExactRoute {
+            backend_id: backend_id.to_owned(),
+            model_id: model_id.to_owned(),
+        };
+        request
+    }
+}
+
+impl StableShutdownAdapter for GatewayStableShutdownAdapter {
+    type Implementation = FteGatewayLifecycle;
+    type Error = GatewayError;
+    type Operation = ControlledGatewayOperation;
+    type ShutdownWitness = GatewayShutdownWitness;
+
+    fn deterministic() -> Self {
+        Self {
+            gateway: Arc::new(Gateway::new(GatewayDefaults::default())),
+            runtime: Arc::new(tokio::runtime::Runtime::new().expect("contract-test runtime")),
+            next_sequence: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn start(&self, _operation_id: &str) -> Result<Self::Operation, Self::Error> {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::AcqRel);
+        let backend_id = format!("w1-controlled-backend-{sequence}");
+        let model_id = format!("{backend_id}-model");
+        let (complete_tx, complete_rx) = oneshot::channel();
+        let (shutdown_observed_tx, shutdown_observed_rx) = mpsc::sync_channel(0);
+        let allow_exit = Arc::new(Semaphore::new(0));
+        self.gateway
+            .register_backend(Arc::new(ControlledGatewayBackend {
+                descriptor: descriptor(&backend_id, BackendLocation::LocalEmbedded),
+                complete: Mutex::new(Some(complete_rx)),
+                allow_exit: Arc::clone(&allow_exit),
+                task: Mutex::new(None),
+                shutdown_observed: Mutex::new(Some(shutdown_observed_tx)),
+            }))?;
+        let request = Self::request(sequence, &backend_id, &model_id);
+        let request_id = request.request_id.clone();
+        let ticket = self.runtime.block_on(self.gateway.execute(request))?;
+        Ok(ControlledGatewayOperation {
+            request_id,
+            sequence,
+            ticket: Mutex::new(Some(ticket)),
+            complete: Mutex::new(Some(complete_tx)),
+            allow_exit,
+            shutdown_observed: Mutex::new(Some(shutdown_observed_rx)),
+        })
+    }
+
+    fn request_completed_release(&self, operation: &Self::Operation) -> Result<(), Self::Error> {
+        operation
+            .complete
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                GatewayError::unavailable(
+                    &operation.request_id,
+                    "contract_completion_already_requested",
+                    "completion may be requested only once",
+                )
+            })?
+            .send(())
+            .map_err(|_| {
+                GatewayError::unavailable(
+                    &operation.request_id,
+                    "contract_completion_disconnected",
+                    "the controlled backend stopped before completion",
+                )
+            })
+    }
+
+    fn wait_released(
+        &self,
+        operation: &Self::Operation,
+        timeout: Duration,
+    ) -> Result<OperationSnapshot, Self::Error> {
+        let ticket = operation
+            .ticket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                GatewayError::unavailable(
+                    &operation.request_id,
+                    "contract_result_already_observed",
+                    "the controlled result may be observed only once",
+                )
+            })?;
+        let response = self
+            .runtime
+            .block_on(async move { tokio::time::timeout(timeout, ticket.final_response()).await })
+            .map_err(|_| {
+                GatewayError::unavailable(
+                    &operation.request_id,
+                    "contract_result_timeout",
+                    "the controlled result did not arrive before the contract deadline",
+                )
+            })??;
+        if response.status != TerminalStatus::Completed {
+            return Err(GatewayError::unavailable(
+                &operation.request_id,
+                "contract_result_not_completed",
+                "the controlled request did not complete successfully",
+            ));
+        }
+        let identity = AttemptIdentity {
+            operation_id: operation.request_id.to_string(),
+            attempt_id: format!("gateway-attempt-{}", operation.sequence),
+            sequence: operation.sequence,
+        };
+        let terminal = TerminalRecord {
+            class: TerminalClass::Completed,
+            sequence: operation.sequence,
+        };
+        Ok(OperationSnapshot {
+            identity,
+            phase: OperationPhase::Released,
+            cancellation_requested: self.gateway.status().lifecycle != GatewayLifecycle::Running,
+            authoritative_terminal: Some(terminal),
+            final_projection: Some(terminal),
+            progress_projection: Vec::new(),
+        })
+    }
+
+    fn allow_worker_exit(&self, operation: &Self::Operation) -> Result<(), Self::Error> {
+        operation.allow_exit.add_permits(1);
+        operation
+            .shutdown_observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                GatewayError::unavailable(
+                    &operation.request_id,
+                    "contract_shutdown_already_observed",
+                    "backend shutdown completion may be observed only once",
+                )
+            })?
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| {
+                GatewayError::unavailable(
+                    &operation.request_id,
+                    "contract_backend_shutdown_timeout",
+                    "the backend worker did not exit before the contract deadline",
+                )
+            })
+    }
+
+    fn begin_shutdown(&self) -> Self::ShutdownWitness {
+        let runtime = Arc::clone(&self.runtime);
+        let gateway = Arc::clone(&self.gateway);
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || {
+            runtime.block_on(async move {
+                let shutdown_gateway = Arc::clone(&gateway);
+                let shutdown =
+                    tokio::spawn(async move { shutdown_gateway.shutdown_report().await });
+                loop {
+                    if gateway.status().lifecycle != GatewayLifecycle::Running {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                let _ = started_tx.send(());
+                let result = match shutdown.await {
+                    Ok(report) => report.result.map(|()| {
+                        let status = gateway.status();
+                        ShutdownOutcome {
+                            facts: ClosedFacts {
+                                lifecycle: lifecycle_phase(status.lifecycle),
+                                active_operations: status.active_requests,
+                                retained_tasks: 0,
+                                expected_workers: report.expected_worker_ids.len(),
+                                joined_workers: report.joined_worker_ids.len(),
+                            },
+                            expected_worker_ids: report.expected_worker_ids,
+                            joined_worker_ids: report.joined_worker_ids,
+                        }
+                    }),
+                    Err(error) => Err(GatewayError::unavailable(
+                        &RequestId::new(),
+                        "contract_shutdown_task_failed",
+                        &format!("Gateway shutdown task failed: {error}"),
+                    )),
+                };
+                let _ = result_tx.send(result);
+            });
+        });
+        GatewayShutdownWitness {
+            started: Mutex::new(Some(started_rx)),
+            result: Mutex::new((result_rx, None)),
+            thread: Some(thread),
+        }
     }
 }
 
@@ -365,8 +642,12 @@ fn service_error(error: &GatewayError) -> ServiceErrorV0 {
 }
 
 #[test]
-fn w1_contract_generic_shutdown_subset_uses_real_gateway() {
-    assert_repeated_shutdown_is_stable_and_empty::<EmptyGatewayShutdownAdapter>();
+fn w1_contract_stable_shutdown_slice_uses_real_gateway_workers() {
+    let evidence = run_stable_shutdown_suite::<GatewayStableShutdownAdapter>("gateway-supervisor");
+    assert_eq!(evidence.product(), "free-token-energy");
+    assert_eq!(evidence.implementation(), "gateway-v2");
+    assert_eq!(evidence.suite(), "stable-shutdown");
+    assert_eq!(evidence.invariants().count(), 2);
 }
 
 #[test]
