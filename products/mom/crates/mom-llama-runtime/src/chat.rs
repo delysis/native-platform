@@ -362,6 +362,8 @@ pub fn chat_send(
         input,
         options,
         None,
+        None,
+        false,
         None::<fn(ChatStreamEvent) -> Result<()>>,
     )
 }
@@ -374,7 +376,7 @@ pub fn chat_send_stream<F>(
 where
     F: FnMut(ChatStreamEvent) -> Result<()>,
 {
-    chat_send_supervised(input, options, None, Some(on_event))
+    chat_send_supervised(input, options, None, None, false, Some(on_event))
 }
 
 pub fn chat_regenerate(
@@ -411,6 +413,8 @@ pub fn chat_regenerate(
         },
         options,
         Some(message_id),
+        None,
+        false,
         None::<fn(ChatStreamEvent) -> Result<()>>,
     )?;
     retag_chat_result(&mut result, "mom_llama.chat_regenerate");
@@ -458,6 +462,8 @@ fn chat_send_supervised<F>(
     input: ChatSendInput,
     options: ChatSendOptions,
     regenerate_user_id: Option<String>,
+    request_id: Option<String>,
+    wait_for_fixture_cancel: bool,
     mut on_event: Option<F>,
 ) -> Result<CommandResult<ChatSendOutput>>
 where
@@ -557,7 +563,17 @@ where
         &attachment_context.text_by_message_id,
         &attachment_context.current_text,
     );
-    let request_id = Uuid::new_v4().to_string();
+    let request_id = request_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    let fixture_cancellation = wait_for_fixture_cancel
+        .then(|| crate::native_runtime::register_fixture_native_request(&request_id))
+        .transpose()?;
+    #[cfg(not(feature = "unstable-w1-vertical-fixtures"))]
+    if wait_for_fixture_cancel {
+        return Err(anyhow::anyhow!(
+            "fixture cancellation is absent from the default product feature graph"
+        ));
+    }
     let cancel_path = format!("native://request/{request_id}");
     register_active_request(
         &settings.data_dir,
@@ -604,7 +620,43 @@ where
         duration_ms,
         cache_id,
         cache_reused,
-    ) = if options.fake_fixture {
+    ) = if options.fake_fixture && wait_for_fixture_cancel {
+        #[cfg(feature = "unstable-w1-vertical-fixtures")]
+        {
+            let cancellation = fixture_cancellation
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("fixture cancellation control is missing"))?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cancellation.cancelled() {
+                if Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "fixture native request was not cancelled before its deadline"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Cancelled)?;
+            stream.finish(
+                "cancelled",
+                Some("The labeled fixture request was cancelled.".to_string()),
+            )?;
+            return Ok(CommandResult::blocked_with_evidence(
+                "mom_llama.chat_send",
+                "stub_blocked",
+                Blocker::new(
+                    "chat_cancelled",
+                    "The labeled fixture request was cancelled through Mom's native cancellation boundary.",
+                    vec!["Send the message again to create a new owned attempt.".to_string()],
+                ),
+                Vec::new(),
+                Vec::new(),
+                false,
+                true,
+            ));
+        }
+        #[cfg(not(feature = "unstable-w1-vertical-fixtures"))]
+        unreachable!("fixture cancellation is rejected before request registration");
+    } else if options.fake_fixture {
         (
             "Fixture assistant response.".to_string(),
             None,
@@ -923,6 +975,82 @@ fn user_turn_is_empty(message: &str, attachments: &ChatAttachmentContext) -> boo
     message.trim().is_empty()
         && attachments.current_text.trim().is_empty()
         && attachments.media.is_empty()
+}
+
+/// Runs the ordinary fake chat path with a caller-fixed request identity.
+///
+/// This boundary exists only for checked-in W1 fixture replay. It refuses real
+/// inference, does not exist in the default feature graph, and carries no
+/// network or process authority.
+#[cfg(feature = "unstable-w1-vertical-fixtures")]
+pub fn chat_send_stream_with_fixture_identity<F>(
+    input: ChatSendInput,
+    request_id: &str,
+    on_event: F,
+) -> Result<CommandResult<ChatSendOutput>>
+where
+    F: FnMut(ChatStreamEvent) -> Result<()>,
+{
+    if request_id.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "fixture request identity must not be empty"
+        ));
+    }
+    chat_send_supervised(
+        input,
+        ChatSendOptions {
+            timeout_s: 1.0,
+            fake_fixture: true,
+        },
+        None,
+        Some(request_id.to_string()),
+        false,
+        Some(on_event),
+    )
+}
+
+/// Runs a fake request through the ordinary stream lifecycle until the real
+/// Mom chat-cancel command reaches its registered native cancellation control.
+#[cfg(feature = "unstable-w1-vertical-fixtures")]
+pub fn chat_send_stream_waiting_for_fixture_cancel<F>(
+    input: ChatSendInput,
+    request_id: &str,
+    on_event: F,
+) -> Result<CommandResult<ChatSendOutput>>
+where
+    F: FnMut(ChatStreamEvent) -> Result<()>,
+{
+    if request_id.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "fixture request identity must not be empty"
+        ));
+    }
+    chat_send_supervised(
+        input,
+        ChatSendOptions {
+            timeout_s: 5.0,
+            fake_fixture: true,
+        },
+        None,
+        Some(request_id.to_string()),
+        true,
+        Some(on_event),
+    )
+}
+
+#[cfg(feature = "unstable-w1-vertical-fixtures")]
+pub fn active_chat_request_count_for_fixture() -> Result<usize> {
+    let settings = resolve_settings()?;
+    Ok(load_active_requests(&settings.data_dir)?
+        .requests
+        .iter()
+        .filter(|request| {
+            matches!(
+                request.state,
+                ChatRequestState::Running | ChatRequestState::CancelRequested
+            )
+        })
+        .count())
 }
 
 pub fn chat_cancel(conversation_id: &str) -> Result<CommandResult<ChatCancelOutput>> {

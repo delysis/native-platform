@@ -1,0 +1,55 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "mom.attachment.import-send-reopen",
+      "attempt_id": "mom-w1-attachment-request",
+      "correlation_id": "mom-w1-ordinary-markdown",
+      "kind": "completed",
+      "payload": {
+        "id": "attachment.root_object",
+        "digest": { "algorithm": "sha256", "hex": "19b385128f4ee3d9e2a1a6f5adaabb73c46fea8463c8fb72f53b24966e75304c" },
+        "length": 169
+      }
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "mom.attachment.store",
+      "schema_id": "mom_llama.attachments.v3",
+      "before": null,
+      "after": {
+        "id": "attachment.root_object",
+        "digest": { "algorithm": "sha256", "hex": "19b385128f4ee3d9e2a1a6f5adaabb73c46fea8463c8fb72f53b24966e75304c" },
+        "length": 169
+      },
+      "disposition": "created"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "mom.attachment.import-send-reopen",
+      "attempt_id": "mom-w1-attachment-request",
+      "correlation_id": "mom-w1-ordinary-markdown",
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 0,
+    "joined_workers": 0
+  },
+  "output_facts": {
+    "artifact_processor_provenance_exact": { "kind": "boolean", "value": true },
+    "canonical_prompt_recomputed_after_reopen": { "kind": "boolean", "value": true },
+    "manifest_namespace_exact": { "kind": "boolean", "value": true },
+    "object_bytes_exact": { "kind": "boolean", "value": true },
+    "policy_fingerprint_exact": { "kind": "boolean", "value": true }
+  },
+  "fail_closed_facts": [
+    "attachment text remained inside the explicit untrusted-data boundary",
+    "content-address mismatch blocks before prompt projection"
+  ]
+}

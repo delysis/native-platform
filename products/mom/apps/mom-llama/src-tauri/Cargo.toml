@@ -8,6 +8,11 @@ rust-version = "1.88"
 
 [features]
 unstable-w1-contracts = ["dep:platform-contracts-v0", "dep:platform-contract-testkit"]
+unstable-w1-vertical-fixtures = [
+    "dep:platform-contracts-v0-vertical",
+    "dep:platform-vertical-fixtures-v0",
+    "mom-llama-runtime/unstable-w1-vertical-fixtures",
+]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -30,6 +35,8 @@ tokio.workspace = true
 thiserror.workspace = true
 platform-contracts-v0 = { workspace = true, optional = true }
 platform-contract-testkit = { workspace = true, optional = true }
+platform-vertical-fixtures-v0 = { workspace = true, optional = true }
+platform-contracts-v0-vertical = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 rfd = { version = "=0.16.0", default-features = false }

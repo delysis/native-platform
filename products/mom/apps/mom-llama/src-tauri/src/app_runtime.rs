@@ -205,6 +205,38 @@ impl AppWorkLease {
         task.wait().await
     }
 
+    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+    pub fn w1_attempt_identity(&self) -> Option<crate::operation_supervisor::AttemptIdentity> {
+        self.supervised
+            .as_ref()
+            .map(|reservation| reservation.lease.identity())
+    }
+
+    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+    pub async fn run_blocking_w1<T, F>(mut self, operation: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&crate::operation_supervisor::OperationLease) -> Result<T, String>
+            + Send
+            + 'static,
+    {
+        let reservation = self
+            .supervised
+            .take()
+            .ok_or_else(|| "Mom Llama's long operation has no supervisor reservation".to_owned())?;
+        let supervisor = reservation
+            .lease
+            .supervisor()
+            .ok_or_else(|| "Mom Llama's operation supervisor is unavailable".to_owned())?;
+        let task = supervisor
+            .spawn(reservation, move |lease| {
+                let _app_lease = self;
+                operation(lease)
+            })
+            .map_err(|error| error.to_string())?;
+        task.wait().await
+    }
+
     fn finish_supervised(&mut self, class: TerminalClass) -> Result<(), String> {
         let Some(reservation) = self.supervised.take() else {
             return Ok(());
@@ -515,6 +547,40 @@ impl AppRuntimeHandle {
         self.0.cancellation_sweeps.fetch_add(1, Ordering::AcqRel);
         let _ = self.0.product_canceller.cancel_all();
     }
+
+    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+    pub fn w1_terminal_facts(&self) -> Vec<crate::operation_supervisor::W1TerminalFact> {
+        self.0.operation_supervisor.w1_terminal_facts()
+    }
+
+    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+    pub fn w1_active_operation_count(&self) -> usize {
+        self.0.operation_supervisor.active_count()
+    }
+
+    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+    pub fn w1_retained_task_count(&self) -> usize {
+        self.0.operation_supervisor.retained_task_count()
+    }
+}
+
+#[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
+pub(crate) fn w1_fixture_runtime() -> AppRuntimeHandle {
+    let host = Arc::new(NativeHost::new(
+        llama_native_host::NativeHostConfig::default(),
+    ));
+    let gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults {
+        catalog_version: "mom-w1-fixture".to_string(),
+    }));
+    AppRuntimeHandle::with_operation_supervisor(
+        Arc::new(ProductGatewayFinalizer(gateway)),
+        Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host))),
+        host,
+        None,
+        Arc::new(RuntimeProductCanceller),
+        Arc::new(ProductNativeFinalizer),
+        OperationSupervisor::with_config(41, 4),
+    )
 }
 
 fn unix_time_ms() -> u64 {

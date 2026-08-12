@@ -3169,7 +3169,9 @@ dependencies = [
  "maud",
  "mom-llama-runtime",
  "platform-contract-testkit",
- "platform-contracts-v0",
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=9fd803f5efcc46ac0256dab876e7c0b1f03bb448)",
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=cbab33555ab9355a6ac453d659c55ec9e0666821)",
+ "platform-vertical-fixtures-v0",
  "rfd",
  "serde",
  "serde_json",
@@ -3210,6 +3212,8 @@ dependencies = [
  "llama-native-engine",
  "llama-native-host",
  "llama-native-types",
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=9fd803f5efcc46ac0256dab876e7c0b1f03bb448)",
+ "platform-vertical-fixtures-v0",
  "rusqlite",
  "security-framework",
  "serde",
@@ -3739,7 +3743,16 @@ name = "platform-contract-testkit"
 version = "0.0.0"
 source = "git+https://github.com/delysis/w1-platform-contracts?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
 dependencies = [
- "platform-contracts-v0",
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=cbab33555ab9355a6ac453d659c55ec9e0666821)",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "platform-contracts-v0"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts?rev=9fd803f5efcc46ac0256dab876e7c0b1f03bb448#9fd803f5efcc46ac0256dab876e7c0b1f03bb448"
+dependencies = [
+ "serde",
  "thiserror 2.0.20",
 ]
 
@@ -3749,6 +3762,18 @@ version = "0.0.0"
 source = "git+https://github.com/delysis/w1-platform-contracts?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
 dependencies = [
  "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "platform-vertical-fixtures-v0"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts?rev=9fd803f5efcc46ac0256dab876e7c0b1f03bb448#9fd803f5efcc46ac0256dab876e7c0b1f03bb448"
+dependencies = [
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=9fd803f5efcc46ac0256dab876e7c0b1f03bb448)",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
 ]
 

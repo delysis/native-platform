@@ -650,7 +650,9 @@ fn decode_hex_key(input: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation_store::{CONVERSATIONS_NAMESPACE, Conversation, ConversationDb};
     use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
 
     #[test]
     fn unit_test_key_selection_does_not_depend_on_the_mutable_data_dir_override() {
@@ -661,6 +663,36 @@ mod tests {
     #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
     struct SecretDocument {
         values: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct W1PriorStoreFixture {
+        schema: String,
+        fixture_key_hex: String,
+        credential_scope: String,
+        physical_schema: String,
+        logical_versions: BTreeMap<String, String>,
+        import_namespace: String,
+        conversation: Conversation,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct W1CacheCorruptionFixture {
+        schema: String,
+        fixture_key_hex: String,
+        native_prefix_namespace: String,
+        authoritative_namespace: String,
+        authoritative_value: String,
+        tampered_ciphertext_hex: String,
+        native_prefix_disposition: String,
+    }
+
+    struct RemovePlaintextOnDrop(PathBuf);
+
+    impl Drop for RemovePlaintextOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
     }
 
     fn test_dir(name: &str) -> PathBuf {
@@ -829,6 +861,237 @@ mod tests {
         assert_eq!(live_cache_rows, 0);
         assert_eq!(quarantine_rows, 1);
         assert_eq!(product_rows, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn w1_redacted_logical_store_imports_cleans_plaintext_and_reopens_with_fixture_only_key()
+    -> Result<()> {
+        let fixture_bytes = include_bytes!("../fixtures/w1/prior-store-v1.json");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fixture_bytes)),
+            "7e44507f4ee444becf112ed1853e9cfb301618aadac19b1909a41cacf95c6ccf"
+        );
+        let fixture: W1PriorStoreFixture = serde_json::from_slice(fixture_bytes)?;
+        assert_eq!(
+            fixture.schema,
+            "mom_llama.w1.redacted_logical_store_import_fixture.v1"
+        );
+        assert_eq!(
+            fixture.credential_scope,
+            "deterministic_fixture_only_not_personal_keychain"
+        );
+        assert_eq!(
+            fixture.physical_schema,
+            "runtime.sqlite3/encrypted_documents.v1"
+        );
+        assert_eq!(fixture.import_namespace, CONVERSATIONS_NAMESPACE);
+        assert_eq!(
+            fixture
+                .logical_versions
+                .get("conversations")
+                .map(String::as_str),
+            Some(CONVERSATIONS_NAMESPACE)
+        );
+        assert_eq!(
+            fixture.logical_versions.get("drafts").map(String::as_str),
+            Some("drafts.v2")
+        );
+        assert_eq!(
+            fixture
+                .logical_versions
+                .get("attachments")
+                .map(String::as_str),
+            Some("mom_llama.attachments.v3")
+        );
+        assert_eq!(
+            fixture.logical_versions.get("personas").map(String::as_str),
+            Some("personas.v1")
+        );
+
+        let data_dir = test_dir("w1-prior-store");
+        fs::create_dir_all(&data_dir)?;
+        let legacy_path = data_dir.join("conversations.json");
+        let _plaintext_cleanup = RemovePlaintextOnDrop(legacy_path.clone());
+        let expected = ConversationDb {
+            conversations: vec![fixture.conversation],
+            selected_conversation_id: Some("mom-w1-prior-store".to_string()),
+        };
+        fs::write(&legacy_path, serde_json::to_vec_pretty(&expected)?)?;
+        let key = decode_hex_key(&fixture.fixture_key_hex)?;
+        let store = RuntimeStore::open_with_key(&data_dir, key)?;
+        assert!(store.import_json_once::<ConversationDb>(CONVERSATIONS_NAMESPACE, &legacy_path)?);
+        assert_eq!(
+            store.get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?,
+            Some(expected.clone())
+        );
+        assert!(
+            !store.import_json_once::<ConversationDb>(CONVERSATIONS_NAMESPACE, &legacy_path)?,
+            "import must be idempotent once the encrypted document exists"
+        );
+        fs::remove_file(&legacy_path)?;
+        assert!(
+            !legacy_path.exists(),
+            "the plaintext import artifact must not remain beside the encrypted store"
+        );
+
+        drop(store);
+        let reopened = RuntimeStore::open_with_key(&data_dir, key)?;
+        assert_eq!(
+            reopened.get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?,
+            Some(expected.clone())
+        );
+        let wrong_key = RuntimeStore::open_with_key(&data_dir, [0x43; 32])?;
+        assert!(
+            wrong_key
+                .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)
+                .is_err()
+        );
+        let database = fs::read(reopened.path())?;
+        let redacted_content = expected.conversations[0].messages[0].content.as_bytes();
+        assert!(
+            !database
+                .windows(redacted_content.len())
+                .any(|window| window == redacted_content)
+        );
+        let connection = Connection::open(reopened.path())?;
+        let user_version: i64 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(user_version, 0);
+        let encrypted_rows: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM encrypted_documents WHERE namespace = ?1",
+            [CONVERSATIONS_NAMESPACE],
+            |row| row.get(0),
+        )?;
+        assert_eq!(encrypted_rows, 1);
+
+        use platform_contracts_v0_vertical::TerminalClass;
+        use platform_vertical_fixtures_v0::{
+            DurableStateFactV0, EquivalenceProjectionV0, EventFactV0, FactValueV0, LifecycleFactV0,
+            OwnershipFactsV0, StateDispositionV0, VerticalIdV0, sha256_identity,
+        };
+        let baseline = sha256_identity("mom.prior_store.redacted_logical", fixture_bytes);
+        let recovered = sha256_identity("mom.prior_store.recovered_logical", fixture_bytes);
+        crate::validate_w1_fixture_projection(
+            VerticalIdV0::MomPriorReleaseStore,
+            EquivalenceProjectionV0 {
+                ordered_events: vec![EventFactV0 {
+                    sequence: 0,
+                    operation_id: "mom.store.redacted-logical-import".to_owned(),
+                    attempt_id: Some("import.once".to_owned()),
+                    correlation_id: None,
+                    kind: "recovered".to_owned(),
+                    payload: Some(baseline.clone()),
+                }],
+                durable_state: vec![DurableStateFactV0 {
+                    state_id: "mom.prior_store.redacted_logical".to_owned(),
+                    schema_id: "runtime.sqlite3/encrypted_documents.v1".to_owned(),
+                    before: Some(baseline),
+                    after: Some(recovered),
+                    disposition: StateDispositionV0::Recovered,
+                }],
+                lifecycle: vec![LifecycleFactV0 {
+                    operation_id: "mom.store.redacted-logical-import".to_owned(),
+                    attempt_id: Some("import.once".to_owned()),
+                    correlation_id: None,
+                    terminal: TerminalClass::Completed,
+                    released: true,
+                }],
+                ownership: OwnershipFactsV0 {
+                    active_operations: 0,
+                    retained_tasks: 0,
+                    expected_workers: 0,
+                    joined_workers: 0,
+                },
+                output_facts: BTreeMap::from([
+                    (
+                        "encrypted_document_count".to_owned(),
+                        FactValueV0::Integer(encrypted_rows),
+                    ),
+                    (
+                        "historical_physical_migration_claimed".to_owned(),
+                        FactValueV0::Boolean(false),
+                    ),
+                    (
+                        "plaintext_source_removed".to_owned(),
+                        FactValueV0::Boolean(!legacy_path.exists()),
+                    ),
+                    (
+                        "reopen_same_fixture_key".to_owned(),
+                        FactValueV0::Boolean(
+                            reopened.get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?
+                                == Some(expected),
+                        ),
+                    ),
+                    ("wrong_key_rejected".to_owned(), FactValueV0::Boolean(true)),
+                ]),
+                fail_closed_facts: vec![
+                    "temporary plaintext import source was removed before acceptance".to_owned(),
+                    "fixture does not claim personal Keychain or historical physical-schema migration evidence".to_owned(),
+                ],
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn w1_native_prefix_corruption_quarantines_only_disposable_state_and_reopens_cold() -> Result<()>
+    {
+        let fixture: W1CacheCorruptionFixture =
+            serde_json::from_str(include_str!("../fixtures/w1/cache-corruption-v1.json"))?;
+        assert_eq!(
+            fixture.schema,
+            "mom_llama.w1.disposable_cache_corruption_fixture.v1"
+        );
+        assert_eq!(
+            fixture.native_prefix_disposition,
+            "quarantine_then_cold_miss"
+        );
+        let data_dir = test_dir("w1-native-prefix-corruption");
+        let key = decode_hex_key(&fixture.fixture_key_hex)?;
+        let store = RuntimeStore::open_with_key(&data_dir, key)?;
+        store.put(
+            &fixture.native_prefix_namespace,
+            &SecretDocument {
+                values: vec!["disposable fixture prefix".to_string()],
+            },
+        )?;
+        let authoritative = SecretDocument {
+            values: vec![fixture.authoritative_value],
+        };
+        store.put(&fixture.authoritative_namespace, &authoritative)?;
+        assert_eq!(fixture.tampered_ciphertext_hex, "00");
+        let tampered = vec![0_u8];
+        Connection::open(store.path())?.execute(
+            "UPDATE encrypted_documents SET ciphertext = ?1 WHERE namespace = ?2",
+            params![tampered, fixture.native_prefix_namespace],
+        )?;
+
+        assert_eq!(
+            store.get_disposable_cache::<SecretDocument>(&fixture.native_prefix_namespace)?,
+            None
+        );
+        assert_eq!(
+            store.get::<SecretDocument>(&fixture.authoritative_namespace)?,
+            Some(authoritative.clone())
+        );
+        drop(store);
+        let reopened = RuntimeStore::open_with_key(&data_dir, key)?;
+        assert_eq!(
+            reopened.get_disposable_cache::<SecretDocument>(&fixture.native_prefix_namespace)?,
+            None
+        );
+        assert_eq!(
+            reopened.get::<SecretDocument>(&fixture.authoritative_namespace)?,
+            Some(authoritative)
+        );
+        let connection = Connection::open(reopened.path())?;
+        let quarantine_rows: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM encrypted_documents WHERE namespace LIKE 'quarantine.disposable-cache.%'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(quarantine_rows, 1);
         Ok(())
     }
 

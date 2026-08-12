@@ -1,0 +1,12 @@
+{
+  "schema": "mom_llama.w1.disposable_cache_corruption_fixture.v1",
+  "fixture_key_hex": "1717171717171717171717171717171717171717171717171717171717171717",
+  "native_prefix_namespace": "native-host-prefix-cache.mom-llama",
+  "session_metadata_namespace": "kv-cache.v3",
+  "session_blob_namespace": "kv-cache.v3.blob.w1-tampered",
+  "authoritative_namespace": "conversations.v2",
+  "authoritative_value": "authoritative conversation state remains exact",
+  "tampered_ciphertext_hex": "00",
+  "native_prefix_disposition": "quarantine_then_cold_miss",
+  "session_blob_disposition": "invalidate_delete_then_cold_miss"
+}

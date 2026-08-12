@@ -18,15 +18,27 @@ pub mod skill_store;
 mod store;
 pub mod tool_loop;
 pub mod upstream_status;
+#[cfg(feature = "unstable-w1-vertical-fixtures")]
+mod w1_vertical_fixture;
 
 pub use attachments::{
     AttachmentImportOutput, AttachmentKind, AttachmentPreview, AttachmentRecord, AttachmentState,
     attachment_import, attachment_import_pasted_text, attachment_list, attachment_preview,
 };
+#[cfg(feature = "unstable-w1-vertical-fixtures")]
+pub use attachments::{
+    W1AttachmentPromptProjection, attachment_import_with_fixture_identity,
+    attachment_prompt_projection_for_fixture,
+};
 pub use chat::{
     ChatCancelOutput, ChatRequestState, ChatSendInput, ChatSendOptions, ChatSendOutput,
     ChatSkipReasoningOutput, ChatStreamEvent, chat_cancel, chat_continue, chat_regenerate,
     chat_send, chat_send_stream, chat_skip_reasoning,
+};
+#[cfg(feature = "unstable-w1-vertical-fixtures")]
+pub use chat::{
+    active_chat_request_count_for_fixture, chat_send_stream_waiting_for_fixture_cancel,
+    chat_send_stream_with_fixture_identity,
 };
 pub use config::{
     GenerationDefaults, KvCachePolicy, Settings, configure_engine, settings_get, settings_reset,
@@ -88,6 +100,8 @@ pub use tool_loop::{
     tool_loop_cancel, tool_loop_prepare, tool_loop_run, tool_loop_run_stream, tool_loop_status,
     tool_permission_list, tool_permission_revoke, tool_permission_set,
 };
+#[cfg(feature = "unstable-w1-vertical-fixtures")]
+pub use w1_vertical_fixture::validate_w1_fixture_projection;
 
 pub const RESULT_SCHEMA: &str = "mom_llama.command_result.v1";
 pub const RECEIPT_SCHEMA: &str = "mom_llama.command_receipt.v1";
