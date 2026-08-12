@@ -1,0 +1,70 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "quit_relaunch_fake_owners",
+  "class": "model_free",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [
+    {
+      "case_id": "loom.full-application-close-and-fresh-runtime",
+      "source": {
+        "repository_id": "delysis/loom-native",
+        "commit": "a210de57a5a289db74a9cc280839e75fdf5f90db",
+        "production_tree": {
+          "id": "loom.row8.production.source_objects.a210de5",
+          "digest": {
+            "algorithm": "sha256",
+              "hex": "14ccf97adc90941db7b9dddcbc9e3de4f11b257bb9dfba55e9a3f1d90c8071cc"
+          },
+          "length": 482
+        }
+      },
+      "inputs": [
+        {
+          "identity": {
+            "id": "loom.quit-relaunch.input",
+            "digest": {
+              "algorithm": "sha256",
+              "hex": "6d47cc78a65c81541df067e750ce99bb3dd33d07b1baf7ba06af2560ece3765c"
+            },
+            "length": 159
+          },
+          "availability": "checked_in",
+          "relative_path": "fixtures/w1/loom-quit-relaunch-v1.json"
+        }
+      ],
+      "state_identities": [],
+      "prerequisites": [],
+      "replay": [
+        {
+          "program": { "kind": "cargo" },
+          "argv": [
+            "test",
+            "-p",
+            "tauri-plugin-loom",
+            "--features",
+            "unstable-w1-vertical-tests",
+            "w1_vertical_fixture::full_application_close_joins_fake_generation_owner_and_fresh_runtime_admits_work",
+            "--",
+            "--exact"
+          ],
+          "required_environment": [],
+          "network": "denied"
+        }
+      ],
+      "expected_projection": {
+        "id": "loom.quit-relaunch.projection",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "c9e49ebd295e40e475e9979744286c8e4a9712ded19f9c9e8c341334900222f5"
+        },
+        "length": 2877
+      }
+    }
+  ],
+  "omitted_claims": [
+    "durable project store reopen",
+    "native GUI process relaunch",
+    "real model inference"
+  ],
+  "negative_evidence": []
+}

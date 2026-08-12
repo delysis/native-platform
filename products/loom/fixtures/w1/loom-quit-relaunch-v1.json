@@ -1,0 +1,5 @@
+{
+  "schema": "delysis.loom.quit_relaunch_fixture.v1",
+  "cancelled_request_id": "loom-w1-quit-active",
+  "relaunched_request_id": "loom-w1-relaunch-active"
+}

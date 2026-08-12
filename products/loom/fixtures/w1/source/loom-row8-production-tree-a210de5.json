@@ -1,0 +1,11 @@
+{
+  "schema": "delysis.production_source_roots.v0",
+  "repository_id": "delysis/loom-native",
+  "commit": "a210de57a5a289db74a9cc280839e75fdf5f90db",
+  "git_object_format": "sha1",
+  "source_roots": {
+    "crates/loom-backend-llama/src/runtime.rs": "58d53908d51a2cb128db2de5d95b13c96e934950",
+    "crates/loom-host/src/generation_supervisor.rs": "a94fae7b223b295da3fc02fb9e5d4443f643b199",
+    "crates/tauri-plugin-loom/src/lib.rs": "02b7c1d791024bed103ab4d031b9d013fea2731c"
+  }
+}

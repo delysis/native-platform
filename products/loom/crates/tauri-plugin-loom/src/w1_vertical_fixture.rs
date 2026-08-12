@@ -16,14 +16,14 @@ use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const BASELINE_COMMIT: &str = "a733508adcb1ef1e689e90ed0c8e410160cb602a";
+const BASELINE_COMMIT: &str = "a210de57a5a289db74a9cc280839e75fdf5f90db";
 const INPUT_BYTES: &[u8] = include_bytes!("../../../fixtures/w1/loom-quit-relaunch-v1.json");
 const MANIFEST_BYTES: &[u8] =
     include_bytes!("../../../fixtures/w1/manifests/loom-quit-relaunch-v0.json");
 const PROJECTION_BYTES: &[u8] =
     include_bytes!("../../../fixtures/w1/projections/loom-quit-relaunch-v1.json");
 const SOURCE_DESCRIPTOR_BYTES: &[u8] =
-    include_bytes!("../../../fixtures/w1/source/loom-production-tree-a733508.json");
+    include_bytes!("../../../fixtures/w1/source/loom-row8-production-tree-a210de5.json");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -236,13 +236,12 @@ fn full_application_close_joins_fake_generation_owner_and_fresh_runtime_admits_w
     assert_eq!(first_close.joined_worker_count, 1);
 
     let fresh = PluginState::default();
-    assert_eq!(
-        fresh
-            .generation_lifecycle
-            .phase()
-            .expect("fresh lifecycle phase"),
-        GenerationSupervisorPhase::Running
-    );
+    let fresh_runtime_running = fresh
+        .generation_lifecycle
+        .phase()
+        .expect("fresh lifecycle phase")
+        == GenerationSupervisorPhase::Running;
+    assert!(fresh_runtime_running);
     ensure_application_running(&fresh, "fresh fixture work").expect("fresh runtime admits work");
     let completed = attach_fixture_worker(
         &fresh,
@@ -269,8 +268,24 @@ fn full_application_close_joins_fake_generation_owner_and_fresh_runtime_admits_w
     );
     assert_eq!(fresh_close.joined_worker_count, 1);
 
+    validate_projection(quit_relaunch_projection(
+        &cancelled,
+        &first_close,
+        &completed,
+        &fresh_close,
+        fresh_runtime_running,
+    ));
+}
+
+fn quit_relaunch_projection(
+    cancelled: &WorkerEvidence,
+    first_close: &CloseEvidence,
+    completed: &WorkerEvidence,
+    fresh_close: &CloseEvidence,
+    fresh_runtime_running: bool,
+) -> EquivalenceProjectionV0 {
     let correlation_id = Some("loom-w1-quit-relaunch".to_owned());
-    let projection = EquivalenceProjectionV0 {
+    EquivalenceProjectionV0 {
         ordered_events: vec![
             EventFactV0 {
                 sequence: 0,
@@ -330,48 +345,57 @@ fn full_application_close_joins_fake_generation_owner_and_fresh_runtime_admits_w
             joined_workers: first_close.joined_worker_ids.len()
                 + fresh_close.joined_worker_ids.len(),
         },
-        output_facts: BTreeMap::from([
-            (
-                "first_admission_closed".to_owned(),
-                FactValueV0::Boolean(first_close.admission_closed),
-            ),
-            (
-                "first_cancellation_observed".to_owned(),
-                FactValueV0::Boolean(cancelled.cancelled.load(Ordering::Acquire)),
-            ),
-            (
-                "first_expected_joined_exact".to_owned(),
-                FactValueV0::Boolean(
-                    first_close.expected_worker_ids == first_close.joined_worker_ids,
-                ),
-            ),
-            (
-                "first_lifecycle_closed".to_owned(),
-                FactValueV0::Boolean(
-                    first_close.closed.lifecycle == GenerationSupervisorPhase::Closed,
-                ),
-            ),
-            (
-                "fresh_completed".to_owned(),
-                FactValueV0::Boolean(completed.finished.load(Ordering::Acquire)),
-            ),
-            (
-                "fresh_expected_joined_exact".to_owned(),
-                FactValueV0::Boolean(
-                    fresh_close.expected_worker_ids == fresh_close.joined_worker_ids,
-                ),
-            ),
-            (
-                "fresh_runtime_running".to_owned(),
-                FactValueV0::Boolean(true),
-            ),
-        ]),
+        output_facts: quit_relaunch_output_facts(
+            cancelled,
+            first_close,
+            completed,
+            fresh_close,
+            fresh_runtime_running,
+        ),
         fail_closed_facts: vec![
             "application admission closed before fake-owner cancellation and join".to_owned(),
             "fresh runtime did not reuse the closed generation supervisor".to_owned(),
         ],
-    };
-    validate_projection(projection);
+    }
+}
+
+fn quit_relaunch_output_facts(
+    cancelled: &WorkerEvidence,
+    first_close: &CloseEvidence,
+    completed: &WorkerEvidence,
+    fresh_close: &CloseEvidence,
+    fresh_runtime_running: bool,
+) -> BTreeMap<String, FactValueV0> {
+    BTreeMap::from([
+        (
+            "first_admission_closed".to_owned(),
+            FactValueV0::Boolean(first_close.admission_closed),
+        ),
+        (
+            "first_cancellation_observed".to_owned(),
+            FactValueV0::Boolean(cancelled.cancelled.load(Ordering::Acquire)),
+        ),
+        (
+            "first_expected_joined_exact".to_owned(),
+            FactValueV0::Boolean(first_close.expected_worker_ids == first_close.joined_worker_ids),
+        ),
+        (
+            "first_lifecycle_closed".to_owned(),
+            FactValueV0::Boolean(first_close.closed.lifecycle == GenerationSupervisorPhase::Closed),
+        ),
+        (
+            "fresh_completed".to_owned(),
+            FactValueV0::Boolean(completed.finished.load(Ordering::Acquire)),
+        ),
+        (
+            "fresh_expected_joined_exact".to_owned(),
+            FactValueV0::Boolean(fresh_close.expected_worker_ids == fresh_close.joined_worker_ids),
+        ),
+        (
+            "fresh_runtime_running".to_owned(),
+            FactValueV0::Boolean(fresh_runtime_running),
+        ),
+    ])
 }
 
 fn terminal_class(snapshot: &GenerationOperationSnapshot) -> TerminalClass {
@@ -442,27 +466,31 @@ fn validate_projection(projection: EquivalenceProjectionV0) {
 fn authenticate_production_root() {
     let descriptor: serde_json::Value =
         serde_json::from_slice(SOURCE_DESCRIPTOR_BYTES).expect("parse source descriptor");
-    let expected = descriptor["source_roots"]["crates/tauri-plugin-loom/src"]
-        .as_str()
-        .expect("tauri-plugin source-root object ID");
-    let output = Command::new("git")
-        .args([
-            "rev-parse",
-            &format!("{BASELINE_COMMIT}:crates/tauri-plugin-loom/src"),
-        ])
-        .current_dir(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(std::path::Path::parent)
-                .expect("workspace root"),
-        )
-        .output()
-        .expect("read baseline production source root");
-    assert!(output.status.success(), "baseline source root exists");
-    assert_eq!(
-        std::str::from_utf8(&output.stdout)
-            .expect("UTF-8 object ID")
-            .trim(),
-        expected
-    );
+    let source_roots = descriptor["source_roots"]
+        .as_object()
+        .expect("source_roots object");
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root");
+    for (path, expected) in source_roots {
+        let expected = expected.as_str().expect("production source object ID");
+        let revision_path = format!("{BASELINE_COMMIT}:{path}");
+        let output = Command::new("git")
+            .args(["rev-parse", &revision_path])
+            .current_dir(repository)
+            .output()
+            .expect("read baseline production source object");
+        assert!(
+            output.status.success(),
+            "baseline production source exists: {path}"
+        );
+        assert_eq!(
+            std::str::from_utf8(&output.stdout)
+                .expect("UTF-8 object ID")
+                .trim(),
+            expected,
+            "production source object drifted: {path}"
+        );
+    }
 }
