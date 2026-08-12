@@ -22,7 +22,7 @@ pub enum ExecutionKind {
     HostedNetwork,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceClaimV0 {
     pub schema: String,
@@ -33,6 +33,40 @@ pub struct EvidenceClaimV0 {
     pub execution_kind: ExecutionKind,
     pub omitted_claims: Vec<String>,
     pub negative_evidence: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEvidenceClaimV0 {
+    schema: String,
+    tier: EvidenceTier,
+    threat_model: String,
+    exact_source: ContentDigest,
+    exact_runtime_or_artifact: ContentDigest,
+    execution_kind: ExecutionKind,
+    omitted_claims: Vec<String>,
+    negative_evidence: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for EvidenceClaimV0 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawEvidenceClaimV0::deserialize(deserializer)?;
+        let value = Self {
+            schema: raw.schema,
+            tier: raw.tier,
+            threat_model: raw.threat_model,
+            exact_source: raw.exact_source,
+            exact_runtime_or_artifact: raw.exact_runtime_or_artifact,
+            execution_kind: raw.execution_kind,
+            omitted_claims: raw.omitted_claims,
+            negative_evidence: raw.negative_evidence,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl EvidenceClaimV0 {

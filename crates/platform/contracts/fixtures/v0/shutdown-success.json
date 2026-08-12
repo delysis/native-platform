@@ -3,6 +3,33 @@
   "phase": "closed",
   "active_operations": 0,
   "retained_tasks": 0,
-  "joined_workers": 2,
+  "expected_workers": 3,
+  "joined_workers": 3,
+  "resources": [
+    {
+      "resource_id": "speech.host.operations",
+      "service": "speech-host",
+      "kind": "operation_registry",
+      "state": "stopped",
+      "expected_workers": 0,
+      "joined_workers": 0
+    },
+    {
+      "resource_id": "speech.host.final-relays",
+      "service": "speech-host",
+      "kind": "task_supervisor",
+      "state": "stopped",
+      "expected_workers": 2,
+      "joined_workers": 2
+    },
+    {
+      "resource_id": "speech.parakeet.worker-pool",
+      "service": "speech-parakeet",
+      "kind": "worker_pool",
+      "state": "stopped",
+      "expected_workers": 1,
+      "joined_workers": 1
+    }
+  ],
   "failures": []
 }

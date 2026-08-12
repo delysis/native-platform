@@ -31,7 +31,7 @@ pub enum TerminalClass {
     Failed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TerminalV0 {
     pub schema: String,
@@ -39,6 +39,34 @@ pub struct TerminalV0 {
     pub attempt_id: Option<AttemptId>,
     pub class: TerminalClass,
     pub error: Option<ServiceErrorV0>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTerminalV0 {
+    schema: String,
+    operation_id: OperationId,
+    attempt_id: Option<AttemptId>,
+    class: TerminalClass,
+    error: Option<ServiceErrorV0>,
+}
+
+impl<'de> Deserialize<'de> for TerminalV0 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawTerminalV0::deserialize(deserializer)?;
+        let value = Self {
+            schema: raw.schema,
+            operation_id: raw.operation_id,
+            attempt_id: raw.attempt_id,
+            class: raw.class,
+            error: raw.error,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl TerminalV0 {

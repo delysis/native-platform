@@ -21,7 +21,7 @@ pub enum TriState {
     Unknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityEntryV0 {
     pub operation: String,
@@ -34,6 +34,44 @@ pub struct CapabilityEntryV0 {
     pub evidence_outcome: String,
     pub observed_at_unix_ms: Option<u64>,
     pub remediation: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCapabilityEntryV0 {
+    operation: String,
+    backend_or_resource_id: String,
+    readiness: Readiness,
+    limits: BTreeMap<String, u64>,
+    network: TriState,
+    privacy_eligible: TriState,
+    evidence_source: String,
+    evidence_outcome: String,
+    observed_at_unix_ms: Option<u64>,
+    remediation: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for CapabilityEntryV0 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawCapabilityEntryV0::deserialize(deserializer)?;
+        let value = Self {
+            operation: raw.operation,
+            backend_or_resource_id: raw.backend_or_resource_id,
+            readiness: raw.readiness,
+            limits: raw.limits,
+            network: raw.network,
+            privacy_eligible: raw.privacy_eligible,
+            evidence_source: raw.evidence_source,
+            evidence_outcome: raw.evidence_outcome,
+            observed_at_unix_ms: raw.observed_at_unix_ms,
+            remediation: raw.remediation,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl CapabilityEntryV0 {
@@ -63,12 +101,36 @@ impl CapabilityEntryV0 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilitySourceReportV0 {
     pub source_id: String,
     pub outcome: String,
     pub safe_detail: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCapabilitySourceReportV0 {
+    source_id: String,
+    outcome: String,
+    safe_detail: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for CapabilitySourceReportV0 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawCapabilitySourceReportV0::deserialize(deserializer)?;
+        let value = Self {
+            source_id: raw.source_id,
+            outcome: raw.outcome,
+            safe_detail: raw.safe_detail,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl CapabilitySourceReportV0 {
@@ -82,7 +144,7 @@ impl CapabilitySourceReportV0 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilitySnapshotV0 {
     pub schema: String,
@@ -90,6 +152,34 @@ pub struct CapabilitySnapshotV0 {
     pub target: String,
     pub services: BTreeMap<ServiceId, Vec<CapabilityEntryV0>>,
     pub reports: Vec<CapabilitySourceReportV0>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCapabilitySnapshotV0 {
+    schema: String,
+    snapshot_id: ContentDigest,
+    target: String,
+    services: BTreeMap<ServiceId, Vec<CapabilityEntryV0>>,
+    reports: Vec<CapabilitySourceReportV0>,
+}
+
+impl<'de> Deserialize<'de> for CapabilitySnapshotV0 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawCapabilitySnapshotV0::deserialize(deserializer)?;
+        let value = Self {
+            schema: raw.schema,
+            snapshot_id: raw.snapshot_id,
+            target: raw.target,
+            services: raw.services,
+            reports: raw.reports,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl CapabilitySnapshotV0 {

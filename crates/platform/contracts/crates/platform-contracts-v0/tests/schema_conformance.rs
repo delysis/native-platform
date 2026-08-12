@@ -1,11 +1,11 @@
 use jsonschema::{Retrieve, Uri, Validator};
-use platform_contracts_v0::TerminalV0;
+use platform_contracts_v0::{ClosedSummaryV0, TerminalV0};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::Arc;
 
-const SCHEMAS: [(&str, &str); 6] = [
+const SCHEMAS: [(&str, &str); 7] = [
     (
         "capability.schema.json",
         include_str!("../../../schemas/v0/capability.schema.json"),
@@ -17,6 +17,10 @@ const SCHEMAS: [(&str, &str); 6] = [
     (
         "publication.schema.json",
         include_str!("../../../schemas/v0/publication.schema.json"),
+    ),
+    (
+        "privacy-policy.schema.json",
+        include_str!("../../../schemas/v0/privacy-policy.schema.json"),
     ),
     (
         "service-error.schema.json",
@@ -32,7 +36,7 @@ const SCHEMAS: [(&str, &str); 6] = [
     ),
 ];
 
-const FIXTURES: [(&str, &str, &str); 12] = [
+const FIXTURES: [(&str, &str, &str); 14] = [
     (
         "capability-known.json",
         "capability.schema.json",
@@ -67,6 +71,16 @@ const FIXTURES: [(&str, &str, &str); 12] = [
         "publication-published.json",
         "publication.schema.json",
         include_str!("../../../fixtures/v0/publication-published.json"),
+    ),
+    (
+        "privacy-policy-hosted-explicit.json",
+        "privacy-policy.schema.json",
+        include_str!("../../../fixtures/v0/privacy-policy-hosted-explicit.json"),
+    ),
+    (
+        "privacy-policy-local-only.json",
+        "privacy-policy.schema.json",
+        include_str!("../../../fixtures/v0/privacy-policy-local-only.json"),
     ),
     (
         "service-error.json",
@@ -253,6 +267,32 @@ fn schemas_reject_critical_semantic_violations() {
         "durability-unknown outcome with non-publication error",
     );
 
+    let privacy = schemas.validator("privacy-policy.schema.json");
+    let mut unknown_tier = fixture("privacy-policy-hosted-explicit.json");
+    unknown_tier["allowed_hosted_data_tiers"] = serde_json::json!(["unknown"]);
+    assert_rejected(&privacy, &unknown_tier, "unknown hosted data tier");
+    let mut missing_provider = fixture("privacy-policy-hosted-explicit.json");
+    missing_provider["allowed_provider_ids"] = serde_json::json!([]);
+    assert_rejected(
+        &privacy,
+        &missing_provider,
+        "allow-listed network without a provider",
+    );
+    let mut local_with_provider = fixture("privacy-policy-local-only.json");
+    local_with_provider["allowed_provider_ids"] = serde_json::json!(["provider.cerebras"]);
+    assert_rejected(
+        &privacy,
+        &local_with_provider,
+        "local-only policy with a hosted provider",
+    );
+    let mut credential = fixture("privacy-policy-hosted-explicit.json");
+    credential["api_key"] = Value::String("secret".to_owned());
+    assert_rejected(
+        &privacy,
+        &credential,
+        "privacy policy carrying credential authority",
+    );
+
     let shutdown = schemas.validator("shutdown.schema.json");
     let mut closed_with_active_work = fixture("shutdown-success.json");
     closed_with_active_work["active_operations"] = Value::from(1);
@@ -261,6 +301,49 @@ fn schemas_reject_critical_semantic_violations() {
         &closed_with_active_work,
         "closed supervisor with active work",
     );
+    let mut empty_resources = fixture("shutdown-success.json");
+    empty_resources["resources"] = serde_json::json!([]);
+    assert_rejected(
+        &shutdown,
+        &empty_resources,
+        "closed supervisor without resource accounting",
+    );
+    let mut path_as_resource_id = fixture("shutdown-success.json");
+    path_as_resource_id["resources"][0]["resource_id"] =
+        Value::String("/private/tmp/worker".to_owned());
+    assert_rejected(
+        &shutdown,
+        &path_as_resource_id,
+        "resource identity carrying a filesystem path",
+    );
+}
+
+#[test]
+fn shutdown_cross_record_accounting_remains_rust_semantic_validation() {
+    let schemas = SchemaSet::load();
+    let validator = schemas.validator("shutdown.schema.json");
+
+    let mut duplicate_failure = fixture("shutdown-multiple-failures.json");
+    duplicate_failure["failures"][1]["failure_id"] =
+        duplicate_failure["failures"][0]["failure_id"].clone();
+    assert!(
+        validator.is_valid(&duplicate_failure),
+        "JSON Schema cannot express unique object fields across array items"
+    );
+    assert!(serde_json::from_value::<ClosedSummaryV0>(duplicate_failure).is_err());
+
+    let mut mismatched_aggregate = fixture("shutdown-success.json");
+    mismatched_aggregate["joined_workers"] = Value::from(2);
+    assert!(
+        validator.is_valid(&mismatched_aggregate),
+        "JSON Schema cannot sum resource worker counts"
+    );
+    assert!(serde_json::from_value::<ClosedSummaryV0>(mismatched_aggregate).is_err());
+
+    let mut unknown_resource = fixture("shutdown-multiple-failures.json");
+    unknown_resource["failures"][0]["resource_id"] = Value::String("speech.unknown".to_owned());
+    assert!(validator.is_valid(&unknown_resource));
+    assert!(serde_json::from_value::<ClosedSummaryV0>(unknown_resource).is_err());
 }
 
 #[test]
@@ -274,10 +357,8 @@ fn terminal_identity_equality_remains_rust_semantic_validation() {
         validator.is_valid(&mismatched),
         "JSON Schema cannot compare sibling field values"
     );
-    let terminal: TerminalV0 =
-        serde_json::from_value(mismatched).expect("mismatched identity remains well-typed JSON");
     assert!(
-        terminal.validate().is_err(),
-        "Rust semantic validation must enforce cross-field identity equality"
+        serde_json::from_value::<TerminalV0>(mismatched).is_err(),
+        "validated deserialization must enforce cross-field identity equality"
     );
 }

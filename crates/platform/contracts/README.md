@@ -19,6 +19,12 @@ temporary repository is archived rather than deleted.
 The suite deliberately contains no Tauri, product, backend, network,
 filesystem, credential, clock, randomness, or live-authority implementation.
 
+The v0 privacy-policy envelope is declarative only. It records a local-only or
+explicit hosted-routing boundary, opaque provider IDs, hosted data tiers,
+payload-redaction requirements, and a safe logging mode. Its pure decision
+method denies invalid policies, unknown observations, and routes not expressly
+allowed. It carries no credentials, provider endpoints, clients, or authority.
+
 Every golden fixture is validated against its JSON Schema using only an
 in-memory schema registry. `fixtures/v0/MANIFEST.sha256` authenticates the exact
 checked-in bytes; typed round trips assert semantic JSON shape. The suite does

@@ -32,7 +32,7 @@ pub enum RetryAdvice {
     Never,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceErrorV0 {
     pub schema: String,
@@ -42,6 +42,38 @@ pub struct ServiceErrorV0 {
     pub operation_id: Option<OperationId>,
     pub service: ServiceId,
     pub safe_detail: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawServiceErrorV0 {
+    schema: String,
+    code: String,
+    class: ErrorClass,
+    retry: RetryAdvice,
+    operation_id: Option<OperationId>,
+    service: ServiceId,
+    safe_detail: String,
+}
+
+impl<'de> Deserialize<'de> for ServiceErrorV0 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawServiceErrorV0::deserialize(deserializer)?;
+        let value = Self {
+            schema: raw.schema,
+            code: raw.code,
+            class: raw.class,
+            retry: raw.retry,
+            operation_id: raw.operation_id,
+            service: raw.service,
+            safe_detail: raw.safe_detail,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl ServiceErrorV0 {

@@ -1,6 +1,8 @@
 use platform_contracts_v0::{
-    CapabilitySnapshotV0, ClosedSummaryV0, EvidenceClaimV0, EvidenceTier, ExecutionKind,
-    PublicationOutcomeV0, ServiceErrorV0, TerminalV0,
+    CapabilitySnapshotV0, ClosedSummaryV0, DataTierV0, EvidenceClaimV0, EvidenceTier,
+    ExecutionKind, PrivacyDecisionV0, PrivacyDenialV0, PrivacyPolicyV0, ProviderId,
+    PublicationOutcomeV0, RedactionStateV0, RoutePrivacyContextV0, RouteTargetV0, ServiceErrorV0,
+    TerminalV0,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -40,12 +42,16 @@ const SHUTDOWN_MULTIPLE_FAILURES: Golden = golden!("shutdown-multiple-failures.j
 const PUBLICATION_NOT_PUBLISHED: Golden = golden!("publication-not-published.json");
 const PUBLICATION_PUBLISHED: Golden = golden!("publication-published.json");
 const PUBLICATION_DURABILITY_UNKNOWN: Golden = golden!("publication-durability-unknown.json");
+const PRIVACY_POLICY_LOCAL_ONLY: Golden = golden!("privacy-policy-local-only.json");
+const PRIVACY_POLICY_HOSTED_EXPLICIT: Golden = golden!("privacy-policy-hosted-explicit.json");
 
-const ALL_GOLDENS: [Golden; 12] = [
+const ALL_GOLDENS: [Golden; 14] = [
     CAPABILITY_KNOWN,
     CAPABILITY_UNKNOWN,
     EVIDENCE_OPERATIONAL,
     EVIDENCE_REPRODUCIBLE,
+    PRIVACY_POLICY_HOSTED_EXPLICIT,
+    PRIVACY_POLICY_LOCAL_ONLY,
     PUBLICATION_DURABILITY_UNKNOWN,
     PUBLICATION_NOT_PUBLISHED,
     PUBLICATION_PUBLISHED,
@@ -171,11 +177,30 @@ fn evidence_goldens_match_the_wire_contract_without_inflation() {
 
 #[test]
 fn shutdown_goldens_match_the_wire_contract() {
-    for golden in [SHUTDOWN_SUCCESS, SHUTDOWN_MULTIPLE_FAILURES] {
-        deserialize_validate_round_trip::<ClosedSummaryV0>(golden, |value| {
-            value.validate().expect("closed summary must validate");
+    let success = deserialize_validate_round_trip::<ClosedSummaryV0>(SHUTDOWN_SUCCESS, |value| {
+        value.validate().expect("closed summary must validate");
+    });
+    assert!(success.succeeded());
+    assert_eq!(success.expected_workers, success.joined_workers);
+    assert_eq!(success.resources.len(), 3);
+
+    let failed =
+        deserialize_validate_round_trip::<ClosedSummaryV0>(SHUTDOWN_MULTIPLE_FAILURES, |value| {
+            value
+                .validate()
+                .expect("failed closed summary must validate")
         });
-    }
+    assert!(!failed.succeeded());
+    assert_eq!(failed.failures.len(), 3);
+    assert_eq!(
+        failed
+            .failures
+            .iter()
+            .filter(|failure| failure.resource_id == "speech.host.final-relays")
+            .count(),
+        2,
+        "multiple failures for one resource must not be collapsed"
+    );
 }
 
 #[test]
@@ -188,6 +213,65 @@ fn publication_goldens_match_the_wire_contract() {
         deserialize_validate_round_trip::<PublicationOutcomeV0>(golden, |value| {
             value.validate().expect("publication outcome must validate");
         });
+    }
+}
+
+#[test]
+fn privacy_policy_goldens_round_trip_and_fail_closed() {
+    let local =
+        deserialize_validate_round_trip::<PrivacyPolicyV0>(PRIVACY_POLICY_LOCAL_ONLY, |value| {
+            value.validate().expect("local-only policy must validate");
+        });
+    assert_eq!(
+        local.decide(&RoutePrivacyContextV0 {
+            target: RouteTargetV0::Local,
+            data_tier: DataTierV0::Restricted,
+            redaction: RedactionStateV0::NotApplied,
+        }),
+        PrivacyDecisionV0::Allowed
+    );
+    assert_eq!(
+        local.decide(&hosted_route("provider.cerebras", DataTierV0::Public)),
+        PrivacyDecisionV0::Denied(PrivacyDenialV0::LocalOnlyBoundary)
+    );
+
+    let hosted = deserialize_validate_round_trip::<PrivacyPolicyV0>(
+        PRIVACY_POLICY_HOSTED_EXPLICIT,
+        |value| {
+            value
+                .validate()
+                .expect("explicit hosted policy must validate")
+        },
+    );
+    assert_eq!(
+        hosted.decide(&hosted_route("provider.cerebras", DataTierV0::Private)),
+        PrivacyDecisionV0::Allowed
+    );
+    assert_eq!(
+        hosted.decide(&hosted_route("provider.other", DataTierV0::Private)),
+        PrivacyDecisionV0::Denied(PrivacyDenialV0::ProviderNotAllowed)
+    );
+    assert_eq!(
+        hosted.decide(&hosted_route("provider.cerebras", DataTierV0::Restricted)),
+        PrivacyDecisionV0::Denied(PrivacyDenialV0::DataTierNotAllowed)
+    );
+    assert_eq!(
+        hosted.decide(&RoutePrivacyContextV0 {
+            target: RouteTargetV0::Unknown,
+            data_tier: DataTierV0::Public,
+            redaction: RedactionStateV0::Unknown,
+        }),
+        PrivacyDecisionV0::Denied(PrivacyDenialV0::UnknownRoute)
+    );
+}
+
+fn hosted_route(provider_id: &str, data_tier: DataTierV0) -> RoutePrivacyContextV0 {
+    RoutePrivacyContextV0 {
+        target: RouteTargetV0::Hosted {
+            provider_id: ProviderId::new(provider_id).expect("provider ID"),
+        },
+        data_tier,
+        redaction: RedactionStateV0::Applied,
     }
 }
 

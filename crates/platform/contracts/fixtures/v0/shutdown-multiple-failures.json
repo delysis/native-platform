@@ -3,30 +3,75 @@
   "phase": "closed",
   "active_operations": 0,
   "retained_tasks": 0,
+  "expected_workers": 3,
   "joined_workers": 1,
-  "failures": [
+  "resources": [
     {
-      "service": "gateway",
-      "error": {
-        "schema": "delysis.service_error.v0",
-        "code": "shutdown.drain_timeout",
-        "class": "timeout",
-        "retry": "after_restart",
-        "operation_id": null,
-        "service": "gateway",
-        "safe_detail": "gateway shutdown exceeded its bounded drain interval"
-      }
+      "resource_id": "speech.host.operations",
+      "service": "speech-host",
+      "kind": "operation_registry",
+      "state": "stopped",
+      "expected_workers": 0,
+      "joined_workers": 0
     },
     {
-      "service": "speech",
+      "resource_id": "speech.host.final-relays",
+      "service": "speech-host",
+      "kind": "task_supervisor",
+      "state": "failed",
+      "expected_workers": 2,
+      "joined_workers": 1
+    },
+    {
+      "resource_id": "speech.parakeet.worker-pool",
+      "service": "speech-parakeet",
+      "kind": "worker_pool",
+      "state": "failed",
+      "expected_workers": 1,
+      "joined_workers": 0
+    }
+  ],
+  "failures": [
+    {
+      "failure_id": "speech.host.final-relay.join",
+      "resource_id": "speech.host.final-relays",
+      "service": "speech-host",
       "error": {
         "schema": "delysis.service_error.v0",
         "code": "shutdown.worker_join",
         "class": "worker",
         "retry": "after_restart",
         "operation_id": null,
-        "service": "speech",
-        "safe_detail": "speech worker join failed after admission closed"
+        "service": "speech-host",
+        "safe_detail": "one final relay did not join after admission closed"
+      }
+    },
+    {
+      "failure_id": "speech.host.final-relay.panic",
+      "resource_id": "speech.host.final-relays",
+      "service": "speech-host",
+      "error": {
+        "schema": "delysis.service_error.v0",
+        "code": "shutdown.worker_panic",
+        "class": "worker",
+        "retry": "after_restart",
+        "operation_id": null,
+        "service": "speech-host",
+        "safe_detail": "a second final relay panicked during shutdown"
+      }
+    },
+    {
+      "failure_id": "speech.parakeet.worker.timeout",
+      "resource_id": "speech.parakeet.worker-pool",
+      "service": "speech-parakeet",
+      "error": {
+        "schema": "delysis.service_error.v0",
+        "code": "shutdown.drain_timeout",
+        "class": "timeout",
+        "retry": "after_restart",
+        "operation_id": null,
+        "service": "speech-parakeet",
+        "safe_detail": "the Parakeet worker exceeded its bounded shutdown interval"
       }
     }
   ]

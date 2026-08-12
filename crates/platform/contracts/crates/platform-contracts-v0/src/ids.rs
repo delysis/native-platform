@@ -58,6 +58,7 @@ macro_rules! identifier {
 identifier!(OperationId);
 identifier!(AttemptId);
 identifier!(ServiceId);
+identifier!(ProviderId);
 
 fn validate_identifier(value: &str) -> Result<(), IdentifierError> {
     if value.is_empty() {

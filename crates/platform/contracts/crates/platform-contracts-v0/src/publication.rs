@@ -5,12 +5,36 @@ use serde::{Deserialize, Serialize};
 
 pub const PUBLICATION_RECEIPT_SCHEMA_V0: &str = "delysis.publication_receipt.v0";
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactIdentityV0 {
     pub id: String,
     pub digest: ContentDigest,
     pub length: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawArtifactIdentityV0 {
+    id: String,
+    digest: ContentDigest,
+    length: u64,
+}
+
+impl<'de> Deserialize<'de> for ArtifactIdentityV0 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawArtifactIdentityV0::deserialize(deserializer)?;
+        let value = Self {
+            id: raw.id,
+            digest: raw.digest,
+            length: raw.length,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl ArtifactIdentityV0 {
@@ -22,13 +46,35 @@ impl ArtifactIdentityV0 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DestinationIdentityV0 {
     /// Opaque identity for the publication filesystem, not an access path.
     pub filesystem_id: String,
     /// Opaque identity for the destination entry, not an authority-bearing path.
     pub path_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDestinationIdentityV0 {
+    filesystem_id: String,
+    path_id: String,
+}
+
+impl<'de> Deserialize<'de> for DestinationIdentityV0 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawDestinationIdentityV0::deserialize(deserializer)?;
+        let value = Self {
+            filesystem_id: raw.filesystem_id,
+            path_id: raw.path_id,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl DestinationIdentityV0 {
@@ -38,7 +84,7 @@ impl DestinationIdentityV0 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicationReceiptV0 {
     pub schema: String,
@@ -48,6 +94,38 @@ pub struct PublicationReceiptV0 {
     pub file_synced: bool,
     pub directory_synced: bool,
     pub idempotent_recovery: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPublicationReceiptV0 {
+    schema: String,
+    artifact: ArtifactIdentityV0,
+    destination: DestinationIdentityV0,
+    visible: bool,
+    file_synced: bool,
+    directory_synced: bool,
+    idempotent_recovery: bool,
+}
+
+impl<'de> Deserialize<'de> for PublicationReceiptV0 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawPublicationReceiptV0::deserialize(deserializer)?;
+        let value = Self {
+            schema: raw.schema,
+            artifact: raw.artifact,
+            destination: raw.destination,
+            visible: raw.visible,
+            file_synced: raw.file_synced,
+            directory_synced: raw.directory_synced,
+            idempotent_recovery: raw.idempotent_recovery,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl PublicationReceiptV0 {
@@ -69,7 +147,7 @@ impl PublicationReceiptV0 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PublicationOutcomeV0 {
     NotPublished {
@@ -82,6 +160,39 @@ pub enum PublicationOutcomeV0 {
         receipt: PublicationReceiptV0,
         error: ServiceErrorV0,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RawPublicationOutcomeV0 {
+    NotPublished {
+        error: ServiceErrorV0,
+    },
+    Published {
+        receipt: PublicationReceiptV0,
+    },
+    PublishedDurabilityUnknown {
+        receipt: PublicationReceiptV0,
+        error: ServiceErrorV0,
+    },
+}
+
+impl<'de> Deserialize<'de> for PublicationOutcomeV0 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawPublicationOutcomeV0::deserialize(deserializer)?;
+        let value = match raw {
+            RawPublicationOutcomeV0::NotPublished { error } => Self::NotPublished { error },
+            RawPublicationOutcomeV0::Published { receipt } => Self::Published { receipt },
+            RawPublicationOutcomeV0::PublishedDurabilityUnknown { receipt, error } => {
+                Self::PublishedDurabilityUnknown { receipt, error }
+            }
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl PublicationOutcomeV0 {

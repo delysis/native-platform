@@ -11,6 +11,7 @@ pub mod error;
 pub mod evidence;
 pub mod ids;
 pub mod lifecycle;
+pub mod privacy;
 pub mod publication;
 pub mod shutdown;
 
@@ -19,12 +20,22 @@ pub use capability::{
 };
 pub use error::{ErrorClass, RetryAdvice, ServiceErrorV0};
 pub use evidence::{EvidenceClaimV0, EvidenceTier, ExecutionKind};
-pub use ids::{AttemptId, ContentDigest, DigestAlgorithm, IdentifierError, OperationId, ServiceId};
+pub use ids::{
+    AttemptId, ContentDigest, DigestAlgorithm, IdentifierError, OperationId, ProviderId, ServiceId,
+};
 pub use lifecycle::{OperationPhase, SupervisorPhase, TerminalClass, TerminalV0};
+pub use privacy::{
+    DataHandlingV0, DataTierV0, LoggingPolicyV0, NetworkPolicyV0, PayloadRedactionV0,
+    PrivacyDecisionV0, PrivacyDenialV0, PrivacyPolicyV0, RedactionStateV0, RoutePrivacyContextV0,
+    RouteTargetV0,
+};
 pub use publication::{
     ArtifactIdentityV0, DestinationIdentityV0, PublicationOutcomeV0, PublicationReceiptV0,
 };
-pub use shutdown::{ClosedSummaryV0, ShutdownFailureV0};
+pub use shutdown::{
+    ClosedSummaryV0, ShutdownFailureV0, ShutdownResourceKind, ShutdownResourceState,
+    ShutdownResourceV0,
+};
 
 /// Validation error shared by the version-zero data envelopes.
 #[derive(Clone, Debug, thiserror::Error, Eq, PartialEq)]
