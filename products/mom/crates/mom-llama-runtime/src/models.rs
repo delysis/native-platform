@@ -23,18 +23,10 @@ pub fn model_list() -> Result<CommandResult<Vec<ModelInfo>>> {
     let mut models = Vec::new();
     let mut seen = BTreeSet::new();
     if let Some(path) = settings.model_path.as_ref() {
+        // A picker grants authority for the selected file, not for an
+        // unbounded walk of its parent directory. Discover other models only
+        // from the explicit cache root below.
         push_model(&mut models, &mut seen, path.clone(), true);
-        if let Some(parent) = path.parent()
-            && let Ok(entries) = fs::read_dir(parent)
-        {
-            for entry in entries.flatten() {
-                let candidate = entry.path();
-                if candidate == *path || !is_gguf(&candidate) {
-                    continue;
-                }
-                push_model(&mut models, &mut seen, candidate, false);
-            }
-        }
     }
     if let Some(cache_dir) = hugging_face_hub_cache_dir() {
         let mut cached = Vec::new();
@@ -105,12 +97,16 @@ fn collect_cached_models(directory: &Path, depth: usize, models: &mut Vec<PathBu
             return;
         }
         let path = entry.path();
-        let Ok(metadata) = fs::metadata(&path) else {
+        let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if metadata.is_dir() {
+        if file_type.is_dir() {
             collect_cached_models(&path, depth + 1, models);
-        } else if metadata.is_file() && is_model_gguf(&path) {
+        } else if (file_type.is_file()
+            || (file_type.is_symlink()
+                && fs::metadata(&path).is_ok_and(|metadata| metadata.is_file())))
+            && is_model_gguf(&path)
+        {
             models.push(path);
         }
     }
@@ -186,7 +182,7 @@ fn is_gguf(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::hugging_face_hub_cache_dir;
+    use super::{collect_cached_models, hugging_face_hub_cache_dir};
 
     #[test]
     fn default_hugging_face_cache_uses_the_shared_desktop_location() {
@@ -205,5 +201,35 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_discovery_does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temporary =
+            std::env::temp_dir().join(format!("mom-llama-model-cache-symlink-{}", crate::now_ms()));
+        let cache = temporary.join("hub");
+        let outside = temporary.join("outside");
+        std::fs::create_dir_all(&cache).expect("cache directory");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        let linked_model = outside.join("linked.gguf");
+        std::fs::write(outside.join("hidden.gguf"), b"GGUF").expect("hidden model");
+        std::fs::write(&linked_model, b"GGUF").expect("linked model");
+        symlink(&outside, cache.join("linked-directory")).expect("directory symlink");
+        symlink(&outside, cache.join("linked-directory.gguf")).expect("GGUF directory symlink");
+        symlink(&linked_model, cache.join("linked-file.gguf")).expect("model symlink");
+        symlink(
+            outside.join("missing.gguf"),
+            cache.join("dangling-file.gguf"),
+        )
+        .expect("dangling model symlink");
+
+        let mut models = Vec::new();
+        collect_cached_models(&cache, 0, &mut models);
+
+        assert_eq!(models, vec![cache.join("linked-file.gguf")]);
+        std::fs::remove_dir_all(&temporary).expect("remove temporary cache");
     }
 }
