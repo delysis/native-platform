@@ -223,11 +223,18 @@ pub trait StableShutdownAdapter: Clone + Sized {
     type Implementation: LifecycleImplementation;
     type Error: std::fmt::Debug;
     type Operation;
+    type ShutdownWitness: ShutdownWitness;
 
     fn deterministic() -> Self;
     fn start(&self, operation_id: &str) -> Result<Self::Operation, Self::Error>;
-    fn finish(&self, operation: Self::Operation) -> Result<(), Self::Error>;
-    fn shutdown(&self) -> ClosedFacts;
+    fn request_completed_release(&self, operation: &Self::Operation) -> Result<(), Self::Error>;
+    fn wait_released(
+        &self,
+        operation: &Self::Operation,
+        timeout: Duration,
+    ) -> Result<OperationSnapshot, Self::Error>;
+    fn allow_worker_exit(&self, operation: &Self::Operation) -> Result<(), Self::Error>;
+    fn begin_shutdown(&self) -> Self::ShutdownWitness;
 }
 
 pub trait TaskReapingAdapter: Clone + Sized {
@@ -787,12 +794,47 @@ pub fn run_stable_shutdown_suite<A: StableShutdownAdapter>(
     component: &str,
 ) -> CoverageEvidence<A::Implementation> {
     let adapter = A::deterministic();
-    let operation = adapter.start("shutdown-after-work").expect("start work");
-    adapter.finish(operation).expect("finish work");
-    let first = adapter.shutdown();
-    let second = adapter.shutdown();
+    let mut operations = (1..=10)
+        .map(|sequence| {
+            adapter
+                .start(&format!("shutdown-after-work-{sequence}"))
+                .expect("start supervised work")
+        })
+        .collect::<Vec<_>>();
+    let shutdown = adapter.begin_shutdown();
+    shutdown
+        .wait_started(WITNESS_TIMEOUT)
+        .expect("first shutdown starts");
+    for operation in operations.iter().rev() {
+        adapter
+            .request_completed_release(operation)
+            .expect("request completion and release");
+        let snapshot = adapter
+            .wait_released(operation, WITNESS_TIMEOUT)
+            .expect("observe release");
+        assert_eq!(snapshot.phase, OperationPhase::Released);
+        adapter
+            .allow_worker_exit(operation)
+            .expect("allow supervised worker exit");
+    }
+    let first = shutdown
+        .wait(WITNESS_TIMEOUT)
+        .expect("first shutdown joins all workers");
+    assert_shutdown_outcome(&first);
+    assert_ne!(
+        first.expected_worker_ids, first.joined_worker_ids,
+        "ten workers must exercise order-independent worker-set accounting"
+    );
+    operations.clear();
+    let repeated = adapter.begin_shutdown();
+    repeated
+        .wait_started(WITNESS_TIMEOUT)
+        .expect("repeated shutdown starts");
+    let second = repeated
+        .wait(WITNESS_TIMEOUT)
+        .expect("repeated shutdown returns canonical outcome");
     assert_eq!(first, second);
-    assert_closed_and_empty(second);
+    assert_shutdown_outcome(&second);
     CoverageEvidence::passed(
         component,
         "stable-shutdown",
@@ -1647,24 +1689,33 @@ impl PanicShutdownBridgeAdapter for ReferenceSupervisorBridge {
     }
 }
 
-impl StableShutdownAdapter for ReferenceAdapter {
+#[cfg(test)]
+impl StableShutdownAdapter for ReferenceSupervisorBridge {
     type Implementation = ReferenceLifecycle;
     type Error = crate::model::AdapterError;
-    type Operation = (ReferenceTicket, ReferenceLease);
+    type Operation = ReferenceControlledOperation;
+    type ShutdownWitness = ReferenceShutdownWitness;
     fn deterministic() -> Self {
-        <Self as OperationModelAdapter>::deterministic(TestConfig::default())
+        <Self as AdmissionQuiesceShutdownBridgeAdapter>::deterministic()
     }
     fn start(&self, operation_id: &str) -> Result<Self::Operation, Self::Error> {
-        start_reference(self, operation_id)
+        <Self as AdmissionQuiesceShutdownBridgeAdapter>::reserve(self, operation_id)
     }
-    fn finish(&self, operation: Self::Operation) -> Result<(), Self::Error> {
-        let (ticket, lease) = operation;
-        finish_reference(self, &lease, TerminalClass::Completed)?;
-        drop(ticket);
-        Ok(())
+    fn request_completed_release(&self, operation: &Self::Operation) -> Result<(), Self::Error> {
+        <Self as ProgressShutdownBridgeAdapter>::request_completed_release(self, operation)
     }
-    fn shutdown(&self) -> ClosedFacts {
-        OperationModelAdapter::shutdown(self)
+    fn wait_released(
+        &self,
+        operation: &Self::Operation,
+        timeout: Duration,
+    ) -> Result<OperationSnapshot, Self::Error> {
+        <Self as AdmissionQuiesceShutdownBridgeAdapter>::wait_released(self, operation, timeout)
+    }
+    fn allow_worker_exit(&self, operation: &Self::Operation) -> Result<(), Self::Error> {
+        <Self as AdmissionQuiesceShutdownBridgeAdapter>::allow_worker_exit(self, operation)
+    }
+    fn begin_shutdown(&self) -> Self::ShutdownWitness {
+        <Self as AdmissionQuiesceShutdownBridgeAdapter>::begin_shutdown(self)
     }
 }
 
@@ -1733,15 +1784,9 @@ fn assert_closed_and_empty(facts: ClosedFacts) {
 fn assert_shutdown_outcome(outcome: &ShutdownOutcome) {
     assert_closed_and_empty(outcome.facts);
     assert!(!outcome.expected_worker_ids.is_empty());
-    assert_eq!(
-        outcome.expected_worker_ids.len(),
-        outcome.facts.expected_workers
-    );
-    assert_eq!(
-        outcome.joined_worker_ids.len(),
-        outcome.facts.joined_workers
-    );
-    assert_eq!(outcome.joined_worker_ids, outcome.expected_worker_ids);
+    outcome
+        .validate()
+        .expect("worker IDs must be unique sets matching scalar join facts");
 }
 
 #[cfg(test)]
@@ -1763,7 +1808,7 @@ mod tests {
             ),
             run_progress_shutdown_bridge_suite::<ReferenceSupervisorBridge>("progress-bridge"),
             run_panic_shutdown_bridge_suite::<ReferenceSupervisorBridge>("panic-bridge"),
-            run_stable_shutdown_suite::<ReferenceAdapter>("shutdown"),
+            run_stable_shutdown_suite::<ReferenceSupervisorBridge>("shutdown"),
             run_task_reaping_suite::<ReferenceAdapter>("task-supervisor"),
         ];
         let manifest = LifecycleCoverageManifest::<ReferenceLifecycle>::accept(evidence)

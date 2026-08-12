@@ -83,6 +83,42 @@ pub struct ShutdownOutcome {
     pub joined_worker_ids: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ShutdownOutcomeError {
+    #[error("shutdown expected-worker IDs are not unique")]
+    DuplicateExpectedWorkerId,
+    #[error("shutdown joined-worker IDs are not unique")]
+    DuplicateJoinedWorkerId,
+    #[error("shutdown worker-ID counts do not match scalar facts")]
+    CountMismatch,
+    #[error("shutdown joined-worker IDs differ from expected-worker IDs")]
+    WorkerSetMismatch,
+}
+
+impl ShutdownOutcome {
+    pub fn validate(&self) -> Result<(), ShutdownOutcomeError> {
+        use std::collections::BTreeSet;
+
+        let expected = self.expected_worker_ids.iter().collect::<BTreeSet<_>>();
+        if expected.len() != self.expected_worker_ids.len() {
+            return Err(ShutdownOutcomeError::DuplicateExpectedWorkerId);
+        }
+        let joined = self.joined_worker_ids.iter().collect::<BTreeSet<_>>();
+        if joined.len() != self.joined_worker_ids.len() {
+            return Err(ShutdownOutcomeError::DuplicateJoinedWorkerId);
+        }
+        if expected.len() != self.facts.expected_workers
+            || joined.len() != self.facts.joined_workers
+        {
+            return Err(ShutdownOutcomeError::CountMismatch);
+        }
+        if expected != joined {
+            return Err(ShutdownOutcomeError::WorkerSetMismatch);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WaitObservation {
     TimedOut,
@@ -494,4 +530,52 @@ fn recover_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod shutdown_outcome_tests {
+    use super::*;
+
+    fn facts(expected_workers: usize, joined_workers: usize) -> ClosedFacts {
+        ClosedFacts {
+            lifecycle: LifecyclePhase::Closed,
+            active_operations: 0,
+            retained_tasks: 0,
+            expected_workers,
+            joined_workers,
+        }
+    }
+
+    #[test]
+    fn shutdown_outcome_rejects_duplicate_worker_ids() {
+        let duplicate_expected = ShutdownOutcome {
+            facts: facts(2, 1),
+            expected_worker_ids: vec!["worker-1".into(), "worker-1".into()],
+            joined_worker_ids: vec!["worker-1".into()],
+        };
+        assert_eq!(
+            duplicate_expected.validate(),
+            Err(ShutdownOutcomeError::DuplicateExpectedWorkerId)
+        );
+
+        let duplicate_joined = ShutdownOutcome {
+            facts: facts(1, 2),
+            expected_worker_ids: vec!["worker-1".into()],
+            joined_worker_ids: vec!["worker-1".into(), "worker-1".into()],
+        };
+        assert_eq!(
+            duplicate_joined.validate(),
+            Err(ShutdownOutcomeError::DuplicateJoinedWorkerId)
+        );
+    }
+
+    #[test]
+    fn shutdown_outcome_compares_worker_ids_as_unordered_sets() {
+        let reordered = ShutdownOutcome {
+            facts: facts(2, 2),
+            expected_worker_ids: vec!["worker-2".into(), "worker-10".into()],
+            joined_worker_ids: vec!["worker-10".into(), "worker-2".into()],
+        };
+        assert_eq!(reordered.validate(), Ok(()));
+    }
 }
