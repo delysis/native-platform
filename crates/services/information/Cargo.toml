@@ -51,6 +51,8 @@ information-native-backend-encyclopedia = { version = "0.1.0", path = "crates/in
 information-native-backend-scripture = { version = "0.1.0", path = "crates/information-native-backend-scripture" }
 information-native-host = { version = "0.1.0", path = "crates/information-native-host" }
 
+platform-contracts-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821" }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

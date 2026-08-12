@@ -32,12 +32,18 @@ jobs:
         with:
           toolchain: "1.92.0"
           components: rustfmt,clippy
+      - name: Install boundary-check tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes ripgrep
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all --check
       - name: Test portable packages
         shell: bash
         run: ./scripts/run-portable-cargo.sh test
+      - name: Test Wave 1 publication adapter
+        shell: bash
+        run: cargo test --locked -p information-native-acquire --features unstable-w1-contracts
       - name: Lint portable packages
         shell: bash
         run: ./scripts/run-portable-cargo.sh clippy
