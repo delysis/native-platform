@@ -28,8 +28,8 @@
       },
       "after": {
         "id": "mom.cache.native-prefix.cold-miss",
-        "digest": { "algorithm": "sha256", "hex": "f06a39b1fe38624e7b8f8d7174e6c5f6ac2e9b9cebf6c0723eb54505354ee061" },
-        "length": 9
+        "digest": { "algorithm": "sha256", "hex": "38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed" },
+        "length": 5
       },
       "disposition": "quarantined"
     },
@@ -43,8 +43,8 @@
       },
       "after": {
         "id": "mom.cache.session-kv.cold-miss",
-        "digest": { "algorithm": "sha256", "hex": "f06a39b1fe38624e7b8f8d7174e6c5f6ac2e9b9cebf6c0723eb54505354ee061" },
-        "length": 9
+        "digest": { "algorithm": "sha256", "hex": "1885429208d88d71764bef9f98d867f16e5c54e7672226734a137201978fab9b" },
+        "length": 1059
       },
       "disposition": "recovered"
     }

@@ -27,14 +27,16 @@ accepted lifecycle contract/testkit pin remains exactly `cbab335...`.
 | `fixtures/w1/cache-corruption-v1.json` | `b2c713869df2a75145af92b2f01993a77537e8d2bc08d5f92cc88871e87b2f8c` | Exact Mom native-prefix and session-KV cache namespaces, a typed authoritative conversation, and their distinct cold-fallback dispositions |
 | `fixtures/w1/cache-native-prefix-state-v1.json` | `787f58b20bbfe28415acb4721b3293e5af42bdd056368b1cac14fe8aec3dd3b8` | Exact typed logical native-prefix cache state before ciphertext corruption |
 | `fixtures/w1/cache-session-state-v1.json` | `4bfc026b7b842e4ef65d6b0993fa6eb13f0d33e0573296aba6b48c04da34425a` | Exact logical session-KV metadata and blob identity before ciphertext corruption |
+| `fixtures/w1/cache-native-prefix-after-state-v1.json` | `38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed` | Exact typed absent native-prefix cache state after quarantine and reopen |
+| `fixtures/w1/cache-session-after-state-v1.json` | `1885429208d88d71764bef9f98d867f16e5c54e7672226734a137201978fab9b` | Exact invalidated session-KV metadata and absent blob state after reopen |
 | `fixtures/w1/chat-cancel-retry-manifest-v0.json` | `d5e78f687cb8d06c823e91cdaa46c7564e042e7f118194dcd2c5a1042d24375d` | Authenticated central-protocol case for Mom chat/cancel/retry |
 | `fixtures/w1/chat-cancel-retry-projection-v0.json` | `5089d654ffc27ce2b2ce34d102a98cd0160a074cb2f9c458dd7fbdacac2bb441` | Frozen product-derived stream, lifecycle, durable-state, and ownership facts |
 | `fixtures/w1/attachment-manifest-v0.json` | `01c8701dc70b586bf3cbe9ad069b4fb97f2fe2719ce8a1b43e7b66d179c9cdb0` | Authenticated central-protocol case for Mom attachment |
 | `fixtures/w1/attachment-projection-v0.json` | `fc10bb8b589c1290e546a7ad0b936b47954d541070154843b1c0beb193d4cb7f` | Frozen import/send/reopen projection |
 | `fixtures/w1/prior-store-manifest-v0.json` | `8259231ba399eabb0f087be4f80f45a1b5986da98b0c1558387b86545e764e86` | Explicit redacted logical import/recovery case with historical DB evidence marked unavailable |
 | `fixtures/w1/prior-store-projection-v0.json` | `2c7bd3fcd1e93ee5bc70ab8c3cf0be6a7f33b71bf03dbff9cd971306bf01b136` | Frozen logical recovery and plaintext-cleanup facts |
-| `fixtures/w1/cache-corruption-manifest-v0.json` | `5c6180e2359a8d1347456b5244940e8b442bfc6acc44b5b6698bfd1c9c737135` | Mom-owned cases within the cross-product corrupted-cache row |
-| `fixtures/w1/cache-corruption-projection-v0.json` | `e534d9fdd49139d701fc80154090ba49c1684dab60d95f18a93393137ecbf728` | Frozen native-prefix quarantine and session-KV invalidation projection bound to their exact logical before states |
+| `fixtures/w1/cache-corruption-manifest-v0.json` | `83dccd2453e26fcaf175fbbf4fa5fdfe7c0b1d14020f7cbc350dcfffea580b61` | Mom-owned cases within the cross-product corrupted-cache row |
+| `fixtures/w1/cache-corruption-projection-v0.json` | `d2e03c9923dd36837c1b13b9a47b2426bf3730652338362417d60a7da420cbe7` | Frozen native-prefix quarantine and session-KV invalidation projection bound to their exact logical before and after states |
 
 ## Product evidence
 
@@ -73,8 +75,8 @@ accepted lifecycle contract/testkit pin remains exactly `cbab335...`.
 - Corrupt `native-host-prefix-cache.mom-llama` ciphertext is quarantined and
   becomes a cold miss after reopen. Corrupt `kv-cache.v3.blob.w1-tampered`
   ciphertext invalidates its metadata, deletes the unusable blob, and becomes a
-  cold miss. The exact logical cache states before corruption are independently
-  frozen and hashed. In both cases the authoritative `conversations.v2` value is
+  cold miss. The exact typed logical cache states before corruption and after
+  reopen are independently frozen and hashed. In both cases the authoritative `conversations.v2` value is
   loaded through the production store as a typed `ConversationDb` before and
   after corruption and after reopen.
 - Supporting-only evidence: a controlled Mom operation owner receives

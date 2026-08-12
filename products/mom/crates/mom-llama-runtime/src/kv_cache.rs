@@ -947,6 +947,13 @@ mod tests {
         blob_length: usize,
     }
 
+    #[cfg(feature = "unstable-w1-vertical-fixtures")]
+    #[derive(Serialize)]
+    struct W1SessionCacheAfterLogicalState<'a> {
+        metadata: &'a KvCacheDb,
+        blob: Option<&'a [u8]>,
+    }
+
     fn test_cache_value(id: &str, model: &str) -> PrefixCacheValue {
         let fingerprint = CacheFingerprint {
             prompt_form: PromptForm::Chat,
@@ -1153,10 +1160,28 @@ mod tests {
         drop(store);
         let store = RuntimeStore::open_with_key(&data_dir, [17_u8; 32])?;
         assert!(load_persistent_value_or_invalidate_from_store(&store, &value.metadata)?.is_none());
+        let native_after = store
+            .get_disposable_cache::<Vec<PrefixCacheValue>>(&fixture.native_prefix_namespace)?;
+        assert_eq!(native_after, None);
+        let session_after_metadata = store
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .ok_or_else(|| anyhow!("cache metadata missing after reopen"))?;
+        let session_after_blob = store.get_bytes(&blob_namespace(&value.metadata.id))?;
+        let mut native_after_bytes = serde_json::to_vec_pretty(&native_after)?;
+        native_after_bytes.push(b'\n');
         assert_eq!(
-            store
-                .get_disposable_cache::<Vec<PrefixCacheValue>>(&fixture.native_prefix_namespace)?,
-            None
+            native_after_bytes,
+            include_bytes!("../fixtures/w1/cache-native-prefix-after-state-v1.json")
+        );
+        let mut session_after_bytes =
+            serde_json::to_vec_pretty(&W1SessionCacheAfterLogicalState {
+                metadata: &session_after_metadata,
+                blob: session_after_blob.as_deref(),
+            })?;
+        session_after_bytes.push(b'\n');
+        assert_eq!(
+            session_after_bytes,
+            include_bytes!("../fixtures/w1/cache-session-after-state-v1.json")
         );
         assert_eq!(
             store.get::<ConversationDb>(&fixture.authoritative_namespace)?,
@@ -1196,7 +1221,8 @@ mod tests {
         };
         let native_before = include_bytes!("../fixtures/w1/cache-native-prefix-state-v1.json");
         let session_before = include_bytes!("../fixtures/w1/cache-session-state-v1.json");
-        let cold_miss = b"cold_miss";
+        let native_after = include_bytes!("../fixtures/w1/cache-native-prefix-after-state-v1.json");
+        let session_after = include_bytes!("../fixtures/w1/cache-session-after-state-v1.json");
         crate::validate_w1_fixture_projection(
             VerticalIdV0::CorruptedDisposableCaches,
             EquivalenceProjectionV0 {
@@ -1228,7 +1254,7 @@ mod tests {
                         )),
                         after: Some(sha256_identity(
                             "mom.cache.native-prefix.cold-miss",
-                            cold_miss,
+                            native_after,
                         )),
                         disposition: StateDispositionV0::Quarantined,
                     },
@@ -1239,7 +1265,10 @@ mod tests {
                             "mom.cache.session-kv.fixture",
                             session_before,
                         )),
-                        after: Some(sha256_identity("mom.cache.session-kv.cold-miss", cold_miss)),
+                        after: Some(sha256_identity(
+                            "mom.cache.session-kv.cold-miss",
+                            session_after,
+                        )),
                         disposition: StateDispositionV0::Recovered,
                     },
                 ],
@@ -1276,11 +1305,10 @@ mod tests {
                     (
                         "native_prefix_cold_after_reopen".to_owned(),
                         FactValueV0::Boolean(
-                            store
-                                .get_disposable_cache::<Vec<PrefixCacheValue>>(
-                                    &fixture.native_prefix_namespace,
-                                )?
-                                .is_none(),
+                            native_after_bytes
+                                == include_bytes!(
+                                    "../fixtures/w1/cache-native-prefix-after-state-v1.json"
+                                ),
                         ),
                     ),
                     (
@@ -1289,13 +1317,13 @@ mod tests {
                     ),
                     (
                         "session_blob_deleted".to_owned(),
-                        FactValueV0::Boolean(
-                            store.get_bytes(&fixture.session_blob_namespace)?.is_none(),
-                        ),
+                        FactValueV0::Boolean(session_after_blob.is_none()),
                     ),
                     (
                         "session_metadata_invalidated".to_owned(),
-                        FactValueV0::Boolean(db.entries[0].state == CacheEntryState::Invalidated),
+                        FactValueV0::Boolean(
+                            session_after_metadata.entries[0].state == CacheEntryState::Invalidated,
+                        ),
                     ),
                 ]),
                 fail_closed_facts: vec![
