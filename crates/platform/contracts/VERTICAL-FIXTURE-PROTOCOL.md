@@ -38,13 +38,12 @@ named production owner rather than fixture-owned shadow state.
    lock entry, and rejects a reused manifest digest.
 
 This two-revision sequence avoids a manifest referring circularly to the commit
-that contains that manifest. The catalogue now contains all eighteen manifests
-in exact row order, including the completed Mom-plus-Information row 17 and
+that contains that manifest. The catalogue contains all eighteen manifests in
+exact row order, including the completed Mom-plus-Information row 17 and
 five-product row 8 documented in
-[`CROSS-PRODUCT-ROWS.md`](CROSS-PRODUCT-ROWS.md). The catalogue authenticates
-the already product-owned fixture definitions; it is intentionally unsealed,
-does not itself accept W1, and does not create or authorize
-`W1-VERTICALS.lock.json`.
+[`CROSS-PRODUCT-ROWS.md`](CROSS-PRODUCT-ROWS.md). `W1-VERTICALS.lock.json`
+authenticates those exact bytes as a sealed candidate. The lock does not itself
+accept W1: a separate steward receipt is still required before W2.
 
 ## Exact row catalogue
 
