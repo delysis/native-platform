@@ -1,9 +1,11 @@
 [package]
 name = "llama-native-host"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "Bounded resident-model host and lifecycle registry for llama-native-engine"
 
 [dependencies]

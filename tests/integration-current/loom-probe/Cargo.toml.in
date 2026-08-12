@@ -17,5 +17,17 @@ loom-learning-current = { package = "loom-learning", git = "https://github.com/d
 platform-contract-testkit-current = { package = "platform-contract-testkit", git = "https://github.com/delysis/w1-platform-contracts", rev = "3ed1f3235edb6d481c324f05fe83b2379e3431e6" }
 platform-vertical-fixtures-v0-current = { package = "platform-vertical-fixtures-v0", git = "https://github.com/delysis/w1-platform-contracts", rev = "3ed1f3235edb6d481c324f05fe83b2379e3431e6" }
 
+[patch."https://github.com/delysis/llama-native-kit"]
+llama-native-cache = { path = "../../crates/native/crates/llama-native-cache" }
+llama-native-engine = { path = "../../crates/native/crates/llama-native-engine" }
+llama-native-host = { path = "../../crates/native/crates/llama-native-host" }
+llama-native-types = { path = "../../crates/native/crates/llama-native-types" }
+
+[patch."https://github.com/delysis/llama-native-kit.git"]
+llama-native-cache = { path = "../../crates/native/crates/llama-native-cache" }
+llama-native-engine = { path = "../../crates/native/crates/llama-native-engine" }
+llama-native-host = { path = "../../crates/native/crates/llama-native-host" }
+llama-native-types = { path = "../../crates/native/crates/llama-native-types" }
+
 [lints.rust]
 unsafe_code = "forbid"

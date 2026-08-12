@@ -2,16 +2,11 @@ use std::collections::BTreeSet;
 
 const ROOT_LOCK: &str = include_str!("../../../Cargo.lock");
 
-const EXACT_PACKAGES: [(&str, &str, &str); 11] = [
+const EXACT_PACKAGES: [(&str, &str, &str); 10] = [
     (
         "llama-cpp-2",
         "https://github.com/delysis/llama-cpp-rs",
         "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
-    ),
-    (
-        "llama-native-types",
-        "https://github.com/delysis/llama-native-kit",
-        "16168bd76a09f74fdee41d0e2fb0441e79ac1005",
     ),
     (
         "fte-types",
@@ -60,31 +55,16 @@ const EXACT_PACKAGES: [(&str, &str, &str); 11] = [
     ),
 ];
 
-const MOM_TRANSITIVE_BASELINES: [(&str, &str, &str); 2] = [
-    (
-        "llama-native-types",
-        "https://github.com/delysis/llama-native-kit",
-        "f7a69316c64d857b99bd847dd44cd852fc5b4ca4",
-    ),
-    (
-        "attachment-native-types",
-        "https://github.com/delysis/attachment-native-kit",
-        "472900732ded5bcfb5cc639c49b3a4f77feece27",
-    ),
-];
+const REMAINING_TRANSITIVE_BASELINES: [(&str, &str, &str); 1] = [(
+    "attachment-native-types",
+    "https://github.com/delysis/attachment-native-kit",
+    "472900732ded5bcfb5cc639c49b3a4f77feece27",
+)];
 
 const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 11] = [
     (
         "https://github.com/delysis/llama-cpp-rs",
         "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
-    ),
-    (
-        "https://github.com/delysis/llama-native-kit",
-        "16168bd76a09f74fdee41d0e2fb0441e79ac1005",
-    ),
-    (
-        "https://github.com/delysis/llama-native-kit",
-        "f7a69316c64d857b99bd847dd44cd852fc5b4ca4",
     ),
     (
         "https://github.com/delysis/free-token-energy",
@@ -118,6 +98,22 @@ const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 11] = [
         "https://github.com/delysis/w1-platform-contracts",
         "3ed1f3235edb6d481c324f05fe83b2379e3431e6",
     ),
+    (
+        "https://github.com/delysis/w1-platform-contracts",
+        "cbab33555ab9355a6ac453d659c55ec9e0666821",
+    ),
+    (
+        "https://github.com/delysis/w1-platform-contracts",
+        "fc24ffff08c52690390b4460f44617d5d9732563",
+    ),
+];
+
+const IMPORTED_NATIVE_PACKAGES: [&str; 5] = [
+    "command-evidence",
+    "llama-native-cache",
+    "llama-native-engine",
+    "llama-native-host",
+    "llama-native-types",
 ];
 
 #[test]
@@ -137,14 +133,33 @@ fn root_lock_contains_every_exact_current_source() {
         assert!(present, "missing exact locked package {name} at {revision}");
         matched.insert((repository, revision));
     }
-    assert_eq!(matched.len(), 9, "expected nine distinct source revisions");
+    assert_eq!(matched.len(), 8, "expected eight distinct source revisions");
 }
 
 #[test]
-fn mom_transitive_pre_cutover_pins_remain_visible() {
+fn imported_native_packages_are_path_rebound() {
     let lock: toml::Value = toml::from_str(ROOT_LOCK).expect("root Cargo.lock TOML");
     let packages = lock["package"].as_array().expect("lock packages");
-    for (name, repository, revision) in MOM_TRANSITIVE_BASELINES {
+    assert!(packages.iter().all(|package| {
+        package
+            .get("source")
+            .and_then(toml::Value::as_str)
+            .is_none_or(|source| !source.contains("github.com/delysis/llama-native-kit"))
+    }));
+    for name in IMPORTED_NATIVE_PACKAGES {
+        let local = packages
+            .iter()
+            .filter(|package| package["name"].as_str() == Some(name))
+            .any(|package| package.get("source").is_none());
+        assert!(local, "missing path-rebound native package {name}");
+    }
+}
+
+#[test]
+fn remaining_transitive_pre_import_pins_remain_visible() {
+    let lock: toml::Value = toml::from_str(ROOT_LOCK).expect("root Cargo.lock TOML");
+    let packages = lock["package"].as_array().expect("lock packages");
+    for (name, repository, revision) in REMAINING_TRANSITIVE_BASELINES {
         let exact_fragment = format!("?rev={revision}#{revision}");
         let present = packages.iter().any(|package| {
             package["name"].as_str() == Some(name)
@@ -155,7 +170,7 @@ fn mom_transitive_pre_cutover_pins_remain_visible() {
         });
         assert!(
             present,
-            "missing Mom transitive baseline {name} at {revision}"
+            "missing remaining transitive baseline {name} at {revision}"
         );
     }
 }
@@ -184,7 +199,10 @@ fn first_party_git_revisions_are_closed_and_exact() {
             format!("rev={revision}"),
             "first-party Git query and locked revision differ"
         );
-        actual.insert((repository.to_owned(), revision.to_owned()));
+        actual.insert((
+            repository.trim_end_matches(".git").to_owned(),
+            revision.to_owned(),
+        ));
     }
 
     let expected = ALLOWED_FIRST_PARTY_REVISIONS

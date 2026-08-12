@@ -6546,7 +6546,7 @@ mod tests {
             1
         );
 
-        let lock = include_str!("../../../Cargo.lock");
+        let lock = include_str!("../../../../../Cargo.lock");
         let locked_source_suffix =
             format!("?rev={LLAMA_CPP_BINDING_REV}#{LLAMA_CPP_BINDING_REV}\"");
         assert_eq!(lock.matches(&locked_source_suffix).count(), 2);

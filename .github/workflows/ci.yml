@@ -17,6 +17,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.92.0 --profile minimal --component clippy,rustfmt
       - name: Install pinned pnpm
@@ -33,12 +35,23 @@ jobs:
         run: rustup run 1.92.0 cargo fmt --all -- --check
       - name: Rust tests
         run: rustup run 1.92.0 cargo test --locked --workspace --all-targets
+      - name: Native W1 lifecycle and vertical contracts
+        if: runner.os == 'Linux'
+        run: rustup run 1.92.0 cargo test --locked -p llama-native-engine --features unstable-w1-contract-tests,unstable-w1-vertical-tests --all-targets
       - name: Exact current non-Loom product graph
         run: rustup run 1.92.0 cargo check --locked -p integration-current --features current-product-graph
       - name: Exact current Loom product graph
         run: rustup run 1.92.0 cargo run --locked -p xtask -- loom-probe
       - name: Strict Clippy
         run: rustup run 1.92.0 cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Native architecture
+        if: runner.os != 'Windows'
+        run: ./crates/native/scripts/check-architecture.sh
+      - name: Workflow policy
+        shell: bash
+        run: |
+          ./crates/native/scripts/check-workflow-policy.sh .
+          ./crates/native/tests/workflow_policy.sh
       - name: Shell policy
         run: rustup run 1.92.0 cargo run --locked -p xtask -- policy
       - name: pnpm lock

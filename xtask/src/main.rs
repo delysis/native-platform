@@ -185,7 +185,7 @@ fn run_loom_probe(root: &Path) -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .context("system clock before Unix epoch")?
         .as_nanos();
-    let probe = env::temp_dir().join(format!(
+    let probe = root.join("target").join(format!(
         "native-platform-loom-probe-{}-{nonce}",
         std::process::id()
     ));

@@ -1,5 +1,13 @@
 [workspace]
-members = ["tests/integration-current", "xtask"]
+members = [
+    "crates/native/crates/command-evidence",
+    "crates/native/crates/llama-native-cache",
+    "crates/native/crates/llama-native-engine",
+    "crates/native/crates/llama-native-host",
+    "crates/native/crates/llama-native-types",
+    "tests/integration-current",
+    "xtask",
+]
 resolver = "3"
 
 [workspace.package]
@@ -12,17 +20,19 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+crossbeam-channel = "0.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
+thiserror = "2"
 toml = "0.9.8"
 
-# Exact W2 integration inputs. These are Git dependencies only: no product
-# source or history is imported into this repository.
+# Exact current integration inputs. Native is imported and path-rebound; the
+# remaining products stay at their accepted immutable Git revisions.
 llama-cpp-2-current = { package = "llama-cpp-2", git = "https://github.com/delysis/llama-cpp-rs", rev = "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391", default-features = false }
-llama-native-types-current = { package = "llama-native-types", git = "https://github.com/delysis/llama-native-kit", rev = "16168bd76a09f74fdee41d0e2fb0441e79ac1005" }
-llama-native-host-current = { package = "llama-native-host", git = "https://github.com/delysis/llama-native-kit", rev = "16168bd76a09f74fdee41d0e2fb0441e79ac1005" }
-command-evidence-current = { package = "command-evidence", git = "https://github.com/delysis/llama-native-kit", rev = "16168bd76a09f74fdee41d0e2fb0441e79ac1005" }
+llama-native-types-current = { package = "llama-native-types", path = "crates/native/crates/llama-native-types" }
+llama-native-host-current = { package = "llama-native-host", path = "crates/native/crates/llama-native-host" }
+command-evidence-current = { package = "command-evidence", path = "crates/native/crates/command-evidence" }
 fte-types-current = { package = "fte-types", git = "https://github.com/delysis/free-token-energy", rev = "67814e76659688fef61f311db588d17eddee0a66" }
 fte-backend-llama-current = { package = "fte-backend-llama", git = "https://github.com/delysis/free-token-energy", rev = "67814e76659688fef61f311db588d17eddee0a66" }
 fte-loopback-current = { package = "fte-loopback", git = "https://github.com/delysis/free-token-energy", rev = "67814e76659688fef61f311db588d17eddee0a66" }
@@ -54,9 +64,23 @@ unimplemented = "deny"
 unwrap_used = "deny"
 
 [workspace.metadata.native-platform.package-groups]
-portable = []
-platform = []
+portable = ["command-evidence", "llama-native-cache", "llama-native-types"]
+platform = ["llama-native-engine", "llama-native-host"]
 product = []
 research = []
 diagnostic = ["integration-current", "xtask"]
 real-hardware = []
+
+[patch."https://github.com/delysis/llama-native-kit"]
+command-evidence = { path = "crates/native/crates/command-evidence" }
+llama-native-cache = { path = "crates/native/crates/llama-native-cache" }
+llama-native-engine = { path = "crates/native/crates/llama-native-engine" }
+llama-native-host = { path = "crates/native/crates/llama-native-host" }
+llama-native-types = { path = "crates/native/crates/llama-native-types" }
+
+[patch."https://github.com/delysis/llama-native-kit.git"]
+command-evidence = { path = "crates/native/crates/command-evidence" }
+llama-native-cache = { path = "crates/native/crates/llama-native-cache" }
+llama-native-engine = { path = "crates/native/crates/llama-native-engine" }
+llama-native-host = { path = "crates/native/crates/llama-native-host" }
+llama-native-types = { path = "crates/native/crates/llama-native-types" }

@@ -123,7 +123,7 @@ fn emit_build_identity() -> Result<(), String> {
     reject_unreviewed_forwarded_environment()?;
 
     let engine_root = PathBuf::from(required_os("CARGO_MANIFEST_DIR")?);
-    let workspace_root = engine_root.join("../..");
+    let workspace_root = engine_root.join("../../../..");
     let types_root = engine_root.join("../llama-native-types");
     let target = required_safe_identifier("TARGET")?;
     let host = required_safe_identifier("HOST")?;
@@ -197,9 +197,9 @@ fn emit_build_identity() -> Result<(), String> {
         "src",
         "../llama-native-types/Cargo.toml",
         "../llama-native-types/src",
-        "../../Cargo.toml",
-        "../../Cargo.lock",
-        "../../.cargo/config.toml",
+        "../../../../Cargo.toml",
+        "../../../../Cargo.lock",
+        "../../../../.cargo/config.toml",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
