@@ -21,12 +21,14 @@ test adapter.
 
 Each adapter binds a `LifecycleImplementation` marker with fixed product and
 implementation constants. Successful runners derive typed `CoverageEvidence`
-from that associated type; callers provide only a component name and cannot
-relabel reference evidence as product evidence. `LifecycleCoverageManifest<I>`
-accepts only `CoverageEvidence<I>` and requires the complete invariant union.
-A passing local suite is not an implementation acceptance statement until that
-manifest accepts. Evidence for two independent implementations inside one
-product cannot be combined.
+from that associated type; ordinary callers provide only a component name and
+cannot accidentally relabel reference evidence as product evidence.
+`LifecycleCoverageManifest<I>` accepts only `CoverageEvidence<I>`, requires
+each of the eleven suite names exactly once, and requires the complete
+invariant union. A passing local suite is not an implementation acceptance
+statement until that manifest accepts. A deliberately dishonest adapter can
+still select a product marker while delegating to reference state, so source
+review remains an explicit acceptance boundary.
 
 Composition does not prove that an adapter is free of shadow state; code review
 must still confirm every method reads or exercises the named production owner.
@@ -37,4 +39,6 @@ facts it does not own.
 Every shutdown fact carries both `expected_workers` and `joined_workers`.
 Successful closed/empty assertions require equality rather than assuming a
 single worker, so a product may truthfully bind a fixed or dynamic multi-worker
-owner.
+owner. Bridge suites additionally require exact expected and joined worker-ID
+sets after exercised work. Review must bind those IDs and scalar facts to the
+production registry, retained task handles, and actual join results.

@@ -1,8 +1,8 @@
 //! Acceptance accounting for composable lifecycle suites.
 //!
 //! Evidence is typed by its lifecycle implementation and can only be minted by
-//! this crate after a suite returns. A manifest therefore cannot accept
-//! evidence from another product or implementation by relabeling strings.
+//! this crate after a suite returns. A manifest therefore prevents accidental
+//! cross-implementation mixing and rejects incomplete or duplicate suite sets.
 
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
@@ -68,6 +68,20 @@ pub const REQUIRED_LIFECYCLE_INVARIANTS: [LifecycleInvariant; 18] = [
     LifecycleInvariant::SequenceExhaustion,
 ];
 
+const REQUIRED_LIFECYCLE_SUITES: [&str; 11] = [
+    "transition-chain",
+    "registry-identity",
+    "attempt-hierarchy",
+    "consumer-cancellation",
+    "terminal-authority",
+    "waiter-control",
+    "admission-quiesce-shutdown-bridge",
+    "progress-shutdown-bridge",
+    "panic-shutdown-bridge",
+    "stable-shutdown",
+    "task-reaping",
+];
+
 pub struct CoverageEvidence<I: LifecycleImplementation> {
     component: String,
     suite: &'static str,
@@ -114,7 +128,9 @@ impl<I: LifecycleImplementation> CoverageEvidence<I> {
 
 /// A complete manifest for exactly one compile-time lifecycle identity.
 ///
-/// Evidence for another identity cannot be supplied:
+/// Evidence for another identity cannot be supplied at the manifest call.
+/// Source review must still reject adapters that deliberately select a false
+/// marker or delegate to shadow state:
 ///
 /// ```compile_fail
 /// use platform_contract_testkit::{
@@ -148,10 +164,25 @@ impl<I: LifecycleImplementation> LifecycleCoverageManifest<I> {
         }
 
         let mut components = BTreeSet::new();
+        let mut suites = BTreeSet::new();
         let mut covered = BTreeSet::new();
         for item in evidence {
+            if !REQUIRED_LIFECYCLE_SUITES.contains(&item.suite) {
+                return Err(AcceptanceError::UnexpectedSuite(item.suite));
+            }
+            if !suites.insert(item.suite) {
+                return Err(AcceptanceError::DuplicateSuite(item.suite));
+            }
             components.insert(item.component);
             covered.extend(item.invariants);
+        }
+        let missing_suites = REQUIRED_LIFECYCLE_SUITES
+            .iter()
+            .copied()
+            .filter(|suite| !suites.contains(suite))
+            .collect::<Vec<_>>();
+        if !missing_suites.is_empty() {
+            return Err(AcceptanceError::MissingSuites(missing_suites));
         }
         let missing = REQUIRED_LIFECYCLE_INVARIANTS
             .iter()
@@ -193,6 +224,12 @@ pub enum AcceptanceError {
     InvalidIdentity { field: &'static str },
     #[error("lifecycle acceptance received no suite evidence")]
     NoEvidence,
+    #[error("lifecycle coverage contains duplicate suite {0}")]
+    DuplicateSuite(&'static str),
+    #[error("lifecycle coverage contains unexpected suite {0}")]
+    UnexpectedSuite(&'static str),
+    #[error("lifecycle coverage is missing required suites: {0:?}")]
+    MissingSuites(Vec<&'static str>),
     #[error("lifecycle coverage is missing required invariants: {0:?}")]
     MissingInvariants(Vec<LifecycleInvariant>),
 }

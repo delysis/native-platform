@@ -14,7 +14,10 @@ Its traits are grouped by proof obligation, not by product or runtime. Every
 adapter binds a compile-time product and implementation marker. Suites mint
 typed private coverage evidence only after their assertions return, and a
 manifest accepts only same-marker evidence whose union includes every ADR-003
-invariant. Callers cannot relabel reference evidence as product evidence.
+invariant and each required suite exactly once. This prevents accidental
+cross-implementation mixing; it cannot make a deliberately dishonest wrapper
+truthful. Source review must still prove that every adapter method and shutdown
+worker fact comes from the named production owner rather than shadow state.
 Cross-boundary obligations such as progress-to-shutdown and
 panic-to-shutdown remain bridge suites; unrelated component-local results
 cannot be combined into those claims. These are test traits only, never a new

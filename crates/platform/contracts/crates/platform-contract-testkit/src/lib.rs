@@ -24,7 +24,7 @@ pub use envelope_suite::{validate_capability_snapshot_v0, validate_service_error
 pub use model::{
     AdapterError, AttemptIdentity, ClosedFacts, LifecyclePhase, OperationModelAdapter,
     OperationPhase, OperationSnapshot, ReferenceAdapter, ReferenceLease, ReferenceTicket,
-    Reservation, TerminalClass, TerminalRecord, TestConfig, WaitObservation,
+    Reservation, ShutdownOutcome, TerminalClass, TerminalRecord, TestConfig, WaitObservation,
 };
 pub use publication_suite::{
     PublicationErrorContext, PublicationModelAdapter, PublicationRequest, PublicationStep,

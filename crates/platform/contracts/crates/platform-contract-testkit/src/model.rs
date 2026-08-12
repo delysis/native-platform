@@ -4,7 +4,7 @@
 //! It is intentionally not a production runtime abstraction.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecyclePhase {
@@ -74,6 +74,13 @@ pub struct ClosedFacts {
     pub retained_tasks: usize,
     pub expected_workers: usize,
     pub joined_workers: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShutdownOutcome {
+    pub facts: ClosedFacts,
+    pub expected_worker_ids: Vec<String>,
+    pub joined_worker_ids: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,7 +169,6 @@ struct ReferenceState {
 #[derive(Debug)]
 struct ReferenceInner {
     state: Mutex<ReferenceState>,
-    state_changed: Condvar,
 }
 
 #[derive(Clone, Debug)]
@@ -240,20 +246,6 @@ impl ReferenceAdapter {
         operation.phase = OperationPhase::Terminal;
         Ok(())
     }
-
-    pub(crate) fn wait_for_shutdown(&self) -> ClosedFacts {
-        self.quiesce();
-        let mut state = self.state();
-        while !state.active.is_empty() || state.retained_tasks != 0 {
-            state = self
-                .inner
-                .state_changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        state.lifecycle = LifecyclePhase::Closed;
-        closed_facts(&state)
-    }
 }
 
 impl OperationModelAdapter for ReferenceAdapter {
@@ -277,7 +269,6 @@ impl OperationModelAdapter for ReferenceAdapter {
                     retained_tasks: 0,
                     joined_workers: 0,
                 }),
-                state_changed: Condvar::new(),
             }),
         }
     }
@@ -416,7 +407,6 @@ impl OperationModelAdapter for ReferenceAdapter {
             .joined_workers
             .checked_add(1)
             .expect("test joined-worker count exhausted");
-        self.inner.state_changed.notify_all();
         Ok(())
     }
 
