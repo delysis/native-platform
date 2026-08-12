@@ -21,6 +21,7 @@ pub use model::{
     W1_CONTRACT_REVISION,
 };
 pub use validation::{
-    ValidationError, VerifiedPrerequisiteV0, compare_candidate, sha256_identity, validate_baseline,
-    validate_lock, validate_manifest, validate_observation, verify_prerequisite_chunks,
+    CaseBaselineV0, ValidationError, VerifiedPrerequisiteV0, compare_candidate, sha256_identity,
+    validate_baseline, validate_lock, validate_manifest, validate_observation,
+    validate_row_baselines, verify_prerequisite_chunks,
 };

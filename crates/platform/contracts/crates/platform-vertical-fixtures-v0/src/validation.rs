@@ -60,6 +60,18 @@ pub struct VerifiedPrerequisiteV0 {
     identity: ArtifactIdentityV0,
 }
 
+/// Caller-owned evidence for one case in a multi-case row manifest.
+///
+/// This envelope carries no authority and retains no fixture input bytes. The
+/// caller remains responsible for producing the observation from the named
+/// product adapter and for supplying any exact prerequisite tokens.
+#[derive(Clone, Copy, Debug)]
+pub struct CaseBaselineV0<'a> {
+    pub expected_projection_bytes: &'a [u8],
+    pub verified_prerequisites: &'a [VerifiedPrerequisiteV0],
+    pub observation: &'a ObservationEnvelopeV0,
+}
+
 impl VerifiedPrerequisiteV0 {
     #[must_use]
     pub fn prerequisite_id(&self) -> &str {
@@ -322,6 +334,61 @@ pub fn validate_baseline(
         });
     }
     compare_projection(case, expected_projection_bytes, observation)
+}
+
+/// Validates every case in one row manifest exactly once.
+///
+/// This is the cross-product aggregation boundary. It neither executes product
+/// adapters nor combines their claims: each caller-supplied observation is
+/// independently checked against its own case source, prerequisites, and
+/// projection before the row is considered complete.
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] when the manifest is invalid, a case is missing,
+/// extra, or repeated, or any individual baseline fails validation.
+pub fn validate_row_baselines(
+    manifest: &VerticalFixtureManifestV0,
+    cases: &[CaseBaselineV0<'_>],
+) -> Result<(), ValidationError> {
+    validate_manifest(manifest)?;
+    if cases.len() != manifest.cases.len() {
+        return Err(ValidationError::Inconsistent {
+            field: "row_baselines.cases",
+        });
+    }
+
+    let manifest_case_ids = manifest
+        .cases
+        .iter()
+        .map(|case| case.case_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut observed_case_ids = BTreeSet::new();
+    for case in cases {
+        let case_id = case.observation.case_id.as_str();
+        if !observed_case_ids.insert(case_id) {
+            return Err(ValidationError::Duplicate {
+                field: "row_baselines.case_id",
+            });
+        }
+        if !manifest_case_ids.contains(case_id) {
+            return Err(ValidationError::MissingCase(case_id.to_owned()));
+        }
+        validate_baseline(
+            manifest,
+            case_id,
+            case.expected_projection_bytes,
+            case.verified_prerequisites,
+            case.observation,
+        )?;
+    }
+
+    if observed_case_ids != manifest_case_ids {
+        return Err(ValidationError::Inconsistent {
+            field: "row_baselines.cases",
+        });
+    }
+    Ok(())
 }
 
 /// Compares a later implementation observation with the frozen projection.

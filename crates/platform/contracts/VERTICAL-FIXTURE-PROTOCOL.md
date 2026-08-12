@@ -38,8 +38,9 @@ named production owner rather than fixture-owned shadow state.
    lock entry, and rejects a reused manifest digest.
 
 This two-revision sequence avoids a manifest referring circularly to the commit
-that contains that manifest. This protocol PR deliberately contains no final
-row manifests or lock.
+that contains that manifest. No final lock exists yet. The currently staged
+cross-product row and the intentionally absent row 8 are documented in
+[`CROSS-PRODUCT-ROWS.md`](CROSS-PRODUCT-ROWS.md).
 
 ## Exact row catalogue
 

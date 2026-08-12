@@ -1,0 +1,113 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "corrupted_disposable_caches",
+  "class": "state",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [{
+    "case_id": "mom.disposable-cache-corruption",
+    "source": {
+      "repository_id": "delysis/mom-llama",
+      "commit": "097da612140c6479f9d40e7816f0500271464ca9",
+      "production_tree": {
+        "id": "git.tree.097da612",
+        "digest": { "algorithm": "sha256", "hex": "d19d539b144d121a0dd1b90f2387616c42874722b8feeeb09dc9584c7ed413c4" },
+        "length": 40
+      }
+    },
+    "inputs": [
+      {
+        "identity": {
+          "id": "mom.cache-corruption.input",
+          "digest": { "algorithm": "sha256", "hex": "b2c713869df2a75145af92b2f01993a77537e8d2bc08d5f92cc88871e87b2f8c" },
+          "length": 1886
+        },
+        "availability": "checked_in",
+        "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-corruption-v1.json"
+      },
+      {
+        "identity": {
+          "id": "mom.cache.native-prefix.logical-state",
+          "digest": { "algorithm": "sha256", "hex": "787f58b20bbfe28415acb4721b3293e5af42bdd056368b1cac14fe8aec3dd3b8" },
+          "length": 1113
+        },
+        "availability": "checked_in",
+        "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-native-prefix-state-v1.json"
+      },
+      {
+        "identity": {
+          "id": "mom.cache.session-kv.logical-state",
+          "digest": { "algorithm": "sha256", "hex": "4bfc026b7b842e4ef65d6b0993fa6eb13f0d33e0573296aba6b48c04da34425a" },
+          "length": 1142
+        },
+        "availability": "checked_in",
+        "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-session-state-v1.json"
+      },
+      {
+        "identity": {
+          "id": "mom.cache.native-prefix.after-logical-state",
+          "digest": { "algorithm": "sha256", "hex": "38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed" },
+          "length": 5
+        },
+        "availability": "checked_in",
+        "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-native-prefix-after-state-v1.json"
+      },
+      {
+        "identity": {
+          "id": "mom.cache.session-kv.after-logical-state",
+          "digest": { "algorithm": "sha256", "hex": "1885429208d88d71764bef9f98d867f16e5c54e7672226734a137201978fab9b" },
+          "length": 1059
+        },
+        "availability": "checked_in",
+        "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-session-after-state-v1.json"
+      }
+    ],
+    "state_identities": [
+      {
+        "state_id": "mom.cache.native-prefix",
+        "schema_id": "native-host-prefix-cache.mom-llama",
+        "baseline": {
+          "identity": {
+            "id": "mom.cache.native-prefix.fixture",
+            "digest": { "algorithm": "sha256", "hex": "787f58b20bbfe28415acb4721b3293e5af42bdd056368b1cac14fe8aec3dd3b8" },
+            "length": 1113
+          },
+          "availability": "checked_in",
+          "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-native-prefix-state-v1.json"
+        }
+      },
+      {
+        "state_id": "mom.cache.session-kv",
+        "schema_id": "kv-cache.v3",
+        "baseline": {
+          "identity": {
+            "id": "mom.cache.session-kv.fixture",
+            "digest": { "algorithm": "sha256", "hex": "4bfc026b7b842e4ef65d6b0993fa6eb13f0d33e0573296aba6b48c04da34425a" },
+            "length": 1142
+          },
+          "availability": "checked_in",
+          "relative_path": "crates/mom-llama-runtime/fixtures/w1/cache-session-state-v1.json"
+        }
+      }
+    ],
+    "prerequisites": [],
+    "replay": [{
+      "program": { "kind": "cargo" },
+      "argv": ["test", "-p", "mom-llama-runtime", "--features", "unstable-w1-vertical-fixtures", "kv_cache::tests::w1_authenticated_persistent_cache_corruption_invalidates_and_falls_back", "--", "--exact"],
+      "required_environment": [],
+      "network": "denied"
+    }],
+    "expected_projection": {
+      "id": "mom.cache-corruption.projection",
+      "digest": { "algorithm": "sha256", "hex": "d2e03c9923dd36837c1b13b9a47b2426bf3730652338362417d60a7da420cbe7" },
+      "length": 2712
+    }
+  }],
+  "omitted_claims": [
+    "FTE provider-owned remote caches",
+    "Information acquisition and publication staging",
+    "Loom disposable caches because none are product-owned",
+    "Native persistent cache storage because native-kit owns only cache values",
+    "Speech Hugging Face model cache because it is externally owned"
+  ],
+  "negative_evidence": []
+}
