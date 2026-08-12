@@ -21,6 +21,9 @@ pub const MAX_NATIVE_FOCUS_SAMPLE_AGE: Duration = Duration::from_secs(1);
 pub const MAX_FOREGROUND_WINDOWS: usize = 64;
 pub const MAX_PENDING_FOREGROUND_COMMANDS: usize = 1_024;
 
+#[cfg(all(test, feature = "unstable-w1-contract-tests"))]
+mod w1_contract_adapter;
+
 /// Native window identity used by one foreground-command challenge.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ForegroundWindowId(Arc<str>);
