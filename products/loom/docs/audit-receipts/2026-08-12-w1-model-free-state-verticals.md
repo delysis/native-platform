@@ -90,14 +90,14 @@ scheduled execution.
 
 ## Verification lane
 
-All final local gates passed:
+The exact current local rebinding gates passed; remote CI for the pushed head is
+still required and pending:
 
 - `cargo fmt --all -- --check`
-- `rustup run 1.88.0 cargo test -p loom-store --all-targets --features unstable-w1-vertical-tests` (152 unit tests and all integration targets)
-- `rustup run 1.88.0 cargo test -p loom-store --features unstable-w1-vertical-tests --test w1_fixture_manifest` (3/3 canonical protocol tests)
-- `rustup run 1.88.0 cargo clippy -p loom-store --all-targets --features unstable-w1-vertical-tests -- -D warnings`
-- `rustup run 1.88.0 cargo test -p loom-host --features unstable-w1-contract-tests` (29/29)
-- `rustup run 1.88.0 cargo test -p tauri-plugin-loom --features unstable-w1-contract-tests` (72/72)
-- `pnpm --dir apps/loom test` (31 files, 181 tests)
-- `pnpm --dir apps/loom check` (zero errors and zero warnings)
-- `pnpm --dir apps/loom build` (passed; the existing chunk-size advisory remains non-fatal)
+- `cd fixtures/w1 && shasum -a 256 -c MANIFEST.sha256` (19/19)
+- `cargo test --locked -p loom-store --features unstable-w1-vertical-tests --test w1_fixture_manifest` (3/3)
+- `cargo clippy --locked -p loom-store --features unstable-w1-vertical-tests --test w1_fixture_manifest -- -D warnings`
+- `cargo test --locked -p tauri-plugin-loom --features unstable-w1-contract-tests` (72/72)
+- `cargo clippy --locked -p tauri-plugin-loom --features unstable-w1-contract-tests --all-targets -- -D warnings`
+- `./scripts/check-w1-contract-pin.sh`
+- `git diff --check`

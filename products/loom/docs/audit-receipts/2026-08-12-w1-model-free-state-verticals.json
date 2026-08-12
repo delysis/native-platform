@@ -1,18 +1,18 @@
 {
   "schema_version": 2,
   "goal": "W1-LOOM-MODEL-FREE-STATE-VERTICALS",
-  "production_source_commit": "e32d0697f6b5e28716e34c6b051d47d5031d010c",
+  "production_source_commit": "a733508adcb1ef1e689e90ed0c8e410160cb602a",
   "production_tree": {
-    "path": "fixtures/w1/source/loom-production-tree-e32d069.json",
-    "sha256": "f19edc9caf22807a4d11f716a921445bf5c407b4e3ad85e7842a5fd8f2fc0f00",
+    "path": "fixtures/w1/source/loom-production-tree-a733508.json",
+    "sha256": "30e5e03b1e18c71d6f9feeb78f0f2eb524402a13f3f57b835680db9d6f52c4cd",
     "byte_len": 1632
   },
   "vertical_protocol_commit": "fc24ffff08c52690390b4460f44617d5d9732563",
   "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
   "fixture_ledger": {
     "path": "fixtures/w1/MANIFEST.sha256",
-    "sha256": "16c34a8d3a63d68326104732e6498001bb793e3cc7693dba72b122d01c03d863",
-    "artifact_count": 15
+    "sha256": "d376bb309e292ddc19beb09a73b7290ce73bbc47e173c3c0fb0fdb53108260bd",
+    "artifact_count": 19
   },
   "rows": [
     {
@@ -20,7 +20,7 @@
       "vertical_id": "loom_suggestion_promotion",
       "status": "canonical_baseline_validated",
       "manifest": "fixtures/w1/manifests/loom-suggestion-promotion-v0.json",
-      "manifest_sha256": "246e0eab459712816e8b236428dc6c2e423aa783d9a031b0f1780771c56a4532",
+      "manifest_sha256": "28d3590c91ea0880e19e71cea55d44c4a831ada2f7e4a9374d2d9557cb5feb5c",
       "projection": "fixtures/w1/projections/loom-suggestion-promotion-v1.json",
       "projection_sha256": "ad46d122d9317107081fe379b7b6e05347bf5ab58621ac00615b388d50141a03",
       "product_replays": [
@@ -34,7 +34,7 @@
       "vertical_id": "loom_research_diagnostic_admitted_distinction",
       "status": "canonical_baseline_validated",
       "manifest": "fixtures/w1/manifests/loom-research-diagnostic-admitted-v0.json",
-      "manifest_sha256": "ef846ab4395e5e4c5b1b1110650b0518adabbc9e1b37e9b7adb0b5ba28041110",
+      "manifest_sha256": "b8eff4377dd738708f2362d812a9f3163ee02a540c23d1d82e506ac2fcdfb604",
       "projection": "fixtures/w1/projections/loom-research-authority-v1.json",
       "projection_sha256": "03483d304b0f57833ac777740b0cde400b5d86331357f08ce4dc5b98f28a4f24",
       "product_replays": [
@@ -46,7 +46,7 @@
       "vertical_id": "loom_prior_project_store",
       "status": "canonical_baseline_validated",
       "manifest": "fixtures/w1/manifests/loom-prior-project-store-v0.json",
-      "manifest_sha256": "1d1750428d2cd27bd82568483e692ddb24c07f988d1a4eb5cbe4587a22cb5785",
+      "manifest_sha256": "5279dc90d5d5f1321dec1b65c1937459267b7bc81bf12c07236afb57a0343ee2",
       "projection": "fixtures/w1/projections/loom-prior-project-store-v10-v1.json",
       "projection_sha256": "e207e171dc3a3ab8d5ea5de6b160bd0cf0409a3f0f15d5413c38d96225404b82",
       "state_identity": {
@@ -62,17 +62,16 @@
     }
   ],
   "verification": {
-    "status": "passed",
+    "status": "local_rebinding_gates_passed_remote_ci_pending",
     "commands": [
       { "command": "cargo fmt --all -- --check", "result": "passed" },
-      { "command": "rustup run 1.88.0 cargo test -p loom-store --all-targets --features unstable-w1-vertical-tests", "result": "passed; 152 unit tests and all integration targets" },
-      { "command": "rustup run 1.88.0 cargo test -p loom-store --features unstable-w1-vertical-tests --test w1_fixture_manifest", "result": "passed; 3 of 3" },
-      { "command": "rustup run 1.88.0 cargo clippy -p loom-store --all-targets --features unstable-w1-vertical-tests -- -D warnings", "result": "passed" },
-      { "command": "rustup run 1.88.0 cargo test -p loom-host --features unstable-w1-contract-tests", "result": "passed; 29 of 29" },
-      { "command": "rustup run 1.88.0 cargo test -p tauri-plugin-loom --features unstable-w1-contract-tests", "result": "passed; 72 of 72" },
-      { "command": "pnpm --dir apps/loom test", "result": "passed; 31 files and 181 tests" },
-      { "command": "pnpm --dir apps/loom check", "result": "passed; 0 errors and 0 warnings" },
-      { "command": "pnpm --dir apps/loom build", "result": "passed; existing non-fatal chunk-size advisory" }
+      { "command": "cd fixtures/w1 && shasum -a 256 -c MANIFEST.sha256", "result": "passed; 19 of 19 byte artifacts" },
+      { "command": "cargo test --locked -p loom-store --features unstable-w1-vertical-tests --test w1_fixture_manifest", "result": "passed; 3 of 3" },
+      { "command": "cargo clippy --locked -p loom-store --features unstable-w1-vertical-tests --test w1_fixture_manifest -- -D warnings", "result": "passed" },
+      { "command": "cargo test --locked -p tauri-plugin-loom --features unstable-w1-contract-tests", "result": "passed; 72 of 72" },
+      { "command": "cargo clippy --locked -p tauri-plugin-loom --features unstable-w1-contract-tests --all-targets -- -D warnings", "result": "passed" },
+      { "command": "./scripts/check-w1-contract-pin.sh", "result": "passed" },
+      { "command": "git diff --check", "result": "passed" }
     ]
   },
   "external_requirements": {
