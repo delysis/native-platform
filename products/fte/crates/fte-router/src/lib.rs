@@ -729,7 +729,6 @@ impl Gateway {
                             }
                         }
                     }
-                    joined_worker_ids.sort_unstable();
                     let retained_tasks = tasks.len();
                     if let Err(error) = lifecycle.wait_until_drained().await {
                         first_error.get_or_insert(error);
@@ -1459,7 +1458,7 @@ mod tests {
         ModelCapabilities, PromptForm, RouteObservations, RoutingPolicy, SamplingOptions,
         StoragePolicy, StreamPolicy, TicketCancellation, ToolPolicy,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use tokio::sync::{mpsc, oneshot};
 
@@ -2434,7 +2433,13 @@ mod tests {
             report.expected_worker_ids,
             vec!["backend-shutdown:draining"]
         );
-        assert_eq!(report.joined_worker_ids, report.expected_worker_ids);
+        assert_eq!(
+            report
+                .joined_worker_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            report.expected_worker_ids.into_iter().collect()
+        );
         assert_eq!(report.retained_tasks, 0);
         assert_eq!(cancellations.load(AtomicOrdering::Acquire), 1);
         assert_eq!(shutdowns.load(AtomicOrdering::Acquire), 1);
