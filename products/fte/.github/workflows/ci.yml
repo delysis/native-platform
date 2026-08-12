@@ -16,6 +16,8 @@ jobs:
       - run: ./scripts/check-workflow-policy.sh
       - run: ./tests/workflow_policy.sh
       - run: ./scripts/check-native-pins.sh
+      - run: ./scripts/check-w1-contract-pin.sh
+      - run: ./tests/w1_contract_pin_policy.sh
 
   portable:
     name: Portable core (${{ matrix.os }})
