@@ -1,0 +1,17 @@
+[package]
+name = "llama-native-host"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Bounded resident-model host and lifecycle registry for llama-native-engine"
+
+[dependencies]
+llama-native-cache = { path = "../llama-native-cache" }
+llama-native-engine = { path = "../llama-native-engine" }
+llama-native-types = { path = "../llama-native-types" }
+
+[lints]
+workspace = true

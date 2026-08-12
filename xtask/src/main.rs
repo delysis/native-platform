@@ -8,7 +8,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const GROUPS: [&str; 6] = [
     "portable",
@@ -146,7 +145,7 @@ fn check_policy(root: &Path) -> Result<()> {
     check_loom_reconciliation(root)?;
     check_evidence_files(root)?;
     check_adrs(root)?;
-    println!("native-platform shell policy: pass");
+    println!("native-platform W3 policy: pass");
     Ok(())
 }
 
@@ -161,7 +160,7 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     )?;
     check_sha256(
         &root.join("tests/integration-current/loom-probe/Cargo.toml.in"),
-        "6b6b6520169a13ae064667725c2bad6ccea93e8ab6cda890b87fb947df0b7823",
+        "21fa6065f6c4af7653ebfcc74d85a499c73278c208073ac4ed0834e40686eb88",
     )?;
     check_sha256(
         &root.join("tests/integration-current/loom-probe/lib.rs.in"),
@@ -169,7 +168,15 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     )?;
     check_sha256(
         &root.join("tests/integration-current/loom-probe/Loom.Cargo.lock"),
-        "fcc81ace8ae20b798cb5b362265776c8208eebe05402493baf8bcf67e229f06b",
+        "a9d0d62da8a9954743fecca8d4e749336e0c8834cba577e0841fe00508b40309",
+    )?;
+    check_sha256(
+        &root.join("migration/llama-native-kit.commit-map"),
+        "90089306976c5c43aabfb23781a7df563f9245724d46cd1c3043e2a817a4c897",
+    )?;
+    check_sha256(
+        &root.join("migration/native-import.json"),
+        "9c5d8d09611fb5e7a62529a4cd6888860cb9c0c3458a3be98872fb913077dbd5",
     )
 }
 
@@ -181,14 +188,16 @@ fn check_sha256(path: &Path, expected: &str) -> Result<()> {
 
 fn run_loom_probe(root: &Path) -> Result<()> {
     check_evidence_files(root)?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock before Unix epoch")?
-        .as_nanos();
-    let probe = env::temp_dir().join(format!(
-        "native-platform-loom-probe-{}-{nonce}",
-        std::process::id()
-    ));
+    // Keep this deliberately short. llama.cpp's CMake/MSBuild scratch paths are
+    // deep enough to exceed Windows' legacy MAX_PATH limit when the probe name
+    // includes a descriptive prefix and timestamp.
+    let probe = root
+        .join("target")
+        .join(format!("lp-{}", std::process::id()));
+    if probe.exists() {
+        fs::remove_dir_all(&probe)
+            .with_context(|| format!("remove stale temporary probe {}", probe.display()))?;
+    }
     fs::create_dir_all(probe.join("src"))?;
     let fixture = root.join("tests/integration-current/loom-probe");
     fs::copy(fixture.join("Cargo.toml.in"), probe.join("Cargo.toml"))?;
@@ -217,12 +226,46 @@ fn check_workspace(root: &Path) -> Result<()> {
         .as_table()
         .context("workspace package-groups table")?;
     ensure!(groups.keys().map(String::as_str).collect::<BTreeSet<_>>() == BTreeSet::from(GROUPS));
+    for (group, expected) in [
+        (
+            "portable",
+            &[
+                "command-evidence",
+                "llama-native-cache",
+                "llama-native-types",
+            ][..],
+        ),
+        ("platform", &["llama-native-engine", "llama-native-host"]),
+        ("product", &[]),
+        ("research", &[]),
+        ("diagnostic", &["integration-current", "xtask"]),
+        ("real-hardware", &[]),
+    ] {
+        let actual = groups[group]
+            .as_array()
+            .with_context(|| format!("workspace package group {group}"))?;
+        ensure!(
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .map(toml::Value::as_str)
+                    .collect::<Option<Vec<_>>>()
+                    .as_deref()
+                    == Some(expected),
+            "workspace package group {group} drift"
+        );
+    }
 
     let cargo_manifests = find_named(root, "Cargo.toml")?;
     ensure!(
         cargo_manifests
             == BTreeSet::from([
                 root.join("Cargo.toml"),
+                root.join("crates/native/crates/command-evidence/Cargo.toml"),
+                root.join("crates/native/crates/llama-native-cache/Cargo.toml"),
+                root.join("crates/native/crates/llama-native-engine/Cargo.toml"),
+                root.join("crates/native/crates/llama-native-host/Cargo.toml"),
+                root.join("crates/native/crates/llama-native-types/Cargo.toml"),
                 root.join("tests/integration-current/Cargo.toml"),
                 root.join("xtask/Cargo.toml"),
             ])
@@ -240,21 +283,27 @@ fn check_workspace(root: &Path) -> Result<()> {
     let xtask_manifest: toml::Value = toml::from_str(&read_text(&root.join("xtask/Cargo.toml"))?)
         .context("parse xtask Cargo.toml")?;
     ensure!(xtask_manifest.get("workspace").is_none());
+    for source in find_extension(root, "rs")? {
+        ensure!(
+            source.starts_with(root.join("crates/native/crates"))
+                || source.starts_with(root.join("tests/integration-current"))
+                || source.starts_with(root.join("xtask")),
+            "Rust source outside the imported native or diagnostic boundaries: {}",
+            source.display()
+        );
+    }
+    ensure!(!root.join("crates/native/Cargo.toml").exists());
+    ensure!(!root.join("crates/native/Cargo.lock").exists());
+    ensure!(!root.join("crates/native/.github/workflows/ci.yml").exists());
     ensure!(
-        find_extension(root, "rs")?
-            == BTreeSet::from([
-                root.join("tests/integration-current/src/lib.rs"),
-                root.join("tests/integration-current/tests/lifecycle.rs"),
-                root.join("tests/integration-current/tests/source_lock.rs"),
-                root.join("tests/integration-current/tests/verticals.rs"),
-                root.join("xtask/src/main.rs"),
-            ]),
-        "repository must contain only diagnostic harness Rust source"
+        !root
+            .join("crates/native/.github/workflows/w1-contract-tests.yml")
+            .exists()
     );
-    for forbidden in ["apps", "crates", "packages", "products"] {
+    for forbidden in ["apps", "packages", "products"] {
         ensure!(
             !root.join(forbidden).exists(),
-            "shell must not contain production directory {forbidden}"
+            "W3 native import must not contain later-wave directory {forbidden}"
         );
     }
     Ok(())
@@ -263,18 +312,18 @@ fn check_workspace(root: &Path) -> Result<()> {
 fn check_ledger(root: &Path) -> Result<()> {
     let ledger: Ledger = serde_json::from_str(&read_text(&root.join("migration/ledger.json"))?)
         .context("parse migration ledger")?;
-    let expected = Ledger {
+    let mut expected = Ledger {
         schema_version: 1,
-        goal: "W2-INTEGRATION".into(),
-        status: "integration_candidate_no_imports".into(),
-        production_source_imported: false,
-        source_history_imported: false,
+        goal: "W3-IMPORT-NATIVE".into(),
+        status: "native_import_candidate_pending_remote_ci".into(),
+        production_source_imported: true,
+        source_history_imported: true,
         integration_candidate: IntegrationCandidate {
-            accepted: false,
+            accepted: true,
             pushed: true,
             product_releases_modified: false,
-            source_imported: false,
-            history_imported: false,
+            source_imported: true,
+            history_imported: true,
             manifest: "tests/integration-current/Cargo.toml".into(),
             coverage: "tests/integration-current/COVERAGE.md".into(),
         },
@@ -391,6 +440,13 @@ fn check_ledger(root: &Path) -> Result<()> {
                 .into(),
         },
     };
+    let native = expected
+        .entries
+        .iter_mut()
+        .find(|entry| entry.source_repository == "delysis/llama-native-kit")
+        .context("expected native migration entry")?;
+    native.import_commit = Some("152a0dda9ba0d1096022d11ddbd08489f524ab31".into());
+    native.path_dependency_cutover_commit = Some("c35c6b2d42f60939f3a3478212743c9c82f28b80".into());
     ensure!(ledger == expected, "migration ledger drift");
     Ok(())
 }

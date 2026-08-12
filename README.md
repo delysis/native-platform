@@ -1,14 +1,14 @@
 # native-platform
 
-This repository is the empty Wave 2 shell for Delysis first-party Rust platform
-and product code. It establishes workspace policy, architecture records,
-migration provenance, and CI before any production source or history is
-imported.
+This repository is the Delysis first-party Rust platform monorepo. Wave 3
+imports the accepted `llama-native-kit` history beneath `crates/native` and
+rebinds current integration graphs to those path packages.
 
-The initial shell makes no product, runtime, hardware, model, provider, or
-migration-equivalence claim. `migration/ledger.json` is the authority for future
-imports; every `import_commit` and `path_dependency_cutover_commit` is currently
-`null`.
+The native import preserves all 45 accepted source commits without squashing.
+`migration/ledger.json`, `migration/native-import.json`, and
+`migration/llama-native-kit.commit-map` bind the source, rewrite, merge, and
+path cutover. Other first-party products remain exact Git integration inputs;
+their source and release manifests have not been moved.
 
 ## Workspace policy
 
@@ -17,7 +17,8 @@ imports; every `import_commit` and `path_dependency_cutover_commit` is currently
 - Central dependencies and lints in `Cargo.toml`.
 - Explicit package groups: portable, platform, product, research, diagnostic,
   and real-hardware.
-- `xtask policy` authenticates the shell, migration ledger, and copied ADRs.
+- `xtask policy` authenticates the workspace, migration evidence, and copied
+  ADRs.
 
 Run the local gates with:
 
@@ -25,8 +26,7 @@ Run the local gates with:
 ./scripts/check-shell-policy.sh
 ```
 
-`tests/integration-current` is the local W2 integration candidate. It consumes
-accepted product revisions through exact Git dependencies, runs shared contract
-and vertical-authentication checks, and records its precise compile boundary in
-`tests/integration-current/COVERAGE.md`. It is not yet accepted. Production
-import and history movement remain later, separately reviewed operations.
+`tests/integration-current` consumes accepted product revisions through exact
+Git dependencies while resolving native crates from `crates/native`. It runs
+shared contract and vertical-authentication checks and records the precise
+split-graph boundary in `tests/integration-current/COVERAGE.md`.

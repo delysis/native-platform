@@ -1064,7 +1064,6 @@ dependencies = [
 [[package]]
 name = "llama-native-cache"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"
 dependencies = [
  "llama-native-types",
  "serde",
@@ -1074,7 +1073,6 @@ dependencies = [
 [[package]]
 name = "llama-native-engine"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",
@@ -1088,7 +1086,6 @@ dependencies = [
 [[package]]
 name = "llama-native-host"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"
 dependencies = [
  "llama-native-cache",
  "llama-native-engine",
@@ -1098,7 +1095,6 @@ dependencies = [
 [[package]]
 name = "llama-native-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit.git?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"
 dependencies = [
  "serde",
  "sha2",

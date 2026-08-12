@@ -465,7 +465,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes 3.0.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -482,7 +482,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "winx",
 ]
 
@@ -651,7 +651,6 @@ dependencies = [
 [[package]]
 name = "command-evidence"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=16168bd76a09f74fdee41d0e2fb0441e79ac1005#16168bd76a09f74fdee41d0e2fb0441e79ac1005"
 dependencies = [
  "serde",
  "serde_json",
@@ -1040,7 +1039,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1202,10 +1201,10 @@ source = "git+https://github.com/delysis/free-token-energy?rev=67814e76659688fef
 dependencies = [
  "async-trait",
  "fte-types",
- "llama-native-cache 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
- "llama-native-engine 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
- "llama-native-host 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
- "llama-native-types 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
+ "llama-native-cache",
+ "llama-native-engine",
+ "llama-native-host",
+ "llama-native-types",
  "tokio",
  "uuid",
 ]
@@ -2021,13 +2020,13 @@ dependencies = [
  "information-native-host",
  "information-native-types",
  "llama-cpp-2",
- "llama-native-host 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=16168bd76a09f74fdee41d0e2fb0441e79ac1005)",
- "llama-native-types 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=16168bd76a09f74fdee41d0e2fb0441e79ac1005)",
+ "llama-native-host",
+ "llama-native-types",
  "loom-types",
  "mom-llama-runtime",
- "platform-contract-testkit",
- "platform-contracts-v0",
- "platform-vertical-fixtures-v0",
+ "platform-contract-testkit 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=3ed1f3235edb6d481c324f05fe83b2379e3431e6)",
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=3ed1f3235edb6d481c324f05fe83b2379e3431e6)",
+ "platform-vertical-fixtures-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=3ed1f3235edb6d481c324f05fe83b2379e3431e6)",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2175,7 +2174,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 [[package]]
 name = "llama-cpp-2"
 version = "0.1.154"
-source = "git+https://github.com/delysis/llama-cpp-rs?rev=a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391#a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391#a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2188,7 +2187,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.154"
-source = "git+https://github.com/delysis/llama-cpp-rs?rev=a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391#a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"
+source = "git+https://github.com/delysis/llama-cpp-rs.git?rev=a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391#a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"
 dependencies = [
  "bindgen",
  "cc",
@@ -2202,19 +2201,8 @@ dependencies = [
 [[package]]
 name = "llama-native-cache"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=16168bd76a09f74fdee41d0e2fb0441e79ac1005#16168bd76a09f74fdee41d0e2fb0441e79ac1005"
 dependencies = [
- "llama-native-types 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=16168bd76a09f74fdee41d0e2fb0441e79ac1005)",
- "serde",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "llama-native-cache"
-version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"
-dependencies = [
- "llama-native-types 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
+ "llama-native-types",
  "serde",
  "sha2 0.10.9",
 ]
@@ -2222,67 +2210,36 @@ dependencies = [
 [[package]]
 name = "llama-native-engine"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=16168bd76a09f74fdee41d0e2fb0441e79ac1005#16168bd76a09f74fdee41d0e2fb0441e79ac1005"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",
  "fs4",
  "llama-cpp-2",
  "llama-cpp-sys-2",
- "llama-native-types 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=16168bd76a09f74fdee41d0e2fb0441e79ac1005)",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "llama-native-engine"
-version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"
-dependencies = [
- "crossbeam-channel",
- "encoding_rs",
- "fs4",
- "llama-cpp-2",
- "llama-cpp-sys-2",
- "llama-native-types 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
+ "llama-native-types",
+ "platform-contract-testkit 0.0.0 (git+https://github.com/delysis/w1-platform-contracts.git?rev=cbab33555ab9355a6ac453d659c55ec9e0666821)",
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts.git?rev=fc24ffff08c52690390b4460f44617d5d9732563)",
+ "platform-vertical-fixtures-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts.git?rev=fc24ffff08c52690390b4460f44617d5d9732563)",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
 ]
 
 [[package]]
 name = "llama-native-host"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=16168bd76a09f74fdee41d0e2fb0441e79ac1005#16168bd76a09f74fdee41d0e2fb0441e79ac1005"
 dependencies = [
- "llama-native-cache 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=16168bd76a09f74fdee41d0e2fb0441e79ac1005)",
- "llama-native-engine 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=16168bd76a09f74fdee41d0e2fb0441e79ac1005)",
- "llama-native-types 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=16168bd76a09f74fdee41d0e2fb0441e79ac1005)",
-]
-
-[[package]]
-name = "llama-native-host"
-version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"
-dependencies = [
- "llama-native-cache 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
- "llama-native-engine 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
- "llama-native-types 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
+ "llama-native-cache",
+ "llama-native-engine",
+ "llama-native-types",
 ]
 
 [[package]]
 name = "llama-native-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=16168bd76a09f74fdee41d0e2fb0441e79ac1005#16168bd76a09f74fdee41d0e2fb0441e79ac1005"
 dependencies = [
  "serde",
- "sha2 0.10.9",
- "thiserror",
-]
-
-[[package]]
-name = "llama-native-types"
-version = "0.1.0"
-source = "git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"
-dependencies = [
- "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror",
 ]
@@ -2507,10 +2464,10 @@ dependencies = [
  "chacha20poly1305",
  "crossbeam-channel",
  "getrandom 0.3.4",
- "llama-native-cache 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
- "llama-native-engine 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
- "llama-native-host 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
- "llama-native-types 0.1.0 (git+https://github.com/delysis/llama-native-kit?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4)",
+ "llama-native-cache",
+ "llama-native-engine",
+ "llama-native-host",
+ "llama-native-types",
  "rusqlite",
  "security-framework",
  "serde",
@@ -2902,7 +2859,16 @@ name = "platform-contract-testkit"
 version = "0.0.0"
 source = "git+https://github.com/delysis/w1-platform-contracts?rev=3ed1f3235edb6d481c324f05fe83b2379e3431e6#3ed1f3235edb6d481c324f05fe83b2379e3431e6"
 dependencies = [
- "platform-contracts-v0",
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=3ed1f3235edb6d481c324f05fe83b2379e3431e6)",
+ "thiserror",
+]
+
+[[package]]
+name = "platform-contract-testkit"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts.git?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
+dependencies = [
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts.git?rev=cbab33555ab9355a6ac453d659c55ec9e0666821)",
  "thiserror",
 ]
 
@@ -2916,11 +2882,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "platform-contracts-v0"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts.git?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "platform-contracts-v0"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts.git?rev=fc24ffff08c52690390b4460f44617d5d9732563#fc24ffff08c52690390b4460f44617d5d9732563"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "platform-vertical-fixtures-v0"
 version = "0.0.0"
 source = "git+https://github.com/delysis/w1-platform-contracts?rev=3ed1f3235edb6d481c324f05fe83b2379e3431e6#3ed1f3235edb6d481c324f05fe83b2379e3431e6"
 dependencies = [
- "platform-contracts-v0",
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=3ed1f3235edb6d481c324f05fe83b2379e3431e6)",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
+name = "platform-vertical-fixtures-v0"
+version = "0.0.0"
+source = "git+https://github.com/delysis/w1-platform-contracts.git?rev=fc24ffff08c52690390b4460f44617d5d9732563#fc24ffff08c52690390b4460f44617d5d9732563"
+dependencies = [
+ "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts.git?rev=fc24ffff08c52690390b4460f44617d5d9732563)",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3093,7 +3089,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3371,7 +3367,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3650,7 +3646,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3873,10 +3869,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4546,7 +4542,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

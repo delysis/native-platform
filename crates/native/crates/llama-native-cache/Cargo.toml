@@ -1,0 +1,17 @@
+[package]
+name = "llama-native-cache"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Tiered, fingerprint-bound prefix cache contracts for native llama.cpp"
+
+[dependencies]
+llama-native-types = { path = "../llama-native-types" }
+serde.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

@@ -1,17 +1,18 @@
-# W2 current-revision integration coverage
+# W3 native path-cutover integration coverage
 
-The default diagnostic harness has one exact Cargo resolver graph and no path
-dependencies to product repositories. Loom's incompatible SQLite dependency
-line is covered by a separately materialized, authenticated, locked graph as
-described below. The harness does not import source or history and does not
-modify a product release.
+The default diagnostic harness resolves the five imported native crates from
+`crates/native`. All other products remain exact Git dependencies. Loom's
+incompatible SQLite dependency line is covered by a separately materialized,
+authenticated, locked graph that also patches native dependencies to the
+imported paths. No product repository or release manifest is modified.
 
 ## Default portable graph
 
-The default workspace gate compiles these public crates directly from exact Git
-revisions:
+The default workspace gate compiles these public boundaries:
 
-- `llama-native-types` at `16168bd76a09f74fdee41d0e2fb0441e79ac1005`;
+- imported `llama-native-types`, `llama-native-cache`,
+  `llama-native-engine`, `llama-native-host`, and `command-evidence`, whose
+  preserved source main is `16168bd76a09f74fdee41d0e2fb0441e79ac1005`;
 - `fte-types` at `67814e76659688fef61f311db588d17eddee0a66`;
 - `attachment-native-types` at `2a8d3a9a1828162a51185d207822ceb1ba6283a8`;
 - `speech-native-types` at `b836318f10a7e11f433ec3ea8dfa48707adc9b06`;
@@ -42,8 +43,8 @@ packages declare `links = "sqlite3"`. The immutable current SHAs therefore
 falsify the phase-one section 19 single-graph goal. The exact conflict is
 recorded in `graph-boundaries.json`.
 
-Two locked probes exhaust the portable inventory without weakening the one
-root-manifest/one-root-lock shell invariant:
+Two locked probes exhaust the portable inventory while the accepted repository
+state retains one root lock:
 
 - `current-product-graph` compiles the 36 non-Loom portable first-party
   libraries and the direct current `llama-cpp-2` boundary;
@@ -51,19 +52,15 @@ root-manifest/one-root-lock shell invariant:
   temporary directory, then compiles all 15 Loom portable libraries with the
   compatible W1 contracts, testkit, and vertical fixtures.
 
-The probes establish exact-revision coexistence. They do not rebind internal
-sibling dependencies to their repositories' accepted current revisions.
+The probes establish exact-revision coexistence with every native dependency
+rebound to the imported packages. They do not change product repositories.
 
-Mom's accepted current revision
-still transitively resolves its immutable pre-cutover pins
-`llama-native-kit@f7a69316c64d857b99bd847dd44cd852fc5b4ca4` and
-`attachment-native-kit@472900732ded5bcfb5cc639c49b3a4f77feece27`
-alongside the current direct revisions. Cargo therefore contains two source
-identities for the corresponding crate names. This is expected baseline
-evidence for the later path-dependency cutover, not evidence that cutover has
-already happened.
+Mom's accepted current revision still resolves its immutable pre-import
+Attachment pin at `472900732ded5bcfb5cc639c49b3a4f77feece27`. Its former
+native pin at `f7a69316c64d857b99bd847dd44cd852fc5b4ca4` is overridden by
+the monorepo path policy and is absent from the locks.
 
 This harness does not claim one-graph compatibility, full application
-compilation, UI execution, model
-loading, hardware behavior, hosted-provider behavior, or product-adapter
-lifecycle execution.
+compilation, UI execution, hosted-provider behavior, or product-adapter
+lifecycle execution. Real-model and host-join evidence is recorded separately
+and never inferred from these compile probes.
