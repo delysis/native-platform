@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use information_native_acquire::{
     AcquireClient, AcquisitionPolicy, ProgressControl, TransferPhase, TransferProgress,
 };
+#[cfg(unix)]
+use information_native_acquire::{ArtifactFetchOptions, NetworkScope, ResumePolicy};
 use information_native_catalog::{CatalogIndex, PlanRequest};
 use information_native_host::{InformationHost, MountInstallationOptions};
 use information_native_retrieval::RetrievalRouter;
@@ -27,8 +29,18 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
+#[cfg(unix)]
+use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::net::{Shutdown, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+#[cfg(unix)]
+use std::thread::{self, JoinHandle};
+#[cfg(unix)]
+use std::time::Duration;
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -74,6 +86,31 @@ const CORRUPT_CACHE_MANIFEST: &[u8] = include_bytes!(concat!(
 const CORRUPT_CACHE_PROJECTION: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/w1/v0/information-corrupted-disposable-cache.projection.json"
+));
+#[cfg(unix)]
+const CORRUPT_RESUME_MANIFEST: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/w1/v0/information-corrupted-resume-cache.manifest.json"
+));
+#[cfg(unix)]
+const CORRUPT_RESUME_PROJECTION: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/w1/v0/information-corrupted-resume-cache.projection.json"
+));
+#[cfg(unix)]
+const RESUME_BODY: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/w1/v0/information-resume-body.txt"
+));
+#[cfg(unix)]
+const MALFORMED_RESUME_SIDECAR: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/w1/v0/information-resume-malformed-sidecar.txt"
+));
+#[cfg(unix)]
+const AUTHORITATIVE_STATE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/w1/v0/information-resume-authoritative-state.json"
 ));
 
 #[derive(Deserialize)]
@@ -586,7 +623,7 @@ fn validate_fixture(
         "evidence": {
             "schema": "delysis.evidence_claim.v0",
             "tier": "reproducible",
-            "threat_model": "deterministic local fixture with no network or credentials",
+            "threat_model": "deterministic local fixture with no external network or credentials",
             "exact_source": case.source.production_tree.digest,
             "exact_runtime_or_artifact": sha256_identity("information.runtime.projection", &runtime_bytes).digest,
             "execution_kind": "fixture",
@@ -986,6 +1023,255 @@ fn corrupted_disposable_acquisition_cache_is_cold_reset() -> TestResult {
     validate_fixture(
         CORRUPT_CACHE_MANIFEST,
         CORRUPT_CACHE_PROJECTION,
+        VerticalIdV0::CorruptedDisposableCaches,
+        actual,
+    )
+}
+
+#[cfg(unix)]
+type ResumeTestServer = JoinHandle<io::Result<Vec<String>>>;
+
+#[cfg(unix)]
+fn http_response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+    let mut response = format!("HTTP/1.1 {status}\r\n").into_bytes();
+    for (name, value) in headers {
+        response.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    response.extend_from_slice(b"Connection: close\r\n\r\n");
+    response.extend_from_slice(body);
+    response
+}
+
+#[cfg(unix)]
+fn read_http_request(stream: &mut TcpStream) -> io::Result<String> {
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.len() > 64 * 1024 {
+            return Err(io::Error::other("test request exceeded 64 KiB"));
+        }
+    }
+    String::from_utf8(request).map_err(io::Error::other)
+}
+
+#[cfg(unix)]
+fn serve_http_sequence(responses: Vec<Vec<u8>>) -> io::Result<(String, ResumeTestServer)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = thread::spawn(move || -> io::Result<Vec<String>> {
+        let mut requests = Vec::with_capacity(responses.len());
+        for response in responses {
+            let (mut stream, _) = listener.accept()?;
+            requests.push(read_http_request(&mut stream)?);
+            stream.write_all(&response)?;
+            stream.flush()?;
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        Ok(requests)
+    });
+    Ok((format!("http://{address}/resource"), server))
+}
+
+#[cfg(unix)]
+fn join_resume_server(server: ResumeTestServer) -> io::Result<Vec<String>> {
+    server
+        .join()
+        .map_err(|_| io::Error::other("resume test server thread panicked"))?
+}
+
+#[cfg(unix)]
+#[test]
+fn malformed_identity_bound_resume_cache_cold_restarts_without_publication() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+    let staging = temporary.path().join("staging.bin");
+    let sidecar = temporary.path().join("staging.resume.json");
+    let authority = temporary.path().join("authority.json");
+    fs::write(&authority, AUTHORITATIVE_STATE)?;
+
+    assert_manifest_input(
+        CORRUPT_RESUME_MANIFEST,
+        "information.resume.body",
+        RESUME_BODY,
+    )?;
+    assert_manifest_input(
+        CORRUPT_RESUME_MANIFEST,
+        "information.resume.malformed_sidecar",
+        MALFORMED_RESUME_SIDECAR,
+    )?;
+    assert_manifest_input(
+        CORRUPT_RESUME_MANIFEST,
+        "information.resume.authoritative_state",
+        AUTHORITATIVE_STATE,
+    )?;
+
+    let first_response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n8\r\nnetwork\n\r\n".to_vec();
+    let second_response = http_response(
+        "200 OK",
+        &[
+            ("Content-Length", "15"),
+            ("Accept-Ranges", "bytes"),
+            ("ETag", "\"v1\""),
+        ],
+        RESUME_BODY,
+    );
+    let (url, server) = serve_http_sequence(vec![first_response, second_response])?;
+    let options = ArtifactFetchOptions {
+        acquisition_policy: AcquisitionPolicy::restricted()
+            .with_network_scope(NetworkScope::AnyAddress),
+        resume: ResumePolicy::durable(&sidecar),
+    };
+    let client = AcquireClient::with_defaults()?;
+    let expected_bytes = u64::try_from(RESUME_BODY.len())?;
+    let expected_sha256 = sha256(RESUME_BODY);
+
+    let mut cancel = |progress: TransferProgress| {
+        if progress.phase == TransferPhase::Downloading {
+            ProgressControl::Cancel
+        } else {
+            ProgressControl::Continue
+        }
+    };
+    let first_result = client.fetch_artifact_with_options(
+        &url,
+        &staging,
+        expected_bytes,
+        &expected_sha256,
+        1024,
+        &options,
+        &mut cancel,
+    );
+    assert!(
+        matches!(
+            first_result,
+            Err(information_native_acquire::AcquireError::Cancelled { .. })
+        ),
+        "unexpected first transfer result: {first_result:?}"
+    );
+    assert_eq!(fs::read(&staging)?, b"network\n");
+    assert!(sidecar.exists());
+
+    fs::write(&sidecar, MALFORMED_RESUME_SIDECAR)?;
+    let authority_before = fs::read(&authority)?;
+    let before_value = directory_state(
+        "information.w1.corrupted_resume_cache.before.v0",
+        temporary.path(),
+    )?;
+    assert_checked_in_value(
+        "information.corrupted_resume_cache.before",
+        "tests/fixtures/w1/v0/information-corrupted-resume-cache-before.json",
+        &before_value,
+    );
+
+    let mut phases = Vec::new();
+    let mut continue_transfer = |progress: TransferProgress| {
+        phases.push(progress.phase);
+        ProgressControl::Continue
+    };
+    let verified = client.fetch_artifact_with_options(
+        &url,
+        &staging,
+        expected_bytes,
+        &expected_sha256,
+        1024,
+        &options,
+        &mut continue_transfer,
+    )?;
+    let requests = join_resume_server(server)?;
+
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| { !request.to_ascii_lowercase().contains("\r\nrange:") })
+    );
+    assert_eq!(verified.resumed_bytes, 0);
+    assert_eq!(verified.bytes, expected_bytes);
+    assert_eq!(verified.sha256, expected_sha256);
+    assert_eq!(fs::read(&staging)?, RESUME_BODY);
+    assert!(!sidecar.exists());
+    assert_eq!(fs::read(&authority)?, authority_before);
+    assert!(!phases.contains(&TransferPhase::Resuming));
+    assert_eq!(phases.last(), Some(&TransferPhase::Complete));
+
+    let after_value = directory_state(
+        "information.w1.corrupted_resume_cache.after.v0",
+        temporary.path(),
+    )?;
+    let actual = projection(
+        vec![
+            event(
+                1,
+                "information.resume-cache-first-attempt",
+                "cancelled_with_identity_bound_partial",
+            ),
+            event(
+                2,
+                "information.resume-cache-retry",
+                "malformed_sidecar_discarded_and_cold_started",
+            ),
+        ],
+        vec![DurableStateFactV0 {
+            state_id: "information.corrupted_resume_cache".to_owned(),
+            schema_id: "information.w1.corrupted_resume_cache.v0".to_owned(),
+            before: Some(checked_in_identity(
+                "information.corrupted_resume_cache.before",
+                "tests/fixtures/w1/v0/information-corrupted-resume-cache-before.json",
+            )),
+            after: Some(identity(
+                "information.corrupted_resume_cache.after",
+                &after_value,
+            )),
+            disposition: StateDispositionV0::Recovered,
+        }],
+        vec![
+            cancelled("information.resume-cache-first-attempt"),
+            completed("information.resume-cache-retry"),
+        ],
+        BTreeMap::from([
+            (
+                "authority_bytes_preserved".to_owned(),
+                FactValueV0::Boolean(true),
+            ),
+            (
+                "cold_restart_from_zero".to_owned(),
+                FactValueV0::Boolean(true),
+            ),
+            (
+                "malformed_sidecar_removed".to_owned(),
+                FactValueV0::Boolean(true),
+            ),
+            (
+                "published_bytes".to_owned(),
+                FactValueV0::Integer(i64::try_from(verified.bytes)?),
+            ),
+            (
+                "published_sha256".to_owned(),
+                FactValueV0::Text(verified.sha256),
+            ),
+            (
+                "unverified_partial_published".to_owned(),
+                FactValueV0::Boolean(false),
+            ),
+        ]),
+        vec![
+            "malformed sidecar never authorizes partial bytes for resume".to_owned(),
+            "cancelled partial bytes are never returned as a verified fetch".to_owned(),
+            "caller-owned authoritative state remains byte-identical".to_owned(),
+        ],
+    );
+    if maybe_dump("corrupt-resume", &actual, &after_value) {
+        return Ok(());
+    }
+    validate_fixture(
+        CORRUPT_RESUME_MANIFEST,
+        CORRUPT_RESUME_PROJECTION,
         VerticalIdV0::CorruptedDisposableCaches,
         actual,
     )
