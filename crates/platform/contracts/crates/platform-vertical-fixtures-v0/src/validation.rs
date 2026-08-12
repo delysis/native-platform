@@ -1,10 +1,10 @@
 use crate::model::{
     ALL_VERTICAL_IDS, ArtifactAvailabilityV0, EquivalenceProjectionV0, FactValueV0,
     FixtureArtifactV0, FixtureCaseV0, FixtureClassV0, GitSourceV0, NegativeEvidenceV0,
-    ObservationEnvelopeV0, PrerequisiteArtifactBytesV0, PrerequisiteKindV0, PrerequisiteV0,
-    ReplayProgramV0, ReplayRecipeV0, StateIdentityV0, VERTICAL_FIXTURE_LOCK_SCHEMA_V0,
-    VERTICAL_FIXTURE_MANIFEST_SCHEMA_V0, VERTICAL_OBSERVATION_SCHEMA_V0, VerticalFixtureLockV0,
-    VerticalFixtureManifestV0, VerticalIdV0, W1_CONTRACT_REVISION,
+    ObservationEnvelopeV0, PrerequisiteKindV0, PrerequisiteV0, ReplayProgramV0, ReplayRecipeV0,
+    StateIdentityV0, VERTICAL_FIXTURE_LOCK_SCHEMA_V0, VERTICAL_FIXTURE_MANIFEST_SCHEMA_V0,
+    VERTICAL_OBSERVATION_SCHEMA_V0, VerticalFixtureLockV0, VerticalFixtureManifestV0, VerticalIdV0,
+    W1_CONTRACT_REVISION,
 };
 use platform_contracts_v0::{
     ArtifactIdentityV0, ContentDigest, EvidenceTier, ExecutionKind, TerminalClass,
@@ -46,6 +46,30 @@ pub enum ValidationError {
     MissingCase(String),
     #[error("vertical lock is missing rows: {0:?}")]
     MissingVerticals(Vec<VerticalIdV0>),
+}
+
+/// Proof that caller-supplied chunks matched one exact prerequisite identity.
+///
+/// Only [`verify_prerequisite_chunks`] can construct this token. It retains the
+/// small declared identity, never the artifact bytes. Callers may therefore
+/// authenticate multi-gigabyte artifacts without making them contiguous or
+/// resident in memory at once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedPrerequisiteV0 {
+    prerequisite_id: String,
+    identity: ArtifactIdentityV0,
+}
+
+impl VerifiedPrerequisiteV0 {
+    #[must_use]
+    pub fn prerequisite_id(&self) -> &str {
+        &self.prerequisite_id
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> &ArtifactIdentityV0 {
+        &self.identity
+    }
 }
 
 /// Validates one row manifest without reading or executing anything it names.
@@ -272,21 +296,21 @@ pub fn validate_lock<'a>(
 /// # Errors
 ///
 /// Returns [`ValidationError`] when any envelope is invalid, the named case is
-/// absent, source or prerequisite identity differs, expected projection or
-/// exact-external prerequisite bytes fail authentication, or the observable
-/// projection differs.
+/// absent, source or prerequisite identity differs, the expected projection
+/// fails authentication, an exact-external prerequisite lacks a matching
+/// stream-verified token, or the observable projection differs.
 pub fn validate_baseline(
     manifest: &VerticalFixtureManifestV0,
     case_id: &str,
     expected_projection_bytes: &[u8],
-    prerequisite_bytes: &[PrerequisiteArtifactBytesV0<'_>],
+    verified_prerequisites: &[VerifiedPrerequisiteV0],
     observation: &ObservationEnvelopeV0,
 ) -> Result<(), ValidationError> {
     validate_manifest(manifest)?;
     validate_observation(observation)?;
     let case = find_case(manifest, case_id)?;
     validate_case_binding(manifest, case, observation)?;
-    authenticate_exact_prerequisites(case, prerequisite_bytes)?;
+    authenticate_exact_prerequisites(case, verified_prerequisites)?;
     if observation.implementation_revision != case.source.commit {
         return Err(ValidationError::Inconsistent {
             field: "implementation_revision",
@@ -310,23 +334,23 @@ pub fn validate_baseline(
 /// # Errors
 ///
 /// Returns [`ValidationError`] when any envelope is invalid, the named case is
-/// absent, expected, prerequisite, or candidate-source bytes fail
-/// authentication, source or prerequisite identity differs, or the projection
-/// differs.
+/// absent, expected or candidate-source bytes fail authentication, an
+/// exact-external prerequisite lacks a matching stream-verified token, source
+/// or prerequisite identity differs, or the projection differs.
 pub fn compare_candidate(
     manifest: &VerticalFixtureManifestV0,
     case_id: &str,
     expected_projection_bytes: &[u8],
     candidate_source: &GitSourceV0,
     candidate_production_tree_bytes: &[u8],
-    prerequisite_bytes: &[PrerequisiteArtifactBytesV0<'_>],
+    verified_prerequisites: &[VerifiedPrerequisiteV0],
     candidate: &ObservationEnvelopeV0,
 ) -> Result<(), ValidationError> {
     validate_manifest(manifest)?;
     validate_observation(candidate)?;
     let case = find_case(manifest, case_id)?;
     validate_case_binding(manifest, case, candidate)?;
-    authenticate_exact_prerequisites(case, prerequisite_bytes)?;
+    authenticate_exact_prerequisites(case, verified_prerequisites)?;
     validate_source(candidate_source)?;
     verify_artifact_bytes(
         "candidate_source.production_tree",
@@ -366,6 +390,62 @@ pub fn sha256_identity(id: impl Into<String>, bytes: &[u8]) -> ArtifactIdentityV
             .expect("SHA-256 implementation always emits 64 lowercase hexadecimal digits"),
         length: u64::try_from(bytes.len()).expect("artifact length must fit in u64"),
     }
+}
+
+/// Authenticates one exact prerequisite from independently supplied chunks.
+///
+/// Chunks are hashed in iterator order and discarded immediately. Empty chunks
+/// are permitted and have no effect. This function performs no filesystem or
+/// other I/O; a product adapter remains responsible for supplying the stream.
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] when the prerequisite identifier or declared
+/// identity is malformed, the total byte length overflows `u64`, or the
+/// streamed length or SHA-256 differs from the declaration.
+pub fn verify_prerequisite_chunks<I, B>(
+    prerequisite_id: impl Into<String>,
+    identity: &ArtifactIdentityV0,
+    chunks: I,
+) -> Result<VerifiedPrerequisiteV0, ValidationError>
+where
+    I: IntoIterator<Item = B>,
+    B: AsRef<[u8]>,
+{
+    let prerequisite_id = prerequisite_id.into();
+    validate_safe_id("prerequisite_id", &prerequisite_id)?;
+    validate_artifact("prerequisite.identity", identity)?;
+
+    let mut digest = Sha256::new();
+    let mut length = 0_u64;
+    for chunk in chunks {
+        let chunk = chunk.as_ref();
+        let chunk_length = u64::try_from(chunk.len()).map_err(|_| ValidationError::Invalid {
+            field: "prerequisite_chunks",
+        })?;
+        length = length
+            .checked_add(chunk_length)
+            .ok_or(ValidationError::Invalid {
+                field: "prerequisite_chunks",
+            })?;
+        digest.update(chunk);
+    }
+
+    if identity.length != length {
+        return Err(ValidationError::LengthMismatch {
+            field: "prerequisite_chunks",
+        });
+    }
+    if identity.digest.hex != format!("{:x}", digest.finalize()) {
+        return Err(ValidationError::DigestMismatch {
+            field: "prerequisite_chunks",
+        });
+    }
+
+    Ok(VerifiedPrerequisiteV0 {
+        prerequisite_id,
+        identity: identity.clone(),
+    })
 }
 
 fn find_case<'a>(
@@ -763,20 +843,20 @@ fn bind_observed_prerequisites(
 
 fn authenticate_exact_prerequisites(
     case: &FixtureCaseV0,
-    prerequisite_bytes: &[PrerequisiteArtifactBytesV0<'_>],
+    verified_prerequisites: &[VerifiedPrerequisiteV0],
 ) -> Result<(), ValidationError> {
     let mut supplied = BTreeMap::new();
-    for artifact in prerequisite_bytes {
+    for artifact in verified_prerequisites {
         validate_safe_id(
-            "prerequisite_bytes.prerequisite_id",
-            artifact.prerequisite_id,
+            "verified_prerequisites.prerequisite_id",
+            artifact.prerequisite_id(),
         )?;
         if supplied
-            .insert(artifact.prerequisite_id, artifact.bytes)
+            .insert(artifact.prerequisite_id(), artifact.identity())
             .is_some()
         {
             return Err(ValidationError::Duplicate {
-                field: "prerequisite_bytes.prerequisite_id",
+                field: "verified_prerequisites.prerequisite_id",
             });
         }
     }
@@ -787,16 +867,20 @@ fn authenticate_exact_prerequisites(
         .collect::<Vec<_>>();
     if exact.len() != supplied.len() {
         return Err(ValidationError::Inconsistent {
-            field: "prerequisite_bytes",
+            field: "verified_prerequisites",
         });
     }
     for prerequisite in exact {
-        let bytes = supplied.get(prerequisite.prerequisite_id.as_str()).ok_or(
+        let identity = supplied.get(prerequisite.prerequisite_id.as_str()).ok_or(
             ValidationError::Inconsistent {
-                field: "prerequisite_bytes",
+                field: "verified_prerequisites",
             },
         )?;
-        verify_artifact_bytes("prerequisite_bytes", &prerequisite.identity, bytes)?;
+        if *identity != &prerequisite.identity {
+            return Err(ValidationError::Inconsistent {
+                field: "verified_prerequisites",
+            });
+        }
     }
     Ok(())
 }

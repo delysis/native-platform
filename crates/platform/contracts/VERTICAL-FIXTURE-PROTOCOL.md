@@ -15,11 +15,11 @@ the projection from production facts. This repository owns only:
 - byte identity and semantic validation;
 - exact before/after projection comparison.
 
-The validator receives bytes and observations from its caller. It cannot read a
-file, execute a replay recipe, open a network connection, inspect a platform,
-load a model, access a Keychain, or mint a capability or operation lease.
-Source review must prove that each product projection comes from the named
-production owner rather than fixture-owned shadow state.
+The validator receives byte chunks and observations from its caller. It cannot
+read a file, execute a replay recipe, open a network connection, inspect a
+platform, load a model, access a Keychain, or mint a capability or operation
+lease. Source review must prove that each product projection comes from the
+named production owner rather than fixture-owned shadow state.
 
 ## Freeze sequence
 
@@ -58,11 +58,16 @@ model bytes, exact Parakeet model and input-audio bytes, or an exact Apple
 installed-voice inventory. Every state case carries at least one exact
 state/schema identity, and its projection binds each declared baseline to the
 corresponding before-state and schema ID. An observation repeats every
-prerequisite kind and identity exactly. Baseline and candidate comparison also
-receive caller-supplied bytes for every `exact_external_artifact` prerequisite
-and authenticate them; platform-inventory and local-runtime prerequisites are
-bound by exact observed identity without pretending that this pure crate can
-inspect the platform.
+prerequisite kind and identity exactly. For every `exact_external_artifact`, a
+caller streams independently owned byte chunks through
+`verify_prerequisite_chunks`. The verifier hashes and counts chunks in order,
+retains no artifact bytes, and returns an opaque `VerifiedPrerequisiteV0` only
+when both SHA-256 and length match the declared identity. Baseline and candidate
+comparison consume a complete, exact-ID set of those tokens and reject missing,
+extra, duplicate, or mismatched mappings. This keeps multi-gigabyte model and
+audio artifacts out of contiguous memory. Platform-inventory and local-runtime
+prerequisites remain bound by exact observed identity without pretending that
+this pure crate can inspect the platform.
 
 ## Replay and equivalence
 
@@ -72,16 +77,17 @@ boundary. It is never a shell command. Environment values are absent, and
 secret- or credential-shaped names are rejected.
 
 `validate_baseline` requires the baseline source revision and production-tree
-digest, authenticates the expected projection bytes, and compares the observed
-projection exactly. `compare_candidate` permits a later implementation
-revision, but authenticates caller-supplied candidate production-tree bytes,
-binds their `GitSourceV0` revision and digest to the candidate observation,
-requires its repository ID to equal the baseline repository ID, and requires
-the same observable projection. The projection includes
-ordered events, durable-state effects, terminal and release facts, worker
-ownership, invariant-level output facts, and fail-closed facts. Volatile time,
-temporary paths, and nondeterministic prose or audio bytes do not belong in the
-projection.
+digest, a complete set of stream-verified exact prerequisites, authenticates
+the expected projection bytes, and compares the observed projection exactly.
+`compare_candidate` permits a later implementation revision, consumes the same
+kind of prerequisite tokens, authenticates caller-supplied candidate
+production-tree bytes, binds their `GitSourceV0` revision and digest to the
+candidate observation, requires its repository ID to equal the baseline
+repository ID, and requires the same observable projection. The projection
+includes ordered events, durable-state effects, terminal and release facts,
+worker ownership, invariant-level output facts, and fail-closed facts. Volatile
+time, temporary paths, and nondeterministic prose or audio bytes do not belong
+in the projection.
 
 Every event identity has exactly one lifecycle identity and vice versa;
 duplicate or contradictory lifecycle rows fail. Events and lifecycle facts may

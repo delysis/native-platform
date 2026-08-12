@@ -2,8 +2,8 @@ mod support;
 
 use platform_contracts_v0::TerminalClass;
 use platform_vertical_fixtures_v0::{
-    GitSourceV0, PrerequisiteArtifactBytesV0, StateDispositionV0, ValidationError, VerticalIdV0,
-    compare_candidate, sha256_identity, validate_baseline, validate_observation,
+    GitSourceV0, StateDispositionV0, ValidationError, VerticalIdV0, compare_candidate,
+    sha256_identity, validate_baseline, validate_observation, verify_prerequisite_chunks,
 };
 
 fn authenticated_candidate(
@@ -191,16 +191,21 @@ fn candidate_source_claim_is_authenticated_and_revision_bound() {
 }
 
 #[test]
-fn candidate_authenticates_exact_external_prerequisite_bytes() {
+fn candidate_consumes_stream_verified_exact_prerequisite() {
     let vertical_id = VerticalIdV0::CurrentExactQwen;
     let (manifest, expected) = support::manifest_and_projection(vertical_id);
     let (candidate, source, source_bytes) = authenticated_candidate(vertical_id);
     let stored = support::prerequisite_bytes(vertical_id);
-    let supplied = stored
+    let verified = stored
         .iter()
-        .map(|(prerequisite_id, bytes)| PrerequisiteArtifactBytesV0 {
-            prerequisite_id,
-            bytes,
+        .map(|(prerequisite_id, bytes)| {
+            let prerequisite = manifest.cases[0]
+                .prerequisites
+                .iter()
+                .find(|prerequisite| prerequisite.prerequisite_id == *prerequisite_id)
+                .expect("declared prerequisite");
+            verify_prerequisite_chunks(prerequisite_id, &prerequisite.identity, bytes.chunks(2))
+                .expect("streamed prerequisite")
         })
         .collect::<Vec<_>>();
     compare_candidate(
@@ -209,29 +214,21 @@ fn candidate_authenticates_exact_external_prerequisite_bytes() {
         &expected,
         &source,
         &source_bytes,
-        &supplied,
+        &verified,
         &candidate,
     )
-    .expect("candidate exact prerequisite bytes");
+    .expect("candidate exact streamed prerequisite");
 
     let mut substituted_bytes = stored[0].1.clone();
     substituted_bytes[0] ^= 1;
-    let substituted = [PrerequisiteArtifactBytesV0 {
-        prerequisite_id: stored[0].0.as_str(),
-        bytes: &substituted_bytes,
-    }];
     assert!(matches!(
-        compare_candidate(
-            &manifest,
-            "primary",
-            &expected,
-            &source,
-            &source_bytes,
-            &substituted,
-            &candidate,
+        verify_prerequisite_chunks(
+            stored[0].0.as_str(),
+            &manifest.cases[0].prerequisites[0].identity,
+            substituted_bytes.chunks(2),
         ),
         Err(ValidationError::DigestMismatch {
-            field: "prerequisite_bytes"
+            field: "prerequisite_chunks"
         })
     ));
 }

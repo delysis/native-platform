@@ -2,9 +2,9 @@ mod support;
 
 use platform_contracts_v0::ExecutionKind;
 use platform_vertical_fixtures_v0::{
-    NegativeEvidenceV0, NetworkBoundaryV0, PrerequisiteArtifactBytesV0, PrerequisiteKindV0,
-    PrerequisiteV0, ValidationError, VerticalFixtureManifestV0, VerticalIdV0, validate_baseline,
-    validate_manifest, validate_observation,
+    NegativeEvidenceV0, NetworkBoundaryV0, PrerequisiteKindV0, PrerequisiteV0, ValidationError,
+    VerticalFixtureManifestV0, VerticalIdV0, validate_baseline, validate_manifest,
+    validate_observation, verify_prerequisite_chunks,
 };
 
 #[test]
@@ -192,33 +192,75 @@ fn state_rows_require_and_bind_exact_state_identities() {
 }
 
 #[test]
-fn exact_external_prerequisite_bytes_and_observed_identity_are_bound() {
+fn exact_external_prerequisite_stream_and_observed_identity_are_bound() {
     let vertical_id = VerticalIdV0::CurrentExactQwen;
     let (manifest, expected) = support::manifest_and_projection(vertical_id);
     let observation = support::observation(vertical_id);
     let stored = support::prerequisite_bytes(vertical_id);
-    let supplied = stored
+    let verified = stored
         .iter()
-        .map(|(prerequisite_id, bytes)| PrerequisiteArtifactBytesV0 {
-            prerequisite_id,
-            bytes,
+        .map(|(prerequisite_id, bytes)| {
+            let prerequisite = manifest.cases[0]
+                .prerequisites
+                .iter()
+                .find(|prerequisite| prerequisite.prerequisite_id == *prerequisite_id)
+                .expect("declared prerequisite");
+            verify_prerequisite_chunks(prerequisite_id, &prerequisite.identity, bytes.chunks(3))
+                .expect("multi-chunk prerequisite identity")
         })
         .collect::<Vec<_>>();
-    validate_baseline(&manifest, "primary", &expected, &supplied, &observation)
-        .expect("exact Qwen prerequisite bytes");
+    assert_eq!(verified[0].prerequisite_id(), stored[0].0);
+    assert_eq!(verified[0].identity().length, stored[0].1.len() as u64);
+    validate_baseline(&manifest, "primary", &expected, &verified, &observation)
+        .expect("exact streamed Qwen prerequisite");
 
     let mut substituted_bytes = stored[0].1.clone();
     substituted_bytes[0] ^= 1;
-    let substituted = [PrerequisiteArtifactBytesV0 {
-        prerequisite_id: stored[0].0.as_str(),
-        bytes: &substituted_bytes,
-    }];
     assert!(matches!(
-        validate_baseline(&manifest, "primary", &expected, &substituted, &observation,),
+        verify_prerequisite_chunks(
+            stored[0].0.as_str(),
+            &manifest.cases[0].prerequisites[0].identity,
+            substituted_bytes.chunks(3),
+        ),
         Err(ValidationError::DigestMismatch {
-            field: "prerequisite_bytes"
+            field: "prerequisite_chunks"
         })
     ));
+
+    let mut wrong_length = manifest.cases[0].prerequisites[0].identity.clone();
+    wrong_length.length += 1;
+    assert_eq!(
+        verify_prerequisite_chunks(stored[0].0.as_str(), &wrong_length, stored[0].1.chunks(3),),
+        Err(ValidationError::LengthMismatch {
+            field: "prerequisite_chunks"
+        })
+    );
+
+    assert_eq!(
+        validate_baseline(&manifest, "primary", &expected, &[], &observation),
+        Err(ValidationError::Inconsistent {
+            field: "verified_prerequisites"
+        })
+    );
+
+    let extra = verify_prerequisite_chunks(
+        "model.extra.gguf",
+        &manifest.cases[0].prerequisites[0].identity,
+        stored[0].1.chunks(3),
+    )
+    .expect("independently verified but undeclared mapping");
+    assert_eq!(
+        validate_baseline(
+            &manifest,
+            "primary",
+            &expected,
+            &[verified[0].clone(), extra],
+            &observation,
+        ),
+        Err(ValidationError::Inconsistent {
+            field: "verified_prerequisites"
+        })
+    );
 
     let mut substituted_observation = observation;
     substituted_observation.observed_prerequisites[0].identity =
@@ -228,7 +270,7 @@ fn exact_external_prerequisite_bytes_and_observed_identity_are_bound() {
             &manifest,
             "primary",
             &expected,
-            &supplied,
+            &verified,
             &substituted_observation,
         ),
         Err(ValidationError::Inconsistent {
@@ -243,7 +285,7 @@ fn exact_external_prerequisite_bytes_and_observed_identity_are_bound() {
             &manifest,
             "primary",
             &expected,
-            &supplied,
+            &verified,
             &substituted_kind,
         ),
         Err(ValidationError::Inconsistent {

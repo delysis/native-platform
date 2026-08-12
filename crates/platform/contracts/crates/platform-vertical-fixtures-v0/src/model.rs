@@ -287,15 +287,6 @@ pub struct ObservationEnvelopeV0 {
     pub projection: EquivalenceProjectionV0,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Caller-owned bytes for one exact-external prerequisite.
-pub struct PrerequisiteArtifactBytesV0<'a> {
-    /// Matches [`PrerequisiteV0::prerequisite_id`] in the selected case.
-    pub prerequisite_id: &'a str,
-    /// Bytes authenticated against the manifest identity; never retained.
-    pub bytes: &'a [u8],
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerticalFixtureLockEntryV0 {
