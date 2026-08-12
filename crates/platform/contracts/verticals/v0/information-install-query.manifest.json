@@ -1,0 +1,19 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "information_install_query",
+  "class": "model_free",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [{
+    "case_id": "information.install-query.production-path.v0",
+    "source": {"repository_id":"delysis/information-native-kit","commit":"750e27e5ad27b6040e7ab7b66f7a2acb910b613a","production_tree":{"id":"information.production.source_roots.750e27e","digest":{"algorithm":"sha256","hex":"e2eca746d04228ee806344d7c40c43723777b3c2ea4ffbe7056c554dbfe08a62"},"length":808}},
+    "inputs": [
+      {"identity":{"id":"information.fixture.sql","digest":{"algorithm":"sha256","hex":"9b8a4f565014cbd04ee823076fce156330fb78ae81d605c9252dabb38e39255d"},"length":2330},"availability":"checked_in","relative_path":"tests/fixtures/w1/v0/information-alexandria.sql"},
+      {"identity":{"id":"information.database","digest":{"algorithm":"sha256","hex":"e1509f8508a2923866f146e907af850ace03286fea37ff5d2dbb9c6254bbc56e"},"length":57344},"availability":"generated_fixture","relative_path":null}
+    ],
+    "state_identities": [], "prerequisites": [],
+    "replay": [{"program":{"kind":"cargo"},"argv":["test","--locked","-p","information-native-host","--features","unstable-w1-vertical-tests","--test","w1_vertical","information_install_query_replays_through_production_paths","--","--exact"],"required_environment":[],"network":"denied"}],
+    "expected_projection":{"id":"information.install_query.projection","digest":{"algorithm":"sha256","hex":"01c194bfcf0a22efaf3f4072e83fdc3635df47f0e072c15336ae6ba4fd7045a3"},"length":2117}
+  }],
+  "omitted_claims":["No live network acquisition or credential is exercised.","Removal execution is not claimed; the production API intentionally exposes confirmation-gated removal planning."],
+  "negative_evidence":[]
+}

@@ -1,0 +1,102 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "fte_legacy_database",
+  "class": "state",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [
+    {
+      "case_id": "legacy_database.explicitly_unsupported",
+      "source": {
+        "repository_id": "delysis/free-token-energy",
+        "commit": "797500060047ccd10f9810fb4d5c8f374e00eb08",
+        "production_tree": {
+          "id": "fte.database.production.source.d022e36",
+          "digest": {
+            "algorithm": "sha256",
+              "hex": "c7fc514cd6509881008ec0d99bc09f083a12f5a0a08e511554e8230338d55900"
+          },
+            "length": 816
+        }
+      },
+      "inputs": [
+        {
+          "identity": {
+            "id": "fte.database.policy.v1",
+            "digest": {
+              "algorithm": "sha256",
+              "hex": "49e1517e829213c7ab7ca70a2a60410068ed00c123d90b4f094d28a10957ec92"
+            },
+            "length": 1504
+          },
+          "availability": "checked_in",
+          "relative_path": "tests/fixtures/w1/v0/fte-database-policy-v1.json"
+        }
+      ],
+      "state_identities": [
+        {
+          "state_id": "fte.database.legacy_sentinel_schema",
+          "schema_id": "delysis.w1.fte.unsupported_legacy_sentinel.v1",
+          "baseline": {
+            "identity": {
+              "id": "fte.database.legacy_sentinel.schema",
+              "digest": {
+                "algorithm": "sha256",
+                "hex": "29b7260ef39614322b8cfc3464c761122b8558974e1807aae6a014c0c06e4113"
+              },
+              "length": 78
+            },
+            "availability": "generated_fixture",
+            "relative_path": null
+          }
+        }
+      ],
+      "prerequisites": [],
+      "replay": [
+        {
+          "program": { "kind": "cargo" },
+          "argv": [
+            "test",
+            "--locked",
+            "-p",
+            "free-token-energy",
+            "--features",
+            "unstable-w1-vertical-tests",
+            "--lib",
+            "db::w1_tests::w1_legacy_database_is_explicitly_unsupported"
+          ],
+          "required_environment": [],
+          "network": "denied"
+        }
+      ],
+      "expected_projection": {
+        "id": "fte.database.rejection.expected_projection",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "846b0d8e11a1408f0094b2b277d582591e2c0a315e9f22b11b40aa5cb795bb3b"
+        },
+        "length": 2946
+      }
+    }
+  ],
+  "omitted_claims": [
+    "legacy database migration equivalence",
+    "historical gateway.db or gateway-v2.db compatibility",
+    "legacy plaintext credential import",
+    "Keychain migration from a prior release database"
+  ],
+  "negative_evidence": [
+    {
+      "evidence_id": "r7.synthetic_legacy_keychain_acceptance",
+      "disposition": "superseded",
+      "artifact": {
+        "id": "fte.receipt.r7.os_credential_acceptance",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "71b5afcba38a8ccefda2e1fcd154807e9240be762151bd055b872dfea333c5d4"
+        },
+        "length": 2068
+      },
+      "reason": "the receipt exercised a synthetic legacy row and real Keychain readback, not an independently produced prior-release database"
+    }
+  ]
+}
