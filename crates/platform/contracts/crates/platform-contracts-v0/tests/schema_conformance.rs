@@ -36,7 +36,7 @@ const SCHEMAS: [(&str, &str); 7] = [
     ),
 ];
 
-const FIXTURES: [(&str, &str, &str); 14] = [
+const FIXTURES: [(&str, &str, &str); 15] = [
     (
         "capability-known.json",
         "capability.schema.json",
@@ -61,6 +61,11 @@ const FIXTURES: [(&str, &str, &str); 14] = [
         "publication-durability-unknown.json",
         "publication.schema.json",
         include_str!("../../../fixtures/v0/publication-durability-unknown.json"),
+    ),
+    (
+        "publication-visible-file-sync-unknown.json",
+        "publication.schema.json",
+        include_str!("../../../fixtures/v0/publication-visible-file-sync-unknown.json"),
     ),
     (
         "publication-not-published.json",
@@ -252,12 +257,17 @@ fn schemas_reject_critical_semantic_violations() {
     );
 
     let publication = schemas.validator("publication.schema.json");
-    let mut durability_without_file_sync = fixture("publication-durability-unknown.json");
-    durability_without_file_sync["receipt"]["file_synced"] = Value::Bool(false);
+    let durability_without_file_sync = fixture("publication-visible-file-sync-unknown.json");
+    assert!(
+        publication.is_valid(&durability_without_file_sync),
+        "visible exact bytes with failed file sync are a valid durability-unknown outcome"
+    );
+    let mut durability_with_directory_sync = durability_without_file_sync;
+    durability_with_directory_sync["receipt"]["directory_synced"] = Value::Bool(true);
     assert_rejected(
         &publication,
-        &durability_without_file_sync,
-        "visible publication without file synchronization",
+        &durability_with_directory_sync,
+        "directory sync cannot be true when file sync is unknown",
     );
     let mut durability_with_wrong_error = fixture("publication-durability-unknown.json");
     durability_with_wrong_error["error"]["class"] = Value::String("storage".to_owned());

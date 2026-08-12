@@ -42,10 +42,12 @@ const SHUTDOWN_MULTIPLE_FAILURES: Golden = golden!("shutdown-multiple-failures.j
 const PUBLICATION_NOT_PUBLISHED: Golden = golden!("publication-not-published.json");
 const PUBLICATION_PUBLISHED: Golden = golden!("publication-published.json");
 const PUBLICATION_DURABILITY_UNKNOWN: Golden = golden!("publication-durability-unknown.json");
+const PUBLICATION_VISIBLE_FILE_SYNC_UNKNOWN: Golden =
+    golden!("publication-visible-file-sync-unknown.json");
 const PRIVACY_POLICY_LOCAL_ONLY: Golden = golden!("privacy-policy-local-only.json");
 const PRIVACY_POLICY_HOSTED_EXPLICIT: Golden = golden!("privacy-policy-hosted-explicit.json");
 
-const ALL_GOLDENS: [Golden; 14] = [
+const ALL_GOLDENS: [Golden; 15] = [
     CAPABILITY_KNOWN,
     CAPABILITY_UNKNOWN,
     EVIDENCE_OPERATIONAL,
@@ -53,6 +55,7 @@ const ALL_GOLDENS: [Golden; 14] = [
     PRIVACY_POLICY_HOSTED_EXPLICIT,
     PRIVACY_POLICY_LOCAL_ONLY,
     PUBLICATION_DURABILITY_UNKNOWN,
+    PUBLICATION_VISIBLE_FILE_SYNC_UNKNOWN,
     PUBLICATION_NOT_PUBLISHED,
     PUBLICATION_PUBLISHED,
     SERVICE_ERROR,
@@ -209,11 +212,26 @@ fn publication_goldens_match_the_wire_contract() {
         PUBLICATION_NOT_PUBLISHED,
         PUBLICATION_PUBLISHED,
         PUBLICATION_DURABILITY_UNKNOWN,
+        PUBLICATION_VISIBLE_FILE_SYNC_UNKNOWN,
     ] {
         deserialize_validate_round_trip::<PublicationOutcomeV0>(golden, |value| {
             value.validate().expect("publication outcome must validate");
         });
     }
+
+    let visible_file_sync_unknown = deserialize_validate_round_trip::<PublicationOutcomeV0>(
+        PUBLICATION_VISIBLE_FILE_SYNC_UNKNOWN,
+        |value| value.validate().expect("publication outcome must validate"),
+    );
+    let PublicationOutcomeV0::PublishedDurabilityUnknown { receipt, .. } =
+        visible_file_sync_unknown
+    else {
+        panic!("file-sync fixture must be a durability-unknown publication");
+    };
+    assert!(receipt.visible);
+    assert!(!receipt.file_synced);
+    assert!(!receipt.directory_synced);
+    assert!(receipt.idempotent_recovery);
 }
 
 #[test]

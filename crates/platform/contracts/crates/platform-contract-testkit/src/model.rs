@@ -72,6 +72,7 @@ pub struct ClosedFacts {
     pub lifecycle: LifecyclePhase,
     pub active_operations: usize,
     pub retained_tasks: usize,
+    pub expected_workers: usize,
     pub joined_workers: usize,
 }
 
@@ -426,6 +427,10 @@ impl OperationModelAdapter for ReferenceAdapter {
             lifecycle: state.lifecycle,
             active_operations: state.active.len(),
             retained_tasks: state.retained_tasks,
+            expected_workers: state
+                .joined_workers
+                .checked_add(state.retained_tasks)
+                .expect("test expected-worker count exhausted"),
             joined_workers: state.joined_workers,
         }
     }

@@ -211,7 +211,7 @@ impl PublicationOutcomeV0 {
             Self::PublishedDurabilityUnknown { receipt, error } => {
                 receipt.validate()?;
                 error.validate()?;
-                if !receipt.file_synced || receipt.directory_synced {
+                if receipt.directory_synced {
                     return Err(ContractError::Inconsistent {
                         field: "published_durability_unknown.receipt",
                     });
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn durability_unknown_requires_visible_file_synced_unsynced_directory() {
+    fn durability_unknown_requires_visible_unsynced_directory() {
         assert!(
             PublicationOutcomeV0::PublishedDurabilityUnknown {
                 receipt: receipt(true, false),
@@ -307,7 +307,7 @@ mod tests {
                 error: publication_error(),
             }
             .validate()
-            .is_err()
+            .is_ok()
         );
 
         let mut invisible = receipt(true, false);
