@@ -1221,6 +1221,7 @@ fn execute_disabled_baseline(
         BatchSupervision {
             event_tx,
             retained_events: Some(retained_events),
+            retain_token_piece_traces: false,
             unrecorded_control_used: None,
             runtime_sample_trace: Some(&mut runtime_sample_trace),
             cancellations,
@@ -3503,6 +3504,10 @@ mod tests {
         let execution = GeneratedBatchExecution {
             outputs: vec![output],
             terminal_sampled_token_ids: vec![None],
+            token_piece_traces: vec![TokenPieceTrace {
+                raw_piece_bytes: vec![b'x'],
+                cumulative_boundaries: vec![0, 1],
+            }],
         };
         assert!(
             join_baseline_runtime_trace(&execution, &[], &mut RuntimeControlLedger::new(&request))
