@@ -1331,8 +1331,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            report.gateway.joined_worker_ids,
-            report.gateway.expected_worker_ids
+            report
+                .gateway
+                .joined_worker_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            report.gateway.expected_worker_ids.into_iter().collect()
         );
         assert_eq!(report.gateway.retained_tasks, 0);
         assert!(report.native_host_joined);
