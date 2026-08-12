@@ -57,6 +57,12 @@ const MAX_PROBE_BYTES: usize = 64 * 1024;
 const MAX_PRIVATE_WORKSPACE_ENTRIES: usize = 2;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 64 * 1024;
 const MAX_EFFECTIVE_ENVIRONMENT_BYTES: usize = 256 * 1024;
+#[cfg(target_os = "linux")]
+const EXECUTABLE_BUSY_OS_ERROR: i32 = 26;
+#[cfg(target_os = "linux")]
+const EXECUTABLE_BUSY_RETRIES: usize = 8;
+#[cfg(target_os = "linux")]
+const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 const PACKET_DOMAIN: &[u8] = b"loom/codex-frontier-critic-packet/v2\0";
 const RECEIPT_DOMAIN: &[u8] = b"loom/codex-frontier-critic-diagnostic-receipt/v2\0";
@@ -698,7 +704,7 @@ fn run_exact_frontier_critic(
     environment.apply(&mut command);
     configure_process_group(&mut command);
     let process_started = Instant::now();
-    let child = command.spawn().map_err(FrontierCriticError::Spawn)?;
+    let child = spawn_reviewed_command(&mut command)?;
     let output = capture_child(
         child,
         Some(&packet.prompt_utf8),
@@ -982,7 +988,7 @@ fn run_probe(
     environment.apply(&mut command);
     configure_process_group(&mut command);
     let process_started = Instant::now();
-    let child = command.spawn().map_err(FrontierCriticError::Spawn)?;
+    let child = spawn_reviewed_command(&mut command)?;
     let output = capture_child(
         child,
         None,
@@ -1150,6 +1156,29 @@ fn configure_process_group(command: &mut Command) {
 
 #[cfg(not(unix))]
 fn configure_process_group(_: &mut Command) {}
+
+fn spawn_reviewed_command(command: &mut Command) -> Result<Child, FrontierCriticError> {
+    #[cfg(target_os = "linux")]
+    {
+        for retry in 0..=EXECUTABLE_BUSY_RETRIES {
+            match command.spawn() {
+                Ok(child) => return Ok(child),
+                Err(error)
+                    if error.raw_os_error() == Some(EXECUTABLE_BUSY_OS_ERROR)
+                        && retry < EXECUTABLE_BUSY_RETRIES =>
+                {
+                    thread::sleep(EXECUTABLE_BUSY_RETRY_DELAY);
+                }
+                Err(error) => return Err(FrontierCriticError::Spawn(error)),
+            }
+        }
+        unreachable!("the bounded executable-busy retry loop always returns")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        command.spawn().map_err(FrontierCriticError::Spawn)
+    }
+}
 
 fn terminate_process_group(child: &mut Child) -> Result<(), FrontierCriticError> {
     #[cfg(unix)]
@@ -1997,6 +2026,38 @@ done
 "#
         )
         .into_bytes()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transient_executable_busy_is_retried_without_hiding_persistent_spawn_errors() {
+        let directory = TempDir::new().expect("tempdir");
+        let cli = directory.path().join("briefly-busy-cli");
+        fs::write(&cli, b"#!/bin/sh\nexit 0\n").expect("script");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).expect("executable");
+        let writable = OpenOptions::new()
+            .write(true)
+            .open(&cli)
+            .expect("hold executable writable");
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            drop(writable);
+        });
+
+        let mut command = Command::new(&cli);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_reviewed_command(&mut command).expect("retry transient ETXTBSY");
+        assert!(child.wait().expect("wait for retried child").success());
+        release.join().expect("release writer");
+
+        let mut missing = Command::new(directory.path().join("absent-cli"));
+        assert!(matches!(
+            spawn_reviewed_command(&mut missing),
+            Err(FrontierCriticError::Spawn(_))
+        ));
     }
 
     #[test]

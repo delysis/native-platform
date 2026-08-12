@@ -47,8 +47,14 @@ jobs:
       - name: Test canonical Loom vertical baselines
         run: cargo test --locked -p loom-store --all-targets --features unstable-w1-vertical-tests
 
+      - name: Authenticate exact Gemma vertical baseline
+        run: cargo test --locked -p loom-backend-llama --features unstable-w1-vertical-tests --test w1_current_exact_gemma
+
       - name: Lint canonical Loom vertical baselines
         run: cargo clippy --locked -p loom-store --all-targets --features unstable-w1-vertical-tests -- -D warnings
+
+      - name: Lint exact Gemma vertical baseline
+        run: cargo clippy --locked -p loom-backend-llama --features unstable-w1-vertical-tests --test w1_current_exact_gemma -- -D warnings
 
       - name: Lint Loom lifecycle owners and adapters
         run: cargo clippy --locked -p loom-host -p tauri-plugin-loom --features tauri-plugin-loom/unstable-w1-contract-tests --all-targets -- -D warnings

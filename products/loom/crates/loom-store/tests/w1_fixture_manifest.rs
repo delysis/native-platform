@@ -66,6 +66,18 @@ fn fixture_bytes(relative_path: &str) -> &'static [u8] {
 
 fn evidence_bytes(relative_path: &str) -> &'static [u8] {
     match relative_path {
+        "gemma-current-input-v0.json" => {
+            include_bytes!("../../../fixtures/w1/gemma-current-input-v0.json")
+        }
+        "gemma-current-manifest-v0.json" => {
+            include_bytes!("../../../fixtures/w1/gemma-current-manifest-v0.json")
+        }
+        "gemma-current-projection-v0.json" => {
+            include_bytes!("../../../fixtures/w1/gemma-current-projection-v0.json")
+        }
+        "gemma-current-source-tree-v0.txt" => {
+            include_bytes!("../../../fixtures/w1/gemma-current-source-tree-v0.txt")
+        }
         "loom-prior-store-v10-v1.json" => fixture_bytes("fixtures/w1/loom-prior-store-v10-v1.json"),
         "loom-research-authority-v1.json" => {
             fixture_bytes("fixtures/w1/loom-research-authority-v1.json")
