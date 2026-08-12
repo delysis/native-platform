@@ -63,6 +63,28 @@ the half-open byte range and source attestation for every source contact,
 including an interrupted contact or one superseded by a restart. Activation is
 a same-filesystem rename inside the managed root.
 
+Verified-byte publication has an explicit commit receipt. A fresh artifact is
+file-synced before its no-clobber publication and the parent directory is
+synced afterward. If that final sync fails, the acquire error carries a
+`PublicationReceipt` and reports `PublishedDurabilityUnknown`; it is never
+collapsed into an ordinary I/O failure. Resume-sidecar creation and replacement
+use the same rule, and a durable artifact is committed only when its complete
+staging bytes are synced before sidecar removal. An exact retry reopens without
+following aliases, checks the complete length and SHA-256, syncs again, and
+returns a receipt marked `idempotent_recovery`; a conflicting destination is
+left untouched and fails closed. Recovery records `PreexistingStage` rather
+than inventing a source contact that did not occur during the retry.
+
+Managed-store publication uses the same rule. Package activation records
+whether the destination `packages` directory and the source-removal `staging`
+directory were synced after the rename. Ready, non-ready, and external registry
+events are file-synced before rename and directory-synced afterward. A
+post-rename sync failure returns `StoreError::CommittedDurabilityUnknown` with
+the visible destination and exact sync facts. Retrying activation re-hashes the
+complete package, rejects a conflicting plan or changed artifact, re-syncs both
+rename parents and the existing ready-event directory, and returns the one
+existing ready receipt without appending a duplicate revision.
+
 The resumability boundary is explicit. A completed staged artifact is rehashed
 and reused after interruption, and its acquisition record is persisted in the
 staging package as an immutable per-artifact journal entry; `stage.json` is

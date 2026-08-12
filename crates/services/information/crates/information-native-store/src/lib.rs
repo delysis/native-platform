@@ -55,6 +55,12 @@ pub enum StoreError {
         #[source]
         source: io::Error,
     },
+    #[error("managed state is visible, but its directory durability is unknown: {source}")]
+    CommittedDurabilityUnknown {
+        receipt: StoreCommitReceipt,
+        #[source]
+        source: io::Error,
+    },
     #[error("could not encode or decode {context}: {source}")]
     Json {
         context: &'static str,
@@ -123,6 +129,29 @@ impl StoreError {
             source,
         }
     }
+}
+
+/// The managed-store boundary that made authoritative state visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreCommitKind {
+    PackageActivation,
+    ReadyReceipt,
+    NonReadyReceipt,
+    ExternalRegistration,
+}
+
+/// Evidence retained when a rename completed but a following directory sync did not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreCommitReceipt {
+    pub installation_id: InstallationId,
+    pub kind: StoreCommitKind,
+    pub destination: PathBuf,
+    pub visible: bool,
+    pub destination_directory_synced: bool,
+    pub source_absent: Option<bool>,
+    pub source_directory_synced: Option<bool>,
+    pub idempotent_recovery: bool,
 }
 
 /// Transfer facts supplied by the acquisition authority. Logical payload bytes
@@ -321,6 +350,13 @@ struct RegistryEvent<T> {
     revision: u64,
     recorded_at: DateTime<Utc>,
     value: T,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitSyncBoundary {
+    PackageDestination,
+    PackageSource,
+    RegistryEvent,
 }
 
 trait RegistryRecord {
@@ -523,10 +559,22 @@ impl ManagedStore {
         plan: &InstallPlan,
         transfer: TransferSummary,
     ) -> Result<InstallReceipt, StoreError> {
+        self.activate_with_commit_sync(plan, transfer, |_boundary, path| sync_directory_io(path))
+    }
+
+    fn activate_with_commit_sync<F>(
+        &self,
+        plan: &InstallPlan,
+        transfer: TransferSummary,
+        mut sync_commit_directory: F,
+    ) -> Result<InstallReceipt, StoreError>
+    where
+        F: FnMut(CommitSyncBoundary, &Path) -> io::Result<()>,
+    {
         validate_store_plan(plan)?;
         let _lock = self.try_lock()?;
         self.ensure_layout()?;
-        self.activate_locked(plan, transfer)
+        self.activate_locked(plan, transfer, &mut sync_commit_directory)
     }
 
     /// Finish the narrow crash window in which a verified staging directory
@@ -560,18 +608,47 @@ impl ManagedStore {
                 started_at,
                 acquisitions: Vec::new(),
             },
+            &mut |_boundary, path| sync_directory_io(path),
         )
         .map(Some)
     }
 
-    fn activate_locked(
+    fn activate_locked<F>(
         &self,
         plan: &InstallPlan,
         transfer: TransferSummary,
-    ) -> Result<InstallReceipt, StoreError> {
+        sync_commit_directory: &mut F,
+    ) -> Result<InstallReceipt, StoreError>
+    where
+        F: FnMut(CommitSyncBoundary, &Path) -> io::Result<()>,
+    {
         if let Some(receipt) = self.read_managed_receipt(&plan.installation_id)? {
             if receipt.state == InstallationState::Ready {
                 ensure_receipt_matches_plan(&receipt, plan)?;
+                let key = installation_key(&plan.installation_id)?;
+                let package = self.packages_root().join(&key);
+                verify_package_directory(&package, plan)?;
+                self.sync_activated_package(plan, &package, true, sync_commit_directory)?;
+                let entry = self.installations_registry_root().join(key);
+                let (_, event_path) = latest_revision_path(&entry)?.ok_or_else(|| {
+                    StoreError::RegistryCorrupt(format!(
+                        "ready installation {} has no registry event",
+                        plan.installation_id
+                    ))
+                })?;
+                if let Err(source) =
+                    sync_commit_directory(CommitSyncBoundary::RegistryEvent, &entry)
+                {
+                    return Err(StoreError::CommittedDurabilityUnknown {
+                        receipt: registry_commit_receipt(
+                            &plan.installation_id,
+                            StoreCommitKind::ReadyReceipt,
+                            event_path,
+                            true,
+                        ),
+                        source,
+                    });
+                }
                 return Ok(receipt);
             }
             ensure_non_ready_receipt_matches_plan(&receipt, plan)?;
@@ -590,21 +667,22 @@ impl ManagedStore {
         let package = self.packages_root().join(&key);
         let stage_exists = path_exists(&stage)?;
         let package_exists = path_exists(&package)?;
-        match (stage_exists, package_exists) {
+        let verified = match (stage_exists, package_exists) {
             (true, false) => {
                 for acquisition in &transfer.acquisitions {
                     record_staged_acquisition_locked(plan, acquisition, &stage)?;
                 }
-                verify_package_directory(&stage, plan)?;
+                let verified = verify_package_directory(&stage, plan)?;
                 fs::rename(&stage, &package)
                     .map_err(|error| StoreError::io("activate staged package", &package, error))?;
-                // Persist the destination before the source removal. If the
-                // second sync is interrupted, recovery may see both names but
-                // must never prefer a durable state with neither name.
-                sync_directory(&self.packages_root())?;
-                sync_directory(&self.staging_root())?;
+                self.sync_activated_package(plan, &package, false, sync_commit_directory)?;
+                verified
             }
-            (false, true) => {}
+            (false, true) => {
+                let verified = verify_package_directory(&package, plan)?;
+                self.sync_activated_package(plan, &package, true, sync_commit_directory)?;
+                verified
+            }
             (false, false) => {
                 return Err(StoreError::StageNotFound(plan.installation_id.clone()));
             }
@@ -614,9 +692,8 @@ impl ManagedStore {
                     plan.installation_id
                 )));
             }
-        }
+        };
 
-        let verified = verify_package_directory(&package, plan)?;
         let manifest_acquisitions = read_staging_manifest(&package)?.acquisitions;
         let acquisitions = if manifest_acquisitions.is_empty() {
             transfer.acquisitions
@@ -674,8 +751,50 @@ impl ManagedStore {
             failure: None,
         };
         receipt.validate()?;
-        self.append_managed_event(&receipt)?;
+        self.append_ready_event(&receipt, sync_commit_directory)?;
         Ok(receipt)
+    }
+
+    fn sync_activated_package<F>(
+        &self,
+        plan: &InstallPlan,
+        package: &Path,
+        idempotent_recovery: bool,
+        sync_commit_directory: &mut F,
+    ) -> Result<(), StoreError>
+    where
+        F: FnMut(CommitSyncBoundary, &Path) -> io::Result<()>,
+    {
+        let packages_root = self.packages_root();
+        if let Err(source) =
+            sync_commit_directory(CommitSyncBoundary::PackageDestination, &packages_root)
+        {
+            return Err(StoreError::CommittedDurabilityUnknown {
+                receipt: package_commit_receipt(
+                    &plan.installation_id,
+                    package,
+                    false,
+                    false,
+                    idempotent_recovery,
+                ),
+                source,
+            });
+        }
+        let staging_root = self.staging_root();
+        if let Err(source) = sync_commit_directory(CommitSyncBoundary::PackageSource, &staging_root)
+        {
+            return Err(StoreError::CommittedDurabilityUnknown {
+                receipt: package_commit_receipt(
+                    &plan.installation_id,
+                    package,
+                    true,
+                    false,
+                    idempotent_recovery,
+                ),
+                source,
+            });
+        }
+        Ok(())
     }
 
     /// Persist an inspectable failed or cancelled receipt without making an
@@ -1184,6 +1303,26 @@ impl ManagedStore {
             &receipt.installation_id,
             receipt,
             "managed installation receipt",
+            StoreCommitKind::NonReadyReceipt,
+        )
+    }
+
+    fn append_ready_event<F>(
+        &self,
+        receipt: &InstallReceipt,
+        sync_commit_directory: &mut F,
+    ) -> Result<(), StoreError>
+    where
+        F: FnMut(CommitSyncBoundary, &Path) -> io::Result<()>,
+    {
+        self.append_registry_event_with_sync(
+            &self.installations_registry_root(),
+            &receipt.installation_id,
+            receipt,
+            "managed installation receipt",
+            StoreCommitKind::ReadyReceipt,
+            false,
+            sync_commit_directory,
         )
     }
 
@@ -1193,6 +1332,7 @@ impl ManagedStore {
             &registration.installation_id,
             registration,
             "external registration",
+            StoreCommitKind::ExternalRegistration,
         )
     }
 
@@ -1202,7 +1342,33 @@ impl ManagedStore {
         installation_id: &InstallationId,
         value: &T,
         context: &'static str,
+        kind: StoreCommitKind,
     ) -> Result<(), StoreError> {
+        self.append_registry_event_with_sync(
+            category_root,
+            installation_id,
+            value,
+            context,
+            kind,
+            false,
+            &mut |_boundary, path| sync_directory_io(path),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_registry_event_with_sync<T: Serialize, F>(
+        &self,
+        category_root: &Path,
+        installation_id: &InstallationId,
+        value: &T,
+        context: &'static str,
+        kind: StoreCommitKind,
+        idempotent_recovery: bool,
+        sync_commit_directory: &mut F,
+    ) -> Result<(), StoreError>
+    where
+        F: FnMut(CommitSyncBoundary, &Path) -> io::Result<()>,
+    {
         let entry = category_root.join(installation_key(installation_id)?);
         if !path_exists(&entry)? {
             create_private_dir(&entry)?;
@@ -1223,7 +1389,18 @@ impl ManagedStore {
         fs::rename(&temporary, &final_path)
             .map_err(|error| StoreError::io("publish registry event", &final_path, error))?;
         temporary_guard.disarm();
-        sync_directory(&entry)
+        if let Err(source) = sync_commit_directory(CommitSyncBoundary::RegistryEvent, &entry) {
+            return Err(StoreError::CommittedDurabilityUnknown {
+                receipt: registry_commit_receipt(
+                    installation_id,
+                    kind,
+                    final_path,
+                    idempotent_recovery,
+                ),
+                source,
+            });
+        }
+        Ok(())
     }
 
     fn read_managed_receipt(
@@ -2145,6 +2322,43 @@ fn ensure_non_ready_receipt_matches_plan(
     Ok(())
 }
 
+fn package_commit_receipt(
+    installation_id: &InstallationId,
+    destination: &Path,
+    destination_directory_synced: bool,
+    source_directory_synced: bool,
+    idempotent_recovery: bool,
+) -> StoreCommitReceipt {
+    StoreCommitReceipt {
+        installation_id: installation_id.clone(),
+        kind: StoreCommitKind::PackageActivation,
+        destination: destination.to_path_buf(),
+        visible: true,
+        destination_directory_synced,
+        source_absent: Some(true),
+        source_directory_synced: Some(source_directory_synced),
+        idempotent_recovery,
+    }
+}
+
+fn registry_commit_receipt(
+    installation_id: &InstallationId,
+    kind: StoreCommitKind,
+    destination: PathBuf,
+    idempotent_recovery: bool,
+) -> StoreCommitReceipt {
+    StoreCommitReceipt {
+        installation_id: installation_id.clone(),
+        kind,
+        destination,
+        visible: true,
+        destination_directory_synced: false,
+        source_absent: None,
+        source_directory_synced: None,
+        idempotent_recovery,
+    }
+}
+
 fn ensure_exact_directory_entries(directory: &Path, expected: &[&str]) -> Result<(), StoreError> {
     let expected = expected.iter().copied().collect::<BTreeSet<_>>();
     let mut observed = BTreeSet::new();
@@ -2525,15 +2739,21 @@ fn ensure_real_directory(path: &Path) -> Result<(), StoreError> {
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), StoreError> {
-    let directory =
-        File::open(path).map_err(|error| StoreError::io("open directory for sync", path, error))?;
-    directory
-        .sync_all()
-        .map_err(|error| StoreError::io("sync directory", path, error))
+    sync_directory_io(path).map_err(|error| StoreError::io("sync directory", path, error))
+}
+
+#[cfg(unix)]
+fn sync_directory_io(path: &Path) -> io::Result<()> {
+    File::open(path).and_then(|directory| directory.sync_all())
 }
 
 #[cfg(not(unix))]
 fn sync_directory(_path: &Path) -> Result<(), StoreError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory_io(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -2776,6 +2996,205 @@ mod tests {
         assert_eq!(receipt.state, InstallationState::Ready);
         assert!(store.list_partial_installs()?.is_empty());
         assert_eq!(store.list()?.managed, vec![receipt]);
+        Ok(())
+    }
+
+    #[test]
+    fn activation_sync_failure_reports_visible_state_and_exact_retry() -> Result<(), Box<dyn Error>>
+    {
+        let temporary = TempDir::new()?;
+        let store = ManagedStore::open(temporary.path().join("store"))?;
+        let payload = b"activation durability";
+        let plan = plan_with_bytes(payload)?;
+        let prepared = store.prepare_install(&plan)?;
+        write_staged(&prepared, payload)?;
+        let transfer = TransferSummary::for_plan(&plan, prepared.prepared_at, false);
+        let mut injected = false;
+
+        let result = store.activate_with_commit_sync(&plan, transfer.clone(), |boundary, path| {
+            if boundary == CommitSyncBoundary::PackageDestination && !injected {
+                injected = true;
+                Err(io::Error::other("injected package-directory sync failure"))
+            } else {
+                sync_directory_io(path)
+            }
+        });
+        let receipt = match result {
+            Err(StoreError::CommittedDurabilityUnknown { receipt, .. }) => receipt,
+            other => {
+                return Err(io::Error::other(format!(
+                    "expected committed/durability-unknown activation: {other:?}"
+                ))
+                .into());
+            }
+        };
+        assert_eq!(receipt.kind, StoreCommitKind::PackageActivation);
+        assert_eq!(receipt.installation_id, plan.installation_id);
+        assert!(receipt.visible);
+        assert!(!receipt.destination_directory_synced);
+        assert_eq!(receipt.source_absent, Some(true));
+        assert_eq!(receipt.source_directory_synced, Some(false));
+        assert!(!receipt.idempotent_recovery);
+        assert!(receipt.destination.exists());
+        assert!(!prepared.directory.exists());
+        assert!(store.list()?.managed.is_empty());
+
+        let artifact = receipt.destination.join("artifacts/library.sqlite");
+        fs::write(&artifact, vec![b'x'; payload.len()])?;
+        assert!(matches!(
+            store.activate(&plan, transfer.clone()),
+            Err(StoreError::ArtifactDigestMismatch { .. })
+        ));
+        fs::write(&artifact, payload)?;
+
+        let mut recovery_injected = false;
+        let repeated =
+            store.activate_with_commit_sync(&plan, transfer.clone(), |boundary, path| {
+                if boundary == CommitSyncBoundary::PackageDestination && !recovery_injected {
+                    recovery_injected = true;
+                    Err(io::Error::other("injected recovery sync failure"))
+                } else {
+                    sync_directory_io(path)
+                }
+            });
+        match repeated {
+            Err(StoreError::CommittedDurabilityUnknown { receipt, .. }) => {
+                assert_eq!(receipt.kind, StoreCommitKind::PackageActivation);
+                assert!(receipt.idempotent_recovery);
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "expected repeated durability-unknown activation: {other:?}"
+                ))
+                .into());
+            }
+        }
+
+        let recovered = store.activate(&plan, transfer)?;
+        assert_eq!(recovered.state, InstallationState::Ready);
+        assert_eq!(fs::read(artifact)?, payload);
+        assert_eq!(store.list()?.managed, vec![recovered]);
+        Ok(())
+    }
+
+    #[test]
+    fn activation_source_sync_failure_records_destination_durability() -> Result<(), Box<dyn Error>>
+    {
+        let temporary = TempDir::new()?;
+        let store = ManagedStore::open(temporary.path().join("store"))?;
+        let payload = b"source removal durability";
+        let plan = plan_with_bytes(payload)?;
+        let prepared = store.prepare_install(&plan)?;
+        write_staged(&prepared, payload)?;
+        let transfer = TransferSummary::for_plan(&plan, prepared.prepared_at, false);
+
+        let result = store.activate_with_commit_sync(&plan, transfer.clone(), |boundary, path| {
+            if boundary == CommitSyncBoundary::PackageSource {
+                Err(io::Error::other("injected staging-directory sync failure"))
+            } else {
+                sync_directory_io(path)
+            }
+        });
+        match result {
+            Err(StoreError::CommittedDurabilityUnknown { receipt, .. }) => {
+                assert_eq!(receipt.kind, StoreCommitKind::PackageActivation);
+                assert!(receipt.destination_directory_synced);
+                assert_eq!(receipt.source_absent, Some(true));
+                assert_eq!(receipt.source_directory_synced, Some(false));
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "expected source-removal durability uncertainty: {other:?}"
+                ))
+                .into());
+            }
+        }
+
+        assert_eq!(
+            store.activate(&plan, transfer)?.state,
+            InstallationState::Ready
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_receipt_sync_failure_is_exactly_idempotent_and_conflict_safe()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TempDir::new()?;
+        let store = ManagedStore::open(temporary.path().join("store"))?;
+        let payload = b"ready receipt durability";
+        let plan = plan_with_bytes(payload)?;
+        let prepared = store.prepare_install(&plan)?;
+        write_staged(&prepared, payload)?;
+        let transfer = TransferSummary::for_plan(&plan, prepared.prepared_at, false);
+        let mut injected = false;
+
+        let result = store.activate_with_commit_sync(&plan, transfer.clone(), |boundary, path| {
+            if boundary == CommitSyncBoundary::RegistryEvent && !injected {
+                injected = true;
+                Err(io::Error::other("injected ready-receipt sync failure"))
+            } else {
+                sync_directory_io(path)
+            }
+        });
+        let commit = match result {
+            Err(StoreError::CommittedDurabilityUnknown { receipt, .. }) => receipt,
+            other => {
+                return Err(io::Error::other(format!(
+                    "expected committed/durability-unknown receipt: {other:?}"
+                ))
+                .into());
+            }
+        };
+        assert_eq!(commit.kind, StoreCommitKind::ReadyReceipt);
+        assert!(commit.visible);
+        assert!(!commit.destination_directory_synced);
+        assert!(!commit.idempotent_recovery);
+        assert!(commit.destination.exists());
+        assert_eq!(store.list()?.managed.len(), 1);
+
+        let mut conflicting = plan_with_bytes(b"conflicting ready receipt")?;
+        conflicting.installation_id = plan.installation_id.clone();
+        conflicting.refresh_plan_sha256()?;
+        assert!(matches!(
+            store.activate(
+                &conflicting,
+                TransferSummary::for_plan(&conflicting, Utc::now(), false)
+            ),
+            Err(StoreError::RegistrationConflict(_))
+        ));
+
+        let mut recovery_injected = false;
+        let repeated =
+            store.activate_with_commit_sync(&plan, transfer.clone(), |boundary, path| {
+                if boundary == CommitSyncBoundary::RegistryEvent && !recovery_injected {
+                    recovery_injected = true;
+                    Err(io::Error::other("injected receipt recovery sync failure"))
+                } else {
+                    sync_directory_io(path)
+                }
+            });
+        match repeated {
+            Err(StoreError::CommittedDurabilityUnknown { receipt, .. }) => {
+                assert_eq!(receipt.kind, StoreCommitKind::ReadyReceipt);
+                assert!(receipt.idempotent_recovery);
+                assert_eq!(receipt.destination, commit.destination);
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "expected repeated receipt durability uncertainty: {other:?}"
+                ))
+                .into());
+            }
+        }
+
+        let recovered = store.activate(&plan, transfer)?;
+        assert_eq!(recovered.state, InstallationState::Ready);
+        let entry = store
+            .installations_registry_root()
+            .join(installation_key(&plan.installation_id)?);
+        assert_eq!(read_directory(&entry)?.len(), 1);
+        assert_eq!(store.list()?.managed, vec![recovered]);
         Ok(())
     }
 

@@ -399,6 +399,80 @@ fn successful_fresh_publish_leaves_exact_bytes_and_no_private_temp() -> TestResu
     Ok(())
 }
 
+#[test]
+fn parent_sync_failure_reports_published_durability_unknown() -> TestResult {
+    let directory = tempdir()?;
+    let destination = directory.path().join("destination.bin");
+    let mut unpublished = UnpublishedFile::create(&destination)?;
+    unpublished.file_mut()?.write_all(b"payload")?;
+
+    let result = unpublished.publish_with_parent_sync(7, &digest(b"payload"), |_path| {
+        Err(io::Error::other("injected parent sync failure"))
+    });
+
+    let receipt = match result {
+        Err(AcquireError::PublishedDurabilityUnknown { receipt, .. }) => receipt,
+        other => {
+            return Err(io::Error::other(format!(
+                "expected a published/durability-unknown result: {other:?}"
+            ))
+            .into());
+        }
+    };
+    assert_eq!(receipt.destination, destination);
+    assert!(receipt.visible);
+    assert!(receipt.file_synced);
+    assert!(!receipt.directory_synced);
+    assert!(!receipt.idempotent_recovery);
+    assert_eq!(fs::read(&receipt.destination)?, b"payload");
+    assert!(unpublished_siblings(directory.path())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn exact_retry_recovers_published_artifact() -> TestResult {
+    let directory = tempdir()?;
+    let source = directory.path().join("source.bin");
+    let destination = directory.path().join("destination.bin");
+    fs::write(&source, b"payload")?;
+    let client = AcquireClient::with_defaults()?;
+
+    let first = client.fetch_file_artifact(&source, &destination, 7, &digest(b"payload"), 1024)?;
+    assert!(!first.publication.idempotent_recovery);
+    fs::remove_file(&source)?;
+
+    let recovered =
+        client.fetch_file_artifact(&source, &destination, 7, &digest(b"payload"), 1024)?;
+    assert!(recovered.publication.idempotent_recovery);
+    assert_eq!(recovered.publication.directory_synced, cfg!(unix));
+    assert_eq!(fs::read(destination)?, b"payload");
+    Ok(())
+}
+
+#[test]
+fn conflicting_retry_fails() -> TestResult {
+    let directory = tempdir()?;
+    let first_source = directory.path().join("first.bin");
+    let conflicting_source = directory.path().join("conflicting.bin");
+    let destination = directory.path().join("destination.bin");
+    fs::write(&first_source, b"payload")?;
+    fs::write(&conflicting_source, b"changed")?;
+    let client = AcquireClient::with_defaults()?;
+
+    client.fetch_file_artifact(&first_source, &destination, 7, &digest(b"payload"), 1024)?;
+    let result = client.fetch_file_artifact(
+        &conflicting_source,
+        &destination,
+        7,
+        &digest(b"changed"),
+        1024,
+    );
+
+    assert!(matches!(result, Err(AcquireError::StagingPathExists)));
+    assert_eq!(fs::read(destination)?, b"payload");
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn unpublished_temp_is_private_and_replacement_safe() -> TestResult {
@@ -1175,6 +1249,37 @@ fn sidecar_rewrite_uses_a_new_private_inode_and_leaves_no_temp() -> TestResult {
     let entries = fs::read_dir(directory.path())?.collect::<Result<Vec<_>, _>>()?;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].path(), path);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn sidecar_post_rename_failure_is_unambiguous() -> TestResult {
+    let directory = tempdir()?;
+    let path = directory.path().join("staging.resume.json");
+    let first = test_resume_state("https://example.com/archive", &digest(b"first"), "\"v1\"");
+    let second = test_resume_state("https://example.com/archive", &digest(b"second"), "\"v2\"");
+    let mut sidecar = SidecarFile::create(&path, &first)?;
+
+    let result = sidecar.replace_state_with_parent_sync(&second, |_path| {
+        Err(io::Error::other("injected parent sync failure"))
+    });
+
+    let receipt = match result {
+        Err(AcquireError::PublishedDurabilityUnknown { receipt, .. }) => receipt,
+        other => {
+            return Err(io::Error::other(format!(
+                "expected a published/durability-unknown result: {other:?}"
+            ))
+            .into());
+        }
+    };
+    assert_eq!(receipt.destination, path);
+    assert!(receipt.visible);
+    assert!(receipt.file_synced);
+    assert!(!receipt.directory_synced);
+    let persisted: ResumeSidecar = serde_json::from_slice(&fs::read(&receipt.destination)?)?;
+    assert_eq!(persisted.validator, second.validator);
     Ok(())
 }
 
