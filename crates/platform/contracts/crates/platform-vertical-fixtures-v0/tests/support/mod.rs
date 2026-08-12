@@ -31,49 +31,57 @@ pub fn artifact(id: &str, byte: char) -> ArtifactIdentityV0 {
     }
 }
 
+fn loom_output_facts() -> BTreeMap<String, FactValueV0> {
+    BTreeMap::from([
+        ("visible_ghost_count".to_owned(), FactValueV0::Integer(1)),
+        (
+            "ghost_anchor".to_owned(),
+            FactValueV0::Text("caret_local".to_owned()),
+        ),
+        (
+            "tab_exact_boundary".to_owned(),
+            FactValueV0::Text("promote_visible_ghost".to_owned()),
+        ),
+        (
+            "tab_without_exact_boundary".to_owned(),
+            FactValueV0::Text("ordinary_tab_or_indent".to_owned()),
+        ),
+        (
+            "additional_candidates".to_owned(),
+            FactValueV0::Text("hidden_until_explicit_review".to_owned()),
+        ),
+        (
+            "persistent_candidate_count".to_owned(),
+            FactValueV0::Boolean(false),
+        ),
+        (
+            "skip_to_manuscript_control".to_owned(),
+            FactValueV0::Boolean(false),
+        ),
+        (
+            "primary_use_this_control".to_owned(),
+            FactValueV0::Boolean(false),
+        ),
+        (
+            "dismissed_manuscript_unchanged".to_owned(),
+            FactValueV0::Boolean(true),
+        ),
+        (
+            "stale_suggestion_promoted".to_owned(),
+            FactValueV0::Boolean(false),
+        ),
+        (
+            "ordinary_tab_action".to_owned(),
+            FactValueV0::Text("ordinary_tab_inserted".to_owned()),
+        ),
+    ])
+}
+
 pub fn projection(vertical_id: VerticalIdV0) -> EquivalenceProjectionV0 {
     let mut output_facts =
         BTreeMap::from([("output_present".to_owned(), FactValueV0::Boolean(true))]);
     if vertical_id == VerticalIdV0::LoomSuggestionPromotion {
-        output_facts.extend([
-            ("visible_ghost_count".to_owned(), FactValueV0::Integer(1)),
-            (
-                "ghost_anchor".to_owned(),
-                FactValueV0::Text("caret_local".to_owned()),
-            ),
-            (
-                "tab_exact_boundary".to_owned(),
-                FactValueV0::Text("promote_visible_ghost".to_owned()),
-            ),
-            (
-                "tab_without_exact_boundary".to_owned(),
-                FactValueV0::Text("ordinary_tab_or_indent".to_owned()),
-            ),
-            (
-                "additional_candidates".to_owned(),
-                FactValueV0::Text("hidden_until_explicit_review".to_owned()),
-            ),
-            (
-                "persistent_candidate_count".to_owned(),
-                FactValueV0::Boolean(false),
-            ),
-            (
-                "skip_to_manuscript_control".to_owned(),
-                FactValueV0::Boolean(false),
-            ),
-            (
-                "primary_use_this_control".to_owned(),
-                FactValueV0::Boolean(false),
-            ),
-            (
-                "dismissed_manuscript_unchanged".to_owned(),
-                FactValueV0::Boolean(true),
-            ),
-            (
-                "stale_manuscript_unchanged".to_owned(),
-                FactValueV0::Boolean(true),
-            ),
-        ]);
+        output_facts.extend(loom_output_facts());
     }
 
     let mut ordered_events = vec![EventFactV0 {

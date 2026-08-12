@@ -1017,7 +1017,11 @@ fn validate_loom_projection(projection: &EquivalenceProjectionV0) -> Result<(), 
         ("skip_to_manuscript_control", FactValueV0::Boolean(false)),
         ("primary_use_this_control", FactValueV0::Boolean(false)),
         ("dismissed_manuscript_unchanged", FactValueV0::Boolean(true)),
-        ("stale_manuscript_unchanged", FactValueV0::Boolean(true)),
+        ("stale_suggestion_promoted", FactValueV0::Boolean(false)),
+        (
+            "ordinary_tab_action",
+            FactValueV0::Text("ordinary_tab_inserted".to_owned()),
+        ),
     ];
     for (name, value) in required {
         if projection.output_facts.get(name) != Some(&value) {
