@@ -5,6 +5,9 @@ members = [
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
     "crates/native/crates/llama-native-types",
+    "crates/platform/contracts/crates/platform-contract-testkit",
+    "crates/platform/contracts/crates/platform-contracts-v0",
+    "crates/platform/contracts/crates/platform-vertical-fixtures-v0",
     "crates/services/attachment/crates/attachment-native-cli",
     "crates/services/attachment/crates/attachment-native-document",
     "crates/services/attachment/crates/attachment-native-host",
@@ -46,7 +49,6 @@ members = [
     "xtask",
 ]
 exclude = [
-    "crates/platform/contracts",
     # W7 keeps Loom isolated only because its rusqlite 0.39 / libsqlite3-sys
     # 0.37 link target cannot coexist with the root graph until W8.
     "products/loom",
