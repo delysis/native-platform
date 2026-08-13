@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-model-load-policy-candidate"
+description = "Enables the model_load_policy_candidate command without any pre-configured scope."
+commands.allow = ["model_load_policy_candidate"]
+
+[[permission]]
+identifier = "deny-model-load-policy-candidate"
+description = "Denies the model_load_policy_candidate command without any pre-configured scope."
+commands.deny = ["model_load_policy_candidate"]

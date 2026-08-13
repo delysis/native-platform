@@ -1,0 +1,46 @@
+[package]
+name = "tauri-plugin-loom"
+links = "tauri-plugin-loom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+unstable-w1-contract-tests = [
+    "loom-host/unstable-w1-contract-tests",
+]
+unstable-w1-vertical-tests = [
+    "dep:platform-contracts-v0-vertical",
+    "dep:platform-vertical-fixtures-v0",
+]
+
+[dependencies]
+loom-document = { path = "../loom-document" }
+loom-backend-llama = { path = "../loom-backend-llama" }
+loom-host = { path = "../loom-host", features = ["tauri-native-focus"] }
+loom-research-types = { path = "../loom-research-types" }
+loom-store = { path = "../loom-store" }
+loom-types = { path = "../loom-types" }
+platform-contracts-v0-vertical = { package = "platform-contracts-v0", git = "https://github.com/delysis/w1-platform-contracts.git", rev = "fc24ffff08c52690390b4460f44617d5d9732563", optional = true }
+platform-vertical-fixtures-v0 = { git = "https://github.com/delysis/w1-platform-contracts.git", rev = "fc24ffff08c52690390b4460f44617d5d9732563", optional = true }
+same-file.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tauri = { version = "2.11.5", default-features = false }
+tauri-plugin-dialog = "2.7.2"
+thiserror.workspace = true
+
+[build-dependencies]
+tauri-plugin = { version = "2.5.4", features = ["build"] }
+
+[dev-dependencies]
+loom-host = { path = "../loom-host", features = ["test-fixtures"] }
+tauri = { version = "2.11.5", default-features = false, features = ["test"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

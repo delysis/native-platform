@@ -1,0 +1,15 @@
+{
+  "schema": "delysis.loom.current_gemma_input.v0",
+  "exact_manuscript_prefix": "Mara pressed her palm to the cold brass, and",
+  "seeds": [41, 42],
+  "sampling": {
+    "temperature": 0.8,
+    "top_k": 40,
+    "top_p": 0.95,
+    "min_p": 0.02,
+    "repeat_last_n": 64,
+    "repeat_penalty": 1.02,
+    "max_tokens": 48
+  },
+  "required_model_sha256": "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670"
+}

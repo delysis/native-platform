@@ -1,0 +1,22 @@
+format = "loom.genre-pack.v1"
+name = "voice-literary-character-v1"
+description = "Voice-heavy literary character work with selective perception and resistant self-knowledge"
+genre_functions = ["voice_heavy_literary_character_work"]
+
+[core_pack]
+format = "loom.core-pack.v1"
+artifact_sha256 = "{{CORE_ARTIFACT_SHA256}}"
+
+[criteria.voice_specificity]
+description = "Makes syntax, attention, metaphor, omission, and judgment inseparable from this consciousness"
+weight_multiplier = 1.25
+behavioral_anchors = ["The narrator notices according to history and desire", "Sentence movement carries temperament without mannered sameness", "Voice persists through action instead of appearing only in aphorisms"]
+
+[criteria.character_revelation]
+description = "Reveals character through consequential misreading, choice, evasion, and contradiction"
+weight_multiplier = 1.25
+behavioral_anchors = ["Self-understanding is partial and behavior supplies independent evidence", "Contradiction creates pressure rather than incoherence", "The movement changes what the reader understands without diagnostic summary"]
+
+[project_anchors.voice_movement]
+description = "Nearby project prose with matching viewpoint and character pressure, not merely surface cadence"
+retrieval_limit = 2

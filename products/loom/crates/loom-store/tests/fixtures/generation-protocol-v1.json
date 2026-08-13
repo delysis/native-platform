@@ -1,0 +1,90 @@
+{
+  "model_environment": {
+    "environment_id": "0000000000000000000000000000000000000000000000000000000000000001",
+    "model_identifier": "golden/gemma-base.gguf",
+    "model_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+    "tokenizer_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+    "backend_identifier": "llama-native-kit",
+    "capabilities": {
+      "prompt_forms": ["completion"],
+      "output_token_ids": true,
+      "raw_model_logprobs": true,
+      "fim": false
+    }
+  },
+  "prompt_recipe": {
+    "mode": "completion",
+    "exact_prompt_blob_id": "3333333333333333333333333333333333333333333333333333333333333333",
+    "exact_prompt_token_ids": [10, 11, 12],
+    "ordered_input_artifact_ids": ["01J00000000000000000000001"],
+    "prompt_token_count": 3
+  },
+  "context_recipe": {
+    "source_revision_id": "01J00000000000000000000002",
+    "ordered_source_artifact_ids": ["01J00000000000000000000003"],
+    "token_budget": 4096,
+    "retrieval_evidence_blob_id": "4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "authority_policy": {
+    "policy_version": 1,
+    "writer_environment_artifact_ids": ["01J00000000000000000000004"],
+    "critic_environment_artifact_ids": ["01J00000000000000000000005"]
+  },
+  "command_envelope": {
+    "command_id": "01J00000000000000000000006",
+    "project_id": "01J00000000000000000000007",
+    "issued_at_ms": 1718000001000,
+    "command": {
+      "command": "weave",
+      "payload": {
+        "generation": {
+          "run_id": "01J00000000000000000000008",
+          "branch_id": "01J00000000000000000000009",
+          "document_id": "01J0000000000000000000000A",
+          "source_revision_id": "01J00000000000000000000002",
+          "target_range": { "start": 42, "end": 42 },
+          "model_environment_artifact_id": "01J00000000000000000000004",
+          "prompt_recipe_artifact_id": "01J0000000000000000000000B",
+          "context_recipe_artifact_id": "01J0000000000000000000000C",
+          "authority_policy_artifact_id": "01J0000000000000000000000D",
+          "seed": 7,
+          "sampling": { "temperature": 0.8, "top_p": 0.95 }
+        }
+      }
+    }
+  },
+  "token_trace": {
+    "generated_token_ids": [101, 102],
+    "observations": [
+      {
+        "token_id": 101,
+        "token_bytes": [108, 105, 103, 104, 116],
+        "raw_model_logprob": -0.25
+      }
+    ],
+    "raw_event_stream_blob_id": "5555555555555555555555555555555555555555555555555555555555555555",
+    "provenance": {
+      "evidence_kind": "live_inference",
+      "metrics": {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "shared_prefix_tokens": 3,
+        "duration_ms": 125
+      }
+    }
+  },
+  "terminal_event": {
+    "event_id": "01J0000000000000000000000E",
+    "run_id": "01J00000000000000000000008",
+    "branch_id": "01J00000000000000000000009",
+    "sequence": 4,
+    "status": "completed",
+    "candidate_id": "01J0000000000000000000000F",
+    "occurred_at_ms": 1718000002000
+  },
+  "promote_command": {
+    "candidate_id": "01J0000000000000000000000F",
+    "expected_source_revision_id": "01J00000000000000000000002",
+    "expected_visible_blob_id": "6666666666666666666666666666666666666666666666666666666666666666"
+  }
+}

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-document-draft-clear"
+description = "Enables the document_draft_clear command without any pre-configured scope."
+commands.allow = ["document_draft_clear"]
+
+[[permission]]
+identifier = "deny-document-draft-clear"
+description = "Denies the document_draft_clear command without any pre-configured scope."
+commands.deny = ["document_draft_clear"]

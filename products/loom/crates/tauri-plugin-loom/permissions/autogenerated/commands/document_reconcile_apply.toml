@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-document-reconcile-apply"
+description = "Enables the document_reconcile_apply command without any pre-configured scope."
+commands.allow = ["document_reconcile_apply"]
+
+[[permission]]
+identifier = "deny-document-reconcile-apply"
+description = "Denies the document_reconcile_apply command without any pre-configured scope."
+commands.deny = ["document_reconcile_apply"]

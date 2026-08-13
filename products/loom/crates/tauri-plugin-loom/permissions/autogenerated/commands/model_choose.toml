@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-model-choose"
+description = "Enables the model_choose command without any pre-configured scope."
+commands.allow = ["model_choose"]
+
+[[permission]]
+identifier = "deny-model-choose"
+description = "Denies the model_choose command without any pre-configured scope."
+commands.deny = ["model_choose"]

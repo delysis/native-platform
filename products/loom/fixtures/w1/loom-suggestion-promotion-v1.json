@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "fixture_id": "loom-suggestion-promotion-v1",
+  "evidence_class": "model_free",
+  "source": {
+    "relative_path": "manuscript/001.md",
+    "revision_text": "The last train was gone, and the platform smelled of wet iron",
+    "caret_byte": 61
+  },
+  "candidate_family": [
+    {
+      "text": ", while somewhere beyond the rain a signal clicked from red to green.",
+      "sha256": "e94bcffd1eb3f286191c378e69ff387918f696fea94e8072fbc01a0cf971d4f5",
+      "seed": 7
+    },
+    {
+      "text": ", and under the empty canopy a paper timetable trembled in the wind.",
+      "sha256": "1e293d189eae05036f0df31d5ebffdac43653e1d3309e2851d934cbfebeacf3b",
+      "seed": 11
+    },
+    {
+      "text": "; the rails held a thin silver line from the lamps and vanished east.",
+      "sha256": "0bce36b7696bba959b9a533c7aaf4cb88e00bfc9a269d66bfdee630e6145c5d7",
+      "seed": 19
+    }
+  ],
+  "expected": {
+    "primary_candidate_index": 0,
+    "result_text": "The last train was gone, and the platform smelled of wet iron, while somewhere beyond the rain a signal clicked from red to green.",
+    "result_sha256": "d3602d33fd8503451d7572e2e78afa93a99cb7229f698e33575e07e29950fee1",
+    "visible_ghost_count": 1,
+    "hidden_candidate_count": 2,
+    "explicit_review_candidate_count": 3,
+    "ordinary_tab": "\t",
+    "forbidden_primary_chrome": [
+      "Skip to manuscript",
+      "alternatives-button",
+      "Use this"
+    ]
+  }
+}

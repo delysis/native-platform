@@ -1,0 +1,22 @@
+format = "loom.genre-pack.v1"
+name = "suspense-thriller-causality-v1"
+description = "Threat, pursuit, deadline, and tactical causality for suspense and thriller movements"
+genre_functions = ["suspense_thriller_causality"]
+
+[core_pack]
+format = "loom.core-pack.v1"
+artifact_sha256 = "{{CORE_ARTIFACT_SHA256}}"
+
+[criteria.threat_geometry]
+description = "Makes threat location, capability, information, timing, and escape constraints concrete"
+weight_multiplier = 1.25
+behavioral_anchors = ["The reader can track what each side can perceive and reach", "Deadline and danger change feasible actions", "Surprise does not depend on silently moving people or objects"]
+
+[criteria.tactical_escalation]
+description = "Escalates through intelligent countermoves and irreversible cost rather than arbitrary complication"
+weight_multiplier = 1.25
+behavioral_anchors = ["Each move answers or exploits prior information", "Competence creates harder choices instead of effortless resolution", "Escalation narrows or transforms options"]
+
+[project_anchors.suspense_movement]
+description = "Nearby project prose with comparable threat geometry and tactical tempo"
+retrieval_limit = 2

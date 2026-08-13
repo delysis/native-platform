@@ -1,0 +1,70 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "loom.research.admitted",
+      "attempt_id": "fixture.live_session",
+      "correlation_id": "research.authority.pair",
+      "kind": "authority_consumed",
+      "payload": {
+        "id": "research.output.bytes",
+        "digest": { "algorithm": "sha256", "hex": "3aedbcff1c11ea03a41c5c3d5bb0bafb0a4f5685b7b0f4cf40475cb39788ffa4" },
+        "length": 28
+      }
+    },
+    {
+      "sequence": 1,
+      "operation_id": "loom.research.reopened_diagnostic",
+      "attempt_id": "fixture.reopen",
+      "correlation_id": "research.authority.pair",
+      "kind": "authority_denied",
+      "payload": null
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "research.admission.record",
+      "schema_id": "loom.research_admission.v1",
+      "before": null,
+      "after": {
+        "id": "research.admission.output",
+        "digest": { "algorithm": "sha256", "hex": "3aedbcff1c11ea03a41c5c3d5bb0bafb0a4f5685b7b0f4cf40475cb39788ffa4" },
+        "length": 28
+      },
+      "disposition": "created"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "loom.research.admitted",
+      "attempt_id": "fixture.live_session",
+      "correlation_id": "research.authority.pair",
+      "terminal": "completed",
+      "released": true
+    },
+    {
+      "operation_id": "loom.research.reopened_diagnostic",
+      "attempt_id": "fixture.reopen",
+      "correlation_id": "research.authority.pair",
+      "terminal": "failed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 0,
+    "joined_workers": 0
+  },
+  "output_facts": {
+    "admitted_authority_uses": { "kind": "integer", "value": 1 },
+    "diagnostic_authority_uses": { "kind": "integer", "value": 0 },
+    "persisted_diagnostic_disposition": { "kind": "text", "value": "no_call_lease" },
+    "reopened_disposition": { "kind": "text", "value": "bytes_replay_only" },
+    "same_source_and_output_bytes": { "kind": "boolean", "value": true }
+  },
+  "fail_closed_facts": [
+    "persisted diagnostic bytes cannot mint call authority",
+    "reopened stale authority cannot be reused"
+  ]
+}
