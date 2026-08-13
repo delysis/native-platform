@@ -415,7 +415,7 @@ fn check_ledger(root: &Path) -> Result<()> {
         .context("parse migration ledger")?;
     let mut expected = Ledger {
         schema_version: 1,
-        goal: "W6-IMPORT-MOM".into(),
+        goal: "W7-IMPORT-LOOM".into(),
         status: "candidate".into(),
         production_source_imported: true,
         source_history_imported: true,
@@ -573,6 +573,18 @@ fn check_ledger(root: &Path) -> Result<()> {
         .context("expected Mom migration entry")?;
     mom.import_commit = Some("cfa2d3c40e74e1d692c0cdb9354cc272249fd4ab".into());
     mom.path_dependency_cutover_commit = Some("5b12072e91dc44f2f93f6dfc0b869d3cc58c26f1".into());
+    mom.source_tags.push(SourceTag {
+        name: "native-platform-v2-horizon-b-2026-08-12".into(),
+        peeled_commit: "3cf57941af6d523378e7fa8b24f5c24c8e50363f".into(),
+    });
+    mom.old_repo_status = "frozen_unarchived_two_release_retirement".into();
+    let loom = expected
+        .entries
+        .iter_mut()
+        .find(|entry| entry.source_repository == "delysis/loom-native")
+        .context("expected Loom migration entry")?;
+    loom.import_commit = Some("19147c74bbe6335331f3fdad256663906c122dc3".into());
+    loom.path_dependency_cutover_commit = Some("6cf468d277a88f085242bdaef017305e1148efda".into());
     for (repository, import_commit) in [
         (
             "delysis/attachment-native-kit",
@@ -660,12 +672,11 @@ fn check_loom_reconciliation(root: &Path) -> Result<()> {
             absent_paths: 0,
         },
         resolution: "reconciled_in_source_history".into(),
-        native_platform_history_imported: false,
-        native_platform_source_imported: false,
+        native_platform_history_imported: true,
+        native_platform_source_imported: true,
         claims_not_established: vec![
-            "No source or history has been imported into native-platform.".into(),
             "This ledger does not replay or independently reimplement ce041.".into(),
-            "This ledger makes no branch-retirement or remote-deletion claim.".into(),
+            "The source repository is not claimed frozen until the protected W7 tag exists.".into(),
         ],
     };
     ensure!(ledger == expected, "Loom reconciliation ledger drift");

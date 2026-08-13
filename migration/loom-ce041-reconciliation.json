@@ -14,11 +14,10 @@
     "absent_paths": 0
   },
   "resolution": "reconciled_in_source_history",
-  "native_platform_history_imported": false,
-  "native_platform_source_imported": false,
+  "native_platform_history_imported": true,
+  "native_platform_source_imported": true,
   "claims_not_established": [
-    "No source or history has been imported into native-platform.",
     "This ledger does not replay or independently reimplement ce041.",
-    "This ledger makes no branch-retirement or remote-deletion claim."
+    "The source repository is not claimed frozen until the protected W7 tag exists."
   ]
 }
