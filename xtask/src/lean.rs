@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -152,8 +152,43 @@ pub(super) fn run(root: &Path, arguments: Vec<String>) -> Result<()> {
         [command] if command == "verify" => verify(root),
         [command] if command == "snapshot" => snapshot(root, "HEAD"),
         [command, revision] if command == "snapshot" => snapshot(root, revision),
-        _ => bail!("usage: cargo xtask lean <verify|snapshot [revision]>"),
+        [command] if command == "measure" => measure_current(root),
+        _ => bail!("usage: cargo xtask lean <verify|snapshot [revision]|measure>"),
     }
+}
+
+fn measure_current(root: &Path) -> Result<()> {
+    let classification = read_classification(root)?;
+    validate_reachability(root)?;
+    let entries = worktree_entries(root)?;
+    validate_classification(&classification, &entries)?;
+    let baseline: Baseline = serde_json::from_str(
+        &fs::read_to_string(root.join(BASELINE_PATH)).context("read W8 lean baseline")?,
+    )?;
+    let current = measure(root, "HEAD", &classification, &entries)?;
+    let result = json!({
+        "schema_version": 1,
+        "baseline_revision": baseline.source_revision,
+        "current_revision": current.source_revision,
+        "rust_nonblank_lines": comparison(baseline.source.rust_nonblank_lines, current.source.rust_nonblank_lines),
+        "production_rust_nonblank_lines": comparison(baseline.source.production_rust_nonblank_lines, current.source.production_rust_nonblank_lines),
+        "test_rust_nonblank_lines": comparison(baseline.source.test_rust_nonblank_lines, current.source.test_rust_nonblank_lines),
+        "public_rust_items_lexical": comparison(baseline.source.public_rust_items_lexical, current.source.public_rust_items_lexical),
+        "workspace_packages": comparison(baseline.workspace_packages, current.workspace_packages),
+        "first_party_git_dependencies": comparison(baseline.first_party_git_dependencies, current.first_party_git_dependencies),
+        "thresholds": baseline.acceptance_thresholds,
+    });
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+fn comparison(baseline: u64, current: u64) -> Value {
+    json!({
+        "baseline": baseline,
+        "current": current,
+        "delta": i128::from(current) - i128::from(baseline),
+        "reduction_basis_points": if baseline == 0 { 0 } else { ((i128::from(baseline) - i128::from(current)) * 10_000) / i128::from(baseline) },
+    })
 }
 
 fn verify(root: &Path) -> Result<()> {
@@ -657,7 +692,33 @@ fn git_entries(root: &Path, revision: &str) -> Result<Vec<GitEntry>> {
     Ok(entries)
 }
 
+fn worktree_entries(root: &Path) -> Result<Vec<GitEntry>> {
+    let output = git(root, ["ls-files", "--cached"])?;
+    output
+        .lines()
+        .map(|path| {
+            let bytes = fs::metadata(root.join(path))
+                .with_context(|| format!("tracked worktree path missing: {path}"))?
+                .len();
+            Ok(GitEntry {
+                path: path.to_owned(),
+                object: String::new(),
+                bytes,
+            })
+        })
+        .collect()
+}
+
 fn read_blobs(root: &Path, entries: &[GitEntry]) -> Result<Vec<Vec<u8>>> {
+    if entries.iter().all(|entry| entry.object.is_empty()) {
+        return entries
+            .iter()
+            .map(|entry| {
+                fs::read(root.join(&entry.path))
+                    .with_context(|| format!("read tracked worktree path {}", entry.path))
+            })
+            .collect();
+    }
     let mut child = Command::new("git")
         .args(["cat-file", "--batch"])
         .current_dir(root)
