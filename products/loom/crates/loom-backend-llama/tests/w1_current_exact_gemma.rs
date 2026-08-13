@@ -211,7 +211,7 @@ fn w1_current_exact_gemma_baseline() -> Result<(), Box<dyn std::error::Error>> {
         build_request(&input, &model_path, &prerequisite.identity.digest.hex)?;
     let backend = LlamaBackend::default();
     let handle = backend.start_exact_continuation(request)?;
-    let result = handle.wait_timeout(Duration::from_secs(300))?;
+    let result = handle.wait_timeout(Duration::from_mins(5))?;
 
     assert_real_result(&result, &input, &prerequisite.identity, prompt_blob);
 

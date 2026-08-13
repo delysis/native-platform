@@ -2165,7 +2165,7 @@ async fn consume_provider_stream(
             () = cancellation.cancelled() => {
                 return Err(cancelled_error(&request_id, &state.route.backend_id));
             }
-            value = tokio::time::timeout(Duration::from_secs(120), bytes.next()) => value,
+            value = tokio::time::timeout(Duration::from_mins(2), bytes.next()) => value,
         };
         let chunk = match next {
             Ok(Some(Ok(chunk))) => chunk,

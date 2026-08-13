@@ -1051,7 +1051,7 @@ impl NativeModelHandle {
                 )
             })?;
         let mut bootstrap = WorkerBootstrapGuard::new(command_tx, shutdown_tx, worker);
-        let readiness = ready_rx.recv_timeout(Duration::from_secs(300));
+        let readiness = ready_rx.recv_timeout(Duration::from_mins(5));
         match readiness {
             Ok(Ok(())) => {}
             Ok(Err(load_error)) => {
@@ -8476,7 +8476,7 @@ mod tests {
             cached_prefix: None,
         })?;
         let event_rx = ticket.events.clone();
-        let outputs = require_ready(ticket.wait_timeout(Duration::from_secs(120))?)?;
+        let outputs = require_ready(ticket.wait_timeout(Duration::from_mins(2))?)?;
         let events = event_rx.try_iter().collect::<Vec<_>>();
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].input_index, 0);
@@ -8534,8 +8534,7 @@ mod tests {
         };
         let family_ticket = handle.generate_batch(family_request.clone())?;
         let family_event_rx = family_ticket.events.clone();
-        let verified =
-            require_ready(family_ticket.wait_verified_timeout(Duration::from_secs(120))?)?;
+        let verified = require_ready(family_ticket.wait_verified_timeout(Duration::from_mins(2))?)?;
         let family_events = family_event_rx.try_iter().collect::<Vec<_>>();
         let family_outputs = verified.outputs();
         assert_eq!(verified.request(), &family_request);
@@ -8609,7 +8608,7 @@ mod tests {
         let legacy_outputs = require_ready(
             handle
                 .generate_batch(legacy_request)?
-                .wait_timeout(Duration::from_secs(120))?,
+                .wait_timeout(Duration::from_mins(2))?,
         )?;
         for (sealed, legacy) in family_outputs.iter().zip(&legacy_outputs) {
             assert_eq!(sealed.branch_id, legacy.branch_id);
@@ -8638,7 +8637,7 @@ mod tests {
         };
         let default_seed_error = handle
             .generate_batch(default_seed_request.clone())?
-            .wait_verified_timeout(Duration::from_secs(120))
+            .wait_verified_timeout(Duration::from_mins(2))
             .expect_err("llama.cpp's randomized seed sentinel must stay unverified");
         assert_eq!(
             default_seed_error.code,
@@ -8649,7 +8648,7 @@ mod tests {
         let legacy_default_seed_outputs = require_ready(
             handle
                 .generate_batch(legacy_default_seed_request)?
-                .wait_timeout(Duration::from_secs(120))?,
+                .wait_timeout(Duration::from_mins(2))?,
         )?;
         assert_eq!(legacy_default_seed_outputs.len(), 1);
         assert!(legacy_default_seed_outputs[0].real_engine_invoked);
@@ -8689,7 +8688,7 @@ mod tests {
         require_ready(
             handle
                 .generate_batch(cache_source_request)?
-                .wait_timeout(Duration::from_secs(120))?,
+                .wait_timeout(Duration::from_mins(2))?,
         )?;
         let mut forged_cache = handle.snapshot_sequence(0)?;
         assert_eq!(forged_cache.token_count, 1);
@@ -8717,7 +8716,7 @@ mod tests {
         };
         let forged_error = handle
             .generate_batch(forged_request.clone())?
-            .wait_verified_timeout(Duration::from_secs(120))
+            .wait_verified_timeout(Duration::from_mins(2))
             .expect_err("relabelled public cache bytes must stay unverified");
         assert_eq!(forged_error.code, NativeErrorCode::UnsupportedParameter);
 
@@ -8726,7 +8725,7 @@ mod tests {
         let legacy_forged_outputs = require_ready(
             handle
                 .generate_batch(legacy_forged_request)?
-                .wait_timeout(Duration::from_secs(120))?,
+                .wait_timeout(Duration::from_mins(2))?,
         )?;
         assert_eq!(legacy_forged_outputs.len(), 1);
         assert!(legacy_forged_outputs[0].real_engine_invoked);
@@ -8770,8 +8769,7 @@ mod tests {
             cached_prefix: None,
         })?;
         assert!(cancel_ticket.cancel_branch("completion-1"));
-        let cancelled_outputs =
-            require_ready(cancel_ticket.wait_timeout(Duration::from_secs(120))?)?;
+        let cancelled_outputs = require_ready(cancel_ticket.wait_timeout(Duration::from_mins(2))?)?;
         assert_eq!(cancelled_outputs[0].state, GenerationState::Completed);
         assert_eq!(cancelled_outputs[1].state, GenerationState::Cancelled);
 
@@ -8867,7 +8865,7 @@ mod tests {
         assert!(budget.fits(512));
         let ticket = handle.generate_batch(request.clone())?;
         assert!(ticket.cancel_branch("cancelled"));
-        let verified = require_ready(ticket.wait_verified_timeout(Duration::from_secs(120))?)?;
+        let verified = require_ready(ticket.wait_verified_timeout(Duration::from_mins(2))?)?;
 
         assert_eq!(verified.request(), &request);
         assert_eq!(verified.outputs().len(), 2);
@@ -8968,7 +8966,7 @@ mod tests {
         let before = require_ready(
             handle
                 .generate(generation_request("embedding-baseline-before"))?
-                .wait_timeout(Duration::from_secs(120))?,
+                .wait_timeout(Duration::from_mins(2))?,
         )?;
 
         let input_tokens = [exact_tokens.clone(), exact_tokens[..2].to_vec()];
@@ -8985,7 +8983,7 @@ mod tests {
         cancelled_ticket.cancel();
         assert_eq!(
             cancelled_ticket
-                .wait_verified_timeout(Duration::from_secs(120))
+                .wait_verified_timeout(Duration::from_mins(2))
                 .expect_err("cancelled real embeddings cannot mint a seal")
                 .code,
             NativeErrorCode::Cancelled
@@ -9017,7 +9015,7 @@ mod tests {
                     EmbeddingPooling::None,
                     EmbeddingNormalization::None,
                 )?)?
-                .wait_verified_timeout(Duration::from_secs(120))?,
+                .wait_verified_timeout(Duration::from_mins(2))?,
         )?;
         let embedding = verified_embedding.output();
 
@@ -9122,7 +9120,7 @@ mod tests {
         let after = require_ready(
             handle
                 .generate(generation_request("embedding-baseline-after"))?
-                .wait_timeout(Duration::from_secs(120))?,
+                .wait_timeout(Duration::from_mins(2))?,
         )?;
         assert_eq!(before.len(), 1);
         assert_eq!(after.len(), 1);
