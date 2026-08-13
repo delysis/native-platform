@@ -11,6 +11,18 @@ members = [
     "crates/services/attachment/crates/attachment-native-inspect",
     "crates/services/attachment/crates/attachment-native-plan",
     "crates/services/attachment/crates/attachment-native-types",
+    "crates/services/information/crates/information-native-acquire",
+    "crates/services/information/crates/information-native-backend-community",
+    "crates/services/information/crates/information-native-backend-encyclopedia",
+    "crates/services/information/crates/information-native-backend-scripture",
+    "crates/services/information/crates/information-native-backend-sqlite",
+    "crates/services/information/crates/information-native-catalog",
+    "crates/services/information/crates/information-native-cli",
+    "crates/services/information/crates/information-native-host",
+    "crates/services/information/crates/information-native-retrieval",
+    "crates/services/information/crates/information-native-store",
+    "crates/services/information/crates/information-native-types",
+    "crates/services/information/crates/tauri-plugin-information-native",
     "products/fte/crates/fte-backend-llama",
     "products/fte/crates/fte-loopback",
     "products/fte/crates/fte-protocols",
@@ -28,7 +40,6 @@ members = [
 ]
 exclude = [
     "crates/platform/contracts",
-    "crates/services/information",
     "crates/services/speech",
     # W7 keeps Loom isolated only because its rusqlite 0.39 / libsqlite3-sys
     # 0.37 link target cannot coexist with the root graph until W8.
@@ -51,19 +62,22 @@ async-trait = "0.1.89"
 axum = "0.8.9"
 bytes = "1.11.1"
 chacha20poly1305 = "0.10.1"
+chrono = { version = "0.4.41", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 futures = "0.3.32"
 getrandom = "0.3"
+fs2 = "0.4.3"
 http = "1"
 http-body-util = "0.1"
 rand = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 rusqlite = { version = "=0.39.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_yaml = "0.9"
 sha2 = "0.10.9"
+tempfile = "3.27.0"
 thiserror = "2"
 tokio = { version = "1.52.1", features = ["full"] }
 tokio-stream = "0.1"
@@ -72,6 +86,7 @@ toml = "0.9.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["limit", "timeout"] }
 tracing = "0.1.44"
+url = { version = "2.5.7", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Exact current integration inputs. Imported first-party sources are path-rebound.
@@ -100,7 +115,7 @@ libarchive_oxide = { version = "=0.2.0", default-features = false, features = ["
 lopdf = { version = "0.44.0", default-features = false }
 lzma-rust2 = { version = "0.18.1", default-features = false, features = ["std", "xz"] }
 mail-parser = { version = "0.11.5", default-features = false }
-quick-xml = { version = "0.41.0", default-features = false }
+quick-xml = { version = "0.41.0", default-features = false, features = ["serialize"] }
 ruzstd = { version = "0.9.0", default-features = false, features = ["hash", "std"] }
 tar = { version = "0.4.46", default-features = false }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2", "deflate64"] }
@@ -110,6 +125,15 @@ fte-store = { path = "products/fte/crates/fte-store" }
 fte-types = { path = "products/fte/crates/fte-types" }
 tauri-plugin-free-token-energy = { path = "products/fte/crates/tauri-plugin-free-token-energy" }
 information-native-host = { path = "crates/services/information/crates/information-native-host" }
+information-native-acquire = { path = "crates/services/information/crates/information-native-acquire" }
+information-native-backend-community = { path = "crates/services/information/crates/information-native-backend-community" }
+information-native-backend-encyclopedia = { path = "crates/services/information/crates/information-native-backend-encyclopedia" }
+information-native-backend-scripture = { path = "crates/services/information/crates/information-native-backend-scripture" }
+information-native-backend-sqlite = { path = "crates/services/information/crates/information-native-backend-sqlite" }
+information-native-catalog = { path = "crates/services/information/crates/information-native-catalog" }
+information-native-retrieval = { path = "crates/services/information/crates/information-native-retrieval" }
+information-native-store = { path = "crates/services/information/crates/information-native-store" }
+information-native-types = { path = "crates/services/information/crates/information-native-types" }
 speech-native-host = { path = "crates/services/speech/crates/speech-native-host" }
 fte-types-current = { package = "fte-types", path = "products/fte/crates/fte-types" }
 fte-backend-llama-current = { package = "fte-backend-llama", path = "products/fte/crates/fte-backend-llama" }
@@ -129,6 +153,7 @@ platform-contracts-v0-current = { package = "platform-contracts-v0", path = "cra
 platform-contract-testkit-current = { package = "platform-contract-testkit", path = "crates/platform/contracts/crates/platform-contract-testkit" }
 platform-vertical-fixtures-v0-current = { package = "platform-vertical-fixtures-v0", path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
 platform-contracts-v0 = { path = "crates/platform/contracts/crates/platform-contracts-v0" }
+platform-contracts-fixture-v0 = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
 platform-contract-testkit = { path = "crates/platform/contracts/crates/platform-contract-testkit" }
 platform-vertical-fixtures-v0 = { path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
 

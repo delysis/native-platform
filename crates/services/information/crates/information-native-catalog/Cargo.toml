@@ -1,10 +1,10 @@
 [package]
 name = "information-native-catalog"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-description.workspace = true
+description = "Local-first offline information resource components for native AI applications"
 license.workspace = true
-readme.workspace = true
+readme = "../../README.md"
 rust-version.workspace = true
 
 [dependencies]
