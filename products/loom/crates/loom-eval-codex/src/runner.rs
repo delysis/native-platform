@@ -1792,7 +1792,7 @@ fn adapter_build_fingerprint() -> BlobId {
         include_bytes!("../Cargo.toml").as_slice(),
         include_bytes!("../../loom-eval/src/blind.rs").as_slice(),
         include_bytes!("../../loom-eval/src/evidence.rs").as_slice(),
-        include_bytes!("../../../Cargo.lock").as_slice(),
+        include_bytes!("../../../../../Cargo.lock").as_slice(),
     ] {
         update_bytes(&mut digest, source);
     }
