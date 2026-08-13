@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "goal": "W7-IMPORT-LOOM",
+  "status": "local_accepted_pending_github_promotion",
+  "sealed_at": "2026-08-13T10:58:49Z",
+  "source": {
+    "repository": "https://github.com/delysis/loom-native.git",
+    "accepted_main": "223110bee4be72386d79306b444517371e4a9930",
+    "accepted_tree": "89eeaa6129d42d31ebb16b425189b3ffefb16724",
+    "commit_count": 77,
+    "merge_commit_count": 8
+  },
+  "rewrite": {
+    "tool": "git-filter-repo==2.47.0",
+    "arguments": [
+      "--to-subdirectory-filter",
+      "products/loom",
+      "--force"
+    ],
+    "destination_prefix": "products/loom",
+    "filtered_head": "fe35a14bfad7fd1958f29edd9d209e3c72bd1692",
+    "commit_map": "migration/loom-native.commit-map",
+    "commit_map_sha256": "6f6bb23c88a4ff43791d5be109643b7527d48dc8baf0fb546583282884542ce0"
+  },
+  "destination": {
+    "accepted_w6_candidate_base": "be08d82eb6d71681f78bd84bae6a37257d5c6d36",
+    "raw_import_merge": "19147c74bbe6335331f3fdad256663906c122dc3",
+    "raw_import_merge_parents": [
+      "be08d82eb6d71681f78bd84bae6a37257d5c6d36",
+      "fe35a14bfad7fd1958f29edd9d209e3c72bd1692"
+    ],
+    "raw_import_tree": "2485b8fd27d44fcf2bff6d4eca34bca9f86befa3",
+    "temporary_nested_workspace": "02039d879ee0d7ede772326b2fc816619f6ebf89",
+    "path_dependency_cutover": "6cf468d277a88f085242bdaef017305e1148efda",
+    "direct_imported_probe": "8f937353bded0bae3e8429243a6b9d7c0e918229",
+    "frontend_registration": "95aaa4a4987dd63951410b19d8e693f29527eae6",
+    "parity_and_history_policy": "757494ca6056bfcf3609e6a9ed2609cbbbc19759",
+    "macos_deployment_floor_fix": "a300c71d609c2085d5b281e5edbb1955b3006ce1",
+    "source_classification": "4912da7c9b387a7db0204b12f4d710c0174fda52",
+    "w6_main_sync": "d00d29e71733cbc57f48a1e628b72b1b2329f1b5",
+    "w1_import_authentication_fix": "e243063ba6631a68e2cc36310b2da5be1a869228",
+    "w6_promotion_evidence": "2fd0802d322118f9ba628f37a1f4a419e4b22830",
+    "ledger_import_boundary": "f43595efbaa67ffae981e51b59ec7e8f2195af83",
+    "shell_policy_fix": "972f45550927f00df2931cd36b1ac6d3c812b059",
+    "loom_cargo_lock_sha256": "f193266e1b8c3430a878097d5420ce069993f0bc136e5f93930d64fe2fd3163c",
+    "loom_pnpm_lock_sha256": "025ff786f7ff9c065b3f938df769b7d7294d9dce46e948b6bd03e6ded6952f2c"
+  },
+  "local_acceptance": {
+    "platform": "macOS 15.6 (24G84), arm64, Apple M4 Max",
+    "rust": {
+      "ordinary_workspace_tests_passed": 637,
+      "ordinary_workspace_tests_ignored": 8,
+      "strict_all_target_clippy": true,
+      "format": true,
+      "w1_fixture_manifest_tests_passed": 3,
+      "w1_loaded_owner_close_fixture_passed": true
+    },
+    "frontend": {
+      "test_files_passed": 32,
+      "tests_passed": 182,
+      "svelte_check_errors": 0,
+      "svelte_check_warnings": 0,
+      "vite_build": true,
+      "advisory": "Existing bundle chunks exceed 500 kB after minification."
+    },
+    "model": {
+      "name": "gemma-4-E2B-base-Q8_0.gguf",
+      "bytes": 4954576032,
+      "sha256": "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670",
+      "fixture": false,
+      "exact_w1_vertical_passed": true
+    },
+    "bundle": {
+      "source_commit": "a300c71d609c2085d5b281e5edbb1955b3006ce1",
+      "name": "Loom W7 a300c71.app",
+      "identifier": "app.delysis.loom.w7.a300c71",
+      "executable": "loom",
+      "executable_bytes": 20924464,
+      "executable_sha256": "1bbbdd20523a8a8e2a8eeaa95bd2118be5de307746b89fcb72abd995d29e58f7",
+      "signature": "ad_hoc"
+    },
+    "visible_behavior": {
+      "exact_manuscript_prefix": "At dawn, the locked observatory began to breathe.",
+      "caret_local_suggestion_visible": true,
+      "accessibility_suggestion_status": "Suggestion available. Tab accepts; Escape dismisses.",
+      "ordinary_tab_accepted_once": true,
+      "accessibility_acceptance_status": "Suggestion accepted",
+      "metal_device": "Apple M4 Max",
+      "gpu_layers_loaded": "36/36"
+    },
+    "durable_state": {
+      "manuscript_relative_path": "writing/manuscript/Untitled.md",
+      "manuscript_bytes": 279,
+      "manuscript_sha256": "274f169492f9f2e0ff0fc3fc6a093a871ee066f45887ab7bcea4b56682172ac3",
+      "selection_id": "01KZX931Z8ZXGBZY14DXN0F37P",
+      "selected_candidate_id": "01KZX92VKZSQM5A1QH9RZDFJFC",
+      "source_revision_id": "01KZX9264SMZ4F148TAEGKBS2W",
+      "resulting_revision_id": "01KZX931Z87GNRA7HNKD5P83ZQ",
+      "foreground_command_id": "01KZX931YSQMRR8AA4XC002Q6Z",
+      "source_candidate_count": 3,
+      "model_environment_id": "5909b76f867b4e4fdeb1193a9f05f9f100b9810a007f498d2977751baa9c10ec",
+      "native_backend_identity": "llama-native-build-v3-3dc8be5e7aabc2714ab52213cda25528462941e822e7358419836a1a832a318e"
+    },
+    "loaded_model_shutdown": {
+      "quit_started_at": "2026-08-13T10:56:19Z",
+      "exit_observed_at": "2026-08-13T10:56:26Z",
+      "observed_upper_bound_ms": 7204,
+      "process_exit_code": 0,
+      "metal_deallocation_observed": true
+    },
+    "immediate_relaunch": {
+      "same_bundle_identifier": "app.delysis.loom.w7.a300c71",
+      "same_exact_model_loaded": true,
+      "metal_device": "Apple M4 Max",
+      "gpu_layers_loaded": "36/36",
+      "manuscript_reopened_in_visible_ui": true,
+      "manuscript_bytes_after_reopen": 279,
+      "manuscript_sha256_after_reopen": "274f169492f9f2e0ff0fc3fc6a093a871ee066f45887ab7bcea4b56682172ac3",
+      "second_loaded_model_shutdown": {
+        "quit_started_at": "2026-08-13T10:58:17Z",
+        "exit_observed_at": "2026-08-13T10:58:32Z",
+        "observed_upper_bound_ms": 14747,
+        "process_exit_code": 0,
+        "metal_deallocation_observed": true
+      }
+    }
+  },
+  "promotion": {
+    "candidate_ci_run": null,
+    "main_merge": null,
+    "final_tag": null,
+    "final_tag_object": null,
+    "tag_ruleset": null
+  },
+  "source_freeze": {
+    "status": "pending W7 acceptance tag",
+    "boundary_tag": null,
+    "readme_only_commit": null,
+    "source_ci_run": null,
+    "hard_freeze_ruleset": null,
+    "repository_archived": false
+  },
+  "claims_deferred_to_w8": [
+    "The complete first-party Cargo graph is not yet unified.",
+    "The root and Loom Cargo locks remain separate until SQLite convergence.",
+    "The root and Loom pnpm locks remain separate until frontend flattening."
+  ],
+  "nonclaims": [
+    "GitHub-hosted Linux and Windows results are informational and are not W7 acceptance gates.",
+    "The exact-Gemma vertical used CPU; the separately exercised product bundle loaded 36 of 36 layers through Metal.",
+    "The app bundle is ad-hoc signed; no distribution-signing claim is made.",
+    "The source repository is not claimed frozen until the protected W7 tag exists."
+  ]
+}

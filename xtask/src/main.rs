@@ -199,6 +199,22 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     check_sha256(
         &root.join("docs/migration/W5-SERVICES-EVIDENCE.md"),
         "a5f5795de3a080151410f582fe460abbe71acf380402c477a2da8fadbb9c6b11",
+    )?;
+    check_sha256(
+        &root.join("migration/mom-import.json"),
+        "1754bd5d1116572967b1f263a897680dc4c40eb1413e1300b06ed365624fc96d",
+    )?;
+    check_sha256(
+        &root.join("docs/migration/W6-MOM-EVIDENCE.md"),
+        "53b176d1ec48e40532225224a60b4edad027248c910d83081c5d0fc9084b0ae5",
+    )?;
+    check_sha256(
+        &root.join("migration/loom-import.json"),
+        "f733c6af59e6d1dae3b8b9431c90ea308293a43f98198b9b95b7d967e0e38ff0",
+    )?;
+    check_sha256(
+        &root.join("docs/migration/W7-LOOM-EVIDENCE.md"),
+        "32568cdfe055bb73f415c34ff5f56ef3d1083286953d032a536a84a1a123ab66",
     )
 }
 
