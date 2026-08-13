@@ -275,6 +275,8 @@ fn check_workspace(root: &Path) -> Result<()> {
                 "fte-types",
                 "llama-native-cache",
                 "llama-native-types",
+                "mom-llama-cli",
+                "mom-llama-runtime",
             ][..],
         ),
         (
@@ -286,7 +288,7 @@ fn check_workspace(root: &Path) -> Result<()> {
                 "tauri-plugin-free-token-energy",
             ],
         ),
-        ("product", &["free-token-energy"]),
+        ("product", &["free-token-energy", "mom-llama-app"]),
         ("research", &[]),
         ("diagnostic", &["integration-current", "xtask"]),
         ("real-hardware", &[]),
@@ -329,6 +331,9 @@ fn check_workspace(root: &Path) -> Result<()> {
                 root.join("products/fte/crates/fte-types/Cargo.toml"),
                 root.join("products/fte/crates/tauri-plugin-free-token-energy/Cargo.toml"),
                 root.join("products/fte/src-tauri/Cargo.toml"),
+                root.join("products/mom/apps/mom-llama/src-tauri/Cargo.toml"),
+                root.join("products/mom/crates/mom-llama-cli/Cargo.toml"),
+                root.join("products/mom/crates/mom-llama-runtime/Cargo.toml"),
                 root.join("crates/services/attachment/Cargo.toml"),
                 root.join("crates/services/attachment/crates/attachment-native-cli/Cargo.toml"),
                 root.join("crates/services/attachment/crates/attachment-native-document/Cargo.toml"),
@@ -395,6 +400,7 @@ fn check_workspace(root: &Path) -> Result<()> {
                 || source.starts_with(root.join("crates/platform"))
                 || source.starts_with(root.join("crates/services"))
                 || source.starts_with(root.join("products/fte"))
+                || source.starts_with(root.join("products/mom"))
                 || source.starts_with(root.join("tests/integration-current"))
                 || source.starts_with(root.join("xtask")),
             "Rust source outside the imported native or diagnostic boundaries: {}",

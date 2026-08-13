@@ -14,6 +14,9 @@ members = [
     "products/fte/crates/fte-types",
     "products/fte/crates/tauri-plugin-free-token-energy",
     "products/fte/src-tauri",
+    "products/mom/apps/mom-llama/src-tauri",
+    "products/mom/crates/mom-llama-cli",
+    "products/mom/crates/mom-llama-runtime",
     "tests/integration-current",
     "xtask",
 ]
@@ -39,8 +42,11 @@ async-stream = "0.3.6"
 async-trait = "0.1.89"
 axum = "0.8.9"
 bytes = "1.11.1"
+chacha20poly1305 = "0.10.1"
+clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 futures = "0.3.32"
+getrandom = "0.3"
 http = "1"
 http-body-util = "0.1"
 rand = "0.9"
@@ -48,6 +54,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+serde_yaml = "0.9"
 sha2 = "0.10.9"
 thiserror = "2"
 tokio = { version = "1.52.1", features = ["full"] }
@@ -70,14 +77,20 @@ llama-native-engine = { path = "crates/native/crates/llama-native-engine" }
 llama-native-host = { path = "crates/native/crates/llama-native-host" }
 llama-native-types = { path = "crates/native/crates/llama-native-types" }
 attachment-native-host = { path = "crates/services/attachment/crates/attachment-native-host" }
+attachment-native-types = { path = "crates/services/attachment/crates/attachment-native-types" }
+fte-backend-llama = { path = "products/fte/crates/fte-backend-llama" }
 fte-router = { path = "products/fte/crates/fte-router" }
+fte-store = { path = "products/fte/crates/fte-store" }
+fte-types = { path = "products/fte/crates/fte-types" }
+tauri-plugin-free-token-energy = { path = "products/fte/crates/tauri-plugin-free-token-energy" }
 information-native-host = { path = "crates/services/information/crates/information-native-host" }
 speech-native-host = { path = "crates/services/speech/crates/speech-native-host" }
 fte-types-current = { package = "fte-types", path = "products/fte/crates/fte-types" }
 fte-backend-llama-current = { package = "fte-backend-llama", path = "products/fte/crates/fte-backend-llama" }
 fte-loopback-current = { package = "fte-loopback", path = "products/fte/crates/fte-loopback" }
 fte-providers-current = { package = "fte-providers", path = "products/fte/crates/fte-providers" }
-mom-llama-runtime-current = { package = "mom-llama-runtime", git = "https://github.com/delysis/mom-llama", rev = "3cf57941af6d523378e7fa8b24f5c24c8e50363f" }
+mom-llama-runtime = { path = "products/mom/crates/mom-llama-runtime" }
+mom-llama-runtime-current = { package = "mom-llama-runtime", path = "products/mom/crates/mom-llama-runtime" }
 attachment-native-types-current = { package = "attachment-native-types", path = "crates/services/attachment/crates/attachment-native-types" }
 attachment-native-host-current = { package = "attachment-native-host", path = "crates/services/attachment/crates/attachment-native-host" }
 speech-native-types-current = { package = "speech-native-types", path = "crates/services/speech/crates/speech-native-types" }
@@ -90,6 +103,10 @@ loom-types-current = { package = "loom-types", git = "https://github.com/delysis
 platform-contracts-v0-current = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
 platform-contract-testkit-current = { package = "platform-contract-testkit", path = "crates/platform/contracts/crates/platform-contract-testkit" }
 platform-vertical-fixtures-v0-current = { package = "platform-vertical-fixtures-v0", path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
+platform-contracts-v0 = { path = "crates/platform/contracts/crates/platform-contracts-v0" }
+platform-contracts-v0-vertical = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
+platform-contract-testkit = { path = "crates/platform/contracts/crates/platform-contract-testkit" }
+platform-vertical-fixtures-v0 = { path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -104,12 +121,15 @@ unimplemented = "deny"
 unwrap_used = "deny"
 
 [workspace.metadata.native-platform.package-groups]
-portable = ["command-evidence", "fte-loopback", "fte-protocols", "fte-providers", "fte-router", "fte-store", "fte-types", "llama-native-cache", "llama-native-types"]
+portable = ["command-evidence", "fte-loopback", "fte-protocols", "fte-providers", "fte-router", "fte-store", "fte-types", "llama-native-cache", "llama-native-types", "mom-llama-cli", "mom-llama-runtime"]
 platform = ["fte-backend-llama", "llama-native-engine", "llama-native-host", "tauri-plugin-free-token-energy"]
-product = ["free-token-energy"]
+product = ["free-token-energy", "mom-llama-app"]
 research = []
 diagnostic = ["integration-current", "xtask"]
 real-hardware = []
+
+[profile.dev.package.sha2]
+opt-level = 3
 
 [patch."https://github.com/delysis/llama-native-kit"]
 command-evidence = { path = "crates/native/crates/command-evidence" }
