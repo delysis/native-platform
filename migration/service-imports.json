@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "goal": "W5-IMPORT-SERVICES",
-  "status": "raw_import_candidate",
+  "status": "promotion_candidate",
   "accepted_w4_base": "6ecbaec3f42adb7dbe63199c0a9217f367548241",
   "rewrite": {
     "tool": "git-filter-repo==2.47.0",
@@ -64,7 +64,7 @@
     }
   ],
   "raw_import_head": "4a45947508cf33fb0f8043e0507f2dda86d5d75c",
-  "path_dependency_cutover": null,
+  "path_dependency_cutover": "a73df93428334dcfd5b302b598e7b9d7be1539ab",
   "promotion": {
     "candidate": null,
     "candidate_ci_run": null,
@@ -78,10 +78,9 @@
     "speech": "pending"
   },
   "nonclaims": [
-    "The three source histories are imported, but path dependency cutover has not yet been recorded.",
     "No candidate or post-merge CI acceptance is claimed.",
     "No source repository freeze, release, tag, or archival action is claimed.",
     "No scheduled fuzz run is required or claimed.",
-    "No real Parakeet or Apple runtime replay is claimed by this raw-import receipt."
+    "The local real Parakeet and Apple installed-voice replays do not substitute for candidate or post-merge CI."
   ]
 }

@@ -145,7 +145,7 @@ fn check_policy(root: &Path) -> Result<()> {
     check_loom_reconciliation(root)?;
     check_evidence_files(root)?;
     check_adrs(root)?;
-    println!("native-platform W5 raw-import candidate policy: pass");
+    println!("native-platform W5 promotion-candidate policy: pass");
     Ok(())
 }
 
@@ -204,11 +204,11 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     )?;
     check_sha256(
         &root.join("migration/service-imports.json"),
-        "9db6abad5da033714cc16ee25fe8905a5c9d6da6291a47a0e5e27538d714ff31",
+        "790d5959b53563884bbd45c06520f34e846fe142b1fb86117602d983b43c1c60",
     )?;
     check_sha256(
         &root.join("docs/migration/W5-SERVICES-EVIDENCE.md"),
-        "498e9accd8b2d9177d71f8420e5f028abe740c56a989189ba6f9d9d1a50ff4a9",
+        "12194b2f81f56740421626888727d93e06fc3c18c0b9eec0cc2e245ce3422da0",
     )
 }
 
