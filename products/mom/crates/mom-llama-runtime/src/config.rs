@@ -11,6 +11,7 @@ use std::sync::{Mutex, OnceLock};
 
 const SETTINGS_FILE: &str = "settings.json";
 const SETTINGS_NAMESPACE: &str = "settings.v2";
+const DEFAULT_MAX_TOKENS: u32 = 512;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -44,7 +45,7 @@ impl Default for GenerationDefaults {
         Self {
             temperature: 0.7,
             top_p: 0.95,
-            max_tokens: 128,
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 }
@@ -381,7 +382,7 @@ pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
         ("xtc_probability".to_string(), Value::Null),
         ("xtc_threshold".to_string(), Value::Null),
         ("typ_p".to_string(), Value::Null),
-        ("max_tokens".to_string(), json!(128)),
+        ("max_tokens".to_string(), json!(DEFAULT_MAX_TOKENS)),
         ("samplers".to_string(), json!("")),
         ("backend_sampling".to_string(), json!(false)),
         ("repeat_last_n".to_string(), Value::Null),
@@ -1014,6 +1015,13 @@ mod tests {
             assert_eq!(policy.allows_prefix_reuse(), policy != KvCachePolicy::None);
             assert_eq!(policy.persists_conversation_checkpoints(), checkpoint);
         }
+    }
+
+    #[test]
+    fn generation_defaults_leave_room_for_reasoning_models_to_answer() {
+        let settings = Settings::defaults_for_data_dir(std::env::temp_dir());
+        assert_eq!(settings.default_max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(settings.sampling_config().max_tokens, DEFAULT_MAX_TOKENS);
     }
 
     #[test]
