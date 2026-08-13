@@ -1,0 +1,118 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-policy:
+    name: Workflow policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: ./scripts/check-workflow-policy.sh
+      - run: ./tests/workflow_policy.sh
+      - run: ./scripts/check-boundaries.sh
+
+  msrv:
+    name: MSRV 1.88
+    needs: workflow-policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.88.0"
+      - run: cargo check --locked --workspace --all-targets
+
+  audit:
+    name: Dependency audit
+    needs: workflow-policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.88.0"
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit
+
+  rust:
+    name: Rust 1.88 (${{ matrix.os }})
+    needs: workflow-policy
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.88.0"
+          components: rustfmt,clippy
+      - run: cargo fmt --all --check
+      - run: cargo test --locked --workspace --all-targets
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - if: runner.os != 'Windows'
+        run: ./scripts/check-boundaries.sh
+
+  fuzz-build:
+    name: Fuzz targets build
+    needs: workflow-policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: nightly-2026-07-26
+          components: rustfmt
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+      - run: cargo fuzz build inspect
+      - run: cargo fuzz build pipeline
+
+  bounded-fuzz:
+    name: Manual bounded fuzz
+    if: github.event_name == 'workflow_dispatch'
+    needs: fuzz-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: nightly-2026-07-26
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Prepare retained evidence
+        run: mkdir -p bounded-fuzz-logs fuzz/artifacts/inspect fuzz/artifacts/pipeline
+      - name: Fuzz inspect for 60 seconds
+        run: cargo fuzz run inspect -- -max_total_time=60 -timeout=5 2>&1 | tee bounded-fuzz-logs/inspect.log
+      - name: Fuzz pipeline for 60 seconds
+        run: cargo fuzz run pipeline -- -max_total_time=60 -timeout=5 2>&1 | tee bounded-fuzz-logs/pipeline.log
+      - name: Record bounded-run identity
+        if: always()
+        run: |
+          printf '%s\n' \
+            "repository=$GITHUB_REPOSITORY" \
+            "sha=$GITHUB_SHA" \
+            "event=$GITHUB_EVENT_NAME" \
+            "run_id=$GITHUB_RUN_ID" \
+            "run_attempt=$GITHUB_RUN_ATTEMPT" \
+            "runner_os=$RUNNER_OS" \
+            "cargo_fuzz=0.13.2" \
+            "nightly=nightly-2026-07-26" \
+            > bounded-fuzz-logs/run-identity.txt
+      - name: Upload bounded-fuzz evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bounded-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            bounded-fuzz-logs/
+            fuzz/artifacts/
+          if-no-files-found: error
+          retention-days: 30

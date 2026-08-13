@@ -1,0 +1,8 @@
+/target/
+/fuzz/target/
+/.DS_Store
+/.idea/
+/.vscode/
+*.profraw
+fuzz/artifacts/
+fuzz/corpus/
