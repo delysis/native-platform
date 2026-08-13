@@ -12,5 +12,3 @@ tauri-plugin-speech-native = { path = "../../crates/tauri-plugin-speech-native" 
 
 [build-dependencies]
 tauri-build = "2"
-
-[workspace]

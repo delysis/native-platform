@@ -3426,7 +3426,7 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
         )
     });
     let invocation_id = started_rx
-        .recv_timeout(Duration::from_secs(120))
+        .recv_timeout(Duration::from_mins(2))
         .map_err(|error| anyhow!("persona group did not start streaming: {error}"))?;
     let cancelled = mom_llama_runtime::mention_cancel(&invocation_id, Some(&cancelled_persona_id))?;
     assert_eq!(
@@ -3651,7 +3651,7 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
         )
     });
 
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_mins(2);
     let active = loop {
         let status = mom_llama_runtime::tool_loop_status(Some(conversation_id))?;
         if let Some(active) = status

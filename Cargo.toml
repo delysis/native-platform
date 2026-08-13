@@ -5,6 +5,34 @@ members = [
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
     "crates/native/crates/llama-native-types",
+    "crates/platform/contracts/crates/platform-contract-testkit",
+    "crates/platform/contracts/crates/platform-contracts-v0",
+    "crates/platform/contracts/crates/platform-vertical-fixtures-v0",
+    "crates/services/attachment/crates/attachment-native-cli",
+    "crates/services/attachment/crates/attachment-native-document",
+    "crates/services/attachment/crates/attachment-native-host",
+    "crates/services/attachment/crates/attachment-native-inspect",
+    "crates/services/attachment/crates/attachment-native-plan",
+    "crates/services/attachment/crates/attachment-native-types",
+    "crates/services/information/crates/information-native-acquire",
+    "crates/services/information/crates/information-native-backend-community",
+    "crates/services/information/crates/information-native-backend-encyclopedia",
+    "crates/services/information/crates/information-native-backend-scripture",
+    "crates/services/information/crates/information-native-backend-sqlite",
+    "crates/services/information/crates/information-native-catalog",
+    "crates/services/information/crates/information-native-cli",
+    "crates/services/information/crates/information-native-host",
+    "crates/services/information/crates/information-native-retrieval",
+    "crates/services/information/crates/information-native-store",
+    "crates/services/information/crates/information-native-types",
+    "crates/services/information/crates/tauri-plugin-information-native",
+    "crates/services/speech/crates/speech-native-backend-parakeet",
+    "crates/services/speech/crates/speech-native-host",
+    "crates/services/speech/crates/speech-native-platform",
+    "crates/services/speech/crates/speech-native-router",
+    "crates/services/speech/crates/speech-native-types",
+    "crates/services/speech/crates/tauri-plugin-speech-native",
+    "crates/services/speech/tests/apple-tauri-w1",
     "products/fte/crates/fte-backend-llama",
     "products/fte/crates/fte-loopback",
     "products/fte/crates/fte-protocols",
@@ -14,21 +42,31 @@ members = [
     "products/fte/crates/fte-types",
     "products/fte/crates/tauri-plugin-free-token-energy",
     "products/fte/src-tauri",
+    "products/loom/apps/loom/src-tauri",
+    "products/loom/crates/loom-backend-llama",
+    "products/loom/crates/loom-benchmark",
+    "products/loom/crates/loom-campaign",
+    "products/loom/crates/loom-cli",
+    "products/loom/crates/loom-context",
+    "products/loom/crates/loom-document",
+    "products/loom/crates/loom-eval",
+    "products/loom/crates/loom-eval-codex",
+    "products/loom/crates/loom-host",
+    "products/loom/crates/loom-inference",
+    "products/loom/crates/loom-learning",
+    "products/loom/crates/loom-research-types",
+    "products/loom/crates/loom-search",
+    "products/loom/crates/loom-store",
+    "products/loom/crates/loom-trial",
+    "products/loom/crates/loom-types",
+    "products/loom/crates/tauri-plugin-loom",
     "products/mom/apps/mom-llama/src-tauri",
     "products/mom/crates/mom-llama-cli",
     "products/mom/crates/mom-llama-runtime",
-    "tests/integration-current",
+    "tests/vertical",
     "xtask",
 ]
-exclude = [
-    "crates/platform/contracts",
-    "crates/services/attachment",
-    "crates/services/information",
-    "crates/services/speech",
-    # W7 keeps Loom isolated only because its rusqlite 0.39 / libsqlite3-sys
-    # 0.37 link target cannot coexist with the root graph until W8.
-    "products/loom",
-]
+exclude = ["crates/services/attachment/fuzz"]
 resolver = "3"
 
 [workspace.package]
@@ -43,22 +81,36 @@ publish = false
 anyhow = "1.0.100"
 async-stream = "0.3.6"
 async-trait = "0.1.89"
+atomic-write-file = "=0.3.0"
 axum = "0.8.9"
 bytes = "1.11.1"
 chacha20poly1305 = "0.10.1"
+chrono = { version = "0.4.41", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 futures = "0.3.32"
 getrandom = "0.3"
+fs2 = "0.4.3"
+fs4 = "1.1.0"
 http = "1"
 http-body-util = "0.1"
+hound = "3.5.1"
+jsonschema = { version = "0.49.8", default-features = false }
+ndarray = { version = "0.17.2", default-features = false, features = ["std"] }
+parakeet-rs = "0.3.7"
 rand = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-rusqlite = { version = "0.32.1", features = ["bundled"] }
+rand_chacha = "0.9.0"
+rand_core = "0.9.5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+rusqlite = { version = "=0.39.0", features = ["bundled"] }
+safetensors = "0.8.0"
+same-file = "1.0.6"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_yaml = "0.9"
 sha2 = "0.10.9"
+similar = "3.1.1"
+tempfile = "3.27.0"
 thiserror = "2"
 tokio = { version = "1.52.1", features = ["full"] }
 tokio-stream = "0.1"
@@ -67,44 +119,56 @@ toml = "0.9.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["limit", "timeout"] }
 tracing = "0.1.44"
+ulid = { version = "1.2.1", features = ["serde"] }
+url = { version = "2.5.7", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Exact current integration inputs. Imported first-party sources are path-rebound.
-llama-cpp-2-current = { package = "llama-cpp-2", git = "https://github.com/delysis/llama-cpp-rs", rev = "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391", default-features = false }
-llama-native-types-current = { package = "llama-native-types", path = "crates/native/crates/llama-native-types" }
-llama-native-host-current = { package = "llama-native-host", path = "crates/native/crates/llama-native-host" }
-command-evidence-current = { package = "command-evidence", path = "crates/native/crates/command-evidence" }
 llama-native-cache = { path = "crates/native/crates/llama-native-cache" }
 llama-native-engine = { path = "crates/native/crates/llama-native-engine" }
 llama-native-host = { path = "crates/native/crates/llama-native-host" }
 llama-native-types = { path = "crates/native/crates/llama-native-types" }
 attachment-native-host = { path = "crates/services/attachment/crates/attachment-native-host" }
+attachment-native-document = { path = "crates/services/attachment/crates/attachment-native-document" }
+attachment-native-inspect = { path = "crates/services/attachment/crates/attachment-native-inspect" }
+attachment-native-plan = { path = "crates/services/attachment/crates/attachment-native-plan" }
 attachment-native-types = { path = "crates/services/attachment/crates/attachment-native-types" }
+base64 = "0.22.1"
+crabz2 = { version = "0.2.0", default-features = false }
+csv = "1.4.0"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+hex = "0.4.3"
+html-to-markdown-rs = { version = "=3.10.6", default-features = false }
+imagesize = { version = "0.15.0", default-features = false, features = ["bmp", "gif", "heif", "jpeg", "png", "tiff", "webp"] }
+infer = { version = "0.22.0", default-features = false, features = ["std"] }
+libarchive_oxide = { version = "=0.2.0", default-features = false, features = ["sevenz"] }
+lopdf = { version = "0.44.0", default-features = false }
+lzma-rust2 = { version = "0.18.1", default-features = false, features = ["std", "xz"] }
+mail-parser = { version = "0.11.5", default-features = false }
+quick-xml = { version = "0.41.0", default-features = false, features = ["serialize"] }
+ruzstd = { version = "0.9.0", default-features = false, features = ["hash", "std"] }
+tar = { version = "0.4.46", default-features = false }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2", "deflate64"] }
 fte-backend-llama = { path = "products/fte/crates/fte-backend-llama" }
 fte-router = { path = "products/fte/crates/fte-router" }
 fte-store = { path = "products/fte/crates/fte-store" }
 fte-types = { path = "products/fte/crates/fte-types" }
 tauri-plugin-free-token-energy = { path = "products/fte/crates/tauri-plugin-free-token-energy" }
 information-native-host = { path = "crates/services/information/crates/information-native-host" }
+information-native-acquire = { path = "crates/services/information/crates/information-native-acquire" }
+information-native-backend-community = { path = "crates/services/information/crates/information-native-backend-community" }
+information-native-backend-encyclopedia = { path = "crates/services/information/crates/information-native-backend-encyclopedia" }
+information-native-backend-scripture = { path = "crates/services/information/crates/information-native-backend-scripture" }
+information-native-backend-sqlite = { path = "crates/services/information/crates/information-native-backend-sqlite" }
+information-native-catalog = { path = "crates/services/information/crates/information-native-catalog" }
+information-native-retrieval = { path = "crates/services/information/crates/information-native-retrieval" }
+information-native-store = { path = "crates/services/information/crates/information-native-store" }
+information-native-types = { path = "crates/services/information/crates/information-native-types" }
 speech-native-host = { path = "crates/services/speech/crates/speech-native-host" }
-fte-types-current = { package = "fte-types", path = "products/fte/crates/fte-types" }
-fte-backend-llama-current = { package = "fte-backend-llama", path = "products/fte/crates/fte-backend-llama" }
-fte-loopback-current = { package = "fte-loopback", path = "products/fte/crates/fte-loopback" }
-fte-providers-current = { package = "fte-providers", path = "products/fte/crates/fte-providers" }
 mom-llama-runtime = { path = "products/mom/crates/mom-llama-runtime" }
-mom-llama-runtime-current = { package = "mom-llama-runtime", path = "products/mom/crates/mom-llama-runtime" }
-attachment-native-types-current = { package = "attachment-native-types", path = "crates/services/attachment/crates/attachment-native-types" }
-attachment-native-host-current = { package = "attachment-native-host", path = "crates/services/attachment/crates/attachment-native-host" }
-speech-native-types-current = { package = "speech-native-types", path = "crates/services/speech/crates/speech-native-types" }
-speech-native-host-current = { package = "speech-native-host", path = "crates/services/speech/crates/speech-native-host" }
-speech-native-platform-current = { package = "speech-native-platform", path = "crates/services/speech/crates/speech-native-platform" }
-speech-native-backend-parakeet-current = { package = "speech-native-backend-parakeet", path = "crates/services/speech/crates/speech-native-backend-parakeet" }
-information-native-types-current = { package = "information-native-types", path = "crates/services/information/crates/information-native-types" }
-information-native-host-current = { package = "information-native-host", path = "crates/services/information/crates/information-native-host" }
-platform-contracts-v0-current = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
-platform-contract-testkit-current = { package = "platform-contract-testkit", path = "crates/platform/contracts/crates/platform-contract-testkit" }
-platform-vertical-fixtures-v0-current = { package = "platform-vertical-fixtures-v0", path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
 platform-contracts-v0 = { path = "crates/platform/contracts/crates/platform-contracts-v0" }
+platform-contracts-v0-vertical = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
+platform-contracts-fixture-v0 = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
 platform-contract-testkit = { path = "crates/platform/contracts/crates/platform-contract-testkit" }
 platform-vertical-fixtures-v0 = { path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
 
@@ -120,77 +184,13 @@ todo = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
 
-[workspace.metadata.native-platform.package-groups]
-portable = ["command-evidence", "fte-loopback", "fte-protocols", "fte-providers", "fte-router", "fte-store", "fte-types", "llama-native-cache", "llama-native-types", "mom-llama-cli", "mom-llama-runtime"]
-platform = ["fte-backend-llama", "llama-native-engine", "llama-native-host", "tauri-plugin-free-token-energy"]
-product = ["free-token-energy", "mom-llama-app"]
-research = []
-diagnostic = ["integration-current", "xtask"]
-real-hardware = []
-
 [profile.dev.package.sha2]
 opt-level = 3
 
-[patch."https://github.com/delysis/llama-native-kit"]
-command-evidence = { path = "crates/native/crates/command-evidence" }
-llama-native-cache = { path = "crates/native/crates/llama-native-cache" }
-llama-native-engine = { path = "crates/native/crates/llama-native-engine" }
-llama-native-host = { path = "crates/native/crates/llama-native-host" }
-llama-native-types = { path = "crates/native/crates/llama-native-types" }
+[profile.test.package.sha2]
+opt-level = 3
 
-[patch."https://github.com/delysis/free-token-energy"]
-fte-backend-llama = { path = "products/fte/crates/fte-backend-llama" }
-fte-loopback = { path = "products/fte/crates/fte-loopback" }
-fte-protocols = { path = "products/fte/crates/fte-protocols" }
-fte-providers = { path = "products/fte/crates/fte-providers" }
-fte-router = { path = "products/fte/crates/fte-router" }
-fte-store = { path = "products/fte/crates/fte-store" }
-fte-types = { path = "products/fte/crates/fte-types" }
-tauri-plugin-free-token-energy = { path = "products/fte/crates/tauri-plugin-free-token-energy" }
-
-[patch."https://github.com/delysis/free-token-energy.git"]
-fte-backend-llama = { path = "products/fte/crates/fte-backend-llama" }
-fte-loopback = { path = "products/fte/crates/fte-loopback" }
-fte-protocols = { path = "products/fte/crates/fte-protocols" }
-fte-providers = { path = "products/fte/crates/fte-providers" }
-fte-router = { path = "products/fte/crates/fte-router" }
-fte-store = { path = "products/fte/crates/fte-store" }
-fte-types = { path = "products/fte/crates/fte-types" }
-tauri-plugin-free-token-energy = { path = "products/fte/crates/tauri-plugin-free-token-energy" }
-
-[patch."https://github.com/delysis/llama-native-kit.git"]
-command-evidence = { path = "crates/native/crates/command-evidence" }
-llama-native-cache = { path = "crates/native/crates/llama-native-cache" }
-llama-native-engine = { path = "crates/native/crates/llama-native-engine" }
-llama-native-host = { path = "crates/native/crates/llama-native-host" }
-llama-native-types = { path = "crates/native/crates/llama-native-types" }
-
-# Cargo canonicalizes Git repository URLs by removing a trailing `.git` before
-# patch lookup. One table per service therefore rebinds both URL spellings.
-# Outer patches cover the root graph; leaf CLIs/plugins remain owned and locked
-# by their preserved nested workspaces until an outer consumer needs them.
-[patch."https://github.com/delysis/attachment-native-kit"]
-attachment-native-document = { path = "crates/services/attachment/crates/attachment-native-document" }
-attachment-native-host = { path = "crates/services/attachment/crates/attachment-native-host" }
-attachment-native-inspect = { path = "crates/services/attachment/crates/attachment-native-inspect" }
-attachment-native-plan = { path = "crates/services/attachment/crates/attachment-native-plan" }
-attachment-native-types = { path = "crates/services/attachment/crates/attachment-native-types" }
-
-[patch."https://github.com/delysis/information-native-kit"]
-information-native-acquire = { path = "crates/services/information/crates/information-native-acquire" }
-information-native-backend-community = { path = "crates/services/information/crates/information-native-backend-community" }
-information-native-backend-encyclopedia = { path = "crates/services/information/crates/information-native-backend-encyclopedia" }
-information-native-backend-scripture = { path = "crates/services/information/crates/information-native-backend-scripture" }
-information-native-backend-sqlite = { path = "crates/services/information/crates/information-native-backend-sqlite" }
-information-native-catalog = { path = "crates/services/information/crates/information-native-catalog" }
-information-native-host = { path = "crates/services/information/crates/information-native-host" }
-information-native-retrieval = { path = "crates/services/information/crates/information-native-retrieval" }
-information-native-store = { path = "crates/services/information/crates/information-native-store" }
-information-native-types = { path = "crates/services/information/crates/information-native-types" }
-
-[patch."https://github.com/delysis/speech-native-kit"]
-speech-native-backend-parakeet = { path = "crates/services/speech/crates/speech-native-backend-parakeet" }
-speech-native-host = { path = "crates/services/speech/crates/speech-native-host" }
-speech-native-platform = { path = "crates/services/speech/crates/speech-native-platform" }
-speech-native-router = { path = "crates/services/speech/crates/speech-native-router" }
-speech-native-types = { path = "crates/services/speech/crates/speech-native-types" }
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

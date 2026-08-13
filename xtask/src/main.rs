@@ -3,19 +3,11 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-const GROUPS: [&str; 6] = [
-    "portable",
-    "platform",
-    "product",
-    "research",
-    "diagnostic",
-    "real-hardware",
-];
+use std::process::Command;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -122,6 +114,40 @@ struct AdrFile {
     sha256: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealManifest {
+    schema_version: u64,
+    algorithm: String,
+    entries: Vec<SealEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealEntry {
+    path: String,
+    length: u64,
+    sha256: String,
+    purpose: String,
+    source: Option<SealSource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealSource {
+    repository: String,
+    revision: String,
+    tag: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackageGroups {
+    schema_version: u64,
+    primary: BTreeMap<String, Vec<String>>,
+    secondary: BTreeMap<String, Vec<String>>,
+}
+
 fn main() -> Result<()> {
     let command = env::args().nth(1).unwrap_or_else(|| "policy".to_owned());
     match command.as_str() {
@@ -148,79 +174,59 @@ fn check_policy(root: &Path) -> Result<()> {
 }
 
 fn check_evidence_files(root: &Path) -> Result<()> {
-    check_sha256(
-        &root.join("tests/integration-current/graph-boundaries.json"),
-        "ab92a68b4596c0797d1464002a6234b53957f6396884cb073c219f290f7805e3",
-    )?;
-    check_sha256(
-        &root.join("migration/exact-head-ci-evidence.json"),
-        "b6cea6491114274f5794efc1e628af1fd51a357a9a7f8bcdc1dec5bea6ec753a",
-    )?;
-    check_sha256(
-        &root.join("migration/w1-platform-contracts.commit-map"),
-        "6f56105a268443356e0245b70a0638dbe43f1d3e9933360e4d62b4f986b54e3d",
-    )?;
-    check_sha256(
-        &root.join("migration/llama-native-kit.commit-map"),
-        "90089306976c5c43aabfb23781a7df563f9245724d46cd1c3043e2a817a4c897",
-    )?;
-    check_sha256(
-        &root.join("migration/native-import.json"),
-        "028d4c6703c8acf6b96b681095ddeef035a6200c425a5421190635b8717795b6",
-    )?;
-    check_sha256(
-        &root.join("migration/free-token-energy.commit-map"),
-        "c3ee3e579668c1c6ca8275de2acf02832b8a0d7f35f1648ec211ce436c1b369e",
-    )?;
-    check_sha256(
-        &root.join("migration/gateway-import.json"),
-        "decaa20d66968e3142a04ee5b7f6a824caf1c272abbac5ec868db211089699d4",
-    )?;
-    check_sha256(
-        &root.join("docs/migration/W4-GATEWAY-EVIDENCE.md"),
-        "fbc4f466c3f36aaff892f3aa6a096bab74ac329d8b7c291882c8e499a0471f79",
-    )?;
-    check_sha256(
-        &root.join("migration/attachment-native-kit.commit-map"),
-        "931fdce49db3ce68e278570f782f20f42d866bffbae55685ef79c5500d92b495",
-    )?;
-    check_sha256(
-        &root.join("migration/information-native-kit.commit-map"),
-        "aadf2bed72b68065cf9d6442697649b6762e7306a9483e1cf09f9301667c15a9",
-    )?;
-    check_sha256(
-        &root.join("migration/speech-native-kit.commit-map"),
-        "b0d954d0c76ed4e7a05b04eb355bfa0e10f8dd7979c625541e4dfd7621ad7a92",
-    )?;
-    check_sha256(
-        &root.join("migration/service-imports.json"),
-        "b2448477203dc70ab209860cdc98ef229adca3461ea52e97253878b6d3c05517",
-    )?;
-    check_sha256(
-        &root.join("docs/migration/W5-SERVICES-EVIDENCE.md"),
-        "a5f5795de3a080151410f582fe460abbe71acf380402c477a2da8fadbb9c6b11",
-    )?;
-    check_sha256(
-        &root.join("migration/mom-import.json"),
-        "1754bd5d1116572967b1f263a897680dc4c40eb1413e1300b06ed365624fc96d",
-    )?;
-    check_sha256(
-        &root.join("docs/migration/W6-MOM-EVIDENCE.md"),
-        "53b176d1ec48e40532225224a60b4edad027248c910d83081c5d0fc9084b0ae5",
-    )?;
-    check_sha256(
-        &root.join("migration/loom-import.json"),
-        "f733c6af59e6d1dae3b8b9431c90ea308293a43f98198b9b95b7d967e0e38ff0",
-    )?;
-    check_sha256(
-        &root.join("docs/migration/W7-LOOM-EVIDENCE.md"),
-        "32568cdfe055bb73f415c34ff5f56ef3d1083286953d032a536a84a1a123ab66",
-    )
-}
+    let manifest: SealManifest =
+        serde_json::from_str(&read_text(&root.join("migration/seal-manifest.json"))?)
+            .context("parse migration seal manifest")?;
+    ensure!(manifest.schema_version == 1);
+    ensure!(manifest.algorithm == "sha256");
+    ensure!(!manifest.entries.is_empty());
 
-fn check_sha256(path: &Path, expected: &str) -> Result<()> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    ensure!(format!("{:x}", Sha256::digest(bytes)) == expected);
+    let mut paths = BTreeSet::new();
+    for entry in manifest.entries {
+        ensure!(!entry.purpose.trim().is_empty(), "empty seal purpose");
+        ensure!(
+            entry.sha256.len() == 64
+                && entry
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        let relative = Path::new(&entry.path);
+        ensure!(
+            !relative.is_absolute()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_))),
+            "unconfined seal path: {}",
+            entry.path
+        );
+        ensure!(paths.insert(entry.path.clone()), "duplicate seal path");
+        let bytes = fs::read(root.join(relative))
+            .with_context(|| format!("read sealed evidence {}", entry.path))?;
+        ensure!(
+            bytes.len() as u64 == entry.length,
+            "sealed length drift: {}",
+            entry.path
+        );
+        ensure!(
+            format!("{:x}", Sha256::digest(&bytes)) == entry.sha256,
+            "sealed digest drift: {}",
+            entry.path
+        );
+        if let Some(source) = entry.source {
+            ensure!(source.repository.starts_with("delysis/"));
+            ensure!(
+                source.revision.len() == 40
+                    && source
+                        .revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            );
+            if let Some(tag) = source.tag {
+                ensure!(!tag.trim().is_empty());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -230,198 +236,211 @@ fn check_workspace(root: &Path) -> Result<()> {
     ensure!(cargo["workspace"]["resolver"].as_str() == Some("3"));
     ensure!(cargo["workspace"]["package"]["edition"].as_str() == Some("2024"));
     ensure!(cargo["workspace"]["package"]["rust-version"].as_str() == Some("1.92"));
-    let groups = cargo["workspace"]["metadata"]["native-platform"]["package-groups"]
-        .as_table()
-        .context("workspace package-groups table")?;
-    ensure!(groups.keys().map(String::as_str).collect::<BTreeSet<_>>() == BTreeSet::from(GROUPS));
-    for (group, expected) in [
-        (
-            "portable",
-            &[
-                "command-evidence",
-                "fte-loopback",
-                "fte-protocols",
-                "fte-providers",
-                "fte-router",
-                "fte-store",
-                "fte-types",
-                "llama-native-cache",
-                "llama-native-types",
-                "mom-llama-cli",
-                "mom-llama-runtime",
-            ][..],
-        ),
-        (
-            "platform",
-            &[
-                "fte-backend-llama",
-                "llama-native-engine",
-                "llama-native-host",
-                "tauri-plugin-free-token-energy",
-            ],
-        ),
-        ("product", &["free-token-energy", "mom-llama-app"]),
-        ("research", &[]),
-        ("diagnostic", &["integration-current", "xtask"]),
-        ("real-hardware", &[]),
-    ] {
-        let actual = groups[group]
+    ensure!(
+        cargo["workspace"]["exclude"]
             .as_array()
-            .with_context(|| format!("workspace package group {group}"))?;
-        ensure!(
-            actual.len() == expected.len()
-                && actual
-                    .iter()
-                    .map(toml::Value::as_str)
-                    .collect::<Option<Vec<_>>>()
-                    .as_deref()
-                    == Some(expected),
-            "workspace package group {group} drift"
-        );
+            .is_some_and(|exclude| {
+                exclude.len() == 1 && exclude[0].as_str() == Some("crates/services/attachment/fuzz")
+            }),
+        "only the Attachment fuzz workspace may be excluded"
+    );
+
+    let output = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["metadata", "--locked", "--no-deps", "--format-version", "1"])
+        .current_dir(root)
+        .output()
+        .context("run cargo metadata")?;
+    ensure!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse cargo metadata")?;
+    let member_ids = metadata["workspace_members"]
+        .as_array()
+        .context("metadata workspace members")?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let workspace_packages = metadata["packages"]
+        .as_array()
+        .context("metadata packages")?
+        .iter()
+        .filter(|package| {
+            package["id"]
+                .as_str()
+                .is_some_and(|id| member_ids.contains(id))
+        })
+        .map(|package| {
+            package["name"]
+                .as_str()
+                .context("metadata package name")
+                .map(str::to_owned)
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+
+    let groups: PackageGroups =
+        serde_json::from_str(&read_text(&root.join("ci/package-groups.json"))?)
+            .context("parse package groups")?;
+    ensure!(groups.schema_version == 1);
+    ensure!(
+        groups
+            .primary
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            == BTreeSet::from([
+                "core",
+                "native",
+                "gateway",
+                "service-attachment",
+                "service-information",
+                "service-speech",
+                "product-fte",
+                "product-mom",
+                "product-loom",
+                "research-loom",
+                "diagnostic",
+                "testkit",
+            ])
+    );
+    ensure!(
+        groups
+            .secondary
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            == BTreeSet::from([
+                "portable",
+                "platform-linux",
+                "platform-macos",
+                "platform-windows",
+                "frontend",
+                "fuzz",
+                "real-hardware",
+                "release",
+            ])
+    );
+    let mut primary_packages = BTreeSet::new();
+    for (group, packages) in groups.primary {
+        ensure!(!packages.is_empty(), "empty primary package group: {group}");
+        for package in packages {
+            ensure!(
+                primary_packages.insert(package),
+                "duplicate primary package"
+            );
+        }
+    }
+    ensure!(
+        primary_packages == workspace_packages,
+        "primary package coverage drift"
+    );
+    for (group, packages) in groups.secondary {
+        let mut seen = BTreeSet::new();
+        for package in packages {
+            ensure!(
+                workspace_packages.contains(&package),
+                "unknown package in secondary group {group}: {package}"
+            );
+            ensure!(
+                seen.insert(package),
+                "duplicate package in secondary group {group}"
+            );
+        }
     }
 
     let cargo_manifests = find_named(root, "Cargo.toml")?;
+    let workspace_roots = cargo_manifests
+        .iter()
+        .filter_map(|path| {
+            toml::from_str::<toml::Value>(&read_text(path).ok()?)
+                .ok()?
+                .get("workspace")
+                .map(|_| path.clone())
+        })
+        .collect::<BTreeSet<_>>();
     ensure!(
-        cargo_manifests
+        workspace_roots
             == BTreeSet::from([
                 root.join("Cargo.toml"),
-                root.join("crates/native/crates/command-evidence/Cargo.toml"),
-                root.join("crates/native/crates/llama-native-cache/Cargo.toml"),
-                root.join("crates/native/crates/llama-native-engine/Cargo.toml"),
-                root.join("crates/native/crates/llama-native-host/Cargo.toml"),
-                root.join("crates/native/crates/llama-native-types/Cargo.toml"),
-                root.join("crates/platform/contracts/Cargo.toml"),
-                root.join("crates/platform/contracts/crates/platform-contract-testkit/Cargo.toml"),
-                root.join("crates/platform/contracts/crates/platform-contracts-v0/Cargo.toml"),
-                root.join("crates/platform/contracts/crates/platform-vertical-fixtures-v0/Cargo.toml"),
-                root.join("products/fte/crates/fte-backend-llama/Cargo.toml"),
-                root.join("products/fte/crates/fte-loopback/Cargo.toml"),
-                root.join("products/fte/crates/fte-protocols/Cargo.toml"),
-                root.join("products/fte/crates/fte-providers/Cargo.toml"),
-                root.join("products/fte/crates/fte-router/Cargo.toml"),
-                root.join("products/fte/crates/fte-store/Cargo.toml"),
-                root.join("products/fte/crates/fte-types/Cargo.toml"),
-                root.join("products/fte/crates/tauri-plugin-free-token-energy/Cargo.toml"),
-                root.join("products/fte/src-tauri/Cargo.toml"),
-                root.join("products/mom/apps/mom-llama/src-tauri/Cargo.toml"),
-                root.join("products/mom/crates/mom-llama-cli/Cargo.toml"),
-                root.join("products/mom/crates/mom-llama-runtime/Cargo.toml"),
-                root.join("products/loom/Cargo.toml"),
-                root.join("products/loom/apps/loom/src-tauri/Cargo.toml"),
-                root.join("products/loom/crates/loom-backend-llama/Cargo.toml"),
-                root.join("products/loom/crates/loom-benchmark/Cargo.toml"),
-                root.join("products/loom/crates/loom-campaign/Cargo.toml"),
-                root.join("products/loom/crates/loom-cli/Cargo.toml"),
-                root.join("products/loom/crates/loom-context/Cargo.toml"),
-                root.join("products/loom/crates/loom-document/Cargo.toml"),
-                root.join("products/loom/crates/loom-eval-codex/Cargo.toml"),
-                root.join("products/loom/crates/loom-eval/Cargo.toml"),
-                root.join("products/loom/crates/loom-host/Cargo.toml"),
-                root.join("products/loom/crates/loom-inference/Cargo.toml"),
-                root.join("products/loom/crates/loom-learning/Cargo.toml"),
-                root.join("products/loom/crates/loom-research-types/Cargo.toml"),
-                root.join("products/loom/crates/loom-search/Cargo.toml"),
-                root.join("products/loom/crates/loom-store/Cargo.toml"),
-                root.join("products/loom/crates/loom-trial/Cargo.toml"),
-                root.join("products/loom/crates/loom-types/Cargo.toml"),
-                root.join("products/loom/crates/tauri-plugin-loom/Cargo.toml"),
-                root.join("crates/services/attachment/Cargo.toml"),
-                root.join("crates/services/attachment/crates/attachment-native-cli/Cargo.toml"),
-                root.join("crates/services/attachment/crates/attachment-native-document/Cargo.toml"),
-                root.join("crates/services/attachment/crates/attachment-native-host/Cargo.toml"),
-                root.join("crates/services/attachment/crates/attachment-native-inspect/Cargo.toml"),
-                root.join("crates/services/attachment/crates/attachment-native-plan/Cargo.toml"),
-                root.join("crates/services/attachment/crates/attachment-native-types/Cargo.toml"),
                 root.join("crates/services/attachment/fuzz/Cargo.toml"),
-                root.join("crates/services/information/Cargo.toml"),
-                root.join("crates/services/information/crates/information-native-acquire/Cargo.toml"),
-                root.join("crates/services/information/crates/information-native-backend-community/Cargo.toml"),
-                root.join("crates/services/information/crates/information-native-backend-encyclopedia/Cargo.toml"),
-                root.join("crates/services/information/crates/information-native-backend-scripture/Cargo.toml"),
-                root.join("crates/services/information/crates/information-native-backend-sqlite/Cargo.toml"),
-                root.join("crates/services/information/crates/information-native-catalog/Cargo.toml"),
-                root.join("crates/services/information/crates/information-native-cli/Cargo.toml"),
-                root.join("crates/services/information/crates/information-native-host/Cargo.toml"),
-                root.join("crates/services/information/crates/information-native-retrieval/Cargo.toml"),
-                root.join("crates/services/information/crates/information-native-store/Cargo.toml"),
-                root.join("crates/services/information/crates/information-native-types/Cargo.toml"),
-                root.join("crates/services/information/crates/tauri-plugin-information-native/Cargo.toml"),
-                root.join("crates/services/speech/Cargo.toml"),
-                root.join("crates/services/speech/crates/speech-native-backend-parakeet/Cargo.toml"),
-                root.join("crates/services/speech/crates/speech-native-host/Cargo.toml"),
-                root.join("crates/services/speech/crates/speech-native-platform/Cargo.toml"),
-                root.join("crates/services/speech/crates/speech-native-router/Cargo.toml"),
-                root.join("crates/services/speech/crates/speech-native-types/Cargo.toml"),
-                root.join("crates/services/speech/crates/tauri-plugin-speech-native/Cargo.toml"),
-                root.join("crates/services/speech/tests/apple-tauri-w1/Cargo.toml"),
-                root.join("tests/integration-current/Cargo.toml"),
-                root.join("xtask/Cargo.toml"),
-            ])
+            ]),
+        "unknown nested Cargo workspace"
     );
     ensure!(
         find_named(root, "Cargo.lock")?
             == BTreeSet::from([
                 root.join("Cargo.lock"),
-                root.join("crates/platform/contracts/Cargo.lock"),
-                root.join("crates/services/attachment/Cargo.lock"),
                 root.join("crates/services/attachment/fuzz/Cargo.lock"),
-                root.join("crates/services/information/Cargo.lock"),
-                root.join("crates/services/speech/Cargo.lock"),
-                root.join("crates/services/speech/tests/apple-tauri-w1/Cargo.lock"),
-                root.join("products/loom/Cargo.lock"),
-            ])
-    );
-    ensure!(
-        find_named(root, "rust-toolchain.toml")?
-            == BTreeSet::from([
-                root.join("rust-toolchain.toml"),
-                root.join("crates/platform/contracts/rust-toolchain.toml"),
-            ])
+            ]),
+        "unknown nested Cargo lock"
     );
     ensure!(
         find_named(root, "pnpm-workspace.yaml")?
-            == BTreeSet::from([
-                root.join("pnpm-workspace.yaml"),
-                root.join("products/loom/pnpm-workspace.yaml"),
-            ])
+            == BTreeSet::from([root.join("pnpm-workspace.yaml")])
     );
-    ensure!(
-        find_named(root, "pnpm-lock.yaml")?
-            == BTreeSet::from([
-                root.join("pnpm-lock.yaml"),
-                root.join("products/loom/pnpm-lock.yaml"),
-            ])
-    );
-    let xtask_manifest: toml::Value = toml::from_str(&read_text(&root.join("xtask/Cargo.toml"))?)
-        .context("parse xtask Cargo.toml")?;
-    ensure!(xtask_manifest.get("workspace").is_none());
-    for source in find_extension(root, "rs")? {
+    ensure!(find_named(root, "pnpm-lock.yaml")? == BTreeSet::from([root.join("pnpm-lock.yaml")]));
+
+    for manifest in cargo_manifests {
+        let value: toml::Value = toml::from_str(&read_text(&manifest)?)
+            .with_context(|| format!("parse {}", manifest.display()))?;
+        check_git_dependencies(&value, &manifest)?;
+    }
+    let package: serde_json::Value = serde_json::from_str(&read_text(&root.join("package.json"))?)
+        .context("parse root package.json")?;
+    ensure!(package["packageManager"].as_str() == Some("pnpm@11.16.0"));
+    let pnpm_workspace = read_text(&root.join("pnpm-workspace.yaml"))?;
+    for package_glob in ["products/fte/**", "products/loom/**", "products/mom/**"] {
         ensure!(
-            source.starts_with(root.join("crates/native/crates"))
-                || source.starts_with(root.join("crates/platform"))
-                || source.starts_with(root.join("crates/services"))
-                || source.starts_with(root.join("products/fte"))
-                || source.starts_with(root.join("products/mom"))
-                || source.starts_with(root.join("products/loom"))
-                || source.starts_with(root.join("tests/integration-current"))
-                || source.starts_with(root.join("xtask")),
-            "Rust source outside the imported native or diagnostic boundaries: {}",
-            source.display()
+            pnpm_workspace.contains(package_glob),
+            "missing pnpm package glob: {package_glob}"
         );
     }
-    ensure!(!root.join("crates/native/Cargo.toml").exists());
-    ensure!(!root.join("crates/native/Cargo.lock").exists());
-    ensure!(!root.join("crates/native/.github/workflows/ci.yml").exists());
-    ensure!(
-        !root
-            .join("crates/native/.github/workflows/w1-contract-tests.yml")
-            .exists()
-    );
-    for forbidden in ["apps", "packages"] {
+    for workflow in find_extension(root, "yml")?
+        .into_iter()
+        .chain(find_extension(root, "yaml")?)
+        .filter(|path| {
+            path.components()
+                .any(|component| component.as_os_str() == "workflows")
+        })
+    {
         ensure!(
-            !root.join(forbidden).exists(),
-            "W3 native import must not contain later-wave directory {forbidden}"
+            workflow.starts_with(root.join(".github/workflows")),
+            "nested active workflow: {}",
+            workflow.display()
         );
+    }
+    Ok(())
+}
+
+fn check_git_dependencies(value: &toml::Value, manifest: &Path) -> Result<()> {
+    match value {
+        toml::Value::Array(values) => {
+            for value in values {
+                check_git_dependencies(value, manifest)?;
+            }
+        }
+        toml::Value::Table(table) => {
+            if let Some(repository) = table.get("git").and_then(toml::Value::as_str) {
+                ensure!(
+                    repository.trim_end_matches(".git")
+                        == "https://github.com/delysis/llama-cpp-rs",
+                    "forbidden Git dependency in {}: {repository}",
+                    manifest.display()
+                );
+                ensure!(
+                    table.get("rev").and_then(toml::Value::as_str)
+                        == Some("a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"),
+                    "unsealed llama-cpp-rs dependency: {}",
+                    manifest.display()
+                );
+            }
+            for value in table.values() {
+                check_git_dependencies(value, manifest)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -431,8 +450,8 @@ fn check_ledger(root: &Path) -> Result<()> {
         .context("parse migration ledger")?;
     let mut expected = Ledger {
         schema_version: 1,
-        goal: "W7-IMPORT-LOOM".into(),
-        status: "candidate".into(),
+        goal: "W8-ONE-WORKSPACE".into(),
+        status: "local_candidate".into(),
         production_source_imported: true,
         source_history_imported: true,
         integration_candidate: IntegrationCandidate {
@@ -441,8 +460,8 @@ fn check_ledger(root: &Path) -> Result<()> {
             product_releases_modified: false,
             source_imported: true,
             history_imported: true,
-            manifest: "tests/integration-current/Cargo.toml".into(),
-            coverage: "tests/integration-current/COVERAGE.md".into(),
+            manifest: "tests/vertical/Cargo.toml".into(),
+            coverage: "tests/vertical/COVERAGE.md".into(),
         },
         accepted_w1_receipt: AcceptedW1Receipt {
             goal: "W1-VERTICALS".into(),
@@ -601,6 +620,11 @@ fn check_ledger(root: &Path) -> Result<()> {
         .context("expected Loom migration entry")?;
     loom.import_commit = Some("19147c74bbe6335331f3fdad256663906c122dc3".into());
     loom.path_dependency_cutover_commit = Some("6cf468d277a88f085242bdaef017305e1148efda".into());
+    loom.source_tags.push(SourceTag {
+        name: "native-platform-v2-horizon-b-2026-08-12".into(),
+        peeled_commit: "223110bee4be72386d79306b444517371e4a9930".into(),
+    });
+    loom.old_repo_status = "frozen_unarchived_two_release_retirement".into();
     for (repository, import_commit) in [
         (
             "delysis/attachment-native-kit",

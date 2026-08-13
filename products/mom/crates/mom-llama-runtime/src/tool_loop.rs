@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 const MAX_TOOL_TURNS: u32 = 8;
 const MODEL_TOOL_PREVIEW_BYTES: usize = 32 * 1024;
-const MODEL_TURN_TIMEOUT: Duration = Duration::from_secs(120);
+const MODEL_TURN_TIMEOUT: Duration = Duration::from_mins(2);
 const TOOL_APPROVALS_NAMESPACE: &str = "tool-loop-approvals.v1";
 const TOOL_PERMISSIONS_NAMESPACE: &str = "tool-permissions.v1";
 const ACTIVE_TOOL_LOOPS_NAMESPACE: &str = "active-tool-loops.v1";

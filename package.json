@@ -5,9 +5,9 @@
   "packageManager": "pnpm@11.16.0",
   "scripts": {
     "check": "pnpm install --lockfile-only --frozen-lockfile",
-    "loom:install": "pnpm --dir products/loom install --frozen-lockfile",
-    "loom:test": "pnpm --dir products/loom/apps/loom run test",
-    "loom:check": "pnpm --dir products/loom/apps/loom run check",
-    "loom:build": "pnpm --dir products/loom/apps/loom run build"
+    "fte:test": "pnpm --filter free-token-energy test",
+    "loom:test": "pnpm --filter @delysis/loom test",
+    "loom:check": "pnpm --filter @delysis/loom check",
+    "loom:build": "pnpm --filter @delysis/loom build"
   }
 }

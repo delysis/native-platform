@@ -62,8 +62,8 @@ impl LoopbackConfig {
             max_header_bytes: 32 * 1024,
             max_concurrent_requests: 16,
             stream_keep_alive: Duration::from_secs(15),
-            stream_idle_timeout: Duration::from_secs(120),
-            stream_total_timeout: Duration::from_secs(60 * 60),
+            stream_idle_timeout: Duration::from_mins(2),
+            stream_total_timeout: Duration::from_hours(1),
             edge_defaults: EdgeDefaults::default(),
         }
     }

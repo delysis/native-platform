@@ -1,6 +1,6 @@
 # W7 Loom import: candidate evidence
 
-Status: **locally accepted; GitHub promotion pending**.
+Status: **accepted, merged, tagged, and source-frozen**.
 
 Accepted Loom source `223110bee4be72386d79306b444517371e4a9930`
 and tree `89eeaa6129d42d31ebb16b425189b3ffefb16724` are imported under
@@ -84,7 +84,25 @@ flattens the Cargo workspaces, and creates one root frontend lock. No new
 Information integration, research profile, hosted critic, mobile UI, source
 ingestion, or crate consolidation is claimed.
 
-GitHub publication, required policy and macOS checks, the protected W7 tag,
-and source-repository README/freeze will be recorded only after local
-acceptance. Linux and Windows jobs are informational under the Mac-first
-policy and do not block local engineering.
+## Promotion and source freeze
+
+PR required run `31693665960` passed policy job `94426458613` and macOS job
+`94426458695` at exact candidate head
+`746576b88859f7ec4ca9a03f86ef34c17aaebc13`. W7 merged without squashing as
+`99c49908ef8ccdb39fbbb1f710331e8a4161bc43`. Annotated tag
+`w7-import-loom-v0-2026-08-13` has tag object
+`87e59891465545962ee06b7033634265acaefbbc`, peels to that exact merge, and is
+protected by no-bypass ruleset `20794241`. Linux and Windows remain
+informational under the Mac-first policy.
+
+The accepted Loom source boundary remains commit
+`223110bee4be72386d79306b444517371e4a9930`, tree
+`89eeaa6129d42d31ebb16b425189b3ffefb16724`. Annotated source tag
+`native-platform-v2-horizon-b-2026-08-12` has object
+`39580736ad0f3bace6753ba83cdb5ffe25571274` and no-bypass protection ruleset
+`20794265`. README-only redirect commit
+`5fc31a787d208586951afec88bc11a975170fe37` passed workflow-policy job
+`94432427919` and macOS Rust job `94432481217` in run `31695560107`.
+No-bypass hard-freeze ruleset `20794407` blocks branch creation, update,
+deletion, and non-fast-forward operations. The source repository intentionally
+remains unarchived through the two-release retirement window.

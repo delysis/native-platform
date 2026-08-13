@@ -1156,8 +1156,14 @@ fn open_read_only_connection(
             "compiled Community Archive bind limit exceeds SQLite bounds",
         )
     })?;
-    connection.set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, bind_limit);
-    if connection.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER) < bind_limit {
+    connection
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, bind_limit)
+        .map_err(map_sqlite_error)?;
+    if connection
+        .limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)
+        .map_err(map_sqlite_error)?
+        < bind_limit
+    {
         return Err(InformationError::new(
             ErrorClass::Unsupported,
             "community_bind_limit_too_low",
@@ -1185,7 +1191,9 @@ fn open_read_only_connection(
     let deadline = now
         .checked_add(Duration::from_millis(timeout_ms))
         .unwrap_or(now);
-    connection.progress_handler(1_000, Some(move || Instant::now() >= deadline));
+    connection
+        .progress_handler(1_000, Some(move || Instant::now() >= deadline))
+        .map_err(map_sqlite_error)?;
     Ok(connection)
 }
 
@@ -3214,7 +3222,7 @@ mod tests {
         assert_eq!(pragma_i64(&connection, "query_only")?, 1);
         assert_eq!(pragma_i64(&connection, "trusted_schema")?, 0);
         assert_eq!(
-            connection.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER),
+            connection.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)?,
             i32::try_from(MAX_SQLITE_BINDS)?
         );
         let interrupted = connection

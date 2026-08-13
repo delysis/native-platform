@@ -69,7 +69,7 @@ impl Default for AcquireConfig {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(15),
-            request_timeout: Duration::from_secs(30 * 60),
+            request_timeout: Duration::from_mins(30),
             max_redirects: 5,
             user_agent: format!("information-native-acquire/{}", env!("CARGO_PKG_VERSION")),
         }

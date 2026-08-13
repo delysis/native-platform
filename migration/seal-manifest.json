@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "algorithm": "sha256",
+  "entries": [
+    {
+      "path": "migration/exact-head-ci-evidence.json",
+      "length": 1594,
+      "sha256": "b6cea6491114274f5794efc1e628af1fd51a357a9a7f8bcdc1dec5bea6ec753a",
+      "purpose": "exact pre-import CI receipts"
+    },
+    {
+      "path": "migration/w1-platform-contracts.commit-map",
+      "length": 2095,
+      "sha256": "6f56105a268443356e0245b70a0638dbe43f1d3e9933360e4d62b4f986b54e3d",
+      "purpose": "W1 filtered-history map",
+      "source": {
+        "repository": "delysis/w1-platform-contracts",
+        "revision": "3ed1f3235edb6d481c324f05fe83b2379e3431e6",
+        "tag": "w1-verticals-v0-2026-08-12"
+      }
+    },
+    {
+      "path": "migration/llama-native-kit.commit-map",
+      "length": 3735,
+      "sha256": "90089306976c5c43aabfb23781a7df563f9245724d46cd1c3043e2a817a4c897",
+      "purpose": "Native filtered-history map",
+      "source": {
+        "repository": "delysis/llama-native-kit",
+        "revision": "16168bd76a09f74fdee41d0e2fb0441e79ac1005",
+        "tag": "native-platform-v2-horizon-b-2026-08-12"
+      }
+    },
+    {
+      "path": "migration/native-import.json",
+      "length": 3879,
+      "sha256": "028d4c6703c8acf6b96b681095ddeef035a6200c425a5421190635b8717795b6",
+      "purpose": "Native import receipt"
+    },
+    {
+      "path": "docs/migration/W3-NATIVE-EVIDENCE.md",
+      "length": 5222,
+      "sha256": "226564341a967d1a37c411a048298bc715748ad52a820b757d27b9343bce631c",
+      "purpose": "W3 acceptance narrative"
+    },
+    {
+      "path": "migration/free-token-energy.commit-map",
+      "length": 4965,
+      "sha256": "c3ee3e579668c1c6ca8275de2acf02832b8a0d7f35f1648ec211ce436c1b369e",
+      "purpose": "FTE filtered-history map",
+      "source": {
+        "repository": "delysis/free-token-energy",
+        "revision": "67814e76659688fef61f311db588d17eddee0a66",
+        "tag": "native-platform-v2-horizon-b-2026-08-12"
+      }
+    },
+    {
+      "path": "migration/gateway-import.json",
+      "length": 3630,
+      "sha256": "decaa20d66968e3142a04ee5b7f6a824caf1c272abbac5ec868db211089699d4",
+      "purpose": "FTE import receipt"
+    },
+    {
+      "path": "docs/migration/W4-GATEWAY-EVIDENCE.md",
+      "length": 3110,
+      "sha256": "fbc4f466c3f36aaff892f3aa6a096bab74ac329d8b7c291882c8e499a0471f79",
+      "purpose": "W4 acceptance narrative"
+    },
+    {
+      "path": "migration/attachment-native-kit.commit-map",
+      "length": 619,
+      "sha256": "931fdce49db3ce68e278570f782f20f42d866bffbae55685ef79c5500d92b495",
+      "purpose": "Attachment filtered-history map",
+      "source": {
+        "repository": "delysis/attachment-native-kit",
+        "revision": "2a8d3a9a1828162a51185d207822ceb1ba6283a8",
+        "tag": "native-platform-v2-horizon-b-2026-08-12"
+      }
+    },
+    {
+      "path": "migration/information-native-kit.commit-map",
+      "length": 1767,
+      "sha256": "aadf2bed72b68065cf9d6442697649b6762e7306a9483e1cf09f9301667c15a9",
+      "purpose": "Information filtered-history map",
+      "source": {
+        "repository": "delysis/information-native-kit",
+        "revision": "7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe",
+        "tag": "native-platform-v2-horizon-b-2026-08-12"
+      }
+    },
+    {
+      "path": "migration/speech-native-kit.commit-map",
+      "length": 2095,
+      "sha256": "b0d954d0c76ed4e7a05b04eb355bfa0e10f8dd7979c625541e4dfd7621ad7a92",
+      "purpose": "Speech filtered-history map",
+      "source": {
+        "repository": "delysis/speech-native-kit",
+        "revision": "b836318f10a7e11f433ec3ea8dfa48707adc9b06",
+        "tag": "native-platform-v2-horizon-b-2026-08-12"
+      }
+    },
+    {
+      "path": "migration/service-imports.json",
+      "length": 6275,
+      "sha256": "b2448477203dc70ab209860cdc98ef229adca3461ea52e97253878b6d3c05517",
+      "purpose": "service import receipts"
+    },
+    {
+      "path": "docs/migration/W5-SERVICES-EVIDENCE.md",
+      "length": 4908,
+      "sha256": "a5f5795de3a080151410f582fe460abbe71acf380402c477a2da8fadbb9c6b11",
+      "purpose": "W5 acceptance narrative"
+    },
+    {
+      "path": "migration/mom-llama.commit-map",
+      "length": 4883,
+      "sha256": "26a8f595de2879aadca81a937df6e3700b287a92fed43af78e6bfc35050e284c",
+      "purpose": "Mom filtered-history map",
+      "source": {
+        "repository": "delysis/mom-llama",
+        "revision": "3cf57941af6d523378e7fa8b24f5c24c8e50363f",
+        "tag": "native-platform-v2-horizon-b-2026-08-12"
+      }
+    },
+    {
+      "path": "migration/mom-import.json",
+      "length": 4935,
+      "sha256": "1754bd5d1116572967b1f263a897680dc4c40eb1413e1300b06ed365624fc96d",
+      "purpose": "Mom import receipt"
+    },
+    {
+      "path": "docs/migration/W6-MOM-EVIDENCE.md",
+      "length": 4659,
+      "sha256": "53b176d1ec48e40532225224a60b4edad027248c910d83081c5d0fc9084b0ae5",
+      "purpose": "W6 acceptance narrative"
+    },
+    {
+      "path": "migration/loom-native.commit-map",
+      "length": 6359,
+      "sha256": "6f6bb23c88a4ff43791d5be109643b7527d48dc8baf0fb546583282884542ce0",
+      "purpose": "Loom filtered-history map",
+      "source": {
+        "repository": "delysis/loom-native",
+        "revision": "223110bee4be72386d79306b444517371e4a9930",
+        "tag": "phase1-audit-2026-08-11"
+      }
+    },
+    {
+      "path": "migration/loom-source-classification.json",
+      "length": 4898,
+      "sha256": "97731452370625be2127d968e6b8ead6bbac078ddea93b11133daa23e4828760",
+      "purpose": "Loom path reconciliation classification"
+    },
+    {
+      "path": "migration/loom-ce041-reconciliation.json",
+      "length": 970,
+      "sha256": "61e250ec6e538509c63161d16ff9a55c029fd3ba477131b0ce668c7ed390748e",
+      "purpose": "Loom branch reconciliation receipt"
+    },
+    {
+      "path": "migration/loom-import.json",
+      "length": 7157,
+      "sha256": "69c04ec99bf6f391ec85dbfa18a12bf0c364020f312e390fcfb6135ae0fa5910",
+      "purpose": "Loom import and local acceptance receipt"
+    },
+    {
+      "path": "docs/migration/W7-LOOM-EVIDENCE.md",
+      "length": 5665,
+      "sha256": "0b86b3392b62e3445e851f3910d96681f834e9b3891ffcc2bd7980e6219694a3",
+      "purpose": "W7 accepted promotion and source-freeze narrative"
+    },
+    {
+      "path": "migration/home.json",
+      "length": 6902,
+      "sha256": "01be6f108122a8e2201745abaa9f6b818a98b4c1b4827e1a7c7475c4d995aa32",
+      "purpose": "W8 HOME local acceptance receipt"
+    },
+    {
+      "path": "docs/migration/HOME-EVIDENCE.md",
+      "length": 5777,
+      "sha256": "610a01c55139f4439ee6ac287262768fd30c527da9194839349c8c4e0aa374bd",
+      "purpose": "W8 HOME local acceptance narrative"
+    }
+  ]
+}

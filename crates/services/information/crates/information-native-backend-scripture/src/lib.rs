@@ -35,7 +35,7 @@ use information_native_types::{
 use rusqlite::ffi::ErrorCode;
 use rusqlite::limits::Limit;
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, DatabaseName, OpenFlags, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1936,16 +1936,20 @@ fn open_read_only_connection(
         .append_pair("immutable", "1");
     let connection = Connection::open_with_flags(uri.as_str(), flags | OpenFlags::SQLITE_OPEN_URI)
         .map_err(map_sqlite_error)?;
-    connection.set_limit(
-        Limit::SQLITE_LIMIT_VARIABLE_NUMBER,
-        i32::try_from(MAX_SQLITE_BINDS).map_err(|_| {
-            integrity_error(
-                "scripture_bind_limit_overflow",
-                "compiled bind limit exceeds SQLite integer bounds",
-            )
-        })?,
-    );
-    if connection.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)
+    connection
+        .set_limit(
+            Limit::SQLITE_LIMIT_VARIABLE_NUMBER,
+            i32::try_from(MAX_SQLITE_BINDS).map_err(|_| {
+                integrity_error(
+                    "scripture_bind_limit_overflow",
+                    "compiled bind limit exceeds SQLite integer bounds",
+                )
+            })?,
+        )
+        .map_err(map_sqlite_error)?;
+    if connection
+        .limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)
+        .map_err(map_sqlite_error)?
         < i32::try_from(MAX_SQLITE_BINDS).unwrap_or(i32::MAX)
     {
         return Err(InformationError::new(
@@ -1954,8 +1958,14 @@ fn open_read_only_connection(
             "SQLite runtime cannot support the compiled Scripture bind limit",
         ));
     }
-    connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES);
-    if connection.limit(Limit::SQLITE_LIMIT_LENGTH) < MAX_SQLITE_VALUE_BYTES {
+    connection
+        .set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)
+        .map_err(map_sqlite_error)?;
+    if connection
+        .limit(Limit::SQLITE_LIMIT_LENGTH)
+        .map_err(map_sqlite_error)?
+        < MAX_SQLITE_VALUE_BYTES
+    {
         return Err(InformationError::new(
             ErrorClass::Unsupported,
             "scripture_sqlite_value_limit_too_low",
@@ -1977,9 +1987,7 @@ fn open_read_only_connection(
     let query_only = connection
         .pragma_query_value(None, "query_only", |row| row.get::<_, i64>(0))
         .map_err(map_sqlite_error)?;
-    let database_read_only = connection
-        .is_readonly(DatabaseName::Main)
-        .map_err(map_sqlite_error)?;
+    let database_read_only = connection.is_readonly("main").map_err(map_sqlite_error)?;
     if trusted_schema != 0 || query_only != 1 || !database_read_only {
         return Err(integrity_error(
             "scripture_read_only_guards_failed",
@@ -1990,7 +1998,9 @@ fn open_read_only_connection(
     let deadline = now
         .checked_add(Duration::from_millis(timeout_ms))
         .unwrap_or(now);
-    connection.progress_handler(1_000, Some(move || Instant::now() >= deadline));
+    connection
+        .progress_handler(1_000, Some(move || Instant::now() >= deadline))
+        .map_err(map_sqlite_error)?;
     Ok(connection)
 }
 

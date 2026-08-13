@@ -65,7 +65,7 @@ test("PR workflow exposes every targeted partition and future product guards", (
   assert.doesNotMatch(source, /platform_windows/);
 });
 
-test("frontend jobs provision the Rust tooling used by current package scripts", () => {
+test("frontend jobs use the single root pnpm workspace", () => {
   const prFrontend = read(prPath).match(/^  frontend:[\s\S]*?(?=^  platform-macos:)/m)?.[0];
   const fullFrontend = read(fullPath).match(/^  frontend:[\s\S]*?(?=^  policy-and-graphs:)/m)?.[0];
   for (const block of [prFrontend, fullFrontend]) {
@@ -73,9 +73,9 @@ test("frontend jobs provision the Rust tooling used by current package scripts",
     assert.match(block, /dtolnay\/rust-toolchain@[0-9a-f]{40}/);
     assert.match(block, /components: clippy,rustfmt/);
     assert.match(block, /libwebkit2gtk-4\.1-dev/);
-    for (const script of ["loom:install", "loom:test", "loom:check", "loom:build"]) {
-      assert.match(block, new RegExp(`pnpm run ${script}`));
-    }
+    assert.match(block, /pnpm install --frozen-lockfile/);
+    assert.match(block, /pnpm -r --if-present run test/);
+    assert.doesNotMatch(block, /loom:install|--dir products\/loom/);
   }
 });
 
@@ -84,7 +84,7 @@ test("the required macOS lane runs Mom parity when Mom changes", () => {
   assert.ok(macos, "platform-macos job block is missing");
   assert.match(macos, /name: Mom macOS parity/);
   assert.match(macos, /mom_present == 'true'/);
-  assert.match(macos, /mom-llama-runtime -p mom-llama-cli -p mom-llama-app/);
+  assert.match(macos, /cargo-group\.mjs test product-mom/);
   assert.match(macos, /unstable-w1-contracts,unstable-w1-vertical-fixtures/);
 });
 

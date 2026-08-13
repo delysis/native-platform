@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "goal": "W8-ONE-WORKSPACE",
+  "status": "local_accepted_pending_github_promotion",
+  "sealed_at": "2026-08-13T20:00:45Z",
+  "candidate": {
+    "commit": "66e6bf091f16ddad0fcbab194db40b2f8b7c3457",
+    "tree": "009927f7cf255daa3f05c8386ffc1a53b5ef0252",
+    "w7_parent": "99c49908ef8ccdb39fbbb1f710331e8a4161bc43"
+  },
+  "workspace": {
+    "first_party_packages": 65,
+    "primary_groups": {
+      "core": 1,
+      "native": 5,
+      "gateway": 7,
+      "service-attachment": 6,
+      "service-information": 12,
+      "service-speech": 6,
+      "product-fte": 2,
+      "product-mom": 3,
+      "product-loom": 9,
+      "research-loom": 9,
+      "diagnostic": 2,
+      "testkit": 3
+    },
+    "root_cargo_lock": {
+      "path": "Cargo.lock",
+      "bytes": 216767,
+      "sha256": "2210d33fbd3359281637c4a90cd96eeb9ca6eed0161f483486ba82cd143bd43d"
+    },
+    "root_pnpm_lock": {
+      "path": "pnpm-lock.yaml",
+      "bytes": 41294,
+      "sha256": "1c2d7d73d3c24ab2a8d1ecce65efb30b65683dcd975212d5c62cb45273ba2714"
+    },
+    "approved_auxiliary_workspace": "crates/services/attachment/fuzz",
+    "first_party_git_dependencies": 0,
+    "external_git_boundary": {
+      "repository": "https://github.com/delysis/llama-cpp-rs.git",
+      "revision": "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"
+    },
+    "sqlite": {
+      "rusqlite": "0.39.0",
+      "libsqlite3_sys": "0.37.0",
+      "sqlite": "3.51.3",
+      "native_links": 1,
+      "compile_options_sha256": "237dbc028deb283af23c96fd82473d36055b11b437c9b282be65e50b1a2acd36",
+      "required_options": ["THREADSAFE=1", "ENABLE_FTS5"]
+    }
+  },
+  "local_acceptance": {
+    "platform": "macOS 15.6 (24G84), arm64, Apple M4 Max",
+    "toolchain": "Rust 1.92.0",
+    "workspace_tests": "passed --workspace --all-targets --locked",
+    "strict_clippy": "passed --workspace --all-targets --locked -- -D warnings",
+    "format": true,
+    "policy": true,
+    "node_ci_tests": "23 passed",
+    "frontend": {
+      "pnpm": "11.16.0",
+      "frozen_lock_install": true,
+      "fte_tests": "2 passed",
+      "loom_test_files": 32,
+      "loom_tests": 182,
+      "svelte_errors": 0,
+      "svelte_warnings": 0,
+      "vite_build": true,
+      "advisory": "Existing Loom bundle chunk exceeds 500 kB after minification."
+    },
+    "native_qwen": {
+      "model_bytes": 484220320,
+      "model_sha256": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14",
+      "exact_vertical": true,
+      "real_local_inference": true,
+      "release_and_join": true
+    },
+    "fte_qwen": {
+      "real_chat": true,
+      "stable_prefix_miss_then_hit": true,
+      "exact_completion": true,
+      "joined_shutdown": true
+    },
+    "mom_qwen": {
+      "real_base_completion": true,
+      "fixture": false,
+      "completion_tokens_positive": true
+    },
+    "loom_gemma": {
+      "model_bytes": 4954576032,
+      "model_sha256": "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670",
+      "exact_vertical": true,
+      "release_and_join": true,
+      "bundle": {
+        "name": "Loom W8 66e6bf0.app",
+        "identifier": "app.delysis.loom.w8.66e6bf0",
+        "executable_bytes": 21127840,
+        "executable_sha256": "fa2c36b6a3610f9d2177852e1309da00cd0bafcfea7d423bf87c86a2f477c527",
+        "signature": "ad_hoc"
+      },
+      "visible_behavior": {
+        "exact_prefix": "At dawn, the locked observatory began to breathe.",
+        "suggestion_status": "Suggestion available. Tab accepts; Escape dismisses.",
+        "ordinary_tab_accepted": true,
+        "acceptance_status": "Suggestion accepted",
+        "metal_device": "Apple M4 Max",
+        "gpu_layers_loaded": "36/36",
+        "manuscript_bytes": 262,
+        "manuscript_sha256": "ef15713f9fc9a00b337e70b146a9b5c9d8e1fb269a8c375362618651c89bbc4d",
+        "selection_id": "01KZYBA06K4P63JWNRZ0CAJXQ3",
+        "selected_candidate_id": "01KZYB8R1FFHCTG44EHNHWA2W7",
+        "source_revision_id": "01KZYB8MFWN50MXB6HBR7VE0A0",
+        "resulting_revision_id": "01KZYBA06KQABR25NBPFE6TQ65",
+        "promotion_command_id": "01KZYBA062ZKHYPQ616S64424A",
+        "model_environment_id": "7385407900474d07ec4ebde1012bccd065bdff4074aa07720563fb7bc1a8812e",
+        "source_candidate_count": 3
+      },
+      "first_loaded_model_shutdown": {
+        "quit_started_at": "2026-08-13T19:59:31Z",
+        "exit_observed_at": "2026-08-13T19:59:40Z",
+        "observed_upper_bound_ms": 9219,
+        "process_exit_code": 0,
+        "metal_deallocation_observed": true
+      },
+      "immediate_relaunch": {
+        "same_bundle": true,
+        "same_model_loaded": true,
+        "manuscript_visibly_reopened": true,
+        "manuscript_bytes": 262,
+        "manuscript_sha256": "ef15713f9fc9a00b337e70b146a9b5c9d8e1fb269a8c375362618651c89bbc4d",
+        "second_loaded_model_shutdown": {
+          "quit_started_at": "2026-08-13T20:00:35Z",
+          "exit_observed_at": "2026-08-13T20:00:45Z",
+          "observed_upper_bound_ms": 9864,
+          "process_exit_code": 0,
+          "metal_deallocation_observed": true
+        }
+      }
+    },
+    "speech": {
+      "parakeet": {
+        "model_bundle_bytes": 480708981,
+        "model_bundle_sha256": "c710ae82b52aa969f89874e7e7b35ad570fec50cc3d943a4fdde0bb874948756",
+        "input_wav_bytes": 305580,
+        "input_wav_sha256": "326d6723b8bcd7ae63cdff4a2c3e536a29a9d3a44e30f9dca7b65e58a9b4aa34",
+        "complete_and_streaming_real_local_inference": true,
+        "request_scoped_cancellation": true,
+        "peer_completion_preserved": true,
+        "joined_shutdown": true,
+        "negative_evidence": "Transcript began with 'hardly beneath' instead of the spoken opening; no accuracy claim is made."
+      },
+      "apple": {
+        "launched_tauri": true,
+        "backend": "apple.av-speech",
+        "voice": "com.apple.eloquence.en-US.Eddy",
+        "language": "en-US",
+        "quality": "normal",
+        "wav_bytes": 153540,
+        "terminal_events": 1,
+        "network": "never",
+        "real_local_inference": true,
+        "executable_bytes": 31737992,
+        "executable_sha256": "52951b42fcfd90b7bfe49028706168d933ff4d97f8a3b433d87ab3527c0d6d3b"
+      }
+    }
+  },
+  "imported_source_tags": {
+    "w6": "w6-import-mom-v0-2026-08-13",
+    "w7": "w7-import-loom-v0-2026-08-13",
+    "source_boundary": "native-platform-v2-horizon-b-2026-08-12"
+  },
+  "promotion": {
+    "candidate_ci_run": null,
+    "main_merge": null,
+    "home_tag": null,
+    "home_tag_object": null,
+    "tag_ruleset": null
+  },
+  "claims_deferred": [
+    "GitHub publication, required policy/macOS checks, main merge, and protected HOME tag remain pending.",
+    "Linux and Windows are informational and are not Mac-first acceptance gates.",
+    "Distribution signing and notarization are release work, not W8 HOME acceptance.",
+    "W9 line/package reduction and W10 release/retirement remain future milestones."
+  ]
+}

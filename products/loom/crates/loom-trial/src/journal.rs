@@ -635,14 +635,11 @@ impl TrialJournal {
             .ok_or(TrialError::SessionLeaseMismatch)?;
         let session_id = TrialSessionId::from_artifact_id(session_lease.session_id());
         let store_lease_fingerprint = session_lease.lease_fingerprint();
-        let persistence = TrialJournalPersistence::Store(Box::new(
-            store.open_research_journal_writer(session_lease)?,
-        ));
-        if let TrialJournalPersistence::Store(writer) = &persistence
-            && !writer.load_trial_events()?.is_empty()
-        {
+        let writer = store.open_research_journal_writer(session_lease)?;
+        if !writer.load_trial_events()?.is_empty() {
             return Err(TrialError::JournalAlreadyExists);
         }
+        let persistence = TrialJournalPersistence::Store(Box::new(writer));
         let mut journal = Self {
             spec,
             trial_run_id,

@@ -126,7 +126,7 @@ test("Mom source selects Mom and root when Mom is present", () => {
 
 test("Loom Svelte source selects Loom frontend when Loom is present", () => {
   const { result } = fixture("products/loom/apps/loom/src/App.svelte", {
-    present: ["products/loom/Cargo.toml"],
+    present: ["products/loom/apps/loom/src-tauri/Cargo.toml"],
   });
   assert.equal(result.presence.loom, true);
   assert.equal(result.flags.loom, true);
@@ -138,7 +138,10 @@ test("Loom Svelte source selects Loom frontend when Loom is present", () => {
 test("root Cargo metadata forces the complete present graph", () => {
   const { result } = fixture("Cargo.toml", {
     contents: "[workspace]\n",
-    present: ["products/mom/Cargo.toml", "products/loom/Cargo.toml"],
+    present: [
+      "products/mom/Cargo.toml",
+      "products/loom/apps/loom/src-tauri/Cargo.toml",
+    ],
   });
   assert.equal(result.risk, "dependency");
   assert.equal(result.flags.full, true);

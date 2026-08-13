@@ -2196,7 +2196,7 @@ mod tests {
         for branch_id in branches {
             assert!(handle.cancel_branch(branch_id));
         }
-        let result = handle.wait_timeout(Duration::from_secs(300))?;
+        let result = handle.wait_timeout(Duration::from_mins(5))?;
         assert!(
             result.candidates.iter().all(|candidate| {
                 candidate.terminal.status == GenerationTerminalStatus::Cancelled
@@ -2303,6 +2303,6 @@ mod tests {
         }
         let backend = LlamaBackend::default();
         let handle = backend.start_exact_continuation(request)?;
-        Ok(handle.wait_timeout(Duration::from_secs(300))?)
+        Ok(handle.wait_timeout(Duration::from_mins(5))?)
     }
 }

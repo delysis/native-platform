@@ -34,7 +34,7 @@ jobs:
           else
             echo "mom=false" >> "$GITHUB_OUTPUT"
           fi
-          if test -f products/loom/Cargo.toml; then
+          if test -f products/loom/apps/loom/src-tauri/Cargo.toml; then
             echo "loom=true" >> "$GITHUB_OUTPUT"
           else
             echo "loom=false" >> "$GITHUB_OUTPUT"
@@ -91,11 +91,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: full-attachment-${{ runner.os }}
-          workspaces: crates/services/attachment -> target
-      - run: cargo fmt --manifest-path crates/services/attachment/Cargo.toml --all -- --check
-      - run: cargo test --locked --manifest-path crates/services/attachment/Cargo.toml --workspace --all-targets
+      - run: node scripts/ci/cargo-group.mjs fmt service-attachment
+      - run: node scripts/ci/cargo-group.mjs test service-attachment
       - if: runner.os == 'Linux'
-        run: cargo clippy --locked --manifest-path crates/services/attachment/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+        run: node scripts/ci/cargo-group.mjs clippy service-attachment
 
   information-portable:
     strategy:
@@ -114,14 +113,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: full-information-${{ runner.os }}
-          workspaces: crates/services/information -> target
-      - working-directory: crates/services/information
-        run: |
-          ./scripts/check-portable-packages.sh
-          ./scripts/run-portable-cargo.sh test
+      - run: node scripts/ci/cargo-group.mjs test service-information
       - if: runner.os == 'Linux'
-        working-directory: crates/services/information
-        run: ./scripts/run-portable-cargo.sh clippy
+        run: node scripts/ci/cargo-group.mjs clippy service-information
 
   information-platform-linux:
     runs-on: ubuntu-latest
@@ -138,10 +132,10 @@ jobs:
         with:
           toolchain: "1.92.0"
           components: clippy
-      - run: cargo test --locked --manifest-path crates/services/information/Cargo.toml -p information-native-acquire --features unstable-w1-contracts
-      - run: cargo test --locked --manifest-path crates/services/information/Cargo.toml -p information-native-host --features unstable-w1-vertical-tests --test w1_vertical
-      - run: cargo test --locked --manifest-path crates/services/information/Cargo.toml -p tauri-plugin-information-native --all-targets
-      - run: cargo clippy --locked --manifest-path crates/services/information/Cargo.toml -p tauri-plugin-information-native --all-targets --all-features -- -D warnings
+      - run: cargo test --locked -p information-native-acquire --features unstable-w1-contracts
+      - run: cargo test --locked -p information-native-host --features unstable-w1-vertical-tests --test w1_vertical
+      - run: cargo test --locked -p tauri-plugin-information-native --all-targets
+      - run: cargo clippy --locked -p tauri-plugin-information-native --all-targets --all-features -- -D warnings
 
   speech:
     strategy:
@@ -169,14 +163,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: full-speech-${{ runner.os }}
-          workspaces: crates/services/speech -> target
-      - run: cargo fmt --manifest-path crates/services/speech/Cargo.toml --all -- --check
-      - run: cargo test --locked --manifest-path crates/services/speech/Cargo.toml --workspace --all-targets
+      - run: node scripts/ci/cargo-group.mjs fmt service-speech
+      - run: node scripts/ci/cargo-group.mjs test service-speech
       - name: Speech W1 contracts
         if: runner.os == 'Linux'
-        run: cargo test --locked --manifest-path crates/services/speech/Cargo.toml -p speech-native-host --all-targets --features unstable-w1-contract-tests,unstable-w1-vertical-tests
+        run: cargo test --locked -p speech-native-host --all-targets --features unstable-w1-contract-tests,unstable-w1-vertical-tests
       - if: runner.os == 'Linux'
-        run: cargo clippy --locked --manifest-path crates/services/speech/Cargo.toml --workspace --all-targets -- -D warnings -A clippy::collapsible-if
+        run: node scripts/ci/cargo-group.mjs clippy service-speech
 
   mom:
     if: ${{ needs.inventory.outputs.mom == 'true' }}
@@ -197,9 +190,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: full-mom-${{ runner.os }}
-      - run: cargo test --locked -p mom-llama-runtime -p mom-llama-cli -p mom-llama-app --all-targets
+      - run: node scripts/ci/cargo-group.mjs test product-mom
       - if: runner.os == 'Linux'
-        run: cargo clippy --locked -p mom-llama-runtime -p mom-llama-cli -p mom-llama-app --all-targets -- -D warnings
+        run: node scripts/ci/cargo-group.mjs clippy product-mom
 
   loom:
     if: ${{ needs.inventory.outputs.loom == 'true' }}
@@ -220,11 +213,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: full-loom-${{ runner.os }}
-          workspaces: products/loom -> target
-      - run: cargo fmt --manifest-path products/loom/Cargo.toml --all -- --check
-      - run: cargo test --locked --manifest-path products/loom/Cargo.toml --workspace --all-targets
+      - run: node scripts/ci/cargo-group.mjs fmt product-loom research-loom
+      - run: node scripts/ci/cargo-group.mjs test product-loom research-loom
       - if: runner.os == 'Linux'
-        run: cargo clippy --locked --manifest-path products/loom/Cargo.toml --workspace --all-targets -- -D warnings
+        run: node scripts/ci/cargo-group.mjs clippy product-loom research-loom
 
   frontend:
     needs: inventory
@@ -250,18 +242,6 @@ jobs:
       - run: pnpm -r --if-present run test
       - run: pnpm -r --if-present run check
       - run: pnpm -r --if-present run build
-      - name: Install imported Loom frontend
-        if: ${{ needs.inventory.outputs.loom == 'true' }}
-        run: pnpm run loom:install
-      - name: Test imported Loom frontend
-        if: ${{ needs.inventory.outputs.loom == 'true' }}
-        run: pnpm run loom:test
-      - name: Check imported Loom frontend
-        if: ${{ needs.inventory.outputs.loom == 'true' }}
-        run: pnpm run loom:check
-      - name: Build imported Loom frontend
-        if: ${{ needs.inventory.outputs.loom == 'true' }}
-        run: pnpm run loom:build
 
   policy-and-graphs:
     runs-on: ubuntu-latest
@@ -273,10 +253,9 @@ jobs:
         with:
           toolchain: "1.92.0"
       - run: node --test scripts/ci/test-ci-plan.mjs scripts/ci/test-ci-required.mjs scripts/ci/test-workflows.mjs
-      - run: ./crates/native/scripts/check-workflow-policy.sh .
       - run: cargo run --locked -p xtask -- policy
-      - run: cargo check --locked -p integration-current --features current-product-graph
-      - run: cargo check --locked --manifest-path products/loom/Cargo.toml --workspace --all-targets
+      - run: cargo test --locked -p integration-vertical
+      - run: cargo tree --locked -i libsqlite3-sys
       - run: ./scripts/check-native-import-history.sh
       - run: ./scripts/check-service-import-history.sh
       - run: ./scripts/check-contract-import-history.sh

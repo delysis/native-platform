@@ -39,7 +39,7 @@ pub const MAX_FRONTIER_PROMPT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_FRONTIER_SCHEMA_BYTES: usize = 1024 * 1024;
 pub const MAX_FRONTIER_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CLI_BINARY_BYTES: u64 = 512 * 1024 * 1024;
-pub const FRONTIER_EXEC_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+pub const FRONTIER_EXEC_TIMEOUT: Duration = Duration::from_mins(15);
 pub const FRONTIER_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const PINNED_CHATGPT_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
@@ -1792,7 +1792,7 @@ fn adapter_build_fingerprint() -> BlobId {
         include_bytes!("../Cargo.toml").as_slice(),
         include_bytes!("../../loom-eval/src/blind.rs").as_slice(),
         include_bytes!("../../loom-eval/src/evidence.rs").as_slice(),
-        include_bytes!("../../../Cargo.lock").as_slice(),
+        include_bytes!("../../../../../Cargo.lock").as_slice(),
     ] {
         update_bytes(&mut digest, source);
     }
