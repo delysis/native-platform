@@ -1,6 +1,6 @@
-# W5 service imports: promotion-candidate evidence
+# W5 service imports: accepted evidence
 
-Status: **path cutover complete; not promoted**.
+Status: **accepted on `main`**.
 
 The accepted Attachment, Information, and Speech source histories have been
 rewritten deterministically beneath distinct service prefixes and merged as
@@ -33,7 +33,7 @@ portable, platform, W1 vertical, boundary, pin, and strict-Clippy gates.
 The imported Speech path also passed both host-bound real replays:
 
 - Parakeet processed the exact retained WAV (305580 bytes, SHA-256
-  `326d6723d9e793974338737bba586e9c742ffb2ed05fd6c9e4d2404df34d7ac0`),
+  `326d6723b8bcd7ae63cdff4a2c3e536a29a9d3a44e30f9dca7b65e58a9b4aa34`),
   completed streamed and non-streamed transcription, cancelled its peer, and
   joined shutdown;
 - the Apple Tauri harness used installed voice
@@ -66,13 +66,23 @@ their service-owned verticals, the genuine imported-path Mom Attachment
 vertical, and platform composition; it does not claim those absent product
 integrations.
 
-## Current boundary
+## Promotion and source-retirement boundary
 
-This document deliberately does not yet claim W5 acceptance. At this point:
+Exact candidate `a7017421209176659035f7e407cb356615257fd5` passed GitHub Actions
+run `31668250934`. Pull request 7 then merged it without squash as
+`5baa238fc7c9676c06d36941d053d53020d21287`; the merge tree is byte-identical
+to the candidate tree. Post-merge run `31670590658` passed Attachment fuzz and
+the Ubuntu, macOS, and Windows workspace jobs.
 
-- candidate and post-merge CI runs are not recorded;
-- the three source repositories remain active and unfrozen;
-- no release or protected final tag is claimed.
+Protected annotated tags `w5-import-services-candidate-v0-2026-08-12` and
+`w5-import-services-v0-2026-08-12` preserve the candidate and functional-main
+boundaries. Ruleset `20781374` protects those exact tag names with no bypass.
 
-These fields must remain pending until their corresponding changes and gates
-have genuinely completed.
+Each old service repository now has protected boundary tag
+`native-platform-v2-horizon-b-2026-08-12`, peeled to its accepted imported
+source commit. README-only freeze commits on each source `main` passed their
+own CI, after which no-bypass rulesets denied branch creation, update,
+deletion, and non-fast-forward pushes. The repositories remain deliberately
+unarchived until two stable native-platform releases have been observed; zero
+such releases are claimed here. Exact tag objects, freeze commits, run IDs,
+and rulesets are recorded in `migration/service-imports.json`.
