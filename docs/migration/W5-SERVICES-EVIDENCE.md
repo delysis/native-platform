@@ -45,10 +45,9 @@ gate. Exact Mom revision `3cf57941af6d523378e7fa8b24f5c24c8e50363f`
 also executes its ordinary-Markdown Attachment vertical against the imported
 Attachment host and types through `scripts/check-mom-attachment-path.sh`.
 
-`platform-runtime` adds the requested explicit `PlatformBuilder` composition
-API. It returns one non-cloneable shutdown owner plus cloneable projected
-handles, creates no service globals, and drains Gateway and Speech before the
-final native join.
+The unused `platform-runtime` composition spike was removed after the W5
+acceptance audit found no consumer. Product-owned composition roots remain the
+authority for shutdown ordering; no generic owner is claimed or substituted.
 
 ## Corrected cross-product boundary
 

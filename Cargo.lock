@@ -4632,20 +4632,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "platform-runtime"
-version = "0.0.0"
-dependencies = [
- "attachment-native-host",
- "fte-router",
- "information-native-host",
- "llama-native-host",
- "llama-native-types",
- "speech-native-host",
- "thiserror 2.0.20",
- "tokio",
-]
-
-[[package]]
 name = "platform-vertical-fixtures-v0"
 version = "0.0.0"
 source = "git+https://github.com/delysis/w1-platform-contracts?rev=3ed1f3235edb6d481c324f05fe83b2379e3431e6#3ed1f3235edb6d481c324f05fe83b2379e3431e6"
