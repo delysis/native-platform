@@ -23,6 +23,13 @@ members = [
     "crates/services/information/crates/information-native-store",
     "crates/services/information/crates/information-native-types",
     "crates/services/information/crates/tauri-plugin-information-native",
+    "crates/services/speech/crates/speech-native-backend-parakeet",
+    "crates/services/speech/crates/speech-native-host",
+    "crates/services/speech/crates/speech-native-platform",
+    "crates/services/speech/crates/speech-native-router",
+    "crates/services/speech/crates/speech-native-types",
+    "crates/services/speech/crates/tauri-plugin-speech-native",
+    "crates/services/speech/tests/apple-tauri-w1",
     "products/fte/crates/fte-backend-llama",
     "products/fte/crates/fte-loopback",
     "products/fte/crates/fte-protocols",
@@ -40,7 +47,6 @@ members = [
 ]
 exclude = [
     "crates/platform/contracts",
-    "crates/services/speech",
     # W7 keeps Loom isolated only because its rusqlite 0.39 / libsqlite3-sys
     # 0.37 link target cannot coexist with the root graph until W8.
     "products/loom",
@@ -70,6 +76,8 @@ getrandom = "0.3"
 fs2 = "0.4.3"
 http = "1"
 http-body-util = "0.1"
+hound = "3.5.1"
+parakeet-rs = "0.3.7"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 rusqlite = { version = "=0.39.0", features = ["bundled"] }
