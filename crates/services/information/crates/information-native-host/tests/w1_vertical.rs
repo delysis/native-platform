@@ -47,6 +47,12 @@ type TestResult = Result<(), Box<dyn Error>>;
 type InstalledDatabase = (InformationHost, InstallPlan, InstallReceipt, Vec<u8>);
 
 const BASELINE: &str = "750e27e5ad27b6040e7ab7b66f7a2acb910b613a";
+const IMPORT_PREFIX: &str = "crates/services/information";
+const IMPORT_MAP: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../../../migration/information-native-kit.commit-map"
+));
+const IMPORT_MAP_SHA256: &str = "aadf2bed72b68065cf9d6442697649b6762e7306a9483e1cf09f9301667c15a9";
 const SOURCE_DESCRIPTOR: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/w1/v0/information-production-tree-750e27e.json"
@@ -128,10 +134,45 @@ fn repository_root() -> &'static Path {
         .expect("workspace root")
 }
 
+fn platform_repository_root() -> &'static Path {
+    repository_root()
+        .ancestors()
+        .find(|candidate| {
+            candidate
+                .join("migration/information-native-kit.commit-map")
+                .is_file()
+        })
+        .expect("native-platform repository root")
+}
+
+fn imported_commit(source_commit: &str) -> String {
+    assert_eq!(sha256(IMPORT_MAP), IMPORT_MAP_SHA256, "import map drifted");
+    let map = std::str::from_utf8(IMPORT_MAP).expect("import map is UTF-8");
+    let matches = map
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            let old = fields.next()?;
+            let new = fields.next()?;
+            (old == source_commit).then_some(new)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "source commit must map exactly once");
+    assert_ne!(
+        matches[0], "0000000000000000000000000000000000000000",
+        "source commit must survive the import"
+    );
+    matches[0].to_owned()
+}
+
+fn imported_path(source_path: &str) -> String {
+    format!("{IMPORT_PREFIX}/{source_path}")
+}
+
 fn git_output(args: &[&str]) -> Vec<u8> {
     let output = Command::new("git")
         .args(args)
-        .current_dir(repository_root())
+        .current_dir(platform_repository_root())
         .output()
         .expect("execute production source identity check");
     assert!(
@@ -148,9 +189,15 @@ fn verify_production_source() {
     assert_eq!(descriptor.schema, "delysis.production_source_roots.v0");
     assert_eq!(descriptor.repository_id, "delysis/information-native-kit");
     assert_eq!(descriptor.commit, BASELINE);
+    let imported_baseline = imported_commit(BASELINE);
     let ancestry = Command::new("git")
-        .args(["merge-base", "--is-ancestor", BASELINE, "HEAD"])
-        .current_dir(repository_root())
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            imported_baseline.as_str(),
+            "HEAD",
+        ])
+        .current_dir(platform_repository_root())
         .status()
         .expect("execute production source ancestry check");
     assert!(
@@ -158,8 +205,9 @@ fn verify_production_source() {
         "fixture revision must descend from baseline"
     );
     for (path, expected) in descriptor.git_trees {
-        for revision in [BASELINE, "HEAD"] {
-            let spec = format!("{revision}:{path}");
+        let imported_path = imported_path(&path);
+        for revision in [imported_baseline.as_str(), "HEAD"] {
+            let spec = format!("{revision}:{imported_path}");
             let actual = String::from_utf8(git_output(&["rev-parse", &spec]))
                 .expect("git object identity is UTF-8");
             assert_eq!(actual.trim(), expected, "production source drift: {path}");

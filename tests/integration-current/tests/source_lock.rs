@@ -1,8 +1,13 @@
 use std::collections::BTreeSet;
 
 const ROOT_LOCK: &str = include_str!("../../../Cargo.lock");
+const IMPORTED_SERVICE_LOCKS: [&str; 3] = [
+    include_str!("../../../crates/services/attachment/Cargo.lock"),
+    include_str!("../../../crates/services/information/Cargo.lock"),
+    include_str!("../../../crates/services/speech/Cargo.lock"),
+];
 
-const EXACT_PACKAGES: [(&str, &str, &str); 9] = [
+const EXACT_PACKAGES: [(&str, &str, &str); 6] = [
     (
         "llama-cpp-2",
         "https://github.com/delysis/llama-cpp-rs",
@@ -12,21 +17,6 @@ const EXACT_PACKAGES: [(&str, &str, &str); 9] = [
         "mom-llama-runtime",
         "https://github.com/delysis/mom-llama",
         "3cf57941af6d523378e7fa8b24f5c24c8e50363f",
-    ),
-    (
-        "attachment-native-types",
-        "https://github.com/delysis/attachment-native-kit",
-        "2a8d3a9a1828162a51185d207822ceb1ba6283a8",
-    ),
-    (
-        "speech-native-types",
-        "https://github.com/delysis/speech-native-kit",
-        "b836318f10a7e11f433ec3ea8dfa48707adc9b06",
-    ),
-    (
-        "information-native-types",
-        "https://github.com/delysis/information-native-kit",
-        "7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe",
     ),
     (
         "loom-types",
@@ -50,13 +40,7 @@ const EXACT_PACKAGES: [(&str, &str, &str); 9] = [
     ),
 ];
 
-const REMAINING_TRANSITIVE_BASELINES: [(&str, &str, &str); 1] = [(
-    "attachment-native-types",
-    "https://github.com/delysis/attachment-native-kit",
-    "472900732ded5bcfb5cc639c49b3a4f77feece27",
-)];
-
-const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 10] = [
+const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 6] = [
     (
         "https://github.com/delysis/llama-cpp-rs",
         "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
@@ -64,22 +48,6 @@ const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 10] = [
     (
         "https://github.com/delysis/mom-llama",
         "3cf57941af6d523378e7fa8b24f5c24c8e50363f",
-    ),
-    (
-        "https://github.com/delysis/attachment-native-kit",
-        "2a8d3a9a1828162a51185d207822ceb1ba6283a8",
-    ),
-    (
-        "https://github.com/delysis/attachment-native-kit",
-        "472900732ded5bcfb5cc639c49b3a4f77feece27",
-    ),
-    (
-        "https://github.com/delysis/speech-native-kit",
-        "b836318f10a7e11f433ec3ea8dfa48707adc9b06",
-    ),
-    (
-        "https://github.com/delysis/information-native-kit",
-        "7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe",
     ),
     (
         "https://github.com/delysis/loom-native",
@@ -119,6 +87,49 @@ const IMPORTED_FTE_PACKAGES: [&str; 9] = [
     "tauri-plugin-free-token-energy",
 ];
 
+const IMPORTED_SERVICE_PACKAGES: [&str; 24] = [
+    "attachment-native-cli",
+    "attachment-native-document",
+    "attachment-native-host",
+    "attachment-native-inspect",
+    "attachment-native-plan",
+    "attachment-native-types",
+    "information-native-acquire",
+    "information-native-backend-community",
+    "information-native-backend-encyclopedia",
+    "information-native-backend-scripture",
+    "information-native-backend-sqlite",
+    "information-native-catalog",
+    "information-native-cli",
+    "information-native-host",
+    "information-native-retrieval",
+    "information-native-store",
+    "information-native-types",
+    "speech-native-backend-parakeet",
+    "speech-native-host",
+    "speech-native-platform",
+    "speech-native-router",
+    "speech-native-types",
+    "tauri-plugin-information-native",
+    "tauri-plugin-speech-native",
+];
+
+const IMPORTED_SERVICE_REPOSITORIES: [&str; 3] = [
+    "github.com/delysis/attachment-native-kit",
+    "github.com/delysis/information-native-kit",
+    "github.com/delysis/speech-native-kit",
+];
+
+// These binaries/plugins have no outer consumer. Keeping them out of the root
+// patch set avoids non-deterministic `[[patch.unused]]` lock records; their
+// preserved nested workspace locks still prove that they are local imports.
+const NESTED_ONLY_SERVICE_LEAVES: [&str; 4] = [
+    "attachment-native-cli",
+    "information-native-cli",
+    "tauri-plugin-information-native",
+    "tauri-plugin-speech-native",
+];
+
 #[test]
 fn root_lock_contains_every_exact_current_source() {
     let lock: toml::Value = toml::from_str(ROOT_LOCK).expect("root Cargo.lock TOML");
@@ -136,7 +147,7 @@ fn root_lock_contains_every_exact_current_source() {
         assert!(present, "missing exact locked package {name} at {revision}");
         matched.insert((repository, revision));
     }
-    assert_eq!(matched.len(), 7, "expected seven distinct source revisions");
+    assert_eq!(matched.len(), 4, "expected four distinct source revisions");
 }
 
 #[test]
@@ -178,21 +189,61 @@ fn imported_native_packages_are_path_rebound() {
 }
 
 #[test]
-fn remaining_transitive_pre_import_pins_remain_visible() {
+fn imported_service_packages_are_path_rebound() {
     let lock: toml::Value = toml::from_str(ROOT_LOCK).expect("root Cargo.lock TOML");
     let packages = lock["package"].as_array().expect("lock packages");
-    for (name, repository, revision) in REMAINING_TRANSITIVE_BASELINES {
-        let exact_fragment = format!("?rev={revision}#{revision}");
-        let present = packages.iter().any(|package| {
-            package["name"].as_str() == Some(name)
-                && package["source"].as_str().is_some_and(|source| {
-                    source.starts_with(&format!("git+{repository}"))
-                        && source.ends_with(&exact_fragment)
+
+    for repository in IMPORTED_SERVICE_REPOSITORIES {
+        assert!(
+            packages.iter().all(|package| {
+                package
+                    .get("source")
+                    .and_then(toml::Value::as_str)
+                    .is_none_or(|source| !source.contains(repository))
+            }),
+            "imported service Git source remains in root lock: {repository}"
+        );
+    }
+
+    let imported_locks = IMPORTED_SERVICE_LOCKS
+        .map(|text| toml::from_str::<toml::Value>(text).expect("imported service Cargo.lock TOML"));
+    for name in IMPORTED_SERVICE_PACKAGES {
+        let root_matches = packages
+            .iter()
+            .filter(|package| package["name"].as_str() == Some(name))
+            .collect::<Vec<_>>();
+        if NESTED_ONLY_SERVICE_LEAVES.contains(&name) {
+            assert!(
+                root_matches.is_empty(),
+                "nested-only service leaf unexpectedly entered root lock: {name}"
+            );
+        } else {
+            assert!(
+                root_matches
+                    .iter()
+                    .any(|package| package.get("source").is_none()),
+                "missing path-rebound root service package {name}"
+            );
+            assert!(
+                root_matches
+                    .iter()
+                    .all(|package| package.get("source").is_none()),
+                "non-local imported service package in root lock: {name}"
+            );
+        }
+
+        let present_in_imported_workspace = imported_locks.iter().any(|lock| {
+            lock["package"]
+                .as_array()
+                .expect("imported service lock packages")
+                .iter()
+                .any(|package| {
+                    package["name"].as_str() == Some(name) && package.get("source").is_none()
                 })
         });
         assert!(
-            present,
-            "missing remaining transitive baseline {name} at {revision}"
+            present_in_imported_workspace,
+            "missing local imported service package {name}"
         );
     }
 }

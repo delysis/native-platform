@@ -41,6 +41,12 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::sync::{mpsc, oneshot};
 
 const BASELINE_COMMIT: &str = "89146595df7ba893ddd704a811377f6cb14856bc";
+const IMPORT_PREFIX: &str = "crates/services/speech";
+const IMPORT_MAP: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../../../migration/speech-native-kit.commit-map"
+));
+const IMPORT_MAP_SHA256: &str = "b0d954d0c76ed4e7a05b04eb355bfa0e10f8dd7979c625541e4dfd7621ad7a92";
 const PRODUCTION_TREE: &[u8] =
     include_bytes!("../../../fixtures/w1/source/speech-production-tree-8914659.json");
 const QUIT_RELAUNCH_BASELINE_COMMIT: &str = "2c427e39ee07c944e0ef51d471729fb676e2f62a";
@@ -61,6 +67,52 @@ static RECEIPT_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 struct ProductionTreeDescriptor {
     commit: String,
     source_roots: BTreeMap<String, String>,
+}
+
+fn service_repository_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("Speech service root")
+}
+
+fn platform_repository_root() -> &'static Path {
+    service_repository_root()
+        .ancestors()
+        .find(|candidate| {
+            candidate
+                .join("migration/speech-native-kit.commit-map")
+                .is_file()
+        })
+        .expect("native-platform repository root")
+}
+
+fn imported_commit(source_commit: &str) -> String {
+    assert_eq!(
+        sha256_identity("speech.import-map", IMPORT_MAP).digest.hex,
+        IMPORT_MAP_SHA256,
+        "import map drifted"
+    );
+    let map = std::str::from_utf8(IMPORT_MAP).expect("import map is UTF-8");
+    let matches = map
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            let old = fields.next()?;
+            let new = fields.next()?;
+            (old == source_commit).then_some(new)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "source commit must map exactly once");
+    assert_ne!(
+        matches[0], "0000000000000000000000000000000000000000",
+        "source commit must survive the import"
+    );
+    matches[0].to_owned()
+}
+
+fn imported_path(source_path: &str) -> String {
+    format!("{IMPORT_PREFIX}/{source_path}")
 }
 
 fn fixture_bytes(relative_path: &str) -> &'static [u8] {
@@ -1258,13 +1310,9 @@ fn w1_sha256_ledger_authenticates_every_checked_in_fixture_byte() {
             "fixture drifted: {relative_path}"
         );
     }
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
     let tracked = Command::new("git")
         .args(["ls-files", "fixtures/w1"])
-        .current_dir(repository)
+        .current_dir(service_repository_root())
         .output()
         .expect("enumerate tracked Speech W1 fixtures");
     assert!(tracked.status.success());
@@ -1515,13 +1563,16 @@ fn w1_fixture_descendant_changes_only_feature_gated_contract_adapter() {
     let descriptor: ProductionTreeDescriptor =
         serde_json::from_slice(PRODUCTION_TREE).expect("parse production-tree descriptor");
     assert_eq!(descriptor.commit, BASELINE_COMMIT);
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
+    let imported_baseline = imported_commit(BASELINE_COMMIT);
+    let repository = platform_repository_root();
     assert!(
         Command::new("git")
-            .args(["merge-base", "--is-ancestor", BASELINE_COMMIT, "HEAD"])
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                imported_baseline.as_str(),
+                "HEAD",
+            ])
             .current_dir(repository)
             .status()
             .expect("execute git ancestry proof")
@@ -1529,18 +1580,18 @@ fn w1_fixture_descendant_changes_only_feature_gated_contract_adapter() {
         "fixture commit must descend from baseline"
     );
     for (source_root, expected_oid) in descriptor.source_roots {
+        let imported_source_root = imported_path(&source_root);
         if source_root == "crates/speech-native-host/src" {
+            let imported_adapter = imported_path("crates/speech-native-host/src/w1_contracts.rs");
             assert!(
                 Command::new("git")
-                    .args([
-                        "diff",
-                        "--quiet",
-                        BASELINE_COMMIT,
-                        "HEAD",
-                        "--",
-                        &source_root,
-                        ":(exclude)crates/speech-native-host/src/w1_contracts.rs",
-                    ])
+                    .arg("diff")
+                    .arg("--quiet")
+                    .arg(imported_baseline.as_str())
+                    .arg("HEAD")
+                    .arg("--")
+                    .arg(&imported_source_root)
+                    .arg(format!(":(exclude){imported_adapter}"))
                     .current_dir(repository)
                     .status()
                     .expect("compare production host source outside the W1 adapter")
@@ -1550,7 +1601,7 @@ fn w1_fixture_descendant_changes_only_feature_gated_contract_adapter() {
             continue;
         }
         let output = Command::new("git")
-            .args(["rev-parse", &format!("HEAD:{source_root}")])
+            .args(["rev-parse", &format!("HEAD:{imported_source_root}")])
             .current_dir(repository)
             .output()
             .expect("read current source-root identity");
@@ -1573,16 +1624,14 @@ fn w1_quit_relaunch_binds_exact_production_source_roots() {
     let descriptor: ProductionTreeDescriptor = serde_json::from_slice(QUIT_RELAUNCH_SOURCE)
         .expect("parse quit/relaunch source descriptor");
     assert_eq!(descriptor.commit, QUIT_RELAUNCH_BASELINE_COMMIT);
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
+    let imported_baseline = imported_commit(QUIT_RELAUNCH_BASELINE_COMMIT);
+    let repository = platform_repository_root();
     assert!(
         Command::new("git")
             .args([
                 "merge-base",
                 "--is-ancestor",
-                QUIT_RELAUNCH_BASELINE_COMMIT,
+                imported_baseline.as_str(),
                 "HEAD",
             ])
             .current_dir(repository)
@@ -1592,10 +1641,11 @@ fn w1_quit_relaunch_binds_exact_production_source_roots() {
         "quit/relaunch fixture must descend from the observation commit"
     );
     for (source_root, expected_oid) in descriptor.source_roots {
+        let imported_source_root = imported_path(&source_root);
         let output = Command::new("git")
             .args([
                 "rev-parse",
-                &format!("{QUIT_RELAUNCH_BASELINE_COMMIT}:{source_root}"),
+                &format!("{imported_baseline}:{imported_source_root}"),
             ])
             .current_dir(repository)
             .output()
@@ -1612,7 +1662,7 @@ fn w1_quit_relaunch_binds_exact_production_source_roots() {
             "observed production source changed: {source_root}"
         );
         let current = Command::new("git")
-            .args(["rev-parse", &format!("HEAD:{source_root}")])
+            .args(["rev-parse", &format!("HEAD:{imported_source_root}")])
             .current_dir(repository)
             .output()
             .expect("read current source-root identity");

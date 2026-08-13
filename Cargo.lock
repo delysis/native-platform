@@ -311,27 +311,8 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 [[package]]
 name = "attachment-native-document"
 version = "0.1.0"
-source = "git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8#2a8d3a9a1828162a51185d207822ceb1ba6283a8"
 dependencies = [
- "attachment-native-types 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8)",
- "csv",
- "html-to-markdown-rs",
- "image",
- "imagesize",
- "lopdf",
- "mail-parser",
- "quick-xml",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "attachment-native-document"
-version = "0.1.0"
-source = "git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27#472900732ded5bcfb5cc639c49b3a4f77feece27"
-dependencies = [
- "attachment-native-types 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27)",
+ "attachment-native-types",
  "csv",
  "html-to-markdown-rs",
  "image",
@@ -347,26 +328,11 @@ dependencies = [
 [[package]]
 name = "attachment-native-host"
 version = "0.1.0"
-source = "git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8#2a8d3a9a1828162a51185d207822ceb1ba6283a8"
 dependencies = [
- "attachment-native-document 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8)",
- "attachment-native-inspect 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8)",
- "attachment-native-plan 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8)",
- "attachment-native-types 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8)",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "attachment-native-host"
-version = "0.1.0"
-source = "git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27#472900732ded5bcfb5cc639c49b3a4f77feece27"
-dependencies = [
- "attachment-native-document 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27)",
- "attachment-native-inspect 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27)",
- "attachment-native-plan 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27)",
- "attachment-native-types 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27)",
+ "attachment-native-document",
+ "attachment-native-inspect",
+ "attachment-native-plan",
+ "attachment-native-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -375,30 +341,8 @@ dependencies = [
 [[package]]
 name = "attachment-native-inspect"
 version = "0.1.0"
-source = "git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8#2a8d3a9a1828162a51185d207822ceb1ba6283a8"
 dependencies = [
- "attachment-native-types 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8)",
- "crabz2",
- "flate2",
- "hex",
- "infer 0.22.0",
- "libarchive_oxide",
- "lopdf",
- "lzma-rust2 0.18.1",
- "mail-parser",
- "ruzstd",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "zip",
-]
-
-[[package]]
-name = "attachment-native-inspect"
-version = "0.1.0"
-source = "git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27#472900732ded5bcfb5cc639c49b3a4f77feece27"
-dependencies = [
- "attachment-native-types 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27)",
+ "attachment-native-types",
  "crabz2",
  "flate2",
  "hex",
@@ -417,20 +361,8 @@ dependencies = [
 [[package]]
 name = "attachment-native-plan"
 version = "0.1.0"
-source = "git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8#2a8d3a9a1828162a51185d207822ceb1ba6283a8"
 dependencies = [
- "attachment-native-types 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8)",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "attachment-native-plan"
-version = "0.1.0"
-source = "git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27#472900732ded5bcfb5cc639c49b3a4f77feece27"
-dependencies = [
- "attachment-native-types 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27)",
+ "attachment-native-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -439,19 +371,6 @@ dependencies = [
 [[package]]
 name = "attachment-native-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8#2a8d3a9a1828162a51185d207822ceb1ba6283a8"
-dependencies = [
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.20",
- "uuid",
-]
-
-[[package]]
-name = "attachment-native-types"
-version = "0.1.0"
-source = "git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27#472900732ded5bcfb5cc639c49b3a4f77feece27"
 dependencies = [
  "serde",
  "serde_json",
@@ -2998,7 +2917,6 @@ dependencies = [
 [[package]]
 name = "information-native-acquire"
 version = "0.1.0"
-source = "git+https://github.com/delysis/information-native-kit?rev=7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe#7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe"
 dependencies = [
  "fs2",
  "hex",
@@ -3017,7 +2935,6 @@ dependencies = [
 [[package]]
 name = "information-native-backend-community"
 version = "0.1.0"
-source = "git+https://github.com/delysis/information-native-kit?rev=7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe#7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe"
 dependencies = [
  "information-native-retrieval",
  "information-native-types",
@@ -3030,7 +2947,6 @@ dependencies = [
 [[package]]
 name = "information-native-backend-encyclopedia"
 version = "0.1.0"
-source = "git+https://github.com/delysis/information-native-kit?rev=7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe#7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe"
 dependencies = [
  "hex",
  "information-native-retrieval",
@@ -3044,7 +2960,6 @@ dependencies = [
 [[package]]
 name = "information-native-backend-scripture"
 version = "0.1.0"
-source = "git+https://github.com/delysis/information-native-kit?rev=7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe#7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe"
 dependencies = [
  "hex",
  "information-native-retrieval",
@@ -3058,7 +2973,6 @@ dependencies = [
 [[package]]
 name = "information-native-backend-sqlite"
 version = "0.1.0"
-source = "git+https://github.com/delysis/information-native-kit?rev=7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe#7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe"
 dependencies = [
  "hex",
  "information-native-retrieval",
@@ -3072,7 +2986,6 @@ dependencies = [
 [[package]]
 name = "information-native-catalog"
 version = "0.1.0"
-source = "git+https://github.com/delysis/information-native-kit?rev=7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe#7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe"
 dependencies = [
  "chrono",
  "information-native-types",
@@ -3087,7 +3000,6 @@ dependencies = [
 [[package]]
 name = "information-native-host"
 version = "0.1.0"
-source = "git+https://github.com/delysis/information-native-kit?rev=7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe#7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe"
 dependencies = [
  "chrono",
  "hex",
@@ -3110,7 +3022,6 @@ dependencies = [
 [[package]]
 name = "information-native-retrieval"
 version = "0.1.0"
-source = "git+https://github.com/delysis/information-native-kit?rev=7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe#7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe"
 dependencies = [
  "information-native-types",
  "serde",
@@ -3120,7 +3031,6 @@ dependencies = [
 [[package]]
 name = "information-native-store"
 version = "0.1.0"
-source = "git+https://github.com/delysis/information-native-kit?rev=7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe#7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe"
 dependencies = [
  "chrono",
  "fs2",
@@ -3136,7 +3046,6 @@ dependencies = [
 [[package]]
 name = "information-native-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/information-native-kit?rev=7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe#7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe"
 dependencies = [
  "chrono",
  "serde",
@@ -3171,8 +3080,8 @@ dependencies = [
 name = "integration-current"
 version = "0.0.0"
 dependencies = [
- "attachment-native-host 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8)",
- "attachment-native-types 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=2a8d3a9a1828162a51185d207822ceb1ba6283a8)",
+ "attachment-native-host",
+ "attachment-native-types",
  "command-evidence",
  "fte-backend-llama",
  "fte-loopback",
@@ -3885,8 +3794,8 @@ version = "0.1.0"
 source = "git+https://github.com/delysis/mom-llama?rev=3cf57941af6d523378e7fa8b24f5c24c8e50363f#3cf57941af6d523378e7fa8b24f5c24c8e50363f"
 dependencies = [
  "anyhow",
- "attachment-native-host 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27)",
- "attachment-native-types 0.1.0 (git+https://github.com/delysis/attachment-native-kit?rev=472900732ded5bcfb5cc639c49b3a4f77feece27)",
+ "attachment-native-host",
+ "attachment-native-types",
  "chacha20poly1305",
  "crossbeam-channel",
  "getrandom 0.3.4",
@@ -4720,6 +4629,20 @@ source = "git+https://github.com/delysis/w1-platform-contracts.git?rev=fc24ffff0
 dependencies = [
  "serde",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "platform-runtime"
+version = "0.0.0"
+dependencies = [
+ "attachment-native-host",
+ "fte-router",
+ "information-native-host",
+ "llama-native-host",
+ "llama-native-types",
+ "speech-native-host",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -5954,7 +5877,6 @@ dependencies = [
 [[package]]
 name = "speech-native-backend-parakeet"
 version = "0.1.0"
-source = "git+https://github.com/delysis/speech-native-kit?rev=b836318f10a7e11f433ec3ea8dfa48707adc9b06#b836318f10a7e11f433ec3ea8dfa48707adc9b06"
 dependencies = [
  "async-trait",
  "hound",
@@ -5966,7 +5888,6 @@ dependencies = [
 [[package]]
 name = "speech-native-host"
 version = "0.1.0"
-source = "git+https://github.com/delysis/speech-native-kit?rev=b836318f10a7e11f433ec3ea8dfa48707adc9b06#b836318f10a7e11f433ec3ea8dfa48707adc9b06"
 dependencies = [
  "serde",
  "speech-native-router",
@@ -5978,7 +5899,6 @@ dependencies = [
 [[package]]
 name = "speech-native-platform"
 version = "0.1.0"
-source = "git+https://github.com/delysis/speech-native-kit?rev=b836318f10a7e11f433ec3ea8dfa48707adc9b06#b836318f10a7e11f433ec3ea8dfa48707adc9b06"
 dependencies = [
  "async-trait",
  "avspeechsynthesizer-rs",
@@ -5993,7 +5913,6 @@ dependencies = [
 [[package]]
 name = "speech-native-router"
 version = "0.1.0"
-source = "git+https://github.com/delysis/speech-native-kit?rev=b836318f10a7e11f433ec3ea8dfa48707adc9b06#b836318f10a7e11f433ec3ea8dfa48707adc9b06"
 dependencies = [
  "serde",
  "speech-native-types",
@@ -6003,7 +5922,6 @@ dependencies = [
 [[package]]
 name = "speech-native-types"
 version = "0.1.0"
-source = "git+https://github.com/delysis/speech-native-kit?rev=b836318f10a7e11f433ec3ea8dfa48707adc9b06#b836318f10a7e11f433ec3ea8dfa48707adc9b06"
 dependencies = [
  "async-trait",
  "serde",

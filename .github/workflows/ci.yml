@@ -53,6 +53,47 @@ jobs:
       - name: Native W1 lifecycle and vertical contracts
         if: runner.os == 'Linux'
         run: rustup run 1.92.0 cargo test --locked -p llama-native-engine --features unstable-w1-contract-tests,unstable-w1-vertical-tests --all-targets
+      - name: Attachment service
+        shell: bash
+        run: |
+          rustup run 1.92.0 cargo fmt --manifest-path crates/services/attachment/Cargo.toml --all -- --check
+          rustup run 1.92.0 cargo test --locked --manifest-path crates/services/attachment/Cargo.toml --workspace --all-targets
+          rustup run 1.92.0 cargo clippy --locked --manifest-path crates/services/attachment/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+      - name: Information portable service
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: 1.92.0
+        run: |
+          cd crates/services/information
+          ./scripts/check-portable-packages.sh
+          ./scripts/run-portable-cargo.sh test
+          cargo test --locked -p information-native-acquire --features unstable-w1-contracts
+          cargo test --locked -p information-native-host --features unstable-w1-vertical-tests --test w1_vertical
+          ./scripts/run-portable-cargo.sh clippy
+      - name: Information platform service
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          rustup run 1.92.0 cargo fmt --manifest-path crates/services/information/Cargo.toml --all -- --check
+          rustup run 1.92.0 cargo test --locked --manifest-path crates/services/information/Cargo.toml -p tauri-plugin-information-native --all-targets
+          rustup run 1.92.0 cargo clippy --locked --manifest-path crates/services/information/Cargo.toml -p tauri-plugin-information-native --all-targets --all-features -- -D warnings
+          ./crates/services/information/scripts/check-boundaries.sh
+          ./crates/services/information/scripts/check-w1-contract-pins.sh
+          ./crates/services/information/tests/w1_contract_pin_policy.sh
+      - name: Speech service
+        shell: bash
+        run: |
+          rustup run 1.92.0 cargo fmt --manifest-path crates/services/speech/Cargo.toml --all -- --check
+          rustup run 1.92.0 cargo test --locked --manifest-path crates/services/speech/Cargo.toml --workspace --all-targets
+          rustup run 1.92.0 cargo clippy --locked --manifest-path crates/services/speech/Cargo.toml --workspace --all-targets -- -D warnings
+      - name: Speech W1 contracts
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          ./crates/services/speech/scripts/check-boundaries.sh
+          ./crates/services/speech/scripts/check-w1-contract-pin.sh
+          rustup run 1.92.0 cargo test --locked --manifest-path crates/services/speech/Cargo.toml -p speech-native-host --all-targets --features unstable-w1-contract-tests,unstable-w1-vertical-tests
+          rustup run 1.92.0 cargo clippy --locked --manifest-path crates/services/speech/Cargo.toml -p speech-native-host --all-targets --features unstable-w1-contract-tests,unstable-w1-vertical-tests -- -D warnings
       - name: Exact current non-Loom product graph
         run: rustup run 1.92.0 cargo check --locked -p integration-current --features current-product-graph
       - name: Exact current Loom product graph
@@ -67,10 +108,34 @@ jobs:
         run: |
           ./crates/native/scripts/check-workflow-policy.sh .
           ./crates/native/tests/workflow_policy.sh
+          ./crates/services/attachment/scripts/check-workflow-policy.sh crates/services/attachment
+          ./crates/services/attachment/tests/workflow_policy.sh
+          ./crates/services/information/scripts/check-workflow-policy.sh crates/services/information
+          ./crates/services/information/tests/workflow_policy.sh
+          ./crates/services/speech/scripts/check-workflow-policy.sh crates/services/speech/.github/workflows
       - name: Native import history
         if: runner.os == 'Linux'
         run: ./scripts/check-native-import-history.sh
+      - name: Service import histories
+        if: runner.os == 'Linux'
+        run: ./scripts/check-service-import-history.sh
       - name: Shell policy
         run: rustup run 1.92.0 cargo run --locked -p xtask -- policy
       - name: pnpm lock
         run: pnpm install --lockfile-only --frozen-lockfile --offline
+
+  attachment-fuzz-build:
+    name: Attachment fuzz targets build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned fuzz toolchain
+        run: rustup toolchain install nightly-2026-07-26 --profile minimal --component rustfmt
+      - name: Install pinned cargo-fuzz
+        run: rustup run nightly-2026-07-26 cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Build Attachment fuzz targets
+        working-directory: crates/services/attachment
+        run: |
+          rustup run nightly-2026-07-26 cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
+          rustup run nightly-2026-07-26 cargo fuzz build inspect
+          rustup run nightly-2026-07-26 cargo fuzz build pipeline
