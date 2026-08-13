@@ -64,6 +64,17 @@ test("PR workflow exposes every targeted partition and future product guards", (
   assert.match(source, /cancel-in-progress: true/);
 });
 
+test("frontend jobs provision the Rust tooling used by current package scripts", () => {
+  const prFrontend = read(prPath).match(/^  frontend:[\s\S]*?(?=^  platform-macos:)/m)?.[0];
+  const fullFrontend = read(fullPath).match(/^  frontend:[\s\S]*?(?=^  policy-and-graphs:)/m)?.[0];
+  for (const block of [prFrontend, fullFrontend]) {
+    assert.ok(block, "frontend job block is missing");
+    assert.match(block, /dtolnay\/rust-toolchain@[0-9a-f]{40}/);
+    assert.match(block, /components: clippy,rustfmt/);
+    assert.match(block, /libwebkit2gtk-4\.1-dev/);
+  }
+});
+
 test("full workflow covers main, nightly, dispatch, products, policy, and fuzz", () => {
   const source = read(fullPath);
   assert.match(source, /^\s+push:\n\s+branches: \[main\]/m);
