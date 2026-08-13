@@ -29,11 +29,22 @@ the omissions from their authenticated manifest. Both FTE vertical suites then
 pass against the single imported package; no historical Git revision or forked
 compatibility crate is retained.
 
+The full FTE application adapter run also found two tests that authenticated
+the accepted historical baseline and then incorrectly required today's
+production prefix to remain byte-identical to that baseline. Later accepted
+FTE routing work had legitimately changed those bytes. The tests now retain
+the historical baseline check, construct a deterministic candidate source from
+the exact current production prefixes and blobs, require those bytes to match
+`HEAD`, and compare the observed behavior as a candidate. This prevents stale
+baseline evidence from rejecting legitimate production work while preserving
+exact-source attribution.
+
 Local macOS verification covers the imported contract workspace, the shared
 integration lifecycle and all 18 authenticated vertical manifests, Native and
-FTE lifecycle adapters, Information publication and vertical adapters, Speech
+FTE lifecycle adapters (including the complete FTE application library with W1
+vertical tests), Information publication and vertical adapters, Speech
 lifecycle and vertical adapters, and the isolated Loom dependency graph. The
-ignored Native real-GGUF tests remain hardware/model-dependent evidence and are
+ignored Native and FTE real-GGUF tests remain model-dependent evidence and are
 not promoted by this migration.
 
 The source repository is frozen without archival after this accepted import.

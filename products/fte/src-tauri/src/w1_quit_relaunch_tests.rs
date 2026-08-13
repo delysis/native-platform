@@ -8,8 +8,8 @@ use fte_types::{
     TerminalStatus, TicketCancellation, ToolPolicy,
 };
 use platform_vertical_fixtures_v0::{
-    EquivalenceProjectionV0, ObservationEnvelopeV0, VerticalFixtureManifestV0, sha256_identity,
-    validate_baseline, validate_manifest,
+    EquivalenceProjectionV0, GitSourceV0, ObservationEnvelopeV0, VerticalFixtureManifestV0,
+    compare_candidate, sha256_identity, validate_manifest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -355,7 +355,14 @@ fn revision_path(imported: bool, revision: &str, path: &str) -> String {
     }
 }
 
-fn verify_production_source() {
+fn append_candidate_file(candidate: &mut Vec<u8>, path: &str, bytes: &[u8]) {
+    candidate.extend_from_slice(&(path.len() as u64).to_be_bytes());
+    candidate.extend_from_slice(path.as_bytes());
+    candidate.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    candidate.extend_from_slice(bytes);
+}
+
+fn verify_production_source() -> (GitSourceV0, Vec<u8>) {
     let descriptor: SourceDescriptor =
         serde_json::from_slice(SOURCE_BYTES).expect("source descriptor");
     assert_eq!(descriptor.schema, "delysis.production_source_roots.v0");
@@ -378,7 +385,8 @@ fn verify_production_source() {
         "fixture commit must descend from baseline"
     );
 
-    for prefix in descriptor.prefixes {
+    let mut candidate_bytes = b"delysis.fte.quit_relaunch.production.candidate.v0\n".to_vec();
+    for prefix in &descriptor.prefixes {
         assert_eq!(prefix.boundary, "first_cfg_test");
         let current = std::fs::read(repository.join(&prefix.path)).expect("read source");
         let baseline = git_output(
@@ -388,27 +396,62 @@ fn verify_production_source() {
                 &revision_path(imported, baseline_commit, &prefix.path),
             ],
         );
-        for bytes in [production_prefix(&current), production_prefix(&baseline)] {
-            let identity = sha256_identity("fte.quit_relaunch.production.prefix", bytes);
-            assert_eq!(identity.digest.hex, prefix.sha256);
-            assert_eq!(identity.length, prefix.byte_len);
-        }
+        let baseline_identity = sha256_identity(
+            "fte.quit_relaunch.production.prefix",
+            production_prefix(&baseline),
+        );
+        assert_eq!(baseline_identity.digest.hex, prefix.sha256);
+        assert_eq!(baseline_identity.length, prefix.byte_len);
+        let head = git_output(
+            &repository,
+            &["show", &revision_path(imported, "HEAD", &prefix.path)],
+        );
+        assert_eq!(
+            production_prefix(&current),
+            production_prefix(&head),
+            "candidate production source must match HEAD"
+        );
+        append_candidate_file(
+            &mut candidate_bytes,
+            &prefix.path,
+            production_prefix(&current),
+        );
     }
 
-    for (path, expected_oid) in descriptor.git_blobs {
-        let working_tree = git_output(&repository, &["hash-object", "--no-filters", "--", &path]);
+    for (path, expected_oid) in &descriptor.git_blobs {
+        let working_tree = git_output(&repository, &["hash-object", "--no-filters", "--", path]);
         assert_eq!(
-            String::from_utf8(working_tree).unwrap().trim(),
-            expected_oid
-        );
-        for revision in [baseline_commit, "HEAD"] {
-            let actual = git_output(
+            String::from_utf8(working_tree.clone()).unwrap().trim(),
+            String::from_utf8(git_output(
                 &repository,
-                &["rev-parse", &revision_path(imported, revision, &path)],
-            );
-            assert_eq!(String::from_utf8(actual).unwrap().trim(), expected_oid);
-        }
+                &["rev-parse", &revision_path(imported, "HEAD", path)],
+            ))
+            .unwrap()
+            .trim(),
+            "candidate blob must match HEAD"
+        );
+        let baseline = git_output(
+            &repository,
+            &["rev-parse", &revision_path(imported, baseline_commit, path)],
+        );
+        assert_eq!(String::from_utf8(baseline).unwrap().trim(), expected_oid);
+        let bytes = std::fs::read(repository.join(path)).expect("read candidate blob");
+        append_candidate_file(&mut candidate_bytes, path, &bytes);
     }
+    let commit = String::from_utf8(git_output(&repository, &["rev-parse", "HEAD"]))
+        .expect("HEAD is UTF-8")
+        .trim()
+        .to_owned();
+    let production_tree =
+        sha256_identity("fte.quit_relaunch.production.candidate", &candidate_bytes);
+    (
+        GitSourceV0 {
+            repository_id: descriptor.repository_id,
+            commit,
+            production_tree,
+        },
+        candidate_bytes,
+    )
 }
 
 #[tokio::test]
@@ -431,7 +474,7 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
         sha256_identity(case.expected_projection.id.clone(), PROJECTION_BYTES),
         case.expected_projection
     );
-    verify_production_source();
+    let (candidate_source, candidate_source_bytes) = verify_production_source();
 
     let credentials = Arc::new(CountingCredentialStore::default());
     let store: Arc<dyn CredentialStore> = credentials.clone();
@@ -675,13 +718,13 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
         "schema": "delysis.vertical_observation.v0",
         "vertical_id": manifest.vertical_id,
         "case_id": case.case_id,
-        "implementation_revision": case.source.commit,
+        "implementation_revision": candidate_source.commit,
         "observed_prerequisites": [],
         "evidence": {
             "schema": "delysis.evidence_claim.v0",
             "tier": "reproducible",
             "threat_model": "product Gateway owner quit closes admission, cancels and releases active work, joins exact workers, then a distinct owner reopens product state and completes fresh work",
-            "exact_source": case.source.production_tree.digest,
+            "exact_source": candidate_source.production_tree.digest,
             "exact_runtime_or_artifact": case.inputs[0].identity.digest,
             "execution_kind": "fixture",
             "omitted_claims": manifest.omitted_claims,
@@ -690,10 +733,12 @@ async fn w1_product_owner_quit_relaunch_is_quiescent_and_fresh() {
         "projection": projection
     }))
     .expect("construct quit/relaunch observation");
-    validate_baseline(
+    compare_candidate(
         &manifest,
         &case.case_id,
         PROJECTION_BYTES,
+        &candidate_source,
+        &candidate_source_bytes,
         &[],
         &observation,
     )
