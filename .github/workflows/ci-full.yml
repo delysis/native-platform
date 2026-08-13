@@ -281,6 +281,7 @@ jobs:
       - run: ./scripts/check-service-import-history.sh
       - run: ./scripts/check-contract-import-history.sh
       - run: ./scripts/check-mom-import-history.sh
+      - run: ./scripts/check-loom-import-history.sh
 
   fuzz-build:
     runs-on: ubuntu-latest
