@@ -5,6 +5,7 @@ members = [
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
     "crates/native/crates/llama-native-types",
+    "crates/platform/runtime",
     "products/fte/crates/fte-backend-llama",
     "products/fte/crates/fte-loopback",
     "products/fte/crates/fte-protocols",
@@ -16,6 +17,11 @@ members = [
     "products/fte/src-tauri",
     "tests/integration-current",
     "xtask",
+]
+exclude = [
+    "crates/services/attachment",
+    "crates/services/information",
+    "crates/services/speech",
 ]
 resolver = "3"
 
@@ -53,7 +59,7 @@ tower-http = { version = "0.6", features = ["limit", "timeout"] }
 tracing = "0.1.44"
 uuid = { version = "1", features = ["v4", "serde"] }
 
-# Exact current integration inputs. Native is imported and path-rebound; the
+# Exact current integration inputs. Imported sources are path-rebound; the
 # remaining products stay at their accepted immutable Git revisions.
 llama-cpp-2-current = { package = "llama-cpp-2", git = "https://github.com/delysis/llama-cpp-rs", rev = "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391", default-features = false }
 llama-native-types-current = { package = "llama-native-types", path = "crates/native/crates/llama-native-types" }
@@ -63,19 +69,23 @@ llama-native-cache = { path = "crates/native/crates/llama-native-cache" }
 llama-native-engine = { path = "crates/native/crates/llama-native-engine" }
 llama-native-host = { path = "crates/native/crates/llama-native-host" }
 llama-native-types = { path = "crates/native/crates/llama-native-types" }
+attachment-native-host = { path = "crates/services/attachment/crates/attachment-native-host" }
+fte-router = { path = "products/fte/crates/fte-router" }
+information-native-host = { path = "crates/services/information/crates/information-native-host" }
+speech-native-host = { path = "crates/services/speech/crates/speech-native-host" }
 fte-types-current = { package = "fte-types", path = "products/fte/crates/fte-types" }
 fte-backend-llama-current = { package = "fte-backend-llama", path = "products/fte/crates/fte-backend-llama" }
 fte-loopback-current = { package = "fte-loopback", path = "products/fte/crates/fte-loopback" }
 fte-providers-current = { package = "fte-providers", path = "products/fte/crates/fte-providers" }
 mom-llama-runtime-current = { package = "mom-llama-runtime", git = "https://github.com/delysis/mom-llama", rev = "3cf57941af6d523378e7fa8b24f5c24c8e50363f" }
-attachment-native-types-current = { package = "attachment-native-types", git = "https://github.com/delysis/attachment-native-kit", rev = "2a8d3a9a1828162a51185d207822ceb1ba6283a8" }
-attachment-native-host-current = { package = "attachment-native-host", git = "https://github.com/delysis/attachment-native-kit", rev = "2a8d3a9a1828162a51185d207822ceb1ba6283a8" }
-speech-native-types-current = { package = "speech-native-types", git = "https://github.com/delysis/speech-native-kit", rev = "b836318f10a7e11f433ec3ea8dfa48707adc9b06" }
-speech-native-host-current = { package = "speech-native-host", git = "https://github.com/delysis/speech-native-kit", rev = "b836318f10a7e11f433ec3ea8dfa48707adc9b06" }
-speech-native-platform-current = { package = "speech-native-platform", git = "https://github.com/delysis/speech-native-kit", rev = "b836318f10a7e11f433ec3ea8dfa48707adc9b06" }
-speech-native-backend-parakeet-current = { package = "speech-native-backend-parakeet", git = "https://github.com/delysis/speech-native-kit", rev = "b836318f10a7e11f433ec3ea8dfa48707adc9b06" }
-information-native-types-current = { package = "information-native-types", git = "https://github.com/delysis/information-native-kit", rev = "7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe" }
-information-native-host-current = { package = "information-native-host", git = "https://github.com/delysis/information-native-kit", rev = "7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe" }
+attachment-native-types-current = { package = "attachment-native-types", path = "crates/services/attachment/crates/attachment-native-types" }
+attachment-native-host-current = { package = "attachment-native-host", path = "crates/services/attachment/crates/attachment-native-host" }
+speech-native-types-current = { package = "speech-native-types", path = "crates/services/speech/crates/speech-native-types" }
+speech-native-host-current = { package = "speech-native-host", path = "crates/services/speech/crates/speech-native-host" }
+speech-native-platform-current = { package = "speech-native-platform", path = "crates/services/speech/crates/speech-native-platform" }
+speech-native-backend-parakeet-current = { package = "speech-native-backend-parakeet", path = "crates/services/speech/crates/speech-native-backend-parakeet" }
+information-native-types-current = { package = "information-native-types", path = "crates/services/information/crates/information-native-types" }
+information-native-host-current = { package = "information-native-host", path = "crates/services/information/crates/information-native-host" }
 loom-types-current = { package = "loom-types", git = "https://github.com/delysis/loom-native", rev = "223110bee4be72386d79306b444517371e4a9930" }
 platform-contracts-v0-current = { package = "platform-contracts-v0", git = "https://github.com/delysis/w1-platform-contracts", rev = "3ed1f3235edb6d481c324f05fe83b2379e3431e6" }
 platform-contract-testkit-current = { package = "platform-contract-testkit", git = "https://github.com/delysis/w1-platform-contracts", rev = "3ed1f3235edb6d481c324f05fe83b2379e3431e6" }
@@ -95,7 +105,7 @@ unwrap_used = "deny"
 
 [workspace.metadata.native-platform.package-groups]
 portable = ["command-evidence", "fte-loopback", "fte-protocols", "fte-providers", "fte-router", "fte-store", "fte-types", "llama-native-cache", "llama-native-types"]
-platform = ["fte-backend-llama", "llama-native-engine", "llama-native-host", "tauri-plugin-free-token-energy"]
+platform = ["fte-backend-llama", "llama-native-engine", "llama-native-host", "platform-runtime", "tauri-plugin-free-token-energy"]
 product = ["free-token-energy"]
 research = []
 diagnostic = ["integration-current", "xtask"]
@@ -134,3 +144,33 @@ llama-native-cache = { path = "crates/native/crates/llama-native-cache" }
 llama-native-engine = { path = "crates/native/crates/llama-native-engine" }
 llama-native-host = { path = "crates/native/crates/llama-native-host" }
 llama-native-types = { path = "crates/native/crates/llama-native-types" }
+
+# Cargo canonicalizes Git repository URLs by removing a trailing `.git` before
+# patch lookup. One table per service therefore rebinds both URL spellings.
+# Outer patches cover the root graph; leaf CLIs/plugins remain owned and locked
+# by their preserved nested workspaces until an outer consumer needs them.
+[patch."https://github.com/delysis/attachment-native-kit"]
+attachment-native-document = { path = "crates/services/attachment/crates/attachment-native-document" }
+attachment-native-host = { path = "crates/services/attachment/crates/attachment-native-host" }
+attachment-native-inspect = { path = "crates/services/attachment/crates/attachment-native-inspect" }
+attachment-native-plan = { path = "crates/services/attachment/crates/attachment-native-plan" }
+attachment-native-types = { path = "crates/services/attachment/crates/attachment-native-types" }
+
+[patch."https://github.com/delysis/information-native-kit"]
+information-native-acquire = { path = "crates/services/information/crates/information-native-acquire" }
+information-native-backend-community = { path = "crates/services/information/crates/information-native-backend-community" }
+information-native-backend-encyclopedia = { path = "crates/services/information/crates/information-native-backend-encyclopedia" }
+information-native-backend-scripture = { path = "crates/services/information/crates/information-native-backend-scripture" }
+information-native-backend-sqlite = { path = "crates/services/information/crates/information-native-backend-sqlite" }
+information-native-catalog = { path = "crates/services/information/crates/information-native-catalog" }
+information-native-host = { path = "crates/services/information/crates/information-native-host" }
+information-native-retrieval = { path = "crates/services/information/crates/information-native-retrieval" }
+information-native-store = { path = "crates/services/information/crates/information-native-store" }
+information-native-types = { path = "crates/services/information/crates/information-native-types" }
+
+[patch."https://github.com/delysis/speech-native-kit"]
+speech-native-backend-parakeet = { path = "crates/services/speech/crates/speech-native-backend-parakeet" }
+speech-native-host = { path = "crates/services/speech/crates/speech-native-host" }
+speech-native-platform = { path = "crates/services/speech/crates/speech-native-platform" }
+speech-native-router = { path = "crates/services/speech/crates/speech-native-router" }
+speech-native-types = { path = "crates/services/speech/crates/speech-native-types" }

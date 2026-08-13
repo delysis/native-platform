@@ -1,0 +1,21 @@
+[package]
+name = "information-native-catalog"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+information-native-types.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

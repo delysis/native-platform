@@ -1,0 +1,32 @@
+[package]
+name = "information-native-cli"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "information-native"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+information-native-acquire.workspace = true
+information-native-backend-community.workspace = true
+information-native-backend-encyclopedia.workspace = true
+information-native-backend-scripture.workspace = true
+information-native-backend-sqlite.workspace = true
+information-native-catalog.workspace = true
+information-native-host.workspace = true
+information-native-retrieval.workspace = true
+information-native-store.workspace = true
+information-native-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

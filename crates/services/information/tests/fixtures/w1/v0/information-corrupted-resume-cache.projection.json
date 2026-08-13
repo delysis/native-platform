@@ -1,0 +1,96 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "information.resume-cache-first-attempt",
+      "attempt_id": null,
+      "correlation_id": null,
+      "kind": "cancelled_with_identity_bound_partial",
+      "payload": null
+    },
+    {
+      "sequence": 1,
+      "operation_id": "information.resume-cache-retry",
+      "attempt_id": null,
+      "correlation_id": null,
+      "kind": "malformed_sidecar_discarded_and_cold_started",
+      "payload": null
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "information.corrupted_resume_cache",
+      "schema_id": "information.w1.corrupted_resume_cache.v0",
+      "before": {
+        "id": "information.corrupted_resume_cache.before",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "1a174626f884a17864997db0a3665409d59b10f62e0bb39de14a3af6e6dbbec4"
+        },
+        "length": 527
+      },
+      "after": {
+        "id": "information.corrupted_resume_cache.after",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "efb78829b3fe8e3b6fb4c2dff49cdfc19d4f0fc6eb4bcd8d1611efbc327bf383"
+        },
+        "length": 375
+      },
+      "disposition": "recovered"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "information.resume-cache-first-attempt",
+      "attempt_id": null,
+      "correlation_id": null,
+      "terminal": "cancelled",
+      "released": true
+    },
+    {
+      "operation_id": "information.resume-cache-retry",
+      "attempt_id": null,
+      "correlation_id": null,
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 0,
+    "joined_workers": 0
+  },
+  "output_facts": {
+    "authority_bytes_preserved": {
+      "kind": "boolean",
+      "value": true
+    },
+    "cold_restart_from_zero": {
+      "kind": "boolean",
+      "value": true
+    },
+    "malformed_sidecar_removed": {
+      "kind": "boolean",
+      "value": true
+    },
+    "published_bytes": {
+      "kind": "integer",
+      "value": 15
+    },
+    "published_sha256": {
+      "kind": "text",
+      "value": "e1d2d6cae77f68a15722481d4aa121249e14753ac541ffeaa63d7db15038f9cf"
+    },
+    "unverified_partial_published": {
+      "kind": "boolean",
+      "value": false
+    }
+  },
+  "fail_closed_facts": [
+    "malformed sidecar never authorizes partial bytes for resume",
+    "cancelled partial bytes are never returned as a verified fetch",
+    "caller-owned authoritative state remains byte-identical"
+  ]
+}

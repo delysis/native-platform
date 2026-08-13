@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "goal": "W5-IMPORT-SERVICES",
+  "status": "promotion_candidate",
+  "accepted_w4_base": "6ecbaec3f42adb7dbe63199c0a9217f367548241",
+  "rewrite": {
+    "tool": "git-filter-repo==2.47.0",
+    "tool_revision": "a40bce548d2c",
+    "arguments": ["--to-subdirectory-filter", "<destination-prefix>", "--force"]
+  },
+  "services": [
+    {
+      "name": "attachment",
+      "source_repository": "https://github.com/delysis/attachment-native-kit.git",
+      "accepted_main": "2a8d3a9a1828162a51185d207822ceb1ba6283a8",
+      "accepted_tree": "b3863274df0535fe445c8295d7a6866ddcba1634",
+      "destination_prefix": "crates/services/attachment",
+      "filtered_head": "0051568608b41a71d43e66899ca2a34345a7f74e",
+      "commit_count": 7,
+      "commit_map": "migration/attachment-native-kit.commit-map",
+      "commit_map_sha256": "931fdce49db3ce68e278570f782f20f42d866bffbae55685ef79c5500d92b495",
+      "raw_import_merge": "5e82ed646bad0f57480f809cedf0cc2745b39dc6",
+      "raw_import_merge_parents": [
+        "6ecbaec3f42adb7dbe63199c0a9217f367548241",
+        "0051568608b41a71d43e66899ca2a34345a7f74e"
+      ],
+      "source_workspace_lock_sha256": "c5159f3c9befee2153f31bebe37991b352c08c9f23a999687e5f48c86cfccc0f",
+      "retained_fuzz_lock_sha256": "daa1019fb2108f2b308370b352da658152bc1fcfcb87032d823bba8cd33ce6b3"
+    },
+    {
+      "name": "information",
+      "source_repository": "https://github.com/delysis/information-native-kit.git",
+      "accepted_main": "7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe",
+      "accepted_tree": "519aad6ce9dd51f52debbb3b2061a7e2810c3d24",
+      "destination_prefix": "crates/services/information",
+      "filtered_head": "8d24a77e28c9a5d82d58f7206d664d419c10e577",
+      "commit_count": 21,
+      "commit_map": "migration/information-native-kit.commit-map",
+      "commit_map_sha256": "aadf2bed72b68065cf9d6442697649b6762e7306a9483e1cf09f9301667c15a9",
+      "raw_import_merge": "b73feb2649c2096505f6489023acf325117c267c",
+      "raw_import_merge_parents": [
+        "5e82ed646bad0f57480f809cedf0cc2745b39dc6",
+        "8d24a77e28c9a5d82d58f7206d664d419c10e577"
+      ],
+      "source_workspace_lock_sha256": "bfecdbf8d76b6813cf8067a150ae405f76e13377b8393acabbb659d97f6667e7"
+    },
+    {
+      "name": "speech",
+      "source_repository": "https://github.com/delysis/speech-native-kit.git",
+      "accepted_main": "b836318f10a7e11f433ec3ea8dfa48707adc9b06",
+      "accepted_tree": "ae104be383a3ab5bbcb6a5e7c4d4f83cb9cad706",
+      "destination_prefix": "crates/services/speech",
+      "filtered_head": "cb1c75a2a15d903712992efd0dad81e6def1f1d3",
+      "commit_count": 25,
+      "commit_map": "migration/speech-native-kit.commit-map",
+      "commit_map_sha256": "b0d954d0c76ed4e7a05b04eb355bfa0e10f8dd7979c625541e4dfd7621ad7a92",
+      "raw_import_merge": "4a45947508cf33fb0f8043e0507f2dda86d5d75c",
+      "raw_import_merge_parents": [
+        "b73feb2649c2096505f6489023acf325117c267c",
+        "cb1c75a2a15d903712992efd0dad81e6def1f1d3"
+      ],
+      "source_workspace_lock_sha256": "589b1372d55b448a92dd3f677dc6941866aa0adecc3fa3b5f6488c9fbc294954",
+      "retained_apple_tauri_lock_sha256": "5677ac260a615940a7d7801434c4ce9c981a450004fe29b9e2b35a67a0f1697c"
+    }
+  ],
+  "raw_import_head": "4a45947508cf33fb0f8043e0507f2dda86d5d75c",
+  "path_dependency_cutover": "a73df93428334dcfd5b302b598e7b9d7be1539ab",
+  "promotion": {
+    "candidate": null,
+    "candidate_ci_run": null,
+    "main_merge": null,
+    "postmerge_ci_run": null,
+    "final_tag": null
+  },
+  "source_freeze": {
+    "attachment": "pending",
+    "information": "pending",
+    "speech": "pending"
+  },
+  "acceptance_adjustments": {
+    "mom_attachment_vertical": "executed from exact Mom revision against imported Attachment paths",
+    "loom_source_fixture": "deferred to W7 because accepted Loom has no Information adapter",
+    "mom_citation_fixture": "deferred to W6 because accepted Mom has no Information adapter",
+    "mom_speech_vertical": "deferred to W6 because accepted Mom has no Speech adapter"
+  },
+  "nonclaims": [
+    "No candidate or post-merge CI acceptance is claimed.",
+    "No source repository freeze, release, tag, or archival action is claimed.",
+    "No scheduled fuzz run is required or claimed.",
+    "The local real Parakeet and Apple installed-voice replays do not substitute for candidate or post-merge CI.",
+    "Co-compilation is not claimed as Loom-Information, Mom-Information, or Mom-Speech product integration."
+  ]
+}

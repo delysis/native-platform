@@ -1,0 +1,22 @@
+{
+  "stac_version": "1.1.0",
+  "type": "Catalog",
+  "id": "overturemaps",
+  "title": "Overture Maps releases",
+  "description": "Overture Maps Foundation data releases",
+  "links": [
+    {
+      "rel": "child",
+      "href": "./2026-06-25.0/catalog.json",
+      "type": "application/json",
+      "title": "2026-06-25.0"
+    },
+    {
+      "rel": "child",
+      "href": "./2026-07-22.0/catalog.json",
+      "type": "application/json",
+      "title": "2026-07-22.0",
+      "latest": true
+    }
+  ]
+}

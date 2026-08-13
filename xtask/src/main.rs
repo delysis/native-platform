@@ -145,7 +145,7 @@ fn check_policy(root: &Path) -> Result<()> {
     check_loom_reconciliation(root)?;
     check_evidence_files(root)?;
     check_adrs(root)?;
-    println!("native-platform W4 policy: pass");
+    println!("native-platform W5 promotion-candidate policy: pass");
     Ok(())
 }
 
@@ -189,6 +189,26 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     check_sha256(
         &root.join("docs/migration/W4-GATEWAY-EVIDENCE.md"),
         "fbc4f466c3f36aaff892f3aa6a096bab74ac329d8b7c291882c8e499a0471f79",
+    )?;
+    check_sha256(
+        &root.join("migration/attachment-native-kit.commit-map"),
+        "931fdce49db3ce68e278570f782f20f42d866bffbae55685ef79c5500d92b495",
+    )?;
+    check_sha256(
+        &root.join("migration/information-native-kit.commit-map"),
+        "aadf2bed72b68065cf9d6442697649b6762e7306a9483e1cf09f9301667c15a9",
+    )?;
+    check_sha256(
+        &root.join("migration/speech-native-kit.commit-map"),
+        "b0d954d0c76ed4e7a05b04eb355bfa0e10f8dd7979c625541e4dfd7621ad7a92",
+    )?;
+    check_sha256(
+        &root.join("migration/service-imports.json"),
+        "517c62307b4829092cd9d64f80df61445c4f6e305aabd97f633f485c0e30a402",
+    )?;
+    check_sha256(
+        &root.join("docs/migration/W5-SERVICES-EVIDENCE.md"),
+        "b8c4a49799b190ff5a6ae950fb10706d7b46d0b78577409b19dc05c943c70ed8",
     )
 }
 
@@ -259,6 +279,7 @@ fn check_workspace(root: &Path) -> Result<()> {
                 "fte-backend-llama",
                 "llama-native-engine",
                 "llama-native-host",
+                "platform-runtime",
                 "tauri-plugin-free-token-energy",
             ],
         ),
@@ -292,6 +313,7 @@ fn check_workspace(root: &Path) -> Result<()> {
                 root.join("crates/native/crates/llama-native-engine/Cargo.toml"),
                 root.join("crates/native/crates/llama-native-host/Cargo.toml"),
                 root.join("crates/native/crates/llama-native-types/Cargo.toml"),
+                root.join("crates/platform/runtime/Cargo.toml"),
                 root.join("products/fte/crates/fte-backend-llama/Cargo.toml"),
                 root.join("products/fte/crates/fte-loopback/Cargo.toml"),
                 root.join("products/fte/crates/fte-protocols/Cargo.toml"),
@@ -301,11 +323,50 @@ fn check_workspace(root: &Path) -> Result<()> {
                 root.join("products/fte/crates/fte-types/Cargo.toml"),
                 root.join("products/fte/crates/tauri-plugin-free-token-energy/Cargo.toml"),
                 root.join("products/fte/src-tauri/Cargo.toml"),
+                root.join("crates/services/attachment/Cargo.toml"),
+                root.join("crates/services/attachment/crates/attachment-native-cli/Cargo.toml"),
+                root.join("crates/services/attachment/crates/attachment-native-document/Cargo.toml"),
+                root.join("crates/services/attachment/crates/attachment-native-host/Cargo.toml"),
+                root.join("crates/services/attachment/crates/attachment-native-inspect/Cargo.toml"),
+                root.join("crates/services/attachment/crates/attachment-native-plan/Cargo.toml"),
+                root.join("crates/services/attachment/crates/attachment-native-types/Cargo.toml"),
+                root.join("crates/services/attachment/fuzz/Cargo.toml"),
+                root.join("crates/services/information/Cargo.toml"),
+                root.join("crates/services/information/crates/information-native-acquire/Cargo.toml"),
+                root.join("crates/services/information/crates/information-native-backend-community/Cargo.toml"),
+                root.join("crates/services/information/crates/information-native-backend-encyclopedia/Cargo.toml"),
+                root.join("crates/services/information/crates/information-native-backend-scripture/Cargo.toml"),
+                root.join("crates/services/information/crates/information-native-backend-sqlite/Cargo.toml"),
+                root.join("crates/services/information/crates/information-native-catalog/Cargo.toml"),
+                root.join("crates/services/information/crates/information-native-cli/Cargo.toml"),
+                root.join("crates/services/information/crates/information-native-host/Cargo.toml"),
+                root.join("crates/services/information/crates/information-native-retrieval/Cargo.toml"),
+                root.join("crates/services/information/crates/information-native-store/Cargo.toml"),
+                root.join("crates/services/information/crates/information-native-types/Cargo.toml"),
+                root.join("crates/services/information/crates/tauri-plugin-information-native/Cargo.toml"),
+                root.join("crates/services/speech/Cargo.toml"),
+                root.join("crates/services/speech/crates/speech-native-backend-parakeet/Cargo.toml"),
+                root.join("crates/services/speech/crates/speech-native-host/Cargo.toml"),
+                root.join("crates/services/speech/crates/speech-native-platform/Cargo.toml"),
+                root.join("crates/services/speech/crates/speech-native-router/Cargo.toml"),
+                root.join("crates/services/speech/crates/speech-native-types/Cargo.toml"),
+                root.join("crates/services/speech/crates/tauri-plugin-speech-native/Cargo.toml"),
+                root.join("crates/services/speech/tests/apple-tauri-w1/Cargo.toml"),
                 root.join("tests/integration-current/Cargo.toml"),
                 root.join("xtask/Cargo.toml"),
             ])
     );
-    ensure!(find_named(root, "Cargo.lock")? == BTreeSet::from([root.join("Cargo.lock")]));
+    ensure!(
+        find_named(root, "Cargo.lock")?
+            == BTreeSet::from([
+                root.join("Cargo.lock"),
+                root.join("crates/services/attachment/Cargo.lock"),
+                root.join("crates/services/attachment/fuzz/Cargo.lock"),
+                root.join("crates/services/information/Cargo.lock"),
+                root.join("crates/services/speech/Cargo.lock"),
+                root.join("crates/services/speech/tests/apple-tauri-w1/Cargo.lock"),
+            ])
+    );
     ensure!(
         find_named(root, "rust-toolchain.toml")?
             == BTreeSet::from([root.join("rust-toolchain.toml")])
@@ -321,6 +382,8 @@ fn check_workspace(root: &Path) -> Result<()> {
     for source in find_extension(root, "rs")? {
         ensure!(
             source.starts_with(root.join("crates/native/crates"))
+                || source.starts_with(root.join("crates/platform"))
+                || source.starts_with(root.join("crates/services"))
                 || source.starts_with(root.join("products/fte"))
                 || source.starts_with(root.join("tests/integration-current"))
                 || source.starts_with(root.join("xtask")),

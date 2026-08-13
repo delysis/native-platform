@@ -1,0 +1,6 @@
+"$schema" = "schemas/schema.json"
+
+[[set]]
+identifier = "mount"
+description = "Bind one previously installed or explicitly registered resource into the live retrieval router without granting registration, acquisition, or query authority."
+permissions = ["allow-information-mount-installation"]

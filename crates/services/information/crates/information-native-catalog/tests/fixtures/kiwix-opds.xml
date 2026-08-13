@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:dc="http://purl.org/dc/terms/"
+      xmlns:opds="https://specs.opds.io/opds-1.2"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+  <id>12fa8e22-4871-a680-0022-579567a3e44c</id>
+  <link rel="self" href="/catalog/v2/entries?count=1"
+        type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+  <title>Filtered Entries</title>
+  <updated>2026-08-09T00:26:12Z</updated>
+  <opensearch:totalResults>3610</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <opensearch:itemsPerPage>1</opensearch:itemsPerPage>
+  <entry>
+    <id>urn:uuid:00083b78-227a-daa7-fb0f-21d764604abc</id>
+    <title>Wikipedia Bulgarian</title>
+    <updated>2026-07-09T00:00:00Z</updated>
+    <summary>Offline Wikipedia in Bulgarian</summary>
+    <language>bul</language>
+    <name>wikipedia_bg_all</name>
+    <flavour>maxi</flavour>
+    <category>wikipedia</category>
+    <tags>wikipedia;_category:wikipedia;_pictures:yes;_ftindex:yes</tags>
+    <articleCount>452996</articleCount>
+    <mediaCount>459506</mediaCount>
+    <link type="text/html" href="https://browse.library.kiwix.org/content/wikipedia_bg_all_maxi_2026-07"/>
+    <author><name>Wikipedia</name></author>
+    <publisher><name>openZIM</name></publisher>
+    <dc:issued>2026-07-09T00:00:00Z</dc:issued>
+    <link rel="http://opds-spec.org/acquisition/open-access"
+          type="application/x-zim"
+          href="https://lb.download.kiwix.org/zim/wikipedia/wikipedia_bg_all_maxi_2026-07.zim.meta4"
+          length="5121103872"/>
+  </entry>
+</feed>

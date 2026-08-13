@@ -1,0 +1,109 @@
+{
+  "schema": "information_native.catalog_sources.v1",
+  "sources": [
+    {
+      "id": "kiwix",
+      "kind": "opds_1_2",
+      "url": "https://opds.library.kiwix.org/catalog/v2/entries",
+      "support": "shipped_discovery_and_exact_metalink",
+      "trust": "upstream_unsigned",
+      "notes": "Resolve acquisition .meta4 records before planning; never treat OPDS length as a digest."
+    },
+    {
+      "id": "overture-maps",
+      "kind": "stac_1_1",
+      "url": "https://stac.overturemaps.org/catalog.json",
+      "support": "shipped_bounded_discovery",
+      "trust": "upstream_unsigned",
+      "notes": "Resolve an immutable release through STAC, then select themes/types and a bounding box. Never hardcode latest."
+    },
+    {
+      "id": "geofabrik-osm-extracts",
+      "kind": "json_index",
+      "url": "https://download.geofabrik.de/index-v1.json",
+      "support": "registry_only",
+      "trust": "upstream_unsigned",
+      "notes": "Regional OSM PBF extracts with checksum sidecars; retain ODbL attribution."
+    },
+    {
+      "id": "wikimedia-dumps",
+      "kind": "provider_adapter",
+      "url": "https://dumps.wikimedia.org/",
+      "support": "registry_only",
+      "trust": "upstream_unsigned",
+      "notes": "Pin project, dump date, multistream index, and upstream checksums; compute SHA-256 locally."
+    },
+    {
+      "id": "project-gutenberg",
+      "kind": "opds_1_2",
+      "url": "https://www.gutenberg.org/ebooks/search.opds/",
+      "support": "registry_only",
+      "trust": "upstream_unsigned",
+      "notes": "Use the official bounded OPDS or bulk RDF catalogue rather than crawling pages; retain the license embedded in each title."
+    },
+    {
+      "id": "wikidata-entities",
+      "kind": "provider_adapter",
+      "url": "https://dumps.wikimedia.org/wikidatawiki/entities/",
+      "support": "registry_only",
+      "trust": "upstream_unsigned",
+      "notes": "Resolve a dated dump and checksum files; do not plan against the mutable latest alias."
+    },
+    {
+      "id": "openalex-snapshot",
+      "kind": "provider_adapter",
+      "url": "https://developers.openalex.org/download/snapshot-format",
+      "support": "registry_only",
+      "trust": "upstream_unsigned",
+      "notes": "Official snapshot documentation. A future adapter must resolve anonymous S3 entity manifests, tolerate their documented refresh-time absence, and verify the manifest is stable across acquisition."
+    },
+    {
+      "id": "crossref-public-data",
+      "kind": "provider_adapter",
+      "url": "https://www.crossref.org/services/metadata-retrieval/public-data-file/",
+      "support": "registry_only",
+      "trust": "upstream_unsigned",
+      "notes": "Annual DOI metadata JSON Lines; resolve the release page to exact archives and independently compute SHA-256."
+    },
+    {
+      "id": "internet-archive",
+      "kind": "provider_adapter",
+      "url": "https://archive.org/advancedsearch.php",
+      "support": "registry_only",
+      "trust": "upstream_unsigned",
+      "notes": "Select explicit item identifiers and original files; item availability never substitutes for per-item rights review."
+    },
+    {
+      "id": "geonames",
+      "kind": "directory_index",
+      "url": "https://download.geonames.org/export/dump/",
+      "support": "registry_only",
+      "trust": "upstream_unsigned",
+      "notes": "Daily tab-delimited gazetteer exports with CC BY attribution and modification/deletion feeds."
+    },
+    {
+      "id": "natural-earth",
+      "kind": "provider_adapter",
+      "url": "https://www.naturalearthdata.com/downloads/",
+      "support": "registry_only",
+      "trust": "upstream_unsigned",
+      "notes": "Pin scale, theme, release, archive length, and locally computed SHA-256 before installation."
+    },
+    {
+      "id": "open-food-facts",
+      "kind": "provider_adapter",
+      "url": "https://world.openfoodfacts.org/data",
+      "support": "registry_only",
+      "trust": "upstream_unsigned",
+      "notes": "Resolve concrete bulk export links from the official data page instead of relying on directory listing; retain database and image-license obligations separately."
+    },
+    {
+      "id": "common-crawl",
+      "kind": "provider_adapter",
+      "url": "https://index.commoncrawl.org/collinfo.json",
+      "support": "registry_only",
+      "trust": "upstream_unsigned",
+      "notes": "Expert opt-in selective WARC materialization only; crawl availability does not grant content rights."
+    }
+  ]
+}

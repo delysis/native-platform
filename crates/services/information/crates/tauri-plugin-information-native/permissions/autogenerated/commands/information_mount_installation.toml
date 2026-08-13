@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-information-mount-installation"
+description = "Enables the information_mount_installation command without any pre-configured scope."
+commands.allow = ["information_mount_installation"]
+
+[[permission]]
+identifier = "deny-information-mount-installation"
+description = "Denies the information_mount_installation command without any pre-configured scope."
+commands.deny = ["information_mount_installation"]

@@ -1,0 +1,20 @@
+{
+  "entries": [
+    {
+      "bytes": 75,
+      "name": "authority.json",
+      "sha256": "6cb2d86d83035cc1723e55eb5ee4f2d395be506108e651f4ac5327f80d5c6ca0"
+    },
+    {
+      "bytes": 8,
+      "name": "staging.bin",
+      "sha256": "37e48922ed4e00f48d385ec6d593d9b72b8e80634d0f336178340e9153602f1d"
+    },
+    {
+      "bytes": 11,
+      "name": "staging.resume.json",
+      "sha256": "9211ed906559d2a87807928b909de754d43e4b52f8e3e2d8fb624bc051d19cfb"
+    }
+  ],
+  "schema": "information.w1.corrupted_resume_cache.before.v0"
+}

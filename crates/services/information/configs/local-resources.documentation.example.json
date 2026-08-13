@@ -1,0 +1,34 @@
+{
+  "schema": "documentation_only.information_native.local_resource_hints.v1",
+  "notice": "This file is not parsed by the kit. Copy values into explicit CLI or trusted host configuration; keep the populated copy outside version control.",
+  "resources": [
+    {
+      "id": "local.primary-alexandria",
+      "path": "/absolute/path/to/alexandria.db",
+      "profile": "alexandria.blocks.v1",
+      "access_mode": "immutable_read_only",
+      "notes": "Rights vary per document; private records stay private."
+    },
+    {
+      "id": "local.community-archive",
+      "path": "/absolute/path/to/community_archive.sqlite",
+      "profile": "community-archive.messages.v28",
+      "access_mode": "live_read_only",
+      "notes": "Requires the dedicated privacy adapter and a quiescent source."
+    },
+    {
+      "id": "local.encyclopedia",
+      "path": "/absolute/path/to/encyclopedia.db",
+      "profile": "encyclopedia.articles.v1",
+      "access_mode": "immutable_read_only",
+      "notes": "Mixed-origin records retain origin-specific rights ceilings."
+    },
+    {
+      "id": "local.scripture-citations",
+      "path": "/absolute/path/to/bible_refs.db",
+      "profile": "alexandria.scripture-references.v1",
+      "access_mode": "immutable_read_only",
+      "notes": "Structured related evidence linked to Alexandria block identifiers."
+    }
+  ]
+}
