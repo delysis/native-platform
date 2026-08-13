@@ -273,6 +273,12 @@ jobs:
       - name: Root platform graph
         if: ${{ needs.plan.outputs.root == 'true' || needs.plan.outputs.native == 'true' || needs.plan.outputs.gateway == 'true' || needs.plan.outputs.mom == 'true' || needs.plan.outputs.full == 'true' }}
         run: cargo check --locked --workspace --all-targets
+      - name: Mom macOS parity
+        if: ${{ needs.plan.outputs.mom_present == 'true' && (needs.plan.outputs.mom == 'true' || needs.plan.outputs.full == 'true') }}
+        run: |
+          cargo test --locked -p mom-llama-runtime -p mom-llama-cli -p mom-llama-app --all-targets
+          cargo test --locked -p mom-llama-runtime --features unstable-w1-vertical-fixtures --all-targets
+          cargo test --locked -p mom-llama-app --features unstable-w1-contracts,unstable-w1-vertical-fixtures --all-targets
       - name: Attachment macOS
         if: ${{ needs.plan.outputs.attachment == 'true' || needs.plan.outputs.full == 'true' }}
         run: cargo test --locked --manifest-path crates/services/attachment/Cargo.toml --workspace --all-targets
@@ -312,6 +318,7 @@ jobs:
       - run: ./scripts/check-native-import-history.sh
       - run: ./scripts/check-service-import-history.sh
       - run: ./scripts/check-contract-import-history.sh
+      - run: ./scripts/check-mom-import-history.sh
 
   fuzz-build:
     if: ${{ needs.plan.outputs.fuzz == 'true' || needs.plan.outputs.full == 'true' }}
