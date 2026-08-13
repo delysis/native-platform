@@ -31,21 +31,21 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-attachment-native-host = { git = "https://github.com/delysis/attachment-native-kit", rev = "472900732ded5bcfb5cc639c49b3a4f77feece27" }
-attachment-native-types = { git = "https://github.com/delysis/attachment-native-kit", rev = "472900732ded5bcfb5cc639c49b3a4f77feece27" }
-llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
-llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
-llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
-llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
-fte-backend-llama = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
-fte-router = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
-fte-store = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
-fte-types = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
-tauri-plugin-free-token-energy = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
-platform-contracts-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821" }
-platform-contract-testkit = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821" }
-platform-contracts-v0-vertical = { package = "platform-contracts-v0", git = "https://github.com/delysis/w1-platform-contracts", rev = "fc24ffff08c52690390b4460f44617d5d9732563" }
-platform-vertical-fixtures-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "fc24ffff08c52690390b4460f44617d5d9732563" }
+attachment-native-host = { path = "../../crates/services/attachment/crates/attachment-native-host" }
+attachment-native-types = { path = "../../crates/services/attachment/crates/attachment-native-types" }
+llama-native-cache = { path = "../../crates/native/crates/llama-native-cache" }
+llama-native-engine = { path = "../../crates/native/crates/llama-native-engine" }
+llama-native-host = { path = "../../crates/native/crates/llama-native-host" }
+llama-native-types = { path = "../../crates/native/crates/llama-native-types" }
+fte-backend-llama = { path = "../fte/crates/fte-backend-llama" }
+fte-router = { path = "../fte/crates/fte-router" }
+fte-store = { path = "../fte/crates/fte-store" }
+fte-types = { path = "../fte/crates/fte-types" }
+tauri-plugin-free-token-energy = { path = "../fte/crates/tauri-plugin-free-token-energy" }
+platform-contracts-v0 = { path = "../../crates/platform/contracts/crates/platform-contracts-v0" }
+platform-contract-testkit = { path = "../../crates/platform/contracts/crates/platform-contract-testkit" }
+platform-contracts-v0-vertical = { package = "platform-contracts-v0", path = "../../crates/platform/contracts/crates/platform-contracts-v0" }
+platform-vertical-fixtures-v0 = { path = "../../crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
