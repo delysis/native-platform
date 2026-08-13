@@ -1,33 +1,41 @@
 # native-platform
 
-This repository is the Delysis first-party Rust platform monorepo. Wave 3
-imported the accepted `llama-native-kit` history beneath `crates/native`.
-Wave 4 imported the accepted Free Token Energy history beneath `products/fte`
-and moved its packages into the root Rust and pnpm workspaces.
+`native-platform` is the canonical Delysis first-party Rust monorepo. It owns
+the Native llama boundary, platform contracts, Attachment, Information,
+Speech, Free Token Energy, Mom Llama, and Loom.
 
-The native import preserves all 45 accepted source commits without squashing.
-`migration/ledger.json`, the two import receipts, and their commit maps bind
-each source, deterministic rewrite, ancestry-preserving merge, and path
-cutover. Other first-party products remain exact Git integration inputs; their
-source and release manifests have not been moved.
+The migration preserves each accepted source repository as ordinary Git
+history under its destination path. `migration/ledger.json`, the commit maps,
+and the generic `migration/seal-manifest.json` bind the accepted revisions and
+evidence. `delysis/llama-cpp-rs` remains the sole external Delysis Git source:
+it is the separately reviewed unsafe upstream boundary.
 
-## Workspace policy
+## Workspace
 
 - Rust 1.92.0, edition 2024, resolver 3.
-- One root `Cargo.lock` and one root `pnpm-lock.yaml`.
-- Central dependencies and lints in `Cargo.toml`.
-- Explicit package groups: portable, platform, product, research, diagnostic,
-  and real-hardware.
-- `xtask policy` authenticates the workspace, migration evidence, and copied
-  ADRs.
+- All 65 first-party packages are members of one root Cargo workspace.
+- One root `Cargo.lock` resolves exact `rusqlite 0.39.0` and one
+  `libsqlite3-sys 0.37.0` native link.
+- One pnpm 11.16.0 workspace and root `pnpm-lock.yaml` own the FTE and Loom
+  frontends.
+- `ci/package-groups.json` assigns every package to exactly one primary group
+  and optional secondary gates.
+- The Attachment fuzz target is the only deliberately excluded auxiliary
+  Cargo workspace.
 
-Run the local gates with:
+Run the local repository policy with:
 
 ```text
 ./scripts/check-shell-policy.sh
 ```
 
-`tests/integration-current` consumes accepted product revisions through exact
-Git dependencies while resolving native crates from `crates/native`. It runs
-shared contract and vertical-authentication checks and records the precise
-split-graph boundary in `tests/integration-current/COVERAGE.md`.
+Run a package group with:
+
+```text
+node scripts/ci/cargo-group.mjs test core
+```
+
+Cross-product lifecycle, source-lock, imported-contract, and SQLite identity
+checks live in `tests/vertical`. Product UI, real-model, and loaded-model
+shutdown evidence remain explicit acceptance gates and are not inferred from
+compilation.
