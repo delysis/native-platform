@@ -1183,16 +1183,20 @@ fn open_read_only_connection(
         .append_pair("immutable", "1");
     let connection = Connection::open_with_flags(uri.as_str(), flags | OpenFlags::SQLITE_OPEN_URI)
         .map_err(map_sqlite_error)?;
-    connection.set_limit(
-        Limit::SQLITE_LIMIT_VARIABLE_NUMBER,
-        i32::try_from(MAX_SQLITE_BINDS).map_err(|_| {
-            integrity_error(
-                "encyclopedia_bind_limit_overflow",
-                "compiled encyclopedia bind limit exceeds SQLite integer bounds",
-            )
-        })?,
-    );
-    if connection.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)
+    connection
+        .set_limit(
+            Limit::SQLITE_LIMIT_VARIABLE_NUMBER,
+            i32::try_from(MAX_SQLITE_BINDS).map_err(|_| {
+                integrity_error(
+                    "encyclopedia_bind_limit_overflow",
+                    "compiled encyclopedia bind limit exceeds SQLite integer bounds",
+                )
+            })?,
+        )
+        .map_err(map_sqlite_error)?;
+    if connection
+        .limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)
+        .map_err(map_sqlite_error)?
         < i32::try_from(MAX_SQLITE_BINDS).unwrap_or(i32::MAX)
     {
         return Err(InformationError::new(
@@ -1226,7 +1230,9 @@ fn open_read_only_connection(
     let deadline = now
         .checked_add(Duration::from_millis(timeout_ms))
         .map_or(now, |value| value);
-    connection.progress_handler(1_000, Some(move || Instant::now() >= deadline));
+    connection
+        .progress_handler(1_000, Some(move || Instant::now() >= deadline))
+        .map_err(map_sqlite_error)?;
     Ok(connection)
 }
 
