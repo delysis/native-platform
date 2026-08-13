@@ -9,7 +9,7 @@ description = "Rust-owned product state, personas, conversations, tools and cach
 
 [features]
 unstable-w1-vertical-fixtures = [
-    "dep:platform-contracts-v0-vertical",
+    "dep:platform-contracts-v0",
     "dep:platform-vertical-fixtures-v0",
 ]
 
@@ -31,7 +31,7 @@ serde_yaml.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 platform-vertical-fixtures-v0 = { workspace = true, optional = true }
-platform-contracts-v0-vertical = { workspace = true, optional = true }
+platform-contracts-v0 = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"

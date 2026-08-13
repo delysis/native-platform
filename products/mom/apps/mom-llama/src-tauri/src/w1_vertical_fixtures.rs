@@ -232,7 +232,7 @@ async fn app_admission_chat_cancel_native_control_and_retry_form_one_transcript(
     ensure!(reopened.messages[0].content == fixture.message);
     ensure!(reopened.messages[1].content == fixture.assistant_text);
 
-    use platform_contracts_v0_vertical::TerminalClass as ContractTerminalClass;
+    use platform_contracts_v0::TerminalClass as ContractTerminalClass;
     use platform_vertical_fixtures_v0::{
         DurableStateFactV0, EquivalenceProjectionV0, EventFactV0, FactValueV0, LifecycleFactV0,
         OwnershipFactsV0, StateDispositionV0, VerticalIdV0, sha256_identity,
@@ -519,7 +519,7 @@ async fn full_app_runtime_quit_joins_fake_owner_and_reopens_same_store() -> Resu
     ensure!(second_terminals[0].identity == completed_identity);
     ensure!(second_terminals[0].terminal.class == TerminalClass::Completed);
 
-    use platform_contracts_v0_vertical::TerminalClass as ContractTerminalClass;
+    use platform_contracts_v0::TerminalClass as ContractTerminalClass;
     use platform_vertical_fixtures_v0::{
         DurableStateFactV0, EquivalenceProjectionV0, EventFactV0, FactValueV0, LifecycleFactV0,
         OwnershipFactsV0, StateDispositionV0, VerticalIdV0, sha256_identity,

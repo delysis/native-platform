@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use platform_contracts_v0_vertical::{
+use platform_contracts_v0::{
     EvidenceClaimV0, EvidenceTier, ExecutionKind, evidence::EVIDENCE_SCHEMA_V0,
 };
 use platform_vertical_fixtures_v0::{

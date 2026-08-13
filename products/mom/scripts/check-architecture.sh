@@ -1,7 +1,11 @@
 #!/bin/sh
 set -eu
 
-cd "$(dirname "$0")/.."
+product_root=$(cd "$(dirname "$0")/.." && pwd)
+repo_root=$(git -C "$product_root" rev-parse --show-toplevel)
+root_manifest="$repo_root/Cargo.toml"
+root_lock="$repo_root/Cargo.lock"
+cd "$product_root"
 
 if find crates -mindepth 1 -maxdepth 1 -type d -name 'llama-native-*' | grep -q .
 then
@@ -21,95 +25,44 @@ then
   exit 1
 fi
 
-if rg -n '^\[patch\.|(llama|attachment)-native-[a-z-]+\s*=\s*\{\s*path\s*=' --glob 'Cargo.toml' .
-then
-  echo "release manifests must use immutable native and attachment Git revisions" >&2
-  exit 1
-fi
-
 if rg -n '(llama|attachment)-native-[a-z-]+\s*=\s*\{\s*path\s*=\s*"\.\.' --glob 'Cargo.toml' .
 then
-  echo "sibling native or attachment paths are forbidden" >&2
+  echo "Mom child manifests must inherit imported dependencies from the root workspace" >&2
   exit 1
 fi
 
 cargo metadata --locked --format-version 1 >/dev/null
 
-native_sources=$(rg -o 'source = "git\+https://github\.com/delysis/llama-native-kit[^\"]+"' Cargo.lock | sort -u | wc -l | tr -d ' ')
-if [ "$native_sources" -ne 1 ]
+for dependency in \
+  'llama-native-cache = { path = "crates/native/crates/llama-native-cache" }' \
+  'llama-native-engine = { path = "crates/native/crates/llama-native-engine" }' \
+  'llama-native-host = { path = "crates/native/crates/llama-native-host" }' \
+  'llama-native-types = { path = "crates/native/crates/llama-native-types" }' \
+  'fte-router = { path = "products/fte/crates/fte-router" }' \
+  'fte-store = { path = "products/fte/crates/fte-store" }' \
+  'fte-types = { path = "products/fte/crates/fte-types" }' \
+  'attachment-native-host = { path = "crates/services/attachment/crates/attachment-native-host" }' \
+  'attachment-native-types = { path = "crates/services/attachment/crates/attachment-native-types" }' \
+  'platform-contracts-v0 = { path = "crates/platform/contracts/crates/platform-contracts-v0" }' \
+  'platform-vertical-fixtures-v0 = { path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }'
+do
+  if ! grep -Fqx "$dependency" "$root_manifest"
+  then
+    echo "missing exact imported root dependency: $dependency" >&2
+    exit 1
+  fi
+done
+
+if rg -n 'source = "git\+https://github\.com/delysis/(mom-llama|llama-native-kit|free-token-energy|attachment-native-kit|w1-platform-contracts)' "$root_lock"
 then
-  echo "the locked graph must contain exactly one llama-native-kit source" >&2
+  echo "the root lock retains a retired first-party Git source used by Mom" >&2
   exit 1
 fi
 
-if ! rg -q 'source = "git\+https://github\.com/delysis/llama-native-kit\?rev=f7a69316c64d857b99bd847dd44cd852fc5b4ca4#f7a69316c64d857b99bd847dd44cd852fc5b4ca4"' Cargo.lock
-then
-  echo "the locked native-kit source does not match the reviewed boundary" >&2
-  exit 1
-fi
-
-fte_sources=$(rg -o 'source = "git\+https://github\.com/delysis/free-token-energy[^\"]+"' Cargo.lock | sort -u | wc -l | tr -d ' ')
-if [ "$fte_sources" -ne 1 ]
-then
-  echo "the locked graph must contain exactly one Free Token Energy source" >&2
-  exit 1
-fi
-
-if ! rg -q 'source = "git\+https://github\.com/delysis/free-token-energy\?rev=1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a#1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a"' Cargo.lock
-then
-  echo "the locked Free Token Energy source does not match the reviewed boundary" >&2
-  exit 1
-fi
-
-attachment_sources=$(rg -o 'source = "git\+https://github\.com/delysis/attachment-native-kit[^"]+"' Cargo.lock | sort -u | wc -l | tr -d ' ')
-if [ "$attachment_sources" -ne 1 ]
-then
-  echo "the locked graph must contain exactly one attachment-native-kit source" >&2
-  exit 1
-fi
-
-if ! rg -q 'source = "git\+https://github\.com/delysis/attachment-native-kit\?rev=472900732ded5bcfb5cc639c49b3a4f77feece27#' Cargo.lock
-then
-  echo "the locked attachment-native-kit source does not match the reviewed boundary" >&2
-  exit 1
-fi
-
-if rg -n '^name = "(fte-speech-|speech-native-|tauri-plugin-(free-token-energy-speech|speech-native))' Cargo.lock
+mom_tree=$(cargo tree --locked -p mom-llama-app --prefix none)
+if printf '%s\n' "$mom_tree" | rg -n '^(fte-speech-|speech-native-|tauri-plugin-(free-token-energy-speech|speech-native))'
 then
   echo "Mom Llama must not resolve speech packages without deliberate speech UX" >&2
-  exit 1
-fi
-
-contract_rev=cbab33555ab9355a6ac453d659c55ec9e0666821
-vertical_rev=fc24ffff08c52690390b4460f44617d5d9732563
-contract_url=https://github.com/delysis/w1-platform-contracts
-contract_tomls=$(rg -l 'w1-platform-contracts' . --glob 'Cargo.toml' --glob '!target/**')
-if [ "$(printf '%s\n' "$contract_tomls" | sed '/^$/d' | wc -l | tr -d ' ')" -ne 1 ]; then
-  echo "Wave 1 contract source must be declared once at the workspace boundary" >&2
-  exit 1
-fi
-if [ "$(rg -F "git = \"$contract_url\", rev = \"$contract_rev\"" Cargo.toml | wc -l | tr -d ' ')" -ne 2 ]; then
-  echo "Wave 1 lifecycle contract and testkit must use the accepted exact revision exactly twice" >&2
-  exit 1
-fi
-if [ "$(rg -F "git = \"$contract_url\", rev = \"$vertical_rev\"" Cargo.toml | wc -l | tr -d ' ')" -ne 2 ]; then
-  echo "Wave 1 vertical contract and fixture adapter must use the accepted exact revision exactly twice" >&2
-  exit 1
-fi
-if rg -n 'w1-platform-contracts.*(branch|tag)[[:space:]]*=' . --glob 'Cargo.toml'; then
-  echo "moving Wave 1 contract dependency found" >&2
-  exit 1
-fi
-if [ "$(rg -F "source = \"git+$contract_url?rev=$contract_rev#$contract_rev\"" Cargo.lock | wc -l | tr -d ' ')" -ne 2 ]; then
-  echo "Wave 1 lifecycle lock must contain exactly the contract and testkit packages at the accepted revision" >&2
-  exit 1
-fi
-if [ "$(rg -F "source = \"git+$contract_url?rev=$vertical_rev#$vertical_rev\"" Cargo.lock | wc -l | tr -d ' ')" -ne 2 ]; then
-  echo "Wave 1 vertical lock must contain exactly the contract and fixture packages at the accepted revision" >&2
-  exit 1
-fi
-if rg 'w1-platform-contracts.*rev[[:space:]]*=' Cargo.toml | rg -v "$contract_rev|$vertical_rev"; then
-  echo "unreviewed Wave 1 contract revision found" >&2
   exit 1
 fi
 
@@ -156,4 +109,4 @@ then
   exit 1
 fi
 
-echo "architecture ok: Mom Llama owns product code; native-kit, attachment-native-kit, and FTE are pinned boundaries"
+echo "architecture ok: Mom owns product code and resolves Native, Attachment, FTE, and W1 from imported root paths"

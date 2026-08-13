@@ -7,10 +7,11 @@ policy and defaults to `local-only`.
 
 ## Dependency rules
 
-- Every FTE package is pinned to one immutable Git revision.
-- That FTE revision pins the same immutable `llama-native-kit` revision Mom
-  Llama uses directly, so Rust sees one `NativeHost` and one DTO identity.
-- Release manifests contain no sibling path overrides and no `[patch]` section.
+- Every FTE package resolves from the imported `products/fte` source.
+- FTE and Mom resolve the same imported Native packages, so Rust sees one
+  `NativeHost` and one DTO identity.
+- Mom child manifests inherit local dependencies from the root workspace; the
+  root lock contains no retired Mom, FTE, Native, Attachment, or W1 Git source.
 - Mom installs `tauri-plugin-free-token-energy`, which is text-only.
 - Mom does not install `tauri-plugin-speech-native`, register speech backends,
   or grant speech permissions until the product has an intentional speech UX.

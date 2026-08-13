@@ -1214,7 +1214,7 @@ mod tests {
         )?;
         assert_eq!(quarantine_rows, 1);
 
-        use platform_contracts_v0_vertical::TerminalClass;
+        use platform_contracts_v0::TerminalClass;
         use platform_vertical_fixtures_v0::{
             DurableStateFactV0, EquivalenceProjectionV0, EventFactV0, FactValueV0, LifecycleFactV0,
             OwnershipFactsV0, StateDispositionV0, VerticalIdV0, sha256_identity,

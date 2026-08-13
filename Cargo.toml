@@ -104,7 +104,6 @@ platform-contracts-v0-current = { package = "platform-contracts-v0", path = "cra
 platform-contract-testkit-current = { package = "platform-contract-testkit", path = "crates/platform/contracts/crates/platform-contract-testkit" }
 platform-vertical-fixtures-v0-current = { package = "platform-vertical-fixtures-v0", path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
 platform-contracts-v0 = { path = "crates/platform/contracts/crates/platform-contracts-v0" }
-platform-contracts-v0-vertical = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
 platform-contract-testkit = { path = "crates/platform/contracts/crates/platform-contract-testkit" }
 platform-vertical-fixtures-v0 = { path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
 

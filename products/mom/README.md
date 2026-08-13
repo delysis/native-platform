@@ -1,8 +1,9 @@
 # Mom Llama
 
-Mom Llama is the canonical native, local-first chat product. This repository
-owns its Rust product runtime, CLI, command/effect contracts, evidence receipts
-and Tauri/Maud interface.
+Mom Llama is the canonical native, local-first chat product in the
+`delysis/native-platform` monorepo. The `products/mom` boundary owns its Rust
+product runtime, CLI, command/effect contracts, evidence receipts and
+Tauri/Maud interface.
 
 It does **not** contain a copied llama.cpp engine or a generic provider gateway:
 
@@ -34,21 +35,20 @@ dependency graph and the exact present status of speech.
   current proof only when it is explicitly source-bound; older path/date-only
   receipts remain informative.
 
-Native-kit, attachment-native-kit and Free Token Energy are exact Git-revision
-dependencies. Release manifests do not use sibling paths or patches.
+Native, Attachment, Free Token Energy, and the shared platform contracts are
+resolved from their imported monorepo paths and one root lock. No retired
+first-party Git source remains in Mom's dependency graph.
 
 ## Gates
 
 ```sh
-cargo fmt --all --check
-cargo test --workspace --exclude mom-llama-app
-cargo clippy --workspace --all-targets --exclude mom-llama-app -- -D warnings
-cargo test -p mom-llama-app
-cargo clippy -p mom-llama-app --all-targets -- -D warnings
-node --check apps/mom-llama/ui/coop-hx.js
-./scripts/check-architecture.sh
-./scripts/check-contracts.sh
-./scripts/check-persona-product-ux.sh
+cargo fmt --all -- --check
+cargo test --locked -p mom-llama-runtime -p mom-llama-cli -p mom-llama-app --all-targets
+cargo clippy --locked -p mom-llama-runtime -p mom-llama-cli -p mom-llama-app --all-targets -- -D warnings
+node --check products/mom/apps/mom-llama/ui/coop-hx.js
+products/mom/scripts/check-architecture.sh
+products/mom/scripts/check-contracts.sh
+products/mom/scripts/check-persona-product-ux.sh
 ```
 
 ## Run the app
@@ -56,8 +56,7 @@ node --check apps/mom-llama/ui/coop-hx.js
 Set `MOM_LLAMA_MODEL_PATH` to a GGUF or select one in Settings, then:
 
 ```sh
-cd apps/mom-llama/src-tauri
-cargo tauri dev
+cargo run --locked -p mom-llama-app
 ```
 
 The extraction deliberately retains the existing Tauri identifier, data paths,

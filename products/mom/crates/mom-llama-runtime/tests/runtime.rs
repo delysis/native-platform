@@ -1499,10 +1499,14 @@ fn fixture_readiness_never_claims_native_inference() -> Result<()> {
 #[test]
 fn product_runtime_rejects_network_process_and_copied_native_authority() -> Result<()> {
     let runtime_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let product_root = runtime_manifest
+        .ancestors()
+        .nth(2)
+        .ok_or_else(|| anyhow!("runtime crate has no product root"))?;
     let repo_root = runtime_manifest
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| anyhow!("runtime crate has no repository root"))?;
+        .ancestors()
+        .nth(4)
+        .ok_or_else(|| anyhow!("runtime crate has no monorepo root"))?;
     let forbidden = [
         "std::net",
         "tokio::net",
@@ -1528,23 +1532,42 @@ fn product_runtime_rejects_network_process_and_copied_native_authority() -> Resu
         "attachment-native-host",
     ] {
         assert!(
-            !repo_root.join("crates").join(crate_name).exists(),
-            "{crate_name} must remain an immutable external dependency"
+            !product_root.join("crates").join(crate_name).exists(),
+            "{crate_name} must not be copied into the Mom product boundary"
         );
     }
     let workspace_manifest = fs::read_to_string(repo_root.join("Cargo.toml"))?;
-    assert_eq!(
-        workspace_manifest
-            .matches("rev = \"f7a69316c64d857b99bd847dd44cd852fc5b4ca4\"")
-            .count(),
-        4,
-        "all four direct native-kit crates must share the reviewed R0 revision"
-    );
-    assert!(!workspace_manifest.contains("2d69f086e922ed7bdfd6236baf5a1ad0ed568360"));
-    assert!(workspace_manifest.contains("rev = \"472900732ded5bcfb5cc639c49b3a4f77feece27\""));
-    assert!(!workspace_manifest.contains("[patch."));
-    assert!(!workspace_manifest.contains("attachment-native-host = { path ="));
-    assert!(!workspace_manifest.contains("attachment-native-types = { path ="));
+    for local_dependency in [
+        "llama-native-cache = { path = \"crates/native/crates/llama-native-cache\" }",
+        "llama-native-engine = { path = \"crates/native/crates/llama-native-engine\" }",
+        "llama-native-host = { path = \"crates/native/crates/llama-native-host\" }",
+        "llama-native-types = { path = \"crates/native/crates/llama-native-types\" }",
+        "attachment-native-host = { path = \"crates/services/attachment/crates/attachment-native-host\" }",
+        "attachment-native-types = { path = \"crates/services/attachment/crates/attachment-native-types\" }",
+        "fte-router = { path = \"products/fte/crates/fte-router\" }",
+        "fte-store = { path = \"products/fte/crates/fte-store\" }",
+        "fte-types = { path = \"products/fte/crates/fte-types\" }",
+        "platform-contracts-v0 = { path = \"crates/platform/contracts/crates/platform-contracts-v0\" }",
+        "platform-vertical-fixtures-v0 = { path = \"crates/platform/contracts/crates/platform-vertical-fixtures-v0\" }",
+    ] {
+        assert!(
+            workspace_manifest.contains(local_dependency),
+            "root workspace must provide imported dependency `{local_dependency}`"
+        );
+    }
+    let runtime_workspace_manifest = fs::read_to_string(runtime_manifest.join("Cargo.toml"))?;
+    for retired_source in [
+        "github.com/delysis/mom-llama",
+        "github.com/delysis/llama-native-kit",
+        "github.com/delysis/free-token-energy",
+        "github.com/delysis/attachment-native-kit",
+        "github.com/delysis/w1-platform-contracts",
+    ] {
+        assert!(
+            !runtime_workspace_manifest.contains(retired_source),
+            "Mom runtime manifest retains retired Git source `{retired_source}`"
+        );
+    }
 
     let runtime_src = runtime_manifest.join("src");
     for entry in fs::read_dir(&runtime_src)? {

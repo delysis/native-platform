@@ -11,8 +11,9 @@ attachment-native-kit ───────────────────�
 mom-llama ──contracts/black-box CLI──> capability-system-compiler
 ```
 
-The arrows mean “is depended on by.” Source dependencies never point back up
-the graph.
+The arrows mean “is depended on by.” These are package ownership boundaries
+inside `delysis/native-platform`; source dependencies never point back up the
+graph.
 
 | Repository | Authoritative ownership |
 |---|---|
@@ -62,5 +63,6 @@ native model advertises that exact capability, or surface a typed blocker.
 ## Enforced negative boundaries
 
 `scripts/check-architecture.sh` rejects copied native/attachment crates,
-undeclared speech dependencies, source patches, sibling dependencies, and
-product network/process authority outside the bounded MCP adapter.
+undeclared speech dependencies, retired first-party Git sources in Mom's
+locked graph, child-manifest path overrides, and product network/process
+authority outside the bounded MCP adapter.
