@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 const BASELINE_COMMIT: &str = "797500060047ccd10f9810fb4d5c8f374e00eb08";
+const IMPORTED_BASELINE_COMMIT: &str = "c46631a929ded6f4c58aff5ba340c2d44da4fca5";
 const MANIFEST_BYTES: &[u8] =
     include_bytes!("../../tests/fixtures/w1/v0/fte-quit-relaunch.manifest.json");
 const INPUT_BYTES: &[u8] =
@@ -340,6 +341,20 @@ fn production_prefix(bytes: &[u8]) -> &[u8] {
     &bytes[..position + 1]
 }
 
+fn imported_layout(repository: &Path) -> bool {
+    !String::from_utf8_lossy(&git_output(repository, &["rev-parse", "--show-prefix"]))
+        .trim()
+        .is_empty()
+}
+
+fn revision_path(imported: bool, revision: &str, path: &str) -> String {
+    if imported {
+        format!("{revision}:products/fte/{path}")
+    } else {
+        format!("{revision}:{path}")
+    }
+}
+
 fn verify_production_source() {
     let descriptor: SourceDescriptor =
         serde_json::from_slice(SOURCE_BYTES).expect("source descriptor");
@@ -347,9 +362,15 @@ fn verify_production_source() {
     assert_eq!(descriptor.repository_id, "delysis/free-token-energy");
     assert_eq!(descriptor.commit, BASELINE_COMMIT);
     let repository = repository_root();
+    let imported = imported_layout(&repository);
+    let baseline_commit = if imported {
+        IMPORTED_BASELINE_COMMIT
+    } else {
+        BASELINE_COMMIT
+    };
     assert!(
         Command::new("git")
-            .args(["merge-base", "--is-ancestor", BASELINE_COMMIT, "HEAD"])
+            .args(["merge-base", "--is-ancestor", baseline_commit, "HEAD"])
             .current_dir(&repository)
             .status()
             .expect("execute ancestry check")
@@ -362,7 +383,10 @@ fn verify_production_source() {
         let current = std::fs::read(repository.join(&prefix.path)).expect("read source");
         let baseline = git_output(
             &repository,
-            &["show", &format!("{}:{}", descriptor.commit, prefix.path)],
+            &[
+                "show",
+                &revision_path(imported, baseline_commit, &prefix.path),
+            ],
         );
         for bytes in [production_prefix(&current), production_prefix(&baseline)] {
             let identity = sha256_identity("fte.quit_relaunch.production.prefix", bytes);
@@ -377,8 +401,11 @@ fn verify_production_source() {
             String::from_utf8(working_tree).unwrap().trim(),
             expected_oid
         );
-        for revision in [&descriptor.commit, "HEAD"] {
-            let actual = git_output(&repository, &["rev-parse", &format!("{revision}:{path}")]);
+        for revision in [baseline_commit, "HEAD"] {
+            let actual = git_output(
+                &repository,
+                &["rev-parse", &revision_path(imported, revision, &path)],
+            );
             assert_eq!(String::from_utf8(actual).unwrap().trim(), expected_oid);
         }
     }
