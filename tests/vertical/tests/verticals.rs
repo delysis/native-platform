@@ -1,6 +1,4 @@
-use platform_vertical_fixtures_v0_current::{
-    ALL_VERTICAL_IDS, VerticalFixtureLockV0, validate_lock,
-};
+use platform_vertical_fixtures_v0::{ALL_VERTICAL_IDS, VerticalFixtureLockV0, validate_lock};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};

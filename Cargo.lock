@@ -3349,32 +3349,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "integration-current"
+name = "integration-vertical"
 version = "0.0.0"
 dependencies = [
- "attachment-native-host",
- "attachment-native-types",
- "command-evidence",
- "fte-backend-llama",
- "fte-loopback",
- "fte-providers",
- "fte-types",
- "information-native-host",
- "information-native-types",
- "llama-cpp-2",
- "llama-native-host",
- "llama-native-types",
- "mom-llama-runtime",
  "platform-contract-testkit",
- "platform-contracts-v0",
  "platform-vertical-fixtures-v0",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "speech-native-backend-parakeet",
- "speech-native-host",
- "speech-native-platform",
- "speech-native-types",
  "toml 0.9.12+spec-1.1.0",
 ]
 
