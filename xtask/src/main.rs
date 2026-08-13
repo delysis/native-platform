@@ -208,7 +208,7 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     )?;
     check_sha256(
         &root.join("docs/migration/W5-SERVICES-EVIDENCE.md"),
-        "f44d7ab8b803dce9cdfd9cb31ae189d99721daa93e06698784e91d7164bff4e8",
+        "a5f5795de3a080151410f582fe460abbe71acf380402c477a2da8fadbb9c6b11",
     )
 }
 
@@ -279,7 +279,6 @@ fn check_workspace(root: &Path) -> Result<()> {
                 "fte-backend-llama",
                 "llama-native-engine",
                 "llama-native-host",
-                "platform-runtime",
                 "tauri-plugin-free-token-energy",
             ],
         ),
@@ -313,7 +312,6 @@ fn check_workspace(root: &Path) -> Result<()> {
                 root.join("crates/native/crates/llama-native-engine/Cargo.toml"),
                 root.join("crates/native/crates/llama-native-host/Cargo.toml"),
                 root.join("crates/native/crates/llama-native-types/Cargo.toml"),
-                root.join("crates/platform/runtime/Cargo.toml"),
                 root.join("products/fte/crates/fte-backend-llama/Cargo.toml"),
                 root.join("products/fte/crates/fte-loopback/Cargo.toml"),
                 root.join("products/fte/crates/fte-protocols/Cargo.toml"),

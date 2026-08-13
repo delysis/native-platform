@@ -5,7 +5,6 @@ members = [
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
     "crates/native/crates/llama-native-types",
-    "crates/platform/runtime",
     "products/fte/crates/fte-backend-llama",
     "products/fte/crates/fte-loopback",
     "products/fte/crates/fte-protocols",
@@ -105,7 +104,7 @@ unwrap_used = "deny"
 
 [workspace.metadata.native-platform.package-groups]
 portable = ["command-evidence", "fte-loopback", "fte-protocols", "fte-providers", "fte-router", "fte-store", "fte-types", "llama-native-cache", "llama-native-types"]
-platform = ["fte-backend-llama", "llama-native-engine", "llama-native-host", "platform-runtime", "tauri-plugin-free-token-energy"]
+platform = ["fte-backend-llama", "llama-native-engine", "llama-native-host", "tauri-plugin-free-token-energy"]
 product = ["free-token-energy"]
 research = []
 diagnostic = ["integration-current", "xtask"]
