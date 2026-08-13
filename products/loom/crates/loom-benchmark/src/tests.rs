@@ -166,7 +166,6 @@ fn fixture(contender_count: usize) -> Fixture {
 fn crate_dependency_boundary_is_headless_and_search_free() {
     let manifest = include_str!("../Cargo.toml");
     for forbidden in [
-        "loom-campaign",
         "loom-search",
         "loom-store",
         "loom-inference",

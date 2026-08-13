@@ -127,12 +127,6 @@ The original desktop slice is recorded in [audit-receipts/2026-08-11-real-gemma-
 - No compaction or general backup implementation exists.
 - No corruption repair UI or complete unknown-extension round-trip suite exists.
 
-### `loom-context`
-
-**Implemented and automated:** bounded ordered completion-prompt parts, deterministic prompt-byte assembly, token-cost metadata, and a validation rule that the live manuscript is the final bytes of a raw completion prompt. Control bytes after the manuscript boundary are rejected. The crate also has bounded exact-excerpt occurrences tied to source artifact/blob/range/hash, tokenizer-bound exact token counts, deterministic fixed-point hybrid ranking, craft-tag evidence, byte/token/count budgets, diversity-aware selection, and exact/fuzzy anti-copy evidence over every prompt excerpt. Semantic retrieval/copy values remain absent unless an external scorer supplies evidence for the exact excerpt occurrence.
-
-**Deferred:** source ingestion, persistence, FTS5/embedding index adapters, actual tokenizer calls, model-assisted reranking, UI/automation integration, model-specific demonstrations, FIM recipes, poetry operations, durable source annotations, and tolerant base-model proposal parsing. The implemented retrieval and anti-copy code is a library primitive, not a source-library product path.
-
 ### `loom-search`
 
 **Implemented and automated:** bounded project/global budget ledgers with atomic charging and resume-safe serialization; pause/resume state transitions; occurrence-preserving exact-content grouping; explicit semantic clustering that never fabricates missing observations; evidence-bound hard gates; fixed-point weighted rubrics with abstention; pairwise aggregation that normalizes candidate-order reversal and exposes position/rubric-permutation disagreement; deterministic Pareto extraction; and replayable quality-plus-seeded-novelty selection that does not let duplicate content occupy both slots.

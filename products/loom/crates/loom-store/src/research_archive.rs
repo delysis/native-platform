@@ -8,9 +8,8 @@ use crate::{
     StoreError,
 };
 
-/// Caller-supplied archive metadata remains diagnostic. `loom-campaign` owns
-/// the move-only evaluated-candidate leases that can produce a live archive;
-/// depending on it here would create a store/campaign cycle.
+/// Caller-supplied archive metadata remains diagnostic. The store does not
+/// mint the move-only authority required to produce a live research archive.
 #[derive(Clone, Copy, Debug)]
 pub struct DiagnosticArchiveSnapshotPersistence<'a> {
     pub campaign_id: CampaignId,
