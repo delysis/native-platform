@@ -1,0 +1,71 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "fte.loopback.roundtrip",
+      "attempt_id": "loopback.attempt.1",
+      "correlation_id": "loopback.restart.w1",
+      "kind": "completed",
+      "payload": {
+        "id": "response.store.after_restart",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "a06f3ae0aea371e6232711cb80d367430f75070f0618e4bdb9fd73a080d8da5f"
+        },
+        "length": 16
+      }
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "response.store",
+      "schema_id": "fte.store.responses.v1",
+      "before": null,
+      "after": {
+        "id": "response.store.after_restart",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "a06f3ae0aea371e6232711cb80d367430f75070f0618e4bdb9fd73a080d8da5f"
+        },
+        "length": 16
+      },
+      "disposition": "created"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "fte.loopback.roundtrip",
+      "attempt_id": "loopback.attempt.1",
+      "correlation_id": "loopback.restart.w1",
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 0,
+    "joined_workers": 0
+  },
+  "output_facts": {
+    "request_corpus_digest": {
+      "kind": "digest",
+      "value": { "algorithm": "sha256", "hex": "3bbcc71a8c4dace6b356fa895b47e5a4c8ad69d8944b5418686695c6f0d2d88a" }
+    },
+    "unauthorized_status": { "kind": "integer", "value": 401 },
+    "rebound_status": { "kind": "integer", "value": 400 },
+    "concurrent_status": { "kind": "integer", "value": 429 },
+    "chat_roundtrip": { "kind": "boolean", "value": true },
+    "raw_completion_roundtrip": { "kind": "boolean", "value": true },
+    "responses_stream_completed": { "kind": "boolean", "value": true },
+    "stored_response_reopened": { "kind": "boolean", "value": true },
+    "continuation_after_restart": { "kind": "boolean", "value": true },
+    "loopback_only": { "kind": "boolean", "value": true }
+  },
+  "fail_closed_facts": [
+    "missing bearer token was rejected",
+    "dns rebinding host was rejected",
+    "concurrency limit rejected overlapping work",
+    "no hosted provider or credential path was entered"
+  ]
+}

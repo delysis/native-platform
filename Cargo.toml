@@ -5,6 +5,15 @@ members = [
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
     "crates/native/crates/llama-native-types",
+    "products/fte/crates/fte-backend-llama",
+    "products/fte/crates/fte-loopback",
+    "products/fte/crates/fte-protocols",
+    "products/fte/crates/fte-providers",
+    "products/fte/crates/fte-router",
+    "products/fte/crates/fte-store",
+    "products/fte/crates/fte-types",
+    "products/fte/crates/tauri-plugin-free-token-energy",
+    "products/fte/src-tauri",
     "tests/integration-current",
     "xtask",
 ]
@@ -20,12 +29,29 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+async-stream = "0.3.6"
+async-trait = "0.1.89"
+axum = "0.8.9"
+bytes = "1.11.1"
 crossbeam-channel = "0.5"
+futures = "0.3.32"
+http = "1"
+http-body-util = "0.1"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 thiserror = "2"
+tokio = { version = "1.52.1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
 toml = "0.9.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["limit", "timeout"] }
+tracing = "0.1.44"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # Exact current integration inputs. Native is imported and path-rebound; the
 # remaining products stay at their accepted immutable Git revisions.
@@ -33,10 +59,14 @@ llama-cpp-2-current = { package = "llama-cpp-2", git = "https://github.com/delys
 llama-native-types-current = { package = "llama-native-types", path = "crates/native/crates/llama-native-types" }
 llama-native-host-current = { package = "llama-native-host", path = "crates/native/crates/llama-native-host" }
 command-evidence-current = { package = "command-evidence", path = "crates/native/crates/command-evidence" }
-fte-types-current = { package = "fte-types", git = "https://github.com/delysis/free-token-energy", rev = "67814e76659688fef61f311db588d17eddee0a66" }
-fte-backend-llama-current = { package = "fte-backend-llama", git = "https://github.com/delysis/free-token-energy", rev = "67814e76659688fef61f311db588d17eddee0a66" }
-fte-loopback-current = { package = "fte-loopback", git = "https://github.com/delysis/free-token-energy", rev = "67814e76659688fef61f311db588d17eddee0a66" }
-fte-providers-current = { package = "fte-providers", git = "https://github.com/delysis/free-token-energy", rev = "67814e76659688fef61f311db588d17eddee0a66" }
+llama-native-cache = { path = "crates/native/crates/llama-native-cache" }
+llama-native-engine = { path = "crates/native/crates/llama-native-engine" }
+llama-native-host = { path = "crates/native/crates/llama-native-host" }
+llama-native-types = { path = "crates/native/crates/llama-native-types" }
+fte-types-current = { package = "fte-types", path = "products/fte/crates/fte-types" }
+fte-backend-llama-current = { package = "fte-backend-llama", path = "products/fte/crates/fte-backend-llama" }
+fte-loopback-current = { package = "fte-loopback", path = "products/fte/crates/fte-loopback" }
+fte-providers-current = { package = "fte-providers", path = "products/fte/crates/fte-providers" }
 mom-llama-runtime-current = { package = "mom-llama-runtime", git = "https://github.com/delysis/mom-llama", rev = "3cf57941af6d523378e7fa8b24f5c24c8e50363f" }
 attachment-native-types-current = { package = "attachment-native-types", git = "https://github.com/delysis/attachment-native-kit", rev = "2a8d3a9a1828162a51185d207822ceb1ba6283a8" }
 attachment-native-host-current = { package = "attachment-native-host", git = "https://github.com/delysis/attachment-native-kit", rev = "2a8d3a9a1828162a51185d207822ceb1ba6283a8" }
@@ -64,9 +94,9 @@ unimplemented = "deny"
 unwrap_used = "deny"
 
 [workspace.metadata.native-platform.package-groups]
-portable = ["command-evidence", "llama-native-cache", "llama-native-types"]
-platform = ["llama-native-engine", "llama-native-host"]
-product = []
+portable = ["command-evidence", "fte-loopback", "fte-protocols", "fte-providers", "fte-router", "fte-store", "fte-types", "llama-native-cache", "llama-native-types"]
+platform = ["fte-backend-llama", "llama-native-engine", "llama-native-host", "tauri-plugin-free-token-energy"]
+product = ["free-token-energy"]
 research = []
 diagnostic = ["integration-current", "xtask"]
 real-hardware = []
@@ -77,6 +107,26 @@ llama-native-cache = { path = "crates/native/crates/llama-native-cache" }
 llama-native-engine = { path = "crates/native/crates/llama-native-engine" }
 llama-native-host = { path = "crates/native/crates/llama-native-host" }
 llama-native-types = { path = "crates/native/crates/llama-native-types" }
+
+[patch."https://github.com/delysis/free-token-energy"]
+fte-backend-llama = { path = "products/fte/crates/fte-backend-llama" }
+fte-loopback = { path = "products/fte/crates/fte-loopback" }
+fte-protocols = { path = "products/fte/crates/fte-protocols" }
+fte-providers = { path = "products/fte/crates/fte-providers" }
+fte-router = { path = "products/fte/crates/fte-router" }
+fte-store = { path = "products/fte/crates/fte-store" }
+fte-types = { path = "products/fte/crates/fte-types" }
+tauri-plugin-free-token-energy = { path = "products/fte/crates/tauri-plugin-free-token-energy" }
+
+[patch."https://github.com/delysis/free-token-energy.git"]
+fte-backend-llama = { path = "products/fte/crates/fte-backend-llama" }
+fte-loopback = { path = "products/fte/crates/fte-loopback" }
+fte-protocols = { path = "products/fte/crates/fte-protocols" }
+fte-providers = { path = "products/fte/crates/fte-providers" }
+fte-router = { path = "products/fte/crates/fte-router" }
+fte-store = { path = "products/fte/crates/fte-store" }
+fte-types = { path = "products/fte/crates/fte-types" }
+tauri-plugin-free-token-energy = { path = "products/fte/crates/tauri-plugin-free-token-energy" }
 
 [patch."https://github.com/delysis/llama-native-kit.git"]
 command-evidence = { path = "crates/native/crates/command-evidence" }

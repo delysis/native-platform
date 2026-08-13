@@ -1,0 +1,196 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "fte-w1-active-before-quit",
+      "attempt_id": "owner.1.active",
+      "correlation_id": "fte.quit_relaunch.w1",
+      "kind": "started",
+      "payload": null
+    },
+    {
+      "sequence": 1,
+      "operation_id": "fte.owner.1",
+      "attempt_id": "owner.1.quit",
+      "correlation_id": "fte.quit_relaunch.w1",
+      "kind": "cancel_requested",
+      "payload": null
+    },
+    {
+      "sequence": 2,
+      "operation_id": "fte-w1-rejected-during-quit",
+      "attempt_id": "owner.1.rejected",
+      "correlation_id": "fte.quit_relaunch.w1",
+      "kind": "failed",
+      "payload": null
+    },
+    {
+      "sequence": 3,
+      "operation_id": "fte-w1-active-before-quit",
+      "attempt_id": "owner.1.active",
+      "correlation_id": "fte.quit_relaunch.w1",
+      "kind": "cancelled",
+      "payload": null
+    },
+    {
+      "sequence": 4,
+      "operation_id": "fte.owner.1",
+      "attempt_id": "owner.1.quit",
+      "correlation_id": "fte.quit_relaunch.w1",
+      "kind": "completed",
+      "payload": {
+        "id": "fte.runtime.first.joined_worker_completion_order",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "eedb673b24eff986a0600a310424f7c390e5f643b6d2f1c313849f86166a7e19"
+        },
+        "length": 268
+      }
+    },
+    {
+      "sequence": 5,
+      "operation_id": "fte.database.profile",
+      "attempt_id": "owner.2.reopen",
+      "correlation_id": "fte.quit_relaunch.w1",
+      "kind": "completed",
+      "payload": {
+        "id": "fte.runtime.profile.marker",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "3c685d4fd0e247dfdcd65f95f50575b2d96930dda96ce2d79932eedcd03078e4"
+        },
+        "length": 40
+      }
+    },
+    {
+      "sequence": 6,
+      "operation_id": "fte-w1-fresh-after-relaunch",
+      "attempt_id": "owner.2.fresh",
+      "correlation_id": "fte.quit_relaunch.w1",
+      "kind": "completed",
+      "payload": {
+        "id": "fte.runtime.fresh.joined_worker_completion_order",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "e40d6028fa7b011bfbbf6eb8e64f9753a0b8802763e74eff0fc5f549e41358e2"
+        },
+        "length": 268
+      }
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "fte.runtime.profile",
+      "schema_id": "fte.database.master_profile.v1",
+      "before": {
+        "id": "fte.runtime.profile.marker",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "3c685d4fd0e247dfdcd65f95f50575b2d96930dda96ce2d79932eedcd03078e4"
+        },
+        "length": 40
+      },
+      "after": {
+        "id": "fte.runtime.profile.marker",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "3c685d4fd0e247dfdcd65f95f50575b2d96930dda96ce2d79932eedcd03078e4"
+        },
+        "length": 40
+      },
+      "disposition": "unchanged"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "fte-w1-active-before-quit",
+      "attempt_id": "owner.1.active",
+      "correlation_id": "fte.quit_relaunch.w1",
+      "terminal": "cancelled",
+      "released": true
+    },
+    {
+      "operation_id": "fte.owner.1",
+      "attempt_id": "owner.1.quit",
+      "correlation_id": "fte.quit_relaunch.w1",
+      "terminal": "completed",
+      "released": true
+    },
+    {
+      "operation_id": "fte-w1-rejected-during-quit",
+      "attempt_id": "owner.1.rejected",
+      "correlation_id": "fte.quit_relaunch.w1",
+      "terminal": "failed",
+      "released": true
+    },
+    {
+      "operation_id": "fte.database.profile",
+      "attempt_id": "owner.2.reopen",
+      "correlation_id": "fte.quit_relaunch.w1",
+      "terminal": "completed",
+      "released": true
+    },
+    {
+      "operation_id": "fte-w1-fresh-after-relaunch",
+      "attempt_id": "owner.2.fresh",
+      "correlation_id": "fte.quit_relaunch.w1",
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 18,
+    "joined_workers": 18
+  },
+  "output_facts": {
+    "admission_closed_during_quit": { "kind": "boolean", "value": true },
+    "active_request_cancelled": { "kind": "boolean", "value": true },
+    "authoritative_terminal_released_before_shutdown_receipt": { "kind": "boolean", "value": true },
+    "first_runtime_id": { "kind": "text", "value": "fte-w1-runtime-owner-1" },
+    "fresh_runtime_id": { "kind": "text", "value": "fte-w1-runtime-owner-2" },
+    "first_exact_joined_worker_set": {
+      "kind": "digest",
+      "value": {
+        "algorithm": "sha256",
+        "hex": "eedb673b24eff986a0600a310424f7c390e5f643b6d2f1c313849f86166a7e19"
+      }
+    },
+    "first_joined_worker_completion_order": {
+      "kind": "digest",
+      "value": {
+        "algorithm": "sha256",
+        "hex": "eedb673b24eff986a0600a310424f7c390e5f643b6d2f1c313849f86166a7e19"
+      }
+    },
+    "fresh_exact_joined_worker_set": {
+      "kind": "digest",
+      "value": {
+        "algorithm": "sha256",
+        "hex": "e40d6028fa7b011bfbbf6eb8e64f9753a0b8802763e74eff0fc5f549e41358e2"
+      }
+    },
+    "fresh_joined_worker_completion_order": {
+      "kind": "digest",
+      "value": {
+        "algorithm": "sha256",
+        "hex": "e40d6028fa7b011bfbbf6eb8e64f9753a0b8802763e74eff0fc5f549e41358e2"
+      }
+    },
+    "native_owner_joined": { "kind": "boolean", "value": true },
+    "same_product_database_reopened": { "kind": "boolean", "value": true },
+    "fresh_owner_distinct": { "kind": "boolean", "value": true },
+    "fresh_owner_completed_work": { "kind": "boolean", "value": true },
+    "fresh_owner_zero_retained_tasks": { "kind": "boolean", "value": true },
+    "credential_store_accesses": { "kind": "integer", "value": 0 },
+    "hosted_network_requests": { "kind": "integer", "value": 0 }
+  },
+  "fail_closed_facts": [
+    "new admission was rejected after quit began",
+    "shutdown receipt was not published before the authoritative cancellation terminal released",
+    "every retained backend worker ID was joined before closure",
+    "fresh work used a distinct Gateway runtime owner",
+    "no hosted provider, API key, Keychain, or network path was entered"
+  ]
+}
