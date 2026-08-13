@@ -3354,6 +3354,7 @@ version = "0.0.0"
 dependencies = [
  "platform-contract-testkit",
  "platform-vertical-fixtures-v0",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
