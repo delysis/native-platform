@@ -1,0 +1,99 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "current_exact_qwen",
+  "class": "real",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [
+    {
+      "case_id": "native-current-exact-qwen",
+      "source": {
+        "repository_id": "delysis/llama-native-kit",
+        "commit": "b36e6e9ed9efde020515f66611daeeb6f7bfc84a",
+        "production_tree": {
+          "id": "llama-native-engine-source-tree",
+          "digest": {
+            "algorithm": "sha256",
+            "hex": "c9548d87d974f357d47f1925140a4e3ea12c4b3ff74905ed4dd0ebc6e22baf4e"
+          },
+          "length": 1016
+        }
+      },
+      "inputs": [
+        {
+          "identity": {
+            "id": "native-current-qwen-input",
+            "digest": {
+              "algorithm": "sha256",
+              "hex": "89d179ddf57496bae148151dd999a7ee5cea0e778783265598d1a03a560f1d6d"
+            },
+            "length": 268
+          },
+          "availability": "checked_in",
+          "relative_path": "fixtures/w1/native-current-qwen-input-v0.json"
+        },
+        {
+          "identity": {
+            "id": "llama-native-engine-source-tree",
+            "digest": {
+              "algorithm": "sha256",
+              "hex": "c9548d87d974f357d47f1925140a4e3ea12c4b3ff74905ed4dd0ebc6e22baf4e"
+            },
+            "length": 1016
+          },
+          "availability": "checked_in",
+          "relative_path": "fixtures/w1/native-current-qwen-source-tree-v0.txt"
+        }
+      ],
+      "state_identities": [],
+      "prerequisites": [
+        {
+          "prerequisite_id": "model.qwen.gguf",
+          "kind": "exact_external_artifact",
+          "identity": {
+            "id": "qwen3-0.6b-q4-k-m.gguf",
+            "digest": {
+              "algorithm": "sha256",
+              "hex": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14"
+            },
+            "length": 484220320
+          }
+        }
+      ],
+      "replay": [
+        {
+          "program": { "kind": "cargo" },
+          "argv": [
+            "test",
+            "--locked",
+            "-p",
+            "llama-native-engine",
+            "--features",
+            "unstable-w1-vertical-tests",
+            "w1_vertical_fixture::w1_current_exact_qwen_baseline",
+            "--",
+            "--ignored",
+            "--exact"
+          ],
+          "required_environment": [
+            "MOM_LLAMA_MODEL_PATH",
+            "MOM_LLAMA_MODEL_SHA256"
+          ],
+          "network": "denied"
+        }
+      ],
+      "expected_projection": {
+        "id": "native-current-qwen-projection",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "e3cd1a9428ce326056329624f0407c3db3adad8f1522a36100111b9410ae6f54"
+        },
+        "length": 1835
+      }
+    }
+  ],
+  "omitted_claims": [
+    "exact generated prose bytes",
+    "accelerator availability or performance"
+  ],
+  "negative_evidence": []
+}

@@ -1,0 +1,31 @@
+{
+  "kind": "published_durability_unknown",
+  "receipt": {
+    "schema": "delysis.publication_receipt.v0",
+    "artifact": {
+      "id": "artifact_fixture_0003",
+      "digest": {
+        "algorithm": "sha256",
+        "hex": "2454a2a4600a465cccf4fdf3e62b6c3b8876d4490a0069d2395a686283688f65"
+      },
+      "length": 4096
+    },
+    "destination": {
+      "filesystem_id": "fixture-library-filesystem",
+      "path_id": "library-visible-file-sync-unknown-bin"
+    },
+    "visible": true,
+    "file_synced": false,
+    "directory_synced": false,
+    "idempotent_recovery": true
+  },
+  "error": {
+    "schema": "delysis.service_error.v0",
+    "code": "publication.visible_file_sync",
+    "class": "publication",
+    "retry": "after_restart",
+    "operation_id": null,
+    "service": "information",
+    "safe_detail": "the exact artifact is visible but file and directory durability are unknown"
+  }
+}

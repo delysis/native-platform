@@ -1,0 +1,9 @@
+{
+  "schema":"delysis.vertical_fixture_manifest.v0","vertical_id":"information_resource_store","class":"state","contract_revision":"cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases":[{"case_id":"information.resource-store.reopen.v0","source":{"repository_id":"delysis/information-native-kit","commit":"750e27e5ad27b6040e7ab7b66f7a2acb910b613a","production_tree":{"id":"information.production.source_roots.750e27e","digest":{"algorithm":"sha256","hex":"e2eca746d04228ee806344d7c40c43723777b3c2ea4ffbe7056c554dbfe08a62"},"length":808}},
+  "inputs":[{"identity":{"id":"information.fixture.sql","digest":{"algorithm":"sha256","hex":"9b8a4f565014cbd04ee823076fce156330fb78ae81d605c9252dabb38e39255d"},"length":2330},"availability":"checked_in","relative_path":"tests/fixtures/w1/v0/information-alexandria.sql"}],
+  "state_identities":[{"state_id":"information.resource_store","schema_id":"information.w1.resource_store.v0","baseline":{"identity":{"id":"information.resource_store.before","digest":{"algorithm":"sha256","hex":"cc281477226d34e4729c550d10d359098f3470d1c7ad70ae9f62f571037a2a25"},"length":93},"availability":"checked_in","relative_path":"tests/fixtures/w1/v0/information-resource-store-before.json"}}],"prerequisites":[],
+  "replay":[{"program":{"kind":"cargo"},"argv":["test","--locked","-p","information-native-host","--features","unstable-w1-vertical-tests","--test","w1_vertical","information_resource_store_reopens_managed_and_external_state","--","--exact"],"required_environment":[],"network":"denied"}],
+  "expected_projection":{"id":"information.resource_store.projection","digest":{"algorithm":"sha256","hex":"4439403249a59529d31ba9282505ce3967492137492f352c79c00ac1635cb786"},"length":1979}}],
+  "omitted_claims":["No external source mutation, migration, or live network acquisition is exercised."],"negative_evidence":[]
+}

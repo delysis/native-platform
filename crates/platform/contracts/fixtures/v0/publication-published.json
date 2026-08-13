@@ -1,0 +1,22 @@
+{
+  "kind": "published",
+  "receipt": {
+    "schema": "delysis.publication_receipt.v0",
+    "artifact": {
+      "id": "artifact_fixture_0001",
+      "digest": {
+        "algorithm": "sha256",
+        "hex": "b6d81b360a5672d80c27430f39153e2c89b81f8a65e7913a949342c1fdbff4e3"
+      },
+      "length": 4096
+    },
+    "destination": {
+      "filesystem_id": "fixture-library-filesystem",
+      "path_id": "library-example-bin"
+    },
+    "visible": true,
+    "file_synced": true,
+    "directory_synced": true,
+    "idempotent_recovery": false
+  }
+}

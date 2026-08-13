@@ -1,0 +1,9 @@
+{
+  "schema": "delysis.privacy_policy.v0",
+  "network": "deny",
+  "data_handling": "local_only",
+  "allowed_provider_ids": [],
+  "allowed_hosted_data_tiers": [],
+  "payload_redaction": "local_only",
+  "logging": "disabled"
+}

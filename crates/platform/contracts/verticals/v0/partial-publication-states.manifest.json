@@ -1,0 +1,13 @@
+{
+  "schema":"delysis.vertical_fixture_manifest.v0","vertical_id":"partial_publication_states","class":"state","contract_revision":"cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases":[{"case_id":"information.partial-publication.recovery.v0","source":{"repository_id":"delysis/information-native-kit","commit":"750e27e5ad27b6040e7ab7b66f7a2acb910b613a","production_tree":{"id":"information.production.source_roots.750e27e","digest":{"algorithm":"sha256","hex":"e2eca746d04228ee806344d7c40c43723777b3c2ea4ffbe7056c554dbfe08a62"},"length":808}},
+  "inputs":[{"identity":{"id":"information.partial.payload","digest":{"algorithm":"sha256","hex":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"},"length":7},"availability":"generated_fixture","relative_path":null}],
+  "state_identities":[
+    {"state_id":"information.partial_acquisition","schema_id":"information.w1.partial_acquisition.v0","baseline":{"identity":{"id":"information.partial.acquisition.before","digest":{"algorithm":"sha256","hex":"d23fce4ef3befb2fa04d26d15dbfc371197b14d44457fb7245e76cf4863d3cc2"},"length":80},"availability":"checked_in","relative_path":"tests/fixtures/w1/v0/information-partial-acquisition-before.json"}},
+    {"state_id":"information.partial_staged","schema_id":"information.w1.partial_staged.v0","baseline":{"identity":{"id":"information.partial.staged.before","digest":{"algorithm":"sha256","hex":"2c7bc9b362f31e563332f12391181695fd3eb7abe14c2ad9cf0ea5cba5a7ee79"},"length":209},"availability":"checked_in","relative_path":"tests/fixtures/w1/v0/information-partial-staged-before.json"}},
+    {"state_id":"information.partial_activated","schema_id":"information.w1.partial_activated.v0","baseline":{"identity":{"id":"information.partial.activated.before","digest":{"algorithm":"sha256","hex":"d694ed91022619eb10af5a3b9edbdbf2f56be6ce30c37835564c90ca419a9e33"},"length":228},"availability":"checked_in","relative_path":"tests/fixtures/w1/v0/information-partial-activated-before.json"}}
+  ],"prerequisites":[],
+  "replay":[{"program":{"kind":"cargo"},"argv":["test","--locked","-p","information-native-host","--features","unstable-w1-vertical-tests","--test","w1_vertical","partial_publication_states_recover_without_clobber_or_network","--","--exact"],"required_environment":[],"network":"denied"}],
+  "expected_projection":{"id":"information.partial_publication.projection","digest":{"algorithm":"sha256","hex":"289c0ecbe6adc708127aab3aea6b2127ef4c1a5ddea5f0ff9cc5ca09ba4f09b3"},"length":4550}}],
+  "omitted_claims":["No live network acquisition is exercised."],"negative_evidence":[]
+}
