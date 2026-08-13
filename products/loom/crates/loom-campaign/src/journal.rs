@@ -523,14 +523,11 @@ impl CampaignJournal {
         verify_persisted_campaign_snapshot(&spec, &session_lease)?;
         let session_id = SchedulerSessionId::from_artifact_id(session_lease.session_id());
         let store_lease_fingerprint = session_lease.lease_fingerprint();
-        let persistence = CampaignJournalPersistence::Store(Box::new(
-            store.open_research_journal_writer(session_lease)?,
-        ));
-        if let CampaignJournalPersistence::Store(writer) = &persistence
-            && !writer.load_campaign_events()?.is_empty()
-        {
+        let writer = store.open_research_journal_writer(session_lease)?;
+        if !writer.load_campaign_events()?.is_empty() {
             return Err(CampaignError::JournalAlreadyExists);
         }
+        let persistence = CampaignJournalPersistence::Store(Box::new(writer));
         let mut journal = Self {
             spec,
             session_id,
