@@ -168,8 +168,16 @@ test('desktop setup reports saved-model failure and picker success without expos
       case 'get_dashboard_stats':
         return { headroom: 0, avg_latency: 0, total_tokens: 0, request_count: 0 };
       case 'get_providers':
-      case 'get_models':
         return [];
+      case 'get_models':
+        return [{
+          id: 'auto',
+          display_name: 'Automatic best available route',
+          providers: ['Hosted provider one', 'Hosted provider two'],
+          supports_chat_completions: true,
+          supports_text_completions: false,
+          prompt_semantics: [],
+        }];
       case 'get_master_profile':
         return {};
       case 'plugin:free-token-energy|loopback_status':
@@ -208,6 +216,13 @@ test('desktop setup reports saved-model failure and picker success without expos
 
   await import(`../src/main.js?desktop-model-test=${Date.now()}`);
   await new Promise((resolve) => setImmediate(resolve));
+  elements.get('chat-model').value = 'auto';
+  elements.get('chat-model').listeners.get('change')();
+  assert.equal(
+    elements.get('playground-model-note').textContent,
+    'Automatic routing prefers a ready local model; configured hosted providers are fallback routes.',
+  );
+  assert.ok(!elements.get('playground-model-note').textContent.includes('provider routes'));
   assert.equal(elements.get('local-model-status-pill').textContent, 'Needs attention');
   assert.equal(elements.get('local-model-name').textContent, 'missing.gguf');
   assert.ok(!elements.get('local-model-detail').textContent.includes('/'));

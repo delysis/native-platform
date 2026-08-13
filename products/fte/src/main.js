@@ -704,6 +704,14 @@ function updatePlaygroundModelNote() {
     return;
   }
 
+  if (model.id === 'auto') {
+    setText(
+      'playground-model-note',
+      'Automatic routing prefers a ready local model; configured hosted providers are fallback routes.',
+    );
+    return;
+  }
+
   const providerCount = Array.isArray(model.providers) ? model.providers.length : 0;
   const providerSummary = providerCount === 0
     ? 'Provider availability is unknown'

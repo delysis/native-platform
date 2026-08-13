@@ -494,6 +494,11 @@ impl GatewayRuntimeOwner {
     }
 
     fn apply_route_policy(&self, requested_model: &str, request: &mut fte_types::GatewayRequest) {
+        if is_automatic_model(requested_model) {
+            request.routing.privacy = PrivacyPolicy::HostedAllowed;
+            request.routing.profile = RouteProfile::PreferLocal;
+            return;
+        }
         if self
             .gateway
             .models()
@@ -942,10 +947,7 @@ fn required_model(object: &serde_json::Map<String, serde_json::Value>) -> anyhow
 }
 
 fn desktop_model_selector(model: &str) -> ModelSelector {
-    if matches!(
-        model.trim().to_ascii_lowercase().as_str(),
-        "auto" | "best" | "free/auto"
-    ) {
+    if is_automatic_model(model) {
         ModelSelector::Profile {
             name: "auto".to_string(),
         }
@@ -954,6 +956,13 @@ fn desktop_model_selector(model: &str) -> ModelSelector {
             model_id: model.trim().to_string(),
         }
     }
+}
+
+fn is_automatic_model(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "auto" | "best" | "free/auto"
+    )
 }
 
 fn register_hosted_backends(
@@ -1439,6 +1448,33 @@ mod tests {
         std::fs::remove_file(path).expect("remove GGUF fixture");
 
         assert!(runtime.shutdown_native_for_process_exit());
+        assert!(runtime.shutdown_native_for_process_exit());
+    }
+
+    #[test]
+    fn desktop_automatic_route_prefers_local_with_hosted_fallback() {
+        let runtime = GatewayRuntimeOwner::new().expect("gateway");
+        runtime
+            .bind_database(test_database("automatic-prefers-local"))
+            .expect("bind database");
+        let request = serde_json::json!({
+            "model":"auto",
+            "messages":[{"role":"user","content":"prefer local"}],
+            "max_tokens":1
+        });
+        let (_, mut canonical) =
+            canonical_chat_request(request, &runtime.catalog).expect("canonical auto request");
+
+        runtime.apply_route_policy("auto", &mut canonical);
+
+        assert_eq!(
+            canonical.model,
+            ModelSelector::Profile {
+                name: "auto".to_string()
+            }
+        );
+        assert_eq!(canonical.routing.privacy, PrivacyPolicy::HostedAllowed);
+        assert_eq!(canonical.routing.profile, RouteProfile::PreferLocal);
         assert!(runtime.shutdown_native_for_process_exit());
     }
 
