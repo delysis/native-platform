@@ -602,6 +602,15 @@ fn check_ledger(root: &Path) -> Result<()> {
         });
         service.old_repo_status = "frozen_unarchived_two_release_retirement".into();
     }
+    let contracts = expected
+        .entries
+        .iter_mut()
+        .find(|entry| entry.source_repository == "delysis/w1-platform-contracts")
+        .context("expected W1 contract migration entry")?;
+    contracts.import_commit = Some("018aa483dbe34ecb3a62f70adc6bfebe99684acc".into());
+    contracts.path_dependency_cutover_commit =
+        Some("1c79381f9111dfd2d266291db243c7a5091a7fe4".into());
+    contracts.old_repo_status = "frozen_unarchived_two_release_retirement".into();
     ensure!(ledger == expected, "migration ledger drift");
     Ok(())
 }

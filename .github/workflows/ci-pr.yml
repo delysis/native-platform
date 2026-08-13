@@ -311,6 +311,7 @@ jobs:
           fetch-depth: 0
       - run: ./scripts/check-native-import-history.sh
       - run: ./scripts/check-service-import-history.sh
+      - run: ./scripts/check-contract-import-history.sh
 
   fuzz-build:
     if: ${{ needs.plan.outputs.fuzz == 'true' || needs.plan.outputs.full == 'true' }}
