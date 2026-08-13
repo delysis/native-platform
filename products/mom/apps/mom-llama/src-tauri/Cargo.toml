@@ -1,0 +1,54 @@
+[package]
+name = "mom-llama-app"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/delysis/mom-llama"
+rust-version = "1.88"
+
+[features]
+unstable-w1-contracts = ["dep:platform-contracts-v0", "dep:platform-contract-testkit"]
+unstable-w1-vertical-fixtures = [
+    "dep:platform-contracts-v0-vertical",
+    "dep:platform-vertical-fixtures-v0",
+    "mom-llama-runtime/unstable-w1-vertical-fixtures",
+]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+mom-llama-runtime = { path = "../../../crates/mom-llama-runtime" }
+llama-native-types = { workspace = true }
+llama-native-host = { workspace = true }
+fte-backend-llama.workspace = true
+fte-router.workspace = true
+fte-store.workspace = true
+fte-types.workspace = true
+maud = "0.26"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-free-token-energy.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+platform-contracts-v0 = { workspace = true, optional = true }
+platform-contract-testkit = { workspace = true, optional = true }
+platform-vertical-fixtures-v0 = { workspace = true, optional = true }
+platform-contracts-v0-vertical = { workspace = true, optional = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+rfd = { version = "=0.16.0", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "=0.16.0", default-features = false, features = ["tokio", "xdg-portal"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+undocumented_unsafe_blocks = "deny"

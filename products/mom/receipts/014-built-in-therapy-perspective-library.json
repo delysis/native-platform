@@ -1,0 +1,75 @@
+{
+  "schema": "llama_native_kit.implementation_receipt.v1",
+  "task_id": "built-in-therapy-perspective-library",
+  "role": "standalone_integrator",
+  "status": "passed",
+  "date": "2026-08-01",
+  "repository": "/Users/george/Documents/llama-native-kit",
+  "summary": [
+    "Compiled all 14 user-supplied therapy-consult profiles into concise Rust-owned perspective prompts without embedding the oversized persona-simulation prompts.",
+    "Revised the shared contract for a licensed mental-health professional: clinically specific formulation, differentials, target selection, sequencing, intervention, contraindication, and monitoring replace consumer-facing safety boilerplate.",
+    "Replaced person-name seat identities with descriptive lens names while retaining explicit public-work attribution and non-impersonation language.",
+    "Added four calm built-in Dream Team presets that cover all 14 perspectives under the four-seat native runtime limit.",
+    "Added professional response discipline requiring clinically specific formulation, discriminating assessment questions, sequencing, targets, interventions, contraindications, monitoring, and a principal blind spot.",
+    "Calibrated evidence claims so EMDR is distinguished from emerging or limited-evidence IFS, Somatic Experiencing, FSAP, DeTUR, and DNMS claims without injecting ritual caveats into every answer.",
+    "Kept built-ins out of the encrypted user database, avoiding writes and secret-store access merely to list the library.",
+    "Proved that persona prompt revisions cannot reuse a token-incompatible cached prefix."
+  ],
+  "changed_paths": [
+    "README.md",
+    "docs/PRODUCT.md",
+    "docs/PERSONA_LIBRARY.md",
+    "crates/llama-native-cache/src/lib.rs",
+    "crates/mom-llama-runtime/src/lib.rs",
+    "crates/mom-llama-runtime/src/consult.rs",
+    "crates/mom-llama-runtime/src/persona_library.rs",
+    "crates/mom-llama-runtime/tests/runtime.rs",
+    "apps/mom-llama/src-tauri/src/view.rs",
+    "receipts/014-built-in-therapy-perspective-library.json"
+  ],
+  "tests_run": [
+    {"command": "cargo fmt --all --check", "outcome": "passed"},
+    {"command": "cargo test --workspace --exclude mom-llama-app", "outcome": "passed"},
+    {"command": "cargo test -p mom-llama-runtime", "outcome": "passed", "detail": "33 unit tests and 18 deterministic integration tests passed; eight real-model acceptance tests remained ignored by default."},
+    {"command": "cargo test -p mom-llama-cli", "outcome": "passed", "detail": "10 deterministic CLI tests passed; one real-model test remained ignored by default."},
+    {"command": "cargo test -p mom-llama-app", "outcome": "passed", "detail": "The rendered-control probe verifies all four built-in team names and the default non-authoritative lens."},
+    {"command": "cargo test -p llama-native-cache", "outcome": "passed", "detail": "Five cache-contract tests passed, including stale persona-prefix rejection."},
+    {"command": "cargo clippy -p mom-llama-runtime -p mom-llama-cli -p mom-llama-app --all-targets -- -D warnings", "outcome": "passed"},
+    {"command": "cargo clippy --workspace --all-targets --exclude mom-llama-app -- -D warnings", "outcome": "passed"},
+    {"command": "cargo build -p mom-llama-app", "outcome": "passed"},
+    {"command": "target/debug/mom-llama-app --smoke", "outcome": "passed", "detail": "76 command-backed controls; rendered native app contains all four built-in teams."},
+    {"command": "MOM_LLAMA_MODEL_PATH=<SmolLM2-GGUF> mom-llama-cli consult start --panel builtin-trauma-balanced", "outcome": "passed", "detail": "Rerun after the professional-prompt revision: four completed nonempty in-process perspective outputs; every seat real_engine_invoked=true and fake_fixture=false."},
+    {"command": "./scripts/check-architecture.sh", "outcome": "passed"},
+    {"command": "./scripts/check-contracts.sh", "outcome": "passed", "detail": "67 commands, 76 affordances, 25 effects, 36 parity rows, 58 upstream settings, zero blockers."},
+    {"command": "git diff --check", "outcome": "passed"}
+  ],
+  "library": {
+    "source_profile_count": 14,
+    "compiled_perspective_count": 14,
+    "built_in_team_count": 4,
+    "maximum_seats_per_team": 4,
+    "all_source_profiles_reachable": true,
+    "public_figure_impersonation": false,
+    "stored_in_user_database": false,
+    "real_native_consult": {
+      "model": "SmolLM2-135M-Instruct-Q4_K_M.gguf",
+      "panel": "builtin-trauma-balanced",
+      "state": "completed",
+      "completed_seats": 4,
+      "real_engine_invoked": true,
+      "fake_fixture": false
+    }
+  },
+  "evidence_boundary": {
+    "emdr": "protocol-based trauma-focused psychotherapy with strong PTSD evidence when delivered by trained practitioners",
+    "ifs": "emerging condition-specific evidence",
+    "somatic_experiencing": "emerging evidence base",
+    "fsap_detur_dnms": "specialized limited-evidence formulation aids",
+    "medical_authority": false
+  },
+  "cache_boundary": {
+    "persona_tier": "encrypted persistent persona prompt pack plus bounded memory promotion",
+    "reuse_rule": "exact token prefix plus complete runtime/model fingerprint",
+    "prompt_revision_behavior": "token-incompatible prior persona state is rejected; an unchanged exact prefix may be extended safely"
+  }
+}

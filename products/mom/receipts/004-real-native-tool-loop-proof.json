@@ -1,0 +1,101 @@
+{
+  "schema": "llama_native_kit.implementation_receipt.v1",
+  "task_id": "real-native-bounded-tool-loop",
+  "role": "standalone_integrator",
+  "status": "passed",
+  "date": "2026-07-29",
+  "repository": "/Users/george/Documents/llama-native-kit",
+  "changed_paths": [
+    "contracts/upstream-parity.json",
+    "contracts/commands.json",
+    "contracts/effects.json",
+    "apps/mom-llama/src-tauri/src/commands.rs",
+    "apps/mom-llama/src-tauri/src/main.rs",
+    "apps/mom-llama/src-tauri/src/view.rs",
+    "apps/mom-llama/ui/coop-hx.js",
+    "apps/mom-llama/ui/style.css",
+    "crates/mom-llama-cli/src/main.rs",
+    "crates/mom-llama-runtime/src/lib.rs",
+    "crates/mom-llama-runtime/src/tool_loop.rs",
+    "crates/mom-llama-runtime/tests/runtime.rs",
+    "scripts/fixtures/mcp-echo-fixture.sh",
+    "receipts/004-real-native-tool-loop-proof.json"
+  ],
+  "tests_run": [
+    {
+      "command": "cargo test -p mom-llama-runtime --test runtime mcp_process_authority_is_explicit_bounded_and_receipted -- --exact",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo test -p mom-llama-runtime --test runtime tool_loop_requires_an_exact_expiring_single_use_approval -- --exact",
+      "outcome": "passed"
+    },
+    {
+      "command": "MOM_LLAMA_MODEL_PATH=<real-gguf> cargo test -p mom-llama-runtime --test runtime real_native_tool_loop_invokes_model_and_persists_tool_lineage -- --ignored --exact",
+      "outcome": "passed",
+      "duration_seconds": 133.78
+    }
+  ],
+  "real_native_tool_loop_evidence": {
+    "model_path": "/Users/george/.local/share/mom-llama-lab/models/SmolLM2-135M-Instruct-Q4_K_M.gguf",
+    "native_device": "cpu",
+    "readiness": "real_prompt_smoke_passed",
+    "real_engine_invoked": true,
+    "fake_fixture": false,
+    "mcp_adapter": "bounded local stdio fixture",
+    "advertised_tool_validated": true,
+    "input_schema_validated": true,
+    "approval": {
+      "encrypted": true,
+      "single_use": true,
+      "expires_minutes": 5,
+      "bound_fields": [
+        "conversation",
+        "prompt",
+        "server",
+        "tool",
+        "arguments",
+        "max_turns"
+      ],
+      "mismatch_rejected": true,
+      "reuse_rejected": true
+    },
+    "tool_result_sha256_recorded": true,
+    "tool_receipt_lineage_recorded": true,
+    "tool_role_message_persisted": true,
+    "model_request_ids_recorded": true,
+    "terminal_answer_nonempty": true
+  },
+  "live_tauri_approval_evidence": {
+    "bundle": "/Users/george/Documents/llama-native-kit/target/debug/bundle/macos/Mom Llama Native Kit.app",
+    "bundle_id": "com.delysis.llama-native-kit.mom-llama",
+    "approval_dialog_verified": true,
+    "cancel_without_execution_verified": true,
+    "single_use_approval_submitted": true,
+    "reviewed_server": "fixture",
+    "reviewed_tool": "echo",
+    "reviewed_prompt": "Use the supplied tool result, then answer in one short sentence.",
+    "reviewed_arguments": {},
+    "reviewed_max_turns": 8,
+    "tool_role_message_visible": true,
+    "terminal_model_message_visible": true,
+    "readiness": "real_prompt_smoke_passed",
+    "screenshot": "/tmp/llama-native-kit-tool-approval.png"
+  },
+  "readiness_changes": [
+    {
+      "feature": "iterative_tool_loop",
+      "before": "real model path unproven in standalone repository",
+      "after": "real bounded native loop and explicit approval proven; feature remains p0_required for structured live rendering and cancellation"
+    }
+  ],
+  "blockers": [
+    "Structured live tool-call and result rendering",
+    "Tool-loop cancellation"
+  ],
+  "reuse_decisions": [
+    "Reused the bounded local stdio MCP fixture only for adapter authority.",
+    "Required real in-process GGUF generation before the command could claim real_prompt_smoke_passed.",
+    "Kept MCP process execution distinct from native engine evidence."
+  ]
+}

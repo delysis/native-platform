@@ -1,0 +1,21 @@
+[package]
+name = "mom-llama-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Machine-exercisable command surface for the Mom Llama product"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+mom-llama-runtime = { path = "../mom-llama-runtime" }
+llama-native-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+
+[lints]
+workspace = true

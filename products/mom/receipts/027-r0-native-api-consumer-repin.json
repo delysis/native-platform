@@ -1,0 +1,123 @@
+{
+  "schema": "mom_llama.native_api_consumer_repin.v1",
+  "task_ids": [
+    "R0-NATIVE-API",
+    "R1-MOM-SUPERVISE"
+  ],
+  "status": "portable_code_reverified_remote_and_launched_evidence_open",
+  "generated_at_utc": "2026-08-11T23:55:25Z",
+  "candidate_base_revision": "d9a5a13a973aedd632b3fb5b3be6ccb8c252d30e",
+  "candidate_source_revision": "4084d1120f63f7bf561e7381da7daec947cbcd44",
+  "candidate_tree": "78903672744706f77fc8494838571de8d7f7c57a",
+  "dependency_revisions": {
+    "llama_native_kit": "f7a69316c64d857b99bd847dd44cd852fc5b4ca4",
+    "free_token_energy": "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a",
+    "attachment_native_kit": "472900732ded5bcfb5cc639c49b3a4f77feece27"
+  },
+  "scope": {
+    "native_packages": "all four direct llama-native-kit packages atomically pin the R0 successor",
+    "gateway_packages": "all five direct Free Token Energy packages atomically pin the code commit that consumes the same R0 successor",
+    "resolved_identity": "Cargo.lock contains exactly one immutable llama-native-kit source and exactly one immutable Free Token Energy source",
+    "polling_migration": "Mom's sole GenerationTicket polling loop transfers ticket ownership into try_wait and retains the returned ticket on Pending",
+    "supervision_preserved": "event draining, product cancellation, timeout cancellation, and terminal result handling remain inside the existing R1-supervised operation"
+  },
+  "gates": [
+    {
+      "command": "cargo fmt --all --check",
+      "outcome": "passed"
+    },
+    {
+      "command": "node --check apps/mom-llama/ui/coop-hx.js",
+      "outcome": "passed"
+    },
+    {
+      "command": "./scripts/check-architecture.sh",
+      "outcome": "passed",
+      "detail": "one native source, one FTE source, exact revisions, immutable Git boundaries, and authority exclusions passed"
+    },
+    {
+      "command": "./scripts/check-contracts.sh",
+      "outcome": "passed",
+      "detail": "78 commands, 87 affordances, 26 effects, 36 parity rows, 58 upstream settings, and zero blockers"
+    },
+    {
+      "command": "./scripts/check-persona-product-ux.sh",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo test --offline --locked --workspace --exclude mom-llama-app",
+      "outcome": "passed_with_declared_ignored_real_model_gates",
+      "detail": "13 CLI integration tests passed with 1 declared real-model ignore; 129 runtime tests passed with 13 declared real-model ignores; doc tests passed"
+    },
+    {
+      "command": "cargo test --offline --locked -p mom-llama-app",
+      "outcome": "passed",
+      "detail": "35 application supervision, command registry, native quit, and view tests passed"
+    },
+    {
+      "command": "cargo clippy --offline --locked --workspace --all-targets --exclude mom-llama-app -- -D warnings && cargo clippy --offline --locked -p mom-llama-app --all-targets -- -D warnings",
+      "outcome": "passed"
+    },
+    {
+      "command": "Rust 1.88.0 full workspace and app tests with explicit 1.88 RUSTC and RUSTDOC",
+      "outcome": "passed_with_declared_ignored_real_model_gates",
+      "detail": "cargo 1.88.0 and rustc 1.88.0 passed the same 13 CLI, 129 runtime, and 35 app tests"
+    },
+    {
+      "command": "Rust 1.88.0 full workspace and app clippy with the 1.88 toolchain bin directory first in PATH and explicit 1.88 RUSTC and RUSTDOC",
+      "outcome": "passed",
+      "detail": "clippy 0.1.88 checked both scopes with warnings denied"
+    },
+    {
+      "command": "cargo metadata --offline --locked --format-version 1",
+      "outcome": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "outcome": "passed"
+    }
+  ],
+  "environment_correction": {
+    "excluded_attempt": "the first pinned-toolchain clippy attempt combined Rust 1.88 Cargo/rustc artifacts with Homebrew clippy-driver 1.95 and was rejected for incompatible compiler metadata",
+    "resolution": "the complete Rust 1.88 toolchain bin directory was placed first in PATH and both clippy scopes were rerun successfully with clippy 0.1.88",
+    "claim": "the excluded mixed-toolchain attempt is not counted as product evidence"
+  },
+  "supplemental_exact_evidence": {
+    "bundle": {
+      "source_revision": "4084d1120f63f7bf561e7381da7daec947cbcd44",
+      "path": "target/release/bundle/macos/Mom Llama R1 4084d11.app",
+      "identifier": "com.delysis.mom-llama.r1.4084d11.acceptance",
+      "executable_bytes": 34961856,
+      "executable_sha256": "7b010c7c4a76ae6fac66c2fce67100d7dca399f954f50f66e69a46a0ff11c157",
+      "minimum_macos": "13.0",
+      "packaging": "passed",
+      "launched": false
+    },
+    "real_qwen_cpu": {
+      "command": "MOM_LLAMA_MODEL_PATH=/Users/george/Documents/llama-native-kit/target/test-models/Qwen_Qwen3-0.6B-Q4_K_M.gguf cargo test -p mom-llama-runtime --test runtime real_native_base_completion_invokes_no_fixture -- --ignored --nocapture",
+      "model_bytes": 484220320,
+      "model_sha256": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14",
+      "outcome": "passed_1_of_1_real_engine_invoked_no_fixture_cpu_2.64s"
+    }
+  },
+  "file_sha256": {
+    "Cargo.lock": "e2f1a4bf856e1c10e704025cc93b88495f4332f379d64ae012b482d9ad3871fd",
+    "Cargo.toml": "04a19f37c5a517177fd203b5b48170f4f37daff4266d14bb515802748a168aa9",
+    "crates/mom-llama-runtime/src/tool_loop.rs": "e97b4ef37e760185ae65d27ce168f6660ff259b15ff1ccd564a1d60a7aea00a6",
+    "crates/mom-llama-runtime/tests/runtime.rs": "2d449d2922c70e4428d868c7560ec808ae0be86ba84a4eb34b5459f69580a7a9",
+    "scripts/check-architecture.sh": "6dca62d4418cf6fea92dbc4ca77999603ee0f268515bd8013a9ab49f5e9e6c37"
+  },
+  "open_promotion_evidence": [
+    "Publish immutable dependency commits f7a69316c64d857b99bd847dd44cd852fc5b4ca4 and 1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a before testing clean remote-only resolution.",
+    "Run current-candidate remote CI after publication.",
+    "Repeat real-Qwen active-generation Cmd+Q, joined shutdown, and immediate same-store relaunch against that exact bundle.",
+    "Exercise Dock Quit or a directly identified AppleEvent Quit against that exact bundle."
+  ],
+  "claims_not_made": [
+    "As of 2026-08-11T23:55:25Z, git ls-remote returned no advertised ref for either new dependency commit; local Cargo cache availability is not remote publication evidence.",
+    "No remote CI was run for source revision 4084d1120f63f7bf561e7381da7daec947cbcd44.",
+    "No launched-app or real-model acceptance was run for source revision 4084d1120f63f7bf561e7381da7daec947cbcd44 when this receipt was written.",
+    "Historical receipts and the earlier exact bundle do not promote this dependency-changed source revision.",
+    "This receipt does not promote the candidate to desktop release readiness."
+  ]
+}

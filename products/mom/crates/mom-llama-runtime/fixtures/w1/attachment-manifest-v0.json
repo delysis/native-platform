@@ -1,0 +1,53 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "mom_attachment",
+  "class": "model_free",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [{
+    "case_id": "mom.ordinary-markdown-attachment",
+    "source": {
+      "repository_id": "delysis/mom-llama",
+      "commit": "097da612140c6479f9d40e7816f0500271464ca9",
+      "production_tree": {
+        "id": "git.tree.097da612",
+        "digest": { "algorithm": "sha256", "hex": "d19d539b144d121a0dd1b90f2387616c42874722b8feeeb09dc9584c7ed413c4" },
+        "length": 40
+      }
+    },
+    "inputs": [
+      {
+        "identity": {
+          "id": "mom.attachment.markdown",
+          "digest": { "algorithm": "sha256", "hex": "19b385128f4ee3d9e2a1a6f5adaabb73c46fea8463c8fb72f53b24966e75304c" },
+          "length": 169
+        },
+        "availability": "checked_in",
+        "relative_path": "crates/mom-llama-runtime/fixtures/w1/ordinary-notes.md"
+      },
+      {
+        "identity": {
+          "id": "mom.attachment.canonical-expectation",
+          "digest": { "algorithm": "sha256", "hex": "500b0af87cefc0c2f60f02754376030befc085d409e5aae5bc57025761c7a792" },
+          "length": 1448
+        },
+        "availability": "checked_in",
+        "relative_path": "crates/mom-llama-runtime/fixtures/w1/ordinary-notes-projection-v1.json"
+      }
+    ],
+    "state_identities": [],
+    "prerequisites": [],
+    "replay": [{
+      "program": { "kind": "cargo" },
+      "argv": ["test", "-p", "mom-llama-runtime", "--features", "unstable-w1-vertical-fixtures", "attachments::tests::w1_ordinary_markdown_round_trips_through_attachment_native_projection_and_reopen", "--", "--exact"],
+      "required_environment": [],
+      "network": "denied"
+    }],
+    "expected_projection": {
+      "id": "mom.attachment.projection",
+      "digest": { "algorithm": "sha256", "hex": "fc10bb8b589c1290e546a7ad0b936b47954d541070154843b1c0beb193d4cb7f" },
+      "length": 1785
+    }
+  }],
+  "omitted_claims": ["calendar or scheduled execution", "network acquisition"],
+  "negative_evidence": []
+}

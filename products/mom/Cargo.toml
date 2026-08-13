@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mom-llama-runtime",
+    "crates/mom-llama-cli",
+    "apps/mom-llama/src-tauri",
+]
+default-members = [
+    "crates/mom-llama-runtime",
+    "crates/mom-llama-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/delysis/mom-llama"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1"
+chacha20poly1305 = "0.10.1"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+getrandom = "0.3"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+attachment-native-host = { git = "https://github.com/delysis/attachment-native-kit", rev = "472900732ded5bcfb5cc639c49b3a4f77feece27" }
+attachment-native-types = { git = "https://github.com/delysis/attachment-native-kit", rev = "472900732ded5bcfb5cc639c49b3a4f77feece27" }
+llama-native-cache = { git = "https://github.com/delysis/llama-native-kit", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
+llama-native-engine = { git = "https://github.com/delysis/llama-native-kit", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
+llama-native-host = { git = "https://github.com/delysis/llama-native-kit", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
+llama-native-types = { git = "https://github.com/delysis/llama-native-kit", rev = "f7a69316c64d857b99bd847dd44cd852fc5b4ca4" }
+fte-backend-llama = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
+fte-router = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
+fte-store = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
+fte-types = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
+tauri-plugin-free-token-energy = { git = "https://github.com/delysis/free-token-energy", rev = "1b4cc9c830cf5593e73b3ca9349ce9ac77d7bf5a" }
+platform-contracts-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821" }
+platform-contract-testkit = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821" }
+platform-contracts-v0-vertical = { package = "platform-contracts-v0", git = "https://github.com/delysis/w1-platform-contracts", rev = "fc24ffff08c52690390b4460f44617d5d9732563" }
+platform-vertical-fixtures-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "fc24ffff08c52690390b4460f44617d5d9732563" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[profile.dev.package.sha2]
+opt-level = 3

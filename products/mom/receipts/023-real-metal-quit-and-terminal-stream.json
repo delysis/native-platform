@@ -1,0 +1,92 @@
+{
+  "schema": "mom_llama.desktop_lifecycle_receipt.v1",
+  "task_id": "real-metal-quit-and-terminal-stream-2026-08-11",
+  "role": "product_runtime_steward",
+  "status": "passed",
+  "date": "2026-08-11",
+  "repository": "https://github.com/delysis/mom-llama",
+  "runtime_source_revision": "44960e13dd07bd8e5eb2ef0db6cfefdd6b8123b0",
+  "receipt_revision": "the commit containing this receipt",
+  "dependency_boundaries": {
+    "attachment_native_kit": "472900732ded5bcfb5cc639c49b3a4f77feece27",
+    "llama_native_kit": "2d69f086e922ed7bdfd6236baf5a1ad0ed568360",
+    "free_token_energy": "d86edfef40771589af4cd8cd72907fa6d3ce6e96",
+    "llama_cpp_rs": "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"
+  },
+  "bundle": {
+    "path_recorded": false,
+    "product_name": "Mom Llama 44960e1",
+    "bundle_identifier": "com.delysis.mom-llama.c44960e1.acceptance",
+    "executable_bytes": 34858592,
+    "executable_sha256": "c7fc6e9cfe50e92931f895e8eb28858218a6c4659f1b411f7aeee8f02404a6d3",
+    "signature": "ad-hoc linker signature",
+    "architecture": "arm64"
+  },
+  "real_model": {
+    "path_recorded": false,
+    "file_name": "Qwen_Qwen3-0.6B-Q4_K_M.gguf",
+    "bytes": 484220320,
+    "sha256": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14",
+    "device": "Metal on Apple M4 Max",
+    "fixture_used": false
+  },
+  "terminal_stream_acceptance": {
+    "response_token_budget": 128,
+    "observed_sequence": [
+      "started",
+      "reasoning_delta",
+      "failed"
+    ],
+    "typed_blocker": "native_response_reasoning_only",
+    "visible_result": "The native model exhausted its response before producing visible assistant text.",
+    "ui_after_terminal": "the Stop control disappeared, the Send control returned, and the draft remained available",
+    "registry_after_terminal": "no running request remained",
+    "invariant": "every observed started event is followed by exactly one completed, cancelled, or failed event with the same request id"
+  },
+  "active_generation_quit_acceptance": {
+    "prompt": "Describe lightning over the lighthouse in one sentence. Now.",
+    "pre_quit_visible_state": "real Qwen reasoning text was visibly streaming and Skip reasoning plus Stop were enabled",
+    "quit_input": "Cmd+Q through the product-owned ordinary menu item",
+    "process_exit_code": 0,
+    "shutdown_receipt": {
+      "gateway_drained": true,
+      "native_host_joined": true,
+      "joined_native_worker_count": 1,
+      "application_work_drained": true,
+      "elapsed_ms": 21
+    },
+    "native_teardown_evidence": "ggml_metal_free: deallocating",
+    "crash_report_created": false
+  },
+  "relaunch_acceptance": {
+    "same_store": true,
+    "immediate_relaunch": true,
+    "draft_recovered_exactly": "Describe lightning over the lighthouse in one sentence. Now.",
+    "second_quit_exit_code": 0,
+    "second_quit_joined_native_worker_count": 0,
+    "process_left_running": false
+  },
+  "negative_evidence": {
+    "superseded_runtime_revision": "643e9a112aa7f5aa36b28c24c1eb8aaa580d5a7e",
+    "failure": "Cmd+Q during real Qwen Metal generation reached AppKit termination with live residency sets and aborted in ggml-metal-device.m",
+    "root_cause": "Tauri's stock macOS Quit item could call AppKit terminate directly and bypass RunEvent::ExitRequested",
+    "correction": "disable the stock default menu, route Cmd+Q through an ordinary owned menu command, and synchronously drain at RunEvent::Exit as a final Dock and AppleEvent fallback",
+    "promotion_rule": "a launch-only or unit-test-only result is not desktop exit authority"
+  },
+  "focused_gates": [
+    {
+      "command": "cargo test -p mom-llama-app --all-targets",
+      "outcome": "passed",
+      "detail": "19 tests, including the source-level macOS quit bypass prohibition"
+    },
+    {
+      "command": "cargo test -p mom-llama-runtime --lib chat --no-fail-fast",
+      "outcome": "passed",
+      "detail": "11 tests, including destructor failure termination and exact single explicit terminal emission"
+    },
+    {
+      "command": "cargo clippy -p mom-llama-runtime -p mom-llama-app --all-targets -- -D warnings",
+      "outcome": "passed"
+    }
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "schema": "llama_native_kit.implementation_receipt.v1",
+  "task_id": "warm-send-and-normal-persona-chat",
+  "role": "standalone_integrator",
+  "status": "implemented_pending_human_visual_confirmation",
+  "date": "2026-08-03",
+  "repository": "/Users/george/Documents/llama-native-kit",
+  "summary": [
+    "Cleared an accepted composer message before awaiting native generation; restore occurs only after a typed blocker or IPC error.",
+    "Proved with the real local SmolLM2 GGUF that reacquiring an unchanged model profile returns the same resident owner-thread worker and leaves one resident slot.",
+    "Re-proved exact Persona prefix reuse: the first mention creates the versioned cache, the next mention reuses it, and a Persona edit invalidates it.",
+    "Made message actions latent and icon-only at rest; they appear on message hover or keyboard focus.",
+    "Removed the Persona-template banner and internal template-selection route from the conversation surface.",
+    "Made Persona names in both the primary picker and Settings start an ordinary sourced chat; profile editing remains behind the Settings pencil.",
+    "Filtered selected PersonaTemplate records out of the chat projection so a stale internal selection falls back to a real chat.",
+    "Rebuilt and launched the macOS bundle. The user confirmed the composer correction and improved responsiveness; final visual confirmation of the new latent actions and normal Persona start remains human-review evidence."
+  ],
+  "changed_paths": [
+    "crates/llama-native-engine/src/lib.rs",
+    "crates/mom-llama-runtime/tests/runtime.rs",
+    "apps/mom-llama/src-tauri/src/view.rs",
+    "apps/mom-llama/ui/coop-hx.js",
+    "apps/mom-llama/ui/style.css",
+    "scripts/check-persona-product-ux.sh",
+    "receipts/017-warm-send-and-normal-persona-chat.json"
+  ],
+  "tests_run": [
+    {
+      "command": "MOM_LLAMA_MODEL_PATH=<SmolLM2-GGUF> cargo test -p mom-llama-runtime --test runtime repeated_profile_acquisition_reuses_the_same_resident_worker -- --ignored --exact --nocapture",
+      "outcome": "passed",
+      "detail": "One real owner-thread worker was loaded; repeated unchanged profile acquisition returned the same Arc allocation and the registry contained one slot."
+    },
+    {
+      "command": "MOM_LLAMA_MODEL_PATH=<SmolLM2-GGUF> cargo test -p mom-llama-runtime --test runtime real_persona_mentions_reuse_only_the_exact_versioned_prefix -- --ignored --exact --nocapture",
+      "outcome": "passed",
+      "detail": "The exact Persona version reused its native prefix state and the edited Persona version fell back to ordinary generation."
+    },
+    {
+      "command": "cargo test --workspace --exclude mom-llama-app",
+      "outcome": "passed",
+      "detail": "All deterministic runtime, engine, cache, command-evidence, CLI, and readiness tests passed; real-environment cases remained ignored by default."
+    },
+    {
+      "command": "cargo test -p mom-llama-app && cargo clippy -p mom-llama-app --all-targets -- -D warnings",
+      "outcome": "passed",
+      "detail": "The native view probe includes immediate composer-clear ordering, latent hover/focus message actions, no template banner, and no persona-open route."
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --exclude mom-llama-app -- -D warnings",
+      "outcome": "passed"
+    },
+    {
+      "command": "./scripts/check-persona-product-ux.sh",
+      "outcome": "passed",
+      "detail": "Exact catalog, direct normal-chat start, immediate composer clear, no internal template surface, and stable transcript viewport passed."
+    },
+    {
+      "command": "./scripts/check-architecture.sh && ./scripts/check-contracts.sh",
+      "outcome": "passed",
+      "detail": "Inference remains in-process; 81 commands, 90 affordances, 25 effects, 36 parity rows, 58 settings, zero blockers."
+    },
+    {
+      "command": "cargo tauri build --debug --bundles app",
+      "outcome": "passed",
+      "detail": "Rebuilt /Users/george/Documents/llama-native-kit/target/debug/bundle/macos/Mom Llama Native Kit.app."
+    },
+    {
+      "command": "git diff --check",
+      "outcome": "passed"
+    }
+  ],
+  "runtime_evidence": {
+    "model_loaded_per_message": false,
+    "residency_scope": "process-wide bounded resident registry",
+    "unload_boundaries": [
+      "explicit model unload",
+      "deprecated server-stop alias",
+      "CLI process exit",
+      "Tauri application exit"
+    ],
+    "composer_clear": "before mom_llama_chat_dispatch await",
+    "composer_restore": "typed blocker or IPC exception only",
+    "persona_prefix_cache": "exact versioned owner reuse with mismatch fallback"
+  },
+  "bundle": {
+    "path": "/Users/george/Documents/llama-native-kit/target/debug/bundle/macos/Mom Llama Native Kit.app",
+    "running_at_handoff": true,
+    "process_id": 26350
+  }
+}
