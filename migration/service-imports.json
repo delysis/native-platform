@@ -1,7 +1,8 @@
 {
   "schema_version": 1,
   "goal": "W5-IMPORT-SERVICES",
-  "status": "promotion_candidate",
+  "status": "accepted",
+  "accepted_at": "2026-08-13T06:27:18Z",
   "accepted_w4_base": "6ecbaec3f42adb7dbe63199c0a9217f367548241",
   "rewrite": {
     "tool": "git-filter-repo==2.47.0",
@@ -66,16 +67,47 @@
   "raw_import_head": "4a45947508cf33fb0f8043e0507f2dda86d5d75c",
   "path_dependency_cutover": "a73df93428334dcfd5b302b598e7b9d7be1539ab",
   "promotion": {
-    "candidate": null,
-    "candidate_ci_run": null,
-    "main_merge": null,
-    "postmerge_ci_run": null,
-    "final_tag": null
+    "candidate": "a7017421209176659035f7e407cb356615257fd5",
+    "candidate_ci_run": 31668250934,
+    "candidate_tag": "w5-import-services-candidate-v0-2026-08-12",
+    "candidate_tag_object": "89e572b2c784686f4c13e7d6d9f518764da0e69e",
+    "main_merge": "5baa238fc7c9676c06d36941d053d53020d21287",
+    "main_merge_tree": "4a4f8be2f67e7c7d6a5cdc2b130a32ce4c4bd65f",
+    "postmerge_ci_run": 31670590658,
+    "final_tag": "w5-import-services-v0-2026-08-12",
+    "final_tag_object": "e0d5871d3649e7e8be0a212c42e619b3aed6c3f0",
+    "tag_ruleset": 20781374
   },
   "source_freeze": {
-    "attachment": "pending",
-    "information": "pending",
-    "speech": "pending"
+    "policy": "boundary-tagged and hard-frozen; retain unarchived until two stable native-platform releases",
+    "stable_native_platform_releases_observed": 0,
+    "attachment": {
+      "boundary_tag": "native-platform-v2-horizon-b-2026-08-12",
+      "boundary_tag_object": "69ece4f3f12efcd8255c4ec783390b579869ee16",
+      "peeled_commit": "2a8d3a9a1828162a51185d207822ceb1ba6283a8",
+      "freeze_main": "02bfde6a8b7520486015bacbd474c66542e3d060",
+      "source_ci_run": 31673194323,
+      "boundary_ruleset": 20782721,
+      "hard_freeze_ruleset": 20782722
+    },
+    "information": {
+      "boundary_tag": "native-platform-v2-horizon-b-2026-08-12",
+      "boundary_tag_object": "9baed44bed0e33638137e72413f2a2de59e3b64d",
+      "peeled_commit": "7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe",
+      "freeze_main": "8f5ab57d65334b80656fa2393ee9d19a543553a1",
+      "source_ci_run": 31673197371,
+      "boundary_ruleset": 20782725,
+      "hard_freeze_ruleset": 20782727
+    },
+    "speech": {
+      "boundary_tag": "native-platform-v2-horizon-b-2026-08-12",
+      "boundary_tag_object": "37e28d23e5e1c9b057da0c2b382dd00d850858bb",
+      "peeled_commit": "b836318f10a7e11f433ec3ea8dfa48707adc9b06",
+      "freeze_main": "fb48988383ed5ae8bff12dc2071bd64d43b1eef2",
+      "source_ci_runs": [31673200396, 31673200437],
+      "boundary_ruleset": 20782728,
+      "hard_freeze_ruleset": 20782729
+    }
   },
   "acceptance_adjustments": {
     "mom_attachment_vertical": "executed from exact Mom revision against imported Attachment paths",
@@ -84,10 +116,9 @@
     "mom_speech_vertical": "deferred to W6 because accepted Mom has no Speech adapter"
   },
   "nonclaims": [
-    "No candidate or post-merge CI acceptance is claimed.",
-    "No source repository freeze, release, tag, or archival action is claimed.",
+    "The source repositories are frozen but deliberately not archived until two stable native-platform releases have been observed.",
     "No scheduled fuzz run is required or claimed.",
-    "The local real Parakeet and Apple installed-voice replays do not substitute for candidate or post-merge CI.",
+    "The local real Parakeet and Apple installed-voice replays are host-bound evidence and are not represented as GitHub-hosted hardware coverage.",
     "Co-compilation is not claimed as Loom-Information, Mom-Information, or Mom-Speech product integration."
   ]
 }

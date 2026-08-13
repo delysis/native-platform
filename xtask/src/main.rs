@@ -145,7 +145,7 @@ fn check_policy(root: &Path) -> Result<()> {
     check_loom_reconciliation(root)?;
     check_evidence_files(root)?;
     check_adrs(root)?;
-    println!("native-platform W5 promotion-candidate policy: pass");
+    println!("native-platform W5 accepted policy: pass");
     Ok(())
 }
 
@@ -204,11 +204,11 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     )?;
     check_sha256(
         &root.join("migration/service-imports.json"),
-        "517c62307b4829092cd9d64f80df61445c4f6e305aabd97f633f485c0e30a402",
+        "b2448477203dc70ab209860cdc98ef229adca3461ea52e97253878b6d3c05517",
     )?;
     check_sha256(
         &root.join("docs/migration/W5-SERVICES-EVIDENCE.md"),
-        "b8c4a49799b190ff5a6ae950fb10706d7b46d0b78577409b19dc05c943c70ed8",
+        "f44d7ab8b803dce9cdfd9cb31ae189d99721daa93e06698784e91d7164bff4e8",
     )
 }
 
@@ -413,7 +413,7 @@ fn check_ledger(root: &Path) -> Result<()> {
         .context("parse migration ledger")?;
     let mut expected = Ledger {
         schema_version: 1,
-        goal: "W4-IMPORT-GATEWAY".into(),
+        goal: "W5-IMPORT-SERVICES".into(),
         status: "accepted".into(),
         production_source_imported: true,
         source_history_imported: true,
@@ -564,6 +564,34 @@ fn check_ledger(root: &Path) -> Result<()> {
         peeled_commit: "67814e76659688fef61f311db588d17eddee0a66".into(),
     });
     gateway.old_repo_status = "frozen_unarchived_two_release_retirement".into();
+    for (repository, import_commit) in [
+        (
+            "delysis/attachment-native-kit",
+            "5e82ed646bad0f57480f809cedf0cc2745b39dc6",
+        ),
+        (
+            "delysis/information-native-kit",
+            "b73feb2649c2096505f6489023acf325117c267c",
+        ),
+        (
+            "delysis/speech-native-kit",
+            "4a45947508cf33fb0f8043e0507f2dda86d5d75c",
+        ),
+    ] {
+        let service = expected
+            .entries
+            .iter_mut()
+            .find(|entry| entry.source_repository == repository)
+            .with_context(|| format!("expected service migration entry {repository}"))?;
+        service.import_commit = Some(import_commit.into());
+        service.path_dependency_cutover_commit =
+            Some("a73df93428334dcfd5b302b598e7b9d7be1539ab".into());
+        service.source_tags.push(SourceTag {
+            name: "native-platform-v2-horizon-b-2026-08-12".into(),
+            peeled_commit: service.source_main.clone(),
+        });
+        service.old_repo_status = "frozen_unarchived_two_release_retirement".into();
+    }
     ensure!(ledger == expected, "migration ledger drift");
     Ok(())
 }
