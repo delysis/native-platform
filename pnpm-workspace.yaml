@@ -1,6 +1,9 @@
 packages:
   - "apps/*"
   - "packages/*"
-  - "products/*"
+  - "products/fte/**"
+  - "products/loom/**"
+  - "products/mom/**"
 
-catalog: {}
+minimumReleaseAgeExclude:
+  - "@sveltejs/vite-plugin-svelte@7.3.0"
