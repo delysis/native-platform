@@ -450,8 +450,8 @@ fn check_ledger(root: &Path) -> Result<()> {
         .context("parse migration ledger")?;
     let mut expected = Ledger {
         schema_version: 1,
-        goal: "W7-IMPORT-LOOM".into(),
-        status: "candidate".into(),
+        goal: "W8-ONE-WORKSPACE".into(),
+        status: "local_candidate".into(),
         production_source_imported: true,
         source_history_imported: true,
         integration_candidate: IntegrationCandidate {

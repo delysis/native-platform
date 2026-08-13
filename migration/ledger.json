@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "goal": "W7-IMPORT-LOOM",
-  "status": "candidate",
+  "goal": "W8-ONE-WORKSPACE",
+  "status": "local_candidate",
   "production_source_imported": true,
   "source_history_imported": true,
   "integration_candidate": {
