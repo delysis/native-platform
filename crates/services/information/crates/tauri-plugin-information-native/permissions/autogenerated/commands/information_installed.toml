@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-information-installed"
+description = "Enables the information_installed command without any pre-configured scope."
+commands.allow = ["information_installed"]
+
+[[permission]]
+identifier = "deny-information-installed"
+description = "Denies the information_installed command without any pre-configured scope."
+commands.deny = ["information_installed"]

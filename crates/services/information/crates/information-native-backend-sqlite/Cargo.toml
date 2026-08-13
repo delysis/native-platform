@@ -1,0 +1,23 @@
+[package]
+name = "information-native-backend-sqlite"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hex.workspace = true
+information-native-retrieval.workspace = true
+information-native-types.workspace = true
+rusqlite = { workspace = true, features = ["hooks", "limits"] }
+serde_json.workspace = true
+sha2.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

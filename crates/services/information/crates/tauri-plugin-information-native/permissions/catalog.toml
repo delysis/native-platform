@@ -1,0 +1,11 @@
+"$schema" = "schemas/schema.json"
+
+[[set]]
+identifier = "catalog"
+description = "Search the configured catalogue, inspect ready installations, and resolve exact install plans without fetching bytes."
+permissions = [
+  "allow-information-status",
+  "allow-information-catalog-search",
+  "allow-information-installed",
+  "allow-information-resolve-install-plan",
+]

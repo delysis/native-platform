@@ -1,0 +1,11 @@
+information-native-types
+information-native-catalog
+information-native-store
+information-native-acquire
+information-native-retrieval
+information-native-backend-sqlite
+information-native-backend-community
+information-native-backend-encyclopedia
+information-native-backend-scripture
+information-native-host
+information-native-cli

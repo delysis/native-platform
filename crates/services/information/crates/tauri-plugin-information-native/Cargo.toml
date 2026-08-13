@@ -1,0 +1,28 @@
+[package]
+name = "tauri-plugin-information-native"
+links = "tauri-plugin-information-native"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+information-native-catalog.workspace = true
+information-native-host.workspace = true
+information-native-retrieval.workspace = true
+information-native-store.workspace = true
+information-native-types.workspace = true
+serde.workspace = true
+tauri = { version = "2", default-features = false }
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

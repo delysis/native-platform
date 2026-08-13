@@ -1,0 +1,5 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = "Inspect information-native host readiness without granting catalogue, query, registration, acquisition, or removal authority."
+permissions = ["allow-information-status"]

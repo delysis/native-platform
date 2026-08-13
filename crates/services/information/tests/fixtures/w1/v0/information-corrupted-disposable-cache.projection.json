@@ -1,0 +1,61 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "information.corrupted-cache-reset",
+      "attempt_id": null,
+      "correlation_id": null,
+      "kind": "malformed_acquisition_temporary_removed",
+      "payload": null
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "information.corrupted_disposable_cache",
+      "schema_id": "information.w1.corrupted_disposable_cache.v0",
+      "before": {
+        "id": "information.corrupted_disposable_cache.before",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "d3f3d718079be28ea426bcbf7eb1dc1722788e62c7b51a92242dda4b85fd3f94"
+        },
+        "length": 243
+      },
+      "after": null,
+      "disposition": "removed"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "information.corrupted-cache-reset",
+      "attempt_id": null,
+      "correlation_id": null,
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 0,
+    "joined_workers": 0
+  },
+  "output_facts": {
+    "authoritative_state_preserved": {
+      "kind": "boolean",
+      "value": true
+    },
+    "malformed_temporary_removed": {
+      "kind": "boolean",
+      "value": true
+    },
+    "network_used": {
+      "kind": "boolean",
+      "value": false
+    }
+  },
+  "fail_closed_facts": [
+    "only disposable .journal-*.tmp acquisition state is removed",
+    "the valid staging manifest and authoritative artifact target remain"
+  ]
+}

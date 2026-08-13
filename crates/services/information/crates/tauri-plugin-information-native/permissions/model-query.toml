@@ -1,0 +1,9 @@
+"$schema" = "schemas/schema.json"
+
+[[set]]
+identifier = "model-query"
+description = "Execute typed model-facing information tool calls. The host forces model_context purpose and requires exact retrieval targets."
+permissions = [
+  "allow-information-status",
+  "allow-information-query",
+]

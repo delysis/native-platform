@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-information-search"
+description = "Enables the information_search command without any pre-configured scope."
+commands.allow = ["information_search"]
+
+[[permission]]
+identifier = "deny-information-search"
+description = "Denies the information_search command without any pre-configured scope."
+commands.deny = ["information_search"]
