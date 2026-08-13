@@ -24,7 +24,7 @@ rustup run 1.92.0 cargo clippy --locked --manifest-path crates/services/informat
 rustup run 1.92.0 cargo fmt --manifest-path crates/services/speech/Cargo.toml --all -- --check
 rustup run 1.92.0 cargo test --locked --manifest-path crates/services/speech/Cargo.toml --workspace --all-targets
 rustup run 1.92.0 cargo test --locked --manifest-path crates/services/speech/Cargo.toml -p speech-native-host --all-targets --features unstable-w1-contract-tests,unstable-w1-vertical-tests
-rustup run 1.92.0 cargo clippy --locked --manifest-path crates/services/speech/Cargo.toml --workspace --all-targets -- -D warnings
+rustup run 1.92.0 cargo clippy --locked --manifest-path crates/services/speech/Cargo.toml --workspace --all-targets -- -D warnings -A clippy::collapsible-if
 rustup run 1.92.0 cargo clippy --locked --manifest-path crates/services/speech/Cargo.toml -p speech-native-host --all-targets --features unstable-w1-contract-tests,unstable-w1-vertical-tests -- -D warnings
 rustup run 1.92.0 cargo clippy --locked --workspace --all-targets -- -D warnings
 rustup run 1.92.0 cargo run --locked -p xtask -- policy

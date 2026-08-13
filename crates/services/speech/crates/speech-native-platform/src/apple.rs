@@ -140,12 +140,12 @@ fn probe_on_device_recognition(observed_at_unix_ms: u64) -> SpeechBackendDescrip
 
     let mut on_device_languages = BTreeSet::new();
     let mut available_on_device_languages = BTreeSet::new();
-    if let Some(recognizer) = SpeechRecognizer::with_locale_checked(&default_locale)
-        && recognizer.supports_on_device_recognition().unwrap_or(false)
-    {
-        on_device_languages.insert(default_locale.clone());
-        if recognizer.is_available() {
-            available_on_device_languages.insert(default_locale);
+    if let Some(recognizer) = SpeechRecognizer::with_locale_checked(&default_locale) {
+        if recognizer.supports_on_device_recognition().unwrap_or(false) {
+            on_device_languages.insert(default_locale.clone());
+            if recognizer.is_available() {
+                available_on_device_languages.insert(default_locale);
+            }
         }
     }
 
