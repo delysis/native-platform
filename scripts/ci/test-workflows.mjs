@@ -19,8 +19,8 @@ function externalActionUses(source) {
     .filter((value) => !value.startsWith("./") && !value.startsWith("docker://"));
 }
 
-test("transition keeps the old required workflow beside both new workflows", () => {
-  assert.equal(fs.existsSync(path.join(root, ".github/workflows/ci.yml")), true);
+test("only the targeted PR and full workflows remain active", () => {
+  assert.equal(fs.existsSync(path.join(root, ".github/workflows/ci.yml")), false);
   assert.equal(fs.existsSync(prPath), true);
   assert.equal(fs.existsSync(fullPath), true);
 });
