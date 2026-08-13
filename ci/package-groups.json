@@ -75,7 +75,6 @@
       "loom-search"
     ],
     "diagnostic": [
-      "integration-vertical",
       "xtask"
     ],
     "testkit": [

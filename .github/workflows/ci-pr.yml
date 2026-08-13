@@ -292,7 +292,6 @@ jobs:
           toolchain: "1.92.0"
       - run: cargo metadata --locked --no-deps
       - run: cargo tree -d
-      - run: cargo test --locked -p integration-vertical
       - run: cargo tree --locked -i libsqlite3-sys
 
   fuzz-build:

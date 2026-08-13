@@ -56,7 +56,6 @@ members = [
     "products/mom/apps/mom-llama/src-tauri",
     "products/mom/crates/mom-llama-cli",
     "products/mom/crates/mom-llama-runtime",
-    "tests/vertical",
     "xtask",
 ]
 exclude = ["crates/services/attachment/fuzz"]

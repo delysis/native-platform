@@ -3336,19 +3336,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "integration-vertical"
-version = "0.0.0"
-dependencies = [
- "platform-contract-testkit",
- "platform-vertical-fixtures-v0",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "toml 0.9.12+spec-1.1.0",
-]
-
-[[package]]
 name = "io-extras"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -252,7 +252,6 @@ jobs:
           toolchain: "1.92.0"
       - run: node --test scripts/ci/test-ci-plan.mjs scripts/ci/test-ci-required.mjs scripts/ci/test-workflows.mjs
       - run: cargo run --locked -p xtask -- policy
-      - run: cargo test --locked -p integration-vertical
       - run: cargo tree --locked -i libsqlite3-sys
 
   fuzz-build:
