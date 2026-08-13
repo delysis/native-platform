@@ -31,9 +31,16 @@ if "$checker" "$fixture" >/dev/null 2>&1; then
 fi
 
 copy_fixture
-sed -i.bak 's/rev = "fc24ffff08c52690390b4460f44617d5d9732563"/branch = "main", rev = "fc24ffff08c52690390b4460f44617d5d9732563"/' "$fixture/Cargo.toml"
+sed -i.bak 's#../../platform/contracts/crates/platform-vertical-fixtures-v0#../../platform/contracts-wrong/crates/platform-vertical-fixtures-v0#' "$fixture/Cargo.toml"
 if "$checker" "$fixture" >/dev/null 2>&1; then
-  echo "moving vertical dependency unexpectedly passed" >&2
+  echo "wrong local vertical path unexpectedly passed" >&2
+  exit 1
+fi
+
+copy_fixture
+printf '%s\n' 'source = "git+https://github.com/delysis/w1-platform-contracts?branch=main"' >> "$fixture/Cargo.lock"
+if "$checker" "$fixture" >/dev/null 2>&1; then
+  echo "external moving dependency unexpectedly passed" >&2
   exit 1
 fi
 

@@ -88,23 +88,32 @@
     }
   },
   "promotion": {
-    "candidate_ci_run": null,
-    "main_merge": null,
-    "final_tag": null,
-    "final_tag_object": null,
-    "tag_ruleset": null
+    "candidate_ci_run": 31687282237,
+    "required_policy_job": 94406205848,
+    "required_macos_job": 94406205909,
+    "main_merge": "78b5b1ecc44b3c79f79227613f027580032192cd",
+    "final_tag": "w6-import-mom-v0-2026-08-13",
+    "final_tag_object": "5d8cd5e0cb9bba5db81d05687d0f63c9242b936c",
+    "tag_ruleset": 20791545
   },
   "source_freeze": {
-    "status": "pending W6 acceptance tag",
-    "boundary_tag": null,
-    "readme_only_commit": null,
-    "source_ci_run": null,
-    "hard_freeze_ruleset": null,
+    "status": "frozen_unarchived_two_release_retirement",
+    "boundary_tag": "native-platform-v2-horizon-b-2026-08-12",
+    "boundary_tag_object": "23ca2af17f4a0b7c9711eebf08c217ec44bd8d57",
+    "boundary_tag_ruleset": 20791575,
+    "readme_only_commit": "c014f4681eccef19c040913b2fbedc4aee5cb299",
+    "source_ci_run": 31689626249,
+    "source_policy_job": 94413677010,
+    "source_runtime_macos_job": 94413703390,
+    "source_app_macos_job": 94413703496,
+    "source_shutdown_run": 31689626209,
+    "source_shutdown_job": 94413676926,
+    "hard_freeze_ruleset": 20791917,
     "repository_archived": false
   },
   "nonclaims": [
     "GitHub-hosted Linux and Windows results are informational and are not W6 acceptance gates.",
     "No Mom Speech, Information, citation, new attachment-format, or hosted-provider feature is claimed.",
-    "The source repository is not claimed frozen until the protected W6 tag exists."
+    "The source repository is frozen but intentionally remains unarchived through the two-release retirement window."
   ]
 }

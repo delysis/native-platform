@@ -1,0 +1,22 @@
+format = "loom.genre-pack.v1"
+name = "mystery-reveal-logic-v1"
+description = "Clue, inference, misdirection, and reveal logic for mystery movements"
+genre_functions = ["mystery_reveal_logic"]
+
+[core_pack]
+format = "loom.core-pack.v1"
+artifact_sha256 = "{{CORE_ARTIFACT_SHA256}}"
+
+[criteria.clue_fairness]
+description = "Places usable evidence before inference while preserving plausible alternative readings"
+weight_multiplier = 1.25
+behavioral_anchors = ["A later inference can cite prior observable facts", "Misdirection exploits interpretation rather than hiding mandatory facts", "Characters know only what their access permits"]
+
+[criteria.reveal_logic]
+description = "Makes revelations retrospectively clarifying, proportionate, and causally consequential"
+weight_multiplier = 1.25
+behavioral_anchors = ["The reveal explains more than it merely announces", "No unsupported confession or coincidence substitutes for inference", "The reveal changes suspicion, danger, objective, or relationship state"]
+
+[project_anchors.mystery_movement]
+description = "Work-disjoint project evidence with comparable clue and reveal function"
+retrieval_limit = 2

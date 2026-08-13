@@ -7,7 +7,6 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const GROUPS: [&str; 6] = [
     "portable",
@@ -127,8 +126,7 @@ fn main() -> Result<()> {
     let command = env::args().nth(1).unwrap_or_else(|| "policy".to_owned());
     match command.as_str() {
         "policy" => check_policy(&workspace_root()),
-        "loom-probe" => run_loom_probe(&workspace_root()),
-        _ => bail!("usage: cargo xtask <policy|loom-probe>"),
+        _ => bail!("usage: cargo xtask policy"),
     }
 }
 
@@ -157,18 +155,6 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     check_sha256(
         &root.join("migration/exact-head-ci-evidence.json"),
         "b6cea6491114274f5794efc1e628af1fd51a357a9a7f8bcdc1dec5bea6ec753a",
-    )?;
-    check_sha256(
-        &root.join("tests/integration-current/loom-probe/Cargo.toml.in"),
-        "dada57a17f9dfba89497071ff9e90be20345f91d648272b96ab9eda0f6514d15",
-    )?;
-    check_sha256(
-        &root.join("tests/integration-current/loom-probe/lib.rs.in"),
-        "b8e310876e4a00fc3d8125ccf3219165fcde299d51e0c1b368927b6796ea3fa3",
-    )?;
-    check_sha256(
-        &root.join("tests/integration-current/loom-probe/Loom.Cargo.lock"),
-        "10dc0c8d6797f050e888f40445c41f2c68f70851a313570ba5e28e0e05ffee2a",
     )?;
     check_sha256(
         &root.join("migration/w1-platform-contracts.commit-map"),
@@ -213,42 +199,28 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     check_sha256(
         &root.join("docs/migration/W5-SERVICES-EVIDENCE.md"),
         "a5f5795de3a080151410f582fe460abbe71acf380402c477a2da8fadbb9c6b11",
+    )?;
+    check_sha256(
+        &root.join("migration/mom-import.json"),
+        "1754bd5d1116572967b1f263a897680dc4c40eb1413e1300b06ed365624fc96d",
+    )?;
+    check_sha256(
+        &root.join("docs/migration/W6-MOM-EVIDENCE.md"),
+        "53b176d1ec48e40532225224a60b4edad027248c910d83081c5d0fc9084b0ae5",
+    )?;
+    check_sha256(
+        &root.join("migration/loom-import.json"),
+        "f733c6af59e6d1dae3b8b9431c90ea308293a43f98198b9b95b7d967e0e38ff0",
+    )?;
+    check_sha256(
+        &root.join("docs/migration/W7-LOOM-EVIDENCE.md"),
+        "32568cdfe055bb73f415c34ff5f56ef3d1083286953d032a536a84a1a123ab66",
     )
 }
 
 fn check_sha256(path: &Path, expected: &str) -> Result<()> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     ensure!(format!("{:x}", Sha256::digest(bytes)) == expected);
-    Ok(())
-}
-
-fn run_loom_probe(root: &Path) -> Result<()> {
-    check_evidence_files(root)?;
-    // Keep this deliberately short. llama.cpp's CMake/MSBuild scratch paths are
-    // deep enough to exceed Windows' legacy MAX_PATH limit when the probe name
-    // includes a descriptive prefix and timestamp.
-    let probe = root
-        .join("target")
-        .join(format!("lp-{}", std::process::id()));
-    if probe.exists() {
-        fs::remove_dir_all(&probe)
-            .with_context(|| format!("remove stale temporary probe {}", probe.display()))?;
-    }
-    fs::create_dir_all(probe.join("src"))?;
-    let fixture = root.join("tests/integration-current/loom-probe");
-    fs::copy(fixture.join("Cargo.toml.in"), probe.join("Cargo.toml"))?;
-    fs::copy(fixture.join("Loom.Cargo.lock"), probe.join("Cargo.lock"))?;
-    fs::copy(fixture.join("lib.rs.in"), probe.join("src/lib.rs"))?;
-
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let status = Command::new(cargo)
-        .args(["check", "--locked"])
-        .current_dir(&probe)
-        .status()
-        .context("run isolated Loom graph probe")?;
-    let cleanup = fs::remove_dir_all(&probe);
-    ensure!(status.success(), "isolated Loom graph probe failed");
-    cleanup.with_context(|| format!("remove temporary probe {}", probe.display()))?;
     Ok(())
 }
 
@@ -334,6 +306,25 @@ fn check_workspace(root: &Path) -> Result<()> {
                 root.join("products/mom/apps/mom-llama/src-tauri/Cargo.toml"),
                 root.join("products/mom/crates/mom-llama-cli/Cargo.toml"),
                 root.join("products/mom/crates/mom-llama-runtime/Cargo.toml"),
+                root.join("products/loom/Cargo.toml"),
+                root.join("products/loom/apps/loom/src-tauri/Cargo.toml"),
+                root.join("products/loom/crates/loom-backend-llama/Cargo.toml"),
+                root.join("products/loom/crates/loom-benchmark/Cargo.toml"),
+                root.join("products/loom/crates/loom-campaign/Cargo.toml"),
+                root.join("products/loom/crates/loom-cli/Cargo.toml"),
+                root.join("products/loom/crates/loom-context/Cargo.toml"),
+                root.join("products/loom/crates/loom-document/Cargo.toml"),
+                root.join("products/loom/crates/loom-eval-codex/Cargo.toml"),
+                root.join("products/loom/crates/loom-eval/Cargo.toml"),
+                root.join("products/loom/crates/loom-host/Cargo.toml"),
+                root.join("products/loom/crates/loom-inference/Cargo.toml"),
+                root.join("products/loom/crates/loom-learning/Cargo.toml"),
+                root.join("products/loom/crates/loom-research-types/Cargo.toml"),
+                root.join("products/loom/crates/loom-search/Cargo.toml"),
+                root.join("products/loom/crates/loom-store/Cargo.toml"),
+                root.join("products/loom/crates/loom-trial/Cargo.toml"),
+                root.join("products/loom/crates/loom-types/Cargo.toml"),
+                root.join("products/loom/crates/tauri-plugin-loom/Cargo.toml"),
                 root.join("crates/services/attachment/Cargo.toml"),
                 root.join("crates/services/attachment/crates/attachment-native-cli/Cargo.toml"),
                 root.join("crates/services/attachment/crates/attachment-native-document/Cargo.toml"),
@@ -377,6 +368,7 @@ fn check_workspace(root: &Path) -> Result<()> {
                 root.join("crates/services/information/Cargo.lock"),
                 root.join("crates/services/speech/Cargo.lock"),
                 root.join("crates/services/speech/tests/apple-tauri-w1/Cargo.lock"),
+                root.join("products/loom/Cargo.lock"),
             ])
     );
     ensure!(
@@ -388,9 +380,18 @@ fn check_workspace(root: &Path) -> Result<()> {
     );
     ensure!(
         find_named(root, "pnpm-workspace.yaml")?
-            == BTreeSet::from([root.join("pnpm-workspace.yaml")])
+            == BTreeSet::from([
+                root.join("pnpm-workspace.yaml"),
+                root.join("products/loom/pnpm-workspace.yaml"),
+            ])
     );
-    ensure!(find_named(root, "pnpm-lock.yaml")? == BTreeSet::from([root.join("pnpm-lock.yaml")]));
+    ensure!(
+        find_named(root, "pnpm-lock.yaml")?
+            == BTreeSet::from([
+                root.join("pnpm-lock.yaml"),
+                root.join("products/loom/pnpm-lock.yaml"),
+            ])
+    );
     let xtask_manifest: toml::Value = toml::from_str(&read_text(&root.join("xtask/Cargo.toml"))?)
         .context("parse xtask Cargo.toml")?;
     ensure!(xtask_manifest.get("workspace").is_none());
@@ -401,6 +402,7 @@ fn check_workspace(root: &Path) -> Result<()> {
                 || source.starts_with(root.join("crates/services"))
                 || source.starts_with(root.join("products/fte"))
                 || source.starts_with(root.join("products/mom"))
+                || source.starts_with(root.join("products/loom"))
                 || source.starts_with(root.join("tests/integration-current"))
                 || source.starts_with(root.join("xtask")),
             "Rust source outside the imported native or diagnostic boundaries: {}",
@@ -429,7 +431,7 @@ fn check_ledger(root: &Path) -> Result<()> {
         .context("parse migration ledger")?;
     let mut expected = Ledger {
         schema_version: 1,
-        goal: "W6-IMPORT-MOM".into(),
+        goal: "W7-IMPORT-LOOM".into(),
         status: "candidate".into(),
         production_source_imported: true,
         source_history_imported: true,
@@ -586,8 +588,19 @@ fn check_ledger(root: &Path) -> Result<()> {
         .find(|entry| entry.source_repository == "delysis/mom-llama")
         .context("expected Mom migration entry")?;
     mom.import_commit = Some("cfa2d3c40e74e1d692c0cdb9354cc272249fd4ab".into());
-    mom.path_dependency_cutover_commit =
-        Some("5b12072e91dc44f2f93f6dfc0b869d3cc58c26f1".into());
+    mom.path_dependency_cutover_commit = Some("5b12072e91dc44f2f93f6dfc0b869d3cc58c26f1".into());
+    mom.source_tags.push(SourceTag {
+        name: "native-platform-v2-horizon-b-2026-08-12".into(),
+        peeled_commit: "3cf57941af6d523378e7fa8b24f5c24c8e50363f".into(),
+    });
+    mom.old_repo_status = "frozen_unarchived_two_release_retirement".into();
+    let loom = expected
+        .entries
+        .iter_mut()
+        .find(|entry| entry.source_repository == "delysis/loom-native")
+        .context("expected Loom migration entry")?;
+    loom.import_commit = Some("19147c74bbe6335331f3fdad256663906c122dc3".into());
+    loom.path_dependency_cutover_commit = Some("6cf468d277a88f085242bdaef017305e1148efda".into());
     for (repository, import_commit) in [
         (
             "delysis/attachment-native-kit",
@@ -675,12 +688,11 @@ fn check_loom_reconciliation(root: &Path) -> Result<()> {
             absent_paths: 0,
         },
         resolution: "reconciled_in_source_history".into(),
-        native_platform_history_imported: false,
-        native_platform_source_imported: false,
+        native_platform_history_imported: true,
+        native_platform_source_imported: true,
         claims_not_established: vec![
-            "No source or history has been imported into native-platform.".into(),
             "This ledger does not replay or independently reimplement ce041.".into(),
-            "This ledger makes no branch-retirement or remote-deletion claim.".into(),
+            "The source repository is not claimed frozen until the protected W7 tag exists.".into(),
         ],
     };
     ensure!(ledger == expected, "Loom reconciliation ledger drift");

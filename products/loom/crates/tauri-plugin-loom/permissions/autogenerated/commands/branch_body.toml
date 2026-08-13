@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-branch-body"
+description = "Enables the branch_body command without any pre-configured scope."
+commands.allow = ["branch_body"]
+
+[[permission]]
+identifier = "deny-branch-body"
+description = "Denies the branch_body command without any pre-configured scope."
+commands.deny = ["branch_body"]

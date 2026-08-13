@@ -73,6 +73,9 @@ test("frontend jobs provision the Rust tooling used by current package scripts",
     assert.match(block, /dtolnay\/rust-toolchain@[0-9a-f]{40}/);
     assert.match(block, /components: clippy,rustfmt/);
     assert.match(block, /libwebkit2gtk-4\.1-dev/);
+    for (const script of ["loom:install", "loom:test", "loom:check", "loom:build"]) {
+      assert.match(block, new RegExp(`pnpm run ${script}`));
+    }
   }
 });
 

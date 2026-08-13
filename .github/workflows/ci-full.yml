@@ -227,6 +227,7 @@ jobs:
         run: cargo clippy --locked --manifest-path products/loom/Cargo.toml --workspace --all-targets -- -D warnings
 
   frontend:
+    needs: inventory
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -249,6 +250,18 @@ jobs:
       - run: pnpm -r --if-present run test
       - run: pnpm -r --if-present run check
       - run: pnpm -r --if-present run build
+      - name: Install imported Loom frontend
+        if: ${{ needs.inventory.outputs.loom == 'true' }}
+        run: pnpm run loom:install
+      - name: Test imported Loom frontend
+        if: ${{ needs.inventory.outputs.loom == 'true' }}
+        run: pnpm run loom:test
+      - name: Check imported Loom frontend
+        if: ${{ needs.inventory.outputs.loom == 'true' }}
+        run: pnpm run loom:check
+      - name: Build imported Loom frontend
+        if: ${{ needs.inventory.outputs.loom == 'true' }}
+        run: pnpm run loom:build
 
   policy-and-graphs:
     runs-on: ubuntu-latest
@@ -263,11 +276,12 @@ jobs:
       - run: ./crates/native/scripts/check-workflow-policy.sh .
       - run: cargo run --locked -p xtask -- policy
       - run: cargo check --locked -p integration-current --features current-product-graph
-      - run: cargo run --locked -p xtask -- loom-probe
+      - run: cargo check --locked --manifest-path products/loom/Cargo.toml --workspace --all-targets
       - run: ./scripts/check-native-import-history.sh
       - run: ./scripts/check-service-import-history.sh
       - run: ./scripts/check-contract-import-history.sh
       - run: ./scripts/check-mom-import-history.sh
+      - run: ./scripts/check-loom-import-history.sh
 
   fuzz-build:
     runs-on: ubuntu-latest

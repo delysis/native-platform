@@ -44,4 +44,5 @@ rustup run 1.92.0 cargo run --locked -p xtask -- policy
 ./scripts/check-native-import-history.sh
 ./scripts/check-service-import-history.sh
 ./scripts/check-mom-import-history.sh
+./scripts/check-loom-import-history.sh
 pnpm install --lockfile-only --frozen-lockfile --offline

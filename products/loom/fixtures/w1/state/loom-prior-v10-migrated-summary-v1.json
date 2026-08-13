@@ -1,0 +1,17 @@
+{
+  "schema": "delysis.loom_project_state_summary.v1",
+  "store_schema_version": 11,
+  "project_id": "00000000000000000000000001",
+  "revision_id": "00000000000000000000000005",
+  "visible_blob_sha256": "834c141212ac3cf23062a3864b45cdf630ae8fc8029092807602fffce1b70739",
+  "selection_count": 0,
+  "pending_outbox_count": 0,
+  "counts": {
+    "blobs": 1,
+    "artifacts": 1,
+    "operations": 1,
+    "revisions": 1,
+    "receipts": 0
+  },
+  "verified_reopens": 2
+}

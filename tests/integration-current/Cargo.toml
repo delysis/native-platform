@@ -37,7 +37,6 @@ information-native-types-current.workspace = true
 llama-cpp-2-current = { workspace = true, optional = true }
 llama-native-host-current = { workspace = true, optional = true }
 llama-native-types-current.workspace = true
-loom-types-current = { workspace = true, optional = true }
 mom-llama-runtime-current = { workspace = true, optional = true }
 platform-contract-testkit-current.workspace = true
 platform-contracts-v0-current.workspace = true

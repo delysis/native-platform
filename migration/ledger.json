@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "goal": "W6-IMPORT-MOM",
+  "goal": "W7-IMPORT-LOOM",
   "status": "candidate",
   "production_source_imported": true,
   "source_history_imported": true,
@@ -79,12 +79,16 @@
         {
           "name": "phase1-audit-2026-08-11",
           "peeled_commit": "00895a0762b463ac54b75911c59b7d10181e3a22"
+        },
+        {
+          "name": "native-platform-v2-horizon-b-2026-08-12",
+          "peeled_commit": "3cf57941af6d523378e7fa8b24f5c24c8e50363f"
         }
       ],
       "destination_prefix": "products/mom",
       "import_commit": "cfa2d3c40e74e1d692c0cdb9354cc272249fd4ab",
       "path_dependency_cutover_commit": "5b12072e91dc44f2f93f6dfc0b869d3cc58c26f1",
-      "old_repo_status": "active",
+      "old_repo_status": "frozen_unarchived_two_release_retirement",
       "migration_role": "first_party_import"
     },
     {
@@ -154,8 +158,8 @@
         }
       ],
       "destination_prefix": "products/loom",
-      "import_commit": null,
-      "path_dependency_cutover_commit": null,
+      "import_commit": "19147c74bbe6335331f3fdad256663906c122dc3",
+      "path_dependency_cutover_commit": "6cf468d277a88f085242bdaef017305e1148efda",
       "old_repo_status": "active",
       "migration_role": "first_party_import"
     },

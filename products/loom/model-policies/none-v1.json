@@ -1,0 +1,9 @@
+{
+  "format": "loom-build-model-policy",
+  "schema_version": 1,
+  "name": "none-v1",
+  "activation": "project_opt_in",
+  "inference_boundary": "local_only",
+  "hosted_fallback": "forbidden",
+  "writers": []
+}

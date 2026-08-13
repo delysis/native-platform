@@ -7,29 +7,16 @@ const IMPORTED_SERVICE_LOCKS: [&str; 3] = [
     include_str!("../../../crates/services/speech/Cargo.lock"),
 ];
 
-const EXACT_PACKAGES: [(&str, &str, &str); 2] = [
-    (
-        "llama-cpp-2",
-        "https://github.com/delysis/llama-cpp-rs",
-        "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
-    ),
-    (
-        "loom-types",
-        "https://github.com/delysis/loom-native",
-        "223110bee4be72386d79306b444517371e4a9930",
-    ),
-];
+const EXACT_PACKAGES: [(&str, &str, &str); 1] = [(
+    "llama-cpp-2",
+    "https://github.com/delysis/llama-cpp-rs",
+    "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
+)];
 
-const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 2] = [
-    (
-        "https://github.com/delysis/llama-cpp-rs",
-        "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
-    ),
-    (
-        "https://github.com/delysis/loom-native",
-        "223110bee4be72386d79306b444517371e4a9930",
-    ),
-];
+const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 1] = [(
+    "https://github.com/delysis/llama-cpp-rs",
+    "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
+)];
 
 const IMPORTED_CONTRACT_PACKAGES: [&str; 3] = [
     "platform-contract-testkit",
@@ -119,7 +106,7 @@ fn root_lock_contains_every_exact_current_source() {
         assert!(present, "missing exact locked package {name} at {revision}");
         matched.insert((repository, revision));
     }
-    assert_eq!(matched.len(), 2, "expected two distinct source revisions");
+    assert_eq!(matched.len(), 1, "expected one external source revision");
 }
 
 #[test]

@@ -1,11 +1,9 @@
 # W3 native path-cutover integration coverage
 
 The default diagnostic harness resolves Native, FTE, Mom, and the W1 contracts
-from their imported paths. Loom remains the only exact first-party product Git
-dependency. Loom's
-incompatible SQLite dependency line is covered by a separately materialized,
-authenticated, locked graph that also patches native dependencies to the
-imported paths. No product repository or release manifest is modified.
+from their imported paths. Loom is imported under `products/loom` and retains
+its own locked workspace only because its SQLite link target cannot yet coexist
+with the root graph. No first-party product remains an external Git dependency.
 
 ## Default portable graph
 
@@ -18,7 +16,8 @@ The default workspace gate compiles these public boundaries:
 - `attachment-native-types` at `2a8d3a9a1828162a51185d207822ceb1ba6283a8`;
 - `speech-native-types` at `b836318f10a7e11f433ec3ea8dfa48707adc9b06`;
 - `information-native-types` at `7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe`;
-- `loom-types` at `223110bee4be72386d79306b444517371e4a9930`;
+- imported `loom-types` whose preserved source head is
+  `223110bee4be72386d79306b444517371e4a9930`;
 - imported W1 contracts, testkit, and vertical validator whose preserved source
   head is `3ed1f3235edb6d481c324f05fe83b2379e3431e6`.
 
@@ -49,9 +48,9 @@ state retains one root lock:
 
 - `current-product-graph` compiles the non-Loom portable first-party
   libraries and the direct current `llama-cpp-2` boundary;
-- `cargo xtask loom-probe` materializes an authenticated manifest and lock in a
-  temporary directory, then compiles all 15 Loom portable libraries with the
-  compatible W1 contracts, testkit, and vertical fixtures.
+- `cargo check --locked --manifest-path products/loom/Cargo.toml --workspace
+  --all-targets` compiles the imported Loom workspace directly, including its
+  local Native and W1 contract dependencies.
 
 The probes establish exact-revision coexistence with every native dependency
 rebound to the imported packages. They do not change product repositories.
@@ -64,4 +63,4 @@ materializing the retired source repository.
 
 This harness does not claim Loom one-graph compatibility, UI execution,
 hosted-provider behavior, or real-model acceptance. Those gates are recorded
-separately and never inferred from compile probes.
+separately and never inferred from compilation.

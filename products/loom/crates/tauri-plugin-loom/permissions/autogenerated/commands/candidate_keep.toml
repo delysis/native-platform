@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-candidate-keep"
+description = "Enables the candidate_keep command without any pre-configured scope."
+commands.allow = ["candidate_keep"]
+
+[[permission]]
+identifier = "deny-candidate-keep"
+description = "Denies the candidate_keep command without any pre-configured scope."
+commands.deny = ["candidate_keep"]

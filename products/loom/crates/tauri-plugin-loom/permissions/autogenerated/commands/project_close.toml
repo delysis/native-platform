@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-project-close"
+description = "Enables the project_close command without any pre-configured scope."
+commands.allow = ["project_close"]
+
+[[permission]]
+identifier = "deny-project-close"
+description = "Denies the project_close command without any pre-configured scope."
+commands.deny = ["project_close"]

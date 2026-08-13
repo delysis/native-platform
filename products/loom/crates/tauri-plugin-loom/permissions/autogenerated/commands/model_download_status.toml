@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-model-download-status"
+description = "Enables the model_download_status command without any pre-configured scope."
+commands.allow = ["model_download_status"]
+
+[[permission]]
+identifier = "deny-model-download-status"
+description = "Denies the model_download_status command without any pre-configured scope."
+commands.deny = ["model_download_status"]

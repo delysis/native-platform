@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-focus-mode-set"
+description = "Enables the focus_mode_set command without any pre-configured scope."
+commands.allow = ["focus_mode_set"]
+
+[[permission]]
+identifier = "deny-focus-mode-set"
+description = "Denies the focus_mode_set command without any pre-configured scope."
+commands.deny = ["focus_mode_set"]

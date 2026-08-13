@@ -257,6 +257,18 @@ jobs:
       - run: pnpm -r --if-present run test
       - run: pnpm -r --if-present run check
       - run: pnpm -r --if-present run build
+      - name: Install imported Loom frontend
+        if: ${{ needs.plan.outputs.frontend_loom == 'true' || needs.plan.outputs.full == 'true' }}
+        run: pnpm run loom:install
+      - name: Test imported Loom frontend
+        if: ${{ needs.plan.outputs.frontend_loom == 'true' || needs.plan.outputs.full == 'true' }}
+        run: pnpm run loom:test
+      - name: Check imported Loom frontend
+        if: ${{ needs.plan.outputs.frontend_loom == 'true' || needs.plan.outputs.full == 'true' }}
+        run: pnpm run loom:check
+      - name: Build imported Loom frontend
+        if: ${{ needs.plan.outputs.frontend_loom == 'true' || needs.plan.outputs.full == 'true' }}
+        run: pnpm run loom:build
 
   platform-macos:
     if: ${{ needs.plan.outputs.platform_macos == 'true' || needs.plan.outputs.full == 'true' }}
@@ -305,7 +317,7 @@ jobs:
       - run: cargo metadata --locked --no-deps
       - run: cargo tree -d
       - run: cargo check --locked -p integration-current --features current-product-graph
-      - run: cargo run --locked -p xtask -- loom-probe
+      - run: cargo check --locked --manifest-path products/loom/Cargo.toml --workspace --all-targets
 
   import-history:
     if: ${{ needs.plan.outputs.migration_history == 'true' || needs.plan.outputs.full == 'true' }}
@@ -319,6 +331,7 @@ jobs:
       - run: ./scripts/check-service-import-history.sh
       - run: ./scripts/check-contract-import-history.sh
       - run: ./scripts/check-mom-import-history.sh
+      - run: ./scripts/check-loom-import-history.sh
 
   fuzz-build:
     if: ${{ needs.plan.outputs.fuzz == 'true' || needs.plan.outputs.full == 'true' }}

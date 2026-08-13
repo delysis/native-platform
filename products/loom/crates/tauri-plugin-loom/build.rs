@@ -1,0 +1,46 @@
+const COMMANDS: &[&str] = &[
+    "project_open_default",
+    "project_choose_create",
+    "project_choose_open",
+    "project_close",
+    "project_current",
+    "project_recover",
+    "document_open",
+    "document_checkpoint",
+    "document_draft_upsert",
+    "document_draft_clear",
+    "document_reconciliation_preview",
+    "document_reconcile_apply",
+    "build_model_policy_get",
+    "model_list",
+    "model_choose",
+    "model_load",
+    "model_load_policy_candidate",
+    "model_unload",
+    "model_download_start",
+    "model_download_cancel",
+    "model_download_status",
+    "model_download_list",
+    "branch_page",
+    "branch_get",
+    "branch_body",
+    "weave_status",
+    "weave_start",
+    "generation_cancel",
+    "candidate_keep",
+    "candidate_promote",
+    "research_promotion_import",
+    "research_promotion_pending",
+    "research_promotion_confirm",
+    "suggestions_set",
+    "focus_mode_set",
+    "application_close",
+    "application_close_abort",
+    "application_close_pending",
+];
+
+fn main() {
+    if let Err(error) = tauri_plugin::Builder::new(COMMANDS).try_build() {
+        panic!("failed to build Loom plugin metadata: {error}");
+    }
+}
