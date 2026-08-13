@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "goal": "W6-IMPORT-MOM",
+  "status": "candidate",
+  "sealed_at": "2026-08-13T09:30:44Z",
+  "source": {
+    "repository": "https://github.com/delysis/mom-llama.git",
+    "accepted_main": "3cf57941af6d523378e7fa8b24f5c24c8e50363f",
+    "accepted_tree": "7670bc1bfb4b94959871d33f7487d3969b2a76c7",
+    "commit_count": 59,
+    "merge_commit_count": 5
+  },
+  "rewrite": {
+    "tool": "git-filter-repo==2.47.0",
+    "arguments": [
+      "--to-subdirectory-filter",
+      "products/mom",
+      "--force"
+    ],
+    "destination_prefix": "products/mom",
+    "filtered_head": "8189804d01be5d12384bcd6f01ceb2c7ef2d4fd7",
+    "commit_map": "migration/mom-llama.commit-map",
+    "commit_map_sha256": "26a8f595de2879aadca81a937df6e3700b287a92fed43af78e6bfc35050e284c"
+  },
+  "destination": {
+    "accepted_w5_w1_base": "bc1c6cafe67d5cdbf2441c7155b89f129e8ba730",
+    "raw_import_merge": "cfa2d3c40e74e1d692c0cdb9354cc272249fd4ab",
+    "raw_import_merge_parents": [
+      "bc1c6cafe67d5cdbf2441c7155b89f129e8ba730",
+      "8189804d01be5d12384bcd6f01ceb2c7ef2d4fd7"
+    ],
+    "raw_import_tree": "d8aeb6eaef71536b2123c14a723e2e4a8630d465",
+    "path_dependency_cutover": "5b12072e91dc44f2f93f6dfc0b869d3cc58c26f1",
+    "root_workspace_adoption": "7ad6a0080463ffc9318e48c4b2378fbadd016df8",
+    "root_lock_resolution": "a9f0603782b5ad796fc755b6a0dcfe104f9fad38",
+    "parity": "b1d58289404eed48542d24cfd921a81eefaffede",
+    "history_and_ci_policy": "73701736116b491183ffac21c2ce4a3f32cc1fe7",
+    "landing_composer_fix": "bc5098c6dba1ee73b1e5dd2298bd8e1a63c8d002",
+    "reasoning_budget_fix": "a601caad0ecadf7f3a644103da10c0fdc5f08c60",
+    "product_acceptance_commit": "a601caad0ecadf7f3a644103da10c0fdc5f08c60",
+    "product_acceptance_tree": "049b20f4b83519aa790f21eea43601aa1f79b07c",
+    "root_cargo_lock_sha256": "dfbe57919e4d729aad775c573f7b12e2a6b1c874795862bdd162e1df552089a5"
+  },
+  "local_acceptance": {
+    "platform": "macOS 15 arm64, Apple M4 Max",
+    "model": {
+      "name": "Qwen_Qwen3-0.6B-Q4_K_M.gguf",
+      "bytes": 484220320,
+      "sha256": "9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14",
+      "fixture": false
+    },
+    "bundle": {
+      "name": "Mom Llama W6 a601caa.app",
+      "identifier": "com.delysis.mom-llama.w6.a601caa",
+      "executable": "mom-llama-app",
+      "executable_bytes": 95491264,
+      "executable_sha256": "601ab55cb522e10ec4fcedb5dd7980c3b1593334ac924dcbc59073679e4e4936"
+    },
+    "visible_behavior": {
+      "first_run_created_real_conversation": true,
+      "reasoning_stream_visible": true,
+      "assistant_text_visible": true,
+      "transcript_message_count": 4,
+      "stop_control_cancelled_request": true,
+      "cancel_status": "The local model request was cancelled.",
+      "active_generation_cmd_q": true,
+      "relaunch_transcript_recovered": true,
+      "relaunch_draft_recovered": "W6 active quit draft a601caa: continue the lighthouse storm for many paragraphs."
+    },
+    "active_generation_shutdown": {
+      "elapsed_ms": 3635,
+      "gateway_drained": true,
+      "native_host_joined": true,
+      "operation_supervisor_phase": "closed",
+      "active_operation_count": 0,
+      "retained_operation_task_count": 0,
+      "expected_operation_worker_count": 1,
+      "joined_operation_worker_count": 1,
+      "expected_native_worker_count": 1,
+      "joined_native_worker_count": 1,
+      "application_work_drained": true
+    },
+    "immediate_relaunch_shutdown": {
+      "elapsed_ms": 3,
+      "gateway_drained": true,
+      "native_host_joined": true,
+      "application_work_drained": true
+    }
+  },
+  "promotion": {
+    "candidate_ci_run": null,
+    "main_merge": null,
+    "final_tag": null,
+    "final_tag_object": null,
+    "tag_ruleset": null
+  },
+  "source_freeze": {
+    "status": "pending W6 acceptance tag",
+    "boundary_tag": null,
+    "readme_only_commit": null,
+    "source_ci_run": null,
+    "hard_freeze_ruleset": null,
+    "repository_archived": false
+  },
+  "nonclaims": [
+    "GitHub-hosted Linux and Windows results are informational and are not W6 acceptance gates.",
+    "No Mom Speech, Information, citation, new attachment-format, or hosted-provider feature is claimed.",
+    "The source repository is not claimed frozen until the protected W6 tag exists."
+  ]
+}
