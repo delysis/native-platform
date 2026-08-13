@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "goal": "W3-IMPORT-NATIVE",
-  "status": "native_import_final_evidence_candidate",
+  "goal": "W4-IMPORT-GATEWAY",
+  "status": "accepted",
   "production_source_imported": true,
   "source_history_imported": true,
   "integration_candidate": {
@@ -60,12 +60,16 @@
         {
           "name": "phase1-audit-2026-08-11",
           "peeled_commit": "c451e23244787fc8de7646a88a4fd4ae10f16f94"
+        },
+        {
+          "name": "native-platform-v2-horizon-b-2026-08-12",
+          "peeled_commit": "67814e76659688fef61f311db588d17eddee0a66"
         }
       ],
       "destination_prefix": "products/fte",
-      "import_commit": null,
-      "path_dependency_cutover_commit": null,
-      "old_repo_status": "active",
+      "import_commit": "8e5c9282314bc85140ac1c7f0421caaed2dc3e93",
+      "path_dependency_cutover_commit": "a76a13066936e219ca10ecc5fc0080395b725fcc",
+      "old_repo_status": "frozen_unarchived_two_release_retirement",
       "migration_role": "first_party_import"
     },
     {

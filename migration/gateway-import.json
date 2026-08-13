@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "goal": "W4-IMPORT-GATEWAY",
+  "status": "accepted",
+  "accepted_at": "2026-08-13T01:51:22Z",
+  "source": {
+    "repository": "https://github.com/delysis/free-token-energy.git",
+    "accepted_main": "67814e76659688fef61f311db588d17eddee0a66",
+    "accepted_tree": "e640949942a444a91e2193870f79a3742424a1d8",
+    "phase_one_tag": "phase1-audit-2026-08-11",
+    "phase_one_tag_peeled_commit": "c451e23244787fc8de7646a88a4fd4ae10f16f94"
+  },
+  "rewrite": {
+    "tool": "git-filter-repo==2.47.0",
+    "arguments": ["--to-subdirectory-filter", "products/fte", "--force"],
+    "destination_prefix": "products/fte",
+    "filtered_head": "c3f0bef8aac5770f42e4f57abc1d7cf0f33b088b",
+    "commit_map": "migration/free-token-energy.commit-map",
+    "commit_map_sha256": "c3ee3e579668c1c6ca8275de2acf02832b8a0d7f35f1648ec211ce436c1b369e",
+    "accepted_head_mapping": "c3f0bef8aac5770f42e4f57abc1d7cf0f33b088b",
+    "phase_one_mapping": "f69dcf9b8b940e983f27faf16fabf47b133cc4e5"
+  },
+  "destination": {
+    "accepted_w3_base": "14cfcde2440b79fd734db040b691be8366688803",
+    "raw_import_merge": "8e5c9282314bc85140ac1c7f0421caaed2dc3e93",
+    "raw_import_merge_parents": [
+      "14cfcde2440b79fd734db040b691be8366688803",
+      "c3f0bef8aac5770f42e4f57abc1d7cf0f33b088b"
+    ],
+    "path_dependency_cutover": "a76a13066936e219ca10ecc5fc0080395b725fcc",
+    "candidate": "b427fd7c5f4af6bd708c2509a010cc5017f06609",
+    "candidate_tree": "cb641eba06ba8b5cb126d0d8b42d44b0b68381f9",
+    "main_merge": "c9dc619300eb78c47fd3a8b9dbfaacf2e7ae45d9",
+    "main_merge_tree": "cb641eba06ba8b5cb126d0d8b42d44b0b68381f9",
+    "main_merge_parents": [
+      "14cfcde2440b79fd734db040b691be8366688803",
+      "b427fd7c5f4af6bd708c2509a010cc5017f06609"
+    ]
+  },
+  "promotion": {
+    "candidate_ci_run": 31655648292,
+    "candidate_ci_result": "passed_all_three_os_jobs",
+    "postmerge_ci_run": 31657465002,
+    "postmerge_ci_result": "passed_all_three_os_jobs",
+    "candidate_tag": "w4-import-gateway-candidate-v0-2026-08-12",
+    "candidate_tag_object": "8c6bad7aa01e2578777c0d89d6161904ff1b8261",
+    "final_tag": "w4-import-gateway-v0-2026-08-12",
+    "final_tag_object": "89f90bdae1f197d7ab8e8929035fbb02ca6bdd34",
+    "tag_ruleset": 20774104
+  },
+  "source_freeze": {
+    "boundary_tag": "native-platform-v2-horizon-b-2026-08-12",
+    "boundary_tag_object": "59a1e695aaac5a7fcab027733552208be8697d26",
+    "boundary_tag_peeled_commit": "67814e76659688fef61f311db588d17eddee0a66",
+    "boundary_tag_ruleset": 20774201,
+    "readme_only_commit": "ecee06feb803fdcdbd2e917f4592697935c3c59a",
+    "readme_only_tree": "a178fb747e5fe67ecc897a2d3fa6f129dee29614",
+    "readme_only_parent": "67814e76659688fef61f311db588d17eddee0a66",
+    "source_ci_runs": [31657662783, 31657662800],
+    "source_ci_result": "passed",
+    "hard_freeze_ruleset": 20775226,
+    "hard_freeze": "active_all_refs_no_bypass",
+    "repository_archived": false,
+    "issues_enabled": true,
+    "open_pull_requests": 0
+  },
+  "cutover": {
+    "root_cargo_lock_count": 1,
+    "root_pnpm_lock_count": 1,
+    "one_gateway_runtime": true,
+    "exact_local_requests_remain_local_only": true,
+    "automatic_requests_prefer_ready_local": true,
+    "bundle_identifier": "dev.delysis.free-token-energy",
+    "minimum_macos_version": "13.0"
+  },
+  "requirements_removed": {
+    "live_paid_provider": "not required and not claimed",
+    "scheduled_attachment_run": "not required and not claimed"
+  },
+  "archive_hold": {
+    "required_stable_native_platform_releases": 2,
+    "observed_stable_native_platform_releases": 0,
+    "archive_gate_satisfied": false
+  }
+}

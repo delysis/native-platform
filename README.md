@@ -1,14 +1,15 @@
 # native-platform
 
 This repository is the Delysis first-party Rust platform monorepo. Wave 3
-imported the accepted `llama-native-kit` history beneath `crates/native` and
-rebound current integration graphs to those path packages.
+imported the accepted `llama-native-kit` history beneath `crates/native`.
+Wave 4 imported the accepted Free Token Energy history beneath `products/fte`
+and moved its packages into the root Rust and pnpm workspaces.
 
 The native import preserves all 45 accepted source commits without squashing.
-`migration/ledger.json`, `migration/native-import.json`, and
-`migration/llama-native-kit.commit-map` bind the source, rewrite, merge, and
-path cutover. Other first-party products remain exact Git integration inputs;
-their source and release manifests have not been moved.
+`migration/ledger.json`, the two import receipts, and their commit maps bind
+each source, deterministic rewrite, ancestry-preserving merge, and path
+cutover. Other first-party products remain exact Git integration inputs; their
+source and release manifests have not been moved.
 
 ## Workspace policy
 
