@@ -155,6 +155,18 @@
       "length": 970,
       "sha256": "61e250ec6e538509c63161d16ff9a55c029fd3ba477131b0ce668c7ed390748e",
       "purpose": "Loom branch reconciliation receipt"
+    },
+    {
+      "path": "migration/loom-import.json",
+      "length": 6670,
+      "sha256": "f733c6af59e6d1dae3b8b9431c90ea308293a43f98198b9b95b7d967e0e38ff0",
+      "purpose": "Loom import and local acceptance receipt"
+    },
+    {
+      "path": "docs/migration/W7-LOOM-EVIDENCE.md",
+      "length": 4727,
+      "sha256": "32568cdfe055bb73f415c34ff5f56ef3d1083286953d032a536a84a1a123ab66",
+      "purpose": "W7 local acceptance narrative"
     }
   ]
 }
