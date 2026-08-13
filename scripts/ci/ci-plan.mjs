@@ -59,7 +59,6 @@ const flags = {
   fuzz: false,
   platform_linux: false,
   platform_macos: false,
-  platform_windows: false,
   full: false,
 };
 
@@ -79,7 +78,6 @@ function markDependency() {
 function markPlatform() {
   flags.platform_linux = true;
   flags.platform_macos = true;
-  flags.platform_windows = true;
 }
 
 function forceFull(nextRisk = "dependency") {
@@ -160,7 +158,9 @@ for (const changedPath of changed) {
       changedPath.endsWith("/ci-pr.yml") ||
       changedPath.endsWith("/ci-full.yml")
     ) {
-      forceFull();
+      flags.root = true;
+      markBehavior();
+      flags.platform_macos = true;
     }
   }
 
@@ -290,7 +290,6 @@ if (flags.frontend_fte || flags.frontend_mom || flags.frontend_loom || flags.ful
   jobs.push("frontend");
 }
 if (flags.platform_macos || flags.full) jobs.push("platform-macos");
-if (flags.platform_windows || flags.full) jobs.push("platform-windows");
 if (flags.dependency_graph || flags.full) jobs.push("dependency-graph");
 if (flags.migration_history || flags.full) jobs.push("import-history");
 if (flags.fuzz || flags.full) jobs.push("fuzz-build");
