@@ -10,6 +10,7 @@ rustup run 1.92.0 cargo test --locked -p llama-native-engine --features unstable
 rustup run 1.92.0 cargo fmt --manifest-path crates/services/attachment/Cargo.toml --all -- --check
 rustup run 1.92.0 cargo test --locked --manifest-path crates/services/attachment/Cargo.toml --workspace --all-targets
 rustup run 1.92.0 cargo clippy --locked --manifest-path crates/services/attachment/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+./scripts/check-mom-attachment-path.sh
 (
     cd crates/services/information
     ./scripts/check-portable-packages.sh

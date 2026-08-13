@@ -41,13 +41,30 @@ The imported Speech path also passed both host-bound real replays:
   terminal event, and completed with network denied.
 
 Attachment fuzz targets are built by ordinary CI. No scheduled run is a W5
-gate. The accepted W1 catalogue remains the authority for product-owned Mom
-and Loom fixture projections until those products move in W6 and W7.
+gate. Exact Mom revision `3cf57941af6d523378e7fa8b24f5c24c8e50363f`
+also executes its ordinary-Markdown Attachment vertical against the imported
+Attachment host and types through `scripts/check-mom-attachment-path.sh`.
 
 `platform-runtime` adds the requested explicit `PlatformBuilder` composition
 API. It returns one non-cloneable shutdown owner plus cloneable projected
 handles, creates no service globals, and drains Gateway and Speech before the
 final native join.
+
+## Corrected cross-product boundary
+
+Three bullets in the original W5 plan cannot truthfully be executed at the
+accepted source revisions: Loom has no Information adapter, and Mom has no
+Information or Speech adapter. Merely compiling these crates in one diagnostic
+graph is not a product vertical. Implementing the adapters here would mutate
+the products before their W6 and W7 history imports and invalidate the accepted
+source heads.
+
+Accordingly, the Loom source fixture moves with Loom to W7. The Mom citation
+fixture and Mom Speech vertical move with Mom to W6. This is an explicit plan
+correction, not evidence of execution. W5 accepts the three service histories,
+their service-owned verticals, the genuine imported-path Mom Attachment
+vertical, and platform composition; it does not claim those absent product
+integrations.
 
 ## Current boundary
 

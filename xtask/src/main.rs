@@ -204,11 +204,11 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     )?;
     check_sha256(
         &root.join("migration/service-imports.json"),
-        "790d5959b53563884bbd45c06520f34e846fe142b1fb86117602d983b43c1c60",
+        "517c62307b4829092cd9d64f80df61445c4f6e305aabd97f633f485c0e30a402",
     )?;
     check_sha256(
         &root.join("docs/migration/W5-SERVICES-EVIDENCE.md"),
-        "12194b2f81f56740421626888727d93e06fc3c18c0b9eec0cc2e245ce3422da0",
+        "b8c4a49799b190ff5a6ae950fb10706d7b46d0b78577409b19dc05c943c70ed8",
     )
 }
 

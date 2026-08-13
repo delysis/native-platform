@@ -55,10 +55,12 @@ state retains one root lock:
 The probes establish exact-revision coexistence with every native dependency
 rebound to the imported packages. They do not change product repositories.
 
-Mom's accepted current revision still resolves its immutable pre-import
-Attachment pin at `472900732ded5bcfb5cc639c49b3a4f77feece27`. Its former
-native pin at `f7a69316c64d857b99bd847dd44cd852fc5b4ca4` is overridden by
-the monorepo path policy and is absent from the locks.
+Mom's accepted current revision declares immutable pre-import Attachment and
+Native pins, but the monorepo patch policy overrides both families and they are
+absent from the root lock. `scripts/check-mom-attachment-path.sh` additionally
+checks out exact Mom revision `3cf57941af6d523378e7fa8b24f5c24c8e50363f`
+and executes its genuine ordinary-Markdown Attachment vertical against the
+imported Attachment paths.
 
 This harness does not claim one-graph compatibility, full application
 compilation, UI execution, hosted-provider behavior, or product-adapter

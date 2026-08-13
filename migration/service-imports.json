@@ -77,10 +77,17 @@
     "information": "pending",
     "speech": "pending"
   },
+  "acceptance_adjustments": {
+    "mom_attachment_vertical": "executed from exact Mom revision against imported Attachment paths",
+    "loom_source_fixture": "deferred to W7 because accepted Loom has no Information adapter",
+    "mom_citation_fixture": "deferred to W6 because accepted Mom has no Information adapter",
+    "mom_speech_vertical": "deferred to W6 because accepted Mom has no Speech adapter"
+  },
   "nonclaims": [
     "No candidate or post-merge CI acceptance is claimed.",
     "No source repository freeze, release, tag, or archival action is claimed.",
     "No scheduled fuzz run is required or claimed.",
-    "The local real Parakeet and Apple installed-voice replays do not substitute for candidate or post-merge CI."
+    "The local real Parakeet and Apple installed-voice replays do not substitute for candidate or post-merge CI.",
+    "Co-compilation is not claimed as Loom-Information, Mom-Information, or Mom-Speech product integration."
   ]
 }
