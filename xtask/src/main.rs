@@ -177,6 +177,18 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     check_sha256(
         &root.join("migration/native-import.json"),
         "028d4c6703c8acf6b96b681095ddeef035a6200c425a5421190635b8717795b6",
+    )?;
+    check_sha256(
+        &root.join("migration/free-token-energy.commit-map"),
+        "c3ee3e579668c1c6ca8275de2acf02832b8a0d7f35f1648ec211ce436c1b369e",
+    )?;
+    check_sha256(
+        &root.join("migration/gateway-import.json"),
+        "decaa20d66968e3142a04ee5b7f6a824caf1c272abbac5ec868db211089699d4",
+    )?;
+    check_sha256(
+        &root.join("docs/migration/W4-GATEWAY-EVIDENCE.md"),
+        "fbc4f466c3f36aaff892f3aa6a096bab74ac329d8b7c291882c8e499a0471f79",
     )
 }
 
@@ -338,8 +350,8 @@ fn check_ledger(root: &Path) -> Result<()> {
         .context("parse migration ledger")?;
     let mut expected = Ledger {
         schema_version: 1,
-        goal: "W3-IMPORT-NATIVE".into(),
-        status: "native_import_final_evidence_candidate".into(),
+        goal: "W4-IMPORT-GATEWAY".into(),
+        status: "accepted".into(),
         production_source_imported: true,
         source_history_imported: true,
         integration_candidate: IntegrationCandidate {
@@ -476,6 +488,19 @@ fn check_ledger(root: &Path) -> Result<()> {
         peeled_commit: "16168bd76a09f74fdee41d0e2fb0441e79ac1005".into(),
     });
     native.old_repo_status = "frozen_unarchived_two_release_retirement".into();
+    let gateway = expected
+        .entries
+        .iter_mut()
+        .find(|entry| entry.source_repository == "delysis/free-token-energy")
+        .context("expected gateway migration entry")?;
+    gateway.import_commit = Some("8e5c9282314bc85140ac1c7f0421caaed2dc3e93".into());
+    gateway.path_dependency_cutover_commit =
+        Some("a76a13066936e219ca10ecc5fc0080395b725fcc".into());
+    gateway.source_tags.push(SourceTag {
+        name: "native-platform-v2-horizon-b-2026-08-12".into(),
+        peeled_commit: "67814e76659688fef61f311db588d17eddee0a66".into(),
+    });
+    gateway.old_repo_status = "frozen_unarchived_two_release_retirement".into();
     ensure!(ledger == expected, "migration ledger drift");
     Ok(())
 }
