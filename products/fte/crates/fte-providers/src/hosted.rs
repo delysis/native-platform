@@ -82,7 +82,7 @@ impl HostedProviderConfig {
             models,
             catalog_version: "configured".to_string(),
             connect_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(10 * 60),
+            request_timeout: Duration::from_mins(10),
         }
     }
 
@@ -115,7 +115,7 @@ impl HostedProviderConfig {
             models,
             catalog_version: "configured".to_string(),
             connect_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(10 * 60),
+            request_timeout: Duration::from_mins(10),
         }
     }
 
@@ -141,7 +141,7 @@ impl HostedProviderConfig {
             models,
             catalog_version: "configured".to_string(),
             connect_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(10 * 60),
+            request_timeout: Duration::from_mins(10),
         }
     }
 
@@ -170,7 +170,7 @@ impl HostedProviderConfig {
             models,
             catalog_version: "configured".to_string(),
             connect_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(10 * 60),
+            request_timeout: Duration::from_mins(10),
         }
     }
 }
@@ -2186,7 +2186,7 @@ async fn consume_provider_stream(
                 ));
             }
         };
-        if started_at.elapsed() > Duration::from_secs(60 * 60) {
+        if started_at.elapsed() > Duration::from_hours(1) {
             return Err(timeout_error(
                 &request_id,
                 &state.route.backend_id,
