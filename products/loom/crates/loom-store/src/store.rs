@@ -3,11 +3,10 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use fs4::TryLockError;
 use loom_document::DocumentContent;
-use loom_research_types::TrialRunId;
 use loom_types::{
     ArtifactId, BlobId, CommandId, CommandKind, CommandReceipt, DocumentId, DocumentKind,
     OperationId, OperationKind, ProjectManifest, RevisionId, now_unix_ms,
@@ -25,11 +24,6 @@ use crate::paths::{
     ensure_directory, ensure_document_parent, ensure_private_directory, inspect_document_path,
     normalize_document_path, reject_symlink_target,
 };
-use crate::research_session::{
-    ExclusiveResearchSessionLease, ExclusiveResearchSessionLeaseInput, ResearchSessionKey,
-    ResearchSessionRegistry, ResearchSessionRegistryState, ResearchSubjectLocator,
-    load_research_subject_snapshot,
-};
 use crate::schema::{CURRENT_SCHEMA_VERSION, configure, migrate};
 use crate::{Result, StoreError};
 
@@ -46,33 +40,7 @@ pub struct ProjectStore {
     pub(crate) root: PathBuf,
     pub(crate) manifest: ProjectManifest,
     pub(crate) connection: Connection,
-    pub(crate) session_nonce: StoreSessionNonce,
-    research_sessions: ResearchSessionRegistry,
-}
-
-/// Unpersisted, per-open capability domain. Copying a database or reopening a
-/// project necessarily creates a different value, invalidating every opaque
-/// lease minted by the prior `ProjectStore`.
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) struct StoreSessionNonce([u8; 32]);
-
-impl StoreSessionNonce {
-    fn generate() -> Result<Self> {
-        let mut bytes = [0_u8; 32];
-        getrandom::fill(&mut bytes)
-            .map_err(|error| StoreError::SessionEntropy(error.to_string()))?;
-        Ok(Self(bytes))
-    }
-
-    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl fmt::Debug for StoreSessionNonce {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("StoreSessionNonce(REDACTED)")
-    }
+    _lease: ProjectLease,
 }
 
 pub(crate) struct ProjectLease {
@@ -100,12 +68,44 @@ impl fmt::Debug for ProjectStore {
 }
 
 impl ProjectStore {
-    pub(crate) fn research_authority_domain_fingerprint(&self) -> BlobId {
-        let mut material = Vec::with_capacity(64 + self.session_nonce.as_bytes().len());
-        material.extend_from_slice(b"loom/store-research-authority-domain/v1\0");
-        material.extend_from_slice(self.session_nonce.as_bytes());
-        material.extend_from_slice(&self.manifest.project_id.as_ulid().to_bytes());
-        BlobId::digest(&material)
+    fn quarantine_pending_legacy_candidates(&mut self) -> Result<()> {
+        let pending = {
+            let mut statement = self.connection.prepare(
+                "SELECT candidate_id
+                 FROM research_legacy_candidate_review_events
+                 WHERE sequence = 0 AND disposition = 'pending'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM research_legacy_candidate_review_events terminal
+                       WHERE terminal.candidate_id = research_legacy_candidate_review_events.candidate_id
+                         AND terminal.sequence > 0
+                   )
+                 ORDER BY candidate_id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let created_at_ms = now_unix_ms().max(1);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for candidate_id in pending {
+            transaction.execute(
+                "INSERT INTO research_legacy_candidate_review_events(
+                    candidate_id, sequence, disposition, assembly_id, reason, created_at_ms
+                 ) VALUES (?1, 1, 'quarantined', NULL, ?2, ?3)",
+                params![
+                    candidate_id,
+                    "legacy candidate predates verifier-owned exact replay; preserved as diagnostic evidence",
+                    created_at_ms,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn initialize(
@@ -221,13 +221,11 @@ impl ProjectStore {
         let mut connection = Connection::open(&database_path)?;
         configure(&connection)?;
         migrate(&mut connection)?;
-        let project_lease = Arc::new(lease);
         let mut store = Self {
             root,
             manifest,
             connection,
-            session_nonce: StoreSessionNonce::generate()?,
-            research_sessions: ResearchSessionRegistryState::new(project_lease),
+            _lease: lease,
         };
         store.quarantine_pending_legacy_candidates()?;
         Ok(store)
@@ -239,114 +237,6 @@ impl ProjectStore {
 
     pub const fn manifest(&self) -> &ProjectManifest {
         &self.manifest
-    }
-
-    /// Acquires the sole process-local scheduler lock for one frozen campaign.
-    pub fn acquire_campaign_session(
-        &self,
-        campaign_fingerprint: BlobId,
-    ) -> Result<ExclusiveResearchSessionLease> {
-        self.acquire_research_session(ResearchSubjectLocator::Campaign(campaign_fingerprint))
-    }
-
-    /// Acquires the sole process-local executor lock for one durable trial
-    /// run. Campaign-owned runs are admitted only after their exact dispatch
-    /// event and are rejected after a campaign terminal/release event.
-    pub fn acquire_trial_run_session(
-        &self,
-        trial_run_id: TrialRunId,
-    ) -> Result<ExclusiveResearchSessionLease> {
-        let admissible: i64 = self.connection.query_row(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM research_trial_runs run
-                WHERE run.trial_run_id = ?1
-                  AND (
-                    run.origin_kind = 'standalone'
-                    OR (
-                      run.origin_kind = 'campaign'
-                      AND EXISTS (
-                        SELECT 1 FROM research_campaign_events dispatched
-                        WHERE dispatched.trial_attempt_id = run.trial_run_id
-                          AND dispatched.event_kind = 'trial_dispatched'
-                      )
-                      AND NOT EXISTS (
-                        SELECT 1 FROM research_campaign_events terminal
-                        WHERE terminal.trial_attempt_id = run.trial_run_id
-                          AND terminal.event_kind IN (
-                            'trial_finished', 'trial_reservation_released'
-                          )
-                      )
-                    )
-                  )
-             )",
-            [trial_run_id.to_string()],
-            |row| row.get(0),
-        )?;
-        if admissible != 1 {
-            return Err(StoreError::TrialRunNotDispatched(trial_run_id));
-        }
-        self.acquire_research_session(ResearchSubjectLocator::TrialRun(trial_run_id))
-    }
-
-    fn acquire_research_session(
-        &self,
-        locator: ResearchSubjectLocator,
-    ) -> Result<ExclusiveResearchSessionLease> {
-        let kind = locator.kind();
-        let subject_fingerprint = locator.subject_fingerprint();
-        let snapshot = load_research_subject_snapshot(&self.connection, locator)?;
-        let Some(snapshot) = snapshot else {
-            return Err(StoreError::ResearchSessionSubjectNotPersisted {
-                kind,
-                subject_fingerprint,
-            });
-        };
-        if snapshot.project_id() != self.manifest.project_id {
-            return Err(StoreError::ResearchSubjectProjectMismatch);
-        }
-        let record_fingerprint = snapshot.record_fingerprint();
-
-        let key = ResearchSessionKey {
-            kind,
-            subject_fingerprint,
-        };
-        let mut registry = self
-            .research_sessions
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !registry.insert(key) {
-            return Err(StoreError::ResearchSessionAlreadyActive {
-                kind,
-                subject_fingerprint,
-            });
-        }
-
-        let session_id = ArtifactId::new();
-        let mut fingerprint_material = Vec::with_capacity(98);
-        fingerprint_material.extend_from_slice(b"loom/research-session/v1\0");
-        fingerprint_material.extend_from_slice(self.session_nonce.as_bytes());
-        fingerprint_material.push(kind.domain_tag());
-        fingerprint_material.extend_from_slice(subject_fingerprint.as_bytes());
-        fingerprint_material.extend_from_slice(record_fingerprint.as_bytes());
-        fingerprint_material.extend_from_slice(&self.manifest.project_id.as_ulid().to_bytes());
-        fingerprint_material.extend_from_slice(&session_id.as_ulid().to_bytes());
-        let lease_fingerprint = BlobId::digest(&fingerprint_material);
-        drop(registry);
-
-        Ok(ExclusiveResearchSessionLease::new(
-            ExclusiveResearchSessionLeaseInput {
-                key,
-                record_fingerprint,
-                project_id: self.manifest.project_id,
-                snapshot,
-                trial_run_id: locator.trial_run_id(),
-                session_id,
-                lease_fingerprint,
-                registry: Arc::clone(&self.research_sessions),
-            },
-        ))
     }
 
     pub fn record_open(&mut self) -> Result<CommandReceipt> {

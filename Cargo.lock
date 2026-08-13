@@ -3931,18 +3931,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "loom-benchmark"
-version = "0.1.0"
-dependencies = [
- "loom-research-types",
- "loom-types",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "loom-cli"
 version = "0.1.0"
 dependencies = [
@@ -3968,23 +3956,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "loom-eval"
-version = "0.1.0"
-dependencies = [
- "llama-native-engine",
- "llama-native-types",
- "loom-inference",
- "loom-research-types",
- "loom-search",
- "loom-types",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.20",
- "ulid",
-]
-
-[[package]]
 name = "loom-host"
 version = "0.1.0"
 dependencies = [
@@ -3995,57 +3966,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "loom-inference"
-version = "0.1.0"
-dependencies = [
- "llama-native-engine",
- "llama-native-types",
- "loom-research-types",
- "loom-types",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "loom-research-types"
-version = "0.1.0"
-dependencies = [
- "loom-types",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.20",
- "toml 0.9.12+spec-1.1.0",
- "ulid",
-]
-
-[[package]]
-name = "loom-search"
-version = "0.1.0"
-dependencies = [
- "loom-types",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "loom-store"
 version = "0.1.0"
 dependencies = [
  "atomic-write-file",
  "fs4",
- "getrandom 0.3.4",
  "libc",
- "loom-benchmark",
  "loom-document",
- "loom-eval",
  "loom-host",
- "loom-inference",
- "loom-research-types",
- "loom-search",
  "loom-types",
  "platform-vertical-fixtures-v0",
  "rusqlite",
@@ -7044,7 +6972,6 @@ dependencies = [
  "loom-backend-llama",
  "loom-document",
  "loom-host",
- "loom-research-types",
  "loom-store",
  "loom-types",
  "platform-contracts-v0",

@@ -12,13 +12,8 @@ unstable-w1-vertical-tests = ["dep:platform-vertical-fixtures-v0"]
 [dependencies]
 atomic-write-file.workspace = true
 fs4.workspace = true
-getrandom.workspace = true
 loom-document = { path = "../loom-document" }
-loom-benchmark = { path = "../loom-benchmark" }
-loom-eval = { path = "../loom-eval" }
-loom-inference = { path = "../loom-inference", features = ["native-evidence"] }
 loom-host = { path = "../loom-host" }
-loom-research-types = { path = "../loom-research-types" }
 loom-types = { path = "../loom-types" }
 platform-vertical-fixtures-v0 = { workspace = true, optional = true }
 rusqlite.workspace = true
@@ -36,8 +31,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 loom-host = { path = "../loom-host", features = ["test-fixtures"] }
-loom-inference = { path = "../loom-inference", features = ["test-support"] }
-loom-search = { path = "../loom-search" }
 tempfile.workspace = true
 
 [lints.rust]

@@ -100,18 +100,13 @@ That test passed locally on CPU. A companion real-model test in the pinned nativ
 | `crates/loom-types` | Versioned identities, artifacts, operations, generation DTOs, commands, events, capabilities, and receipts |
 | `crates/loom-document` | Prose/verse/hybrid projection, UTF-8 artifact slices, and bounded three-way text merge |
 | `crates/loom-store` | Project folders, migrations, blobs, revisions, drafts, outbox/reconciliation recovery, provenance, authority, idempotent generation families, bounded branches, and promotion |
-| `crates/loom-search` | Bounded budgets/state, hard gates, candidate grouping/clustering, rubrics, pairwise disagreement, and quality-plus-novelty selection |
-| `crates/loom-research-types` | Bounded research manifests, graph/state, treatment, assembly, archive, benchmark, and evidence contracts |
-| `crates/loom-inference` | Backend-neutral writer/controller contracts and move-only verified inference admission |
-| `crates/loom-eval` | Evidence-bound gates, rubrics, blind pairwise trials, aggregation, uncertainty, and N-curves |
-| `crates/loom-benchmark` | Search-independent sealed confirmatory execution and qualification journals |
 | `crates/loom-host` | Opt-in agency/focus gates, cancellation token, and bounded job queues |
 | `crates/loom-backend-llama` | Direct local raw-completion adapter, GGUF discovery/inspection, verified downloader, capability mapping, and fit estimates |
 | `crates/tauri-plugin-loom` | Typed desktop IPC for direct default-project opening, editing/reconciliation, model lifecycle/downloads, opt-in automatic raw continuation, durable branches, cancellation/selection, focus mode, and safe close |
 | `crates/loom-cli` | Storage, recovery, and external-reconciliation command-line oracle |
 | `apps/loom` | Quiet Svelte 5/ProseMirror authoring shell, automatic private-suggestion interaction, and Tauri 2 application |
 
-There is no `loom-backend-fte` crate yet. Speech, attachment ingestion, general source indexing, and hosted-provider composition are not implemented Loom product paths. The research engine is headless-first and persistable, but it has not yet run the complete five-function qualification program or produced the three required frozen frontier profiles and Studio views.
+There is no `loom-backend-fte` crate yet. Speech, attachment ingestion, general source indexing, and hosted-provider composition are not implemented Loom product paths. W9 retired the unowned, unqualified research engine; the protected W8 HOME tag preserves it for archaeology or a future explicitly owned experiment.
 
 ## Project layout
 

@@ -305,7 +305,6 @@ fn check_workspace(root: &Path) -> Result<()> {
                 "product-fte",
                 "product-mom",
                 "product-loom",
-                "research-loom",
                 "diagnostic",
                 "testkit",
             ])

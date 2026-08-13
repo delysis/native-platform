@@ -88,23 +88,16 @@
         "loom-backend-llama",
         "loom-document",
         "loom-host",
-        "loom-inference",
         "loom-store",
         "loom-types"
       ],
-      "current_default_transitive_research_packages": [
-        "loom-benchmark",
-        "loom-eval",
-        "loom-research-types",
-        "loom-search"
-      ],
+      "current_default_transitive_research_packages": [],
       "module_roots": [
         "products/loom/apps/loom/src/",
         "products/loom/apps/loom/src-tauri/src/",
         "products/loom/crates/loom-backend-llama/src/",
         "products/loom/crates/loom-document/src/",
         "products/loom/crates/loom-host/src/",
-        "products/loom/crates/loom-inference/src/",
         "products/loom/crates/loom-store/src/",
         "products/loom/crates/loom-types/src/",
         "products/loom/crates/tauri-plugin-loom/src/"
@@ -186,145 +179,44 @@
       "status": "observed",
       "source": "cargo tree -p loom-app --locked --edges normal",
       "entry_package": "loom-app",
-      "research_packages_reachable": [
-        "loom-benchmark",
-        "loom-eval",
-        "loom-research-types",
-        "loom-search"
-      ]
+      "research_packages_reachable": []
     },
     {
       "id": "loom-writing",
-      "status": "required_not_yet_declared",
+      "status": "default",
       "source": "W9 section 10",
       "intended_default": true
     },
     {
       "id": "loom-research",
-      "status": "required_not_yet_declared",
+      "status": "retired_no_owner",
       "source": "W9 section 10",
       "intended_default": false
     },
     {
       "id": "loom-diagnostic",
-      "status": "required_not_yet_declared",
+      "status": "explicit_test_and_real_gate_only",
       "source": "W9 section 10",
       "intended_default": false
     },
     {
       "id": "full-platform-first-release",
-      "status": "decision_pending",
+      "status": "not_selected",
       "source": "W9 section 23"
     },
     {
       "id": "lean-first-release",
-      "status": "decision_pending",
+      "status": "selected",
       "source": "W9 section 23"
     }
   ],
   "research_ownership": {
     "policy": "A nonshipping research package requires an actual experiment, a current owner, current data or receipt, a next milestone, unique capability, and an acceptable maintenance burden before it is retained.",
     "repository_facts": [
-      "The nine packages are the complete research-loom primary group in ci/package-groups.json.",
-      "None of the nine package manifests declares an owner field.",
-      "The current Loom documentation says the five-function qualification program and empirically qualified frozen profiles remain incomplete."
+      "The W8 research packages declared no owner and had no completed qualification program.",
+      "The default Loom desktop had no caller for strict research-inference admission; only the retired packet-import surface reached it.",
+      "The protected W8 HOME tag preserves the complete implementation and evidence."
     ],
-    "packages": [
-      {
-        "package": "loom-benchmark",
-        "owner": null,
-        "owner_status": "not_declared_in_package_manifest",
-        "current_default_loom_reachable": true,
-        "first_party_consumers": [
-          "loom-store"
-        ],
-        "disposition": "review_required"
-      },
-      {
-        "package": "loom-campaign",
-        "owner": null,
-        "owner_status": "not_declared_in_package_manifest",
-        "current_default_loom_reachable": false,
-        "first_party_consumers": [],
-        "disposition": "review_required"
-      },
-      {
-        "package": "loom-context",
-        "owner": null,
-        "owner_status": "not_declared_in_package_manifest",
-        "current_default_loom_reachable": false,
-        "first_party_consumers": [],
-        "disposition": "review_required"
-      },
-      {
-        "package": "loom-eval",
-        "owner": null,
-        "owner_status": "not_declared_in_package_manifest",
-        "current_default_loom_reachable": true,
-        "first_party_consumers": [
-          "loom-campaign",
-          "loom-eval-codex",
-          "loom-store"
-        ],
-        "disposition": "review_required"
-      },
-      {
-        "package": "loom-eval-codex",
-        "owner": null,
-        "owner_status": "not_declared_in_package_manifest",
-        "current_default_loom_reachable": false,
-        "first_party_consumers": [],
-        "disposition": "review_required"
-      },
-      {
-        "package": "loom-learning",
-        "owner": null,
-        "owner_status": "not_declared_in_package_manifest",
-        "current_default_loom_reachable": false,
-        "first_party_consumers": [],
-        "disposition": "review_required"
-      },
-      {
-        "package": "loom-research-types",
-        "owner": null,
-        "owner_status": "not_declared_in_package_manifest",
-        "current_default_loom_reachable": true,
-        "first_party_consumers": [
-          "loom-benchmark",
-          "loom-campaign",
-          "loom-context",
-          "loom-eval",
-          "loom-eval-codex",
-          "loom-inference",
-          "loom-store",
-          "loom-trial",
-          "tauri-plugin-loom"
-        ],
-        "disposition": "review_required"
-      },
-      {
-        "package": "loom-search",
-        "owner": null,
-        "owner_status": "not_declared_in_package_manifest",
-        "current_default_loom_reachable": true,
-        "first_party_consumers": [
-          "loom-campaign",
-          "loom-eval",
-          "loom-eval-codex",
-          "loom-store"
-        ],
-        "disposition": "review_required"
-      },
-      {
-        "package": "loom-trial",
-        "owner": null,
-        "owner_status": "not_declared_in_package_manifest",
-        "current_default_loom_reachable": false,
-        "first_party_consumers": [
-          "loom-campaign"
-        ],
-        "disposition": "review_required"
-      }
-    ]
+    "packages": []
   }
 }

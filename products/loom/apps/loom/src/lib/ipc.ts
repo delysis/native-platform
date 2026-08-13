@@ -15,8 +15,6 @@ import type {
   OpenDocument,
   ProjectCloseReceipt,
   ProjectSnapshot,
-  ResearchPromotionPrompt,
-  ResearchPromotionResult,
   RecoveryReport,
   ReconciliationPreview,
   LoomFailure,
@@ -364,38 +362,6 @@ export function promoteCandidate(
     candidateId,
     expectedSourceRevisionId,
     expectedVisibleBlobId
-  });
-}
-
-export function listPendingResearchPromotions(
-  projectId: string,
-  sessionId: string
-): Promise<ResearchPromotionPrompt[]> {
-  return call('research_promotion_pending', { projectId, sessionId });
-}
-
-export function importResearchPromotion(
-  projectId: string,
-  sessionId: string
-): Promise<ResearchPromotionPrompt | null> {
-  return call('research_promotion_import', { projectId, sessionId });
-}
-
-export function confirmResearchPromotion(
-  projectId: string,
-  sessionId: string,
-  input: ResearchPromotionPrompt
-): Promise<ResearchPromotionResult> {
-  return call('research_promotion_confirm', {
-    projectId,
-    sessionId,
-    input: {
-      command_id: input.command_id,
-      nonce: input.nonce,
-      document_id: input.document_id,
-      candidate_fingerprint: input.candidate_fingerprint,
-      promotion_fingerprint: input.promotion_fingerprint
-    }
   });
 }
 
