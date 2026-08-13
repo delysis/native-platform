@@ -1,0 +1,12 @@
+{
+  "kind": "not_published",
+  "error": {
+    "schema": "delysis.service_error.v0",
+    "code": "publication.digest_mismatch",
+    "class": "integrity",
+    "retry": "never",
+    "operation_id": null,
+    "service": "information",
+    "safe_detail": "the staged artifact did not match its expected digest"
+  }
+}

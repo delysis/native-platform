@@ -1,0 +1,15 @@
+{
+  "schema": "delysis.operation_terminal.v0",
+  "operation_id": "op_fixture_cancelled_0001",
+  "attempt_id": "attempt_fixture_cancelled_0001",
+  "class": "cancelled",
+  "error": {
+    "schema": "delysis.service_error.v0",
+    "code": "consumer.cancelled",
+    "class": "cancelled",
+    "retry": "never",
+    "operation_id": "op_fixture_cancelled_0001",
+    "service": "inference-gateway",
+    "safe_detail": "the consumer requested cancellation"
+  }
+}

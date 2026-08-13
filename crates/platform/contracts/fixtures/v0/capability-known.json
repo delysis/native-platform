@@ -1,0 +1,31 @@
+{
+  "schema": "delysis.capability_snapshot.v0",
+  "snapshot_id": {
+    "algorithm": "sha256",
+    "hex": "ba736b42c79c83d8c74321b0ae86028156511bc112ea16d51c8ed83c06fdf9db"
+  },
+  "target": "fixture-product",
+  "services": {
+    "speech": [
+      {
+        "operation": "transcribe_complete",
+        "backend_or_resource_id": "fixture-parakeet",
+        "readiness": "ready",
+        "limits": { "max_audio_seconds": 3600 },
+        "network": "no",
+        "privacy_eligible": "yes",
+        "evidence_source": "deterministic fixture probe",
+        "evidence_outcome": "operation observed ready",
+        "observed_at_unix_ms": 1786507202000,
+        "remediation": null
+      }
+    ]
+  },
+  "reports": [
+    {
+      "source_id": "fixture-speech-probe",
+      "outcome": "completed",
+      "safe_detail": "the fixture backend reported its bounded capability"
+    }
+  ]
+}

@@ -22,7 +22,7 @@ fte-types = { path = "../fte-types" }
 futures.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-platform-vertical-fixtures-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "fc24ffff08c52690390b4460f44617d5d9732563", optional = true }
+platform-vertical-fixtures-v0 = { path = "../../../../crates/platform/contracts/crates/platform-vertical-fixtures-v0", optional = true }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

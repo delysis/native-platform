@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.delysis.dev/w1/v0/privacy-policy.schema.json",
+  "title": "Delysis privacy policy v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "network",
+    "data_handling",
+    "allowed_provider_ids",
+    "allowed_hosted_data_tiers",
+    "payload_redaction",
+    "logging"
+  ],
+  "properties": {
+    "schema": { "const": "delysis.privacy_policy.v0" },
+    "network": { "enum": ["deny", "allow_listed", "allow_hosted"] },
+    "data_handling": { "enum": ["local_only", "hosted_allowed"] },
+    "allowed_provider_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^[!#-\\[\\]-~]+$"
+      }
+    },
+    "allowed_hosted_data_tiers": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["public", "private", "restricted"] }
+    },
+    "payload_redaction": { "enum": ["local_only", "required_before_egress"] },
+    "logging": { "enum": ["disabled", "redacted_metadata_only"] }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "data_handling": { "const": "local_only" } } },
+      "then": {
+        "properties": {
+          "network": { "const": "deny" },
+          "allowed_provider_ids": { "maxItems": 0 },
+          "allowed_hosted_data_tiers": { "maxItems": 0 },
+          "payload_redaction": { "const": "local_only" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "data_handling": { "const": "hosted_allowed" } } },
+      "then": {
+        "properties": {
+          "network": { "enum": ["allow_listed", "allow_hosted"] },
+          "allowed_hosted_data_tiers": { "minItems": 1 },
+          "payload_redaction": { "const": "required_before_egress" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "network": { "const": "allow_listed" } } },
+      "then": { "properties": { "allowed_provider_ids": { "minItems": 1 } } }
+    },
+    {
+      "if": { "properties": { "network": { "const": "allow_hosted" } } },
+      "then": { "properties": { "allowed_provider_ids": { "maxItems": 0 } } }
+    }
+  ]
+}

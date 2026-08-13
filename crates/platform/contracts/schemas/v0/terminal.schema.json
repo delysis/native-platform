@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.delysis.dev/w1/v0/terminal.schema.json",
+  "title": "Delysis operation terminal v0",
+  "$comment": "For cancelled and failed terminals, Rust semantic validation additionally requires error.operation_id to equal the enclosing operation_id.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "operation_id", "attempt_id", "class", "error"],
+  "properties": {
+    "schema": { "const": "delysis.operation_terminal.v0" },
+    "operation_id": { "$ref": "#/$defs/identifier" },
+    "attempt_id": {
+      "oneOf": [
+        { "$ref": "#/$defs/identifier" },
+        { "type": "null" }
+      ]
+    },
+    "class": { "enum": ["completed", "cancelled", "failed"] },
+    "error": {
+      "oneOf": [
+        { "$ref": "service-error.schema.json" },
+        { "type": "null" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "class": { "const": "completed" } } },
+      "then": { "properties": { "error": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "class": { "const": "cancelled" } } },
+      "then": {
+        "properties": {
+          "error": {
+            "allOf": [
+              { "$ref": "service-error.schema.json" },
+              {
+                "properties": {
+                  "class": { "const": "cancelled" },
+                  "operation_id": { "$ref": "#/$defs/identifier" }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "class": { "const": "failed" } } },
+      "then": {
+        "properties": {
+          "error": {
+            "allOf": [
+              { "$ref": "service-error.schema.json" },
+              {
+                "properties": {
+                  "class": { "not": { "const": "cancelled" } },
+                  "operation_id": { "$ref": "#/$defs/identifier" }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[!#-\\[\\]-~]+$"
+    }
+  }
+}

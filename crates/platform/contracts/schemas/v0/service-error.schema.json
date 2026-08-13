@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.delysis.dev/w1/v0/service-error.schema.json",
+  "title": "Delysis service error v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "code",
+    "class",
+    "retry",
+    "operation_id",
+    "service",
+    "safe_detail"
+  ],
+  "properties": {
+    "schema": { "const": "delysis.service_error.v0" },
+    "code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9_]+(?:\\.[a-z0-9_]+)*$"
+    },
+    "class": {
+      "enum": [
+        "invalid_request",
+        "unsupported",
+        "unavailable",
+        "permission",
+        "privacy",
+        "cancelled",
+        "timeout",
+        "resource_exhausted",
+        "integrity",
+        "publication",
+        "storage",
+        "worker",
+        "internal"
+      ]
+    },
+    "retry": {
+      "enum": [
+        "immediate",
+        "after_user_action",
+        "after_restart",
+        "different_route",
+        "never"
+      ]
+    },
+    "operation_id": {
+      "oneOf": [
+        { "$ref": "#/$defs/identifier" },
+        { "type": "null" }
+      ]
+    },
+    "service": { "$ref": "#/$defs/identifier" },
+    "safe_detail": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[!#-\\[\\]-~]+$"
+    }
+  }
+}

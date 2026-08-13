@@ -7,7 +7,7 @@ const IMPORTED_SERVICE_LOCKS: [&str; 3] = [
     include_str!("../../../crates/services/speech/Cargo.lock"),
 ];
 
-const EXACT_PACKAGES: [(&str, &str, &str); 6] = [
+const EXACT_PACKAGES: [(&str, &str, &str); 3] = [
     (
         "llama-cpp-2",
         "https://github.com/delysis/llama-cpp-rs",
@@ -23,24 +23,9 @@ const EXACT_PACKAGES: [(&str, &str, &str); 6] = [
         "https://github.com/delysis/loom-native",
         "223110bee4be72386d79306b444517371e4a9930",
     ),
-    (
-        "platform-contracts-v0",
-        "https://github.com/delysis/w1-platform-contracts",
-        "3ed1f3235edb6d481c324f05fe83b2379e3431e6",
-    ),
-    (
-        "platform-contract-testkit",
-        "https://github.com/delysis/w1-platform-contracts",
-        "3ed1f3235edb6d481c324f05fe83b2379e3431e6",
-    ),
-    (
-        "platform-vertical-fixtures-v0",
-        "https://github.com/delysis/w1-platform-contracts",
-        "3ed1f3235edb6d481c324f05fe83b2379e3431e6",
-    ),
 ];
 
-const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 6] = [
+const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 3] = [
     (
         "https://github.com/delysis/llama-cpp-rs",
         "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
@@ -53,18 +38,12 @@ const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 6] = [
         "https://github.com/delysis/loom-native",
         "223110bee4be72386d79306b444517371e4a9930",
     ),
-    (
-        "https://github.com/delysis/w1-platform-contracts",
-        "3ed1f3235edb6d481c324f05fe83b2379e3431e6",
-    ),
-    (
-        "https://github.com/delysis/w1-platform-contracts",
-        "cbab33555ab9355a6ac453d659c55ec9e0666821",
-    ),
-    (
-        "https://github.com/delysis/w1-platform-contracts",
-        "fc24ffff08c52690390b4460f44617d5d9732563",
-    ),
+];
+
+const IMPORTED_CONTRACT_PACKAGES: [&str; 3] = [
+    "platform-contract-testkit",
+    "platform-contracts-v0",
+    "platform-vertical-fixtures-v0",
 ];
 
 const IMPORTED_NATIVE_PACKAGES: [&str; 5] = [
@@ -147,7 +126,38 @@ fn root_lock_contains_every_exact_current_source() {
         assert!(present, "missing exact locked package {name} at {revision}");
         matched.insert((repository, revision));
     }
-    assert_eq!(matched.len(), 4, "expected four distinct source revisions");
+    assert_eq!(matched.len(), 3, "expected three distinct source revisions");
+}
+
+#[test]
+fn imported_contract_packages_are_path_rebound() {
+    let locks = std::iter::once(ROOT_LOCK)
+        .chain(IMPORTED_SERVICE_LOCKS)
+        .map(|text| toml::from_str::<toml::Value>(text).expect("Cargo.lock TOML"));
+
+    for lock in locks {
+        let packages = lock["package"].as_array().expect("lock packages");
+        assert!(packages.iter().all(|package| {
+            package
+                .get("source")
+                .and_then(toml::Value::as_str)
+                .is_none_or(|source| !source.contains("github.com/delysis/w1-platform-contracts"))
+        }));
+        for name in IMPORTED_CONTRACT_PACKAGES {
+            if packages
+                .iter()
+                .any(|package| package["name"].as_str() == Some(name))
+            {
+                assert!(
+                    packages
+                        .iter()
+                        .filter(|package| package["name"].as_str() == Some(name))
+                        .all(|package| package.get("source").is_none()),
+                    "non-local imported contract package in lock: {name}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

@@ -1,0 +1,31 @@
+{
+  "schema": "delysis.capability_snapshot.v0",
+  "snapshot_id": {
+    "algorithm": "sha256",
+    "hex": "cb3e59dfb063046b252c456233102774ceb48e1f3a2b98aed45214c69ec6f60e"
+  },
+  "target": "fixture-product",
+  "services": {
+    "speech": [
+      {
+        "operation": "transcribe_complete",
+        "backend_or_resource_id": "apple-speech",
+        "readiness": "unknown",
+        "limits": {},
+        "network": "unknown",
+        "privacy_eligible": "unknown",
+        "evidence_source": "runtime capability probe",
+        "evidence_outcome": "probe unavailable",
+        "observed_at_unix_ms": null,
+        "remediation": "run the platform probe before admission"
+      }
+    ]
+  },
+  "reports": [
+    {
+      "source_id": "platform-speech-probe",
+      "outcome": "unavailable",
+      "safe_detail": "runtime availability could not be established"
+    }
+  ]
+}

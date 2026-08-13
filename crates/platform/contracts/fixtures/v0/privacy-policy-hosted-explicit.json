@@ -1,0 +1,14 @@
+{
+  "schema": "delysis.privacy_policy.v0",
+  "network": "allow_listed",
+  "data_handling": "hosted_allowed",
+  "allowed_provider_ids": [
+    "provider.cerebras"
+  ],
+  "allowed_hosted_data_tiers": [
+    "public",
+    "private"
+  ],
+  "payload_redaction": "required_before_egress",
+  "logging": "redacted_metadata_only"
+}

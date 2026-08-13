@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.delysis.dev/w1/v0/capability.schema.json",
+  "title": "Delysis capability snapshot v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "snapshot_id", "target", "services", "reports"],
+  "properties": {
+    "schema": { "const": "delysis.capability_snapshot.v0" },
+    "snapshot_id": { "$ref": "#/$defs/digest" },
+    "target": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "services": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 1,
+        "items": { "$ref": "#/$defs/entry" }
+      }
+    },
+    "reports": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/report" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[!#-\\[\\]-~]+$"
+    },
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "hex"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "hex": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "backend_or_resource_id",
+        "readiness",
+        "limits",
+        "network",
+        "privacy_eligible",
+        "evidence_source",
+        "evidence_outcome",
+        "observed_at_unix_ms",
+        "remediation"
+      ],
+      "properties": {
+        "operation": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "backend_or_resource_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "readiness": { "enum": ["ready", "unavailable", "unknown"] },
+        "limits": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[a-z0-9_]+$"
+          },
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "network": { "enum": ["yes", "no", "unknown"] },
+        "privacy_eligible": { "enum": ["yes", "no", "unknown"] },
+        "evidence_source": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "evidence_outcome": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "observed_at_unix_ms": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "null" }
+          ]
+        },
+        "remediation": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 1024 },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "readiness": { "enum": ["unavailable", "unknown"] } } },
+          "then": { "properties": { "remediation": { "type": "string", "minLength": 1 } } }
+        }
+      ]
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_id", "outcome", "safe_detail"],
+      "properties": {
+        "source_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "outcome": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "safe_detail": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 2048 },
+            { "type": "null" }
+          ]
+        }
+      }
+    }
+  }
+}

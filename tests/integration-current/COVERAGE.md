@@ -18,12 +18,12 @@ The default workspace gate compiles these public boundaries:
 - `speech-native-types` at `b836318f10a7e11f433ec3ea8dfa48707adc9b06`;
 - `information-native-types` at `7cb255a6f8dda1db7d8e7242f3aa256be06e1bfe`;
 - `loom-types` at `223110bee4be72386d79306b444517371e4a9930`;
-- W1 contracts, testkit, and vertical validator at
-  `3ed1f3235edb6d481c324f05fe83b2379e3431e6`.
+- imported W1 contracts, testkit, and vertical validator whose preserved source
+  head is `3ed1f3235edb6d481c324f05fe83b2379e3431e6`.
 
 The test suite executes the shared deterministic lifecycle reference suite and
-authenticates all eighteen accepted vertical manifests from the exact W1 Cargo
-Git checkout against the accepted lock.
+authenticates all eighteen accepted vertical manifests directly from the
+byte-identical imported W1 source against the accepted lock.
 
 ## Exhaustive portable-library probes
 

@@ -627,8 +627,8 @@ mod tests {
 mod w1_tests {
     use super::*;
     use platform_vertical_fixtures_v0::{
-        EquivalenceProjectionV0, ObservationEnvelopeV0, VerticalFixtureManifestV0, sha256_identity,
-        validate_baseline, validate_manifest,
+        EquivalenceProjectionV0, GitSourceV0, ObservationEnvelopeV0, VerticalFixtureManifestV0,
+        compare_candidate, sha256_identity, validate_manifest,
     };
     use serde::Deserialize;
     use serde_json::{Value, json};
@@ -712,7 +712,14 @@ mod w1_tests {
         &bytes[..position + 1]
     }
 
-    fn verify_production_source() {
+    fn append_candidate_file(candidate: &mut Vec<u8>, path: &str, bytes: &[u8]) {
+        candidate.extend_from_slice(&(path.len() as u64).to_be_bytes());
+        candidate.extend_from_slice(path.as_bytes());
+        candidate.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        candidate.extend_from_slice(bytes);
+    }
+
+    fn verify_production_source() -> (GitSourceV0, Vec<u8>) {
         let descriptor: SourceDescriptor =
             serde_json::from_slice(SOURCE_BYTES).expect("source descriptor");
         assert_eq!(descriptor.schema, "delysis.production_source_roots.v0");
@@ -735,7 +742,8 @@ mod w1_tests {
             "fixture commit must descend from baseline"
         );
 
-        for prefix in descriptor.prefixes {
+        let mut candidate_bytes = b"delysis.fte.database.production.candidate.v0\n".to_vec();
+        for prefix in &descriptor.prefixes {
             assert_eq!(prefix.boundary, "first_cfg_test");
             let current = std::fs::read(repository.join(&prefix.path)).expect("read source");
             let baseline = git_output(
@@ -745,27 +753,48 @@ mod w1_tests {
                     &revision_path(imported, baseline_commit, &prefix.path),
                 ],
             );
-            for bytes in [production_prefix(&current), production_prefix(&baseline)] {
-                let identity = sha256_identity("fte.database.production.prefix", bytes);
-                assert_eq!(identity.digest.hex, prefix.sha256);
-                assert_eq!(identity.length, prefix.byte_len);
-            }
+            let baseline_identity = sha256_identity(
+                "fte.database.production.prefix",
+                production_prefix(&baseline),
+            );
+            assert_eq!(baseline_identity.digest.hex, prefix.sha256);
+            assert_eq!(baseline_identity.length, prefix.byte_len);
+            let head = git_output(
+                &repository,
+                &["show", &revision_path(imported, "HEAD", &prefix.path)],
+            );
+            assert_eq!(
+                production_prefix(&current),
+                production_prefix(&head),
+                "candidate production source must match HEAD"
+            );
+            append_candidate_file(
+                &mut candidate_bytes,
+                &prefix.path,
+                production_prefix(&current),
+            );
         }
 
-        for (path, expected_oid) in descriptor.git_blobs {
+        for (path, expected_oid) in &descriptor.git_blobs {
             let working_tree =
-                git_output(&repository, &["hash-object", "--no-filters", "--", &path]);
+                git_output(&repository, &["hash-object", "--no-filters", "--", path]);
             assert_eq!(
-                String::from_utf8(working_tree).unwrap().trim(),
-                expected_oid
-            );
-            for revision in [baseline_commit, "HEAD"] {
-                let actual = git_output(
+                String::from_utf8(working_tree.clone()).unwrap().trim(),
+                String::from_utf8(git_output(
                     &repository,
-                    &["rev-parse", &revision_path(imported, revision, &path)],
-                );
-                assert_eq!(String::from_utf8(actual).unwrap().trim(), expected_oid);
-            }
+                    &["rev-parse", &revision_path(imported, "HEAD", path)],
+                ))
+                .unwrap()
+                .trim(),
+                "candidate blob must match HEAD"
+            );
+            let baseline = git_output(
+                &repository,
+                &["rev-parse", &revision_path(imported, baseline_commit, path)],
+            );
+            assert_eq!(String::from_utf8(baseline).unwrap().trim(), expected_oid);
+            let bytes = std::fs::read(repository.join(path)).expect("read candidate blob");
+            append_candidate_file(&mut candidate_bytes, path, &bytes);
         }
 
         for path in descriptor.absent_paths {
@@ -786,6 +815,20 @@ mod w1_tests {
                 );
             }
         }
+        let commit = String::from_utf8(git_output(&repository, &["rev-parse", "HEAD"]))
+            .expect("HEAD is UTF-8")
+            .trim()
+            .to_owned();
+        let production_tree =
+            sha256_identity("fte.database.production.candidate", &candidate_bytes);
+        (
+            GitSourceV0 {
+                repository_id: descriptor.repository_id,
+                commit,
+                production_tree,
+            },
+            candidate_bytes,
+        )
     }
 
     fn temporary_database(label: &str) -> PathBuf {
@@ -837,7 +880,7 @@ mod w1_tests {
             ),
             manifest.negative_evidence[0].artifact
         );
-        verify_production_source();
+        let (candidate_source, candidate_source_bytes) = verify_production_source();
 
         let policy: Value = serde_json::from_slice(POLICY_BYTES).expect("parse database policy");
         assert_eq!(policy["historical_database_available"], false);
@@ -1030,13 +1073,13 @@ mod w1_tests {
             "schema": "delysis.vertical_observation.v0",
             "vertical_id": manifest.vertical_id,
             "case_id": case.case_id,
-            "implementation_revision": case.source.commit,
+            "implementation_revision": candidate_source.commit,
             "observed_prerequisites": [],
             "evidence": {
                 "schema": "delysis.evidence_claim.v0",
                 "tier": "reproducible",
                 "threat_model": "production database opening rejects generated unsupported-input sentinels without claiming historical migration equivalence",
-                "exact_source": case.source.production_tree.digest,
+                "exact_source": candidate_source.production_tree.digest,
                 "exact_runtime_or_artifact": case.inputs[0].identity.digest,
                 "execution_kind": "fixture",
                 "omitted_claims": manifest.omitted_claims,
@@ -1045,10 +1088,12 @@ mod w1_tests {
             "projection": projection
         }))
         .expect("construct database observation");
-        validate_baseline(
+        compare_candidate(
             &manifest,
             &case.case_id,
             PROJECTION_BYTES,
+            &candidate_source,
+            &candidate_source_bytes,
             &[],
             &observation,
         )

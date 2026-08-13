@@ -4068,7 +4068,7 @@ mod tests {
                 "exact_source": case.source.production_tree.digest,
                 "exact_runtime_or_artifact": input.digest,
                 "execution_kind": "fixture",
-                "omitted_claims": ["live hosted-provider behavior"],
+                "omitted_claims": manifest.omitted_claims,
                 "negative_evidence": [],
             },
             "projection": actual_projection,

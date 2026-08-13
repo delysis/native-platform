@@ -1,0 +1,112 @@
+{
+  "ordered_events": [
+    {
+      "sequence": 0,
+      "operation_id": "mom_llama_chat_send:2",
+      "attempt_id": "mom_llama_chat_send:2#attempt-41",
+      "correlation_id": "mom-w1-quit-relaunch",
+      "kind": "admission_closed",
+      "payload": null
+    },
+    {
+      "sequence": 1,
+      "operation_id": "mom_llama_chat_send:2",
+      "attempt_id": "mom_llama_chat_send:2#attempt-41",
+      "correlation_id": "mom-w1-quit-relaunch",
+      "kind": "cancellation_requested",
+      "payload": null
+    },
+    {
+      "sequence": 2,
+      "operation_id": "mom_llama_chat_send:2",
+      "attempt_id": "mom_llama_chat_send:2#attempt-41",
+      "correlation_id": "mom-w1-quit-relaunch",
+      "kind": "cancelled",
+      "payload": null
+    },
+    {
+      "sequence": 3,
+      "operation_id": "mom_llama_chat_send:2",
+      "attempt_id": "mom_llama_chat_send:2#attempt-41",
+      "correlation_id": "mom-w1-quit-relaunch",
+      "kind": "worker_joined",
+      "payload": null
+    },
+    {
+      "sequence": 4,
+      "operation_id": "mom_llama_chat_send:2",
+      "attempt_id": "mom_llama_chat_send:2#attempt-42",
+      "correlation_id": "mom-w1-quit-relaunch",
+      "kind": "completed",
+      "payload": null
+    },
+    {
+      "sequence": 5,
+      "operation_id": "mom_llama_chat_send:2",
+      "attempt_id": "mom_llama_chat_send:2#attempt-42",
+      "correlation_id": "mom-w1-quit-relaunch",
+      "kind": "worker_joined",
+      "payload": null
+    }
+  ],
+  "durable_state": [
+    {
+      "state_id": "mom.drafts.store",
+      "schema_id": "runtime.sqlite3/encrypted_documents.v1",
+      "before": {
+        "id": "mom.quit-relaunch.draft",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "bd2d666b44aba47b163a62d2c3e20e3b13149a55bdf1b906bca2dfef7c715596"
+        },
+        "length": 59
+      },
+      "after": {
+        "id": "mom.quit-relaunch.draft",
+        "digest": {
+          "algorithm": "sha256",
+          "hex": "bd2d666b44aba47b163a62d2c3e20e3b13149a55bdf1b906bca2dfef7c715596"
+        },
+        "length": 59
+      },
+      "disposition": "unchanged"
+    }
+  ],
+  "lifecycle": [
+    {
+      "operation_id": "mom_llama_chat_send:2",
+      "attempt_id": "mom_llama_chat_send:2#attempt-41",
+      "correlation_id": "mom-w1-quit-relaunch",
+      "terminal": "cancelled",
+      "released": true
+    },
+    {
+      "operation_id": "mom_llama_chat_send:2",
+      "attempt_id": "mom_llama_chat_send:2#attempt-42",
+      "correlation_id": "mom-w1-quit-relaunch",
+      "terminal": "completed",
+      "released": true
+    }
+  ],
+  "ownership": {
+    "active_operations": 0,
+    "retained_tasks": 0,
+    "expected_workers": 2,
+    "joined_workers": 2
+  },
+  "output_facts": {
+    "first_application_work_drained": { "kind": "boolean", "value": true },
+    "first_gateway_drained": { "kind": "boolean", "value": true },
+    "first_native_host_joined": { "kind": "boolean", "value": true },
+    "first_worker_id": { "kind": "text", "value": "mom-operation-worker-41" },
+    "fresh_worker_id": { "kind": "text", "value": "mom-operation-worker-42" },
+    "fresh_runtime_admitted_work": { "kind": "boolean", "value": true },
+    "same_durable_state_reopened": { "kind": "boolean", "value": true },
+    "worker_epochs_distinct": { "kind": "boolean", "value": true },
+    "zero_orphan_workers": { "kind": "boolean", "value": true }
+  },
+  "fail_closed_facts": [
+    "quit closed admission before the active owner published its terminal",
+    "fresh runtime did not reuse the closed supervisor lifetime"
+  ]
+}

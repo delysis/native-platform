@@ -18,6 +18,7 @@ members = [
     "xtask",
 ]
 exclude = [
+    "crates/platform/contracts",
     "crates/services/attachment",
     "crates/services/information",
     "crates/services/speech",
@@ -86,9 +87,9 @@ speech-native-backend-parakeet-current = { package = "speech-native-backend-para
 information-native-types-current = { package = "information-native-types", path = "crates/services/information/crates/information-native-types" }
 information-native-host-current = { package = "information-native-host", path = "crates/services/information/crates/information-native-host" }
 loom-types-current = { package = "loom-types", git = "https://github.com/delysis/loom-native", rev = "223110bee4be72386d79306b444517371e4a9930" }
-platform-contracts-v0-current = { package = "platform-contracts-v0", git = "https://github.com/delysis/w1-platform-contracts", rev = "3ed1f3235edb6d481c324f05fe83b2379e3431e6" }
-platform-contract-testkit-current = { package = "platform-contract-testkit", git = "https://github.com/delysis/w1-platform-contracts", rev = "3ed1f3235edb6d481c324f05fe83b2379e3431e6" }
-platform-vertical-fixtures-v0-current = { package = "platform-vertical-fixtures-v0", git = "https://github.com/delysis/w1-platform-contracts", rev = "3ed1f3235edb6d481c324f05fe83b2379e3431e6" }
+platform-contracts-v0-current = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
+platform-contract-testkit-current = { package = "platform-contract-testkit", path = "crates/platform/contracts/crates/platform-contract-testkit" }
+platform-vertical-fixtures-v0-current = { package = "platform-vertical-fixtures-v0", path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

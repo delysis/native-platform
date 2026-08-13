@@ -10,7 +10,6 @@ accepted_lifecycle_revision="cbab33555ab9355a6ac453d659c55ec9e0666821"
 accepted_vertical_revision="fc24ffff08c52690390b4460f44617d5d9732563"
 lifecycle_revision="$W1_PLATFORM_CONTRACTS_REV"
 vertical_revision="$W1_VERTICAL_FIXTURES_REV"
-repository="https://github.com/delysis/w1-platform-contracts"
 for revision in "$lifecycle_revision" "$vertical_revision"; do
   if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
     echo "Wave 1 pin is not an exact 40-hex revision: $revision" >&2
@@ -34,19 +33,21 @@ manifest_lines="$({
   find "$product_root" \
     \( -path '*/.git' -o -path '*/target' \) -prune -o \
     -name Cargo.toml \
-    -exec grep -H -F "$repository" {} +
+    -exec grep -H -E 'platform-(contract-testkit|vertical-fixtures-v0)[[:space:]]*=[[:space:]]*\{[[:space:]]*path[[:space:]]*=' {} +
 } 2>/dev/null || true)"
 manifest_count="$(printf '%s\n' "$manifest_lines" | grep -c . || true)"
 if [[ "$manifest_count" -ne 4 ]]; then
   echo "expected four Wave 1 test-only dependency declarations, found $manifest_count" >&2
   exit 1
 fi
-if printf '%s\n' "$manifest_lines" | grep -Eq 'branch[[:space:]]*=|tag[[:space:]]*='; then
-  echo "Wave 1 contract dependency must not use a branch or tag" >&2
+if grep -R -n -F --include='Cargo.toml' --include='Cargo.lock' \
+  'github.com/delysis/w1-platform-contracts' "$product_root" "$lockfile"; then
+  echo "external Wave 1 contract source remains" >&2
   exit 1
 fi
-lifecycle_declaration="platform-contract-testkit = { git = \"$repository\", rev = \"$lifecycle_revision\", optional = true }"
-vertical_declaration="platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }"
+lifecycle_declaration='platform-contract-testkit = { path = "../../../../crates/platform/contracts/crates/platform-contract-testkit", optional = true }'
+vertical_declaration='platform-vertical-fixtures-v0 = { path = "../../../../crates/platform/contracts/crates/platform-vertical-fixtures-v0", optional = true }'
+app_vertical_declaration='platform-vertical-fixtures-v0 = { path = "../../../crates/platform/contracts/crates/platform-vertical-fixtures-v0", optional = true }'
 if printf '%s\n' "$manifest_lines" | grep -Eq '^[^:]+:[[:space:]]*#'; then
   echo "commented Wave 1 dependencies do not satisfy the pin policy" >&2
   exit 1
@@ -55,26 +56,17 @@ if [[ "$(printf '%s\n' "$manifest_lines" | grep -Fc "$lifecycle_declaration")" -
   echo "Wave 1 lifecycle dependency does not use its accepted revision exactly once" >&2
   exit 1
 fi
-if [[ "$(printf '%s\n' "$manifest_lines" | grep -Fc "$vertical_declaration")" -ne 3 ]]; then
-  echo "Wave 1 vertical dependency does not use its protocol revision exactly three times" >&2
+if [[ "$(printf '%s\n' "$manifest_lines" | grep -Fc "$vertical_declaration")" -ne 2 ]] \
+  || [[ "$(printf '%s\n' "$manifest_lines" | grep -Fc "$app_vertical_declaration")" -ne 1 ]]; then
+  echo "Wave 1 vertical dependencies are not rebound to the imported local package" >&2
   exit 1
 fi
 if printf '%s\n' "$manifest_lines" \
   | grep -Fv "$lifecycle_declaration" \
   | grep -Fv "$vertical_declaration" \
+  | grep -Fv "$app_vertical_declaration" \
   | grep -q .; then
   echo "unrecognized Wave 1 dependency declaration" >&2
-  exit 1
-fi
-
-lifecycle_lock_count="$(grep -Fc "?rev=$lifecycle_revision#$lifecycle_revision" "$lockfile" || true)"
-if [[ "$lifecycle_lock_count" -ne 2 ]]; then
-  echo "Cargo.lock has $lifecycle_lock_count lifecycle package sources, expected 2" >&2
-  exit 1
-fi
-vertical_lock_count="$(grep -Fc "?rev=$vertical_revision#$vertical_revision" "$lockfile" || true)"
-if [[ "$vertical_lock_count" -ne 2 ]]; then
-  echo "Cargo.lock has $vertical_lock_count vertical package sources, expected 2" >&2
   exit 1
 fi
 
@@ -86,4 +78,4 @@ if find "$product_root" \
   exit 1
 fi
 
-echo "Wave 1 pins coherent: lifecycle=$lifecycle_revision vertical=$vertical_revision"
+echo "Wave 1 contracts are local; historical lifecycle=$lifecycle_revision vertical=$vertical_revision"

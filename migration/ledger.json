@@ -173,9 +173,9 @@
         }
       ],
       "destination_prefix": "crates/platform/contracts",
-      "import_commit": null,
-      "path_dependency_cutover_commit": null,
-      "old_repo_status": "active",
+      "import_commit": "018aa483dbe34ecb3a62f70adc6bfebe99684acc",
+      "path_dependency_cutover_commit": "1c79381f9111dfd2d266291db243c7a5091a7fe4",
+      "old_repo_status": "frozen_unarchived_two_release_retirement",
       "migration_role": "first_party_import"
     }
   ],

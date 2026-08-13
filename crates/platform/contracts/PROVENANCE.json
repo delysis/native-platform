@@ -1,0 +1,33 @@
+{
+  "schema": "delysis.w1_contract_source_provenance.v0",
+  "status": "temporary_non_production_contract_source",
+  "created_at": "2026-08-12",
+  "source_packet": "/Users/george/Downloads/delysis-phase1-reaudit-2026-08-11",
+  "bound_evidence": [
+    {
+      "path": "W1-ADRS-RECEIPT.json",
+      "sha256": "42daf8038a557cbd2523c8891708ee1919cdd61521724bcd6e6eac90ce82c42a"
+    },
+    {
+      "path": "PHASE1-LOCK-MANIFEST.json",
+      "sha256": "5b40ff08b7dbd37e97a44d61f446dcc72fa0e8b38c20400c33bd50bddcd94db2"
+    },
+    {
+      "path": "R8-FINAL-RECEIPT.json",
+      "sha256": "e44d474091b45d425414ba96e45552df2d3d05cc790a12134fd5f297fc4df939"
+    },
+    {
+      "path": "CURRENT-HEADS.json",
+      "sha256": "b16fe9fe1f7f54054f9dfbdcce3d778fa750ca6f636a2f58484e04ffd5e34437"
+    }
+  ],
+  "authority_limits": [
+    "serialized contracts and receipts do not mint live authority",
+    "fixtures do not establish live hosted-provider behavior",
+    "this repository is not a production runtime kit"
+  ],
+  "retirement": {
+    "gate": "after W2 imports this exact Git history into delysis/native-platform and all consumers replace immutable Git pins with monorepo paths",
+    "action": "archive this repository; do not delete its evidence history"
+  }
+}

@@ -266,6 +266,7 @@ jobs:
       - run: cargo run --locked -p xtask -- loom-probe
       - run: ./scripts/check-native-import-history.sh
       - run: ./scripts/check-service-import-history.sh
+      - run: ./scripts/check-contract-import-history.sh
 
   fuzz-build:
     runs-on: ubuntu-latest
