@@ -158,15 +158,27 @@
     },
     {
       "path": "migration/loom-import.json",
-      "length": 6670,
-      "sha256": "f733c6af59e6d1dae3b8b9431c90ea308293a43f98198b9b95b7d967e0e38ff0",
+      "length": 7157,
+      "sha256": "69c04ec99bf6f391ec85dbfa18a12bf0c364020f312e390fcfb6135ae0fa5910",
       "purpose": "Loom import and local acceptance receipt"
     },
     {
       "path": "docs/migration/W7-LOOM-EVIDENCE.md",
-      "length": 4727,
-      "sha256": "32568cdfe055bb73f415c34ff5f56ef3d1083286953d032a536a84a1a123ab66",
-      "purpose": "W7 local acceptance narrative"
+      "length": 5665,
+      "sha256": "0b86b3392b62e3445e851f3910d96681f834e9b3891ffcc2bd7980e6219694a3",
+      "purpose": "W7 accepted promotion and source-freeze narrative"
+    },
+    {
+      "path": "migration/home.json",
+      "length": 6902,
+      "sha256": "01be6f108122a8e2201745abaa9f6b818a98b4c1b4827e1a7c7475c4d995aa32",
+      "purpose": "W8 HOME local acceptance receipt"
+    },
+    {
+      "path": "docs/migration/HOME-EVIDENCE.md",
+      "length": 5777,
+      "sha256": "610a01c55139f4439ee6ac287262768fd30c527da9194839349c8c4e0aa374bd",
+      "purpose": "W8 HOME local acceptance narrative"
     }
   ]
 }

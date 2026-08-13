@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "goal": "W7-IMPORT-LOOM",
-  "status": "local_accepted_pending_github_promotion",
+  "status": "accepted",
   "sealed_at": "2026-08-13T10:58:49Z",
   "source": {
     "repository": "https://github.com/delysis/loom-native.git",
@@ -126,18 +126,24 @@
     }
   },
   "promotion": {
-    "candidate_ci_run": null,
-    "main_merge": null,
-    "final_tag": null,
-    "final_tag_object": null,
-    "tag_ruleset": null
+    "candidate_ci_run": 31693665960,
+    "required_policy_job": 94426458613,
+    "required_macos_job": 94426458695,
+    "main_merge": "99c49908ef8ccdb39fbbb1f710331e8a4161bc43",
+    "final_tag": "w7-import-loom-v0-2026-08-13",
+    "final_tag_object": "87e59891465545962ee06b7033634265acaefbbc",
+    "tag_ruleset": 20794241
   },
   "source_freeze": {
-    "status": "pending W7 acceptance tag",
-    "boundary_tag": null,
-    "readme_only_commit": null,
-    "source_ci_run": null,
-    "hard_freeze_ruleset": null,
+    "status": "frozen_unarchived_two_release_retirement",
+    "boundary_tag": "native-platform-v2-horizon-b-2026-08-12",
+    "boundary_tag_object": "39580736ad0f3bace6753ba83cdb5ffe25571274",
+    "boundary_tag_ruleset": 20794265,
+    "readme_only_commit": "5fc31a787d208586951afec88bc11a975170fe37",
+    "source_ci_run": 31695560107,
+    "source_policy_job": 94432427919,
+    "source_runtime_macos_job": 94432481217,
+    "hard_freeze_ruleset": 20794407,
     "repository_archived": false
   },
   "claims_deferred_to_w8": [
@@ -149,6 +155,6 @@
     "GitHub-hosted Linux and Windows results are informational and are not W7 acceptance gates.",
     "The exact-Gemma vertical used CPU; the separately exercised product bundle loaded 36 of 36 layers through Metal.",
     "The app bundle is ad-hoc signed; no distribution-signing claim is made.",
-    "The source repository is not claimed frozen until the protected W7 tag exists."
+    "The source repository is frozen but intentionally remains unarchived through the two-release retirement window."
   ]
 }

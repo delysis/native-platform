@@ -620,6 +620,11 @@ fn check_ledger(root: &Path) -> Result<()> {
         .context("expected Loom migration entry")?;
     loom.import_commit = Some("19147c74bbe6335331f3fdad256663906c122dc3".into());
     loom.path_dependency_cutover_commit = Some("6cf468d277a88f085242bdaef017305e1148efda".into());
+    loom.source_tags.push(SourceTag {
+        name: "native-platform-v2-horizon-b-2026-08-12".into(),
+        peeled_commit: "223110bee4be72386d79306b444517371e4a9930".into(),
+    });
+    loom.old_repo_status = "frozen_unarchived_two_release_retirement".into();
     for (repository, import_commit) in [
         (
             "delysis/attachment-native-kit",
