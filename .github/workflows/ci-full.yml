@@ -134,8 +134,6 @@ jobs:
           components: clippy
       - run: cargo test --locked -p information-native-acquire --features unstable-w1-contracts
       - run: cargo test --locked -p information-native-host --features unstable-w1-vertical-tests --test w1_vertical
-      - run: cargo test --locked -p tauri-plugin-information-native --all-targets
-      - run: cargo clippy --locked -p tauri-plugin-information-native --all-targets --all-features -- -D warnings
 
   speech:
     strategy:

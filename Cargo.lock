@@ -1137,15 +1137,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "command-evidence"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "compact_str"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7156,22 +7147,6 @@ dependencies = [
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",
  "url",
-]
-
-[[package]]
-name = "tauri-plugin-information-native"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "information-native-catalog",
- "information-native-host",
- "information-native-retrieval",
- "information-native-store",
- "information-native-types",
- "serde",
- "serde_json",
- "tauri",
- "tauri-plugin",
 ]
 
 [[package]]

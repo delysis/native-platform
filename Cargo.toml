@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/native/crates/command-evidence",
     "crates/native/crates/llama-native-cache",
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
@@ -25,7 +24,6 @@ members = [
     "crates/services/information/crates/information-native-retrieval",
     "crates/services/information/crates/information-native-store",
     "crates/services/information/crates/information-native-types",
-    "crates/services/information/crates/tauri-plugin-information-native",
     "crates/services/speech/crates/speech-native-backend-parakeet",
     "crates/services/speech/crates/speech-native-host",
     "crates/services/speech/crates/speech-native-platform",

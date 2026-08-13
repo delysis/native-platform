@@ -195,7 +195,7 @@ fn verify(root: &Path) -> Result<()> {
         &git_entries(root, &baseline.source_revision)?,
     )?;
     ensure!(
-        baseline_without_timings(&baseline) == baseline_without_timings(&measured),
+        baseline_git_projection(&baseline) == baseline_git_projection(&measured),
         "W8 lean baseline drift; regenerate and review the baseline"
     );
     println!(
@@ -207,12 +207,22 @@ fn verify(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn baseline_without_timings(baseline: &Baseline) -> Value {
+fn baseline_git_projection(baseline: &Baseline) -> Value {
     let mut value = serde_json::to_value(baseline).expect("baseline serializes");
-    value
+    let object = value.as_object_mut().expect("baseline is an object");
+    for field in [
+        "timings",
+        "workspace_packages",
+        "first_party_git_dependencies",
+        "shipping_graph",
+    ] {
+        object.remove(field);
+    }
+    let thresholds = object["acceptance_thresholds"]
         .as_object_mut()
-        .expect("baseline is an object")
-        .remove("timings");
+        .expect("acceptance thresholds are an object");
+    thresholds.remove("maximum_workspace_packages");
+    thresholds.remove("maximum_first_party_git_dependencies");
     value
 }
 

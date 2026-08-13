@@ -5,7 +5,6 @@
       "platform-contracts-v0"
     ],
     "native": [
-      "command-evidence",
       "llama-native-cache",
       "llama-native-engine",
       "llama-native-host",
@@ -39,8 +38,7 @@
       "information-native-host",
       "information-native-retrieval",
       "information-native-store",
-      "information-native-types",
-      "tauri-plugin-information-native"
+      "information-native-types"
     ],
     "service-speech": [
       "speech-native-backend-parakeet",
@@ -98,7 +96,6 @@
       "attachment-native-inspect",
       "attachment-native-plan",
       "attachment-native-types",
-      "command-evidence",
       "fte-loopback",
       "fte-protocols",
       "fte-providers",

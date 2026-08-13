@@ -38,8 +38,6 @@ materialization or query backends remain future work.
 - `information-native-host`: immutable composition root and agent-tool surface.
 - `information-native-cli`: an operator oracle for catalogues, installs,
   imports, queries, and receipts.
-- `tauri-plugin-information-native`: optional Tauri 2 IPC with narrow permission
-  sets.
 
 ## Principles
 
