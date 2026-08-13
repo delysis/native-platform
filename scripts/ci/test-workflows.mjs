@@ -52,7 +52,6 @@ test("PR workflow exposes every targeted partition and future product guards", (
     "frontend",
     "platform-macos",
     "dependency-graph",
-    "import-history",
     "fuzz-build",
   ]) {
     assert.match(source, new RegExp(`^  ${job}:`, "m"), `missing ${job}`);

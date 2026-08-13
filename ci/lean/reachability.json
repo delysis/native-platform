@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_revision": "52765e2e4a2265eaec0f53fd3dfa433362e40b98",
+  "source_revision": "058c4622fac8813417a5e6637091e63e1ef01ea2",
   "source_tree": "fb0362faf422090ec8d8f936d5b31b95da0b01ac",
   "basis": {
     "package_graph": "cargo metadata --no-deps --locked --format-version 1",

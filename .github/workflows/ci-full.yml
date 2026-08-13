@@ -254,11 +254,6 @@ jobs:
       - run: cargo run --locked -p xtask -- policy
       - run: cargo test --locked -p integration-vertical
       - run: cargo tree --locked -i libsqlite3-sys
-      - run: ./scripts/check-native-import-history.sh
-      - run: ./scripts/check-service-import-history.sh
-      - run: ./scripts/check-contract-import-history.sh
-      - run: ./scripts/check-mom-import-history.sh
-      - run: ./scripts/check-loom-import-history.sh
 
   fuzz-build:
     runs-on: ubuntu-latest

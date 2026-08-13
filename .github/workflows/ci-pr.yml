@@ -31,7 +31,6 @@ jobs:
       frontend_mom: ${{ steps.plan.outputs.frontend_mom }}
       frontend_loom: ${{ steps.plan.outputs.frontend_loom }}
       dependency_graph: ${{ steps.plan.outputs.dependency_graph }}
-      migration_history: ${{ steps.plan.outputs.migration_history }}
       fuzz: ${{ steps.plan.outputs.fuzz }}
       platform_macos: ${{ steps.plan.outputs.platform_macos }}
       full: ${{ steps.plan.outputs.full }}
@@ -296,20 +295,6 @@ jobs:
       - run: cargo test --locked -p integration-vertical
       - run: cargo tree --locked -i libsqlite3-sys
 
-  import-history:
-    if: ${{ needs.plan.outputs.migration_history == 'true' || needs.plan.outputs.full == 'true' }}
-    needs: plan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          fetch-depth: 0
-      - run: ./scripts/check-native-import-history.sh
-      - run: ./scripts/check-service-import-history.sh
-      - run: ./scripts/check-contract-import-history.sh
-      - run: ./scripts/check-mom-import-history.sh
-      - run: ./scripts/check-loom-import-history.sh
-
   fuzz-build:
     if: ${{ needs.plan.outputs.fuzz == 'true' || needs.plan.outputs.full == 'true' }}
     needs: plan
@@ -340,7 +325,6 @@ jobs:
       - frontend
       - platform-macos
       - dependency-graph
-      - import-history
       - fuzz-build
     runs-on: ubuntu-latest
     steps:

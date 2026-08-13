@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "milestone": "W8-HOME",
-  "source_revision": "52765e2e4a2265eaec0f53fd3dfa433362e40b98",
+  "source_revision": "058c4622fac8813417a5e6637091e63e1ef01ea2",
   "source_tree": "fb0362faf422090ec8d8f936d5b31b95da0b01ac",
   "metric_contract": {
     "nonblank_line": "UTF-8-lossy logical lines whose trimmed form is nonempty; files are assigned wholly by path class",
@@ -208,9 +208,9 @@
   "timings": {
     "local_workspace_build_ms": 62480,
     "local_build_cache_state": "The W9 worktree target contained only xtask artifacts; Cargo compiled the product graph and reported 62 seconds. This is a reproducible local reference, not a clean-room benchmark.",
-    "required_ci_wall_ms": null,
-    "note": "Populate from a timed W8 worktree build and the required W8 policy/macOS workflow timestamps; null is pending measurement, never zero."
+    "required_ci_wall_ms": 1714000,
+    "note": "Local build is a reproducible reference, not a clean-room benchmark. Required CI wall is from W8 run 31739376767 creation at 20:08:38Z to exact-head macOS success at 20:37:12Z; informational Linux failure is excluded from the Mac-first gate."
   },
   "classification_sha256": "44d847997e1b7f0687cf3b006f9c1743fb1446d5ce0f70c4cbaed7c667fe0f66",
-  "reachability_sha256": "a32c1a49d2d0f7c6414135f9066c9ca0065ff34ea0cd342d74e833a0d4b921be"
+  "reachability_sha256": "ab610e0adcc4bebcfbf056c965b092aee17d7af018ad820198671852518a7884"
 }

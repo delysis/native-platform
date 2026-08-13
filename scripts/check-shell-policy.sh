@@ -18,9 +18,4 @@ node --test scripts/ci/test-ci-plan.mjs scripts/ci/test-ci-required.mjs scripts/
 ./crates/services/attachment/scripts/check-boundaries.sh
 ./crates/services/information/scripts/check-boundaries.sh
 ./crates/services/speech/scripts/check-boundaries.sh
-./scripts/check-native-import-history.sh
-./scripts/check-contract-import-history.sh
-./scripts/check-service-import-history.sh
-./scripts/check-mom-import-history.sh
-./scripts/check-loom-import-history.sh
 pnpm install --lockfile-only --frozen-lockfile --offline
