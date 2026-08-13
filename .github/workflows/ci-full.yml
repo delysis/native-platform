@@ -1,0 +1,286 @@
+name: ci-full
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-full-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUSTUP_TOOLCHAIN: "1.92.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    outputs:
+      mom: ${{ steps.inventory.outputs.mom }}
+      loom: ${{ steps.inventory.outputs.loom }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - id: inventory
+        shell: bash
+        run: |
+          if test -f products/mom/Cargo.toml || test -f products/mom/crates/mom-llama-runtime/Cargo.toml; then
+            echo "mom=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mom=false" >> "$GITHUB_OUTPUT"
+          fi
+          if test -f products/loom/Cargo.toml; then
+            echo "loom=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "loom=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  root:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+      - name: Install desktop system dependencies on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libayatana-appindicator3-dev libglib2.0-dev libgtk-3-dev \
+            librsvg2-dev libwebkit2gtk-4.1-dev patchelf pkg-config
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.92.0"
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: full-root-${{ runner.os }}
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked --workspace --all-targets
+      - name: Native W1 lifecycle and vertical contracts
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p llama-native-engine --features unstable-w1-contract-tests,unstable-w1-vertical-tests --all-targets
+      - if: runner.os == 'Linux'
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  attachment:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.92.0"
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: full-attachment-${{ runner.os }}
+          workspaces: crates/services/attachment -> target
+      - run: cargo fmt --manifest-path crates/services/attachment/Cargo.toml --all -- --check
+      - run: cargo test --locked --manifest-path crates/services/attachment/Cargo.toml --workspace --all-targets
+      - if: runner.os == 'Linux'
+        run: cargo clippy --locked --manifest-path crates/services/attachment/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+
+  information-portable:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.92.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: full-information-${{ runner.os }}
+          workspaces: crates/services/information -> target
+      - working-directory: crates/services/information
+        run: |
+          ./scripts/check-portable-packages.sh
+          ./scripts/run-portable-cargo.sh test
+      - if: runner.os == 'Linux'
+        working-directory: crates/services/information
+        run: ./scripts/run-portable-cargo.sh clippy
+
+  information-platform-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libayatana-appindicator3-dev libglib2.0-dev libgtk-3-dev \
+            librsvg2-dev libwebkit2gtk-4.1-dev patchelf pkg-config
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.92.0"
+          components: clippy
+      - run: cargo test --locked --manifest-path crates/services/information/Cargo.toml -p information-native-acquire --features unstable-w1-contracts
+      - run: cargo test --locked --manifest-path crates/services/information/Cargo.toml -p information-native-host --features unstable-w1-vertical-tests --test w1_vertical
+      - run: cargo test --locked --manifest-path crates/services/information/Cargo.toml -p tauri-plugin-information-native --all-targets
+      - run: cargo clippy --locked --manifest-path crates/services/information/Cargo.toml -p tauri-plugin-information-native --all-targets --all-features -- -D warnings
+
+  speech:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.92.0"
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: full-speech-${{ runner.os }}
+          workspaces: crates/services/speech -> target
+      - run: cargo fmt --manifest-path crates/services/speech/Cargo.toml --all -- --check
+      - run: cargo test --locked --manifest-path crates/services/speech/Cargo.toml --workspace --all-targets
+      - name: Speech W1 contracts
+        if: runner.os == 'Linux'
+        run: cargo test --locked --manifest-path crates/services/speech/Cargo.toml -p speech-native-host --all-targets --features unstable-w1-contract-tests,unstable-w1-vertical-tests
+      - if: runner.os == 'Linux'
+        run: cargo clippy --locked --manifest-path crates/services/speech/Cargo.toml --workspace --all-targets -- -D warnings -A clippy::collapsible-if
+
+  mom:
+    if: ${{ needs.inventory.outputs.mom == 'true' }}
+    needs: inventory
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.92.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: full-mom-${{ runner.os }}
+      - run: cargo test --locked -p mom-llama-runtime -p mom-llama-cli -p mom-llama-app --all-targets
+      - if: runner.os == 'Linux'
+        run: cargo clippy --locked -p mom-llama-runtime -p mom-llama-cli -p mom-llama-app --all-targets -- -D warnings
+
+  loom:
+    if: ${{ needs.inventory.outputs.loom == 'true' }}
+    needs: inventory
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.92.0"
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: full-loom-${{ runner.os }}
+          workspaces: products/loom -> target
+      - run: cargo fmt --manifest-path products/loom/Cargo.toml --all -- --check
+      - run: cargo test --locked --manifest-path products/loom/Cargo.toml --workspace --all-targets
+      - if: runner.os == 'Linux'
+        run: cargo clippy --locked --manifest-path products/loom/Cargo.toml --workspace --all-targets -- -D warnings
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - run: corepack enable
+      - run: corepack prepare pnpm@11.16.0 --activate
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r --if-present run test
+      - run: pnpm -r --if-present run check
+      - run: pnpm -r --if-present run build
+
+  policy-and-graphs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.92.0"
+      - run: node --test scripts/ci/test-ci-plan.mjs scripts/ci/test-ci-required.mjs scripts/ci/test-workflows.mjs
+      - run: ./crates/native/scripts/check-workflow-policy.sh .
+      - run: cargo run --locked -p xtask -- policy
+      - run: cargo check --locked -p integration-current --features current-product-graph
+      - run: cargo run --locked -p xtask -- loom-probe
+      - run: ./scripts/check-native-import-history.sh
+      - run: ./scripts/check-service-import-history.sh
+
+  fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: rustup toolchain install nightly-2026-07-26 --profile minimal
+      - run: rustup run nightly-2026-07-26 cargo install cargo-fuzz --version 0.13.2 --locked
+      - working-directory: crates/services/attachment
+        run: |
+          rustup run nightly-2026-07-26 cargo fuzz build inspect
+          rustup run nightly-2026-07-26 cargo fuzz build pipeline
+
+  full-summary:
+    if: always()
+    needs:
+      - inventory
+      - root
+      - attachment
+      - information-portable
+      - information-platform-linux
+      - speech
+      - mom
+      - loom
+      - frontend
+      - policy-and-graphs
+      - fuzz-build
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          CI_NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          node -e '
+            const needs = JSON.parse(process.env.CI_NEEDS_JSON);
+            const bad = Object.entries(needs).filter(([, value]) =>
+              !["success", "skipped"].includes(value.result)
+            );
+            if (bad.length > 0) {
+              console.error(bad);
+              process.exit(1);
+            }
+          '
