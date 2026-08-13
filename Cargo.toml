@@ -5,6 +5,12 @@ members = [
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
     "crates/native/crates/llama-native-types",
+    "crates/services/attachment/crates/attachment-native-cli",
+    "crates/services/attachment/crates/attachment-native-document",
+    "crates/services/attachment/crates/attachment-native-host",
+    "crates/services/attachment/crates/attachment-native-inspect",
+    "crates/services/attachment/crates/attachment-native-plan",
+    "crates/services/attachment/crates/attachment-native-types",
     "products/fte/crates/fte-backend-llama",
     "products/fte/crates/fte-loopback",
     "products/fte/crates/fte-protocols",
@@ -22,7 +28,6 @@ members = [
 ]
 exclude = [
     "crates/platform/contracts",
-    "crates/services/attachment",
     "crates/services/information",
     "crates/services/speech",
     # W7 keeps Loom isolated only because its rusqlite 0.39 / libsqlite3-sys
@@ -79,7 +84,26 @@ llama-native-engine = { path = "crates/native/crates/llama-native-engine" }
 llama-native-host = { path = "crates/native/crates/llama-native-host" }
 llama-native-types = { path = "crates/native/crates/llama-native-types" }
 attachment-native-host = { path = "crates/services/attachment/crates/attachment-native-host" }
+attachment-native-document = { path = "crates/services/attachment/crates/attachment-native-document" }
+attachment-native-inspect = { path = "crates/services/attachment/crates/attachment-native-inspect" }
+attachment-native-plan = { path = "crates/services/attachment/crates/attachment-native-plan" }
 attachment-native-types = { path = "crates/services/attachment/crates/attachment-native-types" }
+base64 = "0.22.1"
+crabz2 = { version = "0.2.0", default-features = false }
+csv = "1.4.0"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+hex = "0.4.3"
+html-to-markdown-rs = { version = "3.10.6", default-features = false }
+imagesize = { version = "0.15.0", default-features = false, features = ["bmp", "gif", "heif", "jpeg", "png", "tiff", "webp"] }
+infer = { version = "0.22.0", default-features = false, features = ["std"] }
+libarchive_oxide = { version = "=0.2.0", default-features = false, features = ["sevenz"] }
+lopdf = { version = "0.44.0", default-features = false }
+lzma-rust2 = { version = "0.18.1", default-features = false, features = ["std", "xz"] }
+mail-parser = { version = "0.11.5", default-features = false }
+quick-xml = { version = "0.41.0", default-features = false }
+ruzstd = { version = "0.9.0", default-features = false, features = ["hash", "std"] }
+tar = { version = "0.4.46", default-features = false }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2", "deflate64"] }
 fte-backend-llama = { path = "products/fte/crates/fte-backend-llama" }
 fte-router = { path = "products/fte/crates/fte-router" }
 fte-store = { path = "products/fte/crates/fte-store" }
