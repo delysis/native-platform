@@ -4043,6 +4043,12 @@ mod tests {
         assert!(js.contains("selectedConversationKind"));
         assert!(js.contains(r#"selectedConversationKind() === "persona_template""#));
         assert!(js.contains("const instantiated = await instantiatePersona(sourceConversation)"));
+        assert!(
+            js.contains(r#"if (sourceConversation === "default")"#)
+                && js.contains(r#"invoke("mom_llama_conversation_new", { title: "New chat" })"#)
+                && js.contains("conversation = created.result.id;"),
+            "the landing composer must materialize a real conversation before dispatch"
+        );
         assert!(js.contains("renderConsultGroups"));
         assert!(js.contains("refreshConsult()"));
         assert!(js.contains("scheduleSettingsAutosave"));

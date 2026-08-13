@@ -1880,7 +1880,14 @@
         let conversation = sourceConversation;
         const textarea = formField(form, "message");
         try {
-          if (selectedConversationKind() === "persona_template") {
+          if (sourceConversation === "default") {
+            const created = await invoke("mom_llama_conversation_new", { title: "New chat" });
+            report(created);
+            if (created?.status === "blocked" || !created?.result?.id) return;
+            conversation = created.result.id;
+            chat().dataset.currentConversation = conversation;
+            chat().dataset.conversationKind = "chat";
+          } else if (selectedConversationKind() === "persona_template") {
             if (attachmentIds.length) {
               report({
                 status: "blocked",
