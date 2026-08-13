@@ -29,6 +29,8 @@ use platform_vertical_fixtures_v0::{
 use serde::Deserialize;
 
 const BASELINE_COMMIT: &str = "949c0006b57f416190e2ae8ab84dc3a944d6b4d1";
+const FILTERED_BASELINE_COMMIT: &str = "70691d6ca225d3b2e2bab01a6d1d56cb270cb8e8";
+const IMPORTED_PREFIX: &str = "products/loom";
 const MANIFEST_BYTES: &[u8] = include_bytes!("../../../fixtures/w1/gemma-current-manifest-v0.json");
 const INPUT_BYTES: &[u8] = include_bytes!("../../../fixtures/w1/gemma-current-input-v0.json");
 const SOURCE_TREE_BYTES: &[u8] =
@@ -101,18 +103,20 @@ fn checked_in_source_tree() -> Vec<u8> {
             "crates/loom-backend-llama/src",
             "crates/loom-types/src",
         ])
-        .current_dir(workspace_root())
+        .current_dir(monorepo_root())
         .output()
         .expect("read baseline production tree");
     assert!(output.status.success(), "baseline commit must be available");
     output.stdout
 }
 
-fn workspace_root() -> PathBuf {
+fn monorepo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
-        .expect("workspace root")
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .expect("monorepo root")
         .to_owned()
 }
 
@@ -140,16 +144,34 @@ fn w1_current_exact_gemma_manifest_is_authenticated() {
     serde_json::from_slice::<EquivalenceProjectionV0>(EXPECTED_PROJECTION_BYTES)
         .expect("parse exact-Gemma projection");
 
+    let ancestry = Command::new("git")
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            FILTERED_BASELINE_COMMIT,
+            "HEAD",
+        ])
+        .current_dir(monorepo_root())
+        .status()
+        .expect("prove imported baseline ancestry");
+    assert!(
+        ancestry.success(),
+        "the imported source must descend from its prefix-filtered baseline"
+    );
+
+    let backend_source = format!("{IMPORTED_PREFIX}/crates/loom-backend-llama/src");
+    let types_source = format!("{IMPORTED_PREFIX}/crates/loom-types/src");
     let unchanged = Command::new("git")
         .args([
             "diff",
             "--quiet",
-            BASELINE_COMMIT,
+            FILTERED_BASELINE_COMMIT,
+            "HEAD",
             "--",
-            "crates/loom-backend-llama/src",
-            "crates/loom-types/src",
+            &backend_source,
+            &types_source,
         ])
-        .current_dir(workspace_root())
+        .current_dir(monorepo_root())
         .status()
         .expect("compare production sources to baseline");
     assert!(

@@ -13,6 +13,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 const BASELINE_COMMIT: &str = "a733508adcb1ef1e689e90ed0c8e410160cb602a";
+const FILTERED_BASELINE_COMMIT: &str = "579a0cfbb9041bfce3d0b485fb59910b4ec4d4fa";
+const IMPORTED_PREFIX: &str = "products/loom";
 const PRODUCTION_TREE: &[u8] =
     include_bytes!("../../../fixtures/w1/source/loom-production-tree-a733508.json");
 
@@ -302,20 +304,28 @@ fn w1_fixture_descendant_preserves_every_bound_production_source_root() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .expect("workspace root");
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .expect("monorepo root");
     let ancestry = Command::new("git")
-        .args(["merge-base", "--is-ancestor", BASELINE_COMMIT, "HEAD"])
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            FILTERED_BASELINE_COMMIT,
+            "HEAD",
+        ])
         .current_dir(repository)
         .status()
         .expect("execute git ancestry proof");
     assert!(
         ancestry.success(),
-        "fixture commit must descend from baseline"
+        "fixture commit must descend from its prefix-filtered baseline"
     );
 
     for (source_root, expected_oid) in descriptor.source_roots {
+        let imported_source_root = format!("{IMPORTED_PREFIX}/{source_root}");
         let output = Command::new("git")
-            .args(["rev-parse", &format!("HEAD:{source_root}")])
+            .args(["rev-parse", &format!("HEAD:{imported_source_root}")])
             .current_dir(repository)
             .output()
             .expect("read current source-root identity");
@@ -344,9 +354,14 @@ fn assert_tauri_plugin_delta_is_test_only(repository: &Path, actual_oid: &str, e
     }
     let baseline = git_blob(
         repository,
-        &format!("{BASELINE_COMMIT}:crates/tauri-plugin-loom/src/lib.rs"),
+        &format!(
+            "{FILTERED_BASELINE_COMMIT}:{IMPORTED_PREFIX}/crates/tauri-plugin-loom/src/lib.rs"
+        ),
     );
-    let current = git_blob(repository, "HEAD:crates/tauri-plugin-loom/src/lib.rs");
+    let current = git_blob(
+        repository,
+        &format!("HEAD:{IMPORTED_PREFIX}/crates/tauri-plugin-loom/src/lib.rs"),
+    );
     let test_module = concat!(
         "#[cfg(all(test, feature = \"unstable-w1-vertical-tests\"))]\n",
         "mod w1_vertical_fixture;\n",
@@ -360,10 +375,10 @@ fn assert_tauri_plugin_delta_is_test_only(repository: &Path, actual_oid: &str, e
         .args([
             "diff",
             "--name-only",
-            BASELINE_COMMIT,
+            FILTERED_BASELINE_COMMIT,
             "HEAD",
             "--",
-            "crates/tauri-plugin-loom/src",
+            "products/loom/crates/tauri-plugin-loom/src",
         ])
         .current_dir(repository)
         .output()
@@ -372,8 +387,8 @@ fn assert_tauri_plugin_delta_is_test_only(repository: &Path, actual_oid: &str, e
     assert_eq!(
         String::from_utf8(changed.stdout).expect("changed paths are UTF-8"),
         concat!(
-            "crates/tauri-plugin-loom/src/lib.rs\n",
-            "crates/tauri-plugin-loom/src/w1_vertical_fixture.rs\n",
+            "products/loom/crates/tauri-plugin-loom/src/lib.rs\n",
+            "products/loom/crates/tauri-plugin-loom/src/w1_vertical_fixture.rs\n",
         ),
         "tauri-plugin source delta must remain confined to the W1 test module"
     );
