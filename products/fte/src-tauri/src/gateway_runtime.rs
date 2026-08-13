@@ -1306,6 +1306,55 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "writes one disposable synthetic secret to the real OS credential store"]
+    fn real_os_credential_store_round_trips_and_cleans_up() {
+        let account = std::env::var("FTE_W4_KEYCHAIN_ACCOUNT")
+            .expect("FTE_W4_KEYCHAIN_ACCOUNT must name a disposable account");
+        assert!(account.starts_with("w4-disposable-"));
+        let store = Arc::new(OsCredentialStore::new());
+        assert_eq!(store.read(&account).expect("Keychain preflight"), None);
+
+        let runtime = GatewayRuntimeOwner::new_with_store(store.clone()).expect("gateway");
+        let first = format!(
+            "w4-synthetic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        runtime
+            .save_credential(&account, &first)
+            .expect("write and exact readback");
+        assert_eq!(
+            store.read(&account).expect("independent readback"),
+            Some(first.into_bytes())
+        );
+
+        let replacement = format!("w4-replacement-{}", std::process::id());
+        runtime
+            .save_credential(&account, &replacement)
+            .expect("replace and exact readback");
+        assert_eq!(
+            store.read(&account).expect("replacement readback"),
+            Some(replacement.into_bytes())
+        );
+
+        assert!(
+            runtime
+                .delete_credential(&account)
+                .expect("delete credential")
+        );
+        assert_eq!(store.read(&account).expect("post-delete readback"), None);
+        assert!(
+            !runtime
+                .delete_credential(&account)
+                .expect("idempotent delete")
+        );
+        assert!(runtime.shutdown_native_for_process_exit());
+    }
+
     #[tokio::test]
     async fn runtime_shutdown_reports_every_owned_worker_and_native_join() {
         let runtime_id = RequestId("runtime-shutdown-report-test".to_string());
