@@ -66,14 +66,23 @@ test("docs-only changes require policy and nothing else", () => {
   assert.deepEqual(result.jobs, ["policy"]);
 });
 
-test("Native changes require root, Native, and both non-Linux platform jobs", () => {
+test("CI policy changes use root Linux and macOS without expanding to full", () => {
+  const { result } = fixture("scripts/ci/ci-plan.mjs");
+  assert.equal(result.risk, "behavior");
+  assert.equal(result.flags.root, true);
+  assert.equal(result.flags.platform_macos, true);
+  assert.equal(result.flags.full, false);
+  assert.deepEqual(result.jobs, ["policy", "root-linux", "platform-macos"]);
+});
+
+test("Native changes require root, Native, and macOS product coverage", () => {
   const { result } = fixture("crates/native/crates/llama-native-engine/src/lib.rs");
   assert.equal(result.risk, "behavior");
   assert.equal(result.flags.root, true);
   assert.equal(result.flags.native, true);
   assert.equal(result.flags.platform_linux, true);
   assert.equal(result.flags.platform_macos, true);
-  assert.equal(result.flags.platform_windows, true);
+  assert.ok(!("platform_windows" in result.flags));
   assert.ok(result.jobs.includes("native-linux"));
 });
 
@@ -102,7 +111,7 @@ test("Speech Apple changes select Speech and platform coverage", () => {
   );
   assert.equal(result.flags.speech, true);
   assert.equal(result.flags.platform_macos, true);
-  assert.equal(result.flags.platform_windows, true);
+  assert.ok(!result.jobs.includes("platform-windows"));
 });
 
 test("Mom source selects Mom and root when Mom is present", () => {
@@ -137,7 +146,7 @@ test("root Cargo metadata forces the complete present graph", () => {
   assert.ok(result.jobs.includes("mom-linux"));
   assert.ok(result.jobs.includes("loom-linux"));
   assert.ok(result.jobs.includes("platform-macos"));
-  assert.ok(result.jobs.includes("platform-windows"));
+  assert.ok(!result.jobs.includes("platform-windows"));
 });
 
 test("migration maps select import-history without behavioral compilation", () => {

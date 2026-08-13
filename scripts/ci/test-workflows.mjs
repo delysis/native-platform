@@ -51,7 +51,6 @@ test("PR workflow exposes every targeted partition and future product guards", (
     "loom-linux",
     "frontend",
     "platform-macos",
-    "platform-windows",
     "dependency-graph",
     "import-history",
     "fuzz-build",
@@ -62,6 +61,8 @@ test("PR workflow exposes every targeted partition and future product guards", (
   assert.match(source, /loom_present == 'true'/);
   assert.match(source, /group: ci-pr-/);
   assert.match(source, /cancel-in-progress: true/);
+  assert.doesNotMatch(source, /^  platform-windows:/m);
+  assert.doesNotMatch(source, /platform_windows/);
 });
 
 test("frontend jobs provision the Rust tooling used by current package scripts", () => {
@@ -115,6 +116,14 @@ test("full workflow covers main, nightly, dispatch, products, policy, and fuzz",
   assert.match(source, /cargo clippy --locked --workspace --all-targets -- -D warnings/);
   assert.doesNotMatch(source, /self-hosted|real[-_ ]hardware/i);
   assert.match(source, /^\s{4}if: always\(\)$/m);
+});
+
+test("Windows compatibility remains in full CI, not the blocking PR lane", () => {
+  const pr = read(prPath);
+  const full = read(fullPath);
+  assert.doesNotMatch(pr, /windows-latest/);
+  assert.match(full, /windows-latest/);
+  assert.match(full, /ci-full-/);
 });
 
 test("all third-party actions are pinned to immutable commits", () => {
