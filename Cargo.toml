@@ -69,8 +69,7 @@ tower-http = { version = "0.6", features = ["limit", "timeout"] }
 tracing = "0.1.44"
 uuid = { version = "1", features = ["v4", "serde"] }
 
-# Exact current integration inputs. Imported sources are path-rebound; the
-# remaining products stay at their accepted immutable Git revisions.
+# Exact current integration inputs. Imported first-party sources are path-rebound.
 llama-cpp-2-current = { package = "llama-cpp-2", git = "https://github.com/delysis/llama-cpp-rs", rev = "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391", default-features = false }
 llama-native-types-current = { package = "llama-native-types", path = "crates/native/crates/llama-native-types" }
 llama-native-host-current = { package = "llama-native-host", path = "crates/native/crates/llama-native-host" }
@@ -102,7 +101,6 @@ speech-native-platform-current = { package = "speech-native-platform", path = "c
 speech-native-backend-parakeet-current = { package = "speech-native-backend-parakeet", path = "crates/services/speech/crates/speech-native-backend-parakeet" }
 information-native-types-current = { package = "information-native-types", path = "crates/services/information/crates/information-native-types" }
 information-native-host-current = { package = "information-native-host", path = "crates/services/information/crates/information-native-host" }
-loom-types-current = { package = "loom-types", git = "https://github.com/delysis/loom-native", rev = "223110bee4be72386d79306b444517371e4a9930" }
 platform-contracts-v0-current = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
 platform-contract-testkit-current = { package = "platform-contract-testkit", path = "crates/platform/contracts/crates/platform-contract-testkit" }
 platform-vertical-fixtures-v0-current = { package = "platform-vertical-fixtures-v0", path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }

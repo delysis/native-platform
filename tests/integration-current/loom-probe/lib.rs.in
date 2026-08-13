@@ -1,6 +1,0 @@
-#![forbid(unsafe_code)]
-
-//! Isolated exact-revision probe for Loom's fifteen portable library members.
-
-/// Marker proving that the isolated Loom probe crate compiled.
-pub const GRAPH_KIND: &str = "exact-revision-current-loom-graph";

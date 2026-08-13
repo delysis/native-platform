@@ -305,7 +305,7 @@ jobs:
       - run: cargo metadata --locked --no-deps
       - run: cargo tree -d
       - run: cargo check --locked -p integration-current --features current-product-graph
-      - run: cargo run --locked -p xtask -- loom-probe
+      - run: cargo check --locked --manifest-path products/loom/Cargo.toml --workspace --all-targets
 
   import-history:
     if: ${{ needs.plan.outputs.migration_history == 'true' || needs.plan.outputs.full == 'true' }}

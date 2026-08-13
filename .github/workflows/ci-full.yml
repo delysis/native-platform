@@ -263,7 +263,7 @@ jobs:
       - run: ./crates/native/scripts/check-workflow-policy.sh .
       - run: cargo run --locked -p xtask -- policy
       - run: cargo check --locked -p integration-current --features current-product-graph
-      - run: cargo run --locked -p xtask -- loom-probe
+      - run: cargo check --locked --manifest-path products/loom/Cargo.toml --workspace --all-targets
       - run: ./scripts/check-native-import-history.sh
       - run: ./scripts/check-service-import-history.sh
       - run: ./scripts/check-contract-import-history.sh
