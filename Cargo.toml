@@ -25,6 +25,9 @@ exclude = [
     "crates/services/attachment",
     "crates/services/information",
     "crates/services/speech",
+    # W7 keeps Loom isolated only because its rusqlite 0.39 / libsqlite3-sys
+    # 0.37 link target cannot coexist with the root graph until W8.
+    "products/loom",
 ]
 resolver = "3"
 
