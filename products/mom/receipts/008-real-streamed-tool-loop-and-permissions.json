@@ -1,0 +1,87 @@
+{
+  "schema": "llama_native_kit.implementation_receipt.v1",
+  "task_id": "real-streamed-tool-loop-and-persistent-permissions",
+  "role": "standalone_integrator",
+  "status": "passed",
+  "date": "2026-07-30",
+  "repository": "/Users/george/Documents/llama-native-kit",
+  "upstream": {
+    "repo": "ggml-org/llama.cpp",
+    "commit": "32703b42d6d8a74336bf27613705cbc76e2363ee"
+  },
+  "changed_paths": [
+    "apps/mom-llama/src-tauri/src/commands.rs",
+    "apps/mom-llama/src-tauri/src/main.rs",
+    "apps/mom-llama/src-tauri/src/view.rs",
+    "apps/mom-llama/ui/coop-hx.js",
+    "apps/mom-llama/ui/style.css",
+    "contracts/commands.json",
+    "contracts/effects.json",
+    "contracts/upstream-parity.json",
+    "crates/mom-llama-cli/src/main.rs",
+    "crates/mom-llama-runtime/src/lib.rs",
+    "crates/mom-llama-runtime/src/tool_loop.rs",
+    "crates/mom-llama-runtime/tests/runtime.rs",
+    "receipts/008-real-streamed-tool-loop-and-permissions.json"
+  ],
+  "tests_run": [
+    {
+      "command": "cargo test -p mom-llama-runtime -p mom-llama-cli -p mom-llama-app -p llama-native-engine",
+      "outcome": "passed",
+      "detail": "ordinary native runtime, CLI, app-view, encrypted-permission, cache, and consult evidence tests passed"
+    },
+    {
+      "command": "MOM_LLAMA_MODEL_PATH=<SmolLM2-GGUF> cargo test -p mom-llama-runtime --test runtime real_native_tool_loop_invokes_model_and_persists_tool_lineage -- --ignored --exact --nocapture",
+      "outcome": "passed",
+      "duration_seconds": 36.45
+    },
+    {
+      "command": "./scripts/check-contracts.sh",
+      "outcome": "passed",
+      "detail": "64 commands, 71 affordances, 22 effects, and 36 parity rows were internally consistent before this receipt-only parity promotion"
+    }
+  ],
+  "real_tool_loop_evidence": {
+    "model_file": "SmolLM2-135M-Instruct-Q4_K_M.gguf",
+    "native_device": "cpu",
+    "transport": "in_process",
+    "fake_fixture": false,
+    "real_engine_invoked": true,
+    "tool_call_started_observed": true,
+    "tool_result_observed": true,
+    "incremental_model_delta_observed": true,
+    "tool_role_lineage_persisted": true,
+    "final_readiness": "real_prompt_smoke_passed"
+  },
+  "permission_evidence": {
+    "encrypted_at_rest": true,
+    "policies": ["ask", "always_allow", "deny"],
+    "revoke_returns_to": "ask",
+    "deny_blocks_before_execution": true,
+    "always_allow_scope": "exact server and tool only",
+    "single_use_approval_expiry_minutes": 5,
+    "cli_exercisable": true,
+    "tauri_exercisable": true
+  },
+  "readiness_changes": [
+    {
+      "feature": "iterative_tool_loop",
+      "before": "p0_required pending streamed in-progress tool-call/result evidence",
+      "after": "p0_implemented with real in-process tool/result/model streaming, cancellation, and persisted lineage"
+    },
+    {
+      "feature": "tool_permissions_approval",
+      "before": "p0_required with single-use per-invocation approval only",
+      "after": "p0_implemented with encrypted Ask, Always allow, Deny, revoke, and exact-call approvals"
+    }
+  ],
+  "blockers": [
+    "real_image_audio_multimodal",
+    "all_settings_behaviors"
+  ],
+  "reuse_decisions": [
+    "Kept MCP subprocess authority isolated from native inference authority.",
+    "Reused encrypted SQLite rather than creating a browser permission store.",
+    "Always allow bypasses only repeated confirmation for the exact configured server/tool pair."
+  ]
+}

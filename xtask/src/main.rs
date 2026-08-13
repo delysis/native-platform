@@ -275,6 +275,8 @@ fn check_workspace(root: &Path) -> Result<()> {
                 "fte-types",
                 "llama-native-cache",
                 "llama-native-types",
+                "mom-llama-cli",
+                "mom-llama-runtime",
             ][..],
         ),
         (
@@ -286,7 +288,7 @@ fn check_workspace(root: &Path) -> Result<()> {
                 "tauri-plugin-free-token-energy",
             ],
         ),
-        ("product", &["free-token-energy"]),
+        ("product", &["free-token-energy", "mom-llama-app"]),
         ("research", &[]),
         ("diagnostic", &["integration-current", "xtask"]),
         ("real-hardware", &[]),
@@ -329,6 +331,9 @@ fn check_workspace(root: &Path) -> Result<()> {
                 root.join("products/fte/crates/fte-types/Cargo.toml"),
                 root.join("products/fte/crates/tauri-plugin-free-token-energy/Cargo.toml"),
                 root.join("products/fte/src-tauri/Cargo.toml"),
+                root.join("products/mom/apps/mom-llama/src-tauri/Cargo.toml"),
+                root.join("products/mom/crates/mom-llama-cli/Cargo.toml"),
+                root.join("products/mom/crates/mom-llama-runtime/Cargo.toml"),
                 root.join("crates/services/attachment/Cargo.toml"),
                 root.join("crates/services/attachment/crates/attachment-native-cli/Cargo.toml"),
                 root.join("crates/services/attachment/crates/attachment-native-document/Cargo.toml"),
@@ -395,6 +400,7 @@ fn check_workspace(root: &Path) -> Result<()> {
                 || source.starts_with(root.join("crates/platform"))
                 || source.starts_with(root.join("crates/services"))
                 || source.starts_with(root.join("products/fte"))
+                || source.starts_with(root.join("products/mom"))
                 || source.starts_with(root.join("tests/integration-current"))
                 || source.starts_with(root.join("xtask")),
             "Rust source outside the imported native or diagnostic boundaries: {}",
@@ -423,8 +429,8 @@ fn check_ledger(root: &Path) -> Result<()> {
         .context("parse migration ledger")?;
     let mut expected = Ledger {
         schema_version: 1,
-        goal: "W5-IMPORT-SERVICES".into(),
-        status: "accepted".into(),
+        goal: "W6-IMPORT-MOM".into(),
+        status: "candidate".into(),
         production_source_imported: true,
         source_history_imported: true,
         integration_candidate: IntegrationCandidate {
@@ -574,6 +580,14 @@ fn check_ledger(root: &Path) -> Result<()> {
         peeled_commit: "67814e76659688fef61f311db588d17eddee0a66".into(),
     });
     gateway.old_repo_status = "frozen_unarchived_two_release_retirement".into();
+    let mom = expected
+        .entries
+        .iter_mut()
+        .find(|entry| entry.source_repository == "delysis/mom-llama")
+        .context("expected Mom migration entry")?;
+    mom.import_commit = Some("cfa2d3c40e74e1d692c0cdb9354cc272249fd4ab".into());
+    mom.path_dependency_cutover_commit =
+        Some("5b12072e91dc44f2f93f6dfc0b869d3cc58c26f1".into());
     for (repository, import_commit) in [
         (
             "delysis/attachment-native-kit",

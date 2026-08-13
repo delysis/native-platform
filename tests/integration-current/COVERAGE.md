@@ -1,7 +1,8 @@
 # W3 native path-cutover integration coverage
 
-The default diagnostic harness resolves the five imported native crates from
-`crates/native`. All other products remain exact Git dependencies. Loom's
+The default diagnostic harness resolves Native, FTE, Mom, and the W1 contracts
+from their imported paths. Loom remains the only exact first-party product Git
+dependency. Loom's
 incompatible SQLite dependency line is covered by a separately materialized,
 authenticated, locked graph that also patches native dependencies to the
 imported paths. No product repository or release manifest is modified.
@@ -30,7 +31,7 @@ byte-identical imported W1 source against the accepted lock.
 The eight first-party source workspaces contain 62 members. Fifty-one are
 portable library members. Eleven non-library, UI, or platform-shell members are
 outside this compile claim: `tauri-plugin-free-token-energy`,
-`free-token-energy`, `mom-llama-cli`, `mom-llama-app`,
+`free-token-energy`, `mom-llama-app`,
 `attachment-native-cli`, `tauri-plugin-speech-native`,
 `information-native-cli`, `tauri-plugin-information-native`, `loom-cli`,
 `tauri-plugin-loom`, and `loom-app`. The two `llama-cpp-rs` library packages
@@ -46,7 +47,7 @@ recorded in `graph-boundaries.json`.
 Two locked probes exhaust the portable inventory while the accepted repository
 state retains one root lock:
 
-- `current-product-graph` compiles the 36 non-Loom portable first-party
+- `current-product-graph` compiles the non-Loom portable first-party
   libraries and the direct current `llama-cpp-2` boundary;
 - `cargo xtask loom-probe` materializes an authenticated manifest and lock in a
   temporary directory, then compiles all 15 Loom portable libraries with the
@@ -55,14 +56,12 @@ state retains one root lock:
 The probes establish exact-revision coexistence with every native dependency
 rebound to the imported packages. They do not change product repositories.
 
-Mom's accepted current revision declares immutable pre-import Attachment and
-Native pins, but the monorepo patch policy overrides both families and they are
-absent from the root lock. `scripts/check-mom-attachment-path.sh` additionally
-checks out exact Mom revision `3cf57941af6d523378e7fa8b24f5c24c8e50363f`
-and executes its genuine ordinary-Markdown Attachment vertical against the
-imported Attachment paths.
+Mom's accepted history is imported under `products/mom`; its runtime, CLI, and
+application are root members. Its manifests and lock resolve Native, FTE,
+Attachment, and W1 from local imported paths. The direct Mom parity suites now
+exercise its ordinary-Markdown Attachment vertical and store fixtures without
+materializing the retired source repository.
 
-This harness does not claim one-graph compatibility, full application
-compilation, UI execution, hosted-provider behavior, or product-adapter
-lifecycle execution. Real-model and host-join evidence is recorded separately
-and never inferred from these compile probes.
+This harness does not claim Loom one-graph compatibility, UI execution,
+hosted-provider behavior, or real-model acceptance. Those gates are recorded
+separately and never inferred from compile probes.

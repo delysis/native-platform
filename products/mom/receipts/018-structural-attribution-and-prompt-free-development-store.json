@@ -1,0 +1,76 @@
+{
+  "schema": "llama_native_kit.implementation_receipt.v1",
+  "task_id": "structural-attribution-and-prompt-free-development-store",
+  "role": "standalone_integrator",
+  "status": "passed",
+  "date": "2026-08-03",
+  "repository": "/Users/george/Documents/llama-native-kit",
+  "summary": [
+    "Removed speaker attribution from model-authored message text and preserved it as structured transcript metadata.",
+    "Proved that a message without an @handle follows the host-chat path, receives no attribution, and never writes back to the previously mentioned source chat.",
+    "Added an idempotent repair for legacy un-attributed assistant messages that copied a reserved attribution prefix from a structurally attributed ancestor.",
+    "Made debug builds use a separate prompt-free, explicitly non-secure development store; release builds retain the Keychain-backed secure store.",
+    "Built and launched the macOS debug bundle with the local SmolLM2 GGUF, then visually exercised an attributed live-chat mention followed by an ordinary host response."
+  ],
+  "changed_paths": [
+    "README.md",
+    "crates/mom-llama-runtime/src/chat.rs",
+    "crates/mom-llama-runtime/src/config.rs",
+    "crates/mom-llama-runtime/src/conversation_store.rs",
+    "crates/mom-llama-runtime/src/mentions.rs",
+    "crates/mom-llama-runtime/src/store.rs",
+    "crates/mom-llama-runtime/tests/runtime.rs",
+    "receipts/018-structural-attribution-and-prompt-free-development-store.json"
+  ],
+  "tests_run": [
+    {
+      "command": "cargo test --workspace --exclude mom-llama-app",
+      "outcome": "passed",
+      "detail": "All deterministic workspace tests passed, including direct host follow-up/source isolation and legacy attribution repair."
+    },
+    {
+      "command": "cargo test -p mom-llama-app && cargo clippy -p mom-llama-app --all-targets -- -D warnings",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo clippy -p mom-llama-runtime --all-targets -- -D warnings",
+      "outcome": "passed"
+    },
+    {
+      "command": "./scripts/check-persona-product-ux.sh && ./scripts/check-architecture.sh && ./scripts/check-contracts.sh",
+      "outcome": "passed",
+      "detail": "Exact Persona catalog and product UX passed; inference remains in-process; 81 commands, 90 affordances, 25 effects, 36 parity rows, 58 settings, zero blockers."
+    },
+    {
+      "command": "MACOSX_DEPLOYMENT_TARGET=13.0 cargo tauri build --debug --bundles app",
+      "outcome": "passed"
+    },
+    {
+      "command": "Computer Use: live mention followed by an unmentioned host reply",
+      "outcome": "passed",
+      "detail": "The mentioned response rendered one stored source byline. The following ordinary response rendered without a byline or inline attribution prefix."
+    },
+    {
+      "command": "mom-llama-cli conversation list --json structural audit",
+      "outcome": "passed",
+      "detail": "Host had four messages with null final attribution and zero inline attribution prefixes; source remained at two messages."
+    },
+    {
+      "command": "git diff --check",
+      "outcome": "passed"
+    }
+  ],
+  "storage": {
+    "debug_data_dir": "/Users/george/.local/share/llama-native-kit/mom-llama-development",
+    "debug_keychain_access": false,
+    "debug_confidentiality": "none; predictable development key",
+    "release_data_dir": "/Users/george/.local/share/llama-native-kit/mom-llama",
+    "release_keychain_access": true,
+    "secure_debug_override": "LLAMA_NATIVE_KIT_SECURE_STORAGE=1"
+  },
+  "bundle": {
+    "path": "/Users/george/Documents/llama-native-kit/target/debug/bundle/macos/Mom Llama Native Kit.app",
+    "running_at_handoff": true,
+    "process_id": 32002
+  }
+}

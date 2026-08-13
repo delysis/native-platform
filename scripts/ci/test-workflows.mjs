@@ -76,6 +76,15 @@ test("frontend jobs provision the Rust tooling used by current package scripts",
   }
 });
 
+test("the required macOS lane runs Mom parity when Mom changes", () => {
+  const macos = read(prPath).match(/^  platform-macos:[\s\S]*?(?=^  dependency-graph:)/m)?.[0];
+  assert.ok(macos, "platform-macos job block is missing");
+  assert.match(macos, /name: Mom macOS parity/);
+  assert.match(macos, /mom_present == 'true'/);
+  assert.match(macos, /mom-llama-runtime -p mom-llama-cli -p mom-llama-app/);
+  assert.match(macos, /unstable-w1-contracts,unstable-w1-vertical-fixtures/);
+});
+
 test("Speech Linux coverage provisions its GLib build dependencies", () => {
   const prSpeech = read(prPath).match(/^  speech-linux:[\s\S]*?(?=^  mom-linux:)/m)?.[0];
   const fullSpeech = read(fullPath).match(/^  speech:[\s\S]*?(?=^  mom:)/m)?.[0];

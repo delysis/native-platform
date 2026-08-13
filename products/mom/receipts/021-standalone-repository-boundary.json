@@ -1,0 +1,84 @@
+{
+  "schema": "mom_llama.repository_boundary_receipt.v1",
+  "task_id": "standalone-repository-boundary-2026-08-08",
+  "role": "repository_integrator",
+  "status": "passed",
+  "date": "2026-08-08",
+  "repository": "https://github.com/delysis/mom-llama",
+  "product_source_commit": "402ba601f2f086d47f0614e61d1163b3020f7c83",
+  "extraction_source": {
+    "repository": "https://github.com/delysis/llama-native-kit",
+    "commit": "d8696e323160c9dc6d5f286e68db7e671e7077e0",
+    "tag": "mom-llama-extraction-source-2026-08-08",
+    "inventory_sha256": "4bc2d1e9fe91d0557076b6464fb6f74ee7485a9e378968f3b3473eda058839dc"
+  },
+  "dependency_boundaries": {
+    "llama_native_kit": "a185a4be3c6ad6ea1935e01acef8946c7dfdc459",
+    "free_token_energy": "40788e397e79c4c27df40cc702f07af500bb88eb"
+  },
+  "ownership": {
+    "mom_llama": "product runtime, CLI, contracts, receipts and Tauri/Maud app",
+    "llama_native_kit": "in-process llama.cpp runtime only",
+    "free_token_energy": "gateway, providers, loopback and separately installable speech modules",
+    "capability_system_compiler": "Loom compiler/specifications and black-box product acceptance"
+  },
+  "speech_boundary": {
+    "resolved_in_product": false,
+    "product_plugin_installed": false,
+    "canonical_repository": "https://github.com/delysis/free-token-energy",
+    "plugin_package": "tauri-plugin-free-token-energy-speech"
+  },
+  "tests_run": [
+    {
+      "command": "cargo test --workspace --exclude mom-llama-app",
+      "outcome": "passed",
+      "detail": "11 CLI tests passed with 1 real-GGUF test ignored; 46 runtime unit tests passed; 28 runtime integration tests passed with 12 real-environment tests ignored."
+    },
+    {
+      "command": "cargo test -p mom-llama-app",
+      "outcome": "passed",
+      "detail": "4 deterministic native-view tests passed."
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --exclude mom-llama-app -- -D warnings",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo clippy -p mom-llama-app --all-targets -- -D warnings",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo fmt --all --check",
+      "outcome": "passed"
+    },
+    {
+      "command": "./scripts/check-architecture.sh",
+      "outcome": "passed",
+      "detail": "One exact native source, one exact gateway source, no copied native crates, no resolved speech packages, and no sibling path or patch overrides."
+    },
+    {
+      "command": "./scripts/check-contracts.sh",
+      "outcome": "passed",
+      "detail": "82 commands, 91 affordances, 25 effects, 36 parity rows, 58 upstream settings and zero blockers."
+    },
+    {
+      "command": "./scripts/check-persona-product-ux.sh",
+      "outcome": "passed",
+      "detail": "Exact 14-person catalog, zero seeded groups, visible start flow, immediate composer clear and stable transcript viewport."
+    },
+    {
+      "command": "node --check apps/mom-llama/ui/coop-hx.js",
+      "outcome": "passed"
+    },
+    {
+      "command": "cargo metadata --locked --format-version 1",
+      "outcome": "passed"
+    }
+  ],
+  "readiness_claim": {
+    "repository_boundary": "verified",
+    "real_model_retested_in_this_receipt": false,
+    "launched_app_retested_in_this_receipt": false,
+    "note": "This receipt proves repository ownership and deterministic integration gates. It does not promote real-model or launched-app readiness."
+  }
+}

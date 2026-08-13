@@ -1,0 +1,6 @@
+{
+  "schema": "mom_llama.w1.quit_relaunch_fixture.v1",
+  "conversation_id": "mom-w1-quit-relaunch",
+  "active_operation_id": "mom_llama_chat_send:2",
+  "draft": "A durable draft survives a deterministic quit and relaunch."
+}

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default Mom Llama window capability.",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:event:default", "free-token-energy:default"]
+}

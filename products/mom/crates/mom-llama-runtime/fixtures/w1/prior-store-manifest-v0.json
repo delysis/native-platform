@@ -1,0 +1,63 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "mom_prior_release_store",
+  "class": "state",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [{
+    "case_id": "mom.redacted-logical-store-import",
+    "source": {
+      "repository_id": "delysis/mom-llama",
+      "commit": "097da612140c6479f9d40e7816f0500271464ca9",
+      "production_tree": {
+        "id": "git.tree.097da612",
+        "digest": { "algorithm": "sha256", "hex": "d19d539b144d121a0dd1b90f2387616c42874722b8feeeb09dc9584c7ed413c4" },
+        "length": 40
+      }
+    },
+    "inputs": [{
+      "identity": {
+        "id": "mom.prior-store.redacted-input",
+        "digest": { "algorithm": "sha256", "hex": "7e44507f4ee444becf112ed1853e9cfb301618aadac19b1909a41cacf95c6ccf" },
+        "length": 1832
+      },
+      "availability": "checked_in",
+      "relative_path": "crates/mom-llama-runtime/fixtures/w1/prior-store-v1.json"
+    }],
+    "state_identities": [{
+      "state_id": "mom.prior_store.redacted_logical",
+      "schema_id": "runtime.sqlite3/encrypted_documents.v1",
+      "baseline": {
+        "identity": {
+          "id": "mom.prior_store.redacted_logical",
+          "digest": { "algorithm": "sha256", "hex": "7e44507f4ee444becf112ed1853e9cfb301618aadac19b1909a41cacf95c6ccf" },
+          "length": 1832
+        },
+        "availability": "checked_in",
+        "relative_path": "crates/mom-llama-runtime/fixtures/w1/prior-store-v1.json"
+      }
+    }],
+    "prerequisites": [],
+    "replay": [{
+      "program": { "kind": "cargo" },
+      "argv": ["test", "-p", "mom-llama-runtime", "--features", "unstable-w1-vertical-fixtures", "store::tests::w1_redacted_logical_store_imports_cleans_plaintext_and_reopens_with_fixture_only_key", "--", "--exact"],
+      "required_environment": [],
+      "network": "denied"
+    }],
+    "expected_projection": {
+      "id": "mom.prior-store.projection",
+      "digest": { "algorithm": "sha256", "hex": "2c7bd3fcd1e93ee5bc70ab8c3cf0be6a7f33b71bf03dbff9cd971306bf01b136" },
+      "length": 1973
+    }
+  }],
+  "omitted_claims": ["historical physical database migration", "personal Keychain recovery"],
+  "negative_evidence": [{
+    "evidence_id": "mom.historical-db-unavailable",
+    "disposition": "unavailable",
+    "artifact": {
+      "id": "mom.redacted-logical-substitute",
+      "digest": { "algorithm": "sha256", "hex": "7e44507f4ee444becf112ed1853e9cfb301618aadac19b1909a41cacf95c6ccf" },
+      "length": 1832
+    },
+    "reason": "No historical release database is claimed; this fixture is an explicitly redacted logical import and recovery baseline."
+  }]
+}

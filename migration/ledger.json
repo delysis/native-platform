@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "goal": "W5-IMPORT-SERVICES",
-  "status": "accepted",
+  "goal": "W6-IMPORT-MOM",
+  "status": "candidate",
   "production_source_imported": true,
   "source_history_imported": true,
   "integration_candidate": {
@@ -82,8 +82,8 @@
         }
       ],
       "destination_prefix": "products/mom",
-      "import_commit": null,
-      "path_dependency_cutover_commit": null,
+      "import_commit": "cfa2d3c40e74e1d692c0cdb9354cc272249fd4ab",
+      "path_dependency_cutover_commit": "5b12072e91dc44f2f93f6dfc0b869d3cc58c26f1",
       "old_repo_status": "active",
       "migration_role": "first_party_import"
     },

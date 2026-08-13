@@ -7,16 +7,11 @@ const IMPORTED_SERVICE_LOCKS: [&str; 3] = [
     include_str!("../../../crates/services/speech/Cargo.lock"),
 ];
 
-const EXACT_PACKAGES: [(&str, &str, &str); 3] = [
+const EXACT_PACKAGES: [(&str, &str, &str); 2] = [
     (
         "llama-cpp-2",
         "https://github.com/delysis/llama-cpp-rs",
         "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
-    ),
-    (
-        "mom-llama-runtime",
-        "https://github.com/delysis/mom-llama",
-        "3cf57941af6d523378e7fa8b24f5c24c8e50363f",
     ),
     (
         "loom-types",
@@ -25,14 +20,10 @@ const EXACT_PACKAGES: [(&str, &str, &str); 3] = [
     ),
 ];
 
-const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 3] = [
+const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 2] = [
     (
         "https://github.com/delysis/llama-cpp-rs",
         "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
-    ),
-    (
-        "https://github.com/delysis/mom-llama",
-        "3cf57941af6d523378e7fa8b24f5c24c8e50363f",
     ),
     (
         "https://github.com/delysis/loom-native",
@@ -65,6 +56,8 @@ const IMPORTED_FTE_PACKAGES: [&str; 9] = [
     "fte-types",
     "tauri-plugin-free-token-energy",
 ];
+
+const IMPORTED_MOM_PACKAGES: [&str; 3] = ["mom-llama-app", "mom-llama-cli", "mom-llama-runtime"];
 
 const IMPORTED_SERVICE_PACKAGES: [&str; 24] = [
     "attachment-native-cli",
@@ -126,7 +119,7 @@ fn root_lock_contains_every_exact_current_source() {
         assert!(present, "missing exact locked package {name} at {revision}");
         matched.insert((repository, revision));
     }
-    assert_eq!(matched.len(), 3, "expected three distinct source revisions");
+    assert_eq!(matched.len(), 2, "expected two distinct source revisions");
 }
 
 #[test]
@@ -195,6 +188,25 @@ fn imported_native_packages_are_path_rebound() {
             .filter(|package| package["name"].as_str() == Some(name))
             .any(|package| package.get("source").is_none());
         assert!(local, "missing path-rebound native package {name}");
+    }
+}
+
+#[test]
+fn imported_mom_packages_are_path_rebound() {
+    let lock: toml::Value = toml::from_str(ROOT_LOCK).expect("root Cargo.lock TOML");
+    let packages = lock["package"].as_array().expect("lock packages");
+    assert!(packages.iter().all(|package| {
+        package
+            .get("source")
+            .and_then(toml::Value::as_str)
+            .is_none_or(|source| !source.contains("github.com/delysis/mom-llama"))
+    }));
+    for name in IMPORTED_MOM_PACKAGES {
+        let local = packages
+            .iter()
+            .filter(|package| package["name"].as_str() == Some(name))
+            .any(|package| package.get("source").is_none());
+        assert!(local, "missing path-rebound Mom package {name}");
     }
 }
 
