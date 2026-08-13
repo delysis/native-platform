@@ -2,16 +2,11 @@ use std::collections::BTreeSet;
 
 const ROOT_LOCK: &str = include_str!("../../../Cargo.lock");
 
-const EXACT_PACKAGES: [(&str, &str, &str); 10] = [
+const EXACT_PACKAGES: [(&str, &str, &str); 9] = [
     (
         "llama-cpp-2",
         "https://github.com/delysis/llama-cpp-rs",
         "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
-    ),
-    (
-        "fte-types",
-        "https://github.com/delysis/free-token-energy",
-        "67814e76659688fef61f311db588d17eddee0a66",
     ),
     (
         "mom-llama-runtime",
@@ -61,14 +56,10 @@ const REMAINING_TRANSITIVE_BASELINES: [(&str, &str, &str); 1] = [(
     "472900732ded5bcfb5cc639c49b3a4f77feece27",
 )];
 
-const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 11] = [
+const ALLOWED_FIRST_PARTY_REVISIONS: [(&str, &str); 10] = [
     (
         "https://github.com/delysis/llama-cpp-rs",
         "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391",
-    ),
-    (
-        "https://github.com/delysis/free-token-energy",
-        "67814e76659688fef61f311db588d17eddee0a66",
     ),
     (
         "https://github.com/delysis/mom-llama",
@@ -116,6 +107,18 @@ const IMPORTED_NATIVE_PACKAGES: [&str; 5] = [
     "llama-native-types",
 ];
 
+const IMPORTED_FTE_PACKAGES: [&str; 9] = [
+    "free-token-energy",
+    "fte-backend-llama",
+    "fte-loopback",
+    "fte-protocols",
+    "fte-providers",
+    "fte-router",
+    "fte-store",
+    "fte-types",
+    "tauri-plugin-free-token-energy",
+];
+
 #[test]
 fn root_lock_contains_every_exact_current_source() {
     let lock: toml::Value = toml::from_str(ROOT_LOCK).expect("root Cargo.lock TOML");
@@ -133,7 +136,26 @@ fn root_lock_contains_every_exact_current_source() {
         assert!(present, "missing exact locked package {name} at {revision}");
         matched.insert((repository, revision));
     }
-    assert_eq!(matched.len(), 8, "expected eight distinct source revisions");
+    assert_eq!(matched.len(), 7, "expected seven distinct source revisions");
+}
+
+#[test]
+fn imported_fte_packages_are_path_rebound() {
+    let lock: toml::Value = toml::from_str(ROOT_LOCK).expect("root Cargo.lock TOML");
+    let packages = lock["package"].as_array().expect("lock packages");
+    assert!(packages.iter().all(|package| {
+        package
+            .get("source")
+            .and_then(toml::Value::as_str)
+            .is_none_or(|source| !source.contains("github.com/delysis/free-token-energy"))
+    }));
+    for name in IMPORTED_FTE_PACKAGES {
+        let local = packages
+            .iter()
+            .filter(|package| package["name"].as_str() == Some(name))
+            .any(|package| package.get("source").is_none());
+        assert!(local, "missing path-rebound FTE package {name}");
+    }
 }
 
 #[test]

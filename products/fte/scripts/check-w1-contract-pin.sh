@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+product_root="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+lockfile="${2:-$(cd "$product_root/../.." && pwd)/Cargo.lock}"
 # shellcheck source=../w1-contracts.env
-source "$repo_root/w1-contracts.env"
+source "$product_root/w1-contracts.env"
 
 accepted_lifecycle_revision="cbab33555ab9355a6ac453d659c55ec9e0666821"
 accepted_vertical_revision="fc24ffff08c52690390b4460f44617d5d9732563"
@@ -30,7 +31,7 @@ if [[ "$lifecycle_revision" == "$vertical_revision" ]]; then
 fi
 
 manifest_lines="$({
-  find "$repo_root" \
+  find "$product_root" \
     \( -path '*/.git' -o -path '*/target' \) -prune -o \
     -name Cargo.toml \
     -exec grep -H -F "$repository" {} +
@@ -66,7 +67,6 @@ if printf '%s\n' "$manifest_lines" \
   exit 1
 fi
 
-lockfile="$repo_root/Cargo.lock"
 lifecycle_lock_count="$(grep -Fc "?rev=$lifecycle_revision#$lifecycle_revision" "$lockfile" || true)"
 if [[ "$lifecycle_lock_count" -ne 2 ]]; then
   echo "Cargo.lock has $lifecycle_lock_count lifecycle package sources, expected 2" >&2
@@ -78,7 +78,7 @@ if [[ "$vertical_lock_count" -ne 2 ]]; then
   exit 1
 fi
 
-if find "$repo_root" \
+if find "$product_root" \
   \( -path '*/.git' -o -path '*/target' \) -prune -o \
   \( -name Cargo.toml -o -name Cargo.lock -o -name w1-contracts.env \) \
   -exec grep -qs 'efbbe' {} +; then

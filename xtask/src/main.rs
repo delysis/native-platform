@@ -145,7 +145,7 @@ fn check_policy(root: &Path) -> Result<()> {
     check_loom_reconciliation(root)?;
     check_evidence_files(root)?;
     check_adrs(root)?;
-    println!("native-platform W3 policy: pass");
+    println!("native-platform W4 policy: pass");
     Ok(())
 }
 
@@ -231,12 +231,26 @@ fn check_workspace(root: &Path) -> Result<()> {
             "portable",
             &[
                 "command-evidence",
+                "fte-loopback",
+                "fte-protocols",
+                "fte-providers",
+                "fte-router",
+                "fte-store",
+                "fte-types",
                 "llama-native-cache",
                 "llama-native-types",
             ][..],
         ),
-        ("platform", &["llama-native-engine", "llama-native-host"]),
-        ("product", &[]),
+        (
+            "platform",
+            &[
+                "fte-backend-llama",
+                "llama-native-engine",
+                "llama-native-host",
+                "tauri-plugin-free-token-energy",
+            ],
+        ),
+        ("product", &["free-token-energy"]),
         ("research", &[]),
         ("diagnostic", &["integration-current", "xtask"]),
         ("real-hardware", &[]),
@@ -266,6 +280,15 @@ fn check_workspace(root: &Path) -> Result<()> {
                 root.join("crates/native/crates/llama-native-engine/Cargo.toml"),
                 root.join("crates/native/crates/llama-native-host/Cargo.toml"),
                 root.join("crates/native/crates/llama-native-types/Cargo.toml"),
+                root.join("products/fte/crates/fte-backend-llama/Cargo.toml"),
+                root.join("products/fte/crates/fte-loopback/Cargo.toml"),
+                root.join("products/fte/crates/fte-protocols/Cargo.toml"),
+                root.join("products/fte/crates/fte-providers/Cargo.toml"),
+                root.join("products/fte/crates/fte-router/Cargo.toml"),
+                root.join("products/fte/crates/fte-store/Cargo.toml"),
+                root.join("products/fte/crates/fte-types/Cargo.toml"),
+                root.join("products/fte/crates/tauri-plugin-free-token-energy/Cargo.toml"),
+                root.join("products/fte/src-tauri/Cargo.toml"),
                 root.join("tests/integration-current/Cargo.toml"),
                 root.join("xtask/Cargo.toml"),
             ])
@@ -286,6 +309,7 @@ fn check_workspace(root: &Path) -> Result<()> {
     for source in find_extension(root, "rs")? {
         ensure!(
             source.starts_with(root.join("crates/native/crates"))
+                || source.starts_with(root.join("products/fte"))
                 || source.starts_with(root.join("tests/integration-current"))
                 || source.starts_with(root.join("xtask")),
             "Rust source outside the imported native or diagnostic boundaries: {}",
@@ -300,7 +324,7 @@ fn check_workspace(root: &Path) -> Result<()> {
             .join("crates/native/.github/workflows/w1-contract-tests.yml")
             .exists()
     );
-    for forbidden in ["apps", "packages", "products"] {
+    for forbidden in ["apps", "packages"] {
         ensure!(
             !root.join(forbidden).exists(),
             "W3 native import must not contain later-wave directory {forbidden}"

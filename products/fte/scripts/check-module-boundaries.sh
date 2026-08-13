@@ -9,8 +9,8 @@ fail() {
   exit 1
 }
 
-if rg -n 'fte[-_]speech|speech[-_]native|speech_(status|plan|synthesize|transcribe|cancel)' \
-  "$repo_root/Cargo.toml" "$core_plugin/Cargo.toml" "$core_plugin/src" \
+if grep -ERn 'fte[-_]speech|speech[-_]native|speech_(status|plan|synthesize|transcribe|cancel)' \
+  "$core_plugin/Cargo.toml" "$core_plugin/src" \
   "$core_plugin/permissions" "$repo_root/src-tauri/Cargo.toml" \
   "$repo_root/src-tauri/src" "$repo_root/src-tauri/capabilities"; then
   fail "the core Free Token Energy plugin contains speech dependencies, commands, or permissions"

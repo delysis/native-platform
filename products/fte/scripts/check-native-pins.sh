@@ -1,29 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+product_root="$(cd "$(dirname "$0")/.." && pwd)"
+workspace_root="$(cd "$product_root/../.." && pwd)"
 # shellcheck source=../native-pins.env
-source "$repo_root/native-pins.env"
+source "$product_root/native-pins.env"
 
-for revision in "$NATIVE_KIT_REV" "$LLAMA_CPP_RS_REV"; do
-  if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "native pin is not an exact 40-hex revision: $revision" >&2
-    exit 1
-  fi
-done
-
-manifest="$repo_root/Cargo.toml"
-lockfile="$repo_root/Cargo.lock"
-
-native_manifest_count=$(grep -Ec '^llama-native-(cache|engine|host|types) = .*rev = "'"$NATIVE_KIT_REV"'"' "$manifest")
-if [[ "$native_manifest_count" -ne 4 ]]; then
-  echo "Cargo.toml has $native_manifest_count coherent native pins, expected 4" >&2
+if [[ "$NATIVE_KIT_IMPORTED_PATH" != "crates/native" ]]; then
+  echo "unexpected imported native path: $NATIVE_KIT_IMPORTED_PATH" >&2
+  exit 1
+fi
+if [[ ! "$LLAMA_CPP_RS_REV" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "llama-cpp-rs pin is not an exact 40-hex revision: $LLAMA_CPP_RS_REV" >&2
   exit 1
 fi
 
-native_lock_count=$(grep -Fc "?rev=$NATIVE_KIT_REV#$NATIVE_KIT_REV" "$lockfile")
-if [[ "$native_lock_count" -ne 4 ]]; then
-  echo "Cargo.lock has $native_lock_count coherent native sources, expected 4" >&2
+manifest="$workspace_root/Cargo.toml"
+lockfile="$workspace_root/Cargo.lock"
+
+native_manifest_count=$(grep -Ec '^llama-native-(cache|engine|host|types) = \{ path = "crates/native/crates/llama-native-(cache|engine|host|types)" \}$' "$manifest")
+if [[ "$native_manifest_count" -ne 12 ]]; then
+  echo "Cargo.toml has $native_manifest_count canonical native path bindings, expected 12" >&2
+  exit 1
+fi
+
+native_git_count=$(grep -c '^source = "git+https://github.com/delysis/llama-native-kit' "$lockfile" || true)
+if [[ "$native_git_count" -ne 0 ]]; then
+  echo "Cargo.lock retains $native_git_count llama-native-kit Git sources" >&2
   exit 1
 fi
 
@@ -47,4 +50,4 @@ do
   fi
 done
 
-echo "native pins coherent: $NATIVE_KIT_REV / $LLAMA_CPP_RS_REV"
+echo "native paths coherent: $NATIVE_KIT_IMPORTED_PATH / llama-cpp-rs=$LLAMA_CPP_RS_REV"

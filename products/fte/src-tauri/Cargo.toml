@@ -1,12 +1,13 @@
 [package]
 name = "free-token-energy"
-version.workspace = true
+version = "0.1.0"
 description = "Local-first gateway for routing across free-tier AI providers"
 authors = ["Free Token Energy contributors"]
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
