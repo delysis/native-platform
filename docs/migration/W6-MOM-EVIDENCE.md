@@ -1,6 +1,6 @@
 # W6 Mom import: candidate evidence
 
-Status: **locally accepted candidate; publication and source freeze pending**.
+Status: **accepted, merged, tagged, and source-frozen**.
 
 Accepted Mom source `3cf57941af6d523378e7fa8b24f5c24c8e50363f`
 and tree `7670bc1bfb4b94959871d33f7487d3969b2a76c7` are imported under
@@ -66,11 +66,28 @@ No fixture was enabled. In the visible native UI:
   paragraphs.`;
 - the relaunch then exited cleanly in 3 ms without loading workers.
 
-## Promotion boundary
+## Promotion and source freeze
 
-GitHub publication, the required policy and macOS checks, protected W6 tag,
-and source-repository README/freeze are intentionally recorded as pending in
-`migration/mom-import.json`. Linux and Windows jobs remain informational under
-the Mac-first policy and do not block continued local work. No Speech,
-Information, citation, attachment-format, or hosted-provider product feature
-is included or claimed in W6.
+PR required run `31687282237` passed policy job `94406205848` and macOS job
+`94406205909` at exact candidate head
+`be08d82eb6d71681f78bd84bae6a37257d5c6d36`. W6 merged without squashing as
+`78b5b1ecc44b3c79f79227613f027580032192cd`. Annotated tag
+`w6-import-mom-v0-2026-08-13` has tag object
+`5d8cd5e0cb9bba5db81d05687d0f63c9242b936c`, peels to that exact merge, and
+is protected by no-bypass ruleset `20791545`. Linux and Windows jobs remain
+informational under the Mac-first policy and were not acceptance gates.
+
+The Mom source boundary remains accepted commit
+`3cf57941af6d523378e7fa8b24f5c24c8e50363f`, tree
+`7670bc1bfb4b94959871d33f7487d3969b2a76c7`. Annotated source tag
+`native-platform-v2-horizon-b-2026-08-12` has object
+`23ca2af17f4a0b7c9711eebf08c217ec44bd8d57` and no-bypass protection ruleset
+`20791575`. README-only redirect commit
+`c014f4681eccef19c040913b2fbedc4aee5cb299` passed source CI run
+`31689626249` and shutdown run `31689626209`. No-bypass hard-freeze ruleset
+`20791917` blocks branch creation, update, deletion, and non-fast-forward
+operations. The source repository intentionally remains unarchived through
+the two-release retirement window.
+
+No Speech, Information, citation, attachment-format, or hosted-provider
+product feature is included or claimed in W6.
