@@ -14,7 +14,7 @@ unstable-w1-contract-tests = ["dep:platform-contract-testkit"]
 
 [dependencies]
 fte-types = { path = "../fte-types" }
-platform-contract-testkit = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821", optional = true }
+platform-contract-testkit = { path = "../../../../crates/platform/contracts/crates/platform-contract-testkit", optional = true }
 tokio.workspace = true
 
 [dev-dependencies]

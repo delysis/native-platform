@@ -1490,7 +1490,7 @@ dependencies = [
  "fs2",
  "hex",
  "information-native-types",
- "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=cbab33555ab9355a6ac453d659c55ec9e0666821)",
+ "platform-contracts-v0",
  "reqwest 0.12.28",
  "rustix",
  "serde",
@@ -1607,7 +1607,7 @@ dependencies = [
  "information-native-retrieval",
  "information-native-store",
  "information-native-types",
- "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=fc24ffff08c52690390b4460f44617d5d9732563)",
+ "platform-contracts-v0",
  "platform-vertical-fixtures-v0",
  "rusqlite",
  "serde",
@@ -2151,16 +2151,6 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "platform-contracts-v0"
 version = "0.0.0"
-source = "git+https://github.com/delysis/w1-platform-contracts?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
-dependencies = [
- "serde",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "platform-contracts-v0"
-version = "0.0.0"
-source = "git+https://github.com/delysis/w1-platform-contracts?rev=fc24ffff08c52690390b4460f44617d5d9732563#fc24ffff08c52690390b4460f44617d5d9732563"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -2169,9 +2159,8 @@ dependencies = [
 [[package]]
 name = "platform-vertical-fixtures-v0"
 version = "0.0.0"
-source = "git+https://github.com/delysis/w1-platform-contracts?rev=fc24ffff08c52690390b4460f44617d5d9732563#fc24ffff08c52690390b4460f44617d5d9732563"
 dependencies = [
- "platform-contracts-v0 0.0.0 (git+https://github.com/delysis/w1-platform-contracts?rev=fc24ffff08c52690390b4460f44617d5d9732563)",
+ "platform-contracts-v0",
  "serde",
  "serde_json",
  "sha2",

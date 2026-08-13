@@ -26,9 +26,9 @@ speech-native-types = { path = "../speech-native-types" }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-platform-contract-testkit = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821", optional = true }
-platform-contracts-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821", optional = true }
-platform-vertical-fixtures-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "fc24ffff08c52690390b4460f44617d5d9732563", optional = true }
+platform-contract-testkit = { path = "../../../../platform/contracts/crates/platform-contract-testkit", optional = true }
+platform-contracts-v0 = { path = "../../../../platform/contracts/crates/platform-contracts-v0", optional = true }
+platform-vertical-fixtures-v0 = { path = "../../../../platform/contracts/crates/platform-vertical-fixtures-v0", optional = true }
 sha2 = { version = "0.10.9", optional = true }
 serde_json = { workspace = true, optional = true }
 

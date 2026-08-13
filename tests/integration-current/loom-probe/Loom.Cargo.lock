@@ -1576,7 +1576,6 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "platform-contract-testkit"
 version = "0.0.0"
-source = "git+https://github.com/delysis/w1-platform-contracts?rev=3ed1f3235edb6d481c324f05fe83b2379e3431e6#3ed1f3235edb6d481c324f05fe83b2379e3431e6"
 dependencies = [
  "platform-contracts-v0",
  "thiserror",
@@ -1585,7 +1584,6 @@ dependencies = [
 [[package]]
 name = "platform-contracts-v0"
 version = "0.0.0"
-source = "git+https://github.com/delysis/w1-platform-contracts?rev=3ed1f3235edb6d481c324f05fe83b2379e3431e6#3ed1f3235edb6d481c324f05fe83b2379e3431e6"
 dependencies = [
  "serde",
  "thiserror",
@@ -1594,7 +1592,6 @@ dependencies = [
 [[package]]
 name = "platform-vertical-fixtures-v0"
 version = "0.0.0"
-source = "git+https://github.com/delysis/w1-platform-contracts?rev=3ed1f3235edb6d481c324f05fe83b2379e3431e6#3ed1f3235edb6d481c324f05fe83b2379e3431e6"
 dependencies = [
  "platform-contracts-v0",
  "serde",

@@ -7,7 +7,6 @@ fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 lifecycle_revision="cbab33555ab9355a6ac453d659c55ec9e0666821"
 vertical_revision="fc24ffff08c52690390b4460f44617d5d9732563"
-repository="https://github.com/delysis/w1-platform-contracts"
 
 write_fixture() {
   rm -rf "$fixture"
@@ -18,17 +17,16 @@ write_fixture() {
     > "$fixture/w1-contracts.env"
   printf '%s\n' "$1" > "$fixture/crate/Cargo.toml"
   printf '%s\n' \
-    "source = \"git+$repository?rev=$lifecycle_revision#$lifecycle_revision\"" \
-    "source = \"git+$repository?rev=$lifecycle_revision#$lifecycle_revision\"" \
-    "source = \"git+$repository?rev=$vertical_revision#$vertical_revision\"" \
-    "source = \"git+$repository?rev=$vertical_revision#$vertical_revision\"" \
+    'name = "platform-contract-testkit"' \
+    'name = "platform-contracts-v0"' \
+    'name = "platform-vertical-fixtures-v0"' \
     > "$fixture/Cargo.lock"
 }
 
-exact="platform-contract-testkit = { git = \"$repository\", rev = \"$lifecycle_revision\", optional = true }
-platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }
-platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }
-platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }"
+exact='platform-contract-testkit = { path = "../../../../crates/platform/contracts/crates/platform-contract-testkit", optional = true }
+platform-vertical-fixtures-v0 = { path = "../../../../crates/platform/contracts/crates/platform-vertical-fixtures-v0", optional = true }
+platform-vertical-fixtures-v0 = { path = "../../../../crates/platform/contracts/crates/platform-vertical-fixtures-v0", optional = true }
+platform-vertical-fixtures-v0 = { path = "../../../crates/platform/contracts/crates/platform-vertical-fixtures-v0", optional = true }'
 write_fixture "$exact"
 "$checker" "$fixture" "$fixture/Cargo.lock"
 
@@ -42,15 +40,16 @@ if "$checker" "$fixture" "$fixture/Cargo.lock" >/dev/null 2>&1; then
 fi
 write_fixture "$exact"
 
-write_fixture "${exact/ rev = \"$lifecycle_revision\"/ branch = \"main\", rev = \"$lifecycle_revision\"}"
+write_fixture "${exact/platform-contract-testkit\", optional/platform-contract-testkit-wrong\", optional}"
 if "$checker" "$fixture" "$fixture/Cargo.lock" >/dev/null 2>&1; then
-  echo "branch contract dependency unexpectedly passed" >&2
+  echo "wrong local contract path unexpectedly passed" >&2
   exit 1
 fi
 
-write_fixture "${exact/ rev = \"$lifecycle_revision\"/ tag = \"v0\", rev = \"$lifecycle_revision\"}"
+write_fixture "$exact
+source = \"git+https://github.com/delysis/w1-platform-contracts?rev=$lifecycle_revision#$lifecycle_revision\""
 if "$checker" "$fixture" "$fixture/Cargo.lock" >/dev/null 2>&1; then
-  echo "tag contract dependency unexpectedly passed" >&2
+  echo "external contract source unexpectedly passed" >&2
   exit 1
 fi
 
@@ -60,17 +59,14 @@ if "$checker" "$fixture" "$fixture/Cargo.lock" >/dev/null 2>&1; then
   exit 1
 fi
 
-write_fixture "# platform-contract-testkit = { git = \"$repository\", rev = \"$lifecycle_revision\", optional = true }
-# platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }
-# platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }
-# platform-vertical-fixtures-v0 = { git = \"$repository\", rev = \"$vertical_revision\", optional = true }"
+write_fixture "$(printf '%s\n' "$exact" | sed 's/^/# /')"
 if "$checker" "$fixture" "$fixture/Cargo.lock" >/dev/null 2>&1; then
   echo "commented dependency declarations unexpectedly passed" >&2
   exit 1
 fi
 
 write_fixture "$exact
-platform-contracts-v0 = { git = \"$repository\", rev = \"$vertical_revision\" }"
+platform-contract-testkit = { path = \"../../../../crates/platform/contracts/crates/platform-contract-testkit\", optional = true }"
 if "$checker" "$fixture" "$fixture/Cargo.lock" >/dev/null 2>&1; then
   echo "duplicate contract pin unexpectedly passed" >&2
   exit 1

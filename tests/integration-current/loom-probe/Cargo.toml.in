@@ -14,8 +14,18 @@ loom-campaign-current = { package = "loom-campaign", git = "https://github.com/d
 loom-context-current = { package = "loom-context", git = "https://github.com/delysis/loom-native", rev = "223110bee4be72386d79306b444517371e4a9930" }
 loom-eval-codex-current = { package = "loom-eval-codex", git = "https://github.com/delysis/loom-native", rev = "223110bee4be72386d79306b444517371e4a9930" }
 loom-learning-current = { package = "loom-learning", git = "https://github.com/delysis/loom-native", rev = "223110bee4be72386d79306b444517371e4a9930" }
-platform-contract-testkit-current = { package = "platform-contract-testkit", git = "https://github.com/delysis/w1-platform-contracts", rev = "3ed1f3235edb6d481c324f05fe83b2379e3431e6" }
-platform-vertical-fixtures-v0-current = { package = "platform-vertical-fixtures-v0", git = "https://github.com/delysis/w1-platform-contracts", rev = "3ed1f3235edb6d481c324f05fe83b2379e3431e6" }
+platform-contract-testkit-current = { package = "platform-contract-testkit", path = "../../crates/platform/contracts/crates/platform-contract-testkit" }
+platform-vertical-fixtures-v0-current = { package = "platform-vertical-fixtures-v0", path = "../../crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
+
+[patch."https://github.com/delysis/w1-platform-contracts"]
+platform-contracts-v0 = { path = "../../crates/platform/contracts/crates/platform-contracts-v0" }
+platform-contract-testkit = { path = "../../crates/platform/contracts/crates/platform-contract-testkit" }
+platform-vertical-fixtures-v0 = { path = "../../crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
+
+[patch."https://github.com/delysis/w1-platform-contracts.git"]
+platform-contracts-v0 = { path = "../../crates/platform/contracts/crates/platform-contracts-v0" }
+platform-contract-testkit = { path = "../../crates/platform/contracts/crates/platform-contract-testkit" }
+platform-vertical-fixtures-v0 = { path = "../../crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
 
 [patch."https://github.com/delysis/llama-native-kit"]
 llama-native-cache = { path = "../../crates/native/crates/llama-native-cache" }

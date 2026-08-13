@@ -45,7 +45,7 @@ fte-backend-llama = { path = "../crates/fte-backend-llama" }
 llama-native-host.workspace = true
 llama-native-types.workspace = true
 tauri-plugin-free-token-energy = { path = "../crates/tauri-plugin-free-token-energy", features = ["native-llama"] }
-platform-vertical-fixtures-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "fc24ffff08c52690390b4460f44617d5d9732563", optional = true }
+platform-vertical-fixtures-v0 = { path = "../../../crates/platform/contracts/crates/platform-vertical-fixtures-v0", optional = true }
 
 [dev-dependencies]
 async-trait = "0.1.92"

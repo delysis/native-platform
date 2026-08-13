@@ -145,7 +145,7 @@ fn check_policy(root: &Path) -> Result<()> {
     check_loom_reconciliation(root)?;
     check_evidence_files(root)?;
     check_adrs(root)?;
-    println!("native-platform W5 accepted policy: pass");
+    println!("native-platform migration policy: pass");
     Ok(())
 }
 
@@ -160,7 +160,7 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     )?;
     check_sha256(
         &root.join("tests/integration-current/loom-probe/Cargo.toml.in"),
-        "21fa6065f6c4af7653ebfcc74d85a499c73278c208073ac4ed0834e40686eb88",
+        "dada57a17f9dfba89497071ff9e90be20345f91d648272b96ab9eda0f6514d15",
     )?;
     check_sha256(
         &root.join("tests/integration-current/loom-probe/lib.rs.in"),
@@ -168,7 +168,11 @@ fn check_evidence_files(root: &Path) -> Result<()> {
     )?;
     check_sha256(
         &root.join("tests/integration-current/loom-probe/Loom.Cargo.lock"),
-        "a9d0d62da8a9954743fecca8d4e749336e0c8834cba577e0841fe00508b40309",
+        "10dc0c8d6797f050e888f40445c41f2c68f70851a313570ba5e28e0e05ffee2a",
+    )?;
+    check_sha256(
+        &root.join("migration/w1-platform-contracts.commit-map"),
+        "6f56105a268443356e0245b70a0638dbe43f1d3e9933360e4d62b4f986b54e3d",
     )?;
     check_sha256(
         &root.join("migration/llama-native-kit.commit-map"),
@@ -312,6 +316,10 @@ fn check_workspace(root: &Path) -> Result<()> {
                 root.join("crates/native/crates/llama-native-engine/Cargo.toml"),
                 root.join("crates/native/crates/llama-native-host/Cargo.toml"),
                 root.join("crates/native/crates/llama-native-types/Cargo.toml"),
+                root.join("crates/platform/contracts/Cargo.toml"),
+                root.join("crates/platform/contracts/crates/platform-contract-testkit/Cargo.toml"),
+                root.join("crates/platform/contracts/crates/platform-contracts-v0/Cargo.toml"),
+                root.join("crates/platform/contracts/crates/platform-vertical-fixtures-v0/Cargo.toml"),
                 root.join("products/fte/crates/fte-backend-llama/Cargo.toml"),
                 root.join("products/fte/crates/fte-loopback/Cargo.toml"),
                 root.join("products/fte/crates/fte-protocols/Cargo.toml"),
@@ -358,6 +366,7 @@ fn check_workspace(root: &Path) -> Result<()> {
         find_named(root, "Cargo.lock")?
             == BTreeSet::from([
                 root.join("Cargo.lock"),
+                root.join("crates/platform/contracts/Cargo.lock"),
                 root.join("crates/services/attachment/Cargo.lock"),
                 root.join("crates/services/attachment/fuzz/Cargo.lock"),
                 root.join("crates/services/information/Cargo.lock"),
@@ -367,7 +376,10 @@ fn check_workspace(root: &Path) -> Result<()> {
     );
     ensure!(
         find_named(root, "rust-toolchain.toml")?
-            == BTreeSet::from([root.join("rust-toolchain.toml")])
+            == BTreeSet::from([
+                root.join("rust-toolchain.toml"),
+                root.join("crates/platform/contracts/rust-toolchain.toml"),
+            ])
     );
     ensure!(
         find_named(root, "pnpm-workspace.yaml")?
