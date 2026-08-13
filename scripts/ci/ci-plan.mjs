@@ -37,7 +37,7 @@ const presence = {
   mom:
     fs.existsSync("products/mom/Cargo.toml") ||
     fs.existsSync("products/mom/crates/mom-llama-runtime/Cargo.toml"),
-  loom: fs.existsSync("products/loom/Cargo.toml"),
+  loom: fs.existsSync("products/loom/apps/loom/src-tauri/Cargo.toml"),
 };
 
 const flags = {

@@ -1,0 +1,194 @@
+{
+  "schema_version": 1,
+  "primary": {
+    "core": [
+      "platform-contracts-v0"
+    ],
+    "native": [
+      "command-evidence",
+      "llama-native-cache",
+      "llama-native-engine",
+      "llama-native-host",
+      "llama-native-types"
+    ],
+    "gateway": [
+      "fte-backend-llama",
+      "fte-loopback",
+      "fte-protocols",
+      "fte-providers",
+      "fte-router",
+      "fte-store",
+      "fte-types"
+    ],
+    "service-attachment": [
+      "attachment-native-cli",
+      "attachment-native-document",
+      "attachment-native-host",
+      "attachment-native-inspect",
+      "attachment-native-plan",
+      "attachment-native-types"
+    ],
+    "service-information": [
+      "information-native-acquire",
+      "information-native-backend-community",
+      "information-native-backend-encyclopedia",
+      "information-native-backend-scripture",
+      "information-native-backend-sqlite",
+      "information-native-catalog",
+      "information-native-cli",
+      "information-native-host",
+      "information-native-retrieval",
+      "information-native-store",
+      "information-native-types",
+      "tauri-plugin-information-native"
+    ],
+    "service-speech": [
+      "speech-native-backend-parakeet",
+      "speech-native-host",
+      "speech-native-platform",
+      "speech-native-router",
+      "speech-native-types",
+      "tauri-plugin-speech-native"
+    ],
+    "product-fte": [
+      "free-token-energy",
+      "tauri-plugin-free-token-energy"
+    ],
+    "product-mom": [
+      "mom-llama-app",
+      "mom-llama-cli",
+      "mom-llama-runtime"
+    ],
+    "product-loom": [
+      "loom-app",
+      "loom-backend-llama",
+      "loom-cli",
+      "loom-document",
+      "loom-host",
+      "loom-inference",
+      "loom-store",
+      "loom-types",
+      "tauri-plugin-loom"
+    ],
+    "research-loom": [
+      "loom-benchmark",
+      "loom-campaign",
+      "loom-context",
+      "loom-eval",
+      "loom-eval-codex",
+      "loom-learning",
+      "loom-research-types",
+      "loom-search",
+      "loom-trial"
+    ],
+    "diagnostic": [
+      "integration-vertical",
+      "xtask"
+    ],
+    "testkit": [
+      "platform-contract-testkit",
+      "platform-vertical-fixtures-v0",
+      "speech-apple-tauri-w1"
+    ]
+  },
+  "secondary": {
+    "portable": [
+      "attachment-native-document",
+      "attachment-native-host",
+      "attachment-native-inspect",
+      "attachment-native-plan",
+      "attachment-native-types",
+      "command-evidence",
+      "fte-loopback",
+      "fte-protocols",
+      "fte-providers",
+      "fte-router",
+      "fte-store",
+      "fte-types",
+      "information-native-acquire",
+      "information-native-backend-community",
+      "information-native-backend-encyclopedia",
+      "information-native-backend-scripture",
+      "information-native-backend-sqlite",
+      "information-native-catalog",
+      "information-native-host",
+      "information-native-retrieval",
+      "information-native-store",
+      "information-native-types",
+      "llama-native-cache",
+      "llama-native-types",
+      "loom-benchmark",
+      "loom-campaign",
+      "loom-context",
+      "loom-document",
+      "loom-eval",
+      "loom-eval-codex",
+      "loom-host",
+      "loom-inference",
+      "loom-learning",
+      "loom-research-types",
+      "loom-search",
+      "loom-store",
+      "loom-trial",
+      "loom-types",
+      "mom-llama-runtime",
+      "platform-contract-testkit",
+      "platform-contracts-v0",
+      "platform-vertical-fixtures-v0",
+      "speech-native-host",
+      "speech-native-router",
+      "speech-native-types"
+    ],
+    "platform-linux": [
+      "free-token-energy",
+      "llama-native-engine",
+      "llama-native-host",
+      "loom-app",
+      "loom-backend-llama",
+      "mom-llama-app"
+    ],
+    "platform-macos": [
+      "free-token-energy",
+      "llama-native-engine",
+      "llama-native-host",
+      "loom-app",
+      "loom-backend-llama",
+      "mom-llama-app",
+      "speech-apple-tauri-w1",
+      "speech-native-backend-parakeet",
+      "speech-native-platform"
+    ],
+    "platform-windows": [
+      "free-token-energy",
+      "llama-native-engine",
+      "llama-native-host",
+      "loom-app",
+      "loom-backend-llama",
+      "mom-llama-app"
+    ],
+    "frontend": [
+      "free-token-energy",
+      "loom-app"
+    ],
+    "fuzz": [
+      "attachment-native-inspect",
+      "attachment-native-types"
+    ],
+    "real-hardware": [
+      "llama-native-engine",
+      "llama-native-host",
+      "loom-app",
+      "loom-backend-llama",
+      "mom-llama-app",
+      "mom-llama-runtime",
+      "speech-apple-tauri-w1",
+      "speech-native-backend-parakeet",
+      "speech-native-platform"
+    ],
+    "release": [
+      "free-token-energy",
+      "loom-app",
+      "mom-llama-app"
+    ]
+  }
+}

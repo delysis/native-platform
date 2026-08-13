@@ -37,6 +37,4 @@ if grep -n -E 'allow-speech-(synthesize|transcribe|transcription-audio|cancel)' 
   fail "the default Tauri permission grants speech execution authority"
 fi
 
-"$repo_root/scripts/check-w1-contract-pin.sh"
-
 printf 'speech-native-kit boundaries verified\n'
