@@ -6,8 +6,6 @@
   "stability_gate": {
     "stable_candidates": [],
     "required_before_stable": [
-      "Mom active operation exercised through the exact packaged application",
-      "cancelled-operation terminals for packaged active-work claims",
       "applicable packaged backup/restore rollback evidence"
     ]
   },
@@ -94,7 +92,18 @@
       "encrypted_checkpoint_visible": true,
       "checkpoint_reopened_after_exact_bundle_relaunch": true,
       "fresh_process_cache_reuse_proof": "passed_separate_real_engine_harness",
-      "packaged_active_operation_quit": "unverified"
+      "packaged_active_operation_quit": "passed",
+      "ui_stop_control_visible": true,
+      "quit_exit_code": 0,
+      "quit_elapsed_ms": 1825,
+      "native_abort_callback_observed": true,
+      "gateway_drained": true,
+      "operation_supervisor_closed": true,
+      "operation_workers_joined": "1_of_1",
+      "native_workers_joined": "1_of_1",
+      "application_work_drained": true,
+      "exact_bundle_relaunch_recovered_interrupted_prompt_as_draft": true,
+      "cancelled_operation_terminal_claimed": false
     },
     "loom": {
       "product_code_revision": "fc8de70f97ccc665b4319b7b6a4ccc637d076fe3",
@@ -147,8 +156,6 @@
     "Developer ID signing and notarization",
     "component tags and public artifact publication",
     "promotion of the current UX binaries into release archives and digest receipts",
-    "Mom active operation through its exact packaged application",
-    "cancelled-operation terminals for the Loom and FTE packaged active-work runs",
     "applicable packaged backup/restore rollback",
     "Windows and Linux distribution support",
     "two stable consolidated releases",

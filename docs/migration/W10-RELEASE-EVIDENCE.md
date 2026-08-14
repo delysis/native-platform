@@ -92,7 +92,13 @@ to zero. A separate real-engine restart proof confirmed fresh-process cache
 reuse. The revised sidebar visibly exposed 14 Personas and Consult groups,
 transferred a landing draft into a persona chat, seeded a group chat with its
 `@` handle, retained persona and group `@` autocomplete, and respected the
-collapsed Conversations state during search.
+collapsed Conversations state during search. A follow-up exact-bundle run sent
+a real local request and visibly exposed the Stop control before Quit. The
+native abort callback ran; the shutdown receipt recorded the Gateway drained,
+the operation supervisor closed, one operation worker and one native worker
+joined, and all application work drained. The process exited zero in 1,825 ms.
+Exact-root relaunch recovered the interrupted prompt as a composer draft rather
+than a partial assistant message, and final Quit exited zero in 44 ms.
 
 Loom was rebuilt from product-code commit `fc8de70` as bundle
 `app.delysis.loom.ux.fc8de70`; its executable SHA-256 is
@@ -150,10 +156,10 @@ candidate and smoke logs remain locally under the corresponding generated
 These are local release candidates and supplemental UX builds, not stable
 public releases:
 
-- Mom has not yet proven an active-operation Quit through its exact packaged
-  application. Loom and FTE exited during UI-reported active local work, but
-  neither run recorded a cancelled-operation terminal; this is responsive
-  lifecycle evidence, not a stronger cancellation claim;
+- all three current UX bundles exited during UI-reported active local work.
+  Mom additionally emitted a complete joined-shutdown receipt and recovered
+  the interrupted prompt as a draft. These runs prove responsive packaged
+  shutdown; they do not claim that a cancelled-operation terminal was retained;
 - applicable packaged backup/restore rollback remains unverified; Mom and Loom
   have source-level prior-store tests, while FTE is fresh/current-schema-only;
 - signing is ad-hoc, not Developer ID;
