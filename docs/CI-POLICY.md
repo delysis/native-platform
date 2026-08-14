@@ -1,8 +1,10 @@
 # CI policy
 
 The shell gate is authority-free and deterministic. It checks formatting,
-compilation, tests, strict Clippy, the pnpm lock, workspace topology, migration
-null fields, and ADR byte identities. It does not contact product repositories,
+compilation, tests, strict Clippy, the pnpm lock, live workspace topology,
+package-group coverage, and the external Git allowlist. Historical migration
+receipts, seal hashes, and ADR snapshots remain readable provenance but do not
+gate ordinary changes. The shell gate does not contact product repositories,
 load models, use credentials, exercise real hardware, or establish a product
 claim.
 
@@ -13,5 +15,6 @@ not be treated as substitutes for operational acceptance.
 
 There is one root Rust toolchain declaration, one Cargo workspace, one root
 Cargo lockfile, and one root pnpm workspace lockfile. CI uses locked dependency
-resolution and rejects imported source before its ledger entry records an
-authorized import commit.
+resolution, rejects first-party Git dependencies, and pins the one permitted
+external FFI dependency to its reviewed revision. It does not consult the
+migration ledger.
