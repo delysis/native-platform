@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -22,6 +25,77 @@ const momWindowsIconPath = path.join(
 
 function read(file) {
   return fs.readFileSync(file, "utf8");
+}
+
+function sha256(file) {
+  return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+function writeExecutable(file, source) {
+  fs.writeFileSync(file, source, { mode: 0o755 });
+}
+
+function macSmokeFixture(t, weightPath = null) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "delysis-smoke-identity-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+  const candidate = path.join(directory, "candidate");
+  const fakeTools = path.join(directory, "bin");
+  const sourceBundle = path.join(directory, "source", "Mom Llama.app");
+  const contents = path.join(sourceBundle, "Contents");
+  const executable = path.join(contents, "MacOS", "mom-llama-app");
+  const archive = path.join(candidate, "Mom Llama.app.zip");
+  const receipt = path.join(candidate, "release-receipt.json");
+  fs.mkdirSync(path.dirname(executable), { recursive: true });
+  fs.mkdirSync(candidate, { recursive: true });
+  fs.mkdirSync(fakeTools, { recursive: true });
+  writeExecutable(executable, "#!/bin/sh\nexit 0\n");
+  fs.writeFileSync(path.join(contents, "Info.plist"), "fixture plist\n");
+  fs.writeFileSync(archive, "fixture archive bytes\n");
+
+  if (weightPath) {
+    const target = path.join(contents, "Resources", weightPath);
+    if (weightPath.endsWith(".mlpackage")) {
+      fs.mkdirSync(target, { recursive: true });
+    } else {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, "fixture model bytes\n");
+    }
+  }
+
+  writeExecutable(path.join(fakeTools, "uname"), "#!/bin/sh\nprintf 'Darwin\\n'\n");
+  writeExecutable(
+    path.join(fakeTools, "ditto"),
+    "#!/bin/sh\ncp -R \"$FAKE_APP_SOURCE\" \"$4/\"\n",
+  );
+  writeExecutable(
+    path.join(fakeTools, "shasum"),
+    `#!/bin/sh
+node -e 'const fs=require("fs"),crypto=require("crypto"),p=process.argv[1]; console.log(crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex")+"  "+p)' "$3"
+`,
+  );
+
+  const validReceipt = {
+    schema: "delysis.macos-release-receipt.v1",
+    component: "mom",
+    macos: {
+      bundle_id: "com.delysis.llama-native-kit.mom-llama",
+      archive_sha256: sha256(archive),
+      executable_sha256: sha256(executable),
+    },
+  };
+  const run = () =>
+    spawnSync("sh", [smokeScriptPath, "mom", archive], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        FAKE_APP_SOURCE: sourceBundle,
+        PATH: `${fakeTools}${path.delimiter}${process.env.PATH}`,
+        TMPDIR: directory,
+      },
+    });
+
+  return { archive, receipt, run, validReceipt };
 }
 
 function externalActionUses(source) {
@@ -48,6 +122,57 @@ test("local macOS smoke can verify the exact emitted archive", () => {
   assert.match(release, /exact-archive smoke:/);
   assert.match(smoke, /ditto -x -k "\$INPUT_ARCHIVE" "\$INSTALL_ROOT"/);
   assert.match(smoke, /input_archive_sha256:/);
+  assert.match(smoke, /input_release_receipt_sha256:/);
+});
+
+test("supplied macOS ZIP fails closed without its exact adjacent release receipt", (t) => {
+  const fixture = macSmokeFixture(t);
+
+  let result = fixture.run();
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /adjacent release receipt is missing/);
+
+  for (const [field, value, expected] of [
+    ["component", "loom", /release receipt component mismatch/],
+    ["bundle_id", "example.invalid", /release receipt bundle ID mismatch/],
+    ["archive_sha256", "0".repeat(64), /release receipt archive SHA-256 mismatch/],
+    ["executable_sha256", "0".repeat(64), /release receipt executable SHA-256 mismatch/],
+  ]) {
+    const receipt = structuredClone(fixture.validReceipt);
+    if (field === "component") receipt.component = value;
+    else receipt.macos[field] = value;
+    fs.writeFileSync(fixture.receipt, `${JSON.stringify(receipt)}\n`);
+    result = fixture.run();
+    assert.notEqual(result.status, 0, `${field} mismatch must fail`);
+    assert.match(result.stderr, expected);
+  }
+});
+
+for (const extension of [
+  "gguf",
+  "safetensors",
+  "onnx",
+  "pt",
+  "pth",
+  "ckpt",
+  "mlmodel",
+  "mlpackage",
+]) {
+  test(`extracted macOS ZIP rejects .${extension} model weights`, (t) => {
+    const fixture = macSmokeFixture(t, `weights/model.${extension}`);
+    fs.writeFileSync(fixture.receipt, `${JSON.stringify(fixture.validReceipt)}\n`);
+    const result = fixture.run();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /model weights must remain runtime-discovered/);
+  });
+}
+
+test("the packaged executable is not mistaken for model weights", (t) => {
+  const fixture = macSmokeFixture(t);
+  fs.writeFileSync(fixture.receipt, `${JSON.stringify(fixture.validReceipt)}\n`);
+  const result = fixture.run();
+  assert.notEqual(result.status, 0, "the fake unsigned app cannot complete the full smoke");
+  assert.doesNotMatch(result.stderr, /model weights must remain runtime-discovered/);
 });
 
 test("macOS remote candidates are tag or manual artifacts and never PR requirements", () => {

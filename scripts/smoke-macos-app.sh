@@ -33,9 +33,38 @@ case "$COMPONENT" in
     ;;
 esac
 
+require_equal() {
+  field=$1
+  expected=$2
+  observed=$3
+  if [ "$expected" != "$observed" ]; then
+    echo "$field mismatch: expected '$expected', observed '$observed'" >&2
+    exit 1
+  fi
+}
+
+read_receipt_string() {
+  receipt=$1
+  field=$2
+  node - "$receipt" "$field" <<'NODE'
+const fs = require("fs");
+const [receipt, field] = process.argv.slice(2);
+let value = JSON.parse(fs.readFileSync(receipt, "utf8"));
+for (const key of field.split(".")) value = value?.[key];
+if (typeof value !== "string" || value.length === 0) {
+  console.error(`release receipt field is missing or invalid: ${field}`);
+  process.exit(1);
+}
+process.stdout.write(value);
+NODE
+}
+
 SMOKE_ROOT=$(mktemp -d -t "delysis-$COMPONENT-smoke.XXXXXX")
 INPUT_ARCHIVE=
 INPUT_ARCHIVE_SHA256=
+INPUT_RELEASE_RECEIPT=
+INPUT_RELEASE_RECEIPT_SHA256=
+RELEASE_RECEIPT_EXECUTABLE_SHA256=
 
 if [ -n "$SUPPLIED_ARTIFACT" ]; then
   case "$SUPPLIED_ARTIFACT" in
@@ -50,6 +79,19 @@ if [ -n "$SUPPLIED_ARTIFACT" ]; then
       fi
       INPUT_ARCHIVE=$ARTIFACT
       INPUT_ARCHIVE_SHA256=$(shasum -a 256 "$INPUT_ARCHIVE" | awk '{print $1}')
+      INPUT_RELEASE_RECEIPT="$(dirname -- "$INPUT_ARCHIVE")/release-receipt.json"
+      if [ ! -f "$INPUT_RELEASE_RECEIPT" ]; then
+        echo "adjacent release receipt is missing: $INPUT_RELEASE_RECEIPT" >&2
+        exit 1
+      fi
+      INPUT_RELEASE_RECEIPT_SHA256=$(shasum -a 256 "$INPUT_RELEASE_RECEIPT" | awk '{print $1}')
+      RELEASE_RECEIPT_COMPONENT=$(read_receipt_string "$INPUT_RELEASE_RECEIPT" component)
+      RELEASE_RECEIPT_BUNDLE_ID=$(read_receipt_string "$INPUT_RELEASE_RECEIPT" macos.bundle_id)
+      RELEASE_RECEIPT_ARCHIVE_SHA256=$(read_receipt_string "$INPUT_RELEASE_RECEIPT" macos.archive_sha256)
+      RELEASE_RECEIPT_EXECUTABLE_SHA256=$(read_receipt_string "$INPUT_RELEASE_RECEIPT" macos.executable_sha256)
+      require_equal "release receipt component" "$COMPONENT" "$RELEASE_RECEIPT_COMPONENT"
+      require_equal "release receipt bundle ID" "$BUNDLE_ID" "$RELEASE_RECEIPT_BUNDLE_ID"
+      require_equal "release receipt archive SHA-256" "$INPUT_ARCHIVE_SHA256" "$RELEASE_RECEIPT_ARCHIVE_SHA256"
       INSTALL_ROOT="$SMOKE_ROOT/extracted-archive"
       mkdir "$INSTALL_ROOT"
       ditto -x -k "$INPUT_ARCHIVE" "$INSTALL_ROOT"
@@ -70,6 +112,29 @@ if [ ! -d "$BUNDLE" ] || [ ! -x "$EXECUTABLE" ] || [ ! -f "$PLIST" ]; then
   exit 1
 fi
 
+EXECUTABLE_SHA256=$(shasum -a 256 "$EXECUTABLE" | awk '{print $1}')
+if [ -n "$INPUT_ARCHIVE" ]; then
+  require_equal "release receipt executable SHA-256" "$EXECUTABLE_SHA256" "$RELEASE_RECEIPT_EXECUTABLE_SHA256"
+fi
+
+EMBEDDED_MODEL=$(find "$BUNDLE/Contents" \( \
+  -type f \( \
+    -iname '*.gguf' -o \
+    -iname '*.safetensors' -o \
+    -iname '*.onnx' -o \
+    -iname '*.pt' -o \
+    -iname '*.pth' -o \
+    -iname '*.ckpt' -o \
+    -iname '*.mlmodel' -o \
+    -iname '*.mlpackage' \
+  \) -o \
+  -type d -iname '*.mlpackage' \
+\) -print -quit)
+if [ -n "$EMBEDDED_MODEL" ]; then
+  echo "model weights must remain runtime-discovered, but the packaged bundle contains: $EMBEDDED_MODEL" >&2
+  exit 1
+fi
+
 OBSERVED_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")
 OBSERVED_EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")
 if [ "$OBSERVED_BUNDLE_ID" != "$BUNDLE_ID" ]; then
@@ -81,7 +146,6 @@ if [ "$OBSERVED_EXECUTABLE" != "$BINARY_NAME" ]; then
   exit 1
 fi
 codesign --verify --deep --strict "$BUNDLE"
-EXECUTABLE_SHA256=$(shasum -a 256 "$EXECUTABLE" | awk '{print $1}')
 
 PRODUCT_STATE="$SMOKE_ROOT/product"
 mkdir "$PRODUCT_STATE"
@@ -317,6 +381,8 @@ DELYSIS_SMOKE_BUNDLE_ID="$BUNDLE_ID" \
 DELYSIS_SMOKE_EXECUTABLE_SHA="$EXECUTABLE_SHA256" \
 DELYSIS_SMOKE_INPUT_ARCHIVE="$INPUT_ARCHIVE" \
 DELYSIS_SMOKE_INPUT_ARCHIVE_SHA="$INPUT_ARCHIVE_SHA256" \
+DELYSIS_SMOKE_INPUT_RELEASE_RECEIPT="$INPUT_RELEASE_RECEIPT" \
+DELYSIS_SMOKE_INPUT_RELEASE_RECEIPT_SHA="$INPUT_RELEASE_RECEIPT_SHA256" \
 DELYSIS_SMOKE_STATE_ROOT="$PRODUCT_STATE" \
 DELYSIS_SMOKE_RUN_1_PID="$RUN_1_PID" \
 DELYSIS_SMOKE_RUN_2_PID="$RUN_2_PID" \
@@ -332,6 +398,8 @@ const receipt = {
   executable_sha256: e.DELYSIS_SMOKE_EXECUTABLE_SHA,
   input_archive: e.DELYSIS_SMOKE_INPUT_ARCHIVE || null,
   input_archive_sha256: e.DELYSIS_SMOKE_INPUT_ARCHIVE_SHA || null,
+  input_release_receipt: e.DELYSIS_SMOKE_INPUT_RELEASE_RECEIPT || null,
+  input_release_receipt_sha256: e.DELYSIS_SMOKE_INPUT_RELEASE_RECEIPT_SHA || null,
   app_owned_state_root: e.DELYSIS_SMOKE_STATE_ROOT,
   launches: [
     { pid: Number(e.DELYSIS_SMOKE_RUN_1_PID), window_observed: true, product_ready_at_state_root: true, quit: "AXPress on Quit menu item with Cmd-Q binding", exit_status: 0 },
