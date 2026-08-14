@@ -28,6 +28,12 @@ safetensors file, and passed `codesign --verify --deep --strict`. The local
 artifacts and their separate release/smoke receipts are under `dist/macos/`;
 that generated directory is intentionally not committed.
 
+The accepted ZIP for each product was also extracted into a fresh smoke root
+and the extracted application passed the same two-launch Quit/relaunch check.
+Each archive input SHA-256 matched the digest recorded above. This closes the
+identity gap between the build-tree bundle and the emitted archive without
+turning the remote packaging workflow into a development gate.
+
 The Mom smoke opened the same encrypted `runtime.sqlite3` file identity from
 the isolated root on both launches. Each quit emitted positive
 application-drain and native-host join evidence. The release gate also passed prior-store import/reopen,
@@ -44,6 +50,10 @@ The FTE smoke opened the same `gateway.db` and `gateway-v2.db` file identities
 from the isolated root on each launch and used process-local credentials instead of Keychain.
 The release gate also passed local-model configuration reopen, schema reopen,
 native-runtime join, active-router cancellation/drain, and both frontend tests.
+Separately, the ignored current-source macOS credential acceptance test wrote,
+independently read, replaced, deleted, and confirmed cleanup of one disposable
+synthetic Keychain item at `a4161c76075111c462dbe5fef03ddcbd7b2ea193`.
+No real provider credential or hosted request was used.
 
 ## Negative evidence retained
 

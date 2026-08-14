@@ -247,3 +247,4 @@ NODE
 
 echo "macOS release candidate: $OUTPUT_DIR"
 echo "receipt: $RECEIPT"
+echo "exact-archive smoke: scripts/smoke-macos-app.sh $COMPONENT '$ARCHIVE' '$OUTPUT_DIR/smoke-receipt.json'"

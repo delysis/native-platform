@@ -3,7 +3,8 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 COMPONENT=${1:-}
-SUPPLIED_BUNDLE=${2:-}
+SUPPLIED_ARTIFACT=${2:-}
+RECEIPT_DESTINATION=${3:-}
 
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "smoke-macos-app.sh requires macOS" >&2
@@ -27,15 +28,34 @@ case "$COMPONENT" in
     BUNDLE_ID=dev.delysis.free-token-energy
     ;;
   *)
-    echo "usage: $0 {mom|loom|fte} [path/to/App.app]" >&2
+    echo "usage: $0 {mom|loom|fte} [path/to/App.app|path/to/App.app.zip] [receipt.json]" >&2
     exit 2
     ;;
 esac
 
-if [ -n "$SUPPLIED_BUNDLE" ]; then
-  case "$SUPPLIED_BUNDLE" in
-    /*) BUNDLE=$SUPPLIED_BUNDLE ;;
-    *) BUNDLE=$(CDPATH= cd -- "$(dirname -- "$SUPPLIED_BUNDLE")" && pwd)/$(basename -- "$SUPPLIED_BUNDLE") ;;
+SMOKE_ROOT=$(mktemp -d -t "delysis-$COMPONENT-smoke.XXXXXX")
+INPUT_ARCHIVE=
+INPUT_ARCHIVE_SHA256=
+
+if [ -n "$SUPPLIED_ARTIFACT" ]; then
+  case "$SUPPLIED_ARTIFACT" in
+    /*) ARTIFACT=$SUPPLIED_ARTIFACT ;;
+    *) ARTIFACT=$(CDPATH= cd -- "$(dirname -- "$SUPPLIED_ARTIFACT")" && pwd)/$(basename -- "$SUPPLIED_ARTIFACT") ;;
+  esac
+  case "$ARTIFACT" in
+    *.zip)
+      if [ ! -f "$ARTIFACT" ]; then
+        echo "packaged application archive is missing: $ARTIFACT" >&2
+        exit 1
+      fi
+      INPUT_ARCHIVE=$ARTIFACT
+      INPUT_ARCHIVE_SHA256=$(shasum -a 256 "$INPUT_ARCHIVE" | awk '{print $1}')
+      INSTALL_ROOT="$SMOKE_ROOT/extracted-archive"
+      mkdir "$INSTALL_ROOT"
+      ditto -x -k "$INPUT_ARCHIVE" "$INSTALL_ROOT"
+      BUNDLE="$INSTALL_ROOT/$APP_NAME.app"
+      ;;
+    *) BUNDLE=$ARTIFACT ;;
   esac
 else
   TARGET_DIR=$(rustup run 1.92.0 cargo metadata --locked --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" |
@@ -63,7 +83,6 @@ fi
 codesign --verify --deep --strict "$BUNDLE"
 EXECUTABLE_SHA256=$(shasum -a 256 "$EXECUTABLE" | awk '{print $1}')
 
-SMOKE_ROOT=$(mktemp -d -t "delysis-$COMPONENT-smoke.XXXXXX")
 PRODUCT_STATE="$SMOKE_ROOT/product"
 mkdir "$PRODUCT_STATE"
 PRODUCT_STATE_CANONICAL=$(CDPATH= cd -- "$PRODUCT_STATE" && pwd -P)
@@ -296,6 +315,8 @@ DELYSIS_SMOKE_COMPONENT="$COMPONENT" \
 DELYSIS_SMOKE_BUNDLE="$BUNDLE" \
 DELYSIS_SMOKE_BUNDLE_ID="$BUNDLE_ID" \
 DELYSIS_SMOKE_EXECUTABLE_SHA="$EXECUTABLE_SHA256" \
+DELYSIS_SMOKE_INPUT_ARCHIVE="$INPUT_ARCHIVE" \
+DELYSIS_SMOKE_INPUT_ARCHIVE_SHA="$INPUT_ARCHIVE_SHA256" \
 DELYSIS_SMOKE_STATE_ROOT="$PRODUCT_STATE" \
 DELYSIS_SMOKE_RUN_1_PID="$RUN_1_PID" \
 DELYSIS_SMOKE_RUN_2_PID="$RUN_2_PID" \
@@ -309,6 +330,8 @@ const receipt = {
   bundle: e.DELYSIS_SMOKE_BUNDLE,
   bundle_id: e.DELYSIS_SMOKE_BUNDLE_ID,
   executable_sha256: e.DELYSIS_SMOKE_EXECUTABLE_SHA,
+  input_archive: e.DELYSIS_SMOKE_INPUT_ARCHIVE || null,
+  input_archive_sha256: e.DELYSIS_SMOKE_INPUT_ARCHIVE_SHA || null,
   app_owned_state_root: e.DELYSIS_SMOKE_STATE_ROOT,
   launches: [
     { pid: Number(e.DELYSIS_SMOKE_RUN_1_PID), window_observed: true, product_ready_at_state_root: true, quit: "AXPress on Quit menu item with Cmd-Q binding", exit_status: 0 },
@@ -321,7 +344,20 @@ const receipt = {
 process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
 NODE
 
+if [ -n "$RECEIPT_DESTINATION" ]; then
+  receipt_parent=$(dirname -- "$RECEIPT_DESTINATION")
+  if [ ! -d "$receipt_parent" ]; then
+    echo "receipt destination directory does not exist: $receipt_parent" >&2
+    exit 1
+  fi
+  cp "$RECEIPT" "$RECEIPT_DESTINATION"
+  RECEIPT_DESTINATION=$(CDPATH= cd -- "$receipt_parent" && pwd)/$(basename -- "$RECEIPT_DESTINATION")
+fi
+
 trap - EXIT HUP INT TERM
 echo "packaged-app smoke passed twice: $COMPONENT"
 echo "smoke evidence: $SMOKE_ROOT"
 echo "receipt: $RECEIPT"
+if [ -n "$RECEIPT_DESTINATION" ]; then
+  echo "copied receipt: $RECEIPT_DESTINATION"
+fi

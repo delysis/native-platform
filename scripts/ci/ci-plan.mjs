@@ -165,6 +165,16 @@ for (const changedPath of changed) {
     forceFull("release");
   }
 
+  if (
+    changedPath === "scripts/release-macos.sh" ||
+    changedPath === "scripts/smoke-macos-app.sh"
+  ) {
+    recognized = true;
+    risk = "release";
+    flags.root = true;
+    flags.platform_macos = true;
+  }
+
   if (under(changedPath, "crates/native")) {
     recognized = true;
     flags.native = true;
