@@ -35,6 +35,26 @@ test("required successes and unneeded skips pass", () => {
   assert.equal(result.status, 0, result.stderr);
 });
 
+test("a focused Mom plan accepts skipped root and requires its selected lanes", () => {
+  const momPlan = {
+    ...docsPlan,
+    risk: "behavior",
+    presence: { mom: true, loom: false },
+    jobs: ["policy", "mom-linux", "frontend", "platform-macos"],
+  };
+  const needs = {
+    plan: { result: "success" },
+    policy: { result: "success" },
+    "root-linux": { result: "skipped" },
+    "mom-linux": { result: "success" },
+    frontend: { result: "success" },
+    "platform-macos": { result: "success" },
+  };
+  assert.equal(run(momPlan, needs).status, 0);
+  needs.frontend = { result: "skipped" };
+  assert.notEqual(run(momPlan, needs).status, 0);
+});
+
 test("a required skipped, failed, or missing job fails", () => {
   for (const resultName of ["skipped", "failure", undefined]) {
     const needs = {

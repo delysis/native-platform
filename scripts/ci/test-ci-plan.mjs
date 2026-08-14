@@ -60,6 +60,15 @@ function fixture(relativePath, { contents = "changed\n", present = [] } = {}) {
   return { repo, result: plan(repo, fixtureBase, head) };
 }
 
+function fixtureMany(relativePaths, { present = [] } = {}) {
+  const { repo, base } = makeRepo();
+  for (const presentPath of present) write(repo, presentPath, "[workspace]\n");
+  const fixtureBase = present.length > 0 ? commit(repo, "fixture presence") : base;
+  for (const relativePath of relativePaths) write(repo, relativePath);
+  const head = commit(repo, "fixture changes");
+  return { repo, result: plan(repo, fixtureBase, head) };
+}
+
 test("docs-only changes require policy and nothing else", () => {
   const { result } = fixture("docs/architecture.md");
   assert.equal(result.risk, "docs");
@@ -123,14 +132,71 @@ test("Speech Apple changes select Speech and platform coverage", () => {
   assert.ok(!result.jobs.includes("platform-windows"));
 });
 
-test("Mom source selects Mom and root when Mom is present", () => {
-  const { result } = fixture("products/mom/crates/mom-llama-runtime/src/lib.rs", {
+test("Mom native source selects its product and macOS parity without root duplication", () => {
+  const { result } = fixture("products/mom/apps/mom-llama/src-tauri/src/commands.rs", {
     present: ["products/mom/Cargo.toml"],
   });
   assert.equal(result.presence.mom, true);
   assert.equal(result.flags.mom, true);
+  assert.equal(result.flags.root, false);
+  assert.equal(result.flags.platform_macos, true);
+  assert.deepEqual(result.jobs, ["policy", "mom-linux", "platform-macos"]);
+});
+
+test("the PR 22 Mom diff has the focused product, frontend, and macOS plan", () => {
+  const { result } = fixtureMany(
+    [
+      "products/mom/apps/mom-llama/src-tauri/src/commands.rs",
+      "products/mom/apps/mom-llama/src-tauri/src/view.rs",
+      "products/mom/apps/mom-llama/ui/coop-hx.js",
+      "products/mom/crates/mom-llama-cli/src/main.rs",
+      "products/mom/crates/mom-llama-runtime/src/config.rs",
+      "products/mom/crates/mom-llama-runtime/src/server.rs",
+      "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+    ],
+    { present: ["products/mom/Cargo.toml"] },
+  );
+  assert.equal(result.flags.root, false);
+  assert.equal(result.flags.mom, true);
+  assert.equal(result.flags.frontend_mom, true);
+  assert.equal(result.flags.platform_macos, true);
+  assert.deepEqual(result.jobs, [
+    "policy",
+    "mom-linux",
+    "frontend",
+    "platform-macos",
+  ]);
+});
+
+test("product package scripts select their owned frontend checks", () => {
+  const mom = fixture("products/mom/apps/mom-llama/package.json", {
+    contents: '{"scripts":{"check:frontend":"node --check ui/coop-hx.js"}}\n',
+    present: ["products/mom/Cargo.toml"],
+  }).result;
+  assert.equal(mom.flags.frontend_mom, true);
+  assert.deepEqual(mom.jobs, ["policy", "mom-linux", "frontend"]);
+
+  const fte = fixture("products/fte/package.json").result;
+  assert.equal(fte.flags.frontend_fte, true);
+  assert.ok(fte.jobs.includes("frontend"));
+});
+
+test("Mom dependency metadata remains conservative", () => {
+  const { result } = fixture("products/mom/Cargo.toml", {
+    contents: "[workspace]\nmembers = []\n",
+    present: ["products/mom/Cargo.toml"],
+  });
   assert.equal(result.flags.root, true);
-  assert.ok(result.jobs.includes("mom-linux"));
+  assert.equal(result.flags.mom, true);
+  assert.equal(result.flags.dependency_graph, true);
+  assert.equal(result.flags.platform_macos, true);
+  assert.deepEqual(result.jobs, [
+    "policy",
+    "root-linux",
+    "mom-linux",
+    "platform-macos",
+    "dependency-graph",
+  ]);
 });
 
 test("Loom Svelte source selects Loom frontend when Loom is present", () => {

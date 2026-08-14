@@ -11,6 +11,10 @@ const fullPath = path.join(root, ".github/workflows/ci-full.yml");
 const releasePath = path.join(root, ".github/workflows/release-macos.yml");
 const releaseScriptPath = path.join(root, "scripts/release-macos.sh");
 const smokeScriptPath = path.join(root, "scripts/smoke-macos-app.sh");
+const momPackagePath = path.join(
+  root,
+  "products/mom/apps/mom-llama/package.json",
+);
 const momWindowsIconPath = path.join(
   root,
   "products/mom/apps/mom-llama/src-tauri/icons/icon.ico",
@@ -105,23 +109,56 @@ test("root workspace tests can inspect the retained migration evidence", () => {
   assert.match(rootLinux, /actions\/checkout@[0-9a-f]{40}\n\s+with:\n\s+fetch-depth: 0/);
 });
 
-test("frontend jobs use the single root pnpm workspace", () => {
+test("PR frontend runs only selected product frontend commands", () => {
   const prFrontend = read(prPath).match(/^  frontend:[\s\S]*?(?=^  platform-macos:)/m)?.[0];
-  const fullFrontend = read(fullPath).match(/^  frontend:[\s\S]*?(?=^  policy-and-graphs:)/m)?.[0];
-  for (const block of [prFrontend, fullFrontend]) {
-    assert.ok(block, "frontend job block is missing");
-    assert.match(block, /dtolnay\/rust-toolchain@[0-9a-f]{40}/);
-    assert.match(block, /components: clippy,rustfmt/);
-    assert.match(block, /libwebkit2gtk-4\.1-dev/);
-    assert.match(block, /pnpm install --frozen-lockfile/);
-    assert.match(block, /pnpm -r --if-present run test/);
-    assert.doesNotMatch(block, /loom:install|--dir products\/loom/);
+  assert.ok(prFrontend, "PR frontend job block is missing");
+  assert.match(prFrontend, /pnpm install --frozen-lockfile/);
+  assert.doesNotMatch(prFrontend, /pnpm -r/);
+  assert.doesNotMatch(prFrontend, /apt-get|libwebkit2gtk|dtolnay\/rust-toolchain/);
+  assert.match(prFrontend, /name: FTE frontend/);
+  assert.match(prFrontend, /pnpm --filter free-token-energy run check:frontend/);
+  assert.match(prFrontend, /pnpm --filter free-token-energy run test:frontend/);
+  assert.doesNotMatch(
+    prFrontend,
+    /free-token-energy run (?:build|check|check:rust|test|test:rust)\s*$/m,
+  );
+  assert.match(prFrontend, /name: Mom frontend/);
+  assert.match(prFrontend, /pnpm --filter @delysis\/mom-llama run check:frontend/);
+  assert.match(prFrontend, /name: Loom frontend/);
+  assert.match(prFrontend, /pnpm --filter @delysis\/loom run test/);
+  assert.match(prFrontend, /pnpm --filter @delysis\/loom run check/);
+  assert.match(prFrontend, /pnpm --filter @delysis\/loom run build/);
+  for (const flag of ["frontend_fte", "frontend_mom", "frontend_loom"]) {
+    assert.match(prFrontend, new RegExp(`needs\\.plan\\.outputs\\.${flag}`));
   }
+});
+
+test("Mom exposes the frontend syntax check used by PR CI", () => {
+  const scripts = JSON.parse(read(momPackagePath)).scripts;
+  assert.equal(scripts["check:frontend"], "node --check ui/coop-hx.js");
+});
+
+test("full frontend coverage remains unchanged", () => {
+  const fullFrontend = read(fullPath).match(/^  frontend:[\s\S]*?(?=^  policy-and-graphs:)/m)?.[0];
+  assert.ok(fullFrontend, "full frontend job block is missing");
+  assert.match(fullFrontend, /dtolnay\/rust-toolchain@[0-9a-f]{40}/);
+  assert.match(fullFrontend, /components: clippy,rustfmt/);
+  assert.match(fullFrontend, /libwebkit2gtk-4\.1-dev/);
+  assert.match(fullFrontend, /pnpm install --frozen-lockfile/);
+  assert.match(fullFrontend, /pnpm -r --if-present run test/);
+  assert.match(fullFrontend, /pnpm -r --if-present run check/);
+  assert.match(fullFrontend, /pnpm -r --if-present run build/);
+  assert.doesNotMatch(fullFrontend, /loom:install|--dir products\/loom/);
 });
 
 test("the required macOS lane runs Mom parity when Mom changes", () => {
   const macos = read(prPath).match(/^  platform-macos:[\s\S]*?(?=^  dependency-graph:)/m)?.[0];
+  const rootGraph = macos?.match(
+    /- name: Root platform graph[\s\S]*?(?=\n      - name: Mom macOS parity)/,
+  )?.[0];
   assert.ok(macos, "platform-macos job block is missing");
+  assert.ok(rootGraph, "Root platform graph step is missing");
+  assert.doesNotMatch(rootGraph, /needs\.plan\.outputs\.mom/);
   assert.match(macos, /name: Mom macOS parity/);
   assert.match(macos, /mom_present == 'true'/);
   assert.match(macos, /cargo-group\.mjs test product-mom/);
