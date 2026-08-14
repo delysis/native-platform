@@ -286,6 +286,10 @@ test("long Linux lanes parallelize test and Clippy without dropping either", () 
   }
   assert.match(blocks[0], /cargo test --locked --workspace --all-targets/);
   assert.match(blocks[0], /cargo clippy --locked --workspace --all-targets -- -D warnings/);
+  assert.match(
+    blocks[0],
+    /components: \$\{\{ matrix\.command == 'test' && 'rustfmt' \|\| 'clippy' \}\}/,
+  );
   assert.match(blocks[1], /cargo-group\.mjs test product-mom/);
   assert.match(blocks[1], /cargo-group\.mjs clippy product-mom/);
   assert.match(blocks[2], /cargo-group\.mjs test product-loom/);
