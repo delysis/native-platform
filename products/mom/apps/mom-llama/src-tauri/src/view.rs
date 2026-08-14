@@ -3963,7 +3963,7 @@ mod tests {
         assert!(!html.contains("Edits version this template"));
         assert!(!html.contains(r#"class="persona-template-banner""#));
         assert!(html.contains(r#"id="mention-candidates" class="mention-candidates is-hidden""#));
-        let stylesheet = include_str!("../../ui/style.css");
+        let stylesheet = include_str!("../../ui/style.css").replace("\r\n", "\n");
         assert!(
             stylesheet.contains(".composer {\n  position: relative;"),
             "mention autocomplete must be positioned relative to the composer"
