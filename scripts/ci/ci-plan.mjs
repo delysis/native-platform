@@ -168,6 +168,7 @@ for (const changedPath of changed) {
   if (
     changedPath === "scripts/release-macos.sh" ||
     changedPath === "scripts/smoke-macos-app.sh" ||
+    changedPath === "scripts/find-embedded-model.mjs" ||
     changedPath === "scripts/product-state-backup.mjs"
   ) {
     recognized = true;

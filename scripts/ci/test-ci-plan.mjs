@@ -88,6 +88,7 @@ test("macOS release tooling selects only policy and the macOS syntax lane", () =
   for (const relativePath of [
     "scripts/release-macos.sh",
     "scripts/smoke-macos-app.sh",
+    "scripts/find-embedded-model.mjs",
     "scripts/product-state-backup.mjs",
   ]) {
     const { result } = fixture(relativePath);

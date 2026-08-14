@@ -117,19 +117,7 @@ if [ -n "$INPUT_ARCHIVE" ]; then
   require_equal "release receipt executable SHA-256" "$EXECUTABLE_SHA256" "$RELEASE_RECEIPT_EXECUTABLE_SHA256"
 fi
 
-EMBEDDED_MODEL=$(find "$BUNDLE/Contents" \( \
-  -type f \( \
-    -iname '*.gguf' -o \
-    -iname '*.safetensors' -o \
-    -iname '*.onnx' -o \
-    -iname '*.pt' -o \
-    -iname '*.pth' -o \
-    -iname '*.ckpt' -o \
-    -iname '*.mlmodel' -o \
-    -iname '*.mlpackage' \
-  \) -o \
-  -type d -iname '*.mlpackage' \
-\) -print -quit)
+EMBEDDED_MODEL=$(node "$ROOT/scripts/find-embedded-model.mjs" "$BUNDLE/Contents")
 if [ -n "$EMBEDDED_MODEL" ]; then
   echo "model weights must remain runtime-discovered, but the packaged bundle contains: $EMBEDDED_MODEL" >&2
   exit 1
