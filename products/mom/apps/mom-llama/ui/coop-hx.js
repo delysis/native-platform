@@ -634,13 +634,36 @@
 
   const persistCurrentDraftBeforeNavigation = async () => {
     const conversation = selectedConversation();
-    if (conversation === "default") return;
     const form = document.getElementById("chat-form");
-    await persistDraftNow(
-      formValue(form, "message"),
-      draftAttachmentIds(form),
+    const draft = {
       conversation,
-    );
+      message: formValue(form, "message"),
+      attachmentIds: draftAttachmentIds(form),
+    };
+    const persisted = await persistDraftNow(draft.message, draft.attachmentIds, conversation);
+    report(persisted);
+    return persisted?.status === "blocked" ? null : draft;
+  };
+
+  const seedNewChatDraft = async (conversation, draft, prefix = "") => {
+    const transferLandingDraft = draft.conversation === "default";
+    if (!transferLandingDraft && !prefix) return true;
+    const seeded = await invoke("mom_llama_draft_update", {
+      conversation,
+      message: transferLandingDraft ? `${prefix}${draft.message}` : prefix,
+      attachmentIds: transferLandingDraft ? draft.attachmentIds : [],
+    });
+    report(seeded);
+    if (seeded?.status === "blocked") return false;
+    if (transferLandingDraft) {
+      const cleared = await invoke("mom_llama_draft_update", {
+        conversation: draft.conversation,
+        message: "",
+        attachmentIds: [],
+      });
+      report(cleared);
+    }
+    return true;
   };
 
   const focusComposer = () => {
@@ -1299,9 +1322,16 @@
       else collapsedSidebarSections.add(section);
     },
     "sidebar-persona-start": async (button) => {
-      await persistCurrentDraftBeforeNavigation();
+      const draft = await persistCurrentDraftBeforeNavigation();
+      if (!draft) return;
       const result = await instantiatePersona(button.dataset.persona);
-      if (result?.status === "blocked") return;
+      if (result?.status === "blocked" || !result?.result?.id) return;
+      try {
+        await seedNewChatDraft(result.result.id, draft);
+      } catch (error) {
+        await refreshConversationProjection().catch(reportError);
+        throw error;
+      }
       await refreshConversationProjection();
       focusComposer();
     },
@@ -1323,16 +1353,17 @@
         await refreshSidebar();
         return;
       }
-      await persistCurrentDraftBeforeNavigation();
+      const draft = await persistCurrentDraftBeforeNavigation();
+      if (!draft) return;
       const created = await invoke("mom_llama_conversation_new", { title: group.name });
       report(created);
       if (created?.status === "blocked" || !created?.result?.id) return;
-      const seeded = await invoke("mom_llama_draft_update", {
-        conversation: created.result.id,
-        message: `@${group.mention_handle} `,
-        attachmentIds: [],
-      });
-      report(seeded);
+      try {
+        await seedNewChatDraft(created.result.id, draft, `@${group.mention_handle} `);
+      } catch (error) {
+        await refreshConversationProjection().catch(reportError);
+        throw error;
+      }
       await refreshConversationProjection();
       focusComposer();
     },

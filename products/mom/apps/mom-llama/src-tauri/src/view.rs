@@ -1768,30 +1768,32 @@ fn sidebar(conversations: &CommandResult<Vec<Conversation>>, active_id: Option<&
                         data-sidebar-label="Conversations"
                         aria-label="Collapse Conversations"
                         aria-expanded="true"
-                        aria-controls="conversation-list" {
+                        aria-controls="conversation-section-panel" {
                         span { "Conversations" }
                         span class="sidebar-section-chevron" aria-hidden="true" { (icon_markup("chevron-down")) }
                     }
-                    ol id="conversation-search-results" class="conversation-list search-results is-hidden" aria-live="polite" {}
-                    ol id="conversation-list" class="conversation-list sidebar-section-list" {
-                        @if !chats.iter().any(|conversation| conversation.kind == ConversationKind::Chat) {
-                            li class="empty-line" { "No conversations yet" }
-                        }
-                        @for conversation in chats.iter()
-                            .filter(|conversation| conversation.kind == ConversationKind::Chat) {
-                            @let active = active_id == Some(conversation.id.as_str());
-                            li {
-                                button type="button"
-                                    class=(format!("conversation-item {}", if active { "active" } else { "" }))
-                                    data-affordance="conversation.select"
-                                    data-command="mom_llama.conversation_select"
-                                    data-tauri-command="mom_llama_conversation_select"
-                                    data-cli="mom-llama conversation select --conversation <id> --json"
-                                    data-effect="mom_llama.effects.conversation_store.v1"
-                                    data-action="conversation-select"
-                                    data-conversation=(conversation.id.clone()) {
-                                    span { (conversation.title.clone()) }
-                                    small { (message_count(conversation)) }
+                    div id="conversation-section-panel" {
+                        ol id="conversation-search-results" class="conversation-list search-results is-hidden" aria-live="polite" {}
+                        ol id="conversation-list" class="conversation-list sidebar-section-list" {
+                            @if !chats.iter().any(|conversation| conversation.kind == ConversationKind::Chat) {
+                                li class="empty-line" { "No conversations yet" }
+                            }
+                            @for conversation in chats.iter()
+                                .filter(|conversation| conversation.kind == ConversationKind::Chat) {
+                                @let active = active_id == Some(conversation.id.as_str());
+                                li {
+                                    button type="button"
+                                        class=(format!("conversation-item {}", if active { "active" } else { "" }))
+                                        data-affordance="conversation.select"
+                                        data-command="mom_llama.conversation_select"
+                                        data-tauri-command="mom_llama_conversation_select"
+                                        data-cli="mom-llama conversation select --conversation <id> --json"
+                                        data-effect="mom_llama.effects.conversation_store.v1"
+                                        data-action="conversation-select"
+                                        data-conversation=(conversation.id.clone()) {
+                                        span { (conversation.title.clone()) }
+                                        small { (message_count(conversation)) }
+                                    }
                                 }
                             }
                         }
@@ -4135,7 +4137,11 @@ mod tests {
         assert!(!html.contains(r#"data-action="personas-open""#));
         assert!(!html.contains(r#"data-action="consult-open""#));
         for (section, list, label) in [
-            ("conversations", "conversation-list", "Conversations"),
+            (
+                "conversations",
+                "conversation-section-panel",
+                "Conversations",
+            ),
             ("personas", "sidebar-persona-list", "Personas"),
             (
                 "consult-groups",
@@ -4252,6 +4258,9 @@ mod tests {
         assert!(js.contains(r#""sidebar-persona-start": async (button)"#));
         assert!(js.contains(r#""sidebar-consult-group-start": async (button)"#));
         assert!(js.contains("collapsedSidebarSections"));
+        assert!(js.contains("const seedNewChatDraft = async"));
+        assert!(js.contains(r#"draft.conversation === "default""#));
+        assert!(js.contains("await refreshConversationProjection().catch(reportError)"));
         assert!(js.contains("scheduleSettingsAutosave"));
         assert!(
             js.contains(r#"modelPath: formValue(form, "model_path")"#)
@@ -4731,7 +4740,7 @@ mod tests {
             js,
             r#""sidebar-consult-group-start": async (button)"#,
             r#"invoke("mom_llama_conversation_new"#,
-            r#"message: `@${group.mention_handle} `"#,
+            r#"await seedNewChatDraft(created.result.id, draft, `@${group.mention_handle} `)"#,
         );
         assert!(
             js.contains(r#""sidebar-persona-start": async (button)"#)
