@@ -7830,6 +7830,22 @@ mod tests {
         lease
     }
 
+    fn persist_cancelled_test_generation_and_release(
+        state: &PluginState,
+        identity: &GenerationFamilyIdentity,
+        runs: &[(GenerationRunId, BranchId)],
+    ) {
+        terminalize_open_runs(state, identity, runs, "cancelled while closing")
+            .expect("persist terminal generation before release");
+        release_family_after_terminal_persistence(
+            state,
+            identity,
+            runs,
+            GenerationTerminalClass::Cancelled,
+        )
+        .expect("release terminal family");
+    }
+
     #[derive(Debug)]
     struct FlagGenerationWorkerCancellation {
         cancelled: Arc<AtomicBool>,
@@ -9445,43 +9461,41 @@ mod tests {
             })
             .expect("register active family");
         let _lifecycle = start_test_generation_lifecycle(&state.generation_lifecycle, &request_id);
-        let completing_state = Arc::clone(&state);
         let completing_identity = GenerationFamilyIdentity {
             request_id: request_id.clone(),
             project_id,
             session_id,
             document_id,
         };
-        let completion = std::thread::spawn(move || {
-            cancelled
-                .recv_timeout(Duration::from_secs(1))
-                .expect("close must request cancellation");
-            terminalize_open_runs(
-                &completing_state,
-                &completing_identity,
-                &[(run_id, branch_id)],
-                "cancelled while closing",
+        let command_id = CommandId::new();
+        let closing_state = Arc::clone(&state);
+        let close = std::thread::spawn(move || {
+            close_project_with_wait(
+                &closing_state,
+                project_id.to_string(),
+                session_id.to_string(),
+                command_id,
+                PROJECT_CLOSE_GENERATION_WAIT,
             )
-            .expect("persist terminal generation before release");
-            release_family_after_terminal_persistence(
-                &completing_state,
-                &completing_identity,
-                &[(run_id, branch_id)],
-                GenerationTerminalClass::Cancelled,
-            )
-            .expect("release terminal family");
         });
 
-        let command_id = CommandId::new();
-        let receipt = close_project_with_wait(
+        cancelled
+            .recv_timeout(PROJECT_CLOSE_GENERATION_WAIT)
+            .expect("close must request cancellation");
+        assert!(
+            !close.is_finished(),
+            "close must remain pending while terminal evidence is absent"
+        );
+        persist_cancelled_test_generation_and_release(
             &state,
-            project_id.to_string(),
-            session_id.to_string(),
-            command_id,
-            Duration::from_secs(1),
-        )
-        .expect("close after cancellation terminalizes");
-        completion.join().expect("completion thread");
+            &completing_identity,
+            &[(run_id, branch_id)],
+        );
+
+        let receipt = close
+            .join()
+            .expect("close thread")
+            .expect("close after cancellation terminalizes");
         assert_eq!(
             *cancellation.branches.lock().expect("cancelled branches"),
             vec![branch_id]
