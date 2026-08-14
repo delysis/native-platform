@@ -77,6 +77,12 @@ test("PR workflow exposes every targeted partition and future product guards", (
   assert.doesNotMatch(source, /platform_windows/);
 });
 
+test("root workspace tests can inspect the retained migration evidence", () => {
+  const rootLinux = read(prPath).match(/^  root-linux:[\s\S]*?(?=^  native-linux:)/m)?.[0];
+  assert.ok(rootLinux, "root-linux job block is missing");
+  assert.match(rootLinux, /actions\/checkout@[0-9a-f]{40}\n\s+with:\n\s+fetch-depth: 0/);
+});
+
 test("frontend jobs use the single root pnpm workspace", () => {
   const prFrontend = read(prPath).match(/^  frontend:[\s\S]*?(?=^  platform-macos:)/m)?.[0];
   const fullFrontend = read(fullPath).match(/^  frontend:[\s\S]*?(?=^  policy-and-graphs:)/m)?.[0];
