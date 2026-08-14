@@ -188,7 +188,11 @@ for (const changedPath of changed) {
     flags.gateway = true;
     flags.root = true;
     markBehavior();
-    if (changedPath.includes("/ui/") || /\.(?:js|mjs|ts|css|html)$/.test(changedPath)) {
+    if (
+      changedPath.includes("/ui/") ||
+      changedPath.endsWith("/package.json") ||
+      /\.(?:js|mjs|ts|css|html)$/.test(changedPath)
+    ) {
       flags.frontend_fte = true;
     }
     if (changedPath.includes("src-tauri") || changedPath.includes("tauri")) {
@@ -228,9 +232,12 @@ for (const changedPath of changed) {
   if (under(changedPath, "products/mom")) {
     recognized = true;
     flags.mom = true;
-    flags.root = true;
     markBehavior();
-    if (changedPath.includes("/ui/") || /\.(?:js|mjs|ts|css|html)$/.test(changedPath)) {
+    if (
+      changedPath.includes("/ui/") ||
+      changedPath.endsWith("/package.json") ||
+      /\.(?:js|mjs|ts|css|html)$/.test(changedPath)
+    ) {
       flags.frontend_mom = true;
     }
     if (changedPath.includes("src-tauri") || changedPath.includes("native_runtime")) {

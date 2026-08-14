@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "check:frontend": "node --check ui/coop-hx.js",
     "tauri": "tauri"
   },
   "devDependencies": {
