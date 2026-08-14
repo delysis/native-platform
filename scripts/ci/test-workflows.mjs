@@ -139,6 +139,21 @@ test("local macOS smoke can verify the exact emitted archive", () => {
   assert.match(smoke, /input_release_receipt_sha256:/);
 });
 
+test("stable macOS packaging adds only the real distribution gates", () => {
+  const release = read(releaseScriptPath);
+  assert.match(release, /candidate\|stable/);
+  assert.match(release, /stable releases require the exact annotated tag/);
+  assert.match(release, /git cat-file -t "refs\/tags\/\$RELEASE_TAG"/);
+  assert.match(release, /Developer ID Application:/);
+  assert.match(release, /xcrun notarytool submit/);
+  assert.match(release, /xcrun stapler staple/);
+  assert.match(release, /xcrun stapler validate/);
+  assert.match(release, /spctl --assess --type execute/);
+  assert.match(release, /scripts\/smoke-macos-app\.sh" "\$COMPONENT" "\$ARCHIVE"/);
+  assert.match(release, /delysis\.macos-release-receipt\.v2/);
+  assert.doesNotMatch(release, /windows|linux/i);
+});
+
 test("supplied macOS ZIP fails closed without its exact adjacent release receipt", (t) => {
   const fixture = macSmokeFixture(t);
 
@@ -218,6 +233,7 @@ test("macOS remote candidates are tag or manual artifacts and never PR requireme
   assert.match(source, /^\s+package:\s*$/m);
   assert.match(source, /^\s+runs-on: macos-latest$/m);
   assert.match(source, /\.\/scripts\/release-macos\.sh/);
+  assert.match(source, /release-macos\.sh "\$\{\{ steps\.component\.outputs\.component \}\}" candidate/);
   assert.match(source, /actions\/upload-artifact@[0-9a-f]{40}/);
   assert.match(source, /release tag\/version mismatch/);
   assert.match(source, /expected_tag="\$tag_prefix-v\$version"/);

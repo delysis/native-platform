@@ -39,6 +39,13 @@ required only when the artifact is actually distributed through a channel that
 needs them. Model files are discovered at runtime and are never release inputs
 or bundle contents.
 
+The same command has an explicit `stable` mode for that distribution boundary.
+It requires the exact annotated component tag at `HEAD`, an available Developer
+ID Application identity, and a local `notarytool` Keychain profile. It waits for
+notarization, staples and validates the ticket, asks Gatekeeper to assess the
+app, and runs the exact-archive two-launch smoke. The operational procedure is
+documented in `docs/releases/macos.md`.
+
 Internal crates are not independently published unless a real external
 consumer and release boundary are demonstrated.
 
@@ -59,9 +66,10 @@ Semantic versioning describes each component's supported public/product contract
    before accepting it as a local candidate.
 4. Before calling a release stable, exercise an active operation through the
    exact packaged app and verify applicable backup/restore rollback.
-5. Tag the clean commit with the component version.
-6. Upload the artifact asynchronously if distribution is useful.
-7. Keep former repositories readable at their protected phase-one tags until
+5. Tag the accepted clean commit with the component version.
+6. Build the stable Developer ID-signed, notarized package locally.
+7. Upload the artifact asynchronously if distribution is useful.
+8. Keep former repositories readable at their protected phase-one tags until
    the corresponding component migration and rollback proof is accepted.
 
 ## Rollback

@@ -2,6 +2,13 @@
 
 Status: **local macOS candidates accepted; none is stable; publication remains pending**.
 
+The release command now also has a production `stable` mode. It requires the
+exact annotated component tag, a local Developer ID Application identity and
+`notarytool` Keychain profile, successful notarization/stapling/Gatekeeper
+assessment, and an automatic smoke of the exact final ZIP. This is unexercised
+tooling until real signing credentials and a release tag are supplied; it does
+not change the zero-stable-release evidence below. See `docs/releases/macos.md`.
+
 W10 now has one deliberately small local release path. From a clean commit,
 `scripts/release-macos.sh {mom|loom|fte}` runs the product's focused
 source-level migration and shutdown tests, builds an app-only macOS bundle with
