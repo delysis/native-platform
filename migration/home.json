@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "goal": "W8-ONE-WORKSPACE",
-  "status": "local_accepted_pending_github_promotion",
+  "status": "accepted_and_github_promoted",
   "sealed_at": "2026-08-13T20:00:45Z",
   "candidate": {
     "commit": "66e6bf091f16ddad0fcbab194db40b2f8b7c3457",
@@ -170,16 +170,17 @@
     "source_boundary": "native-platform-v2-horizon-b-2026-08-12"
   },
   "promotion": {
-    "candidate_ci_run": null,
-    "main_merge": null,
-    "home_tag": null,
-    "home_tag_object": null,
-    "tag_ruleset": null
+    "candidate_ci_run": 31739376767,
+    "main_merge": "058c4622fac8813417a5e6637091e63e1ef01ea2",
+    "main_tree": "fb0362faf422090ec8d8f936d5b31b95da0b01ac",
+    "home_tag": "w8-home-v0-2026-08-13",
+    "home_tag_object": "a45a6d8cc5e78db526b48513873bda5425cbca95",
+    "tag_ruleset": 20817991
   },
   "claims_deferred": [
-    "GitHub publication, required policy/macOS checks, main merge, and protected HOME tag remain pending.",
     "Linux and Windows are informational and are not Mac-first acceptance gates.",
     "Distribution signing and notarization are release work, not W8 HOME acceptance.",
-    "W9 line/package reduction and W10 release/retirement remain future milestones."
+    "W9 line/package reduction is recorded separately in migration/w9-lean.json.",
+    "Stable release publication and source-repository retirement remain W10 milestones."
   ]
 }

@@ -6,7 +6,8 @@
   "stability_gate": {
     "stable_candidates": [],
     "required_before_stable": [
-      "active operation exercised through the exact packaged application",
+      "Mom active operation exercised through the exact packaged application",
+      "cancelled-operation terminals for packaged active-work claims",
       "applicable packaged backup/restore rollback evidence"
     ]
   },
@@ -81,6 +82,48 @@
       "packaged_current_schema_backup_restore": "unverified"
     }
   },
+  "candidate_class": "accepted_archive_candidates",
+  "supplemental_packaged_ux": {
+    "classification": "debug_bundles_not_promoted_to_release_archives",
+    "mom": {
+      "product_code_revision": "fc8de70f97ccc665b4319b7b6a4ccc637d076fe3",
+      "bundle_id": "com.delysis.mom-llama.ux.fc8de70",
+      "executable_sha256": "fe67432804e05811ff4fadd941659198ebc4a194dfa17b9ba0ec832ff4ed321a",
+      "model_weights_embedded": false,
+      "real_local_chat": true,
+      "encrypted_checkpoint_visible": true,
+      "checkpoint_reopened_after_exact_bundle_relaunch": true,
+      "fresh_process_cache_reuse_proof": "passed_separate_real_engine_harness",
+      "packaged_active_operation_quit": "unverified"
+    },
+    "loom": {
+      "product_code_revision": "fc8de70f97ccc665b4319b7b6a4ccc637d076fe3",
+      "bundle_id": "app.delysis.loom.ux.fc8de70",
+      "executable_sha256": "9ff6b164d56fbfb84a57650995aa1c77068b2670cfa5123c58aef85f6e0b18cd",
+      "model_weights_embedded": false,
+      "cached_model_same_inode_hardlink": true,
+      "ui_reported_active_suggestion_during_quit": true,
+      "quit_exit_code": 0,
+      "quit_elapsed_ms": 102,
+      "exact_bundle_relaunch_recovered_manuscript": true,
+      "real_suggestion_visible_and_tab_accepted": true,
+      "cancelled_generation_terminal": false
+    },
+    "fte": {
+      "product_code_revision": "164fb97c857e5579741b5cd7cda796c1362c011a",
+      "bundle_id": "com.delysis.free-token-energy.ux.164fb97",
+      "executable_sha256": "92f1340f03f137e42f47d68ff800e7e909c865fb021e966bce74ef353959f168",
+      "model_weights_embedded": false,
+      "hugging_face_extensionless_blob_verified_by_gguf_header": true,
+      "real_local_request": true,
+      "ui_reported_routing_during_quit": true,
+      "quit_exit_code": 0,
+      "quit_elapsed_ms": 36,
+      "native_abort_callback_observed": true,
+      "exact_bundle_relaunch_restored_ready_local_provider": true,
+      "cancelled_request_terminal": false
+    }
+  },
   "negative_evidence": {
     "loom_initial_quit_timeout": true,
     "cause": "acceptance mode admitted a remembered Hugging Face model path and waited for its blocking inspection worker",
@@ -103,8 +146,9 @@
   "claims_deferred": [
     "Developer ID signing and notarization",
     "component tags and public artifact publication",
-    "live-model UI acceptance for these exact binaries",
-    "active operation through each exact packaged application",
+    "promotion of the current UX binaries into release archives and digest receipts",
+    "Mom active operation through its exact packaged application",
+    "cancelled-operation terminals for the Loom and FTE packaged active-work runs",
     "applicable packaged backup/restore rollback",
     "Windows and Linux distribution support",
     "two stable consolidated releases",
