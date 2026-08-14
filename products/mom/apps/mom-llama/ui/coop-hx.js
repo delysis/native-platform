@@ -480,8 +480,9 @@
   };
 
   const settingsUpdatePayload = (form) => ({
-    modelPath: formValue(form, "model_path") || null,
-    mmprojPath: formValue(form, "mmproj_path") || null,
+    // Empty strings are explicit clears; omitted or null values mean unchanged.
+    modelPath: formValue(form, "model_path"),
+    mmprojPath: formValue(form, "mmproj_path"),
     device: formValue(form, "native_device") || null,
     contextTokens: numberOrNull(formValue(form, "context_tokens")),
     batchTokens: numberOrNull(formValue(form, "batch_tokens")),

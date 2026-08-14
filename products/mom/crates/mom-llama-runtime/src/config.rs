@@ -309,8 +309,10 @@ fn sampler_order(settings: &Settings) -> Vec<SamplerKind> {
 
 #[derive(Debug, Clone, Default)]
 pub struct SettingsUpdate {
-    pub model_path: Option<PathBuf>,
-    pub mmproj_path: Option<PathBuf>,
+    /// `None` leaves the setting unchanged; `Some(None)` clears it.
+    pub model_path: Option<Option<PathBuf>>,
+    /// `None` leaves the setting unchanged; `Some(None)` clears it.
+    pub mmproj_path: Option<Option<PathBuf>>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_tokens: Option<u32>,
@@ -536,7 +538,7 @@ pub fn configure_engine(
     resident_memory_budget_bytes: Option<u64>,
 ) -> Result<CommandResult<Settings>> {
     let mut result = settings_update(SettingsUpdate {
-        model_path: Some(model_path),
+        model_path: Some(Some(model_path)),
         native_device,
         context_tokens,
         batch_tokens,
@@ -558,13 +560,18 @@ pub fn settings_update(update: SettingsUpdate) -> Result<CommandResult<Settings>
         .and_then(|values| values.get("preEncodeConversation"))
         .and_then(Value::as_bool);
     if let Some(model_path) = update.model_path {
-        settings.model_path = Some(model_path);
+        settings.model_path = model_path;
     }
     if let Some(mmproj_path) = update.mmproj_path {
-        settings.mmproj_path = Some(mmproj_path.clone());
+        settings.mmproj_path = mmproj_path.clone();
         settings.upstream_settings.insert(
             "mmprojPath".to_string(),
-            json!(mmproj_path.display().to_string()),
+            json!(
+                mmproj_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            ),
         );
     }
     if let Some(temperature) = update.temperature {

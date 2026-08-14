@@ -67,7 +67,7 @@ pub fn server_configure(
         ));
     }
     let settings = settings_update(SettingsUpdate {
-        model_path,
+        model_path: model_path.map(Some),
         max_parallel_sequences: slots,
         resident_memory_budget_bytes: memory_budget_bytes,
         ..SettingsUpdate::default()
@@ -227,7 +227,7 @@ pub fn model_slot_load(slot_id: usize, model_path: PathBuf) -> Result<CommandRes
     let mut settings = resolve_settings()?;
     if slot_id == 0 && settings.model_path.as_ref() != Some(&model_path) {
         settings = settings_update(SettingsUpdate {
-            model_path: Some(model_path.clone()),
+            model_path: Some(Some(model_path.clone())),
             ..SettingsUpdate::default()
         })?
         .result

@@ -223,6 +223,52 @@ fn engine_check_blocks_without_model_configuration() -> Result<()> {
 }
 
 #[test]
+fn settings_paths_can_be_replaced_and_explicitly_cleared() -> Result<()> {
+    let _session = TestSession::new("settings-clear-paths")?;
+    let model = PathBuf::from("/models/local.gguf");
+    let mmproj = PathBuf::from("/models/local-mmproj.gguf");
+    let replaced = mom_llama_runtime::settings_update(SettingsUpdate {
+        model_path: Some(Some(model.clone())),
+        mmproj_path: Some(Some(mmproj.clone())),
+        ..SettingsUpdate::default()
+    })?
+    .result
+    .ok_or_else(|| anyhow!("replacement settings missing"))?;
+    assert_eq!(replaced.model_path, Some(model));
+    assert_eq!(replaced.mmproj_path, Some(mmproj));
+
+    let unchanged = mom_llama_runtime::settings_update(SettingsUpdate::default())?
+        .result
+        .ok_or_else(|| anyhow!("unchanged settings missing"))?;
+    assert_eq!(unchanged.model_path, replaced.model_path);
+    assert_eq!(unchanged.mmproj_path, replaced.mmproj_path);
+
+    let cleared = mom_llama_runtime::settings_update(SettingsUpdate {
+        model_path: Some(None),
+        mmproj_path: Some(None),
+        ..SettingsUpdate::default()
+    })?
+    .result
+    .ok_or_else(|| anyhow!("cleared settings missing"))?;
+    assert_eq!(cleared.model_path, None);
+    assert_eq!(cleared.mmproj_path, None);
+    assert_eq!(
+        cleared.upstream_settings.get("mmprojPath"),
+        Some(&json!(""))
+    );
+    let persisted = mom_llama_runtime::settings_get()?
+        .result
+        .ok_or_else(|| anyhow!("persisted settings missing"))?;
+    assert_eq!(persisted.model_path, None);
+    assert_eq!(persisted.mmproj_path, None);
+    assert_eq!(
+        persisted.upstream_settings.get("mmprojPath"),
+        Some(&json!(""))
+    );
+    Ok(())
+}
+
+#[test]
 fn cache_mode_is_coherent_and_off_blocks_manual_cache_access() -> Result<()> {
     let _session = TestSession::new("cache-policy-surface")?;
     let defaults = mom_llama_runtime::settings_get()?
@@ -2475,7 +2521,7 @@ fn configured_real_session(name: &str) -> Result<Option<TestSession>> {
     }
     let session = TestSession::new(name)?;
     mom_llama_runtime::settings_update(SettingsUpdate {
-        model_path: Some(model_path),
+        model_path: Some(Some(model_path)),
         native_device: Some(llama_native_types::NativeDevice::Cpu),
         // Reasoning-capable small models can spend the first hundred tokens
         // inside a private reasoning block. A real acceptance must budget
@@ -2954,8 +3000,8 @@ fn real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_byt
 
     let session = TestSession::new("real-multimodal-image")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
-        model_path: Some(model_path),
-        mmproj_path: Some(mmproj_path),
+        model_path: Some(Some(model_path)),
+        mmproj_path: Some(Some(mmproj_path)),
         native_device: Some(llama_native_types::NativeDevice::Cpu),
         max_tokens: Some(4),
         context_tokens: Some(4096),
@@ -3070,7 +3116,7 @@ fn real_native_reasoning_stream_can_be_forced_to_the_answer() -> Result<()> {
     }
     let _session = TestSession::new("real-reasoning-control")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
-        model_path: Some(model_path),
+        model_path: Some(Some(model_path)),
         native_device: Some(llama_native_types::NativeDevice::Cpu),
         max_tokens: Some(192),
         upstream_settings: Some(BTreeMap::from([
