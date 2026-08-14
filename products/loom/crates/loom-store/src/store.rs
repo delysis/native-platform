@@ -1769,9 +1769,9 @@ mod tests {
 
     fn write_frozen_prior_v10_project(root: &Path, spec: &W1PriorStoreFixture) {
         const PROJECT_MANIFEST: &[u8] =
-            include_bytes!("../../../fixtures/w1/state/loom-prior-v10/.loom/project.json");
+            include_bytes!("../../../fixtures/compat/state/loom-prior-v10/.loom/project.json");
         const DATABASE: &[u8] =
-            include_bytes!("../../../fixtures/w1/state/loom-prior-v10/.loom/loom.sqlite3");
+            include_bytes!("../../../fixtures/compat/state/loom-prior-v10/.loom/loom.sqlite3");
 
         assert_eq!(
             BlobId::digest(PROJECT_MANIFEST),
@@ -2963,9 +2963,9 @@ mod tests {
     }
 
     #[test]
-    fn w1_prior_v10_producer_recreates_frozen_exact_corpus() {
+    fn prior_v10_producer_recreates_frozen_exact_corpus() {
         let spec: W1PriorStoreFixture = serde_json::from_str(include_str!(
-            "../../../fixtures/w1/loom-prior-store-v10-v1.json"
+            "../../../fixtures/compat/prior-store-v10-v1.json"
         ))
         .expect("parse W1 prior-store fixture");
         let directory = tempdir().expect("temporary project root");
@@ -2975,18 +2975,18 @@ mod tests {
         assert_eq!(witness.revision_id, spec.identities.revision_id);
         assert_eq!(
             fs::read(root.join(".loom/project.json")).expect("read produced manifest"),
-            include_bytes!("../../../fixtures/w1/state/loom-prior-v10/.loom/project.json")
+            include_bytes!("../../../fixtures/compat/state/loom-prior-v10/.loom/project.json")
         );
         assert_eq!(
             fs::read(root.join(".loom/loom.sqlite3")).expect("read produced database"),
-            include_bytes!("../../../fixtures/w1/state/loom-prior-v10/.loom/loom.sqlite3")
+            include_bytes!("../../../fixtures/compat/state/loom-prior-v10/.loom/loom.sqlite3")
         );
     }
 
     #[test]
-    fn w1_prior_v10_project_store_migrates_and_reopens_without_identity_drift() {
+    fn prior_v10_project_store_migrates_and_reopens_without_identity_drift() {
         let spec: W1PriorStoreFixture = serde_json::from_str(include_str!(
-            "../../../fixtures/w1/loom-prior-store-v10-v1.json"
+            "../../../fixtures/compat/prior-store-v10-v1.json"
         ))
         .expect("parse W1 prior-store fixture");
         assert_eq!(spec.schema_version, 1);

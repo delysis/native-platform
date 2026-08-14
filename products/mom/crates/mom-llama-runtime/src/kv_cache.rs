@@ -919,12 +919,9 @@ fn encrypted_blob_uri(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     use crate::conversation_store::{Conversation, ConversationDb};
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     use sha2::{Digest, Sha256};
 
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[derive(Debug, Deserialize)]
     struct W1CacheCorruptionFixture {
         schema: String,
@@ -939,7 +936,6 @@ mod tests {
         session_blob_disposition: String,
     }
 
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[derive(Serialize)]
     struct W1SessionCacheLogicalState<'a> {
         metadata: &'a KvCacheDb,
@@ -947,7 +943,6 @@ mod tests {
         blob_length: usize,
     }
 
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[derive(Serialize)]
     struct W1SessionCacheAfterLogicalState<'a> {
         metadata: &'a KvCacheDb,
@@ -1065,11 +1060,10 @@ mod tests {
         assert_eq!(byte_evicted, vec!["invalid", "oldest"]);
     }
 
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[test]
-    fn w1_authenticated_persistent_cache_corruption_invalidates_and_falls_back() -> Result<()> {
+    fn persistent_cache_corruption_invalidates_and_falls_back_after_reopen() -> Result<()> {
         let fixture: W1CacheCorruptionFixture =
-            serde_json::from_str(include_str!("../fixtures/w1/cache-corruption-v1.json"))?;
+            serde_json::from_str(include_str!("../fixtures/compat/cache-corruption-v1.json"))?;
         assert_eq!(
             fixture.schema,
             "mom_llama.w1.disposable_cache_corruption_fixture.v1"
@@ -1114,7 +1108,7 @@ mod tests {
         native_before.push(b'\n');
         assert_eq!(
             native_before,
-            include_bytes!("../fixtures/w1/cache-native-prefix-state-v1.json")
+            include_bytes!("../fixtures/compat/cache-native-prefix-state-v1.json")
         );
         let metadata_before = store
             .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
@@ -1127,7 +1121,7 @@ mod tests {
         session_before.push(b'\n');
         assert_eq!(
             session_before,
-            include_bytes!("../fixtures/w1/cache-session-state-v1.json"),
+            include_bytes!("../fixtures/compat/cache-session-state-v1.json"),
             "{}",
             String::from_utf8_lossy(&session_before)
         );
@@ -1171,7 +1165,7 @@ mod tests {
         native_after_bytes.push(b'\n');
         assert_eq!(
             native_after_bytes,
-            include_bytes!("../fixtures/w1/cache-native-prefix-after-state-v1.json")
+            include_bytes!("../fixtures/compat/cache-native-prefix-after-state-v1.json")
         );
         let mut session_after_bytes =
             serde_json::to_vec_pretty(&W1SessionCacheAfterLogicalState {
@@ -1181,7 +1175,7 @@ mod tests {
         session_after_bytes.push(b'\n');
         assert_eq!(
             session_after_bytes,
-            include_bytes!("../fixtures/w1/cache-session-after-state-v1.json")
+            include_bytes!("../fixtures/compat/cache-session-after-state-v1.json")
         );
         assert_eq!(
             store.get::<ConversationDb>(&fixture.authoritative_namespace)?,
@@ -1214,124 +1208,10 @@ mod tests {
         )?;
         assert_eq!(quarantine_rows, 1);
 
-        use platform_contracts_v0::TerminalClass;
-        use platform_vertical_fixtures_v0::{
-            DurableStateFactV0, EquivalenceProjectionV0, EventFactV0, FactValueV0, LifecycleFactV0,
-            OwnershipFactsV0, StateDispositionV0, VerticalIdV0, sha256_identity,
-        };
-        let native_before = include_bytes!("../fixtures/w1/cache-native-prefix-state-v1.json");
-        let session_before = include_bytes!("../fixtures/w1/cache-session-state-v1.json");
-        let native_after = include_bytes!("../fixtures/w1/cache-native-prefix-after-state-v1.json");
-        let session_after = include_bytes!("../fixtures/w1/cache-session-after-state-v1.json");
-        crate::validate_w1_fixture_projection(
-            VerticalIdV0::CorruptedDisposableCaches,
-            EquivalenceProjectionV0 {
-                ordered_events: vec![
-                    EventFactV0 {
-                        sequence: 0,
-                        operation_id: "mom.cache.native-prefix-corruption".to_owned(),
-                        attempt_id: Some("quarantine.once".to_owned()),
-                        correlation_id: None,
-                        kind: "quarantined".to_owned(),
-                        payload: None,
-                    },
-                    EventFactV0 {
-                        sequence: 1,
-                        operation_id: "mom.cache.session-kv-corruption".to_owned(),
-                        attempt_id: Some("invalidate.once".to_owned()),
-                        correlation_id: None,
-                        kind: "recovered".to_owned(),
-                        payload: None,
-                    },
-                ],
-                durable_state: vec![
-                    DurableStateFactV0 {
-                        state_id: "mom.cache.native-prefix".to_owned(),
-                        schema_id: fixture.native_prefix_namespace.clone(),
-                        before: Some(sha256_identity(
-                            "mom.cache.native-prefix.fixture",
-                            native_before,
-                        )),
-                        after: Some(sha256_identity(
-                            "mom.cache.native-prefix.cold-miss",
-                            native_after,
-                        )),
-                        disposition: StateDispositionV0::Quarantined,
-                    },
-                    DurableStateFactV0 {
-                        state_id: "mom.cache.session-kv".to_owned(),
-                        schema_id: fixture.session_metadata_namespace.clone(),
-                        before: Some(sha256_identity(
-                            "mom.cache.session-kv.fixture",
-                            session_before,
-                        )),
-                        after: Some(sha256_identity(
-                            "mom.cache.session-kv.cold-miss",
-                            session_after,
-                        )),
-                        disposition: StateDispositionV0::Recovered,
-                    },
-                ],
-                lifecycle: vec![
-                    LifecycleFactV0 {
-                        operation_id: "mom.cache.native-prefix-corruption".to_owned(),
-                        attempt_id: Some("quarantine.once".to_owned()),
-                        correlation_id: None,
-                        terminal: TerminalClass::Completed,
-                        released: true,
-                    },
-                    LifecycleFactV0 {
-                        operation_id: "mom.cache.session-kv-corruption".to_owned(),
-                        attempt_id: Some("invalidate.once".to_owned()),
-                        correlation_id: None,
-                        terminal: TerminalClass::Completed,
-                        released: true,
-                    },
-                ],
-                ownership: OwnershipFactsV0 {
-                    active_operations: 0,
-                    retained_tasks: 0,
-                    expected_workers: 0,
-                    joined_workers: 0,
-                },
-                output_facts: std::collections::BTreeMap::from([
-                    (
-                        "authoritative_state_preserved".to_owned(),
-                        FactValueV0::Boolean(
-                            store.get::<ConversationDb>(&fixture.authoritative_namespace)?
-                                == Some(authoritative),
-                        ),
-                    ),
-                    (
-                        "native_prefix_cold_after_reopen".to_owned(),
-                        FactValueV0::Boolean(
-                            native_after_bytes
-                                == include_bytes!(
-                                    "../fixtures/w1/cache-native-prefix-after-state-v1.json"
-                                ),
-                        ),
-                    ),
-                    (
-                        "native_prefix_quarantine_rows".to_owned(),
-                        FactValueV0::Integer(quarantine_rows),
-                    ),
-                    (
-                        "session_blob_deleted".to_owned(),
-                        FactValueV0::Boolean(session_after_blob.is_none()),
-                    ),
-                    (
-                        "session_metadata_invalidated".to_owned(),
-                        FactValueV0::Boolean(
-                            session_after_metadata.entries[0].state == CacheEntryState::Invalidated,
-                        ),
-                    ),
-                ]),
-                fail_closed_facts: vec![
-                    "only disposable cache namespaces were quarantined or invalidated".to_owned(),
-                    "authoritative conversation state was not defaulted or deleted".to_owned(),
-                ],
-            },
-        )?;
+        assert_eq!(
+            store.get::<ConversationDb>(&fixture.authoritative_namespace)?,
+            Some(authoritative)
+        );
         Ok(())
     }
 

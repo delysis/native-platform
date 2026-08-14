@@ -50,7 +50,6 @@ const flags = {
   speech: false,
   mom: false,
   loom: false,
-  contracts: false,
   frontend_fte: false,
   frontend_mom: false,
   frontend_loom: false,
@@ -212,21 +211,6 @@ for (const changedPath of changed) {
   if (under(changedPath, "crates/services/speech")) {
     recognized = true;
     flags.speech = true;
-    markBehavior();
-    markPlatform();
-  }
-
-  if (under(changedPath, "crates/platform/contracts")) {
-    recognized = true;
-    flags.contracts = true;
-    flags.root = true;
-    flags.native = true;
-    flags.gateway = true;
-    flags.attachment = true;
-    flags.information = true;
-    flags.speech = true;
-    flags.mom = presence.mom;
-    flags.loom = presence.loom;
     markBehavior();
     markPlatform();
   }

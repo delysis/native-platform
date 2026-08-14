@@ -3,9 +3,6 @@ mod command_registry;
 mod commands;
 mod operation_supervisor;
 mod view;
-#[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-mod w1_vertical_fixtures;
-
 use anyhow::Result;
 use app_runtime::AppRuntimeHandle;
 use fte_backend_llama::LlamaNativeBackend;

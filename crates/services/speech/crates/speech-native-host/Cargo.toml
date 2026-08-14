@@ -6,31 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
-[features]
-default = []
-unstable-w1-contract-tests = [
-    "dep:platform-contract-testkit",
-    "dep:platform-contracts-v0",
-    "dep:sha2",
-    "dep:serde_json",
-]
-unstable-w1-vertical-tests = [
-    "dep:platform-vertical-fixtures-v0",
-    "dep:sha2",
-    "dep:serde_json",
-]
-
 [dependencies]
 speech-native-router = { path = "../speech-native-router" }
 speech-native-types = { path = "../speech-native-types" }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-platform-contract-testkit = { path = "../../../../platform/contracts/crates/platform-contract-testkit", optional = true }
-platform-contracts-v0 = { path = "../../../../platform/contracts/crates/platform-contracts-v0", optional = true }
-platform-vertical-fixtures-v0 = { path = "../../../../platform/contracts/crates/platform-vertical-fixtures-v0", optional = true }
-sha2 = { version = "0.10.9", optional = true }
-serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait.workspace = true

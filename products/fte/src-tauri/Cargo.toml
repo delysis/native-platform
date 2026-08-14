@@ -18,11 +18,6 @@ publish.workspace = true
 name = "free_token_energy_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-[features]
-default = []
-# Test-only adapter for the immutable Wave 1 vertical fixture protocol.
-unstable-w1-vertical-tests = ["dep:platform-vertical-fixtures-v0"]
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -45,7 +40,6 @@ fte-backend-llama = { path = "../crates/fte-backend-llama" }
 llama-native-host.workspace = true
 llama-native-types.workspace = true
 tauri-plugin-free-token-energy = { path = "../crates/tauri-plugin-free-token-energy", features = ["native-llama"] }
-platform-vertical-fixtures-v0 = { path = "../../../crates/platform/contracts/crates/platform-vertical-fixtures-v0", optional = true }
 
 [dev-dependencies]
 async-trait = "0.1.92"

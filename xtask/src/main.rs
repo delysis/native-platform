@@ -296,7 +296,6 @@ fn check_workspace(root: &Path) -> Result<()> {
             .map(String::as_str)
             .collect::<BTreeSet<_>>()
             == BTreeSet::from([
-                "core",
                 "native",
                 "gateway",
                 "service-attachment",
@@ -306,7 +305,6 @@ fn check_workspace(root: &Path) -> Result<()> {
                 "product-mom",
                 "product-loom",
                 "diagnostic",
-                "testkit",
             ])
     );
     ensure!(

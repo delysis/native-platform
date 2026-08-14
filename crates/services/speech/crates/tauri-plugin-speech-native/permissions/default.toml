@@ -1,5 +1,0 @@
-"$schema" = "schemas/schema.json"
-
-[default]
-description = "Inspect speech host readiness without granting synthesis or transcription authority."
-permissions = ["allow-speech-status"]

@@ -212,5 +212,5 @@
     "note": "Local build is a reproducible reference, not a clean-room benchmark. Required CI wall is from W8 run 31739376767 creation at 20:08:38Z to exact-head macOS success at 20:37:12Z; informational Linux failure is excluded from the Mac-first gate."
   },
   "classification_sha256": "44d847997e1b7f0687cf3b006f9c1743fb1446d5ce0f70c4cbaed7c667fe0f66",
-  "reachability_sha256": "b97e259fd0b94f200899800c7c74f69b7d45cc8722b352126da74dce573e6f9c"
+  "reachability_sha256": "a7a3ecf0573a73e25a54b0b10f587bcaa3a81110dc80aa10f672838bfdbb9e11"
 }

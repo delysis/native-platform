@@ -4,9 +4,6 @@ members = [
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
     "crates/native/crates/llama-native-types",
-    "crates/platform/contracts/crates/platform-contract-testkit",
-    "crates/platform/contracts/crates/platform-contracts-v0",
-    "crates/platform/contracts/crates/platform-vertical-fixtures-v0",
     "crates/services/attachment/crates/attachment-native-cli",
     "crates/services/attachment/crates/attachment-native-document",
     "crates/services/attachment/crates/attachment-native-host",
@@ -29,8 +26,6 @@ members = [
     "crates/services/speech/crates/speech-native-platform",
     "crates/services/speech/crates/speech-native-router",
     "crates/services/speech/crates/speech-native-types",
-    "crates/services/speech/crates/tauri-plugin-speech-native",
-    "crates/services/speech/tests/apple-tauri-w1",
     "products/fte/crates/fte-backend-llama",
     "products/fte/crates/fte-loopback",
     "products/fte/crates/fte-protocols",
@@ -152,11 +147,6 @@ information-native-store = { path = "crates/services/information/crates/informat
 information-native-types = { path = "crates/services/information/crates/information-native-types" }
 speech-native-host = { path = "crates/services/speech/crates/speech-native-host" }
 mom-llama-runtime = { path = "products/mom/crates/mom-llama-runtime" }
-platform-contracts-v0 = { path = "crates/platform/contracts/crates/platform-contracts-v0" }
-platform-contracts-v0-vertical = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
-platform-contracts-fixture-v0 = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
-platform-contract-testkit = { path = "crates/platform/contracts/crates/platform-contract-testkit" }
-platform-vertical-fixtures-v0 = { path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

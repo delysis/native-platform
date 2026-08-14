@@ -650,12 +650,9 @@ fn decode_hex_key(input: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     use crate::conversation_store::{CONVERSATIONS_NAMESPACE, Conversation, ConversationDb};
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     use llama_native_cache::PrefixCacheValue;
     use serde::{Deserialize, Serialize};
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     use std::collections::BTreeMap;
 
     #[test]
@@ -669,7 +666,6 @@ mod tests {
         values: Vec<String>,
     }
 
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[derive(Debug, Deserialize)]
     struct W1PriorStoreFixture {
         schema: String,
@@ -681,7 +677,6 @@ mod tests {
         conversation: Conversation,
     }
 
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[derive(Debug, Deserialize)]
     struct W1CacheCorruptionFixture {
         schema: String,
@@ -693,10 +688,8 @@ mod tests {
         native_prefix_disposition: String,
     }
 
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     struct RemovePlaintextOnDrop(PathBuf);
 
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     impl Drop for RemovePlaintextOnDrop {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
@@ -872,11 +865,10 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[test]
-    fn w1_redacted_logical_store_imports_cleans_plaintext_and_reopens_with_fixture_only_key()
-    -> Result<()> {
-        let fixture_bytes = include_bytes!("../fixtures/w1/prior-store-v1.json");
+    fn prior_logical_store_import_cleans_plaintext_and_reopens_with_fixture_only_key() -> Result<()>
+    {
+        let fixture_bytes = include_bytes!("../fixtures/compat/prior-store-v1.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(fixture_bytes)),
             "7e44507f4ee444becf112ed1853e9cfb301618aadac19b1909a41cacf95c6ccf"
@@ -974,81 +966,17 @@ mod tests {
         )?;
         assert_eq!(encrypted_rows, 1);
 
-        use platform_contracts_v0::TerminalClass;
-        use platform_vertical_fixtures_v0::{
-            DurableStateFactV0, EquivalenceProjectionV0, EventFactV0, FactValueV0, LifecycleFactV0,
-            OwnershipFactsV0, StateDispositionV0, VerticalIdV0, sha256_identity,
-        };
-        let baseline = sha256_identity("mom.prior_store.redacted_logical", fixture_bytes);
-        let recovered = sha256_identity("mom.prior_store.recovered_logical", fixture_bytes);
-        crate::validate_w1_fixture_projection(
-            VerticalIdV0::MomPriorReleaseStore,
-            EquivalenceProjectionV0 {
-                ordered_events: vec![EventFactV0 {
-                    sequence: 0,
-                    operation_id: "mom.store.redacted-logical-import".to_owned(),
-                    attempt_id: Some("import.once".to_owned()),
-                    correlation_id: None,
-                    kind: "recovered".to_owned(),
-                    payload: Some(baseline.clone()),
-                }],
-                durable_state: vec![DurableStateFactV0 {
-                    state_id: "mom.prior_store.redacted_logical".to_owned(),
-                    schema_id: "runtime.sqlite3/encrypted_documents.v1".to_owned(),
-                    before: Some(baseline),
-                    after: Some(recovered),
-                    disposition: StateDispositionV0::Recovered,
-                }],
-                lifecycle: vec![LifecycleFactV0 {
-                    operation_id: "mom.store.redacted-logical-import".to_owned(),
-                    attempt_id: Some("import.once".to_owned()),
-                    correlation_id: None,
-                    terminal: TerminalClass::Completed,
-                    released: true,
-                }],
-                ownership: OwnershipFactsV0 {
-                    active_operations: 0,
-                    retained_tasks: 0,
-                    expected_workers: 0,
-                    joined_workers: 0,
-                },
-                output_facts: BTreeMap::from([
-                    (
-                        "encrypted_document_count".to_owned(),
-                        FactValueV0::Integer(encrypted_rows),
-                    ),
-                    (
-                        "historical_physical_migration_claimed".to_owned(),
-                        FactValueV0::Boolean(false),
-                    ),
-                    (
-                        "plaintext_source_removed".to_owned(),
-                        FactValueV0::Boolean(!legacy_path.exists()),
-                    ),
-                    (
-                        "reopen_same_fixture_key".to_owned(),
-                        FactValueV0::Boolean(
-                            reopened.get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?
-                                == Some(expected),
-                        ),
-                    ),
-                    ("wrong_key_rejected".to_owned(), FactValueV0::Boolean(true)),
-                ]),
-                fail_closed_facts: vec![
-                    "temporary plaintext import source was removed before acceptance".to_owned(),
-                    "fixture does not claim personal Keychain or historical physical-schema migration evidence".to_owned(),
-                ],
-            },
-        )?;
+        assert_eq!(
+            reopened.get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?,
+            Some(expected)
+        );
         Ok(())
     }
 
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
     #[test]
-    fn w1_native_prefix_corruption_quarantines_only_disposable_state_and_reopens_cold() -> Result<()>
-    {
+    fn native_prefix_corruption_quarantines_only_disposable_state_and_reopens_cold() -> Result<()> {
         let fixture: W1CacheCorruptionFixture =
-            serde_json::from_str(include_str!("../fixtures/w1/cache-corruption-v1.json"))?;
+            serde_json::from_str(include_str!("../fixtures/compat/cache-corruption-v1.json"))?;
         assert_eq!(
             fixture.schema,
             "mom_llama.w1.disposable_cache_corruption_fixture.v1"
@@ -1061,7 +989,7 @@ mod tests {
         let key = decode_hex_key(&fixture.fixture_key_hex)?;
         let store = RuntimeStore::open_with_key(&data_dir, key)?;
         let native_prefix: Vec<PrefixCacheValue> = serde_json::from_slice(include_bytes!(
-            "../fixtures/w1/cache-native-prefix-state-v1.json"
+            "../fixtures/compat/cache-native-prefix-state-v1.json"
         ))?;
         store.put(&fixture.native_prefix_namespace, &native_prefix)?;
         let authoritative = ConversationDb {

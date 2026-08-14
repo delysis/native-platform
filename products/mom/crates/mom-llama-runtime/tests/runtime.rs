@@ -1547,8 +1547,6 @@ fn product_runtime_rejects_network_process_and_copied_native_authority() -> Resu
         "fte-router = { path = \"products/fte/crates/fte-router\" }",
         "fte-store = { path = \"products/fte/crates/fte-store\" }",
         "fte-types = { path = \"products/fte/crates/fte-types\" }",
-        "platform-contracts-v0 = { path = \"crates/platform/contracts/crates/platform-contracts-v0\" }",
-        "platform-vertical-fixtures-v0 = { path = \"crates/platform/contracts/crates/platform-vertical-fixtures-v0\" }",
     ] {
         assert!(
             workspace_manifest.contains(local_dependency),
@@ -1561,7 +1559,6 @@ fn product_runtime_rejects_network_process_and_copied_native_authority() -> Resu
         "github.com/delysis/llama-native-kit",
         "github.com/delysis/free-token-energy",
         "github.com/delysis/attachment-native-kit",
-        "github.com/delysis/w1-platform-contracts",
     ] {
         assert!(
             !runtime_workspace_manifest.contains(retired_source),

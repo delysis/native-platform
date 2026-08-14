@@ -99,7 +99,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: native-linux
-      - run: cargo test --locked -p llama-native-engine --features unstable-w1-contract-tests,unstable-w1-vertical-tests --all-targets
       - run: ./crates/native/scripts/check-architecture.sh
 
   gateway-linux:
@@ -159,8 +158,6 @@ jobs:
       - run: node scripts/ci/cargo-group.mjs fmt service-information
       - run: node scripts/ci/cargo-group.mjs test service-information
       - run: node scripts/ci/cargo-group.mjs clippy service-information
-      - run: cargo test --locked -p information-native-acquire --features unstable-w1-contracts
-      - run: cargo test --locked -p information-native-host --features unstable-w1-vertical-tests --test w1_vertical
 
   speech-linux:
     if: ${{ needs.plan.outputs.speech == 'true' || needs.plan.outputs.full == 'true' }}
@@ -185,7 +182,6 @@ jobs:
           shared-key: speech-linux
       - run: node scripts/ci/cargo-group.mjs fmt service-speech
       - run: node scripts/ci/cargo-group.mjs test service-speech
-      - run: cargo test --locked -p speech-native-host --all-targets --features unstable-w1-contract-tests,unstable-w1-vertical-tests
       - run: node scripts/ci/cargo-group.mjs clippy service-speech
 
   mom-linux:
@@ -217,9 +213,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: loom-linux
-      - run: node scripts/ci/cargo-group.mjs fmt product-loom research-loom
-      - run: node scripts/ci/cargo-group.mjs test product-loom research-loom
-      - run: node scripts/ci/cargo-group.mjs clippy product-loom research-loom
+      - run: node scripts/ci/cargo-group.mjs fmt product-loom
+      - run: node scripts/ci/cargo-group.mjs test product-loom
+      - run: node scripts/ci/cargo-group.mjs clippy product-loom
 
   frontend:
     if: ${{ needs.plan.outputs.frontend_fte == 'true' || needs.plan.outputs.frontend_mom == 'true' || needs.plan.outputs.frontend_loom == 'true' || needs.plan.outputs.full == 'true' }}
@@ -266,8 +262,6 @@ jobs:
         if: ${{ needs.plan.outputs.mom_present == 'true' && (needs.plan.outputs.mom == 'true' || needs.plan.outputs.full == 'true') }}
         run: |
           node scripts/ci/cargo-group.mjs test product-mom
-          cargo test --locked -p mom-llama-runtime --features unstable-w1-vertical-fixtures --all-targets
-          cargo test --locked -p mom-llama-app --features unstable-w1-contracts,unstable-w1-vertical-fixtures --all-targets
       - name: Attachment macOS
         if: ${{ needs.plan.outputs.attachment == 'true' || needs.plan.outputs.full == 'true' }}
         run: node scripts/ci/cargo-group.mjs test service-attachment
@@ -279,7 +273,7 @@ jobs:
         run: node scripts/ci/cargo-group.mjs test service-speech
       - name: Loom macOS
         if: ${{ needs.plan.outputs.loom_present == 'true' && (needs.plan.outputs.loom == 'true' || needs.plan.outputs.full == 'true') }}
-        run: node scripts/ci/cargo-group.mjs test product-loom research-loom
+        run: node scripts/ci/cargo-group.mjs test product-loom
 
   dependency-graph:
     if: ${{ needs.plan.outputs.dependency_graph == 'true' || needs.plan.outputs.full == 'true' }}

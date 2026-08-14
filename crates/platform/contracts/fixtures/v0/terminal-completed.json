@@ -1,7 +1,0 @@
-{
-  "schema": "delysis.operation_terminal.v0",
-  "operation_id": "op_fixture_completed_0001",
-  "attempt_id": "attempt_fixture_completed_0001",
-  "class": "completed",
-  "error": null
-}

@@ -2,11 +2,6 @@
 
 mod model_download;
 
-#[cfg(all(test, feature = "unstable-w1-contract-tests"))]
-mod w1_contract_adapter;
-#[cfg(all(test, feature = "unstable-w1-vertical-tests"))]
-mod w1_vertical_fixture;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, Metadata};
 use std::io::Read as _;
@@ -996,35 +991,6 @@ impl GenerationWorkerRegistry {
         self.join_workers(finished).map(|(count, _, _, _)| count)
     }
 
-    #[cfg(all(test, feature = "unstable-w1-contract-tests"))]
-    fn join_request(&self, request_id: &str) -> Result<(), IpcFailure> {
-        let worker = {
-            let mut state = self.lock()?;
-            match state.workers.remove(request_id) {
-                Some(GenerationWorkerSlot::Running {
-                    worker,
-                    owner,
-                    lifecycle_worker_id,
-                }) => (request_id.to_owned(), worker, owner, lifecycle_worker_id),
-                Some(GenerationWorkerSlot::Reserved) => {
-                    return Err(IpcFailure::new(
-                        "generation_worker_starting",
-                        "the generation worker has not attached its JoinHandle",
-                        true,
-                    ));
-                }
-                None => {
-                    return Err(IpcFailure::new(
-                        "generation_worker_not_owned",
-                        "the generation worker is not retained by this registry",
-                        false,
-                    ));
-                }
-            }
-        };
-        self.join_workers(vec![worker]).map(|_| ())
-    }
-
     fn join_all(&self) -> Result<GenerationWorkersJoined, IpcFailure> {
         let workers = {
             let mut state = self.lock()?;
@@ -1181,13 +1147,6 @@ impl GenerationWorkerRegistry {
                 false,
             )
         })
-    }
-
-    #[cfg(all(test, feature = "unstable-w1-contract-tests"))]
-    fn retained_count(&self) -> usize {
-        self.state
-            .lock()
-            .map_or(usize::MAX, |state| state.workers.len())
     }
 }
 
@@ -1772,10 +1731,6 @@ impl IpcFailure {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the exhaustive store-to-IPC mapping is safer as one auditable match"
-    )]
     #[allow(clippy::needless_pass_by_value)]
     fn store(error: loom_store::StoreError) -> Self {
         use loom_store::StoreError;

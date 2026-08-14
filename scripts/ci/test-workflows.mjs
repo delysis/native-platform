@@ -84,7 +84,7 @@ test("the required macOS lane runs Mom parity when Mom changes", () => {
   assert.match(macos, /name: Mom macOS parity/);
   assert.match(macos, /mom_present == 'true'/);
   assert.match(macos, /cargo-group\.mjs test product-mom/);
-  assert.match(macos, /unstable-w1-contracts,unstable-w1-vertical-fixtures/);
+  assert.doesNotMatch(macos, /unstable-w1/);
 });
 
 test("Speech Linux coverage provisions its GLib build dependencies", () => {
@@ -96,23 +96,6 @@ test("Speech Linux coverage provisions its GLib build dependencies", () => {
     assert.match(block, /libwebkit2gtk-4\.1-dev/);
   }
   assert.match(fullSpeech, /if: runner\.os == 'Linux'/);
-});
-
-test("W1 ancestry-bound jobs retain full Git history", () => {
-  const pr = read(prPath);
-  const full = read(fullPath);
-  const blocks = [
-    pr.match(/^  native-linux:[\s\S]*?(?=^  gateway-linux:)/m)?.[0],
-    pr.match(/^  information-linux:[\s\S]*?(?=^  speech-linux:)/m)?.[0],
-    pr.match(/^  speech-linux:[\s\S]*?(?=^  mom-linux:)/m)?.[0],
-    full.match(/^  root:[\s\S]*?(?=^  attachment:)/m)?.[0],
-    full.match(/^  information-platform-linux:[\s\S]*?(?=^  speech:)/m)?.[0],
-    full.match(/^  speech:[\s\S]*?(?=^  mom:)/m)?.[0],
-  ];
-  for (const block of blocks) {
-    assert.ok(block, "W1 job block is missing");
-    assert.match(block, /fetch-depth: 0/);
-  }
 });
 
 test("full workflow covers main, nightly, dispatch, products, policy, and fuzz", () => {

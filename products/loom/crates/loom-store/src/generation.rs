@@ -4577,9 +4577,9 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn w1_exact_boundary_suggestion_promotion_survives_store_reopen() {
+    fn exact_boundary_suggestion_promotion_survives_store_reopen() {
         let spec: W1SuggestionFixture = serde_json::from_str(include_str!(
-            "../../../fixtures/w1/loom-suggestion-promotion-v1.json"
+            "../../../fixtures/compat/suggestion-promotion-v1.json"
         ))
         .expect("parse W1 suggestion fixture");
         assert_eq!(spec.schema_version, 1);

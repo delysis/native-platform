@@ -1,9 +1,6 @@
 {
   "schema_version": 1,
   "primary": {
-    "core": [
-      "platform-contracts-v0"
-    ],
     "native": [
       "llama-native-cache",
       "llama-native-engine",
@@ -45,8 +42,7 @@
       "speech-native-host",
       "speech-native-platform",
       "speech-native-router",
-      "speech-native-types",
-      "tauri-plugin-speech-native"
+      "speech-native-types"
     ],
     "product-fte": [
       "free-token-energy",
@@ -69,11 +65,6 @@
     ],
     "diagnostic": [
       "xtask"
-    ],
-    "testkit": [
-      "platform-contract-testkit",
-      "platform-vertical-fixtures-v0",
-      "speech-apple-tauri-w1"
     ]
   },
   "secondary": {
@@ -106,9 +97,6 @@
       "loom-store",
       "loom-types",
       "mom-llama-runtime",
-      "platform-contract-testkit",
-      "platform-contracts-v0",
-      "platform-vertical-fixtures-v0",
       "speech-native-host",
       "speech-native-router",
       "speech-native-types"
@@ -128,7 +116,6 @@
       "loom-app",
       "loom-backend-llama",
       "mom-llama-app",
-      "speech-apple-tauri-w1",
       "speech-native-backend-parakeet",
       "speech-native-platform"
     ],
@@ -155,7 +142,6 @@
       "loom-backend-llama",
       "mom-llama-app",
       "mom-llama-runtime",
-      "speech-apple-tauri-w1",
       "speech-native-backend-parakeet",
       "speech-native-platform"
     ],

@@ -16,22 +16,6 @@ use crate::operation_supervisor::{
     TerminalClass, validate_worker_sets,
 };
 
-#[cfg(all(test, feature = "unstable-w1-contracts"))]
-mod w1_contract;
-
-#[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-struct W1FixtureNativeFinalizer;
-
-#[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-impl NativeFinalizer for W1FixtureNativeFinalizer {
-    fn shutdown(
-        &self,
-        host: &Arc<NativeHost>,
-    ) -> Result<ProcessExitJoinedNativeHost, mom_llama_runtime::ProductShutdownError> {
-        Ok(host.shutdown_for_process_exit())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppPhase {
     Running,
@@ -252,18 +236,6 @@ impl AppWorkLease {
             })
             .map_err(|error| error.to_string())?;
         task.wait().await
-    }
-
-    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-    pub fn w1_attempt_identity(&self) -> Option<crate::operation_supervisor::AttemptIdentity> {
-        self.supervised
-            .as_ref()
-            .map(|reservation| reservation.lease.identity())
-    }
-
-    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-    pub fn w1_cancellation_signal(&self) -> Option<Arc<AtomicBool>> {
-        self.cancellation.clone()
     }
 
     fn finish_supervised(&mut self, class: TerminalClass) -> Result<(), String> {
@@ -576,50 +548,6 @@ impl AppRuntimeHandle {
         self.0.cancellation_sweeps.fetch_add(1, Ordering::AcqRel);
         let _ = self.0.product_canceller.cancel_all();
     }
-
-    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-    pub fn w1_terminal_facts(&self) -> Vec<crate::operation_supervisor::W1TerminalFact> {
-        self.0.operation_supervisor.w1_terminal_facts()
-    }
-
-    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-    pub fn w1_active_operation_count(&self) -> usize {
-        self.0.operation_supervisor.active_count()
-    }
-
-    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-    pub fn w1_retained_task_count(&self) -> usize {
-        self.0.operation_supervisor.retained_task_count()
-    }
-
-    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-    pub fn w1_operation_supervisor(&self) -> OperationSupervisor {
-        self.0.operation_supervisor.clone()
-    }
-}
-
-#[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-pub(crate) fn w1_fixture_runtime() -> AppRuntimeHandle {
-    w1_fixture_runtime_with_sequence(41)
-}
-
-#[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-pub(crate) fn w1_fixture_runtime_with_sequence(next_sequence: u64) -> AppRuntimeHandle {
-    let host = Arc::new(NativeHost::new(
-        llama_native_host::NativeHostConfig::default(),
-    ));
-    let gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults {
-        catalog_version: "mom-w1-fixture".to_string(),
-    }));
-    AppRuntimeHandle::with_operation_supervisor(
-        Arc::new(ProductGatewayFinalizer(gateway)),
-        Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host))),
-        host,
-        None,
-        Arc::new(RuntimeProductCanceller),
-        Arc::new(W1FixtureNativeFinalizer),
-        OperationSupervisor::with_config(next_sequence, 4),
-    )
 }
 
 fn unix_time_ms() -> u64 {
@@ -873,45 +801,6 @@ mod tests {
         let (first, second) = tokio::join!(runtime.shutdown(), runtime.shutdown());
         assert_eq!(first, second);
         assert!(finalizer_called.load(Ordering::Acquire));
-    }
-
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
-    #[tokio::test]
-    async fn blocking_success_is_cancelled_only_with_authoritative_evidence() {
-        let runtime = super::w1_fixture_runtime();
-        let command = command_spec("mom_llama_chat_send");
-
-        runtime
-            .admit(command)
-            .expect("admit ordinary successful operation")
-            .run_blocking_with_cancellation_evidence(|| Ok(((), false)))
-            .await
-            .expect("ordinary successful operation");
-        assert_eq!(
-            runtime
-                .w1_terminal_facts()
-                .last()
-                .expect("ordinary terminal fact")
-                .terminal
-                .class,
-            crate::operation_supervisor::TerminalClass::Completed
-        );
-
-        runtime
-            .admit(command)
-            .expect("admit authoritatively cancelled operation")
-            .run_blocking_with_cancellation_evidence(|| Ok(((), true)))
-            .await
-            .expect("cancelled command result remains a successful transport result");
-        assert_eq!(
-            runtime
-                .w1_terminal_facts()
-                .last()
-                .expect("cancelled terminal fact")
-                .terminal
-                .class,
-            crate::operation_supervisor::TerminalClass::Cancelled
-        );
     }
 
     fn command_vs_quit_has_one_winner(command: &'static str) {

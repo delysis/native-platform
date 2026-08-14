@@ -148,12 +148,8 @@
         "speech-native-router",
         "speech-native-types"
       ],
-      "optional_edge_packages": [
-        "tauri-plugin-speech-native"
-      ],
-      "test_only_packages": [
-        "speech-apple-tauri-w1"
-      ],
+      "optional_edge_packages": [],
+      "test_only_packages": [],
       "module_roots": [
         "crates/services/speech/crates/speech-native-backend-parakeet/src/",
         "crates/services/speech/crates/speech-native-host/src/",
