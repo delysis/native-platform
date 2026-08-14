@@ -55,7 +55,10 @@
       "packaged_launch_quit_relaunch": true,
       "state_reopened": true,
       "database_file_identity_unchanged": true,
-      "ephemeral_credentials": true
+      "ephemeral_credentials": true,
+      "macos_synthetic_keychain_roundtrip": true,
+      "macos_synthetic_keychain_cleanup_confirmed": true,
+      "keychain_tested_source_revision": "a4161c76075111c462dbe5fef03ddcbd7b2ea193"
     }
   },
   "negative_evidence": {

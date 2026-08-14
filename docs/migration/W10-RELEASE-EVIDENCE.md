@@ -44,6 +44,10 @@ The FTE smoke opened the same `gateway.db` and `gateway-v2.db` file identities
 from the isolated root on each launch and used process-local credentials instead of Keychain.
 The release gate also passed local-model configuration reopen, schema reopen,
 native-runtime join, active-router cancellation/drain, and both frontend tests.
+Separately, the ignored current-source macOS credential acceptance test wrote,
+independently read, replaced, deleted, and confirmed cleanup of one disposable
+synthetic Keychain item at `a4161c76075111c462dbe5fef03ddcbd7b2ea193`.
+No real provider credential or hosted request was used.
 
 ## Negative evidence retained
 
