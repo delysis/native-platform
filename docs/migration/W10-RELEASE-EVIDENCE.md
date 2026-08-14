@@ -20,17 +20,17 @@ did not change between launches. The smoke deliberately does not override
 | Product | Source | Executable SHA-256 | Archive SHA-256 | Archive bytes |
 | --- | --- | --- | --- | ---: |
 | Mom Llama 0.1.0 | `171d312763ccf89cf8bd0cc5820493fccafa6e9a` | `e7958448b4526a0a5390dafe7903dc55a31d614887d925177eddde3e5572b2bb` | `145ee6aba135f81598ee13a516cc87885b6ce0d284ee6ec5b6cecb4ab74b7132` | 10,896,750 |
-| Loom 0.1.0 | `7d39e13393a3144b45968e73d687b5abae3f0638` | `28a34e02f6f7f39d3fb2dcb130211eafee14cf47eb65d7ad83fa2ea9dcde5b03` | `54bff529480bdf12119cd93fab6d88d5badec2f822e62115cf07a6ad3cca52d7` | 8,688,048 |
-| Free Token Energy 0.1.0 | `171d312763ccf89cf8bd0cc5820493fccafa6e9a` | `af02a10246285fd7ed128850b6eb933d5d02d4936ade40dfa622433a689c0f59` | `b43e92af51424856607201f85f63da7181e0023ff6d459137ee816baa8ee352e` | 8,349,181 |
+| Loom 0.1.0 | `f8ee159de31369c29dc12b24a40a01886a9a02c5` | `f22887eef6f3b21712baf5e6a7ebc079fe57aa42ddfc3b3e7fff99b5f708377f` | `5e030ace600c82c0cebfd017b91bb489ec28d297a12c62dffd9cc2ad04184383` | 8,688,521 |
+| Free Token Energy 0.1.0 | `f8ee159de31369c29dc12b24a40a01886a9a02c5` | `d24a63f48d32f6b427aa22cbddf92ecadc7fa64b4db50bb3e5623a531e787e14` | `ca5c1d8779f26a45b43aff82334e872d228d999dfdfb14fd38b53f703531e1a4` | 8,349,209 |
 
 All three bundles declare macOS 13.0 as their floor, contain no GGUF, ONNX, or
 safetensors file, and passed `codesign --verify --deep --strict`. The local
 artifacts and their separate release/smoke receipts are under `dist/macos/`;
 that generated directory is intentionally not committed.
 
-The Mom smoke opened its encrypted `runtime.sqlite3` from the isolated root on
-both launches. Each quit emitted positive application-drain and native-host
-join evidence. The release gate also passed prior-store import/reopen,
+The Mom smoke opened the same encrypted `runtime.sqlite3` file identity from
+the isolated root on both launches. Each quit emitted positive
+application-drain and native-host join evidence. The release gate also passed prior-store import/reopen,
 persistent-cache corruption/reopen, and an active native-operation drain.
 
 The Loom smoke created and reopened one ordinary writing project. Its database
@@ -40,8 +40,8 @@ bound to `writer-gemma4-base-v2`, policy file SHA-256
 The release gate also passed prior-v10 project migration/reopen, suggestion
 promotion/reopen, active-family cancellation/drain, and 178 frontend tests.
 
-The FTE smoke opened both `gateway.db` and `gateway-v2.db` from the isolated
-root on each launch and used process-local credentials instead of Keychain.
+The FTE smoke opened the same `gateway.db` and `gateway-v2.db` file identities
+from the isolated root on each launch and used process-local credentials instead of Keychain.
 The release gate also passed local-model configuration reopen, schema reopen,
 native-runtime join, active-router cancellation/drain, and both frontend tests.
 
