@@ -3648,6 +3648,7 @@ fn prepare_policy_model_load(
             false,
         )
     })?;
+    ensure_model_path_in_isolated_library(state, &canonical_path)?;
     let discovered = discover_strict_policy_candidate(&canonical_path)?;
     if discovered.file_bytes != expectation.model_file_bytes {
         return Err(IpcFailure::new(
@@ -3994,6 +3995,7 @@ fn prepare_model_load(
             false,
         )
     })?;
+    ensure_model_path_in_isolated_library(state, &canonical)?;
     let discovered = discover_loadable_model(state, &canonical)?;
     let _lifecycle = lock_model_lifecycle(state)?;
     let mut registry = lock_model_registry(state)?;
@@ -4716,6 +4718,53 @@ fn base_desktop_model_discovery_options(isolate: bool) -> ModelDiscoveryOptions 
     options.max_entries = options.max_entries.min(20_000);
     options.max_depth = options.max_depth.min(12);
     options
+}
+
+fn ensure_model_path_in_isolated_library(
+    state: &State<'_, PluginState>,
+    canonical_path: &Path,
+) -> Result<(), IpcFailure> {
+    ensure_model_path_in_isolated_library_from(
+        state.isolate_model_discovery,
+        state.app_local_data_root.as_deref(),
+        canonical_path,
+    )
+}
+
+fn ensure_model_path_in_isolated_library_from(
+    isolate: bool,
+    app_local_data_root: Option<&Path>,
+    canonical_path: &Path,
+) -> Result<(), IpcFailure> {
+    if !isolate {
+        return Ok(());
+    }
+    let model_library = app_local_data_root
+        .ok_or_else(|| {
+            IpcFailure::new(
+                "isolated_model_library_unavailable",
+                "acceptance model discovery requires an isolated application data root",
+                false,
+            )
+        })?
+        .join("models")
+        .canonicalize()
+        .map_err(|_| {
+            IpcFailure::new(
+                "isolated_model_library_unavailable",
+                "acceptance model loading requires an existing isolated models directory",
+                false,
+            )
+        })?;
+    if canonical_path.starts_with(&model_library) {
+        Ok(())
+    } else {
+        Err(IpcFailure::new(
+            "model_outside_isolated_library",
+            "acceptance mode will load models only from its isolated models directory",
+            false,
+        ))
+    }
 }
 
 fn remember_user_model_path(
@@ -9142,6 +9191,28 @@ mod tests {
         assert!(isolated.hugging_face_cache_roots.is_empty());
         assert_eq!(isolated.max_entries, normal.max_entries);
         assert_eq!(isolated.max_depth, normal.max_depth);
+    }
+
+    #[test]
+    fn acceptance_model_load_rejects_a_remembered_path_outside_its_library() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let model_library = temporary.path().join("models");
+        std::fs::create_dir(&model_library).expect("isolated model library");
+        let inside = model_library.join("writer.gguf");
+        let outside = temporary.path().join("remembered.gguf");
+        std::fs::write(&inside, b"GGUF").expect("inside model fixture");
+        std::fs::write(&outside, b"GGUF").expect("outside model fixture");
+        let inside = inside.canonicalize().expect("canonical inside model");
+        let outside = outside.canonicalize().expect("canonical outside model");
+
+        ensure_model_path_in_isolated_library_from(true, Some(temporary.path()), &inside)
+            .expect("isolated library model is accepted");
+        let error =
+            ensure_model_path_in_isolated_library_from(true, Some(temporary.path()), &outside)
+                .expect_err("remembered external model must be rejected");
+        assert_eq!(error.code, "model_outside_isolated_library");
+        ensure_model_path_in_isolated_library_from(false, Some(temporary.path()), &outside)
+            .expect("normal mode preserves explicit local model loading");
     }
 
     #[test]
