@@ -680,12 +680,6 @@ fn hosted_defaults() -> EdgeDefaults {
 fn validated_gguf_path(path: &Path) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(path.is_absolute(), "local model path must be absolute");
     anyhow::ensure!(path.is_file(), "local model path must name a regular file");
-    anyhow::ensure!(
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf")),
-        "local model path must have a .gguf extension"
-    );
     let canonical = path.canonicalize()?;
     let mut header = [0_u8; 4];
     std::fs::File::open(&canonical)?.read_exact(&mut header)?;
@@ -1289,6 +1283,34 @@ mod tests {
                 .remove(provider_id)
                 .is_some())
         }
+    }
+
+    #[test]
+    fn validated_gguf_path_accepts_an_extensionless_gguf_by_content() {
+        let cache_root = test_directory_path("extensionless-gguf");
+        std::fs::create_dir_all(&cache_root).expect("create model fixture directory");
+        let blob = cache_root.join("content-addressed-model");
+        write_test_gguf(&blob);
+
+        assert_eq!(
+            validated_gguf_path(&blob).expect("accept extensionless GGUF"),
+            blob.canonicalize().expect("canonical model path")
+        );
+
+        std::fs::remove_dir_all(cache_root).expect("remove cache fixture");
+    }
+
+    #[test]
+    fn validated_gguf_path_rejects_a_named_gguf_without_the_magic_header() {
+        let directory = test_directory_path("invalid-gguf");
+        std::fs::create_dir_all(&directory).expect("create model fixture directory");
+        let path = directory.join("not-a-model.gguf");
+        std::fs::write(&path, b"nope").expect("write invalid model fixture");
+
+        let error = validated_gguf_path(&path).expect_err("reject false GGUF name");
+        assert!(error.to_string().contains("GGUF header"));
+
+        std::fs::remove_dir_all(directory).expect("remove model fixture");
     }
 
     #[test]
@@ -1905,6 +1927,17 @@ mod tests {
     fn test_gguf_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "free-token-energy-{label}-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ))
+    }
+
+    fn test_directory_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "free-token-energy-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
