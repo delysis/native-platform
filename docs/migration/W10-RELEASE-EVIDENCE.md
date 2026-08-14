@@ -1,12 +1,13 @@
 # W10 macOS release-candidate evidence
 
-Status: **local macOS candidates accepted; publication and stable releases remain pending**.
+Status: **local macOS candidates accepted; none is stable; publication remains pending**.
 
 W10 now has one deliberately small local release path. From a clean commit,
-`scripts/release-macos.sh {mom|loom|fte}` runs the product's migration and
-shutdown gates, builds an app-only macOS bundle with the workspace-local Tauri
-CLI, rejects embedded model files, ad-hoc signs the bundle by default, verifies
-the signature, and writes a digest receipt. It does not require GitHub.
+`scripts/release-macos.sh {mom|loom|fte}` runs the product's focused
+source-level migration and shutdown tests, builds an app-only macOS bundle with
+the workspace-local Tauri CLI, rejects embedded model files, ad-hoc signs the
+bundle by default, verifies the signature, and writes a digest receipt. It does
+not require GitHub.
 
 `scripts/smoke-macos-app.sh {mom|loom|fte}` launches the exact packaged child
 twice against one isolated product-state root, observes an on-screen window and
@@ -37,19 +38,26 @@ turning the remote packaging workflow into a development gate.
 The Mom smoke opened the same encrypted `runtime.sqlite3` file identity from
 the isolated root on both launches. Each quit emitted positive
 application-drain and native-host join evidence. The release gate also passed prior-store import/reopen,
-persistent-cache corruption/reopen, and an active native-operation drain.
+persistent-cache corruption/reopen, and an active native-operation drain at
+source-test level. It did not exercise backup/restore rollback or an active
+operation through the packaged application.
 
 The Loom smoke created and reopened one ordinary writing project. Its database
 contains two `open_project` receipts after the second launch. The package is
 bound to `writer-gemma4-base-v2`, policy file SHA-256
 `744fa860ffc979f6c1c9e4e1a96680d31c26b558317755548464df5300b9b791`.
 The release gate also passed prior-v10 project migration/reopen, suggestion
-promotion/reopen, active-family cancellation/drain, and 178 frontend tests.
+promotion/reopen, active-family cancellation/drain, and 178 frontend tests at
+source-test level. It did not exercise backup/restore rollback or an active
+operation through the packaged application.
 
 The FTE smoke opened the same `gateway.db` and `gateway-v2.db` file identities
 from the isolated root on each launch and used process-local credentials instead of Keychain.
-The release gate also passed local-model configuration reopen, schema reopen,
-native-runtime join, active-router cancellation/drain, and both frontend tests.
+The release gate also passed fresh/current-schema reopen, native-runtime join,
+active-router cancellation/drain, and both frontend tests. FTE has no legacy
+database migration path: it accepts a fresh store or the exact current schema
+and rejects legacy, unversioned populated, foreign, and altered-schema
+databases before mutation.
 Separately, the ignored current-source macOS credential acceptance test wrote,
 independently read, replaced, deleted, and confirmed cleanup of one disposable
 synthetic Keychain item at `a4161c76075111c462dbe5fef03ddcbd7b2ea193`.
@@ -86,6 +94,10 @@ candidate and smoke logs remain locally under the corresponding generated
 
 These are local release candidates, not stable public releases:
 
+- none has exercised an active product operation through the exact packaged
+  application;
+- applicable packaged backup/restore rollback remains unverified; Mom and Loom
+  have source-level prior-store tests, while FTE is fresh/current-schema-only;
 - signing is ad-hoc, not Developer ID;
 - notarization was not requested;
 - no component tag or public artifact has been created yet;

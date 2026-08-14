@@ -53,13 +53,15 @@ Semantic versioning describes each component's supported public/product contract
 
 ## Migration
 
-1. Run the component's focused migration, reopen, and shutdown tests locally.
+1. Run the component's focused source-level migration, reopen, and shutdown tests locally.
 2. Build its macOS `.app`, verify its signature, and emit the adjacent receipt.
-3. Launch and quit the packaged app with an isolated test store before calling
-   a candidate stable.
-4. Tag the clean commit with the component version.
-5. Upload the artifact asynchronously if distribution is useful.
-6. Keep former repositories readable at their protected phase-one tags until
+3. Launch, quit, and relaunch the packaged app with an isolated test store
+   before accepting it as a local candidate.
+4. Before calling a release stable, exercise an active operation through the
+   exact packaged app and verify applicable backup/restore rollback.
+5. Tag the clean commit with the component version.
+6. Upload the artifact asynchronously if distribution is useful.
+7. Keep former repositories readable at their protected phase-one tags until
    the corresponding component migration and rollback proof is accepted.
 
 ## Rollback
@@ -67,14 +69,18 @@ Semantic versioning describes each component's supported public/product contract
 Select the prior tag and package, restore the data backup made before migration,
 and verify the package against its receipt before launch. An older binary must
 not open a forward-migrated store. A corrected release receives a new version;
-an existing tag is never moved.
+an existing tag is never moved. The current local candidates have not yet
+exercised this packaged backup/restore rollback procedure.
 
 ## Acceptance
 
 - The local release command works without GitHub or network access once dependencies are cached.
 - The release command rejects dirty source; its receipt records package hashes and signing state.
-- Focused component checks cover migration/reopen and active-operation shutdown.
-- A stable release additionally has an isolated packaged-app launch, quit, and relaunch smoke.
+- Focused component checks cover source-level migration/reopen and
+  active-operation shutdown; they do not establish packaged rollback.
+- A local candidate has an isolated packaged-app launch, quit, and relaunch smoke.
+- A stable release additionally has active packaged-operation evidence and
+  applicable packaged backup/restore rollback evidence.
 - Evidence distinguishes ad-hoc local acceptance from Developer ID/notarized distribution.
 - Archived or diagnostic-only repositories are absent from the active package graph.
 - Live paid-provider spend is not a release acceptance requirement; any hosted behavior claim remains limited to the evidence actually run.

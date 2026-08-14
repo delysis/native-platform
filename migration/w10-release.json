@@ -1,8 +1,15 @@
 {
   "schema_version": 1,
   "goal": "W10-RELEASE-AND-RETIREMENT",
-  "status": "local_macos_candidates_accepted_publication_pending",
+  "status": "local_macos_candidates_accepted_stability_and_publication_pending",
   "platform_scope": "macos",
+  "stability_gate": {
+    "stable_candidates": [],
+    "required_before_stable": [
+      "active operation exercised through the exact packaged application",
+      "applicable packaged backup/restore rollback evidence"
+    ]
+  },
   "release_tooling": {
     "local_command": "scripts/release-macos.sh",
     "packaged_smoke": "scripts/smoke-macos-app.sh",
@@ -28,7 +35,10 @@
       "packaged_launch_quit_relaunch": true,
       "state_reopened": true,
       "database_file_identity_unchanged": true,
-      "native_join_positive": true
+      "native_join_positive": true,
+      "source_prior_store_test": "passed_source_level_logical_import_and_reopen",
+      "packaged_active_operation": "unverified",
+      "packaged_backup_restore_rollback": "unverified"
     },
     "loom": {
       "version": "0.1.0",
@@ -44,7 +54,10 @@
       "packaged_launch_quit_relaunch": true,
       "open_project_receipts": 2,
       "state_reopen_evidence": "open_project_receipt_count_advanced",
-      "acceptance_model_loader_activity": false
+      "acceptance_model_loader_activity": false,
+      "source_prior_store_test": "passed_source_level_prior_v10_migration_and_reopen",
+      "packaged_active_operation": "unverified",
+      "packaged_backup_restore_rollback": "unverified"
     },
     "fte": {
       "version": "0.1.0",
@@ -61,7 +74,11 @@
       "ephemeral_credentials": true,
       "macos_synthetic_keychain_roundtrip": true,
       "macos_synthetic_keychain_cleanup_confirmed": true,
-      "keychain_tested_source_revision": "a4161c76075111c462dbe5fef03ddcbd7b2ea193"
+      "keychain_tested_source_revision": "a4161c76075111c462dbe5fef03ddcbd7b2ea193",
+      "store_compatibility": "fresh_or_exact_current_schema_only",
+      "legacy_database_handling": "rejected_before_mutation_not_imported",
+      "packaged_active_operation": "unverified",
+      "packaged_current_schema_backup_restore": "unverified"
     }
   },
   "negative_evidence": {
@@ -87,6 +104,8 @@
     "Developer ID signing and notarization",
     "component tags and public artifact publication",
     "live-model UI acceptance for these exact binaries",
+    "active operation through each exact packaged application",
+    "applicable packaged backup/restore rollback",
     "Windows and Linux distribution support",
     "two stable consolidated releases",
     "source-repository retirement"
