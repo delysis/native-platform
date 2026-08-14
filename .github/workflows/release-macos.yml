@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       component:
-        description: macOS component to package
+        description: macOS component for an ad-hoc remote candidate
         required: true
         type: choice
         options:
@@ -84,7 +84,8 @@ jobs:
             fi
           fi
           echo "component=$component" >> "$GITHUB_OUTPUT"
-      - run: ./scripts/release-macos.sh "${{ steps.component.outputs.component }}"
+      - name: Build remote candidate
+        run: ./scripts/release-macos.sh "${{ steps.component.outputs.component }}" candidate
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: remote-candidate-${{ steps.component.outputs.component }}-macos-${{ github.sha }}
