@@ -792,8 +792,8 @@ pub fn mom_llama_settings_update(
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_settings_update"))?;
     let value = command_value(mom_llama_runtime::settings_update(SettingsUpdate {
-        model_path: input.model_path.map(PathBuf::from),
-        mmproj_path: input.mmproj_path.map(PathBuf::from),
+        model_path: path_setting_patch(input.model_path),
+        mmproj_path: path_setting_patch(input.mmproj_path),
         native_device: input.device.as_deref().map(native_device_from_str),
         context_tokens: input.context_tokens,
         batch_tokens: input.batch_tokens,
@@ -1191,6 +1191,10 @@ fn value_to_settings_map(value: Value) -> Option<std::collections::BTreeMap<Stri
     Some(object.into_iter().collect())
 }
 
+fn path_setting_patch(value: Option<String>) -> Option<Option<PathBuf>> {
+    value.map(|value| (!value.is_empty()).then(|| PathBuf::from(value)))
+}
+
 fn native_device_from_str(value: &str) -> NativeDevice {
     match value {
         "cpu" => NativeDevice::Cpu,
@@ -1260,7 +1264,8 @@ fn kv_policy_from_str(value: &str) -> KvCachePolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ATTACHMENT_PREVIEW_BYTES, ensure_attachment_preview_size};
+    use super::{MAX_ATTACHMENT_PREVIEW_BYTES, ensure_attachment_preview_size, path_setting_patch};
+    use std::path::PathBuf;
 
     fn command_body<'a>(source: &'a str, name: &str) -> &'a str {
         let declaration = format!("pub async fn {name}");
@@ -1281,6 +1286,16 @@ mod tests {
         )
         .expect_err("a preview over the hard byte ceiling must fail closed");
         assert!(error.starts_with("attachment_preview_too_large:"));
+    }
+
+    #[test]
+    fn path_setting_patch_distinguishes_omitted_clear_and_replace() {
+        assert_eq!(path_setting_patch(None), None);
+        assert_eq!(path_setting_patch(Some(String::new())), Some(None));
+        assert_eq!(
+            path_setting_patch(Some("/models/local.gguf".to_string())),
+            Some(Some(PathBuf::from("/models/local.gguf")))
+        );
     }
 
     #[test]

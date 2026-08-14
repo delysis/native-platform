@@ -4052,6 +4052,12 @@ mod tests {
         assert!(js.contains("renderConsultGroups"));
         assert!(js.contains("refreshConsult()"));
         assert!(js.contains("scheduleSettingsAutosave"));
+        assert!(
+            js.contains(r#"modelPath: formValue(form, "model_path")"#)
+                && js.contains(r#"mmprojPath: formValue(form, "mmproj_path")"#)
+                && !js.contains(r#"mmprojPath: formValue(form, "mmproj_path") || null"#),
+            "empty native model paths must remain explicit clear patches"
+        );
         assert!(js.contains("mom_llama_conversation_system_message_update"));
         assert!(js.contains("Couldn’t save changes"));
         assert!(js.contains("autosave.dataset.state = \"idle\""));

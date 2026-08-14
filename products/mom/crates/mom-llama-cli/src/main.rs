@@ -1398,8 +1398,8 @@ fn run() -> Result<()> {
                 json,
             } => print_result(
                 mom_llama_runtime::settings_update(SettingsUpdate {
-                    model_path,
-                    mmproj_path,
+                    model_path: model_path.map(Some),
+                    mmproj_path: mmproj_path.map(Some),
                     native_device: device.map(map_native_device),
                     context_tokens,
                     batch_tokens,
