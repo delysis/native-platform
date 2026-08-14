@@ -152,9 +152,21 @@ require_equal CFBundleShortVersionString "$VERSION" "$OBSERVED_VERSION"
 require_equal CFBundleExecutable "$BINARY_NAME" "$OBSERVED_EXECUTABLE"
 require_equal LSMinimumSystemVersion "$MINIMUM_MACOS" "$OBSERVED_MINIMUM_MACOS"
 
-EMBEDDED_MODEL=$(find "$BUNDLE/Contents" -type f \( -iname '*.gguf' -o -iname '*.safetensors' -o -iname '*.onnx' \) -print -quit)
+EMBEDDED_MODEL=$(find "$BUNDLE/Contents" \( \
+  -type f \( \
+    -iname '*.gguf' -o \
+    -iname '*.safetensors' -o \
+    -iname '*.onnx' -o \
+    -iname '*.pt' -o \
+    -iname '*.pth' -o \
+    -iname '*.ckpt' -o \
+    -iname '*.mlmodel' -o \
+    -iname '*.mlpackage' \
+  \) -o \
+  -type d -iname '*.mlpackage' \
+\) -print -quit)
 if [ -n "$EMBEDDED_MODEL" ]; then
-  echo "model file must remain runtime-discovered, but the bundle contains: $EMBEDDED_MODEL" >&2
+  echo "model weights must remain runtime-discovered, but the bundle contains: $EMBEDDED_MODEL" >&2
   exit 1
 fi
 

@@ -175,6 +175,27 @@ test("the packaged executable is not mistaken for model weights", (t) => {
   assert.doesNotMatch(result.stderr, /model weights must remain runtime-discovered/);
 });
 
+test("the macOS builder rejects the same common model-weight formats as the archive smoke", () => {
+  const releaseSource = read(path.join(root, "scripts/release-macos.sh"));
+  const smokeSource = read(smokeScriptPath);
+  for (const extension of [
+    "gguf",
+    "safetensors",
+    "onnx",
+    "pt",
+    "pth",
+    "ckpt",
+    "mlmodel",
+    "mlpackage",
+  ]) {
+    const pattern = `-iname '*.${extension}'`;
+    assert.ok(releaseSource.includes(pattern));
+    assert.ok(smokeSource.includes(pattern));
+  }
+  assert.match(releaseSource, /-type d -iname '\*\.mlpackage'/);
+  assert.match(smokeSource, /-type d -iname '\*\.mlpackage'/);
+});
+
 test("macOS remote candidates are tag or manual artifacts and never PR requirements", () => {
   const source = read(releasePath);
   assert.match(source, /^\s+tags:\s*$/m);
