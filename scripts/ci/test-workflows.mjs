@@ -281,7 +281,10 @@ test("PR frontend runs only selected product frontend commands", () => {
 
 test("Mom exposes the frontend syntax check used by PR CI", () => {
   const scripts = JSON.parse(read(momPackagePath)).scripts;
-  assert.equal(scripts["check:frontend"], "node --check ui/coop-hx.js");
+  assert.equal(
+    scripts["check:frontend"],
+    "node --check ui/cache-inspector.js && node --check ui/coop-hx.js",
+  );
 });
 
 test("full frontend coverage remains unchanged", () => {
