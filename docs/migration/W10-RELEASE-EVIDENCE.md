@@ -28,6 +28,12 @@ safetensors file, and passed `codesign --verify --deep --strict`. The local
 artifacts and their separate release/smoke receipts are under `dist/macos/`;
 that generated directory is intentionally not committed.
 
+The accepted ZIP for each product was also extracted into a fresh smoke root
+and the extracted application passed the same two-launch Quit/relaunch check.
+Each archive input SHA-256 matched the digest recorded above. This closes the
+identity gap between the build-tree bundle and the emitted archive without
+turning the remote packaging workflow into a development gate.
+
 The Mom smoke opened the same encrypted `runtime.sqlite3` file identity from
 the isolated root on both launches. Each quit emitted positive
 application-drain and native-host join evidence. The release gate also passed prior-store import/reopen,
