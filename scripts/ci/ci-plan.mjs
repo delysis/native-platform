@@ -171,7 +171,6 @@ for (const changedPath of changed) {
   ) {
     recognized = true;
     risk = "release";
-    flags.root = true;
     flags.platform_macos = true;
   }
 
