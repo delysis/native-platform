@@ -170,15 +170,15 @@
     },
     {
       "path": "migration/home.json",
-      "length": 6902,
-      "sha256": "01be6f108122a8e2201745abaa9f6b818a98b4c1b4827e1a7c7475c4d995aa32",
-      "purpose": "W8 HOME local acceptance receipt"
+      "length": 7037,
+      "sha256": "ee869c59a71ef47d859870cd570501c6d25a0146e6ea1771e9788905277a8b83",
+      "purpose": "W8 HOME acceptance and promotion receipt"
     },
     {
       "path": "docs/migration/HOME-EVIDENCE.md",
-      "length": 5777,
-      "sha256": "610a01c55139f4439ee6ac287262768fd30c527da9194839349c8c4e0aa374bd",
-      "purpose": "W8 HOME local acceptance narrative"
+      "length": 5909,
+      "sha256": "adc7bfe8296dacc124d636160503d3241a029aad111164328619e8a328adb9aa",
+      "purpose": "W8 HOME acceptance and promotion narrative"
     }
   ]
 }

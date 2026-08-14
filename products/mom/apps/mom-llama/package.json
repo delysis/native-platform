@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "check:frontend": "node --check ui/coop-hx.js",
+    "check:frontend": "node --check ui/cache-inspector.js && node --check ui/coop-hx.js",
+    "test:frontend": "node --test ui/cache-inspector.test.js",
     "tauri": "tauri"
   },
   "devDependencies": {

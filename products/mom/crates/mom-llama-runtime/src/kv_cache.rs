@@ -5,10 +5,10 @@ use crate::receipts::{Blocker, CommandResult};
 use crate::skill_store::load_skill_db;
 use crate::store::RuntimeStore;
 use anyhow::{Result, anyhow};
+pub use llama_native_cache::{CacheEntryState, CacheFingerprint, CacheTier};
 use llama_native_cache::{
-    CacheEntryState, CacheFingerprint, CacheMatch, CacheTier, MemoryPrefixCache,
-    PrefixCacheMetadata, PrefixCacheValue, longest_compatible_prefix,
-    longest_compatible_prefix_for_owner,
+    CacheMatch, MemoryPrefixCache, PrefixCacheMetadata, PrefixCacheValue,
+    longest_compatible_prefix, longest_compatible_prefix_for_owner,
 };
 use llama_native_engine::NativeModelHandle;
 use llama_native_types::{

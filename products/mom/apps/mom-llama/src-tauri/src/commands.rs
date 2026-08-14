@@ -39,14 +39,6 @@ pub fn mom_llama_render_sidebar_fragment(
 }
 
 #[tauri::command]
-pub fn mom_llama_render_persona_picker_fragment(
-    runtime: State<'_, AppRuntimeHandle>,
-) -> Result<Response, String> {
-    let _lease = runtime.admit(command_spec("mom_llama_render_persona_picker_fragment"))?;
-    markup_response(crate::view::render_persona_picker_fragment())
-}
-
-#[tauri::command]
 pub fn mom_llama_render_settings_fragment(
     runtime: State<'_, AppRuntimeHandle>,
 ) -> Result<Response, String> {

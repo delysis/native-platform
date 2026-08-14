@@ -85,12 +85,18 @@ test("CI policy changes use root Linux and macOS without expanding to full", () 
 });
 
 test("macOS release tooling selects only policy and the macOS syntax lane", () => {
-  const { result } = fixture("scripts/smoke-macos-app.sh");
-  assert.equal(result.risk, "release");
-  assert.equal(result.flags.root, false);
-  assert.equal(result.flags.platform_macos, true);
-  assert.equal(result.flags.full, false);
-  assert.deepEqual(result.jobs, ["policy", "platform-macos"]);
+  for (const relativePath of [
+    "scripts/release-macos.sh",
+    "scripts/smoke-macos-app.sh",
+    "scripts/product-state-backup.mjs",
+  ]) {
+    const { result } = fixture(relativePath);
+    assert.equal(result.risk, "release");
+    assert.equal(result.flags.root, false);
+    assert.equal(result.flags.platform_macos, true);
+    assert.equal(result.flags.full, false);
+    assert.deepEqual(result.jobs, ["policy", "platform-macos"]);
+  }
 });
 
 test("Native changes require root, Native, and macOS product coverage", () => {

@@ -1,6 +1,6 @@
 # W8 HOME: local acceptance evidence
 
-Status: **locally accepted; GitHub promotion pending**.
+Status: **accepted, promoted through GitHub, and tagged**.
 
 The W8 candidate commit is
 `66e6bf091f16ddad0fcbab194db40b2f8b7c3457`, tree
@@ -102,9 +102,12 @@ WAV bytes, one terminal, `network=never`, and `real_local_inference=true`.
 
 ## Promotion boundary
 
-W6 and W7 are merged, protected, and their source repositories frozen. W8 is
-locally accepted but does not yet claim GitHub publication, required policy
-and macOS checks, main merge, or a protected HOME tag. Linux and Windows are
-informational under the Mac-first policy and do not block local engineering.
-Distribution signing/notarization, W9 line/package reduction, and W10 release
-and retirement are not claimed by this receipt.
+W6 and W7 are merged, protected, and their source repositories frozen. The W8
+candidate was promoted as main merge
+`058c4622fac8813417a5e6637091e63e1ef01ea2`, tree
+`fb0362faf422090ec8d8f936d5b31b95da0b01ac`, and protected tag
+`w8-home-v0-2026-08-13`. The later W9 receipt records that promotion and uses
+it as its immutable baseline. Linux and Windows are informational under the
+Mac-first policy and do not block local engineering. Distribution
+signing/notarization, W9 line/package reduction, and W10 release and retirement
+are not claimed by this W8 receipt.

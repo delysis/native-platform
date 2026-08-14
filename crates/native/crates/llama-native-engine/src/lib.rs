@@ -53,7 +53,9 @@ use sha2::{Digest, Sha256};
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, Metadata};
+use std::io::Read as _;
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
@@ -5080,17 +5082,6 @@ fn validate_config(config: &NativeModelConfig) -> NativeResult<()> {
             format!("model file does not exist: {}", config.model_path.display()),
         ));
     }
-    if config
-        .model_path
-        .extension()
-        .and_then(|value| value.to_str())
-        != Some("gguf")
-    {
-        return Err(NativeError::new(
-            NativeErrorCode::ModelInvalid,
-            "native models must use the .gguf format",
-        ));
-    }
     validate_expected_sha256(
         "expected_model_sha256",
         config.expected_model_sha256.as_deref(),
@@ -5103,6 +5094,25 @@ fn validate_config(config: &NativeModelConfig) -> NativeResult<()> {
         return Err(NativeError::new(
             NativeErrorCode::InvalidConfig,
             "expected_mmproj_sha256 requires a multimodal projector path",
+        ));
+    }
+    validate_gguf_header(&config.model_path)
+}
+
+fn validate_gguf_header(path: &Path) -> NativeResult<()> {
+    let mut header = [0_u8; 4];
+    File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                format!("failed to inspect local model header: {error}"),
+            )
+        })?;
+    if &header != b"GGUF" {
+        return Err(NativeError::new(
+            NativeErrorCode::ModelInvalid,
+            "native model does not have a GGUF header",
         ));
     }
     Ok(())
@@ -8030,6 +8040,26 @@ mod tests {
         let error = validate_config(&config)
             .expect_err("a projector digest without a projector path is ambiguous");
         assert_eq!(error.code, NativeErrorCode::InvalidConfig);
+    }
+
+    #[test]
+    fn native_config_recognizes_gguf_content_instead_of_trusting_the_file_name() {
+        let directory = TestArtifactDirectory::new("gguf-content-validation");
+        let extensionless = directory.join("content-addressed-model");
+        std::fs::write(&extensionless, b"GGUF").expect("write extensionless GGUF fixture");
+        validate_config(&NativeModelConfig::local(extensionless))
+            .expect("extensionless GGUF content is valid");
+
+        let uppercase = directory.join("model.GGUF");
+        std::fs::write(&uppercase, b"GGUF").expect("write uppercase GGUF fixture");
+        validate_config(&NativeModelConfig::local(uppercase))
+            .expect("uppercase extension does not hide valid GGUF content");
+
+        let false_name = directory.join("not-a-model.gguf");
+        std::fs::write(&false_name, b"nope").expect("write false GGUF fixture");
+        let error = validate_config(&NativeModelConfig::local(false_name))
+            .expect_err("a .gguf suffix cannot replace the GGUF header");
+        assert_eq!(error.code, NativeErrorCode::ModelInvalid);
     }
 
     #[test]

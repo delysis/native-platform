@@ -218,7 +218,7 @@ test("PR workflow is always triggered and has one truthful aggregate", () => {
   assert.match(source, /^\s{4}if: always\(\)$/m);
   assert.match(source, /CI_NEEDS_JSON:\s*\$\{\{ toJSON\(needs\) \}\}/);
   assert.match(source, /node scripts\/ci\/ci-required\.mjs/);
-  assert.match(source, /node --test scripts\/ci\/test-ci-plan\.mjs scripts\/ci\/test-ci-required\.mjs scripts\/ci\/test-workflows\.mjs/);
+  assert.match(source, /node --test scripts\/ci\/test-ci-plan\.mjs scripts\/ci\/test-ci-required\.mjs scripts\/ci\/test-product-state-backup\.mjs scripts\/ci\/test-workflows\.mjs/);
 });
 
 test("PR workflow exposes every targeted partition and future product guards", () => {
@@ -281,7 +281,10 @@ test("PR frontend runs only selected product frontend commands", () => {
 
 test("Mom exposes the frontend syntax check used by PR CI", () => {
   const scripts = JSON.parse(read(momPackagePath)).scripts;
-  assert.equal(scripts["check:frontend"], "node --check ui/coop-hx.js");
+  assert.equal(
+    scripts["check:frontend"],
+    "node --check ui/cache-inspector.js && node --check ui/coop-hx.js",
+  );
 });
 
 test("full frontend coverage remains unchanged", () => {
