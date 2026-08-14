@@ -23,6 +23,7 @@ pub struct Builder {
     loopback: Option<LoopbackConfig>,
     default_loopback: bool,
     app_data_dir: Option<PathBuf>,
+    cleanup_on_exit: bool,
     #[cfg(feature = "native-llama")]
     native_backend: Option<Arc<fte_backend_llama::LlamaNativeBackend>>,
 }
@@ -43,6 +44,7 @@ impl Builder {
             loopback: None,
             default_loopback: false,
             app_data_dir: None,
+            cleanup_on_exit: true,
             #[cfg(feature = "native-llama")]
             native_backend: None,
         }
@@ -143,6 +145,15 @@ impl Builder {
         self
     }
 
+    /// Defers `RunEvent::Exit` cleanup to an embedding application that
+    /// drains the shared Gateway before requesting final process exit.
+    /// Plugin drop remains an idempotent fallback after that coordinated exit.
+    #[must_use]
+    pub fn with_application_managed_exit(mut self) -> Self {
+        self.cleanup_on_exit = false;
+        self
+    }
+
     pub fn register_backend(self, backend: Arc<dyn GatewayBackend>) -> Result<Self, GatewayError> {
         self.gateway.register_backend(backend)?;
         Ok(self)
@@ -154,6 +165,7 @@ impl Builder {
         let loopback_config = self.loopback;
         let default_loopback = self.default_loopback;
         let app_data_dir = self.app_data_dir;
+        let cleanup_on_exit = self.cleanup_on_exit;
         PluginBuilder::new("free-token-energy")
             .invoke_handler(tauri::generate_handler![
                 gateway_status,
@@ -193,8 +205,9 @@ impl Builder {
             // `App::run` callback. Draining here guarantees that the app may
             // subsequently close its application-owned native host without a
             // gateway bridge or provider task still using it.
-            .on_event(|app, event| {
-                if matches!(event, RunEvent::Exit)
+            .on_event(move |app, event| {
+                if cleanup_on_exit
+                    && matches!(event, RunEvent::Exit)
                     && let Some(state) = app.try_state::<PluginState>()
                 {
                     state.cleanup_blocking();
@@ -639,6 +652,16 @@ mod tests {
         let root = PathBuf::from("/tmp/fte-acceptance-plugin-root");
         let builder = Builder::new().with_app_data_dir(root.clone());
         assert_eq!(builder.app_data_dir, Some(root));
+    }
+
+    #[test]
+    fn application_managed_exit_disables_only_the_early_exit_hook() {
+        assert!(Builder::new().cleanup_on_exit);
+        assert!(
+            !Builder::new()
+                .with_application_managed_exit()
+                .cleanup_on_exit
+        );
     }
 
     #[test]

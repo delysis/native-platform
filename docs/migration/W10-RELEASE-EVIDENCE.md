@@ -22,41 +22,57 @@ did not change between launches. The smoke deliberately does not override
 | --- | --- | --- | --- | ---: |
 | Mom Llama 0.1.0 | `352adc59fafbc188decd7059cf94da9433a8a324` | `f05d3a38d808751daa2056ec77a840285b7072384e172f756bc7ceadbef97d33` | `682292d3133c0131647cc426c975c19dadce8350a648d590b80e0fc6ca3210a5` | 10,901,576 |
 | Loom 0.1.0 | `352adc59fafbc188decd7059cf94da9433a8a324` | `4066002780b796d667f45fc7471dccb9d19db49f3e4c649830ef14d01139bd9e` | `af7fd24d0749e83f02005b848658cc886d8cffed4878fe973a58c62d2b7c5c71` | 8,688,610 |
-| Free Token Energy 0.1.0 | `352adc59fafbc188decd7059cf94da9433a8a324` | `a70f28b27ac420277f793bffce9ec8247e542f68e67391ca8cf3dca1089cd998` | `191d781d2664aa085a7792b074e1d4adbb74f2e99cc91146d2b2deed692138f9` | 8,349,125 |
+| Free Token Energy 0.1.0 | `bff02a8d71448eade6c282d54d4090a71dd8e699` | `0181b8e886ba5f867c0d4c1aec24a19e410e81d02fde600b7c0cf4335d2c6d04` | `9e8998d77d47cd611c32af8035274bf2066ea590b1b0654c1190ae58e3b9d18e` | 8,383,515 |
 
 All three bundles declare macOS 13.0 as their floor, contain no GGUF, ONNX, or
 safetensors file, and passed `codesign --verify --deep --strict`. The local
 release receipts are under `dist/macos/`; that generated directory is
 intentionally not committed.
 
-The accepted ZIP for each product was also extracted into fresh smoke root
+The accepted Mom and Loom ZIPs were extracted into fresh smoke root
 `/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/delysis-352adc-archive-smoke.XXXXXX.2ybD4JyTHn`.
-The exact extracted application visibly reached product readiness, quit zero,
+The accepted FTE ZIP was independently extracted and smoked twice under
+`/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/delysis-fte-smoke.XXXXXX.y82ykQ4U1s`.
+Each exact extracted application visibly reached product readiness, quit zero,
 relaunched against the same isolated state root, reached readiness again, and
-quit zero. The extracted executable hashes matched the receipts above,
-`codesign --verify --deep --strict` passed again, and the extracted tree
-contained no named model-weight files. This closes the identity gap between
-the build-tree bundle and emitted archive without turning remote packaging
-into a development gate.
+quit zero. The extracted executable hashes matched their release receipts,
+`codesign --verify --deep --strict` passed again, and the extracted trees
+contained no named or header-detected model-weight files. This closes the
+identity gap between the build-tree bundle and emitted archive without turning
+remote packaging into a development gate.
 
 The Mom smoke opened the same encrypted `runtime.sqlite3` file identity from
 the isolated root on both launches. Each quit emitted positive
-application-drain and native-host join evidence. The release gate also passed prior-store import/reopen,
-persistent-cache corruption/reopen, and an active native-operation drain at
-source-test level. It did not exercise backup/restore rollback or an active
-operation through the packaged application.
+application-drain and native-host join evidence. The exact archive then ran a
+real local request against a cached model. A fresh process restored 103 KV
+cells from the encrypted checkpoint; the inspector reported one checkpoint,
+150 tokens, 3.3 MiB, and a warm entry. This proves that between-session KV
+reuse remained functional and that the prior `Cache unverified` screen was a
+presentation defect. During a second active request, Quit aborted native work,
+joined the operation and native workers, drained application work, and exited
+zero. Exact-archive relaunch recovered the interrupted prompt as a draft. The
+same exact UI also exposed 14 Personas and the Consult groups list, started new
+chats from both lists, and retained persona/group `@` completion.
 
 The Loom smoke created and reopened one ordinary writing project. Its database
-contains two `open_project` receipts after the second launch. The package is
+contains two `open_project` receipts after the second launch. The exact archive
+was then launched against a cached Gemma base model hard-linked into the
+isolated acceptance model library, so no model bytes were copied. With the UI
+reporting `Preparing`, Quit exited zero and deallocated Metal; exact-archive
+relaunch recovered the manuscript. The package is
 bound to `writer-gemma4-base-v2`, policy file SHA-256
 `744fa860ffc979f6c1c9e4e1a96680d31c26b558317755548464df5300b9b791`.
 The release gate also passed prior-v10 project migration/reopen, suggestion
-promotion/reopen, active-family cancellation/drain, and 178 frontend tests at
-source-test level. It did not exercise backup/restore rollback or an active
-operation through the packaged application.
+promotion/reopen, active-family cancellation/drain, and 178 frontend tests.
 
 The FTE smoke opened the same `gateway.db` and `gateway-v2.db` file identities
 from the isolated root on each launch and used process-local credentials instead of Keychain.
+The exact `bff02a8` archive then selected the existing cached Qwen 0.6B GGUF,
+visibly reached `Routing…`, and accepted Cmd-Q during an active local request. It exited
+zero in 3,502 ms with `gateway_drained=true`, `native_host_joined=true`, all
+eight expected gateway workers joined, and zero retained tasks. Relaunch against
+the same isolated root restored the local provider as Ready and retained the
+one request record; the final idle Quit exited zero.
 The release gate also passed fresh/current-schema reopen, native-runtime join,
 active-router cancellation/drain, and both frontend tests. FTE has no legacy
 database migration path: it accepts a fresh store or the exact current schema
@@ -161,6 +177,17 @@ from `PRAGMA quick_check`; every receipt recorded zero model payload files.
 
 ## Negative evidence retained
 
+The original exact FTE archive from `352adc5` did not exit after Cmd-Q during
+an active local request. It remained alive for more than three minutes and was
+interrupted only after a process sample was captured. The sample showed the
+AppKit main thread synchronously joining plugin cleanup while a Tokio worker
+was blocked waiting for a WebKit main-run-loop callback. Commit `bff02a8`
+replaced that cycle with an application-owned two-stage exit: AppKit remains
+live while one asynchronous gateway drain completes, the complete joined
+receipt is checked, and only then is application exit allowed. The exact new
+archive result above is the regression proof; the failed archive is not
+silently counted as accepted active-operation evidence.
+
 The first current-source Loom packaged smoke did not exit within the original
 30-second bound. Sampling proved that Quit had been accepted and was waiting
 for an admitted blocking model inspection: acceptance discovery had found the
@@ -189,9 +216,9 @@ candidate and smoke logs remain locally under the corresponding generated
 These are local release candidates and supplemental UX builds, not stable
 public releases:
 
-- all three current UX bundles exited during UI-reported active local work.
-  Mom additionally emitted a complete joined-shutdown receipt and recovered
-  the interrupted prompt as a draft. These runs prove responsive packaged
+- all three accepted release archives exited during UI-reported active local
+  work and reopened product-owned state. Mom and FTE additionally emitted
+  complete joined-shutdown receipts. These runs prove responsive packaged
   shutdown; they do not claim that a cancelled-operation terminal was retained;
 - packaged backup/restore rollback passed for all three current-schema state
   roots, including visible reopen by both the current and prior binaries. This
@@ -199,9 +226,8 @@ public releases:
 - signing is ad-hoc, not Developer ID;
 - notarization was not requested;
 - no component tag or public artifact has been created yet;
-- the current archives prove lifecycle, isolated state reopen, signature, and
-  bundle identity. The earlier debug UX checks add real-model behavior for all
-  three products; that behavior is not relabeled as exact-archive inference;
+- the current archives prove lifecycle, isolated state reopen, signature,
+  bundle identity, and exact-archive real-model shutdown for all three products;
 - prior W6-W8 real-model receipts remain useful regression evidence, but they
   are not relabeled as evidence for these exact binaries;
 - macOS is the current supported release platform. Linux CI is informational,
