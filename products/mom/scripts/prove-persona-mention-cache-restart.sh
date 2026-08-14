@@ -20,7 +20,8 @@ export LLAMA_NATIVE_KIT_STORE_KEY_HEX="${LLAMA_NATIVE_KIT_STORE_KEY_HEX:-5555555
 
 cd "$repo_root"
 cargo build -q -p mom-llama-cli
-cli="$repo_root/target/debug/mom-llama-cli"
+target_dir="$(cargo metadata --format-version 1 --no-deps | jq -er '.target_directory')"
+cli="$target_dir/debug/mom-llama-cli"
 
 "$cli" settings update \
   --model-path "$model_file" \
