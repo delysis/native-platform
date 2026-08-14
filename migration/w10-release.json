@@ -73,6 +73,16 @@
     ],
     "isolation_hardened_by": "f8ee159de31369c29dc12b24a40a01886a9a02c5"
   },
+  "current_source_real_model": {
+    "source_revision": "0632c16b070ed220b40f07af380891162970961a",
+    "source_tree": "3005a734f972314fac6df2485e0313ca53ba46b5",
+    "model": "SmolLM2-135M-Instruct-Q4_K_M.gguf",
+    "model_sha256": "2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d",
+    "loaded_from_hugging_face_cache_in_place": true,
+    "native_joined_shutdown": "passed",
+    "fte_real_chat_completion_and_stable_prefix_cache": "passed",
+    "packaged_ui_claimed": false
+  },
   "claims_deferred": [
     "Developer ID signing and notarization",
     "component tags and public artifact publication",
