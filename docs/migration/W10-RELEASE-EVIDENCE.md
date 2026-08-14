@@ -55,6 +55,17 @@ independently read, replaced, deleted, and confirmed cleanup of one disposable
 synthetic Keychain item at `a4161c76075111c462dbe5fef03ddcbd7b2ea193`.
 No real provider credential or hosted request was used.
 
+Current-source local inference was rerun at the exact tree promoted as
+`0632c16b070ed220b40f07af380891162970961a`, using the existing Hugging Face
+cache in place. SmolLM2 135M Q4_K_M (SHA-256
+`2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d`)
+loaded through the real Native host; live-client revocation, joined shutdown,
+slot removal, and stopped admission passed. The FTE llama adapter then passed
+real chat, cold-to-warm stable-prefix cache reuse, completion, and
+`real_local_inference` receipts. No model bytes were copied into the checkout
+or application artifacts. This is current-source runtime evidence, not a claim
+that the packaged UI exercised a live model.
+
 ## Negative evidence retained
 
 The first current-source Loom packaged smoke did not exit within the original
