@@ -16,7 +16,7 @@ bound to Cmd-Q), requires exit status zero, and verifies that the executable
 did not change between launches. The smoke deliberately does not override
 `HOME`.
 
-## Accepted local candidates
+## Accepted archive candidates
 
 | Product | Source | Executable SHA-256 | Archive SHA-256 | Archive bytes |
 | --- | --- | --- | --- | ---: |
@@ -74,6 +74,52 @@ real chat, cold-to-warm stable-prefix cache reuse, completion, and
 or application artifacts. This is current-source runtime evidence, not a claim
 that the packaged UI exercised a live model.
 
+## Current packaged UX evidence
+
+These checks supplement, but do not replace, the archive candidates above.
+They intentionally use local debug bundles with ad-hoc signatures so product
+work can advance without waiting for remote packaging or release credentials.
+
+Mom Llama was rebuilt from product-code commit `fc8de70` as bundle
+`com.delysis.mom-llama.ux.fc8de70`; its executable SHA-256 is
+`fe67432804e05811ff4fadd941659198ebc4a194dfa17b9ba0ec832ff4ed321a`.
+The 86-MiB bundle contains no model weights and used the cached SmolLM2 GGUF.
+The packaged UI completed a real local chat. Its inspector then reported one
+encrypted 30.5-MiB checkpoint and one warm entry. After clean Quit and exact
+bundle relaunch against the same isolated root, the conversation and stored
+checkpoint were present while the process-local warm count correctly returned
+to zero. A separate real-engine restart proof confirmed fresh-process cache
+reuse. The revised sidebar visibly exposed 14 Personas and Consult groups,
+transferred a landing draft into a persona chat, seeded a group chat with its
+`@` handle, retained persona and group `@` autocomplete, and respected the
+collapsed Conversations state during search.
+
+Loom was rebuilt from product-code commit `fc8de70` as bundle
+`app.delysis.loom.ux.fc8de70`; its executable SHA-256 is
+`9ff6b164d56fbfb84a57650995aa1c77068b2670cfa5123c58aef85f6e0b18cd`.
+The 60-MiB bundle contains no model weights. Its cached Gemma GGUF was
+hard-linked into the isolated acceptance root: both paths were inode
+`69825204`, 4,954,576,032 bytes, with link count six, so the run allocated no
+duplicate model bytes. The packaged UI reached Ready and accepted Quit while
+reporting `Suggestions are growing privately`; the exact process exited zero
+in 102 ms and deallocated its Metal context. Relaunch recovered the manuscript.
+A real suggestion subsequently became visible and was accepted with Tab.
+Final Quit exited zero in 106 ms.
+
+Free Token Energy was rebuilt from commit `164fb97` as bundle
+`com.delysis.free-token-energy.ux.164fb97`; its executable SHA-256 is
+`92f1340f03f137e42f47d68ff800e7e909c865fb021e966bce74ef353959f168`.
+The 62-MiB bundle contains no model weights. The native picker selected the
+cached SmolLM2 snapshot alias, macOS resolved it to the extensionless
+content-addressed Hugging Face blob, and the application verified the file by
+its GGUF header instead of trusting a suffix. The packaged Playground completed
+a real local request. During a second request the UI visibly reported
+`Routing...`; Quit exited zero in 36 ms, invoked the native abort callback, and
+deallocated Metal. Exact-bundle relaunch against the same isolated root showed
+the local provider Ready with both local requests and token metrics recovered.
+Final Quit exited zero in 42 ms. The cache blob remained at its original inode
+and no model bytes were copied into the bundle or acceptance root.
+
 ## Negative evidence retained
 
 The first current-source Loom packaged smoke did not exit within the original
@@ -85,6 +131,15 @@ WebView preference could still pass the remembered path directly, so commit
 `7d39e13` also rejected model paths outside `<acceptance-root>/models` at the
 backend boundary. Normal Loom discovery remains unchanged.
 
+The first current FTE packaged UX check selected the intended Hugging Face
+snapshot alias, but macOS returned its canonical extensionless blob path. The
+pre-fix validator rejected that path solely because it lacked a `.gguf`
+suffix. Commit `164fb97` replaced filename trust with a four-byte GGUF header
+check in both the application and native engine. Focused suites, strict Clippy,
+a real extensionless-blob Metal inference, and the packaged UI run above all
+passed. The stored display name is the content hash because macOS discarded the
+friendly alias; this is a cosmetic limitation, not a copied-weight fallback.
+
 The final accepted Loom smoke completed both launches and quits in about two
 seconds total. Its logs contain no `llama_model_loader` activity. The failed
 candidate and smoke logs remain locally under the corresponding generated
@@ -92,17 +147,22 @@ candidate and smoke logs remain locally under the corresponding generated
 
 ## Evidence boundary
 
-These are local release candidates, not stable public releases:
+These are local release candidates and supplemental UX builds, not stable
+public releases:
 
-- none has exercised an active product operation through the exact packaged
-  application;
+- Mom has not yet proven an active-operation Quit through its exact packaged
+  application. Loom and FTE exited during UI-reported active local work, but
+  neither run recorded a cancelled-operation terminal; this is responsive
+  lifecycle evidence, not a stronger cancellation claim;
 - applicable packaged backup/restore rollback remains unverified; Mom and Loom
   have source-level prior-store tests, while FTE is fresh/current-schema-only;
 - signing is ad-hoc, not Developer ID;
 - notarization was not requested;
 - no component tag or public artifact has been created yet;
-- the packaged smoke proves lifecycle, isolated state reopen, and bundle
-  identity, but does not claim a live model generation or visible suggestion;
+- the older archive smokes prove lifecycle, isolated state reopen, and bundle
+  identity only. The current UX checks add exact-bundle real-model behavior for
+  all three products, but have not been promoted into new release archives or
+  digest receipts;
 - prior W6-W8 real-model receipts remain useful regression evidence, but they
   are not relabeled as evidence for these exact binaries;
 - macOS is the current supported release platform. Linux CI is informational,
