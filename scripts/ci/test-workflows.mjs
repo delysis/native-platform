@@ -304,6 +304,9 @@ test("the required macOS lane runs Mom parity when Mom changes", () => {
   )?.[0];
   assert.ok(macos, "platform-macos job block is missing");
   assert.ok(rootGraph, "Root platform graph step is missing");
+  assert.match(macos, /name: Release tooling shell syntax\n\s+run: sh -n scripts\/release-macos\.sh scripts\/smoke-macos-app\.sh/);
+  assert.match(macos, /dtolnay\/rust-toolchain@[0-9a-f]{40}\n\s+if: \$\{\{[^}]*needs\.plan\.outputs\.root/);
+  assert.match(macos, /Swatinem\/rust-cache@[0-9a-f]{40}\n\s+if: \$\{\{[^}]*needs\.plan\.outputs\.root/);
   assert.doesNotMatch(rootGraph, /needs\.plan\.outputs\.mom/);
   assert.match(macos, /name: Mom macOS parity/);
   assert.match(macos, /mom_present == 'true'/);
