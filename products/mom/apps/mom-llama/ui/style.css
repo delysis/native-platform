@@ -696,17 +696,24 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .composer-bottom { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .composer-left, .composer-right { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .round-button { width: 40px; height: 40px; border-radius: 50%; background: #2b2b2b; }
-.composer select {
+.conversation-model-chip {
+  display: flex;
   max-width: 250px;
+  min-width: 0;
   height: 36px;
-  border: 0;
+  align-items: center;
+  gap: 6px;
   border-radius: 7px;
   padding: 0 8px;
   color: var(--text);
   background: #2b2b2b;
+  white-space: nowrap;
 }
+.conversation-model-chip-label { color: var(--faint); font-size: 10px; }
+.conversation-model-chip strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; }
 .runtime-dot { width: 9px; height: 9px; flex: 0 0 9px; border-radius: 50%; background: var(--danger); }
 .runtime-dot.ready { background: var(--success); }
+.runtime-dot.configured { background: #c49a5a; }
 .send-button { width: 42px; height: 42px; border-radius: 50%; color: #111; background: #a9a9a9; }
 .send-button:hover { background: #d0d0d0; }
 .keyboard-hint { margin: 18px 0 0; color: var(--muted); font-size: 13px; }
@@ -950,7 +957,7 @@ kbd { padding: 2px 6px; border-radius: 4px; color: #c5c5c5; background: #2a2a2a;
   .chat-main.empty { padding-inline: 16px; }
   .chat-main.has-messages { padding-inline: 12px; }
   .composer { border-radius: 22px; }
-  .composer select { max-width: 150px; }
+  .conversation-model-chip { max-width: 150px; }
   .settings-dialog { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr) 68px; }
   .settings-sections { grid-row: 1; display: flex; gap: 4px; padding: 10px; border-right: 0; border-bottom: 1px solid #292929; overflow-x: auto; }
   .settings-sections h2 { display: none; }
