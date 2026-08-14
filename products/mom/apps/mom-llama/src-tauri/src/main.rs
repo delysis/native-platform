@@ -530,7 +530,6 @@ fn main() {
             commands::mom_llama_render_app,
             commands::mom_llama_render_chat_fragment,
             commands::mom_llama_render_sidebar_fragment,
-            commands::mom_llama_render_persona_picker_fragment,
             commands::mom_llama_render_settings_fragment,
             commands::mom_llama_pick_file,
             commands::mom_llama_engine_check,

@@ -1452,10 +1452,6 @@ pub fn render_sidebar_fragment() -> Result<String> {
     Ok(sidebar(&conversations, selected.as_deref()).into_string())
 }
 
-pub fn render_persona_picker_fragment() -> Result<String> {
-    Ok(persona_view().into_string())
-}
-
 pub fn render_settings_fragment() -> Result<String> {
     let settings = mom_llama_runtime::settings_get()?;
     let engine = mom_llama_runtime::engine_status()?;
@@ -1497,10 +1493,6 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
     let always_show_sidebar = upstream_settings_bool(settings, "alwaysShowSidebarOnDesktop");
     let custom_css = upstream_settings_value(settings, "customCss");
     let show_build_version = upstream_settings_bool(settings, "showBuildVersion");
-    let current_conversation_id = active
-        .as_ref()
-        .map(|conversation| conversation.id.as_str())
-        .unwrap_or("default");
     html! {
         div class=(format!(
                 "llama-ui-shell{}",
@@ -1518,8 +1510,6 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
                 (button("settings.open", Some("settings-open"), "icon-button settings-toggle", false))
             }
             (chat_view_with_draft(settings, engine, active.as_ref(), Some(draft)))
-            (persona_view())
-            (consult_view(current_conversation_id))
             (settings_modal(settings, engine, models, skills, kv, active.as_ref()))
             (persona_freeze_modal())
             (tool_approval_modal())
@@ -1707,6 +1697,30 @@ fn latest_synthesizable_invocation(active: Option<&Conversation>) -> Option<Stri
 }
 
 fn sidebar(conversations: &CommandResult<Vec<Conversation>>, active_id: Option<&str>) -> Markup {
+    let StoreProjection {
+        value: mut personas,
+        blocker: persona_blocker,
+    } = store_projection(
+        mom_llama_runtime::persona_list(),
+        "persona_store_unavailable",
+        "Saved Personas could not be loaded from local storage.",
+    );
+    personas.sort_by(|left, right| left.title.cmp(&right.title));
+    let StoreProjection {
+        value: mut groups,
+        blocker: group_blocker,
+    } = store_projection(
+        mom_llama_runtime::persona_group_list(),
+        "persona_group_store_unavailable",
+        "Consult groups could not be loaded from local storage.",
+    );
+    groups.sort_by(|left, right| left.name.cmp(&right.name));
+    let chats = conversations.result.as_deref().unwrap_or(&[]);
+    let conversation_list = control("conversation.list");
+    let persona_list = control("persona.list");
+    let group_list = control("persona_group.list");
+    let persona_start = control("persona.instantiate");
+    let conversation_new = control("conversation.new");
     html! {
         aside class="sidebar" aria-label="Sidebar" {
             h2 { "llama.cpp" }
@@ -1736,32 +1750,130 @@ fn sidebar(conversations: &CommandResult<Vec<Conversation>>, active_id: Option<&
                     }
                     (button("conversation.search.close", Some("conversation-search-close"), "icon-button search-close", false))
                 }
-                (button("persona.list", Some("personas-open"), "nav-button", false))
-                (button("consult.open", Some("consult-open"), "nav-button", false))
                 (button("mcp.status", Some("mcp-status"), "nav-button", false))
             }
-            section class="conversation-block" aria-label="Conversations" {
-                h3 { "Conversations" }
-                ol id="conversation-search-results" class="conversation-list search-results is-hidden" aria-live="polite" {}
-                ol id="conversation-list" class="conversation-list" {
-                    @if conversations.result.as_deref().unwrap_or(&[]).is_empty() {
-                        li class="empty-line" { "No conversations yet" }
+            div class="sidebar-sections" {
+                section class="sidebar-section conversation-block" aria-label="Conversations" data-sidebar-section="conversations" {
+                    button type="button" class="nav-button sidebar-section-toggle"
+                        data-affordance=(conversation_list.affordance)
+                        data-command=(conversation_list.command)
+                        data-tauri-command=(conversation_list.tauri_command)
+                        data-cli=(conversation_list.cli)
+                        data-effect=(conversation_list.effect)
+                        data-action="sidebar-section-toggle"
+                        data-sidebar-section="conversations"
+                        data-sidebar-label="Conversations"
+                        aria-label="Collapse Conversations"
+                        aria-expanded="true"
+                        aria-controls="conversation-list" {
+                        span { "Conversations" }
+                        span class="sidebar-section-chevron" aria-hidden="true" { (icon_markup("chevron-down")) }
                     }
-                    @for conversation in conversations.result.as_deref().unwrap_or(&[]).iter()
-                        .filter(|conversation| conversation.kind == mom_llama_runtime::ConversationKind::Chat) {
-                        @let active = active_id == Some(conversation.id.as_str());
-                        li {
-                            button type="button"
-                                class=(format!("conversation-item {}", if active { "active" } else { "" }))
-                                data-affordance="conversation.select"
-                                data-command="mom_llama.conversation_select"
-                                data-tauri-command="mom_llama_conversation_select"
-                                data-cli="mom-llama conversation select --conversation <id> --json"
-                                data-effect="mom_llama.effects.conversation_store.v1"
-                                data-action="conversation-select"
-                                data-conversation=(conversation.id.clone()) {
-                                span { (conversation.title.clone()) }
-                                small { (message_count(conversation)) }
+                    ol id="conversation-search-results" class="conversation-list search-results is-hidden" aria-live="polite" {}
+                    ol id="conversation-list" class="conversation-list sidebar-section-list" {
+                        @if !chats.iter().any(|conversation| conversation.kind == ConversationKind::Chat) {
+                            li class="empty-line" { "No conversations yet" }
+                        }
+                        @for conversation in chats.iter()
+                            .filter(|conversation| conversation.kind == ConversationKind::Chat) {
+                            @let active = active_id == Some(conversation.id.as_str());
+                            li {
+                                button type="button"
+                                    class=(format!("conversation-item {}", if active { "active" } else { "" }))
+                                    data-affordance="conversation.select"
+                                    data-command="mom_llama.conversation_select"
+                                    data-tauri-command="mom_llama_conversation_select"
+                                    data-cli="mom-llama conversation select --conversation <id> --json"
+                                    data-effect="mom_llama.effects.conversation_store.v1"
+                                    data-action="conversation-select"
+                                    data-conversation=(conversation.id.clone()) {
+                                    span { (conversation.title.clone()) }
+                                    small { (message_count(conversation)) }
+                                }
+                            }
+                        }
+                    }
+                }
+                section class="sidebar-section" aria-label="Personas" data-sidebar-section="personas" {
+                    button type="button" class="nav-button sidebar-section-toggle"
+                        data-affordance=(persona_list.affordance)
+                        data-command=(persona_list.command)
+                        data-tauri-command=(persona_list.tauri_command)
+                        data-cli=(persona_list.cli)
+                        data-effect=(persona_list.effect)
+                        data-action="sidebar-section-toggle"
+                        data-sidebar-section="personas"
+                        data-sidebar-label="Personas"
+                        aria-label="Collapse Personas"
+                        aria-expanded="true"
+                        aria-controls="sidebar-persona-list" {
+                        span { "Personas" }
+                        span class="sidebar-section-chevron" aria-hidden="true" { (icon_markup("chevron-down")) }
+                    }
+                    ol id="sidebar-persona-list" class="conversation-list sidebar-section-list" {
+                        @if let Some(blocker) = &persona_blocker {
+                            li { (store_blocker(blocker)) }
+                        } @else if personas.is_empty() {
+                            li class="empty-line" { "No Personas yet" }
+                        }
+                        @for persona in personas {
+                            @let handle = persona.execution_profile.mention_handle.clone();
+                            li {
+                                button type="button" class="conversation-item sidebar-persona-item"
+                                    data-affordance=(persona_start.affordance)
+                                    data-command=(persona_start.command)
+                                    data-tauri-command=(persona_start.tauri_command)
+                                    data-cli=(persona_start.cli)
+                                    data-effect=(persona_start.effect)
+                                    data-action="sidebar-persona-start"
+                                    data-persona=(persona.id.clone())
+                                    aria-label=(format!("Start a new chat with {} (@{})", persona.title, handle)) {
+                                    span { (persona.title) }
+                                    small { "@" (handle) }
+                                }
+                            }
+                        }
+                    }
+                }
+                section class="sidebar-section" aria-label="Consult groups" data-sidebar-section="consult-groups" {
+                    button type="button" class="nav-button sidebar-section-toggle"
+                        data-affordance=(group_list.affordance)
+                        data-command=(group_list.command)
+                        data-tauri-command=(group_list.tauri_command)
+                        data-cli=(group_list.cli)
+                        data-effect=(group_list.effect)
+                        data-action="sidebar-section-toggle"
+                        data-sidebar-section="consult-groups"
+                        data-sidebar-label="Consult groups"
+                        aria-label="Collapse Consult groups"
+                        aria-expanded="true"
+                        aria-controls="sidebar-consult-group-list" {
+                        span { "Consult groups" }
+                        span class="sidebar-section-chevron" aria-hidden="true" { (icon_markup("chevron-down")) }
+                    }
+                    ol id="sidebar-consult-group-list" class="conversation-list sidebar-section-list" {
+                        @if let Some(blocker) = &group_blocker {
+                            li { (store_blocker(blocker)) }
+                        } @else if groups.is_empty() {
+                            li class="empty-line" { "No consult groups yet" }
+                        }
+                        @for group in groups {
+                            @let handle = group.mention_handle.clone();
+                            @let member_count = group.persona_ids.len();
+                            li {
+                                button type="button" class="conversation-item sidebar-consult-group-item"
+                                    data-affordance=(conversation_new.affordance)
+                                    data-command=(conversation_new.command)
+                                    data-tauri-command=(conversation_new.tauri_command)
+                                    data-cli=(conversation_new.cli)
+                                    data-effect=(conversation_new.effect)
+                                    data-action="sidebar-consult-group-start"
+                                    data-group=(group.id.clone())
+                                    data-handle=(handle.clone())
+                                    aria-label=(format!("Start a new chat with consult group {} (@{})", group.name, handle)) {
+                                    span { (group.name) }
+                                    small { "@" (handle) " · " (member_count) " members" }
+                                }
                             }
                         }
                     }
@@ -1771,86 +1883,6 @@ fn sidebar(conversations: &CommandResult<Vec<Conversation>>, active_id: Option<&
                 (button("conversation.rename", Some("conversation-rename"), "small-button", active_id.is_none()))
                 (button("conversation.delete", Some("conversation-delete"), "small-button danger", active_id.is_none()))
                 (button("conversation.import", Some("conversation-import"), "small-button", false))
-            }
-        }
-    }
-}
-
-fn persona_view() -> Markup {
-    let StoreProjection {
-        value: mut personas,
-        blocker,
-    } = store_projection(
-        mom_llama_runtime::persona_list(),
-        "persona_store_unavailable",
-        "Saved Personas could not be loaded from local storage.",
-    );
-    personas.sort_by(|left, right| left.title.cmp(&right.title));
-    let settings_open = control("settings.open");
-    let select = control("conversation.select");
-    let instantiate = control("persona.instantiate");
-    html! {
-        section id="persona-view" class="persona-picker is-hidden" aria-label="Personas"
-            hidden[true] aria-hidden="true" {
-            div class="persona-picker-card" role="dialog" aria-modal="true" aria-labelledby="persona-picker-title" {
-                header {
-                    div {
-                        h2 id="persona-picker-title" { "Personas" }
-                        p { "Open a saved Persona or start a new chat." }
-                    }
-                    button type="button" class="icon-button"
-                        data-affordance="persona.list"
-                        data-command="mom_llama.persona_list"
-                        data-tauri-command="mom_llama_persona_list"
-                        data-cli="mom-llama persona list --json"
-                        data-effect="mom_llama.effects.conversation_store.v1"
-                        data-action="personas-close"
-                        aria-label="Close Personas" { (icon_markup("x")) }
-                }
-                div class="persona-picker-options" {
-                    @if let Some(blocker) = &blocker {
-                        (store_blocker(blocker))
-                    } @else if personas.is_empty() {
-                        p class="empty-line" { "No Personas have been saved yet." }
-                    }
-                    @for persona in personas {
-                        div class="persona-picker-row" {
-                            button type="button" class="persona-picker-option"
-                                data-affordance=(select.affordance)
-                                data-command=(select.command)
-                                data-tauri-command=(select.tauri_command)
-                                data-cli=(select.cli)
-                                data-effect=(select.effect)
-                                data-action="persona-open"
-                                data-conversation=(persona.id.clone()) {
-                                span class="persona-picker-icon" { (icon_markup("user-round")) }
-                                span class="persona-picker-copy" {
-                                    strong { (persona.title.clone()) }
-                                    small { "@" (persona.execution_profile.mention_handle.clone()) }
-                                }
-                            }
-                            button type="button" class="icon-button persona-picker-launch"
-                                title=(format!("Start a chat with {}", persona.title))
-                                aria-label=(format!("Start a chat with {}", persona.title))
-                                data-affordance=(instantiate.affordance)
-                                data-command=(instantiate.command)
-                                data-tauri-command=(instantiate.tauri_command)
-                                data-cli=(instantiate.cli)
-                                data-effect=(instantiate.effect)
-                                data-action="persona-instantiate"
-                                data-persona=(persona.id.clone()) {
-                                (icon_markup("message-circle"))
-                            }
-                        }
-                    }
-                }
-                button type="button" class="text-button"
-                    data-affordance=(settings_open.affordance)
-                    data-command=(settings_open.command)
-                    data-tauri-command=(settings_open.tauri_command)
-                    data-cli=(settings_open.cli)
-                    data-effect=(settings_open.effect)
-                    data-action="personas-settings-open" { "Manage Personas in Settings" }
             }
         }
     }
@@ -1978,56 +2010,6 @@ fn composer(
             output id="chat-events" class="stream-events" aria-live="polite" {}
         }
         p class="keyboard-hint" { "Press " kbd { "Enter" } " to send, " kbd { "Shift + Enter" } " for new line" }
-    }
-}
-
-fn consult_view(conversation_id: &str) -> Markup {
-    let StoreProjection {
-        value: groups,
-        blocker,
-    } = store_projection(
-        mom_llama_runtime::persona_group_list(),
-        "persona_group_store_unavailable",
-        "Consult groups could not be loaded from local storage.",
-    );
-    let settings_open = control("settings.open");
-    html! {
-        section id="consult-view" class="consult-picker is-hidden" aria-label="Consult groups"
-            data-current-conversation=(conversation_id) {
-            div class="consult-picker-card" {
-                header {
-                    div { h2 { "Consult groups" } p { "Insert a saved group into this message." } }
-                    (button("consult.close", Some("consult-close"), "icon-button", false))
-                }
-                div class="consult-group-options" {
-                    @if let Some(blocker) = &blocker {
-                        (store_blocker(blocker))
-                    } @else if groups.is_empty() {
-                        p class="empty-line" { "No groups yet. Create one in Settings." }
-                    }
-                    @for group in groups {
-                        button type="button" class="consult-group-option"
-                            data-affordance="persona_group.list"
-                            data-command="mom_llama.persona_group_list"
-                            data-tauri-command="mom_llama_persona_group_list"
-                            data-cli="mom-llama persona-group list --json"
-                            data-effect="mom_llama.effects.consult_read.v1"
-                            data-action="consult-group-insert"
-                            data-handle=(group.mention_handle.clone()) {
-                            span { "@" (group.mention_handle) }
-                            small { (group.name) " · " (group.persona_ids.len()) " members" }
-                        }
-                    }
-                }
-                button type="button" class="text-button"
-                    data-affordance=(settings_open.affordance)
-                    data-command=(settings_open.command)
-                    data-tauri-command=(settings_open.tauri_command)
-                    data-cli=(settings_open.cli)
-                    data-effect=(settings_open.effect)
-                    data-action="consult-settings-open" { "Manage groups in Settings" }
-            }
-        }
     }
 }
 
@@ -2829,12 +2811,12 @@ fn persona_settings() -> Markup {
         "persona_store_unavailable",
         "Saved Personas could not be loaded from local storage.",
     );
-    let select = control("conversation.select");
+    let edit = control("persona.get");
     html! {
         section class="settings-card persona-library" {
             h3 { "Personas" }
             p class="field-help" {
-                "Open a Persona to edit its transcript, or use the pencil for its model and context profile."
+                "Manage each Persona's model, context profile, and saved template. Start chats from the main sidebar."
             }
             div id="persona-list" class="persona-list" {
                 @if let Some(blocker) = &blocker {
@@ -2845,12 +2827,13 @@ fn persona_settings() -> Markup {
                 @for persona in &personas {
                     div class="persona-row" {
                         button type="button" class="persona-select"
-                            data-affordance=(select.affordance)
-                            data-command=(select.command)
-                            data-tauri-command=(select.tauri_command)
-                            data-cli=(select.cli)
-                            data-effect=(select.effect)
-                            data-action="persona-open" data-conversation=(persona.id.clone()) {
+                            data-affordance=(edit.affordance)
+                            data-command=(edit.command)
+                            data-tauri-command=(edit.tauri_command)
+                            data-cli=(edit.cli)
+                            data-effect=(edit.effect)
+                            aria-label=(format!("Edit {} persona", persona.title))
+                            data-action="persona-edit" data-persona=(persona.id.clone()) {
                             span { (persona.title.clone()) }
                             small { "@" (persona.execution_profile.mention_handle.clone()) }
                         }
@@ -3949,6 +3932,18 @@ mod tests {
             mom_llama_runtime::now_ms()
         ));
         mom_llama_runtime::config::set_data_dir_override_for_tests(Some(data_dir));
+        let persona_ids = mom_llama_runtime::persona_list()?
+            .result
+            .unwrap_or_default()
+            .into_iter()
+            .take(2)
+            .map(|persona| persona.id)
+            .collect::<Vec<_>>();
+        mom_llama_runtime::persona_group_create(
+            "Care team".to_string(),
+            "care-team".to_string(),
+            persona_ids,
+        )?;
         let html = render_app()?;
         mom_llama_runtime::config::set_data_dir_override_for_tests(None);
         for forbidden in ["__sveltekit__", "React", "Vue", "fetch("] {
@@ -4010,16 +4005,36 @@ mod tests {
             ),
             "tool authority must stay behind an explicit hidden approval dialog"
         );
-        assert!(html.contains(r#"id="consult-view" class="consult-picker is-hidden""#));
+        assert!(!html.contains(r#"id="consult-view""#));
+        assert!(!html.contains(r#"id="persona-view""#));
+        assert!(!html.contains(r#"data-action="personas-open""#));
+        assert!(!html.contains(r#"data-action="consult-open""#));
+        for (section, list, label) in [
+            ("conversations", "conversation-list", "Conversations"),
+            ("personas", "sidebar-persona-list", "Personas"),
+            (
+                "consult-groups",
+                "sidebar-consult-group-list",
+                "Consult groups",
+            ),
+        ] {
+            assert!(html.contains(&format!(r#"data-sidebar-section="{section}""#)));
+            assert!(html.contains(&format!(r#"aria-controls="{list}""#)));
+            assert!(html.contains(&format!(r#"aria-label="Collapse {label}""#)));
+        }
+        assert!(html.contains(r#"data-action="sidebar-persona-start""#));
         assert!(html.contains(
-            r#"id="persona-view" class="persona-picker is-hidden" aria-label="Personas" hidden aria-hidden="true""#
+            r#"aria-label="Start a new chat with Bessel van der Kolk (@bessel-van-der-kolk)""#
         ));
-        assert!(html.contains(r#"data-action="personas-open""#));
-        assert!(html.contains("Open a saved Persona or start a new chat."));
+        assert!(html.contains(r#"data-action="sidebar-consult-group-start""#));
+        assert!(html.contains(
+            r#"aria-label="Start a new chat with consult group Care team (@care-team)""#
+        ));
         assert!(html.contains("Bessel van der Kolk"));
-        assert!(!html.contains("Body &amp; trauma lens"));
+        assert!(html.contains("@care-team · 2 members"));
         assert!(!html.contains(r#"data-action="skills-open""#));
-        assert!(html.contains(r#"data-action="persona-open""#));
+        assert!(!html.contains(r#"data-action="persona-open""#));
+        assert!(html.contains("Start chats from the main sidebar."));
         assert!(!html.contains("Edits version this template"));
         assert!(!html.contains(r#"class="persona-template-banner""#));
         assert!(html.contains(r#"id="mention-candidates" class="mention-candidates is-hidden""#));
@@ -4099,7 +4114,7 @@ mod tests {
                 && js.contains("stream.dataset.followTail"),
             "chat fragment refreshes must preserve the reader's transcript position"
         );
-        assert!(js.contains("mom_llama_render_persona_picker_fragment"));
+        assert!(!js.contains("mom_llama_render_persona_picker_fragment"));
         assert!(js.contains("selectedConversationKind"));
         assert!(js.contains(r#"selectedConversationKind() === "persona_template""#));
         assert!(js.contains("const instantiated = await instantiatePersona(sourceConversation)"));
@@ -4109,8 +4124,9 @@ mod tests {
                 && js.contains("conversation = created.result.id;"),
             "the landing composer must materialize a real conversation before dispatch"
         );
-        assert!(js.contains("renderConsultGroups"));
-        assert!(js.contains("refreshConsult()"));
+        assert!(js.contains(r#""sidebar-persona-start": async (button)"#));
+        assert!(js.contains(r#""sidebar-consult-group-start": async (button)"#));
+        assert!(js.contains("collapsedSidebarSections"));
         assert!(js.contains("scheduleSettingsAutosave"));
         assert!(
             js.contains(r#"modelPath: formValue(form, "model_path")"#)
@@ -4127,7 +4143,7 @@ mod tests {
                 && stylesheet.contains("@keyframes settings-save-spin"),
             "autosave feedback must stay icon-only, transient, and native to the established icon language"
         );
-        assert!(js.contains(r#"openSettings("consult")"#));
+        assert!(js.contains(r#"refreshSettings("consult")"#));
         let composer_clear = js
             .find(r#"if (textarea) textarea.value = "";"#)
             .expect("composer must clear optimistically when a send is accepted");
@@ -4480,7 +4496,6 @@ mod tests {
             ("conversationSelect", "conversation.select"),
             ("mentionCancel", "mention.cancel"),
             ("mentionCandidates", "mention.candidates"),
-            ("personaGroupList", "persona_group.list"),
             ("messageEdit", "message.edit"),
         ] {
             assert_dynamic_js_contract(js, key, control(affordance));
@@ -4491,7 +4506,6 @@ mod tests {
             r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.conversationSelect)"#,
             r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.mentionCancel)"#,
             r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.mentionCandidates)"#,
-            r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.personaGroupList)"#,
             r#"createCommandElement("textarea", DYNAMIC_CONTROL_SPECS.messageEdit)"#,
             r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.messageEdit)"#,
         ] {
@@ -4509,9 +4523,26 @@ mod tests {
         );
         assert_command_precedes_local_mutation(
             js,
-            r#""consult-group-insert": async (button)"#,
+            r#""sidebar-consult-group-start": async (button)"#,
             r#"invoke("mom_llama_persona_group_list")"#,
-            r#"textarea.value += `${prefix}@${handle} `"#,
+            r#"invoke("mom_llama_conversation_new"#,
+        );
+        assert_command_precedes_local_mutation(
+            js,
+            r#""sidebar-consult-group-start": async (button)"#,
+            r#"invoke("mom_llama_conversation_new"#,
+            r#"message: `@${group.mention_handle} `"#,
+        );
+        assert!(
+            js.contains(r#""sidebar-persona-start": async (button)"#)
+                && js.contains("await instantiatePersona(button.dataset.persona)"),
+            "sidebar Personas must instantiate a new chat instead of selecting the template"
+        );
+        assert!(
+            js.contains(r#"aria-label="Personas, chats, and consult groups""#)
+                || include_str!("view.rs")
+                    .contains(r#"aria-label="Personas, chats, and consult groups""#,),
+            "composer mention autocomplete must continue to expose people, chats, and groups"
         );
         assert_command_precedes_local_mutation(
             js,

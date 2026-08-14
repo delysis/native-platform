@@ -30,7 +30,6 @@
 
   const shell = () => document.querySelector(".llama-ui-shell");
   const chat = () => document.getElementById("chat");
-  const consult = () => document.getElementById("consult-view");
   const selectedConversation = () =>
     (chat() && chat().dataset.currentConversation) || "default";
   const selectedConversationKind = () =>
@@ -346,8 +345,26 @@
     restoreChatViewport(viewport, replacement);
     return replacement;
   };
-  const refreshSidebar = () => swap(".sidebar", "mom_llama_render_sidebar_fragment");
-  const refreshPersonas = () => swap("#persona-view", "mom_llama_render_persona_picker_fragment");
+  const collapsedSidebarSections = new Set();
+  const applySidebarSectionState = (root = document) => {
+    root?.querySelectorAll?.("[data-action='sidebar-section-toggle']").forEach((button) => {
+      const section = button.dataset.sidebarSection;
+      const list = document.getElementById(button.getAttribute("aria-controls"));
+      if (!section || !list) return;
+      const expanded = !collapsedSidebarSections.has(section);
+      button.setAttribute("aria-expanded", String(expanded));
+      button.setAttribute(
+        "aria-label",
+        `${expanded ? "Collapse" : "Expand"} ${button.dataset.sidebarLabel || section}`,
+      );
+      list.hidden = !expanded;
+    });
+  };
+  const refreshSidebar = async () => {
+    const replacement = await swap(".sidebar", "mom_llama_render_sidebar_fragment");
+    applySidebarSectionState(replacement);
+    return replacement;
+  };
   const refreshSettings = async (section = "general") => {
     const wasOpen = !document.getElementById("settings-modal")?.hidden;
     const modal = await swap("#settings-modal", "mom_llama_render_settings_fragment");
@@ -590,7 +607,6 @@
     const result = await invoke("mom_llama_persona_get", { persona: personaId });
     report(result);
     if (result?.status === "blocked" || !result?.result) return false;
-    closePersonas();
     openSettings("personas");
     setPersonaEditor(result.result);
     return true;
@@ -603,6 +619,24 @@
     });
     report(result);
     return result;
+  };
+
+  const persistCurrentDraftBeforeNavigation = async () => {
+    const conversation = selectedConversation();
+    if (conversation === "default") return;
+    const form = document.getElementById("chat-form");
+    await persistDraftNow(
+      formValue(form, "message"),
+      draftAttachmentIds(form),
+      conversation,
+    );
+  };
+
+  const focusComposer = () => {
+    const textarea = document.querySelector("#chat-form textarea[name='message']");
+    if (!textarea) return;
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
   };
 
   const personaProfileFromEditor = () => {
@@ -748,13 +782,6 @@
       tauri: "mom_llama_mention_candidates",
       cli: "mom-llama mention candidates --query <text> --json",
       effect: "mom_llama.effects.conversation_store.v1",
-    }),
-    personaGroupList: Object.freeze({
-      affordance: "persona_group.list",
-      command: "mom_llama.persona_group_list",
-      tauri: "mom_llama_persona_group_list",
-      cli: "mom-llama persona-group list --json",
-      effect: "mom_llama.effects.consult_read.v1",
     }),
     messageEdit: Object.freeze({
       affordance: "message.edit",
@@ -1132,87 +1159,6 @@
     list.classList.remove("is-hidden");
   };
 
-  const renderStoreBlocker = (blocker, fallback) => {
-    const message = document.createElement("p");
-    message.className = "store-blocker";
-    message.setAttribute("role", "status");
-    message.dataset.blockerCode = blocker?.code || "local_store_unavailable";
-    message.textContent = blocker?.message || fallback;
-    return message;
-  };
-
-  const renderConsultGroups = (response) => {
-    const options = consult()?.querySelector(".consult-group-options");
-    if (!options) return;
-    options.replaceChildren();
-    if (response?.status === "blocked" || response?.blocker) {
-      options.append(renderStoreBlocker(
-        response?.blocker,
-        "Consult groups could not be loaded from local storage.",
-      ));
-      return;
-    }
-    const groups = response?.result || [];
-    if (!groups.length) {
-      const empty = document.createElement("p");
-      empty.className = "empty-line";
-      empty.textContent = "No groups yet. Create one in Settings.";
-      options.append(empty);
-      return;
-    }
-    groups.forEach((group) => {
-      const button = createCommandElement("button", DYNAMIC_CONTROL_SPECS.personaGroupList);
-      button.type = "button";
-      button.className = "consult-group-option";
-      button.dataset.action = "consult-group-insert";
-      button.dataset.handle = group.mention_handle || "";
-      const handle = document.createElement("span");
-      handle.textContent = `@${group.mention_handle || ""}`;
-      const detail = document.createElement("small");
-      detail.textContent = `${group.name || "Consult group"} · ${(group.persona_ids || []).length} members`;
-      button.append(handle, detail);
-      options.append(button);
-    });
-  };
-
-  const refreshConsult = async () => {
-    const response = await invoke("mom_llama_persona_group_list");
-    renderConsultGroups(response);
-    if (response?.status === "blocked") report(response);
-    return consult();
-  };
-
-  const openConsult = async () => {
-    shell()?.classList.remove("sidebar-open");
-    const view = await refreshConsult();
-    if (view) {
-      view.classList.remove("is-hidden");
-      view.querySelector(".consult-group-option")?.focus();
-    }
-  };
-
-  const closeConsult = () => {
-    consult()?.classList.add("is-hidden");
-  };
-
-  const openPersonas = async () => {
-    shell()?.classList.remove("sidebar-open");
-    const view = await refreshPersonas();
-    if (!view) return;
-    view.hidden = false;
-    view.classList.remove("is-hidden");
-    view.setAttribute("aria-hidden", "false");
-    view.querySelector(".persona-picker-option")?.focus();
-  };
-
-  const closePersonas = () => {
-    const view = document.getElementById("persona-view");
-    if (!view) return;
-    view.hidden = true;
-    view.classList.add("is-hidden");
-    view.setAttribute("aria-hidden", "true");
-  };
-
   const onToolLoopEvent = (event) => {
     const payload = event.payload || event;
     const live = document.getElementById("tool-loop-live");
@@ -1317,49 +1263,72 @@
       await invoke("mom_llama_conversation_list");
       shell()?.classList.toggle("sidebar-open");
     },
-    "settings-open": async () => { await invoke("mom_llama_settings_get"); openSettings(); },
-    "settings-close": async () => { await invoke("mom_llama_settings_get"); closeSettings(); },
-    "settings-section": async (button) => switchSettingsSection(button.dataset.section || "general"),
-    "skills-open": async () => { await invoke("mom_llama_skill_list"); openSettings("general"); },
-    "personas-open": async () => { await invoke("mom_llama_persona_list"); await openPersonas(); },
-    "personas-close": async () => { await invoke("mom_llama_persona_list"); closePersonas(); },
-    "personas-settings-open": async () => {
-      await invoke("mom_llama_settings_get");
-      closePersonas();
-      openSettings("personas");
+    "sidebar-section-toggle": async (button) => {
+      const section = button.dataset.sidebarSection;
+      const list = document.getElementById(button.getAttribute("aria-controls"));
+      if (!section || !list) return;
+      const command = {
+        conversations: "mom_llama_conversation_list",
+        personas: "mom_llama_persona_list",
+        "consult-groups": "mom_llama_persona_group_list",
+      }[section];
+      const listed = command ? await invoke(command) : null;
+      if (listed?.status === "blocked") {
+        report(listed);
+        return;
+      }
+      const expanded = button.getAttribute("aria-expanded") !== "true";
+      button.setAttribute("aria-expanded", String(expanded));
+      button.setAttribute(
+        "aria-label",
+        `${expanded ? "Collapse" : "Expand"} ${button.dataset.sidebarLabel || section}`,
+      );
+      list.hidden = !expanded;
+      if (expanded) collapsedSidebarSections.delete(section);
+      else collapsedSidebarSections.add(section);
     },
-    "consult-open": async () => openConsult(),
-    "consult-close": async () => { await invoke("mom_llama_conversation_list"); closeConsult(); },
-    "consult-settings-open": async () => {
-      await invoke("mom_llama_settings_get");
-      closeConsult();
-      openSettings("consult");
+    "sidebar-persona-start": async (button) => {
+      await persistCurrentDraftBeforeNavigation();
+      const result = await instantiatePersona(button.dataset.persona);
+      if (result?.status === "blocked") return;
+      await refreshConversationProjection();
+      focusComposer();
     },
-    "consult-group-insert": async (button) => {
-      const textarea = document.querySelector("#chat-form textarea[name='message']");
-      if (!textarea) return;
-      const handle = button.dataset.handle || "";
-      const response = await invoke("mom_llama_persona_group_list");
-      const current = (response?.result || []).some((group) => (
-        String(group.mention_handle || "").toLowerCase() === handle.toLowerCase()
+    "sidebar-consult-group-start": async (button) => {
+      const listed = await invoke("mom_llama_persona_group_list");
+      const group = (listed?.result || []).find((candidate) => (
+        candidate.id === button.dataset.group
+        && String(candidate.mention_handle || "").toLowerCase()
+          === String(button.dataset.handle || "").toLowerCase()
       ));
-      if (response?.status === "blocked" || !current) {
-        report(response?.status === "blocked" ? response : {
+      if (listed?.status === "blocked" || !group) {
+        report(listed?.status === "blocked" ? listed : {
           status: "blocked",
           blocker: {
             code: "persona_group_not_found",
             message: "That consult group is no longer available.",
           },
         });
-        await refreshConsult();
+        await refreshSidebar();
         return;
       }
-      const prefix = textarea.value && !textarea.value.endsWith(" ") ? " " : "";
-      textarea.value += `${prefix}@${handle} `;
-      textarea.dispatchEvent(new Event("input", { bubbles: true }));
-      closeConsult();
-      textarea.focus();
+      await persistCurrentDraftBeforeNavigation();
+      const created = await invoke("mom_llama_conversation_new", { title: group.name });
+      report(created);
+      if (created?.status === "blocked" || !created?.result?.id) return;
+      const seeded = await invoke("mom_llama_draft_update", {
+        conversation: created.result.id,
+        message: `@${group.mention_handle} `,
+        attachmentIds: [],
+      });
+      report(seeded);
+      await refreshConversationProjection();
+      focusComposer();
     },
+    "settings-open": async () => { await invoke("mom_llama_settings_get"); openSettings(); },
+    "settings-close": async () => { await invoke("mom_llama_settings_get"); closeSettings(); },
+    "settings-section": async (button) => switchSettingsSection(button.dataset.section || "general"),
+    "skills-open": async () => { await invoke("mom_llama_skill_list"); openSettings("general"); },
     "mention-insert": async (button) => {
       const textarea = document.querySelector("#chat-form textarea[name='message']");
       if (!textarea) return;
@@ -1410,17 +1379,6 @@
     "conversation-select": async (button) => {
       const result = await invoke("mom_llama_conversation_select", { conversation: button.dataset.conversation });
       report(result); await refreshConversationProjection();
-    },
-    "persona-open": async (button) => {
-      const result = await invoke("mom_llama_conversation_select", {
-        conversation: button.dataset.conversation,
-      });
-      report(result);
-      if (result?.status !== "blocked") {
-        closeSettings();
-        closePersonas();
-        await refreshConversationProjection();
-      }
     },
     "chat-cancel": async () => report(await invoke("mom_llama_chat_cancel", { conversation: selectedConversation() })),
     "chat-skip-reasoning": async (button) => {
@@ -1488,7 +1446,7 @@
       report(result);
       if (result?.status !== "blocked") {
         setModalVisibility("persona-freeze-modal", false);
-        await Promise.all([refreshSettings("personas"), refreshPersonas()]);
+        await Promise.all([refreshSettings("personas"), refreshSidebar()]);
       }
     },
     "persona-edit": async (button) => openPersonaProfile(button.dataset.persona),
@@ -1497,7 +1455,6 @@
       const result = await instantiatePersona(button.dataset.persona);
       if (result?.status !== "blocked") {
         closeSettings();
-        closePersonas();
         await refreshConversationProjection();
       }
     },
@@ -1507,7 +1464,6 @@
       if (result?.status !== "blocked") {
         await Promise.all([
           refreshSettings("personas"),
-          refreshPersonas(),
           refreshConversationProjection(),
         ]);
       }
@@ -1520,7 +1476,6 @@
       if (result?.status !== "blocked") {
         await Promise.all([
           refreshSettings("personas"),
-          refreshPersonas(),
           refreshConversationProjection(),
         ]);
       }
@@ -1541,13 +1496,13 @@
         : await invoke("mom_llama_persona_group_create", payload);
       report(result);
       if (result?.status !== "blocked") {
-        await Promise.all([refreshSettings("consult"), refreshConsult()]);
+        await Promise.all([refreshSettings("consult"), refreshSidebar()]);
       }
     },
     "persona-group-delete": async (button) => {
       if (!armDestructiveAction(button)) return;
       report(await invoke("mom_llama_persona_group_delete", { group: button.dataset.group }));
-      await Promise.all([refreshSettings("consult"), refreshConsult()]);
+      await Promise.all([refreshSettings("consult"), refreshSidebar()]);
     },
     "message-edit-save": async (button) => {
       const content = button.closest(".message-card")?.querySelector("textarea")?.value || "";

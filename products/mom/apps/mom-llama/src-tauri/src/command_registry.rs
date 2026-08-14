@@ -60,7 +60,6 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     read("mom_llama_render_app", false, true),
     read("mom_llama_render_chat_fragment", false, true),
     read("mom_llama_render_sidebar_fragment", false, false),
-    read("mom_llama_render_persona_picker_fragment", false, false),
     read("mom_llama_render_settings_fragment", false, true),
     long("mom_llama_pick_file", true, false),
     long("mom_llama_engine_check", true, true),
