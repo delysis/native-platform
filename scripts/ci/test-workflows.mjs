@@ -14,6 +14,7 @@ const fullPath = path.join(root, ".github/workflows/ci-full.yml");
 const releasePath = path.join(root, ".github/workflows/release-macos.yml");
 const releaseScriptPath = path.join(root, "scripts/release-macos.sh");
 const smokeScriptPath = path.join(root, "scripts/smoke-macos-app.sh");
+const embeddedModelScriptPath = path.join(root, "scripts/find-embedded-model.mjs");
 const momPackagePath = path.join(
   root,
   "products/mom/apps/mom-llama/package.json",
@@ -35,7 +36,7 @@ function writeExecutable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o755 });
 }
 
-function macSmokeFixture(t, weightPath = null) {
+function macSmokeFixture(t, weightPath = null, weightContents = "fixture model bytes\n") {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "delysis-smoke-identity-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
 
@@ -59,7 +60,7 @@ function macSmokeFixture(t, weightPath = null) {
       fs.mkdirSync(target, { recursive: true });
     } else {
       fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, "fixture model bytes\n");
+      fs.writeFileSync(target, weightContents);
     }
   }
 
@@ -97,6 +98,19 @@ node -e 'const fs=require("fs"),crypto=require("crypto"),p=process.argv[1]; cons
 
   return { archive, receipt, run, validReceipt };
 }
+
+test("extracted macOS ZIP rejects an extensionless GGUF payload", (t) => {
+  const fixture = macSmokeFixture(
+    t,
+    "weights/0123456789abcdef",
+    Buffer.from("GGUFextensionless model bytes"),
+  );
+  fs.writeFileSync(fixture.receipt, `${JSON.stringify(fixture.validReceipt)}\n`);
+  const result = fixture.run();
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /model weights must remain runtime-discovered/);
+  assert.match(result.stderr, /0123456789abcdef/);
+});
 
 function externalActionUses(source) {
   return [...source.matchAll(/^\s*-\s+uses:\s+([^\s#]+).*$/gm)]
@@ -176,8 +190,11 @@ test("the packaged executable is not mistaken for model weights", (t) => {
 });
 
 test("the macOS builder rejects the same common model-weight formats as the archive smoke", () => {
-  const releaseSource = read(path.join(root, "scripts/release-macos.sh"));
+  const releaseSource = read(releaseScriptPath);
   const smokeSource = read(smokeScriptPath);
+  const scannerSource = read(embeddedModelScriptPath);
+  assert.match(releaseSource, /scripts\/find-embedded-model\.mjs/);
+  assert.match(smokeSource, /scripts\/find-embedded-model\.mjs/);
   for (const extension of [
     "gguf",
     "safetensors",
@@ -188,12 +205,9 @@ test("the macOS builder rejects the same common model-weight formats as the arch
     "mlmodel",
     "mlpackage",
   ]) {
-    const pattern = `-iname '*.${extension}'`;
-    assert.ok(releaseSource.includes(pattern));
-    assert.ok(smokeSource.includes(pattern));
+    assert.ok(scannerSource.includes(`".${extension}"`));
   }
-  assert.match(releaseSource, /-type d -iname '\*\.mlpackage'/);
-  assert.match(smokeSource, /-type d -iname '\*\.mlpackage'/);
+  assert.match(scannerSource, /Buffer\.from\("GGUF"\)/);
 });
 
 test("macOS remote candidates are tag or manual artifacts and never PR requirements", () => {

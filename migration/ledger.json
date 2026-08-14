@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "goal": "W8-ONE-WORKSPACE",
-  "status": "local_candidate",
+  "status": "accepted",
   "production_source_imported": true,
   "source_history_imported": true,
   "integration_candidate": {
@@ -10,8 +10,8 @@
     "product_releases_modified": false,
     "source_imported": true,
     "history_imported": true,
-    "manifest": "tests/vertical/Cargo.toml",
-    "coverage": "tests/vertical/COVERAGE.md"
+    "manifest": "Cargo.toml",
+    "coverage": "docs/migration/HOME-EVIDENCE.md"
   },
   "accepted_w1_receipt": {
     "goal": "W1-VERTICALS",
