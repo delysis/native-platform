@@ -3009,7 +3009,11 @@ mod tests {
             .count();
         let stable_options = options
             .iter()
-            .filter(|option| !option.starts_with("COMPILER="))
+            .filter(|option| {
+                !option.starts_with("COMPILER=")
+                    && !option.starts_with("ATOMIC_INTRINSICS=")
+                    && !option.starts_with("MUTEX_")
+            })
             .map(String::as_str)
             .collect::<Vec<_>>()
             .join("\n");
@@ -3019,9 +3023,27 @@ mod tests {
         assert_eq!(compiler_options, 1, "expected one SQLite compiler identity");
         assert!(options.iter().any(|option| option == "THREADSAFE=1"));
         assert!(options.iter().any(|option| option == "ENABLE_FTS5"));
+        // The bundled source and enabled features are shared, but SQLite's
+        // mutex and atomic implementations correctly differ between Win32 and
+        // Unix. Assert those choices explicitly, then seal the complete common
+        // option set instead of pretending the platform primitives match.
+        let (expected_atomics, expected_mutex) = if cfg!(target_os = "windows") {
+            ("ATOMIC_INTRINSICS=0", "MUTEX_W32")
+        } else {
+            ("ATOMIC_INTRINSICS=1", "MUTEX_PTHREADS")
+        };
+        assert!(options.iter().any(|option| option == expected_atomics));
+        assert_eq!(
+            options
+                .iter()
+                .filter(|option| option.starts_with("MUTEX_"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![expected_mutex]
+        );
         assert_eq!(
             format!("{:x}", Sha256::digest(stable_options.as_bytes())),
-            "2ff61812ddeeedba4e4cd1f0765cc979f1589661984ec5e15120a97d6e41bfe2",
+            "805b0fcb795dc1b685e1c3c5f26b3b0b00acb92136a0b683e63a98fc4b5f3c5b",
             "bundled SQLite compile options changed:\n{stable_options}"
         );
     }

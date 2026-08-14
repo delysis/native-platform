@@ -9,6 +9,10 @@ const root = path.resolve(import.meta.dirname, "../..");
 const prPath = path.join(root, ".github/workflows/ci-pr.yml");
 const fullPath = path.join(root, ".github/workflows/ci-full.yml");
 const releasePath = path.join(root, ".github/workflows/release-macos.yml");
+const momWindowsIconPath = path.join(
+  root,
+  "products/mom/apps/mom-llama/src-tauri/icons/icon.ico",
+);
 
 function read(file) {
   return fs.readFileSync(file, "utf8");
@@ -25,6 +29,11 @@ test("only the targeted PR, full, and asynchronous release workflows remain acti
   assert.equal(fs.existsSync(prPath), true);
   assert.equal(fs.existsSync(fullPath), true);
   assert.equal(fs.existsSync(releasePath), true);
+});
+
+test("Mom retains the Windows resource icon required by Tauri builds", () => {
+  const icon = fs.readFileSync(momWindowsIconPath);
+  assert.deepEqual([...icon.subarray(0, 4)], [0, 0, 1, 0]);
 });
 
 test("macOS remote candidates are tag or manual artifacts and never PR requirements", () => {
