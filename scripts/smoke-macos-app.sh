@@ -1,0 +1,291 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+COMPONENT=${1:-}
+SUPPLIED_BUNDLE=${2:-}
+
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "smoke-macos-app.sh requires macOS" >&2
+  exit 1
+fi
+
+case "$COMPONENT" in
+  mom)
+    APP_NAME="Mom Llama"
+    BINARY_NAME=mom-llama-app
+    BUNDLE_ID=com.delysis.llama-native-kit.mom-llama
+    ;;
+  loom)
+    APP_NAME=Loom
+    BINARY_NAME=loom-app
+    BUNDLE_ID=app.delysis.loom
+    ;;
+  fte)
+    APP_NAME="Free Token Energy"
+    BINARY_NAME=free-token-energy
+    BUNDLE_ID=dev.delysis.free-token-energy
+    ;;
+  *)
+    echo "usage: $0 {mom|loom|fte} [path/to/App.app]" >&2
+    exit 2
+    ;;
+esac
+
+if [ -n "$SUPPLIED_BUNDLE" ]; then
+  case "$SUPPLIED_BUNDLE" in
+    /*) BUNDLE=$SUPPLIED_BUNDLE ;;
+    *) BUNDLE=$(CDPATH= cd -- "$(dirname -- "$SUPPLIED_BUNDLE")" && pwd)/$(basename -- "$SUPPLIED_BUNDLE") ;;
+  esac
+else
+  TARGET_DIR=$(rustup run 1.92.0 cargo metadata --locked --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" |
+    node -e 'let s=""; process.stdin.on("data", c => s += c).on("end", () => console.log(JSON.parse(s).target_directory))')
+  BUNDLE="$TARGET_DIR/release/bundle/macos/$APP_NAME.app"
+fi
+
+EXECUTABLE="$BUNDLE/Contents/MacOS/$BINARY_NAME"
+PLIST="$BUNDLE/Contents/Info.plist"
+if [ ! -d "$BUNDLE" ] || [ ! -x "$EXECUTABLE" ] || [ ! -f "$PLIST" ]; then
+  echo "expected packaged application is missing or incomplete: $BUNDLE" >&2
+  exit 1
+fi
+
+OBSERVED_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")
+OBSERVED_EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")
+if [ "$OBSERVED_BUNDLE_ID" != "$BUNDLE_ID" ]; then
+  echo "bundle identifier mismatch: expected $BUNDLE_ID, observed $OBSERVED_BUNDLE_ID" >&2
+  exit 1
+fi
+if [ "$OBSERVED_EXECUTABLE" != "$BINARY_NAME" ]; then
+  echo "bundle executable mismatch: expected $BINARY_NAME, observed $OBSERVED_EXECUTABLE" >&2
+  exit 1
+fi
+codesign --verify --deep --strict "$BUNDLE"
+EXECUTABLE_SHA256=$(shasum -a 256 "$EXECUTABLE" | awk '{print $1}')
+
+SMOKE_ROOT=$(mktemp -d -t "delysis-$COMPONENT-smoke.XXXXXX")
+PRODUCT_STATE="$SMOKE_ROOT/product"
+mkdir "$PRODUCT_STATE"
+PRODUCT_STATE_CANONICAL=$(CDPATH= cd -- "$PRODUCT_STATE" && pwd -P)
+ACTIVE_PID=
+
+cleanup_failed_process() {
+  if [ -n "$ACTIVE_PID" ] && kill -0 "$ACTIVE_PID" 2>/dev/null; then
+    kill "$ACTIVE_PID" 2>/dev/null || true
+    wait "$ACTIVE_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_failed_process EXIT HUP INT TERM
+
+wait_for_window() {
+  target_pid=$1
+  xcrun swift - "$target_pid" <<'SWIFT'
+import CoreGraphics
+import Foundation
+
+let pid = Int32(CommandLine.arguments[1])!
+let deadline = Date().addingTimeInterval(20)
+repeat {
+    let rows = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID)! as! [[String: Any]]
+    let ready = rows.contains { row in
+        guard (row[kCGWindowOwnerPID as String] as? Int32) == pid,
+              (row[kCGWindowLayer as String] as? Int) == 0,
+              (row[kCGWindowIsOnscreen as String] as? Int) == 1,
+              let bounds = row[kCGWindowBounds as String] as? [String: Any],
+              let width = bounds["Width"] as? Double,
+              let height = bounds["Height"] as? Double else {
+            return false
+        }
+        return width > 0 && height > 0
+    }
+    if ready { exit(0) }
+    Thread.sleep(forTimeInterval: 0.1)
+} while Date() < deadline
+fputs("packaged application did not expose an on-screen window\n", stderr)
+exit(1)
+SWIFT
+}
+
+wait_for_readiness() {
+  run_number=$1
+  target_pid=$2
+  stderr_log=$3
+  attempt=0
+  while [ "$attempt" -lt 300 ]; do
+    if ! kill -0 "$target_pid" 2>/dev/null; then
+      echo "application exited before product state became ready" >&2
+      return 1
+    fi
+    case "$COMPONENT" in
+      mom)
+        [ -f "$PRODUCT_STATE/runtime.sqlite3" ] &&
+          grep -Fq "mom-llama runtime ready: $PRODUCT_STATE" "$stderr_log" && return 0
+        ;;
+      loom)
+        loom_root="$PRODUCT_STATE/writing"
+        if [ -f "$loom_root/.loom/project.json" ] &&
+          [ -f "$loom_root/.loom/loom.sqlite3" ] &&
+          [ -f "$loom_root/manuscript/Untitled.md" ]; then
+          open_count=$(sqlite3 "$loom_root/.loom/loom.sqlite3" \
+            "SELECT count(*) FROM command_receipts WHERE command_kind = 'open_project';" 2>/dev/null || echo 0)
+          [ "$open_count" -ge "$run_number" ] && return 0
+        fi
+        ;;
+      fte)
+        [ -f "$PRODUCT_STATE/gateway.db" ] &&
+          [ -f "$PRODUCT_STATE/gateway-v2.db" ] &&
+          grep -Fq "free-token-energy runtime ready: $PRODUCT_STATE_CANONICAL" "$stderr_log" && return 0
+        ;;
+    esac
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  echo "product state did not become ready before the 30-second deadline" >&2
+  return 1
+}
+
+quit_through_application_menu() {
+  target_pid=$1
+  osascript - "$target_pid" "$APP_NAME" <<'APPLESCRIPT'
+on run argv
+  set targetPid to item 1 of argv as integer
+  set appName to item 2 of argv
+  tell application "System Events"
+    set matches to every application process whose unix id is targetPid
+    if (count of matches) is not 1 then error "target application process did not appear"
+    set targetProcess to item 1 of matches
+    set quitItem to menu item ("Quit " & appName) of menu 1 of menu bar item appName of menu bar 1 of targetProcess
+    perform action "AXPress" of quitItem
+  end tell
+end run
+APPLESCRIPT
+}
+
+wait_for_clean_exit() {
+  target_pid=$1
+  attempt=0
+  while :; do
+    process_state=$(ps -p "$target_pid" -o state= | tr -d ' ')
+    case "$process_state" in
+      ""|Z*) break ;;
+    esac
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 300 ]; then
+      echo "application did not exit within 30 seconds after its Cmd-Q menu command (pid $target_pid)" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  wait "$target_pid"
+}
+
+run_once() {
+  run_number=$1
+  stdout_log="$SMOKE_ROOT/launch-$run_number.stdout.log"
+  stderr_log="$SMOKE_ROOT/launch-$run_number.stderr.log"
+  echo "+ launch $run_number: $EXECUTABLE"
+  case "$COMPONENT" in
+    mom)
+      env LLAMA_NATIVE_KIT_DATA_DIR="$PRODUCT_STATE" \
+        LLAMA_NATIVE_KIT_STORE_KEY_HEX=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f \
+        "$EXECUTABLE" >"$stdout_log" 2>"$stderr_log" &
+      ;;
+    loom)
+      env DELYSIS_LOOM_ACCEPTANCE_DIR="$PRODUCT_STATE" \
+        "$EXECUTABLE" >"$stdout_log" 2>"$stderr_log" &
+      ;;
+    fte)
+      env DELYSIS_FTE_ACCEPTANCE_DIR="$PRODUCT_STATE" \
+        "$EXECUTABLE" >"$stdout_log" 2>"$stderr_log" &
+      ;;
+  esac
+  ACTIVE_PID=$!
+  eval "RUN_${run_number}_PID=$ACTIVE_PID"
+
+  if ! wait_for_window "$ACTIVE_PID"; then
+    echo "packaged app did not expose a window" >&2
+    echo "application logs: $stdout_log and $stderr_log" >&2
+    return 1
+  fi
+  if ! wait_for_readiness "$run_number" "$ACTIVE_PID" "$stderr_log"; then
+    echo "application logs: $stdout_log and $stderr_log" >&2
+    return 1
+  fi
+  if ! quit_through_application_menu "$ACTIVE_PID"; then
+    echo "could not activate the app's ordinary Cmd-Q menu item; macOS Accessibility permission may be required" >&2
+    echo "application logs: $stdout_log and $stderr_log" >&2
+    return 1
+  fi
+  if ! wait_for_clean_exit "$ACTIVE_PID"; then
+    echo "application logs: $stdout_log and $stderr_log" >&2
+    return 1
+  fi
+  case "$COMPONENT" in
+    mom)
+      if ! grep -F 'mom-llama shutdown: {"Ok":' "$stderr_log" |
+        grep -Fq '"native_host_joined":true'; then
+        echo "Mom exited without positive native-host join evidence" >&2
+        echo "application log: $stderr_log" >&2
+        return 1
+      fi
+      if ! grep -F 'mom-llama shutdown: {"Ok":' "$stderr_log" |
+        grep -Fq '"application_work_drained":true'; then
+        echo "Mom exited without positive application-drain evidence" >&2
+        echo "application log: $stderr_log" >&2
+        return 1
+      fi
+      ;;
+    fte)
+      if grep -Fq 'Free Token Energy cleanup failed' "$stderr_log"; then
+        echo "FTE reported a gateway cleanup failure" >&2
+        echo "application log: $stderr_log" >&2
+        return 1
+      fi
+      ;;
+  esac
+  ACTIVE_PID=
+}
+
+run_once 1
+run_once 2
+
+EXECUTABLE_SHA256_AFTER=$(shasum -a 256 "$EXECUTABLE" | awk '{print $1}')
+if [ "$EXECUTABLE_SHA256_AFTER" != "$EXECUTABLE_SHA256" ]; then
+  echo "packaged executable changed while the smoke test was running" >&2
+  exit 1
+fi
+STATE_INVENTORY="$SMOKE_ROOT/state-inventory.txt"
+find "$PRODUCT_STATE" -mindepth 1 -print | LC_ALL=C sort > "$STATE_INVENTORY"
+RECEIPT="$SMOKE_ROOT/smoke-receipt.json"
+
+DELYSIS_SMOKE_COMPONENT="$COMPONENT" \
+DELYSIS_SMOKE_BUNDLE="$BUNDLE" \
+DELYSIS_SMOKE_BUNDLE_ID="$BUNDLE_ID" \
+DELYSIS_SMOKE_EXECUTABLE_SHA="$EXECUTABLE_SHA256" \
+DELYSIS_SMOKE_STATE_ROOT="$PRODUCT_STATE" \
+DELYSIS_SMOKE_RUN_1_PID="$RUN_1_PID" \
+DELYSIS_SMOKE_RUN_2_PID="$RUN_2_PID" \
+node <<'NODE' > "$RECEIPT"
+const e = process.env;
+const receipt = {
+  schema: "delysis.macos-packaged-app-smoke.v1",
+  created_at: new Date().toISOString(),
+  component: e.DELYSIS_SMOKE_COMPONENT,
+  bundle: e.DELYSIS_SMOKE_BUNDLE,
+  bundle_id: e.DELYSIS_SMOKE_BUNDLE_ID,
+  executable_sha256: e.DELYSIS_SMOKE_EXECUTABLE_SHA,
+  app_owned_state_root: e.DELYSIS_SMOKE_STATE_ROOT,
+  launches: [
+    { pid: Number(e.DELYSIS_SMOKE_RUN_1_PID), window_observed: true, product_ready_at_state_root: true, quit: "AXPress on Quit menu item with Cmd-Q binding", exit_status: 0 },
+    { pid: Number(e.DELYSIS_SMOKE_RUN_2_PID), window_observed: true, product_ready_at_state_root: true, quit: "AXPress on Quit menu item with Cmd-Q binding", exit_status: 0 },
+  ],
+  app_owned_state_reopened: true,
+  scope_note: "Product-owned state was isolated. macOS and WKWebView may write framework-managed caches outside this root.",
+};
+process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
+NODE
+
+trap - EXIT HUP INT TERM
+echo "packaged-app smoke passed twice: $COMPONENT"
+echo "smoke evidence: $SMOKE_ROOT"
+echo "receipt: $RECEIPT"

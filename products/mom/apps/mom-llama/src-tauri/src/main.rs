@@ -448,6 +448,7 @@ async fn mom_llama_runtime_initialize(
         }
     };
     startup.begin_runtime_build()?;
+    let runtime_data_dir = settings.data_dir.clone();
 
     let gateway = Arc::clone(&startup.gateway);
     let built = match tauri::async_runtime::spawn_blocking(move || build_runtime(gateway, settings))
@@ -462,7 +463,10 @@ async fn mom_llama_runtime_initialize(
 
     match built {
         Ok(runtime) => match startup.install(&app, runtime) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                eprintln!("mom-llama runtime ready: {}", runtime_data_dir.display());
+                Ok(())
+            }
             Err(runtime) => {
                 runtime.begin_quiesce();
                 let shutdown = runtime.shutdown().await;
@@ -971,11 +975,24 @@ fn cleanup_rejected_native_owner(
 }
 
 fn build_gateway_plugin(gateway: Arc<Gateway>) -> TauriPlugin<tauri::Wry> {
-    tauri_plugin_free_token_energy::Builder::new()
+    let mut builder = tauri_plugin_free_token_energy::Builder::new()
         .with_gateway(gateway)
         .with_store(Arc::new(MomGatewayStore))
-        .with_default_loopback()
-        .build()
+        .with_default_loopback();
+    if let Some(app_data_dir) =
+        gateway_app_data_dir_override(std::env::var_os("LLAMA_NATIVE_KIT_DATA_DIR"))
+    {
+        builder = builder.with_app_data_dir(app_data_dir);
+    }
+    builder.build()
+}
+
+fn gateway_app_data_dir_override(
+    configured: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    configured
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 struct MomGatewayStore;
@@ -1056,7 +1073,8 @@ mod tests {
         NativeBuildCleanup, NativeBuildCleanupEvidence, PostOwnerBuildCause, StartupAction,
         StartupController, StartupShutdownAction, decide_final_exit_target,
         failed_build_disposition, final_exit_decision, finish_post_owner_build,
-        rejected_build_disposition, safe_to_exit_after_shutdown, smoke_receipt,
+        gateway_app_data_dir_override, rejected_build_disposition, safe_to_exit_after_shutdown,
+        smoke_receipt,
     };
     use crate::app_runtime::{AppShutdownError, AppShutdownSummary};
     use fte_router::{Gateway, GatewayDefaults};
@@ -1325,6 +1343,20 @@ mod tests {
         assert!(!source.contains(predefined_quit));
         assert!(!source.contains(predefined_quit_with_text));
         assert!(!source.contains(default_menu));
+    }
+
+    #[test]
+    fn explicit_runtime_data_directory_also_owns_gateway_plugin_state() {
+        let root = std::path::PathBuf::from("/tmp/mom-llama-acceptance");
+        assert_eq!(
+            gateway_app_data_dir_override(Some(root.clone().into_os_string())),
+            Some(root)
+        );
+        assert_eq!(
+            gateway_app_data_dir_override(Some(std::ffi::OsString::new())),
+            None
+        );
+        assert_eq!(gateway_app_data_dir_override(None), None);
     }
 
     #[test]

@@ -59,6 +59,10 @@ pub fn run() {
 
             app.manage(db);
             app.manage(desktop_gateway_runtime);
+            eprintln!(
+                "free-token-energy runtime ready: {}",
+                app_data_dir.display()
+            );
 
             Ok(())
         })
