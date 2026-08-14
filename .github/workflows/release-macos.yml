@@ -1,0 +1,70 @@
+name: release-macos
+
+on:
+  push:
+    tags:
+      - "mom-llama-v*"
+      - "loom-v*"
+      - "fte-desktop-v*"
+  workflow_dispatch:
+    inputs:
+      component:
+        description: macOS component to package
+        required: true
+        type: choice
+        options:
+          - mom
+          - loom
+          - fte
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-macos-${{ github.ref }}-${{ inputs.component || 'tag' }}
+  cancel-in-progress: false
+
+env:
+  RUSTUP_TOOLCHAIN: "1.92.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: release-macos
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - run: corepack enable
+      - run: corepack prepare pnpm@11.16.0 --activate
+      - run: pnpm install --frozen-lockfile
+      - id: component
+        env:
+          REQUESTED_COMPONENT: ${{ inputs.component }}
+        run: |
+          component="$REQUESTED_COMPONENT"
+          if test -z "$component"; then
+            case "$GITHUB_REF_NAME" in
+              mom-llama-v*) component=mom ;;
+              loom-v*) component=loom ;;
+              fte-desktop-v*) component=fte ;;
+              *) echo "unsupported release tag: $GITHUB_REF_NAME" >&2; exit 1 ;;
+            esac
+          fi
+          echo "component=$component" >> "$GITHUB_OUTPUT"
+      - run: ./scripts/release-macos.sh "${{ steps.component.outputs.component }}"
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: ${{ steps.component.outputs.component }}-macos-${{ github.sha }}
+          path: dist/macos/${{ steps.component.outputs.component }}-*/
+          if-no-files-found: error
+          retention-days: 14
