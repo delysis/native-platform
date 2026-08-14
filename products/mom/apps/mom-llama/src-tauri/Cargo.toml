@@ -30,7 +30,7 @@ thiserror.workspace = true
 rfd = { version = "=0.16.0", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rfd = { version = "=0.16.0", default-features = false, features = ["tokio", "xdg-portal"] }
+rfd = { version = "=0.16.0", default-features = false, features = ["gtk3", "tokio"] }
 
 [lints]
 workspace = true
