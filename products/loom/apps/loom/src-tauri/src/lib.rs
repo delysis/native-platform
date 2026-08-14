@@ -29,9 +29,11 @@ pub fn run() {
             return;
         }
     };
+    let isolate_model_discovery = acceptance_app_local_data_root.is_some();
     let loom_plugin = tauri_plugin_loom::Builder::new()
         .with_build_model_policy(build_model_policy)
-        .with_app_local_data_root(acceptance_app_local_data_root);
+        .with_app_local_data_root(acceptance_app_local_data_root)
+        .with_isolated_model_discovery(isolate_model_discovery);
     tauri::Builder::default()
         // Tauri's stock macOS Quit item calls AppKit `terminate:` directly and
         // bypasses RunEvent::ExitRequested. Loom owns a regular Cmd+Q menu item

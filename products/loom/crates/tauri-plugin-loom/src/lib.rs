@@ -251,18 +251,20 @@ pub struct PluginState {
     downloads: Arc<ModelDownloadRegistry>,
     download_workers: DownloadWorkerRegistry,
     app_local_data_root: Option<PathBuf>,
+    isolate_model_discovery: bool,
     build_model_policy: BuildModelPolicy,
 }
 
 impl Default for PluginState {
     fn default() -> Self {
-        Self::with_app_local_data_root(None, BuildModelPolicy::default())
+        Self::with_app_local_data_root(None, false, BuildModelPolicy::default())
     }
 }
 
 impl PluginState {
     fn with_app_local_data_root(
         app_local_data_root: Option<PathBuf>,
+        isolate_model_discovery: bool,
         build_model_policy: BuildModelPolicy,
     ) -> Self {
         let native_runtime = Arc::new(NativeHostRuntime::default());
@@ -290,6 +292,7 @@ impl PluginState {
             downloads: Arc::new(ModelDownloadRegistry::default()),
             download_workers: DownloadWorkerRegistry::default(),
             app_local_data_root,
+            isolate_model_discovery,
             build_model_policy,
         }
     }
@@ -1600,6 +1603,7 @@ impl BranchCancellation for LlamaCancellation {
 pub struct Builder {
     build_model_policy: BuildModelPolicy,
     app_local_data_root: Option<PathBuf>,
+    isolate_model_discovery: bool,
 }
 
 impl Builder {
@@ -1620,9 +1624,16 @@ impl Builder {
         self
     }
 
+    #[must_use]
+    pub fn with_isolated_model_discovery(mut self, isolate: bool) -> Self {
+        self.isolate_model_discovery = isolate;
+        self
+    }
+
     pub fn build<R: Runtime>(self) -> TauriPlugin<R> {
         let build_model_policy = self.build_model_policy;
         let app_local_data_root = self.app_local_data_root;
+        let isolate_model_discovery = self.isolate_model_discovery;
         PluginBuilder::new("loom")
             .invoke_handler(tauri::generate_handler![
                 project_open_default,
@@ -1667,6 +1678,7 @@ impl Builder {
                     .or_else(|| app.path().app_local_data_dir().ok());
                 app.manage(PluginState::with_app_local_data_root(
                     app_local_data_root,
+                    isolate_model_discovery,
                     build_model_policy,
                 ));
                 Ok(())
@@ -4672,9 +4684,7 @@ fn discover_strict_policy_candidate(
 fn desktop_model_discovery_options(
     state: &State<'_, PluginState>,
 ) -> Result<ModelDiscoveryOptions, IpcFailure> {
-    let mut options = ModelDiscoveryOptions::default();
-    options.max_entries = options.max_entries.min(20_000);
-    options.max_depth = options.max_depth.min(12);
+    let mut options = base_desktop_model_discovery_options(state.isolate_model_discovery);
     if let Some(path) = std::env::var_os("LOOM_GGUF_MODEL_PATH") {
         options.user_paths.push(PathBuf::from(path));
     }
@@ -4696,6 +4706,16 @@ fn desktop_model_discovery_options(
             .cloned(),
     );
     Ok(options)
+}
+
+fn base_desktop_model_discovery_options(isolate: bool) -> ModelDiscoveryOptions {
+    let mut options = ModelDiscoveryOptions::default();
+    if isolate {
+        options.hugging_face_cache_roots.clear();
+    }
+    options.max_entries = options.max_entries.min(20_000);
+    options.max_depth = options.max_depth.min(12);
+    options
 }
 
 fn remember_user_model_path(
@@ -9087,8 +9107,11 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join("isolated-app-local-data");
         std::fs::create_dir(&root).expect("isolated app data root");
-        let state =
-            PluginState::with_app_local_data_root(Some(root.clone()), BuildModelPolicy::default());
+        let state = PluginState::with_app_local_data_root(
+            Some(root.clone()),
+            true,
+            BuildModelPolicy::default(),
+        );
 
         assert_eq!(
             default_project_path(&state).expect("default project path"),
@@ -9104,6 +9127,21 @@ mod tests {
             .expect("model library"),
             root.join("models")
         );
+        assert!(state.isolate_model_discovery);
+    }
+
+    #[test]
+    fn acceptance_discovery_excludes_user_hugging_face_cache_only() {
+        let normal = base_desktop_model_discovery_options(false);
+        let isolated = base_desktop_model_discovery_options(true);
+
+        assert_eq!(
+            normal.hugging_face_cache_roots,
+            ModelDiscoveryOptions::default().hugging_face_cache_roots
+        );
+        assert!(isolated.hugging_face_cache_roots.is_empty());
+        assert_eq!(isolated.max_entries, normal.max_entries);
+        assert_eq!(isolated.max_depth, normal.max_depth);
     }
 
     #[test]
