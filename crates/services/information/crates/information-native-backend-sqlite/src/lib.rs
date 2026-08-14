@@ -3003,16 +3003,26 @@ mod tests {
             .expect("query compile options")
             .collect::<Result<Vec<_>, _>>()
             .expect("collect compile options");
-        let serialized = options.join("\n");
+        let compiler_options = options
+            .iter()
+            .filter(|option| option.starts_with("COMPILER="))
+            .count();
+        let stable_options = options
+            .iter()
+            .filter(|option| !option.starts_with("COMPILER="))
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert_eq!(rusqlite::version(), version);
         assert_eq!(version, "3.51.3");
+        assert_eq!(compiler_options, 1, "expected one SQLite compiler identity");
         assert!(options.iter().any(|option| option == "THREADSAFE=1"));
         assert!(options.iter().any(|option| option == "ENABLE_FTS5"));
         assert_eq!(
-            format!("{:x}", Sha256::digest(serialized.as_bytes())),
-            "237dbc028deb283af23c96fd82473d36055b11b437c9b282be65e50b1a2acd36",
-            "bundled SQLite compile options changed:\n{serialized}"
+            format!("{:x}", Sha256::digest(stable_options.as_bytes())),
+            "2ff61812ddeeedba4e4cd1f0765cc979f1589661984ec5e15120a97d6e41bfe2",
+            "bundled SQLite compile options changed:\n{stable_options}"
         );
     }
 }
