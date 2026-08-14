@@ -11,10 +11,10 @@ pub struct AcceptanceIsolation {
 
 impl AcceptanceIsolation {
     pub fn from_environment() -> Result<Option<Self>> {
-        Self::from_value(std::env::var_os(ACCEPTANCE_DIR_ENV))
+        Self::from_value(std::env::var_os(ACCEPTANCE_DIR_ENV), &std::env::temp_dir())
     }
 
-    fn from_value(value: Option<OsString>) -> Result<Option<Self>> {
+    fn from_value(value: Option<OsString>, temporary_directory: &Path) -> Result<Option<Self>> {
         let Some(value) = value else {
             return Ok(None);
         };
@@ -40,15 +40,17 @@ impl AcceptanceIsolation {
                 configured.display()
             )
         })?;
-        if root.parent().is_none() {
-            bail!("{ACCEPTANCE_DIR_ENV} must not name the filesystem root");
-        }
-        if std::env::var_os("HOME")
-            .and_then(|home| PathBuf::from(home).canonicalize().ok())
-            .as_deref()
-            == Some(root.as_path())
-        {
-            bail!("{ACCEPTANCE_DIR_ENV} must not name the user's home directory");
+        let temporary_directory = temporary_directory.canonicalize().with_context(|| {
+            format!(
+                "the operating-system temporary directory is invalid: {}",
+                temporary_directory.display()
+            )
+        })?;
+        if root == temporary_directory || !root.starts_with(&temporary_directory) {
+            bail!(
+                "{ACCEPTANCE_DIR_ENV} must be a child of {}",
+                temporary_directory.display()
+            );
         }
         Ok(Some(Self { root }))
     }
@@ -81,15 +83,21 @@ mod tests {
 
     #[test]
     fn absent_acceptance_environment_preserves_normal_mode() {
-        assert_eq!(AcceptanceIsolation::from_value(None).unwrap(), None);
+        assert_eq!(
+            AcceptanceIsolation::from_value(None, &std::env::temp_dir()).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn existing_absolute_directory_owns_the_acceptance_database() {
         let root = test_directory("valid");
-        let isolation = AcceptanceIsolation::from_value(Some(root.clone().into_os_string()))
-            .expect("valid acceptance directory")
-            .expect("acceptance mode");
+        let isolation = AcceptanceIsolation::from_value(
+            Some(root.clone().into_os_string()),
+            &std::env::temp_dir(),
+        )
+        .expect("valid acceptance directory")
+        .expect("acceptance mode");
         assert_eq!(isolation.root(), root.canonicalize().unwrap());
         assert_eq!(
             isolation.desktop_database(),
@@ -100,9 +108,12 @@ mod tests {
 
     #[test]
     fn relative_and_missing_acceptance_directories_fail_closed() {
-        let relative = AcceptanceIsolation::from_value(Some(OsString::from("relative")))
-            .unwrap_err()
-            .to_string();
+        let relative = AcceptanceIsolation::from_value(
+            Some(OsString::from("relative")),
+            &std::env::temp_dir(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(relative.contains("absolute"));
 
         let missing = std::env::temp_dir().join(format!(
@@ -110,10 +121,30 @@ mod tests {
             std::process::id(),
             NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
-        let error = AcceptanceIsolation::from_value(Some(missing.into_os_string()))
+        let error =
+            AcceptanceIsolation::from_value(Some(missing.into_os_string()), &std::env::temp_dir())
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("existing directory"));
+    }
+
+    #[test]
+    fn temp_root_and_directories_outside_the_supplied_temp_root_fail_closed() {
+        let temporary_directory = test_directory("temporary-root");
+        let outside_directory = test_directory("outside-root");
+
+        for configured in [&temporary_directory, &outside_directory] {
+            let error = AcceptanceIsolation::from_value(
+                Some(configured.clone().into_os_string()),
+                &temporary_directory,
+            )
             .unwrap_err()
             .to_string();
-        assert!(error.contains("existing directory"));
+            assert!(error.contains("must be a child"));
+        }
+
+        std::fs::remove_dir(outside_directory).expect("remove outside directory");
+        std::fs::remove_dir(temporary_directory).expect("remove temporary directory");
     }
 
     #[cfg(unix)]
@@ -124,9 +155,12 @@ mod tests {
         let root = test_directory("symlink-target");
         let link = root.with_extension("link");
         symlink(&root, &link).expect("create acceptance symlink");
-        let error = AcceptanceIsolation::from_value(Some(link.clone().into_os_string()))
-            .unwrap_err()
-            .to_string();
+        let error = AcceptanceIsolation::from_value(
+            Some(link.clone().into_os_string()),
+            &std::env::temp_dir(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("symbolic link"));
         std::fs::remove_file(link).expect("remove acceptance symlink");
         std::fs::remove_dir(root).expect("remove acceptance target");

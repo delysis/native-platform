@@ -144,6 +144,22 @@ wait_for_readiness() {
   return 1
 }
 
+state_identity() {
+  case "$COMPONENT" in
+    mom)
+      stat -f '%d:%i' "$PRODUCT_STATE/runtime.sqlite3"
+      ;;
+    loom)
+      printf 'open-project-receipt-%s\n' "$1"
+      ;;
+    fte)
+      printf '%s|%s\n' \
+        "$(stat -f '%d:%i' "$PRODUCT_STATE/gateway.db")" \
+        "$(stat -f '%d:%i' "$PRODUCT_STATE/gateway-v2.db")"
+      ;;
+  esac
+}
+
 quit_through_application_menu() {
   target_pid=$1
   osascript - "$target_pid" "$APP_NAME" <<'APPLESCRIPT'
@@ -211,6 +227,11 @@ run_once() {
     echo "application logs: $stdout_log and $stderr_log" >&2
     return 1
   fi
+  observed_state_identity=$(state_identity "$run_number")
+  case "$run_number" in
+    1) RUN_1_STATE_IDENTITY=$observed_state_identity ;;
+    2) RUN_2_STATE_IDENTITY=$observed_state_identity ;;
+  esac
   if ! quit_through_application_menu "$ACTIVE_PID"; then
     echo "could not activate the app's ordinary Cmd-Q menu item; macOS Accessibility permission may be required" >&2
     echo "application logs: $stdout_log and $stderr_log" >&2
@@ -249,6 +270,19 @@ run_once() {
 run_once 1
 run_once 2
 
+case "$COMPONENT" in
+  mom|fte)
+    if [ "$RUN_1_STATE_IDENTITY" != "$RUN_2_STATE_IDENTITY" ]; then
+      echo "product database identity changed between packaged launches" >&2
+      exit 1
+    fi
+    REOPEN_EVIDENCE="same database file identity observed after application readiness on both launches"
+    ;;
+  loom)
+    REOPEN_EVIDENCE="open_project receipt count advanced across launches"
+    ;;
+esac
+
 EXECUTABLE_SHA256_AFTER=$(shasum -a 256 "$EXECUTABLE" | awk '{print $1}')
 if [ "$EXECUTABLE_SHA256_AFTER" != "$EXECUTABLE_SHA256" ]; then
   echo "packaged executable changed while the smoke test was running" >&2
@@ -265,6 +299,7 @@ DELYSIS_SMOKE_EXECUTABLE_SHA="$EXECUTABLE_SHA256" \
 DELYSIS_SMOKE_STATE_ROOT="$PRODUCT_STATE" \
 DELYSIS_SMOKE_RUN_1_PID="$RUN_1_PID" \
 DELYSIS_SMOKE_RUN_2_PID="$RUN_2_PID" \
+DELYSIS_SMOKE_REOPEN_EVIDENCE="$REOPEN_EVIDENCE" \
 node <<'NODE' > "$RECEIPT"
 const e = process.env;
 const receipt = {
@@ -280,6 +315,7 @@ const receipt = {
     { pid: Number(e.DELYSIS_SMOKE_RUN_2_PID), window_observed: true, product_ready_at_state_root: true, quit: "AXPress on Quit menu item with Cmd-Q binding", exit_status: 0 },
   ],
   app_owned_state_reopened: true,
+  state_reopen_evidence: e.DELYSIS_SMOKE_REOPEN_EVIDENCE,
   scope_note: "Product-owned state was isolated. macOS and WKWebView may write framework-managed caches outside this root.",
 };
 process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);

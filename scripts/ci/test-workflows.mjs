@@ -27,7 +27,7 @@ test("only the targeted PR, full, and asynchronous release workflows remain acti
   assert.equal(fs.existsSync(releasePath), true);
 });
 
-test("macOS releases are tag or manual artifacts and never PR requirements", () => {
+test("macOS remote candidates are tag or manual artifacts and never PR requirements", () => {
   const source = read(releasePath);
   assert.match(source, /^\s+tags:\s*$/m);
   assert.match(source, /^\s+workflow_dispatch:\s*$/m);
@@ -36,6 +36,9 @@ test("macOS releases are tag or manual artifacts and never PR requirements", () 
   assert.match(source, /^\s+runs-on: macos-latest$/m);
   assert.match(source, /\.\/scripts\/release-macos\.sh/);
   assert.match(source, /actions\/upload-artifact@[0-9a-f]{40}/);
+  assert.match(source, /release tag\/version mismatch/);
+  assert.match(source, /expected_tag="\$tag_prefix-v\$version"/);
+  assert.match(source, /remote-candidate-/);
 });
 
 test("PR workflow is always triggered and has one truthful aggregate", () => {

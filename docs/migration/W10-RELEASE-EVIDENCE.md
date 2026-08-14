@@ -75,9 +75,11 @@ These are local release candidates, not stable public releases:
 - macOS is the current supported release platform. Linux CI is informational,
   and Windows is not claimed.
 
-The optional `release-macos.yml` workflow runs only for explicit component
-tags or manual dispatch and uploads the same locally authoritative artifacts.
-It never runs on pull requests and is not a local-development gate. W9 run
+The optional `release-macos.yml` workflow runs only for exact component-version
+tags or manual dispatch and rebuilds a distinct remote candidate with its own
+receipt. That artifact does not inherit the local package digest or smoke
+evidence. The workflow never runs on pull requests and is not a
+local-development gate. W9 run
 `31774222096` passed policy, macOS, root Linux, Mom Linux, Loom Linux, fuzz, and
 the remaining service/dependency lanes at `aca1f85`.
 

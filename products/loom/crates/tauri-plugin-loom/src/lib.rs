@@ -4687,26 +4687,30 @@ fn desktop_model_discovery_options(
     state: &State<'_, PluginState>,
 ) -> Result<ModelDiscoveryOptions, IpcFailure> {
     let mut options = base_desktop_model_discovery_options(state.isolate_model_discovery);
-    if let Some(path) = std::env::var_os("LOOM_GGUF_MODEL_PATH") {
+    if !state.isolate_model_discovery
+        && let Some(path) = std::env::var_os("LOOM_GGUF_MODEL_PATH")
+    {
         options.user_paths.push(PathBuf::from(path));
     }
     if let Some(root) = &state.app_local_data_root {
         options.user_paths.push(root.join("models"));
     }
-    options.user_paths.extend(
-        state
-            .user_model_paths
-            .lock()
-            .map_err(|_| {
-                IpcFailure::new(
-                    "model_path_registry_poisoned",
-                    "the selected-model registry entered an invalid state; restart Loom",
-                    false,
-                )
-            })?
-            .iter()
-            .cloned(),
-    );
+    if !state.isolate_model_discovery {
+        options.user_paths.extend(
+            state
+                .user_model_paths
+                .lock()
+                .map_err(|_| {
+                    IpcFailure::new(
+                        "model_path_registry_poisoned",
+                        "the selected-model registry entered an invalid state; restart Loom",
+                        false,
+                    )
+                })?
+                .iter()
+                .cloned(),
+        );
+    }
     Ok(options)
 }
 
@@ -4747,15 +4751,28 @@ fn ensure_model_path_in_isolated_library_from(
                 false,
             )
         })?
-        .join("models")
-        .canonicalize()
-        .map_err(|_| {
-            IpcFailure::new(
-                "isolated_model_library_unavailable",
-                "acceptance model loading requires an existing isolated models directory",
-                false,
-            )
-        })?;
+        .join("models");
+    let metadata = model_library.symlink_metadata().map_err(|_| {
+        IpcFailure::new(
+            "isolated_model_library_unavailable",
+            "acceptance model loading requires an existing isolated models directory",
+            false,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(IpcFailure::new(
+            "isolated_model_library_unavailable",
+            "acceptance model loading requires a real isolated models directory",
+            false,
+        ));
+    }
+    let model_library = model_library.canonicalize().map_err(|_| {
+        IpcFailure::new(
+            "isolated_model_library_unavailable",
+            "acceptance model loading requires an existing isolated models directory",
+            false,
+        )
+    })?;
     if canonical_path.starts_with(&model_library) {
         Ok(())
     } else {
@@ -9213,6 +9230,27 @@ mod tests {
         assert_eq!(error.code, "model_outside_isolated_library");
         ensure_model_path_in_isolated_library_from(false, Some(temporary.path()), &outside)
             .expect("normal mode preserves explicit local model loading");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acceptance_model_load_rejects_a_symlinked_model_library() {
+        use std::os::unix::fs::symlink;
+
+        let acceptance = tempfile::tempdir().expect("acceptance app data");
+        let external = tempfile::tempdir().expect("external model library");
+        let model = external.path().join("writer.gguf");
+        std::fs::write(&model, b"GGUF").expect("model fixture");
+        symlink(external.path(), acceptance.path().join("models"))
+            .expect("symlinked model library");
+
+        let error = ensure_model_path_in_isolated_library_from(
+            true,
+            Some(acceptance.path()),
+            &model.canonicalize().expect("canonical model"),
+        )
+        .expect_err("symlinked acceptance model library must be rejected");
+        assert_eq!(error.code, "isolated_model_library_unavailable");
     }
 
     #[test]

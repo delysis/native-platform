@@ -60,11 +60,34 @@ jobs:
               *) echo "unsupported release tag: $GITHUB_REF_NAME" >&2; exit 1 ;;
             esac
           fi
+          case "$component" in
+            mom)
+              config=products/mom/apps/mom-llama/src-tauri/tauri.conf.json
+              tag_prefix=mom-llama
+              ;;
+            loom)
+              config=products/loom/apps/loom/src-tauri/tauri.conf.json
+              tag_prefix=loom
+              ;;
+            fte)
+              config=products/fte/src-tauri/tauri.conf.json
+              tag_prefix=fte-desktop
+              ;;
+            *) echo "unsupported release component: $component" >&2; exit 1 ;;
+          esac
+          version=$(node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).version)' "$config")
+          if test "$GITHUB_REF_TYPE" = tag; then
+            expected_tag="$tag_prefix-v$version"
+            if test "$GITHUB_REF_NAME" != "$expected_tag"; then
+              echo "release tag/version mismatch: expected $expected_tag, observed $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+          fi
           echo "component=$component" >> "$GITHUB_OUTPUT"
       - run: ./scripts/release-macos.sh "${{ steps.component.outputs.component }}"
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
-          name: ${{ steps.component.outputs.component }}-macos-${{ github.sha }}
+          name: remote-candidate-${{ steps.component.outputs.component }}-macos-${{ github.sha }}
           path: dist/macos/${{ steps.component.outputs.component }}-*/
           if-no-files-found: error
           retention-days: 14
