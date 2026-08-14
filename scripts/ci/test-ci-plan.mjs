@@ -73,6 +73,7 @@ test("docs-only changes require policy and nothing else", () => {
   const { result } = fixture("docs/architecture.md");
   assert.equal(result.risk, "docs");
   assert.deepEqual(result.jobs, ["policy"]);
+  assert.deepEqual(result.macos_matrix, []);
 });
 
 test("CI policy changes use root Linux and macOS without expanding to full", () => {
@@ -82,6 +83,7 @@ test("CI policy changes use root Linux and macOS without expanding to full", () 
   assert.equal(result.flags.platform_macos, true);
   assert.equal(result.flags.full, false);
   assert.deepEqual(result.jobs, ["policy", "root-linux", "platform-macos"]);
+  assert.deepEqual(result.macos_matrix, ["release", "root"]);
 });
 
 test("macOS release tooling selects only policy and the macOS syntax lane", () => {
@@ -97,6 +99,7 @@ test("macOS release tooling selects only policy and the macOS syntax lane", () =
     assert.equal(result.flags.platform_macos, true);
     assert.equal(result.flags.full, false);
     assert.deepEqual(result.jobs, ["policy", "platform-macos"]);
+    assert.deepEqual(result.macos_matrix, ["release"]);
   }
 });
 
@@ -109,6 +112,7 @@ test("Native changes require root, Native, and macOS product coverage", () => {
   assert.equal(result.flags.platform_macos, true);
   assert.ok(!("platform_windows" in result.flags));
   assert.ok(result.jobs.includes("native-linux"));
+  assert.deepEqual(result.macos_matrix, ["release", "root"]);
 });
 
 test("Attachment inspection changes select Attachment and fuzz only", () => {
@@ -137,6 +141,7 @@ test("Speech Apple changes select Speech and platform coverage", () => {
   assert.equal(result.flags.speech, true);
   assert.equal(result.flags.platform_macos, true);
   assert.ok(!result.jobs.includes("platform-windows"));
+  assert.deepEqual(result.macos_matrix, ["release", "speech"]);
 });
 
 test("Mom native source selects its product and macOS parity without root duplication", () => {
@@ -148,6 +153,7 @@ test("Mom native source selects its product and macOS parity without root duplic
   assert.equal(result.flags.root, false);
   assert.equal(result.flags.platform_macos, true);
   assert.deepEqual(result.jobs, ["policy", "mom-linux", "platform-macos"]);
+  assert.deepEqual(result.macos_matrix, ["release", "mom"]);
 });
 
 test("the PR 22 Mom diff has the focused product, frontend, and macOS plan", () => {
@@ -204,6 +210,7 @@ test("Mom dependency metadata remains conservative", () => {
     "platform-macos",
     "dependency-graph",
   ]);
+  assert.deepEqual(result.macos_matrix, ["release", "root", "mom"]);
 });
 
 test("Loom Svelte source selects Loom frontend when Loom is present", () => {
@@ -232,6 +239,15 @@ test("root Cargo metadata forces the complete present graph", () => {
   assert.ok(result.jobs.includes("loom-linux"));
   assert.ok(result.jobs.includes("platform-macos"));
   assert.ok(!result.jobs.includes("platform-windows"));
+  assert.deepEqual(result.macos_matrix, [
+    "release",
+    "root",
+    "mom",
+    "attachment",
+    "information",
+    "speech",
+    "loom",
+  ]);
 });
 
 test("migration maps retain policy verification without history replay", () => {
@@ -281,4 +297,5 @@ test("GitHub output carries the compact plan and every declared flag", () => {
   for (const flag of Object.keys(result.flags)) {
     assert.match(output, new RegExp(`^${flag}=(?:true|false)$`, "m"));
   }
+  assert.match(output, /^macos_matrix=\[\]$/m);
 });

@@ -292,6 +292,19 @@ if (flags.platform_macos || flags.full) jobs.push("platform-macos");
 if (flags.dependency_graph || flags.full) jobs.push("dependency-graph");
 if (flags.fuzz || flags.full) jobs.push("fuzz-build");
 
+const macosMatrix = [];
+if (flags.platform_macos || flags.full) {
+  macosMatrix.push("release");
+  if (flags.root || flags.native || flags.gateway || flags.full) {
+    macosMatrix.push("root");
+  }
+  if (presence.mom && (flags.mom || flags.full)) macosMatrix.push("mom");
+  if (flags.attachment || flags.full) macosMatrix.push("attachment");
+  if (flags.information || flags.full) macosMatrix.push("information");
+  if (flags.speech || flags.full) macosMatrix.push("speech");
+  if (presence.loom && (flags.loom || flags.full)) macosMatrix.push("loom");
+}
+
 const plan = {
   schema: "native-platform.ci-plan.v1",
   event: eventName,
@@ -301,6 +314,7 @@ const plan = {
   changed,
   presence,
   flags,
+  macos_matrix: macosMatrix,
   jobs: [...new Set(jobs)],
 };
 
@@ -314,4 +328,8 @@ if (process.env.GITHUB_OUTPUT) {
   }
   fs.appendFileSync(process.env.GITHUB_OUTPUT, `mom_present=${presence.mom}\n`);
   fs.appendFileSync(process.env.GITHUB_OUTPUT, `loom_present=${presence.loom}\n`);
+  fs.appendFileSync(
+    process.env.GITHUB_OUTPUT,
+    `macos_matrix=${JSON.stringify(macosMatrix)}\n`,
+  );
 }
