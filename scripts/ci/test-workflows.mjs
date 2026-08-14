@@ -269,6 +269,33 @@ test("root workspace tests can inspect the retained migration evidence", () => {
   assert.match(rootLinux, /actions\/checkout@[0-9a-f]{40}\n\s+with:\n\s+fetch-depth: 0/);
 });
 
+test("long Linux lanes parallelize test and Clippy without dropping either", () => {
+  const source = read(prPath);
+  const blocks = [
+    source.match(/^  root-linux:[\s\S]*?(?=^  native-linux:)/m)?.[0],
+    source.match(/^  mom-linux:[\s\S]*?(?=^  loom-linux:)/m)?.[0],
+    source.match(/^  loom-linux:[\s\S]*?(?=^  frontend:)/m)?.[0],
+  ];
+  for (const block of blocks) {
+    assert.ok(block, "parallel Linux job block is missing");
+    assert.match(block, /fail-fast: false/);
+    assert.match(block, /command: \[test, clippy\]/);
+    assert.match(block, /save-if: \$\{\{ matrix\.command == 'test' \}\}/);
+    assert.match(block, /if: \$\{\{ matrix\.command == 'test' \}\}/);
+    assert.match(block, /if: \$\{\{ matrix\.command == 'clippy' \}\}/);
+  }
+  assert.match(blocks[0], /cargo test --locked --workspace --all-targets/);
+  assert.match(blocks[0], /cargo clippy --locked --workspace --all-targets -- -D warnings/);
+  assert.match(
+    blocks[0],
+    /components: \$\{\{ matrix\.command == 'test' && 'rustfmt' \|\| 'clippy' \}\}/,
+  );
+  assert.match(blocks[1], /cargo-group\.mjs test product-mom/);
+  assert.match(blocks[1], /cargo-group\.mjs clippy product-mom/);
+  assert.match(blocks[2], /cargo-group\.mjs test product-loom/);
+  assert.match(blocks[2], /cargo-group\.mjs clippy product-loom/);
+});
+
 test("PR frontend runs only selected product frontend commands", () => {
   const prFrontend = read(prPath).match(/^  frontend:[\s\S]*?(?=^  platform-macos:)/m)?.[0];
   assert.ok(prFrontend, "PR frontend job block is missing");
@@ -314,20 +341,27 @@ test("full frontend coverage remains unchanged", () => {
   assert.doesNotMatch(fullFrontend, /loom:install|--dir products\/loom/);
 });
 
-test("the required macOS lane runs Mom parity when Mom changes", () => {
+test("the required macOS matrix preserves every gate without serializing them", () => {
   const macos = read(prPath).match(/^  platform-macos:[\s\S]*?(?=^  dependency-graph:)/m)?.[0];
   const rootGraph = macos?.match(
     /- name: Root platform graph[\s\S]*?(?=\n      - name: Mom macOS parity)/,
   )?.[0];
   assert.ok(macos, "platform-macos job block is missing");
   assert.ok(rootGraph, "Root platform graph step is missing");
-  assert.match(macos, /name: Release tooling shell syntax\n\s+run: sh -n scripts\/release-macos\.sh scripts\/smoke-macos-app\.sh/);
-  assert.match(macos, /dtolnay\/rust-toolchain@[0-9a-f]{40}\n\s+if: \$\{\{[^}]*needs\.plan\.outputs\.root/);
-  assert.match(macos, /Swatinem\/rust-cache@[0-9a-f]{40}\n\s+if: \$\{\{[^}]*needs\.plan\.outputs\.root/);
+  assert.match(macos, /component: \$\{\{ fromJSON\(needs\.plan\.outputs\.macos_matrix\) \}\}/);
+  assert.match(macos, /fail-fast: false/);
+  assert.match(macos, /name: Release tooling shell syntax\n\s+if: \$\{\{ matrix\.component == 'release' \}\}\n\s+run: sh -n scripts\/release-macos\.sh scripts\/smoke-macos-app\.sh/);
+  assert.match(macos, /dtolnay\/rust-toolchain@[0-9a-f]{40}\n\s+if: \$\{\{ matrix\.component != 'release' \}\}/);
+  assert.match(macos, /Swatinem\/rust-cache@[0-9a-f]{40}\n\s+if: \$\{\{ matrix\.component != 'release' \}\}/);
+  assert.match(macos, /shared-key: platform-macos-\$\{\{ matrix\.component \}\}/);
+  assert.doesNotMatch(macos, /save-if:/);
   assert.doesNotMatch(rootGraph, /needs\.plan\.outputs\.mom/);
   assert.match(macos, /name: Mom macOS parity/);
-  assert.match(macos, /mom_present == 'true'/);
+  assert.match(macos, /matrix\.component == 'mom'/);
   assert.match(macos, /cargo-group\.mjs test product-mom/);
+  for (const component of ["root", "mom", "attachment", "information", "speech", "loom"]) {
+    assert.match(macos, new RegExp(`matrix\\.component == '${component}'`));
+  }
   assert.doesNotMatch(macos, /unstable-w1/);
 });
 

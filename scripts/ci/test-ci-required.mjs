@@ -55,6 +55,28 @@ test("a focused Mom plan accepts skipped root and requires its selected lanes", 
   assert.notEqual(run(momPlan, needs).status, 0);
 });
 
+test("matrix-backed job IDs are consumed as one fail-closed aggregate result", () => {
+  const matrixPlan = {
+    ...docsPlan,
+    risk: "behavior",
+    presence: { mom: true, loom: false },
+    jobs: ["policy", "root-linux", "mom-linux", "platform-macos"],
+  };
+  const needs = {
+    plan: { result: "success" },
+    policy: { result: "success" },
+    "root-linux": { result: "success" },
+    "mom-linux": { result: "success" },
+    "platform-macos": { result: "success" },
+  };
+  assert.equal(run(matrixPlan, needs).status, 0);
+  for (const job of ["root-linux", "mom-linux", "platform-macos"]) {
+    const failed = structuredClone(needs);
+    failed[job].result = "failure";
+    assert.notEqual(run(matrixPlan, failed).status, 0, `${job} must fail closed`);
+  }
+});
+
 test("a required skipped, failed, or missing job fails", () => {
   for (const resultName of ["skipped", "failure", undefined]) {
     const needs = {
