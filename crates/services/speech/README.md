@@ -15,7 +15,6 @@ product conversation state.
 | `speech-native-host` | Backend registry, dispatch, cancellation, and orderly shutdown. |
 | `speech-native-platform` | Conservative platform capability discovery and the proven Apple TTS adapter. |
 | `speech-native-backend-parakeet` | Resident local Parakeet STT using Hugging Face-managed weights. |
-| `tauri-plugin-speech-native` | Optional Rust-only Tauri 2 IPC adapter around an injected `Arc<SpeechHost>`. |
 
 STT and TTS live together because they share audio formats, streaming and
 backpressure, cancellation, platform permission semantics, voice/model
@@ -33,10 +32,12 @@ speech-native-kit ──► local STT/TTS host
 
 Free Token Energy may implement hosted speech backends or OpenAI-compatible
 audio endpoints as an optional downstream bridge. Those adapters depend on
-this repository; this repository never depends on Free Token Energy.
+these crates; the speech core never depends on Free Token Energy.
 
-The plugin's default permission is status-only. Applications grant synthesis,
-file transcription, or live transcription permission sets explicitly.
+There is no generic Tauri speech plugin in the lean workspace. A product that
+ships speech owns its capture/playback UX, permission policy, IPC commands, and
+joined shutdown at its composition root. A Rust consumer may inject and use an
+`Arc<SpeechHost>` directly.
 
 ## Verification
 

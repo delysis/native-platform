@@ -160,8 +160,19 @@ todo = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
 
+[profile.dev]
+# This workspace links several large native runtimes. Full debuginfo plus
+# incremental object retention can grow a local target directory by tens of
+# gigabytes without improving ordinary source-level backtraces.
+debug = "line-tables-only"
+incremental = false
+
 [profile.dev.package.sha2]
 opt-level = 3
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
 
 [profile.test.package.sha2]
 opt-level = 3

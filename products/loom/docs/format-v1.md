@@ -1,6 +1,6 @@
 # Loom project format v1
 
-Status: initial versioned foundation. Project manifest schema version `1` is the stable on-disk compatibility boundary. The current branch reaches additive SQLite migration `10`; database migration numbers do not change the manifest version when they preserve the v1 contract. Migration 10 adds immutable, content-addressed exact token-piece bytes and cumulative boundary vectors for newly verified native calls while leaving historical migration-9 evidence replayable as diagnostic data without inventing missing boundaries.
+Status: initial versioned foundation. Project manifest schema version `1` is the stable on-disk compatibility boundary. The current branch reaches additive SQLite migration `11`; database migration numbers do not change the manifest version when they preserve the v1 contract. Migration 10 added immutable, content-addressed exact token-piece bytes and cumulative boundary vectors for verified native calls. Migration 11 adds receipts for ordinary foreground writing commands.
 
 ## Authority split
 
@@ -114,7 +114,7 @@ Migration `7` adds the clean-port research admission foundation:
 - canonical, internally fingerprinted promotion requests and append-only, actor-bound, single-use user-presence events tied to one command and strictly increasing host-session index;
 - immutable legacy review events. Pre-migration candidates and every new diagnostic legacy candidate receive a terminal quarantine record rather than implicit research eligibility.
 
-`LiveBaseWriterClaim` and related values are declarations, not credentials. The raw receipt/event-stream replay mint is test-only, and no production constructor for `AdmittedModelCall` exists. `loom-inference` alone consumes the native backend's opaque generation seal and mints a move-only `VerifiedInferenceOutcome`. `loom-store` may adopt that value once and derive private downstream tokens for the current random store-session nonce; reopening or copying the project invalidates them. It must never recreate authority from receipt fields, JSON, hashes, record replay, or an admission row. Persisted fixture, mock, critic, historical, literal, or caller-declared live records cannot become strict assemblies.
+`LiveBaseWriterClaim` and related values are declarations, not credentials. The raw receipt/event-stream replay mint was test-only, and no production constructor for `AdmittedModelCall` exists. The W9 lean profile removed the research inference and orchestration code that could consume this schema. `loom-store` retains migrations 7-10 solely so existing projects remain forward-readable; persisted fixture, mock, critic, historical, literal, or caller-declared live records cannot become foreground writing authority. New writing activity uses the migration-11 foreground command path.
 
 Migration `8` makes verified batch adoption atomic and replayable:
 
