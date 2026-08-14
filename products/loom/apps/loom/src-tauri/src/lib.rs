@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
 use loom_types::BuildModelPolicy;
 use tauri::menu::{
     AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID,
@@ -11,6 +14,7 @@ const EMBEDDED_BUILD_MODEL_POLICY: &[u8] =
 const EMBEDDED_BUILD_MODEL_POLICY_NAME: &str = env!("LOOM_BUILD_MODEL_POLICY_NAME");
 const EMBEDDED_BUILD_MODEL_POLICY_SHA256: &str = env!("LOOM_BUILD_MODEL_POLICY_SHA256");
 const APPLICATION_QUIT_ACCELERATOR: &str = "CmdOrCtrl+Q";
+const ACCEPTANCE_DIRECTORY_ENV: &str = "DELYSIS_LOOM_ACCEPTANCE_DIR";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -18,7 +22,16 @@ pub fn run() {
         eprintln!("Loom's embedded model policy failed its integrity check");
         return;
     };
-    let loom_plugin = tauri_plugin_loom::Builder::new().with_build_model_policy(build_model_policy);
+    let acceptance_app_local_data_root = match acceptance_app_local_data_root() {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("Loom refused its acceptance directory: {error}");
+            return;
+        }
+    };
+    let loom_plugin = tauri_plugin_loom::Builder::new()
+        .with_build_model_policy(build_model_policy)
+        .with_app_local_data_root(acceptance_app_local_data_root);
     tauri::Builder::default()
         // Tauri's stock macOS Quit item calls AppKit `terminate:` directly and
         // bypasses RunEvent::ExitRequested. Loom owns a regular Cmd+Q menu item
@@ -29,6 +42,54 @@ pub fn run() {
         .plugin(loom_plugin.build())
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| eprintln!("Loom could not start: {error}"));
+}
+
+fn acceptance_app_local_data_root() -> Result<Option<PathBuf>, String> {
+    acceptance_app_local_data_root_from(
+        std::env::var_os(ACCEPTANCE_DIRECTORY_ENV),
+        &std::env::temp_dir(),
+    )
+}
+
+fn acceptance_app_local_data_root_from(
+    configured: Option<OsString>,
+    temporary_directory: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let Some(configured) = configured else {
+        return Ok(None);
+    };
+    let configured = PathBuf::from(configured);
+    if !configured.is_absolute() {
+        return Err(format!(
+            "{ACCEPTANCE_DIRECTORY_ENV} must name an absolute path"
+        ));
+    }
+    let metadata = configured.symlink_metadata().map_err(|error| {
+        format!("{ACCEPTANCE_DIRECTORY_ENV} must name an existing directory: {error}")
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{ACCEPTANCE_DIRECTORY_ENV} must not name a symbolic link"
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("{ACCEPTANCE_DIRECTORY_ENV} must name a directory"));
+    }
+
+    let configured = configured.canonicalize().map_err(|error| {
+        format!("{ACCEPTANCE_DIRECTORY_ENV} could not be resolved safely: {error}")
+    })?;
+    let temporary_directory = temporary_directory
+        .canonicalize()
+        .map_err(|error| format!("the operating-system temporary directory is invalid: {error}"))?;
+    if configured == temporary_directory || !configured.starts_with(&temporary_directory) {
+        return Err(format!(
+            "{ACCEPTANCE_DIRECTORY_ENV} must be a child of {}",
+            temporary_directory.display()
+        ));
+    }
+
+    Ok(Some(configured))
 }
 
 fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
@@ -153,6 +214,9 @@ fn embedded_build_model_policy() -> Result<BuildModelPolicy, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    use tempfile::tempdir;
 
     #[test]
     fn embedded_policy_is_canonical_and_bound_to_its_build_identity() {
@@ -189,5 +253,91 @@ mod tests {
         assert!(!source.contains(predefined_quit));
         assert!(!source.contains(predefined_quit_with_text));
         assert!(!source.contains(default_menu));
+    }
+
+    #[test]
+    fn acceptance_directory_is_opt_in() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        assert_eq!(
+            acceptance_app_local_data_root_from(None, temporary_directory.path())
+                .expect("unset override"),
+            None
+        );
+    }
+
+    #[test]
+    fn acceptance_directory_accepts_an_existing_absolute_temp_child() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let acceptance_directory = temporary_directory.path().join("loom-acceptance");
+        fs::create_dir(&acceptance_directory).expect("acceptance directory");
+
+        let resolved = acceptance_app_local_data_root_from(
+            Some(acceptance_directory.clone().into_os_string()),
+            temporary_directory.path(),
+        )
+        .expect("valid acceptance directory");
+
+        assert_eq!(
+            resolved,
+            Some(
+                acceptance_directory
+                    .canonicalize()
+                    .expect("canonical acceptance directory")
+            )
+        );
+    }
+
+    #[test]
+    fn acceptance_directory_rejects_relative_missing_and_non_directory_paths() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let missing = temporary_directory.path().join("missing");
+        let file = temporary_directory.path().join("file");
+        fs::write(&file, b"not a directory").expect("test file");
+
+        for configured in [PathBuf::from("relative"), missing, file] {
+            assert!(
+                acceptance_app_local_data_root_from(
+                    Some(configured.into_os_string()),
+                    temporary_directory.path(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn acceptance_directory_rejects_the_temp_root_and_paths_outside_it() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let outside_directory = tempdir().expect("outside directory");
+
+        for configured in [temporary_directory.path(), outside_directory.path()] {
+            assert!(
+                acceptance_app_local_data_root_from(
+                    Some(configured.as_os_str().to_owned()),
+                    temporary_directory.path(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acceptance_directory_rejects_a_symbolic_link_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let temporary_directory = tempdir().expect("temporary directory");
+        let target = temporary_directory.path().join("target");
+        let link = temporary_directory.path().join("link");
+        fs::create_dir(&target).expect("target directory");
+        symlink(&target, &link).expect("symbolic link");
+
+        assert!(
+            acceptance_app_local_data_root_from(
+                Some(link.into_os_string()),
+                temporary_directory.path(),
+            )
+            .is_err()
+        );
     }
 }

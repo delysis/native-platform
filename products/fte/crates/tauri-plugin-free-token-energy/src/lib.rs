@@ -10,6 +10,7 @@ use fte_types::{
     GatewayStatus, LoopbackStatus, ModelDescriptor, RequestId,
 };
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use tauri::ipc::Channel;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -21,6 +22,7 @@ pub struct Builder {
     secret_resolver: Option<Arc<dyn SecretResolver>>,
     loopback: Option<LoopbackConfig>,
     default_loopback: bool,
+    app_data_dir: Option<PathBuf>,
     #[cfg(feature = "native-llama")]
     native_backend: Option<Arc<fte_backend_llama::LlamaNativeBackend>>,
 }
@@ -40,6 +42,7 @@ impl Builder {
             secret_resolver: None,
             loopback: None,
             default_loopback: false,
+            app_data_dir: None,
             #[cfg(feature = "native-llama")]
             native_backend: None,
         }
@@ -132,6 +135,14 @@ impl Builder {
         self
     }
 
+    /// Overrides the plugin-owned response database and loopback-token root.
+    /// The embedding application is responsible for validating this path.
+    #[must_use]
+    pub fn with_app_data_dir(mut self, app_data_dir: PathBuf) -> Self {
+        self.app_data_dir = Some(app_data_dir);
+        self
+    }
+
     pub fn register_backend(self, backend: Arc<dyn GatewayBackend>) -> Result<Self, GatewayError> {
         self.gateway.register_backend(backend)?;
         Ok(self)
@@ -142,6 +153,7 @@ impl Builder {
         let store = self.store;
         let loopback_config = self.loopback;
         let default_loopback = self.default_loopback;
+        let app_data_dir = self.app_data_dir;
         PluginBuilder::new("free-token-energy")
             .invoke_handler(tauri::generate_handler![
                 gateway_status,
@@ -155,7 +167,10 @@ impl Builder {
                 loopback_rotate_token,
             ])
             .setup(move |app, _api| {
-                let app_data_dir = app.path().app_data_dir()?;
+                let app_data_dir = match app_data_dir {
+                    Some(app_data_dir) => app_data_dir,
+                    None => app.path().app_data_dir()?,
+                };
                 std::fs::create_dir_all(&app_data_dir)?;
                 let store: Arc<dyn ResponseStore> = match store {
                     Some(store) => store,
@@ -618,6 +633,13 @@ fn plugin_quiescing_error(request_id: &RequestId) -> GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_app_data_directory_is_retained_exactly() {
+        let root = PathBuf::from("/tmp/fte-acceptance-plugin-root");
+        let builder = Builder::new().with_app_data_dir(root.clone());
+        assert_eq!(builder.app_data_dir, Some(root));
+    }
 
     #[test]
     fn cleanup_coordinator_is_idempotent_and_retains_safe_error() {
