@@ -6,12 +6,13 @@
   "stability_gate": {
     "stable_candidates": [],
     "required_before_stable": [
-      "applicable packaged backup/restore rollback evidence"
+      "promotion of the current UX binaries into signed notarized release archives"
     ]
   },
   "release_tooling": {
     "local_command": "scripts/release-macos.sh",
     "packaged_smoke": "scripts/smoke-macos-app.sh",
+    "state_backup": "scripts/product-state-backup.mjs",
     "github_workflow": ".github/workflows/release-macos.yml",
     "github_required_for_local_candidate": false,
     "signing": "ad_hoc",
@@ -103,6 +104,7 @@
       "native_workers_joined": "1_of_1",
       "application_work_drained": true,
       "exact_bundle_relaunch_recovered_interrupted_prompt_as_draft": true,
+      "packaged_backup_restore_rollback": "passed_with_prior_and_current_binaries",
       "cancelled_operation_terminal_claimed": false
     },
     "loom": {
@@ -116,6 +118,7 @@
       "quit_elapsed_ms": 102,
       "exact_bundle_relaunch_recovered_manuscript": true,
       "real_suggestion_visible_and_tab_accepted": true,
+      "packaged_backup_restore_rollback": "passed_with_prior_and_current_binaries",
       "cancelled_generation_terminal": false
     },
     "fte": {
@@ -130,7 +133,50 @@
       "quit_elapsed_ms": 36,
       "native_abort_callback_observed": true,
       "exact_bundle_relaunch_restored_ready_local_provider": true,
+      "packaged_current_schema_backup_restore": "passed_with_prior_and_current_binaries",
       "cancelled_request_terminal": false
+    }
+  },
+  "packaged_state_rollback": {
+    "tool": "scripts/product-state-backup.mjs",
+    "prior_source_revision": "be641b1d03da1c147ccecffdeb48c2266ac38a77",
+    "application_stopped_before_backup_and_restore": true,
+    "source_roots_overwritten": false,
+    "backup_destinations_new": true,
+    "restore_destinations_absent_or_empty": true,
+    "symbolic_links_and_special_files_rejected": true,
+    "named_and_extensionless_gguf_model_payloads_excluded": true,
+    "sqlite_quick_check": "ok_all_four_databases",
+    "evidence_root": "/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/delysis-state-rollback.XXXXXX.u93jDRmze1",
+    "mom": {
+      "tree_sha256": "f0f19627eafb4a75eb3a576d60063ebd79ff667141ae8ee620bdf44834a2a47f",
+      "entry_count": 3,
+      "backup_receipt_sha256": "975dca3fabdc1aff5b45ff525c6e66dcd19f14fa3979a0b7e45b999ed2c3cda2",
+      "restore_receipt": "mom-final-restore.json",
+      "restore_receipt_sha256": "a8712fe3a4a01394630ecd845597b2bf8a0114d76b3b6e60cd9ad5964fba0695",
+      "prior_marker_reopened_by_current_binary": true,
+      "current_mutation_excluded_after_restore": true,
+      "prior_marker_reopened_by_prior_binary": true
+    },
+    "loom": {
+      "tree_sha256": "4ac641606ff5dc586dc27025a8c7b9d9c6dda00bdd9e3f1ddbcb2aa1171b78df",
+      "entry_count": 21,
+      "backup_receipt_sha256": "4fece089bc8239c2bfddb00d4cb7e3f442d8a0f77bcadcd99e4b2ce87e4f8541",
+      "restore_receipt": "loom-final-restore.json",
+      "restore_receipt_sha256": "250530be2abbf0b67f78554bc18822cf2ff934f81313f19e49cefaa482687b60",
+      "prior_marker_reopened_by_current_binary": true,
+      "current_mutation_excluded_after_restore": true,
+      "prior_marker_reopened_by_prior_binary": true
+    },
+    "fte": {
+      "tree_sha256": "193af5401084c0a5fe4e4d4cbc688afeeee622414eec8074a286413808abe64e",
+      "entry_count": 8,
+      "backup_receipt_sha256": "4d11853e29a5cd8f7f8767ae36843861dbf07690a7ce027de2e38b01f23ded46",
+      "restore_receipt": "fte-final-restore.json",
+      "restore_receipt_sha256": "70138434d8fd3b6d716aac231535ec88739d27ab560b9dca5cd8e85c6949528e",
+      "prior_marker_reopened_by_current_binary": true,
+      "current_mutation_excluded_after_restore": true,
+      "prior_marker_reopened_by_prior_binary": true
     }
   },
   "negative_evidence": {
@@ -156,7 +202,6 @@
     "Developer ID signing and notarization",
     "component tags and public artifact publication",
     "promotion of the current UX binaries into release archives and digest receipts",
-    "applicable packaged backup/restore rollback",
     "Windows and Linux distribution support",
     "two stable consolidated releases",
     "source-repository retirement"

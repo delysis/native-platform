@@ -126,6 +126,35 @@ the local provider Ready with both local requests and token metrics recovered.
 Final Quit exited zero in 42 ms. The cache blob remained at its original inode
 and no model bytes were copied into the bundle or acceptance root.
 
+## Packaged state backup and rollback
+
+`scripts/product-state-backup.mjs` is the deliberately small offline rollback
+tool for all three products. It requires the applicable application to be
+stopped, copies state into a new destination, excludes named model formats and
+extensionless files with GGUF magic, rejects symbolic links and other special
+files, and binds the payload to per-file and tree SHA-256 manifests. Restore
+accepts only an absent or empty destination and emits its own digest-bound
+receipt. The source state root is never overwritten.
+
+The packaged rollback acceptance used prior build `be641b1` to create one
+visible marker in each isolated state root: a Mom draft, a Loom manuscript, and
+an FTE local profile name. With all prior applications stopped, all three
+backups and independent restores verified. The current Mom `fc8de70`, Loom
+`fc8de70`, and FTE `164fb97` bundles then opened the original roots, visibly
+recovered the prior markers, replaced them with current-build mutations, and
+exited zero. Finally, the exact prior bundles opened fresh restored roots and
+visibly recovered the original markers rather than the current mutations.
+
+The preserved local receipt root is
+`/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/delysis-state-rollback.XXXXXX.u93jDRmze1`.
+The verified tree SHA-256 values are
+`f0f19627eafb4a75eb3a576d60063ebd79ff667141ae8ee620bdf44834a2a47f`
+for Mom, `4ac641606ff5dc586dc27025a8c7b9d9c6dda00bdd9e3f1ddbcb2aa1171b78df`
+for Loom, and
+`193af5401084c0a5fe4e4d4cbc688afeeee622414eec8074a286413808abe64e`
+for FTE. The restored Mom, Loom, and both FTE SQLite databases returned `ok`
+from `PRAGMA quick_check`; every receipt recorded zero model payload files.
+
 ## Negative evidence retained
 
 The first current-source Loom packaged smoke did not exit within the original
@@ -160,8 +189,9 @@ public releases:
   Mom additionally emitted a complete joined-shutdown receipt and recovered
   the interrupted prompt as a draft. These runs prove responsive packaged
   shutdown; they do not claim that a cancelled-operation terminal was retained;
-- applicable packaged backup/restore rollback remains unverified; Mom and Loom
-  have source-level prior-store tests, while FTE is fresh/current-schema-only;
+- packaged backup/restore rollback passed for all three current-schema state
+  roots, including visible reopen by both the current and prior binaries. This
+  does not invent a legacy FTE migration path: FTE remains current-schema-only;
 - signing is ad-hoc, not Developer ID;
 - notarization was not requested;
 - no component tag or public artifact has been created yet;

@@ -69,15 +69,18 @@ Semantic versioning describes each component's supported public/product contract
 Select the prior tag and package, restore the data backup made before migration,
 and verify the package against its receipt before launch. An older binary must
 not open a forward-migrated store. A corrected release receives a new version;
-an existing tag is never moved. The current local candidates have not yet
-exercised this packaged backup/restore rollback procedure.
+an existing tag is never moved. The current packaged builds exercised this
+procedure with `scripts/product-state-backup.mjs`: each current binary mutated
+the original state, and the prior binary recovered the pre-migration marker
+from a fresh restored root.
 
 ## Acceptance
 
 - The local release command works without GitHub or network access once dependencies are cached.
 - The release command rejects dirty source; its receipt records package hashes and signing state.
 - Focused component checks cover source-level migration/reopen and
-  active-operation shutdown; they do not establish packaged rollback.
+  active-operation shutdown; the separate offline state tool establishes
+  packaged rollback.
 - A local candidate has an isolated packaged-app launch, quit, and relaunch smoke.
 - A stable release additionally has active packaged-operation evidence and
   applicable packaged backup/restore rollback evidence.
