@@ -378,6 +378,17 @@
     return modal;
   };
 
+  const refreshCacheInspector = async (action, result) => {
+    report(result);
+    await refreshSettings("developer");
+    const status = document.getElementById("cache-action-status");
+    const inspector = window.MomLlamaCacheInspector;
+    if (!status || !inspector) return result;
+    status.textContent = inspector.actionMessage(action, result);
+    status.dataset.state = inspector.actionState(result);
+    return result;
+  };
+
   const refreshConversationProjection = async () => {
     await Promise.all([refreshChat(), refreshSidebar()]);
   };
@@ -1648,12 +1659,13 @@
       report(await invoke("mom_llama_skill_apply", { conversation: selectedConversation(), skill: button.dataset.skill }));
       await refreshSettings("general");
     },
-    "kv-status": async () => report(await invoke("mom_llama_kv_cache_status")),
-    "kv-save": async () => { report(await invoke("mom_llama_kv_cache_save", { skill: null })); await refreshSettings("developer"); },
-    "kv-restore": async () => { report(await invoke("mom_llama_kv_cache_restore", { cache: null })); await refreshSettings("developer"); },
+    "kv-status": async () => refreshCacheInspector(
+      "refresh",
+      await invoke("mom_llama_kv_cache_status"),
+    ),
     "kv-clear": async (button) => {
       if (!armDestructiveAction(button)) return;
-      report(await invoke("mom_llama_kv_cache_clear")); await refreshSettings("developer");
+      await refreshCacheInspector("clear", await invoke("mom_llama_kv_cache_clear"));
     },
     "mcp-status": async () => { report(await invoke("mom_llama_mcp_status")); openSettings("mcp"); },
     "mcp-command-browse": async () => {

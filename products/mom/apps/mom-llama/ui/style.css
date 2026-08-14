@@ -812,6 +812,30 @@ kbd { padding: 2px 6px; border-radius: 4px; color: #c5c5c5; background: #2a2a2a;
 .settings-subgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 20px; }
 .settings-card { padding: 16px; border: 1px solid var(--border); border-radius: 8px; }
 .settings-card h3 { margin: 0 0 12px; font-size: 15px; }
+.cache-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.cache-card-heading h3 { margin-bottom: 4px; }
+.cache-card-heading p { margin: 0; color: var(--text); font-size: 13px; }
+.cache-explanation, .cache-empty, .cache-invalidated, .cache-action-status {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.cache-explanation { margin: 12px 0; }
+.cache-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0 0 12px; }
+.cache-metrics div { min-width: 0; padding: 9px; border-radius: 6px; background: var(--surface); }
+.cache-metrics dt { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
+.cache-metrics dd { margin: 3px 0 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 650; }
+.cache-entry-list { display: grid; gap: 6px; margin: 10px 0 12px; }
+.cache-entry { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px; border: 1px solid var(--border); border-radius: 6px; }
+.cache-entry > div { min-width: 0; display: grid; gap: 2px; }
+.cache-entry strong, .cache-entry small { overflow-wrap: anywhere; }
+.cache-entry small { color: var(--muted); font-size: 11px; }
+.cache-entry-state { flex: 0 0 auto; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+.cache-invalidated { color: var(--danger); }
+.cache-actions { margin-top: 12px; }
+.cache-action-status { min-height: 18px; margin: 9px 0 0; }
+.cache-action-status[data-state="passed"] { color: var(--text); }
+.cache-action-status[data-state="blocked"] { color: var(--danger); }
 .current-chat-settings { margin-bottom: 20px; background: color-mix(in srgb, var(--surface) 28%, transparent); }
 .current-chat-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
 .current-chat-heading h3 { margin: 0 0 3px; }

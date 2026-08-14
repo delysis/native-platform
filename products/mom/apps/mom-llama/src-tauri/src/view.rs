@@ -2,8 +2,11 @@ use anyhow::Result;
 use maud::{Markup, PreEscaped, html};
 use mom_llama_runtime::{
     AttachmentKind, AttachmentRecord, Blocker, CommandResult, Conversation, ConversationKind,
-    DraftMessage, KvCachePolicy, Message, MessageRole, Settings, engine::EngineCheckOutput,
-    kv_cache::KvCacheStatus, models::ModelInfo, skill_store::Skill,
+    DraftMessage, KvCachePolicy, Message, MessageRole, Settings,
+    engine::EngineCheckOutput,
+    kv_cache::{CacheEntryState, CacheTier, KvCacheStatus},
+    models::ModelInfo,
+    skill_store::Skill,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -537,7 +540,7 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         tauri_command: "mom_llama_kv_cache_status",
         cli: "mom-llama kv-cache status --json",
         effect: "mom_llama.effects.kv_cache_status.v1",
-        label: "Cache status",
+        label: "Refresh",
     },
     ControlSpec {
         affordance: "kv.save",
@@ -545,7 +548,7 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         tauri_command: "mom_llama_kv_cache_save",
         cli: "mom-llama kv-cache save --skill <id> --json",
         effect: "mom_llama.effects.kv_cache_mutate.v1",
-        label: "Save cache",
+        label: "Build assistant prefix",
     },
     ControlSpec {
         affordance: "kv.restore",
@@ -553,7 +556,7 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         tauri_command: "mom_llama_kv_cache_restore",
         cli: "mom-llama kv-cache restore --cache <id> --json",
         effect: "mom_llama.effects.kv_cache_mutate.v1",
-        label: "Restore cache",
+        label: "Verify and warm cache",
     },
     ControlSpec {
         affordance: "kv.clear",
@@ -561,7 +564,7 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         tauri_command: "mom_llama_kv_cache_clear",
         cli: "mom-llama kv-cache clear --json",
         effect: "mom_llama.effects.kv_cache_mutate.v1",
-        label: "Clear cache",
+        label: "Clear all",
     },
     ControlSpec {
         affordance: "mcp.status",
@@ -2522,16 +2525,7 @@ fn settings_modal(
                                     data-effect="mom_llama.effects.skill_store.v1" { "Cancel edit" }
                             }
                         }
-                            section class="settings-card" data-settings-card="cache" {
-                            h3 { "Prompt cache" }
-                            p { (kv_label(kv)) }
-                            div class="button-strip" {
-                                (button("kv.status", Some("kv-status"), "small-button", false))
-                                (button("kv.save", Some("kv-save"), "small-button", false))
-                                (button("kv.restore", Some("kv-restore"), "small-button", false))
-                                (button("kv.clear", Some("kv-clear"), "small-button danger", false))
-                            }
-                        }
+                            (prompt_cache_card(kv))
                             section class="settings-card" data-settings-card="engine" {
                             h3 { "Engine" }
                             p { (readiness_short_label(engine)) }
@@ -3862,29 +3856,160 @@ fn json_value_to_form_value(value: &Value) -> String {
     }
 }
 
+fn prompt_cache_card(kv: &CommandResult<KvCacheStatus>) -> Markup {
+    let status = kv.result.as_ref();
+    let ready_entries = status
+        .map(|status| {
+            status
+                .entries
+                .iter()
+                .filter(|entry| entry.state == CacheEntryState::Ready)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let invalidated_entries = status.map_or(0, |status| {
+        status
+            .entries
+            .iter()
+            .filter(|entry| entry.state == CacheEntryState::Invalidated)
+            .count()
+    });
+    let memory_entries = status.map_or(0, |status| status.memory_entries);
+    let persistent_bytes = status.map_or(0, |status| status.persistent_bytes);
+    html! {
+        section id="prompt-cache-card" class="settings-card prompt-cache-card"
+            data-settings-card="cache"
+            data-cache-state=(status.map_or("unavailable", |status| kv_state_value(status.status))) {
+            div class="cache-card-heading" {
+                div {
+                    h3 { "Prompt cache" }
+                    p id="prompt-cache-summary" { (kv_label(kv)) }
+                }
+            }
+            p class="cache-explanation" {
+                "Conversation checkpoints and persona prefixes are encrypted on this Mac. "
+                "Compatible checkpoints restore automatically; integrity and the exact model fingerprint are checked before reuse."
+            }
+            dl class="cache-metrics" {
+                div {
+                    dt { "Stored" }
+                    dd { (ready_entries.len()) }
+                }
+                div {
+                    dt { "Encrypted state" }
+                    dd { (human_cache_bytes(persistent_bytes)) }
+                }
+                div {
+                    dt { "Warm now" }
+                    dd { (memory_entries) }
+                }
+            }
+            @if ready_entries.is_empty() {
+                p class="cache-empty" { "No persisted prompt checkpoints." }
+            } @else {
+                div class="cache-entry-list" aria-label="Persisted prompt checkpoints" {
+                    @for entry in ready_entries {
+                        div class="cache-entry" data-cache-id=(entry.id.clone()) {
+                            div {
+                                strong { (entry.label.clone()) }
+                                small { (cache_entry_detail(entry.tier, entry.token_ids.len(), entry.state_bytes)) }
+                            }
+                            span class="cache-entry-state" { "Stored" }
+                        }
+                    }
+                }
+            }
+            @if invalidated_entries > 0 {
+                p class="cache-invalidated" {
+                    (invalidated_entries) " invalidated "
+                    (if invalidated_entries == 1 { "record is" } else { "records are" })
+                    " retained for inspection until the cache is cleared."
+                }
+            }
+            @if let Some(blocker) = kv.blocker.as_ref() {
+                (store_blocker(blocker))
+            }
+            div class="button-strip cache-actions" {
+                (button("kv.status", Some("kv-status"), "small-button", false))
+                (button("kv.clear", Some("kv-clear"), "small-button danger", false))
+            }
+            p id="cache-action-status" class="cache-action-status" role="status" aria-live="polite" {}
+        }
+    }
+}
+
 fn kv_label(kv: &CommandResult<KvCacheStatus>) -> String {
     let Some(status) = kv.result.as_ref() else {
         return "Cache unavailable".to_string();
     };
+    let ready = status
+        .entries
+        .iter()
+        .filter(|entry| entry.state == CacheEntryState::Ready)
+        .count();
     match status.status {
-        mom_llama_runtime::kv_cache::KvCacheState::Disabled => "Caching off".to_string(),
-        mom_llama_runtime::kv_cache::KvCacheState::UnsupportedByEngine => {
-            "Cache unsupported".to_string()
+        mom_llama_runtime::kv_cache::KvCacheState::Disabled => {
+            format!("Caching is off · {ready} stored")
         }
-        mom_llama_runtime::kv_cache::KvCacheState::BlockedMissingModel => "No model".to_string(),
+        mom_llama_runtime::kv_cache::KvCacheState::UnsupportedByEngine => {
+            format!("Engine cache unsupported · {ready} stored")
+        }
+        mom_llama_runtime::kv_cache::KvCacheState::BlockedMissingModel => {
+            format!("No model selected · {ready} stored")
+        }
         mom_llama_runtime::kv_cache::KvCacheState::BlockedMissingCacheDir => {
-            "Cache not initialized".to_string()
+            "Encrypted cache store unavailable".to_string()
         }
         mom_llama_runtime::kv_cache::KvCacheState::ConfiguredNotVerified => {
-            "Cache unverified".to_string()
+            "Ready to create automatic checkpoints".to_string()
         }
         mom_llama_runtime::kv_cache::KvCacheState::PromptSmokeVerified => {
-            "Cache smoke verified".to_string()
+            format!("Native restore verified · {ready} stored")
         }
-        mom_llama_runtime::kv_cache::KvCacheState::Saved => "Cache saved".to_string(),
-        mom_llama_runtime::kv_cache::KvCacheState::Restored => "Cache restored".to_string(),
-        mom_llama_runtime::kv_cache::KvCacheState::Invalidated => "Cache cleared".to_string(),
+        mom_llama_runtime::kv_cache::KvCacheState::Saved => {
+            format!(
+                "{ready} encrypted checkpoint{} stored",
+                if ready == 1 { "" } else { "s" }
+            )
+        }
+        mom_llama_runtime::kv_cache::KvCacheState::Restored => {
+            format!("Checkpoint restored · {ready} stored")
+        }
+        mom_llama_runtime::kv_cache::KvCacheState::Invalidated => {
+            "Prompt cache cleared".to_string()
+        }
     }
+}
+
+const fn kv_state_value(state: mom_llama_runtime::kv_cache::KvCacheState) -> &'static str {
+    match state {
+        mom_llama_runtime::kv_cache::KvCacheState::Disabled => "disabled",
+        mom_llama_runtime::kv_cache::KvCacheState::UnsupportedByEngine => "unsupported_by_engine",
+        mom_llama_runtime::kv_cache::KvCacheState::BlockedMissingModel => "blocked_missing_model",
+        mom_llama_runtime::kv_cache::KvCacheState::BlockedMissingCacheDir => {
+            "blocked_missing_cache_dir"
+        }
+        mom_llama_runtime::kv_cache::KvCacheState::ConfiguredNotVerified => {
+            "configured_not_verified"
+        }
+        mom_llama_runtime::kv_cache::KvCacheState::PromptSmokeVerified => "prompt_smoke_verified",
+        mom_llama_runtime::kv_cache::KvCacheState::Saved => "saved",
+        mom_llama_runtime::kv_cache::KvCacheState::Restored => "restored",
+        mom_llama_runtime::kv_cache::KvCacheState::Invalidated => "invalidated",
+    }
+}
+
+fn cache_entry_detail(tier: CacheTier, tokens: usize, bytes: usize) -> String {
+    let tier = match tier {
+        CacheTier::MemoryLru => "Memory prefix",
+        CacheTier::SessionPersistent => "Conversation checkpoint",
+        CacheTier::PersonaPack => "Persona prefix",
+    };
+    format!("{tier} · {tokens} tokens · {}", human_cache_bytes(bytes))
+}
+
+fn human_cache_bytes(size: usize) -> String {
+    human_bytes(u64::try_from(size).ok())
 }
 
 fn message_count(conversation: &Conversation) -> String {
@@ -4272,6 +4397,81 @@ mod tests {
             "the packaged CSP must permit only local blob-backed attachment media"
         );
         Ok(())
+    }
+
+    #[test]
+    fn prompt_cache_inspector_reports_real_tiers_without_manual_session_restore_controls() {
+        use llama_native_types::{PromptForm, PromptTokenPolicy};
+        use mom_llama_runtime::kv_cache::{CacheFingerprint, KvCacheMetadata, KvCacheState};
+
+        let fingerprint = CacheFingerprint {
+            prompt_form: PromptForm::Chat,
+            prompt_token_policy: PromptTokenPolicy::ChatTemplate,
+            model_sha256: "model".to_string(),
+            binding_version: "binding".to_string(),
+            build_id: "build".to_string(),
+            tokenizer_sha256: "tokenizer".to_string(),
+            chat_template_sha256: "template".to_string(),
+            multimodal_projector_sha256: None,
+            lora_adapters_sha256: Vec::new(),
+            context_tokens: 2_048,
+            batch_tokens: 128,
+            max_sequences: 1,
+            device: "cpu".to_string(),
+            rope_config_sha256: "rope".to_string(),
+            kv_layout_sha256: "layout".to_string(),
+        };
+        let conversation = KvCacheMetadata::new(
+            "conversation-cache",
+            CacheTier::SessionPersistent,
+            fingerprint.clone(),
+            vec![1, 2, 3],
+            4_096,
+            1,
+        )
+        .with_owner("conversation-1")
+        .with_label("Conversation conversation-1");
+        let persona = KvCacheMetadata::new(
+            "persona-cache",
+            CacheTier::PersonaPack,
+            fingerprint,
+            vec![1, 2],
+            2_048,
+            2,
+        )
+        .with_owner("persona-1")
+        .with_label("Persona: Calm helper");
+        let cache = CommandResult::passed(
+            "mom_llama.kv_cache_status",
+            "contracted",
+            KvCacheStatus {
+                status: KvCacheState::Saved,
+                policy: KvCachePolicy::KvCacheCandidate,
+                cache_dir: "encrypted://runtime.sqlite3".to_string(),
+                entries: vec![conversation, persona],
+                memory_entries: 1,
+                memory_bytes: 2_048,
+                memory_capacity_bytes: 256 * 1024 * 1024,
+                persistent_bytes: 6_144,
+                persistent_capacity_bytes: 2 * 1024 * 1024 * 1024,
+                persistent_capacity_entries: 64,
+            },
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+
+        let html = prompt_cache_card(&cache).into_string();
+        assert!(html.contains("2 encrypted checkpoints stored"));
+        assert!(html.contains("Conversation checkpoint · 3 tokens · 4096 bytes"));
+        assert!(html.contains("Persona prefix · 2 tokens · 2048 bytes"));
+        assert!(html.contains("Compatible checkpoints restore automatically"));
+        assert!(html.contains(r#"data-action="kv-status""#));
+        assert!(html.contains(r#"data-action="kv-clear""#));
+        assert!(!html.contains(r#"data-action="kv-save""#));
+        assert!(!html.contains(r#"data-action="kv-restore""#));
+        assert!(!html.contains("runtime.sqlite3"));
     }
 
     #[test]
