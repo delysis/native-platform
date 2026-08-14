@@ -7,25 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-default = []
-unstable-w1-contract-tests = [
-    "loom-host/unstable-w1-contract-tests",
-]
-unstable-w1-vertical-tests = [
-    "dep:platform-contracts-v0-vertical",
-    "dep:platform-vertical-fixtures-v0",
-]
-
 [dependencies]
 loom-document = { path = "../loom-document" }
 loom-backend-llama = { path = "../loom-backend-llama" }
 loom-host = { path = "../loom-host", features = ["tauri-native-focus"] }
-loom-research-types = { path = "../loom-research-types" }
 loom-store = { path = "../loom-store" }
 loom-types = { path = "../loom-types" }
-platform-contracts-v0-vertical = { workspace = true, optional = true }
-platform-vertical-fixtures-v0 = { workspace = true, optional = true }
 same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true

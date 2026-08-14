@@ -20,21 +20,4 @@ if grep -R -n -E --include='*.rs' --include='Cargo.toml' \
   fail "speech-native-kit contains network or loopback authority"
 fi
 
-grep -q '^name = "tauri-plugin-speech-native"$' \
-  "$repo_root/crates/tauri-plugin-speech-native/Cargo.toml" \
-  || fail "the Tauri plugin package name changed"
-
-grep -q 'PluginBuilder::new("speech-native")' \
-  "$repo_root/crates/tauri-plugin-speech-native/src/lib.rs" \
-  || fail "the Tauri runtime namespace changed"
-
-default_permissions="$repo_root/crates/tauri-plugin-speech-native/permissions/default.toml"
-grep -q 'allow-speech-status' "$default_permissions" \
-  || fail "the default permission no longer allows status inspection"
-
-if grep -n -E 'allow-speech-(synthesize|transcribe|transcription-audio|cancel)' \
-  "$default_permissions"; then
-  fail "the default Tauri permission grants speech execution authority"
-fi
-
 printf 'speech-native-kit boundaries verified\n'

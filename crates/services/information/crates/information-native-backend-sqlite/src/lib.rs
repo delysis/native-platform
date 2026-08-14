@@ -2253,6 +2253,7 @@ mod tests {
     use information_native_types::{
         QUERY_SCHEMA, QueryBudget, QueryFilters, QueryId, RetrievalTarget, UsePermission,
     };
+    use sha2::{Digest, Sha256};
     use std::error::Error;
     use std::io::Write;
     use std::sync::Arc;
@@ -2986,5 +2987,42 @@ mod tests {
         let result = backend.search(&query)?;
         assert!(!result.hits.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn bundled_sqlite_identity_and_compile_options_are_stable() {
+        let connection = Connection::open_in_memory().expect("open bundled SQLite");
+        let version: String = connection
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .expect("read SQLite version");
+        let mut statement = connection
+            .prepare("SELECT compile_options FROM pragma_compile_options ORDER BY compile_options")
+            .expect("prepare compile-options query");
+        let options = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query compile options")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect compile options");
+        let compiler_options = options
+            .iter()
+            .filter(|option| option.starts_with("COMPILER="))
+            .count();
+        let stable_options = options
+            .iter()
+            .filter(|option| !option.starts_with("COMPILER="))
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(rusqlite::version(), version);
+        assert_eq!(version, "3.51.3");
+        assert_eq!(compiler_options, 1, "expected one SQLite compiler identity");
+        assert!(options.iter().any(|option| option == "THREADSAFE=1"));
+        assert!(options.iter().any(|option| option == "ENABLE_FTS5"));
+        assert_eq!(
+            format!("{:x}", Sha256::digest(stable_options.as_bytes())),
+            "2ff61812ddeeedba4e4cd1f0765cc979f1589661984ec5e15120a97d6e41bfe2",
+            "bundled SQLite compile options changed:\n{stable_options}"
+        );
     }
 }

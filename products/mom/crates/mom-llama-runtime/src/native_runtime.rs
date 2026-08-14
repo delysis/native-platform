@@ -9,11 +9,7 @@ use llama_native_host::{
 };
 use llama_native_types::{NativeError, NativeErrorCode, NativeModelConfig, ResidentModelStatus};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "unstable-w1-vertical-fixtures")]
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "unstable-w1-vertical-fixtures")]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -502,7 +498,7 @@ pub fn unload_resident_model() -> bool {
 }
 
 pub fn cancel_native_request(request_id: &str, branch_id: Option<&str>) -> usize {
-    let native = product_host()
+    product_host()
         .lock()
         .ok()
         .and_then(|current| {
@@ -512,73 +508,7 @@ pub fn cancel_native_request(request_id: &str, branch_id: Option<&str>) -> usize
                 .and_then(|host| host.host.upgrade())
                 .map(|host| host.cancel(request_id, branch_id))
         })
-        .unwrap_or_default();
-    #[cfg(feature = "unstable-w1-vertical-fixtures")]
-    let fixture = cancel_fixture_native_request(request_id, branch_id);
-    #[cfg(not(feature = "unstable-w1-vertical-fixtures"))]
-    let fixture = 0;
-    native.saturating_add(fixture)
-}
-
-#[cfg(feature = "unstable-w1-vertical-fixtures")]
-pub(crate) struct W1FixtureNativeRequest {
-    request_id: String,
-    cancelled: Arc<AtomicBool>,
-}
-
-#[cfg(feature = "unstable-w1-vertical-fixtures")]
-impl W1FixtureNativeRequest {
-    pub(crate) fn cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-}
-
-#[cfg(feature = "unstable-w1-vertical-fixtures")]
-impl Drop for W1FixtureNativeRequest {
-    fn drop(&mut self) {
-        if let Ok(mut requests) = fixture_native_requests().lock() {
-            requests.remove(&self.request_id);
-        }
-    }
-}
-
-#[cfg(feature = "unstable-w1-vertical-fixtures")]
-pub(crate) fn register_fixture_native_request(
-    request_id: &str,
-) -> anyhow::Result<W1FixtureNativeRequest> {
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let replaced = fixture_native_requests()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("fixture native cancellation registry is unavailable"))?
-        .insert(request_id.to_string(), Arc::clone(&cancelled));
-    if replaced.is_some() {
-        anyhow::bail!("fixture native request identity is already registered");
-    }
-    Ok(W1FixtureNativeRequest {
-        request_id: request_id.to_string(),
-        cancelled,
-    })
-}
-
-#[cfg(feature = "unstable-w1-vertical-fixtures")]
-fn fixture_native_requests() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
-    static REQUESTS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
-    REQUESTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[cfg(feature = "unstable-w1-vertical-fixtures")]
-fn cancel_fixture_native_request(request_id: &str, branch_id: Option<&str>) -> usize {
-    if branch_id.is_some() {
-        return 0;
-    }
-    fixture_native_requests()
-        .lock()
-        .ok()
-        .and_then(|requests| requests.get(request_id).cloned())
-        .map_or(0, |cancelled| {
-            cancelled.store(true, Ordering::Release);
-            1
-        })
+        .unwrap_or_default()
 }
 
 pub fn skip_native_reasoning(request_id: &str, branch_id: Option<&str>) -> usize {

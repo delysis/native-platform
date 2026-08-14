@@ -11,10 +11,11 @@ policy and defaults to `local-only`.
 - FTE and Mom resolve the same imported Native packages, so Rust sees one
   `NativeHost` and one DTO identity.
 - Mom child manifests inherit local dependencies from the root workspace; the
-  root lock contains no retired Mom, FTE, Native, Attachment, or W1 Git source.
+  root lock contains no first-party Git source.
 - Mom installs `tauri-plugin-free-token-energy`, which is text-only.
-- Mom does not install `tauri-plugin-speech-native`, register speech backends,
-  or grant speech permissions until the product has an intentional speech UX.
+- Mom does not register speech backends or grant speech permissions until the
+  product has an intentional speech UX. There is no generic speech Tauri plugin
+  in the lean workspace; a future Mom speech edge is product-owned.
 - Loopback remains disabled at startup. FTE's typed Rust/IPC boundary can start
   it explicitly, but Mom Llama does not yet expose a loopback Settings control.
 - Hosted routes cannot enter the `local-only` candidate set.

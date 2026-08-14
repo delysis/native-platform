@@ -9,11 +9,9 @@ license.workspace = true
 default = []
 tauri-native-focus = ["dep:tauri"]
 test-fixtures = []
-unstable-w1-contract-tests = ["dep:platform-contract-testkit"]
 
 [dependencies]
 loom-types = { path = "../loom-types" }
-platform-contract-testkit = { workspace = true, optional = true }
 tauri = { version = "2.11.5", default-features = false, optional = true }
 thiserror.workspace = true
 

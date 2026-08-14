@@ -53,14 +53,13 @@ it would be dishonest to claim live audio streaming or pre-emptive native
 cancellation. Those capabilities remain false until a truly asynchronous
 bridge is implemented and tested.
 
-The reusable speech crates have no Tauri dependency. The Rust-only,
-speech-specific `tauri-plugin-speech-native` owns an injected
-`SpeechHost` and exposes scoped status, route-plan, synthesize, transcribe,
-stream, and cancel commands plus the
-`SpeechNativeExt::speech_native` Rust extension method.
-The provider/text gateway contains no speech state, dependency, command,
-permission, or shutdown path. Ordinary Rust consumers use the same service and
-backend traits without Tauri.
+The reusable speech crates have no Tauri dependency. W9 removed the generic
+speech Tauri plugin because no current product installs it. A product that
+ships speech must own its narrow IPC commands, permissions, capture/playback
+UX, and host shutdown at the product composition root. The provider/text
+gateway contains no speech state, dependency, command, permission, or shutdown
+path. Ordinary Rust consumers use the service and backend traits without
+Tauri.
 
 The host lifecycle is one-way: `running -> quiescing -> closed`. Route
 selection and global request-ID reservation occur under the same state lock.
@@ -73,29 +72,14 @@ blocking panics are converted into shutdown evidence. The Parakeet and Apple
 adapters use the same active-count contract, so neither adapter can report
 shutdown while its native worker remains alive. Host and backend request nonces
 use checked allocation and fail closed before wraparound.
-The Tauri plugin performs this joined shutdown at `RunEvent::Exit`, reports a
-failure rather than discarding it, and repeats the retained operation as a
-drop-time fallback.
+A product edge must perform this joined shutdown during its native application
+exit event and surface failure rather than discarding it. If live
+transcription is exposed, the product edge must preserve both halves of the
+typed contract: bounded output events and the backpressured input audio sink.
+Closing either side cancels only that request.
 
-Live Tauri transcription has an explicit input half as well as an output event
-half. `speech_transcribe_stream` opens the bounded request, while
-`speech_transcription_audio_push` and `speech_transcription_audio_finish` feed
-ordered PCM chunks through the ticket's typed audio sink. Closing the event
-channel or ticket cancels only that request.
-
-### Tauri migration
-
-The speech request and event types are unchanged. Applications moving from the
-former combined plugin must:
-
-1. install `tauri-plugin-speech-native` separately;
-2. grant `speech-native:default` instead of receiving speech through
-   `free-token-energy:default`;
-3. invoke `plugin:speech-native|speech_*` commands; and
-4. import `SpeechNativeExt` for Rust-side access.
-
-Applications that do not use speech need no speech crate, plugin, permission,
-backend registration, or shutdown path.
+Applications that do not use speech need no speech crate, permission, backend
+registration, or shutdown path.
 
 ## Default Selection Policy
 
@@ -191,10 +175,10 @@ needs exact feature tests for timestamps, partials, translation, and
 diarization.
 
 The pre-extraction FTE desktop produced real Apple and Parakeet launched-app
-receipts through the same plugin-managed host. Those receipts are historical
-provenance, not readiness for this repository's next release. A standalone
-Tauri smoke consumer must rerun Apple synthesis and Parakeet transcription
-before a release claims launched-app evidence. The real Parakeet integration
+receipts through the former plugin-managed host. Those receipts are historical
+provenance, not readiness for this repository's next release. A product-owned
+launched-app smoke must rerun Apple synthesis and Parakeet transcription before
+a release claims launched-app evidence. The real Parakeet integration
 test uses `SPEECH_NATIVE_TEST_WAV` (with a legacy alias), streams PCM through
 the input sink, and cancels one request without affecting its completing peer.
 

@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "goal": "W9-LEAN",
+  "status": "local_accepted_pending_github_promotion",
+  "baseline": {
+    "commit": "058c4622fac8813417a5e6637091e63e1ef01ea2",
+    "tree": "fb0362faf422090ec8d8f936d5b31b95da0b01ac",
+    "tag": "w8-home-v0-2026-08-13"
+  },
+  "candidate": {
+    "implementation_commit": "7cd3627683061f9f51a56b4d61a73c3767819d30",
+    "implementation_tree": "88173c1ff488aaa9b4356b6fe5c158e352d28eb7",
+    "receipt_commit": "self"
+  },
+  "metrics": {
+    "rust_nonblank_lines": {"before": 293326, "after": 179910, "delta": -113416, "reduction_basis_points": 3866},
+    "production_rust_nonblank_lines": {"before": 261075, "after": 169206, "delta": -91869, "reduction_basis_points": 3518},
+    "test_rust_nonblank_lines": {"before": 29975, "after": 8476, "delta": -21499, "reduction_basis_points": 7172},
+    "public_rust_items_lexical": {"before": 5579, "after": 2567, "delta": -3012, "reduction_basis_points": 5398},
+    "workspace_packages": {"before": 65, "after": 47, "delta": -18, "reduction_basis_points": 2769},
+    "first_party_git_dependencies": {"before": 0, "after": 0, "delta": 0},
+    "tracked_files_at_rust_checkpoint": {"before": 1096, "after": 693, "delta": -403},
+    "fixture_bytes_at_rust_checkpoint": {"before": 1381962, "after": 1122996, "delta": -258966},
+    "git_lines_through_implementation_checkpoint": {"insertions": 1789, "deletions": 136898, "net": -135109}
+  },
+  "shipping": {
+    "profile": "lean_mac_first",
+    "workspace_packages": 47,
+    "loom_default_research_packages": 0,
+    "research_files": 1,
+    "research_file_retained": "products/loom/crates/loom-store/src/research_admission.rs",
+    "generic_speech_tauri_plugin": false,
+    "linux_windows_required": false
+  },
+  "build": {
+    "model_weights_embedded": false,
+    "model_loading": "GGUF by filesystem path; Parakeet from Hugging Face cache snapshot in place",
+    "pathological_target_bytes_approx": 44023414784,
+    "pathological_free_volume_bytes_approx": 140509184,
+    "cleanup": "cargo clean in the exact W9 worktree only",
+    "dev_test_profile": {"debug": "line-tables-only", "incremental": false},
+    "clean_workspace_build_ms": 119350,
+    "clean_workspace_target_bytes_approx": 5476083302,
+    "w8_local_reference_build_ms": 62480,
+    "comparison_note": "Different cache and toolchain state; no speedup claim.",
+    "loom_release": {
+      "w8_executable_bytes": 21127840,
+      "w9_executable_bytes": 20685776,
+      "w9_delta_bytes": -442064,
+      "w9_reduction_basis_points": 209,
+      "w9_sha256": "0d5293b2988872efa2d5f88e472a89d736be4532da70f00b1869d0947aa77aed",
+      "w9_clean_build_ms": 187920
+    }
+  },
+  "verification": {
+    "workspace_check_all_targets": "passed",
+    "workspace_strict_clippy_all_targets": "passed",
+    "xtask_tests": "passed",
+    "lean_verify": "passed",
+    "loom_frontend": "31 files, 178 tests passed; check clean; Vite build passed",
+    "node_ci_policy_tests": "27 passed",
+    "focused_data_and_vertical_tests": "passed",
+    "post_profile_loom_app": "build, strict Clippy, and 3 tests passed",
+    "fresh_full_policy": "passed after disk-bounding profile: workspace tests, strict Clippy, policy, 27 Node tests, architecture boundaries, and offline frozen pnpm lock",
+    "fresh_full_policy_target_bytes_approx": 13958643712
+  },
+  "github": {
+    "pull_request": null,
+    "required_ci_wall_ms": null,
+    "merge_commit": null,
+    "tag": null
+  },
+  "claims_deferred": [
+    "The prior ENOSPC full-policy attempt is retained as negative environment evidence; the fresh bounded rerun passed.",
+    "Required macOS CI timing is measured after pull-request publication and does not block local work.",
+    "Linux and Windows are informational compatibility follow-ups.",
+    "Signing, notarization, stable releases, and source-repository retirement are W10 work."
+  ]
+}

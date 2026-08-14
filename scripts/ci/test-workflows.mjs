@@ -52,7 +52,6 @@ test("PR workflow exposes every targeted partition and future product guards", (
     "frontend",
     "platform-macos",
     "dependency-graph",
-    "import-history",
     "fuzz-build",
   ]) {
     assert.match(source, new RegExp(`^  ${job}:`, "m"), `missing ${job}`);
@@ -63,6 +62,12 @@ test("PR workflow exposes every targeted partition and future product guards", (
   assert.match(source, /cancel-in-progress: true/);
   assert.doesNotMatch(source, /^  platform-windows:/m);
   assert.doesNotMatch(source, /platform_windows/);
+});
+
+test("root workspace tests can inspect the retained migration evidence", () => {
+  const rootLinux = read(prPath).match(/^  root-linux:[\s\S]*?(?=^  native-linux:)/m)?.[0];
+  assert.ok(rootLinux, "root-linux job block is missing");
+  assert.match(rootLinux, /actions\/checkout@[0-9a-f]{40}\n\s+with:\n\s+fetch-depth: 0/);
 });
 
 test("frontend jobs use the single root pnpm workspace", () => {
@@ -85,7 +90,7 @@ test("the required macOS lane runs Mom parity when Mom changes", () => {
   assert.match(macos, /name: Mom macOS parity/);
   assert.match(macos, /mom_present == 'true'/);
   assert.match(macos, /cargo-group\.mjs test product-mom/);
-  assert.match(macos, /unstable-w1-contracts,unstable-w1-vertical-fixtures/);
+  assert.doesNotMatch(macos, /unstable-w1/);
 });
 
 test("Speech Linux coverage provisions its GLib build dependencies", () => {
@@ -99,20 +104,29 @@ test("Speech Linux coverage provisions its GLib build dependencies", () => {
   assert.match(fullSpeech, /if: runner\.os == 'Linux'/);
 });
 
-test("W1 ancestry-bound jobs retain full Git history", () => {
+test("Mom and Loom Linux coverage provisions desktop build dependencies", () => {
   const pr = read(prPath);
   const full = read(fullPath);
   const blocks = [
-    pr.match(/^  native-linux:[\s\S]*?(?=^  gateway-linux:)/m)?.[0],
-    pr.match(/^  information-linux:[\s\S]*?(?=^  speech-linux:)/m)?.[0],
-    pr.match(/^  speech-linux:[\s\S]*?(?=^  mom-linux:)/m)?.[0],
-    full.match(/^  root:[\s\S]*?(?=^  attachment:)/m)?.[0],
-    full.match(/^  information-platform-linux:[\s\S]*?(?=^  speech:)/m)?.[0],
-    full.match(/^  speech:[\s\S]*?(?=^  mom:)/m)?.[0],
+    pr.match(/^  mom-linux:[\s\S]*?(?=^  loom-linux:)/m)?.[0],
+    pr.match(/^  loom-linux:[\s\S]*?(?=^  frontend:)/m)?.[0],
+    full.match(/^  mom:[\s\S]*?(?=^  loom:)/m)?.[0],
+    full.match(/^  loom:[\s\S]*?(?=^  frontend:)/m)?.[0],
   ];
   for (const block of blocks) {
-    assert.ok(block, "W1 job block is missing");
-    assert.match(block, /fetch-depth: 0/);
+    assert.ok(block, "product job block is missing");
+    assert.match(block, /libglib2\.0-dev/);
+    assert.match(block, /libgtk-3-dev/);
+  }
+  assert.match(blocks[2], /if: runner\.os == 'Linux'/);
+  assert.match(blocks[3], /if: runner\.os == 'Linux'/);
+});
+
+test("fuzz workflows select the owned nested fuzz workspace explicitly", () => {
+  for (const source of [read(prPath), read(fullPath)]) {
+    assert.match(source, /^\s{2}fuzz-build:/m);
+    assert.match(source, /cargo fuzz build --fuzz-dir crates\/services\/attachment\/fuzz inspect/);
+    assert.match(source, /cargo fuzz build --fuzz-dir crates\/services\/attachment\/fuzz pipeline/);
   }
 });
 

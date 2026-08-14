@@ -42,9 +42,7 @@ for dependency in \
   'fte-store = { path = "products/fte/crates/fte-store" }' \
   'fte-types = { path = "products/fte/crates/fte-types" }' \
   'attachment-native-host = { path = "crates/services/attachment/crates/attachment-native-host" }' \
-  'attachment-native-types = { path = "crates/services/attachment/crates/attachment-native-types" }' \
-  'platform-contracts-v0 = { path = "crates/platform/contracts/crates/platform-contracts-v0" }' \
-  'platform-vertical-fixtures-v0 = { path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }'
+  'attachment-native-types = { path = "crates/services/attachment/crates/attachment-native-types" }'
 do
   if ! grep -Fqx "$dependency" "$root_manifest"
   then
@@ -53,7 +51,7 @@ do
   fi
 done
 
-if rg -n 'source = "git\+https://github\.com/delysis/(mom-llama|llama-native-kit|free-token-energy|attachment-native-kit|w1-platform-contracts)' "$root_lock"
+if rg -n 'source = "git\+https://github\.com/delysis/(mom-llama|llama-native-kit|free-token-energy|attachment-native-kit)' "$root_lock"
 then
   echo "the root lock retains a retired first-party Git source used by Mom" >&2
   exit 1
@@ -109,4 +107,4 @@ then
   exit 1
 fi
 
-echo "architecture ok: Mom owns product code and resolves Native, Attachment, FTE, and W1 from imported root paths"
+echo "architecture ok: Mom owns product code and resolves Native, Attachment, and FTE from imported root paths"

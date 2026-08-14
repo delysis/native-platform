@@ -38,7 +38,6 @@ alongside the legacy summary fields for a compatibility window.
   tiers.
 - `llama-native-host`: application-owned resident-model registry, memory/slot
   budgeting, cancellation, lifecycle, and injected cache persistence.
-- `command-evidence`: source- and runtime-fingerprint-bound readiness receipts.
 
 [`docs/FREE_TOKEN_ENERGY_INTEGRATION.md`](docs/FREE_TOKEN_ENERGY_INTEGRATION.md)
 documents the typed adapter boundary. See [`docs/MODULE_BOUNDARIES.md`](docs/MODULE_BOUNDARIES.md)

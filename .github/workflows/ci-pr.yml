@@ -31,7 +31,6 @@ jobs:
       frontend_mom: ${{ steps.plan.outputs.frontend_mom }}
       frontend_loom: ${{ steps.plan.outputs.frontend_loom }}
       dependency_graph: ${{ steps.plan.outputs.dependency_graph }}
-      migration_history: ${{ steps.plan.outputs.migration_history }}
       fuzz: ${{ steps.plan.outputs.fuzz }}
       platform_macos: ${{ steps.plan.outputs.platform_macos }}
       full: ${{ steps.plan.outputs.full }}
@@ -69,6 +68,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
       - name: Install desktop system dependencies
         run: |
           sudo apt-get update
@@ -100,7 +101,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: native-linux
-      - run: cargo test --locked -p llama-native-engine --features unstable-w1-contract-tests,unstable-w1-vertical-tests --all-targets
       - run: ./crates/native/scripts/check-architecture.sh
 
   gateway-linux:
@@ -160,8 +160,6 @@ jobs:
       - run: node scripts/ci/cargo-group.mjs fmt service-information
       - run: node scripts/ci/cargo-group.mjs test service-information
       - run: node scripts/ci/cargo-group.mjs clippy service-information
-      - run: cargo test --locked -p information-native-acquire --features unstable-w1-contracts
-      - run: cargo test --locked -p information-native-host --features unstable-w1-vertical-tests --test w1_vertical
 
   speech-linux:
     if: ${{ needs.plan.outputs.speech == 'true' || needs.plan.outputs.full == 'true' }}
@@ -186,7 +184,6 @@ jobs:
           shared-key: speech-linux
       - run: node scripts/ci/cargo-group.mjs fmt service-speech
       - run: node scripts/ci/cargo-group.mjs test service-speech
-      - run: cargo test --locked -p speech-native-host --all-targets --features unstable-w1-contract-tests,unstable-w1-vertical-tests
       - run: node scripts/ci/cargo-group.mjs clippy service-speech
 
   mom-linux:
@@ -195,6 +192,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install desktop system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libayatana-appindicator3-dev libglib2.0-dev libgtk-3-dev \
+            librsvg2-dev libwebkit2gtk-4.1-dev patchelf pkg-config
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: "1.92.0"
@@ -211,6 +214,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install desktop system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libayatana-appindicator3-dev libglib2.0-dev libgtk-3-dev \
+            librsvg2-dev libwebkit2gtk-4.1-dev patchelf pkg-config
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: "1.92.0"
@@ -218,9 +227,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: loom-linux
-      - run: node scripts/ci/cargo-group.mjs fmt product-loom research-loom
-      - run: node scripts/ci/cargo-group.mjs test product-loom research-loom
-      - run: node scripts/ci/cargo-group.mjs clippy product-loom research-loom
+      - run: node scripts/ci/cargo-group.mjs fmt product-loom
+      - run: node scripts/ci/cargo-group.mjs test product-loom
+      - run: node scripts/ci/cargo-group.mjs clippy product-loom
 
   frontend:
     if: ${{ needs.plan.outputs.frontend_fte == 'true' || needs.plan.outputs.frontend_mom == 'true' || needs.plan.outputs.frontend_loom == 'true' || needs.plan.outputs.full == 'true' }}
@@ -267,8 +276,6 @@ jobs:
         if: ${{ needs.plan.outputs.mom_present == 'true' && (needs.plan.outputs.mom == 'true' || needs.plan.outputs.full == 'true') }}
         run: |
           node scripts/ci/cargo-group.mjs test product-mom
-          cargo test --locked -p mom-llama-runtime --features unstable-w1-vertical-fixtures --all-targets
-          cargo test --locked -p mom-llama-app --features unstable-w1-contracts,unstable-w1-vertical-fixtures --all-targets
       - name: Attachment macOS
         if: ${{ needs.plan.outputs.attachment == 'true' || needs.plan.outputs.full == 'true' }}
         run: node scripts/ci/cargo-group.mjs test service-attachment
@@ -280,7 +287,7 @@ jobs:
         run: node scripts/ci/cargo-group.mjs test service-speech
       - name: Loom macOS
         if: ${{ needs.plan.outputs.loom_present == 'true' && (needs.plan.outputs.loom == 'true' || needs.plan.outputs.full == 'true') }}
-        run: node scripts/ci/cargo-group.mjs test product-loom research-loom
+        run: node scripts/ci/cargo-group.mjs test product-loom
 
   dependency-graph:
     if: ${{ needs.plan.outputs.dependency_graph == 'true' || needs.plan.outputs.full == 'true' }}
@@ -293,22 +300,7 @@ jobs:
           toolchain: "1.92.0"
       - run: cargo metadata --locked --no-deps
       - run: cargo tree -d
-      - run: cargo test --locked -p integration-vertical
       - run: cargo tree --locked -i libsqlite3-sys
-
-  import-history:
-    if: ${{ needs.plan.outputs.migration_history == 'true' || needs.plan.outputs.full == 'true' }}
-    needs: plan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          fetch-depth: 0
-      - run: ./scripts/check-native-import-history.sh
-      - run: ./scripts/check-service-import-history.sh
-      - run: ./scripts/check-contract-import-history.sh
-      - run: ./scripts/check-mom-import-history.sh
-      - run: ./scripts/check-loom-import-history.sh
 
   fuzz-build:
     if: ${{ needs.plan.outputs.fuzz == 'true' || needs.plan.outputs.full == 'true' }}
@@ -318,10 +310,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - run: rustup toolchain install nightly-2026-07-26 --profile minimal
       - run: rustup run nightly-2026-07-26 cargo install cargo-fuzz --version 0.13.2 --locked
-      - working-directory: crates/services/attachment
-        run: |
-          rustup run nightly-2026-07-26 cargo fuzz build inspect
-          rustup run nightly-2026-07-26 cargo fuzz build pipeline
+      - run: |
+          rustup run nightly-2026-07-26 cargo fuzz build --fuzz-dir crates/services/attachment/fuzz inspect
+          rustup run nightly-2026-07-26 cargo fuzz build --fuzz-dir crates/services/attachment/fuzz pipeline
 
   ci-required:
     name: ci-required
@@ -340,7 +331,6 @@ jobs:
       - frontend
       - platform-macos
       - dependency-graph
-      - import-history
       - fuzz-build
     runs-on: ubuntu-latest
     steps:

@@ -152,10 +152,10 @@ test("root Cargo metadata forces the complete present graph", () => {
   assert.ok(!result.jobs.includes("platform-windows"));
 });
 
-test("migration maps select import-history without behavioral compilation", () => {
+test("migration maps retain policy verification without history replay", () => {
   const { result } = fixture("migration/example.commit-map");
   assert.equal(result.risk, "import");
-  assert.deepEqual(result.jobs, ["policy", "import-history"]);
+  assert.deepEqual(result.jobs, ["policy"]);
 });
 
 test("unknown additions and deletions fail closed to full", () => {

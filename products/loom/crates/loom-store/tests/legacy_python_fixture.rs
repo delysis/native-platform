@@ -14,8 +14,8 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use loom_research_types::NonEmptyByteRange;
 use loom_types::BlobId;
+use loom_types::ByteRange;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -258,21 +258,17 @@ fn translate_historical_assembly(
         let end = python_char_to_byte(&raw, span.raw_char_end).ok_or_else(|| {
             TranslationError::Invalid(format!("span end is out of bounds: {}", span.span_id))
         })?;
-        let range = NonEmptyByteRange::new(start as u64, end as u64).map_err(|error| {
-            if start == end {
-                TranslationError::EmptySpan {
-                    span_id: span.span_id.clone(),
-                }
-            } else {
-                TranslationError::Invalid(format!(
-                    "legacy span range is invalid for {}: {error}",
-                    span.span_id
-                ))
-            }
+        let range = ByteRange::new(start as u64, end as u64).ok_or_else(|| {
+            TranslationError::Invalid(format!("invalid span range for {}", span.span_id))
         })?;
-        let text = range.checked_str(raw.as_bytes()).map_err(|error| {
+        if range.is_empty() {
+            return Err(TranslationError::EmptySpan {
+                span_id: span.span_id.clone(),
+            });
+        }
+        let text = raw.get(start..end).ok_or_else(|| {
             TranslationError::Invalid(format!(
-                "legacy span is not a UTF-8 byte slice for {}: {error}",
+                "legacy span is not a UTF-8 byte slice for {}",
                 span.span_id
             ))
         })?;

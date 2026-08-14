@@ -1,7 +1,6 @@
-// The full lifecycle surface is exercised by the optional immutable contract
-// harness. Product builds use the same implementation through AppRuntime, but
-// do not call every hierarchy and observation method directly.
-#![cfg_attr(not(all(test, feature = "unstable-w1-contracts")), allow(dead_code))]
+// Product builds use this implementation through AppRuntime. Some hierarchy
+// and observation methods are intentionally retained for focused unit tests.
+#![allow(dead_code)]
 
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -48,13 +47,6 @@ pub struct AttemptIdentity {
 pub struct TerminalRecord {
     pub class: TerminalClass,
     pub sequence: u64,
-}
-
-#[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct W1TerminalFact {
-    pub identity: AttemptIdentity,
-    pub terminal: TerminalRecord,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,8 +126,6 @@ struct SupervisorState {
     exited_worker_ids: Vec<String>,
     joined_worker_ids: Vec<String>,
     shutdown: Option<SupervisorShutdownOutcome>,
-    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-    w1_terminal_facts: Vec<W1TerminalFact>,
 }
 
 #[derive(Debug)]
@@ -219,8 +209,6 @@ impl OperationSupervisor {
                 exited_worker_ids: Vec::new(),
                 joined_worker_ids: Vec::new(),
                 shutdown: None,
-                #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-                w1_terminal_facts: Vec::new(),
             }),
             changed: Condvar::new(),
         }))
@@ -417,7 +405,7 @@ impl OperationSupervisor {
 
     pub fn release(&self, lease: &OperationLease) -> Result<(), SupervisorError> {
         self.require_current(lease)?;
-        let _terminal = {
+        {
             let mut data = lease
                 .attempt
                 .data
@@ -426,10 +414,9 @@ impl OperationSupervisor {
             if data.phase != OperationPhase::Terminal {
                 return Err(SupervisorError::InvalidTransition);
             }
-            let terminal = data.terminal.ok_or(SupervisorError::InvalidTransition)?;
+            data.terminal.ok_or(SupervisorError::InvalidTransition)?;
             data.phase = OperationPhase::Released;
-            terminal
-        };
+        }
         let mut state = self.lock_state();
         let sequence = lease.attempt.identity.sequence;
         let current = state
@@ -439,11 +426,6 @@ impl OperationSupervisor {
         if !current {
             return Err(SupervisorError::StaleLease);
         }
-        #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-        state.w1_terminal_facts.push(W1TerminalFact {
-            identity: lease.attempt.identity.clone(),
-            terminal: _terminal,
-        });
         state.attempts.remove(&sequence);
         let operation_id = &lease.attempt.identity.operation_id;
         let remove_operation = {
@@ -580,11 +562,6 @@ impl OperationSupervisor {
 
     pub fn active_count(&self) -> usize {
         self.lock_state().attempts.len()
-    }
-
-    #[cfg(all(test, feature = "unstable-w1-vertical-fixtures"))]
-    pub fn w1_terminal_facts(&self) -> Vec<W1TerminalFact> {
-        self.lock_state().w1_terminal_facts.clone()
     }
 
     pub fn retained_task_count(&self) -> usize {

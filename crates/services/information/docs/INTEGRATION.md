@@ -8,7 +8,6 @@ The native kit does not depend on Loom, a model runtime, or a Tauri app.
 ```toml
 [dependencies]
 information-native-host = { path = "../information-native-kit/crates/information-native-host" }
-tauri-plugin-information-native = { path = "../information-native-kit/crates/tauri-plugin-information-native" }
 ```
 
 ## Retrieval-to-model boundary

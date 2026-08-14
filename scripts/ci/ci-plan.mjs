@@ -50,12 +50,10 @@ const flags = {
   speech: false,
   mom: false,
   loom: false,
-  contracts: false,
   frontend_fte: false,
   frontend_mom: false,
   frontend_loom: false,
   dependency_graph: false,
-  migration_history: false,
   fuzz: false,
   platform_linux: false,
   platform_macos: false,
@@ -94,7 +92,6 @@ function forceFull(nextRisk = "dependency") {
   flags.frontend_mom = presence.mom;
   flags.frontend_loom = presence.loom;
   flags.dependency_graph = true;
-  flags.migration_history = true;
   flags.fuzz = true;
   markPlatform();
   risk = nextRisk;
@@ -122,7 +119,6 @@ for (const changedPath of changed) {
 
   if (under(changedPath, "migration") || changedPath.endsWith(".commit-map")) {
     recognized = true;
-    flags.migration_history = true;
     if (risk === "docs") risk = "import";
   }
 
@@ -219,21 +215,6 @@ for (const changedPath of changed) {
     markPlatform();
   }
 
-  if (under(changedPath, "crates/platform/contracts")) {
-    recognized = true;
-    flags.contracts = true;
-    flags.root = true;
-    flags.native = true;
-    flags.gateway = true;
-    flags.attachment = true;
-    flags.information = true;
-    flags.speech = true;
-    flags.mom = presence.mom;
-    flags.loom = presence.loom;
-    markBehavior();
-    markPlatform();
-  }
-
   if (under(changedPath, "products/mom")) {
     recognized = true;
     flags.mom = true;
@@ -291,7 +272,6 @@ if (flags.frontend_fte || flags.frontend_mom || flags.frontend_loom || flags.ful
 }
 if (flags.platform_macos || flags.full) jobs.push("platform-macos");
 if (flags.dependency_graph || flags.full) jobs.push("dependency-graph");
-if (flags.migration_history || flags.full) jobs.push("import-history");
 if (flags.fuzz || flags.full) jobs.push("fuzz-build");
 
 const plan = {

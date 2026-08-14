@@ -1917,7 +1917,3 @@ mod tests {
         std::fs::write(path, b"GGUF").expect("write minimal GGUF fixture");
     }
 }
-
-#[cfg(all(test, feature = "unstable-w1-vertical-tests"))]
-#[path = "w1_quit_relaunch_tests.rs"]
-mod w1_quit_relaunch_tests;

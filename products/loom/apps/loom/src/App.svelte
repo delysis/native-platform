@@ -15,14 +15,12 @@
     chooseModel,
     closeProject as closeProjectSession,
     currentProjectSession,
-    confirmResearchPromotion,
     getBranch,
     getBranchBody,
     getBranchPage,
     getBuildModelPolicy,
     getModelDownloadStatus,
     getWeaveStatus,
-    importResearchPromotion,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
     listenForGenerationEvents,
@@ -30,7 +28,6 @@
     loadPolicyModelCandidate,
     listModels,
     listModelDownloads,
-    listPendingResearchPromotions,
     openDefaultProject,
     openDocument,
     previewDocumentReconciliation,
@@ -152,7 +149,6 @@
     LoomFailure,
     OpenDocument,
     ProjectSnapshot,
-    ResearchPromotionPrompt,
     ReconciliationPreview,
     SaveState,
     TransientDraftSnapshot,
@@ -189,10 +185,6 @@
   let modelManagerReturnFocus: HTMLElement | null = null;
   let strandReviewDialog: HTMLDialogElement | undefined;
   let strandReviewOpen = false;
-  let pendingResearchPromotions: ResearchPromotionPrompt[] = [];
-  let activeResearchPromotion: ResearchPromotionPrompt | null = null;
-  let researchPromotionImportInFlight = false;
-  let researchPromotionInFlight = false;
   let reviewCandidateId: string | null = null;
   let projectMenu: HTMLDetailsElement | undefined;
   let projectMenuTrigger: HTMLElement | undefined;
@@ -866,9 +858,6 @@
     compositionActive = false;
     sourceComposing = false;
     branches = [];
-    pendingResearchPromotions = [];
-    activeResearchPromotion = null;
-    researchPromotionInFlight = false;
     promotionArmedCandidateId = null;
     resetLiveGenerationView();
     editVersion = 0;
@@ -2864,126 +2853,6 @@
       if (!(await reattachNativeProject())) recordFailure(error);
     } finally {
       opening = false;
-    }
-  }
-
-  async function refreshPendingResearchPromotions(): Promise<void> {
-    if (!project || !desktop) {
-      pendingResearchPromotions = [];
-      return;
-    }
-    const captured = {
-      projectId: project.project_id,
-      sessionId: project.session_id
-    };
-    try {
-      const prompts = await listPendingResearchPromotions(
-        captured.projectId,
-        captured.sessionId
-      );
-      if (
-        project?.project_id === captured.projectId &&
-        project.session_id === captured.sessionId
-      ) {
-        pendingResearchPromotions = prompts;
-        if (
-          activeResearchPromotion &&
-          !prompts.some((prompt) => prompt.command_id === activeResearchPromotion?.command_id)
-        ) {
-          activeResearchPromotion = null;
-        }
-      }
-    } catch (error) {
-      if (
-        project?.project_id === captured.projectId &&
-        project.session_id === captured.sessionId
-      ) recordFailure(error);
-    }
-  }
-
-  async function importReviewedResearchPromotion(): Promise<void> {
-    if (!project || !document || !desktop || researchPromotionImportInFlight) return;
-    if (compositionActive) {
-      announce('Finish composing text before importing reviewed research');
-      return;
-    }
-    if (!flushEditors() || !(await flushCurrentDocument())) return;
-    const captured = {
-      projectId: project.project_id,
-      sessionId: project.session_id,
-      documentId: document.summary.document_id
-    };
-    researchPromotionImportInFlight = true;
-    clearFailure();
-    try {
-      const prompt = await importResearchPromotion(captured.projectId, captured.sessionId);
-      if (!prompt) return;
-      if (
-        project?.project_id !== captured.projectId ||
-        project.session_id !== captured.sessionId ||
-        !project.documents.some((candidate) => candidate.document_id === prompt.document_id) ||
-        prompt.expires_at_unix_ms <= Date.now()
-      ) {
-        throw new Error('The desktop staged research for a stale project, document, or deadline.');
-      }
-      pendingResearchPromotions = [
-        prompt,
-        ...pendingResearchPromotions.filter(
-          (candidate) => candidate.command_id !== prompt.command_id
-        )
-      ];
-      activeResearchPromotion = prompt;
-      announce('Reviewed research is ready for an explicit foreground decision');
-    } catch (error) {
-      recordFailure(error);
-    } finally {
-      researchPromotionImportInFlight = false;
-    }
-  }
-
-  async function confirmActiveResearchPromotion(): Promise<void> {
-    if (!project || !activeResearchPromotion || researchPromotionInFlight) return;
-    const capturedProject = project;
-    const capturedPrompt = activeResearchPromotion;
-    researchPromotionInFlight = true;
-    clearFailure();
-    try {
-      const result = await confirmResearchPromotion(
-        capturedProject.project_id,
-        capturedProject.session_id,
-        capturedPrompt
-      );
-      if (
-        result.receipt.command_id !== capturedPrompt.command_id ||
-        result.receipt.project_id !== capturedProject.project_id ||
-        !result.receipt.result_revision_id ||
-        !result.receipt.result_blob_id ||
-        documentProjectionDecision(result.receipt.visible_projection) !== 'applied'
-      ) {
-        throw new Error('The research promotion receipt did not prove an applied manuscript revision.');
-      }
-      activeResearchPromotion = null;
-      pendingResearchPromotions = pendingResearchPromotions.filter(
-        (prompt) => prompt.command_id !== capturedPrompt.command_id
-      );
-      const refreshed = await currentProjectSession();
-      if (
-        project?.project_id === capturedProject.project_id &&
-        project.session_id === capturedProject.session_id
-      ) {
-        project = refreshed;
-        const summary = refreshed.documents.find(
-          (candidate) => candidate.document_id === capturedPrompt.document_id
-        );
-        if (summary) await selectDocument(summary, true);
-        announce('Research selection promoted');
-      }
-    } catch (error) {
-      recordFailure(error);
-      activeResearchPromotion = null;
-      await refreshPendingResearchPromotions();
-    } finally {
-      researchPromotionInFlight = false;
     }
   }
 
@@ -5234,7 +5103,7 @@
         </div>
       {/if}
       <details class="project-menu" bind:this={projectMenu}>
-        <summary class="more-button" bind:this={projectMenuTrigger} title="Writing options" on:click={() => void refreshPendingResearchPromotions()}>
+        <summary class="more-button" bind:this={projectMenuTrigger} title="Writing options">
           <span aria-hidden="true">•••</span>
           <span class="sr-only">Writing options for {project.title}</span>
         </summary>
@@ -5270,32 +5139,6 @@
             >
               <span>Review suggestions</span>
               <span class="menu-state">{reviewableBranches.length}</span>
-            </button>
-          {/if}
-          {#if document}
-            <button
-              type="button"
-              disabled={editorReadonly || researchPromotionImportInFlight}
-              on:click={() => {
-                closeProjectMenu();
-                void importReviewedResearchPromotion();
-              }}
-            >
-              <span>Import reviewed research…</span>
-              {#if researchPromotionImportInFlight}<span class="menu-state">Choosing…</span>{/if}
-            </button>
-          {/if}
-          {#if pendingResearchPromotions.length > 0}
-            <button
-              type="button"
-              aria-haspopup="dialog"
-              on:click={() => {
-                activeResearchPromotion = pendingResearchPromotions[0] ?? null;
-                closeProjectMenu();
-              }}
-            >
-              <span>Review research selection</span>
-              <span class="menu-state">{pendingResearchPromotions.length}</span>
             </button>
           {/if}
           <div class="project-menu-separator"></div>
@@ -5652,41 +5495,6 @@
         </div>
       </section>
     </main>
-  {/if}
-
-  {#if activeResearchPromotion}
-    <div
-      class="model-manager-backdrop"
-      role="presentation"
-      on:click={(event) => {
-        if (event.target === event.currentTarget && !researchPromotionInFlight) {
-          activeResearchPromotion = null;
-        }
-      }}
-    >
-      <div class="model-manager" role="dialog" aria-modal="true" aria-labelledby="research-promotion-title">
-        <header class="model-manager-header">
-          <h2 id="research-promotion-title">Research selection</h2>
-          <button class="icon-button" type="button" disabled={researchPromotionInFlight} on:click={() => (activeResearchPromotion = null)} aria-label="Close research selection">×</button>
-        </header>
-        <div class="model-manager-body">
-          <section class="model-setup-callout">
-            <div class="model-setup-intro">
-              <strong>Promote the reviewed research result?</strong>
-              <p>This is a separate, one-use foreground decision. It will replace the bound manuscript revision with the admitted {activeResearchPromotion.subject_kind === 'candidate_projection' ? 'candidate projection' : 'mixed-authorship result'}.</p>
-            </div>
-            <pre class="exact-resolution">{activeResearchPromotion.result_text}</pre>
-            <p class="muted">The decision expires shortly and cannot be replayed after focus changes, project close, or restart.</p>
-            <div class="model-setup-actions">
-              <button class="primary-button" type="button" disabled={researchPromotionInFlight} on:click={() => void confirmActiveResearchPromotion()}>
-                {researchPromotionInFlight ? 'Verifying foreground command…' : 'Promote reviewed result'}
-              </button>
-              <button class="secondary-button" type="button" disabled={researchPromotionInFlight} on:click={() => (activeResearchPromotion = null)}>Not now</button>
-            </div>
-          </section>
-        </div>
-      </div>
-    </div>
   {/if}
 
   {#if modelManagerOpen}

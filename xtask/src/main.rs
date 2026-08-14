@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod lean;
+
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -149,10 +151,12 @@ struct PackageGroups {
 }
 
 fn main() -> Result<()> {
-    let command = env::args().nth(1).unwrap_or_else(|| "policy".to_owned());
+    let mut arguments = env::args().skip(1);
+    let command = arguments.next().unwrap_or_else(|| "policy".to_owned());
     match command.as_str() {
         "policy" => check_policy(&workspace_root()),
-        _ => bail!("usage: cargo xtask policy"),
+        "lean" => lean::run(&workspace_root(), arguments.collect()),
+        _ => bail!("usage: cargo xtask <policy|lean>"),
     }
 }
 
@@ -165,6 +169,7 @@ fn workspace_root() -> PathBuf {
 
 fn check_policy(root: &Path) -> Result<()> {
     check_workspace(root)?;
+    lean::run(root, vec!["verify".to_owned()])?;
     check_ledger(root)?;
     check_loom_reconciliation(root)?;
     check_evidence_files(root)?;
@@ -291,7 +296,6 @@ fn check_workspace(root: &Path) -> Result<()> {
             .map(String::as_str)
             .collect::<BTreeSet<_>>()
             == BTreeSet::from([
-                "core",
                 "native",
                 "gateway",
                 "service-attachment",
@@ -300,9 +304,7 @@ fn check_workspace(root: &Path) -> Result<()> {
                 "product-fte",
                 "product-mom",
                 "product-loom",
-                "research-loom",
                 "diagnostic",
-                "testkit",
             ])
     );
     ensure!(

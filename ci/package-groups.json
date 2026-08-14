@@ -1,11 +1,7 @@
 {
   "schema_version": 1,
   "primary": {
-    "core": [
-      "platform-contracts-v0"
-    ],
     "native": [
-      "command-evidence",
       "llama-native-cache",
       "llama-native-engine",
       "llama-native-host",
@@ -39,16 +35,14 @@
       "information-native-host",
       "information-native-retrieval",
       "information-native-store",
-      "information-native-types",
-      "tauri-plugin-information-native"
+      "information-native-types"
     ],
     "service-speech": [
       "speech-native-backend-parakeet",
       "speech-native-host",
       "speech-native-platform",
       "speech-native-router",
-      "speech-native-types",
-      "tauri-plugin-speech-native"
+      "speech-native-types"
     ],
     "product-fte": [
       "free-token-energy",
@@ -65,30 +59,12 @@
       "loom-cli",
       "loom-document",
       "loom-host",
-      "loom-inference",
       "loom-store",
       "loom-types",
       "tauri-plugin-loom"
     ],
-    "research-loom": [
-      "loom-benchmark",
-      "loom-campaign",
-      "loom-context",
-      "loom-eval",
-      "loom-eval-codex",
-      "loom-learning",
-      "loom-research-types",
-      "loom-search",
-      "loom-trial"
-    ],
     "diagnostic": [
-      "integration-vertical",
       "xtask"
-    ],
-    "testkit": [
-      "platform-contract-testkit",
-      "platform-vertical-fixtures-v0",
-      "speech-apple-tauri-w1"
     ]
   },
   "secondary": {
@@ -98,7 +74,6 @@
       "attachment-native-inspect",
       "attachment-native-plan",
       "attachment-native-types",
-      "command-evidence",
       "fte-loopback",
       "fte-protocols",
       "fte-providers",
@@ -117,24 +92,11 @@
       "information-native-types",
       "llama-native-cache",
       "llama-native-types",
-      "loom-benchmark",
-      "loom-campaign",
-      "loom-context",
       "loom-document",
-      "loom-eval",
-      "loom-eval-codex",
       "loom-host",
-      "loom-inference",
-      "loom-learning",
-      "loom-research-types",
-      "loom-search",
       "loom-store",
-      "loom-trial",
       "loom-types",
       "mom-llama-runtime",
-      "platform-contract-testkit",
-      "platform-contracts-v0",
-      "platform-vertical-fixtures-v0",
       "speech-native-host",
       "speech-native-router",
       "speech-native-types"
@@ -154,7 +116,6 @@
       "loom-app",
       "loom-backend-llama",
       "mom-llama-app",
-      "speech-apple-tauri-w1",
       "speech-native-backend-parakeet",
       "speech-native-platform"
     ],
@@ -181,7 +142,6 @@
       "loom-backend-llama",
       "mom-llama-app",
       "mom-llama-runtime",
-      "speech-apple-tauri-w1",
       "speech-native-backend-parakeet",
       "speech-native-platform"
     ],

@@ -26,7 +26,6 @@ const knownJobs = [
   "frontend",
   "platform-macos",
   "dependency-graph",
-  "import-history",
   "fuzz-build",
 ];
 
@@ -63,7 +62,6 @@ if (plan.flags?.full === true) {
     "frontend",
     "platform-macos",
     "dependency-graph",
-    "import-history",
     "fuzz-build",
   ];
   if (plan.presence?.mom === true) fullJobs.push("mom-linux");

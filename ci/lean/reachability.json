@@ -1,0 +1,218 @@
+{
+  "schema_version": 1,
+  "source_revision": "058c4622fac8813417a5e6637091e63e1ef01ea2",
+  "source_tree": "fb0362faf422090ec8d8f936d5b31b95da0b01ac",
+  "basis": {
+    "package_graph": "cargo metadata --no-deps --locked --format-version 1",
+    "default_product_graph": "cargo tree --locked --edges normal",
+    "package_groups": "ci/package-groups.json",
+    "accepted_boundary": "W9 section 4.2"
+  },
+  "journeys": [
+    {
+      "id": "fte-gateway-loopback",
+      "entry_packages": [
+        "free-token-energy",
+        "tauri-plugin-free-token-energy"
+      ],
+      "package_roots": [
+        "fte-backend-llama",
+        "fte-loopback",
+        "fte-protocols",
+        "fte-providers",
+        "fte-router",
+        "fte-store",
+        "fte-types",
+        "llama-native-cache",
+        "llama-native-engine",
+        "llama-native-host",
+        "llama-native-types"
+      ],
+      "module_roots": [
+        "products/fte/src-tauri/src/",
+        "products/fte/crates/fte-backend-llama/src/",
+        "products/fte/crates/fte-loopback/src/",
+        "products/fte/crates/fte-protocols/src/",
+        "products/fte/crates/fte-providers/src/",
+        "products/fte/crates/fte-router/src/",
+        "products/fte/crates/fte-store/src/",
+        "products/fte/crates/fte-types/src/",
+        "products/fte/crates/tauri-plugin-free-token-energy/src/"
+      ]
+    },
+    {
+      "id": "mom-local-chat-persona-attachment-quit",
+      "entry_packages": [
+        "mom-llama-app",
+        "mom-llama-runtime"
+      ],
+      "package_roots": [
+        "attachment-native-document",
+        "attachment-native-host",
+        "attachment-native-inspect",
+        "attachment-native-plan",
+        "attachment-native-types",
+        "fte-backend-llama",
+        "fte-loopback",
+        "fte-protocols",
+        "fte-router",
+        "fte-store",
+        "fte-types",
+        "llama-native-cache",
+        "llama-native-engine",
+        "llama-native-host",
+        "llama-native-types",
+        "tauri-plugin-free-token-energy"
+      ],
+      "module_roots": [
+        "products/mom/apps/mom-llama/src-tauri/src/",
+        "products/mom/crates/mom-llama-runtime/src/",
+        "crates/services/attachment/crates/attachment-native-document/src/",
+        "crates/services/attachment/crates/attachment-native-host/src/",
+        "crates/services/attachment/crates/attachment-native-inspect/src/",
+        "crates/services/attachment/crates/attachment-native-plan/src/",
+        "crates/services/attachment/crates/attachment-native-types/src/"
+      ]
+    },
+    {
+      "id": "loom-quiet-writing-suggestion-promotion-quit",
+      "entry_packages": [
+        "loom-app",
+        "tauri-plugin-loom"
+      ],
+      "package_roots": [
+        "llama-native-cache",
+        "llama-native-engine",
+        "llama-native-host",
+        "llama-native-types",
+        "loom-backend-llama",
+        "loom-document",
+        "loom-host",
+        "loom-store",
+        "loom-types"
+      ],
+      "current_default_transitive_research_packages": [],
+      "module_roots": [
+        "products/loom/apps/loom/src/",
+        "products/loom/apps/loom/src-tauri/src/",
+        "products/loom/crates/loom-backend-llama/src/",
+        "products/loom/crates/loom-document/src/",
+        "products/loom/crates/loom-host/src/",
+        "products/loom/crates/loom-store/src/",
+        "products/loom/crates/loom-types/src/",
+        "products/loom/crates/tauri-plugin-loom/src/"
+      ]
+    },
+    {
+      "id": "information-install-query-core",
+      "entry_packages": [
+        "information-native-cli",
+        "information-native-host"
+      ],
+      "package_roots": [
+        "information-native-acquire",
+        "information-native-backend-community",
+        "information-native-backend-encyclopedia",
+        "information-native-backend-scripture",
+        "information-native-backend-sqlite",
+        "information-native-catalog",
+        "information-native-retrieval",
+        "information-native-store",
+        "information-native-types"
+      ],
+      "optional_edge_packages": [
+        "tauri-plugin-information-native"
+      ],
+      "module_roots": [
+        "crates/services/information/crates/information-native-acquire/src/",
+        "crates/services/information/crates/information-native-backend-community/src/",
+        "crates/services/information/crates/information-native-backend-encyclopedia/src/",
+        "crates/services/information/crates/information-native-backend-scripture/src/",
+        "crates/services/information/crates/information-native-backend-sqlite/src/",
+        "crates/services/information/crates/information-native-catalog/src/",
+        "crates/services/information/crates/information-native-cli/src/",
+        "crates/services/information/crates/information-native-host/src/",
+        "crates/services/information/crates/information-native-retrieval/src/",
+        "crates/services/information/crates/information-native-store/src/",
+        "crates/services/information/crates/information-native-types/src/"
+      ]
+    },
+    {
+      "id": "speech-core-selected-backends",
+      "entry_packages": [
+        "speech-native-backend-parakeet",
+        "speech-native-platform"
+      ],
+      "package_roots": [
+        "speech-native-host",
+        "speech-native-router",
+        "speech-native-types"
+      ],
+      "optional_edge_packages": [],
+      "test_only_packages": [],
+      "module_roots": [
+        "crates/services/speech/crates/speech-native-backend-parakeet/src/",
+        "crates/services/speech/crates/speech-native-host/src/",
+        "crates/services/speech/crates/speech-native-platform/src/",
+        "crates/services/speech/crates/speech-native-router/src/",
+        "crates/services/speech/crates/speech-native-types/src/"
+      ]
+    }
+  ],
+  "shipping_profiles": [
+    {
+      "id": "current-release-group",
+      "status": "observed",
+      "source": "ci/package-groups.json secondary.release",
+      "packages": [
+        "free-token-energy",
+        "loom-app",
+        "mom-llama-app"
+      ]
+    },
+    {
+      "id": "loom-current-default",
+      "status": "observed",
+      "source": "cargo tree -p loom-app --locked --edges normal",
+      "entry_package": "loom-app",
+      "research_packages_reachable": []
+    },
+    {
+      "id": "loom-writing",
+      "status": "default",
+      "source": "W9 section 10",
+      "intended_default": true
+    },
+    {
+      "id": "loom-research",
+      "status": "retired_no_owner",
+      "source": "W9 section 10",
+      "intended_default": false
+    },
+    {
+      "id": "loom-diagnostic",
+      "status": "explicit_test_and_real_gate_only",
+      "source": "W9 section 10",
+      "intended_default": false
+    },
+    {
+      "id": "full-platform-first-release",
+      "status": "not_selected",
+      "source": "W9 section 23"
+    },
+    {
+      "id": "lean-first-release",
+      "status": "selected",
+      "source": "W9 section 23"
+    }
+  ],
+  "research_ownership": {
+    "policy": "A nonshipping research package requires an actual experiment, a current owner, current data or receipt, a next milestone, unique capability, and an acceptable maintenance burden before it is retained.",
+    "repository_facts": [
+      "The W8 research packages declared no owner and had no completed qualification program.",
+      "The default Loom desktop had no caller for strict research-inference admission; only the retired packet-import surface reached it.",
+      "The protected W8 HOME tag preserves the complete implementation and evidence."
+    ],
+    "packages": []
+  }
+}

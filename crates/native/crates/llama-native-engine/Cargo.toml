@@ -8,14 +8,6 @@ repository.workspace = true
 publish.workspace = true
 description = "Owner-thread in-process llama.cpp engine with typed streaming and cancellation"
 
-[features]
-default = []
-unstable-w1-contract-tests = ["dep:platform-contract-testkit"]
-unstable-w1-vertical-tests = [
-    "dep:platform-contracts-v0-vertical",
-    "dep:platform-vertical-fixtures-v0",
-]
-
 [dependencies]
 llama-native-types = { path = "../llama-native-types" }
 crossbeam-channel.workspace = true
@@ -24,9 +16,6 @@ fs4 = "1.1.0"
 llama-cpp-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391", default-features = false, features = ["common", "sampler", "mtmd"] }
 llama-cpp-sys-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391", default-features = false }
 sha2.workspace = true
-platform-contract-testkit = { path = "../../../platform/contracts/crates/platform-contract-testkit", optional = true }
-platform-contracts-v0-vertical = { package = "platform-contracts-v0", path = "../../../platform/contracts/crates/platform-contracts-v0", optional = true }
-platform-vertical-fixtures-v0 = { path = "../../../platform/contracts/crates/platform-vertical-fixtures-v0", optional = true }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 llama-cpp-2 = { version = "=0.1.154", git = "https://github.com/delysis/llama-cpp-rs.git", rev = "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391", default-features = false, features = ["common", "sampler", "mtmd", "metal"] }

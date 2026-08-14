@@ -1,13 +1,10 @@
 use std::path::PathBuf;
 
-use loom_research_types::{CampaignId, TrialRunId};
 use loom_types::{
     ArtifactId, BlobId, BranchId, CandidateId, CommandId, DocumentKind, GenerationRunId,
     ModelEnvironmentId, RevisionId,
 };
 use thiserror::Error;
-
-use crate::research_session::ResearchSessionKind;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -19,59 +16,6 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("document projection failed: {0}")]
     Document(#[from] loom_document::DocumentError),
-    #[error("research call evidence failed validation: {0}")]
-    ResearchCall(#[from] loom_research_types::CallError),
-    #[error("research assembly evidence failed validation: {0}")]
-    ResearchAssembly(#[from] loom_research_types::AssemblyError),
-    #[error("research admission failed: {0}")]
-    ResearchAdmission(String),
-    #[error("a canonical research execution record cannot be empty")]
-    EmptyResearchExecutionRecord,
-    #[error(
-        "canonical research execution record has {actual_bytes} bytes; limit is {max_bytes} bytes"
-    )]
-    ResearchExecutionRecordTooLarge {
-        actual_bytes: usize,
-        max_bytes: usize,
-    },
-    #[error("research execution record {fingerprint} already exists with another semantic kind")]
-    ResearchExecutionRecordConflict { fingerprint: BlobId },
-    #[error("frozen research subject belongs to another project")]
-    ResearchSubjectProjectMismatch,
-    #[error("frozen research subject {subject} conflicts with persisted evidence")]
-    ResearchExecutionSubjectConflict { subject: BlobId },
-    #[error("campaign {0} must be persisted before its trials")]
-    ResearchCampaignNotPersisted(CampaignId),
-    #[error("invalid frozen research subject: {0}")]
-    InvalidFrozenResearchSubject(String),
-    #[error("invalid diagnostic research evidence: {0}")]
-    InvalidResearchDiagnostic(String),
-    #[error(
-        "cannot acquire a {kind:?} research session for unpersisted subject {subject_fingerprint}"
-    )]
-    ResearchSessionSubjectNotPersisted {
-        kind: ResearchSessionKind,
-        subject_fingerprint: BlobId,
-    },
-    #[error("a {kind:?} research session for {subject_fingerprint} is already active")]
-    ResearchSessionAlreadyActive {
-        kind: ResearchSessionKind,
-        subject_fingerprint: BlobId,
-    },
-    #[error("trial run {0} is absent, not yet dispatched, or already terminal")]
-    TrialRunNotDispatched(TrialRunId),
-    #[error("research journal writer is not bound to this exact current store lease")]
-    ResearchJournalLeaseMismatch,
-    #[error("research journal mutation violates the bounded neutral store contract")]
-    InvalidResearchJournalMutation,
-    #[error("research journal exceeds its persisted event limit of {max_events}")]
-    ResearchJournalEventLimit { max_events: usize },
-    #[error("research journal record has {actual_bytes} bytes; limit is {max_bytes} bytes")]
-    ResearchJournalRecordTooLarge { actual_bytes: u64, max_bytes: usize },
-    #[error("research journal records exceed the aggregate limit of {max_bytes} bytes")]
-    ResearchJournalTotalTooLarge { max_bytes: u64 },
-    #[error("could not obtain entropy for a project-store session: {0}")]
-    SessionEntropy(String),
     #[error("project path is not valid UTF-8: {0:?}")]
     NonUtf8Path(PathBuf),
     #[error("unsafe project-relative path `{0}`")]

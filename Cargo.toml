@@ -1,13 +1,9 @@
 [workspace]
 members = [
-    "crates/native/crates/command-evidence",
     "crates/native/crates/llama-native-cache",
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
     "crates/native/crates/llama-native-types",
-    "crates/platform/contracts/crates/platform-contract-testkit",
-    "crates/platform/contracts/crates/platform-contracts-v0",
-    "crates/platform/contracts/crates/platform-vertical-fixtures-v0",
     "crates/services/attachment/crates/attachment-native-cli",
     "crates/services/attachment/crates/attachment-native-document",
     "crates/services/attachment/crates/attachment-native-host",
@@ -25,14 +21,11 @@ members = [
     "crates/services/information/crates/information-native-retrieval",
     "crates/services/information/crates/information-native-store",
     "crates/services/information/crates/information-native-types",
-    "crates/services/information/crates/tauri-plugin-information-native",
     "crates/services/speech/crates/speech-native-backend-parakeet",
     "crates/services/speech/crates/speech-native-host",
     "crates/services/speech/crates/speech-native-platform",
     "crates/services/speech/crates/speech-native-router",
     "crates/services/speech/crates/speech-native-types",
-    "crates/services/speech/crates/tauri-plugin-speech-native",
-    "crates/services/speech/tests/apple-tauri-w1",
     "products/fte/crates/fte-backend-llama",
     "products/fte/crates/fte-loopback",
     "products/fte/crates/fte-protocols",
@@ -44,26 +37,15 @@ members = [
     "products/fte/src-tauri",
     "products/loom/apps/loom/src-tauri",
     "products/loom/crates/loom-backend-llama",
-    "products/loom/crates/loom-benchmark",
-    "products/loom/crates/loom-campaign",
     "products/loom/crates/loom-cli",
-    "products/loom/crates/loom-context",
     "products/loom/crates/loom-document",
-    "products/loom/crates/loom-eval",
-    "products/loom/crates/loom-eval-codex",
     "products/loom/crates/loom-host",
-    "products/loom/crates/loom-inference",
-    "products/loom/crates/loom-learning",
-    "products/loom/crates/loom-research-types",
-    "products/loom/crates/loom-search",
     "products/loom/crates/loom-store",
-    "products/loom/crates/loom-trial",
     "products/loom/crates/loom-types",
     "products/loom/crates/tauri-plugin-loom",
     "products/mom/apps/mom-llama/src-tauri",
     "products/mom/crates/mom-llama-cli",
     "products/mom/crates/mom-llama-runtime",
-    "tests/vertical",
     "xtask",
 ]
 exclude = ["crates/services/attachment/fuzz"]
@@ -103,7 +85,6 @@ rand_chacha = "0.9.0"
 rand_core = "0.9.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 rusqlite = { version = "=0.39.0", features = ["bundled"] }
-safetensors = "0.8.0"
 same-file = "1.0.6"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -166,11 +147,6 @@ information-native-store = { path = "crates/services/information/crates/informat
 information-native-types = { path = "crates/services/information/crates/information-native-types" }
 speech-native-host = { path = "crates/services/speech/crates/speech-native-host" }
 mom-llama-runtime = { path = "products/mom/crates/mom-llama-runtime" }
-platform-contracts-v0 = { path = "crates/platform/contracts/crates/platform-contracts-v0" }
-platform-contracts-v0-vertical = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
-platform-contracts-fixture-v0 = { package = "platform-contracts-v0", path = "crates/platform/contracts/crates/platform-contracts-v0" }
-platform-contract-testkit = { path = "crates/platform/contracts/crates/platform-contract-testkit" }
-platform-vertical-fixtures-v0 = { path = "crates/platform/contracts/crates/platform-vertical-fixtures-v0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -184,8 +160,19 @@ todo = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
 
+[profile.dev]
+# This workspace links several large native runtimes. Full debuginfo plus
+# incremental object retention can grow a local target directory by tens of
+# gigabytes without improving ordinary source-level backtraces.
+debug = "line-tables-only"
+incremental = false
+
 [profile.dev.package.sha2]
 opt-level = 3
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
 
 [profile.test.package.sha2]
 opt-level = 3

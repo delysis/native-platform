@@ -32,10 +32,4 @@ if rg -n '(^|[^[:alnum:]_])unsafe([[:space:]]|\{|fn|trait|impl)' \
     exit 1
 fi
 
-if rg -n -F 'github.com/delysis/w1-platform-contracts' "$repo_dir" \
-    --glob 'Cargo.toml' --glob 'Cargo.lock' --glob '!target/**'; then
-    echo "external Wave 1 contract source remains in Information" >&2
-    exit 1
-fi
-
 echo "information-native authority boundaries passed"

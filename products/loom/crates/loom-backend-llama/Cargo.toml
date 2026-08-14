@@ -7,13 +7,6 @@ license.workspace = true
 repository.workspace = true
 description = "Direct in-process llama.cpp adapter for Loom"
 
-[features]
-default = []
-unstable-w1-vertical-tests = [
-    "dep:platform-contracts-v0-vertical",
-    "dep:platform-vertical-fixtures-v0",
-]
-
 [dependencies]
 crossbeam-channel = "0.5.15"
 fs4.workspace = true
@@ -22,8 +15,6 @@ llama-native-engine.workspace = true
 llama-native-host.workspace = true
 llama-native-types.workspace = true
 loom-types = { path = "../loom-types" }
-platform-contracts-v0-vertical = { workspace = true, optional = true }
-platform-vertical-fixtures-v0 = { workspace = true, optional = true }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 same-file.workspace = true
 serde.workspace = true

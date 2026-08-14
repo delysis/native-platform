@@ -1009,14 +1009,6 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "unstable-w1-vertical-tests")]
-    mod w1_source_tree {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../tests/support/w1_source_tree.rs"
-        ));
-    }
-
     use super::*;
     use async_trait::async_trait;
     use axum::http::HeaderValue;
@@ -1027,177 +1019,14 @@ mod tests {
         ModelCapabilities, ModelDescriptor, OutputItem, PromptForm, RouteObservations,
         TerminalStatus, TicketCancellation, UsageProvenance,
     };
-    #[cfg(feature = "unstable-w1-vertical-tests")]
-    use platform_vertical_fixtures_v0::{
-        EquivalenceProjectionV0, ObservationEnvelopeV0, VerticalFixtureManifestV0, sha256_identity,
-        validate_baseline, validate_manifest,
-    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{mpsc, oneshot};
 
-    #[cfg(feature = "unstable-w1-vertical-tests")]
-    const W1_CORPUS_BYTES: &[u8] =
-        include_bytes!("../../../tests/fixtures/w1/v0/fte-hosted-loopback.json");
-    #[cfg(feature = "unstable-w1-vertical-tests")]
-    const W1_MANIFEST_BYTES: &[u8] =
-        include_bytes!("../../../tests/fixtures/w1/v0/fte-hosted-loopback.manifest.json");
-    #[cfg(feature = "unstable-w1-vertical-tests")]
-    const W1_LOOPBACK_PROJECTION_BYTES: &[u8] =
-        include_bytes!("../../../tests/fixtures/w1/v0/fte-loopback-projection.json");
-
-    fn w1_hosted_loopback_fixture() -> Value {
+    fn hosted_loopback_fixture() -> Value {
         serde_json::from_str(include_str!(
-            "../../../tests/fixtures/w1/v0/fte-hosted-loopback.json"
+            "../../../tests/fixtures/compat/hosted-loopback.json"
         ))
-        .expect("parse W1 hosted/loopback fixture")
-    }
-
-    #[cfg(feature = "unstable-w1-vertical-tests")]
-    fn digest_json(bytes: &[u8]) -> Value {
-        serde_json::to_value(sha256_identity("fact", bytes).digest).expect("digest JSON")
-    }
-
-    #[cfg(feature = "unstable-w1-vertical-tests")]
-    struct LoopbackObservation<'a> {
-        unauthorized_status: u16,
-        rebound_status: u16,
-        concurrent_status: u16,
-        stream_body: &'a str,
-        chat: &'a Value,
-        completion: &'a Value,
-        stored_response_id: &'a str,
-        stored_response_reopened: bool,
-        continuation: &'a Value,
-    }
-
-    #[cfg(feature = "unstable-w1-vertical-tests")]
-    fn validate_w1_loopback_projection(fixture: &Value, actual: LoopbackObservation<'_>) {
-        let manifest: VerticalFixtureManifestV0 =
-            serde_json::from_slice(W1_MANIFEST_BYTES).expect("W1 vertical manifest");
-        validate_manifest(&manifest).expect("valid W1 vertical manifest");
-        let case = manifest
-            .cases
-            .iter()
-            .find(|case| case.case_id == "loopback.roundtrip")
-            .expect("loopback case");
-        let input = &case.inputs[0].identity;
-        assert_eq!(
-            sha256_identity(input.id.clone(), W1_CORPUS_BYTES),
-            *input,
-            "manifest must authenticate the complete loopback corpus"
-        );
-
-        assert_eq!(
-            sha256_identity(
-                case.source.production_tree.id.clone(),
-                w1_source_tree::BYTES
-            ),
-            case.source.production_tree,
-            "manifest must authenticate the complete production source descriptor"
-        );
-        w1_source_tree::verify();
-
-        let requests = serde_json::to_vec(&fixture["loopback"]["requests"])
-            .expect("loopback request corpus bytes");
-        let stored_identity = sha256_identity(
-            "response.store.after_restart",
-            actual.stored_response_id.as_bytes(),
-        );
-        let stored_identity_json =
-            serde_json::to_value(&stored_identity).expect("stored identity JSON");
-        let expected_events = fixture["loopback"]["expected"]["stream_events"]
-            .as_array()
-            .expect("stream events");
-        let stream_completed = expected_events.iter().all(|event| {
-            actual.stream_body.contains(&format!(
-                "event: {}",
-                event.as_str().expect("stream event name")
-            ))
-        });
-        let chat_roundtrip = actual.chat["object"] == "chat.completion"
-            && actual.chat["choices"][0]["message"]["content"] == "hello";
-        let raw_roundtrip = actual.completion["object"] == "text_completion"
-            && actual.completion["choices"][0]["text"] == "hello";
-        let continuation_after_restart = actual.continuation["previous_response_id"]
-            == actual.stored_response_id
-            && actual.continuation["id"]
-                == fixture["loopback"]["expected"]["continuation_response_id"];
-        let actual_projection: EquivalenceProjectionV0 = serde_json::from_value(json!({
-            "ordered_events": [{
-                "sequence": 0,
-                "operation_id": "fte.loopback.roundtrip",
-                "attempt_id": "loopback.attempt.1",
-                "correlation_id": "loopback.restart.w1",
-                "kind": "completed",
-                "payload": stored_identity_json,
-            }],
-            "durable_state": [{
-                "state_id": "response.store",
-                "schema_id": "fte.store.responses.v1",
-                "before": null,
-                "after": stored_identity_json,
-                "disposition": "created",
-            }],
-            "lifecycle": [{
-                "operation_id": "fte.loopback.roundtrip",
-                "attempt_id": "loopback.attempt.1",
-                "correlation_id": "loopback.restart.w1",
-                "terminal": "completed",
-                "released": true,
-            }],
-            "ownership": {
-                "active_operations": 0,
-                "retained_tasks": 0,
-                "expected_workers": 0,
-                "joined_workers": 0,
-            },
-            "output_facts": {
-                "request_corpus_digest": {"kind": "digest", "value": digest_json(&requests)},
-                "unauthorized_status": {"kind": "integer", "value": actual.unauthorized_status},
-                "rebound_status": {"kind": "integer", "value": actual.rebound_status},
-                "concurrent_status": {"kind": "integer", "value": actual.concurrent_status},
-                "chat_roundtrip": {"kind": "boolean", "value": chat_roundtrip},
-                "raw_completion_roundtrip": {"kind": "boolean", "value": raw_roundtrip},
-                "responses_stream_completed": {"kind": "boolean", "value": stream_completed},
-                "stored_response_reopened": {"kind": "boolean", "value": actual.stored_response_reopened},
-                "continuation_after_restart": {"kind": "boolean", "value": continuation_after_restart},
-                "loopback_only": {"kind": "boolean", "value": true},
-            },
-            "fail_closed_facts": [
-                "missing bearer token was rejected",
-                "dns rebinding host was rejected",
-                "concurrency limit rejected overlapping work",
-                "no hosted provider or credential path was entered",
-            ],
-        }))
-        .expect("actual loopback projection");
-        let observation: ObservationEnvelopeV0 = serde_json::from_value(json!({
-            "schema": "delysis.vertical_observation.v0",
-            "vertical_id": "fte_hosted_fixture_loopback",
-            "case_id": case.case_id,
-            "implementation_revision": case.source.commit,
-            "observed_prerequisites": [],
-            "evidence": {
-                "schema": "delysis.evidence_claim.v0",
-                "tier": "reproducible",
-                "threat_model": "authenticated loopback socket using production protocol, storage, restart, and security paths with a deterministic backend",
-                "exact_source": case.source.production_tree.digest,
-                "exact_runtime_or_artifact": input.digest,
-                "execution_kind": "fixture",
-                "omitted_claims": manifest.omitted_claims,
-                "negative_evidence": [],
-            },
-            "projection": actual_projection,
-        }))
-        .expect("loopback observation");
-        validate_baseline(
-            &manifest,
-            &case.case_id,
-            W1_LOOPBACK_PROJECTION_BYTES,
-            &[],
-            &observation,
-        )
-        .expect("loopback production behavior matches authenticated W1 projection");
+        .expect("parse hosted/loopback fixture")
     }
 
     struct NoopCancellation;
@@ -1562,7 +1391,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_loopback_socket_enforces_security_stream_state_and_storage() {
-        let fixture = w1_hosted_loopback_fixture();
+        let fixture = hosted_loopback_fixture();
         assert_eq!(fixture["execution"]["network"], "loopback_only");
         assert_eq!(fixture["execution"]["hosted_request_sent"], false);
         assert_eq!(fixture["execution"]["credential_required"], false);
@@ -1770,10 +1599,6 @@ mod tests {
             .await
             .expect("reopened stored response JSON");
         assert_eq!(reopened_stored, stored);
-        #[cfg(feature = "unstable-w1-vertical-tests")]
-        let stored_response_id = reopened_stored["id"]
-            .as_str()
-            .expect("reopened stored response ID");
         let continuation = client
             .post(format!("{restarted_base}/v1/responses"))
             .bearer_auth(&token)
@@ -1796,21 +1621,6 @@ mod tests {
         );
 
         restarted.shutdown().await;
-        #[cfg(feature = "unstable-w1-vertical-tests")]
-        validate_w1_loopback_projection(
-            &fixture,
-            LoopbackObservation {
-                unauthorized_status,
-                rebound_status,
-                concurrent_status,
-                stream_body: &body,
-                chat: &chat,
-                completion: &completion,
-                stored_response_id,
-                stored_response_reopened: reopened_stored == stored,
-                continuation: &continuation,
-            },
-        );
         let _ = fs::remove_dir_all(token_directory);
         let _ = fs::remove_file(&database_path);
         let _ = fs::remove_file(database_path.with_extension("sqlite3-shm"));
