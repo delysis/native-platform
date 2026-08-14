@@ -1621,7 +1621,7 @@ fn chat_view_with_draft(
                     }
                 }
             }
-            (composer(engine, settings, draft, &attachments))
+            (composer(engine, settings, active, draft, &attachments))
         }
     }
 }
@@ -1859,10 +1859,11 @@ fn persona_view() -> Markup {
 fn composer(
     engine: &CommandResult<impl Serialize>,
     settings: &CommandResult<Settings>,
+    active: Option<&Conversation>,
     draft: Option<&CommandResult<DraftMessage>>,
     attachments: &[AttachmentRecord],
 ) -> Markup {
-    let enabled = matches!(engine.status.as_str(), "host_integrated" | "configured");
+    let readiness = conversation_model_readiness(engine, active, settings);
     let draft = draft.and_then(|draft| draft.result.as_ref());
     let draft_message = draft
         .map(|draft| draft.message.as_str())
@@ -1952,20 +1953,9 @@ fn composer(
                     (button("attachment.import", Some("attachment-import"), "round-button", false))
                 }
                 div class="composer-right" {
-                    select name="model_picker" aria-label="Model"
-                        data-affordance="readiness.model_select"
-                        data-command="mom_llama.model_select"
-                        data-tauri-command="mom_llama_model_select"
-                        data-cli="mom-llama model select --model-path <path> --json"
-                        data-effect="mom_llama.effects.model_select.v1" {
-                        @if models_available_for_label(settings) {
-                            option value=(model_path(settings)) { (model_chip_label(settings)) }
-                        } @else {
-                            option value="" { "No model" }
-                        }
-                    }
-                    span class=(format!("runtime-dot {}", if enabled { "ready" } else { "blocked" }))
-                        title=(readiness_short_label(engine)) {}
+                    (conversation_model_chip(active, settings))
+                    span class=(format!("runtime-dot {}", readiness.class))
+                        title=(readiness.label) {}
                     (button(
                         "chat.composer.skip_reasoning",
                         Some("chat-skip-reasoning"),
@@ -1980,7 +1970,7 @@ fn composer(
                         data-tauri-command="mom_llama_chat_dispatch"
                         data-cli="mom-llama chat dispatch --conversation <id> --message <text> --json"
                         data-effect="mom_llama.effects.chat_send.v1"
-                        disabled[!enabled] {
+                        disabled[!readiness.enabled] {
                         "↑"
                     }
                 }
@@ -2056,7 +2046,12 @@ fn message_row(
     let expand_tool_content = upstream_settings_bool(settings, "alwaysShowToolCallContent");
     let show_agentic_stats = show_stats && upstream_settings_bool(settings, "showAgenticTurnStats");
     let show_raw_output_switch = upstream_settings_bool(settings, "showRawOutputSwitch");
-    let model = model_chip_label(settings);
+    let model = message
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+        .map(|model| model_chip_label(settings, model))
+        .unwrap_or_else(|| "Unknown model".to_string());
     html! {
         article id=(format!("message-{}", message.id))
             class=(format!("message-row {role}"))
@@ -2613,7 +2608,8 @@ fn settings_panel(
                 (current_chat_instructions(active))
                 section class="settings-card native-runtime" {
                     h3 { "Native runtime" }
-                    (settings_path_input("Model path", "model_path", settings_value(settings, "model_path"), "model-browse"))
+                    (settings_path_input("Default model for new chats", "model_path", settings_value(settings, "model_path"), "model-browse"))
+                    p class="field-help" { "New chats capture this default. Existing chats use their saved conversation model when available." }
                     @if let Some(cache) = mom_llama_runtime::hugging_face_hub_cache_dir() {
                         p class="field-help model-cache-hint" {
                             "Model discovery and the file picker use the shared Hugging Face cache at "
@@ -3659,17 +3655,92 @@ fn readiness_short_label(engine: &CommandResult<impl Serialize>) -> String {
     }
 }
 
-fn model_label(settings: &CommandResult<Settings>) -> String {
-    settings
-        .result
-        .as_ref()
-        .and_then(|settings| settings.model_path.as_ref())
-        .map(|path| file_name(path))
-        .unwrap_or_else(|| "No model".to_string())
+fn effective_conversation_model_path<'a>(
+    active: Option<&'a Conversation>,
+    settings: &'a CommandResult<Settings>,
+) -> Option<&'a Path> {
+    active
+        .and_then(|conversation| {
+            conversation
+                .execution_profile
+                .model_path
+                .as_deref()
+                .or(conversation.selected_model_path.as_deref())
+        })
+        .or_else(|| {
+            settings
+                .result
+                .as_ref()
+                .and_then(|settings| settings.model_path.as_deref())
+        })
 }
 
-fn model_chip_label(settings: &CommandResult<Settings>) -> String {
-    let label = model_label(settings);
+struct ConversationModelReadiness {
+    enabled: bool,
+    class: &'static str,
+    label: String,
+}
+
+fn conversation_model_readiness(
+    engine: &CommandResult<impl Serialize>,
+    active: Option<&Conversation>,
+    settings: &CommandResult<Settings>,
+) -> ConversationModelReadiness {
+    let Some(path) = effective_conversation_model_path(active, settings) else {
+        return ConversationModelReadiness {
+            enabled: false,
+            class: "blocked",
+            label: "No GGUF model is configured for this conversation".to_string(),
+        };
+    };
+    if let Err(blocked) = mom_llama_runtime::engine::validate_model_path(path) {
+        return ConversationModelReadiness {
+            enabled: false,
+            class: "blocked",
+            label: blocked.blocker.message,
+        };
+    }
+    let global_matches = settings
+        .result
+        .as_ref()
+        .and_then(|settings| settings.model_path.as_deref())
+        == Some(path);
+    if engine.status == "host_integrated" && global_matches {
+        ConversationModelReadiness {
+            enabled: true,
+            class: "ready",
+            label: "Conversation model loaded".to_string(),
+        }
+    } else {
+        ConversationModelReadiness {
+            enabled: true,
+            class: "configured",
+            label: "Conversation model ready to load".to_string(),
+        }
+    }
+}
+
+fn conversation_model_chip(
+    active: Option<&Conversation>,
+    settings: &CommandResult<Settings>,
+) -> Markup {
+    let path = effective_conversation_model_path(active, settings);
+    let display = path
+        .map(file_name)
+        .map(|label| model_chip_label(settings, &label))
+        .unwrap_or_else(|| "No model".to_string());
+    let title = path
+        .map(|path| format!("Conversation model: {}", path.display()))
+        .unwrap_or_else(|| "Conversation model: no model configured".to_string());
+    html! {
+        span class="conversation-model-chip" aria-label=(title.clone()) title=(title) {
+            span class="conversation-model-chip-label" { "Conversation model" }
+            strong { (display) }
+        }
+    }
+}
+
+fn model_chip_label(settings: &CommandResult<Settings>, label: &str) -> String {
     let raw = upstream_settings_bool(settings, "showRawModelNames");
     let mut display = if raw {
         label.trim_end_matches(".gguf").to_string()
@@ -3682,12 +3753,12 @@ fn model_chip_label(settings: &CommandResult<Settings>) -> String {
             .join("-")
     };
     if upstream_settings_bool(settings, "showModelQuantization")
-        && let Some(quantization) = model_quantization(&label)
+        && let Some(quantization) = model_quantization(label)
     {
         display.push_str(&format!(" · {quantization}"));
     }
     if upstream_settings_bool(settings, "showModelTags") {
-        let tags = model_tags(settings, &label);
+        let tags = model_tags(settings, label);
         if !tags.is_empty() {
             display.push_str(&format!(" · {}", tags.join(" · ")));
         }
@@ -3726,23 +3797,6 @@ fn model_tags(settings: &CommandResult<Settings>, label: &str) -> Vec<&'static s
         tags.push("reasoning");
     }
     tags
-}
-
-fn models_available_for_label(settings: &CommandResult<Settings>) -> bool {
-    settings
-        .result
-        .as_ref()
-        .and_then(|settings| settings.model_path.as_ref())
-        .is_some()
-}
-
-fn model_path(settings: &CommandResult<Settings>) -> String {
-    settings
-        .result
-        .as_ref()
-        .and_then(|settings| settings.model_path.as_ref())
-        .map(|path| path.display().to_string())
-        .unwrap_or_default()
 }
 
 fn settings_value(settings: &CommandResult<Settings>, key: &str) -> String {
@@ -3883,6 +3937,7 @@ fn human_bytes(size: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn rendered_app_controls_have_contract_metadata() -> Result<()> {
@@ -3928,6 +3983,11 @@ mod tests {
         assert!(html.contains("Current chat instructions"));
         assert!(html.contains(r#"data-chat-setting="system_message""#));
         assert!(html.contains("Changes save automatically"));
+        assert!(html.contains("Default model for new chats"));
+        assert!(html.contains(
+            "New chats capture this default. Existing chats use their saved conversation model when available."
+        ));
+        assert!(!html.contains(r#"name="model_picker""#));
         assert!(!html.contains("Save settings"));
         assert!(html.contains(r#"class="settings-autosave" data-state="idle""#));
         assert!(html.contains("settings-save-glyph-saved"));
@@ -4553,7 +4613,7 @@ mod tests {
             attachment_record("notes", "", "notes.md", AttachmentKind::Text),
             attachment_record("image", "", "garden.png", AttachmentKind::Image),
         ];
-        let html = composer(&engine, &settings, Some(&draft), &attachments).into_string();
+        let html = composer(&engine, &settings, None, Some(&draft), &attachments).into_string();
         assert!(html.contains(r#"id="composer-attachments" class="composer-attachments""#));
         assert!(html.contains(r#"data-staged-attachment-id="image""#));
         assert!(html.contains(r#"data-staged-attachment-id="notes""#));
@@ -4561,6 +4621,194 @@ mod tests {
         assert!(html.contains(r#"data-command="mom_llama.draft_update""#));
         assert!(html.find("garden.png") < html.find("notes.md"));
         assert!(html.contains("Read these"));
+    }
+
+    #[test]
+    fn composer_projects_the_conversation_model_in_runtime_precedence_order() {
+        let engine = CommandResult::passed(
+            "mom_llama.engine_check",
+            "configured",
+            serde_json::json!({"ready": true}),
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        );
+        let mut settings_value = Settings::defaults_for_data_dir(std::env::temp_dir());
+        settings_value.model_path = Some(PathBuf::from("/models/global-default-Q8_0.gguf"));
+        settings_value
+            .upstream_settings
+            .insert("showRawModelNames".to_string(), Value::Bool(true));
+        let settings = CommandResult::passed(
+            "mom_llama.settings_get",
+            "contracted",
+            settings_value,
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let mut conversation =
+            test_conversation("chat", "Chat", ConversationKind::Chat, Vec::new());
+        conversation.execution_profile.model_path =
+            Some(PathBuf::from("/models/frozen-profile-Q4_K_M.gguf"));
+        conversation.selected_model_path =
+            Some(PathBuf::from("/models/legacy-selected-Q5_K_M.gguf"));
+
+        assert_eq!(
+            effective_conversation_model_path(Some(&conversation), &settings),
+            Some(Path::new("/models/frozen-profile-Q4_K_M.gguf"))
+        );
+        let profile_html =
+            composer(&engine, &settings, Some(&conversation), None, &[]).into_string();
+        assert!(profile_html.contains("Conversation model"));
+        assert!(profile_html.contains("frozen-profile-Q4_K_M"));
+        assert!(!profile_html.contains("legacy-selected-Q5_K_M"));
+        assert!(!profile_html.contains("global-default-Q8_0"));
+        assert!(!profile_html.contains(r#"name="model_picker""#));
+        assert!(!profile_html.contains("mom_llama_model_select"));
+
+        conversation.execution_profile.model_path = None;
+        assert_eq!(
+            effective_conversation_model_path(Some(&conversation), &settings),
+            Some(Path::new("/models/legacy-selected-Q5_K_M.gguf"))
+        );
+        let selected_html =
+            composer(&engine, &settings, Some(&conversation), None, &[]).into_string();
+        assert!(selected_html.contains("legacy-selected-Q5_K_M"));
+        assert!(!selected_html.contains("global-default-Q8_0"));
+
+        conversation.selected_model_path = None;
+        assert_eq!(
+            effective_conversation_model_path(Some(&conversation), &settings),
+            Some(Path::new("/models/global-default-Q8_0.gguf"))
+        );
+        let default_html =
+            composer(&engine, &settings, Some(&conversation), None, &[]).into_string();
+        assert!(default_html.contains("global-default-Q8_0"));
+    }
+
+    #[test]
+    fn composer_admission_and_readiness_follow_the_conversation_model() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "mom-conversation-model-readiness-{}-{}",
+            std::process::id(),
+            mom_llama_runtime::now_ms()
+        ));
+        std::fs::create_dir_all(&directory)?;
+        let conversation_model = directory.join("conversation-Q4_K_M.gguf");
+        std::fs::write(&conversation_model, b"test model identity")?;
+        let settings = CommandResult::passed(
+            "mom_llama.settings_get",
+            "contracted",
+            Settings::defaults_for_data_dir(directory.clone()),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let mut conversation =
+            test_conversation("chat", "Chat", ConversationKind::Chat, Vec::new());
+        conversation.execution_profile.model_path = Some(conversation_model.clone());
+        let blocked_global: CommandResult<Value> = CommandResult::blocked(
+            "mom_llama.engine_check",
+            "blocked_missing_model",
+            Blocker::new("model_path_missing", "No global model", Vec::new()),
+        );
+
+        let configured =
+            conversation_model_readiness(&blocked_global, Some(&conversation), &settings);
+        assert!(configured.enabled);
+        assert_eq!(configured.class, "configured");
+        assert_eq!(configured.label, "Conversation model ready to load");
+        let html =
+            composer(&blocked_global, &settings, Some(&conversation), None, &[]).into_string();
+        assert!(html.contains(r#"class="runtime-dot configured""#));
+        assert!(html.contains("Conversation model ready to load"));
+        assert!(!html.contains(r#"type="submit" class="send-button" disabled"#));
+
+        conversation.execution_profile.model_path =
+            Some(directory.join("missing-conversation.gguf"));
+        let missing = conversation_model_readiness(&blocked_global, Some(&conversation), &settings);
+        assert!(!missing.enabled);
+        assert_eq!(missing.class, "blocked");
+        assert!(missing.label.contains("does not exist"));
+
+        let mut loaded_settings_value = Settings::defaults_for_data_dir(directory.clone());
+        loaded_settings_value.model_path = Some(conversation_model.clone());
+        let loaded_settings = CommandResult::passed(
+            "mom_llama.settings_get",
+            "contracted",
+            loaded_settings_value,
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        conversation.execution_profile.model_path = Some(conversation_model);
+        let loaded_engine = CommandResult::passed(
+            "mom_llama.engine_check",
+            "host_integrated",
+            serde_json::json!({"ready": true}),
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        );
+        let loaded =
+            conversation_model_readiness(&loaded_engine, Some(&conversation), &loaded_settings);
+        assert!(loaded.enabled);
+        assert_eq!(loaded.class, "ready");
+        assert_eq!(loaded.label, "Conversation model loaded");
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn assistant_stats_use_the_persisted_message_model_not_the_global_default() {
+        let mut settings_value = Settings::defaults_for_data_dir(std::env::temp_dir());
+        settings_value.model_path = Some(PathBuf::from("/models/global-default-Q8_0.gguf"));
+        settings_value
+            .upstream_settings
+            .insert("showMessageStats".to_string(), Value::Bool(true));
+        settings_value
+            .upstream_settings
+            .insert("showRawModelNames".to_string(), Value::Bool(true));
+        let settings = CommandResult::passed(
+            "mom_llama.settings_get",
+            "contracted",
+            settings_value,
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        );
+        let mut message = test_message("assistant", MessageRole::Assistant, "Answer");
+        message.model = Some("frozen-conversation-Q4_K_M.gguf".to_string());
+        message.prompt_tokens = Some(7);
+        message.completion_tokens = Some(11);
+
+        let html = message_row(&message, &settings, &[], true, true).into_string();
+        assert!(html.contains("frozen-conversation-Q4_K_M"));
+        assert!(!html.contains("global-default-Q8_0"));
+        assert!(html.contains("7 prompt · 11 generated"));
+
+        message.model = None;
+        let legacy_html = message_row(&message, &settings, &[], true, true).into_string();
+        assert!(legacy_html.contains("Unknown model"));
+        assert!(!legacy_html.contains("global-default-Q8_0"));
+
+        message.model = Some("  ".to_string());
+        let blank_html = message_row(&message, &settings, &[], true, true).into_string();
+        assert!(blank_html.contains("Unknown model"));
+    }
+
+    #[test]
+    fn frontend_has_no_composer_model_mutation_path() {
+        let js = include_str!("../../ui/coop-hx.js");
+        assert!(!js.contains("select[name='model_picker']"));
+        assert!(js.contains(r#""model-select": async (button)"#));
+        assert!(js.contains(r#"invoke("mom_llama_model_select", { modelPath: path })"#));
     }
 
     fn attachment_record(

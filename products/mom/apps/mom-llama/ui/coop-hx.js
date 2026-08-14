@@ -2052,11 +2052,6 @@
       scheduleChatInstructionsAutosave(event.target, 0);
       return;
     }
-    if (!event.target.matches("select[name='model_picker']") || !event.target.value) return;
-    try {
-      report(await invoke("mom_llama_model_select", { modelPath: event.target.value }));
-      await refreshChat();
-    } catch (error) { reportError(error); }
   });
 
   const listen = async () => {
