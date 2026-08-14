@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "goal": "W9-LEAN",
-  "status": "local_accepted_pending_github_promotion",
+  "status": "accepted_and_github_promoted",
   "baseline": {
     "commit": "058c4622fac8813417a5e6637091e63e1ef01ea2",
     "tree": "fb0362faf422090ec8d8f936d5b31b95da0b01ac",
@@ -65,14 +65,15 @@
     "fresh_full_policy_target_bytes_approx": 13958643712
   },
   "github": {
-    "pull_request": null,
-    "required_ci_wall_ms": null,
-    "merge_commit": null,
+    "pull_request": "https://github.com/delysis/native-platform/pull/17",
+    "required_run": "https://github.com/delysis/native-platform/actions/runs/31774222096",
+    "required_ci_wall_ms": 1140000,
+    "merge_commit": "eaa318cf2e104e23b6dc0038b27508a1313526d5",
     "tag": null
   },
   "claims_deferred": [
     "The prior ENOSPC full-policy attempt is retained as negative environment evidence; the fresh bounded rerun passed.",
-    "Required macOS CI timing is measured after pull-request publication and does not block local work.",
+    "The required PR workflow passed in 19 minutes; its timing did not block local W10 work.",
     "Linux and Windows are informational compatibility follow-ups.",
     "Signing, notarization, stable releases, and source-repository retirement are W10 work."
   ]

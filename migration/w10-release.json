@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "goal": "W10-RELEASE-AND-RETIREMENT",
+  "status": "local_macos_candidates_accepted_publication_pending",
+  "platform_scope": "macos",
+  "release_tooling": {
+    "local_command": "scripts/release-macos.sh",
+    "packaged_smoke": "scripts/smoke-macos-app.sh",
+    "github_workflow": ".github/workflows/release-macos.yml",
+    "github_required_for_local_candidate": false,
+    "signing": "ad_hoc",
+    "notarization": "not_requested"
+  },
+  "inputs": {
+    "cargo_lock_sha256": "645aea9483b9e307c51518f65623c975d717af14e10c74b6634e2b68c470ff0b",
+    "pnpm_lock_sha256": "fe9c4308c6194528920f0675219c06245e192fd546960ae83d9abd34e673a5b8"
+  },
+  "candidates": {
+    "mom": {
+      "version": "0.1.0",
+      "source_revision": "171d312763ccf89cf8bd0cc5820493fccafa6e9a",
+      "source_tree": "0ce954814a2c11ffa6269c58647fce8e480acc11",
+      "bundle_id": "com.delysis.llama-native-kit.mom-llama",
+      "executable_sha256": "e7958448b4526a0a5390dafe7903dc55a31d614887d925177eddde3e5572b2bb",
+      "archive_sha256": "145ee6aba135f81598ee13a516cc87885b6ce0d284ee6ec5b6cecb4ab74b7132",
+      "archive_bytes": 10896750,
+      "packaged_launch_quit_relaunch": true,
+      "state_reopened": true,
+      "database_file_identity_unchanged": true,
+      "native_join_positive": true
+    },
+    "loom": {
+      "version": "0.1.0",
+      "source_revision": "f8ee159de31369c29dc12b24a40a01886a9a02c5",
+      "source_tree": "91012a6df07272b82025961f1f2f9a70356cf7d7",
+      "bundle_id": "app.delysis.loom",
+      "executable_sha256": "f22887eef6f3b21712baf5e6a7ebc079fe57aa42ddfc3b3e7fff99b5f708377f",
+      "archive_sha256": "5e030ace600c82c0cebfd017b91bb489ec28d297a12c62dffd9cc2ad04184383",
+      "archive_bytes": 8688521,
+      "build_model_policy": "writer-gemma4-base-v2",
+      "build_model_policy_sha256": "744fa860ffc979f6c1c9e4e1a96680d31c26b558317755548464df5300b9b791",
+      "packaged_launch_quit_relaunch": true,
+      "open_project_receipts": 2,
+      "state_reopen_evidence": "open_project_receipt_count_advanced",
+      "acceptance_model_loader_activity": false
+    },
+    "fte": {
+      "version": "0.1.0",
+      "source_revision": "f8ee159de31369c29dc12b24a40a01886a9a02c5",
+      "source_tree": "91012a6df07272b82025961f1f2f9a70356cf7d7",
+      "bundle_id": "dev.delysis.free-token-energy",
+      "executable_sha256": "d24a63f48d32f6b427aa22cbddf92ecadc7fa64b4db50bb3e5623a531e787e14",
+      "archive_sha256": "ca5c1d8779f26a45b43aff82334e872d228d999dfdfb14fd38b53f703531e1a4",
+      "archive_bytes": 8349209,
+      "packaged_launch_quit_relaunch": true,
+      "state_reopened": true,
+      "database_file_identity_unchanged": true,
+      "ephemeral_credentials": true
+    }
+  },
+  "negative_evidence": {
+    "loom_initial_quit_timeout": true,
+    "cause": "acceptance mode admitted a remembered Hugging Face model path and waited for its blocking inspection worker",
+    "fixed_by": [
+      "61c3b1195ebf42f8d852287490bcbc1a795f9a20",
+      "7d39e13393a3144b45968e73d687b5abae3f0638"
+    ],
+    "isolation_hardened_by": "f8ee159de31369c29dc12b24a40a01886a9a02c5"
+  },
+  "claims_deferred": [
+    "Developer ID signing and notarization",
+    "component tags and public artifact publication",
+    "live-model UI acceptance for these exact binaries",
+    "Windows and Linux distribution support",
+    "two stable consolidated releases",
+    "source-repository retirement"
+  ],
+  "retirement": {
+    "required_stable_releases": 2,
+    "observed_stable_releases": 0,
+    "source_repositories_archived": false,
+    "llama_cpp_rs_remains_active": true
+  }
+}

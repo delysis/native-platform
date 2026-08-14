@@ -250,19 +250,21 @@ pub struct PluginState {
     model_loads: Arc<ModelLoadRegistry>,
     downloads: Arc<ModelDownloadRegistry>,
     download_workers: DownloadWorkerRegistry,
-    model_library_root: Option<PathBuf>,
+    app_local_data_root: Option<PathBuf>,
+    isolate_model_discovery: bool,
     build_model_policy: BuildModelPolicy,
 }
 
 impl Default for PluginState {
     fn default() -> Self {
-        Self::with_model_library_root(None, BuildModelPolicy::default())
+        Self::with_app_local_data_root(None, false, BuildModelPolicy::default())
     }
 }
 
 impl PluginState {
-    fn with_model_library_root(
-        model_library_root: Option<PathBuf>,
+    fn with_app_local_data_root(
+        app_local_data_root: Option<PathBuf>,
+        isolate_model_discovery: bool,
         build_model_policy: BuildModelPolicy,
     ) -> Self {
         let native_runtime = Arc::new(NativeHostRuntime::default());
@@ -289,7 +291,8 @@ impl PluginState {
             model_loads: Arc::new(ModelLoadRegistry::default()),
             downloads: Arc::new(ModelDownloadRegistry::default()),
             download_workers: DownloadWorkerRegistry::default(),
-            model_library_root,
+            app_local_data_root,
+            isolate_model_discovery,
             build_model_policy,
         }
     }
@@ -1599,6 +1602,8 @@ impl BranchCancellation for LlamaCancellation {
 #[derive(Debug, Default)]
 pub struct Builder {
     build_model_policy: BuildModelPolicy,
+    app_local_data_root: Option<PathBuf>,
+    isolate_model_discovery: bool,
 }
 
 impl Builder {
@@ -1613,8 +1618,22 @@ impl Builder {
         self
     }
 
+    #[must_use]
+    pub fn with_app_local_data_root(mut self, app_local_data_root: Option<PathBuf>) -> Self {
+        self.app_local_data_root = app_local_data_root;
+        self
+    }
+
+    #[must_use]
+    pub fn with_isolated_model_discovery(mut self, isolate: bool) -> Self {
+        self.isolate_model_discovery = isolate;
+        self
+    }
+
     pub fn build<R: Runtime>(self) -> TauriPlugin<R> {
         let build_model_policy = self.build_model_policy;
+        let app_local_data_root = self.app_local_data_root;
+        let isolate_model_discovery = self.isolate_model_discovery;
         PluginBuilder::new("loom")
             .invoke_handler(tauri::generate_handler![
                 project_open_default,
@@ -1654,9 +1673,12 @@ impl Builder {
                 application_close_pending,
             ])
             .setup(move |app, _api| {
-                let model_library_root = app.path().app_local_data_dir().ok();
-                app.manage(PluginState::with_model_library_root(
-                    model_library_root,
+                let app_local_data_root = app_local_data_root
+                    .clone()
+                    .or_else(|| app.path().app_local_data_dir().ok());
+                app.manage(PluginState::with_app_local_data_root(
+                    app_local_data_root,
+                    isolate_model_discovery,
                     build_model_policy,
                 ));
                 Ok(())
@@ -2189,24 +2211,28 @@ struct DesktopLoomEvent {
 /// first launch. The folder is still an ordinary Loom project; this command
 /// merely removes file-management ceremony from the default authoring path.
 #[tauri::command]
-async fn project_open_default<R: Runtime>(
-    app: AppHandle<R>,
+async fn project_open_default(
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
     ensure_application_running(&state, "a project session")?;
     reserve_project_choice(&state)?;
-    let result = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| {
+    let result =
+        default_project_path(&state).and_then(|path| open_or_initialize_default_project(&path));
+    finish_project_choice(&state, result)
+}
+
+fn default_project_path(state: &PluginState) -> Result<PathBuf, IpcFailure> {
+    state
+        .app_local_data_root
+        .as_deref()
+        .map(|root| root.join(DEFAULT_PROJECT_DIRECTORY))
+        .ok_or_else(|| {
             IpcFailure::new(
                 "default_project_directory_unavailable",
-                format!("the local writing directory is unavailable: {error}"),
+                "the operating system did not provide an application data directory",
                 true,
             )
         })
-        .and_then(|root| open_or_initialize_default_project(&root.join(DEFAULT_PROJECT_DIRECTORY)));
-    finish_project_choice(&state, result)
 }
 
 #[tauri::command]
@@ -3622,6 +3648,7 @@ fn prepare_policy_model_load(
             false,
         )
     })?;
+    ensure_model_path_in_isolated_library(state, &canonical_path)?;
     let discovered = discover_strict_policy_candidate(&canonical_path)?;
     if discovered.file_bytes != expectation.model_file_bytes {
         return Err(IpcFailure::new(
@@ -3968,6 +3995,7 @@ fn prepare_model_load(
             false,
         )
     })?;
+    ensure_model_path_in_isolated_library(state, &canonical)?;
     let discovered = discover_loadable_model(state, &canonical)?;
     let _lifecycle = lock_model_lifecycle(state)?;
     let mut registry = lock_model_registry(state)?;
@@ -4400,7 +4428,7 @@ fn prepare_model_download(
         ));
     }
 
-    let root = state.model_library_root.as_deref().ok_or_else(|| {
+    let root = state.app_local_data_root.as_deref().ok_or_else(|| {
         IpcFailure::new(
             "model_library_unavailable",
             "the operating system did not provide an application data directory",
@@ -4658,30 +4686,102 @@ fn discover_strict_policy_candidate(
 fn desktop_model_discovery_options(
     state: &State<'_, PluginState>,
 ) -> Result<ModelDiscoveryOptions, IpcFailure> {
-    let mut options = ModelDiscoveryOptions::default();
-    options.max_entries = options.max_entries.min(20_000);
-    options.max_depth = options.max_depth.min(12);
-    if let Some(path) = std::env::var_os("LOOM_GGUF_MODEL_PATH") {
+    let mut options = base_desktop_model_discovery_options(state.isolate_model_discovery);
+    if !state.isolate_model_discovery
+        && let Some(path) = std::env::var_os("LOOM_GGUF_MODEL_PATH")
+    {
         options.user_paths.push(PathBuf::from(path));
     }
-    if let Some(root) = &state.model_library_root {
+    if let Some(root) = &state.app_local_data_root {
         options.user_paths.push(root.join("models"));
     }
-    options.user_paths.extend(
-        state
-            .user_model_paths
-            .lock()
-            .map_err(|_| {
-                IpcFailure::new(
-                    "model_path_registry_poisoned",
-                    "the selected-model registry entered an invalid state; restart Loom",
-                    false,
-                )
-            })?
-            .iter()
-            .cloned(),
-    );
+    if !state.isolate_model_discovery {
+        options.user_paths.extend(
+            state
+                .user_model_paths
+                .lock()
+                .map_err(|_| {
+                    IpcFailure::new(
+                        "model_path_registry_poisoned",
+                        "the selected-model registry entered an invalid state; restart Loom",
+                        false,
+                    )
+                })?
+                .iter()
+                .cloned(),
+        );
+    }
     Ok(options)
+}
+
+fn base_desktop_model_discovery_options(isolate: bool) -> ModelDiscoveryOptions {
+    let mut options = ModelDiscoveryOptions::default();
+    if isolate {
+        options.hugging_face_cache_roots.clear();
+    }
+    options.max_entries = options.max_entries.min(20_000);
+    options.max_depth = options.max_depth.min(12);
+    options
+}
+
+fn ensure_model_path_in_isolated_library(
+    state: &State<'_, PluginState>,
+    canonical_path: &Path,
+) -> Result<(), IpcFailure> {
+    ensure_model_path_in_isolated_library_from(
+        state.isolate_model_discovery,
+        state.app_local_data_root.as_deref(),
+        canonical_path,
+    )
+}
+
+fn ensure_model_path_in_isolated_library_from(
+    isolate: bool,
+    app_local_data_root: Option<&Path>,
+    canonical_path: &Path,
+) -> Result<(), IpcFailure> {
+    if !isolate {
+        return Ok(());
+    }
+    let model_library = app_local_data_root
+        .ok_or_else(|| {
+            IpcFailure::new(
+                "isolated_model_library_unavailable",
+                "acceptance model discovery requires an isolated application data root",
+                false,
+            )
+        })?
+        .join("models");
+    let metadata = model_library.symlink_metadata().map_err(|_| {
+        IpcFailure::new(
+            "isolated_model_library_unavailable",
+            "acceptance model loading requires an existing isolated models directory",
+            false,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(IpcFailure::new(
+            "isolated_model_library_unavailable",
+            "acceptance model loading requires a real isolated models directory",
+            false,
+        ));
+    }
+    let model_library = model_library.canonicalize().map_err(|_| {
+        IpcFailure::new(
+            "isolated_model_library_unavailable",
+            "acceptance model loading requires an existing isolated models directory",
+            false,
+        )
+    })?;
+    if canonical_path.starts_with(&model_library) {
+        Ok(())
+    } else {
+        Err(IpcFailure::new(
+            "model_outside_isolated_library",
+            "acceptance mode will load models only from its isolated models directory",
+            false,
+        ))
+    }
 }
 
 fn remember_user_model_path(
@@ -9066,6 +9166,91 @@ mod tests {
             original
         );
         assert!(!root.join(".loom").exists());
+    }
+
+    #[test]
+    fn app_local_override_routes_default_project_and_model_library() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let root = temporary.path().join("isolated-app-local-data");
+        std::fs::create_dir(&root).expect("isolated app data root");
+        let state = PluginState::with_app_local_data_root(
+            Some(root.clone()),
+            true,
+            BuildModelPolicy::default(),
+        );
+
+        assert_eq!(
+            default_project_path(&state).expect("default project path"),
+            root.join(DEFAULT_PROJECT_DIRECTORY)
+        );
+        assert_eq!(
+            prepare_model_library(
+                state
+                    .app_local_data_root
+                    .as_deref()
+                    .expect("app-local data root")
+            )
+            .expect("model library"),
+            root.join("models")
+        );
+        assert!(state.isolate_model_discovery);
+    }
+
+    #[test]
+    fn acceptance_discovery_excludes_user_hugging_face_cache_only() {
+        let normal = base_desktop_model_discovery_options(false);
+        let isolated = base_desktop_model_discovery_options(true);
+
+        assert_eq!(
+            normal.hugging_face_cache_roots,
+            ModelDiscoveryOptions::default().hugging_face_cache_roots
+        );
+        assert!(isolated.hugging_face_cache_roots.is_empty());
+        assert_eq!(isolated.max_entries, normal.max_entries);
+        assert_eq!(isolated.max_depth, normal.max_depth);
+    }
+
+    #[test]
+    fn acceptance_model_load_rejects_a_remembered_path_outside_its_library() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let model_library = temporary.path().join("models");
+        std::fs::create_dir(&model_library).expect("isolated model library");
+        let inside = model_library.join("writer.gguf");
+        let outside = temporary.path().join("remembered.gguf");
+        std::fs::write(&inside, b"GGUF").expect("inside model fixture");
+        std::fs::write(&outside, b"GGUF").expect("outside model fixture");
+        let inside = inside.canonicalize().expect("canonical inside model");
+        let outside = outside.canonicalize().expect("canonical outside model");
+
+        ensure_model_path_in_isolated_library_from(true, Some(temporary.path()), &inside)
+            .expect("isolated library model is accepted");
+        let error =
+            ensure_model_path_in_isolated_library_from(true, Some(temporary.path()), &outside)
+                .expect_err("remembered external model must be rejected");
+        assert_eq!(error.code, "model_outside_isolated_library");
+        ensure_model_path_in_isolated_library_from(false, Some(temporary.path()), &outside)
+            .expect("normal mode preserves explicit local model loading");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acceptance_model_load_rejects_a_symlinked_model_library() {
+        use std::os::unix::fs::symlink;
+
+        let acceptance = tempfile::tempdir().expect("acceptance app data");
+        let external = tempfile::tempdir().expect("external model library");
+        let model = external.path().join("writer.gguf");
+        std::fs::write(&model, b"GGUF").expect("model fixture");
+        symlink(external.path(), acceptance.path().join("models"))
+            .expect("symlinked model library");
+
+        let error = ensure_model_path_in_isolated_library_from(
+            true,
+            Some(acceptance.path()),
+            &model.canonicalize().expect("canonical model"),
+        )
+        .expect_err("symlinked acceptance model library must be rejected");
+        assert_eq!(error.code, "isolated_model_library_unavailable");
     }
 
     #[test]

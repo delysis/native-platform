@@ -8,6 +8,11 @@ import test from "node:test";
 const root = path.resolve(import.meta.dirname, "../..");
 const prPath = path.join(root, ".github/workflows/ci-pr.yml");
 const fullPath = path.join(root, ".github/workflows/ci-full.yml");
+const releasePath = path.join(root, ".github/workflows/release-macos.yml");
+const momWindowsIconPath = path.join(
+  root,
+  "products/mom/apps/mom-llama/src-tauri/icons/icon.ico",
+);
 
 function read(file) {
   return fs.readFileSync(file, "utf8");
@@ -19,10 +24,30 @@ function externalActionUses(source) {
     .filter((value) => !value.startsWith("./") && !value.startsWith("docker://"));
 }
 
-test("only the targeted PR and full workflows remain active", () => {
+test("only the targeted PR, full, and asynchronous release workflows remain active", () => {
   assert.equal(fs.existsSync(path.join(root, ".github/workflows/ci.yml")), false);
   assert.equal(fs.existsSync(prPath), true);
   assert.equal(fs.existsSync(fullPath), true);
+  assert.equal(fs.existsSync(releasePath), true);
+});
+
+test("Mom retains the Windows resource icon required by Tauri builds", () => {
+  const icon = fs.readFileSync(momWindowsIconPath);
+  assert.deepEqual([...icon.subarray(0, 4)], [0, 0, 1, 0]);
+});
+
+test("macOS remote candidates are tag or manual artifacts and never PR requirements", () => {
+  const source = read(releasePath);
+  assert.match(source, /^\s+tags:\s*$/m);
+  assert.match(source, /^\s+workflow_dispatch:\s*$/m);
+  assert.doesNotMatch(source, /^\s+pull_request:/m);
+  assert.match(source, /^\s+package:\s*$/m);
+  assert.match(source, /^\s+runs-on: macos-latest$/m);
+  assert.match(source, /\.\/scripts\/release-macos\.sh/);
+  assert.match(source, /actions\/upload-artifact@[0-9a-f]{40}/);
+  assert.match(source, /release tag\/version mismatch/);
+  assert.match(source, /expected_tag="\$tag_prefix-v\$version"/);
+  assert.match(source, /remote-candidate-/);
 });
 
 test("PR workflow is always triggered and has one truthful aggregate", () => {
@@ -153,7 +178,7 @@ test("Windows compatibility remains in full CI, not the blocking PR lane", () =>
 });
 
 test("all third-party actions are pinned to immutable commits", () => {
-  for (const file of [prPath, fullPath]) {
+  for (const file of [prPath, fullPath, releasePath]) {
     for (const action of externalActionUses(read(file))) {
       assert.match(action, /^[^/@]+\/[^/@]+@[0-9a-f]{40}$/, `${file}: ${action}`);
     }

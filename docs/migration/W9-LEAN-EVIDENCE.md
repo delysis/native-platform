@@ -1,6 +1,6 @@
 # W9 lean consolidation evidence
 
-Status: **locally accepted; GitHub promotion pending**.
+Status: **accepted and promoted through GitHub**.
 
 W9 is measured from the protected W8 HOME merge
 `058c4622fac8813417a5e6637091e63e1ef01ea2` (tree
@@ -113,6 +113,12 @@ a fresh run passed the complete locked workspace/all-target test suite, strict
 Clippy, lean and migration policy, 27 Node CI tests, all four architecture
 boundary scripts, and the offline frozen pnpm lock check. The complete gate
 peaked at roughly 13 GB of generated target data rather than 41 GB.
+
+PR [#17](https://github.com/delysis/native-platform/pull/17) passed its complete
+required workflow at candidate `aca1f850f6ef37d23a06b7a17f26c334674aef95`
+([run 31774222096](https://github.com/delysis/native-platform/actions/runs/31774222096))
+and merged as `eaa318cf2e104e23b6dc0038b27508a1313526d5`. The required
+workflow took 19 minutes from its first job start through the aggregate gate.
 
 Signed/notarized distribution and source-repository retirement belong to W10,
 not W9.

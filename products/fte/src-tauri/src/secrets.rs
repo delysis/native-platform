@@ -1,7 +1,9 @@
 //! OS-backed provider credential authority.
 
 use keyring::{Entry, Error as KeyringError};
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Mutex;
 
 const SERVICE: &str = "dev.delysis.free-token-energy.provider";
 
@@ -74,6 +76,47 @@ impl CredentialStore for OsCredentialStore {
     }
 }
 
+/// Process-local credential authority used only by explicit packaged-app
+/// acceptance runs. It cannot address or persist into the OS credential store.
+#[derive(Debug, Default)]
+pub struct EphemeralCredentialStore {
+    values: Mutex<BTreeMap<String, Vec<u8>>>,
+}
+
+impl CredentialStore for EphemeralCredentialStore {
+    fn write(&self, provider_id: &str, secret: &[u8]) -> Result<(), SecretStoreError> {
+        validate_provider_id(provider_id)?;
+        if secret.is_empty() {
+            return Err(SecretStoreError::new("provider secret must not be empty"));
+        }
+        self.values
+            .lock()
+            .map_err(|_| SecretStoreError::new("ephemeral credential state is unavailable"))?
+            .insert(provider_id.to_string(), secret.to_vec());
+        Ok(())
+    }
+
+    fn read(&self, provider_id: &str) -> Result<Option<Vec<u8>>, SecretStoreError> {
+        validate_provider_id(provider_id)?;
+        Ok(self
+            .values
+            .lock()
+            .map_err(|_| SecretStoreError::new("ephemeral credential state is unavailable"))?
+            .get(provider_id)
+            .cloned())
+    }
+
+    fn delete(&self, provider_id: &str) -> Result<bool, SecretStoreError> {
+        validate_provider_id(provider_id)?;
+        Ok(self
+            .values
+            .lock()
+            .map_err(|_| SecretStoreError::new("ephemeral credential state is unavailable"))?
+            .remove(provider_id)
+            .is_some())
+    }
+}
+
 fn validate_provider_id(provider_id: &str) -> Result<(), SecretStoreError> {
     if provider_id.is_empty()
         || provider_id.len() > 128
@@ -94,7 +137,7 @@ fn keyring_error(action: &str, error: KeyringError) -> SecretStoreError {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_provider_id;
+    use super::{CredentialStore, EphemeralCredentialStore, validate_provider_id};
 
     #[test]
     fn provider_ids_are_bounded_and_namespace_safe() {
@@ -103,5 +146,21 @@ mod tests {
         assert!(validate_provider_id("").is_err());
         assert!(validate_provider_id("../escape").is_err());
         assert!(validate_provider_id("MixedCase").is_err());
+    }
+
+    #[test]
+    fn ephemeral_credentials_round_trip_without_crossing_instances() {
+        let first = EphemeralCredentialStore::default();
+        let second = EphemeralCredentialStore::default();
+
+        assert_eq!(first.read("openrouter").unwrap(), None);
+        first.write("openrouter", b"acceptance-only").unwrap();
+        assert_eq!(
+            first.read("openrouter").unwrap(),
+            Some(b"acceptance-only".to_vec())
+        );
+        assert_eq!(second.read("openrouter").unwrap(), None);
+        assert!(first.delete("openrouter").unwrap());
+        assert_eq!(first.read("openrouter").unwrap(), None);
     }
 }

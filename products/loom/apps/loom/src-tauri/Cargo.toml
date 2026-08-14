@@ -25,6 +25,9 @@ tauri = { version = "2.11.5", features = [] }
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-loom = { path = "../../../crates/tauri-plugin-loom" }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
