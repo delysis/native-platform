@@ -20,20 +20,24 @@ did not change between launches. The smoke deliberately does not override
 
 | Product | Source | Executable SHA-256 | Archive SHA-256 | Archive bytes |
 | --- | --- | --- | --- | ---: |
-| Mom Llama 0.1.0 | `171d312763ccf89cf8bd0cc5820493fccafa6e9a` | `e7958448b4526a0a5390dafe7903dc55a31d614887d925177eddde3e5572b2bb` | `145ee6aba135f81598ee13a516cc87885b6ce0d284ee6ec5b6cecb4ab74b7132` | 10,896,750 |
-| Loom 0.1.0 | `f8ee159de31369c29dc12b24a40a01886a9a02c5` | `f22887eef6f3b21712baf5e6a7ebc079fe57aa42ddfc3b3e7fff99b5f708377f` | `5e030ace600c82c0cebfd017b91bb489ec28d297a12c62dffd9cc2ad04184383` | 8,688,521 |
-| Free Token Energy 0.1.0 | `f8ee159de31369c29dc12b24a40a01886a9a02c5` | `d24a63f48d32f6b427aa22cbddf92ecadc7fa64b4db50bb3e5623a531e787e14` | `ca5c1d8779f26a45b43aff82334e872d228d999dfdfb14fd38b53f703531e1a4` | 8,349,209 |
+| Mom Llama 0.1.0 | `352adc59fafbc188decd7059cf94da9433a8a324` | `f05d3a38d808751daa2056ec77a840285b7072384e172f756bc7ceadbef97d33` | `682292d3133c0131647cc426c975c19dadce8350a648d590b80e0fc6ca3210a5` | 10,901,576 |
+| Loom 0.1.0 | `352adc59fafbc188decd7059cf94da9433a8a324` | `4066002780b796d667f45fc7471dccb9d19db49f3e4c649830ef14d01139bd9e` | `af7fd24d0749e83f02005b848658cc886d8cffed4878fe973a58c62d2b7c5c71` | 8,688,610 |
+| Free Token Energy 0.1.0 | `352adc59fafbc188decd7059cf94da9433a8a324` | `a70f28b27ac420277f793bffce9ec8247e542f68e67391ca8cf3dca1089cd998` | `191d781d2664aa085a7792b074e1d4adbb74f2e99cc91146d2b2deed692138f9` | 8,349,125 |
 
 All three bundles declare macOS 13.0 as their floor, contain no GGUF, ONNX, or
 safetensors file, and passed `codesign --verify --deep --strict`. The local
-artifacts and their separate release/smoke receipts are under `dist/macos/`;
-that generated directory is intentionally not committed.
+release receipts are under `dist/macos/`; that generated directory is
+intentionally not committed.
 
-The accepted ZIP for each product was also extracted into a fresh smoke root
-and the extracted application passed the same two-launch Quit/relaunch check.
-Each archive input SHA-256 matched the digest recorded above. This closes the
-identity gap between the build-tree bundle and the emitted archive without
-turning the remote packaging workflow into a development gate.
+The accepted ZIP for each product was also extracted into fresh smoke root
+`/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/delysis-352adc-archive-smoke.XXXXXX.2ybD4JyTHn`.
+The exact extracted application visibly reached product readiness, quit zero,
+relaunched against the same isolated state root, reached readiness again, and
+quit zero. The extracted executable hashes matched the receipts above,
+`codesign --verify --deep --strict` passed again, and the extracted tree
+contained no named model-weight files. This closes the identity gap between
+the build-tree bundle and emitted archive without turning remote packaging
+into a development gate.
 
 The Mom smoke opened the same encrypted `runtime.sqlite3` file identity from
 the isolated root on both launches. Each quit emitted positive
@@ -195,10 +199,9 @@ public releases:
 - signing is ad-hoc, not Developer ID;
 - notarization was not requested;
 - no component tag or public artifact has been created yet;
-- the older archive smokes prove lifecycle, isolated state reopen, and bundle
-  identity only. The current UX checks add exact-bundle real-model behavior for
-  all three products, but have not been promoted into new release archives or
-  digest receipts;
+- the current archives prove lifecycle, isolated state reopen, signature, and
+  bundle identity. The earlier debug UX checks add real-model behavior for all
+  three products; that behavior is not relabeled as exact-archive inference;
 - prior W6-W8 real-model receipts remain useful regression evidence, but they
   are not relabeled as evidence for these exact binaries;
 - macOS is the current supported release platform. Linux CI is informational,

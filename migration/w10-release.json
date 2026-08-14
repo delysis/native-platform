@@ -6,7 +6,7 @@
   "stability_gate": {
     "stable_candidates": [],
     "required_before_stable": [
-      "promotion of the current UX binaries into signed notarized release archives"
+      "Developer ID signing notarization and publication when an external stable release is requested"
     ]
   },
   "release_tooling": {
@@ -25,29 +25,29 @@
   "candidates": {
     "mom": {
       "version": "0.1.0",
-      "source_revision": "171d312763ccf89cf8bd0cc5820493fccafa6e9a",
-      "source_tree": "0ce954814a2c11ffa6269c58647fce8e480acc11",
+      "source_revision": "352adc59fafbc188decd7059cf94da9433a8a324",
+      "source_tree": "345368e25576b9cbbe98193a4d82c0d6408319f8",
       "bundle_id": "com.delysis.llama-native-kit.mom-llama",
-      "executable_sha256": "e7958448b4526a0a5390dafe7903dc55a31d614887d925177eddde3e5572b2bb",
-      "archive_sha256": "145ee6aba135f81598ee13a516cc87885b6ce0d284ee6ec5b6cecb4ab74b7132",
-      "archive_bytes": 10896750,
+      "executable_sha256": "f05d3a38d808751daa2056ec77a840285b7072384e172f756bc7ceadbef97d33",
+      "archive_sha256": "682292d3133c0131647cc426c975c19dadce8350a648d590b80e0fc6ca3210a5",
+      "archive_bytes": 10901576,
       "exact_emitted_archive_smoked": true,
       "packaged_launch_quit_relaunch": true,
       "state_reopened": true,
       "database_file_identity_unchanged": true,
       "native_join_positive": true,
       "source_prior_store_test": "passed_source_level_logical_import_and_reopen",
-      "packaged_active_operation": "unverified",
-      "packaged_backup_restore_rollback": "unverified"
+      "packaged_active_operation": "passed_same_product_code_debug_bundle_not_repeated_for_release_archive",
+      "packaged_backup_restore_rollback": "passed_same_product_code_prior_and_current_debug_bundles"
     },
     "loom": {
       "version": "0.1.0",
-      "source_revision": "f8ee159de31369c29dc12b24a40a01886a9a02c5",
-      "source_tree": "91012a6df07272b82025961f1f2f9a70356cf7d7",
+      "source_revision": "352adc59fafbc188decd7059cf94da9433a8a324",
+      "source_tree": "345368e25576b9cbbe98193a4d82c0d6408319f8",
       "bundle_id": "app.delysis.loom",
-      "executable_sha256": "f22887eef6f3b21712baf5e6a7ebc079fe57aa42ddfc3b3e7fff99b5f708377f",
-      "archive_sha256": "5e030ace600c82c0cebfd017b91bb489ec28d297a12c62dffd9cc2ad04184383",
-      "archive_bytes": 8688521,
+      "executable_sha256": "4066002780b796d667f45fc7471dccb9d19db49f3e4c649830ef14d01139bd9e",
+      "archive_sha256": "af7fd24d0749e83f02005b848658cc886d8cffed4878fe973a58c62d2b7c5c71",
+      "archive_bytes": 8688610,
       "exact_emitted_archive_smoked": true,
       "build_model_policy": "writer-gemma4-base-v2",
       "build_model_policy_sha256": "744fa860ffc979f6c1c9e4e1a96680d31c26b558317755548464df5300b9b791",
@@ -56,17 +56,17 @@
       "state_reopen_evidence": "open_project_receipt_count_advanced",
       "acceptance_model_loader_activity": false,
       "source_prior_store_test": "passed_source_level_prior_v10_migration_and_reopen",
-      "packaged_active_operation": "unverified",
-      "packaged_backup_restore_rollback": "unverified"
+      "packaged_active_operation": "passed_same_product_code_debug_bundle_not_repeated_for_release_archive",
+      "packaged_backup_restore_rollback": "passed_same_product_code_prior_and_current_debug_bundles"
     },
     "fte": {
       "version": "0.1.0",
-      "source_revision": "f8ee159de31369c29dc12b24a40a01886a9a02c5",
-      "source_tree": "91012a6df07272b82025961f1f2f9a70356cf7d7",
+      "source_revision": "352adc59fafbc188decd7059cf94da9433a8a324",
+      "source_tree": "345368e25576b9cbbe98193a4d82c0d6408319f8",
       "bundle_id": "dev.delysis.free-token-energy",
-      "executable_sha256": "d24a63f48d32f6b427aa22cbddf92ecadc7fa64b4db50bb3e5623a531e787e14",
-      "archive_sha256": "ca5c1d8779f26a45b43aff82334e872d228d999dfdfb14fd38b53f703531e1a4",
-      "archive_bytes": 8349209,
+      "executable_sha256": "a70f28b27ac420277f793bffce9ec8247e542f68e67391ca8cf3dca1089cd998",
+      "archive_sha256": "191d781d2664aa085a7792b074e1d4adbb74f2e99cc91146d2b2deed692138f9",
+      "archive_bytes": 8349125,
       "exact_emitted_archive_smoked": true,
       "packaged_launch_quit_relaunch": true,
       "state_reopened": true,
@@ -77,11 +77,23 @@
       "keychain_tested_source_revision": "a4161c76075111c462dbe5fef03ddcbd7b2ea193",
       "store_compatibility": "fresh_or_exact_current_schema_only",
       "legacy_database_handling": "rejected_before_mutation_not_imported",
-      "packaged_active_operation": "unverified",
-      "packaged_current_schema_backup_restore": "unverified"
+      "packaged_active_operation": "passed_same_product_code_debug_bundle_not_repeated_for_release_archive",
+      "packaged_current_schema_backup_restore": "passed_same_product_code_prior_and_current_debug_bundles"
     }
   },
   "candidate_class": "accepted_archive_candidates",
+  "current_archive_smoke": {
+    "source_revision": "352adc59fafbc188decd7059cf94da9433a8a324",
+    "source_tree": "345368e25576b9cbbe98193a4d82c0d6408319f8",
+    "evidence_root": "/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/delysis-352adc-archive-smoke.XXXXXX.2ybD4JyTHn",
+    "exact_archives_extracted": true,
+    "exact_executable_hashes_matched_release_receipts": true,
+    "codesign_verified_after_extraction": true,
+    "named_model_weight_files_found": 0,
+    "mom_launch_quit_relaunch": "passed_zero_exit_twice",
+    "loom_launch_quit_relaunch": "passed_zero_exit_twice",
+    "fte_launch_quit_relaunch": "passed_zero_exit_twice"
+  },
   "supplemental_packaged_ux": {
     "classification": "debug_bundles_not_promoted_to_release_archives",
     "mom": {
@@ -201,7 +213,6 @@
   "claims_deferred": [
     "Developer ID signing and notarization",
     "component tags and public artifact publication",
-    "promotion of the current UX binaries into release archives and digest receipts",
     "Windows and Linux distribution support",
     "two stable consolidated releases",
     "source-repository retirement"
