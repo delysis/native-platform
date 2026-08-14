@@ -111,6 +111,32 @@ test("Speech Linux coverage provisions its GLib build dependencies", () => {
   assert.match(fullSpeech, /if: runner\.os == 'Linux'/);
 });
 
+test("Mom and Loom Linux coverage provisions desktop build dependencies", () => {
+  const pr = read(prPath);
+  const full = read(fullPath);
+  const blocks = [
+    pr.match(/^  mom-linux:[\s\S]*?(?=^  loom-linux:)/m)?.[0],
+    pr.match(/^  loom-linux:[\s\S]*?(?=^  frontend:)/m)?.[0],
+    full.match(/^  mom:[\s\S]*?(?=^  loom:)/m)?.[0],
+    full.match(/^  loom:[\s\S]*?(?=^  frontend:)/m)?.[0],
+  ];
+  for (const block of blocks) {
+    assert.ok(block, "product job block is missing");
+    assert.match(block, /libglib2\.0-dev/);
+    assert.match(block, /libgtk-3-dev/);
+  }
+  assert.match(blocks[2], /if: runner\.os == 'Linux'/);
+  assert.match(blocks[3], /if: runner\.os == 'Linux'/);
+});
+
+test("fuzz workflows select the owned nested fuzz workspace explicitly", () => {
+  for (const source of [read(prPath), read(fullPath)]) {
+    assert.match(source, /^\s{2}fuzz-build:/m);
+    assert.match(source, /cargo fuzz build --fuzz-dir crates\/services\/attachment\/fuzz inspect/);
+    assert.match(source, /cargo fuzz build --fuzz-dir crates\/services\/attachment\/fuzz pipeline/);
+  }
+});
+
 test("full workflow covers main, nightly, dispatch, products, policy, and fuzz", () => {
   const source = read(fullPath);
   assert.match(source, /^\s+push:\n\s+branches: \[main\]/m);
