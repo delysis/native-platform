@@ -51,9 +51,17 @@ describe('App ghost reactivity wiring', () => {
     expect(source).not.toContain('Insert suggestion');
     expect(source).not.toContain('strand-evidence');
     expect(source).toContain('class="canvas-controls"');
+    expect(source).toContain('data-tauri-drag-region');
     expect(source).not.toContain('Autosave is always on');
     expect(source).toContain('aria-label={autosaveLabel}');
     expect(source).toContain('New document (⌘N)');
+  });
+
+  it('uses the macOS overlay titlebar for one integrated toolbar', () => {
+    const config = JSON.parse(readFileSync(new URL('../../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+    const mainWindow = config.app.windows[0];
+    expect(mainWindow.titleBarStyle).toBe('Overlay');
+    expect(mainWindow.hiddenTitle).toBe(false);
   });
 
 });

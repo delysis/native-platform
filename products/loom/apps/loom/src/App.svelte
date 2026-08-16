@@ -5355,8 +5355,12 @@
 
 <div class="app-shell">
   {#if project}
-    <div class="canvas-controls" aria-label="Writing controls">
-      <div class="canvas-controls-left">
+    <div
+      class="canvas-controls"
+      aria-label="Writing controls"
+      data-tauri-drag-region
+    >
+      <div class="canvas-controls-left" data-no-window-drag>
         {#if project.documents.length > 1}
           <button
             bind:this={outlineToggle}
@@ -5377,7 +5381,7 @@
           on:click={() => void newDocument()}
         ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
       </div>
-      <div class="canvas-controls-right">
+      <div class="canvas-controls-right" data-no-window-drag>
         {#if shuttleEnabled}
           <span class="shuttle-indicator" title="Shuttle accepts one suggested word after four idle seconds">Shuttle</span>
         {/if}

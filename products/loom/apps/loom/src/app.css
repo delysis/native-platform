@@ -39,26 +39,27 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 
 .canvas-controls {
-  position: absolute;
+  position: relative;
   z-index: 17;
-  top: 8px;
-  right: 8px;
-  left: 8px;
-  height: 28px;
+  min-width: 0;
+  height: 30px;
+  flex: 0 0 30px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  pointer-events: none;
+  padding: 0 8px 0 76px;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--paper) 96%, transparent);
   user-select: none;
   -webkit-user-select: none;
 }
-.canvas-controls-left, .canvas-controls-right { display: flex; align-items: center; gap: 3px; pointer-events: auto; }
+.canvas-controls-left, .canvas-controls-right { display: flex; align-items: center; gap: 5px; }
 .canvas-controls-right { margin-left: auto; }
 .topbar-caption, .muted { color: var(--muted); font-size: 13px; }
 .titlebar-button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; line-height: 1; }
 .titlebar-button svg { width: 15px; height: 15px; display: block; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
 .gear-button svg { width: 16px; height: 16px; stroke-width: 1.2; }
-.outline-scrim { position: fixed; z-index: 18; inset: 0; display: block; padding: 0; border: 0; background: rgb(25 25 23 / 28%); }
+.outline-scrim { position: fixed; z-index: 18; inset: 30px 0 0; display: block; padding: 0; border: 0; background: rgb(25 25 23 / 28%); }
 .outline-toggle:hover, .outline-toggle[aria-expanded="true"] { color: var(--ink); background: var(--paper-deep); }
 .more-button, .icon-button, .bare-button {
   border: 0;
@@ -93,7 +94,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 
 .workspace-grid { min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(0, 1fr); }
 .workspace-grid.single-document .outline-panel { display: none; }
-.outline-panel { position: fixed; z-index: 19; top: 0; bottom: 0; left: 0; width: min(82vw, 300px); min-width: 0; display: flex; visibility: hidden; flex-direction: column; border-right: 1px solid var(--line); background: #f1ede5; box-shadow: 12px 0 32px rgb(25 25 23 / 16%); transform: translateX(-104%); }
+.outline-panel { position: fixed; z-index: 19; top: 30px; bottom: 0; left: 0; width: min(82vw, 300px); min-width: 0; display: flex; visibility: hidden; flex-direction: column; border-right: 1px solid var(--line); background: #f1ede5; box-shadow: 12px 0 32px rgb(25 25 23 / 16%); transform: translateX(-104%); }
 .outline-panel.open { visibility: visible; transform: translateX(0); }
 .panel-heading { min-height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; color: var(--ink); font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .bare-button { font-size: 18px; }
@@ -302,8 +303,8 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   .reconciliation-columns { grid-template-columns: 1fr; }
 }
 @media (max-width: 620px) {
-  .canvas-controls { right: 5px; left: 5px; }
-  .project-menu-popover { position: fixed; top: 34px; right: 8px; left: 8px; width: auto; }
+  .canvas-controls { padding-right: 5px; }
+  .project-menu-popover { position: fixed; top: 30px; right: 8px; left: 8px; width: auto; }
   .document-header { width: calc(100% - 28px); padding-top: 24px; }
   .loom-prosemirror, .source-pane textarea { --writing-gutter: 20px; padding: 22px var(--writing-gutter) 25vh; }
   .project-actions { flex-direction: column; }
@@ -352,7 +353,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
     --selection-ink: #fff;
     --ghost-ink: color-mix(in srgb, var(--muted) 84%, transparent);
   }
-  .outline-panel, .source-pane { background: #252722; }
+  .canvas-controls, .outline-panel, .source-pane { background: #252722; }
   .secondary-button, .document-list button.active, .project-card, .project-card input, .model-manager-picker select, .model-download-form input { color: var(--ink); background: #30322e; }
   .download-error { color: #ffd7d5; background: #603532; }
   .search-field { background: rgb(255 255 255 / 4%); }
