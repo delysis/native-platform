@@ -139,6 +139,14 @@ test("local macOS smoke can verify the exact emitted archive", () => {
   assert.match(smoke, /input_release_receipt_sha256:/);
 });
 
+test("Loom UI smoke cannot attach to an active editor or invent a model identity", () => {
+  const smoke = read(smokeScriptPath);
+  assert.match(smoke, /running_exact_pids=\$\(exact_bundle_pid\)/);
+  assert.match(smoke, /refusing to run macOS UI smoke while the exact application bundle is already running/);
+  assert.match(smoke, /gemma-4-12B-it-qat-q4_0\.gguf/);
+  assert.doesNotMatch(smoke, /acceptance-writer/);
+});
+
 test("stable macOS packaging adds only the real distribution gates", () => {
   const release = read(releaseScriptPath);
   assert.match(release, /candidate\|stable/);

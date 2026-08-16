@@ -448,6 +448,10 @@ function ghostWidget(plan: GhostTextPlan): HTMLElement {
       row.append(number, text);
       fan.append(row);
     });
+    const hint = document.createElement('span');
+    hint.className = 'loom-ghost-fan-hint';
+    hint.textContent = '↑↓ choose  ·  Return insert  ·  → next word';
+    fan.append(hint);
     container.append(fan);
   }
   container.classList.toggle('fan-visible', plan.fanVisible);
@@ -499,6 +503,7 @@ export function setGhostText(
     current?.text === presentation?.text &&
     Boolean(current?.insertsOnAccept) === Boolean(presentation?.insertsOnAccept) &&
     Boolean(current?.hidden) === Boolean(presentation?.hidden) &&
+    Boolean(current?.fanVisible) === Boolean(presentation?.fanVisible) &&
     (current?.unconsumeText ?? '') === (presentation?.unconsumeText ?? '') &&
     alternativesMatch(current?.alternatives, presentation?.alternatives)
   ) return;
@@ -506,7 +511,12 @@ export function setGhostText(
     clearGhostText(view);
     return;
   }
-  const next = { ...presentation, fanVisible: Boolean(current?.fanVisible) };
+  const next = {
+    ...presentation,
+    fanVisible: presentation.fanVisible === undefined
+      ? Boolean(current?.fanVisible)
+      : presentation.fanVisible
+  };
   view.dispatch(view.state.tr
     .setMeta(ghostTextPluginKey, { kind: 'set', presentation: next } satisfies GhostTextMeta)
     .setMeta('addToHistory', false));
@@ -518,12 +528,11 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
     state: {
       init: () => null,
       apply(transaction, current) {
-        if (transaction.docChanged || transaction.selectionSet) return null;
         const meta = transactionMeta(transaction);
-        if (!meta) return current;
-        if (meta.kind === 'set') return meta.presentation;
-        if (meta.kind === 'fan') return current ? { ...current, fanVisible: meta.visible } : current;
-        return null;
+        if (meta?.kind === 'set') return meta.presentation;
+        if (meta?.kind === 'fan') return current ? { ...current, fanVisible: meta.visible } : current;
+        if (meta?.kind === 'clear' || transaction.docChanged || transaction.selectionSet) return null;
+        return current;
       }
     },
     props: {
@@ -553,6 +562,7 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           (event.key === 'ArrowUp' || event.key === 'ArrowDown')
         ) {
           event.preventDefault();
+          if (!plan.fanVisible) setGhostFanVisible(view, true);
           handlers.cycle?.(event.key === 'ArrowDown' ? 1 : -1);
           return true;
         }
@@ -572,9 +582,42 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
             handlers.unconsume?.(plan.candidateId, plan.presentationKey, plan.unconsumeText)
           ) {
             event.preventDefault();
-            view.dispatch(view.state.tr.delete(start, end));
+            const removedBytes = new TextEncoder().encode(plan.unconsumeText).byteLength;
+            const anchorByteOffset = plan.anchorByteOffset - removedBytes;
+            if (anchorByteOffset < 0) return false;
+            view.dispatch(view.state.tr
+              .delete(start, end)
+              .setMeta(ghostTextPluginKey, {
+                kind: 'set',
+                presentation: {
+                  active: true,
+                  candidateId: plan.candidateId,
+                  presentationKey: `${plan.presentationKey}:rollback:${removedBytes}`,
+                  surfaceKey: plan.surfaceKey,
+                  anchorByteOffset,
+                  text: `${plan.unconsumeText}${plan.text}`,
+                  insertsOnAccept: true,
+                  alternatives: plan.alternatives,
+                  hidden: plan.hidden,
+                  unconsumeText: '',
+                  fanVisible: plan.fanVisible
+                }
+              } satisfies GhostTextMeta));
             return true;
           }
+        }
+        if (
+          plan &&
+          plan.fanVisible &&
+          event.altKey &&
+          !event.metaKey &&
+          !event.ctrlKey &&
+          (event.key === 'Enter' || event.key === 'Tab')
+        ) {
+          if (!handlers.insert?.(plan.candidateId, plan.presentationKey, plan.text)) return false;
+          event.preventDefault();
+          view.dispatch(view.state.tr.insertText(plan.text));
+          return true;
         }
         if (
           plan &&
@@ -582,7 +625,11 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           !event.metaKey &&
           !event.ctrlKey &&
           event.key === 'ArrowRight' &&
-          handlers.visible(plan.presentationKey, plan.surfaceKey, plan.anchorByteOffset)
+          (plan.fanVisible || handlers.visible(
+            plan.presentationKey,
+            plan.surfaceKey,
+            plan.anchorByteOffset
+          ))
         ) {
           const word = nextSuggestionWord(plan.text);
           if (!word || !handlers.insert?.(plan.candidateId, plan.presentationKey, word)) return false;

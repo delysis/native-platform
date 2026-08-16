@@ -119,6 +119,20 @@ describe('visual ghost widget', () => {
     view.dispatch(state.tr.setMeta(ghostTextPluginKey, { kind: 'fan', visible: true }));
     setGhostText(view, { ...withAlternatives, presentationKey: 'a:2', text: ' first grows' });
     expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(true);
+    setGhostText(view, {
+      ...withAlternatives,
+      presentationKey: 'a:3',
+      text: ' first grows again',
+      fanVisible: false
+    });
+    expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(false);
+    setGhostText(view, {
+      ...withAlternatives,
+      presentationKey: 'a:4',
+      text: ' first grows once more',
+      fanVisible: true
+    });
+    expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(true);
   });
 
   it('reverses the exact last accepted word before falling back to macOS navigation', () => {
@@ -149,6 +163,50 @@ describe('visual ghost widget', () => {
     expect(handled).toBe(true);
     expect(unconsumed).toEqual([' one']);
     expect(state.doc.textContent).toBe('A waits');
+    expect(ghostTextPluginKey.getState(state)).toMatchObject({
+      anchorByteOffset: 1,
+      text: ' one two'
+    });
+    const decorations = plugin.props.decorations?.call(plugin, state) as DecorationSet;
+    expect(decorations.find()).toHaveLength(1);
+  });
+
+  it('chooses the highlighted alternative with Option-Return while the inline ghost is hidden', () => {
+    const inserted: string[] = [];
+    const plugin = createGhostTextPlugin({
+      accept: () => true,
+      dismiss() {},
+      visible: () => false,
+      insert: (_candidateId, _presentationKey, text) => {
+        inserted.push(text);
+        return true;
+      }
+    });
+    const doc = defaultMarkdownParser.parse('A waits');
+    let state = EditorState.create({ doc, selection: Selection.atEnd(doc), plugins: [plugin] });
+    state = state.apply(state.tr.setMeta(ghostTextPluginKey, {
+      kind: 'set',
+      presentation: {
+        ...suggestion,
+        text: ' for rain.',
+        fanVisible: true,
+        alternatives: [
+          { candidateId: 'a', presentationKey: suggestion.presentationKey, text: ' for rain.' },
+          { candidateId: 'b', presentationKey: 'b:1', text: ' until dawn.' }
+        ]
+      }
+    }));
+    const view = {
+      get state() { return state; },
+      dispatch(transaction: Parameters<EditorState['apply']>[0]) { state = state.apply(transaction); }
+    } as unknown as EditorView;
+    const handled = plugin.props.handleKeyDown?.call(plugin, view, {
+      key: 'Enter', altKey: true, metaKey: false, ctrlKey: false,
+      isComposing: false, keyCode: 13, preventDefault() {}
+    } as unknown as KeyboardEvent);
+    expect(handled).toBe(true);
+    expect(inserted).toEqual([' for rain.']);
+    expect(state.doc.textContent).toBe('A waits for rain.');
   });
 });
 
@@ -294,6 +352,20 @@ describe('faithful visual ghost projection', () => {
       markdown,
       anchor,
       ' for morning.'
+    )).toBe(true);
+  });
+
+  it('admits the next completion after visual source normalization removes an invisible terminal space', () => {
+    const markdown = 'Something';
+    const doc = defaultMarkdownParser.parse(markdown);
+    const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
+    const anchor = new TextEncoder().encode(markdown).byteLength;
+    expect(exactMarkdownByteOffsetAtSelection(state, markdown)).toBe(anchor);
+    expect(visualGhostTextIsFaithfulAtSelection(
+      state,
+      markdown,
+      anchor,
+      ' lingers in the hallway.'
     )).toBe(true);
   });
 

@@ -78,8 +78,10 @@ describe('App ghost reactivity wiring', () => {
     );
     expect(toggle).toContain('setSuggestionsEnabled(!suggestionsEnabled)');
     expect(toggle).not.toContain('openModelManager');
-    expect(source).toContain('class="writer-onboarding"');
-    expect(source).toContain('Set up private writing suggestions');
+    expect(source).not.toContain('class="writer-onboarding"');
+    expect(source).not.toContain('Set up private writing suggestions');
+    expect(source).toContain('class="model-setup-callout"');
+    expect(source).toContain('Private writing model');
   });
 
   it('makes an empty writing surface visibly writable in both editor modes', () => {

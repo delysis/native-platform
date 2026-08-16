@@ -3,6 +3,7 @@ import {
   acceptedCompletionText,
   completionPresentation,
   completionShouldRequestNextBatch,
+  completionTextAtBoundary,
   consumeCompletionRemainder,
   consumeCompletionWord,
   cycleCompletionSession,
@@ -67,5 +68,13 @@ describe('cached completion session', () => {
     expect(insertAtUtf8Boundary('héllo', 3, ' brave')).toBe('hé bravello');
     expect(removeBeforeUtf8Boundary('hé bravello', 9, ' brave')).toBe('héllo');
     expect(insertAtUtf8Boundary('héllo', 2, 'x')).toBeNull();
+  });
+
+  it('adds only the editor-owned separator required by the insertion boundary', () => {
+    expect(completionTextAtBoundary('I am trying', 11, 'to continue')).toBe(' to continue');
+    expect(completionTextAtBoundary('I am trying.', 12, 'Then')).toBe(' Then');
+    expect(completionTextAtBoundary('I am trying ', 12, 'again')).toBe('again');
+    expect(completionTextAtBoundary('Wait', 4, ', please')).toBe(', please');
+    expect(completionTextAtBoundary('hé', 2, 'x')).toBeNull();
   });
 });

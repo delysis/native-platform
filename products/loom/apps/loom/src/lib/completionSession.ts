@@ -154,6 +154,28 @@ export function utf8ByteBoundaryToStringIndex(text: string, targetBytes: number)
   return bytes === targetBytes ? text.length : null;
 }
 
+/**
+ * Project a standalone chat response onto a manuscript insertion boundary.
+ * Chat templates conventionally begin assistant text without leading
+ * whitespace, while an editor completion often needs one. The generated
+ * candidate remains immutable; this pure presentation projection makes the
+ * editor-owned separator explicit and reversible.
+ */
+export function completionTextAtBoundary(
+  manuscript: string,
+  targetBytes: number,
+  candidate: string
+): string | null {
+  const index = utf8ByteBoundaryToStringIndex(manuscript, targetBytes);
+  if (index === null) return null;
+  const previous = Array.from(manuscript.slice(0, index)).at(-1);
+  const first = Array.from(candidate)[0];
+  if (!previous || !first || /\s/u.test(previous) || /\s/u.test(first)) return candidate;
+  const closesProse = /[\p{L}\p{N}\p{Pe}.,!?;:'’”"]/u.test(previous);
+  const startsProse = /[\p{L}\p{N}\p{Ps}'‘“"]/u.test(first);
+  return closesProse && startsProse ? ` ${candidate}` : candidate;
+}
+
 export function insertAtUtf8Boundary(text: string, targetBytes: number, insertion: string): string | null {
   const index = utf8ByteBoundaryToStringIndex(text, targetBytes);
   return index === null ? null : `${text.slice(0, index)}${insertion}${text.slice(index)}`;

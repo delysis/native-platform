@@ -5,6 +5,8 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 COMPONENT=${1:-}
 SUPPLIED_ARTIFACT=${2:-}
 RECEIPT_DESTINATION=${3:-}
+LOOM_SMOKE_GGUF_MODEL_PATH=${LOOM_SMOKE_GGUF_MODEL_PATH:-}
+LOOM_SMOKE_REAL_COMPLETIONS=${LOOM_SMOKE_REAL_COMPLETIONS:-}
 
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "smoke-macos-app.sh requires macOS" >&2
@@ -32,6 +34,14 @@ case "$COMPONENT" in
     exit 2
     ;;
 esac
+
+if [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ] && [ ! -f "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
+  echo "LOOM_SMOKE_GGUF_MODEL_PATH is not a model file: $LOOM_SMOKE_GGUF_MODEL_PATH" >&2
+  exit 1
+fi
+if [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
+  LOOM_SMOKE_REAL_COMPLETIONS=1
+fi
 
 require_equal() {
   field=$1
@@ -140,6 +150,7 @@ mkdir "$PRODUCT_STATE"
 PRODUCT_STATE_CANONICAL=$(CDPATH= cd -- "$PRODUCT_STATE" && pwd -P)
 ACTIVE_PID=
 ACTIVE_LAUNCHER_PID=
+LOOM_SMOKE_MODEL_LINK=
 
 cleanup_failed_process() {
   if [ -n "$ACTIVE_PID" ] && kill -0 "$ACTIVE_PID" 2>/dev/null; then
@@ -148,6 +159,9 @@ cleanup_failed_process() {
   if [ -n "$ACTIVE_LAUNCHER_PID" ] && kill -0 "$ACTIVE_LAUNCHER_PID" 2>/dev/null; then
     kill "$ACTIVE_LAUNCHER_PID" 2>/dev/null || true
     wait "$ACTIVE_LAUNCHER_PID" 2>/dev/null || true
+  fi
+  if [ -n "$LOOM_SMOKE_MODEL_LINK" ] && [ -f "$LOOM_SMOKE_MODEL_LINK" ]; then
+    unlink "$LOOM_SMOKE_MODEL_LINK"
   fi
 }
 trap cleanup_failed_process EXIT HUP INT TERM
@@ -306,6 +320,34 @@ func stringAttribute(_ element: AXUIElement, _ name: CFString) -> String {
     attribute(element, name) as? String ?? ""
 }
 
+func pointAttribute(_ element: AXUIElement, _ name: CFString) -> CGPoint? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else {
+        return nil
+    }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cgPoint else { return nil }
+    var point = CGPoint.zero
+    return AXValueGetValue(value, .cgPoint, &point) ? point : nil
+}
+
+func sizeAttribute(_ element: AXUIElement, _ name: CFString) -> CGSize? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else {
+        return nil
+    }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cgSize else { return nil }
+    var size = CGSize.zero
+    return AXValueGetValue(value, .cgSize, &size) ? size : nil
+}
+
+func frame(_ element: AXUIElement) -> CGRect? {
+    guard let origin = pointAttribute(element, kAXPositionAttribute as CFString),
+          let size = sizeAttribute(element, kAXSizeAttribute as CFString) else {
+        return nil
+    }
+    return CGRect(origin: origin, size: size)
+}
+
 func findEditor(_ root: AXUIElement) -> AXUIElement? {
     var queue = [root]
     var cursor = 0
@@ -340,6 +382,20 @@ guard let editor else {
     exit(1)
 }
 
+guard let window = (attribute(application, kAXWindowsAttribute as CFString) as? [AXUIElement])?.first,
+      let windowFrame = frame(window),
+      let editorFrame = frame(editor) else {
+    fputs("could not read Loom's window and manuscript-editor frames\n", stderr)
+    exit(1)
+}
+let visibleEditorFrame = windowFrame.intersection(editorFrame)
+guard !visibleEditorFrame.isNull,
+      visibleEditorFrame.width >= 100,
+      visibleEditorFrame.height >= 40 else {
+    fputs("Loom exposed an accessible editor that was not visibly laid out in its window\n", stderr)
+    exit(1)
+}
+
 guard AXUIElementSetAttributeValue(editor, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success else {
     fputs("could not focus Loom's accessible manuscript text area\n", stderr)
     exit(1)
@@ -356,7 +412,23 @@ down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
 up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
 down.post(tap: .cghidEventTap)
 up.post(tap: .cghidEventTap)
-print("AX-focused text area received native keyboard events")
+let evidence: [String: Any] = [
+    "dispatch": "AX-focused text area received native keyboard events",
+    "editor_frame": [
+        "x": editorFrame.minX,
+        "y": editorFrame.minY,
+        "width": editorFrame.width,
+        "height": editorFrame.height
+    ],
+    "visible_editor_frame": [
+        "x": visibleEditorFrame.minX,
+        "y": visibleEditorFrame.minY,
+        "width": visibleEditorFrame.width,
+        "height": visibleEditorFrame.height
+    ]
+]
+let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+print(String(data: data, encoding: .utf8)!)
 SWIFT
 }
 
@@ -381,6 +453,13 @@ func strings(_ element: AXUIElement) -> String {
         .joined(separator: " ")
 }
 
+func supportsPress(_ element: AXUIElement) -> Bool {
+    var names: CFArray?
+    guard AXUIElementCopyActionNames(element, &names) == .success,
+          let actions = names as? [String] else { return false }
+    return actions.contains(kAXPressAction as String)
+}
+
 func button(named needle: String) -> AXUIElement? {
     var queue = [application]
     var cursor = 0
@@ -388,8 +467,9 @@ func button(named needle: String) -> AXUIElement? {
         let element = queue[cursor]
         cursor += 1
         let role = attribute(element, kAXRoleAttribute as CFString) as? String
-        if (role == kAXButtonRole as String || role == kAXCheckBoxRole as String),
-           strings(element).contains(needle) {
+        if (role == kAXButtonRole as String || role == kAXCheckBoxRole as String || supportsPress(element)),
+           strings(element).contains(needle),
+           (attribute(element, kAXEnabledAttribute as CFString) as? Bool) != false {
             return element
         }
         if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
@@ -408,13 +488,21 @@ func waitForButton(_ name: String, timeout: TimeInterval = 5) -> AXUIElement? {
     return nil
 }
 
-if let autocompleteOn = button(named: "Turn autocomplete off") {
-    guard AXUIElementPerformAction(autocompleteOn, kAXPressAction as CFString) == .success else {
-        fputs("could not turn autocomplete off through its exact titlebar control\n", stderr)
-        exit(1)
+let settledDeadline = Date().addingTimeInterval(90)
+var autocompleteSettledOff = false
+repeat {
+    if button(named: "Turn autocomplete on") != nil {
+        autocompleteSettledOff = true
+        break
     }
-}
-guard waitForButton("Turn autocomplete on") != nil else {
+    if let autocompleteOn = button(named: "Turn autocomplete off"),
+       AXUIElementPerformAction(autocompleteOn, kAXPressAction as CFString) == .success {
+        autocompleteSettledOff = waitForButton("Turn autocomplete on", timeout: 15) != nil
+        break
+    }
+    Thread.sleep(forTimeInterval: 0.1)
+} while Date() < settledDeadline
+guard autocompleteSettledOff else {
     fputs("autocomplete did not expose its independent off state\n", stderr)
     exit(1)
 }
@@ -448,6 +536,236 @@ let evidence: [String: Any] = [
 let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
 print(String(data: data, encoding: .utf8)!)
 SWIFT
+}
+
+exercise_loom_formatting_palette() {
+  target_pid=$1
+  xcrun swift - "$target_pid" <<'SWIFT'
+import ApplicationServices
+import Foundation
+
+let pid = Int32(CommandLine.arguments[1])!
+let application = AXUIElementCreateApplication(pid)
+
+func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
+    return value
+}
+
+func strings(_ element: AXUIElement) -> String {
+    [kAXDescriptionAttribute, kAXTitleAttribute, kAXHelpAttribute]
+        .compactMap { attribute(element, $0 as CFString) as? String }
+        .joined(separator: " ")
+}
+
+func supportsPress(_ element: AXUIElement) -> Bool {
+    var names: CFArray?
+    guard AXUIElementCopyActionNames(element, &names) == .success,
+          let actions = names as? [String] else { return false }
+    return actions.contains(kAXPressAction as String)
+}
+
+func pointAttribute(_ element: AXUIElement, _ name: CFString) -> CGPoint? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else {
+        return nil
+    }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cgPoint else { return nil }
+    var point = CGPoint.zero
+    return AXValueGetValue(value, .cgPoint, &point) ? point : nil
+}
+
+func sizeAttribute(_ element: AXUIElement, _ name: CFString) -> CGSize? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else {
+        return nil
+    }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cgSize else { return nil }
+    var size = CGSize.zero
+    return AXValueGetValue(value, .cgSize, &size) ? size : nil
+}
+
+func press(_ element: AXUIElement) -> Bool {
+    if supportsPress(element),
+       AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
+        return true
+    }
+    guard let origin = pointAttribute(element, kAXPositionAttribute as CFString),
+          let size = sizeAttribute(element, kAXSizeAttribute as CFString),
+          size.width > 0, size.height > 0 else { return false }
+    let center = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
+    guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: center, mouseButton: .left),
+          let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: center, mouseButton: .left) else {
+        return false
+    }
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+    return true
+}
+
+func button(named needle: String) -> AXUIElement? {
+    var queue = [application]
+    var cursor = 0
+    while cursor < queue.count && cursor < 4096 {
+        let element = queue[cursor]
+        cursor += 1
+        if strings(element).contains(needle) {
+            return element
+        }
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    return nil
+}
+
+func waitForButton(_ name: String, timeout: TimeInterval = 5) -> AXUIElement? {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if let match = button(named: name) { return match }
+        Thread.sleep(forTimeInterval: 0.1)
+    } while Date() < deadline
+    return nil
+}
+
+guard let format = waitForButton("Format text"),
+      press(format) else {
+    fputs("could not open Loom's formatting palette through its exact titlebar control\n", stderr)
+    exit(1)
+}
+guard let title = waitForButton("Title"),
+      press(title) else {
+    fputs("could not invoke Title from Loom's open formatting palette\n", stderr)
+    exit(1)
+}
+
+let evidence: [String: Any] = [
+    "control_path": "Format text -> Title",
+    "dispatch": "exact accessible control action or its observed AX frame center",
+    "required_effect": "persisted manuscript changed to an H1 Markdown block"
+]
+let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+print(String(data: data, encoding: .utf8)!)
+SWIFT
+}
+
+set_loom_completion_toggle() {
+  target_pid=$1
+  control_name=$2
+  already_name=$3
+  xcrun swift - "$target_pid" "$control_name" "$already_name" <<'SWIFT'
+import ApplicationServices
+import Foundation
+
+let pid = Int32(CommandLine.arguments[1])!
+let controlName = CommandLine.arguments[2]
+let alreadyName = CommandLine.arguments[3]
+let application = AXUIElementCreateApplication(pid)
+
+func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
+    return value
+}
+
+func strings(_ element: AXUIElement) -> String {
+    [kAXDescriptionAttribute, kAXTitleAttribute, kAXHelpAttribute]
+        .compactMap { attribute(element, $0 as CFString) as? String }
+        .joined(separator: " ")
+}
+
+let deadline = Date().addingTimeInterval(180)
+repeat {
+    var queue = [application]
+    var cursor = 0
+    while cursor < queue.count && cursor < 4096 {
+        let element = queue[cursor]
+        cursor += 1
+        let description = strings(element)
+        let enabled = (attribute(element, kAXEnabledAttribute as CFString) as? Bool) != false
+        if enabled {
+            if description.contains(alreadyName) { exit(0) }
+            if description.contains(controlName),
+               AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
+                exit(0)
+            }
+        }
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    Thread.sleep(forTimeInterval: 0.1)
+} while Date() < deadline
+fputs("could not press Loom completion control: \(controlName)\n", stderr)
+exit(1)
+SWIFT
+}
+
+wait_for_loom_accessibility_text() {
+  target_pid=$1
+  expected=$2
+  xcrun swift - "$target_pid" "$expected" <<'SWIFT'
+import ApplicationServices
+import Foundation
+
+let pid = Int32(CommandLine.arguments[1])!
+let expected = CommandLine.arguments[2]
+let application = AXUIElementCreateApplication(pid)
+
+func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
+    return value
+}
+
+let deadline = Date().addingTimeInterval(180)
+repeat {
+    var queue = [application]
+    var cursor = 0
+    while cursor < queue.count && cursor < 4096 {
+        let element = queue[cursor]
+        cursor += 1
+        let strings = [kAXDescriptionAttribute, kAXTitleAttribute, kAXValueAttribute]
+            .compactMap { attribute(element, $0 as CFString) as? String }
+        if strings.contains(where: { $0.contains(expected) }) {
+            print(expected)
+            exit(0)
+        }
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    Thread.sleep(forTimeInterval: 0.2)
+} while Date() < deadline
+fputs("Loom never exposed the required accessible runtime state: \(expected)\n", stderr)
+exit(1)
+SWIFT
+}
+
+wait_for_loom_manuscript_extension() {
+  manuscript=$1
+  prefix=$2
+  attempt=0
+  while [ "$attempt" -lt 1800 ]; do
+    if node - "$manuscript" "$prefix" <<'NODE'
+const fs = require('fs');
+const [path, prefix] = process.argv.slice(2);
+const observed = fs.readFileSync(path, 'utf8');
+process.exit(observed.startsWith(prefix) && observed.length > prefix.length && /\S/u.test(observed.slice(prefix.length)) ? 0 : 1);
+NODE
+    then
+      node - "$manuscript" <<'NODE'
+const fs = require('fs');
+process.stdout.write(JSON.stringify(fs.readFileSync(process.argv[2], 'utf8')));
+NODE
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  echo "Shuttle never persisted a completion word after a real four-way batch" >&2
+  return 1
 }
 
 create_loom_document_and_require_editor() {
@@ -687,11 +1005,13 @@ run_once() {
   run_number=$1
   stdout_log="$SMOKE_ROOT/launch-$run_number.stdout.log"
   stderr_log="$SMOKE_ROOT/launch-$run_number.stderr.log"
-  echo "+ launch $run_number: $EXECUTABLE"
-  if [ -n "$(exact_bundle_pid)" ]; then
-    echo "refusing ambiguous smoke launch while the exact application bundle is already running" >&2
+  running_exact_pids=$(exact_bundle_pid)
+  if [ -n "$running_exact_pids" ]; then
+    echo "refusing to run macOS UI smoke while the exact application bundle is already running (pid(s): $(printf '%s' "$running_exact_pids" | tr '\n' ' '))" >&2
+    echo "quit the app and run this smoke in a dedicated session so automation cannot steal or mutate an active editor" >&2
     return 1
   fi
+  echo "+ launch $run_number: $EXECUTABLE"
   case "$COMPONENT" in
     mom)
       open -F -n -W -o "$stdout_log" --stderr "$stderr_log" \
@@ -712,14 +1032,14 @@ run_once() {
   ACTIVE_PID=
   attempt=0
   while [ "$attempt" -lt 200 ]; do
-    ACTIVE_PID=$(exact_bundle_pid | tail -n 1)
+    ACTIVE_PID=$(exact_bundle_pid | head -n 1)
     [ -n "$ACTIVE_PID" ] && break
     if ! kill -0 "$ACTIVE_LAUNCHER_PID" 2>/dev/null; then break; fi
     attempt=$((attempt + 1))
     sleep 0.1
   done
   if [ -z "$ACTIVE_PID" ]; then
-    echo "LaunchServices did not expose the exact application process" >&2
+    echo "LaunchServices did not expose a new exact-bundle process" >&2
     return 1
   fi
   echo "+ bound pid: $ACTIVE_PID"
@@ -736,10 +1056,12 @@ run_once() {
   fi
   if [ "$COMPONENT" = loom ] && [ "$run_number" -eq 1 ]; then
     loom_manuscript="$PRODUCT_STATE/writing/manuscript/Untitled.md"
-    if ! RUN_1_COMPLETION_CONTROLS_EVIDENCE=$(exercise_loom_completion_controls "$ACTIVE_PID"); then
-      echo "autocomplete and Shuttle did not behave as independent native controls" >&2
-      echo "application logs: $stdout_log and $stderr_log" >&2
-      return 1
+    if [ -z "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
+      if ! RUN_1_COMPLETION_CONTROLS_EVIDENCE=$(exercise_loom_completion_controls "$ACTIVE_PID"); then
+        echo "autocomplete and Shuttle did not behave as independent native controls" >&2
+        echo "application logs: $stdout_log and $stderr_log" >&2
+        return 1
+      fi
     fi
     RUN_1_EDITOR_SENTINEL='Loom native smoke: editor persistence.'
     if ! RUN_1_EDITOR_EVIDENCE=$(type_into_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL"); then
@@ -748,6 +1070,49 @@ run_once() {
       return 1
     fi
     if ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL"; then
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    if [ -n "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
+      if [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
+        model_library="$PRODUCT_STATE/models"
+        mkdir -p "$model_library"
+        LOOM_SMOKE_MODEL_LINK="$model_library/gemma-4-12B-it-qat-q4_0.gguf"
+        if [ -e "$LOOM_SMOKE_MODEL_LINK" ]; then
+          echo "isolated acceptance model target already exists: $LOOM_SMOKE_MODEL_LINK" >&2
+          return 1
+        fi
+        ln "$LOOM_SMOKE_GGUF_MODEL_PATH" "$LOOM_SMOKE_MODEL_LINK"
+        require_equal "acceptance model hard-link identity" \
+          "$(stat -f '%d:%i' "$LOOM_SMOKE_GGUF_MODEL_PATH")" \
+          "$(stat -f '%d:%i' "$LOOM_SMOKE_MODEL_LINK")"
+      fi
+      if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"; then
+        echo "could not establish autocomplete off before refreshing the isolated model library" >&2
+        return 1
+      fi
+      if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn autocomplete on" "Turn autocomplete off"; then
+        echo "could not enable autocomplete for the real-model presentation check" >&2
+        return 1
+      fi
+      if ! RUN_1_REAL_GHOST_EVIDENCE=$(wait_for_loom_accessibility_text "$ACTIVE_PID" "Suggestion available."); then
+        echo "a real four-way batch never produced an observed visible ghost presentation" >&2
+        echo "application logs: $stdout_log and $stderr_log" >&2
+        return 1
+      fi
+      if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"; then
+        echo "could not restore autocomplete off after the real-model presentation check" >&2
+        return 1
+      fi
+    fi
+    RUN_1_FORMATTED_SENTINEL="# $RUN_1_EDITOR_SENTINEL"
+    if ! RUN_1_FORMATTING_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID"); then
+      echo "the visual formatting palette could not be exercised in the exact app" >&2
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    if ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_FORMATTED_SENTINEL"; then
+      echo "formatting controls were dispatched but did not persist the required Markdown change" >&2
       echo "application logs: $stdout_log and $stderr_log" >&2
       return 1
     fi
@@ -769,6 +1134,22 @@ run_once() {
       echo "application logs: $stdout_log and $stderr_log" >&2
       return 1
     fi
+    if [ -n "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
+      if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn Shuttle on" "Turn Shuttle off"; then
+        echo "could not enable Shuttle for the real-model consumption check" >&2
+        return 1
+      fi
+      if ! RUN_1_REAL_SHUTTLE_TEXT=$(wait_for_loom_manuscript_extension \
+        "$RUN_1_NEW_DOCUMENT_PATH" "$RUN_1_NEW_DOCUMENT_SENTINEL"); then
+        echo "Shuttle did not consume a cached word from a real four-way batch" >&2
+        echo "application logs: $stdout_log and $stderr_log" >&2
+        return 1
+      fi
+      if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn Shuttle off" "Turn Shuttle on"; then
+        echo "could not restore Shuttle off after the real-model consumption check" >&2
+        return 1
+      fi
+    fi
     RUN_1_MANUSCRIPT_SHA256_BEFORE=$(shasum -a 256 "$loom_manuscript" | awk '{print $1}')
     if ! RUN_1_DRAG_EVIDENCE=$(retry_titlebar_drag_and_require_delta "$ACTIVE_PID"); then
       echo "titlebar drag did not produce an observed window-frame delta for pid $ACTIVE_PID" >&2
@@ -780,7 +1161,7 @@ run_once() {
       "$RUN_1_MANUSCRIPT_SHA256_BEFORE" "$RUN_1_MANUSCRIPT_SHA256_AFTER"
   elif [ "$COMPONENT" = loom ] && [ "$run_number" -eq 2 ]; then
     loom_manuscript="$PRODUCT_STATE/writing/manuscript/Untitled.md"
-    if ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL"; then
+    if ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_FORMATTED_SENTINEL"; then
       echo "persisted editor input did not reopen on the second exact-bundle launch" >&2
       return 1
     fi
@@ -871,6 +1252,10 @@ DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER="${RUN_1_MANUSCRIPT_SHA256_AFTER:-}" \
 DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE="${RUN_1_COMPLETION_CONTROLS_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE="${RUN_1_EDITOR_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_EDITOR_SENTINEL="${RUN_1_EDITOR_SENTINEL:-}" \
+DELYSIS_SMOKE_RUN_1_FORMATTED_SENTINEL="${RUN_1_FORMATTED_SENTINEL:-}" \
+DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE="${RUN_1_FORMATTING_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE="${RUN_1_REAL_GHOST_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT="${RUN_1_REAL_SHUTTLE_TEXT:-}" \
 DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER_EDITOR_INPUT="${RUN_1_MANUSCRIPT_SHA256_AFTER_EDITOR_INPUT:-}" \
 DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE="${RUN_1_NEW_DOCUMENT_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_PATH="${RUN_1_NEW_DOCUMENT_PATH:-}" \
@@ -887,6 +1272,9 @@ const completionControls = e.DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE
   : null;
 const newDocument = e.DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE)
+  : null;
+const formatting = e.DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE
+  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE)
   : null;
 const receipt = {
   schema: "delysis.macos-packaged-app-smoke.v1",
@@ -913,6 +1301,14 @@ const receipt = {
         dispatch: e.DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE,
         sentinel: e.DELYSIS_SMOKE_RUN_1_EDITOR_SENTINEL,
         manuscript_sha256_after_input: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER_EDITOR_INPUT,
+      } : null,
+      visual_formatting: formatting ? {
+        ...formatting,
+        observed_persisted_markdown: e.DELYSIS_SMOKE_RUN_1_FORMATTED_SENTINEL,
+      } : null,
+      real_model_completion: e.DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE ? {
+        ghost_presentation: e.DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE,
+        shuttle_persisted_manuscript: e.DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT || null,
       } : null,
       new_document: newDocument ? {
         ...newDocument,
@@ -946,6 +1342,11 @@ if [ -n "$RECEIPT_DESTINATION" ]; then
   fi
   cp "$RECEIPT" "$RECEIPT_DESTINATION"
   RECEIPT_DESTINATION=$(CDPATH= cd -- "$receipt_parent" && pwd)/$(basename -- "$RECEIPT_DESTINATION")
+fi
+
+if [ -n "$LOOM_SMOKE_MODEL_LINK" ] && [ -f "$LOOM_SMOKE_MODEL_LINK" ]; then
+  unlink "$LOOM_SMOKE_MODEL_LINK"
+  LOOM_SMOKE_MODEL_LINK=
 fi
 
 trap - EXIT HUP INT TERM

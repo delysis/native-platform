@@ -132,6 +132,7 @@
     acceptedCompletionText,
     completionPresentation as completionSessionPresentation,
     completionShouldRequestNextBatch,
+    completionTextAtBoundary,
     consumeCompletionText,
     cycleCompletionSession,
     insertAtUtf8Boundary,
@@ -226,7 +227,6 @@
   let modelUnloading = false;
   let modelChoosing = false;
   let modelManagerOpen = false;
-  let writerSetupExpanded = false;
   let modelManagerPanel: HTMLElement | undefined;
   let modelManagerReturnFocus: HTMLElement | null = null;
   let activeSuggestionRunId: string | null = null;
@@ -298,6 +298,7 @@
   let weaveStarting = false;
   let uncertainWeave: WeaveCapture | null = null;
   const staleWeaveCleanupTimers = new Set<number>();
+  const weaveStatusPollTimers = new Set<number>();
   let branchRefreshTimer: number | undefined;
   let branchPollTimer: number | undefined;
   let branchPollInFlight = false;
@@ -636,10 +637,10 @@
   );
   $: visualGhostTargetByte = mode === 'visual' ? visualSelectionByte : null;
   $: completionContextKey = project && document
-    ? `${project.session_id}:${document.summary.document_id}:${documentEpoch}:${mode}`
+    ? `${project.session_id}:${document.summary.document_id}:${document.summary.revision_id}:${document.visible_blob_id}:${documentEpoch}:${mode}`
     : '';
   $: visualGhostSurfaceKey = project && document
-    ? `${project.session_id}:${document.summary.document_id}:${documentEpoch}:visual`
+    ? `${project.session_id}:${document.summary.document_id}:${document.summary.revision_id}:${document.visible_blob_id}:${documentEpoch}:visual`
     : '';
   $: sourceGhostTargetByte = sourceGhostTargetByteFor(
     mode,
@@ -940,6 +941,8 @@
       applicationCloseRetry.dispose();
       for (const timer of staleWeaveCleanupTimers) window.clearTimeout(timer);
       staleWeaveCleanupTimers.clear();
+      for (const timer of weaveStatusPollTimers) window.clearTimeout(timer);
+      weaveStatusPollTimers.clear();
       unlistenWindowFocus?.();
       unlistenFileCommands?.();
     };
@@ -994,6 +997,8 @@
 
   function resetLiveGenerationView(): void {
     stopBranchPolling();
+    for (const timer of weaveStatusPollTimers) window.clearTimeout(timer);
+    weaveStatusPollTimers.clear();
     unpresentableVisualGhostPresentationKeys = [];
     branchRefreshSerial += 1;
     branchRefreshQueued = false;
@@ -4270,9 +4275,12 @@
       if (state.dismissedCandidateIds.includes(candidateId)) continue;
       const verified = verifiedGhostSuggestion(branch, state.verifiedBodyByRun[branch.run_id]);
       const rawText = verified?.text ?? state.liveTextByRun[branch.run_id] ?? branch.text;
-      const text = editorMode === 'visual'
+      const candidateText = editorMode === 'visual'
         ? visualGhostTextSafePrefix(rawText)
         : rawText;
+      const text = candidateText === null
+        ? null
+        : completionTextAtBoundary(state.sourceText, targetByte, candidateText);
       if (!text || !candidateTextIsSurfaceable(text)) continue;
       const rawPresentationKey = verified?.presentationKey ??
         `stream:${branch.run_id}:${encoder.encode(rawText).byteLength}`;
@@ -4712,6 +4720,37 @@
     scheduleActiveBranchPoll();
   }
 
+  function scheduleWeaveStatusPoll(captured: WeaveCapture, attempt = 0): void {
+    if (attempt >= 240 || !weaveCaptureStillCurrent(captured)) return;
+    const delay = Math.min(250 + attempt * 50, 1_000);
+    const timer = window.setTimeout(async () => {
+      weaveStatusPollTimers.delete(timer);
+      if (!weaveCaptureStillCurrent(captured)) return;
+      try {
+        const status = await getWeaveStatus(
+          captured.projectId,
+          captured.sessionId,
+          captured.commandId
+        );
+        if (!status) {
+          scheduleWeaveStatusPoll(captured, attempt + 1);
+          return;
+        }
+        if (!weaveCaptureStillCurrent(captured) || !installWeaveSnapshot(status, captured)) {
+          return;
+        }
+        if (status.branches.some(isBranchActive)) {
+          scheduleWeaveStatusPoll(captured, attempt + 1);
+        }
+      } catch {
+        if (weaveCaptureStillCurrent(captured)) {
+          scheduleWeaveStatusPoll(captured, attempt + 1);
+        }
+      }
+    }, delay);
+    weaveStatusPollTimers.add(timer);
+  }
+
   function scheduleStaleWeaveCleanup(captured: WeaveCapture, attempt = 0): void {
     if (attempt >= 8) return;
     const delay = Math.min(400 * (2 ** attempt), 4_000);
@@ -4815,6 +4854,7 @@
       });
       if (installWeaveSnapshot(started, captured)) {
         uncertainWeave = null;
+        if (started.branches.some(isBranchActive)) scheduleWeaveStatusPoll(captured);
         announce(started.branches.some(isBranchActive)
           ? 'Suggestions are growing privately'
           : 'Stored strands were recovered');
@@ -6073,54 +6113,6 @@
             </div>
           {/if}
 
-          {#if suggestionSetupNeeded}
-            <section class:expanded={writerSetupExpanded} class="writer-onboarding" aria-label="Writing suggestions setup">
-              <div class="writer-onboarding-copy">
-                <span class="writer-onboarding-mark" aria-hidden="true">✦</span>
-                <span>
-                  <strong>Set up private writing suggestions</strong>
-                  {#if availableWriterModels.length > 0}
-                    <small>{availableWriterModels.length} local text {availableWriterModels.length === 1 ? 'model is' : 'models are'} ready to inspect.</small>
-                  {:else}
-                    <small>No standalone text GGUF is visible yet. Locate one without moving it.</small>
-                  {/if}
-                </span>
-              </div>
-              <div class="writer-onboarding-actions">
-                {#if availableWriterModels[0]}
-                  <button
-                    class="primary-button compact"
-                    type="button"
-                    disabled={!desktop || modelLoading || modelChoosing || modelUnloading}
-                    on:click={() => void useDiscoveredSuggestionWriter(availableWriterModels[0])}
-                  >{modelLoading && selectedModelPath === availableWriterModels[0].model_path ? 'Loading…' : `Use ${writerSetupName(availableWriterModels[0])}`}</button>
-                {/if}
-                {#if availableWriterModels.length > 1}
-                  <button class="secondary-button compact" type="button" aria-expanded={writerSetupExpanded} on:click={() => (writerSetupExpanded = !writerSetupExpanded)}>
-                    {writerSetupExpanded ? 'Hide models' : 'Choose another…'}
-                  </button>
-                {/if}
-                <button class="bare-button compact" type="button" disabled={!desktop || modelChoosing || modelLoading || modelUnloading} on:click={() => void chooseSuggestionWriterModel()}>
-                  {modelChoosing ? 'Locating…' : 'Locate file…'}
-                </button>
-                <button class="bare-button compact" type="button" on:click={() => void setSuggestionsEnabled(false)}>Not now</button>
-              </div>
-              {#if writerSetupExpanded && availableWriterModels.length > 1}
-                <div class="writer-onboarding-list" aria-label="Local text models">
-                  {#each availableWriterModels as model (model.model_path)}
-                    <button type="button" disabled={modelLoading || modelChoosing || modelUnloading} on:click={() => void useDiscoveredSuggestionWriter(model)}>
-                      <span><strong>{writerSetupName(model)}</strong><small>{model.display_name}</small></span>
-                      <span>{formatByteCount(model.file_bytes)}</span>
-                    </button>
-                  {/each}
-                </div>
-              {/if}
-              {#if modelSetupError}
-                <p class="model-setup-error" role="alert">{modelSetupError}</p>
-              {/if}
-            </section>
-          {/if}
-
           <section class="editor-stage" aria-label="Writing surface">
             {#if showVisual}
               <div class="editor-pane visual-pane" aria-label="Visual editor pane">
@@ -6183,7 +6175,7 @@
                   readonly={editorReadonly || document.summary.kind === 'hybrid' || Boolean(exactTextSurface && verseCodec && !verseCodec.editable)}
                   verse={exactTextSurface}
                   verseNewline={exactTextSurface ? verseCodec?.newline ?? 'mixed' : null}
-                  surfaceKey={`${project.session_id}:${document.summary.document_id}:${documentEpoch}:${mode}`}
+                  surfaceKey={`${project.session_id}:${document.summary.document_id}:${document.summary.revision_id}:${document.visible_blob_id}:${documentEpoch}:${mode}`}
                   ghostText={sourceGhostSuggestion?.text ?? ''}
                   ghostCandidateId={sourceGhostSuggestion?.candidateId ?? ''}
                   ghostPresentationKey={sourceGhostSuggestion?.presentationKey ?? ''}

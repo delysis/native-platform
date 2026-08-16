@@ -336,6 +336,7 @@ export function sourceGhostKeyAction(
   if (event.altKey) {
     if (optionFanVisible && event.key === 'ArrowDown') return 'cycle_next';
     if (optionFanVisible && event.key === 'ArrowUp') return 'cycle_previous';
+    if (optionFanVisible && event.key === 'ArrowRight') return 'accept_word';
     if (!hasVisibleGhost) return null;
     if (event.key === 'ArrowRight') return 'accept_word';
     if (event.key === 'ArrowDown') return 'cycle_next';

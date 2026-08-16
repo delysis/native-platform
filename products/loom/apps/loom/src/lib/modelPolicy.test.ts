@@ -106,6 +106,21 @@ describe('orderedLocalTextModels', () => {
 });
 
 describe('startupWriterCandidates', () => {
+  it('quietly selects the official Gemma 4 12B QAT artifact before legacy policy candidates', () => {
+    const gemma = model({
+      display_name: 'gemma-4-12B-it-qat-q4_0.gguf',
+      model_path: '/models/gemma-4-12B-it-qat-q4_0.gguf',
+      file_bytes: 6_975_879_296,
+      policy_candidate: null
+    });
+    const policy = model({ model_path: '/models/legacy-policy.gguf' });
+
+    expect(startupWriterCandidates([policy, gemma], null)).toEqual([
+      { modelPath: gemma.model_path, profileId: null, policyRank: -1, remembered: false },
+      { modelPath: policy.model_path, profileId: 'writer-v1', policyRank: 0, remembered: false }
+    ]);
+  });
+
   it('quietly reopens an explicitly selected generic text model before policy discovery', () => {
     const remembered = model({ model_path: '/models/remembered.gguf', policy_candidate: null });
     const policy = model({ model_path: '/models/policy.gguf' });

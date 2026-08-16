@@ -23,6 +23,33 @@ describe('Markdown-safe visual formatting', () => {
     expect(defaultMarkdownSerializer.serialize(formatted('Words\n', 'subheading').doc)).toBe('### Words');
   });
 
+  it('changes the current paragraph style from a caret-only palette invocation', () => {
+    const doc = defaultMarkdownParser.parse('Words');
+    let state = EditorState.create({
+      doc,
+      selection: TextSelection.create(doc, doc.content.size - 1)
+    });
+    expect(applyVisualFormat(state, 'title', '', (transaction) => {
+      state = state.apply(transaction);
+    })).toBe(true);
+    expect(defaultMarkdownSerializer.serialize(state.doc)).toBe('# Words');
+    expect(visualFormatState(state).block).toBe('title');
+  });
+
+  it('arms an inline mark at an empty selection and applies it to subsequent typing', () => {
+    const doc = defaultMarkdownParser.parse('Words');
+    let state = EditorState.create({
+      doc,
+      selection: TextSelection.create(doc, doc.content.size - 1)
+    });
+    expect(applyVisualFormat(state, 'bold', '', (transaction) => {
+      state = state.apply(transaction);
+    })).toBe(true);
+    expect(visualFormatState(state).bold).toBe(true);
+    state = state.apply(state.tr.insertText(' more'));
+    expect(defaultMarkdownSerializer.serialize(state.doc)).toBe('Words **more**');
+  });
+
   it('applies inline marks, quotes, lists, and links losslessly', () => {
     expect(defaultMarkdownSerializer.serialize(formatted('Words\n', 'bold').doc)).toBe('**Words**');
     expect(defaultMarkdownSerializer.serialize(formatted('Words\n', 'italic').doc)).toBe('*Words*');
@@ -41,5 +68,14 @@ describe('Markdown-safe visual formatting', () => {
       state = state.apply(transaction);
     })).toBe(false);
     expect(applyVisualFormat(state, 'link', 'bad url', () => {})).toBe(false);
+  });
+
+  it('removes an existing link without changing its text', () => {
+    const linked = formatted('[Words](https://example.com)', 'link', 'https://other.example');
+    let state = linked;
+    expect(applyVisualFormat(state, 'unlink', '', (transaction) => {
+      state = state.apply(transaction);
+    })).toBe(true);
+    expect(defaultMarkdownSerializer.serialize(state.doc)).toBe('Words');
   });
 });

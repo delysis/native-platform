@@ -7,7 +7,7 @@
   import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
   import { onDestroy, onMount } from 'svelte';
-  import { parseVisualMarkdown } from './markdownSafety';
+  import { normalizeVisualMarkdownSource, parseVisualMarkdown } from './markdownSafety';
   import {
     clearGhostText,
     createGhostTextPlugin,
@@ -66,14 +66,16 @@
   let mount: HTMLDivElement;
   let scrollViewport: HTMLElement | null = null;
   let view: EditorView | undefined;
-  let lastEmitted = value;
-  let editorEmpty = value.length === 0;
+  let lastEmitted = normalizeVisualMarkdownSource(value);
+  let editorEmpty = lastEmitted.length === 0;
   let projectionTimer: number | undefined;
+  let normalizationTimer: number | undefined;
   let localDocumentChanged = false;
   let composing = false;
   let suppressedGhostKey = '';
   let reportedGhostPresentationKey = '';
   let reportedRejectedPresentationIdentity = '';
+  let optionHeld = false;
   let visibilityFrame: number | undefined;
   let selectionReportTimer: number | undefined;
   let boundaryCacheDocument: ProseMirrorNode | null = null;
@@ -137,6 +139,15 @@
   function scheduleProjection(delay = 240): void {
     if (projectionTimer !== undefined) return;
     projectionTimer = window.setTimeout(projectDocument, delay);
+  }
+
+  function scheduleExternalNormalization(original: string, normalized: string): void {
+    if (original === normalized) return;
+    if (normalizationTimer !== undefined) window.clearTimeout(normalizationTimer);
+    normalizationTimer = window.setTimeout(() => {
+      normalizationTimer = undefined;
+      if (view && value === original && lastEmitted === normalized) onChange(normalized);
+    }, 0);
   }
 
   export function flushPending(): boolean {
@@ -256,9 +267,34 @@
     }, delay);
   }
 
+  function setOptionHeld(held: boolean): void {
+    if (optionHeld === held) return;
+    optionHeld = held;
+    if (!view) return;
+    const plan = currentGhostTextPlan(view.state);
+    if (!plan || plan.alternatives.length < 2) return;
+    setGhostText(view, { ...plan, active: true, fanVisible: held });
+  }
+
+  function handleWindowKeyDown(event: KeyboardEvent): void {
+    if (event.key === 'Alt' || (event.altKey && !event.metaKey && !event.ctrlKey)) {
+      setOptionHeld(true);
+    }
+  }
+
+  function handleWindowKeyUp(event: KeyboardEvent): void {
+    if (event.key === 'Alt' || !event.altKey) setOptionHeld(false);
+  }
+
+  function handleWindowBlur(): void {
+    setOptionHeld(false);
+  }
+
   onMount(() => {
+    const initialMarkdown = normalizeVisualMarkdownSource(value);
+    lastEmitted = initialMarkdown;
     view = new EditorView(mount, {
-      state: stateFor(value),
+      state: stateFor(initialMarkdown),
       editable: () => !readonly,
       attributes: editorAttributes(),
       dispatchTransaction(transaction) {
@@ -320,21 +356,27 @@
       }
     });
     reportSelection(view.state);
+    scheduleExternalNormalization(value, initialMarkdown);
     scrollViewport = mount.closest<HTMLElement>('.editor-pane');
     scheduleGhostVisibilityReport();
     window.addEventListener('resize', reportGhostVisibility);
+    window.addEventListener('keydown', handleWindowKeyDown, true);
+    window.addEventListener('keyup', handleWindowKeyUp, true);
+    window.addEventListener('blur', handleWindowBlur);
     scrollViewport?.addEventListener('scroll', reportGhostVisibility, { passive: true });
     if (autofocus) view.focus();
   });
 
   $: if (view && value !== lastEmitted && !composing && !localDocumentChanged) {
-    lastEmitted = value;
-    const next = stateFor(value);
+    const normalized = normalizeVisualMarkdownSource(value);
+    lastEmitted = normalized;
+    const next = stateFor(normalized);
     view.updateState(next);
     editorEmpty = next.doc.textContent.length === 0;
     clearBoundaryCache();
     reportSelection(next);
     scheduleGhostVisibilityReport();
+    scheduleExternalNormalization(value, normalized);
   }
 
   $: if (view) {
@@ -382,7 +424,8 @@
       insertsOnAccept: ghostInsertsOnAccept,
       alternatives: ghostAlternatives,
       hidden: ghostHidden,
-      unconsumeText: ghostUnconsumeText
+      unconsumeText: ghostUnconsumeText,
+      fanVisible: optionHeld
     } : null;
     setGhostText(view, presentation);
     scheduleGhostVisibilityReport();
@@ -390,12 +433,16 @@
 
   onDestroy(() => {
     if (projectionTimer !== undefined) window.clearTimeout(projectionTimer);
+    if (normalizationTimer !== undefined) window.clearTimeout(normalizationTimer);
     if (visibilityFrame !== undefined) window.cancelAnimationFrame(visibilityFrame);
     if (selectionReportTimer !== undefined) window.clearTimeout(selectionReportTimer);
     if (composing) onCompositionChange(false);
     onSelectionChange(null);
     if (reportedGhostPresentationKey) onGhostVisibilityChange('');
     window.removeEventListener('resize', reportGhostVisibility);
+    window.removeEventListener('keydown', handleWindowKeyDown, true);
+    window.removeEventListener('keyup', handleWindowKeyUp, true);
+    window.removeEventListener('blur', handleWindowBlur);
     scrollViewport?.removeEventListener('scroll', reportGhostVisibility);
     view?.destroy();
   });

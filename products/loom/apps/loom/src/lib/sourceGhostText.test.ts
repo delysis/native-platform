@@ -260,7 +260,7 @@ describe('sourceGhostKeyAction', () => {
     expect(sourceGhostKeyAction(key({ key: 'ArrowUp', altKey: true }), false, true))
       .toBe('cycle_previous');
     expect(sourceGhostKeyAction(key({ key: 'ArrowRight', altKey: true }), false, true))
-      .toBeNull();
+      .toBe('accept_word');
   });
 
   it('dismisses with Escape and ignores IME key events', () => {

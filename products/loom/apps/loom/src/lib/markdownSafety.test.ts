@@ -1,6 +1,10 @@
 import { defaultMarkdownParser } from 'prosemirror-markdown';
 import { describe, expect, it } from 'vitest';
-import { canRoundTripMarkdownExactly, canUseVisualMarkdown } from './markdownSafety';
+import {
+  canRoundTripMarkdownExactly,
+  canUseVisualMarkdown,
+  normalizeVisualMarkdownSource
+} from './markdownSafety';
 
 describe('visual Markdown safety gate', () => {
   it('admits the canonical subset used by the visual editor', () => {
@@ -35,5 +39,14 @@ describe('visual Markdown safety gate', () => {
     expect(canUseVisualMarkdown('- A quiet item ', false)).toBe(false);
     expect(canUseVisualMarkdown('```text\ncode\n``` ', false)).toBe(false);
     expect(canUseVisualMarkdown('~~unsupported~~ ', false)).toBe(false);
+  });
+
+  it('normalizes only the invisible terminal prose byte that would stale a completion boundary', () => {
+    expect(normalizeVisualMarkdownSource('Something ')).toBe('Something');
+    expect(normalizeVisualMarkdownSource('# Heading ')).toBe('# Heading');
+
+    expect(normalizeVisualMarkdownSource('Something  ')).toBe('Something  ');
+    expect(normalizeVisualMarkdownSource('- A quiet item ')).toBe('- A quiet item ');
+    expect(normalizeVisualMarkdownSource('Something\n')).toBe('Something\n');
   });
 });

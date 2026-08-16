@@ -38,6 +38,15 @@ const GEMMA_4_BASE_WRITER_PROFILE = 'gemma_4_e2b_base_q8_loom_v1';
 const OFFICIAL_GEMMA_4_12B_QAT_FILE = 'gemma-4-12b-it-qat-q4_0.gguf';
 const OFFICIAL_GEMMA_4_12B_QAT_BYTES = 6_975_879_296;
 
+function isOfficialGemma4_12BQat(model: ModelCapabilitySummary): boolean {
+  return model.local &&
+    model.header_verified &&
+    !model.loaded &&
+    model.display_name.toLocaleLowerCase('en-US') === OFFICIAL_GEMMA_4_12B_QAT_FILE &&
+    model.file_bytes === OFFICIAL_GEMMA_4_12B_QAT_BYTES &&
+    !looksLikeVisionAdapter(model);
+}
+
 export function writerProfileForBuildPolicy(
   policy: BuildModelPolicySummary | null
 ): string | null {
@@ -88,10 +97,7 @@ export function orderedLocalTextModels(
 ): ModelCapabilitySummary[] {
   const priority = (model: ModelCapabilitySummary): [number, number, string] => {
     if (model.model_path === rememberedPath) return [0, 0, model.model_path];
-    if (
-      model.display_name.toLocaleLowerCase('en-US') === OFFICIAL_GEMMA_4_12B_QAT_FILE &&
-      model.file_bytes === OFFICIAL_GEMMA_4_12B_QAT_BYTES
-    ) return [1, 0, model.model_path];
+    if (isOfficialGemma4_12BQat(model)) return [1, 0, model.model_path];
     if (model.policy_candidate) return [2, model.policy_candidate.rank, model.model_path];
     return [3, 0, model.model_path];
   };
@@ -110,12 +116,17 @@ export function orderedLocalTextModels(
     });
 }
 
-/** A writer the author chose explicitly remains the quiet startup default. */
+/**
+ * A writer the author chose explicitly remains first. Otherwise the official
+ * Gemma 4 12B QAT artifact is Loom's quiet product default, followed by older
+ * exact build-policy candidates.
+ */
 export function startupWriterCandidates(
   models: readonly ModelCapabilitySummary[],
   rememberedPath: string | null
 ): StartupWriterCandidate[] {
   const policyCandidates = orderedLocalWriterCandidates(models);
+  const officialGemma = models.find(isOfficialGemma4_12BQat);
   const rememberedProfile = rememberedPath
     ? models.find((model) => model.model_path === rememberedPath)?.policy_candidate?.profile_id ?? null
     : null;
@@ -128,8 +139,18 @@ export function startupWriterCandidates(
           remembered: true
         }]
       : []),
+    ...(officialGemma && officialGemma.model_path !== rememberedPath
+      ? [{
+          modelPath: officialGemma.model_path,
+          profileId: null,
+          policyRank: -1,
+          remembered: false
+        }]
+      : []),
     ...policyCandidates
-      .filter((candidate) => candidate.modelPath !== rememberedPath)
+      .filter((candidate) =>
+        candidate.modelPath !== rememberedPath &&
+        candidate.modelPath !== officialGemma?.model_path)
       .map((candidate) => ({ ...candidate, remembered: false }))
   ];
 }

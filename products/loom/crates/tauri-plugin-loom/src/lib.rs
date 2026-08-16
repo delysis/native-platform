@@ -6382,19 +6382,25 @@ fn sampling_for_weave_case(
         dynamic_temperature_exponent: 1.0,
         top_k: 40,
         top_p: 0.95,
-        min_p: 0.0,
+        min_p: if repetition_resistant_prose {
+            0.05
+        } else {
+            0.0
+        },
         typical_p: 1.0,
         xtc_probability: 0.0,
         xtc_threshold: 0.1,
         repeat_last_n: 64,
-        repeat_penalty: if repetition_resistant_prose {
-            1.08
-        } else {
-            1.0
-        },
+        // Prompt penalties operate over the full rendered Gemma chat scaffold,
+        // not merely generated prose. Keep them neutral; the model and min-p
+        // filter provide diversity without distorting the first word.
+        repeat_penalty: 1.0,
         frequency_penalty: 0.0,
         presence_penalty: 0.0,
-        dry_multiplier: if repetition_resistant_prose { 0.8 } else { 0.0 },
+        // DRY consumes the rendered instruction/chat control tokens as history.
+        // On Gemma 4 this can suppress ordinary prose tokens before the first
+        // generated word and drive the sampler into numeric degeneration.
+        dry_multiplier: 0.0,
         dry_base: 1.75,
         dry_allowed_length: if repetition_resistant_prose { 4 } else { 2 },
         dry_penalty_last_n: if repetition_resistant_prose { 256 } else { -1 },
@@ -6656,8 +6662,7 @@ fn persist_generation_result<R: Runtime>(
             &candidate,
             &identity.request_id,
             binding.exact_prompt_blob_id,
-            binding.model_environment.environment_id,
-            &binding.model.local_model_id,
+            &binding.model,
             input_index,
         )
         .map_err(|error| {
@@ -9496,8 +9501,9 @@ mod tests {
         assert_ne!(verse.seed, manual.seed);
         assert_eq!(automatic.max_tokens, 48);
         assert_eq!(automatic.temperature.to_bits(), 0.8_f32.to_bits());
-        assert_eq!(automatic.repeat_penalty.to_bits(), 1.08_f32.to_bits());
-        assert_eq!(automatic.dry_multiplier.to_bits(), 0.8_f32.to_bits());
+        assert_eq!(automatic.min_p.to_bits(), 0.05_f32.to_bits());
+        assert_eq!(automatic.repeat_penalty.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(automatic.dry_multiplier.to_bits(), 0.0_f32.to_bits());
         assert_eq!(automatic.dry_allowed_length, 4);
         assert_eq!(automatic.dry_penalty_last_n, 256);
         assert_eq!(verse.repeat_penalty.to_bits(), 1.0_f32.to_bits());
@@ -9534,7 +9540,7 @@ mod tests {
         let manual = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::ManualV2);
         assert_eq!(
             prose.fingerprint().sha256_hex(),
-            "8958697e23818dd62c364f46d14d12e977a10b2428be17d255954a25bd3d529c"
+            "3da7620eae64153b0c5785abcdffb094b3eef47677a4beec9ab71fe8c718f334"
         );
         assert_eq!(
             verse.fingerprint().sha256_hex(),

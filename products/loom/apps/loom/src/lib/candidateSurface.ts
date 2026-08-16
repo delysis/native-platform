@@ -44,10 +44,17 @@ export function candidateSurfaceDecision(text: string): CandidateSurfaceDecision
     return { surface: false, reason: 'artifact' };
   }
   const compactAscii = text.trim();
+  const compactVisibleAscii = Array.from(compactAscii).filter((scalar) => /\S/u.test(scalar));
   if (
     /^[\x00-\x7f]*$/u.test(compactAscii) &&
-    Array.from(compactAscii).filter((scalar) => /\S/u.test(scalar)).length < 4
+    compactVisibleAscii.length < 4
   ) return { surface: false, reason: 'too_short' };
+  if (
+    /^[\x00-\x7f]*$/u.test(compactAscii) &&
+    compactVisibleAscii.length >= 4 &&
+    compactVisibleAscii.filter((scalar) => /[0-9]/u.test(scalar)).length /
+      compactVisibleAscii.length >= 0.8
+  ) return { surface: false, reason: 'numeric' };
   if (hasDegenerateUnbrokenPeriod(text)) {
     return { surface: false, reason: 'repetition' };
   }

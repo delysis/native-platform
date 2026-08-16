@@ -330,9 +330,13 @@
 
   function handleKeydown(event: KeyboardEvent): void {
     const candidate = currentPlan();
-    if (event.key === 'Alt' && candidate && ghostAlternatives.length > 1) {
+    if (
+      (event.key === 'Alt' || event.altKey) &&
+      candidate &&
+      ghostAlternatives.length > 1
+    ) {
       optionFanVisible = true;
-      return;
+      if (event.key === 'Alt') return;
     }
     if (
       candidate &&
@@ -365,6 +369,18 @@
       )
       ? candidate
       : null;
+    if (
+      candidate &&
+      optionFanVisible &&
+      event.altKey &&
+      (event.key === 'Enter' || event.key === 'Tab') &&
+      insertVisibleGhostText(candidate, candidate.text)
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      suppressCurrentGhost();
+      return;
+    }
     const action = sourceGhostKeyAction(event, Boolean(visible), optionFanVisible && Boolean(candidate));
     if (!action) return;
     if ((action === 'cycle_next' || action === 'cycle_previous') && candidate) {
@@ -394,9 +410,10 @@
         return;
       }
     }
-    if (action === 'accept_word' && visible) {
-      const word = nextSuggestionWord(visible.text);
-      if (word && insertVisibleGhostText(visible, word)) {
+    const wordCandidate = visible ?? (optionFanVisible ? candidate : null);
+    if (action === 'accept_word' && wordCandidate) {
+      const word = nextSuggestionWord(wordCandidate.text);
+      if (word && insertVisibleGhostText(wordCandidate, word)) {
         event.preventDefault();
         event.stopPropagation();
       }
@@ -423,6 +440,22 @@
   function handleKeyup(event: KeyboardEvent): void {
     if (event.key === 'Alt' || !event.altKey) optionFanVisible = false;
     handleSelection();
+  }
+
+  function handleWindowOptionDown(event: KeyboardEvent): void {
+    if (
+      (event.key === 'Alt' || (event.altKey && !event.metaKey && !event.ctrlKey)) &&
+      currentPlan() &&
+      ghostAlternatives.length > 1
+    ) optionFanVisible = true;
+  }
+
+  function handleWindowOptionUp(event: KeyboardEvent): void {
+    if (event.key === 'Alt' || !event.altKey) optionFanVisible = false;
+  }
+
+  function handleWindowBlur(): void {
+    optionFanVisible = false;
   }
 
   function insertVisibleGhostText(candidate: SourceGhostPlan, text: string): boolean {
@@ -481,6 +514,9 @@
     resizeObserver = new ResizeObserver(invalidateAndRequestGeometry);
     resizeObserver.observe(element);
     document.addEventListener('selectionchange', handleDocumentSelectionChange);
+    window.addEventListener('keydown', handleWindowOptionDown, true);
+    window.addEventListener('keyup', handleWindowOptionUp, true);
+    window.addEventListener('blur', handleWindowBlur);
     syncGeometry();
   });
 
@@ -533,6 +569,9 @@
     if (geometryFrame !== undefined) window.cancelAnimationFrame(geometryFrame);
     reportVisiblePresentationKey('');
     document.removeEventListener('selectionchange', handleDocumentSelectionChange);
+    window.removeEventListener('keydown', handleWindowOptionDown, true);
+    window.removeEventListener('keyup', handleWindowOptionUp, true);
+    window.removeEventListener('blur', handleWindowBlur);
   });
 </script>
 
@@ -578,6 +617,7 @@
           <span class="loom-ghost-fan-index">{index + 1}</span><span>{alternative.text}</span>
         </div>
       {/each}
+      <div class="loom-ghost-fan-hint">↑↓ choose&nbsp; · &nbsp;Return insert&nbsp; · &nbsp;→ next word</div>
     </div>
   {/if}
 </div>

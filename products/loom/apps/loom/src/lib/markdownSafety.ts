@@ -39,6 +39,21 @@ function differsOnlyByHarmlessTerminalProseSpace(markdown: string): boolean {
 }
 
 /**
+ * Remove the one source byte that the admitted visual dialect cannot display.
+ *
+ * A terminal ASCII space in prose has no rendered or Markdown meaning, but it
+ * changes the backend completion boundary. Leaving that invisible byte in the
+ * project while the visual caret sits before it makes every otherwise valid
+ * completion look stale. Normalize only after the parser and serializer prove
+ * this exact one-byte discrepancy; meaningful whitespace remains untouched.
+ */
+export function normalizeVisualMarkdownSource(markdown: string): string {
+  return differsOnlyByHarmlessTerminalProseSpace(markdown)
+    ? markdown.slice(0, -1)
+    : markdown;
+}
+
+/**
  * Keep an admitted visual editing session mounted across transient serializer
  * states. Source/imported text must still prove an exact dialect round trip,
  * except for one terminal ASCII space that the serializer demonstrably drops
