@@ -360,4 +360,42 @@ mod tests {
         assert!(report.truncated);
         assert!(report.models.len() < 4);
     }
+
+    /// Developer acceptance check for Loom's quiet first-run writer discovery.
+    ///
+    /// This intentionally depends on the official artifact being present in the
+    /// current user's Hugging Face cache, so it stays ignored in hermetic CI.
+    #[test]
+    #[ignore = "requires the official Gemma 4 12B QAT Q4_0 GGUF in the local Hugging Face cache"]
+    fn real_default_cache_discovers_official_gemma_4_12b_qat() {
+        const FILE_NAME: &str = "gemma-4-12b-it-qat-q4_0.gguf";
+        const FILE_BYTES: u64 = 6_975_879_296;
+
+        let mut options = ModelDiscoveryOptions::default();
+        options.max_entries = options.max_entries.min(20_000);
+        options.max_depth = options.max_depth.min(12);
+        let report = discover_gguf_models(&options).expect("discover default desktop models");
+
+        assert!(
+            !report.truncated,
+            "the bounded desktop scan truncated after {} visited entries",
+            report.visited_entries
+        );
+        let model = report
+            .models
+            .iter()
+            .find(|model| {
+                model
+                    .selected_path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(FILE_NAME))
+                    && model.file_bytes == FILE_BYTES
+            })
+            .expect("official Gemma 4 12B QAT Q4_0 artifact");
+
+        assert_eq!(model.source, ModelDiscoverySource::HuggingFaceCache);
+        assert_eq!(model.header, GgufHeaderStatus::Verified);
+        assert!(model.resolved_path.is_file());
+    }
 }

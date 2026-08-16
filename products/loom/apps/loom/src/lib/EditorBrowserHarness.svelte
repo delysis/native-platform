@@ -4,6 +4,7 @@
   import VisualFormatMenu from './VisualFormatMenu.svelte';
   import {
     completionPresentation,
+    completionSessionContextKey,
     completionShouldRequestNextBatch,
     consumeCompletionText,
     cycleCompletionSession,
@@ -19,13 +20,22 @@
 
   export let initialValue = 'alpha beta gamma';
   export let completionCandidates: CompletionCandidate[] = [];
+  export let autocomplete = true;
+  export let shuttle = false;
 
   let markdown = initialValue;
   let pendingMarkdown: string | null = null;
   let editor: LoomEditor;
+  const completionContextKey = completionSessionContextKey(
+    'browser-session',
+    'browser-document',
+    1,
+    'visual'
+  );
   let session: CompletionSession | null = completionCandidates.length > 0
-    ? startCompletionSession('browser:document:visual', completionCandidates, completionCandidates[0].runId)
+    ? startCompletionSession(completionContextKey, completionCandidates, completionCandidates[0].runId)
     : null;
+  let checkpointRevision = 1;
   let generationRequests = 0;
   let exhaustionHandled = false;
   let completionReady = false;
@@ -80,6 +90,10 @@
     if (pendingMarkdown === null) generationRequests += 1;
   }
 
+  function caretNavigation(): void {
+    if (completionReady) generationRequests += 1;
+  }
+
   function insert(candidateId: string, presentationKey: string, text: string): boolean {
     if (
       !session ||
@@ -114,6 +128,14 @@
     if (session) session = cycleCompletionSession(session, offset);
   }
 
+  function simulateCheckpoint(): void {
+    checkpointRevision += 1;
+  }
+
+  function advanceShuttle(): void {
+    if (shuttle) editor.acceptGhostWord(false);
+  }
+
   onMount(async () => {
     await tick();
     editor.focusAtDocumentEnd();
@@ -133,10 +155,12 @@
     ghostAnchorByteOffset={presentation?.targetByte ?? null}
     ghostInsertsOnAccept={true}
     ghostAlternatives={alternatives}
+    ghostHidden={!autocomplete}
     ghostUnconsumeText={unconsumeText}
     surfaceKey="browser:surface"
     onChange={change}
     onImmediateDocumentMutation={immediateMutation}
+    onCaretNavigation={caretNavigation}
     onGhostInsert={insert}
     onGhostUnconsume={unconsume}
     onGhostCycle={cycle}
@@ -146,4 +170,8 @@
   <output aria-label="Serialized Markdown">{markdown}</output>
   <output aria-label="Generation Requests">{generationRequests}</output>
   <output aria-label="Completion Presentation">{presentation ? `${presentation.targetByte}:${presentation.presentationKey}:${presentation.text}` : 'none'}</output>
+  <output aria-label="Completion Context">{session?.contextKey ?? 'none'}</output>
+  <output aria-label="Checkpoint Revision">{checkpointRevision}</output>
+  <button type="button" on:mousedown|preventDefault on:click={simulateCheckpoint}>Simulate checkpoint</button>
+  <button type="button" on:mousedown|preventDefault on:click={advanceShuttle}>Advance Shuttle</button>
 </main>

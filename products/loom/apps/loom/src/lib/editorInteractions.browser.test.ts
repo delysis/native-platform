@@ -13,12 +13,16 @@ afterEach(async () => {
   document.body.replaceChildren();
 });
 
-function render(initialValue: string, completionCandidates: CompletionCandidate[] = []): void {
+function render(
+  initialValue: string,
+  completionCandidates: CompletionCandidate[] = [],
+  modes: { autocomplete?: boolean; shuttle?: boolean } = {}
+): void {
   const target = document.createElement('div');
   document.body.append(target);
   mounted = mount(EditorBrowserHarness, {
     target,
-    props: { initialValue, completionCandidates }
+    props: { initialValue, completionCandidates, ...modes }
   });
 }
 
@@ -105,5 +109,46 @@ describe('real WebKit editor interactions', () => {
     ).toContain('there');
     expect(document.querySelectorAll('.loom-ghost-fan-row')).toHaveLength(4);
     await keyboard.cleanup();
+  });
+
+  it('keeps the cached session across an autosave identity change and requests only after exhaustion', async () => {
+    render('hello', [
+      { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true }
+    ]);
+    const context = page.getByRole('status', { name: 'Completion Context' });
+    await expect.element(context).toHaveTextContent('browser-session:browser-document:1:visual');
+
+    await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
+    await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
+      .toHaveTextContent('hello world');
+    await page.getByRole('button', { name: 'Simulate checkpoint' }).click();
+    await expect.element(page.getByRole('status', { name: 'Checkpoint Revision' }))
+      .toHaveTextContent('2');
+    await expect.element(context).toHaveTextContent('browser-session:browser-document:1:visual');
+    await expect.element(page.getByText('again', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
+      .toHaveTextContent('0');
+
+    await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
+    await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
+      .toHaveTextContent('hello world again');
+    await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
+      .toHaveTextContent('1');
+  });
+
+  it('advances Shuttle through the shared session while ordinary ghost text is off', async () => {
+    render('hello', [
+      { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true }
+    ], { autocomplete: false, shuttle: true });
+    const hiddenGhost = page.getByText(' world again', { exact: true }).first();
+    await expect.element(hiddenGhost).toBeInTheDocument();
+    await expect.element(hiddenGhost).not.toBeVisible();
+
+    await page.getByRole('button', { name: 'Advance Shuttle' }).click();
+    await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
+      .toHaveTextContent('hello world');
+    await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
+      .toHaveTextContent('0');
+    await expect.element(page.getByText('again', { exact: true }).first()).not.toBeVisible();
   });
 });
