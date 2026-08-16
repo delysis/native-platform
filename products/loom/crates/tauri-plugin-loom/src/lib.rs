@@ -56,6 +56,7 @@ use crate::model_download::{
 
 const INITIAL_DOCUMENT: &str = "manuscript/Untitled.md";
 const DEFAULT_PROJECT_DIRECTORY: &str = "writing";
+const MAX_UNTITLED_DOCUMENT_CANDIDATES: u32 = 10_000;
 const PROJECT_CLOSE_GENERATION_WAIT: Duration = Duration::from_secs(3);
 const MAX_MODEL_DOWNLOAD_URL_BYTES: usize = 16 * 1024;
 const POLICY_MODEL_HASH_BUFFER_BYTES: usize = 1024 * 1024;
@@ -63,6 +64,35 @@ const MAX_TRACKED_GENERATION_WORKERS: usize = DEFAULT_MAX_ACTIVE_GENERATION_BRAN
 #[cfg(test)]
 const FOREGROUND_COMMAND_TEST_TTL: Duration = Duration::from_secs(30);
 pub const APPLICATION_QUIT_MENU_ID: &str = "loom.application.quit";
+pub const FILE_NEW_DOCUMENT_MENU_ID: &str = "loom.file.new-document";
+pub const FILE_OPEN_PROJECT_MENU_ID: &str = "loom.file.open-project";
+pub const FILE_SAVE_MENU_ID: &str = "loom.file.save";
+pub const FILE_EXPORT_COPY_MENU_ID: &str = "loom.file.export-copy";
+pub const FILE_COMMAND_EVENT: &str = "loom://file-command";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FileMenuCommand {
+    NewDocument,
+    OpenProject,
+    Save,
+    ExportCopy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct FileMenuCommandEvent {
+    command: FileMenuCommand,
+}
+
+fn file_menu_command(menu_id: &str) -> Option<FileMenuCommand> {
+    match menu_id {
+        FILE_NEW_DOCUMENT_MENU_ID => Some(FileMenuCommand::NewDocument),
+        FILE_OPEN_PROJECT_MENU_ID => Some(FileMenuCommand::OpenProject),
+        FILE_SAVE_MENU_ID => Some(FileMenuCommand::Save),
+        FILE_EXPORT_COPY_MENU_ID => Some(FileMenuCommand::ExportCopy),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ApplicationPhase {
@@ -1642,8 +1672,10 @@ impl Builder {
                 project_close,
                 project_current,
                 project_recover,
+                document_create,
                 document_open,
                 document_checkpoint,
+                document_export_choose,
                 document_draft_upsert,
                 document_draft_clear,
                 document_reconciliation_preview,
@@ -1720,11 +1752,8 @@ impl Builder {
                 if let RunEvent::Exit = event {
                     quiesce_unpreventable_runtime_exit(app);
                 }
-                if let RunEvent::MenuEvent(menu_event) = event
-                    && menu_event.id() == APPLICATION_QUIT_MENU_ID
-                {
-                    let _ = prepare_application_exit_request(app);
-                    emit_application_close_request(app);
+                if let RunEvent::MenuEvent(menu_event) = event {
+                    handle_menu_event(app, menu_event.id().as_ref());
                 }
                 if let RunEvent::ExitRequested { api, .. } = event
                     && !prepare_application_exit_request(app)
@@ -1734,6 +1763,17 @@ impl Builder {
                 }
             })
             .build()
+    }
+}
+
+fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, menu_id: &str) {
+    if menu_id == APPLICATION_QUIT_MENU_ID {
+        let _ = prepare_application_exit_request(app);
+        emit_application_close_request(app);
+        return;
+    }
+    if let Some(command) = file_menu_command(menu_id) {
+        let _ = app.emit(FILE_COMMAND_EVENT, FileMenuCommandEvent { command });
     }
 }
 
@@ -2194,7 +2234,7 @@ enum ValidatedWeavePolicy {
     },
 }
 
-const AUTOMATIC_WEAVE_BRANCH_COUNT_V2: u32 = 3;
+const AUTOMATIC_WEAVE_BRANCH_COUNT_V2: u32 = 4;
 const AUTOMATIC_WEAVE_MAX_TOKENS_V2: u32 = 48;
 const AUTOMATIC_WEAVE_TEMPERATURE_V2: f32 = 0.8;
 
@@ -2738,6 +2778,73 @@ async fn project_recover(
 }
 
 #[tauri::command]
+async fn document_create(
+    project_id: String,
+    session_id: String,
+    state: State<'_, PluginState>,
+) -> Result<ProjectSnapshot, IpcFailure> {
+    let mut session = lock_session(&state)?;
+    let active_session_id = session.active_session_id.ok_or_else(|| {
+        IpcFailure::new(
+            "corrupt_project_session",
+            "the live project session is missing its session ID",
+            false,
+        )
+    })?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    create_untitled_document(store)?;
+    snapshot_for(store, active_session_id)
+}
+
+fn create_untitled_document(store: &mut ProjectStore) -> Result<String, IpcFailure> {
+    let registered_paths = store
+        .list_documents()
+        .map_err(IpcFailure::store)?
+        .into_iter()
+        .map(|document| document.relative_path)
+        .collect::<BTreeSet<_>>();
+
+    for ordinal in 1..=MAX_UNTITLED_DOCUMENT_CANDIDATES {
+        let relative_path = if ordinal == 1 {
+            INITIAL_DOCUMENT.to_owned()
+        } else {
+            format!("manuscript/Untitled-{ordinal}.md")
+        };
+        if registered_paths.contains(&relative_path)
+            || !document_path_is_absent(store.root(), &relative_path)?
+        {
+            continue;
+        }
+        store
+            .create_document_if_absent(
+                &relative_path,
+                DocumentContent::Prose(String::new()),
+                "new document",
+            )
+            .map_err(IpcFailure::store)?;
+        return Ok(relative_path);
+    }
+
+    Err(IpcFailure::new(
+        "untitled_document_capacity_exhausted",
+        "Loom could not allocate another Untitled manuscript name",
+        false,
+    ))
+}
+
+fn document_path_is_absent(root: &Path, relative_path: &str) -> Result<bool, IpcFailure> {
+    match std::fs::symlink_metadata(root.join(relative_path)) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(IpcFailure::new(
+            "document_path_inspection_failed",
+            format!("the candidate manuscript path could not be inspected: {error}"),
+            true,
+        )),
+    }
+}
+
+#[tauri::command]
 async fn document_open(
     project_id: String,
     session_id: String,
@@ -2765,6 +2872,62 @@ async fn document_open(
         draft = None;
     }
     Ok(open_document_from(document, draft))
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+async fn document_export_choose<R: Runtime>(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    relative_path: String,
+    app: AppHandle<R>,
+    state: State<'_, PluginState>,
+) -> Result<Option<Receipt>, IpcFailure> {
+    {
+        let mut session = lock_session(&state)?;
+        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        ensure_registered_document(store, &relative_path, &document_id)?;
+    }
+
+    let suggested_name = Path::new(&relative_path)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("Loom-export.md");
+    let Some(destination) = app
+        .dialog()
+        .file()
+        .set_title("Export a copy")
+        .set_file_name(suggested_name)
+        .add_filter("Markdown or plain text", &["md", "markdown", "txt"])
+        .blocking_save_file()
+    else {
+        return Ok(None);
+    };
+    let destination = destination.into_path().map_err(|error| {
+        IpcFailure::new(
+            "export_destination_unavailable",
+            format!("the export destination is not a local filesystem path: {error}"),
+            false,
+        )
+    })?;
+
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    export_registered_document(store, &document_id, &relative_path, &destination).map(Some)
+}
+
+fn export_registered_document(
+    store: &mut ProjectStore,
+    document_id: &str,
+    relative_path: &str,
+    destination: &Path,
+) -> Result<Receipt, IpcFailure> {
+    ensure_registered_document(store, relative_path, document_id)?;
+    store
+        .export_document(relative_path, destination)
+        .map(Receipt::from)
+        .map_err(IpcFailure::store)
 }
 
 #[tauri::command]
@@ -8884,6 +9047,122 @@ mod tests {
     }
 
     #[test]
+    fn file_menu_ids_route_only_to_explicit_renderer_commands() {
+        assert_eq!(
+            file_menu_command(FILE_NEW_DOCUMENT_MENU_ID),
+            Some(FileMenuCommand::NewDocument)
+        );
+        assert_eq!(
+            file_menu_command(FILE_OPEN_PROJECT_MENU_ID),
+            Some(FileMenuCommand::OpenProject)
+        );
+        assert_eq!(
+            file_menu_command(FILE_SAVE_MENU_ID),
+            Some(FileMenuCommand::Save)
+        );
+        assert_eq!(
+            file_menu_command(FILE_EXPORT_COPY_MENU_ID),
+            Some(FileMenuCommand::ExportCopy)
+        );
+        assert_eq!(file_menu_command(APPLICATION_QUIT_MENU_ID), None);
+        assert_eq!(file_menu_command("loom.file.unknown"), None);
+        assert_eq!(
+            serde_json::to_value(FileMenuCommandEvent {
+                command: FileMenuCommand::ExportCopy,
+            })
+            .expect("serialize file menu command"),
+            serde_json::json!({ "command": "export_copy" })
+        );
+    }
+
+    #[test]
+    fn new_document_skips_registered_and_unmanaged_visible_paths_without_overwriting() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("first manuscript".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let unmanaged = root.join("manuscript/Untitled-2.md");
+        std::fs::write(&unmanaged, "external manuscript").expect("unmanaged visible file");
+
+        let created = create_untitled_document(&mut store).expect("new document");
+
+        assert_eq!(created, "manuscript/Untitled-3.md");
+        assert_eq!(
+            std::fs::read_to_string(root.join(INITIAL_DOCUMENT)).expect("first manuscript"),
+            "first manuscript"
+        );
+        assert_eq!(
+            std::fs::read_to_string(unmanaged).expect("unmanaged manuscript"),
+            "external manuscript"
+        );
+        assert_eq!(
+            store
+                .read_document(&created)
+                .expect("created document")
+                .text,
+            ""
+        );
+    }
+
+    #[test]
+    fn export_copy_is_document_bound_and_refuses_uncheckpointed_visible_bytes() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("exact manuscript\n".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let destination = temporary.path().join("copy.md");
+
+        let receipt = export_registered_document(
+            &mut store,
+            &document.document_id.to_string(),
+            INITIAL_DOCUMENT,
+            &destination,
+        )
+        .expect("export copy");
+        assert_eq!(receipt.command_kind, "export");
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("exported bytes"),
+            "exact manuscript\n"
+        );
+
+        let wrong_destination = temporary.path().join("wrong.md");
+        let wrong_identity = export_registered_document(
+            &mut store,
+            &DocumentId::new().to_string(),
+            INITIAL_DOCUMENT,
+            &wrong_destination,
+        )
+        .expect_err("foreign document identity");
+        assert_eq!(wrong_identity.code, "document_identity_mismatch");
+        assert!(!wrong_destination.exists());
+
+        std::fs::write(root.join(INITIAL_DOCUMENT), "external edit\n").expect("external edit");
+        let stale_destination = temporary.path().join("stale.md");
+        let stale = export_registered_document(
+            &mut store,
+            &document.document_id.to_string(),
+            INITIAL_DOCUMENT,
+            &stale_destination,
+        )
+        .expect_err("uncheckpointed visible bytes");
+        assert_eq!(stale.code, "external_file_change");
+        assert!(!stale_destination.exists());
+    }
+
+    #[test]
     fn word_count_handles_whitespace_without_normalizing_document() {
         assert_eq!(count_words("first\n  second\tthird"), 3);
     }
@@ -8936,7 +9215,7 @@ mod tests {
                 .expect_err("revision budget exhausted"),
             AutomaticBudgetError::Exhausted
         );
-        assert_eq!(AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2, 288);
+        assert_eq!(AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2, 384);
     }
 
     #[test]
@@ -9085,10 +9364,9 @@ mod tests {
     fn automatic_policy_has_no_runtime_budget_fields() {
         let parsed: WeavePolicySnapshot =
             serde_json::from_str(r#"{"kind":"automatic_v2"}"#).expect("automatic policy");
-        assert_eq!(
-            validate_weave_policy(parsed).expect("validate automatic"),
-            ValidatedWeavePolicy::AutomaticV2
-        );
+        let validated = validate_weave_policy(parsed).expect("validate automatic");
+        assert_eq!(validated, ValidatedWeavePolicy::AutomaticV2);
+        assert_eq!(validated.branch_count(), 4);
         assert!(
             serde_json::from_str::<WeavePolicySnapshot>(
                 r#"{"kind":"automatic_v2","max_tokens":2048}"#

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
   import type { VerseNewlineKind } from './verseCodec';
+  import { nextSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
   import {
     planSourceGhostText,
     renderedSourceGhostPresentationKey,
@@ -27,11 +28,19 @@
   export let ghostText = '';
   export let ghostCandidateId = '';
   export let ghostPresentationKey = '';
+  export let ghostInsertsOnAccept = false;
+  export let ghostAlternatives: readonly SuggestionAlternative[] = [];
   export let onValueInput: (textarea: HTMLTextAreaElement) => void = () => {};
   export let onSelectionChange: (textarea: HTMLTextAreaElement) => void = () => {};
   export let onCompositionStart: () => void = () => {};
   export let onCompositionEnd: (textarea: HTMLTextAreaElement) => void = () => {};
   export let onGhostAccept: (candidateId: string, presentationKey: string) => boolean = () => false;
+  export let onGhostInsert: (
+    candidateId: string,
+    presentationKey: string,
+    text: string
+  ) => boolean = () => false;
+  export let onGhostCycle: (offset: number) => void = () => {};
   export let onGhostDismiss: (candidateId: string, presentationKey: string) => void = () => {};
   export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
 
@@ -54,6 +63,7 @@
   let ltrContent = true;
   let plan: SourceGhostPlan | null = null;
   let presentationAnchor: SourceGhostAnchor | null = null;
+  let optionFanVisible = false;
 
   const mirroredProperties = [
     'direction',
@@ -283,6 +293,7 @@
 
   function handleBlur(): void {
     focused = false;
+    optionFanVisible = false;
     hideCurrentGhost();
   }
 
@@ -315,6 +326,10 @@
 
   function handleKeydown(event: KeyboardEvent): void {
     const candidate = currentPlan();
+    if (event.key === 'Alt' && candidate && ghostAlternatives.length > 1) {
+      optionFanVisible = true;
+      return;
+    }
     const livePresentationKey = renderedGhostPresentationKey(candidate);
     const visible = candidate &&
       renderedSourceGhostPresentationKey(candidate, viewport ? Boolean(viewport.hidden) : true) ===
@@ -327,6 +342,12 @@
       : null;
     const action = sourceGhostKeyAction(event, Boolean(visible));
     if (!action) return;
+    if ((action === 'cycle_next' || action === 'cycle_previous') && visible) {
+      event.preventDefault();
+      event.stopPropagation();
+      onGhostCycle(action === 'cycle_next' ? 1 : -1);
+      return;
+    }
     if (action === 'dismiss') {
       if (!visible) return;
       event.preventDefault();
@@ -338,13 +359,23 @@
     if (action === 'accept' && visible) {
       // The parent must consume the exact visibility witness before this
       // component clears it. Its boolean result is the authority to promote.
-      const accepted = onGhostAccept(visible.candidateId, visible.presentationKey);
+      const accepted = ghostInsertsOnAccept
+        ? insertVisibleGhostText(visible, visible.text)
+        : onGhostAccept(visible.candidateId, visible.presentationKey);
       suppressCurrentGhost();
       if (accepted) {
         event.preventDefault();
         event.stopPropagation();
         return;
       }
+    }
+    if (action === 'accept_word' && visible) {
+      const word = nextSuggestionWord(visible.text);
+      if (word && insertVisibleGhostText(visible, word)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return;
     }
     if (!element || readonly) return;
     event.preventDefault();
@@ -364,6 +395,27 @@
     onValueInput(element);
   }
 
+  function handleKeyup(event: KeyboardEvent): void {
+    if (event.key === 'Alt' || !event.altKey) optionFanVisible = false;
+    handleSelection();
+  }
+
+  function insertVisibleGhostText(candidate: SourceGhostPlan, text: string): boolean {
+    if (
+      !element ||
+      readonly ||
+      !text ||
+      !onGhostInsert(candidate.candidateId, candidate.presentationKey, text)
+    ) return false;
+    const start = element.selectionStart;
+    const end = element.selectionEnd;
+    element.setRangeText(text, start, end, 'end');
+    if (element.selectionStart !== start + text.length) return false;
+    readSelection(false, false);
+    onValueInput(element);
+    return true;
+  }
+
   function handleDocumentSelectionChange(): void {
     if (document.activeElement === element) readSelection(true, true);
   }
@@ -380,6 +432,20 @@
     onSelectionChange(element);
     syncGeometry();
     return focused;
+  }
+
+  export function acceptGhostWord(): boolean {
+    const candidate = currentPlan();
+    if (
+      !focused ||
+      !candidate ||
+      renderedGhostPresentationKey(candidate) !== candidate.presentationKey
+    ) return false;
+    const word = nextSuggestionWord(candidate.text);
+    if (!word) return false;
+    const accepted = insertVisibleGhostText(candidate, word);
+    if (accepted) suppressCurrentGhost();
+    return accepted;
   }
 
   onMount(() => {
@@ -469,7 +535,7 @@
     on:input={handleInput}
     on:select={handleSelection}
     on:click={handleSelection}
-    on:keyup={handleSelection}
+    on:keyup={handleKeyup}
     on:keydown={handleKeydown}
     on:scroll={invalidateAndRequestGeometry}
     on:compositionstart={handleCompositionStart}
@@ -478,4 +544,13 @@
     spellcheck="true"
     wrap={verse ? 'off' : 'soft'}
   ></textarea>
+  {#if plan && optionFanVisible && ghostAlternatives.length > 1}
+    <div class="source-suggestion-fan" aria-hidden="true">
+      {#each ghostAlternatives as alternative, index (alternative.presentationKey)}
+        <div class:active={alternative.presentationKey === plan.presentationKey} class="loom-ghost-fan-row">
+          <span class="loom-ghost-fan-index">{index + 1}</span><span>{alternative.text}</span>
+        </div>
+      {/each}
+    </div>
+  {/if}
 </div>

@@ -20,11 +20,33 @@ export function canRoundTripMarkdownExactly(markdown: string): boolean {
   }
 }
 
+function differsOnlyByHarmlessTerminalProseSpace(markdown: string): boolean {
+  if (!markdown.endsWith(' ') || markdown.endsWith('  ')) return false;
+
+  try {
+    const parsed = parseVisualMarkdown(markdown);
+    let tail: ProseMirrorNode | null = parsed.lastChild;
+    while (tail && !tail.isTextblock && tail.lastChild) tail = tail.lastChild;
+
+    if (!tail || (tail.type.name !== 'paragraph' && tail.type.name !== 'heading')) {
+      return false;
+    }
+
+    return defaultMarkdownSerializer.serialize(parsed) === markdown.slice(0, -1);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Keep an admitted visual editing session mounted across transient serializer
- * states such as a trailing space. Source/imported text still has to prove an
- * exact dialect parse/serialize round trip before it can enter the editor.
+ * states. Source/imported text must still prove an exact dialect round trip,
+ * except for one terminal ASCII space that the serializer demonstrably drops
+ * from a prose text block. Two spaces can encode a hard break, while code and
+ * unsupported syntax remain fail-closed.
  */
 export function canUseVisualMarkdown(markdown: string, visualSessionActive: boolean): boolean {
-  return visualSessionActive || canRoundTripMarkdownExactly(markdown);
+  return visualSessionActive ||
+    canRoundTripMarkdownExactly(markdown) ||
+    differsOnlyByHarmlessTerminalProseSpace(markdown);
 }

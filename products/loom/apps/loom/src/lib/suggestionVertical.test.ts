@@ -244,10 +244,8 @@ describe('W1 model-free suggestion vertical', () => {
     for (const forbidden of fixture.expected.forbidden_primary_chrome) {
       expect(source).not.toContain(forbidden);
     }
-    const menuStart = source.indexOf('<div class="project-menu-popover"');
-    const menuEnd = source.indexOf('</details>', menuStart);
-    const explicitReview = source.indexOf('<span>Review suggestions</span>');
-    expect(explicitReview).toBeGreaterThan(menuStart);
-    expect(explicitReview).toBeLessThan(menuEnd);
+    expect(source).not.toContain('Review suggestions');
+    expect(source).not.toContain('Insert suggestion');
+    expect(source).not.toContain('strand-evidence');
   });
 });

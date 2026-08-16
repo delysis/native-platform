@@ -44,7 +44,9 @@ describe('planGhostText', () => {
       presentationKey: suggestion.presentationKey,
       surfaceKey: suggestion.surfaceKey,
       anchorByteOffset: suggestion.anchorByteOffset,
-      text: suggestion.text
+      text: suggestion.text,
+      insertsOnAccept: false,
+      alternatives: []
     });
   });
 

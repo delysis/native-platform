@@ -249,6 +249,9 @@ describe('sourceGhostKeyAction', () => {
     expect(sourceGhostKeyAction(key({ shiftKey: true }), true)).toBeNull();
     expect(sourceGhostKeyAction(key({ metaKey: true }), true)).toBeNull();
     expect(sourceGhostKeyAction(key(), false)).toBe('insert_tab');
+    expect(sourceGhostKeyAction(key({ key: 'ArrowRight', altKey: true }), true)).toBe('accept_word');
+    expect(sourceGhostKeyAction(key({ key: 'ArrowDown', altKey: true }), true)).toBe('cycle_next');
+    expect(sourceGhostKeyAction(key({ key: 'ArrowUp', altKey: true }), true)).toBe('cycle_previous');
   });
 
   it('dismisses with Escape and ignores IME key events', () => {

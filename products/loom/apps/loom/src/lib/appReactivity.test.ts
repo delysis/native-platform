@@ -37,17 +37,16 @@ describe('App ghost reactivity wiring', () => {
     expect(source).not.toContain('A private strand is ready');
   });
 
-  it('keeps suggestion review out of the quiet topbar and removes the focusable skip control', () => {
+  it('keeps suggestion review and implementation evidence out of the quiet titlebar', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     expect(source).not.toContain('Skip to manuscript');
     expect(source).not.toContain('alternatives-button');
-    expect(source).toContain('<span>Review suggestions</span>');
-    expect(source).toContain('Insert suggestion');
-    const menuStart = source.indexOf('<div class="project-menu-popover"');
-    const menuEnd = source.indexOf('</details>', menuStart);
-    const reviewAction = source.indexOf('<span>Review suggestions</span>');
-    expect(reviewAction).toBeGreaterThan(menuStart);
-    expect(reviewAction).toBeLessThan(menuEnd);
+    expect(source).not.toContain('Review suggestions');
+    expect(source).not.toContain('Insert suggestion');
+    expect(source).not.toContain('strand-evidence');
+    expect(source).toContain('class="window-chrome"');
+    expect(source).toContain('Autosave is always on');
+    expect(source).toContain('New document (⌘N)');
   });
 
 });

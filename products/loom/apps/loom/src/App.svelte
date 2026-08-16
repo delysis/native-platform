@@ -14,7 +14,9 @@
     chooseAndOpenProject,
     chooseModel,
     closeProject as closeProjectSession,
+    createDocument,
     currentProjectSession,
+    exportDocumentCopy,
     getBranch,
     getBranchBody,
     getBranchPage,
@@ -23,6 +25,7 @@
     getWeaveStatus,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
+    listenForFileCommands,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
     loadPolicyModelCandidate,
@@ -48,12 +51,10 @@
     type VerseEditorCodec,
     type VerseNewlineKind
   } from './lib/verseCodec';
-  import { canRoundTripMarkdownExactly, canUseVisualMarkdown } from './lib/markdownSafety';
+  import { canUseVisualMarkdown } from './lib/markdownSafety';
   import {
     autocompleteDisposition,
-    exactVerifiedSuggestionFamily,
     verifiedGhostSuggestion,
-    visibleVerifiedGhostSuggestion,
     type AutocompleteDisposition
   } from './lib/ghostSuggestion';
   import {
@@ -62,13 +63,11 @@
     type AutocompleteRetryLedger
   } from './lib/autocompleteRetry';
   import {
-    candidateSurfaceReason,
     candidateTextIsSurfaceable
   } from './lib/candidateSurface';
   import { sourceGhostPresentationCompatible } from './lib/sourceGhostText';
   import { visualGhostTextMayBePlainProse } from './lib/ghostText';
   import { isExtendedGraphemeBoundary } from './lib/graphemeBoundary';
-  import { branchIsActionableOnShelf } from './lib/branchShelf';
   import {
     verifyBranchBody,
     verifiedBodyMatchesBranch,
@@ -114,6 +113,10 @@
     shouldDiscoverModelsOnStartup
   } from './lib/startupSafety';
   import { newUlid } from './lib/ulid';
+  import {
+    cycleSuggestionIndex,
+    type SuggestionAlternative
+  } from './lib/suggestionInteraction';
   import {
     DEFAULT_MODEL_DOWNLOAD_LIMIT_GIB,
     deriveGgufFileName,
@@ -183,11 +186,12 @@
   let modelManagerOpen = false;
   let modelManagerPanel: HTMLElement | undefined;
   let modelManagerReturnFocus: HTMLElement | null = null;
-  let strandReviewDialog: HTMLDialogElement | undefined;
-  let strandReviewOpen = false;
-  let reviewCandidateId: string | null = null;
+  let activeSuggestionRunId: string | null = null;
   let projectMenu: HTMLDetailsElement | undefined;
   let projectMenuTrigger: HTMLElement | undefined;
+  let unlistenFileCommands: (() => void) | undefined;
+  let fileCommandInFlight = false;
+  let appliedNativeTitle = '';
   let suggestionsEnabled = false;
   let suggestionsChanging = false;
   let suggestionsIdleTimer: number | undefined;
@@ -246,6 +250,10 @@
   let cancellationCommandByRun: Record<string, string> = {};
   let promotionArmedCandidateId: string | null = null;
   let promotionInFlight = false;
+  let shuttleEnabled = false;
+  let shuttleTimer: number | undefined;
+  let shuttleTimerKey = '';
+  let windowFocused = true;
   let uncertainPromotion: PromotionCapture | null = null;
   let unlistenGenerationEvents: (() => void) | undefined;
   let generationListenerDisposed = false;
@@ -269,9 +277,11 @@
   let visualEditor: {
     flushPending: () => boolean;
     focusAtDocumentEnd: () => boolean;
+    acceptGhostWord: () => boolean;
   } | null = null;
   let sourceEditor: {
     focusAtDocumentEnd: () => boolean;
+    acceptGhostWord: () => boolean;
   } | null = null;
   let componentMounted = false;
   let desktopWorkspaceStarted = false;
@@ -358,6 +368,12 @@
     status?: BranchCard['status'];
     candidateId?: string;
     error?: string;
+  }
+
+  interface InlineGhostSuggestion extends SuggestionAlternative {
+    runId: string;
+    targetByte: number;
+    insertsOnAccept: boolean;
   }
 
   interface PromotionCapture {
@@ -520,9 +536,6 @@
     branch.source_revision_id === document?.summary.revision_id &&
     branch.model_id === currentModel?.model_id
   );
-  $: shelfBranches = branches.filter((branch) =>
-    branchIsActionableOnShelf(branch, document?.summary.revision_id)
-  );
   $: branchPromotionReady = Boolean(
     project &&
     document &&
@@ -557,6 +570,39 @@
     documentText,
     verseCodec
   );
+  $: sourceGhostNewline = document?.summary.kind === 'verse'
+    ? verseCodec?.newline ?? 'mixed'
+    : null;
+  $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual');
+  $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source');
+  $: activeSuggestionFamily = mode === 'visual'
+    ? visualSuggestionFamily
+    : mode === 'source'
+      ? sourceSuggestionFamily
+      : [];
+  $: if (
+    activeSuggestionFamily.length > 0 &&
+    !activeSuggestionFamily.some((suggestion) => suggestion.runId === activeSuggestionRunId)
+  ) activeSuggestionRunId = activeSuggestionFamily[0].runId;
+  $: selectedInlineSuggestion = activeSuggestionFamily.find(
+    (suggestion) => suggestion.runId === activeSuggestionRunId
+  ) ?? activeSuggestionFamily[0] ?? null;
+  $: ghostSuggestion = mode === 'visual' ? selectedInlineSuggestion : null;
+  $: sourceGhostSuggestion = mode === 'source' ? selectedInlineSuggestion : null;
+  $: ghostAlternatives = activeSuggestionFamily.map((suggestion) => ({
+    candidateId: suggestion.candidateId,
+    presentationKey: suggestion.presentationKey,
+    text: suggestion.text
+  }));
+  $: activeGhostSuggestion = mode === 'visual'
+    ? ghostSuggestion?.presentationKey === visibleVisualGhostPresentationKey
+      ? ghostSuggestion
+      : null
+    : mode === 'source'
+      ? sourceGhostSuggestion?.presentationKey === visibleSourceGhostPresentationKey
+        ? sourceGhostSuggestion
+        : null
+      : null;
   $: visualAutocompleteDisposition = autocompleteDisposition({
     active: mode === 'visual' && suggestionsEnabled && !visualMutationPending && branchPromotionReady,
     branches: currentReadyBranches,
@@ -566,12 +612,6 @@
     targetByte: visualGhostTargetByte,
     presentationCompatible: visualGhostTextMayBePlainProse
   });
-  $: ghostSuggestion = visualAutocompleteDisposition.kind === 'available'
-    ? visualAutocompleteDisposition.suggestion
-    : null;
-  $: sourceGhostNewline = document?.summary.kind === 'verse'
-    ? verseCodec?.newline ?? 'mixed'
-    : null;
   $: sourceAutocompleteDisposition = autocompleteDisposition({
     active: mode === 'source' && suggestionsEnabled && !sourceDirty && !compositionActive && branchPromotionReady,
     branches: currentReadyBranches,
@@ -582,59 +622,6 @@
     presentationCompatible: (text) =>
       sourceGhostPresentationCompatible(sourceDisplayText, text, sourceGhostNewline)
   });
-  $: sourceGhostCandidate = sourceAutocompleteDisposition.kind === 'available'
-    ? sourceAutocompleteDisposition.suggestion
-    : null;
-  $: sourceGhostSuggestion = sourceGhostCandidate;
-  $: activeGhostSuggestion = mode === 'visual'
-    ? visibleVerifiedGhostSuggestion(
-      ghostSuggestion,
-      visibleVisualGhostPresentationKey
-    )
-    : mode === 'source'
-      ? visibleVerifiedGhostSuggestion(
-        sourceGhostSuggestion,
-        visibleSourceGhostPresentationKey
-      )
-      : null;
-  $: reviewTargetByte = mode === 'visual'
-    ? visualGhostTargetByte
-    : mode === 'source'
-      ? sourceGhostTargetByte
-      : null;
-  $: exactReviewBranches = exactVerifiedSuggestionFamily({
-    active: suggestionsEnabled && branchPromotionReady,
-    branches: shelfBranches,
-    verifiedBodyByRun: verifiedBranchBodyByRun,
-    targetByte: reviewTargetByte
-  });
-  $: reviewableBranches = exactReviewBranches.filter((branch) => {
-    if (!candidateTextIsSurfaceable(branch.text)) return false;
-    const suggestion = verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[branch.run_id]);
-    if (!suggestion) return false;
-    if (mode === 'visual') {
-      return visualGhostTextMayBePlainProse(suggestion.text) &&
-        !unpresentableVisualGhostPresentationKeys.includes(suggestion.presentationKey);
-    }
-    return sourceGhostPresentationCompatible(
-      sourceDisplayText,
-      suggestion.text,
-      sourceGhostNewline
-    );
-  });
-  $: suppressedReviewBranches = exactReviewBranches.filter((branch) =>
-    !candidateTextIsSurfaceable(branch.text)
-  );
-  $: if (
-    reviewableBranches.length > 0 &&
-    !reviewableBranches.some((branch) => branch.candidate_id === reviewCandidateId)
-  ) reviewCandidateId = reviewableBranches[0].candidate_id;
-  $: reviewBranch = reviewableBranches.find(
-    (branch) => branch.candidate_id === reviewCandidateId
-  ) ?? reviewableBranches[0] ?? null;
-  $: reviewBranchIndex = reviewBranch
-    ? reviewableBranches.findIndex((branch) => branch.run_id === reviewBranch.run_id)
-    : -1;
   $: suggestionMenuState = suggestionsChanging
     ? '…'
     : modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0
@@ -644,13 +631,28 @@
         : currentModel
           ? 'Ready'
           : 'Set up';
+  $: nativeWindowTitle = document?.summary.title ?? project?.title ?? 'Loom';
+  $: autosaveLabel = saveState === 'saving'
+    ? 'Saving…'
+    : saveState === 'dirty'
+      ? 'Autosave pending'
+      : saveState === 'error' || saveState === 'uncertain'
+        ? saveMessage
+        : project
+          ? 'Autosaved'
+          : 'No document';
+  $: if (desktop) void syncNativeWindowTitle(nativeWindowTitle);
   $: if (
     activeGhostSuggestion &&
     activeGhostSuggestion.presentationKey !== announcedGhostPresentationKey
   ) {
     announcedGhostPresentationKey = activeGhostSuggestion.presentationKey;
-    announce('Suggestion available. Tab accepts; Escape dismisses.');
+    announce('Suggestion available. Tab accepts all; Option Right accepts one word; Option Up or Down switches.');
   }
+  $: shuttleScheduleKey = shuttleEnabled && windowFocused && activeGhostSuggestion
+    ? `${activeGhostSuggestion.candidateId}:${editVersion}:${mode}`
+    : '';
+  $: syncShuttleTimer(shuttleScheduleKey);
   $: automaticBoundaryIsExact = mode === 'visual'
     ? visualSelectionByte !== null
     : mode === 'source' && Boolean(sourceTextarea) && sourceSelectionStart === sourceSelectionEnd;
@@ -762,10 +764,12 @@
       closeRequestListener?.();
       if (modelDownloadPollTimer !== undefined) window.clearTimeout(modelDownloadPollTimer);
       if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
+      if (shuttleTimer !== undefined) window.clearTimeout(shuttleTimer);
       applicationCloseRetry.dispose();
       for (const timer of staleWeaveCleanupTimers) window.clearTimeout(timer);
       staleWeaveCleanupTimers.clear();
       unlistenWindowFocus?.();
+      unlistenFileCommands?.();
     };
   });
 
@@ -773,8 +777,19 @@
     if (!componentMounted || desktopWorkspaceStarted) return;
     desktopWorkspaceStarted = true;
     void installWindowFocusHandler();
+    void installFileCommandListener();
     void installGenerationEventListener();
     void restoreDesktopWorkspace();
+  }
+
+  async function syncNativeWindowTitle(title: string): Promise<void> {
+    if (!componentMounted || !desktop || appliedNativeTitle === title) return;
+    try {
+      await getCurrentWindow().setTitle(title);
+      if (componentMounted) appliedNativeTitle = title;
+    } catch (error) {
+      if (componentMounted) recordFailure(error);
+    }
   }
 
   function countWords(text: string): number {
@@ -848,7 +863,7 @@
       sourceProjectionTimer = undefined;
     }
     if (document) documentEpoch += 1;
-    closeStrandReview();
+    promotionArmedCandidateId = null;
     document = null;
     documentText = '';
     sourceDisplayText = '';
@@ -1089,6 +1104,7 @@
   async function installWindowFocusHandler(): Promise<void> {
     try {
       const unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+        windowFocused = focused;
         if (!focused && !compositionActive && !reconciliation) {
           flushEditors();
           void saveNow();
@@ -2856,6 +2872,95 @@
     }
   }
 
+  async function openAnotherProject(): Promise<void> {
+    if (fileCommandInFlight || opening) return;
+    fileCommandInFlight = true;
+    try {
+      const outcome = await closeProject();
+      if (outcome.status === 'closed') await doOpenProject();
+    } finally {
+      fileCommandInFlight = false;
+    }
+  }
+
+  async function newDocument(): Promise<void> {
+    if (!project || fileCommandInFlight || editorReadonly) return;
+    if (!flushEditors()) return;
+    fileCommandInFlight = true;
+    try {
+      await saveNow();
+      if (!project || uncertainSave || saveState === 'error' || saveState === 'uncertain') return;
+      const previousDocumentIds = new Set(project.documents.map((candidate) => candidate.document_id));
+      const refreshed = await createDocument(project.project_id, project.session_id);
+      if (
+        !project ||
+        refreshed.project_id !== project.project_id ||
+        refreshed.session_id !== project.session_id
+      ) return;
+      const created = refreshed.documents.find(
+        (candidate) => !previousDocumentIds.has(candidate.document_id)
+      );
+      if (!created) throw new Error('The desktop did not expose the newly created document.');
+      project = refreshed;
+      await selectDocument(created, true);
+      announce(`Created ${created.title}. Changes autosave as you write.`);
+    } catch (error) {
+      recordFailure(error);
+    } finally {
+      fileCommandInFlight = false;
+    }
+  }
+
+  async function exportCopy(): Promise<void> {
+    if (!project || !document || fileCommandInFlight || editorReadonly) return;
+    if (!flushEditors()) return;
+    fileCommandInFlight = true;
+    try {
+      await saveNow();
+      if (!project || !document || uncertainSave || saveState === 'error' || saveState === 'uncertain') return;
+      const receipt = await exportDocumentCopy(
+        project.project_id,
+        project.session_id,
+        document.summary.document_id,
+        document.summary.relative_path
+      );
+      if (receipt) announce(`Exported a copy of ${document.summary.title}`);
+    } catch (error) {
+      recordFailure(error);
+    } finally {
+      fileCommandInFlight = false;
+    }
+  }
+
+  async function installFileCommandListener(): Promise<void> {
+    try {
+      const unlisten = await listenForFileCommands(({ command }) => {
+        switch (command) {
+          case 'new_document':
+            void newDocument();
+            break;
+          case 'open_project':
+            void openAnotherProject();
+            break;
+          case 'save':
+            if (flushEditors()) void saveNow();
+            break;
+          case 'export_copy':
+            void exportCopy();
+            break;
+        }
+      });
+      if (!componentMounted) {
+        unlisten();
+        return;
+      }
+      unlistenFileCommands?.();
+      unlistenFileCommands = unlisten;
+    } catch (error) {
+      if (componentMounted) recordFailure(error);
+    }
+  }
+
   async function finishOpeningProject(
     opened: ProjectSnapshot,
     restoreSerial: number
@@ -3100,7 +3205,7 @@
         saveMessage = 'All changes saved';
         announce(`Opened ${summary.title}`);
       }
-      mode = summary.kind === 'prose' && canRoundTripMarkdownExactly(effectiveText)
+      mode = summary.kind === 'prose' && canUseVisualMarkdown(effectiveText, false)
         ? preferredProseMode
         : 'source';
       await refreshBranchesFor(
@@ -3798,7 +3903,62 @@
   function dismissInlineSuggestion(candidateId: string | null | undefined): void {
     if (!candidateId || dismissedCandidateIds.includes(candidateId)) return;
     dismissedCandidateIds = [...dismissedCandidateIds, candidateId];
-    announce('Suggestion dismissed; it remains available in Writing options');
+    announce('Suggestion dismissed');
+  }
+
+  function inlineSuggestionFamily(
+    targetByte: number | null,
+    editorMode: 'visual' | 'source'
+  ): InlineGhostSuggestion[] {
+    if (
+      !suggestionsEnabled ||
+      !branchPromotionReady ||
+      targetByte === null ||
+      !document ||
+      !currentModel
+    ) return [];
+
+    const encoder = new TextEncoder();
+    const family: InlineGhostSuggestion[] = [];
+    for (const branch of branches) {
+      if (
+        branch.source_revision_id !== document.summary.revision_id ||
+        branch.model_id !== currentModel.model_id ||
+        branch.target_start_byte !== targetByte ||
+        branch.target_end_byte !== targetByte ||
+        branch.selection === 'promote' ||
+        branch.selection === 'reject' ||
+        !['queued', 'generating', 'ready'].includes(branch.status)
+      ) continue;
+
+      const candidateId = `run:${branch.run_id}`;
+      if (dismissedCandidateIds.includes(candidateId)) continue;
+      const verified = verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[branch.run_id]);
+      const text = verified?.text ?? liveBranchText[branch.run_id] ?? branch.text;
+      if (!candidateTextIsSurfaceable(text)) continue;
+      const presentationKey = verified?.presentationKey ??
+        `stream:${branch.run_id}:${encoder.encode(text).byteLength}`;
+      if (editorMode === 'visual') {
+        if (
+          !visualGhostTextMayBePlainProse(text) ||
+          unpresentableVisualGhostPresentationKeys.includes(presentationKey)
+        ) continue;
+      } else if (!sourceGhostPresentationCompatible(
+        sourceDisplayText,
+        text,
+        sourceGhostNewline
+      )) continue;
+
+      family.push({
+        candidateId,
+        presentationKey,
+        text,
+        runId: branch.run_id,
+        targetByte,
+        insertsOnAccept: !verified
+      });
+    }
+    return family;
   }
 
   function rejectVisualGhostPresentation(
@@ -3837,11 +3997,12 @@
 
   function acceptActiveGhost(candidateId: string, presentationKey: string): boolean {
     const eligible = eligibleGhostForCurrentMode();
-    const branch = branches.find((candidate) => candidate.candidate_id === candidateId);
+    const branch = branches.find((candidate) => candidate.run_id === eligible?.runId);
     if (
       !branch ||
       eligible?.candidateId !== candidateId ||
       eligible.presentationKey !== presentationKey ||
+      eligible.insertsOnAccept ||
       !canPromoteBranch(branch)
     ) return false;
     // LoomEditor and SourceEditor invoke this callback only after synchronously
@@ -3852,45 +4013,76 @@
     return true;
   }
 
+  function authorizeGhostInsertion(
+    candidateId: string,
+    presentationKey: string,
+    text: string
+  ): boolean {
+    const eligible = eligibleGhostForCurrentMode();
+    return Boolean(
+      eligible &&
+      eligible.candidateId === candidateId &&
+      eligible.presentationKey === presentationKey &&
+      text &&
+      eligible.text.startsWith(text) &&
+      branchPromotionReady
+    );
+  }
+
+  function cycleActiveSuggestion(offset: number): void {
+    if (activeSuggestionFamily.length < 2) return;
+    const current = activeSuggestionFamily.findIndex(
+      (suggestion) => suggestion.runId === activeSuggestionRunId
+    );
+    const next = cycleSuggestionIndex(activeSuggestionFamily.length, current, offset);
+    if (next < 0) return;
+    activeSuggestionRunId = activeSuggestionFamily[next].runId;
+    promotionArmedCandidateId = null;
+    announce(`Suggestion ${next + 1} of ${activeSuggestionFamily.length}`);
+  }
+
+  function setShuttleEnabled(enabled: boolean): void {
+    shuttleEnabled = enabled;
+    if (!enabled) {
+      if (shuttleTimer !== undefined) window.clearTimeout(shuttleTimer);
+      shuttleTimer = undefined;
+      shuttleTimerKey = '';
+    }
+    announce(enabled
+      ? 'Shuttle on. One suggestion word advances after four idle seconds; Escape stops.'
+      : 'Shuttle off');
+  }
+
+  function syncShuttleTimer(key: string): void {
+    if (key === shuttleTimerKey) return;
+    if (shuttleTimer !== undefined) window.clearTimeout(shuttleTimer);
+    shuttleTimer = undefined;
+    shuttleTimerKey = key;
+    if (!key) return;
+    shuttleTimer = window.setTimeout(() => {
+      shuttleTimer = undefined;
+      if (shuttleTimerKey !== key || !windowFocused || !shuttleEnabled) return;
+      const accepted = mode === 'visual'
+        ? visualEditor?.acceptGhostWord() ?? false
+        : sourceEditor?.acceptGhostWord() ?? false;
+      if (!accepted) {
+        shuttleTimerKey = '';
+        syncShuttleTimer(key);
+      }
+    }, 4_000);
+  }
+
   function dismissActiveGhost(candidateId: string, presentationKey: string): void {
     const eligible = eligibleGhostForCurrentMode();
     if (
       eligible?.candidateId !== candidateId ||
       eligible.presentationKey !== presentationKey
     ) return;
-    dismissInlineSuggestion(candidateId);
-  }
-
-  async function openStrandReview(): Promise<void> {
-    if (reviewableBranches.length === 0) return;
-    reviewCandidateId = activeGhostSuggestion?.candidateId ??
-      reviewableBranches[0].candidate_id;
-    promotionArmedCandidateId = null;
-    strandReviewOpen = true;
-    closeProjectMenu();
-    await tick();
-    if (!strandReviewDialog) return;
-    if (!strandReviewDialog.open) strandReviewDialog.showModal();
-    strandReviewDialog.querySelector<HTMLElement>('[data-review-close]')?.focus();
-  }
-
-  function closeStrandReview(): void {
-    promotionArmedCandidateId = null;
-    if (strandReviewDialog?.open) {
-      strandReviewDialog.close();
-    } else {
-      strandReviewOpen = false;
+    if (shuttleEnabled) {
+      setShuttleEnabled(false);
+      return;
     }
-  }
-
-  function moveStrandReview(offset: number): void {
-    if (reviewableBranches.length < 2 || reviewBranchIndex < 0) return;
-    const nextIndex = (
-      reviewBranchIndex + offset + reviewableBranches.length
-    ) % reviewableBranches.length;
-    reviewCandidateId = reviewableBranches[nextIndex].candidate_id;
-    promotionArmedCandidateId = null;
-    announce(`Suggestion ${nextIndex + 1} of ${reviewableBranches.length}`);
+    dismissInlineSuggestion(candidateId);
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
@@ -3968,7 +4160,7 @@
       started.document_id !== captured.documentId ||
       started.source_revision_id !== captured.sourceRevisionId ||
       !started.exact_prompt_blob_id ||
-      started.branches.length !== 3
+      started.branches.length !== 4
     ) {
       throw new Error('The desktop returned a branch family for different source identities.');
     }
@@ -4304,7 +4496,7 @@
         throw new Error('The promoted revision was not visible in the project snapshot.');
       }
       uncertainPromotion = null;
-      closeStrandReview();
+      promotionArmedCandidateId = null;
       restoreWritingFocus = true;
       announce(outcome === 'reconciliation'
         ? 'The suggestion is saved; an external file change now needs review'
@@ -4317,16 +4509,16 @@
         clearFailure();
         switch (outcome) {
           case 'promoted':
-            closeStrandReview();
+            promotionArmedCandidateId = null;
             restoreWritingFocus = true;
             announce('Suggestion accepted');
             break;
           case 'source_changed':
-            closeStrandReview();
+            promotionArmedCandidateId = null;
             announce('The manuscript changed independently; Loom reopened it without attributing the change to this strand');
             break;
           case 'reconciliation':
-            closeStrandReview();
+            promotionArmedCandidateId = null;
             announce('An external manuscript change needs review before promotion can be attributed');
             break;
           case 'unchanged':
@@ -4501,7 +4693,7 @@
     uncertainSave = null;
     branches = [];
     resetLiveGenerationView();
-    mode = opened.summary.kind === 'prose' && canRoundTripMarkdownExactly(opened.text)
+    mode = opened.summary.kind === 'prose' && canUseVisualMarkdown(opened.text, false)
       ? preferredProseMode
       : 'source';
     if (opened.transient_draft) {
@@ -4812,7 +5004,7 @@
     if (next === 'visual' && !canUseVisual) return;
     flushEditors();
     if (next === 'source' && document) setSourceDocument(documentText, document.summary.kind);
-    if (document?.summary.kind === 'prose' && canRoundTripMarkdownExactly(documentText)) {
+    if (document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')) {
       preferredProseMode = next;
     }
     mode = next;
@@ -5017,7 +5209,7 @@
     modelRefreshSerial += 1;
     modelLoadSerial += 1;
     documentEpoch += 1;
-    closeStrandReview();
+    promotionArmedCandidateId = null;
     project = null;
     document = null;
     documentText = '';
@@ -5060,62 +5252,56 @@
     return 'Prose';
   }
 
-  function promotionUnavailableReason(branch: BranchCard): string {
-    if (document?.summary.kind === 'hybrid') {
-      return 'Hybrid promotion waits for a lossless block-manifest IPC boundary.';
-    }
-    if (branch.source_revision_id !== document?.summary.revision_id) {
-      return 'This strand belongs to an earlier manuscript revision. Keep it as an alternative instead.';
-    }
-    if (editVersion !== savedVersion || sourceDirty) return 'Wait for the manuscript to finish saving.';
-    if (branch.selection === 'promote' || branch.selection === 'reject') {
-      return 'This strand already has a final recorded selection.';
-    }
-    return 'Promotion is unavailable while manuscript state is unsettled.';
-  }
 </script>
 
 <svelte:head>
+  <title>{nativeWindowTitle}</title>
   <meta name="description" content="Loom — a local-first writing environment for prose and poetry" />
 </svelte:head>
 
 <div class="app-shell">
   {#if project}
-    <header class="topbar" aria-label="Writing controls">
-      {#if project.documents.length > 1}
+    <header class="window-chrome" aria-label="Writing controls" data-tauri-drag-region>
+      <div class="window-chrome-left" data-tauri-drag-region="false">
+        {#if project.documents.length > 1}
+          <button
+            bind:this={outlineToggle}
+            class="titlebar-button outline-toggle"
+            type="button"
+            aria-controls="project-outline"
+            aria-expanded={outlineOpen}
+            aria-label={outlineOpen ? 'Close manuscript outline' : 'Open manuscript outline'}
+            on:click={() => void setOutlineOpen(!outlineOpen)}
+          >☰</button>
+        {/if}
         <button
-          bind:this={outlineToggle}
-          class="outline-toggle"
+          class="titlebar-button new-document-button"
           type="button"
-          aria-controls="project-outline"
-          aria-expanded={outlineOpen}
-          aria-label={outlineOpen ? 'Close manuscript outline' : 'Open manuscript outline'}
-          on:click={() => void setOutlineOpen(!outlineOpen)}
-        >☰</button>
-      {/if}
-      <h1 class="context-title" title={document?.summary.title ?? project.title}>
-        {document?.summary.title ?? project.title}
-      </h1>
-      <div class="topbar-spacer"></div>
-      {#if document && (saveState === 'error' || saveState === 'uncertain')}
-        <div class="save-status state-{saveState}" role="status" aria-live="polite">
-          <span class="status-dot"></span>{saveMessage}
+          aria-label="New document"
+          title="New document (⌘N)"
+          disabled={fileCommandInFlight || editorReadonly}
+          on:click={() => void newDocument()}
+        >+</button>
+      </div>
+      <div class="window-chrome-right" data-tauri-drag-region="false">
+        {#if shuttleEnabled}
+          <span class="shuttle-indicator" title="Shuttle accepts one suggested word after four idle seconds">Shuttle</span>
+        {/if}
+        <div class="save-status state-{saveState}" role="status" aria-live="polite" title={`${autosaveLabel}. Save now with ⌘S; export a copy with ⇧⌘S.`}>
+          <span class="status-dot"></span><span class="save-status-label">{autosaveLabel}</span>
         </div>
-      {/if}
       <details class="project-menu" bind:this={projectMenu}>
-        <summary class="more-button" bind:this={projectMenuTrigger} title="Writing options">
-          <span aria-hidden="true">•••</span>
-          <span class="sr-only">Writing options for {project.title}</span>
+        <summary class="titlebar-button gear-button" bind:this={projectMenuTrigger} title="Settings" aria-label="Settings">
+          <span aria-hidden="true">⚙︎</span>
         </summary>
-        <div class="project-menu-popover" aria-label="Project and editor options">
-          <div class="project-menu-title">{project.title}</div>
+        <div class="project-menu-popover" aria-label="Editor and suggestion settings">
           {#if document}
             <div class="project-menu-label">Editor</div>
             <button class:active={mode === 'visual'} type="button" aria-pressed={mode === 'visual'} disabled={!canUseVisual || editorReadonly} on:click={() => { closeProjectMenu(); void setMode('visual'); }}>
-              <span>Visual editor</span><span aria-hidden="true">{mode === 'visual' ? '✓' : ''}</span>
+              <span>Write</span><span aria-hidden="true">{mode === 'visual' ? '✓' : ''}</span>
             </button>
             <button class:active={mode === 'source'} type="button" aria-pressed={mode === 'source'} disabled={editorReadonly} on:click={() => { closeProjectMenu(); void setMode('source'); }}>
-              <span>Source editor</span><span aria-hidden="true">{mode === 'source' ? '✓' : ''}</span>
+              <span>Markdown</span><span aria-hidden="true">{mode === 'source' ? '✓' : ''}</span>
             </button>
             <div class="project-menu-separator"></div>
           {/if}
@@ -5130,23 +5316,23 @@
               {suggestionMenuState}
             </span>
           </button>
-          {#if document && reviewableBranches.length > 0}
-            <button
-              type="button"
-              aria-haspopup="dialog"
-              aria-label={`Review ${reviewableBranches.length} saved writing ${reviewableBranches.length === 1 ? 'suggestion' : 'suggestions'}`}
-              on:click={() => void openStrandReview()}
-            >
-              <span>Review suggestions</span>
-              <span class="menu-state">{reviewableBranches.length}</span>
-            </button>
-          {/if}
-          <div class="project-menu-separator"></div>
-          <button type="button" disabled={reconciliationResolutionLocked || (editorReadonly && transition !== 'closing' && !(reconciliation && !document))} on:click={() => { closeProjectMenu(); void closeProject(); }}>
-            {transition === 'closing' ? 'Retry closing project' : 'Close project'}
+          <button
+            class:active={shuttleEnabled}
+            type="button"
+            aria-pressed={shuttleEnabled}
+            disabled={!suggestionsEnabled || !currentModel}
+            title="After four idle seconds, accept one suggested word"
+            on:click={() => {
+              setShuttleEnabled(!shuttleEnabled);
+              closeProjectMenu();
+            }}
+          >
+            <span>Shuttle</span><span aria-hidden="true">{shuttleEnabled ? 'On' : 'Off'}</span>
           </button>
+          <p class="autosave-note"><span class="status-dot state-saved"></span>Autosave is always on. Use the File menu for New, Open, Save, and Export Copy.</p>
         </div>
       </details>
+      </div>
     </header>
   {/if}
 
@@ -5318,11 +5504,15 @@
                       ghostCandidateId={ghostSuggestion?.candidateId ?? ''}
                       ghostPresentationKey={ghostSuggestion?.presentationKey ?? ''}
                       ghostAnchorByteOffset={ghostSuggestion?.targetByte ?? null}
+                      ghostInsertsOnAccept={ghostSuggestion?.insertsOnAccept ?? false}
+                      ghostAlternatives={ghostAlternatives}
                       surfaceKey={visualGhostSurfaceKey}
                       onChange={updateText}
                       onCompositionChange={setVisualComposition}
                       onImmediateDocumentMutation={invalidateVisualSuggestionImmediately}
                       onGhostAccept={acceptActiveGhost}
+                      onGhostInsert={authorizeGhostInsertion}
+                      onGhostCycle={cycleActiveSuggestion}
                       onGhostDismiss={dismissActiveGhost}
                       onGhostPresentationRejected={rejectVisualGhostPresentation}
                       onGhostVisibilityChange={(presentationKey) => {
@@ -5357,6 +5547,8 @@
                   ghostText={sourceGhostSuggestion?.text ?? ''}
                   ghostCandidateId={sourceGhostSuggestion?.candidateId ?? ''}
                   ghostPresentationKey={sourceGhostSuggestion?.presentationKey ?? ''}
+                  ghostInsertsOnAccept={sourceGhostSuggestion?.insertsOnAccept ?? false}
+                  ghostAlternatives={ghostAlternatives}
                   onCompositionStart={beginSourceComposition}
                   onCompositionEnd={finishSourceComposition}
                   onValueInput={(textarea) => {
@@ -5365,6 +5557,8 @@
                   }}
                   onSelectionChange={updateSourceSelection}
                   onGhostAccept={acceptActiveGhost}
+                  onGhostInsert={authorizeGhostInsertion}
+                  onGhostCycle={cycleActiveSuggestion}
                   onGhostDismiss={dismissActiveGhost}
                   onGhostVisibilityChange={(presentationKey) => {
                     visibleSourceGhostPresentationKey = presentationKey;
@@ -5374,85 +5568,6 @@
               </div>
             {/if}
           </section>
-
-          {#if strandReviewOpen}
-            <dialog
-              class="strand-review"
-              bind:this={strandReviewDialog}
-              aria-labelledby="strand-review-title"
-              on:click={(event) => {
-                if (event.target === strandReviewDialog) closeStrandReview();
-              }}
-              on:close={() => {
-                strandReviewOpen = false;
-                promotionArmedCandidateId = null;
-                projectMenuTrigger?.focus();
-              }}
-              on:cancel={() => {
-                strandReviewOpen = false;
-                promotionArmedCandidateId = null;
-              }}
-            >
-              <div class="strand-review-shell">
-              <header class="strand-review-header">
-                <div>
-                  <h2 id="strand-review-title">Suggestions</h2>
-                  {#if reviewBranchIndex >= 0}
-                    <span>{reviewBranchIndex + 1} of {reviewableBranches.length}</span>
-                  {/if}
-                </div>
-                <button
-                  class="dialog-close"
-                  data-review-close
-                  type="button"
-                  aria-label="Close suggestions"
-                  on:click={closeStrandReview}
-                >×</button>
-              </header>
-
-              {#if reviewBranch}
-                <div class="strand-review-prose">{reviewBranch.text}</div>
-
-                {#if reviewableBranches.length > 1}
-                  <nav class="strand-review-navigation" aria-label="Suggestion navigation">
-                    <button type="button" on:click={() => moveStrandReview(-1)}>Previous</button>
-                    <button type="button" on:click={() => moveStrandReview(1)}>Next</button>
-                  </nav>
-                {/if}
-
-                <details class="strand-evidence">
-                  <summary>Evidence</summary>
-                  <dl>
-                    <div><dt>Model</dt><dd>{reviewBranch.model_id ?? 'Recorded model'}</dd></div>
-                    <div><dt>Seed</dt><dd>{reviewBranch.seed ?? 'Recorded in provenance'}</dd></div>
-                    <div><dt>Boundary</dt><dd>{reviewBranch.target_start_byte}</dd></div>
-                    <div><dt>Output</dt><dd>{reviewBranch.output_blob_id ?? 'Pending immutable body'}</dd></div>
-                    <div><dt>Run</dt><dd>{reviewBranch.run_id}</dd></div>
-                  </dl>
-                  {#if suppressedReviewBranches.length > 0}
-                    <details class="suppressed-output">
-                      <summary>{suppressedReviewBranches.length} malformed {suppressedReviewBranches.length === 1 ? 'output' : 'outputs'} held back</summary>
-                      {#each suppressedReviewBranches as suppressed (suppressed.run_id)}
-                        <div>
-                          <strong>{candidateSurfaceReason(suppressed.text) ?? 'Held back'}</strong>
-                          <pre>{suppressed.text}</pre>
-                        </div>
-                      {/each}
-                    </details>
-                  {/if}
-                </details>
-
-                <footer class="strand-review-actions">
-                  <button class="primary-button" type="button" on:click={() => void acceptInlineSuggestion(reviewBranch)} disabled={!canPromoteBranch(reviewBranch)} title={promotionUnavailableReason(reviewBranch)}>
-                    Insert suggestion
-                  </button>
-                </footer>
-              {:else}
-                <p class="strand-review-empty">No suitable alternative remains at this caret.</p>
-              {/if}
-              </div>
-            </dialog>
-          {/if}
 
           {#if uncertainPromotion}
             <div class="attention-action">

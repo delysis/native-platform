@@ -11,11 +11,13 @@
   import {
     clearGhostText,
     createGhostTextPlugin,
+    currentGhostTextPlan,
     exactMarkdownByteOffsetAtSelection,
     setGhostText,
     visibleGhostWidgetPresentationKey,
     visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
+  import { nextSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
 
   export let value = '';
   export let label = 'Manuscript editor';
@@ -25,11 +27,19 @@
   export let ghostCandidateId = '';
   export let ghostPresentationKey = '';
   export let ghostAnchorByteOffset: number | null = null;
+  export let ghostInsertsOnAccept = false;
+  export let ghostAlternatives: readonly SuggestionAlternative[] = [];
   export let surfaceKey = '';
   export let onChange: (markdown: string) => void = () => {};
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onImmediateDocumentMutation: () => void = () => {};
   export let onGhostAccept: (candidateId: string, presentationKey: string) => boolean = () => false;
+  export let onGhostInsert: (
+    candidateId: string,
+    presentationKey: string,
+    text: string
+  ) => boolean = () => false;
+  export let onGhostCycle: (offset: number) => void = () => {};
   export let onGhostDismiss: (candidateId: string, presentationKey: string) => void = () => {};
   export let onGhostPresentationRejected: (
     candidateId: string,
@@ -131,6 +141,20 @@
     return view.hasFocus();
   }
 
+  export function acceptGhostWord(): boolean {
+    if (!view || readonly || composing || !view.hasFocus()) return false;
+    const plan = currentGhostTextPlan(view.state);
+    if (
+      !plan ||
+      visibleGhostWidgetPresentationKey(view) !== plan.presentationKey ||
+      selectionBoundary(view.state) !== plan.anchorByteOffset
+    ) return false;
+    const word = nextSuggestionWord(plan.text);
+    if (!word || !onGhostInsert(plan.candidateId, plan.presentationKey, word)) return false;
+    view.dispatch(view.state.tr.insertText(word));
+    return true;
+  }
+
   function parse(markdown: string): ProseMirrorNode {
     return parseVisualMarkdown(markdown);
   }
@@ -159,6 +183,9 @@
         keymap(baseKeymap),
         createGhostTextPlugin({
           accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
+          insert: (candidateId, presentationKey, text) =>
+            onGhostInsert(candidateId, presentationKey, text),
+          cycle: onGhostCycle,
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
           visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>
             Boolean(view) &&
@@ -169,6 +196,16 @@
         })
       ]
     });
+  }
+
+  function editorAttributes(): Record<string, string> {
+    return {
+      'aria-label': label,
+      class: 'loom-prosemirror',
+      role: 'textbox',
+      'aria-multiline': 'true',
+      spellcheck: 'true'
+    };
   }
 
   function reportSelection(state: EditorState): void {
@@ -187,13 +224,7 @@
     view = new EditorView(mount, {
       state: stateFor(value),
       editable: () => !readonly,
-      attributes: {
-        'aria-label': label,
-        class: 'loom-prosemirror',
-        role: 'textbox',
-        'aria-multiline': 'true',
-        spellcheck: 'true'
-      },
+      attributes: editorAttributes(),
       dispatchTransaction(transaction) {
         if (!view) return;
         const next = view.state.apply(transaction);
@@ -268,7 +299,7 @@
   }
 
   $: if (view) {
-    view.setProps({ editable: () => !readonly });
+    view.setProps({ editable: () => !readonly, attributes: editorAttributes() });
     const anchorByteOffset = ghostAnchorByteOffset;
     const exactAnchor = anchorByteOffset !== null &&
       selectionBoundary(view.state) === anchorByteOffset;
@@ -308,7 +339,9 @@
       presentationKey: ghostPresentationKey,
       surfaceKey,
       anchorByteOffset,
-      text: ghostText
+      text: ghostText,
+      insertsOnAccept: ghostInsertsOnAccept,
+      alternatives: ghostAlternatives
     } : null;
     setGhostText(view, presentation);
     scheduleGhostVisibilityReport();

@@ -6,6 +6,7 @@ import {
   isExtendedGraphemeBoundary
 } from './graphemeBoundary';
 import { parseVisualMarkdown } from './markdownSafety';
+import { nextSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
 
 export interface GhostTextPresentation {
   active: boolean;
@@ -14,6 +15,8 @@ export interface GhostTextPresentation {
   surfaceKey: string;
   anchorByteOffset: number;
   text: string;
+  insertsOnAccept?: boolean;
+  alternatives?: readonly SuggestionAlternative[];
 }
 
 export interface GhostTextPlan {
@@ -23,6 +26,8 @@ export interface GhostTextPlan {
   surfaceKey: string;
   anchorByteOffset: number;
   text: string;
+  insertsOnAccept: boolean;
+  alternatives: readonly SuggestionAlternative[];
 }
 
 export interface GhostTextHandlers {
@@ -31,6 +36,8 @@ export interface GhostTextHandlers {
    * falls back to inserting an ordinary tab into the manuscript.
    */
   accept: (candidateId: string, presentationKey: string) => boolean;
+  insert?: (candidateId: string, presentationKey: string, text: string) => boolean;
+  cycle?: (offset: number) => void;
   dismiss: (candidateId: string, presentationKey: string) => void;
   visible: (
     presentationKey: string,
@@ -86,7 +93,9 @@ export function planGhostText(
     presentationKey: presentation.presentationKey,
     surfaceKey: presentation.surfaceKey,
     anchorByteOffset: presentation.anchorByteOffset,
-    text: presentation.text
+    text: presentation.text,
+    insertsOnAccept: Boolean(presentation.insertsOnAccept),
+    alternatives: presentation.alternatives ?? []
   };
 }
 
@@ -365,6 +374,12 @@ export function visibleGhostWidgetPresentationKey(view: EditorView): string {
 }
 
 function ghostWidget(plan: GhostTextPlan): HTMLElement {
+  const container = document.createElement('span');
+  container.className = 'loom-ghost-widget';
+  container.contentEditable = 'false';
+  container.draggable = false;
+  container.spellcheck = false;
+
   const widget = document.createElement('span');
   widget.className = 'loom-visual-ghost';
   widget.setAttribute(GHOST_PRESENTATION_ATTRIBUTE, plan.presentationKey);
@@ -373,7 +388,47 @@ function ghostWidget(plan: GhostTextPlan): HTMLElement {
   widget.draggable = false;
   widget.spellcheck = false;
   widget.textContent = plan.text;
-  return widget;
+  container.append(widget);
+
+  if (plan.alternatives.length > 1) {
+    const fan = document.createElement('span');
+    fan.className = 'loom-ghost-fan';
+    fan.setAttribute('aria-hidden', 'true');
+    plan.alternatives.forEach((alternative, index) => {
+      const row = document.createElement('span');
+      row.className = 'loom-ghost-fan-row';
+      if (alternative.presentationKey === plan.presentationKey) row.classList.add('active');
+      const number = document.createElement('span');
+      number.className = 'loom-ghost-fan-index';
+      number.textContent = String(index + 1);
+      const text = document.createElement('span');
+      text.textContent = alternative.text;
+      row.append(number, text);
+      fan.append(row);
+    });
+    container.append(fan);
+  }
+  return container;
+}
+
+function setGhostFanVisible(view: EditorView, visible: boolean): void {
+  view.dom.querySelectorAll<HTMLElement>('.loom-ghost-widget').forEach((widget) => {
+    widget.classList.toggle('fan-visible', visible);
+  });
+}
+
+function alternativesMatch(
+  left: readonly SuggestionAlternative[] | undefined,
+  right: readonly SuggestionAlternative[] | undefined
+): boolean {
+  const leftItems = left ?? [];
+  const rightItems = right ?? [];
+  return leftItems.length === rightItems.length && leftItems.every((item, index) => {
+    const other = rightItems[index];
+    return Boolean(other) && item.candidateId === other.candidateId &&
+      item.presentationKey === other.presentationKey &&
+      item.text === other.text;
+  });
 }
 
 function clearTransaction(view: EditorView): Transaction {
@@ -398,7 +453,9 @@ export function setGhostText(
     current?.candidateId === presentation?.candidateId &&
     current?.surfaceKey === presentation?.surfaceKey &&
     current?.anchorByteOffset === presentation?.anchorByteOffset &&
-    current?.text === presentation?.text
+    current?.text === presentation?.text &&
+    Boolean(current?.insertsOnAccept) === Boolean(presentation?.insertsOnAccept) &&
+    alternativesMatch(current?.alternatives, presentation?.alternatives)
   ) return;
   if (!presentation) {
     clearGhostText(view);
@@ -436,6 +493,34 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
       handleKeyDown(view, event) {
         const plan = planGhostText(view.state, ghostTextPluginKey.getState(view.state) ?? null);
         if (event.isComposing || event.keyCode === 229) return false;
+        if (event.key === 'Alt' && !event.metaKey && !event.ctrlKey) {
+          setGhostFanVisible(view, true);
+          return false;
+        }
+        if (
+          plan &&
+          event.altKey &&
+          !event.metaKey &&
+          !event.ctrlKey &&
+          (event.key === 'ArrowUp' || event.key === 'ArrowDown')
+        ) {
+          event.preventDefault();
+          handlers.cycle?.(event.key === 'ArrowDown' ? 1 : -1);
+          return true;
+        }
+        if (
+          plan &&
+          event.altKey &&
+          !event.metaKey &&
+          !event.ctrlKey &&
+          event.key === 'ArrowRight' &&
+          handlers.visible(plan.presentationKey, plan.surfaceKey, plan.anchorByteOffset)
+        ) {
+          const word = nextSuggestionWord(plan.text);
+          if (!word || !handlers.insert?.(plan.candidateId, plan.presentationKey, word)) return false;
+          view.dispatch(view.state.tr.insertText(word));
+          return true;
+        }
         if (plan && event.key === 'Escape' && !event.metaKey && !event.ctrlKey && !event.altKey) {
           view.dispatch(clearTransaction(view));
           handlers.dismiss(plan.candidateId, plan.presentationKey);
@@ -456,9 +541,13 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
             // Claim parent authority while its exact visibility witness still
             // exists. Clearing first would invalidate every legitimate
             // acceptance before the parent can bind it to durable authority.
-            const accepted = handlers.accept(plan.candidateId, plan.presentationKey);
+            const accepted = plan.insertsOnAccept
+              ? Boolean(handlers.insert?.(plan.candidateId, plan.presentationKey, plan.text))
+              : handlers.accept(plan.candidateId, plan.presentationKey);
             if (accepted) {
-              view.dispatch(clearTransaction(view));
+              view.dispatch(plan.insertsOnAccept
+                ? view.state.tr.insertText(plan.text)
+                : clearTransaction(view));
               return true;
             }
           }
@@ -470,6 +559,16 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           return true;
         }
         return false;
+      },
+      handleDOMEvents: {
+        keyup(view, event) {
+          if (event.key === 'Alt') setGhostFanVisible(view, false);
+          return false;
+        },
+        blur(view) {
+          setGhostFanVisible(view, false);
+          return false;
+        }
       }
     }
   });

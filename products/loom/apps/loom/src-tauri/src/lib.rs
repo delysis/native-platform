@@ -14,6 +14,10 @@ const EMBEDDED_BUILD_MODEL_POLICY: &[u8] =
 const EMBEDDED_BUILD_MODEL_POLICY_NAME: &str = env!("LOOM_BUILD_MODEL_POLICY_NAME");
 const EMBEDDED_BUILD_MODEL_POLICY_SHA256: &str = env!("LOOM_BUILD_MODEL_POLICY_SHA256");
 const APPLICATION_QUIT_ACCELERATOR: &str = "CmdOrCtrl+Q";
+const FILE_NEW_DOCUMENT_ACCELERATOR: &str = "CmdOrCtrl+N";
+const FILE_OPEN_PROJECT_ACCELERATOR: &str = "CmdOrCtrl+O";
+const FILE_SAVE_ACCELERATOR: &str = "CmdOrCtrl+S";
+const FILE_EXPORT_COPY_ACCELERATOR: &str = "CmdOrCtrl+Shift+S";
 const ACCEPTANCE_DIRECTORY_ENV: &str = "DELYSIS_LOOM_ACCEPTANCE_DIR";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -115,6 +119,7 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
         true,
         Some(APPLICATION_QUIT_ACCELERATOR),
     )?;
+    let file = build_file_menu(app, &quit)?;
     let window = Submenu::with_id_and_items(
         app,
         WINDOW_SUBMENU_ID,
@@ -158,16 +163,7 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
                     &quit,
                 ],
             )?,
-            &Submenu::with_items(
-                app,
-                "File",
-                true,
-                &[
-                    &PredefinedMenuItem::close_window(app, None)?,
-                    #[cfg(not(target_os = "macos"))]
-                    &quit,
-                ],
-            )?,
+            &file,
             &Submenu::with_items(
                 app,
                 "Edit",
@@ -191,6 +187,58 @@ fn build_desktop_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> 
             )?,
             &window,
             &help,
+        ],
+    )
+}
+
+fn build_file_menu<R: Runtime>(
+    app: &AppHandle<R>,
+    quit: &MenuItem<R>,
+) -> tauri::Result<Submenu<R>> {
+    #[cfg(target_os = "macos")]
+    let _ = quit;
+    let new_document = MenuItem::with_id(
+        app,
+        tauri_plugin_loom::FILE_NEW_DOCUMENT_MENU_ID,
+        "New Document",
+        true,
+        Some(FILE_NEW_DOCUMENT_ACCELERATOR),
+    )?;
+    let open_project = MenuItem::with_id(
+        app,
+        tauri_plugin_loom::FILE_OPEN_PROJECT_MENU_ID,
+        "Open Project…",
+        true,
+        Some(FILE_OPEN_PROJECT_ACCELERATOR),
+    )?;
+    let save = MenuItem::with_id(
+        app,
+        tauri_plugin_loom::FILE_SAVE_MENU_ID,
+        "Save",
+        true,
+        Some(FILE_SAVE_ACCELERATOR),
+    )?;
+    let export_copy = MenuItem::with_id(
+        app,
+        tauri_plugin_loom::FILE_EXPORT_COPY_MENU_ID,
+        "Export Copy…",
+        true,
+        Some(FILE_EXPORT_COPY_ACCELERATOR),
+    )?;
+    Submenu::with_items(
+        app,
+        "File",
+        true,
+        &[
+            &new_document,
+            &open_project,
+            &PredefinedMenuItem::separator(app)?,
+            &save,
+            &export_copy,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::close_window(app, None)?,
+            #[cfg(not(target_os = "macos"))]
+            quit,
         ],
     )
 }
@@ -255,6 +303,33 @@ mod tests {
         assert!(!source.contains(predefined_quit));
         assert!(!source.contains(predefined_quit_with_text));
         assert!(!source.contains(default_menu));
+    }
+
+    #[test]
+    fn native_file_menu_exposes_standard_document_accelerators() {
+        assert_eq!(FILE_NEW_DOCUMENT_ACCELERATOR, "CmdOrCtrl+N");
+        assert_eq!(FILE_OPEN_PROJECT_ACCELERATOR, "CmdOrCtrl+O");
+        assert_eq!(FILE_SAVE_ACCELERATOR, "CmdOrCtrl+S");
+        assert_eq!(FILE_EXPORT_COPY_ACCELERATOR, "CmdOrCtrl+Shift+S");
+
+        let source = include_str!("lib.rs");
+        for menu_id in [
+            "FILE_NEW_DOCUMENT_MENU_ID",
+            "FILE_OPEN_PROJECT_MENU_ID",
+            "FILE_SAVE_MENU_ID",
+            "FILE_EXPORT_COPY_MENU_ID",
+        ] {
+            assert!(
+                source.contains(menu_id),
+                "missing native file menu item {menu_id}"
+            );
+        }
+        for label in ["New Document", "Open Project…", "Save", "Export Copy…"] {
+            assert!(
+                source.contains(label),
+                "missing native file menu label {label}"
+            );
+        }
     }
 
     #[test]
