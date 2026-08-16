@@ -166,6 +166,20 @@ cleanup_failed_process() {
 }
 trap cleanup_failed_process EXIT HUP INT TERM
 
+if [ "$COMPONENT" = loom ] && [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
+  model_library="$PRODUCT_STATE/models"
+  mkdir -p "$model_library"
+  LOOM_SMOKE_MODEL_LINK="$model_library/gemma-4-12B-it-qat-q4_0.gguf"
+  if [ -e "$LOOM_SMOKE_MODEL_LINK" ]; then
+    echo "isolated acceptance model target already exists: $LOOM_SMOKE_MODEL_LINK" >&2
+    exit 1
+  fi
+  ln "$LOOM_SMOKE_GGUF_MODEL_PATH" "$LOOM_SMOKE_MODEL_LINK"
+  require_equal "acceptance model hard-link identity" \
+    "$(stat -f '%d:%i' "$LOOM_SMOKE_GGUF_MODEL_PATH")" \
+    "$(stat -f '%d:%i' "$LOOM_SMOKE_MODEL_LINK")"
+fi
+
 wait_for_window() {
   target_pid=$1
   xcrun swift - "$target_pid" <<'SWIFT'
@@ -1074,19 +1088,6 @@ run_once() {
       return 1
     fi
     if [ -n "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
-      if [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
-        model_library="$PRODUCT_STATE/models"
-        mkdir -p "$model_library"
-        LOOM_SMOKE_MODEL_LINK="$model_library/gemma-4-12B-it-qat-q4_0.gguf"
-        if [ -e "$LOOM_SMOKE_MODEL_LINK" ]; then
-          echo "isolated acceptance model target already exists: $LOOM_SMOKE_MODEL_LINK" >&2
-          return 1
-        fi
-        ln "$LOOM_SMOKE_GGUF_MODEL_PATH" "$LOOM_SMOKE_MODEL_LINK"
-        require_equal "acceptance model hard-link identity" \
-          "$(stat -f '%d:%i' "$LOOM_SMOKE_GGUF_MODEL_PATH")" \
-          "$(stat -f '%d:%i' "$LOOM_SMOKE_MODEL_LINK")"
-      fi
       if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"; then
         echo "could not establish autocomplete off before refreshing the isolated model library" >&2
         return 1

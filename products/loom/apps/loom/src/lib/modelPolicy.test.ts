@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ModelCapabilitySummary } from './types';
 import {
+  isEphemeralAcceptanceModelPath,
   automaticWriterForBuildPolicy,
   isUsableSuggestionWriter,
   isVerifiedPolicyWriter,
@@ -167,6 +168,18 @@ describe('preferredWriterModelPath', () => {
       .toBe(remembered.model_path);
     expect(preferredWriterModelPath([first, resident], first.model_path, first.model_path))
       .toBe(resident.model_path);
+  });
+});
+
+describe('acceptance model preferences', () => {
+  it('recognizes only the isolated smoke model namespace as ephemeral', () => {
+    expect(isEphemeralAcceptanceModelPath(
+      '/private/var/folders/x/T/delysis-loom-smoke.XXXXXX.a1b2/product/models/gemma.gguf'
+    )).toBe(true);
+    expect(isEphemeralAcceptanceModelPath(
+      '/Users/george/.cache/huggingface/hub/models--google--gemma/blobs/real'
+    )).toBe(false);
+    expect(isEphemeralAcceptanceModelPath('/tmp/my-writing-model.gguf')).toBe(false);
   });
 });
 

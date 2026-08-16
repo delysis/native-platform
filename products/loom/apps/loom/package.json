@@ -7,7 +7,8 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "vitest run",
+    "test": "vitest run --exclude '**/*.browser.test.ts'",
+    "test:browser": "vitest run --config vitest.browser.config.ts",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -28,6 +29,8 @@
     "@sveltejs/vite-plugin-svelte": "7.3.0",
     "@tauri-apps/cli": "2.11.4",
     "@types/node": "26.2.0",
+    "@vitest/browser-playwright": "4.1.10",
+    "playwright": "1.62.1",
     "svelte-check": "4.7.5",
     "typescript": "6.0.3",
     "vite": "8.2.1",

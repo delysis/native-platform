@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   acceptedCompletionText,
   completionPresentation,
+  completionSessionContextKey,
   completionShouldRequestNextBatch,
   completionTextAtBoundary,
   consumeCompletionRemainder,
@@ -22,6 +23,14 @@ const candidates: CompletionCandidate[] = [
 ];
 
 describe('cached completion session', () => {
+  it('uses document lifetime identity rather than autosave revision identity', () => {
+    expect(completionSessionContextKey('session', 'document', 7, 'visual'))
+      .toBe('session:document:7:visual');
+    expect(completionSessionContextKey('session', 'document', 7, 'visual'))
+      .toBe(completionSessionContextKey('session', 'document', 7, 'visual'));
+    expect(completionSessionContextKey('', 'document', 7, 'visual')).toBe('');
+  });
+
   it('consumes and reverses words without requesting a new candidate', () => {
     const started = startCompletionSession('doc:visual', candidates, 'run-a');
     expect(started).not.toBeNull();

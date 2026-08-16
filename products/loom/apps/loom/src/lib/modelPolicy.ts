@@ -38,6 +38,16 @@ const GEMMA_4_BASE_WRITER_PROFILE = 'gemma_4_e2b_base_q8_loom_v1';
 const OFFICIAL_GEMMA_4_12B_QAT_FILE = 'gemma-4-12b-it-qat-q4_0.gguf';
 const OFFICIAL_GEMMA_4_12B_QAT_BYTES = 6_975_879_296;
 
+/**
+ * Native acceptance runs keep their model library under an ephemeral temp
+ * root. A WebKit preference outlives that root because it is keyed by bundle
+ * identifier, so it must never become a production startup preference.
+ */
+export function isEphemeralAcceptanceModelPath(modelPath: string): boolean {
+  const normalized = modelPath.replaceAll('\\', '/');
+  return /\/delysis-loom-smoke\.[^/]+\/product\/models\/[^/]+$/u.test(normalized);
+}
+
 function isOfficialGemma4_12BQat(model: ModelCapabilitySummary): boolean {
   return model.local &&
     model.header_verified &&

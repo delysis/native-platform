@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { cycleSuggestionIndex, nextSuggestionWord } from './suggestionInteraction';
+import {
+  cycleSuggestionIndex,
+  nextSuggestionWord,
+  nextVisualSuggestionWord
+} from './suggestionInteraction';
 
 describe('suggestion interaction', () => {
   it('accepts one word with its surrounding prose spacing and punctuation', () => {
@@ -18,6 +22,12 @@ describe('suggestion interaction', () => {
     expect(nextSuggestionWord(' breat')).toBe(' breat');
     expect(nextSuggestionWord(' 雨が止み、次')).toBe(' 雨が止み、次');
     expect(nextSuggestionWord('   ')).toBeNull();
+  });
+
+  it('leaves terminal paragraph whitespace in the visual ghost', () => {
+    expect(nextVisualSuggestionWord(' world again')).toBe(' world');
+    expect(nextVisualSuggestionWord(' world')).toBe(' world');
+    expect(nextVisualSuggestionWord(' “Listen,” she said.')).toBe(' “Listen,”');
   });
 
   it('cycles in both directions without leaving the family', () => {

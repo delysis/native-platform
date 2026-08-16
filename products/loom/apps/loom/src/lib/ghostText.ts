@@ -6,7 +6,7 @@ import {
   isExtendedGraphemeBoundary
 } from './graphemeBoundary';
 import { parseVisualMarkdown } from './markdownSafety';
-import { nextSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
+import { nextVisualSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
 
 export interface GhostTextPresentation {
   active: boolean;
@@ -631,7 +631,7 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
             plan.anchorByteOffset
           ))
         ) {
-          const word = nextSuggestionWord(plan.text);
+          const word = nextVisualSuggestionWord(plan.text);
           if (!word || !handlers.insert?.(plan.candidateId, plan.presentationKey, word)) return false;
           view.dispatch(view.state.tr.insertText(word));
           return true;

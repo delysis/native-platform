@@ -21,6 +21,23 @@ export interface CompletionStep {
   text: string;
 }
 
+export function completionSessionContextKey(
+  projectSessionId: string,
+  documentId: string,
+  documentEpoch: number,
+  mode: 'visual' | 'source'
+): string {
+  if (
+    !projectSessionId ||
+    !documentId ||
+    !Number.isSafeInteger(documentEpoch) ||
+    documentEpoch < 0
+  ) {
+    return '';
+  }
+  return `${projectSessionId}:${documentId}:${documentEpoch}:${mode}`;
+}
+
 export function startCompletionSession(
   contextKey: string,
   candidates: readonly CompletionCandidate[],

@@ -40,7 +40,22 @@ describe('App ghost reactivity wiring', () => {
     expect(visualFamily).toContain('verifiedBranchBodyByRun');
     expect(visualFamily).toContain('currentModel');
     expect(visualFamily).toContain('branchPromotionReady');
+    expect(visualFamily).toContain('documentText');
+
+    const sourceFamily = dependencyThunkFor(compiled, '$.set(sourceSuggestionFamily');
+    expect(sourceFamily).toContain('sourceDisplayText');
     expect(source).not.toContain('A private strand is ready');
+  });
+
+  it('keeps cached completion identity stable across autosave revision changes', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const context = source.slice(
+      source.indexOf('$: completionContextKey ='),
+      source.indexOf('$: visualGhostSurfaceKey =')
+    );
+    expect(context).toContain('completionSessionContextKey');
+    expect(context).not.toContain('revision_id');
+    expect(context).not.toContain('visible_blob_id');
   });
 
   it('keeps suggestion review and implementation evidence out of the quiet titlebar', () => {

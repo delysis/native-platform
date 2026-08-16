@@ -7,7 +7,11 @@
   import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
   import { onDestroy, onMount } from 'svelte';
-  import { normalizeVisualMarkdownSource, parseVisualMarkdown } from './markdownSafety';
+  import {
+    normalizeVisualMarkdownSource,
+    parseVisualMarkdown,
+    serializeVisualMarkdown
+  } from './markdownSafety';
   import {
     clearGhostText,
     createGhostTextPlugin,
@@ -17,7 +21,7 @@
     visibleGhostWidgetPresentationKey,
     visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
-  import { nextSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
+  import { nextVisualSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
   import {
     applyVisualFormat,
     visualFormatState,
@@ -83,6 +87,8 @@
   let boundaryCacheFrom = -1;
   let boundaryCacheTo = -1;
   let boundaryCacheValue: number | null = null;
+  let formattingSelectionDocument: ProseMirrorNode | null = null;
+  let formattingSelection: Selection | null = null;
 
   function clearBoundaryCache(): void {
     boundaryCacheDocument = null;
@@ -130,7 +136,7 @@
       projectionTimer = undefined;
     }
     localDocumentChanged = false;
-    lastEmitted = defaultMarkdownSerializer.serialize(view.state.doc);
+    lastEmitted = serializeVisualMarkdown(view.state.doc);
     clearBoundaryCache();
     onChange(lastEmitted);
     reportSelection(view.state);
@@ -168,14 +174,39 @@
 
   export function focusPreservingSelection(): boolean {
     if (!view || readonly) return false;
+    if (
+      formattingSelection &&
+      formattingSelectionDocument === view.state.doc &&
+      !view.state.selection.eq(formattingSelection)
+    ) {
+      view.dispatch(view.state.tr.setSelection(formattingSelection));
+    }
     view.focus();
     return view.hasFocus();
   }
 
+  export function captureFormattingSelection(): boolean {
+    if (!view || readonly || composing) return false;
+    if (formattingSelection && formattingSelectionDocument === view.state.doc && !view.hasFocus()) {
+      return true;
+    }
+    formattingSelectionDocument = view.state.doc;
+    formattingSelection = view.state.selection;
+    return true;
+  }
+
+  export function clearFormattingSelection(): void {
+    formattingSelectionDocument = null;
+    formattingSelection = null;
+  }
+
   export function applyFormatting(action: VisualFormatAction, href = ''): boolean {
     if (!view || readonly || composing) return false;
+    focusPreservingSelection();
     const applied = applyVisualFormat(view.state, action, href, (transaction) => view?.dispatch(transaction));
     if (applied) {
+      formattingSelectionDocument = view.state.doc;
+      formattingSelection = view.state.selection;
       view.focus();
       onFormatStateChange(visualFormatState(view.state));
     }
@@ -190,7 +221,7 @@
       (requireVisible && visibleGhostWidgetPresentationKey(view) !== plan.presentationKey) ||
       selectionBoundary(view.state) !== plan.anchorByteOffset
     ) return false;
-    const word = nextSuggestionWord(plan.text);
+    const word = nextVisualSuggestionWord(plan.text);
     if (!word || !onGhostInsert(plan.candidateId, plan.presentationKey, word)) return false;
     view.dispatch(view.state.tr.insertText(word));
     return true;
@@ -303,6 +334,7 @@
         view.updateState(next);
         editorEmpty = next.doc.textContent.length === 0;
         if (transaction.docChanged) {
+          clearFormattingSelection();
           clearBoundaryCache();
           if (selectionReportTimer !== undefined) {
             window.clearTimeout(selectionReportTimer);
@@ -432,6 +464,7 @@
   }
 
   onDestroy(() => {
+    clearFormattingSelection();
     if (projectionTimer !== undefined) window.clearTimeout(projectionTimer);
     if (normalizationTimer !== undefined) window.clearTimeout(normalizationTimer);
     if (visibilityFrame !== undefined) window.cancelAnimationFrame(visibilityFrame);

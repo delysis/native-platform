@@ -23,6 +23,19 @@ export function nextSuggestionWord(text: string): string | null {
   return visible && /\S/u.test(visible) ? visible : null;
 }
 
+/**
+ * ProseMirror's Markdown serializer removes a space at the end of a paragraph.
+ * Keep that separator in the unconsumed ghost instead of pretending it became
+ * part of the canonical manuscript. This makes a word acceptance exactly
+ * reversible and keeps the next cached word anchored to real bytes.
+ */
+export function nextVisualSuggestionWord(text: string): string | null {
+  const word = nextSuggestionWord(text);
+  if (!word || word.length === text.length) return word;
+  const withoutTerminalWhitespace = word.replace(/\s+$/u, '');
+  return /\S/u.test(withoutTerminalWhitespace) ? withoutTerminalWhitespace : word;
+}
+
 export function cycleSuggestionIndex(length: number, current: number, offset: number): number {
   if (!Number.isSafeInteger(length) || length <= 0) return -1;
   const normalizedCurrent = Number.isSafeInteger(current) && current >= 0 && current < length

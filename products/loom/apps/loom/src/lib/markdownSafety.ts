@@ -54,6 +54,15 @@ export function normalizeVisualMarkdownSource(markdown: string): string {
 }
 
 /**
+ * Serialize the live ProseMirror document to the one canonical byte sequence
+ * that both persistence and completion anchoring consume. Local edits and
+ * externally restored Markdown must cross the same normalization boundary.
+ */
+export function serializeVisualMarkdown(document: ProseMirrorNode): string {
+  return normalizeVisualMarkdownSource(defaultMarkdownSerializer.serialize(document));
+}
+
+/**
  * Keep an admitted visual editing session mounted across transient serializer
  * states. Source/imported text must still prove an exact dialect round trip,
  * except for one terminal ASCII space that the serializer demonstrably drops

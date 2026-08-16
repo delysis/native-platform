@@ -2,6 +2,7 @@
   import { onMount, tick } from 'svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
+  import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
   import {
     abortApplicationClose,
@@ -68,6 +69,10 @@
   } from './lib/candidateSurface';
   import { sourceGhostPresentationCompatible } from './lib/sourceGhostText';
   import {
+    inlineSuggestionFamily,
+    type InlineGhostSuggestion
+  } from './lib/inlineSuggestionFamily';
+  import {
     visualGhostTextMayBePlainProse,
     visualGhostTextSafePrefix
   } from './lib/ghostText';
@@ -125,14 +130,13 @@
   } from './lib/startupSafety';
   import { newUlid } from './lib/ulid';
   import {
-    cycleSuggestionIndex,
-    type SuggestionAlternative
+    cycleSuggestionIndex
   } from './lib/suggestionInteraction';
   import {
     acceptedCompletionText,
     completionPresentation as completionSessionPresentation,
+    completionSessionContextKey,
     completionShouldRequestNextBatch,
-    completionTextAtBoundary,
     consumeCompletionText,
     cycleCompletionSession,
     insertAtUtf8Boundary,
@@ -170,6 +174,7 @@
     utf8ByteOffset
   } from './lib/weaveSafety';
   import {
+    isEphemeralAcceptanceModelPath,
     isVerifiedPolicyWriter,
     isUsableSuggestionWriter,
     looksLikeVisionAdapter,
@@ -235,8 +240,7 @@
   let handledCompletionExhaustionKey = '';
   let projectMenu: HTMLDetailsElement | undefined;
   let projectMenuTrigger: HTMLElement | undefined;
-  let formatMenu: HTMLDetailsElement | undefined;
-  let formatHref = '';
+  let formatMenu: VisualFormatMenu | undefined;
   let visualFormatting: VisualFormatState = {
     block: 'body',
     bold: false,
@@ -339,6 +343,8 @@
     flushPending: () => boolean;
     focusAtDocumentEnd: () => boolean;
     focusPreservingSelection: () => boolean;
+    captureFormattingSelection: () => boolean;
+    clearFormattingSelection: () => void;
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
   } | null = null;
@@ -433,26 +439,6 @@
     status?: BranchCard['status'];
     candidateId?: string;
     error?: string;
-  }
-
-  interface InlineGhostSuggestion extends SuggestionAlternative {
-    runId: string;
-    targetByte: number;
-    insertsOnAccept: boolean;
-  }
-
-  interface InlineSuggestionState {
-    branches: BranchCard[];
-    verifiedBodyByRun: Record<string, VerifiedBranchBody>;
-    liveTextByRun: Record<string, string>;
-    currentModel: ModelCapabilitySummary | null | undefined;
-    document: OpenDocument | null;
-    suggestionsEnabled: boolean;
-    promotionReady: boolean;
-    dismissedCandidateIds: string[];
-    unpresentableVisualKeys: string[];
-    sourceText: string;
-    sourceNewline: VerseNewlineKind | null;
   }
 
   interface PromotionCapture {
@@ -637,7 +623,12 @@
   );
   $: visualGhostTargetByte = mode === 'visual' ? visualSelectionByte : null;
   $: completionContextKey = project && document
-    ? `${project.session_id}:${document.summary.document_id}:${document.summary.revision_id}:${document.visible_blob_id}:${documentEpoch}:${mode}`
+    ? completionSessionContextKey(
+        project.session_id,
+        document.summary.document_id,
+        documentEpoch,
+        mode
+      )
     : '';
   $: visualGhostSurfaceKey = project && document
     ? `${project.session_id}:${document.summary.document_id}:${document.summary.revision_id}:${document.visible_blob_id}:${documentEpoch}:visual`
@@ -665,7 +656,7 @@
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
     unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
-    sourceText: sourceDisplayText,
+    manuscriptText: documentText,
     sourceNewline: sourceGhostNewline
   });
   $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source', {
@@ -678,7 +669,7 @@
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
     unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
-    sourceText: sourceDisplayText,
+    manuscriptText: sourceDisplayText,
     sourceNewline: sourceGhostNewline
   });
   $: baseSuggestionFamily = mode === 'visual'
@@ -720,7 +711,9 @@
       ? boundCompletionSession.candidates as InlineGhostSuggestion[]
       : sessionSuggestion ? [sessionSuggestion] : []
     : [];
-  $: activeSuggestionFamily = boundCompletionSession ? sessionSuggestionFamily : baseSuggestionFamily;
+  $: activeSuggestionFamily = pendingCompletionText !== null
+    ? []
+    : boundCompletionSession ? sessionSuggestionFamily : baseSuggestionFamily;
   $: if (
     activeSuggestionFamily.length > 0 &&
     !activeSuggestionFamily.some((suggestion) => suggestion.runId === activeSuggestionRunId)
@@ -2475,13 +2468,7 @@
   }
 
   function closeFormatMenu(refocus = true): void {
-    if (formatMenu) formatMenu.open = false;
-    if (refocus) void tick().then(() => visualEditor?.focusPreservingSelection());
-  }
-
-  function runVisualFormat(action: VisualFormatAction, href = ''): void {
-    if (!visualEditor?.applyFormatting(action, href)) return;
-    if (action === 'link') formatHref = href.trim();
+    formatMenu?.close(refocus);
   }
 
   async function setOutlineOpen(open: boolean): Promise<void> {
@@ -2553,13 +2540,19 @@
 
   function loadLastLocalModelPath(): string | null {
     try {
-      return window.localStorage.getItem(lastLocalModelKey);
+      const remembered = window.localStorage.getItem(lastLocalModelKey);
+      if (remembered && isEphemeralAcceptanceModelPath(remembered)) {
+        window.localStorage.removeItem(lastLocalModelKey);
+        return null;
+      }
+      return remembered;
     } catch {
       return null;
     }
   }
 
   function rememberLastLocalModelPath(modelPath: string): void {
+    if (isEphemeralAcceptanceModelPath(modelPath)) return;
     try {
       window.localStorage.setItem(lastLocalModelKey, modelPath);
     } catch {
@@ -4245,71 +4238,6 @@
     announce('Suggestion dismissed');
   }
 
-  function inlineSuggestionFamily(
-    targetByte: number | null,
-    editorMode: 'visual' | 'source',
-    state: InlineSuggestionState
-  ): InlineGhostSuggestion[] {
-    if (
-      !state.suggestionsEnabled ||
-      !state.promotionReady ||
-      targetByte === null ||
-      !state.document ||
-      !state.currentModel
-    ) return [];
-
-    const encoder = new TextEncoder();
-    const family: InlineGhostSuggestion[] = [];
-    for (const branch of state.branches) {
-      if (
-        branch.source_revision_id !== state.document.summary.revision_id ||
-        branch.model_id !== state.currentModel.model_id ||
-        branch.target_start_byte !== targetByte ||
-        branch.target_end_byte !== targetByte ||
-        branch.selection === 'promote' ||
-        branch.selection === 'reject' ||
-        !['queued', 'generating', 'ready'].includes(branch.status)
-      ) continue;
-
-      const candidateId = `run:${branch.run_id}`;
-      if (state.dismissedCandidateIds.includes(candidateId)) continue;
-      const verified = verifiedGhostSuggestion(branch, state.verifiedBodyByRun[branch.run_id]);
-      const rawText = verified?.text ?? state.liveTextByRun[branch.run_id] ?? branch.text;
-      const candidateText = editorMode === 'visual'
-        ? visualGhostTextSafePrefix(rawText)
-        : rawText;
-      const text = candidateText === null
-        ? null
-        : completionTextAtBoundary(state.sourceText, targetByte, candidateText);
-      if (!text || !candidateTextIsSurfaceable(text)) continue;
-      const rawPresentationKey = verified?.presentationKey ??
-        `stream:${branch.run_id}:${encoder.encode(rawText).byteLength}`;
-      const presentationKey = text === rawText
-        ? rawPresentationKey
-        : `${rawPresentationKey}:prose-prefix:${encoder.encode(text).byteLength}`;
-      if (editorMode === 'visual') {
-        if (
-          !visualGhostTextMayBePlainProse(text) ||
-          state.unpresentableVisualKeys.includes(presentationKey)
-        ) continue;
-      } else if (!sourceGhostPresentationCompatible(
-        state.sourceText,
-        text,
-        state.sourceNewline
-      )) continue;
-
-      family.push({
-        candidateId,
-        presentationKey,
-        text,
-        runId: branch.run_id,
-        targetByte,
-        insertsOnAccept: !verified || text !== rawText
-      });
-    }
-    return family;
-  }
-
   function rejectVisualGhostPresentation(
     candidateId: string,
     presentationKey: string,
@@ -4590,6 +4518,11 @@
       projectMenuTrigger?.focus();
       return;
     }
+    if (event.key === 'Escape' && formatMenu?.isOpen()) {
+      event.preventDefault();
+      closeFormatMenu();
+      return;
+    }
     if (event.key === 'Escape' && shuttleEnabled) {
       event.preventDefault();
       void setShuttleEnabled(false);
@@ -4620,7 +4553,7 @@
       !projectMenu.contains(event.target)
     ) closeProjectMenu();
     if (
-      formatMenu?.open &&
+      formatMenu?.isOpen() &&
       event.target instanceof Node &&
       !formatMenu.contains(event.target)
     ) closeFormatMenu(false);
@@ -5865,43 +5798,11 @@
       ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
       <div class="canvas-controls-right" data-no-window-drag>
         {#if document && mode === 'visual' && canUseVisual}
-          <details
-            class="format-menu"
+          <VisualFormatMenu
             bind:this={formatMenu}
-            on:toggle={() => {
-              if (formatMenu?.open) formatHref = visualFormatting.linkHref;
-            }}
-          >
-            <summary class="titlebar-button format-button" title="Format text" aria-label="Format text">Aa</summary>
-            <div class="format-popover" aria-label="Text formatting">
-              <div class="format-style-grid" aria-label="Paragraph style">
-                {#each [
-                  ['body', 'Body'],
-                  ['title', 'Title'],
-                  ['heading', 'Heading'],
-                  ['subheading', 'Subheading']
-                ] as style}
-                  <button
-                    class:active={visualFormatting.block === style[0]}
-                    type="button"
-                    on:click={() => runVisualFormat(style[0] as VisualFormatAction)}
-                  >{style[1]}</button>
-                {/each}
-              </div>
-              <div class="format-command-row" aria-label="Inline formatting">
-                <button class:active={visualFormatting.bold} type="button" aria-label="Bold" title="Bold (⌘B)" on:click={() => runVisualFormat('bold')}><strong>B</strong></button>
-                <button class:active={visualFormatting.italic} type="button" aria-label="Italic" title="Italic (⌘I)" on:click={() => runVisualFormat('italic')}><em>I</em></button>
-                <button class:active={visualFormatting.blockquote} type="button" aria-label="Block quote" on:click={() => runVisualFormat('blockquote')}>“”</button>
-                <button class:active={visualFormatting.bulletList} type="button" aria-label="Bulleted list" on:click={() => runVisualFormat('bullet_list')}>•≡</button>
-                <button class:active={visualFormatting.orderedList} type="button" aria-label="Numbered list" on:click={() => runVisualFormat('ordered_list')}>1≡</button>
-              </div>
-              <div class="format-link-row">
-                <input bind:value={formatHref} aria-label="Link destination" placeholder="https://…" />
-                <button type="button" disabled={visualFormatting.selectionEmpty || !formatHref.trim()} on:click={() => runVisualFormat('link', formatHref)}>Link</button>
-                <button type="button" disabled={visualFormatting.selectionEmpty || !visualFormatting.linkHref} on:click={() => runVisualFormat('unlink')}>Remove</button>
-              </div>
-            </div>
-          </details>
+            editor={visualEditor}
+            formatting={visualFormatting}
+          />
         {/if}
         <button
           class:active={suggestionsEnabled && Boolean(currentModel)}
@@ -6149,7 +6050,6 @@
                       onCaretNavigation={invalidateCompletionForCaretNavigation}
                       onFormatStateChange={(state) => {
                         visualFormatting = state;
-                        if (!formatMenu?.open) formatHref = state.linkHref;
                       }}
                       readonly={editorReadonly}
                       autofocus={true}

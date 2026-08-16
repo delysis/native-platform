@@ -1,9 +1,11 @@
 import { defaultMarkdownParser } from 'prosemirror-markdown';
+import { EditorState, Selection } from 'prosemirror-state';
 import { describe, expect, it } from 'vitest';
 import {
   canRoundTripMarkdownExactly,
   canUseVisualMarkdown,
-  normalizeVisualMarkdownSource
+  normalizeVisualMarkdownSource,
+  serializeVisualMarkdown
 } from './markdownSafety';
 
 describe('visual Markdown safety gate', () => {
@@ -48,5 +50,16 @@ describe('visual Markdown safety gate', () => {
     expect(normalizeVisualMarkdownSource('Something  ')).toBe('Something  ');
     expect(normalizeVisualMarkdownSource('- A quiet item ')).toBe('- A quiet item ');
     expect(normalizeVisualMarkdownSource('Something\n')).toBe('Something\n');
+  });
+
+  it('canonicalizes a terminal space produced by a live ProseMirror edit before persistence', () => {
+    const document = defaultMarkdownParser.parse('hello');
+    const state = EditorState.create({
+      doc: document,
+      selection: Selection.atEnd(document)
+    });
+    const edited = state.tr.insertText(' ').doc;
+
+    expect(serializeVisualMarkdown(edited)).toBe('hello');
   });
 });
