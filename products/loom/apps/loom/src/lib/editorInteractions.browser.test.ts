@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { page, userEvent } from 'vitest/browser';
 import '../app.css';
 import EditorBrowserHarness from './EditorBrowserHarness.svelte';
+import SourceEditorBrowserHarness from './SourceEditorBrowserHarness.svelte';
 import type { CompletionCandidate } from './completionSession';
 
 let mounted: ReturnType<typeof mount> | null = null;
@@ -23,6 +24,18 @@ function render(
   mounted = mount(EditorBrowserHarness, {
     target,
     props: { initialValue, completionCandidates, ...modes }
+  });
+}
+
+function renderSource(
+  initialValue: string,
+  completionCandidates: CompletionCandidate[]
+): void {
+  const target = document.createElement('div');
+  document.body.append(target);
+  mounted = mount(SourceEditorBrowserHarness, {
+    target,
+    props: { initialValue, completionCandidates }
   });
 }
 
@@ -150,5 +163,34 @@ describe('real WebKit editor interactions', () => {
     await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
       .toHaveTextContent('0');
     await expect.element(page.getByText('again', { exact: true }).first()).not.toBeVisible();
+  });
+
+  it('keeps the selected MD remainder visible across acceptance and checkpoint, then reverses it', async () => {
+    const keyboard = userEvent.setup();
+    renderSource('hello', [
+      { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
+      { candidateId: 'b', presentationKey: 'b:1', text: ' there friend', runId: 'run-b', targetByte: 5, insertsOnAccept: true },
+      { candidateId: 'c', presentationKey: 'c:1', text: ' from here', runId: 'run-c', targetByte: 5, insertsOnAccept: true },
+      { candidateId: 'd', presentationKey: 'd:1', text: ' and onward', runId: 'run-d', targetByte: 5, insertsOnAccept: true }
+    ]);
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
+
+    await keyboard.keyboard('{Alt>}{ArrowDown}{ArrowRight}{/Alt}');
+    await expect.poll(
+      () => page.getByRole('status', { name: 'Source Markdown' }).element().textContent
+    ).toBe('hello there ');
+    await expect.element(page.getByText('friend', { exact: true }).first()).toBeVisible();
+    await page.getByRole('button', { name: 'Source checkpoint' }).click();
+    await expect.element(page.getByText('friend', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByRole('status', { name: 'Source Generation Requests' }))
+      .toHaveTextContent('0');
+
+    await keyboard.keyboard('{Alt>}{ArrowLeft}{/Alt}');
+    await expect.element(page.getByRole('status', { name: 'Source Markdown' }))
+      .toHaveTextContent('hello');
+    await expect.element(page.getByText(' there friend', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByRole('status', { name: 'Source Generation Requests' }))
+      .toHaveTextContent('0');
+    await keyboard.cleanup();
   });
 });

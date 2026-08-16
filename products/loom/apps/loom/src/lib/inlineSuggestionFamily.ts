@@ -32,6 +32,44 @@ export interface InlineSuggestionState {
   sourceNewline: VerseNewlineKind | null;
 }
 
+/**
+ * Project immutable model output onto one exact editor boundary. Initial
+ * candidate discovery and every later streaming refresh must use this same
+ * function: otherwise an editor-owned separator can vanish on refresh and
+ * make a valid partially consumed session look divergent.
+ */
+export function projectInlineCandidateText(
+  targetByte: number,
+  editorMode: 'visual' | 'source',
+  manuscriptText: string,
+  rawText: string,
+  sourceNewline: VerseNewlineKind | null
+): string | null {
+  const candidateText = editorMode === 'visual'
+    ? visualGhostTextSafePrefix(rawText)
+    : rawText;
+  const text = candidateText === null
+    ? null
+    : completionTextAtBoundary(manuscriptText, targetByte, candidateText);
+  if (!text || !candidateTextIsSurfaceable(text)) return null;
+  if (editorMode === 'visual') {
+    return visualGhostTextMayBePlainProse(text) ? text : null;
+  }
+  return sourceGhostPresentationCompatible(manuscriptText, text, sourceNewline)
+    ? text
+    : null;
+}
+
+export function projectedInlinePresentationKey(
+  rawPresentationKey: string,
+  rawText: string,
+  projectedText: string
+): string {
+  return projectedText === rawText
+    ? rawPresentationKey
+    : `${rawPresentationKey}:prose-prefix:${new TextEncoder().encode(projectedText).byteLength}`;
+}
+
 export function inlineSuggestionFamily(
   targetByte: number | null,
   editorMode: 'visual' | 'source',
@@ -62,28 +100,22 @@ export function inlineSuggestionFamily(
     if (state.dismissedCandidateIds.includes(candidateId)) continue;
     const verified = verifiedGhostSuggestion(branch, state.verifiedBodyByRun[branch.run_id]);
     const rawText = verified?.text ?? state.liveTextByRun[branch.run_id] ?? branch.text;
-    const candidateText = editorMode === 'visual'
-      ? visualGhostTextSafePrefix(rawText)
-      : rawText;
-    const text = candidateText === null
-      ? null
-      : completionTextAtBoundary(state.manuscriptText, targetByte, candidateText);
-    if (!text || !candidateTextIsSurfaceable(text)) continue;
+    const text = projectInlineCandidateText(
+      targetByte,
+      editorMode,
+      state.manuscriptText,
+      rawText,
+      state.sourceNewline
+    );
+    if (!text) continue;
     const rawPresentationKey = verified?.presentationKey ??
       `stream:${branch.run_id}:${encoder.encode(rawText).byteLength}`;
-    const presentationKey = text === rawText
-      ? rawPresentationKey
-      : `${rawPresentationKey}:prose-prefix:${encoder.encode(text).byteLength}`;
+    const presentationKey = projectedInlinePresentationKey(rawPresentationKey, rawText, text);
     if (editorMode === 'visual') {
       if (
-        !visualGhostTextMayBePlainProse(text) ||
         state.unpresentableVisualKeys.includes(presentationKey)
       ) continue;
-    } else if (!sourceGhostPresentationCompatible(
-      state.manuscriptText,
-      text,
-      state.sourceNewline
-    )) continue;
+    }
 
     family.push({
       candidateId,

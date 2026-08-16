@@ -162,6 +162,25 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion)');
   });
 
+  it('keeps source completion echoes synchronous and source surface identity stable across autosave', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const sourceEditor = readFileSync(new URL('./SourceEditor.svelte', import.meta.url), 'utf8');
+    const sourceMutation = source.slice(
+      source.indexOf('function updateFromSource'),
+      source.indexOf('function updateSourceSelection')
+    );
+    expect(sourceMutation).toContain('if (pendingCompletionText !== null) commitSourceDraft();');
+    expect(source).toContain('surfaceKey={completionContextKey}');
+    expect(source).not.toContain('surfaceKey={`${project.session_id}:${document.summary.document_id}:${document.summary.revision_id}');
+    expect(sourceEditor).toContain('observedValue = element.value;');
+  });
+
+  it('arms a fresh completion batch after changing editor modes', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const modeChange = source.slice(source.indexOf('async function setMode'), source.indexOf('function announce'));
+    expect(modeChange).toContain("scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open')");
+  });
+
   it('uses the macOS overlay titlebar for one integrated toolbar', () => {
     const config = JSON.parse(readFileSync(new URL('../../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
     const capability = JSON.parse(readFileSync(new URL('../../src-tauri/capabilities/default.json', import.meta.url), 'utf8'));

@@ -70,12 +70,11 @@
   import { sourceGhostPresentationCompatible } from './lib/sourceGhostText';
   import {
     inlineSuggestionFamily,
+    projectInlineCandidateText,
+    projectedInlinePresentationKey,
     type InlineGhostSuggestion
   } from './lib/inlineSuggestionFamily';
-  import {
-    visualGhostTextMayBePlainProse,
-    visualGhostTextSafePrefix
-  } from './lib/ghostText';
+  import { visualGhostTextMayBePlainProse } from './lib/ghostText';
   import { isExtendedGraphemeBoundary } from './lib/graphemeBoundary';
   import {
     verifyBranchBody,
@@ -694,14 +693,23 @@
     const rawText = selected && branch
       ? verified?.text ?? liveBranchText[selected.runId] ?? branch.text
       : '';
-    const text = mode === 'visual' ? visualGhostTextSafePrefix(rawText) : rawText;
+    const text = selected
+      ? projectInlineCandidateText(
+          selected.targetByte,
+          mode,
+          mode === 'visual' ? documentText : sourceDisplayText,
+          rawText,
+          sourceGhostNewline
+        )
+      : null;
     if (selected && text && candidateTextIsSurfaceable(text)) {
+      const rawPresentationKey = verified?.presentationKey ??
+        `stream:${selected.runId}:${new TextEncoder().encode(rawText).byteLength}`;
       const updated = updateCompletionCandidate(
         boundCompletionSession,
         selected.runId,
         text,
-        verified?.presentationKey ??
-          `stream:${selected.runId}:${new TextEncoder().encode(rawText).byteLength}`
+        projectedInlinePresentationKey(rawPresentationKey, rawText, text)
       );
       syncCompletionCandidate(boundCompletionSession, updated);
     }
@@ -3573,7 +3581,14 @@
     if (transition !== 'idle') return;
     sourceDisplayText = display;
     sourceDirty = true;
-    if (!sourceComposing) scheduleSourceProjection();
+    if (!sourceComposing) {
+      // Completion-owned textarea mutations are exact and already authorized
+      // synchronously. Project them in the same event turn so the cached
+      // remainder and reversal affordance never disappear behind the ordinary
+      // source-edit debounce.
+      if (pendingCompletionText !== null) commitSourceDraft();
+      else scheduleSourceProjection();
+    }
   }
 
   function updateSourceSelection(textarea: HTMLTextAreaElement): void {
@@ -5490,6 +5505,9 @@
     mode = next;
     await tick();
     focusCurrentWritingSurfaceAtEnd();
+    if (completionAutomationEnabled() && currentModel && document) {
+      scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
+    }
     announce(`${next} editor mode`);
   }
 
@@ -6085,7 +6103,7 @@
                   readonly={editorReadonly || document.summary.kind === 'hybrid' || Boolean(exactTextSurface && verseCodec && !verseCodec.editable)}
                   verse={exactTextSurface}
                   verseNewline={exactTextSurface ? verseCodec?.newline ?? 'mixed' : null}
-                  surfaceKey={`${project.session_id}:${document.summary.document_id}:${document.summary.revision_id}:${document.visible_blob_id}:${documentEpoch}:${mode}`}
+                  surfaceKey={completionContextKey}
                   ghostText={sourceGhostSuggestion?.text ?? ''}
                   ghostCandidateId={sourceGhostSuggestion?.candidateId ?? ''}
                   ghostPresentationKey={sourceGhostSuggestion?.presentationKey ?? ''}

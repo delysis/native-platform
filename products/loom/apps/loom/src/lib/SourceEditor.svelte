@@ -354,6 +354,11 @@
       event.stopPropagation();
       const end = element.selectionStart;
       element.setRangeText('', end - ghostUnconsumeText.length, end, 'end');
+      // This exact DOM mutation was authorized by the parent completion
+      // session. Record its value before Svelte echoes it back through the
+      // `value` prop so the reactive external-edit guard cannot suppress the
+      // newly restored remainder presentation.
+      observedValue = element.value;
       suppressCurrentGhost();
       readSelection(false, false);
       onValueInput(element);
@@ -469,6 +474,10 @@
     const end = element.selectionEnd;
     element.setRangeText(text, start, end, 'end');
     if (element.selectionStart !== start + text.length) return false;
+    // The parent has already consumed these exact bytes. Distinguish its
+    // ensuing value-prop echo from a manual/external edit; otherwise the echo
+    // suppresses the new session remainder merely because it is new text.
+    observedValue = element.value;
     readSelection(false, false);
     onValueInput(element);
     return true;

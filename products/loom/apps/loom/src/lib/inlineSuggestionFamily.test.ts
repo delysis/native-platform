@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { inlineSuggestionFamily, type InlineSuggestionState } from './inlineSuggestionFamily';
+import {
+  inlineSuggestionFamily,
+  projectInlineCandidateText,
+  type InlineSuggestionState
+} from './inlineSuggestionFamily';
+import {
+  completionPresentation,
+  consumeCompletionText,
+  startCompletionSession,
+  updateCompletionCandidate
+} from './completionSession';
 import type { BranchCard, ModelCapabilitySummary, OpenDocument } from './types';
 
 function state(manuscriptText: string): InlineSuggestionState {
@@ -83,5 +93,33 @@ describe('inline suggestion family', () => {
       insertsOnAccept: true
     }]);
     expect(inlineSuggestionFamily(5, 'visual', state(''))).toEqual([]);
+  });
+
+  it('preserves the same editor-owned separator through stream refresh after one word', () => {
+    const family = inlineSuggestionFamily(5, 'visual', state('hello'));
+    const session = startCompletionSession('context', family, 'run-1');
+    expect(session).not.toBeNull();
+    const consumed = consumeCompletionText(session!, ' world');
+    expect(consumed).not.toBeNull();
+
+    const projected = projectInlineCandidateText(
+      5,
+      'visual',
+      'hello world',
+      'world continues farther',
+      null
+    );
+    expect(projected).toBe(' world continues farther');
+    const refreshed = updateCompletionCandidate(
+      consumed!.session,
+      'run-1',
+      projected!,
+      'stream:run-1:23'
+    );
+    expect(refreshed).not.toBeNull();
+    expect(completionPresentation(refreshed!)).toMatchObject({
+      text: ' continues farther',
+      targetByte: 11
+    });
   });
 });
