@@ -165,7 +165,7 @@ describe('real WebKit editor interactions', () => {
     await expect.element(page.getByText('again', { exact: true }).first()).not.toBeVisible();
   });
 
-  it('keeps the selected MD remainder visible across acceptance and checkpoint, then reverses it', async () => {
+  it('keeps the selected MD remainder visible across its value echo and a stable rerender, then reverses it', async () => {
     const keyboard = userEvent.setup();
     renderSource('hello', [
       { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
@@ -180,7 +180,7 @@ describe('real WebKit editor interactions', () => {
       () => page.getByRole('status', { name: 'Source Markdown' }).element().textContent
     ).toBe('hello there ');
     await expect.element(page.getByText('friend', { exact: true }).first()).toBeVisible();
-    await page.getByRole('button', { name: 'Source checkpoint' }).click();
+    await page.getByRole('button', { name: 'Stable rerender' }).click();
     await expect.element(page.getByText('friend', { exact: true }).first()).toBeVisible();
     await expect.element(page.getByRole('status', { name: 'Source Generation Requests' }))
       .toHaveTextContent('0');

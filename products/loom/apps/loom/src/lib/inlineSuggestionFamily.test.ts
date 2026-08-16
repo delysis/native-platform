@@ -121,5 +121,12 @@ describe('inline suggestion family', () => {
       text: ' continues farther',
       targetByte: 11
     });
+    expect(projectInlineCandidateText(
+      5,
+      'source',
+      'hello world',
+      'world continues farther',
+      null
+    )).toBe(' world continues farther');
   });
 });

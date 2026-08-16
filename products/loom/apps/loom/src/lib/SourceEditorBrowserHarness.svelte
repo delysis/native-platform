@@ -30,7 +30,7 @@
     : null;
   let ready = false;
   let generationRequests = 0;
-  let checkpointRevision = 1;
+  let rerenderSerial = 1;
 
   $: presentation = ready && session
     ? session.acceptedChunks.length === 0
@@ -122,6 +122,6 @@
   </div>
   <output aria-label="Source Markdown">{markdown}</output>
   <output aria-label="Source Generation Requests">{generationRequests}</output>
-  <output aria-label="Source Checkpoint Revision">{checkpointRevision}</output>
-  <button type="button" on:mousedown|preventDefault on:click={() => checkpointRevision += 1}>Source checkpoint</button>
+  <output aria-label="Source Rerender Serial">{rerenderSerial}</output>
+  <button type="button" on:mousedown|preventDefault on:click={() => rerenderSerial += 1}>Stable rerender</button>
 </main>
