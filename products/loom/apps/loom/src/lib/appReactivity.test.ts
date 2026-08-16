@@ -169,7 +169,13 @@ describe('App ghost reactivity wiring', () => {
     expect(mainWindow.titleBarStyle).toBe('Overlay');
     expect(mainWindow.hiddenTitle).toBe(true);
     expect(capability.permissions).toContain('core:window:allow-start-dragging');
+    expect(capability.permissions).toContain('core:window:allow-is-fullscreen');
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const styles = readFileSync(new URL('../app.css', import.meta.url), 'utf8');
+    expect(source).toContain('class:native-fullscreen={nativeFullscreen}');
+    expect(source).toContain('observeNativeFullscreen(');
+    expect(styles).toContain('--titlebar-leading-inset: 76px;');
+    expect(styles).toContain('.canvas-controls.native-fullscreen { --titlebar-leading-inset: 8px; }');
     expect(source).toContain('class="titlebar-drag-surface"');
     expect(source).not.toContain('data-tauri-drag-region');
     expect(source).toContain('on:mousedown={startTitlebarDrag}');

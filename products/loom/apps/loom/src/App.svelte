@@ -149,6 +149,7 @@
     type CompletionSession
   } from './lib/completionSession';
   import { completionEngineEnabled, inlineGhostHidden } from './lib/completionModes';
+  import { observeNativeFullscreen } from './lib/nativeFullscreen';
   import {
     armCompletionGeneration,
     bindCompletionGenerationAnchor,
@@ -353,6 +354,8 @@
     acceptGhostWord: (requireVisible?: boolean) => boolean;
   } | null = null;
   let componentMounted = false;
+  let nativeFullscreen = false;
+  let stopNativeFullscreenObservation: (() => void) | undefined;
   let desktopWorkspaceStarted = false;
   let startupHeldForApplicationClose = false;
   let workspaceRestoreSerial = 0;
@@ -877,6 +880,10 @@
     appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
     if (desktop) {
+      stopNativeFullscreenObservation = observeNativeFullscreen(
+        getCurrentWindow(),
+        (fullscreen) => nativeFullscreen = fullscreen
+      );
       void (async () => {
         try {
           const lifecycle = await installWindowLifecycleHandlers();
@@ -914,6 +921,8 @@
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
       appearanceMedia?.removeEventListener('change', syncSystemAppearance);
       appearanceMedia = null;
+      stopNativeFullscreenObservation?.();
+      stopNativeFullscreenObservation = undefined;
       if (saveTimer !== undefined) window.clearTimeout(saveTimer);
       if (sourceProjectionTimer !== undefined) window.clearTimeout(sourceProjectionTimer);
       if (draftTimer !== undefined) window.clearTimeout(draftTimer);
@@ -5749,6 +5758,7 @@
   {#if project}
     <div
       class="canvas-controls"
+      class:native-fullscreen={nativeFullscreen}
       aria-label="Writing controls"
     >
       <div class="canvas-controls-left" data-no-window-drag>
