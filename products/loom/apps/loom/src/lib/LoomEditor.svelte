@@ -60,6 +60,7 @@
   ) => void;
   export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
   export let onSelectionChange: (markdownByteOffset: number | null) => void = () => {};
+  export let onCaretNavigation: () => void = () => {};
   export let onFormatStateChange: (state: VisualFormatState) => void = () => {};
 
   let mount: HTMLDivElement;
@@ -273,6 +274,7 @@
           }
           onSelectionChange(null);
         } else if (transaction.selectionSet) {
+          onCaretNavigation();
           onSelectionChange(null);
           scheduleSelectionReport();
         }

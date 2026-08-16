@@ -144,6 +144,14 @@
     type CompletionSession
   } from './lib/completionSession';
   import { completionEngineEnabled, inlineGhostHidden } from './lib/completionModes';
+  import {
+    armCompletionGeneration,
+    bindCompletionGenerationAnchor,
+    completionGenerationIsArmed,
+    disarmCompletionGeneration,
+    type CompletionGenerationIntent,
+    type CompletionGenerationTrigger
+  } from './lib/completionGenerationIntent';
   import type {
     VisualFormatAction,
     VisualFormatState
@@ -246,6 +254,7 @@
   let suggestionsChanging = false;
   let suggestionsIdleTimer: number | undefined;
   let scheduledSuggestion: SuggestionSchedule | null = null;
+  let completionGenerationIntent: CompletionGenerationIntent | null = null;
   let suggestionIntentEpoch = 0;
   let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
   let dismissedCandidateIds: string[] = [];
@@ -826,6 +835,7 @@
       !promotionInFlight &&
       transition === 'idle' &&
       !editorReadonly &&
+      completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion) &&
       (saveState === 'clean' || saveState === 'saved') &&
       editVersion === savedVersion &&
       document.summary.revision_id &&
@@ -835,7 +845,12 @@
       activeBranchCount === 0
   );
   $: retryEvaluationSnapshot = {
-    enabled: desktop && branchPromotionReady && completionAutomationEnabled() && Boolean(currentModel) && activeBranchCount === 0,
+    enabled: desktop &&
+      branchPromotionReady &&
+      completionAutomationEnabled() &&
+      Boolean(currentModel) &&
+      activeBranchCount === 0 &&
+      completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion),
     disposition: mode === 'visual'
       ? visualAutocompleteDisposition
       : sourceAutocompleteDisposition
@@ -2374,7 +2389,7 @@
       !workspaceRestoreIsCurrent(captured)
     ) return false;
     if (currentModel) {
-      if (document) scheduleAutomaticSuggestions(editVersion);
+      if (document) scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
       return true;
     }
 
@@ -2391,7 +2406,7 @@
     await tick();
     if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
     if (currentModel) {
-      if (document) scheduleAutomaticSuggestions(editVersion);
+      if (document) scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
       return true;
     }
     if (modelLoading || modelUnloading || transition !== 'idle' || !document) {
@@ -2588,6 +2603,7 @@
     if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
     suggestionsIdleTimer = undefined;
     scheduledSuggestion = null;
+    completionGenerationIntent = disarmCompletionGeneration();
     suggestionIntentEpoch += 1;
   }
 
@@ -2653,7 +2669,7 @@
           : 'Suggestions on; Loom is preparing a tested local writer'
         : 'Suggestions off');
       if (automationEnabled && writerReady && document) {
-        scheduleAutomaticSuggestions(editVersion);
+        scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'explicit_enable');
       }
     } catch (error) {
       suggestionsEnabled = previousEnabled;
@@ -2726,7 +2742,7 @@
     if (completionAutomationEnabled() && loaded.completion && document) {
       await tick();
       if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
-      scheduleAutomaticSuggestions(editVersion);
+      scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
     }
     return true;
   }
@@ -2957,7 +2973,8 @@
       if (!componentMounted) return false;
       project = current;
       if (!(await finishOpeningProject(current, restoreSerial))) return false;
-      wakePreferredWriterEnsure();
+      const captured = currentWorkspaceCapture();
+      if (captured) void restoreCompletionBackground(captured);
       announce(`Reattached ${current.title}`);
       return true;
     } catch {
@@ -3031,6 +3048,62 @@
       : visualEditor?.focusAtDocumentEnd() ?? false;
   }
 
+  async function restoreCompletionAutomation(
+    captured: WorkspaceRestoreCapture
+  ): Promise<boolean> {
+    if (!workspaceRestoreIsCurrent(captured)) return false;
+    try {
+      const identity = await getBuildModelPolicy();
+      if (!workspaceRestoreIsCurrent(captured)) return false;
+      buildModelPolicy = identity;
+    } catch {
+      if (!workspaceRestoreIsCurrent(captured)) return false;
+      buildModelPolicy = null;
+      suggestionsEnabled = false;
+      announce('Suggestions are off because this build could not verify its local writer policy');
+      return false;
+    }
+
+    const storedSuggestionsPreference = loadSuggestionPreference(captured.projectId);
+    try {
+      const policy = await runCurrentWorkspaceStep({
+        capture: captured,
+        isCurrent: workspaceRestoreIsCurrent,
+        run: () => setSuggestionsPolicy(
+          captured.projectId,
+          captured.sessionId,
+          storedSuggestionsPreference
+        )
+      });
+      if (policy.status === 'stale') return false;
+      suggestionsEnabled = storedSuggestionsPreference;
+    } catch (error) {
+      if (!workspaceRestoreIsCurrent(captured)) return false;
+      suggestionsEnabled = false;
+      recordFailure(error);
+      announce('Suggestions remain off because the project gate could not be restored');
+      return false;
+    }
+
+    if (suggestionsEnabled && currentModel && document) {
+      scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
+    } else if (suggestionsEnabled && !currentModel) {
+      queuePreferredWriterRequest(captured);
+    }
+    return true;
+  }
+
+  async function restoreCompletionBackground(
+    captured: WorkspaceRestoreCapture
+  ): Promise<void> {
+    await restoreCompletionAutomation(captured);
+    if (!workspaceRestoreIsCurrent(captured)) return;
+    await recoverModelDownloads();
+    if (!workspaceRestoreIsCurrent(captured)) return;
+    if (!shouldDiscoverModelsOnStartup(completionAutomationEnabled())) return;
+    requestPreferredWriterEnsure(captured);
+  }
+
   async function restoreDesktopWorkspace(): Promise<void> {
     const restoreSerial = ++workspaceRestoreSerial;
     await restoreBeforeBackgroundWork({
@@ -3042,10 +3115,7 @@
       },
       isCurrent: workspaceRestoreIsCurrent,
       background: async (captured) => {
-        await recoverModelDownloads();
-        if (!workspaceRestoreIsCurrent(captured)) return;
-        if (!shouldDiscoverModelsOnStartup(completionAutomationEnabled())) return;
-        requestPreferredWriterEnsure(captured);
+        await restoreCompletionBackground(captured);
       }
     });
   }
@@ -3060,7 +3130,11 @@
       if (!componentMounted || restoreSerial !== workspaceRestoreSerial) return;
       project = opened;
       if (await finishOpeningProject(opened, restoreSerial)) {
-        wakePreferredWriterEnsure();
+        await tick();
+        await waitForWritingSurfacePaint();
+        focusCurrentWritingSurfaceAtEnd();
+        const captured = currentWorkspaceCapture();
+        if (captured) void restoreCompletionBackground(captured);
         announce(`Opened ${opened.title}`);
       }
     } catch (error) {
@@ -3172,35 +3246,8 @@
     outlineOpen = false;
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
-    try {
-      const identity = await getBuildModelPolicy();
-      if (!workspaceRestoreIsCurrent(captured)) return false;
-      buildModelPolicy = identity;
-    } catch {
-      if (!workspaceRestoreIsCurrent(captured)) return false;
-      buildModelPolicy = null;
-      announce('Suggestions are off because this build could not verify its local writer policy');
-    }
-    const storedSuggestionsPreference = loadSuggestionPreference(captured.projectId);
     suggestionsEnabled = false;
-    try {
-      const policy = await runCurrentWorkspaceStep({
-        capture: captured,
-        isCurrent: workspaceRestoreIsCurrent,
-        run: () => setSuggestionsPolicy(
-          captured.projectId,
-          captured.sessionId,
-          storedSuggestionsPreference
-        )
-      });
-      if (policy.status === 'stale') return false;
-      suggestionsEnabled = storedSuggestionsPreference;
-    } catch (error) {
-      if (!workspaceRestoreIsCurrent(captured)) return false;
-      suggestionsEnabled = false;
-      recordFailure(error);
-      announce('Suggestions remain off because the project gate could not be restored');
-    }
+    shuttleEnabled = false;
     dismissedCandidateIds = [];
     if (opened.pending_recovery > 0) {
       const recovered = await runCurrentWorkspaceStep({
@@ -3229,9 +3276,6 @@
       if (!workspaceRestoreIsCurrent(captured)) return false;
       await tick();
       if (!workspaceRestoreIsCurrent(captured)) return false;
-      if (completionAutomationEnabled() && currentModel && document) {
-        scheduleAutomaticSuggestions(editVersion);
-      }
     } else {
       documentEpoch += 1;
       document = null;
@@ -3250,9 +3294,6 @@
       clearReconciliationState();
       saveState = 'clean';
       saveMessage = 'Project is ready';
-    }
-    if (storedSuggestionsPreference && suggestionsEnabled && !currentModel) {
-      queuePreferredWriterRequest(captured);
     }
     return true;
   }
@@ -3406,7 +3447,7 @@
       mode = summary.kind === 'prose' && canUseVisualMarkdown(effectiveText, false)
         ? preferredProseMode
         : 'source';
-      await refreshBranchesFor(
+      void refreshBranchesFor(
         source.projectId,
         source.sessionId,
         opened.summary.document_id,
@@ -3529,9 +3570,16 @@
   }
 
   function updateSourceSelection(textarea: HTMLTextAreaElement): void {
+    const previousStart = sourceSelectionStart;
+    const previousEnd = sourceSelectionEnd;
+    const completionWasActive = completionActivityExists();
     sourceSelectionStart = textarea.selectionStart;
     sourceSelectionEnd = textarea.selectionEnd;
-    if (pendingCompletionText !== null || !completionSession) return;
+    if (
+      pendingCompletionText !== null ||
+      !completionWasActive ||
+      (previousStart === sourceSelectionStart && previousEnd === sourceSelectionEnd)
+    ) return;
     const target = sourceGhostTargetByteFor(
       mode,
       true,
@@ -3542,15 +3590,48 @@
       documentText,
       verseCodec
     );
-    const expected = completionSessionPresentation(completionSession)?.targetByte ?? null;
-    if (target !== null && expected !== null && target !== expected) invalidateCompletionIntent();
+    const expected = completionSession
+      ? completionSessionPresentation(completionSession)?.targetByte ?? null
+      : selectedInlineSuggestion?.targetByte ?? completionGenerationIntent?.anchorByte ?? null;
+    if (expected === null && target !== null) {
+      completionGenerationIntent = bindCompletionGenerationAnchor(
+        completionGenerationIntent,
+        completionContextKey,
+        editVersion,
+        target
+      );
+      return;
+    }
+    if (target !== null && expected !== null && target !== expected) {
+      invalidateCompletionForCaretNavigation();
+    }
   }
 
   function updateVisualSelection(markdownByteOffset: number | null): void {
+    const previous = visualSelectionByte;
+    const completionWasActive = completionActivityExists();
     visualSelectionByte = markdownByteOffset;
-    if (pendingCompletionText !== null || markdownByteOffset === null || !completionSession) return;
-    const expected = completionSessionPresentation(completionSession)?.targetByte ?? null;
-    if (expected !== null && markdownByteOffset !== expected) invalidateCompletionIntent();
+    if (
+      pendingCompletionText !== null ||
+      markdownByteOffset === null ||
+      markdownByteOffset === previous ||
+      !completionWasActive
+    ) return;
+    const expected = completionSession
+      ? completionSessionPresentation(completionSession)?.targetByte ?? null
+      : selectedInlineSuggestion?.targetByte ?? completionGenerationIntent?.anchorByte ?? null;
+    if (expected === null) {
+      completionGenerationIntent = bindCompletionGenerationAnchor(
+        completionGenerationIntent,
+        completionContextKey,
+        editVersion,
+        markdownByteOffset
+      );
+      return;
+    }
+    if (expected !== null && markdownByteOffset !== expected) {
+      invalidateCompletionForCaretNavigation();
+    }
   }
 
   function scheduleSourceProjection(delay = 240): void {
@@ -3587,12 +3668,25 @@
 
   function scheduleAutomaticSuggestions(
     targetEditVersion: number,
-    delay = suggestionsIdleDelayMs
+    delay = suggestionsIdleDelayMs,
+    trigger: CompletionGenerationTrigger = 'document_edit'
   ): void {
+    completionGenerationIntent = armCompletionGeneration(
+      completionContextKey,
+      targetEditVersion,
+      trigger,
+      mode === 'visual' ? visualSelectionByte : sourceGhostTargetByte
+    );
+    if (!completionGenerationIntent) return;
     armSuggestionSchedule({ kind: 'edit_pause', editVersion: targetEditVersion }, delay);
   }
 
   function scheduleAutocompleteRetry(ticket: AutocompleteRetryTicket): void {
+    if (!completionGenerationIsArmed(
+      completionGenerationIntent,
+      completionContextKey,
+      ticket.editVersion
+    )) return;
     armSuggestionSchedule(
       { kind: 'exhausted_retry', ticket },
       suggestionsRetryDelayMs
@@ -3609,6 +3703,7 @@
       !currentModel ||
       !project ||
       !document ||
+      !completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion) ||
       document.summary.kind === 'hybrid'
     ) return;
     scheduledSuggestion = schedule;
@@ -3693,6 +3788,7 @@
       !currentModel ||
       !project ||
       !document ||
+      !completionGenerationIsArmed(completionGenerationIntent, completionContextKey, targetEditVersion) ||
       compositionActive ||
       transition !== 'idle'
     ) {
@@ -4254,16 +4350,30 @@
     handledCompletionExhaustionKey = key;
     completionSession = null;
     pendingCompletionText = null;
-    scheduleAutomaticSuggestions(editVersion);
+    scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'candidate_exhausted');
   }
 
-  function invalidateCompletionIntent(): void {
-    if (!completionSession && pendingCompletionText === null) return;
+  function completionActivityExists(): boolean {
+    return Boolean(
+      completionGenerationIntent ||
+      completionSession ||
+      pendingCompletionText !== null ||
+      scheduledSuggestion ||
+      weaveStarting ||
+      activeBranchCount > 0 ||
+      selectedInlineSuggestion
+    );
+  }
+
+  function invalidateCompletionForCaretNavigation(): void {
+    if (!completionActivityExists()) return;
     completionSession = null;
     pendingCompletionText = null;
-    suggestionIntentEpoch += 1;
+    promotionArmedCandidateId = null;
+    dismissedCandidateIds = [];
+    unpresentableVisualGhostPresentationKeys = [];
+    cancelSuggestionTimer();
     if (activeBranchCount > 0) void cancelActiveBranches();
-    scheduleAutomaticSuggestions(editVersion);
   }
 
   function sessionForEligibleGhost(eligible: InlineGhostSuggestion): CompletionSession | null {
@@ -4412,7 +4522,7 @@
         writerReady = Boolean(currentModel);
       }
       if (automationEnabled && writerReady && document) {
-        scheduleAutomaticSuggestions(editVersion);
+        scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'explicit_enable');
       }
       announce(enabled
         ? writerReady
@@ -4721,7 +4831,7 @@
         const failure = normalizeFailure(error);
         if (captureIsCurrent && failureIsDefiniteContention(failure)) {
           uncertainWeave = null;
-          scheduleAutomaticSuggestions(editVersion);
+          scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'retry');
           return;
         }
         if (captureIsCurrent) {
@@ -5388,7 +5498,9 @@
       return;
     }
     if (next === 'visual' && !canUseVisual) return;
+    if (next === mode) return;
     flushEditors();
+    invalidateCompletionForCaretNavigation();
     if (next === 'source' && document) setSourceDocument(documentText, document.summary.kind);
     if (document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')) {
       preferredProseMode = next;
@@ -5467,7 +5579,9 @@
       applicationAllowsModelPreparation(applicationClosePhase)
     ) {
       requestPreferredWriterForCurrentWorkspace();
-      if (currentModel && document) scheduleAutomaticSuggestions(editVersion);
+      if (currentModel && document) {
+        scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
+      }
     }
     return { status: 'resume' };
   }
@@ -5676,14 +5790,16 @@
             on:click={() => void setOutlineOpen(!outlineOpen)}
           ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 4h10M3 8h10M3 12h10" /></svg></button>
         {/if}
-        <button
-          class="titlebar-button new-document-button"
-          type="button"
-          aria-label="New document"
-          title="New document (⌘N)"
-          disabled={fileCommandInFlight || editorReadonly}
-          on:click={() => void newDocument()}
-        ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
+        {#if transition === 'idle'}
+          <button
+            class="titlebar-button new-document-button"
+            type="button"
+            aria-label="New document"
+            title="New document (⌘N)"
+            disabled={fileCommandInFlight || editorReadonly}
+            on:click={() => void newDocument()}
+          ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
+        {/if}
         {#if document}
           <button
             class="titlebar-button mode-toggle"
@@ -5704,7 +5820,6 @@
       </div>
       <div
         class="titlebar-drag-surface"
-        data-tauri-drag-region
         aria-hidden="true"
         on:mousedown={startTitlebarDrag}
       ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
@@ -6039,6 +6154,7 @@
                         visibleVisualGhostPresentationKey = presentationKey;
                       }}
                       onSelectionChange={updateVisualSelection}
+                      onCaretNavigation={invalidateCompletionForCaretNavigation}
                       onFormatStateChange={(state) => {
                         visualFormatting = state;
                         if (!formatMenu?.open) formatHref = state.linkHref;
@@ -6105,7 +6221,10 @@
           {/if}
         {:else}
           <section class="empty-project">
-            {#if uncertainPromotion}
+            {#if transition === 'navigation'}
+              <h1>Opening your writing…</h1>
+              <p>The document controls will appear when the writing surface is ready.</p>
+            {:else if uncertainPromotion}
               <h1>Promotion needs confirmation.</h1>
               <p>The active editor was detached so stale bytes cannot overwrite a promotion that may already be durable.</p>
               <button class="primary-button" type="button" on:click={() => void resolveUncertainPromotion()} disabled={promotionInFlight}>

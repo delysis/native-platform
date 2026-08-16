@@ -35,7 +35,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:fo
   outline: 3px solid color-mix(in srgb, var(--moss) 52%, transparent);
   outline-offset: 2px;
 }
-button:disabled { cursor: not-allowed; opacity: .45; }
+button:disabled { cursor: default; opacity: .45; }
 
 .app-shell { position: relative; height: 100dvh; min-height: 0; display: flex; flex-direction: column; background: var(--paper); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
@@ -83,7 +83,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .project-menu-popover { position: absolute; z-index: 25; top: calc(100% + 6px); right: 0; width: min(245px, calc(100vw - 16px)); padding: 7px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); box-shadow: var(--shadow); }
 .project-menu-popover button { width: 100%; min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 7px 9px; border: 0; border-radius: 6px; color: var(--ink); background: transparent; cursor: pointer; font-size: 12px; text-align: left; }
 .project-menu-popover button:hover, .project-menu-popover button.active { background: var(--paper-deep); }
-.project-menu-popover button:disabled { cursor: not-allowed; }
+.project-menu-popover button:disabled { cursor: default; }
 .project-menu-label { padding: 5px 9px 4px; color: var(--quiet); font-size: 9px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
 .project-menu-title { overflow: hidden; padding: 7px 9px 9px; color: var(--muted); font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .project-menu-separator { height: 1px; margin: 6px 3px; background: var(--line-soft); }
@@ -171,7 +171,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .loom-editor-shell { position: relative; min-height: 100%; }
 .editor-mount { position: relative; z-index: 2; min-height: 100%; }
 .loom-prosemirror { --writing-gutter: clamp(24px, 5vw, 72px); width: min(100%, calc(82ch + var(--writing-gutter) + var(--writing-gutter))); min-height: 100%; margin: 0 auto; padding: clamp(24px, 4vh, 42px) var(--writing-gutter) 25vh; outline: 0; color: var(--ink); font: 19px/1.72 Iowan Old Style, Palatino, Georgia, serif; caret-color: var(--clay); }
-.loom-editor-placeholder { --writing-gutter: clamp(24px, 5vw, 72px); position: absolute; z-index: 1; inset: 0; width: min(100%, calc(82ch + var(--writing-gutter) + var(--writing-gutter))); margin: 0 auto; padding: clamp(24px, 4vh, 42px) var(--writing-gutter) 25vh; color: var(--quiet); font: 19px/1.72 Iowan Old Style, Palatino, Georgia, serif; pointer-events: none; }
+.loom-editor-placeholder { --writing-gutter: clamp(24px, 5vw, 72px); position: absolute; z-index: 3; inset: 0; width: min(100%, calc(82ch + var(--writing-gutter) + var(--writing-gutter))); margin: 0 auto; padding: clamp(24px, 4vh, 42px) var(--writing-gutter) 25vh; color: var(--quiet); font: 19px/1.72 Iowan Old Style, Palatino, Georgia, serif; pointer-events: none; }
 .source-pane textarea::placeholder { color: var(--quiet); opacity: 1; }
 .loom-prosemirror p { margin: 0 0 1.05em; }
 .loom-prosemirror h1, .loom-prosemirror h2, .loom-prosemirror h3 { font-family: inherit; font-weight: 600; line-height: 1.25; }

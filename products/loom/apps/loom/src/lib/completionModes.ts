@@ -8,5 +8,5 @@ export function completionEngineEnabled(modes: CompletionModes): boolean {
 }
 
 export function inlineGhostHidden(modes: CompletionModes): boolean {
-  return !modes.autocomplete || modes.shuttle;
+  return !modes.autocomplete;
 }

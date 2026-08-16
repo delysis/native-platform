@@ -217,7 +217,7 @@ Thread.sleep(forTimeInterval: 0.75)
 // hidden. Exercise Loom's explicit noninteractive web drag strip to its left.
 let start = CGPoint(x: before.minX + before.width * 0.30, y: before.minY + 15)
 let horizontal = before.minX + before.width + 72 < 1500 ? 64.0 : -64.0
-let vertical = before.minY + before.height + 40 < 900 ? 32.0 : -32.0
+let vertical = 0.0
 let finish = CGPoint(x: start.x + horizontal, y: start.y + vertical)
 guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left),
       let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: finish, mouseButton: .left) else {
@@ -268,6 +268,20 @@ let evidence: [String: Any] = [
 let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
 print(String(data: data, encoding: .utf8)!)
 SWIFT
+}
+
+retry_titlebar_drag_and_require_delta() {
+  target_pid=$1
+  drag_attempt=1
+  while [ "$drag_attempt" -le 3 ]; do
+    if drag_evidence=$(drag_window_and_require_delta "$target_pid"); then
+      printf '%s\n' "$drag_evidence"
+      return 0
+    fi
+    drag_attempt=$((drag_attempt + 1))
+    sleep 0.25
+  done
+  return 1
 }
 
 type_into_loom_editor() {
@@ -436,6 +450,90 @@ print(String(data: data, encoding: .utf8)!)
 SWIFT
 }
 
+create_loom_document_and_require_editor() {
+  target_pid=$1
+  xcrun swift - "$target_pid" <<'SWIFT'
+import ApplicationServices
+import Foundation
+
+let pid = Int32(CommandLine.arguments[1])!
+let application = AXUIElementCreateApplication(pid)
+
+func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
+    return value
+}
+
+func stringAttribute(_ element: AXUIElement, _ name: CFString) -> String {
+    attribute(element, name) as? String ?? ""
+}
+
+func descendants() -> [AXUIElement] {
+    var queue = [application]
+    var cursor = 0
+    while cursor < queue.count && cursor < 4096 {
+        let element = queue[cursor]
+        cursor += 1
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    return queue
+}
+
+func button(named needle: String) -> AXUIElement? {
+    descendants().first { element in
+        guard stringAttribute(element, kAXRoleAttribute as CFString) == kAXButtonRole as String else {
+            return false
+        }
+        return [
+            stringAttribute(element, kAXDescriptionAttribute as CFString),
+            stringAttribute(element, kAXTitleAttribute as CFString),
+            stringAttribute(element, kAXHelpAttribute as CFString)
+        ].joined(separator: " ").contains(needle)
+    }
+}
+
+guard let window = (attribute(application, kAXWindowsAttribute as CFString) as? [AXUIElement])?.first,
+      let create = button(named: "New document") else {
+    fputs("could not bind the new-document check to Loom's exact accessible window\n", stderr)
+    exit(1)
+}
+let beforeTitle = stringAttribute(window, kAXTitleAttribute as CFString)
+guard AXUIElementPerformAction(create, kAXPressAction as CFString) == .success else {
+    fputs("could not press Loom's new-document control\n", stderr)
+    exit(1)
+}
+
+let deadline = Date().addingTimeInterval(10)
+var afterTitle = beforeTitle
+var focusedEditor = false
+repeat {
+    afterTitle = stringAttribute(window, kAXTitleAttribute as CFString)
+    focusedEditor = descendants().contains { element in
+        stringAttribute(element, kAXRoleAttribute as CFString) == kAXTextAreaRole as String &&
+            (attribute(element, kAXFocusedAttribute as CFString) as? Bool) == true
+    }
+    if afterTitle != beforeTitle && focusedEditor { break }
+    Thread.sleep(forTimeInterval: 0.1)
+} while Date() < deadline
+
+guard afterTitle != beforeTitle, focusedEditor else {
+    fputs("new document did not expose and focus a fresh writing surface\n", stderr)
+    exit(1)
+}
+
+let evidence: [String: Any] = [
+    "title_before": beforeTitle,
+    "title_after": afterTitle,
+    "focused_editor_observed": focusedEditor
+]
+let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+print(String(data: data, encoding: .utf8)!)
+SWIFT
+}
+
 require_loom_manuscript_text() {
   manuscript=$1
   expected=$2
@@ -454,6 +552,35 @@ NODE
     sleep 0.1
   done
   echo "native editor input did not reach the persisted Loom manuscript" >&2
+  return 1
+}
+
+require_loom_new_manuscript_text() {
+  manuscript_root=$1
+  original_manuscript=$2
+  expected=$3
+  attempt=0
+  while [ "$attempt" -lt 120 ]; do
+    matching_path=$(find "$manuscript_root" -type f -name '*.md' ! -path "$original_manuscript" -print | while IFS= read -r candidate; do
+      if node - "$candidate" "$expected" <<'NODE'
+const fs = require('fs');
+const [path, expected] = process.argv.slice(2);
+const observed = fs.readFileSync(path, 'utf8');
+process.exit(observed.trimEnd() === expected ? 0 : 1);
+NODE
+      then
+        printf '%s\n' "$candidate"
+        break
+      fi
+    done)
+    if [ -n "$matching_path" ]; then
+      printf '%s\n' "$matching_path"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  echo "native input did not reach the newly created Loom manuscript" >&2
   return 1
 }
 
@@ -609,15 +736,6 @@ run_once() {
   fi
   if [ "$COMPONENT" = loom ] && [ "$run_number" -eq 1 ]; then
     loom_manuscript="$PRODUCT_STATE/writing/manuscript/Untitled.md"
-    RUN_1_MANUSCRIPT_SHA256_BEFORE=$(shasum -a 256 "$loom_manuscript" | awk '{print $1}')
-    if ! RUN_1_DRAG_EVIDENCE=$(drag_window_and_require_delta "$ACTIVE_PID"); then
-      echo "titlebar drag did not produce an observed window-frame delta for pid $ACTIVE_PID" >&2
-      echo "application logs: $stdout_log and $stderr_log" >&2
-      return 1
-    fi
-    RUN_1_MANUSCRIPT_SHA256_AFTER=$(shasum -a 256 "$loom_manuscript" | awk '{print $1}')
-    require_equal "manuscript SHA-256 after titlebar drag" \
-      "$RUN_1_MANUSCRIPT_SHA256_BEFORE" "$RUN_1_MANUSCRIPT_SHA256_AFTER"
     if ! RUN_1_COMPLETION_CONTROLS_EVIDENCE=$(exercise_loom_completion_controls "$ACTIVE_PID"); then
       echo "autocomplete and Shuttle did not behave as independent native controls" >&2
       echo "application logs: $stdout_log and $stderr_log" >&2
@@ -634,6 +752,32 @@ run_once() {
       return 1
     fi
     RUN_1_MANUSCRIPT_SHA256_AFTER_EDITOR_INPUT=$(shasum -a 256 "$loom_manuscript" | awk '{print $1}')
+    if ! RUN_1_NEW_DOCUMENT_EVIDENCE=$(create_loom_document_and_require_editor "$ACTIVE_PID"); then
+      echo "new document did not expose a focused writing surface in the exact app" >&2
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    RUN_1_NEW_DOCUMENT_SENTINEL='Loom native smoke: new document editor.'
+    if ! type_into_loom_editor "$ACTIVE_PID" "$RUN_1_NEW_DOCUMENT_SENTINEL" >/dev/null; then
+      echo "could not type into the newly created document's writing surface" >&2
+      return 1
+    fi
+    if ! RUN_1_NEW_DOCUMENT_PATH=$(require_loom_new_manuscript_text \
+      "$PRODUCT_STATE/writing/manuscript" \
+      "$loom_manuscript" \
+      "$RUN_1_NEW_DOCUMENT_SENTINEL"); then
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    RUN_1_MANUSCRIPT_SHA256_BEFORE=$(shasum -a 256 "$loom_manuscript" | awk '{print $1}')
+    if ! RUN_1_DRAG_EVIDENCE=$(retry_titlebar_drag_and_require_delta "$ACTIVE_PID"); then
+      echo "titlebar drag did not produce an observed window-frame delta for pid $ACTIVE_PID" >&2
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    RUN_1_MANUSCRIPT_SHA256_AFTER=$(shasum -a 256 "$loom_manuscript" | awk '{print $1}')
+    require_equal "manuscript SHA-256 after titlebar drag" \
+      "$RUN_1_MANUSCRIPT_SHA256_BEFORE" "$RUN_1_MANUSCRIPT_SHA256_AFTER"
   elif [ "$COMPONENT" = loom ] && [ "$run_number" -eq 2 ]; then
     loom_manuscript="$PRODUCT_STATE/writing/manuscript/Untitled.md"
     if ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL"; then
@@ -728,6 +872,9 @@ DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE="${RUN_1_COMPLETION_CONTROLS_EV
 DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE="${RUN_1_EDITOR_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_EDITOR_SENTINEL="${RUN_1_EDITOR_SENTINEL:-}" \
 DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER_EDITOR_INPUT="${RUN_1_MANUSCRIPT_SHA256_AFTER_EDITOR_INPUT:-}" \
+DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE="${RUN_1_NEW_DOCUMENT_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_PATH="${RUN_1_NEW_DOCUMENT_PATH:-}" \
+DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_SENTINEL="${RUN_1_NEW_DOCUMENT_SENTINEL:-}" \
 DELYSIS_SMOKE_RUN_2_MANUSCRIPT_SHA="${RUN_2_MANUSCRIPT_SHA256:-}" \
 DELYSIS_SMOKE_REOPEN_EVIDENCE="$REOPEN_EVIDENCE" \
 node <<'NODE' > "$RECEIPT"
@@ -737,6 +884,9 @@ const titlebarDrag = e.DELYSIS_SMOKE_RUN_1_DRAG_EVIDENCE
   : null;
 const completionControls = e.DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE)
+  : null;
+const newDocument = e.DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE
+  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE)
   : null;
 const receipt = {
   schema: "delysis.macos-packaged-app-smoke.v1",
@@ -763,6 +913,11 @@ const receipt = {
         dispatch: e.DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE,
         sentinel: e.DELYSIS_SMOKE_RUN_1_EDITOR_SENTINEL,
         manuscript_sha256_after_input: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER_EDITOR_INPUT,
+      } : null,
+      new_document: newDocument ? {
+        ...newDocument,
+        path: e.DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_PATH,
+        sentinel: e.DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_SENTINEL,
       } : null,
       quit: "AXPress on Quit menu item with Cmd-Q binding",
       exit_status: 0

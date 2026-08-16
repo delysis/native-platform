@@ -51,7 +51,7 @@ describe('App ghost reactivity wiring', () => {
     expect(source).not.toContain('Insert suggestion');
     expect(source).not.toContain('strand-evidence');
     expect(source).toContain('class="canvas-controls"');
-    expect(source).toContain('data-tauri-drag-region');
+    expect(source).toContain('on:mousedown={startTitlebarDrag}');
     expect(source).not.toContain('Autosave is always on');
     expect(source).toContain('aria-label={autosaveLabel}');
     expect(source).toContain('New document (⌘N)');
@@ -93,8 +93,56 @@ describe('App ghost reactivity wiring', () => {
     expect(markdown).toContain('{placeholder}');
     expect(visual).toContain('class="loom-editor-placeholder"');
     expect(css).toContain('.loom-editor-placeholder');
+    expect(css).toMatch(/\.loom-editor-placeholder \{[^}]*z-index: 3/);
     expect(css).toContain('.source-pane textarea::placeholder');
     expect(source).toContain('autofocus={true}');
+  });
+
+  it('opens the writing surface before optional completion setup', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const openProject = source.slice(
+      source.indexOf('async function finishOpeningProject'),
+      source.indexOf('async function selectDocument')
+    );
+    const background = source.slice(
+      source.indexOf('async function restoreCompletionBackground'),
+      source.indexOf('async function restoreDesktopWorkspace')
+    );
+
+    expect(openProject).toContain('await selectDocument(first)');
+    expect(openProject).not.toContain('getBuildModelPolicy');
+    expect(openProject).not.toContain('setSuggestionsPolicy');
+    expect(background).toContain('await restoreCompletionAutomation(captured)');
+    expect(source).toContain('void refreshBranchesFor(\n        source.projectId');
+    expect(source).not.toContain('await refreshBranchesFor(\n        source.projectId');
+    expect(source).toContain("{#if transition === 'idle'}\n          <button\n            class=\"titlebar-button new-document-button\"");
+    expect(source).toContain('Opening your writing…');
+  });
+
+  it('disarms completion on caret navigation without scheduling replacement inference', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const visual = readFileSync(new URL('./LoomEditor.svelte', import.meta.url), 'utf8');
+    const invalidate = source.slice(
+      source.indexOf('function invalidateCompletionForCaretNavigation'),
+      source.indexOf('function sessionForEligibleGhost')
+    );
+    const sourceSelection = source.slice(
+      source.indexOf('function updateSourceSelection'),
+      source.indexOf('function updateVisualSelection')
+    );
+    const visualSelection = source.slice(
+      source.indexOf('function updateVisualSelection'),
+      source.indexOf('function scheduleSourceProjection')
+    );
+
+    expect(invalidate).toContain('cancelSuggestionTimer()');
+    expect(invalidate).toContain('cancelActiveBranches()');
+    expect(invalidate).not.toContain('scheduleAutomaticSuggestions');
+    expect(sourceSelection).toContain('invalidateCompletionForCaretNavigation()');
+    expect(visualSelection).toContain('invalidateCompletionForCaretNavigation()');
+    expect(source).toContain('onCaretNavigation={invalidateCompletionForCaretNavigation}');
+    expect(visual).toContain('onCaretNavigation();');
+    expect(source).toContain('completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion)');
   });
 
   it('uses the macOS overlay titlebar for one integrated toolbar', () => {
@@ -106,6 +154,7 @@ describe('App ghost reactivity wiring', () => {
     expect(capability.permissions).toContain('core:window:allow-start-dragging');
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     expect(source).toContain('class="titlebar-drag-surface"');
+    expect(source).not.toContain('data-tauri-drag-region');
     expect(source).toContain('on:mousedown={startTitlebarDrag}');
     expect(source).toContain('getCurrentWindow().startDragging()');
     expect(source).toContain('<span class="titlebar-document-title">{nativeWindowTitle}</span>');
