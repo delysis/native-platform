@@ -244,6 +244,36 @@ export function visualGhostTextMayBePlainProse(text: string): boolean {
 }
 
 /**
+ * Return the longest exact leading slice that the visual editor can render as
+ * literal prose. A completion may wander into Markdown or another paragraph
+ * after a useful opening; hiding the entire suggestion in that case makes a
+ * successful generation look broken. Partial slices are inserted as ordinary
+ * edits and never promoted as if they were the full stored candidate.
+ */
+export function visualGhostTextSafePrefix(text: string): string | null {
+  if (visualGhostTextMayBePlainProse(text)) return text;
+  if (!text || !/\S/u.test(text)) return null;
+
+  const boundaries = new Set<number>();
+  for (const match of text.matchAll(/\n|[\s,.;:!?—]+/gu)) {
+    if (match.index > 0) boundaries.add(match.index);
+    boundaries.add(match.index + match[0].length);
+  }
+  for (const match of text.matchAll(/[*_`#[\]()>!-]/gu)) {
+    if (match.index > 0) boundaries.add(match.index);
+  }
+
+  const ordered = [...boundaries]
+    .filter((boundary) => boundary > 0 && boundary < text.length)
+    .sort((left, right) => right - left);
+  for (const boundary of ordered) {
+    const prefix = text.slice(0, boundary).replace(/[ \t\n]+$/u, '');
+    if (prefix && visualGhostTextMayBePlainProse(prefix)) return prefix;
+  }
+  return null;
+}
+
+/**
  * Prove that promoting the exact raw bytes yields canonical plain prose at the
  * exact visual caret. Inline text is checked against a literal ProseMirror
  * transaction. Paragraph continuations are checked by parsing and serializing

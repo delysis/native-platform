@@ -19,6 +19,14 @@ export type AutomaticWriterSummary = ModelCapabilitySummary & {
   policy_verified: ModelPolicyProfile;
 };
 
+export type SuggestionWriterSummary = ModelCapabilitySummary & {
+  local: true;
+  loaded: true;
+  header_verified: true;
+  completion: true;
+  output_tokens: true;
+};
+
 const GEMMA_4_BASE_WRITER_PROFILE = 'gemma_4_e2b_base_q8_loom_v1';
 
 export function writerProfileForBuildPolicy(
@@ -93,9 +101,26 @@ export function isVerifiedPolicyWriter(
 }
 
 /**
+ * A model explicitly loaded through the native runtime may power suggestions
+ * once its descriptor proves text completion and generated-token output. Media
+ * adapters stay out of this path; they are not standalone language models.
+ */
+export function isUsableSuggestionWriter(
+  model: ModelCapabilitySummary
+): model is SuggestionWriterSummary {
+  return model.loaded &&
+    model.local &&
+    model.header_verified &&
+    model.completion &&
+    model.output_tokens &&
+    model.projector_present === false &&
+    model.media_kinds.length === 0;
+}
+
+/**
  * Select only a resident model whose exact native identity belongs to this
- * closed build policy. A generic loaded completion model remains visible to
- * Advanced controls but cannot become the automatic writer in renderer state.
+ * closed build policy. This strict selector powers quiet/default loading;
+ * `suggestionWriter` separately recognizes an explicitly loaded text model.
  */
 export function automaticWriterForBuildPolicy(
   models: readonly ModelCapabilitySummary[],
@@ -106,4 +131,25 @@ export function automaticWriterForBuildPolicy(
     ? models.find((model): model is AutomaticWriterSummary =>
       isVerifiedPolicyWriter(model, profileId))
     : undefined;
+}
+
+/**
+ * Prefer the exact tested writer when it is resident, then accept an
+ * explicitly loaded native-verified text model. Generic models are never
+ * selected by quiet discovery; this function only recognizes the one the
+ * author has already chosen and loaded.
+ */
+export function suggestionWriter(
+  models: readonly ModelCapabilitySummary[],
+  policy: BuildModelPolicySummary | null
+): SuggestionWriterSummary | undefined {
+  return automaticWriterForBuildPolicy(models, policy) ??
+    models.find(isUsableSuggestionWriter);
+}
+
+export function looksLikeVisionAdapter(model: ModelCapabilitySummary): boolean {
+  return model.projector_present === true ||
+    model.media_kinds.length > 0 ||
+    /(^|[-_.])(mmproj|projector)([-_.]|$)/iu.test(model.display_name) ||
+    /(^|[/\\-_.])(mmproj|projector)([/\\-_.]|$)/iu.test(model.model_path);
 }

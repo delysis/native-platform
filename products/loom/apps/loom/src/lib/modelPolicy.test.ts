@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest';
 import type { ModelCapabilitySummary } from './types';
 import {
   automaticWriterForBuildPolicy,
+  isUsableSuggestionWriter,
   isVerifiedPolicyWriter,
+  looksLikeVisionAdapter,
   orderedLocalWriterCandidates,
   preferredWriterModelPath,
+  suggestionWriter,
   writerProfileForBuildPolicy
 } from './modelPolicy';
 
@@ -171,6 +174,41 @@ describe('automaticWriterForBuildPolicy', () => {
       activation: 'project_opt_in',
       canonical_sha256: 'ce3bdf5e3dbcac6f7bcc164ec4cc5c78b4a7b5bef7c49b3cd52c61e123b75fe0'
     })).toBeUndefined();
+  });
+});
+
+describe('explicit local suggestion writers', () => {
+  const policy = {
+    name: 'writer-gemma4-base-v2',
+    activation: 'quiet_default',
+    canonical_sha256: '2d402d213b60ba65c4d018907e9eba67ccfbc1e97081cc0505f9713ae2dd89d2'
+  } as const;
+
+  it('accepts a native-inspected text model without granting policy identity', () => {
+    const generic = model({
+      model_id: 'generic',
+      loaded: true,
+      completion: true,
+      output_tokens: true,
+      projector_present: false,
+      media_kinds: []
+    });
+    expect(isUsableSuggestionWriter(generic)).toBe(true);
+    expect(suggestionWriter([generic], policy)?.model_id).toBe('generic');
+  });
+
+  it('rejects adapters and media models from text suggestions', () => {
+    const adapter = model({ display_name: 'clip-mmproj.gguf' });
+    const vision = model({
+      loaded: true,
+      completion: true,
+      output_tokens: true,
+      projector_present: true,
+      media_kinds: ['image']
+    });
+    expect(looksLikeVisionAdapter(adapter)).toBe(true);
+    expect(isUsableSuggestionWriter(vision)).toBe(false);
+    expect(suggestionWriter([vision], policy)).toBeUndefined();
   });
 });
 

@@ -28,6 +28,7 @@
     listenForFileCommands,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
+    loadModel,
     loadPolicyModelCandidate,
     listModels,
     listModelDownloads,
@@ -66,7 +67,10 @@
     candidateTextIsSurfaceable
   } from './lib/candidateSurface';
   import { sourceGhostPresentationCompatible } from './lib/sourceGhostText';
-  import { visualGhostTextMayBePlainProse } from './lib/ghostText';
+  import {
+    visualGhostTextMayBePlainProse,
+    visualGhostTextSafePrefix
+  } from './lib/ghostText';
   import { isExtendedGraphemeBoundary } from './lib/graphemeBoundary';
   import {
     verifyBranchBody,
@@ -88,7 +92,8 @@
   } from './lib/projectScope';
   import {
     captureForIdempotentRetry,
-    closeResultMayHaveCommitted
+    closeResultMayHaveCommitted,
+    failureIsDefiniteContention
   } from './lib/sessionSafety';
   import { drainGenerationsAndClose } from './lib/sessionCloseCoordinator';
   import {
@@ -130,10 +135,12 @@
     utf8ByteOffset
   } from './lib/weaveSafety';
   import {
-    automaticWriterForBuildPolicy,
     isVerifiedPolicyWriter,
+    isUsableSuggestionWriter,
+    looksLikeVisionAdapter,
     orderedLocalWriterCandidates,
     preferredWriterModelPath,
+    suggestionWriter,
     writerProfileForBuildPolicy
   } from './lib/modelPolicy';
   import type {
@@ -234,6 +241,7 @@
   let branchBodyErrorByRun: Record<string, string> = {};
   let branchRefreshSerial = 0;
   let branchRefreshInFlightCount = 0;
+  let branchRefreshQueued = false;
   let sourceTextarea: HTMLTextAreaElement | undefined;
   let weaveStarting = false;
   let uncertainWeave: WeaveCapture | null = null;
@@ -376,6 +384,20 @@
     insertsOnAccept: boolean;
   }
 
+  interface InlineSuggestionState {
+    branches: BranchCard[];
+    verifiedBodyByRun: Record<string, VerifiedBranchBody>;
+    liveTextByRun: Record<string, string>;
+    currentModel: ModelCapabilitySummary | null | undefined;
+    document: OpenDocument | null;
+    suggestionsEnabled: boolean;
+    promotionReady: boolean;
+    dismissedCandidateIds: string[];
+    unpresentableVisualKeys: string[];
+    sourceText: string;
+    sourceNewline: VerseNewlineKind | null;
+  }
+
   interface PromotionCapture {
     commandId: string;
     restoreSerial: number;
@@ -498,7 +520,7 @@
     return !query || candidate.title.toLocaleLowerCase().includes(query) || candidate.relative_path.toLocaleLowerCase().includes(query);
   }) ?? [];
   $: loadedModel = models.find((model) => model.loaded) ?? null;
-  $: currentModel = automaticWriterForBuildPolicy(models, buildModelPolicy);
+  $: currentModel = suggestionWriter(models, buildModelPolicy);
   $: suggestionSetupNeeded = Boolean(
     project &&
     document &&
@@ -520,7 +542,8 @@
     model.local &&
     model.header_verified &&
     !model.loaded &&
-    !model.policy_candidate
+    !model.policy_candidate &&
+    !looksLikeVisionAdapter(model)
   );
   $: activeModelDownloads = modelDownloads.filter((download) => !modelDownloadIsTerminal(download));
   $: pendingModelDownloadSnapshot = pendingModelDownload
@@ -573,8 +596,32 @@
   $: sourceGhostNewline = document?.summary.kind === 'verse'
     ? verseCodec?.newline ?? 'mixed'
     : null;
-  $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual');
-  $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source');
+  $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual', {
+    branches,
+    verifiedBodyByRun: verifiedBranchBodyByRun,
+    liveTextByRun: liveBranchText,
+    currentModel,
+    document,
+    suggestionsEnabled,
+    promotionReady: branchPromotionReady,
+    dismissedCandidateIds,
+    unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
+    sourceText: sourceDisplayText,
+    sourceNewline: sourceGhostNewline
+  });
+  $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source', {
+    branches,
+    verifiedBodyByRun: verifiedBranchBodyByRun,
+    liveTextByRun: liveBranchText,
+    currentModel,
+    document,
+    suggestionsEnabled,
+    promotionReady: branchPromotionReady,
+    dismissedCandidateIds,
+    unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
+    sourceText: sourceDisplayText,
+    sourceNewline: sourceGhostNewline
+  });
   $: activeSuggestionFamily = mode === 'visual'
     ? visualSuggestionFamily
     : mode === 'source'
@@ -824,6 +871,7 @@
     stopBranchPolling();
     unpresentableVisualGhostPresentationKeys = [];
     branchRefreshSerial += 1;
+    branchRefreshQueued = false;
     branchNextCursor = null;
     branchFirstPageCursor = null;
     branchHasMore = false;
@@ -1818,6 +1866,16 @@
     reportFailure = true,
     expectedViewEpoch = branchPollEpoch
   ): Promise<boolean> {
+    if (branchRefreshInFlightCount > 0) {
+      branchRefreshQueued = true;
+      return false;
+    }
+    if (draftInFlight || saveInFlight) {
+      branchRefreshQueued = true;
+      scheduleBranchRefresh();
+      return false;
+    }
+    branchRefreshQueued = false;
     const refreshSerial = ++branchRefreshSerial;
     branchRefreshInFlightCount += 1;
     try {
@@ -1875,18 +1933,27 @@
       if (branches.some(isBranchActive)) scheduleActiveBranchPoll();
       return true;
     } catch (error) {
+      const failure = normalizeFailure(error);
+      if (failureIsDefiniteContention(failure)) {
+        branchRefreshQueued = true;
+        return false;
+      }
       if (
         reportFailure &&
         project?.project_id === projectId &&
         project.session_id === sessionId &&
         document?.summary.document_id === documentId
       ) {
-        recordFailure(error);
+        recordFailure(failure);
         announce('Stored strands could not be refreshed');
       }
       return false;
     } finally {
       branchRefreshInFlightCount = Math.max(0, branchRefreshInFlightCount - 1);
+      if (branchRefreshInFlightCount === 0 && branchRefreshQueued) {
+        branchRefreshQueued = false;
+        scheduleBranchRefresh();
+      }
     }
   }
 
@@ -2595,15 +2662,15 @@
     }
   }
 
-  async function activatePolicyWriter(
+  async function activateSuggestionWriter(
     selected: ModelCapabilitySummary,
     captured: WorkspaceRestoreCapture
   ): Promise<boolean> {
     if (modelLoading || modelUnloading || !workspaceRestoreIsCurrent(captured)) return false;
     const policyCandidate = selected.policy_candidate;
-    if (!policyCandidate) {
-      modelSetupError = `This file is not ${expectedPolicyWriterName()}. It cannot power suggestions in this build.`;
-      announce('That model is not compatible with suggestions in this version of Loom');
+    if (looksLikeVisionAdapter(selected)) {
+      modelSetupError = 'That file is a vision or projector adapter, not a standalone writing model.';
+      announce('Choose a standalone GGUF language model');
       return false;
     }
 
@@ -2612,20 +2679,21 @@
     const loadSerial = ++modelLoadSerial;
     modelLoading = true;
     modelSetupError = '';
-    announce('Verifying the writing model');
+    announce('Inspecting the writing model locally');
     try {
-      const loaded = await loadPolicyModelCandidate(
-        policyCandidate.profile_id,
-        selected.model_path
-      );
+      const loaded = policyCandidate
+        ? await loadPolicyModelCandidate(policyCandidate.profile_id, selected.model_path)
+        : await loadModel(selected.model_path);
       if (
         !componentMounted ||
         !applicationAllowsModelPreparation(applicationClosePhase) ||
         loadSerial !== modelLoadSerial ||
         !workspaceRestoreIsCurrent(captured)
       ) return false;
-      if (!isVerifiedPolicyWriter(loaded, policyCandidate.profile_id)) {
-        throw new Error('Native verification did not return the exact writer capabilities required by this build.');
+      if (policyCandidate
+        ? !isVerifiedPolicyWriter(loaded, policyCandidate.profile_id)
+        : !isUsableSuggestionWriter(loaded)) {
+        throw new Error('Native inspection did not find a text-completion model suitable for writing suggestions.');
       }
       if (!(await installLoadedModel(loaded, false, captured))) {
         throw new Error('The verified writer could not be attached to the current writing session.');
@@ -2643,8 +2711,8 @@
         loadSerial === modelLoadSerial
       ) {
         const failure = normalizeFailure(error);
-        modelSetupError = `Loom could not verify this as ${expectedPolicyWriterName()}. ${failure.message}`;
-        announce('That model did not pass writing-model verification');
+        modelSetupError = `Loom could not use this local model for writing suggestions. ${failure.message}`;
+        announce('That file could not be loaded as a text writing model');
         await refreshModels(captured);
       }
       return false;
@@ -2656,18 +2724,14 @@
     }
   }
 
-  async function choosePolicyWriterModel(): Promise<void> {
+  async function chooseSuggestionWriterModel(): Promise<void> {
     if (modelChoosing || modelLoading || modelUnloading) return;
     const captured = currentWorkspaceCapture();
-    if (!captured || !buildModelPolicy || buildModelPolicy.name === 'none-v1') {
-      modelSetupError = 'This build does not define a verified local writing model.';
-      announce('Suggestions remain off because no verified writing model is configured');
-      return;
-    }
+    if (!captured) return;
 
     modelChoosing = true;
     modelSetupError = '';
-    announce('Locate the supported writing model on this computer');
+    announce('Locate a local GGUF writing model');
     try {
       const selected = await chooseModel();
       if (!selected) {
@@ -2675,7 +2739,7 @@
         return;
       }
       if (!workspaceRestoreIsCurrent(captured)) return;
-      await activatePolicyWriter(selected, captured);
+      await activateSuggestionWriter(selected, captured);
     } catch (error) {
       if (componentMounted && workspaceRestoreIsCurrent(captured)) {
         const failure = normalizeFailure(error);
@@ -2687,10 +2751,10 @@
     }
   }
 
-  async function useDiscoveredPolicyWriter(model: ModelCapabilitySummary): Promise<void> {
+  async function useDiscoveredSuggestionWriter(model: ModelCapabilitySummary): Promise<void> {
     const captured = currentWorkspaceCapture();
     if (!captured) return;
-    await activatePolicyWriter(model, captured);
+    await activateSuggestionWriter(model, captured);
   }
 
   async function unloadCurrentModel(): Promise<void> {
@@ -3557,6 +3621,7 @@
       text: documentText,
       editVersion
     };
+    let retryAfterContention = false;
     const operation = (async (): Promise<boolean> => {
       try {
         const draft = await upsertTransientDraft(
@@ -3605,7 +3670,15 @@
         return true;
       } catch (error) {
         if (documentEpoch !== captured.epoch) return true;
-        const failure = recordFailure(error);
+        const failure = normalizeFailure(error);
+        if (failureIsDefiniteContention(failure)) {
+          if (uncertainDraft === captured) uncertainDraft = null;
+          saveState = 'dirty';
+          saveMessage = 'Autosave pending';
+          retryAfterContention = true;
+          return false;
+        }
+        recordFailure(failure);
         const retryCapture = captureForIdempotentRetry(captured, failure);
         if (retryCapture) {
           uncertainDraft = retryCapture;
@@ -3630,7 +3703,7 @@
         saveState !== 'error' &&
         saveState !== 'uncertain'
       ) {
-        scheduleDraftJournal();
+        scheduleDraftJournal(retryAfterContention ? 200 : undefined);
       }
     }
   }
@@ -3808,7 +3881,15 @@
         documentEpoch !== captured.documentEpoch ||
         !projectSessionIsCurrent(project, captured)
       ) return;
-      const failure = recordFailure(error);
+      const failure = normalizeFailure(error);
+      if (failureIsDefiniteContention(failure)) {
+        if (uncertainSave?.commandId === captured.commandId) uncertainSave = null;
+        saveState = 'dirty';
+        saveMessage = 'Autosave pending';
+        saveQueued = true;
+        return;
+      }
+      recordFailure(failure);
       if (
         failure.code === 'external_file_change' ||
         failure.code === 'source_blob_conflict' ||
@@ -3908,22 +3989,23 @@
 
   function inlineSuggestionFamily(
     targetByte: number | null,
-    editorMode: 'visual' | 'source'
+    editorMode: 'visual' | 'source',
+    state: InlineSuggestionState
   ): InlineGhostSuggestion[] {
     if (
-      !suggestionsEnabled ||
-      !branchPromotionReady ||
+      !state.suggestionsEnabled ||
+      !state.promotionReady ||
       targetByte === null ||
-      !document ||
-      !currentModel
+      !state.document ||
+      !state.currentModel
     ) return [];
 
     const encoder = new TextEncoder();
     const family: InlineGhostSuggestion[] = [];
-    for (const branch of branches) {
+    for (const branch of state.branches) {
       if (
-        branch.source_revision_id !== document.summary.revision_id ||
-        branch.model_id !== currentModel.model_id ||
+        branch.source_revision_id !== state.document.summary.revision_id ||
+        branch.model_id !== state.currentModel.model_id ||
         branch.target_start_byte !== targetByte ||
         branch.target_end_byte !== targetByte ||
         branch.selection === 'promote' ||
@@ -3932,21 +4014,27 @@
       ) continue;
 
       const candidateId = `run:${branch.run_id}`;
-      if (dismissedCandidateIds.includes(candidateId)) continue;
-      const verified = verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[branch.run_id]);
-      const text = verified?.text ?? liveBranchText[branch.run_id] ?? branch.text;
-      if (!candidateTextIsSurfaceable(text)) continue;
-      const presentationKey = verified?.presentationKey ??
-        `stream:${branch.run_id}:${encoder.encode(text).byteLength}`;
+      if (state.dismissedCandidateIds.includes(candidateId)) continue;
+      const verified = verifiedGhostSuggestion(branch, state.verifiedBodyByRun[branch.run_id]);
+      const rawText = verified?.text ?? state.liveTextByRun[branch.run_id] ?? branch.text;
+      const text = editorMode === 'visual'
+        ? visualGhostTextSafePrefix(rawText)
+        : rawText;
+      if (!text || !candidateTextIsSurfaceable(text)) continue;
+      const rawPresentationKey = verified?.presentationKey ??
+        `stream:${branch.run_id}:${encoder.encode(rawText).byteLength}`;
+      const presentationKey = text === rawText
+        ? rawPresentationKey
+        : `${rawPresentationKey}:prose-prefix:${encoder.encode(text).byteLength}`;
       if (editorMode === 'visual') {
         if (
           !visualGhostTextMayBePlainProse(text) ||
-          unpresentableVisualGhostPresentationKeys.includes(presentationKey)
+          state.unpresentableVisualKeys.includes(presentationKey)
         ) continue;
       } else if (!sourceGhostPresentationCompatible(
-        sourceDisplayText,
+        state.sourceText,
         text,
-        sourceGhostNewline
+        state.sourceNewline
       )) continue;
 
       family.push({
@@ -3955,7 +4043,7 @@
         text,
         runId: branch.run_id,
         targetByte,
-        insertsOnAccept: !verified
+        insertsOnAccept: !verified || text !== rawText
       });
     }
     return family;
@@ -4338,8 +4426,14 @@
         document?.summary.document_id === captured.documentId
       ) {
         const captureIsCurrent = weaveCaptureStillCurrent(captured);
+        const failure = normalizeFailure(error);
+        if (captureIsCurrent && failureIsDefiniteContention(failure)) {
+          uncertainWeave = null;
+          scheduleAutomaticSuggestions(editVersion);
+          return;
+        }
         if (captureIsCurrent) {
-          recordFailure(error);
+          recordFailure(failure);
           uncertainWeave = captured;
         }
         try {
@@ -4426,7 +4520,7 @@
   async function cancelActiveBranches(): Promise<void> {
     const active = branches.filter(isBranchActive);
     if (active.length === 0) return;
-    await Promise.all(active.map((branch) => cancelBranch(branch)));
+    for (const branch of active) await cancelBranch(branch);
   }
 
   function canPromoteBranch(branch: BranchCard): boolean {
@@ -5261,8 +5355,8 @@
 
 <div class="app-shell">
   {#if project}
-    <header class="window-chrome" aria-label="Writing controls" data-tauri-drag-region>
-      <div class="window-chrome-left" data-tauri-drag-region="false">
+    <div class="canvas-controls" aria-label="Writing controls">
+      <div class="canvas-controls-left">
         {#if project.documents.length > 1}
           <button
             bind:this={outlineToggle}
@@ -5272,7 +5366,7 @@
             aria-expanded={outlineOpen}
             aria-label={outlineOpen ? 'Close manuscript outline' : 'Open manuscript outline'}
             on:click={() => void setOutlineOpen(!outlineOpen)}
-          >☰</button>
+          ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 4h10M3 8h10M3 12h10" /></svg></button>
         {/if}
         <button
           class="titlebar-button new-document-button"
@@ -5281,18 +5375,18 @@
           title="New document (⌘N)"
           disabled={fileCommandInFlight || editorReadonly}
           on:click={() => void newDocument()}
-        >+</button>
+        ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
       </div>
-      <div class="window-chrome-right" data-tauri-drag-region="false">
+      <div class="canvas-controls-right">
         {#if shuttleEnabled}
           <span class="shuttle-indicator" title="Shuttle accepts one suggested word after four idle seconds">Shuttle</span>
         {/if}
-        <div class="save-status state-{saveState}" role="status" aria-live="polite" title={`${autosaveLabel}. Save now with ⌘S; export a copy with ⇧⌘S.`}>
-          <span class="status-dot"></span><span class="save-status-label">{autosaveLabel}</span>
+        <div class="save-status state-{saveState}" role="status" aria-label={autosaveLabel}>
+          <span class="status-dot"></span>
         </div>
       <details class="project-menu" bind:this={projectMenu}>
         <summary class="titlebar-button gear-button" bind:this={projectMenuTrigger} title="Settings" aria-label="Settings">
-          <span aria-hidden="true">⚙︎</span>
+          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M9 6.4A2.6 2.6 0 1 0 9 11.6 2.6 2.6 0 0 0 9 6.4Z" /><path d="M15 9a6 6 0 0 0-.08-.96l1.35-1.05-1.5-2.6-1.58.65a6 6 0 0 0-1.65-.96L11.3 2.4h-3l-.24 1.68a6 6 0 0 0-1.65.96l-1.58-.65-1.5 2.6 1.35 1.05A6 6 0 0 0 4.6 9c0 .33.03.65.08.96l-1.35 1.05 1.5 2.6 1.58-.65c.5.4 1.06.72 1.65.96l.24 1.68h3l.24-1.68a6 6 0 0 0 1.65-.96l1.58.65 1.5-2.6-1.35-1.05c.05-.31.08-.63.08-.96Z" /></svg>
         </summary>
         <div class="project-menu-popover" aria-label="Editor and suggestion settings">
           {#if document}
@@ -5329,11 +5423,10 @@
           >
             <span>Shuttle</span><span aria-hidden="true">{shuttleEnabled ? 'On' : 'Off'}</span>
           </button>
-          <p class="autosave-note"><span class="status-dot state-saved"></span>Autosave is always on. Use the File menu for New, Open, Save, and Export Copy.</p>
         </div>
       </details>
       </div>
-    </header>
+    </div>
   {/if}
 
   {#if project}
@@ -5669,7 +5762,7 @@
             <section class="model-setup-callout">
               <div class="model-setup-intro">
                 <strong>Private writing model</strong>
-                <p>Loom uses {expectedPolicyWriterName()} for suggestions. The model stays on this computer.</p>
+                <p>Loom prefers {expectedPolicyWriterName()}, or you can choose another local text model. Nothing leaves this computer.</p>
               </div>
 
               {#if compatibleWriterModels.length > 0}
@@ -5683,7 +5776,7 @@
                       <button
                         class="primary-button compact"
                         type="button"
-                        on:click={() => void useDiscoveredPolicyWriter(model)}
+                        on:click={() => void useDiscoveredSuggestionWriter(model)}
                         disabled={!desktop || modelChoosing || modelLoading || modelUnloading}
                       >{modelLoading && selectedModelPath === model.model_path ? 'Verifying…' : 'Verify and use'}</button>
                     </article>
@@ -5691,8 +5784,8 @@
                 </div>
               {:else}
                 <div class="model-empty-state">
-                  <strong>No compatible writing model found.</strong>
-                  <span>Loom checked its model library and the local Hugging Face cache. You can locate an existing GGUF file without moving it.</span>
+                  <strong>No recommended writing model found.</strong>
+                  <span>Choose any local text-model GGUF below or locate one without moving it.</span>
                 </div>
               {/if}
 
@@ -5704,9 +5797,9 @@
                 <button
                   class={compatibleWriterModels.length > 0 ? 'bare-button compact' : 'secondary-button'}
                   type="button"
-                  on:click={() => void choosePolicyWriterModel()}
+                  on:click={() => void chooseSuggestionWriterModel()}
                   disabled={!desktop || modelChoosing || modelLoading || modelUnloading}
-                >{modelChoosing ? 'Locating…' : 'Locate compatible model file…'}</button>
+                >{modelChoosing ? 'Locating…' : 'Locate model file…'}</button>
                 <button class="bare-button compact" type="button" on:click={() => void refreshCurrentModelsAndEnsureWriter()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>Refresh library</button>
               </div>
             </section>
@@ -5718,8 +5811,8 @@
               <section class="model-library" aria-labelledby="model-library-title">
             <div class="section-heading">
               <div>
-                <h3 id="model-library-title">Other local models</h3>
-                <p>Visible for diagnosis only. This build will not use an unverified model for suggestions.</p>
+                <h3 id="model-library-title">Local writing models</h3>
+                <p>Choose any text-model GGUF. Loom inspects it locally before use; vision adapters are excluded.</p>
               </div>
             </div>
 
@@ -5731,7 +5824,12 @@
                       <strong>{model.display_name}</strong>
                       <span>{formatByteCount(model.file_bytes)}</span>
                     </div>
-                    <span class="model-incompatible">Not compatible with suggestions</span>
+                    <button
+                      class="secondary-button compact"
+                      type="button"
+                      on:click={() => void useDiscoveredSuggestionWriter(model)}
+                      disabled={!desktop || modelChoosing || modelLoading || modelUnloading}
+                    >{modelLoading && selectedModelPath === model.model_path ? 'Inspecting…' : 'Use'}</button>
                   </article>
                 {/each}
               </div>

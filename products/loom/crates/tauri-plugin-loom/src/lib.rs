@@ -194,7 +194,7 @@ struct AutomaticBudgetReservation<'authority> {
 impl AutomaticBudgetAuthority {
     fn reserve(
         &self,
-        _writer: &PolicyBoundAutomaticWriter,
+        _writer: &AutomaticSuggestionAuthority,
         scope: AutomaticBudgetScope,
     ) -> Result<AutomaticBudgetReservation<'_>, AutomaticBudgetError> {
         let mut ledger = self
@@ -369,18 +369,36 @@ mod automatic_writer_authority {
         policy_identity: BuildModelPolicyIdentity,
     }
 
+    /// An explicitly selected local model whose native descriptor proves the
+    /// exact text-completion contract used by Loom suggestions. This witness
+    /// deliberately carries no build-policy identity and therefore cannot be
+    /// used by quiet/default model discovery.
+    #[derive(Debug)]
+    pub(super) struct VerifiedTextAutomaticWriter {
+        loaded: LoadedModel,
+    }
+
+    #[derive(Debug)]
+    pub(super) enum AutomaticSuggestionAuthority {
+        Policy(PolicyBoundAutomaticWriter),
+        VerifiedText(VerifiedTextAutomaticWriter),
+    }
+
     #[derive(Debug)]
     enum AuthorizedWeaveModelKind {
-        Automatic(PolicyBoundAutomaticWriter),
+        Automatic(AutomaticSuggestionAuthority),
         Manual(LoadedModel),
     }
 
     #[derive(Debug)]
     enum SubmittedWeaveAuthority {
-        Automatic {
+        AutomaticPolicy {
             profile_id: BuildWriterProfileId,
             rank: u32,
             policy_identity: BuildModelPolicyIdentity,
+        },
+        AutomaticVerifiedText {
+            model_sha256: String,
         },
         Manual,
     }
@@ -396,7 +414,8 @@ mod automatic_writer_authority {
 
     /// The only model authority accepted by the shared Weave submission path.
     /// Manual requests retain their explicit escape hatch; automatic requests
-    /// necessarily carry a non-forgeable policy witness until request creation.
+    /// necessarily carry either exact build-policy identity or a non-forgeable
+    /// native-verified text-only capability witness until request creation.
     #[derive(Debug)]
     pub(super) struct AuthorizedWeaveModel {
         policy: ValidatedWeavePolicy,
@@ -448,12 +467,81 @@ mod automatic_writer_authority {
             } = self;
             (
                 loaded.profile,
-                SubmittedWeaveAuthority::Automatic {
+                SubmittedWeaveAuthority::AutomaticPolicy {
                     profile_id,
                     rank,
                     policy_identity,
                 },
             )
+        }
+    }
+
+    impl VerifiedTextAutomaticWriter {
+        fn bind(loaded: LoadedModel) -> Result<Self, IpcFailure> {
+            let capabilities = &loaded.descriptor.capabilities;
+            if loaded.profile.projector_path.is_some()
+                || loaded.descriptor.projector_sha256.is_some()
+                || !capabilities.media.is_empty()
+            {
+                return Err(IpcFailure::new(
+                    "automatic_writer_media_unsupported",
+                    "writing suggestions require a text-only model without a vision, audio, or projector adapter",
+                    false,
+                ));
+            }
+            if !capabilities.completion_text.is_supported()
+                || !capabilities.generated_token_ids.is_supported()
+                || !capabilities.ordered_outputs.is_supported()
+                || !capabilities.per_case_sampling.is_supported()
+                || !capabilities.per_case_cancellation.is_supported()
+                || capabilities.max_cases == 0
+            {
+                return Err(IpcFailure::new(
+                    "automatic_writer_capability_mismatch",
+                    "native inspection did not prove the text-completion, generated-token, and bounded batch controls required by writing suggestions",
+                    false,
+                ));
+            }
+            Ok(Self { loaded })
+        }
+
+        fn into_request_parts(self) -> (LocalModelProfile, SubmittedWeaveAuthority) {
+            let Self { loaded } = self;
+            (
+                loaded.profile,
+                SubmittedWeaveAuthority::AutomaticVerifiedText {
+                    model_sha256: loaded.descriptor.model_sha256,
+                },
+            )
+        }
+    }
+
+    impl AutomaticSuggestionAuthority {
+        fn bind(loaded: LoadedModel, policy: &BuildModelPolicy) -> Result<Self, IpcFailure> {
+            if policy
+                .matching_writer(
+                    &loaded.descriptor.model_sha256,
+                    loaded.descriptor.model_file_bytes,
+                )
+                .is_some()
+            {
+                return PolicyBoundAutomaticWriter::bind(loaded, policy).map(Self::Policy);
+            }
+            VerifiedTextAutomaticWriter::bind(loaded).map(Self::VerifiedText)
+        }
+
+        fn loaded(&self) -> &LoadedModel {
+            match self {
+                Self::Policy(writer) => &writer.loaded,
+                Self::VerifiedText(writer) => &writer.loaded,
+            }
+        }
+
+        fn into_request_parts(self) -> (LocalModelProfile, SubmittedWeaveAuthority) {
+            match self {
+                Self::Policy(writer) => writer.into_request_parts(),
+                Self::VerifiedText(writer) => writer.into_request_parts(),
+            }
         }
     }
 
@@ -464,10 +552,13 @@ mod automatic_writer_authority {
         ) -> Result<LlamaGenerationHandle, LlamaBackendError> {
             let Self { request, authority } = self;
             match authority {
-                SubmittedWeaveAuthority::Automatic {
+                SubmittedWeaveAuthority::AutomaticPolicy {
                     profile_id: _profile_id,
                     rank: _rank,
                     policy_identity: _policy_identity,
+                } => {}
+                SubmittedWeaveAuthority::AutomaticVerifiedText {
+                    model_sha256: _model_sha256,
                 } => {}
                 SubmittedWeaveAuthority::Manual => {}
             }
@@ -483,7 +574,7 @@ mod automatic_writer_authority {
         ) -> Result<Self, IpcFailure> {
             let kind = match &policy {
                 ValidatedWeavePolicy::AutomaticV2 => AuthorizedWeaveModelKind::Automatic(
-                    PolicyBoundAutomaticWriter::bind(loaded, build_policy)?,
+                    AutomaticSuggestionAuthority::bind(loaded, build_policy)?,
                 ),
                 ValidatedWeavePolicy::ManualV2 { .. } => AuthorizedWeaveModelKind::Manual(loaded),
             };
@@ -512,12 +603,12 @@ mod automatic_writer_authority {
 
         pub(super) fn loaded(&self) -> &LoadedModel {
             match &self.kind {
-                AuthorizedWeaveModelKind::Automatic(writer) => &writer.loaded,
+                AuthorizedWeaveModelKind::Automatic(writer) => writer.loaded(),
                 AuthorizedWeaveModelKind::Manual(loaded) => loaded,
             }
         }
 
-        pub(super) fn automatic_writer(&self) -> Option<&PolicyBoundAutomaticWriter> {
+        pub(super) fn automatic_writer(&self) -> Option<&AutomaticSuggestionAuthority> {
             match &self.kind {
                 AuthorizedWeaveModelKind::Automatic(writer) => Some(writer),
                 AuthorizedWeaveModelKind::Manual(_) => None,
@@ -555,16 +646,19 @@ mod automatic_writer_authority {
             &self,
         ) -> Option<(BuildWriterProfileId, u32, BuildModelPolicyIdentity)> {
             match &self.kind {
-                AuthorizedWeaveModelKind::Automatic(writer) => {
-                    Some((writer.profile_id, writer.rank, writer.policy_identity))
-                }
-                AuthorizedWeaveModelKind::Manual(_) => None,
+                AuthorizedWeaveModelKind::Automatic(AutomaticSuggestionAuthority::Policy(
+                    writer,
+                )) => Some((writer.profile_id, writer.rank, writer.policy_identity)),
+                AuthorizedWeaveModelKind::Automatic(
+                    AutomaticSuggestionAuthority::VerifiedText(_),
+                )
+                | AuthorizedWeaveModelKind::Manual(_) => None,
             }
         }
     }
 }
 
-use automatic_writer_authority::{AuthorizedWeaveModel, PolicyBoundAutomaticWriter};
+use automatic_writer_authority::{AuthorizedWeaveModel, AutomaticSuggestionAuthority};
 
 #[derive(Clone, Debug)]
 struct GenerationResultBinding {
@@ -8623,29 +8717,84 @@ mod tests {
     }
 
     #[test]
-    fn automatic_writer_authority_rejects_none_and_arbitrary_resident_models() {
+    fn explicitly_loaded_generic_text_model_mints_non_policy_automatic_authority() {
         let writer_policy = BuildModelPolicy::writer_gemma4_base_v2();
-        let exact_writer =
-            test_policy_loaded_model(&writer_policy, Path::new("/tmp/policy-writer.gguf"));
-        let none_error = AuthorizedWeaveModel::bind(
-            ValidatedWeavePolicy::AutomaticV2,
-            exact_writer,
-            &BuildModelPolicy::none_v1(),
-        )
-        .expect_err("none-v1 cannot authorize automatic generation");
-        assert_eq!(none_error.code, "automatic_writer_not_in_build_policy");
-
         let arbitrary = test_loaded_model(
             Path::new("/tmp/arbitrary-completion-model.gguf"),
             "arbitrary-completion-model",
         );
-        let arbitrary_error = AuthorizedWeaveModel::bind(
+        let authorized = AuthorizedWeaveModel::bind(
             ValidatedWeavePolicy::AutomaticV2,
             arbitrary,
             &writer_policy,
         )
-        .expect_err("an arbitrary capable resident model is not a build writer");
-        assert_eq!(arbitrary_error.code, "automatic_writer_not_in_build_policy");
+        .expect("native-verified text completion model");
+
+        assert_eq!(authorized.automatic_binding(), None);
+        assert_eq!(
+            authorized.loaded().descriptor.stable_model_id,
+            "arbitrary-completion-model"
+        );
+    }
+
+    #[test]
+    fn generic_text_model_never_acquires_quiet_policy_identity() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let mut generic = test_loaded_model(Path::new("/tmp/generic.gguf"), "generic");
+        generic.descriptor.model_file_bytes = policy
+            .writers()
+            .first()
+            .expect("policy writer")
+            .model_file_bytes();
+        let summary = model_summary(&generic, true, &policy);
+
+        assert!(summary.policy_candidate.is_none());
+        assert!(summary.policy_verified.is_none());
+        assert!(summary.tested_profile.is_none());
+        assert!(
+            policy
+                .matching_writer(
+                    &generic.descriptor.model_sha256,
+                    generic.descriptor.model_file_bytes,
+                )
+                .is_none(),
+            "a size-only discovery hint must never become quiet-load identity"
+        );
+    }
+
+    #[test]
+    fn generic_automatic_authority_rejects_projector_and_media_models() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let mut projector =
+            test_loaded_model(Path::new("/tmp/projector.gguf"), "projector-adapter");
+        projector.profile.projector_path = Some(PathBuf::from("/tmp/adapter.mmproj"));
+        projector.descriptor.projector_sha256 = Some(BlobId::digest(b"projector").to_string());
+        assert_eq!(
+            AuthorizedWeaveModel::bind(ValidatedWeavePolicy::AutomaticV2, projector, &policy)
+                .expect_err("projector model")
+                .code,
+            "automatic_writer_media_unsupported"
+        );
+
+        let mut vision = test_loaded_model(Path::new("/tmp/vision.gguf"), "vision-model");
+        vision
+            .descriptor
+            .capabilities
+            .media
+            .push(loom_backend_llama::VerifiedMediaCapability {
+                kind: loom_backend_llama::VerifiedMediaKind::Image,
+                projector_required: true,
+                accepted_mime_types: Some(vec!["image/png".to_owned()]),
+                max_objects_per_request: Some(1),
+                max_bytes_per_object: Some(1024),
+                max_total_bytes_per_request: Some(1024),
+            });
+        assert_eq!(
+            AuthorizedWeaveModel::bind(ValidatedWeavePolicy::AutomaticV2, vision, &policy)
+                .expect_err("media-capable model")
+                .code,
+            "automatic_writer_media_unsupported"
+        );
     }
 
     #[test]
@@ -8716,28 +8865,30 @@ mod tests {
     fn rejected_automatic_writers_leave_budget_ledger_untouched() {
         let authority = AutomaticBudgetAuthority::default();
         let writer_policy = BuildModelPolicy::writer_gemma4_base_v2();
-        let arbitrary_rejection = AuthorizedWeaveModel::bind(
+        let mut incapable =
+            test_loaded_model(Path::new("/tmp/incapable.gguf"), "incapable-generic");
+        incapable.descriptor.capabilities.completion_text = CapabilitySupport::Unsupported;
+        let capability_rejection = AuthorizedWeaveModel::bind(
             ValidatedWeavePolicy::AutomaticV2,
-            test_loaded_model(Path::new("/tmp/arbitrary.gguf"), "arbitrary"),
+            incapable,
             &writer_policy,
         );
         assert_eq!(
-            arbitrary_rejection
-                .expect_err("arbitrary model cannot mint the opaque request authority")
+            capability_rejection
+                .expect_err("incapable model cannot mint the opaque request authority")
                 .code,
-            "automatic_writer_not_in_build_policy"
+            "automatic_writer_capability_mismatch"
         );
 
-        let none_rejection = AuthorizedWeaveModel::bind(
-            ValidatedWeavePolicy::AutomaticV2,
-            test_policy_loaded_model(&writer_policy, Path::new("/tmp/policy-writer.gguf")),
-            &BuildModelPolicy::none_v1(),
-        );
+        let mut media = test_loaded_model(Path::new("/tmp/media.gguf"), "media-generic");
+        media.descriptor.projector_sha256 = Some(BlobId::digest(b"projector").to_string());
+        let media_rejection =
+            AuthorizedWeaveModel::bind(ValidatedWeavePolicy::AutomaticV2, media, &writer_policy);
         assert_eq!(
-            none_rejection
-                .expect_err("none-v1 cannot mint the opaque request authority")
+            media_rejection
+                .expect_err("media model cannot mint the opaque request authority")
                 .code,
-            "automatic_writer_not_in_build_policy"
+            "automatic_writer_media_unsupported"
         );
 
         let ledger = authority.ledger.lock().expect("automatic budget ledger");
@@ -9216,6 +9367,41 @@ mod tests {
             AutomaticBudgetError::Exhausted
         );
         assert_eq!(AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2, 384);
+    }
+
+    #[test]
+    fn generic_automatic_writer_uses_the_same_revision_budget() {
+        let authority = AutomaticBudgetAuthority::default();
+        let automatic = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            test_loaded_model(Path::new("/tmp/generic-budget.gguf"), "generic-budget"),
+            &BuildModelPolicy::writer_gemma4_base_v2(),
+        )
+        .expect("generic automatic authority");
+        let writer = automatic
+            .automatic_writer()
+            .expect("generic automatic writer witness");
+        let scope = AutomaticBudgetScope {
+            project: ProjectId::new(),
+            session: CommandId::new(),
+            document: DocumentId::new(),
+            source_revision: RevisionId::new(),
+        };
+
+        authority
+            .reserve(writer, scope)
+            .expect("first family")
+            .commit();
+        authority
+            .reserve(writer, scope)
+            .expect("replacement family")
+            .commit();
+        assert_eq!(
+            authority
+                .reserve(writer, scope)
+                .expect_err("generic revision budget exhausted"),
+            AutomaticBudgetError::Exhausted
+        );
     }
 
     #[test]

@@ -35,29 +35,30 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:fo
 }
 button:disabled { cursor: not-allowed; opacity: .45; }
 
-.app-shell { height: 100dvh; min-height: 0; display: flex; flex-direction: column; background: var(--paper); }
+.app-shell { position: relative; height: 100dvh; min-height: 0; display: flex; flex-direction: column; background: var(--paper); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 
-.window-chrome {
-  min-width: 0;
-  height: 30px;
-  flex: 0 0 30px;
+.canvas-controls {
+  position: absolute;
+  z-index: 17;
+  top: 8px;
+  right: 8px;
+  left: 8px;
+  height: 28px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 7px 0 76px;
-  background: color-mix(in srgb, var(--paper) 92%, transparent);
+  pointer-events: none;
   user-select: none;
   -webkit-user-select: none;
 }
-.window-chrome-left, .window-chrome-right { display: flex; align-items: center; gap: 3px; }
-.window-chrome-right { margin-left: auto; }
+.canvas-controls-left, .canvas-controls-right { display: flex; align-items: center; gap: 3px; pointer-events: auto; }
+.canvas-controls-right { margin-left: auto; }
 .topbar-caption, .muted { color: var(--muted); font-size: 13px; }
 .titlebar-button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; line-height: 1; }
-.outline-toggle { font-size: 12px; }
-.new-document-button { font-size: 19px; font-weight: 300; }
-.gear-button { font-size: 15px; }
-.outline-scrim { position: fixed; z-index: 18; inset: 30px 0 0; display: block; padding: 0; border: 0; background: rgb(25 25 23 / 28%); }
+.titlebar-button svg { width: 15px; height: 15px; display: block; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
+.gear-button svg { width: 16px; height: 16px; stroke-width: 1.2; }
+.outline-scrim { position: fixed; z-index: 18; inset: 0; display: block; padding: 0; border: 0; background: rgb(25 25 23 / 28%); }
 .outline-toggle:hover, .outline-toggle[aria-expanded="true"] { color: var(--ink); background: var(--paper-deep); }
 .more-button, .icon-button, .bare-button {
   border: 0;
@@ -78,13 +79,11 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .project-menu-separator { height: 1px; margin: 6px 3px; background: var(--line-soft); }
 .project-menu-popover .menu-state { color: var(--quiet); font-size: 10px; }
 .project-menu-popover .menu-state.ready { color: var(--moss); }
-.autosave-note { display: flex; align-items: flex-start; gap: 7px; margin: 7px 7px 5px; padding-top: 9px; border-top: 1px solid var(--line-soft); color: var(--muted); font-size: 10px; line-height: 1.45; }
-.autosave-note .status-dot { margin-top: 4px; background: var(--moss); }
 .icon-button { display: flex; align-items: center; gap: 6px; min-height: 34px; padding: 6px 10px; border-radius: 7px; }
 .icon-button.active { color: var(--moss-dark); background: var(--moss-soft); }
 .button-label { font-size: 13px; }
 .model-download-badge { min-width: 18px; padding: 2px 5px; border-radius: 999px; color: white; background: var(--moss-dark); font-size: 9px; font-weight: 750; text-align: center; }
-.save-status { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+.save-status { width: 20px; height: 24px; display: grid; place-items: center; color: var(--muted); }
 .status-dot { width: 7px; height: 7px; display: inline-block; flex: 0 0 auto; border-radius: 999px; background: var(--quiet); }
 .state-saving .status-dot { background: #bf8a37; }
 .state-saved .status-dot, .status-dot.ready { background: var(--moss); }
@@ -94,7 +93,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 
 .workspace-grid { min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(0, 1fr); }
 .workspace-grid.single-document .outline-panel { display: none; }
-.outline-panel { position: fixed; z-index: 19; top: 30px; bottom: 0; left: 0; width: min(82vw, 300px); min-width: 0; display: flex; visibility: hidden; flex-direction: column; border-right: 1px solid var(--line); background: #f1ede5; box-shadow: 12px 0 32px rgb(25 25 23 / 16%); transform: translateX(-104%); }
+.outline-panel { position: fixed; z-index: 19; top: 0; bottom: 0; left: 0; width: min(82vw, 300px); min-width: 0; display: flex; visibility: hidden; flex-direction: column; border-right: 1px solid var(--line); background: #f1ede5; box-shadow: 12px 0 32px rgb(25 25 23 / 16%); transform: translateX(-104%); }
 .outline-panel.open { visibility: visible; transform: translateX(0); }
 .panel-heading { min-height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; color: var(--ink); font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .bare-button { font-size: 18px; }
@@ -297,13 +296,13 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .toast button { border: 0; color: white; background: transparent; cursor: pointer; font-size: 18px; }
 
 @media (max-width: 900px) {
-  .button-label, .save-status-label { display: none; }
+  .button-label { display: none; }
   .welcome { overflow: auto; padding: 40px 24px 70px; }
   .project-card { width: min(100%, 600px); }
   .reconciliation-columns { grid-template-columns: 1fr; }
 }
 @media (max-width: 620px) {
-  .window-chrome { padding-right: 5px; }
+  .canvas-controls { right: 5px; left: 5px; }
   .project-menu-popover { position: fixed; top: 34px; right: 8px; left: 8px; width: auto; }
   .document-header { width: calc(100% - 28px); padding-top: 24px; }
   .loom-prosemirror, .source-pane textarea { --writing-gutter: 20px; padding: 22px var(--writing-gutter) 25vh; }
@@ -353,7 +352,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
     --selection-ink: #fff;
     --ghost-ink: color-mix(in srgb, var(--muted) 84%, transparent);
   }
-  .window-chrome, .outline-panel, .source-pane { background: #252722; }
+  .outline-panel, .source-pane { background: #252722; }
   .secondary-button, .document-list button.active, .project-card, .project-card input, .model-manager-picker select, .model-download-form input { color: var(--ink); background: #30322e; }
   .download-error { color: #ffd7d5; background: #603532; }
   .search-field { background: rgb(255 255 255 / 4%); }

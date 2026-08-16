@@ -34,6 +34,12 @@ describe('App ghost reactivity wiring', () => {
     const retry = dependencyThunkFor(compiled, '$.set(retryEvaluationSnapshot');
     expect(retry).toContain('visualAutocompleteDisposition');
     expect(retry).toContain('sourceAutocompleteDisposition');
+
+    const visualFamily = dependencyThunkFor(compiled, '$.set(visualSuggestionFamily');
+    expect(visualFamily).toContain('branches');
+    expect(visualFamily).toContain('verifiedBranchBodyByRun');
+    expect(visualFamily).toContain('currentModel');
+    expect(visualFamily).toContain('branchPromotionReady');
     expect(source).not.toContain('A private strand is ready');
   });
 
@@ -44,8 +50,9 @@ describe('App ghost reactivity wiring', () => {
     expect(source).not.toContain('Review suggestions');
     expect(source).not.toContain('Insert suggestion');
     expect(source).not.toContain('strand-evidence');
-    expect(source).toContain('class="window-chrome"');
-    expect(source).toContain('Autosave is always on');
+    expect(source).toContain('class="canvas-controls"');
+    expect(source).not.toContain('Autosave is always on');
+    expect(source).toContain('aria-label={autosaveLabel}');
     expect(source).toContain('New document (⌘N)');
   });
 

@@ -13,6 +13,7 @@ import {
   visualGhostInsertionIsVisible,
   visualGhostTextIsFaithfulAtSelection,
   visualGhostTextMayBePlainProse,
+  visualGhostTextSafePrefix,
   type GhostTextPresentation
 } from './ghostText';
 
@@ -264,6 +265,13 @@ describe('faithful visual ghost projection', () => {
       anchor - 1,
       ' softly'
     )).toBe(false);
+  });
+
+  it('surfaces the useful prose prefix when a completion later wanders into markup', () => {
+    expect(visualGhostTextSafePrefix(' The door opened.\n# Notes')).toBe(' The door opened.');
+    expect(visualGhostTextSafePrefix(' She waited **boldly**')).toBe(' She waited');
+    expect(visualGhostTextSafePrefix(' **boldly**')).toBeNull();
+    expect(visualGhostTextSafePrefix(' ordinary prose')).toBe(' ordinary prose');
   });
 
   it('rejects candidate edges that join a human grapheme', () => {
