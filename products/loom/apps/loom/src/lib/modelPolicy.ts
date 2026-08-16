@@ -10,6 +10,13 @@ export interface LocalWriterCandidate {
   policyRank: number;
 }
 
+export interface StartupWriterCandidate {
+  modelPath: string;
+  profileId: string | null;
+  policyRank: number;
+  remembered: boolean;
+}
+
 export type AutomaticWriterSummary = ModelCapabilitySummary & {
   local: true;
   loaded: true;
@@ -28,6 +35,8 @@ export type SuggestionWriterSummary = ModelCapabilitySummary & {
 };
 
 const GEMMA_4_BASE_WRITER_PROFILE = 'gemma_4_e2b_base_q8_loom_v1';
+const OFFICIAL_GEMMA_4_12B_QAT_FILE = 'gemma-4-12b-it-qat-q4_0.gguf';
+const OFFICIAL_GEMMA_4_12B_QAT_BYTES = 6_975_879_296;
 
 export function writerProfileForBuildPolicy(
   policy: BuildModelPolicySummary | null
@@ -66,6 +75,63 @@ export function orderedLocalWriterCandidates(
       compareCodePoints(left.profileId, right.profileId) ||
       compareCodePoints(left.modelPath, right.modelPath)
     );
+}
+
+/**
+ * Show every locally discovered standalone text GGUF during setup. Policy
+ * candidates remain useful evidence, but they are not the boundary of what
+ * Loom can run after native inspection.
+ */
+export function orderedLocalTextModels(
+  models: readonly ModelCapabilitySummary[],
+  rememberedPath: string | null = null
+): ModelCapabilitySummary[] {
+  const priority = (model: ModelCapabilitySummary): [number, number, string] => {
+    if (model.model_path === rememberedPath) return [0, 0, model.model_path];
+    if (
+      model.display_name.toLocaleLowerCase('en-US') === OFFICIAL_GEMMA_4_12B_QAT_FILE &&
+      model.file_bytes === OFFICIAL_GEMMA_4_12B_QAT_BYTES
+    ) return [1, 0, model.model_path];
+    if (model.policy_candidate) return [2, model.policy_candidate.rank, model.model_path];
+    return [3, 0, model.model_path];
+  };
+
+  return models
+    .filter((model) =>
+      model.local &&
+      model.header_verified &&
+      !model.loaded &&
+      !looksLikeVisionAdapter(model)
+    )
+    .sort((left, right) => {
+      const a = priority(left);
+      const b = priority(right);
+      return a[0] - b[0] || a[1] - b[1] || compareCodePoints(a[2], b[2]);
+    });
+}
+
+/** A writer the author chose explicitly remains the quiet startup default. */
+export function startupWriterCandidates(
+  models: readonly ModelCapabilitySummary[],
+  rememberedPath: string | null
+): StartupWriterCandidate[] {
+  const policyCandidates = orderedLocalWriterCandidates(models);
+  const rememberedProfile = rememberedPath
+    ? models.find((model) => model.model_path === rememberedPath)?.policy_candidate?.profile_id ?? null
+    : null;
+  return [
+    ...(rememberedPath
+      ? [{
+          modelPath: rememberedPath,
+          profileId: rememberedProfile,
+          policyRank: -1,
+          remembered: true
+        }]
+      : []),
+    ...policyCandidates
+      .filter((candidate) => candidate.modelPath !== rememberedPath)
+      .map((candidate) => ({ ...candidate, remembered: false }))
+  ];
 }
 
 /**

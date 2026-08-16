@@ -17,6 +17,9 @@ export interface GhostTextPresentation {
   text: string;
   insertsOnAccept?: boolean;
   alternatives?: readonly SuggestionAlternative[];
+  hidden?: boolean;
+  unconsumeText?: string;
+  fanVisible?: boolean;
 }
 
 export interface GhostTextPlan {
@@ -28,6 +31,9 @@ export interface GhostTextPlan {
   text: string;
   insertsOnAccept: boolean;
   alternatives: readonly SuggestionAlternative[];
+  hidden: boolean;
+  unconsumeText: string;
+  fanVisible: boolean;
 }
 
 export interface GhostTextHandlers {
@@ -37,6 +43,7 @@ export interface GhostTextHandlers {
    */
   accept: (candidateId: string, presentationKey: string) => boolean;
   insert?: (candidateId: string, presentationKey: string, text: string) => boolean;
+  unconsume?: (candidateId: string, presentationKey: string, text: string) => boolean;
   cycle?: (offset: number) => void;
   dismiss: (candidateId: string, presentationKey: string) => void;
   visible: (
@@ -55,7 +62,8 @@ export interface GhostClientRect {
 
 type GhostTextMeta =
   | { kind: 'set'; presentation: GhostTextPresentation }
-  | { kind: 'clear' };
+  | { kind: 'clear' }
+  | { kind: 'fan'; visible: boolean };
 
 export const ghostTextPluginKey = new PluginKey<GhostTextPresentation | null>('loom-ghost-text');
 export const VISUAL_TAB_INDENT = '\t';
@@ -95,7 +103,10 @@ export function planGhostText(
     anchorByteOffset: presentation.anchorByteOffset,
     text: presentation.text,
     insertsOnAccept: Boolean(presentation.insertsOnAccept),
-    alternatives: presentation.alternatives ?? []
+    alternatives: presentation.alternatives ?? [],
+    hidden: Boolean(presentation.hidden),
+    unconsumeText: presentation.unconsumeText ?? '',
+    fanVisible: Boolean(presentation.fanVisible)
   };
 }
 
@@ -412,6 +423,7 @@ function ghostWidget(plan: GhostTextPlan): HTMLElement {
 
   const widget = document.createElement('span');
   widget.className = 'loom-visual-ghost';
+  widget.classList.toggle('ghost-text-hidden', plan.hidden || plan.fanVisible);
   widget.setAttribute(GHOST_PRESENTATION_ATTRIBUTE, plan.presentationKey);
   widget.setAttribute('aria-hidden', 'true');
   widget.contentEditable = 'false';
@@ -438,13 +450,14 @@ function ghostWidget(plan: GhostTextPlan): HTMLElement {
     });
     container.append(fan);
   }
+  container.classList.toggle('fan-visible', plan.fanVisible);
   return container;
 }
 
 function setGhostFanVisible(view: EditorView, visible: boolean): void {
-  view.dom.querySelectorAll<HTMLElement>('.loom-ghost-widget').forEach((widget) => {
-    widget.classList.toggle('fan-visible', visible);
-  });
+  view.dispatch(view.state.tr
+    .setMeta(ghostTextPluginKey, { kind: 'fan', visible } satisfies GhostTextMeta)
+    .setMeta('addToHistory', false));
 }
 
 function alternativesMatch(
@@ -485,14 +498,17 @@ export function setGhostText(
     current?.anchorByteOffset === presentation?.anchorByteOffset &&
     current?.text === presentation?.text &&
     Boolean(current?.insertsOnAccept) === Boolean(presentation?.insertsOnAccept) &&
+    Boolean(current?.hidden) === Boolean(presentation?.hidden) &&
+    (current?.unconsumeText ?? '') === (presentation?.unconsumeText ?? '') &&
     alternativesMatch(current?.alternatives, presentation?.alternatives)
   ) return;
   if (!presentation) {
     clearGhostText(view);
     return;
   }
+  const next = { ...presentation, fanVisible: Boolean(current?.fanVisible) };
   view.dispatch(view.state.tr
-    .setMeta(ghostTextPluginKey, { kind: 'set', presentation } satisfies GhostTextMeta)
+    .setMeta(ghostTextPluginKey, { kind: 'set', presentation: next } satisfies GhostTextMeta)
     .setMeta('addToHistory', false));
 }
 
@@ -505,7 +521,9 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
         if (transaction.docChanged || transaction.selectionSet) return null;
         const meta = transactionMeta(transaction);
         if (!meta) return current;
-        return meta.kind === 'set' ? meta.presentation : null;
+        if (meta.kind === 'set') return meta.presentation;
+        if (meta.kind === 'fan') return current ? { ...current, fanVisible: meta.visible } : current;
+        return null;
       }
     },
     props: {
@@ -537,6 +555,26 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           event.preventDefault();
           handlers.cycle?.(event.key === 'ArrowDown' ? 1 : -1);
           return true;
+        }
+        if (
+          plan &&
+          plan.unconsumeText &&
+          event.altKey &&
+          !event.metaKey &&
+          !event.ctrlKey &&
+          event.key === 'ArrowLeft'
+        ) {
+          const end = view.state.selection.from;
+          const start = end - plan.unconsumeText.length;
+          if (
+            start >= 0 &&
+            view.state.doc.textBetween(start, end, '\n', '\n') === plan.unconsumeText &&
+            handlers.unconsume?.(plan.candidateId, plan.presentationKey, plan.unconsumeText)
+          ) {
+            event.preventDefault();
+            view.dispatch(view.state.tr.delete(start, end));
+            return true;
+          }
         }
         if (
           plan &&

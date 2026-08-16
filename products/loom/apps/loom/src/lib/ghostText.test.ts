@@ -47,7 +47,10 @@ describe('planGhostText', () => {
       anchorByteOffset: suggestion.anchorByteOffset,
       text: suggestion.text,
       insertsOnAccept: false,
-      alternatives: []
+      alternatives: [],
+      hidden: false,
+      unconsumeText: '',
+      fanVisible: false
     });
   });
 
@@ -90,6 +93,62 @@ describe('visual ghost widget', () => {
     expect(found[0].from).toBe(state.selection.from);
     expect(found[0].to).toBe(state.selection.from);
     expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(before);
+  });
+
+  it('keeps the Option alternatives palette open across streamed presentation updates', () => {
+    const plugin = createGhostTextPlugin({
+      accept: () => true, dismiss() {}, visible: () => true
+    });
+    let state = EditorState.create({
+      doc: defaultMarkdownParser.parse('A paragraph.'),
+      selection: TextSelection.create(defaultMarkdownParser.parse('A paragraph.'), 4),
+      plugins: [plugin]
+    });
+    const view = {
+      get state() { return state; },
+      dispatch(transaction: Parameters<EditorState['apply']>[0]) { state = state.apply(transaction); }
+    } as unknown as EditorView;
+    const withAlternatives = {
+      ...suggestion,
+      alternatives: [
+        { candidateId: 'a', presentationKey: 'a:1', text: ' first' },
+        { candidateId: 'b', presentationKey: 'b:1', text: ' second' }
+      ]
+    };
+    setGhostText(view, withAlternatives);
+    view.dispatch(state.tr.setMeta(ghostTextPluginKey, { kind: 'fan', visible: true }));
+    setGhostText(view, { ...withAlternatives, presentationKey: 'a:2', text: ' first grows' });
+    expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(true);
+  });
+
+  it('reverses the exact last accepted word before falling back to macOS navigation', () => {
+    const unconsumed: string[] = [];
+    const plugin = createGhostTextPlugin({
+      accept: () => true,
+      dismiss() {},
+      visible: () => true,
+      unconsume: (_candidateId, _presentationKey, text) => {
+        unconsumed.push(text);
+        return true;
+      }
+    });
+    const doc = defaultMarkdownParser.parse('A one waits');
+    let state = EditorState.create({ doc, selection: TextSelection.create(doc, 6), plugins: [plugin] });
+    state = state.apply(state.tr.setMeta(ghostTextPluginKey, {
+      kind: 'set',
+      presentation: { ...suggestion, anchorByteOffset: 5, text: ' two', unconsumeText: ' one' }
+    }));
+    const view = {
+      get state() { return state; },
+      dispatch(transaction: Parameters<EditorState['apply']>[0]) { state = state.apply(transaction); }
+    } as unknown as EditorView;
+    const handled = plugin.props.handleKeyDown?.call(plugin, view, {
+      key: 'ArrowLeft', altKey: true, metaKey: false, ctrlKey: false,
+      isComposing: false, keyCode: 37, preventDefault() {}
+    } as unknown as KeyboardEvent);
+    expect(handled).toBe(true);
+    expect(unconsumed).toEqual([' one']);
+    expect(state.doc.textContent).toBe('A waits');
   });
 });
 

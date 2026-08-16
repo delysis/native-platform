@@ -57,11 +57,68 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('New document (⌘N)');
   });
 
+  it('uses compact stateful controls for mode, autocomplete, and Shuttle', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    expect(source).toContain('class="titlebar-button mode-toggle"');
+    expect(source).toContain("aria-label={mode === 'visual' ? 'Switch to Markdown editor' : 'Switch to visual editor'}");
+    expect(source).toContain('class="titlebar-button suggestions-toggle"');
+    expect(source).toContain("aria-label={suggestionsEnabled ? 'Turn autocomplete off' : 'Turn autocomplete on'}");
+    expect(source).toContain('class="titlebar-button shuttle-toggle"');
+    expect(source).toContain("aria-label={shuttleEnabled ? 'Turn Shuttle off' : 'Turn Shuttle on'}");
+    expect(source).toContain('disabled={!project || suggestionsChanging}');
+    expect(source).not.toContain('disabled={!suggestionsEnabled || !currentModel}');
+    expect(source).toContain('completionAutomationEnabled(suggestionsEnabled, enabled)');
+    expect(source).toContain('inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled })');
+    expect(source).toContain("if (event.key === 'Escape' && shuttleEnabled)");
+    expect(source).not.toContain('>Write</button>');
+    expect(source).not.toContain('>Shuttle</button>');
+    const toggle = source.slice(
+      source.indexOf('async function toggleSuggestionsFromTitlebar'),
+      source.indexOf('function focusableElementsWithin')
+    );
+    expect(toggle).toContain('setSuggestionsEnabled(!suggestionsEnabled)');
+    expect(toggle).not.toContain('openModelManager');
+    expect(source).toContain('class="writer-onboarding"');
+    expect(source).toContain('Set up private writing suggestions');
+  });
+
+  it('makes an empty writing surface visibly writable in both editor modes', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const visual = readFileSync(new URL('./LoomEditor.svelte', import.meta.url), 'utf8');
+    const markdown = readFileSync(new URL('./SourceEditor.svelte', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../app.css', import.meta.url), 'utf8');
+    expect(visual).toContain("export let placeholder = 'Start writing…'");
+    expect(visual).toContain("'aria-placeholder': placeholder");
+    expect(markdown).toContain("export let placeholder = 'Start writing…'");
+    expect(markdown).toContain('{placeholder}');
+    expect(visual).toContain('class="loom-editor-placeholder"');
+    expect(css).toContain('.loom-editor-placeholder');
+    expect(css).toContain('.source-pane textarea::placeholder');
+    expect(source).toContain('autofocus={true}');
+  });
+
   it('uses the macOS overlay titlebar for one integrated toolbar', () => {
     const config = JSON.parse(readFileSync(new URL('../../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+    const capability = JSON.parse(readFileSync(new URL('../../src-tauri/capabilities/default.json', import.meta.url), 'utf8'));
     const mainWindow = config.app.windows[0];
     expect(mainWindow.titleBarStyle).toBe('Overlay');
-    expect(mainWindow.hiddenTitle).toBe(false);
+    expect(mainWindow.hiddenTitle).toBe(true);
+    expect(capability.permissions).toContain('core:window:allow-start-dragging');
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    expect(source).toContain('class="titlebar-drag-surface"');
+    expect(source).toContain('on:mousedown={startTitlebarDrag}');
+    expect(source).toContain('getCurrentWindow().startDragging()');
+    expect(source).toContain('<span class="titlebar-document-title">{nativeWindowTitle}</span>');
+  });
+
+  it('keeps the document sidebar nonmodal and persistent', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const sidebar = source.slice(source.indexOf('<aside'), source.indexOf('</aside>') + '</aside>'.length);
+    expect(source).toContain('<aside');
+    expect(source).not.toContain('class="outline-scrim"');
+    expect(sidebar).not.toContain('aria-modal="true"');
+    expect(sidebar).not.toContain('<span>Manuscript</span>');
+    expect(source).not.toContain("await setOutlineOpen(false);\n                await selectDocument");
   });
 
 });

@@ -18,9 +18,17 @@
     visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
   import { nextSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
+  import {
+    applyVisualFormat,
+    visualFormatState,
+    type VisualFormatAction,
+    type VisualFormatState
+  } from './visualFormatting';
+  import { visualMarkdownInputRules } from './visualInputRules';
 
   export let value = '';
   export let label = 'Manuscript editor';
+  export let placeholder = 'Start writing…';
   export let readonly = false;
   export let autofocus = false;
   export let ghostText = '';
@@ -29,6 +37,8 @@
   export let ghostAnchorByteOffset: number | null = null;
   export let ghostInsertsOnAccept = false;
   export let ghostAlternatives: readonly SuggestionAlternative[] = [];
+  export let ghostHidden = false;
+  export let ghostUnconsumeText = '';
   export let surfaceKey = '';
   export let onChange: (markdown: string) => void = () => {};
   export let onCompositionChange: (active: boolean) => void = () => {};
@@ -40,6 +50,7 @@
     text: string
   ) => boolean = () => false;
   export let onGhostCycle: (offset: number) => void = () => {};
+  export let onGhostUnconsume: (candidateId: string, presentationKey: string, text: string) => boolean = () => false;
   export let onGhostDismiss: (candidateId: string, presentationKey: string) => void = () => {};
   export let onGhostPresentationRejected: (
     candidateId: string,
@@ -49,11 +60,13 @@
   ) => void;
   export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
   export let onSelectionChange: (markdownByteOffset: number | null) => void = () => {};
+  export let onFormatStateChange: (state: VisualFormatState) => void = () => {};
 
   let mount: HTMLDivElement;
   let scrollViewport: HTMLElement | null = null;
   let view: EditorView | undefined;
   let lastEmitted = value;
+  let editorEmpty = value.length === 0;
   let projectionTimer: number | undefined;
   let localDocumentChanged = false;
   let composing = false;
@@ -141,12 +154,28 @@
     return view.hasFocus();
   }
 
-  export function acceptGhostWord(): boolean {
+  export function focusPreservingSelection(): boolean {
+    if (!view || readonly) return false;
+    view.focus();
+    return view.hasFocus();
+  }
+
+  export function applyFormatting(action: VisualFormatAction, href = ''): boolean {
+    if (!view || readonly || composing) return false;
+    const applied = applyVisualFormat(view.state, action, href, (transaction) => view?.dispatch(transaction));
+    if (applied) {
+      view.focus();
+      onFormatStateChange(visualFormatState(view.state));
+    }
+    return applied;
+  }
+
+  export function acceptGhostWord(requireVisible = true): boolean {
     if (!view || readonly || composing || !view.hasFocus()) return false;
     const plan = currentGhostTextPlan(view.state);
     if (
       !plan ||
-      visibleGhostWidgetPresentationKey(view) !== plan.presentationKey ||
+      (requireVisible && visibleGhostWidgetPresentationKey(view) !== plan.presentationKey) ||
       selectionBoundary(view.state) !== plan.anchorByteOffset
     ) return false;
     const word = nextSuggestionWord(plan.text);
@@ -169,6 +198,7 @@
       doc: parse(markdown),
       plugins: [
         history(),
+        visualMarkdownInputRules(),
         keymap({
           'Mod-z': undo,
           'Shift-Mod-z': redo,
@@ -185,6 +215,8 @@
           accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
           insert: (candidateId, presentationKey, text) =>
             onGhostInsert(candidateId, presentationKey, text),
+          unconsume: (candidateId, presentationKey, text) =>
+            onGhostUnconsume(candidateId, presentationKey, text),
           cycle: onGhostCycle,
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
           visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>
@@ -201,6 +233,8 @@
   function editorAttributes(): Record<string, string> {
     return {
       'aria-label': label,
+      'aria-placeholder': placeholder,
+      'data-placeholder': placeholder,
       class: 'loom-prosemirror',
       role: 'textbox',
       'aria-multiline': 'true',
@@ -210,6 +244,7 @@
 
   function reportSelection(state: EditorState): void {
     onSelectionChange(selectionBoundary(state));
+    onFormatStateChange(visualFormatState(state));
   }
 
   function scheduleSelectionReport(delay = 48): void {
@@ -229,6 +264,7 @@
         if (!view) return;
         const next = view.state.apply(transaction);
         view.updateState(next);
+        editorEmpty = next.doc.textContent.length === 0;
         if (transaction.docChanged) {
           clearBoundaryCache();
           if (selectionReportTimer !== undefined) {
@@ -293,6 +329,7 @@
     lastEmitted = value;
     const next = stateFor(value);
     view.updateState(next);
+    editorEmpty = next.doc.textContent.length === 0;
     clearBoundaryCache();
     reportSelection(next);
     scheduleGhostVisibilityReport();
@@ -341,7 +378,9 @@
       anchorByteOffset,
       text: ghostText,
       insertsOnAccept: ghostInsertsOnAccept,
-      alternatives: ghostAlternatives
+      alternatives: ghostAlternatives,
+      hidden: ghostHidden,
+      unconsumeText: ghostUnconsumeText
     } : null;
     setGhostText(view, presentation);
     scheduleGhostVisibilityReport();
@@ -361,5 +400,8 @@
 </script>
 
 <div class="loom-editor-shell">
+  {#if editorEmpty}
+    <div class="loom-editor-placeholder" aria-hidden="true">{placeholder}</div>
+  {/if}
   <div class="editor-mount" bind:this={mount}></div>
 </div>

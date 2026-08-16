@@ -5,9 +5,11 @@ import {
   isUsableSuggestionWriter,
   isVerifiedPolicyWriter,
   looksLikeVisionAdapter,
+  orderedLocalTextModels,
   orderedLocalWriterCandidates,
   preferredWriterModelPath,
   suggestionWriter,
+  startupWriterCandidates,
   writerProfileForBuildPolicy
 } from './modelPolicy';
 
@@ -67,6 +69,56 @@ describe('orderedLocalWriterCandidates', () => {
     expect(orderedLocalWriterCandidates([lowerPriority, preferred])).toEqual([
       { modelPath: '/z.gguf', profileId: 'writer-first', policyRank: 1 },
       { modelPath: '/a.gguf', profileId: 'writer-later', policyRank: 4 }
+    ]);
+  });
+});
+
+describe('orderedLocalTextModels', () => {
+  it('shows generic text GGUFs while excluding projectors and remote files', () => {
+    const generic = model({ model_path: '/models/z-writer.gguf', policy_candidate: null });
+    const policy = model({ model_path: '/models/policy.gguf' });
+    const projector = model({
+      model_path: '/models/mmproj-vision.gguf',
+      display_name: 'mmproj-vision.gguf',
+      policy_candidate: null
+    });
+    const remote = model({ model_path: '/models/remote.gguf', local: false });
+    expect(orderedLocalTextModels([generic, projector, remote, policy]).map((item) => item.model_path))
+      .toEqual(['/models/policy.gguf', '/models/z-writer.gguf']);
+  });
+
+  it('puts the remembered writer first, then the official Gemma 4 12B QAT artifact', () => {
+    const remembered = model({ model_path: '/models/remembered.gguf', policy_candidate: null });
+    const gemma = model({
+      display_name: 'gemma-4-12b-it-qat-q4_0.gguf',
+      model_path: '/models/gemma-4-12b-it-qat-q4_0.gguf',
+      file_bytes: 6_975_879_296,
+      policy_candidate: null
+    });
+    const other = model({ model_path: '/models/a.gguf', policy_candidate: null });
+    expect(orderedLocalTextModels([other, gemma, remembered], remembered.model_path)
+      .map((item) => item.model_path)).toEqual([
+        remembered.model_path,
+        gemma.model_path,
+        other.model_path
+      ]);
+  });
+});
+
+describe('startupWriterCandidates', () => {
+  it('quietly reopens an explicitly selected generic text model before policy discovery', () => {
+    const remembered = model({ model_path: '/models/remembered.gguf', policy_candidate: null });
+    const policy = model({ model_path: '/models/policy.gguf' });
+    expect(startupWriterCandidates([policy, remembered], remembered.model_path)).toEqual([
+      { modelPath: remembered.model_path, profileId: null, policyRank: -1, remembered: true },
+      { modelPath: policy.model_path, profileId: 'writer-v1', policyRank: 0, remembered: false }
+    ]);
+  });
+
+  it('does not duplicate a remembered policy candidate', () => {
+    const remembered = model({ model_path: '/models/remembered.gguf' });
+    expect(startupWriterCandidates([remembered], remembered.model_path)).toEqual([
+      { modelPath: remembered.model_path, profileId: 'writer-v1', policyRank: -1, remembered: true }
     ]);
   });
 });

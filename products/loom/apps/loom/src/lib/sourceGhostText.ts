@@ -329,10 +329,13 @@ export function sourceMirrorGeometry(
 
 export function sourceGhostKeyAction(
   event: SourceGhostKey,
-  hasVisibleGhost: boolean
+  hasVisibleGhost: boolean,
+  optionFanVisible = false
 ): SourceGhostKeyAction {
   if (event.isComposing || event.keyCode === 229 || event.metaKey || event.ctrlKey) return null;
   if (event.altKey) {
+    if (optionFanVisible && event.key === 'ArrowDown') return 'cycle_next';
+    if (optionFanVisible && event.key === 'ArrowUp') return 'cycle_previous';
     if (!hasVisibleGhost) return null;
     if (event.key === 'ArrowRight') return 'accept_word';
     if (event.key === 'ArrowDown') return 'cycle_next';

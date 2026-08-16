@@ -25,11 +25,14 @@
   export let verseNewline: VerseNewlineKind | null = null;
   export let surfaceKey = '';
   export let label = 'Markdown source editor';
+  export let placeholder = 'Start writing…';
   export let ghostText = '';
   export let ghostCandidateId = '';
   export let ghostPresentationKey = '';
   export let ghostInsertsOnAccept = false;
   export let ghostAlternatives: readonly SuggestionAlternative[] = [];
+  export let ghostHidden = false;
+  export let ghostUnconsumeText = '';
   export let onValueInput: (textarea: HTMLTextAreaElement) => void = () => {};
   export let onSelectionChange: (textarea: HTMLTextAreaElement) => void = () => {};
   export let onCompositionStart: () => void = () => {};
@@ -41,6 +44,7 @@
     text: string
   ) => boolean = () => false;
   export let onGhostCycle: (offset: number) => void = () => {};
+  export let onGhostUnconsume: (candidateId: string, presentationKey: string, text: string) => boolean = () => false;
   export let onGhostDismiss: (candidateId: string, presentationKey: string) => void = () => {};
   export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
 
@@ -330,6 +334,27 @@
       optionFanVisible = true;
       return;
     }
+    if (
+      candidate &&
+      ghostUnconsumeText &&
+      event.altKey &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      event.key === 'ArrowLeft' &&
+      element &&
+      element.selectionStart === element.selectionEnd &&
+      element.value.slice(0, element.selectionStart).endsWith(ghostUnconsumeText) &&
+      onGhostUnconsume(candidate.candidateId, candidate.presentationKey, ghostUnconsumeText)
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      const end = element.selectionStart;
+      element.setRangeText('', end - ghostUnconsumeText.length, end, 'end');
+      suppressCurrentGhost();
+      readSelection(false, false);
+      onValueInput(element);
+      return;
+    }
     const livePresentationKey = renderedGhostPresentationKey(candidate);
     const visible = candidate &&
       renderedSourceGhostPresentationKey(candidate, viewport ? Boolean(viewport.hidden) : true) ===
@@ -340,9 +365,9 @@
       )
       ? candidate
       : null;
-    const action = sourceGhostKeyAction(event, Boolean(visible));
+    const action = sourceGhostKeyAction(event, Boolean(visible), optionFanVisible && Boolean(candidate));
     if (!action) return;
-    if ((action === 'cycle_next' || action === 'cycle_previous') && visible) {
+    if ((action === 'cycle_next' || action === 'cycle_previous') && candidate) {
       event.preventDefault();
       event.stopPropagation();
       onGhostCycle(action === 'cycle_next' ? 1 : -1);
@@ -434,12 +459,12 @@
     return focused;
   }
 
-  export function acceptGhostWord(): boolean {
+  export function acceptGhostWord(requireVisible = true): boolean {
     const candidate = currentPlan();
     if (
       !focused ||
       !candidate ||
-      renderedGhostPresentationKey(candidate) !== candidate.presentationKey
+      (requireVisible && renderedGhostPresentationKey(candidate) !== candidate.presentationKey)
     ) return false;
     const word = nextSuggestionWord(candidate.text);
     if (!word) return false;
@@ -520,7 +545,7 @@
   <div class="source-ghost-viewport" aria-hidden="true" hidden={!plan} bind:this={viewport}>
     <div class="source-ghost-mirror" bind:this={mirror}>
       {#if plan}
-        <span>{plan.prefix}</span><span class="loom-source-ghost-text" bind:this={ghostSpan}>{plan.text}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
+        <span>{plan.prefix}</span><span class:ghost-text-hidden={ghostHidden || optionFanVisible} class="loom-source-ghost-text" bind:this={ghostSpan}>{plan.text}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
       {/if}
     </div>
   </div>
@@ -541,6 +566,8 @@
     on:compositionstart={handleCompositionStart}
     on:compositionend={handleCompositionEnd}
     aria-label={label}
+    aria-placeholder={placeholder}
+    {placeholder}
     spellcheck="true"
     wrap={verse ? 'off' : 'soft'}
   ></textarea>
