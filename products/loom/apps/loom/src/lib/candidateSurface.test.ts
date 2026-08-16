@@ -13,6 +13,17 @@ describe('candidateSurfaceDecision', () => {
       surface: false,
       reason: 'numeric'
     });
+    for (const text of [
+      '103214758975897510321475103214475103244751032275',
+      '100%01587316716161616116161166666611666161616616',
+      '100%015434343434444444415433333333.100%015444443',
+      ' the cold1234434343434343434343434343434343434343434343'
+    ]) {
+      expect(candidateSurfaceDecision(text)).toEqual({
+        surface: false,
+        reason: 'numeric'
+      });
+    }
     expect(candidateSurfaceDecision(`She put ${'her '.repeat(24)}`)).toEqual({
       surface: false,
       reason: 'repetition'
@@ -27,6 +38,7 @@ describe('candidateSurfaceDecision', () => {
       });
     }
     expect(candidateTextIsSurfaceable('wait')).toBe(true);
+    expect(candidateTextIsSurfaceable(' In 1984, she found the door.')).toBe(true);
     expect(candidateTextIsSurfaceable('…')).toBe(true);
     expect(candidateTextIsSurfaceable('雨')).toBe(true);
   });

@@ -81,7 +81,14 @@ export interface SourceGhostKey {
   altKey: boolean;
 }
 
-export type SourceGhostKeyAction = 'accept' | 'dismiss' | 'insert_tab' | null;
+export type SourceGhostKeyAction =
+  | 'accept'
+  | 'accept_word'
+  | 'cycle_next'
+  | 'cycle_previous'
+  | 'dismiss'
+  | 'insert_tab'
+  | null;
 
 export interface SourceTabEdit {
   value: string;
@@ -322,15 +329,20 @@ export function sourceMirrorGeometry(
 
 export function sourceGhostKeyAction(
   event: SourceGhostKey,
-  hasVisibleGhost: boolean
+  hasVisibleGhost: boolean,
+  optionFanVisible = false
 ): SourceGhostKeyAction {
-  if (
-    event.isComposing ||
-    event.keyCode === 229 ||
-    event.metaKey ||
-    event.ctrlKey ||
-    event.altKey
-  ) return null;
+  if (event.isComposing || event.keyCode === 229 || event.metaKey || event.ctrlKey) return null;
+  if (event.altKey) {
+    if (optionFanVisible && event.key === 'ArrowDown') return 'cycle_next';
+    if (optionFanVisible && event.key === 'ArrowUp') return 'cycle_previous';
+    if (optionFanVisible && event.key === 'ArrowRight') return 'accept_word';
+    if (!hasVisibleGhost) return null;
+    if (event.key === 'ArrowRight') return 'accept_word';
+    if (event.key === 'ArrowDown') return 'cycle_next';
+    if (event.key === 'ArrowUp') return 'cycle_previous';
+    return null;
+  }
   if (event.key === 'Escape') return hasVisibleGhost ? 'dismiss' : null;
   if (event.key === 'Tab' && !event.shiftKey) {
     return hasVisibleGhost ? 'accept' : 'insert_tab';

@@ -304,6 +304,16 @@ jobs:
         if: ${{ matrix.component != 'release' }}
         with:
           shared-key: platform-macos-${{ matrix.component }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        if: ${{ matrix.component == 'loom' }}
+        with:
+          node-version: "22"
+      - if: ${{ matrix.component == 'loom' }}
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.16.0 --activate
+          pnpm install --frozen-lockfile
+          pnpm --filter @delysis/loom exec playwright install webkit
       - name: Release tooling shell syntax
         if: ${{ matrix.component == 'release' }}
         run: sh -n scripts/release-macos.sh scripts/smoke-macos-app.sh
@@ -325,7 +335,9 @@ jobs:
         run: node scripts/ci/cargo-group.mjs test service-speech
       - name: Loom macOS
         if: ${{ matrix.component == 'loom' }}
-        run: node scripts/ci/cargo-group.mjs test product-loom
+        run: |
+          node scripts/ci/cargo-group.mjs test product-loom
+          pnpm --filter @delysis/loom run test:browser
 
   dependency-graph:
     if: ${{ needs.plan.outputs.dependency_graph == 'true' || needs.plan.outputs.full == 'true' }}

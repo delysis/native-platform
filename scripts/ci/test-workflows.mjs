@@ -139,6 +139,25 @@ test("local macOS smoke can verify the exact emitted archive", () => {
   assert.match(smoke, /input_release_receipt_sha256:/);
 });
 
+test("Loom UI smoke cannot attach to an active editor or invent a model identity", () => {
+  const smoke = read(smokeScriptPath);
+  assert.match(smoke, /running_exact_pids=\$\(exact_bundle_pid\)/);
+  assert.match(smoke, /refusing to run macOS UI smoke while the exact application bundle is already running/);
+  assert.match(smoke, /gemma-4-12B-it-qat-q4_0\.gguf/);
+  assert.ok(
+    smoke.indexOf('LOOM_SMOKE_MODEL_LINK="$model_library/gemma-4-12B-it-qat-q4_0.gguf"') <
+      smoke.indexOf("run_once 1"),
+    "the exact Gemma link must exist before Loom startup discovery",
+  );
+  assert.doesNotMatch(smoke, /acceptance-writer/);
+});
+
+test("Loom's required macOS lane runs the headless WebKit editor interactions", () => {
+  const workflow = read(".github/workflows/ci-pr.yml");
+  assert.match(workflow, /pnpm --filter @delysis\/loom exec playwright install webkit/);
+  assert.match(workflow, /pnpm --filter @delysis\/loom run test:browser/);
+});
+
 test("stable macOS packaging adds only the real distribution gates", () => {
   const release = read(releaseScriptPath);
   assert.match(release, /candidate\|stable/);
