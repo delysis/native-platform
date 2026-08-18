@@ -17,6 +17,7 @@
     createGhostTextPlugin,
     currentGhostTextPlan,
     exactMarkdownByteOffsetAtSelection,
+    setGhostFanVisible,
     setGhostText,
     visibleGhostWidgetPresentationKey,
     visualGhostTextIsFaithfulAtSelection
@@ -75,6 +76,7 @@
   let projectionTimer: number | undefined;
   let normalizationTimer: number | undefined;
   let localDocumentChanged = false;
+  let completionMutationAuthorized = false;
   let composing = false;
   let suppressedGhostKey = '';
   let reportedGhostPresentationKey = '';
@@ -222,9 +224,29 @@
       selectionBoundary(view.state) !== plan.anchorByteOffset
     ) return false;
     const word = nextVisualSuggestionWord(plan.text);
-    if (!word || !onGhostInsert(plan.candidateId, plan.presentationKey, word)) return false;
+    if (!word || !authorizeCompletionInsertion(plan.candidateId, plan.presentationKey, word)) return false;
     view.dispatch(view.state.tr.insertText(word));
     return true;
+  }
+
+  function authorizeCompletionInsertion(
+    candidateId: string,
+    presentationKey: string,
+    text: string
+  ): boolean {
+    const authorized = onGhostInsert(candidateId, presentationKey, text);
+    if (authorized) completionMutationAuthorized = true;
+    return authorized;
+  }
+
+  function authorizeCompletionReversal(
+    candidateId: string,
+    presentationKey: string,
+    text: string
+  ): boolean {
+    const authorized = onGhostUnconsume(candidateId, presentationKey, text);
+    if (authorized) completionMutationAuthorized = true;
+    return authorized;
   }
 
   function parse(markdown: string): ProseMirrorNode {
@@ -256,10 +278,8 @@
         keymap(baseKeymap),
         createGhostTextPlugin({
           accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
-          insert: (candidateId, presentationKey, text) =>
-            onGhostInsert(candidateId, presentationKey, text),
-          unconsume: (candidateId, presentationKey, text) =>
-            onGhostUnconsume(candidateId, presentationKey, text),
+          insert: authorizeCompletionInsertion,
+          unconsume: authorizeCompletionReversal,
           cycle: onGhostCycle,
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
           visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>
@@ -299,12 +319,19 @@
   }
 
   function setOptionHeld(held: boolean): void {
-    if (optionHeld === held) return;
+    const changed = optionHeld !== held;
     optionHeld = held;
-    if (!view) return;
+    if (!view || !changed) return;
+    if (!held) {
+      // Clear the raw plugin flag even if a completion-owned document update
+      // temporarily makes the derived plan ineligible. Its decoration can
+      // otherwise survive with a latched hidden/fan state until another edit.
+      setGhostFanVisible(view, false);
+      return;
+    }
     const plan = currentGhostTextPlan(view.state);
-    if (!plan || plan.alternatives.length < 2) return;
-    setGhostText(view, { ...plan, active: true, fanVisible: held });
+    if (!plan) return;
+    if (plan.alternatives.length > 1) setGhostFanVisible(view, true);
   }
 
   function handleWindowKeyDown(event: KeyboardEvent): void {
@@ -314,7 +341,9 @@
   }
 
   function handleWindowKeyUp(event: KeyboardEvent): void {
-    if (event.key === 'Alt' || !event.altKey) setOptionHeld(false);
+    if (event.key === 'Alt' || !event.altKey) {
+      setOptionHeld(false);
+    }
   }
 
   function handleWindowBlur(): void {
@@ -330,6 +359,8 @@
       attributes: editorAttributes(),
       dispatchTransaction(transaction) {
         if (!view) return;
+        const completionMutation = transaction.docChanged && completionMutationAuthorized;
+        if (transaction.docChanged) completionMutationAuthorized = false;
         const next = view.state.apply(transaction);
         view.updateState(next);
         editorEmpty = next.doc.textContent.length === 0;
@@ -355,7 +386,15 @@
           suppressedGhostKey = ghostPresentationKey;
           onImmediateDocumentMutation();
           localDocumentChanged = true;
-          if (!composing) scheduleProjection();
+          if (!composing) {
+            // Word stepping is already authorized against the exact visible
+            // completion session. Project it into the parent immediately so
+            // the next Option-Left/Right event observes the updated anchor and
+            // cached remainder instead of falling into the ordinary 240 ms
+            // typing debounce.
+            if (completionMutation) projectDocument();
+            else scheduleProjection();
+          }
         }
       },
       handleDOMEvents: {
@@ -457,7 +496,10 @@
       alternatives: ghostAlternatives,
       hidden: ghostHidden,
       unconsumeText: ghostUnconsumeText,
-      fanVisible: optionHeld
+      // Once a word is consumed the session is locked to one candidate. Do
+      // not hide its cached remainder behind a now-empty alternatives fan
+      // while Option is still held.
+      fanVisible: optionHeld && ghostAlternatives.length > 1
     } : null;
     setGhostText(view, presentation);
     scheduleGhostVisibilityReport();

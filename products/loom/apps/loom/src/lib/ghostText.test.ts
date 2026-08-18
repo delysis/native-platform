@@ -8,6 +8,7 @@ import {
   ghostTextPluginKey,
   planGhostText,
   renderedGhostPresentationKey,
+  setGhostFanVisible,
   setGhostText,
   VISUAL_TAB_INDENT,
   visualGhostInsertionIsVisible,
@@ -119,18 +120,20 @@ describe('visual ghost widget', () => {
     view.dispatch(state.tr.setMeta(ghostTextPluginKey, { kind: 'fan', visible: true }));
     setGhostText(view, { ...withAlternatives, presentationKey: 'a:2', text: ' first grows' });
     expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(true);
+    setGhostFanVisible(view, false);
     setGhostText(view, {
       ...withAlternatives,
       presentationKey: 'a:3',
       text: ' first grows again',
-      fanVisible: false
+      fanVisible: true
     });
     expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(false);
+    setGhostFanVisible(view, true);
     setGhostText(view, {
       ...withAlternatives,
       presentationKey: 'a:4',
       text: ' first grows once more',
-      fanVisible: true
+      fanVisible: false
     });
     expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(true);
   });

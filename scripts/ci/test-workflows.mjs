@@ -150,6 +150,11 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
     "the exact Gemma link must exist before Loom startup discovery",
   );
   assert.doesNotMatch(smoke, /acceptance-writer/);
+  assert.match(smoke, /exercise_loom_completion_word_reversal/);
+  assert.match(smoke, /Option-Right did not persist one cached completion word/);
+  assert.match(smoke, /Option-Left did not restore the exact pre-acceptance manuscript bytes/);
+  assert.match(smoke, /generation-run count across Option-Right\/Left/);
+  assert.match(smoke, /option_word_reversal: completionWordReversal/);
 });
 
 test("Loom's required macOS lane runs the headless WebKit editor interactions", () => {

@@ -782,6 +782,152 @@ NODE
   return 1
 }
 
+exercise_loom_completion_word_reversal() {
+  target_pid=$1
+  manuscript=$2
+  prefix=$3
+  xcrun swift - "$target_pid" "$manuscript" "$prefix" <<'SWIFT'
+import AppKit
+import ApplicationServices
+import CryptoKit
+import Foundation
+
+let pid = Int32(CommandLine.arguments[1])!
+let manuscript = CommandLine.arguments[2]
+let prefix = CommandLine.arguments[3]
+let application = AXUIElementCreateApplication(pid)
+
+func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
+    return value
+}
+
+func stringAttribute(_ element: AXUIElement, _ name: CFString) -> String {
+    attribute(element, name) as? String ?? ""
+}
+
+func descendants() -> [AXUIElement] {
+    var queue = [application]
+    var cursor = 0
+    while cursor < queue.count && cursor < 4096 {
+        let element = queue[cursor]
+        cursor += 1
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    return queue
+}
+
+func editor() -> AXUIElement? {
+    descendants().first { element in
+        stringAttribute(element, kAXRoleAttribute as CFString) == kAXTextAreaRole as String
+    }
+}
+
+@discardableResult
+func postKey(_ key: CGKeyCode, down: Bool, flags: CGEventFlags) -> Bool {
+    guard let event = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: down) else {
+        return false
+    }
+    event.flags = flags
+    event.post(tap: .cghidEventTap)
+    return true
+}
+
+func readManuscript() -> Data? {
+    try? Data(contentsOf: URL(fileURLWithPath: manuscript), options: [.uncached])
+}
+
+func sha256(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+func waitForChangedManuscript(from original: Data, timeout: TimeInterval) -> Data? {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if let current = readManuscript(), current != original,
+           let text = String(data: current, encoding: .utf8), text.hasPrefix(prefix) {
+            let suffix = text.dropFirst(prefix.count)
+            if suffix.rangeOfCharacter(from: .whitespacesAndNewlines.inverted) != nil {
+                return current
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    } while Date() < deadline
+    return nil
+}
+
+func waitForExactManuscript(_ expected: Data, timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if readManuscript() == expected { return true }
+        Thread.sleep(forTimeInterval: 0.05)
+    } while Date() < deadline
+    return false
+}
+
+NSRunningApplication(processIdentifier: pid)?.activate(options: [])
+guard let writingSurface = editor(),
+      AXUIElementSetAttributeValue(
+        writingSurface,
+        kAXFocusedAttribute as CFString,
+        kCFBooleanTrue
+      ) == .success else {
+    fputs("could not focus Loom's exact writing surface for completion reversal\n", stderr)
+    exit(1)
+}
+guard let original = readManuscript() else {
+    fputs("could not read Loom's isolated manuscript before completion reversal\n", stderr)
+    exit(1)
+}
+Thread.sleep(forTimeInterval: 0.1)
+
+// Keep the physical Option state down across both arrows. The test observes
+// persisted manuscript bytes after each event instead of trusting dispatch.
+guard postKey(58, down: true, flags: [.maskAlternate]) else {
+    fputs("could not construct Loom's Option modifier event\n", stderr)
+    exit(1)
+}
+defer { postKey(58, down: false, flags: []) }
+
+func releaseOptionAndFail(_ message: String) -> Never {
+    postKey(58, down: false, flags: [])
+    fputs("\(message)\n", stderr)
+    exit(1)
+}
+
+guard postKey(124, down: true, flags: [.maskAlternate]),
+      postKey(124, down: false, flags: [.maskAlternate]) else {
+    releaseOptionAndFail("could not construct Loom's Option-Right events")
+}
+guard let accepted = waitForChangedManuscript(from: original, timeout: 30) else {
+    releaseOptionAndFail("Option-Right did not persist one cached completion word")
+}
+
+guard postKey(123, down: true, flags: [.maskAlternate]),
+      postKey(123, down: false, flags: [.maskAlternate]) else {
+    releaseOptionAndFail("could not construct Loom's Option-Left events")
+}
+guard waitForExactManuscript(original, timeout: 30) else {
+    releaseOptionAndFail("Option-Left did not restore the exact pre-acceptance manuscript bytes")
+}
+
+let evidence: [String: Any] = [
+    "dispatch": "Option held across native Right and Left arrow events",
+    "original_bytes": original.count,
+    "accepted_bytes": accepted.count,
+    "original_sha256": sha256(original),
+    "accepted_sha256": sha256(accepted),
+    "rollback_sha256": sha256(readManuscript()!),
+    "accepted_then_exactly_reversed": true
+]
+let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+print(String(data: data, encoding: .utf8)!)
+SWIFT
+}
+
 create_loom_document_and_require_editor() {
   target_pid=$1
   xcrun swift - "$target_pid" <<'SWIFT'
@@ -1101,6 +1247,20 @@ run_once() {
         echo "application logs: $stdout_log and $stderr_log" >&2
         return 1
       fi
+      loom_generation_count_before_reversal=$(sqlite3 \
+        "$PRODUCT_STATE/writing/.loom/loom.sqlite3" \
+        'SELECT count(*) FROM generation_runs;')
+      if ! RUN_1_REAL_WORD_REVERSAL_EVIDENCE=$(exercise_loom_completion_word_reversal \
+        "$ACTIVE_PID" "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL"); then
+        echo "Option-Right/Left did not consume and exactly reverse one cached word" >&2
+        echo "application logs: $stdout_log and $stderr_log" >&2
+        return 1
+      fi
+      loom_generation_count_after_reversal=$(sqlite3 \
+        "$PRODUCT_STATE/writing/.loom/loom.sqlite3" \
+        'SELECT count(*) FROM generation_runs;')
+      require_equal "generation-run count across Option-Right/Left" \
+        "$loom_generation_count_before_reversal" "$loom_generation_count_after_reversal"
       if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"; then
         echo "could not restore autocomplete off after the real-model presentation check" >&2
         return 1
@@ -1256,6 +1416,7 @@ DELYSIS_SMOKE_RUN_1_EDITOR_SENTINEL="${RUN_1_EDITOR_SENTINEL:-}" \
 DELYSIS_SMOKE_RUN_1_FORMATTED_SENTINEL="${RUN_1_FORMATTED_SENTINEL:-}" \
 DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE="${RUN_1_FORMATTING_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE="${RUN_1_REAL_GHOST_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE="${RUN_1_REAL_WORD_REVERSAL_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT="${RUN_1_REAL_SHUTTLE_TEXT:-}" \
 DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER_EDITOR_INPUT="${RUN_1_MANUSCRIPT_SHA256_AFTER_EDITOR_INPUT:-}" \
 DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE="${RUN_1_NEW_DOCUMENT_EVIDENCE:-}" \
@@ -1276,6 +1437,9 @@ const newDocument = e.DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE
   : null;
 const formatting = e.DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE)
+  : null;
+const completionWordReversal = e.DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE
+  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE)
   : null;
 const receipt = {
   schema: "delysis.macos-packaged-app-smoke.v1",
@@ -1309,6 +1473,7 @@ const receipt = {
       } : null,
       real_model_completion: e.DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE ? {
         ghost_presentation: e.DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE,
+        option_word_reversal: completionWordReversal,
         shuttle_persisted_manuscript: e.DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT || null,
       } : null,
       new_document: newDocument ? {

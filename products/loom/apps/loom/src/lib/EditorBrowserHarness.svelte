@@ -145,28 +145,30 @@
 
 <main>
   <VisualFormatMenu {editor} {formatting} />
-  <LoomEditor
-    bind:this={editor}
-    value={markdown}
-    autofocus={true}
-    ghostText={presentation?.text ?? ''}
-    ghostCandidateId={presentation?.candidateId ?? ''}
-    ghostPresentationKey={presentation?.presentationKey ?? ''}
-    ghostAnchorByteOffset={presentation?.targetByte ?? null}
-    ghostInsertsOnAccept={true}
-    ghostAlternatives={alternatives}
-    ghostHidden={!autocomplete}
-    ghostUnconsumeText={unconsumeText}
-    surfaceKey="browser:surface"
-    onChange={change}
-    onImmediateDocumentMutation={immediateMutation}
-    onCaretNavigation={caretNavigation}
-    onGhostInsert={insert}
-    onGhostUnconsume={unconsume}
-    onGhostCycle={cycle}
-    onGhostPresentationRejected={() => {}}
-    onFormatStateChange={(state) => formatting = state}
-  />
+  <section class="editor-pane">
+    <LoomEditor
+      bind:this={editor}
+      value={markdown}
+      autofocus={true}
+      ghostText={presentation?.text ?? ''}
+      ghostCandidateId={presentation?.candidateId ?? ''}
+      ghostPresentationKey={presentation?.presentationKey ?? ''}
+      ghostAnchorByteOffset={presentation?.targetByte ?? null}
+      ghostInsertsOnAccept={true}
+      ghostAlternatives={alternatives}
+      ghostHidden={!autocomplete}
+      ghostUnconsumeText={unconsumeText}
+      surfaceKey="browser:surface"
+      onChange={change}
+      onImmediateDocumentMutation={immediateMutation}
+      onCaretNavigation={caretNavigation}
+      onGhostInsert={insert}
+      onGhostUnconsume={unconsume}
+      onGhostCycle={cycle}
+      onGhostPresentationRejected={() => {}}
+      onFormatStateChange={(state) => formatting = state}
+    />
+  </section>
   <output aria-label="Serialized Markdown">{markdown}</output>
   <output aria-label="Generation Requests">{generationRequests}</output>
   <output aria-label="Completion Presentation">{presentation ? `${presentation.targetByte}:${presentation.presentationKey}:${presentation.text}` : 'none'}</output>

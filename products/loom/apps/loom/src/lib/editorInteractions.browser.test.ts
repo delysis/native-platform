@@ -103,6 +103,24 @@ describe('real WebKit editor interactions', () => {
     expect(paragraph?.firstChild?.textContent).toBe('hello');
   });
 
+  it('reverses an accepted visual word on the immediately following key event', async () => {
+    const keyboard = userEvent.setup();
+    render('hello', [
+      { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
+      { candidateId: 'b', presentationKey: 'b:1', text: ' there friend', runId: 'run-b', targetByte: 5, insertsOnAccept: true }
+    ]);
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
+
+    await keyboard.keyboard('{Alt>}{ArrowRight}{ArrowLeft}{/Alt}');
+
+    await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
+      .toHaveTextContent('hello');
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
+      .toHaveTextContent('0');
+    await keyboard.cleanup();
+  });
+
   it('keeps all four alternatives visible while Option cycles the active candidate', async () => {
     const keyboard = userEvent.setup();
     render('hello', [
@@ -125,13 +143,15 @@ describe('real WebKit editor interactions', () => {
   });
 
   it('keeps the cached session across an autosave identity change and requests only after exhaustion', async () => {
+    const keyboard = userEvent.setup();
     render('hello', [
       { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true }
     ]);
     const context = page.getByRole('status', { name: 'Completion Context' });
     await expect.element(context).toHaveTextContent('browser-session:browser-document:1:visual');
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
 
-    await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
+    await keyboard.keyboard('{Alt>}{ArrowRight}{/Alt}');
     await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
       .toHaveTextContent('hello world');
     await page.getByRole('button', { name: 'Simulate checkpoint' }).click();
@@ -142,11 +162,12 @@ describe('real WebKit editor interactions', () => {
     await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
       .toHaveTextContent('0');
 
-    await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
+    await keyboard.keyboard('{Alt>}{ArrowRight}{/Alt}');
     await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
       .toHaveTextContent('hello world again');
     await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
       .toHaveTextContent('1');
+    await keyboard.cleanup();
   });
 
   it('advances Shuttle through the shared session while ordinary ghost text is off', async () => {

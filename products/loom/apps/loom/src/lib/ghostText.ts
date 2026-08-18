@@ -458,7 +458,7 @@ function ghostWidget(plan: GhostTextPlan): HTMLElement {
   return container;
 }
 
-function setGhostFanVisible(view: EditorView, visible: boolean): void {
+export function setGhostFanVisible(view: EditorView, visible: boolean): void {
   view.dispatch(view.state.tr
     .setMeta(ghostTextPluginKey, { kind: 'fan', visible } satisfies GhostTextMeta)
     .setMeta('addToHistory', false));
@@ -513,9 +513,12 @@ export function setGhostText(
   }
   const next = {
     ...presentation,
-    fanVisible: presentation.fanVisible === undefined
-      ? Boolean(current?.fanVisible)
-      : presentation.fanVisible
+    // Candidate text and modifier interaction are independent state axes.
+    // Once a plugin plan exists, a streamed/cached candidate rerender must not
+    // overwrite the fan state established by the actual Option key events.
+    fanVisible: current
+      ? Boolean(current.fanVisible)
+      : Boolean(presentation.fanVisible)
   };
   view.dispatch(view.state.tr
     .setMeta(ghostTextPluginKey, { kind: 'set', presentation: next } satisfies GhostTextMeta)
@@ -551,7 +554,7 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
         const plan = planGhostText(view.state, ghostTextPluginKey.getState(view.state) ?? null);
         if (event.isComposing || event.keyCode === 229) return false;
         if (event.key === 'Alt' && !event.metaKey && !event.ctrlKey) {
-          setGhostFanVisible(view, true);
+          if (plan && plan.alternatives.length > 1) setGhostFanVisible(view, true);
           return false;
         }
         if (
