@@ -176,8 +176,8 @@ if [ "$COMPONENT" = loom ] && [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
   fi
   ln "$LOOM_SMOKE_GGUF_MODEL_PATH" "$LOOM_SMOKE_MODEL_LINK"
   require_equal "acceptance model hard-link identity" \
-    "$(stat -f '%d:%i' "$LOOM_SMOKE_GGUF_MODEL_PATH")" \
-    "$(stat -f '%d:%i' "$LOOM_SMOKE_MODEL_LINK")"
+    "$(stat -Lf '%d:%i' "$LOOM_SMOKE_GGUF_MODEL_PATH")" \
+    "$(stat -Lf '%d:%i' "$LOOM_SMOKE_MODEL_LINK")"
 fi
 
 wait_for_window() {
@@ -383,13 +383,12 @@ func findEditor(_ root: AXUIElement) -> AXUIElement? {
 }
 
 NSRunningApplication(processIdentifier: pid)?.activate(options: [])
-let deadline = Date().addingTimeInterval(10)
 var editor: AXUIElement?
-repeat {
+for _ in 0..<600 {
     editor = findEditor(application)
     if editor != nil { break }
     Thread.sleep(forTimeInterval: 0.1)
-} while Date() < deadline
+}
 
 guard let editor else {
     fputs("could not find Loom's accessible manuscript text area\n", stderr)
@@ -410,24 +409,82 @@ guard !visibleEditorFrame.isNull,
     exit(1)
 }
 
-guard AXUIElementSetAttributeValue(editor, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success else {
-    fputs("could not focus Loom's accessible manuscript text area\n", stderr)
-    exit(1)
-}
-Thread.sleep(forTimeInterval: 0.2)
-
-var utf16 = Array(sentinel.utf16)
-guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-      let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+guard let selectAllDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+      let selectAllUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
     fputs("could not construct manuscript keyboard events\n", stderr)
     exit(1)
 }
-down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-down.post(tap: .cghidEventTap)
-up.post(tap: .cghidEventTap)
+selectAllDown.flags = [.maskCommand]
+selectAllUp.flags = [.maskCommand]
+
+func typeString(_ value: String) -> Bool {
+    for character in value {
+        var utf16 = Array(String(character).utf16)
+        guard let characterDown = CGEvent(
+                keyboardEventSource: nil,
+                virtualKey: 0,
+                keyDown: true
+              ),
+              let characterUp = CGEvent(
+                keyboardEventSource: nil,
+                virtualKey: 0,
+                keyDown: false
+              ) else {
+            return false
+        }
+        characterDown.keyboardSetUnicodeString(
+            stringLength: utf16.count,
+            unicodeString: &utf16
+        )
+        characterUp.keyboardSetUnicodeString(
+            stringLength: utf16.count,
+            unicodeString: &utf16
+        )
+        characterDown.postToPid(pid)
+        characterUp.postToPid(pid)
+    }
+    return true
+}
+
+// Product-state readiness can precede the Svelte document-open transition,
+// especially while a large default writer is being inspected or loaded. A
+// dispatched key is not evidence. Retry an idempotent Select-All + type until
+// the exact AX value changes and remains observable in the bound editor.
+var observedEditorValue = ""
+for _ in 0..<60 {
+    guard AXUIElementSetAttributeValue(
+        editor,
+        kAXFocusedAttribute as CFString,
+        kCFBooleanTrue
+    ) == .success else {
+        fputs("could not focus Loom's accessible manuscript text area\n", stderr)
+        exit(1)
+    }
+    selectAllDown.postToPid(pid)
+    selectAllUp.postToPid(pid)
+    Thread.sleep(forTimeInterval: 0.05)
+    guard typeString(sentinel) else {
+        fputs("could not construct the complete manuscript keyboard sequence\n", stderr)
+        exit(1)
+    }
+
+    for _ in 0..<20 {
+        observedEditorValue = stringAttribute(editor, kAXValueAttribute as CFString)
+        if observedEditorValue.trimmingCharacters(in: .newlines) == sentinel { break }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    if observedEditorValue.trimmingCharacters(in: .newlines) == sentinel { break }
+    Thread.sleep(forTimeInterval: 0.25)
+}
+
+guard observedEditorValue.trimmingCharacters(in: .newlines) == sentinel else {
+    fputs("native keyboard input never produced the exact observable editor value\n", stderr)
+    exit(1)
+}
 let evidence: [String: Any] = [
-    "dispatch": "AX-focused text area received native keyboard events",
+    "dispatch": "PID-targeted Select-All and native keyboard input",
+    "observed_editor_value": true,
+    "observed_editor_utf8_bytes": observedEditorValue.lengthOfBytes(using: .utf8),
     "editor_frame": [
         "x": editorFrame.minX,
         "y": editorFrame.minY,
@@ -689,8 +746,8 @@ func strings(_ element: AXUIElement) -> String {
         .joined(separator: " ")
 }
 
-let deadline = Date().addingTimeInterval(180)
-repeat {
+var pressed = false
+for _ in 0..<1800 {
     var queue = [application]
     var cursor = 0
     while cursor < queue.count && cursor < 4096 {
@@ -700,9 +757,10 @@ repeat {
         let enabled = (attribute(element, kAXEnabledAttribute as CFString) as? Bool) != false
         if enabled {
             if description.contains(alreadyName) { exit(0) }
-            if description.contains(controlName),
+            if !pressed,
+               description.contains(controlName),
                AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
-                exit(0)
+                pressed = true
             }
         }
         if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
@@ -710,7 +768,7 @@ repeat {
         }
     }
     Thread.sleep(forTimeInterval: 0.1)
-} while Date() < deadline
+}
 fputs("could not press Loom completion control: \(controlName)\n", stderr)
 exit(1)
 SWIFT
@@ -733,8 +791,7 @@ func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
     return value
 }
 
-let deadline = Date().addingTimeInterval(180)
-repeat {
+for _ in 0..<1800 {
     var queue = [application]
     var cursor = 0
     while cursor < queue.count && cursor < 4096 {
@@ -751,7 +808,7 @@ repeat {
         }
     }
     Thread.sleep(forTimeInterval: 0.2)
-} while Date() < deadline
+}
 fputs("Loom never exposed the required accessible runtime state: \(expected)\n", stderr)
 exit(1)
 SWIFT
@@ -832,7 +889,7 @@ func postKey(_ key: CGKeyCode, down: Bool, flags: CGEventFlags) -> Bool {
         return false
     }
     event.flags = flags
-    event.post(tap: .cghidEventTap)
+    event.postToPid(pid)
     return true
 }
 
@@ -1417,6 +1474,8 @@ DELYSIS_SMOKE_RUN_1_FORMATTED_SENTINEL="${RUN_1_FORMATTED_SENTINEL:-}" \
 DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE="${RUN_1_FORMATTING_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE="${RUN_1_REAL_GHOST_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE="${RUN_1_REAL_WORD_REVERSAL_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_GENERATION_COUNT_BEFORE_REVERSAL="${loom_generation_count_before_reversal:-}" \
+DELYSIS_SMOKE_RUN_1_GENERATION_COUNT_AFTER_REVERSAL="${loom_generation_count_after_reversal:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT="${RUN_1_REAL_SHUTTLE_TEXT:-}" \
 DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER_EDITOR_INPUT="${RUN_1_MANUSCRIPT_SHA256_AFTER_EDITOR_INPUT:-}" \
 DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE="${RUN_1_NEW_DOCUMENT_EVIDENCE:-}" \
@@ -1432,6 +1491,9 @@ const titlebarDrag = e.DELYSIS_SMOKE_RUN_1_DRAG_EVIDENCE
 const completionControls = e.DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE)
   : null;
+const editorInput = e.DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE
+  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE)
+  : null;
 const newDocument = e.DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE)
   : null;
@@ -1440,6 +1502,9 @@ const formatting = e.DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE
   : null;
 const completionWordReversal = e.DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE)
+  : null;
+const shuttleText = e.DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT
+  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT)
   : null;
 const receipt = {
   schema: "delysis.macos-packaged-app-smoke.v1",
@@ -1462,8 +1527,8 @@ const receipt = {
       manuscript_sha256_before_drag: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_BEFORE || null,
       manuscript_sha256_after_drag: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER || null,
       completion_controls: completionControls,
-      editor_input: e.DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE ? {
-        dispatch: e.DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE,
+      editor_input: editorInput ? {
+        ...editorInput,
         sentinel: e.DELYSIS_SMOKE_RUN_1_EDITOR_SENTINEL,
         manuscript_sha256_after_input: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER_EDITOR_INPUT,
       } : null,
@@ -1473,8 +1538,12 @@ const receipt = {
       } : null,
       real_model_completion: e.DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE ? {
         ghost_presentation: e.DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE,
-        option_word_reversal: completionWordReversal,
-        shuttle_persisted_manuscript: e.DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT || null,
+        option_word_reversal: completionWordReversal ? {
+          ...completionWordReversal,
+          generation_runs_before: Number(e.DELYSIS_SMOKE_RUN_1_GENERATION_COUNT_BEFORE_REVERSAL),
+          generation_runs_after: Number(e.DELYSIS_SMOKE_RUN_1_GENERATION_COUNT_AFTER_REVERSAL),
+        } : null,
+        shuttle_persisted_manuscript: shuttleText,
       } : null,
       new_document: newDocument ? {
         ...newDocument,
