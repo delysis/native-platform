@@ -10,8 +10,10 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-project-close`
 - `allow-project-current`
 - `allow-project-recover`
+- `allow-document-create`
 - `allow-document-open`
 - `allow-document-checkpoint`
+- `allow-document-export-choose`
 - `allow-document-draft-upsert`
 - `allow-document-draft-clear`
 - `allow-document-reconciliation-preview`
@@ -340,6 +342,32 @@ Denies the document_checkpoint command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-document-create`
+
+</td>
+<td>
+
+Enables the document_create command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-create`
+
+</td>
+<td>
+
+Denies the document_create command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-document-draft-clear`
 
 </td>
@@ -385,6 +413,32 @@ Enables the document_draft_upsert command without any pre-configured scope.
 <td>
 
 Denies the document_draft_upsert command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-export-choose`
+
+</td>
+<td>
+
+Enables the document_export_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-export-choose`
+
+</td>
+<td>
+
+Denies the document_export_choose command without any pre-configured scope.
 
 </td>
 </tr>

@@ -5438,11 +5438,19 @@ fn describe_model(
     fingerprint: &ModelFingerprint,
     media_kinds: Vec<MediaKind>,
 ) -> NativeModelDescriptor {
-    let display_name = model
+    let declared_name = model
         .meta_val_str("general.name")
         .ok()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| config.model_id.clone());
+        .filter(|name| !name.trim().is_empty());
+    let base_model_name = model
+        .meta_val_str("general.base_model.0.name")
+        .ok()
+        .filter(|name| !name.trim().is_empty());
+    let display_name = inspected_display_name(
+        declared_name.as_deref(),
+        base_model_name.as_deref(),
+        &config.model_id,
+    );
     let architecture = model
         .meta_val_str("general.architecture")
         .unwrap_or_else(|_| "unknown".to_string());
@@ -5499,6 +5507,25 @@ fn describe_model(
             exact,
         },
     }
+}
+
+fn inspected_display_name(
+    declared_name: Option<&str>,
+    base_model_name: Option<&str>,
+    configured_model_id: &str,
+) -> String {
+    let declared_name = declared_name.map(str::trim).filter(|name| !name.is_empty());
+    let declared_is_placeholder = declared_name
+        .is_some_and(|name| matches!(name.to_ascii_lowercase().as_str(), "hf" | "gguf" | "model"));
+    if !declared_is_placeholder && let Some(name) = declared_name {
+        return name.to_string();
+    }
+    base_model_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .or(declared_name)
+        .unwrap_or(configured_model_id)
+        .to_string()
 }
 
 fn inspected_capabilities(
@@ -5748,6 +5775,26 @@ mod tests {
 
     static TEST_ARTIFACT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
     static REAL_MODEL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn inspected_name_replaces_generic_hf_label_with_declared_base_model() {
+        assert_eq!(
+            inspected_display_name(
+                Some("Hf"),
+                Some("Gemma 4 12B It"),
+                "content-addressed-model"
+            ),
+            "Gemma 4 12B It"
+        );
+        assert_eq!(
+            inspected_display_name(
+                Some("Writer fine-tune"),
+                Some("Gemma 4 12B It"),
+                "content-addressed-model"
+            ),
+            "Writer fine-tune"
+        );
+    }
 
     fn test_generation_reservation(
         request_id: &str,

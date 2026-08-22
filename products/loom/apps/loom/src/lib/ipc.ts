@@ -53,6 +53,10 @@ export function currentProjectSession(): Promise<ProjectSnapshot> {
   return call('project_current');
 }
 
+export function createDocument(projectId: string, sessionId: string): Promise<ProjectSnapshot> {
+  return call('document_create', { projectId, sessionId });
+}
+
 export async function getBuildModelPolicy(): Promise<BuildModelPolicySummary> {
   const value = await call<unknown>('build_model_policy_get');
   return decodeBuildModelPolicy(value);
@@ -65,6 +69,15 @@ export function openDocument(
   relativePath: string
 ): Promise<OpenDocument> {
   return call('document_open', { projectId, sessionId, documentId, relativePath });
+}
+
+export function exportDocumentCopy(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  relativePath: string
+): Promise<CommandReceipt | null> {
+  return call('document_export_choose', { projectId, sessionId, documentId, relativePath });
 }
 
 export function checkpointDocument(
@@ -387,6 +400,22 @@ export function listenForApplicationCloseRequests(
     });
   }
   return listen('loom://application-close-requested', handler);
+}
+
+export interface FileCommandEvent {
+  command: 'new_document' | 'open_project' | 'save' | 'export_copy';
+}
+
+export function listenForFileCommands(
+  handler: (event: FileCommandEvent) => void
+): Promise<UnlistenFn> {
+  if (!isDesktopRuntime()) {
+    return Promise.reject({
+      code: 'desktop_runtime_required',
+      message: 'File menu commands require the Loom desktop runtime.'
+    });
+  }
+  return listen<FileCommandEvent>('loom://file-command', ({ payload }) => handler(payload));
 }
 
 export function setFocusMode(

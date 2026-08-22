@@ -2,6 +2,7 @@
   import { onMount, tick } from 'svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
+  import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
   import {
     abortApplicationClose,
@@ -14,7 +15,9 @@
     chooseAndOpenProject,
     chooseModel,
     closeProject as closeProjectSession,
+    createDocument,
     currentProjectSession,
+    exportDocumentCopy,
     getBranch,
     getBranchBody,
     getBranchPage,
@@ -23,8 +26,10 @@
     getWeaveStatus,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
+    listenForFileCommands,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
+    loadModel,
     loadPolicyModelCandidate,
     listModels,
     listModelDownloads,
@@ -48,12 +53,10 @@
     type VerseEditorCodec,
     type VerseNewlineKind
   } from './lib/verseCodec';
-  import { canRoundTripMarkdownExactly, canUseVisualMarkdown } from './lib/markdownSafety';
+  import { canUseVisualMarkdown } from './lib/markdownSafety';
   import {
     autocompleteDisposition,
-    exactVerifiedSuggestionFamily,
     verifiedGhostSuggestion,
-    visibleVerifiedGhostSuggestion,
     type AutocompleteDisposition
   } from './lib/ghostSuggestion';
   import {
@@ -62,13 +65,17 @@
     type AutocompleteRetryLedger
   } from './lib/autocompleteRetry';
   import {
-    candidateSurfaceReason,
     candidateTextIsSurfaceable
   } from './lib/candidateSurface';
   import { sourceGhostPresentationCompatible } from './lib/sourceGhostText';
+  import {
+    inlineSuggestionFamily,
+    projectInlineCandidateText,
+    projectedInlinePresentationKey,
+    type InlineGhostSuggestion
+  } from './lib/inlineSuggestionFamily';
   import { visualGhostTextMayBePlainProse } from './lib/ghostText';
   import { isExtendedGraphemeBoundary } from './lib/graphemeBoundary';
-  import { branchIsActionableOnShelf } from './lib/branchShelf';
   import {
     verifyBranchBody,
     verifiedBodyMatchesBranch,
@@ -89,7 +96,8 @@
   } from './lib/projectScope';
   import {
     captureForIdempotentRetry,
-    closeResultMayHaveCommitted
+    closeResultMayHaveCommitted,
+    failureIsDefiniteContention
   } from './lib/sessionSafety';
   import { drainGenerationsAndClose } from './lib/sessionCloseCoordinator';
   import {
@@ -104,6 +112,12 @@
   import { ApplicationCloseRetryScheduler } from './lib/applicationCloseRetry';
   import { suggestionsEnabledFromStoredPreference } from './lib/suggestionPreference';
   import {
+    appearancePreference,
+    resolveAppearance,
+    toggledAppearance,
+    type AppearancePreference
+  } from './lib/appearance';
+  import {
     captureProjectCloseAgency,
     restoreProjectCloseAgency,
     type ProjectCloseAgencySnapshot
@@ -114,6 +128,39 @@
     shouldDiscoverModelsOnStartup
   } from './lib/startupSafety';
   import { newUlid } from './lib/ulid';
+  import {
+    cycleSuggestionIndex
+  } from './lib/suggestionInteraction';
+  import {
+    acceptedCompletionText,
+    completionPresentation as completionSessionPresentation,
+    completionSessionContextKey,
+    completionShouldRequestNextBatch,
+    consumeCompletionText,
+    cycleCompletionSession,
+    insertAtUtf8Boundary,
+    remainingCompletionText,
+    removeBeforeUtf8Boundary,
+    selectedCompletionCandidate,
+    startCompletionSession,
+    unconsumeCompletionWord,
+    updateCompletionCandidate,
+    type CompletionSession
+  } from './lib/completionSession';
+  import { completionEngineEnabled, inlineGhostHidden } from './lib/completionModes';
+  import { observeNativeFullscreen } from './lib/nativeFullscreen';
+  import {
+    armCompletionGeneration,
+    bindCompletionGenerationAnchor,
+    completionGenerationIsArmed,
+    disarmCompletionGeneration,
+    type CompletionGenerationIntent,
+    type CompletionGenerationTrigger
+  } from './lib/completionGenerationIntent';
+  import type {
+    VisualFormatAction,
+    VisualFormatState
+  } from './lib/visualFormatting';
   import {
     DEFAULT_MODEL_DOWNLOAD_LIMIT_GIB,
     deriveGgufFileName,
@@ -127,11 +174,14 @@
     utf8ByteOffset
   } from './lib/weaveSafety';
   import {
-    automaticWriterForBuildPolicy,
+    isEphemeralAcceptanceModelPath,
     isVerifiedPolicyWriter,
-    orderedLocalWriterCandidates,
+    isUsableSuggestionWriter,
+    looksLikeVisionAdapter,
+    orderedLocalTextModels,
     preferredWriterModelPath,
-    writerProfileForBuildPolicy
+    suggestionWriter,
+    startupWriterCandidates
   } from './lib/modelPolicy';
   import type {
     BranchCard,
@@ -170,8 +220,9 @@
   let search = '';
   let outlineOpen = false;
   let outlineToggle: HTMLButtonElement | undefined;
-  let outlinePanel: HTMLElement | undefined;
-  let outlineSearch: HTMLInputElement | undefined;
+  let appearance: AppearancePreference = 'system';
+  let systemDark = false;
+  let appearanceMedia: MediaQueryList | null = null;
   let models: ModelCapabilitySummary[] = [];
   let selectedModelPath = '';
   let compatibleWriterModels: ModelCapabilitySummary[] = [];
@@ -183,15 +234,31 @@
   let modelManagerOpen = false;
   let modelManagerPanel: HTMLElement | undefined;
   let modelManagerReturnFocus: HTMLElement | null = null;
-  let strandReviewDialog: HTMLDialogElement | undefined;
-  let strandReviewOpen = false;
-  let reviewCandidateId: string | null = null;
+  let activeSuggestionRunId: string | null = null;
+  let completionSession: CompletionSession | null = null;
+  let pendingCompletionText: string | null = null;
+  let handledCompletionExhaustionKey = '';
   let projectMenu: HTMLDetailsElement | undefined;
   let projectMenuTrigger: HTMLElement | undefined;
+  let formatMenu: VisualFormatMenu | undefined;
+  let visualFormatting: VisualFormatState = {
+    block: 'body',
+    bold: false,
+    italic: false,
+    blockquote: false,
+    bulletList: false,
+    orderedList: false,
+    linkHref: '',
+    selectionEmpty: true
+  };
+  let unlistenFileCommands: (() => void) | undefined;
+  let fileCommandInFlight = false;
+  let appliedNativeTitle = '';
   let suggestionsEnabled = false;
   let suggestionsChanging = false;
   let suggestionsIdleTimer: number | undefined;
   let scheduledSuggestion: SuggestionSchedule | null = null;
+  let completionGenerationIntent: CompletionGenerationIntent | null = null;
   let suggestionIntentEpoch = 0;
   let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
   let dismissedCandidateIds: string[] = [];
@@ -230,10 +297,12 @@
   let branchBodyErrorByRun: Record<string, string> = {};
   let branchRefreshSerial = 0;
   let branchRefreshInFlightCount = 0;
+  let branchRefreshQueued = false;
   let sourceTextarea: HTMLTextAreaElement | undefined;
   let weaveStarting = false;
   let uncertainWeave: WeaveCapture | null = null;
   const staleWeaveCleanupTimers = new Set<number>();
+  const weaveStatusPollTimers = new Set<number>();
   let branchRefreshTimer: number | undefined;
   let branchPollTimer: number | undefined;
   let branchPollInFlight = false;
@@ -246,6 +315,10 @@
   let cancellationCommandByRun: Record<string, string> = {};
   let promotionArmedCandidateId: string | null = null;
   let promotionInFlight = false;
+  let shuttleEnabled = false;
+  let shuttleTimer: number | undefined;
+  let shuttleTimerKey = '';
+  let windowFocused = true;
   let uncertainPromotion: PromotionCapture | null = null;
   let unlistenGenerationEvents: (() => void) | undefined;
   let generationListenerDisposed = false;
@@ -269,11 +342,19 @@
   let visualEditor: {
     flushPending: () => boolean;
     focusAtDocumentEnd: () => boolean;
+    focusPreservingSelection: () => boolean;
+    captureFormattingSelection: () => boolean;
+    clearFormattingSelection: () => void;
+    applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
+    acceptGhostWord: (requireVisible?: boolean) => boolean;
   } | null = null;
   let sourceEditor: {
     focusAtDocumentEnd: () => boolean;
+    acceptGhostWord: (requireVisible?: boolean) => boolean;
   } | null = null;
   let componentMounted = false;
+  let nativeFullscreen = false;
+  let stopNativeFullscreenObservation: (() => void) | undefined;
   let desktopWorkspaceStarted = false;
   let startupHeldForApplicationClose = false;
   let workspaceRestoreSerial = 0;
@@ -302,6 +383,8 @@
   let pendingCloseCommandId: string | null = null;
   let pendingCloseMayHaveCommitted = false;
   let pendingCloseAgency: ProjectCloseAgencySnapshot | null = null;
+  let pendingCloseInlineSuggestionsEnabled: boolean | null = null;
+  let pendingCloseShuttleEnabled: boolean | null = null;
   let closeInFlight: Promise<ProjectCloseOutcome> | null = null;
   let reconciliation: ReconciliationPreview | null = null;
   let reconciliationResolution = '';
@@ -476,17 +559,25 @@
   const suggestionsRetryDelayMs = 350;
   const maximumAutomaticSuggestionRetries = 1;
   const maximumAutocompleteRetryWaits = 50;
+  const appearancePreferenceKey = 'loom.appearance.v1';
+
+  function completionAutomationEnabled(
+    autocomplete = suggestionsEnabled,
+    shuttle = shuttleEnabled
+  ): boolean {
+    return completionEngineEnabled({ autocomplete, shuttle });
+  }
 
   $: visibleDocuments = project?.documents.filter((candidate) => {
     const query = search.trim().toLocaleLowerCase();
     return !query || candidate.title.toLocaleLowerCase().includes(query) || candidate.relative_path.toLocaleLowerCase().includes(query);
   }) ?? [];
   $: loadedModel = models.find((model) => model.loaded) ?? null;
-  $: currentModel = automaticWriterForBuildPolicy(models, buildModelPolicy);
+  $: currentModel = suggestionWriter(models, buildModelPolicy);
   $: suggestionSetupNeeded = Boolean(
     project &&
     document &&
-    suggestionsEnabled &&
+    completionAutomationEnabled() &&
     !currentModel &&
     !modelLoading &&
     !modelUnloading &&
@@ -497,15 +588,7 @@
     transition === 'idle'
   );
   $: selectedModel = models.find((model) => model.model_path === selectedModelPath) ?? null;
-  $: compatibleWriterModels = orderedLocalWriterCandidates(models)
-    .map((candidate) => models.find((model) => model.model_path === candidate.modelPath))
-    .filter((model): model is ModelCapabilitySummary => Boolean(model));
-  $: otherLocalModels = models.filter((model) =>
-    model.local &&
-    model.header_verified &&
-    !model.loaded &&
-    !model.policy_candidate
-  );
+  $: availableWriterModels = orderedLocalTextModels(models, loadLastLocalModelPath());
   $: activeModelDownloads = modelDownloads.filter((download) => !modelDownloadIsTerminal(download));
   $: pendingModelDownloadSnapshot = pendingModelDownload
     ? modelDownloads.find((download) => download.command_id === pendingModelDownload?.commandId) ?? null
@@ -519,9 +602,6 @@
     branch.selection !== 'reject' &&
     branch.source_revision_id === document?.summary.revision_id &&
     branch.model_id === currentModel?.model_id
-  );
-  $: shelfBranches = branches.filter((branch) =>
-    branchIsActionableOnShelf(branch, document?.summary.revision_id)
   );
   $: branchPromotionReady = Boolean(
     project &&
@@ -544,8 +624,16 @@
     !uncertainPromotion
   );
   $: visualGhostTargetByte = mode === 'visual' ? visualSelectionByte : null;
+  $: completionContextKey = project && document
+    ? completionSessionContextKey(
+        project.session_id,
+        document.summary.document_id,
+        documentEpoch,
+        mode
+      )
+    : '';
   $: visualGhostSurfaceKey = project && document
-    ? `${project.session_id}:${document.summary.document_id}:${documentEpoch}:visual`
+    ? `${project.session_id}:${document.summary.document_id}:${document.summary.revision_id}:${document.visible_blob_id}:${documentEpoch}:visual`
     : '';
   $: sourceGhostTargetByte = sourceGhostTargetByteFor(
     mode,
@@ -557,8 +645,120 @@
     documentText,
     verseCodec
   );
+  $: sourceGhostNewline = document?.summary.kind === 'verse'
+    ? verseCodec?.newline ?? 'mixed'
+    : null;
+  $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual', {
+    branches,
+    verifiedBodyByRun: verifiedBranchBodyByRun,
+    liveTextByRun: liveBranchText,
+    currentModel,
+    document,
+    suggestionsEnabled: completionAutomationEnabled(),
+    promotionReady: branchPromotionReady,
+    dismissedCandidateIds,
+    unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
+    manuscriptText: documentText,
+    sourceNewline: sourceGhostNewline
+  });
+  $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source', {
+    branches,
+    verifiedBodyByRun: verifiedBranchBodyByRun,
+    liveTextByRun: liveBranchText,
+    currentModel,
+    document,
+    suggestionsEnabled: completionAutomationEnabled(),
+    promotionReady: branchPromotionReady,
+    dismissedCandidateIds,
+    unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
+    manuscriptText: sourceDisplayText,
+    sourceNewline: sourceGhostNewline
+  });
+  $: baseSuggestionFamily = mode === 'visual'
+    ? visualSuggestionFamily
+    : mode === 'source'
+      ? sourceSuggestionFamily
+      : [];
+  $: boundCompletionSession = completionSession?.contextKey === completionContextKey
+    ? completionSession
+    : null;
+  $: if (boundCompletionSession) {
+    const selected = selectedCompletionCandidate(boundCompletionSession);
+    const branch = selected
+      ? branches.find((candidate) => candidate.run_id === selected.runId)
+      : null;
+    const verified = selected && branch
+      ? verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[selected.runId])
+      : null;
+    const rawText = selected && branch
+      ? verified?.text ?? liveBranchText[selected.runId] ?? branch.text
+      : '';
+    const text = selected
+      ? projectInlineCandidateText(
+          selected.targetByte,
+          mode,
+          mode === 'visual' ? documentText : sourceDisplayText,
+          rawText,
+          sourceGhostNewline
+        )
+      : null;
+    if (selected && text && candidateTextIsSurfaceable(text)) {
+      const rawPresentationKey = verified?.presentationKey ??
+        `stream:${selected.runId}:${new TextEncoder().encode(rawText).byteLength}`;
+      const updated = updateCompletionCandidate(
+        boundCompletionSession,
+        selected.runId,
+        text,
+        projectedInlinePresentationKey(rawPresentationKey, rawText, text)
+      );
+      syncCompletionCandidate(boundCompletionSession, updated);
+    }
+  }
+  $: sessionSuggestion = boundCompletionSession
+    ? completionSessionPresentation(boundCompletionSession) as InlineGhostSuggestion | null
+    : null;
+  $: sessionSuggestionFamily = boundCompletionSession
+    ? boundCompletionSession.acceptedChunks.length === 0
+      ? boundCompletionSession.candidates as InlineGhostSuggestion[]
+      : sessionSuggestion ? [sessionSuggestion] : []
+    : [];
+  $: activeSuggestionFamily = pendingCompletionText !== null
+    ? []
+    : boundCompletionSession ? sessionSuggestionFamily : baseSuggestionFamily;
+  $: if (
+    activeSuggestionFamily.length > 0 &&
+    !activeSuggestionFamily.some((suggestion) => suggestion.runId === activeSuggestionRunId)
+  ) activeSuggestionRunId = activeSuggestionFamily[0].runId;
+  $: selectedInlineSuggestion = activeSuggestionFamily.find(
+    (suggestion) => suggestion.runId === activeSuggestionRunId
+  ) ?? activeSuggestionFamily[0] ?? null;
+  $: ghostSuggestion = mode === 'visual' ? selectedInlineSuggestion : null;
+  $: sourceGhostSuggestion = mode === 'source' ? selectedInlineSuggestion : null;
+  $: ghostAlternatives = activeSuggestionFamily.map((suggestion) => ({
+    candidateId: suggestion.candidateId,
+    presentationKey: suggestion.presentationKey,
+    text: suggestion.text
+  }));
+  $: ghostUnconsumeText = boundCompletionSession?.acceptedChunks.at(-1) ?? '';
+  $: activeGhostSuggestion = mode === 'visual'
+    ? ghostSuggestion?.presentationKey === visibleVisualGhostPresentationKey
+      ? ghostSuggestion
+      : null
+    : mode === 'source'
+      ? sourceGhostSuggestion?.presentationKey === visibleSourceGhostPresentationKey
+        ? sourceGhostSuggestion
+        : null
+      : null;
+  $: completionExhaustionKey = boundCompletionSession && completionShouldRequestNextBatch(
+    boundCompletionSession,
+    pendingCompletionText !== null,
+    branches.find((branch) => branch.run_id === boundCompletionSession.selectedRunId)?.status === 'ready'
+  )
+      ? `${boundCompletionSession.contextKey}:${boundCompletionSession.selectedRunId}:${acceptedCompletionText(boundCompletionSession).length}`
+      : '';
+  $: finishCompletionIfExhausted(completionExhaustionKey);
   $: visualAutocompleteDisposition = autocompleteDisposition({
-    active: mode === 'visual' && suggestionsEnabled && !visualMutationPending && branchPromotionReady,
+    active: mode === 'visual' && completionAutomationEnabled() && !visualMutationPending && branchPromotionReady,
     branches: currentReadyBranches,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     dismissedCandidateIds,
@@ -566,14 +766,8 @@
     targetByte: visualGhostTargetByte,
     presentationCompatible: visualGhostTextMayBePlainProse
   });
-  $: ghostSuggestion = visualAutocompleteDisposition.kind === 'available'
-    ? visualAutocompleteDisposition.suggestion
-    : null;
-  $: sourceGhostNewline = document?.summary.kind === 'verse'
-    ? verseCodec?.newline ?? 'mixed'
-    : null;
   $: sourceAutocompleteDisposition = autocompleteDisposition({
-    active: mode === 'source' && suggestionsEnabled && !sourceDirty && !compositionActive && branchPromotionReady,
+    active: mode === 'source' && completionAutomationEnabled() && !sourceDirty && !compositionActive && branchPromotionReady,
     branches: currentReadyBranches,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     dismissedCandidateIds,
@@ -582,59 +776,6 @@
     presentationCompatible: (text) =>
       sourceGhostPresentationCompatible(sourceDisplayText, text, sourceGhostNewline)
   });
-  $: sourceGhostCandidate = sourceAutocompleteDisposition.kind === 'available'
-    ? sourceAutocompleteDisposition.suggestion
-    : null;
-  $: sourceGhostSuggestion = sourceGhostCandidate;
-  $: activeGhostSuggestion = mode === 'visual'
-    ? visibleVerifiedGhostSuggestion(
-      ghostSuggestion,
-      visibleVisualGhostPresentationKey
-    )
-    : mode === 'source'
-      ? visibleVerifiedGhostSuggestion(
-        sourceGhostSuggestion,
-        visibleSourceGhostPresentationKey
-      )
-      : null;
-  $: reviewTargetByte = mode === 'visual'
-    ? visualGhostTargetByte
-    : mode === 'source'
-      ? sourceGhostTargetByte
-      : null;
-  $: exactReviewBranches = exactVerifiedSuggestionFamily({
-    active: suggestionsEnabled && branchPromotionReady,
-    branches: shelfBranches,
-    verifiedBodyByRun: verifiedBranchBodyByRun,
-    targetByte: reviewTargetByte
-  });
-  $: reviewableBranches = exactReviewBranches.filter((branch) => {
-    if (!candidateTextIsSurfaceable(branch.text)) return false;
-    const suggestion = verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[branch.run_id]);
-    if (!suggestion) return false;
-    if (mode === 'visual') {
-      return visualGhostTextMayBePlainProse(suggestion.text) &&
-        !unpresentableVisualGhostPresentationKeys.includes(suggestion.presentationKey);
-    }
-    return sourceGhostPresentationCompatible(
-      sourceDisplayText,
-      suggestion.text,
-      sourceGhostNewline
-    );
-  });
-  $: suppressedReviewBranches = exactReviewBranches.filter((branch) =>
-    !candidateTextIsSurfaceable(branch.text)
-  );
-  $: if (
-    reviewableBranches.length > 0 &&
-    !reviewableBranches.some((branch) => branch.candidate_id === reviewCandidateId)
-  ) reviewCandidateId = reviewableBranches[0].candidate_id;
-  $: reviewBranch = reviewableBranches.find(
-    (branch) => branch.candidate_id === reviewCandidateId
-  ) ?? reviewableBranches[0] ?? null;
-  $: reviewBranchIndex = reviewBranch
-    ? reviewableBranches.findIndex((branch) => branch.run_id === reviewBranch.run_id)
-    : -1;
   $: suggestionMenuState = suggestionsChanging
     ? '…'
     : modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0
@@ -644,13 +785,36 @@
         : currentModel
           ? 'Ready'
           : 'Set up';
+  $: nativeWindowTitle = document?.summary.title ?? project?.title ?? 'Loom';
+  $: resolvedAppearance = resolveAppearance(appearance, systemDark);
+  $: autosaveLabel = saveState === 'saving'
+    ? 'Saving…'
+    : saveState === 'dirty'
+      ? 'Autosave pending'
+      : saveState === 'error' || saveState === 'uncertain'
+        ? saveMessage
+        : project
+          ? 'Autosaved'
+          : 'No document';
+  $: if (desktop) void syncNativeWindowTitle(nativeWindowTitle);
+  $: if (componentMounted) {
+    window.document.documentElement.dataset.theme = resolvedAppearance;
+    window.document.documentElement.style.colorScheme = resolvedAppearance;
+  }
   $: if (
+    suggestionsEnabled &&
+    !shuttleEnabled &&
     activeGhostSuggestion &&
     activeGhostSuggestion.presentationKey !== announcedGhostPresentationKey
   ) {
     announcedGhostPresentationKey = activeGhostSuggestion.presentationKey;
-    announce('Suggestion available. Tab accepts; Escape dismisses.');
+    announce('Suggestion available. Tab accepts all; Option Right accepts one word; Option Up or Down switches.');
   }
+  $: shuttleCandidate = shuttleEnabled ? selectedInlineSuggestion : activeGhostSuggestion;
+  $: shuttleScheduleKey = shuttleEnabled && windowFocused && shuttleCandidate
+    ? `${shuttleCandidate.candidateId}:${boundCompletionSession?.acceptedChunks.length ?? 0}:${editVersion}:${mode}`
+    : '';
+  $: syncShuttleTimer(shuttleScheduleKey);
   $: automaticBoundaryIsExact = mode === 'visual'
     ? visualSelectionByte !== null
     : mode === 'source' && Boolean(sourceTextarea) && sourceSelectionStart === sourceSelectionEnd;
@@ -666,7 +830,7 @@
       currentModel &&
       !modelLoading &&
       !modelUnloading &&
-      suggestionsEnabled &&
+      completionAutomationEnabled() &&
       !uncertainWeave &&
       !compositionActive &&
       !visualMutationPending &&
@@ -676,6 +840,7 @@
       !promotionInFlight &&
       transition === 'idle' &&
       !editorReadonly &&
+      completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion) &&
       (saveState === 'clean' || saveState === 'saved') &&
       editVersion === savedVersion &&
       document.summary.revision_id &&
@@ -685,7 +850,12 @@
       activeBranchCount === 0
   );
   $: retryEvaluationSnapshot = {
-    enabled: desktop && branchPromotionReady && suggestionsEnabled && Boolean(currentModel) && activeBranchCount === 0,
+    enabled: desktop &&
+      branchPromotionReady &&
+      completionAutomationEnabled() &&
+      Boolean(currentModel) &&
+      activeBranchCount === 0 &&
+      completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion),
     disposition: mode === 'visual'
       ? visualAutocompleteDisposition
       : sourceAutocompleteDisposition
@@ -709,8 +879,19 @@
 
   onMount(() => {
     componentMounted = true;
+    appearance = appearancePreference(window.localStorage.getItem(appearancePreferenceKey));
+    appearanceMedia = window.matchMedia('(prefers-color-scheme: dark)');
+    systemDark = appearanceMedia.matches;
+    const syncSystemAppearance = (event: MediaQueryListEvent): void => {
+      systemDark = event.matches;
+    };
+    appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
     if (desktop) {
+      stopNativeFullscreenObservation = observeNativeFullscreen(
+        getCurrentWindow(),
+        (fullscreen) => nativeFullscreen = fullscreen
+      );
       void (async () => {
         try {
           const lifecycle = await installWindowLifecycleHandlers();
@@ -746,6 +927,10 @@
       clearPreferredWriterRequest();
       window.removeEventListener('keydown', handleGlobalKeydown);
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
+      appearanceMedia?.removeEventListener('change', syncSystemAppearance);
+      appearanceMedia = null;
+      stopNativeFullscreenObservation?.();
+      stopNativeFullscreenObservation = undefined;
       if (saveTimer !== undefined) window.clearTimeout(saveTimer);
       if (sourceProjectionTimer !== undefined) window.clearTimeout(sourceProjectionTimer);
       if (draftTimer !== undefined) window.clearTimeout(draftTimer);
@@ -762,10 +947,14 @@
       closeRequestListener?.();
       if (modelDownloadPollTimer !== undefined) window.clearTimeout(modelDownloadPollTimer);
       if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
+      if (shuttleTimer !== undefined) window.clearTimeout(shuttleTimer);
       applicationCloseRetry.dispose();
       for (const timer of staleWeaveCleanupTimers) window.clearTimeout(timer);
       staleWeaveCleanupTimers.clear();
+      for (const timer of weaveStatusPollTimers) window.clearTimeout(timer);
+      weaveStatusPollTimers.clear();
       unlistenWindowFocus?.();
+      unlistenFileCommands?.();
     };
   });
 
@@ -773,8 +962,19 @@
     if (!componentMounted || desktopWorkspaceStarted) return;
     desktopWorkspaceStarted = true;
     void installWindowFocusHandler();
+    void installFileCommandListener();
     void installGenerationEventListener();
     void restoreDesktopWorkspace();
+  }
+
+  async function syncNativeWindowTitle(title: string): Promise<void> {
+    if (!componentMounted || !desktop || appliedNativeTitle === title) return;
+    try {
+      await getCurrentWindow().setTitle(title);
+      if (componentMounted) appliedNativeTitle = title;
+    } catch (error) {
+      if (componentMounted) recordFailure(error);
+    }
   }
 
   function countWords(text: string): number {
@@ -807,8 +1007,11 @@
 
   function resetLiveGenerationView(): void {
     stopBranchPolling();
+    for (const timer of weaveStatusPollTimers) window.clearTimeout(timer);
+    weaveStatusPollTimers.clear();
     unpresentableVisualGhostPresentationKeys = [];
     branchRefreshSerial += 1;
+    branchRefreshQueued = false;
     branchNextCursor = null;
     branchFirstPageCursor = null;
     branchHasMore = false;
@@ -848,7 +1051,7 @@
       sourceProjectionTimer = undefined;
     }
     if (document) documentEpoch += 1;
-    closeStrandReview();
+    promotionArmedCandidateId = null;
     document = null;
     documentText = '';
     sourceDisplayText = '';
@@ -1089,6 +1292,7 @@
   async function installWindowFocusHandler(): Promise<void> {
     try {
       const unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+        windowFocused = focused;
         if (!focused && !compositionActive && !reconciliation) {
           flushEditors();
           void saveNow();
@@ -1750,7 +1954,7 @@
       !project ||
       !document ||
       !currentModel ||
-      !suggestionsEnabled ||
+      !completionAutomationEnabled() ||
       !branchPromotionReady
     ) return;
     const sourceRevisionId = document.summary.revision_id;
@@ -1802,6 +2006,16 @@
     reportFailure = true,
     expectedViewEpoch = branchPollEpoch
   ): Promise<boolean> {
+    if (branchRefreshInFlightCount > 0) {
+      branchRefreshQueued = true;
+      return false;
+    }
+    if (draftInFlight || saveInFlight) {
+      branchRefreshQueued = true;
+      scheduleBranchRefresh();
+      return false;
+    }
+    branchRefreshQueued = false;
     const refreshSerial = ++branchRefreshSerial;
     branchRefreshInFlightCount += 1;
     try {
@@ -1859,18 +2073,27 @@
       if (branches.some(isBranchActive)) scheduleActiveBranchPoll();
       return true;
     } catch (error) {
+      const failure = normalizeFailure(error);
+      if (failureIsDefiniteContention(failure)) {
+        branchRefreshQueued = true;
+        return false;
+      }
       if (
         reportFailure &&
         project?.project_id === projectId &&
         project.session_id === sessionId &&
         document?.summary.document_id === documentId
       ) {
-        recordFailure(error);
+        recordFailure(failure);
         announce('Stored strands could not be refreshed');
       }
       return false;
     } finally {
       branchRefreshInFlightCount = Math.max(0, branchRefreshInFlightCount - 1);
+      if (branchRefreshInFlightCount === 0 && branchRefreshQueued) {
+        branchRefreshQueued = false;
+        scheduleBranchRefresh();
+      }
     }
   }
 
@@ -2106,7 +2329,7 @@
   function queuePreferredWriterRequest(captured: WorkspaceRestoreCapture): void {
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !suggestionsEnabled ||
+      !completionAutomationEnabled() ||
       !workspaceRestoreIsCurrent(captured)
     ) return;
     preferredWriterPending = { ...captured };
@@ -2135,7 +2358,7 @@
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
       !captured ||
-      !suggestionsEnabled ||
+      !completionAutomationEnabled() ||
       currentModel
     ) return;
     requestPreferredWriterEnsure(captured);
@@ -2147,7 +2370,7 @@
     if (!captured) return Promise.resolve(Boolean(currentModel));
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !suggestionsEnabled ||
+      !completionAutomationEnabled() ||
       !workspaceRestoreIsCurrent(captured)
     ) {
       clearPreferredWriterRequest(captured);
@@ -2177,18 +2400,18 @@
   ): Promise<boolean> {
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !suggestionsEnabled ||
+      !completionAutomationEnabled() ||
       !workspaceRestoreIsCurrent(captured)
     ) return false;
     if (currentModel) {
-      if (document) scheduleAutomaticSuggestions(editVersion);
+      if (document) scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
       return true;
     }
 
     const refreshed = await refreshModels(captured);
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !suggestionsEnabled ||
+      !completionAutomationEnabled() ||
       !workspaceRestoreIsCurrent(captured)
     ) return false;
     if (!refreshed && modelRefreshInFlightCount > 0) {
@@ -2198,7 +2421,7 @@
     await tick();
     if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
     if (currentModel) {
-      if (document) scheduleAutomaticSuggestions(editVersion);
+      if (document) scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
       return true;
     }
     if (modelLoading || modelUnloading || transition !== 'idle' || !document) {
@@ -2261,11 +2484,28 @@
     if (projectMenu) projectMenu.open = false;
   }
 
+  function closeFormatMenu(refocus = true): void {
+    formatMenu?.close(refocus);
+  }
+
   async function setOutlineOpen(open: boolean): Promise<void> {
     outlineOpen = open;
     await tick();
-    if (open) outlineSearch?.focus();
-    else outlineToggle?.focus();
+  }
+
+  function setAppearance(next: AppearancePreference): void {
+    appearance = next;
+    window.localStorage.setItem(appearancePreferenceKey, next);
+    announce(next === 'system' ? 'Appearance follows the system' : `${next} appearance`);
+  }
+
+  function toggleAppearance(): void {
+    setAppearance(toggledAppearance(appearance, systemDark));
+  }
+
+  function startTitlebarDrag(event: MouseEvent): void {
+    if (!desktop || event.button !== 0) return;
+    void getCurrentWindow().startDragging().catch(recordFailure);
   }
 
   function openModelManager(trigger: HTMLElement): void {
@@ -2317,13 +2557,19 @@
 
   function loadLastLocalModelPath(): string | null {
     try {
-      return window.localStorage.getItem(lastLocalModelKey);
+      const remembered = window.localStorage.getItem(lastLocalModelKey);
+      if (remembered && isEphemeralAcceptanceModelPath(remembered)) {
+        window.localStorage.removeItem(lastLocalModelKey);
+        return null;
+      }
+      return remembered;
     } catch {
       return null;
     }
   }
 
   function rememberLastLocalModelPath(modelPath: string): void {
+    if (isEphemeralAcceptanceModelPath(modelPath)) return;
     try {
       window.localStorage.setItem(lastLocalModelKey, modelPath);
     } catch {
@@ -2372,6 +2618,7 @@
     if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
     suggestionsIdleTimer = undefined;
     scheduledSuggestion = null;
+    completionGenerationIntent = disarmCompletionGeneration();
     suggestionIntentEpoch += 1;
   }
 
@@ -2390,7 +2637,7 @@
     const previousDismissedCandidateIds = dismissedCandidateIds;
     suggestionsChanging = true;
     suggestionIntentEpoch += 1;
-    if (!enabled) {
+    if (!enabled && !shuttleEnabled) {
       suggestionsEnabled = false;
       cancelSuggestionTimer();
       dismissedCandidateIds = currentReadyBranches
@@ -2398,7 +2645,12 @@
         .filter((candidateId): candidateId is string => Boolean(candidateId));
     }
     try {
-      await setSuggestionsPolicy(boundProject.project_id, boundProject.session_id, enabled);
+      const automationEnabled = completionAutomationEnabled(enabled, shuttleEnabled);
+      await setSuggestionsPolicy(
+        boundProject.project_id,
+        boundProject.session_id,
+        automationEnabled
+      );
       if (
         !applicationAllowsModelPreparation(applicationClosePhase) ||
         project?.project_id !== boundProject.project_id ||
@@ -2412,12 +2664,12 @@
           // The backend gate remains authoritative if browser persistence is unavailable.
         }
       }
-      if (!enabled) {
+      if (!automationEnabled) {
         clearPreferredWriterRequest();
         scheduleActiveBranchPoll();
       }
       let writerReady = Boolean(currentModel);
-      if (enabled && !writerReady) {
+      if (automationEnabled && !writerReady) {
         const captured: WorkspaceRestoreCapture = {
           restoreSerial: workspaceRestoreSerial,
           projectId: boundProject.project_id,
@@ -2431,8 +2683,8 @@
           ? 'Suggestions on; Loom will quietly prepare private strands when typing pauses'
           : 'Suggestions on; Loom is preparing a tested local writer'
         : 'Suggestions off');
-      if (enabled && writerReady && document) {
-        scheduleAutomaticSuggestions(editVersion);
+      if (automationEnabled && writerReady && document) {
+        scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'explicit_enable');
       }
     } catch (error) {
       suggestionsEnabled = previousEnabled;
@@ -2445,6 +2697,10 @@
     } finally {
       suggestionsChanging = false;
     }
+  }
+
+  async function toggleSuggestionsFromTitlebar(): Promise<void> {
+    await setSuggestionsEnabled(!suggestionsEnabled);
   }
 
   function focusableElementsWithin(container: HTMLElement): HTMLElement[] {
@@ -2498,10 +2754,10 @@
     if (!quiet) {
       announce(`${loaded.display_name} is verified for exact local completion`);
     }
-    if (suggestionsEnabled && loaded.completion && document) {
+    if (completionAutomationEnabled() && loaded.completion && document) {
       await tick();
       if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
-      scheduleAutomaticSuggestions(editVersion);
+      scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
     }
     return true;
   }
@@ -2513,35 +2769,29 @@
     if (currentModel) return true;
     if (!document || transition !== 'idle' || modelLoading || modelUnloading) return false;
     if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
-    const discoveredCandidates = orderedLocalWriterCandidates(models);
     const rememberedPath = loadLastLocalModelPath();
-    const rememberedProfile = writerProfileForBuildPolicy(buildModelPolicy);
-    const candidates = [
-      ...(rememberedPath && rememberedProfile &&
-      !discoveredCandidates.some((candidate) => candidate.modelPath === rememberedPath)
-        ? [{
-            modelPath: rememberedPath,
-            profileId: rememberedProfile,
-            policyRank: -1,
-            remembered: true
-          }]
-        : []),
-      ...discoveredCandidates.map((candidate) => ({ ...candidate, remembered: false }))
-    ];
+    const candidates = startupWriterCandidates(models, rememberedPath);
     for (const candidate of candidates) {
       if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
       if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
       const loadSerial = ++modelLoadSerial;
       modelLoading = true;
       try {
-        const loaded = await loadPolicyModelCandidate(candidate.profileId, candidate.modelPath);
+        const loaded = candidate.profileId
+          ? await loadPolicyModelCandidate(candidate.profileId, candidate.modelPath)
+          : await loadModel(candidate.modelPath);
         if (
           !componentMounted ||
           !applicationAllowsModelPreparation(applicationClosePhase) ||
           loadSerial !== modelLoadSerial ||
           (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
         ) return false;
-        if (!isVerifiedPolicyWriter(loaded, candidate.profileId)) {
+        if (candidate.profileId
+          ? !isVerifiedPolicyWriter(loaded, candidate.profileId)
+          : !isUsableSuggestionWriter(loaded)) {
+          if (candidate.remembered && !candidate.profileId) {
+            forgetLastLocalModelPath(candidate.modelPath);
+          }
           await refreshModels(expectedWorkspace);
           continue;
         }
@@ -2554,7 +2804,10 @@
           (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
         ) return false;
         const failure = normalizeFailure(error);
-        if (candidate.remembered && rememberedWriterPathIsInvalid(failure.code)) {
+        if (candidate.remembered && (
+          rememberedWriterPathIsInvalid(failure.code) ||
+          (!candidate.profileId && ['model_path_error', 'model_header_unverified'].includes(failure.code))
+        )) {
           forgetLastLocalModelPath(candidate.modelPath);
         }
         await refreshModels(expectedWorkspace);
@@ -2568,26 +2821,21 @@
     return false;
   }
 
-  function expectedPolicyWriterName(): string {
-    switch (buildModelPolicy?.name) {
-      case 'writer-gemma4-base-v1':
-      case 'writer-gemma4-base-v2':
-        return 'the tested Gemma 4 base writing model';
-      case 'none-v1':
-      case undefined:
-        return 'the tested writing model for this version of Loom';
-    }
+  function writerSetupName(model: ModelCapabilitySummary): string {
+    return model.display_name.toLocaleLowerCase('en-US') === 'gemma-4-12b-it-qat-q4_0.gguf'
+      ? 'Gemma 4 12B QAT'
+      : model.display_name;
   }
 
-  async function activatePolicyWriter(
+  async function activateSuggestionWriter(
     selected: ModelCapabilitySummary,
     captured: WorkspaceRestoreCapture
   ): Promise<boolean> {
     if (modelLoading || modelUnloading || !workspaceRestoreIsCurrent(captured)) return false;
     const policyCandidate = selected.policy_candidate;
-    if (!policyCandidate) {
-      modelSetupError = `This file is not ${expectedPolicyWriterName()}. It cannot power suggestions in this build.`;
-      announce('That model is not compatible with suggestions in this version of Loom');
+    if (looksLikeVisionAdapter(selected)) {
+      modelSetupError = 'That file is a vision or projector adapter, not a standalone writing model.';
+      announce('Choose a standalone GGUF language model');
       return false;
     }
 
@@ -2596,27 +2844,28 @@
     const loadSerial = ++modelLoadSerial;
     modelLoading = true;
     modelSetupError = '';
-    announce('Verifying the writing model');
+    announce('Inspecting the writing model locally');
     try {
-      const loaded = await loadPolicyModelCandidate(
-        policyCandidate.profile_id,
-        selected.model_path
-      );
+      const loaded = policyCandidate
+        ? await loadPolicyModelCandidate(policyCandidate.profile_id, selected.model_path)
+        : await loadModel(selected.model_path);
       if (
         !componentMounted ||
         !applicationAllowsModelPreparation(applicationClosePhase) ||
         loadSerial !== modelLoadSerial ||
         !workspaceRestoreIsCurrent(captured)
       ) return false;
-      if (!isVerifiedPolicyWriter(loaded, policyCandidate.profile_id)) {
-        throw new Error('Native verification did not return the exact writer capabilities required by this build.');
+      if (policyCandidate
+        ? !isVerifiedPolicyWriter(loaded, policyCandidate.profile_id)
+        : !isUsableSuggestionWriter(loaded)) {
+        throw new Error('Native inspection did not find a text-completion model suitable for writing suggestions.');
       }
-      if (!(await installLoadedModel(loaded, false, captured))) {
+      if (!(await installLoadedModel(loaded, true, captured))) {
         throw new Error('The verified writer could not be attached to the current writing session.');
       }
       clearFailure();
       modelSetupError = '';
-      announce(`${loaded.display_name} is ready to suggest writing`);
+      announce(`${writerSetupName(selected)} is ready to suggest writing`);
       if (modelManagerOpen) closeModelManager(true);
       return true;
     } catch (error) {
@@ -2627,8 +2876,8 @@
         loadSerial === modelLoadSerial
       ) {
         const failure = normalizeFailure(error);
-        modelSetupError = `Loom could not verify this as ${expectedPolicyWriterName()}. ${failure.message}`;
-        announce('That model did not pass writing-model verification');
+        modelSetupError = `Loom could not use this local model for writing suggestions. ${failure.message}`;
+        announce('That file could not be loaded as a text writing model');
         await refreshModels(captured);
       }
       return false;
@@ -2640,18 +2889,14 @@
     }
   }
 
-  async function choosePolicyWriterModel(): Promise<void> {
+  async function chooseSuggestionWriterModel(): Promise<void> {
     if (modelChoosing || modelLoading || modelUnloading) return;
     const captured = currentWorkspaceCapture();
-    if (!captured || !buildModelPolicy || buildModelPolicy.name === 'none-v1') {
-      modelSetupError = 'This build does not define a verified local writing model.';
-      announce('Suggestions remain off because no verified writing model is configured');
-      return;
-    }
+    if (!captured) return;
 
     modelChoosing = true;
     modelSetupError = '';
-    announce('Locate the supported writing model on this computer');
+    announce('Locate a local GGUF writing model');
     try {
       const selected = await chooseModel();
       if (!selected) {
@@ -2659,7 +2904,7 @@
         return;
       }
       if (!workspaceRestoreIsCurrent(captured)) return;
-      await activatePolicyWriter(selected, captured);
+      await activateSuggestionWriter(selected, captured);
     } catch (error) {
       if (componentMounted && workspaceRestoreIsCurrent(captured)) {
         const failure = normalizeFailure(error);
@@ -2671,10 +2916,10 @@
     }
   }
 
-  async function useDiscoveredPolicyWriter(model: ModelCapabilitySummary): Promise<void> {
+  async function useDiscoveredSuggestionWriter(model: ModelCapabilitySummary): Promise<void> {
     const captured = currentWorkspaceCapture();
     if (!captured) return;
-    await activatePolicyWriter(model, captured);
+    await activateSuggestionWriter(model, captured);
   }
 
   async function unloadCurrentModel(): Promise<void> {
@@ -2743,7 +2988,8 @@
       if (!componentMounted) return false;
       project = current;
       if (!(await finishOpeningProject(current, restoreSerial))) return false;
-      wakePreferredWriterEnsure();
+      const captured = currentWorkspaceCapture();
+      if (captured) void restoreCompletionBackground(captured);
       announce(`Reattached ${current.title}`);
       return true;
     } catch {
@@ -2817,58 +3063,10 @@
       : visualEditor?.focusAtDocumentEnd() ?? false;
   }
 
-  async function restoreDesktopWorkspace(): Promise<void> {
-    const restoreSerial = ++workspaceRestoreSerial;
-    await restoreBeforeBackgroundWork({
-      restore: () => openInitialProject(restoreSerial),
-      present: async () => {
-        await tick();
-        await waitForWritingSurfacePaint();
-        focusCurrentWritingSurfaceAtEnd();
-      },
-      isCurrent: workspaceRestoreIsCurrent,
-      background: async (captured) => {
-        await recoverModelDownloads();
-        if (!workspaceRestoreIsCurrent(captured)) return;
-        if (!shouldDiscoverModelsOnStartup(suggestionsEnabled)) return;
-        requestPreferredWriterEnsure(captured);
-      }
-    });
-  }
-
-  async function doOpenProject(): Promise<void> {
-    const restoreSerial = ++workspaceRestoreSerial;
-    modelRefreshSerial += 1;
-    opening = true;
-    clearFailure();
-    try {
-      const opened = await chooseAndOpenProject();
-      if (!componentMounted || restoreSerial !== workspaceRestoreSerial) return;
-      project = opened;
-      if (await finishOpeningProject(opened, restoreSerial)) {
-        wakePreferredWriterEnsure();
-        announce(`Opened ${opened.title}`);
-      }
-    } catch (error) {
-      if (!(await reattachNativeProject())) recordFailure(error);
-    } finally {
-      opening = false;
-    }
-  }
-
-  async function finishOpeningProject(
-    opened: ProjectSnapshot,
-    restoreSerial: number
+  async function restoreCompletionAutomation(
+    captured: WorkspaceRestoreCapture
   ): Promise<boolean> {
-    const captured: WorkspaceRestoreCapture = {
-      restoreSerial,
-      projectId: opened.project_id,
-      sessionId: opened.session_id
-    };
     if (!workspaceRestoreIsCurrent(captured)) return false;
-    outlineOpen = false;
-    clearPreferredWriterRequest();
-    cancelSuggestionTimer();
     try {
       const identity = await getBuildModelPolicy();
       if (!workspaceRestoreIsCurrent(captured)) return false;
@@ -2876,10 +3074,12 @@
     } catch {
       if (!workspaceRestoreIsCurrent(captured)) return false;
       buildModelPolicy = null;
+      suggestionsEnabled = false;
       announce('Suggestions are off because this build could not verify its local writer policy');
+      return false;
     }
+
     const storedSuggestionsPreference = loadSuggestionPreference(captured.projectId);
-    suggestionsEnabled = false;
     try {
       const policy = await runCurrentWorkspaceStep({
         capture: captured,
@@ -2897,7 +3097,172 @@
       suggestionsEnabled = false;
       recordFailure(error);
       announce('Suggestions remain off because the project gate could not be restored');
+      return false;
     }
+
+    if (suggestionsEnabled && currentModel && document) {
+      scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
+    } else if (suggestionsEnabled && !currentModel) {
+      queuePreferredWriterRequest(captured);
+    }
+    return true;
+  }
+
+  async function restoreCompletionBackground(
+    captured: WorkspaceRestoreCapture
+  ): Promise<void> {
+    await restoreCompletionAutomation(captured);
+    if (!workspaceRestoreIsCurrent(captured)) return;
+    await recoverModelDownloads();
+    if (!workspaceRestoreIsCurrent(captured)) return;
+    if (!shouldDiscoverModelsOnStartup(completionAutomationEnabled())) return;
+    requestPreferredWriterEnsure(captured);
+  }
+
+  async function restoreDesktopWorkspace(): Promise<void> {
+    const restoreSerial = ++workspaceRestoreSerial;
+    await restoreBeforeBackgroundWork({
+      restore: () => openInitialProject(restoreSerial),
+      present: async () => {
+        await tick();
+        await waitForWritingSurfacePaint();
+        focusCurrentWritingSurfaceAtEnd();
+      },
+      isCurrent: workspaceRestoreIsCurrent,
+      background: async (captured) => {
+        await restoreCompletionBackground(captured);
+      }
+    });
+  }
+
+  async function doOpenProject(): Promise<void> {
+    const restoreSerial = ++workspaceRestoreSerial;
+    modelRefreshSerial += 1;
+    opening = true;
+    clearFailure();
+    try {
+      const opened = await chooseAndOpenProject();
+      if (!componentMounted || restoreSerial !== workspaceRestoreSerial) return;
+      project = opened;
+      if (await finishOpeningProject(opened, restoreSerial)) {
+        await tick();
+        await waitForWritingSurfacePaint();
+        focusCurrentWritingSurfaceAtEnd();
+        const captured = currentWorkspaceCapture();
+        if (captured) void restoreCompletionBackground(captured);
+        announce(`Opened ${opened.title}`);
+      }
+    } catch (error) {
+      if (!(await reattachNativeProject())) recordFailure(error);
+    } finally {
+      opening = false;
+    }
+  }
+
+  async function openAnotherProject(): Promise<void> {
+    if (fileCommandInFlight || opening) return;
+    fileCommandInFlight = true;
+    try {
+      const outcome = await closeProject();
+      if (outcome.status === 'closed') await doOpenProject();
+    } finally {
+      fileCommandInFlight = false;
+    }
+  }
+
+  async function newDocument(): Promise<void> {
+    if (!project || fileCommandInFlight || editorReadonly) return;
+    if (!flushEditors()) return;
+    fileCommandInFlight = true;
+    try {
+      await saveNow();
+      if (!project || uncertainSave || saveState === 'error' || saveState === 'uncertain') return;
+      const previousDocumentIds = new Set(project.documents.map((candidate) => candidate.document_id));
+      const refreshed = await createDocument(project.project_id, project.session_id);
+      if (
+        !project ||
+        refreshed.project_id !== project.project_id ||
+        refreshed.session_id !== project.session_id
+      ) return;
+      const created = refreshed.documents.find(
+        (candidate) => !previousDocumentIds.has(candidate.document_id)
+      );
+      if (!created) throw new Error('The desktop did not expose the newly created document.');
+      project = refreshed;
+      await selectDocument(created, true);
+      announce(`Created ${created.title}. Changes autosave as you write.`);
+    } catch (error) {
+      recordFailure(error);
+    } finally {
+      fileCommandInFlight = false;
+    }
+  }
+
+  async function exportCopy(): Promise<void> {
+    if (!project || !document || fileCommandInFlight || editorReadonly) return;
+    if (!flushEditors()) return;
+    fileCommandInFlight = true;
+    try {
+      await saveNow();
+      if (!project || !document || uncertainSave || saveState === 'error' || saveState === 'uncertain') return;
+      const receipt = await exportDocumentCopy(
+        project.project_id,
+        project.session_id,
+        document.summary.document_id,
+        document.summary.relative_path
+      );
+      if (receipt) announce(`Exported a copy of ${document.summary.title}`);
+    } catch (error) {
+      recordFailure(error);
+    } finally {
+      fileCommandInFlight = false;
+    }
+  }
+
+  async function installFileCommandListener(): Promise<void> {
+    try {
+      const unlisten = await listenForFileCommands(({ command }) => {
+        switch (command) {
+          case 'new_document':
+            void newDocument();
+            break;
+          case 'open_project':
+            void openAnotherProject();
+            break;
+          case 'save':
+            if (flushEditors()) void saveNow();
+            break;
+          case 'export_copy':
+            void exportCopy();
+            break;
+        }
+      });
+      if (!componentMounted) {
+        unlisten();
+        return;
+      }
+      unlistenFileCommands?.();
+      unlistenFileCommands = unlisten;
+    } catch (error) {
+      if (componentMounted) recordFailure(error);
+    }
+  }
+
+  async function finishOpeningProject(
+    opened: ProjectSnapshot,
+    restoreSerial: number
+  ): Promise<boolean> {
+    const captured: WorkspaceRestoreCapture = {
+      restoreSerial,
+      projectId: opened.project_id,
+      sessionId: opened.session_id
+    };
+    if (!workspaceRestoreIsCurrent(captured)) return false;
+    outlineOpen = false;
+    clearPreferredWriterRequest();
+    cancelSuggestionTimer();
+    suggestionsEnabled = false;
+    shuttleEnabled = false;
     dismissedCandidateIds = [];
     if (opened.pending_recovery > 0) {
       const recovered = await runCurrentWorkspaceStep({
@@ -2926,9 +3291,6 @@
       if (!workspaceRestoreIsCurrent(captured)) return false;
       await tick();
       if (!workspaceRestoreIsCurrent(captured)) return false;
-      if (suggestionsEnabled && currentModel && document) {
-        scheduleAutomaticSuggestions(editVersion);
-      }
     } else {
       documentEpoch += 1;
       document = null;
@@ -2947,9 +3309,6 @@
       clearReconciliationState();
       saveState = 'clean';
       saveMessage = 'Project is ready';
-    }
-    if (storedSuggestionsPreference && suggestionsEnabled && !currentModel) {
-      queuePreferredWriterRequest(captured);
     }
     return true;
   }
@@ -3100,10 +3459,10 @@
         saveMessage = 'All changes saved';
         announce(`Opened ${summary.title}`);
       }
-      mode = summary.kind === 'prose' && canRoundTripMarkdownExactly(effectiveText)
+      mode = summary.kind === 'prose' && canUseVisualMarkdown(effectiveText, false)
         ? preferredProseMode
         : 'source';
-      await refreshBranchesFor(
+      void refreshBranchesFor(
         source.projectId,
         source.sessionId,
         opened.summary.document_id,
@@ -3139,27 +3498,34 @@
 
   function updateText(text: string): void {
     if (transition !== 'idle') return;
+    const completionMutation = pendingCompletionText === text;
+    pendingCompletionText = null;
     const mutationWasInvalidated = visualMutationPending;
     visualMutationPending = false;
     if (text === documentText) return;
     documentText = text;
     editVersion += 1;
-    if (!mutationWasInvalidated) suggestionIntentEpoch += 1;
+    if (!completionMutation && !mutationWasInvalidated) suggestionIntentEpoch += 1;
     uncertainWeave = null;
     saveState = 'dirty';
     saveMessage = saveInFlight ? 'Saving earlier changes…' : 'Unsaved changes';
     promotionArmedCandidateId = null;
-    dismissedCandidateIds = [];
-    unpresentableVisualGhostPresentationKeys = [];
-    if (activeBranchCount > 0) void cancelActiveBranches();
+    if (!completionMutation) {
+      completionSession = null;
+      dismissedCandidateIds = [];
+      unpresentableVisualGhostPresentationKeys = [];
+      if (activeBranchCount > 0) void cancelActiveBranches();
+    }
     scheduleDraftJournal();
     scheduleSave();
-    scheduleAutomaticSuggestions(editVersion);
+    if (!completionMutation) scheduleAutomaticSuggestions(editVersion);
   }
 
   function invalidateVisualSuggestionImmediately(): void {
     if (transition !== 'idle' || visualMutationPending) return;
+    if (pendingCompletionText !== null) return;
     visualMutationPending = true;
+    completionSession = null;
     suggestionIntentEpoch += 1;
     uncertainWeave = null;
     promotionArmedCandidateId = null;
@@ -3215,16 +3581,79 @@
     if (transition !== 'idle') return;
     sourceDisplayText = display;
     sourceDirty = true;
-    if (!sourceComposing) scheduleSourceProjection();
+    if (!sourceComposing) {
+      // Completion-owned textarea mutations are exact and already authorized
+      // synchronously. Project them in the same event turn so the cached
+      // remainder and reversal affordance never disappear behind the ordinary
+      // source-edit debounce.
+      if (pendingCompletionText !== null) commitSourceDraft();
+      else scheduleSourceProjection();
+    }
   }
 
   function updateSourceSelection(textarea: HTMLTextAreaElement): void {
+    const previousStart = sourceSelectionStart;
+    const previousEnd = sourceSelectionEnd;
+    const completionWasActive = completionActivityExists();
     sourceSelectionStart = textarea.selectionStart;
     sourceSelectionEnd = textarea.selectionEnd;
+    if (
+      pendingCompletionText !== null ||
+      !completionWasActive ||
+      (previousStart === sourceSelectionStart && previousEnd === sourceSelectionEnd)
+    ) return;
+    const target = sourceGhostTargetByteFor(
+      mode,
+      true,
+      sourceSelectionStart,
+      sourceSelectionEnd,
+      sourceDisplayText,
+      document,
+      documentText,
+      verseCodec
+    );
+    const expected = completionSession
+      ? completionSessionPresentation(completionSession)?.targetByte ?? null
+      : selectedInlineSuggestion?.targetByte ?? completionGenerationIntent?.anchorByte ?? null;
+    if (expected === null && target !== null) {
+      completionGenerationIntent = bindCompletionGenerationAnchor(
+        completionGenerationIntent,
+        completionContextKey,
+        editVersion,
+        target
+      );
+      return;
+    }
+    if (target !== null && expected !== null && target !== expected) {
+      invalidateCompletionForCaretNavigation();
+    }
   }
 
   function updateVisualSelection(markdownByteOffset: number | null): void {
+    const previous = visualSelectionByte;
+    const completionWasActive = completionActivityExists();
     visualSelectionByte = markdownByteOffset;
+    if (
+      pendingCompletionText !== null ||
+      markdownByteOffset === null ||
+      markdownByteOffset === previous ||
+      !completionWasActive
+    ) return;
+    const expected = completionSession
+      ? completionSessionPresentation(completionSession)?.targetByte ?? null
+      : selectedInlineSuggestion?.targetByte ?? completionGenerationIntent?.anchorByte ?? null;
+    if (expected === null) {
+      completionGenerationIntent = bindCompletionGenerationAnchor(
+        completionGenerationIntent,
+        completionContextKey,
+        editVersion,
+        markdownByteOffset
+      );
+      return;
+    }
+    if (expected !== null && markdownByteOffset !== expected) {
+      invalidateCompletionForCaretNavigation();
+    }
   }
 
   function scheduleSourceProjection(delay = 240): void {
@@ -3261,12 +3690,25 @@
 
   function scheduleAutomaticSuggestions(
     targetEditVersion: number,
-    delay = suggestionsIdleDelayMs
+    delay = suggestionsIdleDelayMs,
+    trigger: CompletionGenerationTrigger = 'document_edit'
   ): void {
+    completionGenerationIntent = armCompletionGeneration(
+      completionContextKey,
+      targetEditVersion,
+      trigger,
+      mode === 'visual' ? visualSelectionByte : sourceGhostTargetByte
+    );
+    if (!completionGenerationIntent) return;
     armSuggestionSchedule({ kind: 'edit_pause', editVersion: targetEditVersion }, delay);
   }
 
   function scheduleAutocompleteRetry(ticket: AutocompleteRetryTicket): void {
+    if (!completionGenerationIsArmed(
+      completionGenerationIntent,
+      completionContextKey,
+      ticket.editVersion
+    )) return;
     armSuggestionSchedule(
       { kind: 'exhausted_retry', ticket },
       suggestionsRetryDelayMs
@@ -3279,10 +3721,11 @@
     scheduledSuggestion = null;
     if (
       !desktop ||
-      !suggestionsEnabled ||
+      !completionAutomationEnabled() ||
       !currentModel ||
       !project ||
       !document ||
+      !completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion) ||
       document.summary.kind === 'hybrid'
     ) return;
     scheduledSuggestion = schedule;
@@ -3321,7 +3764,7 @@
       !project ||
       !document ||
       !currentModel ||
-      !suggestionsEnabled ||
+      !completionAutomationEnabled() ||
       project.project_id !== ticket.projectId ||
       project.session_id !== ticket.sessionId ||
       document.summary.document_id !== ticket.documentId ||
@@ -3363,10 +3806,11 @@
     if (
       scheduledSuggestion !== schedule ||
       targetEditVersion !== editVersion ||
-      !suggestionsEnabled ||
+      !completionAutomationEnabled() ||
       !currentModel ||
       !project ||
       !document ||
+      !completionGenerationIsArmed(completionGenerationIntent, completionContextKey, targetEditVersion) ||
       compositionActive ||
       transition !== 'idle'
     ) {
@@ -3452,6 +3896,7 @@
       text: documentText,
       editVersion
     };
+    let retryAfterContention = false;
     const operation = (async (): Promise<boolean> => {
       try {
         const draft = await upsertTransientDraft(
@@ -3500,7 +3945,15 @@
         return true;
       } catch (error) {
         if (documentEpoch !== captured.epoch) return true;
-        const failure = recordFailure(error);
+        const failure = normalizeFailure(error);
+        if (failureIsDefiniteContention(failure)) {
+          if (uncertainDraft === captured) uncertainDraft = null;
+          saveState = 'dirty';
+          saveMessage = 'Autosave pending';
+          retryAfterContention = true;
+          return false;
+        }
+        recordFailure(failure);
         const retryCapture = captureForIdempotentRetry(captured, failure);
         if (retryCapture) {
           uncertainDraft = retryCapture;
@@ -3525,7 +3978,7 @@
         saveState !== 'error' &&
         saveState !== 'uncertain'
       ) {
-        scheduleDraftJournal();
+        scheduleDraftJournal(retryAfterContention ? 200 : undefined);
       }
     }
   }
@@ -3703,7 +4156,15 @@
         documentEpoch !== captured.documentEpoch ||
         !projectSessionIsCurrent(project, captured)
       ) return;
-      const failure = recordFailure(error);
+      const failure = normalizeFailure(error);
+      if (failureIsDefiniteContention(failure)) {
+        if (uncertainSave?.commandId === captured.commandId) uncertainSave = null;
+        saveState = 'dirty';
+        saveMessage = 'Autosave pending';
+        saveQueued = true;
+        return;
+      }
+      recordFailure(failure);
       if (
         failure.code === 'external_file_change' ||
         failure.code === 'source_blob_conflict' ||
@@ -3798,7 +4259,7 @@
   function dismissInlineSuggestion(candidateId: string | null | undefined): void {
     if (!candidateId || dismissedCandidateIds.includes(candidateId)) return;
     dismissedCandidateIds = [...dismissedCandidateIds, candidateId];
-    announce('Suggestion dismissed; it remains available in Writing options');
+    announce('Suggestion dismissed');
   }
 
   function rejectVisualGhostPresentation(
@@ -3835,13 +4296,63 @@
         : null;
   }
 
+  function syncCompletionCandidate(
+    expected: CompletionSession,
+    updated: CompletionSession | null
+  ): void {
+    if (completionSession !== expected) return;
+    completionSession = updated;
+    if (!updated) pendingCompletionText = null;
+  }
+
+  function finishCompletionIfExhausted(key: string): void {
+    if (!key || key === handledCompletionExhaustionKey) return;
+    handledCompletionExhaustionKey = key;
+    completionSession = null;
+    pendingCompletionText = null;
+    scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'candidate_exhausted');
+  }
+
+  function completionActivityExists(): boolean {
+    return Boolean(
+      completionGenerationIntent ||
+      completionSession ||
+      pendingCompletionText !== null ||
+      scheduledSuggestion ||
+      weaveStarting ||
+      activeBranchCount > 0 ||
+      selectedInlineSuggestion
+    );
+  }
+
+  function invalidateCompletionForCaretNavigation(): void {
+    if (!completionActivityExists()) return;
+    completionSession = null;
+    pendingCompletionText = null;
+    promotionArmedCandidateId = null;
+    dismissedCandidateIds = [];
+    unpresentableVisualGhostPresentationKeys = [];
+    cancelSuggestionTimer();
+    if (activeBranchCount > 0) void cancelActiveBranches();
+  }
+
+  function sessionForEligibleGhost(eligible: InlineGhostSuggestion): CompletionSession | null {
+    if (completionSession) return completionSession;
+    return startCompletionSession(
+      completionContextKey,
+      activeSuggestionFamily,
+      eligible.runId
+    );
+  }
+
   function acceptActiveGhost(candidateId: string, presentationKey: string): boolean {
     const eligible = eligibleGhostForCurrentMode();
-    const branch = branches.find((candidate) => candidate.candidate_id === candidateId);
+    const branch = branches.find((candidate) => candidate.run_id === eligible?.runId);
     if (
       !branch ||
       eligible?.candidateId !== candidateId ||
       eligible.presentationKey !== presentationKey ||
+      eligible.insertsOnAccept ||
       !canPromoteBranch(branch)
     ) return false;
     // LoomEditor and SourceEditor invoke this callback only after synchronously
@@ -3852,45 +4363,171 @@
     return true;
   }
 
+  function authorizeGhostInsertion(
+    candidateId: string,
+    presentationKey: string,
+    text: string
+  ): boolean {
+    const eligible = eligibleGhostForCurrentMode();
+    if (
+      !eligible ||
+      eligible.candidateId !== candidateId ||
+      eligible.presentationKey !== presentationKey ||
+      !text ||
+      !eligible.text.startsWith(text) ||
+      pendingCompletionText !== null ||
+      (!completionSession && !branchPromotionReady)
+    ) return false;
+    const initial = sessionForEligibleGhost(eligible);
+    if (!initial) return false;
+    const consumed = consumeCompletionText(initial, text);
+    if (!consumed) return false;
+    const expected = insertAtUtf8Boundary(documentText, eligible.targetByte, text);
+    if (expected === null) return false;
+    completionSession = consumed.session;
+    pendingCompletionText = expected;
+    return true;
+  }
+
+  function authorizeGhostUnconsume(
+    candidateId: string,
+    presentationKey: string,
+    text: string
+  ): boolean {
+    const eligible = eligibleGhostForCurrentMode();
+    if (
+      !completionSession ||
+      !eligible ||
+      eligible.candidateId !== candidateId ||
+      eligible.presentationKey !== presentationKey ||
+      pendingCompletionText !== null
+    ) return false;
+    const step = unconsumeCompletionWord(completionSession);
+    if (!step || step.text !== text) return false;
+    const expected = removeBeforeUtf8Boundary(documentText, eligible.targetByte, text);
+    if (expected === null) return false;
+    completionSession = step.session;
+    pendingCompletionText = expected;
+    return true;
+  }
+
+  function cycleActiveSuggestion(offset: number): void {
+    if (completionSession) {
+      const next = cycleCompletionSession(completionSession, offset);
+      if (next === completionSession) return;
+      completionSession = next;
+      activeSuggestionRunId = next.selectedRunId;
+      promotionArmedCandidateId = null;
+      const index = next.candidates.findIndex((candidate) => candidate.runId === next.selectedRunId);
+      announce(`Suggestion ${index + 1} of ${next.candidates.length}`);
+      return;
+    }
+    if (activeSuggestionFamily.length < 2) return;
+    const current = activeSuggestionFamily.findIndex(
+      (suggestion) => suggestion.runId === activeSuggestionRunId
+    );
+    const next = cycleSuggestionIndex(activeSuggestionFamily.length, current, offset);
+    if (next < 0) return;
+    activeSuggestionRunId = activeSuggestionFamily[next].runId;
+    promotionArmedCandidateId = null;
+    announce(`Suggestion ${next + 1} of ${activeSuggestionFamily.length}`);
+  }
+
+  async function setShuttleEnabled(enabled: boolean): Promise<void> {
+    if (
+      !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !project ||
+      suggestionsChanging
+    ) return;
+    if (enabled && !buildModelPolicy) {
+      announce('Shuttle remains off because this build could not verify its local writer policy');
+      return;
+    }
+    const boundProject = project;
+    const previousEnabled = shuttleEnabled;
+    suggestionsChanging = true;
+    suggestionIntentEpoch += 1;
+    try {
+      await setSuggestionsPolicy(
+        boundProject.project_id,
+        boundProject.session_id,
+        completionAutomationEnabled(suggestionsEnabled, enabled)
+      );
+      if (
+        !applicationAllowsModelPreparation(applicationClosePhase) ||
+        project?.project_id !== boundProject.project_id ||
+        project.session_id !== boundProject.session_id
+      ) return;
+      shuttleEnabled = enabled;
+      if (!enabled) {
+        if (shuttleTimer !== undefined) window.clearTimeout(shuttleTimer);
+        shuttleTimer = undefined;
+        shuttleTimerKey = '';
+      }
+      const automationEnabled = completionAutomationEnabled();
+      if (!automationEnabled) {
+        clearPreferredWriterRequest();
+        cancelSuggestionTimer();
+        scheduleActiveBranchPoll();
+      }
+      let writerReady = Boolean(currentModel);
+      if (automationEnabled && !writerReady) {
+        const captured: WorkspaceRestoreCapture = {
+          restoreSerial: workspaceRestoreSerial,
+          projectId: boundProject.project_id,
+          sessionId: boundProject.session_id
+        };
+        await tick();
+        requestPreferredWriterEnsure(captured);
+        writerReady = Boolean(currentModel);
+      }
+      if (automationEnabled && writerReady && document) {
+        scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'explicit_enable');
+      }
+      announce(enabled
+        ? writerReady
+          ? 'Shuttle on. One suggestion word advances after four idle seconds; Escape stops.'
+          : 'Shuttle on. Loom is preparing a local writer.'
+        : 'Shuttle off');
+    } catch (error) {
+      shuttleEnabled = previousEnabled;
+      recordFailure(error);
+      announce('Shuttle could not change because the project gate did not respond');
+    } finally {
+      suggestionsChanging = false;
+    }
+  }
+
+  function syncShuttleTimer(key: string): void {
+    if (key === shuttleTimerKey) return;
+    if (shuttleTimer !== undefined) window.clearTimeout(shuttleTimer);
+    shuttleTimer = undefined;
+    shuttleTimerKey = key;
+    if (!key) return;
+    shuttleTimer = window.setTimeout(() => {
+      shuttleTimer = undefined;
+      if (shuttleTimerKey !== key || !windowFocused || !shuttleEnabled) return;
+      const accepted = mode === 'visual'
+        ? visualEditor?.acceptGhostWord(false) ?? false
+        : sourceEditor?.acceptGhostWord(false) ?? false;
+      if (!accepted) {
+        shuttleTimerKey = '';
+        syncShuttleTimer(key);
+      }
+    }, 4_000);
+  }
+
   function dismissActiveGhost(candidateId: string, presentationKey: string): void {
     const eligible = eligibleGhostForCurrentMode();
     if (
       eligible?.candidateId !== candidateId ||
       eligible.presentationKey !== presentationKey
     ) return;
-    dismissInlineSuggestion(candidateId);
-  }
-
-  async function openStrandReview(): Promise<void> {
-    if (reviewableBranches.length === 0) return;
-    reviewCandidateId = activeGhostSuggestion?.candidateId ??
-      reviewableBranches[0].candidate_id;
-    promotionArmedCandidateId = null;
-    strandReviewOpen = true;
-    closeProjectMenu();
-    await tick();
-    if (!strandReviewDialog) return;
-    if (!strandReviewDialog.open) strandReviewDialog.showModal();
-    strandReviewDialog.querySelector<HTMLElement>('[data-review-close]')?.focus();
-  }
-
-  function closeStrandReview(): void {
-    promotionArmedCandidateId = null;
-    if (strandReviewDialog?.open) {
-      strandReviewDialog.close();
-    } else {
-      strandReviewOpen = false;
+    if (shuttleEnabled) {
+      void setShuttleEnabled(false);
+      return;
     }
-  }
-
-  function moveStrandReview(offset: number): void {
-    if (reviewableBranches.length < 2 || reviewBranchIndex < 0) return;
-    const nextIndex = (
-      reviewBranchIndex + offset + reviewableBranches.length
-    ) % reviewableBranches.length;
-    reviewCandidateId = reviewableBranches[nextIndex].candidate_id;
-    promotionArmedCandidateId = null;
-    announce(`Suggestion ${nextIndex + 1} of ${reviewableBranches.length}`);
+    dismissInlineSuggestion(candidateId);
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
@@ -3905,9 +4542,14 @@
       projectMenuTrigger?.focus();
       return;
     }
-    if (event.key === 'Escape' && outlineOpen) {
+    if (event.key === 'Escape' && formatMenu?.isOpen()) {
       event.preventDefault();
-      void setOutlineOpen(false);
+      closeFormatMenu();
+      return;
+    }
+    if (event.key === 'Escape' && shuttleEnabled) {
+      event.preventDefault();
+      void setShuttleEnabled(false);
       return;
     }
     const modifier = event.metaKey || event.ctrlKey;
@@ -3934,6 +4576,11 @@
       event.target instanceof Node &&
       !projectMenu.contains(event.target)
     ) closeProjectMenu();
+    if (
+      formatMenu?.isOpen() &&
+      event.target instanceof Node &&
+      !formatMenu.contains(event.target)
+    ) closeFormatMenu(false);
   }
 
   function captureWeaveCursorByte(): number {
@@ -3968,7 +4615,7 @@
       started.document_id !== captured.documentId ||
       started.source_revision_id !== captured.sourceRevisionId ||
       !started.exact_prompt_blob_id ||
-      started.branches.length !== 3
+      started.branches.length !== 4
     ) {
       throw new Error('The desktop returned a branch family for different source identities.');
     }
@@ -4006,7 +4653,7 @@
       editVersion === captured.editVersion &&
       suggestionIntentEpoch === captured.intentEpoch &&
       currentModel?.model_id === captured.modelId &&
-      suggestionsEnabled
+      completionAutomationEnabled()
     );
   }
 
@@ -4028,6 +4675,37 @@
       }
     }));
     scheduleActiveBranchPoll();
+  }
+
+  function scheduleWeaveStatusPoll(captured: WeaveCapture, attempt = 0): void {
+    if (attempt >= 240 || !weaveCaptureStillCurrent(captured)) return;
+    const delay = Math.min(250 + attempt * 50, 1_000);
+    const timer = window.setTimeout(async () => {
+      weaveStatusPollTimers.delete(timer);
+      if (!weaveCaptureStillCurrent(captured)) return;
+      try {
+        const status = await getWeaveStatus(
+          captured.projectId,
+          captured.sessionId,
+          captured.commandId
+        );
+        if (!status) {
+          scheduleWeaveStatusPoll(captured, attempt + 1);
+          return;
+        }
+        if (!weaveCaptureStillCurrent(captured) || !installWeaveSnapshot(status, captured)) {
+          return;
+        }
+        if (status.branches.some(isBranchActive)) {
+          scheduleWeaveStatusPoll(captured, attempt + 1);
+        }
+      } catch {
+        if (weaveCaptureStillCurrent(captured)) {
+          scheduleWeaveStatusPoll(captured, attempt + 1);
+        }
+      }
+    }, delay);
+    weaveStatusPollTimers.add(timer);
   }
 
   function scheduleStaleWeaveCleanup(captured: WeaveCapture, attempt = 0): void {
@@ -4133,6 +4811,7 @@
       });
       if (installWeaveSnapshot(started, captured)) {
         uncertainWeave = null;
+        if (started.branches.some(isBranchActive)) scheduleWeaveStatusPoll(captured);
         announce(started.branches.some(isBranchActive)
           ? 'Suggestions are growing privately'
           : 'Stored strands were recovered');
@@ -4146,8 +4825,14 @@
         document?.summary.document_id === captured.documentId
       ) {
         const captureIsCurrent = weaveCaptureStillCurrent(captured);
+        const failure = normalizeFailure(error);
+        if (captureIsCurrent && failureIsDefiniteContention(failure)) {
+          uncertainWeave = null;
+          scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'retry');
+          return;
+        }
         if (captureIsCurrent) {
-          recordFailure(error);
+          recordFailure(failure);
           uncertainWeave = captured;
         }
         try {
@@ -4234,7 +4919,7 @@
   async function cancelActiveBranches(): Promise<void> {
     const active = branches.filter(isBranchActive);
     if (active.length === 0) return;
-    await Promise.all(active.map((branch) => cancelBranch(branch)));
+    for (const branch of active) await cancelBranch(branch);
   }
 
   function canPromoteBranch(branch: BranchCard): boolean {
@@ -4304,7 +4989,7 @@
         throw new Error('The promoted revision was not visible in the project snapshot.');
       }
       uncertainPromotion = null;
-      closeStrandReview();
+      promotionArmedCandidateId = null;
       restoreWritingFocus = true;
       announce(outcome === 'reconciliation'
         ? 'The suggestion is saved; an external file change now needs review'
@@ -4317,16 +5002,16 @@
         clearFailure();
         switch (outcome) {
           case 'promoted':
-            closeStrandReview();
+            promotionArmedCandidateId = null;
             restoreWritingFocus = true;
             announce('Suggestion accepted');
             break;
           case 'source_changed':
-            closeStrandReview();
+            promotionArmedCandidateId = null;
             announce('The manuscript changed independently; Loom reopened it without attributing the change to this strand');
             break;
           case 'reconciliation':
-            closeStrandReview();
+            promotionArmedCandidateId = null;
             announce('An external manuscript change needs review before promotion can be attributed');
             break;
           case 'unchanged':
@@ -4501,7 +5186,7 @@
     uncertainSave = null;
     branches = [];
     resetLiveGenerationView();
-    mode = opened.summary.kind === 'prose' && canRoundTripMarkdownExactly(opened.text)
+    mode = opened.summary.kind === 'prose' && canUseVisualMarkdown(opened.text, false)
       ? preferredProseMode
       : 'source';
     if (opened.transient_draft) {
@@ -4810,14 +5495,19 @@
       return;
     }
     if (next === 'visual' && !canUseVisual) return;
+    if (next === mode) return;
     flushEditors();
+    invalidateCompletionForCaretNavigation();
     if (next === 'source' && document) setSourceDocument(documentText, document.summary.kind);
-    if (document?.summary.kind === 'prose' && canRoundTripMarkdownExactly(documentText)) {
+    if (document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')) {
       preferredProseMode = next;
     }
     mode = next;
     await tick();
     focusCurrentWritingSurfaceAtEnd();
+    if (completionAutomationEnabled() && currentModel && document) {
+      scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
+    }
     announce(`${next} editor mode`);
   }
 
@@ -4845,7 +5535,9 @@
       project.session_id === closing.session_id
     );
     const agency = pendingCloseAgency;
-    const restoreSuggestions = agency?.suggestionsEnabled ?? suggestionsEnabled;
+    const restoreAutomation = agency?.suggestionsEnabled ?? completionAutomationEnabled();
+    const restoreSuggestions = pendingCloseInlineSuggestionsEnabled ?? suggestionsEnabled;
+    const restoreShuttle = pendingCloseShuttleEnabled ?? shuttleEnabled;
     if (agency && sameSession) {
       try {
         await restoreProjectCloseAgency(agency, {
@@ -4870,19 +5562,26 @@
       }
     }
 
-    if (sameSession) suggestionsEnabled = restoreSuggestions;
+    if (sameSession) {
+      suggestionsEnabled = restoreSuggestions;
+      shuttleEnabled = restoreShuttle;
+    }
     pendingCloseCommandId = null;
     pendingCloseMayHaveCommitted = false;
     pendingCloseAgency = null;
+    pendingCloseInlineSuggestionsEnabled = null;
+    pendingCloseShuttleEnabled = null;
     transition = 'idle';
     scheduleActiveBranchPoll();
     if (
       sameSession &&
-      restoreSuggestions &&
+      restoreAutomation &&
       applicationAllowsModelPreparation(applicationClosePhase)
     ) {
       requestPreferredWriterForCurrentWorkspace();
-      if (currentModel && document) scheduleAutomaticSuggestions(editVersion);
+      if (currentModel && document) {
+        scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
+      }
     }
     return { status: 'resume' };
   }
@@ -4956,8 +5655,11 @@
       // Stop new automatic admission before native close drains any reserved
       // startup already in flight. Keep the persisted preference unchanged so
       // a later reopen can restore the author's choice deliberately.
-      pendingCloseAgency ??= captureProjectCloseAgency(suggestionsEnabled);
+      pendingCloseAgency ??= captureProjectCloseAgency(completionAutomationEnabled());
+      pendingCloseInlineSuggestionsEnabled ??= suggestionsEnabled;
+      pendingCloseShuttleEnabled ??= shuttleEnabled;
       suggestionsEnabled = false;
+      shuttleEnabled = false;
       cancelSuggestionTimer();
       const outcome = await drainGenerationsAndClose({
         disableAutomation: () => setSuggestionsPolicy(
@@ -5017,7 +5719,7 @@
     modelRefreshSerial += 1;
     modelLoadSerial += 1;
     documentEpoch += 1;
-    closeStrandReview();
+    promotionArmedCandidateId = null;
     project = null;
     document = null;
     documentText = '';
@@ -5033,12 +5735,15 @@
     saveMessage = 'No project open';
     outlineOpen = false;
     suggestionsEnabled = false;
+    shuttleEnabled = false;
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
     dismissedCandidateIds = [];
     pendingCloseCommandId = null;
     pendingCloseMayHaveCommitted = false;
     pendingCloseAgency = null;
+    pendingCloseInlineSuggestionsEnabled = null;
+    pendingCloseShuttleEnabled = null;
     uncertainSave = null;
     draftVersion = '0';
     draftSavedEditVersion = 0;
@@ -5060,65 +5765,133 @@
     return 'Prose';
   }
 
-  function promotionUnavailableReason(branch: BranchCard): string {
-    if (document?.summary.kind === 'hybrid') {
-      return 'Hybrid promotion waits for a lossless block-manifest IPC boundary.';
-    }
-    if (branch.source_revision_id !== document?.summary.revision_id) {
-      return 'This strand belongs to an earlier manuscript revision. Keep it as an alternative instead.';
-    }
-    if (editVersion !== savedVersion || sourceDirty) return 'Wait for the manuscript to finish saving.';
-    if (branch.selection === 'promote' || branch.selection === 'reject') {
-      return 'This strand already has a final recorded selection.';
-    }
-    return 'Promotion is unavailable while manuscript state is unsettled.';
-  }
 </script>
 
 <svelte:head>
+  <title>{nativeWindowTitle}</title>
   <meta name="description" content="Loom — a local-first writing environment for prose and poetry" />
 </svelte:head>
 
 <div class="app-shell">
   {#if project}
-    <header class="topbar" aria-label="Writing controls">
-      {#if project.documents.length > 1}
+    <div
+      class="canvas-controls"
+      class:native-fullscreen={nativeFullscreen}
+      aria-label="Writing controls"
+    >
+      <div class="canvas-controls-left" data-no-window-drag>
+        {#if project.documents.length > 1}
+          <button
+            bind:this={outlineToggle}
+            class="titlebar-button outline-toggle"
+            type="button"
+            aria-controls="project-outline"
+            aria-expanded={outlineOpen}
+            aria-label={outlineOpen ? 'Close manuscript outline' : 'Open manuscript outline'}
+            on:click={() => void setOutlineOpen(!outlineOpen)}
+          ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 4h10M3 8h10M3 12h10" /></svg></button>
+        {/if}
+        {#if transition === 'idle'}
+          <button
+            class="titlebar-button new-document-button"
+            type="button"
+            aria-label="New document"
+            title="New document (⌘N)"
+            disabled={fileCommandInFlight || editorReadonly}
+            on:click={() => void newDocument()}
+          ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
+        {/if}
+        {#if document}
+          <button
+            class="titlebar-button mode-toggle"
+            type="button"
+            aria-label={mode === 'visual' ? 'Switch to Markdown editor' : 'Switch to visual editor'}
+            aria-pressed={mode === 'source'}
+            title={mode === 'visual' ? 'Markdown source' : 'Visual writing'}
+            disabled={editorReadonly || (mode === 'source' && !canUseVisual)}
+            on:click={() => void setMode(mode === 'visual' ? 'source' : 'visual')}
+          >
+            {#if mode === 'visual'}
+              <svg aria-hidden="true" viewBox="0 0 18 18"><path d="m5 13 1.2-3.6 6.6-6.6 2.4 2.4-6.6 6.6L5 13Z"/><path d="m6.2 9.4 2.4 2.4M4.4 14.3h9.2"/></svg>
+            {:else}
+              <span class="markdown-monogram" aria-hidden="true">MD</span>
+            {/if}
+          </button>
+        {/if}
+      </div>
+      <div
+        class="titlebar-drag-surface"
+        aria-hidden="true"
+        on:mousedown={startTitlebarDrag}
+      ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
+      <div class="canvas-controls-right" data-no-window-drag>
+        {#if document && mode === 'visual' && canUseVisual}
+          <VisualFormatMenu
+            bind:this={formatMenu}
+            editor={visualEditor}
+            formatting={visualFormatting}
+          />
+        {/if}
         <button
-          bind:this={outlineToggle}
-          class="outline-toggle"
+          class:active={suggestionsEnabled && Boolean(currentModel)}
+          class:preparing={suggestionsEnabled && !currentModel}
+          class="titlebar-button suggestions-toggle"
           type="button"
-          aria-controls="project-outline"
-          aria-expanded={outlineOpen}
-          aria-label={outlineOpen ? 'Close manuscript outline' : 'Open manuscript outline'}
-          on:click={() => void setOutlineOpen(!outlineOpen)}
-        >☰</button>
-      {/if}
-      <h1 class="context-title" title={document?.summary.title ?? project.title}>
-        {document?.summary.title ?? project.title}
-      </h1>
-      <div class="topbar-spacer"></div>
-      {#if document && (saveState === 'error' || saveState === 'uncertain')}
-        <div class="save-status state-{saveState}" role="status" aria-live="polite">
-          <span class="status-dot"></span>{saveMessage}
+          aria-label={suggestionsEnabled ? 'Turn autocomplete off' : 'Turn autocomplete on'}
+          aria-pressed={suggestionsEnabled}
+          title={suggestionsEnabled ? `Autocomplete: ${suggestionMenuState}` : 'Autocomplete: Off'}
+          disabled={!project || suggestionsChanging}
+          on:click={() => void toggleSuggestionsFromTitlebar()}
+        >
+          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="m9 2 .65 2.1L12 5l-2.35.9L9 8l-.65-2.1L6 5l2.35-.9L9 2ZM4.4 8.4l.45 1.45 1.55.55-1.55.55-.45 1.45-.45-1.45-1.55-.55 1.55-.55.45-1.45ZM12.4 9.2l.85 2.55 2.55.85-2.55.85L12.4 16l-.85-2.55L9 12.6l2.55-.85.85-2.55Z"/></svg>
+        </button>
+        <button
+          class:active={shuttleEnabled}
+          class:preparing={shuttleEnabled && !currentModel}
+          class="titlebar-button shuttle-toggle"
+          type="button"
+          aria-label={shuttleEnabled ? 'Turn Shuttle off' : 'Turn Shuttle on'}
+          aria-pressed={shuttleEnabled}
+          title={shuttleEnabled ? 'Shuttle: accepting one word every four idle seconds' : 'Shuttle: Off'}
+          disabled={!project || suggestionsChanging}
+          on:click={() => void setShuttleEnabled(!shuttleEnabled)}
+        >
+          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M4 4.5 10.5 9 4 13.5v-9ZM13.5 4.5v9"/></svg>
+        </button>
+        <div class="save-status state-{saveState}" role="status" aria-label={autosaveLabel}>
+          <span class="status-dot"></span>
         </div>
-      {/if}
-      <details class="project-menu" bind:this={projectMenu}>
-        <summary class="more-button" bind:this={projectMenuTrigger} title="Writing options">
-          <span aria-hidden="true">•••</span>
-          <span class="sr-only">Writing options for {project.title}</span>
-        </summary>
-        <div class="project-menu-popover" aria-label="Project and editor options">
-          <div class="project-menu-title">{project.title}</div>
-          {#if document}
-            <div class="project-menu-label">Editor</div>
-            <button class:active={mode === 'visual'} type="button" aria-pressed={mode === 'visual'} disabled={!canUseVisual || editorReadonly} on:click={() => { closeProjectMenu(); void setMode('visual'); }}>
-              <span>Visual editor</span><span aria-hidden="true">{mode === 'visual' ? '✓' : ''}</span>
-            </button>
-            <button class:active={mode === 'source'} type="button" aria-pressed={mode === 'source'} disabled={editorReadonly} on:click={() => { closeProjectMenu(); void setMode('source'); }}>
-              <span>Source editor</span><span aria-hidden="true">{mode === 'source' ? '✓' : ''}</span>
-            </button>
-            <div class="project-menu-separator"></div>
+        <button
+          class="titlebar-button appearance-button"
+          type="button"
+          aria-label={`Use ${resolvedAppearance === 'dark' ? 'light' : 'dark'} appearance`}
+          title={`Appearance: ${appearance === 'system' ? `System (${resolvedAppearance})` : appearance}`}
+          on:click={toggleAppearance}
+        >
+          {#if resolvedAppearance === 'dark'}
+            <svg aria-hidden="true" viewBox="0 0 18 18"><circle cx="9" cy="9" r="3"/><path d="M9 1.8v1.4M9 14.8v1.4M1.8 9h1.4M14.8 9h1.4M3.9 3.9l1 1M13.1 13.1l1 1M14.1 3.9l-1 1M4.9 13.1l-1 1"/></svg>
+          {:else}
+            <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M14.7 11.7A6.4 6.4 0 0 1 6.3 3.3a6.4 6.4 0 1 0 8.4 8.4Z"/></svg>
           {/if}
+        </button>
+      <details class="project-menu" bind:this={projectMenu}>
+        <summary class="titlebar-button gear-button" bind:this={projectMenuTrigger} title="Settings" aria-label="Settings">
+          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M9 6.4A2.6 2.6 0 1 0 9 11.6 2.6 2.6 0 0 0 9 6.4Z" /><path d="M15 9a6 6 0 0 0-.08-.96l1.35-1.05-1.5-2.6-1.58.65a6 6 0 0 0-1.65-.96L11.3 2.4h-3l-.24 1.68a6 6 0 0 0-1.65.96l-1.58-.65-1.5 2.6 1.35 1.05A6 6 0 0 0 4.6 9c0 .33.03.65.08.96l-1.35 1.05 1.5 2.6 1.58-.65c.5.4 1.06.72 1.65.96l.24 1.68h3l.24-1.68a6 6 0 0 0 1.65-.96l1.58.65 1.5-2.6-1.35-1.05c.05-.31.08-.63.08-.96Z" /></svg>
+        </summary>
+        <div class="project-menu-popover" aria-label="Editor and suggestion settings">
+          <div class="project-menu-label">Appearance</div>
+          {#each ['system', 'light', 'dark'] as choice}
+            <button
+              class:active={appearance === choice}
+              type="button"
+              aria-pressed={appearance === choice}
+              on:click={() => setAppearance(choice as AppearancePreference)}
+            >
+              <span>{choice === 'system' ? 'System' : choice === 'light' ? 'Light' : 'Dark'}</span>
+              <span aria-hidden="true">{appearance === choice ? '✓' : ''}</span>
+            </button>
+          {/each}
+          <div class="project-menu-separator"></div>
           <button
             class:active={suggestionsEnabled && Boolean(currentModel)}
             type="button"
@@ -5130,55 +5903,24 @@
               {suggestionMenuState}
             </span>
           </button>
-          {#if document && reviewableBranches.length > 0}
-            <button
-              type="button"
-              aria-haspopup="dialog"
-              aria-label={`Review ${reviewableBranches.length} saved writing ${reviewableBranches.length === 1 ? 'suggestion' : 'suggestions'}`}
-              on:click={() => void openStrandReview()}
-            >
-              <span>Review suggestions</span>
-              <span class="menu-state">{reviewableBranches.length}</span>
-            </button>
-          {/if}
-          <div class="project-menu-separator"></div>
-          <button type="button" disabled={reconciliationResolutionLocked || (editorReadonly && transition !== 'closing' && !(reconciliation && !document))} on:click={() => { closeProjectMenu(); void closeProject(); }}>
-            {transition === 'closing' ? 'Retry closing project' : 'Close project'}
-          </button>
         </div>
       </details>
-    </header>
+      </div>
+    </div>
   {/if}
 
   {#if project}
-    {#if outlineOpen}
-      <button class="outline-scrim" type="button" aria-label="Close manuscript outline" on:click={() => void setOutlineOpen(false)}></button>
-    {/if}
-    <div class:single-document={project.documents.length === 1} class="workspace-grid">
-      <div
-        bind:this={outlinePanel}
+    <div class:single-document={project.documents.length === 1} class:outline-open={outlineOpen} class="workspace-grid">
+      <aside
         id="project-outline"
         class:open={outlineOpen}
         class="outline-panel"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Manuscript outline"
-        tabindex="-1"
-        on:keydown={(event) => trapFocusWithin(event, outlinePanel)}
+        aria-label="Documents"
       >
-        <div class="panel-heading">
-          <span>Manuscript</span>
-          <button
-            class="dialog-close"
-            type="button"
-            aria-label="Close manuscript outline"
-            on:click={() => void setOutlineOpen(false)}
-          >×</button>
-        </div>
         <label class="search-field">
           <span class="sr-only">Search project</span>
           <span aria-hidden="true">⌕</span>
-          <input bind:this={outlineSearch} bind:value={search} type="search" placeholder="Find in project" />
+          <input bind:value={search} type="search" placeholder="Find in project" />
         </label>
         <nav class="document-list" aria-label="Documents">
           {#each visibleDocuments as candidate (candidate.document_id)}
@@ -5186,22 +5928,19 @@
               class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}
               type="button"
               disabled={editorReadonly}
-              on:click={() => void (async () => {
-                await setOutlineOpen(false);
-                await selectDocument(candidate, true);
-              })()}
+              on:click={() => void selectDocument(candidate, true)}
             >
               <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
               <span class="document-label">
                 <strong>{candidate.title}</strong>
-                <small>{kindLabel(candidate.kind)} · {candidate.word_count.toLocaleString()} words</small>
+                <small>{candidate.word_count.toLocaleString()} {candidate.word_count === 1 ? 'word' : 'words'}</small>
               </span>
             </button>
           {:else}
             <p class="empty-copy">No notes.</p>
           {/each}
         </nav>
-      </div>
+      </aside>
 
       <main id="manuscript" class="manuscript-area" tabindex="-1">
         {#if reconciliation}
@@ -5318,17 +6057,28 @@
                       ghostCandidateId={ghostSuggestion?.candidateId ?? ''}
                       ghostPresentationKey={ghostSuggestion?.presentationKey ?? ''}
                       ghostAnchorByteOffset={ghostSuggestion?.targetByte ?? null}
+                      ghostInsertsOnAccept={ghostSuggestion?.insertsOnAccept ?? false}
+                      ghostAlternatives={ghostAlternatives}
+                      ghostHidden={inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled })}
+                      {ghostUnconsumeText}
                       surfaceKey={visualGhostSurfaceKey}
                       onChange={updateText}
                       onCompositionChange={setVisualComposition}
                       onImmediateDocumentMutation={invalidateVisualSuggestionImmediately}
                       onGhostAccept={acceptActiveGhost}
+                      onGhostInsert={authorizeGhostInsertion}
+                      onGhostCycle={cycleActiveSuggestion}
+                      onGhostUnconsume={authorizeGhostUnconsume}
                       onGhostDismiss={dismissActiveGhost}
                       onGhostPresentationRejected={rejectVisualGhostPresentation}
                       onGhostVisibilityChange={(presentationKey) => {
                         visibleVisualGhostPresentationKey = presentationKey;
                       }}
                       onSelectionChange={updateVisualSelection}
+                      onCaretNavigation={invalidateCompletionForCaretNavigation}
+                      onFormatStateChange={(state) => {
+                        visualFormatting = state;
+                      }}
                       readonly={editorReadonly}
                       autofocus={true}
                     />
@@ -5353,10 +6103,14 @@
                   readonly={editorReadonly || document.summary.kind === 'hybrid' || Boolean(exactTextSurface && verseCodec && !verseCodec.editable)}
                   verse={exactTextSurface}
                   verseNewline={exactTextSurface ? verseCodec?.newline ?? 'mixed' : null}
-                  surfaceKey={`${project.session_id}:${document.summary.document_id}:${documentEpoch}:${mode}`}
+                  surfaceKey={completionContextKey}
                   ghostText={sourceGhostSuggestion?.text ?? ''}
                   ghostCandidateId={sourceGhostSuggestion?.candidateId ?? ''}
                   ghostPresentationKey={sourceGhostSuggestion?.presentationKey ?? ''}
+                  ghostInsertsOnAccept={sourceGhostSuggestion?.insertsOnAccept ?? false}
+                  ghostAlternatives={ghostAlternatives}
+                  ghostHidden={inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled })}
+                  {ghostUnconsumeText}
                   onCompositionStart={beginSourceComposition}
                   onCompositionEnd={finishSourceComposition}
                   onValueInput={(textarea) => {
@@ -5365,6 +6119,9 @@
                   }}
                   onSelectionChange={updateSourceSelection}
                   onGhostAccept={acceptActiveGhost}
+                  onGhostInsert={authorizeGhostInsertion}
+                  onGhostCycle={cycleActiveSuggestion}
+                  onGhostUnconsume={authorizeGhostUnconsume}
                   onGhostDismiss={dismissActiveGhost}
                   onGhostVisibilityChange={(presentationKey) => {
                     visibleSourceGhostPresentationKey = presentationKey;
@@ -5375,85 +6132,6 @@
             {/if}
           </section>
 
-          {#if strandReviewOpen}
-            <dialog
-              class="strand-review"
-              bind:this={strandReviewDialog}
-              aria-labelledby="strand-review-title"
-              on:click={(event) => {
-                if (event.target === strandReviewDialog) closeStrandReview();
-              }}
-              on:close={() => {
-                strandReviewOpen = false;
-                promotionArmedCandidateId = null;
-                projectMenuTrigger?.focus();
-              }}
-              on:cancel={() => {
-                strandReviewOpen = false;
-                promotionArmedCandidateId = null;
-              }}
-            >
-              <div class="strand-review-shell">
-              <header class="strand-review-header">
-                <div>
-                  <h2 id="strand-review-title">Suggestions</h2>
-                  {#if reviewBranchIndex >= 0}
-                    <span>{reviewBranchIndex + 1} of {reviewableBranches.length}</span>
-                  {/if}
-                </div>
-                <button
-                  class="dialog-close"
-                  data-review-close
-                  type="button"
-                  aria-label="Close suggestions"
-                  on:click={closeStrandReview}
-                >×</button>
-              </header>
-
-              {#if reviewBranch}
-                <div class="strand-review-prose">{reviewBranch.text}</div>
-
-                {#if reviewableBranches.length > 1}
-                  <nav class="strand-review-navigation" aria-label="Suggestion navigation">
-                    <button type="button" on:click={() => moveStrandReview(-1)}>Previous</button>
-                    <button type="button" on:click={() => moveStrandReview(1)}>Next</button>
-                  </nav>
-                {/if}
-
-                <details class="strand-evidence">
-                  <summary>Evidence</summary>
-                  <dl>
-                    <div><dt>Model</dt><dd>{reviewBranch.model_id ?? 'Recorded model'}</dd></div>
-                    <div><dt>Seed</dt><dd>{reviewBranch.seed ?? 'Recorded in provenance'}</dd></div>
-                    <div><dt>Boundary</dt><dd>{reviewBranch.target_start_byte}</dd></div>
-                    <div><dt>Output</dt><dd>{reviewBranch.output_blob_id ?? 'Pending immutable body'}</dd></div>
-                    <div><dt>Run</dt><dd>{reviewBranch.run_id}</dd></div>
-                  </dl>
-                  {#if suppressedReviewBranches.length > 0}
-                    <details class="suppressed-output">
-                      <summary>{suppressedReviewBranches.length} malformed {suppressedReviewBranches.length === 1 ? 'output' : 'outputs'} held back</summary>
-                      {#each suppressedReviewBranches as suppressed (suppressed.run_id)}
-                        <div>
-                          <strong>{candidateSurfaceReason(suppressed.text) ?? 'Held back'}</strong>
-                          <pre>{suppressed.text}</pre>
-                        </div>
-                      {/each}
-                    </details>
-                  {/if}
-                </details>
-
-                <footer class="strand-review-actions">
-                  <button class="primary-button" type="button" on:click={() => void acceptInlineSuggestion(reviewBranch)} disabled={!canPromoteBranch(reviewBranch)} title={promotionUnavailableReason(reviewBranch)}>
-                    Insert suggestion
-                  </button>
-                </footer>
-              {:else}
-                <p class="strand-review-empty">No suitable alternative remains at this caret.</p>
-              {/if}
-              </div>
-            </dialog>
-          {/if}
-
           {#if uncertainPromotion}
             <div class="attention-action">
               <button class="secondary-button" type="button" on:click={() => void resolveUncertainPromotion()} disabled={promotionInFlight}>
@@ -5463,7 +6141,10 @@
           {/if}
         {:else}
           <section class="empty-project">
-            {#if uncertainPromotion}
+            {#if transition === 'navigation'}
+              <h1>Opening your writing…</h1>
+              <p>The document controls will appear when the writing surface is ready.</p>
+            {:else if uncertainPromotion}
               <h1>Promotion needs confirmation.</h1>
               <p>The active editor was detached so stale bytes cannot overwrite a promotion that may already be durable.</p>
               <button class="primary-button" type="button" on:click={() => void resolveUncertainPromotion()} disabled={promotionInFlight}>
@@ -5554,21 +6235,21 @@
             <section class="model-setup-callout">
               <div class="model-setup-intro">
                 <strong>Private writing model</strong>
-                <p>Loom uses {expectedPolicyWriterName()} for suggestions. The model stays on this computer.</p>
+                <p>Choose any local text GGUF. Loom inspects it locally before use; vision adapters are excluded and nothing leaves this computer.</p>
               </div>
 
-              {#if compatibleWriterModels.length > 0}
+              {#if availableWriterModels.length > 0}
                 <div class="writer-model-list" aria-label="Compatible writing models">
-                  {#each compatibleWriterModels as model (model.model_path)}
+                  {#each availableWriterModels as model (model.model_path)}
                     <article class="writer-model-choice">
                       <div>
                         <strong>{model.display_name}</strong>
-                        <span>{formatByteCount(model.file_bytes)} · Possible local match</span>
+                        <span>{formatByteCount(model.file_bytes)} · Local text GGUF</span>
                       </div>
                       <button
                         class="primary-button compact"
                         type="button"
-                        on:click={() => void useDiscoveredPolicyWriter(model)}
+                        on:click={() => void useDiscoveredSuggestionWriter(model)}
                         disabled={!desktop || modelChoosing || modelLoading || modelUnloading}
                       >{modelLoading && selectedModelPath === model.model_path ? 'Verifying…' : 'Verify and use'}</button>
                     </article>
@@ -5576,8 +6257,8 @@
                 </div>
               {:else}
                 <div class="model-empty-state">
-                  <strong>No compatible writing model found.</strong>
-                  <span>Loom checked its model library and the local Hugging Face cache. You can locate an existing GGUF file without moving it.</span>
+                  <strong>No recommended writing model found.</strong>
+                  <span>Choose any local text-model GGUF below or locate one without moving it.</span>
                 </div>
               {/if}
 
@@ -5587,11 +6268,11 @@
 
               <div class="model-setup-actions">
                 <button
-                  class={compatibleWriterModels.length > 0 ? 'bare-button compact' : 'secondary-button'}
+                  class={availableWriterModels.length > 0 ? 'bare-button compact' : 'secondary-button'}
                   type="button"
-                  on:click={() => void choosePolicyWriterModel()}
+                  on:click={() => void chooseSuggestionWriterModel()}
                   disabled={!desktop || modelChoosing || modelLoading || modelUnloading}
-                >{modelChoosing ? 'Locating…' : 'Locate compatible model file…'}</button>
+                >{modelChoosing ? 'Locating…' : 'Locate model file…'}</button>
                 <button class="bare-button compact" type="button" on:click={() => void refreshCurrentModelsAndEnsureWriter()} disabled={!desktop || modelChoosing || modelLoading || modelUnloading}>Refresh library</button>
               </div>
             </section>
@@ -5600,33 +6281,14 @@
           <details class="model-advanced-panel">
             <summary>Advanced</summary>
             <div class="model-advanced-content">
+            {#if selectedModel?.loaded}
               <section class="model-library" aria-labelledby="model-library-title">
             <div class="section-heading">
               <div>
-                <h3 id="model-library-title">Other local models</h3>
-                <p>Visible for diagnosis only. This build will not use an unverified model for suggestions.</p>
+                <h3 id="model-library-title">Loaded model</h3>
+                <p>Native runtime details for the writer currently in memory.</p>
               </div>
             </div>
-
-            {#if otherLocalModels.length > 0}
-              <div class="other-model-list">
-                {#each otherLocalModels as model (model.model_path)}
-                  <article class="other-model-row">
-                    <div>
-                      <strong>{model.display_name}</strong>
-                      <span>{formatByteCount(model.file_bytes)}</span>
-                    </div>
-                    <span class="model-incompatible">Not compatible with suggestions</span>
-                  </article>
-                {/each}
-              </div>
-            {:else}
-              <div class="model-empty-state">
-                <strong>No other local GGUF models found.</strong>
-              </div>
-            {/if}
-
-            {#if selectedModel?.loaded}
               <article class="model-facts">
                 <details class="model-technical">
                   <summary>Loaded writer details</summary>
@@ -5652,8 +6314,8 @@
                   </button>
                 </div>
               </article>
-            {/if}
               </section>
+            {/if}
 
               <details class="model-download-panel">
             <summary>Add a model from a verified URL</summary>

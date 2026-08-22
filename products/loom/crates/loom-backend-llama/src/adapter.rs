@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use llama_native_types::{
-    CompletionPrompt, GenerationBatchRequest, GenerationCase, GenerationEvent as NativeEvent,
-    GenerationEventKind as NativeEventKind, GenerationOutput, GenerationState, NativeError,
-    NativeTransport, SamplingConfig, SpecialTokenPolicy,
+    ChatMessage, ChatRole, ChatTemplateChoice, CompletionPrompt, GenerationBatchRequest,
+    GenerationCase, GenerationEvent as NativeEvent, GenerationEventKind as NativeEventKind,
+    GenerationOutput, GenerationState, NativeError, NativeTransport, SamplingConfig,
+    SpecialTokenPolicy,
 };
 use loom_types::{
     ArtifactId, BlobId, BranchCandidate, BranchId, ByteRange, CandidateId, GeneratedSpan,
@@ -30,6 +31,9 @@ use crate::runtime::{
 pub const DEFAULT_EVENT_CAPACITY: usize = 256;
 pub const MAX_EVENT_CAPACITY: usize = 65_536;
 const _: () = assert!(DEFAULT_EVENT_CAPACITY > 0 && DEFAULT_EVENT_CAPACITY <= MAX_EVENT_CAPACITY);
+
+const WRITER_CHAT_INSTRUCTION: &str = "Write only the new prose that belongs after <cursor>. Never copy text from inside <manuscript>, and do not explain, label, quote, or describe your reasoning.\n\n<manuscript>\n";
+const WRITER_CHAT_CURSOR: &str = "\n</manuscript>\n<cursor>";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContinuationCase {
@@ -55,8 +59,13 @@ impl ContinuationCase {
 pub struct ExactContinuationRequest {
     pub request_id: String,
     pub model: LocalModelProfile,
-    /// The exact UTF-8 bytes submitted as the completion prompt. The adapter
-    /// appends no system, chat-template, instruction, or control text.
+    /// The exact source-bound UTF-8 manuscript prefix being continued.
+    ///
+    /// `PromptMode::Completion` describes the product operation. Base models
+    /// receive these bytes as a raw completion prompt. Instruction-tuned
+    /// models receive the same bytes as the user message of the adapter's
+    /// recorded writer chat contract; the backend receipt binds that transport
+    /// choice so validation cannot confuse the two.
     pub exact_manuscript_prefix: String,
     pub prompt_recipe: PromptRecipe,
     pub cases: Vec<ContinuationCase>,
@@ -240,7 +249,7 @@ impl LlamaBackend {
         validate_request(&request, &model, self.event_capacity)?;
         let exact_prompt_blob_id = BlobId::digest(request.exact_manuscript_prefix.as_bytes());
         let model_environment = model_environment_from_verified(&model)?;
-        let native_request = build_native_request(&request);
+        let native_request = build_native_request(&request, &model);
         let execution = self
             .runtime
             .as_batch_runtime()
@@ -852,6 +861,7 @@ struct CandidateMaterial {
 struct BackendReceipt<'a> {
     exact_prompt_blob_id: BlobId,
     model_environment_id: loom_types::ModelEnvironmentId,
+    input_contract: WriterInputContract,
     output: &'a GenerationOutput,
 }
 
@@ -859,7 +869,17 @@ struct BackendReceipt<'a> {
 struct OwnedBackendReceipt {
     exact_prompt_blob_id: BlobId,
     model_environment_id: loom_types::ModelEnvironmentId,
+    input_contract: WriterInputContract,
     output: GenerationOutput,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WriterInputContract {
+    #[default]
+    RawCompletion,
+    InstructionChat,
+    Gemma4NonThinkingChat,
 }
 
 /// Verifies that preserved native receipt bytes describe this exact Loom run.
@@ -872,8 +892,7 @@ pub fn validate_candidate_receipt_binding(
     record: &CandidateProvenanceRecord,
     expected_request_id: &str,
     expected_prompt_blob_id: BlobId,
-    expected_model_environment_id: loom_types::ModelEnvironmentId,
-    expected_local_model_id: &str,
+    expected_model: &VerifiedModelDescriptor,
     expected_input_index: usize,
 ) -> Result<(), LlamaBackendError> {
     let receipt: OwnedBackendReceipt = serde_json::from_slice(&record.backend_receipt_bytes)?;
@@ -904,11 +923,12 @@ pub fn validate_candidate_receipt_binding(
     };
     let output_blob_id = BlobId::digest(output.text.as_bytes());
     let identities_match = receipt.exact_prompt_blob_id == expected_prompt_blob_id
-        && receipt.model_environment_id == expected_model_environment_id
+        && receipt.model_environment_id == expected_model.model_environment_id
+        && receipt.input_contract == writer_input_contract(expected_model)
         && output.request_id == expected_request_id
         && output.branch_id == record.generation.branch_id.to_string()
         && output.input_index == expected_input_index
-        && output.model_id == expected_local_model_id
+        && output.model_id == expected_model.local_model_id
         && output.text == record.output_text
         && output.finish_reason == record.finish_reason
         && output_token_ids == record.token_trace.generated_token_ids
@@ -989,6 +1009,17 @@ fn build_candidate_material(
         &request.model.model_id,
         runtime_evidence,
     )?;
+    if obviously_incompatible_numeric_continuation(&request.exact_manuscript_prefix, &output.text) {
+        #[cfg(test)]
+        eprintln!(
+            "rejected numeric continuation for case {}: {:?}",
+            identity.input_index, output.text
+        );
+        return Err(LlamaBackendError::OutputContract(
+            "generated continuation is numeric degeneration incompatible with the manuscript prefix"
+                .to_string(),
+        ));
+    }
     if output.token_observations.is_some() {
         return Err(LlamaBackendError::OutputContract(
             "native probability observations cannot be relabeled as Loom logprobs".to_string(),
@@ -1000,6 +1031,7 @@ fn build_candidate_material(
     let backend_receipt_bytes = serde_json::to_vec(&BackendReceipt {
         exact_prompt_blob_id,
         model_environment_id: model.model_environment_id,
+        input_contract: writer_input_contract(model),
         output: &output,
     })?;
     let backend_receipt_blob_id = BlobId::digest(&backend_receipt_bytes);
@@ -1051,6 +1083,30 @@ fn build_candidate_material(
         raw_event_stream_bytes,
         backend_receipt_bytes,
     })
+}
+
+fn obviously_incompatible_numeric_continuation(prefix: &str, continuation: &str) -> bool {
+    let prefix_letters = prefix
+        .chars()
+        .rev()
+        .take(256)
+        .filter(|character| character.is_alphabetic())
+        .count();
+    if prefix_letters < 12 {
+        return false;
+    }
+    let visible = continuation
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<Vec<_>>();
+    if visible.len() < 8 {
+        return false;
+    }
+    let digits = visible
+        .iter()
+        .filter(|character| character.is_numeric())
+        .count();
+    digits.saturating_mul(5) >= visible.len().saturating_mul(4)
 }
 
 fn checked_token_ids(
@@ -1176,7 +1232,11 @@ fn validate_request(
     Ok(())
 }
 
-fn build_native_request(request: &ExactContinuationRequest) -> GenerationBatchRequest {
+fn build_native_request(
+    request: &ExactContinuationRequest,
+    model: &VerifiedModelDescriptor,
+) -> GenerationBatchRequest {
+    let input_contract = writer_input_contract(model);
     GenerationBatchRequest {
         request_id: request.request_id.clone(),
         model_id: request.model.model_id.clone(),
@@ -1185,23 +1245,78 @@ fn build_native_request(request: &ExactContinuationRequest) -> GenerationBatchRe
             .iter()
             .map(|case| GenerationCase {
                 case_id: case.generation.branch_id.to_string(),
-                input: llama_native_types::GenerationInput::Completion {
-                    prompts: vec![CompletionPrompt::Text {
-                        text: request.exact_manuscript_prefix.clone(),
-                        // Raw completion still needs the model's beginning-of-sequence
-                        // token.  Omitting it is not a purer prompt: Gemma 4 loses its
-                        // trained sequence boundary and collapses into token loops.
-                        // The manuscript bytes remain exact and independently hashed;
-                        // the typed token policy makes the one added control token
-                        // explicit in native evidence.
-                        special_tokens: SpecialTokenPolicy::AddBosParseSpecial,
-                    }],
+                input: match input_contract {
+                    WriterInputContract::RawCompletion => {
+                        llama_native_types::GenerationInput::Completion {
+                            prompts: vec![CompletionPrompt::Text {
+                                text: request.exact_manuscript_prefix.clone(),
+                                // Raw completion still needs the model's beginning-of-sequence
+                                // token. The manuscript bytes remain independently hashed; the
+                                // typed token policy makes the added control token explicit.
+                                special_tokens: SpecialTokenPolicy::AddBosParseSpecial,
+                            }],
+                        }
+                    }
+                    WriterInputContract::InstructionChat => {
+                        llama_native_types::GenerationInput::Chat {
+                            messages: vec![ChatMessage {
+                                role: ChatRole::User,
+                                content: format!(
+                                    "{WRITER_CHAT_INSTRUCTION}{}{WRITER_CHAT_CURSOR}",
+                                    request.exact_manuscript_prefix,
+                                ),
+                            }],
+                            // Use the template embedded in the exact GGUF. Gemma 4's canonical
+                            // model template is not equivalent to llama.cpp's legacy `gemma`
+                            // alias; the latter produced numeric degeneration in live acceptance.
+                            template: ChatTemplateChoice::ModelDefault,
+                        }
+                    }
+                    WriterInputContract::Gemma4NonThinkingChat => {
+                        llama_native_types::GenerationInput::Completion {
+                            prompts: vec![CompletionPrompt::Text {
+                                text: format!(
+                                    "<|turn>user\n{WRITER_CHAT_INSTRUCTION}{}{WRITER_CHAT_CURSOR}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+                                    request.exact_manuscript_prefix,
+                                ),
+                                // The official Gemma 4 non-thinking generation prompt is
+                                // rendered explicitly because the GGUF's older embedded Jinja
+                                // defaults to thinking and the pinned simple template API cannot
+                                // pass `enable_thinking=false`. The receipt records this contract.
+                                special_tokens: SpecialTokenPolicy::AddBosParseSpecial,
+                            }],
+                        }
+                    }
                 },
                 sampling: case.sampling.clone(),
                 cached_prefix: None,
             })
             .collect(),
     }
+}
+
+fn writer_input_contract(model: &VerifiedModelDescriptor) -> WriterInputContract {
+    if !model.capabilities.chat.is_supported() {
+        return WriterInputContract::RawCompletion;
+    }
+    if model
+        .architecture
+        .as_deref()
+        .is_some_and(|architecture| architecture.starts_with("gemma4"))
+    {
+        // Base Gemma 4 files do not declare a chat template. Architecture plus
+        // an inspected chat capability is therefore stronger evidence than a
+        // filename or the often-generic `general.name = Hf` metadata.
+        return WriterInputContract::Gemma4NonThinkingChat;
+    }
+    let identity = format!("{} {}", model.display_name, model.local_model_id).to_lowercase();
+    let instruction_tuned = identity
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| matches!(part, "it" | "instruct" | "instruction" | "chat"));
+    if !instruction_tuned {
+        return WriterInputContract::RawCompletion;
+    }
+    WriterInputContract::InstructionChat
 }
 
 fn validate_output(
@@ -1770,8 +1885,7 @@ mod tests {
                 record,
                 &result.request_id,
                 result.exact_prompt_blob_id,
-                result.model_environment.environment_id,
-                &result.model.local_model_id,
+                &result.model,
                 input_index,
             )
             .expect("receipt must bind the exact fixture result");
@@ -1874,6 +1988,59 @@ mod tests {
         assert!(matches!(
             backend.shutdown_joined(),
             Err(LlamaBackendError::NativeShutdownAuthorityUnavailable)
+        ));
+    }
+
+    #[test]
+    fn instruction_tuned_writer_uses_bound_transport_while_base_writer_stays_raw() {
+        let request = request_with_two_cases();
+        let mut model = verify_model_inspection(&request.model, model_inspection(&request.model))
+            .expect("verified fixture model");
+
+        let raw = build_native_request(&request, &model);
+        assert!(matches!(
+            raw.cases[0].input,
+            llama_native_types::GenerationInput::Completion { .. }
+        ));
+
+        model.display_name = "gemma-4-12b-it-qat-q4_0".to_string();
+        model.local_model_id = "gemma-4-12b-it-qat-q4_0".to_string();
+        model.architecture = Some("gemma4".to_string());
+        model.capabilities.chat = crate::CapabilitySupport::Supported;
+        let chat = build_native_request(&request, &model);
+        let llama_native_types::GenerationInput::Completion { prompts } = &chat.cases[0].input
+        else {
+            panic!("Gemma 4 writer did not use its explicit non-thinking transport");
+        };
+        let CompletionPrompt::Text {
+            text,
+            special_tokens,
+        } = &prompts[0]
+        else {
+            panic!("Gemma 4 writer prompt was unexpectedly token-bound");
+        };
+        assert!(text.contains(&request.exact_manuscript_prefix));
+        assert!(text.ends_with("<|turn>model\n<|channel>thought\n<channel|>"));
+        assert_eq!(special_tokens, &SpecialTokenPolicy::AddBosParseSpecial);
+    }
+
+    #[test]
+    fn prose_prefix_rejects_numeric_model_collapse_without_banning_numeric_writing() {
+        assert!(obviously_incompatible_numeric_continuation(
+            "I am trying to break your heart.",
+            "100%01587316716161616116161166666611666161616616"
+        ));
+        assert!(obviously_incompatible_numeric_continuation(
+            "Mara pressed her palm to the cold brass, and",
+            " the cold1234434343434343434343434343434343434343434343"
+        ));
+        assert!(!obviously_incompatible_numeric_continuation(
+            "The code on the brass plate was",
+            " 1984, and below it someone had scratched a name."
+        ));
+        assert!(!obviously_incompatible_numeric_continuation(
+            "1234567890",
+            "1111111111111111"
         ));
     }
 
@@ -2047,6 +2214,22 @@ mod tests {
     }
 
     #[test]
+    fn inspected_gemma4_chat_capability_selects_chat_without_filename_guessing() {
+        let profile = model_profile();
+        let mut model = verify_model_inspection(&profile, model_inspection(&profile))
+            .expect("verified fixture model");
+        model.architecture = Some("gemma4".to_string());
+        model.display_name = "Hf".to_string();
+        model.local_model_id = "93567e57a8fe10b2".to_string();
+        model.capabilities.chat = crate::model::CapabilitySupport::Supported;
+
+        assert_eq!(
+            writer_input_contract(&model),
+            WriterInputContract::Gemma4NonThinkingChat
+        );
+    }
+
+    #[test]
     fn inspection_rechecks_configured_digest_assertions() {
         let mut profile = model_profile();
         let unrestricted = verify_model_inspection(&profile, model_inspection(&profile))
@@ -2151,12 +2334,30 @@ mod tests {
 
     #[test]
     #[ignore = "requires LOOM_GGUF_MODEL_PATH, LOOM_GGUF_MODEL_SHA256, and a real local GGUF"]
-    fn real_gguf_raw_family_acceptance() -> Result<(), Box<dyn std::error::Error>> {
+    fn real_gguf_four_way_writer_acceptance() -> Result<(), Box<dyn std::error::Error>> {
         let model_path = std::env::var("LOOM_GGUF_MODEL_PATH")?;
         let expected_sha256 = std::env::var("LOOM_GGUF_MODEL_SHA256")?;
-        let result = run_real_raw_family(&model_path, &expected_sha256)?;
+        let result = run_real_writer_family(&model_path, &expected_sha256)?;
+        eprintln!(
+            "four-way writer batch: {:?}",
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.output_text.as_str())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(result.model.model_sha256, expected_sha256);
-        assert_eq!(result.candidates.len(), 2);
+        assert_eq!(result.candidates.len(), 4);
+        assert!(
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.output_text.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                >= 2,
+            "four-way writer batch did not produce distinct choices"
+        );
         assert!(result.candidates.iter().all(|candidate| {
             candidate
                 .token_trace
@@ -2166,6 +2367,37 @@ mod tests {
                     provenance.evidence_kind == InferenceEvidenceKind::LiveInference
                 })
         }));
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| plausible_real_continuation(&candidate.output_text)),
+            "real writer completion did not produce prose: {:?}",
+            result
+                .candidates
+                .iter()
+                .map(|candidate| candidate.output_text.as_str())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires LOOM_GGUF_MODEL_PATH, LOOM_GGUF_MODEL_SHA256, and a real local GGUF"]
+    fn real_gguf_single_writer_acceptance() -> Result<(), Box<dyn std::error::Error>> {
+        let model_path = std::env::var("LOOM_GGUF_MODEL_PATH")?;
+        let expected_sha256 = std::env::var("LOOM_GGUF_MODEL_SHA256")?;
+        let result = run_real_family(&model_path, &expected_sha256, 1)?;
+        assert_eq!(result.candidates.len(), 1);
+        eprintln!(
+            "single writer completion: {:?}",
+            result.candidates[0].output_text
+        );
+        assert!(
+            plausible_real_continuation(&result.candidates[0].output_text),
+            "single writer completion did not produce prose: {:?}",
+            result.candidates[0].output_text
+        );
         Ok(())
     }
 
@@ -2268,24 +2500,76 @@ mod tests {
     fn plausible_real_continuation(text: &str) -> bool {
         let words = text
             .split(|character: char| !character.is_alphanumeric())
-            .filter(|word| !word.is_empty())
+            .filter(|word| word.chars().count() >= 2 && word.chars().all(char::is_alphabetic))
             .map(str::to_lowercase)
             .collect::<Vec<_>>();
         words.len() >= 4
             && !words
                 .windows(6)
                 .any(|window| window.iter().all(|word| word == &window[0]))
+            && !has_repeated_word_cycle(&words)
+    }
+
+    fn has_repeated_word_cycle(words: &[String]) -> bool {
+        if words.len() < 12 {
+            return false;
+        }
+        let minimum_coverage = words.len().saturating_mul(3).div_ceil(5);
+        let maximum_width = 8.min(words.len() / 3);
+        (2..=maximum_width).any(|width| {
+            (0..width).any(|offset| {
+                let mut repeated_windows = 1;
+                let mut start = offset + width;
+                while start + width <= words.len() {
+                    if words[start..start + width] == words[start - width..start] {
+                        repeated_windows += 1;
+                        if repeated_windows >= 3 && repeated_windows * width >= minimum_coverage {
+                            return true;
+                        }
+                    } else {
+                        repeated_windows = 1;
+                    }
+                    start += width;
+                }
+                false
+            })
+        })
+    }
+
+    fn run_real_writer_family(
+        model_path: &str,
+        expected_sha256: &str,
+    ) -> Result<ExactContinuationResult, Box<dyn std::error::Error>> {
+        run_real_family(model_path, expected_sha256, 4)
     }
 
     fn run_real_raw_family(
         model_path: &str,
         expected_sha256: &str,
     ) -> Result<ExactContinuationResult, Box<dyn std::error::Error>> {
+        run_real_family(model_path, expected_sha256, 2)
+    }
+
+    fn run_real_family(
+        model_path: &str,
+        expected_sha256: &str,
+        case_count: usize,
+    ) -> Result<ExactContinuationResult, Box<dyn std::error::Error>> {
         let mut request = request_with_two_cases();
+        while request.cases.len() < case_count {
+            let index = request.cases.len();
+            let mut case = request.cases[0].clone();
+            case.generation.branch_id = BranchId::new();
+            case.generation.run_id = GenerationRunId::new();
+            case.sampling.seed = 41 + u32::try_from(index)?;
+            case.generation.seed = u64::from(case.sampling.seed);
+            case.generation.sampling = serde_json::to_value(&case.sampling)?;
+            request.cases.push(case);
+        }
+        request.cases.truncate(case_count);
         request.model = LocalModelProfile::for_gguf(model_path);
         request.model.expected_model_sha256 = Some(expected_sha256.to_string());
-        request.model.device = crate::LocalDevicePreference::Cpu;
-        request.model.max_parallel_cases = 2;
+        request.model.max_parallel_cases = u32::try_from(case_count)?;
         request.request_id = "real-raw-family".to_string();
         request.exact_manuscript_prefix =
             "Mara pressed her palm to the cold brass, and".to_string();
@@ -2295,9 +2579,13 @@ mod tests {
             case.sampling.temperature = 0.8;
             case.sampling.top_k = 40;
             case.sampling.top_p = 0.95;
-            case.sampling.min_p = 0.02;
+            case.sampling.min_p = 0.05;
             case.sampling.repeat_last_n = 64;
-            case.sampling.repeat_penalty = 1.02;
+            case.sampling.repeat_penalty = 1.0;
+            case.sampling.dry_multiplier = 0.0;
+            case.sampling.dry_base = 1.75;
+            case.sampling.dry_allowed_length = 4;
+            case.sampling.dry_penalty_last_n = 256;
             case.sampling.max_tokens = 48;
             case.generation.sampling = serde_json::to_value(&case.sampling)?;
         }

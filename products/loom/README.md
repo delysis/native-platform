@@ -67,7 +67,7 @@ Run the macOS development desktop app after the pinned native dependency has bee
 pnpm --filter @delysis/loom tauri dev
 ```
 
-The desktop build defaults to the checked-in `writer-gemma4-base-v2` policy: a local-only, raw-completion writer identity with quiet suggestions as the product default. `writer-gemma4-base-v1` preserves the earlier explicit project-opt-in behavior, and `none-v1` builds without an automatic writer preference. Select one of those exact allow-listed contracts with `LOOM_BUILD_MODEL_POLICY`; arbitrary policy files and model paths are rejected at build time. Model files are always discovered or selected at runtime, so release binaries do not contain paths from the machine that built them.
+The desktop build defaults to the checked-in `writer-gemma4-base-v2` policy: a local-only, raw-completion writer identity with quiet suggestions as the product default. At runtime Loom first reopens a model the author explicitly selected; otherwise it quietly prefers Google's official `gemma-4-12b-it-qat-q4_0.gguf` artifact when bounded local discovery finds its exact file name and byte length, then falls back to the older build-policy writer. Every candidate still passes native GGUF inspection before use. `writer-gemma4-base-v1` preserves the earlier explicit project-opt-in behavior, and `none-v1` builds without an automatic writer preference. Select one of those exact allow-listed contracts with `LOOM_BUILD_MODEL_POLICY`; arbitrary policy files and model paths are rejected at build time. Model files are always discovered or selected at runtime, so release binaries do not contain paths from the machine that built them.
 
 ## Real GGUF acceptance tests
 

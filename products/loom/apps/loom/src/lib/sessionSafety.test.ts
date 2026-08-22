@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   captureForIdempotentRetry,
   closeResultMayHaveCommitted,
+  failureIsDefiniteContention,
   resultMayHaveCommitted
 } from './sessionSafety';
 
@@ -23,6 +24,17 @@ describe('closeResultMayHaveCommitted', () => {
       message: 'retry',
       retryable: true
     })).toBe(true);
+  });
+
+  it('treats native try-lock contention as a definite no-op', () => {
+    const busy = {
+      code: 'project_busy',
+      message: 'another bounded project operation is still running',
+      retryable: true
+    };
+    expect(failureIsDefiniteContention(busy)).toBe(true);
+    expect(resultMayHaveCommitted(busy)).toBe(false);
+    expect(captureForIdempotentRetry({ commandId: 'new' }, busy)).toBeNull();
   });
 
   it('unlocks only for a typed refusal known not to have committed', () => {

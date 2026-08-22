@@ -139,6 +139,40 @@ test("local macOS smoke can verify the exact emitted archive", () => {
   assert.match(smoke, /input_release_receipt_sha256:/);
 });
 
+test("Loom UI smoke cannot attach to an active editor or invent a model identity", () => {
+  const smoke = read(smokeScriptPath);
+  assert.match(smoke, /running_exact_pids=\$\(exact_bundle_pid\)/);
+  assert.match(smoke, /refusing to run macOS UI smoke while the exact application bundle is already running/);
+  assert.match(smoke, /gemma-4-12B-it-qat-q4_0\.gguf/);
+  assert.ok(
+    smoke.indexOf('LOOM_SMOKE_MODEL_LINK="$model_library/gemma-4-12B-it-qat-q4_0.gguf"') <
+      smoke.indexOf("run_once 1"),
+    "the exact Gemma link must exist before Loom startup discovery",
+  );
+  assert.match(smoke, /stat -Lf '%d:%i' "\$LOOM_SMOKE_GGUF_MODEL_PATH"/);
+  assert.doesNotMatch(smoke, /acceptance-writer/);
+  assert.match(smoke, /exercise_loom_completion_word_reversal/);
+  assert.match(smoke, /characterDown\.postToPid\(pid\)/);
+  assert.match(smoke, /event\.postToPid\(pid\)/);
+  assert.match(smoke, /native keyboard input never produced the exact observable editor value/);
+  assert.match(smoke, /observed_editor_value/);
+  assert.match(smoke, /Option-Right did not persist one cached completion word/);
+  assert.match(smoke, /Option-Left did not restore the exact pre-acceptance manuscript bytes/);
+  assert.match(smoke, /generation-run count across Option-Right\/Left/);
+  assert.match(smoke, /var pressed = false/);
+  assert.match(smoke, /if description\.contains\(alreadyName\) \{ exit\(0\) \}/);
+  assert.match(smoke, /option_word_reversal: completionWordReversal/);
+  assert.match(smoke, /generation_runs_before:/);
+  assert.match(smoke, /generation_runs_after:/);
+  assert.match(smoke, /editor_input: editorInput/);
+});
+
+test("Loom's required macOS lane runs the headless WebKit editor interactions", () => {
+  const workflow = read(".github/workflows/ci-pr.yml");
+  assert.match(workflow, /pnpm --filter @delysis\/loom exec playwright install webkit/);
+  assert.match(workflow, /pnpm --filter @delysis\/loom run test:browser/);
+});
+
 test("stable macOS packaging adds only the real distribution gates", () => {
   const release = read(releaseScriptPath);
   assert.match(release, /candidate\|stable/);

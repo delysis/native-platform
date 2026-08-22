@@ -56,6 +56,7 @@ use crate::model_download::{
 
 const INITIAL_DOCUMENT: &str = "manuscript/Untitled.md";
 const DEFAULT_PROJECT_DIRECTORY: &str = "writing";
+const MAX_UNTITLED_DOCUMENT_CANDIDATES: u32 = 10_000;
 const PROJECT_CLOSE_GENERATION_WAIT: Duration = Duration::from_secs(3);
 const MAX_MODEL_DOWNLOAD_URL_BYTES: usize = 16 * 1024;
 const POLICY_MODEL_HASH_BUFFER_BYTES: usize = 1024 * 1024;
@@ -63,6 +64,35 @@ const MAX_TRACKED_GENERATION_WORKERS: usize = DEFAULT_MAX_ACTIVE_GENERATION_BRAN
 #[cfg(test)]
 const FOREGROUND_COMMAND_TEST_TTL: Duration = Duration::from_secs(30);
 pub const APPLICATION_QUIT_MENU_ID: &str = "loom.application.quit";
+pub const FILE_NEW_DOCUMENT_MENU_ID: &str = "loom.file.new-document";
+pub const FILE_OPEN_PROJECT_MENU_ID: &str = "loom.file.open-project";
+pub const FILE_SAVE_MENU_ID: &str = "loom.file.save";
+pub const FILE_EXPORT_COPY_MENU_ID: &str = "loom.file.export-copy";
+pub const FILE_COMMAND_EVENT: &str = "loom://file-command";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FileMenuCommand {
+    NewDocument,
+    OpenProject,
+    Save,
+    ExportCopy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct FileMenuCommandEvent {
+    command: FileMenuCommand,
+}
+
+fn file_menu_command(menu_id: &str) -> Option<FileMenuCommand> {
+    match menu_id {
+        FILE_NEW_DOCUMENT_MENU_ID => Some(FileMenuCommand::NewDocument),
+        FILE_OPEN_PROJECT_MENU_ID => Some(FileMenuCommand::OpenProject),
+        FILE_SAVE_MENU_ID => Some(FileMenuCommand::Save),
+        FILE_EXPORT_COPY_MENU_ID => Some(FileMenuCommand::ExportCopy),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ApplicationPhase {
@@ -164,7 +194,7 @@ struct AutomaticBudgetReservation<'authority> {
 impl AutomaticBudgetAuthority {
     fn reserve(
         &self,
-        _writer: &PolicyBoundAutomaticWriter,
+        _writer: &AutomaticSuggestionAuthority,
         scope: AutomaticBudgetScope,
     ) -> Result<AutomaticBudgetReservation<'_>, AutomaticBudgetError> {
         let mut ledger = self
@@ -339,18 +369,36 @@ mod automatic_writer_authority {
         policy_identity: BuildModelPolicyIdentity,
     }
 
+    /// An explicitly selected local model whose native descriptor proves the
+    /// exact text-completion contract used by Loom suggestions. This witness
+    /// deliberately carries no build-policy identity and therefore cannot be
+    /// used by quiet/default model discovery.
+    #[derive(Debug)]
+    pub(super) struct VerifiedTextAutomaticWriter {
+        loaded: LoadedModel,
+    }
+
+    #[derive(Debug)]
+    pub(super) enum AutomaticSuggestionAuthority {
+        Policy(PolicyBoundAutomaticWriter),
+        VerifiedText(VerifiedTextAutomaticWriter),
+    }
+
     #[derive(Debug)]
     enum AuthorizedWeaveModelKind {
-        Automatic(PolicyBoundAutomaticWriter),
+        Automatic(AutomaticSuggestionAuthority),
         Manual(LoadedModel),
     }
 
     #[derive(Debug)]
     enum SubmittedWeaveAuthority {
-        Automatic {
+        AutomaticPolicy {
             profile_id: BuildWriterProfileId,
             rank: u32,
             policy_identity: BuildModelPolicyIdentity,
+        },
+        AutomaticVerifiedText {
+            model_sha256: String,
         },
         Manual,
     }
@@ -366,7 +414,8 @@ mod automatic_writer_authority {
 
     /// The only model authority accepted by the shared Weave submission path.
     /// Manual requests retain their explicit escape hatch; automatic requests
-    /// necessarily carry a non-forgeable policy witness until request creation.
+    /// necessarily carry either exact build-policy identity or a non-forgeable
+    /// native-verified text-only capability witness until request creation.
     #[derive(Debug)]
     pub(super) struct AuthorizedWeaveModel {
         policy: ValidatedWeavePolicy,
@@ -418,12 +467,81 @@ mod automatic_writer_authority {
             } = self;
             (
                 loaded.profile,
-                SubmittedWeaveAuthority::Automatic {
+                SubmittedWeaveAuthority::AutomaticPolicy {
                     profile_id,
                     rank,
                     policy_identity,
                 },
             )
+        }
+    }
+
+    impl VerifiedTextAutomaticWriter {
+        fn bind(loaded: LoadedModel) -> Result<Self, IpcFailure> {
+            let capabilities = &loaded.descriptor.capabilities;
+            if loaded.profile.projector_path.is_some()
+                || loaded.descriptor.projector_sha256.is_some()
+                || !capabilities.media.is_empty()
+            {
+                return Err(IpcFailure::new(
+                    "automatic_writer_media_unsupported",
+                    "writing suggestions require a text-only model without a vision, audio, or projector adapter",
+                    false,
+                ));
+            }
+            if !capabilities.completion_text.is_supported()
+                || !capabilities.generated_token_ids.is_supported()
+                || !capabilities.ordered_outputs.is_supported()
+                || !capabilities.per_case_sampling.is_supported()
+                || !capabilities.per_case_cancellation.is_supported()
+                || capabilities.max_cases == 0
+            {
+                return Err(IpcFailure::new(
+                    "automatic_writer_capability_mismatch",
+                    "native inspection did not prove the text-completion, generated-token, and bounded batch controls required by writing suggestions",
+                    false,
+                ));
+            }
+            Ok(Self { loaded })
+        }
+
+        fn into_request_parts(self) -> (LocalModelProfile, SubmittedWeaveAuthority) {
+            let Self { loaded } = self;
+            (
+                loaded.profile,
+                SubmittedWeaveAuthority::AutomaticVerifiedText {
+                    model_sha256: loaded.descriptor.model_sha256,
+                },
+            )
+        }
+    }
+
+    impl AutomaticSuggestionAuthority {
+        fn bind(loaded: LoadedModel, policy: &BuildModelPolicy) -> Result<Self, IpcFailure> {
+            if policy
+                .matching_writer(
+                    &loaded.descriptor.model_sha256,
+                    loaded.descriptor.model_file_bytes,
+                )
+                .is_some()
+            {
+                return PolicyBoundAutomaticWriter::bind(loaded, policy).map(Self::Policy);
+            }
+            VerifiedTextAutomaticWriter::bind(loaded).map(Self::VerifiedText)
+        }
+
+        fn loaded(&self) -> &LoadedModel {
+            match self {
+                Self::Policy(writer) => &writer.loaded,
+                Self::VerifiedText(writer) => &writer.loaded,
+            }
+        }
+
+        fn into_request_parts(self) -> (LocalModelProfile, SubmittedWeaveAuthority) {
+            match self {
+                Self::Policy(writer) => writer.into_request_parts(),
+                Self::VerifiedText(writer) => writer.into_request_parts(),
+            }
         }
     }
 
@@ -434,10 +552,13 @@ mod automatic_writer_authority {
         ) -> Result<LlamaGenerationHandle, LlamaBackendError> {
             let Self { request, authority } = self;
             match authority {
-                SubmittedWeaveAuthority::Automatic {
+                SubmittedWeaveAuthority::AutomaticPolicy {
                     profile_id: _profile_id,
                     rank: _rank,
                     policy_identity: _policy_identity,
+                } => {}
+                SubmittedWeaveAuthority::AutomaticVerifiedText {
+                    model_sha256: _model_sha256,
                 } => {}
                 SubmittedWeaveAuthority::Manual => {}
             }
@@ -453,7 +574,7 @@ mod automatic_writer_authority {
         ) -> Result<Self, IpcFailure> {
             let kind = match &policy {
                 ValidatedWeavePolicy::AutomaticV2 => AuthorizedWeaveModelKind::Automatic(
-                    PolicyBoundAutomaticWriter::bind(loaded, build_policy)?,
+                    AutomaticSuggestionAuthority::bind(loaded, build_policy)?,
                 ),
                 ValidatedWeavePolicy::ManualV2 { .. } => AuthorizedWeaveModelKind::Manual(loaded),
             };
@@ -482,12 +603,12 @@ mod automatic_writer_authority {
 
         pub(super) fn loaded(&self) -> &LoadedModel {
             match &self.kind {
-                AuthorizedWeaveModelKind::Automatic(writer) => &writer.loaded,
+                AuthorizedWeaveModelKind::Automatic(writer) => writer.loaded(),
                 AuthorizedWeaveModelKind::Manual(loaded) => loaded,
             }
         }
 
-        pub(super) fn automatic_writer(&self) -> Option<&PolicyBoundAutomaticWriter> {
+        pub(super) fn automatic_writer(&self) -> Option<&AutomaticSuggestionAuthority> {
             match &self.kind {
                 AuthorizedWeaveModelKind::Automatic(writer) => Some(writer),
                 AuthorizedWeaveModelKind::Manual(_) => None,
@@ -525,16 +646,19 @@ mod automatic_writer_authority {
             &self,
         ) -> Option<(BuildWriterProfileId, u32, BuildModelPolicyIdentity)> {
             match &self.kind {
-                AuthorizedWeaveModelKind::Automatic(writer) => {
-                    Some((writer.profile_id, writer.rank, writer.policy_identity))
-                }
-                AuthorizedWeaveModelKind::Manual(_) => None,
+                AuthorizedWeaveModelKind::Automatic(AutomaticSuggestionAuthority::Policy(
+                    writer,
+                )) => Some((writer.profile_id, writer.rank, writer.policy_identity)),
+                AuthorizedWeaveModelKind::Automatic(
+                    AutomaticSuggestionAuthority::VerifiedText(_),
+                )
+                | AuthorizedWeaveModelKind::Manual(_) => None,
             }
         }
     }
 }
 
-use automatic_writer_authority::{AuthorizedWeaveModel, PolicyBoundAutomaticWriter};
+use automatic_writer_authority::{AuthorizedWeaveModel, AutomaticSuggestionAuthority};
 
 #[derive(Clone, Debug)]
 struct GenerationResultBinding {
@@ -1642,8 +1766,10 @@ impl Builder {
                 project_close,
                 project_current,
                 project_recover,
+                document_create,
                 document_open,
                 document_checkpoint,
+                document_export_choose,
                 document_draft_upsert,
                 document_draft_clear,
                 document_reconciliation_preview,
@@ -1720,11 +1846,8 @@ impl Builder {
                 if let RunEvent::Exit = event {
                     quiesce_unpreventable_runtime_exit(app);
                 }
-                if let RunEvent::MenuEvent(menu_event) = event
-                    && menu_event.id() == APPLICATION_QUIT_MENU_ID
-                {
-                    let _ = prepare_application_exit_request(app);
-                    emit_application_close_request(app);
+                if let RunEvent::MenuEvent(menu_event) = event {
+                    handle_menu_event(app, menu_event.id().as_ref());
                 }
                 if let RunEvent::ExitRequested { api, .. } = event
                     && !prepare_application_exit_request(app)
@@ -1734,6 +1857,17 @@ impl Builder {
                 }
             })
             .build()
+    }
+}
+
+fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, menu_id: &str) {
+    if menu_id == APPLICATION_QUIT_MENU_ID {
+        let _ = prepare_application_exit_request(app);
+        emit_application_close_request(app);
+        return;
+    }
+    if let Some(command) = file_menu_command(menu_id) {
+        let _ = app.emit(FILE_COMMAND_EVENT, FileMenuCommandEvent { command });
     }
 }
 
@@ -2194,7 +2328,7 @@ enum ValidatedWeavePolicy {
     },
 }
 
-const AUTOMATIC_WEAVE_BRANCH_COUNT_V2: u32 = 3;
+const AUTOMATIC_WEAVE_BRANCH_COUNT_V2: u32 = 4;
 const AUTOMATIC_WEAVE_MAX_TOKENS_V2: u32 = 48;
 const AUTOMATIC_WEAVE_TEMPERATURE_V2: f32 = 0.8;
 
@@ -2738,6 +2872,73 @@ async fn project_recover(
 }
 
 #[tauri::command]
+async fn document_create(
+    project_id: String,
+    session_id: String,
+    state: State<'_, PluginState>,
+) -> Result<ProjectSnapshot, IpcFailure> {
+    let mut session = lock_session(&state)?;
+    let active_session_id = session.active_session_id.ok_or_else(|| {
+        IpcFailure::new(
+            "corrupt_project_session",
+            "the live project session is missing its session ID",
+            false,
+        )
+    })?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    create_untitled_document(store)?;
+    snapshot_for(store, active_session_id)
+}
+
+fn create_untitled_document(store: &mut ProjectStore) -> Result<String, IpcFailure> {
+    let registered_paths = store
+        .list_documents()
+        .map_err(IpcFailure::store)?
+        .into_iter()
+        .map(|document| document.relative_path)
+        .collect::<BTreeSet<_>>();
+
+    for ordinal in 1..=MAX_UNTITLED_DOCUMENT_CANDIDATES {
+        let relative_path = if ordinal == 1 {
+            INITIAL_DOCUMENT.to_owned()
+        } else {
+            format!("manuscript/Untitled-{ordinal}.md")
+        };
+        if registered_paths.contains(&relative_path)
+            || !document_path_is_absent(store.root(), &relative_path)?
+        {
+            continue;
+        }
+        store
+            .create_document_if_absent(
+                &relative_path,
+                DocumentContent::Prose(String::new()),
+                "new document",
+            )
+            .map_err(IpcFailure::store)?;
+        return Ok(relative_path);
+    }
+
+    Err(IpcFailure::new(
+        "untitled_document_capacity_exhausted",
+        "Loom could not allocate another Untitled manuscript name",
+        false,
+    ))
+}
+
+fn document_path_is_absent(root: &Path, relative_path: &str) -> Result<bool, IpcFailure> {
+    match std::fs::symlink_metadata(root.join(relative_path)) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(IpcFailure::new(
+            "document_path_inspection_failed",
+            format!("the candidate manuscript path could not be inspected: {error}"),
+            true,
+        )),
+    }
+}
+
+#[tauri::command]
 async fn document_open(
     project_id: String,
     session_id: String,
@@ -2765,6 +2966,62 @@ async fn document_open(
         draft = None;
     }
     Ok(open_document_from(document, draft))
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+async fn document_export_choose<R: Runtime>(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    relative_path: String,
+    app: AppHandle<R>,
+    state: State<'_, PluginState>,
+) -> Result<Option<Receipt>, IpcFailure> {
+    {
+        let mut session = lock_session(&state)?;
+        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        ensure_registered_document(store, &relative_path, &document_id)?;
+    }
+
+    let suggested_name = Path::new(&relative_path)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("Loom-export.md");
+    let Some(destination) = app
+        .dialog()
+        .file()
+        .set_title("Export a copy")
+        .set_file_name(suggested_name)
+        .add_filter("Markdown or plain text", &["md", "markdown", "txt"])
+        .blocking_save_file()
+    else {
+        return Ok(None);
+    };
+    let destination = destination.into_path().map_err(|error| {
+        IpcFailure::new(
+            "export_destination_unavailable",
+            format!("the export destination is not a local filesystem path: {error}"),
+            false,
+        )
+    })?;
+
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    export_registered_document(store, &document_id, &relative_path, &destination).map(Some)
+}
+
+fn export_registered_document(
+    store: &mut ProjectStore,
+    document_id: &str,
+    relative_path: &str,
+    destination: &Path,
+) -> Result<Receipt, IpcFailure> {
+    ensure_registered_document(store, relative_path, document_id)?;
+    store
+        .export_document(relative_path, destination)
+        .map(Receipt::from)
+        .map_err(IpcFailure::store)
 }
 
 #[tauri::command]
@@ -6125,19 +6382,25 @@ fn sampling_for_weave_case(
         dynamic_temperature_exponent: 1.0,
         top_k: 40,
         top_p: 0.95,
-        min_p: 0.0,
+        min_p: if repetition_resistant_prose {
+            0.05
+        } else {
+            0.0
+        },
         typical_p: 1.0,
         xtc_probability: 0.0,
         xtc_threshold: 0.1,
         repeat_last_n: 64,
-        repeat_penalty: if repetition_resistant_prose {
-            1.08
-        } else {
-            1.0
-        },
+        // Prompt penalties operate over the full rendered Gemma chat scaffold,
+        // not merely generated prose. Keep them neutral; the model and min-p
+        // filter provide diversity without distorting the first word.
+        repeat_penalty: 1.0,
         frequency_penalty: 0.0,
         presence_penalty: 0.0,
-        dry_multiplier: if repetition_resistant_prose { 0.8 } else { 0.0 },
+        // DRY consumes the rendered instruction/chat control tokens as history.
+        // On Gemma 4 this can suppress ordinary prose tokens before the first
+        // generated word and drive the sampler into numeric degeneration.
+        dry_multiplier: 0.0,
         dry_base: 1.75,
         dry_allowed_length: if repetition_resistant_prose { 4 } else { 2 },
         dry_penalty_last_n: if repetition_resistant_prose { 256 } else { -1 },
@@ -6399,8 +6662,7 @@ fn persist_generation_result<R: Runtime>(
             &candidate,
             &identity.request_id,
             binding.exact_prompt_blob_id,
-            binding.model_environment.environment_id,
-            &binding.model.local_model_id,
+            &binding.model,
             input_index,
         )
         .map_err(|error| {
@@ -8460,29 +8722,84 @@ mod tests {
     }
 
     #[test]
-    fn automatic_writer_authority_rejects_none_and_arbitrary_resident_models() {
+    fn explicitly_loaded_generic_text_model_mints_non_policy_automatic_authority() {
         let writer_policy = BuildModelPolicy::writer_gemma4_base_v2();
-        let exact_writer =
-            test_policy_loaded_model(&writer_policy, Path::new("/tmp/policy-writer.gguf"));
-        let none_error = AuthorizedWeaveModel::bind(
-            ValidatedWeavePolicy::AutomaticV2,
-            exact_writer,
-            &BuildModelPolicy::none_v1(),
-        )
-        .expect_err("none-v1 cannot authorize automatic generation");
-        assert_eq!(none_error.code, "automatic_writer_not_in_build_policy");
-
         let arbitrary = test_loaded_model(
             Path::new("/tmp/arbitrary-completion-model.gguf"),
             "arbitrary-completion-model",
         );
-        let arbitrary_error = AuthorizedWeaveModel::bind(
+        let authorized = AuthorizedWeaveModel::bind(
             ValidatedWeavePolicy::AutomaticV2,
             arbitrary,
             &writer_policy,
         )
-        .expect_err("an arbitrary capable resident model is not a build writer");
-        assert_eq!(arbitrary_error.code, "automatic_writer_not_in_build_policy");
+        .expect("native-verified text completion model");
+
+        assert_eq!(authorized.automatic_binding(), None);
+        assert_eq!(
+            authorized.loaded().descriptor.stable_model_id,
+            "arbitrary-completion-model"
+        );
+    }
+
+    #[test]
+    fn generic_text_model_never_acquires_quiet_policy_identity() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let mut generic = test_loaded_model(Path::new("/tmp/generic.gguf"), "generic");
+        generic.descriptor.model_file_bytes = policy
+            .writers()
+            .first()
+            .expect("policy writer")
+            .model_file_bytes();
+        let summary = model_summary(&generic, true, &policy);
+
+        assert!(summary.policy_candidate.is_none());
+        assert!(summary.policy_verified.is_none());
+        assert!(summary.tested_profile.is_none());
+        assert!(
+            policy
+                .matching_writer(
+                    &generic.descriptor.model_sha256,
+                    generic.descriptor.model_file_bytes,
+                )
+                .is_none(),
+            "a size-only discovery hint must never become quiet-load identity"
+        );
+    }
+
+    #[test]
+    fn generic_automatic_authority_rejects_projector_and_media_models() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let mut projector =
+            test_loaded_model(Path::new("/tmp/projector.gguf"), "projector-adapter");
+        projector.profile.projector_path = Some(PathBuf::from("/tmp/adapter.mmproj"));
+        projector.descriptor.projector_sha256 = Some(BlobId::digest(b"projector").to_string());
+        assert_eq!(
+            AuthorizedWeaveModel::bind(ValidatedWeavePolicy::AutomaticV2, projector, &policy)
+                .expect_err("projector model")
+                .code,
+            "automatic_writer_media_unsupported"
+        );
+
+        let mut vision = test_loaded_model(Path::new("/tmp/vision.gguf"), "vision-model");
+        vision
+            .descriptor
+            .capabilities
+            .media
+            .push(loom_backend_llama::VerifiedMediaCapability {
+                kind: loom_backend_llama::VerifiedMediaKind::Image,
+                projector_required: true,
+                accepted_mime_types: Some(vec!["image/png".to_owned()]),
+                max_objects_per_request: Some(1),
+                max_bytes_per_object: Some(1024),
+                max_total_bytes_per_request: Some(1024),
+            });
+        assert_eq!(
+            AuthorizedWeaveModel::bind(ValidatedWeavePolicy::AutomaticV2, vision, &policy)
+                .expect_err("media-capable model")
+                .code,
+            "automatic_writer_media_unsupported"
+        );
     }
 
     #[test]
@@ -8553,28 +8870,30 @@ mod tests {
     fn rejected_automatic_writers_leave_budget_ledger_untouched() {
         let authority = AutomaticBudgetAuthority::default();
         let writer_policy = BuildModelPolicy::writer_gemma4_base_v2();
-        let arbitrary_rejection = AuthorizedWeaveModel::bind(
+        let mut incapable =
+            test_loaded_model(Path::new("/tmp/incapable.gguf"), "incapable-generic");
+        incapable.descriptor.capabilities.completion_text = CapabilitySupport::Unsupported;
+        let capability_rejection = AuthorizedWeaveModel::bind(
             ValidatedWeavePolicy::AutomaticV2,
-            test_loaded_model(Path::new("/tmp/arbitrary.gguf"), "arbitrary"),
+            incapable,
             &writer_policy,
         );
         assert_eq!(
-            arbitrary_rejection
-                .expect_err("arbitrary model cannot mint the opaque request authority")
+            capability_rejection
+                .expect_err("incapable model cannot mint the opaque request authority")
                 .code,
-            "automatic_writer_not_in_build_policy"
+            "automatic_writer_capability_mismatch"
         );
 
-        let none_rejection = AuthorizedWeaveModel::bind(
-            ValidatedWeavePolicy::AutomaticV2,
-            test_policy_loaded_model(&writer_policy, Path::new("/tmp/policy-writer.gguf")),
-            &BuildModelPolicy::none_v1(),
-        );
+        let mut media = test_loaded_model(Path::new("/tmp/media.gguf"), "media-generic");
+        media.descriptor.projector_sha256 = Some(BlobId::digest(b"projector").to_string());
+        let media_rejection =
+            AuthorizedWeaveModel::bind(ValidatedWeavePolicy::AutomaticV2, media, &writer_policy);
         assert_eq!(
-            none_rejection
-                .expect_err("none-v1 cannot mint the opaque request authority")
+            media_rejection
+                .expect_err("media model cannot mint the opaque request authority")
                 .code,
-            "automatic_writer_not_in_build_policy"
+            "automatic_writer_media_unsupported"
         );
 
         let ledger = authority.ledger.lock().expect("automatic budget ledger");
@@ -8884,6 +9203,122 @@ mod tests {
     }
 
     #[test]
+    fn file_menu_ids_route_only_to_explicit_renderer_commands() {
+        assert_eq!(
+            file_menu_command(FILE_NEW_DOCUMENT_MENU_ID),
+            Some(FileMenuCommand::NewDocument)
+        );
+        assert_eq!(
+            file_menu_command(FILE_OPEN_PROJECT_MENU_ID),
+            Some(FileMenuCommand::OpenProject)
+        );
+        assert_eq!(
+            file_menu_command(FILE_SAVE_MENU_ID),
+            Some(FileMenuCommand::Save)
+        );
+        assert_eq!(
+            file_menu_command(FILE_EXPORT_COPY_MENU_ID),
+            Some(FileMenuCommand::ExportCopy)
+        );
+        assert_eq!(file_menu_command(APPLICATION_QUIT_MENU_ID), None);
+        assert_eq!(file_menu_command("loom.file.unknown"), None);
+        assert_eq!(
+            serde_json::to_value(FileMenuCommandEvent {
+                command: FileMenuCommand::ExportCopy,
+            })
+            .expect("serialize file menu command"),
+            serde_json::json!({ "command": "export_copy" })
+        );
+    }
+
+    #[test]
+    fn new_document_skips_registered_and_unmanaged_visible_paths_without_overwriting() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("first manuscript".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let unmanaged = root.join("manuscript/Untitled-2.md");
+        std::fs::write(&unmanaged, "external manuscript").expect("unmanaged visible file");
+
+        let created = create_untitled_document(&mut store).expect("new document");
+
+        assert_eq!(created, "manuscript/Untitled-3.md");
+        assert_eq!(
+            std::fs::read_to_string(root.join(INITIAL_DOCUMENT)).expect("first manuscript"),
+            "first manuscript"
+        );
+        assert_eq!(
+            std::fs::read_to_string(unmanaged).expect("unmanaged manuscript"),
+            "external manuscript"
+        );
+        assert_eq!(
+            store
+                .read_document(&created)
+                .expect("created document")
+                .text,
+            ""
+        );
+    }
+
+    #[test]
+    fn export_copy_is_document_bound_and_refuses_uncheckpointed_visible_bytes() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("exact manuscript\n".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let destination = temporary.path().join("copy.md");
+
+        let receipt = export_registered_document(
+            &mut store,
+            &document.document_id.to_string(),
+            INITIAL_DOCUMENT,
+            &destination,
+        )
+        .expect("export copy");
+        assert_eq!(receipt.command_kind, "export");
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("exported bytes"),
+            "exact manuscript\n"
+        );
+
+        let wrong_destination = temporary.path().join("wrong.md");
+        let wrong_identity = export_registered_document(
+            &mut store,
+            &DocumentId::new().to_string(),
+            INITIAL_DOCUMENT,
+            &wrong_destination,
+        )
+        .expect_err("foreign document identity");
+        assert_eq!(wrong_identity.code, "document_identity_mismatch");
+        assert!(!wrong_destination.exists());
+
+        std::fs::write(root.join(INITIAL_DOCUMENT), "external edit\n").expect("external edit");
+        let stale_destination = temporary.path().join("stale.md");
+        let stale = export_registered_document(
+            &mut store,
+            &document.document_id.to_string(),
+            INITIAL_DOCUMENT,
+            &stale_destination,
+        )
+        .expect_err("uncheckpointed visible bytes");
+        assert_eq!(stale.code, "external_file_change");
+        assert!(!stale_destination.exists());
+    }
+
+    #[test]
     fn word_count_handles_whitespace_without_normalizing_document() {
         assert_eq!(count_words("first\n  second\tthird"), 3);
     }
@@ -8936,7 +9371,42 @@ mod tests {
                 .expect_err("revision budget exhausted"),
             AutomaticBudgetError::Exhausted
         );
-        assert_eq!(AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2, 288);
+        assert_eq!(AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2, 384);
+    }
+
+    #[test]
+    fn generic_automatic_writer_uses_the_same_revision_budget() {
+        let authority = AutomaticBudgetAuthority::default();
+        let automatic = AuthorizedWeaveModel::bind(
+            ValidatedWeavePolicy::AutomaticV2,
+            test_loaded_model(Path::new("/tmp/generic-budget.gguf"), "generic-budget"),
+            &BuildModelPolicy::writer_gemma4_base_v2(),
+        )
+        .expect("generic automatic authority");
+        let writer = automatic
+            .automatic_writer()
+            .expect("generic automatic writer witness");
+        let scope = AutomaticBudgetScope {
+            project: ProjectId::new(),
+            session: CommandId::new(),
+            document: DocumentId::new(),
+            source_revision: RevisionId::new(),
+        };
+
+        authority
+            .reserve(writer, scope)
+            .expect("first family")
+            .commit();
+        authority
+            .reserve(writer, scope)
+            .expect("replacement family")
+            .commit();
+        assert_eq!(
+            authority
+                .reserve(writer, scope)
+                .expect_err("generic revision budget exhausted"),
+            AutomaticBudgetError::Exhausted
+        );
     }
 
     #[test]
@@ -9031,8 +9501,9 @@ mod tests {
         assert_ne!(verse.seed, manual.seed);
         assert_eq!(automatic.max_tokens, 48);
         assert_eq!(automatic.temperature.to_bits(), 0.8_f32.to_bits());
-        assert_eq!(automatic.repeat_penalty.to_bits(), 1.08_f32.to_bits());
-        assert_eq!(automatic.dry_multiplier.to_bits(), 0.8_f32.to_bits());
+        assert_eq!(automatic.min_p.to_bits(), 0.05_f32.to_bits());
+        assert_eq!(automatic.repeat_penalty.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(automatic.dry_multiplier.to_bits(), 0.0_f32.to_bits());
         assert_eq!(automatic.dry_allowed_length, 4);
         assert_eq!(automatic.dry_penalty_last_n, 256);
         assert_eq!(verse.repeat_penalty.to_bits(), 1.0_f32.to_bits());
@@ -9069,7 +9540,7 @@ mod tests {
         let manual = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::ManualV2);
         assert_eq!(
             prose.fingerprint().sha256_hex(),
-            "8958697e23818dd62c364f46d14d12e977a10b2428be17d255954a25bd3d529c"
+            "3da7620eae64153b0c5785abcdffb094b3eef47677a4beec9ab71fe8c718f334"
         );
         assert_eq!(
             verse.fingerprint().sha256_hex(),
@@ -9085,10 +9556,9 @@ mod tests {
     fn automatic_policy_has_no_runtime_budget_fields() {
         let parsed: WeavePolicySnapshot =
             serde_json::from_str(r#"{"kind":"automatic_v2"}"#).expect("automatic policy");
-        assert_eq!(
-            validate_weave_policy(parsed).expect("validate automatic"),
-            ValidatedWeavePolicy::AutomaticV2
-        );
+        let validated = validate_weave_policy(parsed).expect("validate automatic");
+        assert_eq!(validated, ValidatedWeavePolicy::AutomaticV2);
+        assert_eq!(validated.branch_count(), 4);
         assert!(
             serde_json::from_str::<WeavePolicySnapshot>(
                 r#"{"kind":"automatic_v2","max_tokens":2048}"#

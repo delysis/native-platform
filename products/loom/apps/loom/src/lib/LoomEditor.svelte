@@ -7,29 +7,55 @@
   import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
   import { onDestroy, onMount } from 'svelte';
-  import { parseVisualMarkdown } from './markdownSafety';
+  import {
+    normalizeVisualMarkdownSource,
+    parseVisualMarkdown,
+    serializeVisualMarkdown
+  } from './markdownSafety';
   import {
     clearGhostText,
     createGhostTextPlugin,
+    currentGhostTextPlan,
     exactMarkdownByteOffsetAtSelection,
+    setGhostFanVisible,
     setGhostText,
     visibleGhostWidgetPresentationKey,
     visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
+  import { nextVisualSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
+  import {
+    applyVisualFormat,
+    visualFormatState,
+    type VisualFormatAction,
+    type VisualFormatState
+  } from './visualFormatting';
+  import { visualMarkdownInputRules } from './visualInputRules';
 
   export let value = '';
   export let label = 'Manuscript editor';
+  export let placeholder = 'Start writing…';
   export let readonly = false;
   export let autofocus = false;
   export let ghostText = '';
   export let ghostCandidateId = '';
   export let ghostPresentationKey = '';
   export let ghostAnchorByteOffset: number | null = null;
+  export let ghostInsertsOnAccept = false;
+  export let ghostAlternatives: readonly SuggestionAlternative[] = [];
+  export let ghostHidden = false;
+  export let ghostUnconsumeText = '';
   export let surfaceKey = '';
   export let onChange: (markdown: string) => void = () => {};
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onImmediateDocumentMutation: () => void = () => {};
   export let onGhostAccept: (candidateId: string, presentationKey: string) => boolean = () => false;
+  export let onGhostInsert: (
+    candidateId: string,
+    presentationKey: string,
+    text: string
+  ) => boolean = () => false;
+  export let onGhostCycle: (offset: number) => void = () => {};
+  export let onGhostUnconsume: (candidateId: string, presentationKey: string, text: string) => boolean = () => false;
   export let onGhostDismiss: (candidateId: string, presentationKey: string) => void = () => {};
   export let onGhostPresentationRejected: (
     candidateId: string,
@@ -39,17 +65,23 @@
   ) => void;
   export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
   export let onSelectionChange: (markdownByteOffset: number | null) => void = () => {};
+  export let onCaretNavigation: () => void = () => {};
+  export let onFormatStateChange: (state: VisualFormatState) => void = () => {};
 
   let mount: HTMLDivElement;
   let scrollViewport: HTMLElement | null = null;
   let view: EditorView | undefined;
-  let lastEmitted = value;
+  let lastEmitted = normalizeVisualMarkdownSource(value);
+  let editorEmpty = lastEmitted.length === 0;
   let projectionTimer: number | undefined;
+  let normalizationTimer: number | undefined;
   let localDocumentChanged = false;
+  let completionMutationAuthorized = false;
   let composing = false;
   let suppressedGhostKey = '';
   let reportedGhostPresentationKey = '';
   let reportedRejectedPresentationIdentity = '';
+  let optionHeld = false;
   let visibilityFrame: number | undefined;
   let selectionReportTimer: number | undefined;
   let boundaryCacheDocument: ProseMirrorNode | null = null;
@@ -57,6 +89,8 @@
   let boundaryCacheFrom = -1;
   let boundaryCacheTo = -1;
   let boundaryCacheValue: number | null = null;
+  let formattingSelectionDocument: ProseMirrorNode | null = null;
+  let formattingSelection: Selection | null = null;
 
   function clearBoundaryCache(): void {
     boundaryCacheDocument = null;
@@ -104,7 +138,7 @@
       projectionTimer = undefined;
     }
     localDocumentChanged = false;
-    lastEmitted = defaultMarkdownSerializer.serialize(view.state.doc);
+    lastEmitted = serializeVisualMarkdown(view.state.doc);
     clearBoundaryCache();
     onChange(lastEmitted);
     reportSelection(view.state);
@@ -113,6 +147,15 @@
   function scheduleProjection(delay = 240): void {
     if (projectionTimer !== undefined) return;
     projectionTimer = window.setTimeout(projectDocument, delay);
+  }
+
+  function scheduleExternalNormalization(original: string, normalized: string): void {
+    if (original === normalized) return;
+    if (normalizationTimer !== undefined) window.clearTimeout(normalizationTimer);
+    normalizationTimer = window.setTimeout(() => {
+      normalizationTimer = undefined;
+      if (view && value === original && lastEmitted === normalized) onChange(normalized);
+    }, 0);
   }
 
   export function flushPending(): boolean {
@@ -131,6 +174,81 @@
     return view.hasFocus();
   }
 
+  export function focusPreservingSelection(): boolean {
+    if (!view || readonly) return false;
+    if (
+      formattingSelection &&
+      formattingSelectionDocument === view.state.doc &&
+      !view.state.selection.eq(formattingSelection)
+    ) {
+      view.dispatch(view.state.tr.setSelection(formattingSelection));
+    }
+    view.focus();
+    return view.hasFocus();
+  }
+
+  export function captureFormattingSelection(): boolean {
+    if (!view || readonly || composing) return false;
+    if (formattingSelection && formattingSelectionDocument === view.state.doc && !view.hasFocus()) {
+      return true;
+    }
+    formattingSelectionDocument = view.state.doc;
+    formattingSelection = view.state.selection;
+    return true;
+  }
+
+  export function clearFormattingSelection(): void {
+    formattingSelectionDocument = null;
+    formattingSelection = null;
+  }
+
+  export function applyFormatting(action: VisualFormatAction, href = ''): boolean {
+    if (!view || readonly || composing) return false;
+    focusPreservingSelection();
+    const applied = applyVisualFormat(view.state, action, href, (transaction) => view?.dispatch(transaction));
+    if (applied) {
+      formattingSelectionDocument = view.state.doc;
+      formattingSelection = view.state.selection;
+      view.focus();
+      onFormatStateChange(visualFormatState(view.state));
+    }
+    return applied;
+  }
+
+  export function acceptGhostWord(requireVisible = true): boolean {
+    if (!view || readonly || composing || !view.hasFocus()) return false;
+    const plan = currentGhostTextPlan(view.state);
+    if (
+      !plan ||
+      (requireVisible && visibleGhostWidgetPresentationKey(view) !== plan.presentationKey) ||
+      selectionBoundary(view.state) !== plan.anchorByteOffset
+    ) return false;
+    const word = nextVisualSuggestionWord(plan.text);
+    if (!word || !authorizeCompletionInsertion(plan.candidateId, plan.presentationKey, word)) return false;
+    view.dispatch(view.state.tr.insertText(word));
+    return true;
+  }
+
+  function authorizeCompletionInsertion(
+    candidateId: string,
+    presentationKey: string,
+    text: string
+  ): boolean {
+    const authorized = onGhostInsert(candidateId, presentationKey, text);
+    if (authorized) completionMutationAuthorized = true;
+    return authorized;
+  }
+
+  function authorizeCompletionReversal(
+    candidateId: string,
+    presentationKey: string,
+    text: string
+  ): boolean {
+    const authorized = onGhostUnconsume(candidateId, presentationKey, text);
+    if (authorized) completionMutationAuthorized = true;
+    return authorized;
+  }
+
   function parse(markdown: string): ProseMirrorNode {
     return parseVisualMarkdown(markdown);
   }
@@ -145,6 +263,7 @@
       doc: parse(markdown),
       plugins: [
         history(),
+        visualMarkdownInputRules(),
         keymap({
           'Mod-z': undo,
           'Shift-Mod-z': redo,
@@ -159,6 +278,9 @@
         keymap(baseKeymap),
         createGhostTextPlugin({
           accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
+          insert: authorizeCompletionInsertion,
+          unconsume: authorizeCompletionReversal,
+          cycle: onGhostCycle,
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
           visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>
             Boolean(view) &&
@@ -171,8 +293,21 @@
     });
   }
 
+  function editorAttributes(): Record<string, string> {
+    return {
+      'aria-label': label,
+      'aria-placeholder': placeholder,
+      'data-placeholder': placeholder,
+      class: 'loom-prosemirror',
+      role: 'textbox',
+      'aria-multiline': 'true',
+      spellcheck: 'true'
+    };
+  }
+
   function reportSelection(state: EditorState): void {
     onSelectionChange(selectionBoundary(state));
+    onFormatStateChange(visualFormatState(state));
   }
 
   function scheduleSelectionReport(delay = 48): void {
@@ -183,22 +318,54 @@
     }, delay);
   }
 
+  function setOptionHeld(held: boolean): void {
+    const changed = optionHeld !== held;
+    optionHeld = held;
+    if (!view || !changed) return;
+    if (!held) {
+      // Clear the raw plugin flag even if a completion-owned document update
+      // temporarily makes the derived plan ineligible. Its decoration can
+      // otherwise survive with a latched hidden/fan state until another edit.
+      setGhostFanVisible(view, false);
+      return;
+    }
+    const plan = currentGhostTextPlan(view.state);
+    if (!plan) return;
+    if (plan.alternatives.length > 1) setGhostFanVisible(view, true);
+  }
+
+  function handleWindowKeyDown(event: KeyboardEvent): void {
+    if (event.key === 'Alt' || (event.altKey && !event.metaKey && !event.ctrlKey)) {
+      setOptionHeld(true);
+    }
+  }
+
+  function handleWindowKeyUp(event: KeyboardEvent): void {
+    if (event.key === 'Alt' || !event.altKey) {
+      setOptionHeld(false);
+    }
+  }
+
+  function handleWindowBlur(): void {
+    setOptionHeld(false);
+  }
+
   onMount(() => {
+    const initialMarkdown = normalizeVisualMarkdownSource(value);
+    lastEmitted = initialMarkdown;
     view = new EditorView(mount, {
-      state: stateFor(value),
+      state: stateFor(initialMarkdown),
       editable: () => !readonly,
-      attributes: {
-        'aria-label': label,
-        class: 'loom-prosemirror',
-        role: 'textbox',
-        'aria-multiline': 'true',
-        spellcheck: 'true'
-      },
+      attributes: editorAttributes(),
       dispatchTransaction(transaction) {
         if (!view) return;
+        const completionMutation = transaction.docChanged && completionMutationAuthorized;
+        if (transaction.docChanged) completionMutationAuthorized = false;
         const next = view.state.apply(transaction);
         view.updateState(next);
+        editorEmpty = next.doc.textContent.length === 0;
         if (transaction.docChanged) {
+          clearFormattingSelection();
           clearBoundaryCache();
           if (selectionReportTimer !== undefined) {
             window.clearTimeout(selectionReportTimer);
@@ -206,6 +373,7 @@
           }
           onSelectionChange(null);
         } else if (transaction.selectionSet) {
+          onCaretNavigation();
           onSelectionChange(null);
           scheduleSelectionReport();
         }
@@ -218,7 +386,15 @@
           suppressedGhostKey = ghostPresentationKey;
           onImmediateDocumentMutation();
           localDocumentChanged = true;
-          if (!composing) scheduleProjection();
+          if (!composing) {
+            // Word stepping is already authorized against the exact visible
+            // completion session. Project it into the parent immediately so
+            // the next Option-Left/Right event observes the updated anchor and
+            // cached remainder instead of falling into the ordinary 240 ms
+            // typing debounce.
+            if (completionMutation) projectDocument();
+            else scheduleProjection();
+          }
         }
       },
       handleDOMEvents: {
@@ -251,24 +427,31 @@
       }
     });
     reportSelection(view.state);
+    scheduleExternalNormalization(value, initialMarkdown);
     scrollViewport = mount.closest<HTMLElement>('.editor-pane');
     scheduleGhostVisibilityReport();
     window.addEventListener('resize', reportGhostVisibility);
+    window.addEventListener('keydown', handleWindowKeyDown, true);
+    window.addEventListener('keyup', handleWindowKeyUp, true);
+    window.addEventListener('blur', handleWindowBlur);
     scrollViewport?.addEventListener('scroll', reportGhostVisibility, { passive: true });
     if (autofocus) view.focus();
   });
 
   $: if (view && value !== lastEmitted && !composing && !localDocumentChanged) {
-    lastEmitted = value;
-    const next = stateFor(value);
+    const normalized = normalizeVisualMarkdownSource(value);
+    lastEmitted = normalized;
+    const next = stateFor(normalized);
     view.updateState(next);
+    editorEmpty = next.doc.textContent.length === 0;
     clearBoundaryCache();
     reportSelection(next);
     scheduleGhostVisibilityReport();
+    scheduleExternalNormalization(value, normalized);
   }
 
   $: if (view) {
-    view.setProps({ editable: () => !readonly });
+    view.setProps({ editable: () => !readonly, attributes: editorAttributes() });
     const anchorByteOffset = ghostAnchorByteOffset;
     const exactAnchor = anchorByteOffset !== null &&
       selectionBoundary(view.state) === anchorByteOffset;
@@ -308,25 +491,41 @@
       presentationKey: ghostPresentationKey,
       surfaceKey,
       anchorByteOffset,
-      text: ghostText
+      text: ghostText,
+      insertsOnAccept: ghostInsertsOnAccept,
+      alternatives: ghostAlternatives,
+      hidden: ghostHidden,
+      unconsumeText: ghostUnconsumeText,
+      // Once a word is consumed the session is locked to one candidate. Do
+      // not hide its cached remainder behind a now-empty alternatives fan
+      // while Option is still held.
+      fanVisible: optionHeld && ghostAlternatives.length > 1
     } : null;
     setGhostText(view, presentation);
     scheduleGhostVisibilityReport();
   }
 
   onDestroy(() => {
+    clearFormattingSelection();
     if (projectionTimer !== undefined) window.clearTimeout(projectionTimer);
+    if (normalizationTimer !== undefined) window.clearTimeout(normalizationTimer);
     if (visibilityFrame !== undefined) window.cancelAnimationFrame(visibilityFrame);
     if (selectionReportTimer !== undefined) window.clearTimeout(selectionReportTimer);
     if (composing) onCompositionChange(false);
     onSelectionChange(null);
     if (reportedGhostPresentationKey) onGhostVisibilityChange('');
     window.removeEventListener('resize', reportGhostVisibility);
+    window.removeEventListener('keydown', handleWindowKeyDown, true);
+    window.removeEventListener('keyup', handleWindowKeyUp, true);
+    window.removeEventListener('blur', handleWindowBlur);
     scrollViewport?.removeEventListener('scroll', reportGhostVisibility);
     view?.destroy();
   });
 </script>
 
 <div class="loom-editor-shell">
+  {#if editorEmpty}
+    <div class="loom-editor-placeholder" aria-hidden="true">{placeholder}</div>
+  {/if}
   <div class="editor-mount" bind:this={mount}></div>
 </div>
