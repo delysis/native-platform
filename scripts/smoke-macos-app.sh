@@ -1642,8 +1642,13 @@ wait_for_loom_manuscript_extension() {
     if node - "$manuscript" "$prefix" <<'NODE'
 const fs = require('fs');
 const [path, prefix] = process.argv.slice(2);
-const observed = fs.readFileSync(path, 'utf8');
-process.exit(observed.startsWith(prefix) && observed.length > prefix.length && /\S/u.test(observed.slice(prefix.length)) ? 0 : 1);
+try {
+  const observed = fs.readFileSync(path, 'utf8');
+  process.exit(observed.startsWith(prefix) && observed.length > prefix.length && /\S/u.test(observed.slice(prefix.length)) ? 0 : 1);
+} catch (error) {
+  if (error?.code === 'ENOENT') process.exit(1);
+  throw error;
+}
 NODE
     then
       node - "$manuscript" <<'NODE'
@@ -2570,8 +2575,13 @@ require_loom_new_manuscript_text() {
       if node - "$candidate" "$expected" <<'NODE'
 const fs = require('fs');
 const [path, expected] = process.argv.slice(2);
-const observed = fs.readFileSync(path, 'utf8');
-process.exit(observed === expected ? 0 : 1);
+try {
+  const observed = fs.readFileSync(path, 'utf8');
+  process.exit(observed === expected ? 0 : 1);
+} catch (error) {
+  if (error?.code === 'ENOENT') process.exit(1);
+  throw error;
+}
 NODE
       then
         printf '%s\n' "$candidate"
