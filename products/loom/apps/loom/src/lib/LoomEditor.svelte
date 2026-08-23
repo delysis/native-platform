@@ -36,6 +36,8 @@
   } from './visualFormatting';
   import { visualMarkdownInputRules } from './visualInputRules';
 
+  const formattingSelectionRestoreMeta = 'loomFormattingSelectionRestore';
+
   export let value = '';
   export let label = 'Manuscript editor';
   export let placeholder = 'Start writing…';
@@ -106,6 +108,7 @@
   let boundaryCacheDiagnostic: string | null = null;
   let formattingSelectionDocument: ProseMirrorNode | null = null;
   let formattingSelection: Selection | null = null;
+  let formattingRestoreFrame: number | undefined;
   let reportedCompletionAccessibilityIdentity = '';
 
   function reportCompletionAccessibility(): void {
@@ -256,6 +259,10 @@
   }
 
   export function clearFormattingSelection(): void {
+    if (formattingRestoreFrame !== undefined) {
+      window.cancelAnimationFrame(formattingRestoreFrame);
+      formattingRestoreFrame = undefined;
+    }
     formattingSelectionDocument = null;
     formattingSelection = null;
   }
@@ -265,10 +272,42 @@
     focusPreservingSelection();
     const applied = applyVisualFormat(view.state, action, href, (transaction) => view?.dispatch(transaction));
     if (applied) {
-      formattingSelectionDocument = view.state.doc;
-      formattingSelection = view.state.selection;
-      view.focus();
-      onFormatStateChange(visualFormatState(view.state));
+      const formattedView = view;
+      const formattedDocument = formattedView.state.doc;
+      const formattedSelection = formattedView.state.selection;
+      formattingSelectionDocument = formattedDocument;
+      formattingSelection = formattedSelection;
+      formattedView.focus();
+      onFormatStateChange(visualFormatState(formattedView.state));
+      // WebKit may reconcile an Accessibility activation or a structurally
+      // changed contenteditable after the click handler, overwriting both DOM
+      // focus and the mutable palette selection cache. Restore the immutable
+      // post-command selection once activation has settled.
+      if (formattingRestoreFrame !== undefined) {
+        window.cancelAnimationFrame(formattingRestoreFrame);
+      }
+      formattingRestoreFrame = window.requestAnimationFrame(() => {
+        // Give WebKit one render turn to publish any late contenteditable
+        // selection reconciliation before installing the authoritative state.
+        formattingRestoreFrame = window.requestAnimationFrame(() => {
+          formattingRestoreFrame = undefined;
+          if (
+            !view ||
+            view !== formattedView ||
+            readonly ||
+            composing ||
+            formattedView.state.doc !== formattedDocument
+          ) return;
+          if (!formattedView.state.selection.eq(formattedSelection)) {
+            formattedView.dispatch(formattedView.state.tr
+              .setSelection(formattedSelection)
+              .setMeta(formattingSelectionRestoreMeta, true));
+          }
+          formattedView.focus();
+          formattingSelectionDocument = formattedView.state.doc;
+          formattingSelection = formattedView.state.selection;
+        });
+      });
     }
     return applied;
   }
@@ -459,7 +498,10 @@
           ) {
             formattingSelection = next.selection;
           }
-          if (view.hasFocus()) onCaretNavigation();
+          if (
+            view.hasFocus() &&
+            transaction.getMeta(formattingSelectionRestoreMeta) !== true
+          ) onCaretNavigation();
           onSelectionChange(null, 'selection_settling', null);
           scheduleSelectionReport();
         }

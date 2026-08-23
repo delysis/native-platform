@@ -176,6 +176,35 @@ describe('real WebKit editor interactions', () => {
     expect(document.getSelection()?.toString().trim()).toBe('Words');
   });
 
+  it('restores the immutable formatted caret after late WebKit selection reconciliation', async () => {
+    render('Words');
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await editor.click();
+    await userEvent.keyboard('{End}');
+
+    const formatButton = page.getByRole('button', { name: 'Format text' });
+    (formatButton.element() as HTMLButtonElement).click();
+    await expect.element(formatButton).toHaveAttribute('aria-expanded', 'true');
+    (page.getByRole('button', { name: 'Title' }).element() as HTMLButtonElement).click();
+    expect(document.getSelection()?.isCollapsed).toBe(true);
+    expect(document.getSelection()?.focusOffset).toBe('Words'.length);
+
+    const range = document.createRange();
+    range.selectNodeContents(editor.element());
+    const selection = document.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    document.dispatchEvent(new Event('selectionchange'));
+    expect(document.getSelection()?.toString().trim()).toBe('Words');
+
+    await expect.poll(serializedMarkdown).toBe('# Words');
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    expect(document.activeElement).toBe(editor.element());
+    expect(document.getSelection()?.isCollapsed).toBe(true);
+    expect(document.getSelection()?.focusOffset).toBe('Words'.length);
+  });
+
   it('keeps one terminal prose space outside inline palette formatting', async () => {
     const keyboard = userEvent.setup();
     render('Words ');
