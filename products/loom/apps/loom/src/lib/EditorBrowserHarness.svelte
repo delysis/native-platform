@@ -39,6 +39,7 @@
   let generationRequests = 0;
   let exhaustionHandled = false;
   let completionReady = false;
+  let lastFormattingResult = 'none';
   let formatting: VisualFormatState = {
     block: 'body',
     bold: false,
@@ -59,12 +60,14 @@
     ? session.candidates.map((candidate) => ({
         candidateId: candidate.candidateId,
         presentationKey: candidate.presentationKey,
-        text: candidate.text
+        text: candidate.text,
+        runId: candidate.runId
       }))
     : presentation ? [{
         candidateId: presentation.candidateId,
         presentationKey: presentation.presentationKey,
-        text: presentation.text
+        text: presentation.text,
+        runId: presentation.runId
       }] : [];
   $: unconsumeText = session?.acceptedChunks.at(-1) ?? '';
   $: {
@@ -128,6 +131,15 @@
     if (session) session = cycleCompletionSession(session, offset);
   }
 
+  function dismiss(candidateId: string, presentationKey: string): void {
+    if (
+      presentation?.candidateId !== candidateId ||
+      presentation.presentationKey !== presentationKey
+    ) return;
+    session = null;
+    pendingMarkdown = null;
+  }
+
   function simulateCheckpoint(): void {
     checkpointRevision += 1;
   }
@@ -144,7 +156,13 @@
 </script>
 
 <main>
-  <VisualFormatMenu {editor} {formatting} />
+  <VisualFormatMenu
+    {editor}
+    {formatting}
+    onCommandResult={(action, applied, diagnostic) => {
+      lastFormattingResult = `${action}:${applied ? 'applied' : 'refused'}:${diagnostic}`;
+    }}
+  />
   <section class="editor-pane">
     <LoomEditor
       bind:this={editor}
@@ -156,7 +174,7 @@
       ghostAnchorByteOffset={presentation?.targetByte ?? null}
       ghostInsertsOnAccept={true}
       ghostAlternatives={alternatives}
-      ghostHidden={!autocomplete}
+      ghostHidden={shuttle || !autocomplete}
       ghostUnconsumeText={unconsumeText}
       surfaceKey="browser:surface"
       onChange={change}
@@ -165,6 +183,7 @@
       onGhostInsert={insert}
       onGhostUnconsume={unconsume}
       onGhostCycle={cycle}
+      onGhostDismiss={dismiss}
       onGhostPresentationRejected={() => {}}
       onFormatStateChange={(state) => formatting = state}
     />
@@ -174,6 +193,7 @@
   <output aria-label="Completion Presentation">{presentation ? `${presentation.targetByte}:${presentation.presentationKey}:${presentation.text}` : 'none'}</output>
   <output aria-label="Completion Context">{session?.contextKey ?? 'none'}</output>
   <output aria-label="Checkpoint Revision">{checkpointRevision}</output>
+  <output aria-label="Formatting Result">{lastFormattingResult}</output>
   <button type="button" on:mousedown|preventDefault on:click={simulateCheckpoint}>Simulate checkpoint</button>
   <button type="button" on:mousedown|preventDefault on:click={advanceShuttle}>Advance Shuttle</button>
 </main>

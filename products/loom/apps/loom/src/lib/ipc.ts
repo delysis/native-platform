@@ -26,15 +26,83 @@ import { decodeBuildModelPolicy } from './buildModelPolicy';
 
 const PREFIX = 'plugin:loom|';
 
+// Project commands share one renderer-side ordering lane. Classify by the
+// smaller, fail-safe exception set: an unrecognized future command is queued.
+// Native session admission is authoritative across renderers and blocks for
+// its bounded critical sections, so renderer classification is an ordering and
+// latency optimization rather than a correctness boundary.
+const INDEPENDENT_COMMANDS = new Set([
+  'application_close_abort',
+  'application_close_pending',
+  'build_model_policy_get',
+  'model_download_cancel',
+  'model_download_list',
+  'model_download_start',
+  'model_download_status',
+  'model_list',
+  'model_load',
+  'model_load_policy_candidate',
+  'model_unload'
+]);
+
+const PROJECT_TRANSITION_RETRY_DELAYS_MS = [20, 40, 80, 160, 240, 360, 500] as const;
+
+let sessionCommandTail: Promise<void> = Promise.resolve();
+
 export function isDesktopRuntime(): boolean {
   return '__TAURI_INTERNALS__' in window;
+}
+
+function isTypedProjectAdmissionPending(command: string, error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const value = error as Record<string, unknown>;
+  return value.retryable === true &&
+    command === 'project_current' &&
+    value.code === 'project_transition_in_progress';
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, milliseconds));
+}
+
+async function invokeWhenProjectSessionAdmitted<T>(
+  command: string,
+  args: Record<string, unknown>
+): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await invoke<T>(`${PREFIX}${command}`, args);
+    } catch (error) {
+      if (!isTypedProjectAdmissionPending(command, error)) throw error;
+      // A detached chooser/close transition is observable native state, not an
+      // error. Keep waiting for its exact outcome without spinning.
+      const delay = PROJECT_TRANSITION_RETRY_DELAYS_MS[
+        Math.min(attempt, PROJECT_TRANSITION_RETRY_DELAYS_MS.length - 1)
+      ];
+      await wait(delay);
+    }
+  }
+}
+
+function enqueueSessionCommand<T>(operation: () => Promise<T>): Promise<T> {
+  const result = sessionCommandTail.then(operation);
+  sessionCommandTail = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
 }
 
 async function call<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   if (!isDesktopRuntime()) {
     throw { code: 'desktop_runtime_required', message: 'This command requires the Loom desktop runtime.' };
   }
-  return invoke<T>(`${PREFIX}${command}`, args);
+
+  if (INDEPENDENT_COMMANDS.has(command)) {
+    return invoke<T>(`${PREFIX}${command}`, args);
+  }
+
+  return enqueueSessionCommand(() => invokeWhenProjectSessionAdmitted<T>(command, args));
 }
 
 export function chooseAndCreateProject(title: string): Promise<ProjectSnapshot> {

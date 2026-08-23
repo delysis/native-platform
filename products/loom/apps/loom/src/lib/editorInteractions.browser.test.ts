@@ -40,6 +40,152 @@ function renderSource(
 }
 
 describe('real WebKit editor interactions', () => {
+  function serializedMarkdown(): string {
+    return page.getByRole('status', { name: 'Serialized Markdown' }).element().textContent ?? '';
+  }
+
+  it('preserves a paused terminal separator for later typing and palette commands', async () => {
+    const keyboard = userEvent.setup();
+    render('Something');
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await editor.click();
+    await keyboard.keyboard('{End} ');
+    await expect.poll(serializedMarkdown).toBe('Something ');
+
+    // Cross both the editor projection debounce and ProseMirror's history
+    // grouping window. The next word must retain the writer-entered separator.
+    await new Promise((resolve) => window.setTimeout(resolve, 650));
+    await keyboard.keyboard('else');
+    await expect.poll(serializedMarkdown).toBe('Something else');
+    await new Promise((resolve) => window.setTimeout(resolve, 650));
+    await keyboard.keyboard('{Meta>}z{/Meta}');
+    await expect.poll(serializedMarkdown).toBe('Something ');
+    await keyboard.keyboard('{Meta>}{Shift>}z{/Shift}{/Meta}');
+    await expect.poll(serializedMarkdown).toBe('Something else');
+
+    await page.getByText('Aa', { exact: true }).click();
+    await page.getByRole('button', { name: 'Title' }).click();
+    await expect.poll(serializedMarkdown).toBe('# Something else');
+    await page.getByRole('button', { name: 'Body' }).click();
+    await expect.poll(serializedMarkdown).toBe('Something else');
+    await keyboard.cleanup();
+  });
+
+  it('wires every Aa formatting family to exact Markdown', async () => {
+    render('Words');
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await editor.click();
+    await userEvent.keyboard('{Meta>}a{/Meta}');
+    await page.getByText('Aa', { exact: true }).click();
+
+    for (const [label, expected] of [
+      ['Title', '# Words'],
+      ['Heading', '## Words'],
+      ['Subheading', '### Words'],
+      ['Body', 'Words']
+    ] as const) {
+      await page.getByRole('button', { name: label, exact: true }).click();
+      await expect.poll(serializedMarkdown).toBe(expected);
+    }
+
+    for (const [label, formatted, restored] of [
+      ['Bold', '**Words**', 'Words'],
+      ['Italic', '*Words*', 'Words'],
+      ['Block quote', '> Words', 'Words'],
+      ['Bulleted list', '* Words', 'Words'],
+      ['Numbered list', '1. Words', 'Words']
+    ] as const) {
+      await page.getByRole('button', { name: label }).click();
+      await expect.poll(serializedMarkdown).toBe(formatted);
+      await page.getByRole('button', { name: label }).click();
+      await expect.element(page.getByRole('status', { name: 'Formatting Result' }))
+        .toHaveTextContent('applied');
+      await expect.poll(serializedMarkdown).toBe(restored);
+    }
+
+    await userEvent.fill(
+      page.getByRole('textbox', { name: 'Link destination' }),
+      'https://example.com'
+    );
+    await page.getByRole('button', { name: 'Link' }).click();
+    await expect.poll(serializedMarkdown).toBe('[Words](https://example.com)');
+    await page.getByRole('button', { name: 'Remove' }).click();
+    await expect.poll(serializedMarkdown).toBe('Words');
+  });
+
+  it('keeps one terminal prose space outside inline palette formatting', async () => {
+    const keyboard = userEvent.setup();
+    render('Words ');
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await editor.click();
+    await keyboard.keyboard('{Meta>}a{/Meta}');
+    await page.getByText('Aa', { exact: true }).click();
+
+    for (const [label, formatted] of [
+      ['Bold', '**Words** '],
+      ['Italic', '*Words* ']
+    ] as const) {
+      await page.getByRole('button', { name: label }).click();
+      await expect.poll(serializedMarkdown).toBe(formatted);
+      await page.getByRole('button', { name: label }).click();
+      await expect.poll(serializedMarkdown).toBe('Words ');
+    }
+
+    await userEvent.fill(
+      page.getByRole('textbox', { name: 'Link destination' }),
+      'https://example.com'
+    );
+    await page.getByRole('button', { name: 'Link' }).click();
+    await expect.poll(serializedMarkdown).toBe('[Words](https://example.com) ');
+    await page.getByRole('button', { name: 'Remove' }).click();
+    await expect.poll(serializedMarkdown).toBe('Words ');
+    await keyboard.cleanup();
+  });
+
+  it('renders a completion at the exact byte after a terminal prose space', async () => {
+    render('Something ', [
+      { candidateId: 'a', presentationKey: 'a:1', text: 'lingers here', runId: 'run-a', targetByte: 10, insertsOnAccept: true }
+    ]);
+    await expect.element(page.getByText('lingers here', { exact: true }).first()).toBeVisible();
+    await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
+    await expect.poll(serializedMarkdown).toBe('Something lingers');
+    await expect.element(page.getByText('here', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
+      .toHaveTextContent('0');
+  });
+
+  it('refuses a direct multiline visual ghost without corrupting document structure or history', async () => {
+    const keyboard = userEvent.setup();
+    render('hello', [
+      {
+        candidateId: 'multiline',
+        presentationKey: 'multiline:1',
+        text: ' world.\n\nA new paragraph.',
+        runId: 'run-multiline',
+        targetByte: 5,
+        insertsOnAccept: true
+      }
+    ]);
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await expect.element(page.getByRole('status', { name: 'Completion Presentation' }))
+      .toHaveTextContent('A new paragraph.');
+
+    expect(editor.element().querySelector('.loom-visual-ghost')).toBeNull();
+    expect(editor.element().querySelectorAll(':scope > p')).toHaveLength(1);
+    await keyboard.keyboard('{Alt>}{ArrowRight}{/Alt}');
+    await expect.poll(serializedMarkdown).toBe('hello');
+
+    await keyboard.keyboard('!');
+    await expect.poll(serializedMarkdown).toBe('hello!');
+    await keyboard.keyboard('{Meta>}z{/Meta}');
+    await expect.poll(serializedMarkdown).toBe('hello');
+    expect(editor.element().querySelector('.loom-visual-ghost')).toBeNull();
+    const paragraphs = editor.element().querySelectorAll(':scope > p');
+    expect(paragraphs).toHaveLength(1);
+    expect(paragraphs[0]?.textContent).toBe('hello');
+    await keyboard.cleanup();
+  });
+
   it('keeps a real editor selection while opening Aa and applying Bold', async () => {
     render('alpha beta gamma');
     const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
@@ -71,6 +217,22 @@ describe('real WebKit editor interactions', () => {
       .toHaveTextContent('[linked words](https://example.com)');
   });
 
+  it('changes an existing link destination through the Aa palette', async () => {
+    render('[linked words](https://old.example)');
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await editor.click();
+    await userEvent.keyboard('{Meta>}a{/Meta}');
+    await page.getByText('Aa', { exact: true }).click();
+    await userEvent.fill(
+      page.getByRole('textbox', { name: 'Link destination' }),
+      'https://new.example'
+    );
+    await page.getByRole('button', { name: 'Link' }).click();
+
+    await expect.poll(serializedMarkdown)
+      .toBe('[linked words](https://new.example)');
+  });
+
   it('renders, consumes, and reverses a cached ghost without new inference', async () => {
     render('hello', [
       { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
@@ -96,11 +258,42 @@ describe('real WebKit editor interactions', () => {
       .toHaveTextContent('hello');
     await expect.element(page.getByText(' world again', { exact: true }).first())
       .toBeVisible();
+    expect(page.getByRole('listbox', { name: 'Completion suggestions' }).query()).toBeNull();
     await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
       .toHaveTextContent('0');
     const paragraph = page.getByRole('textbox', { name: 'Manuscript editor' })
       .element().querySelector('p');
     expect(paragraph?.firstChild?.textContent).toBe('hello');
+  });
+
+  it('retains one exhausted word only for one immediate exact rollback', async () => {
+    const keyboard = userEvent.setup();
+    render('hello', [
+      { candidateId: 'a', presentationKey: 'a:1', text: ' world', runId: 'run-a', targetByte: 5, insertsOnAccept: true }
+    ]);
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+
+    await keyboard.keyboard('{Alt>}{ArrowRight}{ArrowLeft}');
+    await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
+      .toHaveTextContent('hello');
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    await keyboard.keyboard('{ArrowLeft}{/Alt}');
+    await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
+      .toHaveTextContent('hello');
+    await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
+      .toHaveTextContent('1');
+    await keyboard.cleanup();
+  });
+
+  it('lets Escape deliberately clear exhausted rollback authority', async () => {
+    render('hello', [
+      { candidateId: 'a', presentationKey: 'a:1', text: ' world', runId: 'run-a', targetByte: 5, insertsOnAccept: true }
+    ]);
+    await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}{Escape}');
+    await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
+      .toHaveTextContent('hello world');
+    await expect.element(page.getByRole('status', { name: 'Completion Presentation' }))
+      .toHaveTextContent('none');
   });
 
   it('reverses an accepted visual word on the immediately following key event', async () => {
@@ -121,6 +314,24 @@ describe('real WebKit editor interactions', () => {
     await keyboard.cleanup();
   });
 
+  it('dismisses a consumed cached continuation instead of re-serving it', async () => {
+    render('hello', [
+      { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
+      { candidateId: 'b', presentationKey: 'b:1', text: ' there friend', runId: 'run-b', targetByte: 5, insertsOnAccept: true }
+    ]);
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
+
+    await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}{Escape}');
+
+    await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
+      .toHaveTextContent('hello world');
+    await expect.element(page.getByRole('status', { name: 'Completion Presentation' }))
+      .toHaveTextContent('none');
+    expect(page.getByText('again', { exact: true }).query()).toBeNull();
+    await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
+      .toHaveTextContent('0');
+  });
+
   it('keeps all four alternatives visible while Option cycles the active candidate', async () => {
     const keyboard = userEvent.setup();
     render('hello', [
@@ -132,13 +343,26 @@ describe('real WebKit editor interactions', () => {
     await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
 
     await keyboard.keyboard('{Alt>}{ArrowDown}');
+    const fan = page.getByRole('listbox', { name: 'Completion suggestions' });
+    await expect.element(fan).toBeVisible();
+    const options = page.getByRole('option');
+    await expect.element(options).toHaveLength(4);
     const rows = Array.from(document.querySelectorAll<HTMLElement>('.loom-ghost-fan-row'));
     expect(rows).toHaveLength(4);
     expect(rows.every((row) => row.getClientRects().length > 0)).toBe(true);
     await expect.poll(
       () => document.querySelector<HTMLElement>('.loom-ghost-fan-row.active')?.textContent
     ).toContain('there');
+    expect(document.querySelector('[role="option"][aria-selected="true"]')
+      ?.getAttribute('aria-description')).toContain('"run_id":"run-b"');
     expect(document.querySelectorAll('.loom-ghost-fan-row')).toHaveLength(4);
+    await keyboard.keyboard('{ArrowUp}');
+    await expect.poll(
+      () => document.querySelector<HTMLElement>('.loom-ghost-fan-row.active')?.textContent
+    ).toContain('world');
+    expect(document.querySelector('[role="option"][aria-selected="true"]')
+      ?.getAttribute('aria-description')).toContain('"run_id":"run-a"');
+    await keyboard.keyboard('{/Alt}');
     await keyboard.cleanup();
   });
 
@@ -170,10 +394,10 @@ describe('real WebKit editor interactions', () => {
     await keyboard.cleanup();
   });
 
-  it('advances Shuttle through the shared session while ordinary ghost text is off', async () => {
+  it('advances Shuttle through the shared session while autocomplete is also on', async () => {
     render('hello', [
       { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true }
-    ], { autocomplete: false, shuttle: true });
+    ], { autocomplete: true, shuttle: true });
     const hiddenGhost = page.getByText(' world again', { exact: true }).first();
     await expect.element(hiddenGhost).toBeInTheDocument();
     await expect.element(hiddenGhost).not.toBeVisible();
@@ -210,6 +434,23 @@ describe('real WebKit editor interactions', () => {
     await expect.element(page.getByRole('status', { name: 'Source Markdown' }))
       .toHaveTextContent('hello');
     await expect.element(page.getByText(' there friend', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByRole('status', { name: 'Source Generation Requests' }))
+      .toHaveTextContent('0');
+    await keyboard.cleanup();
+  });
+
+  it('retains exhausted source authority for one exact Option-Left rollback', async () => {
+    const keyboard = userEvent.setup();
+    renderSource('hello', [
+      { candidateId: 'a', presentationKey: 'a:1', text: ' world', runId: 'run-a', targetByte: 5, insertsOnAccept: true }
+    ]);
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+
+    await keyboard.keyboard('{Alt>}{ArrowRight}{ArrowLeft}{/Alt}');
+
+    await expect.element(page.getByRole('status', { name: 'Source Markdown' }))
+      .toHaveTextContent('hello');
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
     await expect.element(page.getByRole('status', { name: 'Source Generation Requests' }))
       .toHaveTextContent('0');
     await keyboard.cleanup();

@@ -13,6 +13,7 @@ interface SessionCloseOperations<T> {
   disableAutomation: () => Promise<void>;
   cancelKnownBranches: () => Promise<void>;
   closeProject: () => Promise<T>;
+  validateCloseResult: (value: T) => void;
   normalizeFailure: (error: unknown) => LoomFailure;
   closeResultMayHaveCommitted: (failure: LoomFailure) => boolean;
   wait: (delayMs: number) => Promise<void>;
@@ -87,8 +88,9 @@ export async function drainGenerationsAndClose<T>(
 
   for (let attempt = 0; ; attempt += 1) {
     if (!operations.isCurrent()) return { status: 'stale' };
+    let value: T;
     try {
-      return { status: 'closed', value: await operations.closeProject() };
+      value = await operations.closeProject();
     } catch (error) {
       const failure = operations.normalizeFailure(error);
       if (!isKnownCloseWait(failure)) {
@@ -124,6 +126,12 @@ export async function drainGenerationsAndClose<T>(
         // See the authoritative close check above.
       }
       if (!(await waitWhileCurrent(operations, delay))) return { status: 'stale' };
+      continue;
     }
+    // Receipt identity is a local protocol invariant, not a transport result.
+    // Validate outside the invocation catch so a mismatched receipt cannot be
+    // reclassified as uncertain and retried forever.
+    operations.validateCloseResult(value);
+    return { status: 'closed', value };
   }
 }

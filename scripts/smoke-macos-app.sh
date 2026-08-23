@@ -151,8 +151,20 @@ PRODUCT_STATE_CANONICAL=$(CDPATH= cd -- "$PRODUCT_STATE" && pwd -P)
 ACTIVE_PID=
 ACTIVE_LAUNCHER_PID=
 LOOM_SMOKE_MODEL_LINK=
+LOOM_PROJECT_BUSY_MONITOR_PID=
+LOOM_PROJECT_BUSY_MONITOR_STOP=
+LOOM_GENERATION_GUARD_PID=
+LOOM_GENERATION_GUARD_STOP=
 
 cleanup_failed_process() {
+  if [ -n "$LOOM_PROJECT_BUSY_MONITOR_PID" ] && kill -0 "$LOOM_PROJECT_BUSY_MONITOR_PID" 2>/dev/null; then
+    kill "$LOOM_PROJECT_BUSY_MONITOR_PID" 2>/dev/null || true
+    wait "$LOOM_PROJECT_BUSY_MONITOR_PID" 2>/dev/null || true
+  fi
+  if [ -n "$LOOM_GENERATION_GUARD_PID" ] && kill -0 "$LOOM_GENERATION_GUARD_PID" 2>/dev/null; then
+    kill "$LOOM_GENERATION_GUARD_PID" 2>/dev/null || true
+    wait "$LOOM_GENERATION_GUARD_PID" 2>/dev/null || true
+  fi
   if [ -n "$ACTIVE_PID" ] && kill -0 "$ACTIVE_PID" 2>/dev/null; then
     kill "$ACTIVE_PID" 2>/dev/null || true
   fi
@@ -634,11 +646,16 @@ SWIFT
 
 exercise_loom_formatting_palette() {
   target_pid=$1
-  xcrun swift - "$target_pid" <<'SWIFT'
+  action_name=$2
+  link_destination=${3:-}
+  xcrun swift - "$target_pid" "$action_name" "$link_destination" <<'SWIFT'
+import AppKit
 import ApplicationServices
 import Foundation
 
 let pid = Int32(CommandLine.arguments[1])!
+let actionName = CommandLine.arguments[2]
+let linkDestination = CommandLine.arguments[3]
 let application = AXUIElementCreateApplication(pid)
 
 func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
@@ -647,10 +664,10 @@ func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
     return value
 }
 
-func strings(_ element: AXUIElement) -> String {
+func strings(_ element: AXUIElement) -> [String] {
     [kAXDescriptionAttribute, kAXTitleAttribute, kAXHelpAttribute]
         .compactMap { attribute(element, $0 as CFString) as? String }
-        .joined(separator: " ")
+        .filter { !$0.isEmpty }
 }
 
 func supportsPress(_ element: AXUIElement) -> Bool {
@@ -660,58 +677,40 @@ func supportsPress(_ element: AXUIElement) -> Bool {
     return actions.contains(kAXPressAction as String)
 }
 
-func pointAttribute(_ element: AXUIElement, _ name: CFString) -> CGPoint? {
+func rangeAttribute(_ element: AXUIElement, _ name: CFString) -> CFRange? {
     guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else {
         return nil
     }
     let value = raw as! AXValue
-    guard AXValueGetType(value) == .cgPoint else { return nil }
-    var point = CGPoint.zero
-    return AXValueGetValue(value, .cgPoint, &point) ? point : nil
+    guard AXValueGetType(value) == .cfRange else { return nil }
+    var range = CFRange()
+    return AXValueGetValue(value, .cfRange, &range) ? range : nil
 }
 
-func sizeAttribute(_ element: AXUIElement, _ name: CFString) -> CGSize? {
-    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else {
-        return nil
-    }
-    let value = raw as! AXValue
-    guard AXValueGetType(value) == .cgSize else { return nil }
-    var size = CGSize.zero
-    return AXValueGetValue(value, .cgSize, &size) ? size : nil
-}
-
-func press(_ element: AXUIElement) -> Bool {
-    if supportsPress(element),
-       AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
-        return true
-    }
-    guard let origin = pointAttribute(element, kAXPositionAttribute as CFString),
-          let size = sizeAttribute(element, kAXSizeAttribute as CFString),
-          size.width > 0, size.height > 0 else { return false }
-    let center = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
-    guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: center, mouseButton: .left),
-          let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: center, mouseButton: .left) else {
-        return false
-    }
-    down.post(tap: .cghidEventTap)
-    up.post(tap: .cghidEventTap)
-    return true
-}
-
-func button(named needle: String) -> AXUIElement? {
+func descendants() -> [AXUIElement] {
     var queue = [application]
     var cursor = 0
     while cursor < queue.count && cursor < 4096 {
         let element = queue[cursor]
         cursor += 1
-        if strings(element).contains(needle) {
-            return element
-        }
         if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
             queue.append(contentsOf: children)
         }
     }
-    return nil
+    return queue
+}
+
+func press(_ element: AXUIElement) -> Bool {
+    supportsPress(element) &&
+        AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+}
+
+func button(named needle: String) -> AXUIElement? {
+    descendants().first { element in
+        strings(element).contains(needle) &&
+            supportsPress(element) &&
+            (attribute(element, kAXEnabledAttribute as CFString) as? Bool) != false
+    }
 }
 
 func waitForButton(_ name: String, timeout: TimeInterval = 5) -> AXUIElement? {
@@ -723,21 +722,284 @@ func waitForButton(_ name: String, timeout: TimeInterval = 5) -> AXUIElement? {
     return nil
 }
 
-guard let format = waitForButton("Format text"),
-      press(format) else {
-    fputs("could not open Loom's formatting palette through its exact titlebar control\n", stderr)
+func textField(named needle: String) -> AXUIElement? {
+    descendants().first { element in
+        strings(element).contains(needle) &&
+            (attribute(element, kAXRoleAttribute as CFString) as? String) == kAXTextFieldRole as String &&
+            (attribute(element, kAXEnabledAttribute as CFString) as? Bool) != false
+    }
+}
+
+guard let editor = descendants().first(where: {
+    (attribute($0, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String
+}),
+      let beforeSelection = rangeAttribute(editor, kAXSelectedTextRangeAttribute as CFString) else {
+    fputs("could not bind the formatting action to Loom's accessible manuscript selection\n", stderr)
     exit(1)
 }
-guard let title = waitForButton("Title"),
-      press(title) else {
-    fputs("could not invoke Title from Loom's open formatting palette\n", stderr)
+
+NSRunningApplication(processIdentifier: pid)?.activate(options: [])
+// Link is intentionally disabled until its destination is valid, so it
+// cannot witness whether the palette is open. Its stable text field can.
+if textField(named: "Link destination") == nil {
+    guard let format = waitForButton("Format text"), press(format) else {
+        fputs("could not open Loom's formatting palette through its exact titlebar control\n", stderr)
+        exit(1)
+    }
+}
+
+if actionName == "Link" {
+    let destinationDeadline = Date().addingTimeInterval(5)
+    var destination: AXUIElement?
+    repeat {
+        destination = textField(named: "Link destination")
+        if destination != nil { break }
+        Thread.sleep(forTimeInterval: 0.1)
+    } while Date() < destinationDeadline
+    guard let destination,
+          AXUIElementSetAttributeValue(
+            destination,
+            kAXFocusedAttribute as CFString,
+            kCFBooleanTrue
+          ) == .success,
+          let selectAllDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+          let selectAllUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+        fputs("could not focus Loom's exact Link destination field through Accessibility\n", stderr)
+        exit(1)
+    }
+    selectAllDown.flags = [.maskCommand]
+    selectAllUp.flags = [.maskCommand]
+    selectAllDown.postToPid(pid)
+    selectAllUp.postToPid(pid)
+    for character in linkDestination {
+        var utf16 = Array(String(character).utf16)
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+            fputs("could not construct Loom's PID-targeted Link destination input\n", stderr)
+            exit(1)
+        }
+        down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
+        up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
+        down.postToPid(pid)
+        up.postToPid(pid)
+    }
+    let valueDeadline = Date().addingTimeInterval(5)
+    while Date() < valueDeadline {
+        if (attribute(destination, kAXValueAttribute as CFString) as? String) == linkDestination,
+           button(named: "Link") != nil { break }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    guard (attribute(destination, kAXValueAttribute as CFString) as? String) == linkDestination,
+          button(named: "Link") != nil else {
+        fputs("Loom did not bind the PID-targeted Link destination or enable its action\n", stderr)
+        exit(1)
+    }
+}
+
+guard let action = waitForButton(actionName), press(action) else {
+    fputs("could not invoke \(actionName) from Loom's open formatting palette\n", stderr)
+    exit(1)
+}
+
+let focusDeadline = Date().addingTimeInterval(5)
+var afterSelection: CFRange?
+var editorFocused = false
+repeat {
+    editorFocused = (attribute(editor, kAXFocusedAttribute as CFString) as? Bool) == true
+    afterSelection = rangeAttribute(editor, kAXSelectedTextRangeAttribute as CFString)
+    if editorFocused && afterSelection != nil { break }
+    Thread.sleep(forTimeInterval: 0.05)
+} while Date() < focusDeadline
+guard editorFocused, let afterSelection else {
+    fputs("Loom's formatting palette did not restore focus and selection to the manuscript editor\n", stderr)
     exit(1)
 }
 
 let evidence: [String: Any] = [
-    "control_path": "Format text -> Title",
-    "dispatch": "exact accessible control action or its observed AX frame center",
-    "required_effect": "persisted manuscript changed to an H1 Markdown block"
+    "control_path": "Format text -> \(actionName)",
+    "dispatch": "AXPress on exact accessible controls bound to the target PID",
+    "link_destination": linkDestination.isEmpty ? NSNull() : linkDestination,
+    "selection_before": ["location": beforeSelection.location, "length": beforeSelection.length],
+    "selection_after": ["location": afterSelection.location, "length": afterSelection.length],
+    "editor_refocused": true
+]
+let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+print(String(data: data, encoding: .utf8)!)
+SWIFT
+}
+
+select_all_in_loom_editor() {
+  target_pid=$1
+  expected=$2
+  xcrun swift - "$target_pid" "$expected" <<'SWIFT'
+import AppKit
+import ApplicationServices
+import Foundation
+
+let pid = Int32(CommandLine.arguments[1])!
+let expected = CommandLine.arguments[2]
+let application = AXUIElementCreateApplication(pid)
+
+func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
+    return value
+}
+
+func rangeAttribute(_ element: AXUIElement, _ name: CFString) -> CFRange? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cfRange else { return nil }
+    var range = CFRange()
+    return AXValueGetValue(value, .cfRange, &range) ? range : nil
+}
+
+func editor() -> AXUIElement? {
+    var queue = [application]
+    var cursor = 0
+    while cursor < queue.count && cursor < 4096 {
+        let element = queue[cursor]
+        cursor += 1
+        if (attribute(element, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String {
+            return element
+        }
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    return nil
+}
+
+guard let writingSurface = editor(),
+      AXUIElementSetAttributeValue(
+        writingSurface,
+        kAXFocusedAttribute as CFString,
+        kCFBooleanTrue
+      ) == .success,
+      let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+      let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+    fputs("could not focus Loom's exact editor for Select-All\n", stderr)
+    exit(1)
+}
+down.flags = [.maskCommand]
+up.flags = [.maskCommand]
+down.postToPid(pid)
+up.postToPid(pid)
+
+let deadline = Date().addingTimeInterval(5)
+var observed: CFRange?
+repeat {
+    observed = rangeAttribute(writingSurface, kAXSelectedTextRangeAttribute as CFString)
+    if observed?.location == 0 && observed?.length == expected.utf16.count { break }
+    Thread.sleep(forTimeInterval: 0.05)
+} while Date() < deadline
+guard let observed, observed.location == 0, observed.length == expected.utf16.count else {
+    fputs("Loom's exact editor did not retain the full manuscript selection\n", stderr)
+    exit(1)
+}
+let evidence: [String: Any] = [
+    "dispatch": "PID-targeted Command-A",
+    "selection": ["location": observed.location, "length": observed.length]
+]
+let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+print(String(data: data, encoding: .utf8)!)
+SWIFT
+}
+
+require_loom_editor_state() {
+  target_pid=$1
+  expected=$2
+  selection_mode=$3
+  xcrun swift - "$target_pid" "$expected" "$selection_mode" <<'SWIFT'
+import ApplicationServices
+import Foundation
+
+let pid = Int32(CommandLine.arguments[1])!
+let expected = CommandLine.arguments[2]
+let selectionMode = CommandLine.arguments[3]
+let application = AXUIElementCreateApplication(pid)
+
+func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
+    return value
+}
+
+func rangeAttribute(_ element: AXUIElement, _ name: CFString) -> CFRange? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cfRange else { return nil }
+    var range = CFRange()
+    return AXValueGetValue(value, .cfRange, &range) ? range : nil
+}
+
+func editor() -> AXUIElement? {
+    var queue = [application]
+    var cursor = 0
+    while cursor < queue.count && cursor < 4096 {
+        let element = queue[cursor]
+        cursor += 1
+        if (attribute(element, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String {
+            return element
+        }
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    return nil
+}
+
+func withoutTerminalLineBreaks(_ value: String) -> String {
+    var normalized = value
+    while normalized.last == "\n" || normalized.last == "\r" { normalized.removeLast() }
+    return normalized
+}
+
+guard let writingSurface = editor() else {
+    fputs("could not find Loom's accessible manuscript editor for WYSIWYG verification\n", stderr)
+    exit(1)
+}
+let deadline = Date().addingTimeInterval(12)
+var observedValue = ""
+var observedSelection: CFRange?
+var focused = false
+repeat {
+    observedValue = withoutTerminalLineBreaks(
+        (attribute(writingSurface, kAXValueAttribute as CFString) as? String) ?? ""
+    )
+    observedSelection = rangeAttribute(writingSurface, kAXSelectedTextRangeAttribute as CFString)
+    focused = (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true
+    let selectionMatches: Bool
+    switch selectionMode {
+    case "caret-end":
+        selectionMatches = observedSelection?.location == expected.utf16.count && observedSelection?.length == 0
+    case "select-all":
+        selectionMatches = observedSelection?.location == 0 && observedSelection?.length == expected.utf16.count
+    default:
+        selectionMatches = observedSelection != nil
+    }
+    if observedValue == expected && focused && selectionMatches { break }
+    Thread.sleep(forTimeInterval: 0.05)
+} while Date() < deadline
+
+let selectionMatches: Bool
+switch selectionMode {
+case "caret-end":
+    selectionMatches = observedSelection?.location == expected.utf16.count && observedSelection?.length == 0
+case "select-all":
+    selectionMatches = observedSelection?.location == 0 && observedSelection?.length == expected.utf16.count
+default:
+    selectionMatches = observedSelection != nil
+}
+guard observedValue == expected, focused, selectionMatches, let observedSelection else {
+    fputs("Loom's live AX editor diverged from the exact canonical manuscript or lost focus/selection\n", stderr)
+    exit(1)
+}
+let evidence: [String: Any] = [
+    "canonical_editor_value": observedValue,
+    "focused": true,
+    "selection_mode": selectionMode,
+    "selection": ["location": observedSelection.location, "length": observedSelection.length]
 ]
 let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
 print(String(data: data, encoding: .utf8)!)
@@ -748,13 +1010,15 @@ set_loom_completion_toggle() {
   target_pid=$1
   control_name=$2
   already_name=$3
-  xcrun swift - "$target_pid" "$control_name" "$already_name" <<'SWIFT'
+  press_requirement=${4:-allow-already}
+  xcrun swift - "$target_pid" "$control_name" "$already_name" "$press_requirement" <<'SWIFT'
 import ApplicationServices
 import Foundation
 
 let pid = Int32(CommandLine.arguments[1])!
 let controlName = CommandLine.arguments[2]
 let alreadyName = CommandLine.arguments[3]
+let requirePress = CommandLine.arguments[4] == "require-press"
 let application = AXUIElementCreateApplication(pid)
 
 func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
@@ -779,7 +1043,20 @@ for _ in 0..<1800 {
         let description = strings(element)
         let enabled = (attribute(element, kAXEnabledAttribute as CFString) as? Bool) != false
         if enabled {
-            if description.contains(alreadyName) { exit(0) }
+            if description.contains(alreadyName) {
+                guard pressed || !requirePress else {
+                    fputs("Loom completion control reached the requested state without the required single press: \(controlName)\n", stderr)
+                    exit(1)
+                }
+                let evidence: [String: Any] = [
+                    "requested_control": controlName,
+                    "resulting_control": alreadyName,
+                    "pressed_exactly_once": pressed
+                ]
+                let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+                print(String(data: data, encoding: .utf8)!)
+                exit(0)
+            }
             if !pressed,
                description.contains(controlName),
                AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
@@ -800,12 +1077,17 @@ SWIFT
 wait_for_loom_accessibility_text() {
   target_pid=$1
   expected=$2
-  xcrun swift - "$target_pid" "$expected" <<'SWIFT'
+  generation_failure=${3:-}
+  project_busy_failure=${4:-}
+  xcrun swift - \
+    "$target_pid" "$expected" "$generation_failure" "$project_busy_failure" <<'SWIFT'
 import ApplicationServices
 import Foundation
 
 let pid = Int32(CommandLine.arguments[1])!
 let expected = CommandLine.arguments[2]
+let asynchronousFailurePaths = [CommandLine.arguments[3], CommandLine.arguments[4]]
+    .filter { !$0.isEmpty }
 let application = AXUIElementCreateApplication(pid)
 
 func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
@@ -815,6 +1097,10 @@ func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
 }
 
 for _ in 0..<1800 {
+    if asynchronousFailurePaths.contains(where: { FileManager.default.fileExists(atPath: $0) }) {
+        fputs("Loom failed an asynchronous generation or project_busy guard before the required accessible state\n", stderr)
+        exit(1)
+    }
     var queue = [application]
     var cursor = 0
     while cursor < queue.count && cursor < 4096 {
@@ -878,11 +1164,316 @@ exit(1)
 SWIFT
 }
 
+start_loom_project_busy_monitor() {
+  target_pid=$1
+  monitor_name=$2
+  LOOM_PROJECT_BUSY_MONITOR_STOP="$SMOKE_ROOT/$monitor_name.stop"
+  LOOM_PROJECT_BUSY_MONITOR_READY="$SMOKE_ROOT/$monitor_name.ready"
+  LOOM_PROJECT_BUSY_MONITOR_FAILURE="$SMOKE_ROOT/$monitor_name.failure.json"
+  LOOM_PROJECT_BUSY_MONITOR_OUTPUT="$SMOKE_ROOT/$monitor_name.evidence.json"
+  LOOM_PROJECT_BUSY_MONITOR_ERROR="$SMOKE_ROOT/$monitor_name.stderr.log"
+  rm -f \
+    "$LOOM_PROJECT_BUSY_MONITOR_STOP" \
+    "$LOOM_PROJECT_BUSY_MONITOR_READY" \
+    "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" \
+    "$LOOM_PROJECT_BUSY_MONITOR_OUTPUT" \
+    "$LOOM_PROJECT_BUSY_MONITOR_ERROR"
+  xcrun swift - \
+    "$target_pid" \
+    "$LOOM_PROJECT_BUSY_MONITOR_STOP" \
+    "$LOOM_PROJECT_BUSY_MONITOR_READY" \
+    "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" \
+    >"$LOOM_PROJECT_BUSY_MONITOR_OUTPUT" \
+    2>"$LOOM_PROJECT_BUSY_MONITOR_ERROR" <<'SWIFT' &
+import ApplicationServices
+import Foundation
+
+let pid = Int32(CommandLine.arguments[1])!
+let stopPath = CommandLine.arguments[2]
+let readyPath = CommandLine.arguments[3]
+let failurePath = CommandLine.arguments[4]
+let application = AXUIElementCreateApplication(pid)
+let manager = FileManager.default
+let startedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
+var polls = 0
+
+func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
+    return value
+}
+
+func projectBusyMatch() -> [String: Any]? {
+    var queue = [application]
+    var cursor = 0
+    while cursor < queue.count && cursor < 4096 {
+        let element = queue[cursor]
+        cursor += 1
+        let values = [kAXDescriptionAttribute, kAXTitleAttribute, kAXHelpAttribute, kAXValueAttribute]
+            .compactMap { attribute(element, $0 as CFString) as? String }
+            .filter { !$0.isEmpty }
+        if values.contains(where: {
+            $0.localizedCaseInsensitiveContains("project_busy") ||
+                $0.localizedCaseInsensitiveContains("another bounded project operation is still running")
+        }) {
+            return [
+                "role": (attribute(element, kAXRoleAttribute as CFString) as? String) ?? "",
+                "strings": values
+            ]
+        }
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    return nil
+}
+
+_ = manager.createFile(atPath: readyPath, contents: Data())
+while !manager.fileExists(atPath: stopPath) {
+    polls += 1
+    if let match = projectBusyMatch() {
+        let evidence: [String: Any] = [
+            "pid": pid,
+            "started_at_ms": startedAtMs,
+            "detected_at_ms": Int64(Date().timeIntervalSince1970 * 1_000),
+            "polls": polls,
+            "project_busy_alert_observed": true,
+            "match": match
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+        try? data.write(to: URL(fileURLWithPath: failurePath), options: [.atomic])
+        print(String(data: data, encoding: .utf8)!)
+        fputs("Loom exposed a project_busy alert during native smoke\n", stderr)
+        exit(42)
+    }
+    Thread.sleep(forTimeInterval: 0.05)
+}
+
+let evidence: [String: Any] = [
+    "pid": pid,
+    "started_at_ms": startedAtMs,
+    "finished_at_ms": Int64(Date().timeIntervalSince1970 * 1_000),
+    "polls": polls,
+    "project_busy_alert_observed": false
+]
+let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+print(String(data: data, encoding: .utf8)!)
+SWIFT
+  LOOM_PROJECT_BUSY_MONITOR_PID=$!
+
+  monitor_attempt=0
+  while [ "$monitor_attempt" -lt 200 ]; do
+    if [ -f "$LOOM_PROJECT_BUSY_MONITOR_READY" ]; then
+      return 0
+    fi
+    if [ -f "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" ] ||
+      ! kill -0 "$LOOM_PROJECT_BUSY_MONITOR_PID" 2>/dev/null; then
+      cat "$LOOM_PROJECT_BUSY_MONITOR_ERROR" >&2 2>/dev/null || true
+      return 1
+    fi
+    monitor_attempt=$((monitor_attempt + 1))
+    sleep 0.05
+  done
+  echo "Loom project_busy alert monitor did not become ready" >&2
+  return 1
+}
+
+require_loom_project_busy_monitor() {
+  if [ -f "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" ]; then
+    cat "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" >&2
+    cat "$LOOM_PROJECT_BUSY_MONITOR_ERROR" >&2 2>/dev/null || true
+    return 1
+  fi
+  if [ -z "$LOOM_PROJECT_BUSY_MONITOR_PID" ] ||
+    ! kill -0 "$LOOM_PROJECT_BUSY_MONITOR_PID" 2>/dev/null; then
+    cat "$LOOM_PROJECT_BUSY_MONITOR_ERROR" >&2 2>/dev/null || true
+    echo "Loom project_busy alert monitor ended before the observed interaction interval" >&2
+    return 1
+  fi
+}
+
+stop_loom_project_busy_monitor() {
+  touch "$LOOM_PROJECT_BUSY_MONITOR_STOP"
+  if wait "$LOOM_PROJECT_BUSY_MONITOR_PID"; then
+    monitor_status=0
+  else
+    monitor_status=$?
+  fi
+  LOOM_PROJECT_BUSY_MONITOR_PID=
+  if [ "$monitor_status" -ne 0 ] || [ -f "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" ]; then
+    cat "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" >&2 2>/dev/null || true
+    cat "$LOOM_PROJECT_BUSY_MONITOR_ERROR" >&2 2>/dev/null || true
+    return 1
+  fi
+  if [ ! -s "$LOOM_PROJECT_BUSY_MONITOR_OUTPUT" ]; then
+    echo "Loom project_busy alert monitor produced no success evidence" >&2
+    return 1
+  fi
+}
+
+start_loom_generation_guard() {
+  database=$1
+  baseline=$2
+  monitor_name=$3
+  LOOM_GENERATION_GUARD_STOP="$SMOKE_ROOT/$monitor_name.stop"
+  LOOM_GENERATION_GUARD_READY="$SMOKE_ROOT/$monitor_name.ready"
+  LOOM_GENERATION_GUARD_FAILURE="$SMOKE_ROOT/$monitor_name.failure.json"
+  LOOM_GENERATION_GUARD_OUTPUT="$SMOKE_ROOT/$monitor_name.evidence.json"
+  LOOM_GENERATION_GUARD_ERROR="$SMOKE_ROOT/$monitor_name.stderr.log"
+  rm -f \
+    "$LOOM_GENERATION_GUARD_STOP" \
+    "$LOOM_GENERATION_GUARD_READY" \
+    "$LOOM_GENERATION_GUARD_FAILURE" \
+    "$LOOM_GENERATION_GUARD_OUTPUT" \
+    "$LOOM_GENERATION_GUARD_ERROR"
+  (
+    expected=$((baseline + 4))
+    polls=0
+    unreadable_polls=0
+    maximum=$baseline
+    touch "$LOOM_GENERATION_GUARD_READY"
+    while [ ! -f "$LOOM_GENERATION_GUARD_STOP" ]; do
+      count=$(sqlite3 "$database" 'SELECT count(*) FROM generation_runs;' 2>/dev/null || true)
+      case "$count" in
+        ''|*[!0-9]*)
+          unreadable_polls=$((unreadable_polls + 1))
+          ;;
+        *)
+          if [ "$count" -gt "$maximum" ]; then maximum=$count; fi
+          if [ "$count" -gt "$expected" ]; then
+            printf '{"baseline":%s,"expected_maximum":%s,"observed":%s,"polls":%s,"fifth_run_observed":true}\n' \
+              "$baseline" "$expected" "$count" "$polls" >"$LOOM_GENERATION_GUARD_FAILURE"
+            echo "Loom admitted a fifth generation run while the first ghost/cache family was in use" >&2
+            exit 1
+          fi
+          ;;
+      esac
+      polls=$((polls + 1))
+      sleep 0.05
+    done
+    final=$(sqlite3 "$database" 'SELECT count(*) FROM generation_runs;' 2>/dev/null || true)
+    case "$final" in
+      ''|*[!0-9]*)
+        echo "could not read the final Loom generation-run count" >&2
+        exit 1
+        ;;
+    esac
+    if [ "$final" -ne "$expected" ]; then
+      printf '{"baseline":%s,"expected":%s,"observed":%s,"polls":%s,"fifth_run_observed":false}\n' \
+        "$baseline" "$expected" "$final" "$polls" >"$LOOM_GENERATION_GUARD_FAILURE"
+      echo "Loom generation family did not remain exactly four runs through ghost/cache use" >&2
+      exit 1
+    fi
+    printf '{"baseline":%s,"expected":%s,"final":%s,"maximum_observed":%s,"polls":%s,"unreadable_polls":%s,"fifth_run_observed":false}\n' \
+      "$baseline" "$expected" "$final" "$maximum" "$polls" "$unreadable_polls"
+  ) >"$LOOM_GENERATION_GUARD_OUTPUT" 2>"$LOOM_GENERATION_GUARD_ERROR" &
+  LOOM_GENERATION_GUARD_PID=$!
+
+  guard_attempt=0
+  while [ "$guard_attempt" -lt 200 ]; do
+    if [ -f "$LOOM_GENERATION_GUARD_READY" ]; then
+      return 0
+    fi
+    if [ -f "$LOOM_GENERATION_GUARD_FAILURE" ] ||
+      ! kill -0 "$LOOM_GENERATION_GUARD_PID" 2>/dev/null; then
+      cat "$LOOM_GENERATION_GUARD_ERROR" >&2 2>/dev/null || true
+      return 1
+    fi
+    guard_attempt=$((guard_attempt + 1))
+    sleep 0.05
+  done
+  echo "Loom generation-family guard did not become ready" >&2
+  return 1
+}
+
+require_loom_generation_guard() {
+  if [ -f "$LOOM_GENERATION_GUARD_FAILURE" ]; then
+    cat "$LOOM_GENERATION_GUARD_FAILURE" >&2
+    cat "$LOOM_GENERATION_GUARD_ERROR" >&2 2>/dev/null || true
+    return 1
+  fi
+  if [ -z "$LOOM_GENERATION_GUARD_PID" ] ||
+    ! kill -0 "$LOOM_GENERATION_GUARD_PID" 2>/dev/null; then
+    cat "$LOOM_GENERATION_GUARD_ERROR" >&2 2>/dev/null || true
+    echo "Loom generation-family guard ended before cached completion use finished" >&2
+    return 1
+  fi
+}
+
+stop_loom_generation_guard() {
+  touch "$LOOM_GENERATION_GUARD_STOP"
+  if wait "$LOOM_GENERATION_GUARD_PID"; then
+    guard_status=0
+  else
+    guard_status=$?
+  fi
+  LOOM_GENERATION_GUARD_PID=
+  if [ "$guard_status" -ne 0 ] || [ -f "$LOOM_GENERATION_GUARD_FAILURE" ]; then
+    cat "$LOOM_GENERATION_GUARD_FAILURE" >&2 2>/dev/null || true
+    cat "$LOOM_GENERATION_GUARD_ERROR" >&2 2>/dev/null || true
+    return 1
+  fi
+  if [ ! -s "$LOOM_GENERATION_GUARD_OUTPUT" ]; then
+    echo "Loom generation-family guard produced no success evidence" >&2
+    return 1
+  fi
+}
+
+capture_loom_completion_diagnostics() {
+  target_pid=$1
+  database=$2
+  manuscript=$3
+  baseline=$4
+  destination=$5
+  diagnostic_control=$(loom_completion_control_state "$target_pid" 2>&1 || true)
+  diagnostic_count=$(sqlite3 "$database" 'SELECT count(*) FROM generation_runs;' 2>/dev/null || true)
+  diagnostic_runs=$(sqlite3 -json "$database" \
+    'SELECT run_id, branch_id, source_revision_id, source_blob_id, target_start_byte, target_end_byte, created_at_ms FROM generation_runs ORDER BY created_at_ms DESC LIMIT 12;' \
+    2>/dev/null || printf '[]')
+  diagnostic_manuscript_sha=$(shasum -a 256 "$manuscript" 2>/dev/null | awk '{print $1}' || true)
+  DELYSIS_DIAGNOSTIC_CONTROL="$diagnostic_control" \
+  DELYSIS_DIAGNOSTIC_COUNT="$diagnostic_count" \
+  DELYSIS_DIAGNOSTIC_RUNS="$diagnostic_runs" \
+  DELYSIS_DIAGNOSTIC_BASELINE="$baseline" \
+  DELYSIS_DIAGNOSTIC_MANUSCRIPT_SHA="$diagnostic_manuscript_sha" \
+  DELYSIS_DIAGNOSTIC_PROJECT_BUSY_FAILURE="${LOOM_PROJECT_BUSY_MONITOR_FAILURE:-}" \
+  DELYSIS_DIAGNOSTIC_GENERATION_FAILURE="${LOOM_GENERATION_GUARD_FAILURE:-}" \
+  node <<'NODE' >"$destination"
+const fs = require('fs');
+const e = process.env;
+const generationRunCount = /^\d+$/.test(e.DELYSIS_DIAGNOSTIC_COUNT || '')
+  ? Number(e.DELYSIS_DIAGNOSTIC_COUNT)
+  : null;
+function parsed(value) {
+  try { return JSON.parse(value); } catch { return value || null; }
+}
+function optionalFile(path) {
+  if (!path || !fs.existsSync(path)) return null;
+  return parsed(fs.readFileSync(path, 'utf8'));
+}
+process.stdout.write(`${JSON.stringify({
+  captured_at: new Date().toISOString(),
+  completion_control: parsed(e.DELYSIS_DIAGNOSTIC_CONTROL),
+  generation_run_baseline: Number(e.DELYSIS_DIAGNOSTIC_BASELINE),
+  generation_run_count: generationRunCount,
+  latest_generation_runs: parsed(e.DELYSIS_DIAGNOSTIC_RUNS),
+  manuscript_sha256: e.DELYSIS_DIAGNOSTIC_MANUSCRIPT_SHA || null,
+  project_busy_monitor_failure: optionalFile(e.DELYSIS_DIAGNOSTIC_PROJECT_BUSY_FAILURE),
+  generation_guard_failure: optionalFile(e.DELYSIS_DIAGNOSTIC_GENERATION_FAILURE),
+}, null, 2)}\n`);
+NODE
+}
+
 wait_for_loom_generation_family() {
   database=$1
   baseline=$2
   attempt=0
   while [ "$attempt" -lt 1800 ]; do
+    if { [ -n "${LOOM_GENERATION_GUARD_FAILURE:-}" ] && [ -f "$LOOM_GENERATION_GUARD_FAILURE" ]; } ||
+      { [ -n "${LOOM_PROJECT_BUSY_MONITOR_FAILURE:-}" ] && [ -f "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" ]; }; then
+      echo "Loom failed an asynchronous generation or project_busy guard before family admission" >&2
+      return 1
+    fi
     count=$(sqlite3 "$database" 'SELECT count(*) FROM generation_runs;' 2>/dev/null || true)
     case "$count" in
       ''|*[!0-9]*) ;;
@@ -893,7 +1484,63 @@ wait_for_loom_generation_family() {
             echo "Loom admitted $delta generation runs instead of one four-choice batch" >&2
             return 1
           fi
-          printf '{"baseline":%s,"admitted":%s,"family_size":4}\n' "$baseline" "$count"
+          family_rows=$(sqlite3 -json "$database" \
+            "SELECT run_id, branch_id, document_id, source_revision_id, source_blob_id, target_start_byte, target_end_byte, model_environment_artifact_id, prompt_recipe_artifact_id, context_recipe_artifact_id, authority_policy_artifact_id, created_at_ms FROM generation_runs ORDER BY created_at_ms, run_id LIMIT 4 OFFSET $baseline;" \
+            2>/dev/null || printf '[]')
+          if ! family_evidence=$(
+            LOOM_FAMILY_ROWS="$family_rows" \
+            LOOM_FAMILY_BASELINE="$baseline" \
+            LOOM_FAMILY_ADMITTED="$count" \
+            node <<'NODE'
+const rows = JSON.parse(process.env.LOOM_FAMILY_ROWS || '[]');
+const unique = (field) => new Set(rows.map((row) => JSON.stringify(row[field])));
+const same = (field) => unique(field).size === 1;
+const identityFields = [
+  'document_id',
+  'source_revision_id',
+  'source_blob_id',
+  'target_start_byte',
+  'target_end_byte',
+  'model_environment_artifact_id',
+  'prompt_recipe_artifact_id',
+  'context_recipe_artifact_id',
+  'authority_policy_artifact_id',
+  'created_at_ms',
+];
+if (
+  rows.length !== 4 ||
+  unique('run_id').size !== 4 ||
+  unique('branch_id').size !== 4 ||
+  !identityFields.every(same)
+) {
+  console.error('four admitted runs did not form one exact source/anchor/model family');
+  process.exit(1);
+}
+process.stdout.write(JSON.stringify({
+  baseline: Number(process.env.LOOM_FAMILY_BASELINE),
+  admitted: Number(process.env.LOOM_FAMILY_ADMITTED),
+  family_size: rows.length,
+  run_ids: rows.map((row) => row.run_id),
+  branch_ids: rows.map((row) => row.branch_id),
+  document_id: rows[0].document_id,
+  source_revision_id: rows[0].source_revision_id,
+  source_blob_id: rows[0].source_blob_id,
+  target: {
+    start_byte: rows[0].target_start_byte,
+    end_byte: rows[0].target_end_byte,
+  },
+  model_environment_artifact_id: rows[0].model_environment_artifact_id,
+  prompt_recipe_artifact_id: rows[0].prompt_recipe_artifact_id,
+  context_recipe_artifact_id: rows[0].context_recipe_artifact_id,
+  authority_policy_artifact_id: rows[0].authority_policy_artifact_id,
+  created_at_ms: rows[0].created_at_ms,
+}));
+NODE
+          ); then
+            echo "Loom's four runs were not one exact source/anchor/model family" >&2
+            return 1
+          fi
+          printf '%s\n' "$family_evidence"
           return 0
         fi
         ;;
@@ -910,6 +1557,10 @@ wait_for_loom_manuscript_extension() {
   prefix=$2
   attempt=0
   while [ "$attempt" -lt 1800 ]; do
+    if [ -n "${LOOM_PROJECT_BUSY_MONITOR_FAILURE:-}" ] && [ -f "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" ]; then
+      echo "Loom exposed project_busy before Shuttle persisted its cached word" >&2
+      return 1
+    fi
     if node - "$manuscript" "$prefix" <<'NODE'
 const fs = require('fs');
 const [path, prefix] = process.argv.slice(2);
@@ -934,7 +1585,10 @@ exercise_loom_completion_word_reversal() {
   target_pid=$1
   manuscript=$2
   prefix=$3
-  xcrun swift - "$target_pid" "$manuscript" "$prefix" <<'SWIFT'
+  generation_failure=${4:-}
+  project_busy_failure=${5:-}
+  xcrun swift - \
+    "$target_pid" "$manuscript" "$prefix" "$generation_failure" "$project_busy_failure" <<'SWIFT'
 import AppKit
 import ApplicationServices
 import CryptoKit
@@ -943,6 +1597,8 @@ import Foundation
 let pid = Int32(CommandLine.arguments[1])!
 let manuscript = CommandLine.arguments[2]
 let prefix = CommandLine.arguments[3]
+let asynchronousFailurePaths = [CommandLine.arguments[4], CommandLine.arguments[5]]
+    .filter { !$0.isEmpty }
 let application = AXUIElementCreateApplication(pid)
 
 func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
@@ -953,6 +1609,17 @@ func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
 
 func stringAttribute(_ element: AXUIElement, _ name: CFString) -> String {
     attribute(element, name) as? String ?? ""
+}
+
+let stringAttributes = [
+    kAXValueAttribute,
+    kAXTitleAttribute,
+    kAXDescriptionAttribute,
+    kAXHelpAttribute
+].map { $0 as CFString }
+
+func strings(_ element: AXUIElement) -> [String] {
+    stringAttributes.compactMap { attribute(element, $0) as? String }
 }
 
 func descendants() -> [AXUIElement] {
@@ -974,6 +1641,129 @@ func editor() -> AXUIElement? {
     }
 }
 
+func jsonObject(in text: String, schema: String) -> [String: Any]? {
+    guard let schemaRange = text.range(of: "\"schema\":\"\(schema)\"") else { return nil }
+    let prefix = text[..<schemaRange.lowerBound]
+    guard let open = prefix.lastIndex(of: "{"),
+          let close = text.lastIndex(of: "}"),
+          open <= close,
+          let data = String(text[open...close]).data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          object["schema"] as? String == schema else { return nil }
+    return object
+}
+
+func completionWitness() -> [String: Any]? {
+    for element in descendants() {
+        for value in strings(element) {
+            if let object = jsonObject(
+                in: value,
+                schema: "delysis.loom-completion-witness.v1"
+            ) { return object }
+        }
+    }
+    return nil
+}
+
+func supportsPress(_ element: AXUIElement) -> Bool {
+    var names: CFArray?
+    guard AXUIElementCopyActionNames(element, &names) == .success,
+          let actions = names as? [String] else { return false }
+    return actions.contains(kAXPressAction as String)
+}
+
+func button(named name: String) -> AXUIElement? {
+    descendants().first { element in
+        strings(element).contains(where: { $0.contains(name) }) &&
+            supportsPress(element) &&
+            (attribute(element, kAXEnabledAttribute as CFString) as? Bool) != false
+    }
+}
+
+func pressButton(named name: String, timeout: TimeInterval = 10) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if let control = button(named: name),
+           AXUIElementPerformAction(control, kAXPressAction as CFString) == .success {
+            return true
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    } while Date() < deadline
+    return false
+}
+
+func visual(_ witness: [String: Any]) -> [String: Any] {
+    witness["visual"] as? [String: Any] ?? [:]
+}
+
+func bool(_ object: [String: Any], _ key: String) -> Bool {
+    object[key] as? Bool ?? false
+}
+
+func integer(_ object: [String: Any], _ key: String) -> Int {
+    (object[key] as? NSNumber)?.intValue ?? -1
+}
+
+func string(_ object: [String: Any], _ key: String) -> String {
+    object[key] as? String ?? ""
+}
+
+func stringArray(_ object: [String: Any], _ key: String) -> [String] {
+    object[key] as? [String] ?? []
+}
+
+func familyRunIds(_ witness: [String: Any]) -> [String] {
+    (witness["candidates"] as? [[String: Any]] ?? []).map { string($0, "run_id") }
+}
+
+func lastAction(_ witness: [String: Any]) -> [String: Any] {
+    witness["last_action"] as? [String: Any] ?? [:]
+}
+
+func sameFamily(
+    _ witness: [String: Any],
+    context: String,
+    runIds: [String]
+) -> Bool {
+    string(witness, "context_key") == context &&
+        familyRunIds(witness) == runIds &&
+        integer(witness, "family_count") == 4
+}
+
+func fanAccessibility() -> (listbox: Bool, options: [[String: Any]]) {
+    var listbox = false
+    var byPresentation: [String: [String: Any]] = [:]
+    for element in descendants() {
+        let values = strings(element)
+        if values.contains(where: { $0 == "Completion suggestions" }) {
+            listbox = true
+        }
+        for value in values {
+            guard var option = jsonObject(
+                in: value,
+                schema: "delysis.loom-completion-option.v1"
+            ) else { continue }
+            option["ax_selected"] =
+                (attribute(element, kAXSelectedAttribute as CFString) as? Bool) == true
+            let key = string(option, "presentation_key")
+            if !key.isEmpty { byPresentation[key] = option }
+        }
+    }
+    return (listbox, Array(byPresentation.values))
+}
+
+func exactAccessibleFan(_ witness: [String: Any]) -> [[String: Any]]? {
+    let fan = fanAccessibility()
+    guard fan.listbox,
+          fan.options.count == 4,
+          fan.options.filter({ bool($0, "ax_selected") }).count == 1,
+          let selected = fan.options.first(where: { bool($0, "ax_selected") }),
+          string(selected, "run_id") == string(witness, "selected_run_id") else {
+        return nil
+    }
+    return fan.options.sorted { integer($0, "index") < integer($1, "index") }
+}
+
 @discardableResult
 func postKey(_ key: CGKeyCode, down: Bool, flags: CGEventFlags) -> Bool {
     guard let event = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: down) else {
@@ -992,9 +1782,27 @@ func sha256(_ data: Data) -> String {
     SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 }
 
+func asynchronousGuardFailed() -> Bool {
+    asynchronousFailurePaths.contains { FileManager.default.fileExists(atPath: $0) }
+}
+
+func waitForWitness(
+    timeout: TimeInterval,
+    _ predicate: ([String: Any]) -> Bool
+) -> [String: Any]? {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if asynchronousGuardFailed() { return nil }
+        if let witness = completionWitness(), predicate(witness) { return witness }
+        Thread.sleep(forTimeInterval: 0.05)
+    } while Date() < deadline
+    return nil
+}
+
 func waitForChangedManuscript(from original: Data, timeout: TimeInterval) -> Data? {
     let deadline = Date().addingTimeInterval(timeout)
     repeat {
+        if asynchronousGuardFailed() { return nil }
         if let current = readManuscript(), current != original,
            let text = String(data: current, encoding: .utf8), text.hasPrefix(prefix) {
             let suffix = text.dropFirst(prefix.count)
@@ -1010,6 +1818,7 @@ func waitForChangedManuscript(from original: Data, timeout: TimeInterval) -> Dat
 func waitForExactManuscript(_ expected: Data, timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     repeat {
+        if asynchronousGuardFailed() { return false }
         if readManuscript() == expected { return true }
         Thread.sleep(forTimeInterval: 0.05)
     } while Date() < deadline
@@ -1032,6 +1841,32 @@ guard let original = readManuscript() else {
 }
 Thread.sleep(forTimeInterval: 0.1)
 
+guard let initial = waitForWitness(timeout: 30, { witness in
+    let rendered = visual(witness)
+    return bool(witness, "session_cached") &&
+        integer(witness, "family_count") == 4 &&
+        integer(witness, "accepted_chunk_count") == 0 &&
+        bool(witness, "autocomplete_enabled") &&
+        !bool(witness, "shuttle_enabled") &&
+        !string(witness, "inline_visible_key").isEmpty &&
+        bool(rendered, "available") &&
+        !bool(rendered, "optionHeld") &&
+        !bool(rendered, "fanVisible")
+}) else {
+    fputs("Loom did not expose one exact cached four-choice completion witness\n", stderr)
+    exit(1)
+}
+let context = string(initial, "context_key")
+let runIds = familyRunIds(initial)
+let initialRunId = string(initial, "selected_run_id")
+let initialActionSequence = integer(lastAction(initial), "sequence")
+guard !context.isEmpty,
+      Set(runIds).count == 4,
+      !initialRunId.isEmpty else {
+    fputs("Loom's initial completion witness lacked exact family identity\n", stderr)
+    exit(1)
+}
+
 // Keep the physical Option state down across both arrows. The test observes
 // persisted manuscript bytes after each event instead of trusting dispatch.
 guard postKey(58, down: true, flags: [.maskAlternate]) else {
@@ -1046,12 +1881,66 @@ func releaseOptionAndFail(_ message: String) -> Never {
     exit(1)
 }
 
+guard let fanOpened = waitForWitness(timeout: 10, { witness in
+    let rendered = visual(witness)
+    return sameFamily(witness, context: context, runIds: runIds) &&
+        bool(rendered, "optionHeld") &&
+        bool(rendered, "fanVisible") &&
+        stringArray(rendered, "alternativeRunIds") == runIds
+}), let fanOptions = exactAccessibleFan(fanOpened) else {
+    releaseOptionAndFail("physical Option-down did not expose one accessible four-choice fan")
+}
+
+guard postKey(125, down: true, flags: [.maskAlternate]),
+      postKey(125, down: false, flags: [.maskAlternate]) else {
+    releaseOptionAndFail("could not construct Loom's Option-Down events")
+}
+guard let cycledDown = waitForWitness(timeout: 10, { witness in
+    let rendered = visual(witness)
+    return sameFamily(witness, context: context, runIds: runIds) &&
+        string(witness, "selected_run_id") != initialRunId &&
+        bool(rendered, "optionHeld") &&
+        bool(rendered, "fanVisible")
+}), exactAccessibleFan(cycledDown) != nil else {
+    releaseOptionAndFail("Option-Down did not select a different run while the four-choice fan stayed visible")
+}
+let cycledRunId = string(cycledDown, "selected_run_id")
+
+guard postKey(126, down: true, flags: [.maskAlternate]),
+      postKey(126, down: false, flags: [.maskAlternate]) else {
+    releaseOptionAndFail("could not construct Loom's Option-Up events")
+}
+guard let cycledUp = waitForWitness(timeout: 10, { witness in
+    let rendered = visual(witness)
+    return sameFamily(witness, context: context, runIds: runIds) &&
+        string(witness, "selected_run_id") == initialRunId &&
+        bool(rendered, "optionHeld") &&
+        bool(rendered, "fanVisible")
+}), exactAccessibleFan(cycledUp) != nil else {
+    releaseOptionAndFail("Option-Up did not restore the original run while the four-choice fan stayed visible")
+}
+
 guard postKey(124, down: true, flags: [.maskAlternate]),
       postKey(124, down: false, flags: [.maskAlternate]) else {
     releaseOptionAndFail("could not construct Loom's Option-Right events")
 }
 guard let accepted = waitForChangedManuscript(from: original, timeout: 30) else {
     releaseOptionAndFail("Option-Right did not persist one cached completion word")
+}
+guard let wordAccepted = waitForWitness(timeout: 10, { witness in
+    let rendered = visual(witness)
+    let action = lastAction(witness)
+    return sameFamily(witness, context: context, runIds: runIds) &&
+        string(witness, "selected_run_id") == initialRunId &&
+        integer(witness, "accepted_chunk_count") == 1 &&
+        bool(witness, "authority_frozen") &&
+        bool(rendered, "optionHeld") &&
+        !bool(rendered, "fanVisible") &&
+        string(action, "kind") == "option_word" &&
+        string(action, "run_id") == initialRunId &&
+        integer(action, "sequence") > initialActionSequence
+}) else {
+    releaseOptionAndFail("Option-Right did not retain physical Option and exact cached-session authority")
 }
 
 guard postKey(123, down: true, flags: [.maskAlternate]),
@@ -1062,6 +1951,268 @@ guard waitForExactManuscript(original, timeout: 30) else {
     releaseOptionAndFail("Option-Left did not restore the exact pre-acceptance manuscript bytes")
 }
 
+guard let rolledBack = waitForWitness(timeout: 10, { witness in
+    let rendered = visual(witness)
+    return sameFamily(witness, context: context, runIds: runIds) &&
+        string(witness, "selected_run_id") == initialRunId &&
+        integer(witness, "accepted_chunk_count") == 0 &&
+        bool(witness, "authority_frozen") &&
+        bool(rendered, "optionHeld") &&
+        bool(rendered, "fanVisible") &&
+        stringArray(rendered, "alternativeRunIds") == runIds
+}), exactAccessibleFan(rolledBack) != nil else {
+    releaseOptionAndFail("Option-Left did not restore the same cached four-choice fan while Option remained held")
+}
+
+postKey(58, down: false, flags: [])
+guard let optionReleased = waitForWitness(timeout: 10, { witness in
+    let rendered = visual(witness)
+    return sameFamily(witness, context: context, runIds: runIds) &&
+        !bool(rendered, "optionHeld") &&
+        !bool(rendered, "fanVisible")
+}) else {
+    fputs("physical Option-up did not close the completion fan\n", stderr)
+    exit(1)
+}
+
+guard pressButton(named: "Turn Shuttle on") else {
+    fputs("could not enable Shuttle on the cached completion session\n", stderr)
+    exit(1)
+}
+guard let shuttleEnabled = waitForWitness(timeout: 10, { witness in
+    let rendered = visual(witness)
+    return sameFamily(witness, context: context, runIds: runIds) &&
+        bool(witness, "autocomplete_enabled") &&
+        bool(witness, "shuttle_enabled") &&
+        bool(witness, "inline_hidden_requested") &&
+        string(witness, "inline_visible_key").isEmpty &&
+        integer(witness, "accepted_chunk_count") == 0 &&
+        bool(rendered, "inlineHidden") &&
+        !bool(rendered, "optionHeld") &&
+        !bool(rendered, "fanVisible")
+}) else {
+    fputs("Shuttle did not hide the inline presentation while retaining the exact cached family\n", stderr)
+    exit(1)
+}
+guard let shuttleAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
+      let shuttleAccepted = waitForWitness(timeout: 10, { witness in
+          let action = lastAction(witness)
+          return sameFamily(witness, context: context, runIds: runIds) &&
+              bool(witness, "autocomplete_enabled") &&
+              bool(witness, "shuttle_enabled") &&
+              bool(witness, "inline_hidden_requested") &&
+              string(witness, "inline_visible_key").isEmpty &&
+              integer(witness, "accepted_chunk_count") == 1 &&
+              integer(witness, "accepted_utf8_bytes") > 0 &&
+              bool(witness, "authority_frozen") &&
+              string(action, "kind") == "shuttle_word" &&
+              string(action, "run_id") == initialRunId &&
+              integer(action, "accepted_utf8_bytes") == integer(witness, "accepted_utf8_bytes") &&
+              integer(action, "sequence") > integer(lastAction(wordAccepted), "sequence")
+      }) else {
+    fputs("Shuttle did not consume exactly one word from the same hidden cached family\n", stderr)
+    exit(1)
+}
+let shuttleAction = lastAction(shuttleAccepted)
+guard shuttleAcceptedBytes.count - original.count == integer(shuttleAction, "inserted_utf8_bytes") else {
+    fputs("Shuttle's persisted byte delta did not equal its authorized cached word\n", stderr)
+    exit(1)
+}
+
+guard pressButton(named: "Turn Shuttle off") else {
+    fputs("could not stop Shuttle after its first cached word\n", stderr)
+    exit(1)
+}
+guard let shuttleDisabled = waitForWitness(timeout: 10, { witness in
+    return sameFamily(witness, context: context, runIds: runIds) &&
+        bool(witness, "autocomplete_enabled") &&
+        !bool(witness, "shuttle_enabled") &&
+        !bool(witness, "inline_hidden_requested") &&
+        integer(witness, "accepted_chunk_count") == 1 &&
+        string(lastAction(witness), "kind") == "shuttle_word"
+}) else {
+    fputs("Shuttle-off did not preserve its exact one-word cached session\n", stderr)
+    exit(1)
+}
+
+guard AXUIElementSetAttributeValue(
+        writingSurface,
+        kAXFocusedAttribute as CFString,
+        kCFBooleanTrue
+      ) == .success,
+      postKey(58, down: true, flags: [.maskAlternate]),
+      postKey(123, down: true, flags: [.maskAlternate]),
+      postKey(123, down: false, flags: [.maskAlternate]) else {
+    releaseOptionAndFail("could not dispatch Shuttle's exact Option-Left rollback")
+}
+guard waitForExactManuscript(original, timeout: 30),
+      let shuttleRolledBack = waitForWitness(timeout: 10, { witness in
+          let rendered = visual(witness)
+          return sameFamily(witness, context: context, runIds: runIds) &&
+              integer(witness, "accepted_chunk_count") == 0 &&
+              bool(witness, "authority_frozen") &&
+              bool(rendered, "optionHeld") &&
+              bool(rendered, "fanVisible") &&
+              stringArray(rendered, "alternativeRunIds") == runIds
+      }), exactAccessibleFan(shuttleRolledBack) != nil else {
+    releaseOptionAndFail("Option-Left did not exactly reverse Shuttle's cached word and restore its fan")
+}
+postKey(58, down: false, flags: [])
+guard let shuttleRollbackReleased = waitForWitness(timeout: 10, { witness in
+    let rendered = visual(witness)
+    return sameFamily(witness, context: context, runIds: runIds) &&
+        !bool(rendered, "optionHeld") &&
+        !bool(rendered, "fanVisible")
+}) else {
+    fputs("Option-up did not settle after Shuttle rollback\n", stderr)
+    exit(1)
+}
+
+// Prove the documented fan Return action against a deliberately non-default
+// run, then use the exhausted session's rollback-only plan immediately.
+guard postKey(58, down: true, flags: [.maskAlternate]),
+      let returnFan = waitForWitness(timeout: 10, { witness in
+          let rendered = visual(witness)
+          return sameFamily(witness, context: context, runIds: runIds) &&
+              bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
+      }), exactAccessibleFan(returnFan) != nil,
+      postKey(125, down: true, flags: [.maskAlternate]),
+      postKey(125, down: false, flags: [.maskAlternate]),
+      let returnSelected = waitForWitness(timeout: 10, { witness in
+          let rendered = visual(witness)
+          return sameFamily(witness, context: context, runIds: runIds) &&
+              string(witness, "selected_run_id") != initialRunId &&
+              bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
+      }), exactAccessibleFan(returnSelected) != nil else {
+    releaseOptionAndFail("could not select a non-default cached run for fan Return")
+}
+let returnRunId = string(returnSelected, "selected_run_id")
+let returnPreviousSequence = integer(lastAction(returnSelected), "sequence")
+guard postKey(36, down: true, flags: [.maskAlternate]),
+      postKey(36, down: false, flags: [.maskAlternate]),
+      let returnAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
+      let returnAccepted = waitForWitness(timeout: 10, { witness in
+          let rendered = visual(witness)
+          let action = lastAction(witness)
+          return sameFamily(witness, context: context, runIds: runIds) &&
+              string(witness, "selected_run_id") == returnRunId &&
+              integer(witness, "accepted_chunk_count") == 1 &&
+              bool(witness, "authority_frozen") &&
+              bool(rendered, "optionHeld") &&
+              !bool(rendered, "fanVisible") &&
+              string(action, "kind") == "fan_return" &&
+              string(action, "run_id") == returnRunId &&
+              integer(action, "sequence") > returnPreviousSequence
+      }) else {
+    releaseOptionAndFail("fan Return did not persist the selected cached remainder")
+}
+let returnAction = lastAction(returnAccepted)
+guard returnAcceptedBytes.count - original.count == integer(returnAction, "inserted_utf8_bytes"),
+      integer(returnAction, "accepted_utf8_bytes") == integer(returnAction, "inserted_utf8_bytes"),
+      (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
+      postKey(123, down: true, flags: [.maskAlternate]),
+      postKey(123, down: false, flags: [.maskAlternate]),
+      waitForExactManuscript(original, timeout: 30),
+      let returnRolledBack = waitForWitness(timeout: 10, { witness in
+          let rendered = visual(witness)
+          return sameFamily(witness, context: context, runIds: runIds) &&
+              string(witness, "selected_run_id") == returnRunId &&
+              integer(witness, "accepted_chunk_count") == 0 &&
+              bool(witness, "authority_frozen") &&
+              bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
+      }), exactAccessibleFan(returnRolledBack) != nil else {
+    releaseOptionAndFail("fan Return was not exact, focused, or immediately reversible")
+}
+postKey(58, down: false, flags: [])
+guard let returnReleased = waitForWitness(timeout: 10, { witness in
+    let rendered = visual(witness)
+    return sameFamily(witness, context: context, runIds: runIds) &&
+        !bool(rendered, "optionHeld") && !bool(rendered, "fanVisible")
+}) else {
+    fputs("Option-up did not settle after fan Return rollback\n", stderr)
+    exit(1)
+}
+
+// Repeat with fan Tab. A literal-tab fallback cannot satisfy the action kind,
+// selected-run identity, or exact authorized byte delta below.
+guard postKey(58, down: true, flags: [.maskAlternate]),
+      let tabFan = waitForWitness(timeout: 10, { witness in
+          let rendered = visual(witness)
+          return sameFamily(witness, context: context, runIds: runIds) &&
+              bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
+      }), exactAccessibleFan(tabFan) != nil,
+      postKey(125, down: true, flags: [.maskAlternate]),
+      postKey(125, down: false, flags: [.maskAlternate]),
+      let tabSelected = waitForWitness(timeout: 10, { witness in
+          let rendered = visual(witness)
+          return sameFamily(witness, context: context, runIds: runIds) &&
+              string(witness, "selected_run_id") != returnRunId &&
+              bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
+      }), exactAccessibleFan(tabSelected) != nil else {
+    releaseOptionAndFail("could not select another cached run for fan Tab")
+}
+let tabRunId = string(tabSelected, "selected_run_id")
+let tabPreviousSequence = integer(lastAction(tabSelected), "sequence")
+guard postKey(48, down: true, flags: [.maskAlternate]),
+      postKey(48, down: false, flags: [.maskAlternate]),
+      let tabAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
+      let tabAccepted = waitForWitness(timeout: 10, { witness in
+          let rendered = visual(witness)
+          let action = lastAction(witness)
+          return sameFamily(witness, context: context, runIds: runIds) &&
+              string(witness, "selected_run_id") == tabRunId &&
+              integer(witness, "accepted_chunk_count") == 1 &&
+              bool(witness, "authority_frozen") &&
+              bool(rendered, "optionHeld") &&
+              !bool(rendered, "fanVisible") &&
+              string(action, "kind") == "fan_tab" &&
+              string(action, "run_id") == tabRunId &&
+              integer(action, "sequence") > tabPreviousSequence
+      }) else {
+    releaseOptionAndFail("fan Tab did not persist the selected cached remainder")
+}
+let tabAction = lastAction(tabAccepted)
+guard tabAcceptedBytes.count - original.count == integer(tabAction, "inserted_utf8_bytes"),
+      integer(tabAction, "accepted_utf8_bytes") == integer(tabAction, "inserted_utf8_bytes"),
+      (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
+      postKey(123, down: true, flags: [.maskAlternate]),
+      postKey(123, down: false, flags: [.maskAlternate]),
+      waitForExactManuscript(original, timeout: 30),
+      let tabRolledBack = waitForWitness(timeout: 10, { witness in
+          let rendered = visual(witness)
+          return sameFamily(witness, context: context, runIds: runIds) &&
+              string(witness, "selected_run_id") == tabRunId &&
+              integer(witness, "accepted_chunk_count") == 0 &&
+              bool(witness, "authority_frozen") &&
+              bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
+      }), exactAccessibleFan(tabRolledBack) != nil else {
+    releaseOptionAndFail("fan Tab was not exact, focused, or immediately reversible")
+}
+postKey(58, down: false, flags: [])
+guard let tabReleased = waitForWitness(timeout: 10, { witness in
+    let rendered = visual(witness)
+    return sameFamily(witness, context: context, runIds: runIds) &&
+        !bool(rendered, "optionHeld") && !bool(rendered, "fanVisible")
+}) else {
+    fputs("Option-up did not settle after fan Tab rollback\n", stderr)
+    exit(1)
+}
+
+guard pressButton(named: "Turn autocomplete off") else {
+    fputs("could not turn the shared completion engine off after cached checks\n", stderr)
+    exit(1)
+}
+guard let engineDisabled = waitForWitness(timeout: 10, { witness in
+    return !bool(witness, "autocomplete_enabled") &&
+        !bool(witness, "shuttle_enabled") &&
+        !bool(witness, "session_cached") &&
+        integer(witness, "family_count") == 0 &&
+        string(lastAction(witness), "kind") == "fan_tab"
+}) else {
+    fputs("shared engine on-to-off did not clear the cached completion session\n", stderr)
+    exit(1)
+}
+
 let evidence: [String: Any] = [
     "dispatch": "Option held across native Right and Left arrow events",
     "original_bytes": original.count,
@@ -1069,7 +2220,36 @@ let evidence: [String: Any] = [
     "original_sha256": sha256(original),
     "accepted_sha256": sha256(accepted),
     "rollback_sha256": sha256(readManuscript()!),
-    "accepted_then_exactly_reversed": true
+    "accepted_then_exactly_reversed": true,
+    "context_key": context,
+    "family_run_ids": runIds,
+    "initial_selected_run_id": initialRunId,
+    "cycled_down_run_id": cycledRunId,
+    "accessible_fan_options": fanOptions,
+    "initial_witness": initial,
+    "fan_opened_witness": fanOpened,
+    "cycled_down_witness": cycledDown,
+    "cycled_up_witness": cycledUp,
+    "word_accepted_witness": wordAccepted,
+    "rolled_back_witness": rolledBack,
+    "option_released_witness": optionReleased,
+    "shuttle_enabled_witness": shuttleEnabled,
+    "shuttle_accepted_witness": shuttleAccepted,
+    "shuttle_accepted_sha256": sha256(shuttleAcceptedBytes),
+    "shuttle_disabled_witness": shuttleDisabled,
+    "shuttle_rolled_back_witness": shuttleRolledBack,
+    "shuttle_rollback_released_witness": shuttleRollbackReleased,
+    "fan_return_selected_witness": returnSelected,
+    "fan_return_accepted_witness": returnAccepted,
+    "fan_return_accepted_sha256": sha256(returnAcceptedBytes),
+    "fan_return_rolled_back_witness": returnRolledBack,
+    "fan_return_released_witness": returnReleased,
+    "fan_tab_selected_witness": tabSelected,
+    "fan_tab_accepted_witness": tabAccepted,
+    "fan_tab_accepted_sha256": sha256(tabAcceptedBytes),
+    "fan_tab_rolled_back_witness": tabRolledBack,
+    "fan_tab_released_witness": tabReleased,
+    "engine_disabled_witness": engineDisabled
 ]
 let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
 print(String(data: data, encoding: .utf8)!)
@@ -1169,7 +2349,7 @@ require_loom_manuscript_text() {
 const fs = require('fs');
 const [path, expected] = process.argv.slice(2);
 const observed = fs.readFileSync(path, 'utf8');
-process.exit(observed.trimEnd() === expected ? 0 : 1);
+process.exit(observed === expected ? 0 : 1);
 NODE
     then
       return 0
@@ -1192,7 +2372,7 @@ require_loom_new_manuscript_text() {
 const fs = require('fs');
 const [path, expected] = process.argv.slice(2);
 const observed = fs.readFileSync(path, 'utf8');
-process.exit(observed.trimEnd() === expected ? 0 : 1);
+process.exit(observed === expected ? 0 : 1);
 NODE
       then
         printf '%s\n' "$candidate"
@@ -1364,15 +2544,32 @@ run_once() {
   fi
   if [ "$COMPONENT" = loom ] && [ "$run_number" -eq 1 ]; then
     loom_manuscript="$PRODUCT_STATE/writing/manuscript/Untitled.md"
-    if [ -z "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
+    loom_database="$PRODUCT_STATE/writing/.loom/loom.sqlite3"
+    if ! start_loom_project_busy_monitor "$ACTIVE_PID" "launch-1-project-busy-monitor"; then
+      echo "could not start the exact-PID project_busy alert monitor" >&2
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    if [ -n "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
+      if ! RUN_1_AUTOCOMPLETE_OFF_EVIDENCE=$(set_loom_completion_toggle \
+        "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"); then
+        echo "could not establish autocomplete off before real-completion typing" >&2
+        return 1
+      fi
+      loom_generation_count_before_batch=$(sqlite3 \
+        "$loom_database" \
+        'SELECT count(*) FROM generation_runs;')
+    else
       if ! RUN_1_COMPLETION_CONTROLS_EVIDENCE=$(exercise_loom_completion_controls "$ACTIVE_PID"); then
         echo "autocomplete and Shuttle did not behave as independent native controls" >&2
         echo "application logs: $stdout_log and $stderr_log" >&2
         return 1
       fi
     fi
-    RUN_1_EDITOR_SENTINEL='Loom native smoke: editor persistence.'
-    if ! RUN_1_EDITOR_EVIDENCE=$(type_into_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL"); then
+    RUN_1_EDITOR_CORE_SENTINEL='Loom native smoke: editor persistence.'
+    RUN_1_EDITOR_INPUT_SENTINEL="$RUN_1_EDITOR_CORE_SENTINEL "
+    RUN_1_EDITOR_SENTINEL=$RUN_1_EDITOR_INPUT_SENTINEL
+    if ! RUN_1_EDITOR_EVIDENCE=$(type_into_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_INPUT_SENTINEL"); then
       echo "could not drive the exact app's accessible manuscript editor" >&2
       echo "application logs: $stdout_log and $stderr_log" >&2
       return 1
@@ -1381,64 +2578,217 @@ run_once() {
       echo "application logs: $stdout_log and $stderr_log" >&2
       return 1
     fi
+    if ! RUN_1_WYSIWYG_EVIDENCE=$(require_loom_editor_state \
+      "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "caret-end"); then
+      echo "terminal-space input did not reconcile to one exact live/persisted WYSIWYG value" >&2
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    RUN_1_MANUSCRIPT_SHA256_AFTER_EDITOR_INPUT=$(shasum -a 256 "$loom_manuscript" | awk '{print $1}')
+    if ! require_loom_project_busy_monitor; then
+      echo "ordinary editor typing exposed a project_busy alert" >&2
+      return 1
+    fi
     if [ -n "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
-      loom_generation_count_before_batch=$(sqlite3 \
-        "$PRODUCT_STATE/writing/.loom/loom.sqlite3" \
+      loom_generation_count_after_off_typing=$(sqlite3 \
+        "$loom_database" \
         'SELECT count(*) FROM generation_runs;')
-      if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"; then
-        echo "could not establish autocomplete off before refreshing the isolated model library" >&2
+      require_equal "generation-run count while autocomplete was off during typing" \
+        "$loom_generation_count_before_batch" "$loom_generation_count_after_off_typing"
+      if ! start_loom_generation_guard \
+        "$loom_database" \
+        "$loom_generation_count_before_batch" \
+        "launch-1-generation-family-guard"; then
+        echo "could not start the one-family generation guard" >&2
         return 1
       fi
-      if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn autocomplete on" "Turn autocomplete off"; then
-        echo "could not enable autocomplete for the real-model presentation check" >&2
+      if ! RUN_1_AUTOCOMPLETE_ENABLE_EVIDENCE=$(set_loom_completion_toggle \
+        "$ACTIVE_PID" "Turn autocomplete on" "Turn autocomplete off" "require-press"); then
+        echo "could not enable autocomplete exactly once for the real-model presentation check" >&2
         return 1
       fi
       if ! RUN_1_REAL_GENERATION_EVIDENCE=$(wait_for_loom_generation_family \
-        "$PRODUCT_STATE/writing/.loom/loom.sqlite3" \
+        "$loom_database" \
         "$loom_generation_count_before_batch"); then
+        RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-completion-diagnostics.json"
+        capture_loom_completion_diagnostics \
+          "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
+          "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
         echo "completion control state: $(loom_completion_control_state "$ACTIVE_PID" 2>&1 || true)" >&2
+        echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
+        cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
         echo "application logs: $stdout_log and $stderr_log" >&2
         return 1
       fi
-      if ! RUN_1_REAL_GHOST_EVIDENCE=$(wait_for_loom_accessibility_text "$ACTIVE_PID" "Suggestion available."); then
+      if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
+        echo "the first real completion family violated its generation/alert guard" >&2
+        return 1
+      fi
+      if ! RUN_1_REAL_GHOST_EVIDENCE=$(wait_for_loom_accessibility_text \
+        "$ACTIVE_PID" "Suggestion available." \
+        "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"); then
+        RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-ghost-timeout-diagnostics.json"
+        capture_loom_completion_diagnostics \
+          "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
+          "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
         echo "a real four-way batch never produced an observed visible ghost presentation" >&2
+        echo "completion control state: $(loom_completion_control_state "$ACTIVE_PID" 2>&1 || true)" >&2
+        echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
+        cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
         echo "application logs: $stdout_log and $stderr_log" >&2
+        return 1
+      fi
+      if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
+        echo "visible ghost presentation admitted an extra run or exposed project_busy" >&2
         return 1
       fi
       loom_generation_count_before_reversal=$(sqlite3 \
-        "$PRODUCT_STATE/writing/.loom/loom.sqlite3" \
+        "$loom_database" \
         'SELECT count(*) FROM generation_runs;')
       loom_expected_generation_count=$((loom_generation_count_before_batch + 4))
       require_equal "generation-run count before Option reversal" \
         "$loom_expected_generation_count" "$loom_generation_count_before_reversal"
       if ! RUN_1_REAL_WORD_REVERSAL_EVIDENCE=$(exercise_loom_completion_word_reversal \
-        "$ACTIVE_PID" "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL"); then
-        echo "Option-Right/Left did not consume and exactly reverse one cached word" >&2
+        "$ACTIVE_PID" "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" \
+        "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"); then
+        echo "the exact four-choice cache did not survive fan, Shuttle, Return, Tab, and rollback checks" >&2
         echo "application logs: $stdout_log and $stderr_log" >&2
         return 1
       fi
-      loom_generation_count_after_reversal=$(sqlite3 \
-        "$PRODUCT_STATE/writing/.loom/loom.sqlite3" \
-        'SELECT count(*) FROM generation_runs;')
-      require_equal "generation-run count across Option-Right/Left" \
-        "$loom_generation_count_before_reversal" "$loom_generation_count_after_reversal"
-      if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"; then
-        echo "could not restore autocomplete off after the real-model presentation check" >&2
+      if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
+        echo "cached completion interactions admitted a fifth run or exposed project_busy" >&2
         return 1
       fi
+      loom_generation_count_after_reversal=$(sqlite3 \
+        "$loom_database" \
+        'SELECT count(*) FROM generation_runs;')
+      require_equal "generation-run count across all cached completion interactions" \
+        "$loom_generation_count_before_reversal" "$loom_generation_count_after_reversal"
+      if ! DELYSIS_DATABASE_FAMILY="$RUN_1_REAL_GENERATION_EVIDENCE" \
+        DELYSIS_ACCESSIBILITY_FAMILY="$RUN_1_REAL_WORD_REVERSAL_EVIDENCE" \
+        node <<'NODE'
+const db = JSON.parse(process.env.DELYSIS_DATABASE_FAMILY);
+const ax = JSON.parse(process.env.DELYSIS_ACCESSIBILITY_FAMILY);
+const normalizedRunIds = (runIds) => [...new Set(runIds)].sort();
+if (
+  JSON.stringify(normalizedRunIds(db.run_ids)) !==
+    JSON.stringify(normalizedRunIds(ax.family_run_ids)) ||
+  normalizedRunIds(db.run_ids).length !== 4 ||
+  normalizedRunIds(ax.family_run_ids).length !== 4 ||
+  db.family_size !== ax.family_run_ids.length
+) {
+  console.error('database family run IDs did not equal the exact AX cached family');
+  process.exit(1);
+}
+NODE
+      then
+        echo "the native fan witness was not bound to the admitted database family" >&2
+        return 1
+      fi
+      if ! stop_loom_generation_guard; then
+        echo "the four-run family did not remain singular through every cached interaction" >&2
+        return 1
+      fi
+      RUN_1_REAL_GENERATION_GUARD_EVIDENCE=$(cat "$LOOM_GENERATION_GUARD_OUTPUT")
     fi
-    RUN_1_FORMATTED_SENTINEL="# $RUN_1_EDITOR_SENTINEL"
-    if ! RUN_1_FORMATTING_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID"); then
-      echo "the visual formatting palette could not be exercised in the exact app" >&2
-      echo "application logs: $stdout_log and $stderr_log" >&2
+    RUN_1_TITLE_SENTINEL="# $RUN_1_EDITOR_SENTINEL"
+    if ! RUN_1_FORMAT_TITLE_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Title") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_TITLE_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "caret-end" >/dev/null; then
+      echo "Format text -> Title did not preserve exact manuscript/AX/focus state" >&2
       return 1
     fi
-    if ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_FORMATTED_SENTINEL"; then
-      echo "formatting controls were dispatched but did not persist the required Markdown change" >&2
-      echo "application logs: $stdout_log and $stderr_log" >&2
+    if ! RUN_1_FORMAT_BODY_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Body") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "caret-end" >/dev/null; then
+      echo "Format text -> Body did not exactly reverse the paragraph style" >&2
       return 1
     fi
-    RUN_1_MANUSCRIPT_SHA256_AFTER_EDITOR_INPUT=$(shasum -a 256 "$loom_manuscript" | awk '{print $1}')
+
+    if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
+      ! RUN_1_FORMAT_BOLD_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Bold") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "**$RUN_1_EDITOR_CORE_SENTINEL** " ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
+      echo "Format text -> Bold did not preserve the exact selected WYSIWYG text" >&2
+      return 1
+    fi
+    if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
+      ! RUN_1_FORMAT_BOLD_REVERSE_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Bold") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
+      echo "Format text -> Bold did not reverse to the exact manuscript" >&2
+      return 1
+    fi
+
+    if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
+      ! RUN_1_FORMAT_LIST_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Bulleted list") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "* $RUN_1_EDITOR_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
+      echo "Format text -> Bulleted list did not preserve the exact selected WYSIWYG text" >&2
+      return 1
+    fi
+    if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
+      ! RUN_1_FORMAT_LIST_REVERSE_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Bulleted list") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
+      echo "Format text -> Bulleted list did not reverse to the exact manuscript" >&2
+      return 1
+    fi
+
+    RUN_1_LINK_DESTINATION='https://example.com'
+    RUN_1_LINK_SENTINEL="[$RUN_1_EDITOR_CORE_SENTINEL]($RUN_1_LINK_DESTINATION) "
+    if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
+      ! RUN_1_FORMAT_LINK_EVIDENCE=$(exercise_loom_formatting_palette \
+        "$ACTIVE_PID" "Link" "$RUN_1_LINK_DESTINATION") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_LINK_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
+      echo "Format text -> Link did not preserve the exact selected WYSIWYG text" >&2
+      return 1
+    fi
+    if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
+      ! RUN_1_FORMAT_REMOVE_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Remove") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
+      echo "Format text -> Remove did not restore the exact unlinked manuscript" >&2
+      return 1
+    fi
+    RUN_1_FORMATTED_SENTINEL=$RUN_1_EDITOR_SENTINEL
+    RUN_1_FORMATTING_EVIDENCE=$(
+      DELYSIS_FORMAT_TITLE="$RUN_1_FORMAT_TITLE_EVIDENCE" \
+      DELYSIS_FORMAT_BODY="$RUN_1_FORMAT_BODY_EVIDENCE" \
+      DELYSIS_FORMAT_BOLD="$RUN_1_FORMAT_BOLD_EVIDENCE" \
+      DELYSIS_FORMAT_BOLD_REVERSE="$RUN_1_FORMAT_BOLD_REVERSE_EVIDENCE" \
+      DELYSIS_FORMAT_LIST="$RUN_1_FORMAT_LIST_EVIDENCE" \
+      DELYSIS_FORMAT_LIST_REVERSE="$RUN_1_FORMAT_LIST_REVERSE_EVIDENCE" \
+      DELYSIS_FORMAT_LINK="$RUN_1_FORMAT_LINK_EVIDENCE" \
+      DELYSIS_FORMAT_REMOVE="$RUN_1_FORMAT_REMOVE_EVIDENCE" \
+      DELYSIS_FORMAT_CANONICAL="$RUN_1_EDITOR_SENTINEL" \
+      DELYSIS_FORMAT_CORE="$RUN_1_EDITOR_CORE_SENTINEL" \
+      DELYSIS_FORMAT_LINK_DESTINATION="$RUN_1_LINK_DESTINATION" \
+      node <<'NODE'
+const e = process.env;
+const stage = (name, evidence, markdown) => ({ name, ...JSON.parse(evidence), observed_persisted_markdown: markdown });
+process.stdout.write(JSON.stringify({
+  canonical_plain_text: e.DELYSIS_FORMAT_CANONICAL,
+  final_persisted_markdown: e.DELYSIS_FORMAT_CANONICAL,
+  stages: [
+    stage('title', e.DELYSIS_FORMAT_TITLE, `# ${e.DELYSIS_FORMAT_CANONICAL}`),
+    stage('body', e.DELYSIS_FORMAT_BODY, e.DELYSIS_FORMAT_CANONICAL),
+    stage('bold', e.DELYSIS_FORMAT_BOLD, `**${e.DELYSIS_FORMAT_CORE}** `),
+    stage('bold_reverse', e.DELYSIS_FORMAT_BOLD_REVERSE, e.DELYSIS_FORMAT_CANONICAL),
+    stage('bullet_list', e.DELYSIS_FORMAT_LIST, `* ${e.DELYSIS_FORMAT_CANONICAL}`),
+    stage('bullet_list_reverse', e.DELYSIS_FORMAT_LIST_REVERSE, e.DELYSIS_FORMAT_CANONICAL),
+    stage('link', e.DELYSIS_FORMAT_LINK, `[${e.DELYSIS_FORMAT_CORE}](${e.DELYSIS_FORMAT_LINK_DESTINATION}) `),
+    stage('remove_link', e.DELYSIS_FORMAT_REMOVE, e.DELYSIS_FORMAT_CANONICAL),
+  ],
+}));
+NODE
+    )
+    if ! require_loom_project_busy_monitor; then
+      echo "formatting overlap exposed a project_busy alert" >&2
+      return 1
+    fi
+    RUN_1_MANUSCRIPT_SHA256_AFTER_FORMATTING=$(shasum -a 256 "$loom_manuscript" | awk '{print $1}')
     if ! RUN_1_NEW_DOCUMENT_EVIDENCE=$(create_loom_document_and_require_editor "$ACTIVE_PID"); then
       echo "new document did not expose a focused writing surface in the exact app" >&2
       echo "application logs: $stdout_log and $stderr_log" >&2
@@ -1456,22 +2806,11 @@ run_once() {
       echo "application logs: $stdout_log and $stderr_log" >&2
       return 1
     fi
-    if [ -n "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
-      if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn Shuttle on" "Turn Shuttle off"; then
-        echo "could not enable Shuttle for the real-model consumption check" >&2
-        return 1
-      fi
-      if ! RUN_1_REAL_SHUTTLE_TEXT=$(wait_for_loom_manuscript_extension \
-        "$RUN_1_NEW_DOCUMENT_PATH" "$RUN_1_NEW_DOCUMENT_SENTINEL"); then
-        echo "Shuttle did not consume a cached word from a real four-way batch" >&2
-        echo "application logs: $stdout_log and $stderr_log" >&2
-        return 1
-      fi
-      if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn Shuttle off" "Turn Shuttle on"; then
-        echo "could not restore Shuttle off after the real-model consumption check" >&2
-        return 1
-      fi
+    if ! require_loom_project_busy_monitor || ! stop_loom_project_busy_monitor; then
+      echo "Loom exposed project_busy during the monitored editor/autosave/completion interval" >&2
+      return 1
     fi
+    RUN_1_PROJECT_BUSY_MONITOR_EVIDENCE=$(cat "$LOOM_PROJECT_BUSY_MONITOR_OUTPUT")
     RUN_1_MANUSCRIPT_SHA256_BEFORE=$(shasum -a 256 "$loom_manuscript" | awk '{print $1}')
     if ! RUN_1_DRAG_EVIDENCE=$(retry_titlebar_drag_and_require_delta "$ACTIVE_PID"); then
       echo "titlebar drag did not produce an observed window-frame delta for pid $ACTIVE_PID" >&2
@@ -1489,7 +2828,7 @@ run_once() {
     fi
     RUN_2_MANUSCRIPT_SHA256=$(shasum -a 256 "$loom_manuscript" | awk '{print $1}')
     require_equal "reopened manuscript SHA-256" \
-      "$RUN_1_MANUSCRIPT_SHA256_AFTER_EDITOR_INPUT" "$RUN_2_MANUSCRIPT_SHA256"
+      "$RUN_1_MANUSCRIPT_SHA256_AFTER_FORMATTING" "$RUN_2_MANUSCRIPT_SHA256"
   fi
   observed_state_identity=$(state_identity "$run_number")
   case "$run_number" in
@@ -1506,6 +2845,24 @@ run_once() {
     return 1
   fi
   case "$COMPONENT" in
+    loom)
+      if grep -Eiq 'project_busy|another bounded project operation is still running' \
+        "$stdout_log" "$stderr_log"; then
+        echo "Loom launch logs contain project_busy during native smoke" >&2
+        grep -Ein 'project_busy|another bounded project operation is still running' \
+          "$stdout_log" "$stderr_log" >&2 || true
+        return 1
+      fi
+      if [ "$run_number" -eq 1 ]; then
+        project_busy_receipt_count=$(sqlite3 \
+          "$PRODUCT_STATE/writing/.loom/loom.sqlite3" \
+          "SELECT count(*) FROM command_receipts WHERE instr(lower(receipt_json), 'project_busy') > 0 OR instr(lower(receipt_json), 'another bounded project operation is still running') > 0;")
+        require_equal "durable project_busy command-receipt count" "0" "$project_busy_receipt_count"
+        RUN_1_PROJECT_BUSY_LOG_EVIDENCE=$(printf \
+          '{"stdout_and_stderr_scanned_after_exit":true,"durable_command_receipts_scanned":true,"project_busy_receipt_count":%s,"project_busy_observed":false}' \
+          "$project_busy_receipt_count")
+      fi
+      ;;
     mom)
       if ! grep -F 'mom-llama shutdown: {"Ok":' "$stderr_log" |
         grep -Fq '"native_host_joined":true'; then
@@ -1573,19 +2930,26 @@ DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_BEFORE="${RUN_1_MANUSCRIPT_SHA256_BEFORE:-}" 
 DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER="${RUN_1_MANUSCRIPT_SHA256_AFTER:-}" \
 DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE="${RUN_1_COMPLETION_CONTROLS_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE="${RUN_1_EDITOR_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_EDITOR_INPUT_SENTINEL="${RUN_1_EDITOR_INPUT_SENTINEL:-}" \
 DELYSIS_SMOKE_RUN_1_EDITOR_SENTINEL="${RUN_1_EDITOR_SENTINEL:-}" \
+DELYSIS_SMOKE_RUN_1_WYSIWYG_EVIDENCE="${RUN_1_WYSIWYG_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_FORMATTED_SENTINEL="${RUN_1_FORMATTED_SENTINEL:-}" \
 DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE="${RUN_1_FORMATTING_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_AUTOCOMPLETE_OFF_EVIDENCE="${RUN_1_AUTOCOMPLETE_OFF_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_AUTOCOMPLETE_ENABLE_EVIDENCE="${RUN_1_AUTOCOMPLETE_ENABLE_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE="${RUN_1_REAL_GHOST_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_GENERATION_EVIDENCE="${RUN_1_REAL_GENERATION_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_REAL_GENERATION_GUARD_EVIDENCE="${RUN_1_REAL_GENERATION_GUARD_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE="${RUN_1_REAL_WORD_REVERSAL_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_GENERATION_COUNT_BEFORE_REVERSAL="${loom_generation_count_before_reversal:-}" \
 DELYSIS_SMOKE_RUN_1_GENERATION_COUNT_AFTER_REVERSAL="${loom_generation_count_after_reversal:-}" \
-DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT="${RUN_1_REAL_SHUTTLE_TEXT:-}" \
 DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER_EDITOR_INPUT="${RUN_1_MANUSCRIPT_SHA256_AFTER_EDITOR_INPUT:-}" \
+DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER_FORMATTING="${RUN_1_MANUSCRIPT_SHA256_AFTER_FORMATTING:-}" \
 DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE="${RUN_1_NEW_DOCUMENT_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_PATH="${RUN_1_NEW_DOCUMENT_PATH:-}" \
 DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_SENTINEL="${RUN_1_NEW_DOCUMENT_SENTINEL:-}" \
+DELYSIS_SMOKE_RUN_1_PROJECT_BUSY_MONITOR_EVIDENCE="${RUN_1_PROJECT_BUSY_MONITOR_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_PROJECT_BUSY_LOG_EVIDENCE="${RUN_1_PROJECT_BUSY_LOG_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_2_MANUSCRIPT_SHA="${RUN_2_MANUSCRIPT_SHA256:-}" \
 DELYSIS_SMOKE_REOPEN_EVIDENCE="$REOPEN_EVIDENCE" \
 node <<'NODE' > "$RECEIPT"
@@ -1599,21 +2963,32 @@ const completionControls = e.DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE
 const editorInput = e.DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE)
   : null;
+const wysiwyg = e.DELYSIS_SMOKE_RUN_1_WYSIWYG_EVIDENCE
+  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_WYSIWYG_EVIDENCE)
+  : null;
 const newDocument = e.DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_NEW_DOCUMENT_EVIDENCE)
   : null;
 const formatting = e.DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE)
   : null;
-const completionWordReversal = e.DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE
+const cachedCompletionInteractions = e.DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE)
   : null;
 const generationFamily = e.DELYSIS_SMOKE_RUN_1_REAL_GENERATION_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_REAL_GENERATION_EVIDENCE)
   : null;
-const shuttleText = e.DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT
-  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT)
+const generationGuard = e.DELYSIS_SMOKE_RUN_1_REAL_GENERATION_GUARD_EVIDENCE
+  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_REAL_GENERATION_GUARD_EVIDENCE)
   : null;
+const autocompleteActivation = e.DELYSIS_SMOKE_RUN_1_AUTOCOMPLETE_OFF_EVIDENCE ? {
+  off_before_typing: JSON.parse(e.DELYSIS_SMOKE_RUN_1_AUTOCOMPLETE_OFF_EVIDENCE),
+  enabled_after_canonical_persistence: JSON.parse(e.DELYSIS_SMOKE_RUN_1_AUTOCOMPLETE_ENABLE_EVIDENCE),
+} : null;
+const projectBusyRegression = e.DELYSIS_SMOKE_RUN_1_PROJECT_BUSY_MONITOR_EVIDENCE ? {
+  accessibility_monitor: JSON.parse(e.DELYSIS_SMOKE_RUN_1_PROJECT_BUSY_MONITOR_EVIDENCE),
+  launch_log_scan: JSON.parse(e.DELYSIS_SMOKE_RUN_1_PROJECT_BUSY_LOG_EVIDENCE),
+} : null;
 const receipt = {
   schema: "delysis.macos-packaged-app-smoke.v1",
   created_at: new Date().toISOString(),
@@ -1635,24 +3010,29 @@ const receipt = {
       manuscript_sha256_before_drag: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_BEFORE || null,
       manuscript_sha256_after_drag: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER || null,
       completion_controls: completionControls,
+      project_busy_regression: projectBusyRegression,
       editor_input: editorInput ? {
         ...editorInput,
-        sentinel: e.DELYSIS_SMOKE_RUN_1_EDITOR_SENTINEL,
+        typed_terminal_space_sentinel: e.DELYSIS_SMOKE_RUN_1_EDITOR_INPUT_SENTINEL,
+        canonical_manuscript: e.DELYSIS_SMOKE_RUN_1_EDITOR_SENTINEL,
+        live_wysiwyg_after_persistence: wysiwyg,
         manuscript_sha256_after_input: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER_EDITOR_INPUT,
       } : null,
       visual_formatting: formatting ? {
         ...formatting,
         observed_persisted_markdown: e.DELYSIS_SMOKE_RUN_1_FORMATTED_SENTINEL,
+        manuscript_sha256_after_formatting: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER_FORMATTING,
       } : null,
       real_model_completion: e.DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE ? {
+        autocomplete_activation: autocompleteActivation,
         generation_family: generationFamily,
+        generation_family_guard: generationGuard,
         ghost_presentation: e.DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE,
-        option_word_reversal: completionWordReversal ? {
-          ...completionWordReversal,
+        cached_completion_interactions: cachedCompletionInteractions ? {
+          ...cachedCompletionInteractions,
           generation_runs_before: Number(e.DELYSIS_SMOKE_RUN_1_GENERATION_COUNT_BEFORE_REVERSAL),
           generation_runs_after: Number(e.DELYSIS_SMOKE_RUN_1_GENERATION_COUNT_AFTER_REVERSAL),
         } : null,
-        shuttle_persisted_manuscript: shuttleText,
       } : null,
       new_document: newDocument ? {
         ...newDocument,

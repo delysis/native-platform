@@ -5,6 +5,7 @@ import {
   canRoundTripMarkdownExactly,
   canUseVisualMarkdown,
   normalizeVisualMarkdownSource,
+  parseVisualMarkdown,
   serializeVisualMarkdown
 } from './markdownSafety';
 
@@ -29,7 +30,7 @@ describe('visual Markdown safety gate', () => {
   });
 
   it('does not eject a live visual editor for an ordinary trailing space', () => {
-    expect(canRoundTripMarkdownExactly('It ')).toBe(false);
+    expect(canRoundTripMarkdownExactly('It ')).toBe(true);
     expect(canUseVisualMarkdown('It ', true)).toBe(true);
     expect(canUseVisualMarkdown('It ', false)).toBe(true);
   });
@@ -43,16 +44,16 @@ describe('visual Markdown safety gate', () => {
     expect(canUseVisualMarkdown('~~unsupported~~ ', false)).toBe(false);
   });
 
-  it('normalizes only the invisible terminal prose byte that would stale a completion boundary', () => {
-    expect(normalizeVisualMarkdownSource('Something ')).toBe('Something');
-    expect(normalizeVisualMarkdownSource('# Heading ')).toBe('# Heading');
+  it('keeps the admitted terminal prose byte in the canonical manuscript identity', () => {
+    expect(normalizeVisualMarkdownSource('Something ')).toBe('Something ');
+    expect(normalizeVisualMarkdownSource('# Heading ')).toBe('# Heading ');
 
     expect(normalizeVisualMarkdownSource('Something  ')).toBe('Something  ');
     expect(normalizeVisualMarkdownSource('- A quiet item ')).toBe('- A quiet item ');
     expect(normalizeVisualMarkdownSource('Something\n')).toBe('Something\n');
   });
 
-  it('canonicalizes a terminal space produced by a live ProseMirror edit before persistence', () => {
+  it('round-trips a terminal space produced by a live ProseMirror edit', () => {
     const document = defaultMarkdownParser.parse('hello');
     const state = EditorState.create({
       doc: document,
@@ -60,6 +61,7 @@ describe('visual Markdown safety gate', () => {
     });
     const edited = state.tr.insertText(' ').doc;
 
-    expect(serializeVisualMarkdown(edited)).toBe('hello');
+    expect(serializeVisualMarkdown(edited)).toBe('hello ');
+    expect(parseVisualMarkdown(serializeVisualMarkdown(edited)).eq(edited)).toBe(true);
   });
 });

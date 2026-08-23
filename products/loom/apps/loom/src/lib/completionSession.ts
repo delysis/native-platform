@@ -14,6 +14,8 @@ export interface CompletionSession {
   candidates: CompletionCandidate[];
   selectedRunId: string;
   acceptedChunks: string[];
+  /** Sticky authority: once insertion starts, base-family churn cannot replace this snapshot. */
+  authorityFrozen: boolean;
 }
 
 export interface CompletionStep {
@@ -47,7 +49,13 @@ export function startCompletionSession(
   if (!contextKey || snapshots.length === 0 || !snapshots.some((item) => item.runId === selectedRunId)) {
     return null;
   }
-  return { contextKey, candidates: snapshots, selectedRunId, acceptedChunks: [] };
+  return {
+    contextKey,
+    candidates: snapshots,
+    selectedRunId,
+    acceptedChunks: [],
+    authorityFrozen: false
+  };
 }
 
 export function selectedCompletionCandidate(session: CompletionSession): CompletionCandidate | null {
@@ -73,7 +81,11 @@ export function consumeCompletionText(
   if (!text || remaining === null || !remaining.startsWith(text)) return null;
   return {
     text,
-    session: { ...session, acceptedChunks: [...session.acceptedChunks, text] }
+    session: {
+      ...session,
+      acceptedChunks: [...session.acceptedChunks, text],
+      authorityFrozen: true
+    }
   };
 }
 
@@ -116,6 +128,10 @@ export function updateCompletionCandidate(
   text: string,
   presentationKey: string
 ): CompletionSession | null {
+  // A consumed candidate is an immutable authorization snapshot. Late stream
+  // chunks must not rewrite either the reversible text or its presentation
+  // identity, including after every accepted chunk has been unconsumed.
+  if (session.authorityFrozen) return session;
   const accepted = acceptedCompletionText(session);
   if (runId === session.selectedRunId && !text.startsWith(accepted)) return null;
   let changed = false;
@@ -129,10 +145,64 @@ export function updateCompletionCandidate(
   return changed ? { ...session, candidates } : session;
 }
 
+/**
+ * Grow or refresh an unconsumed family without changing its selected identity.
+ * Once any text has been consumed, the original immutable snapshot remains the
+ * only reversible continuation authority.
+ */
+export function synchronizeCompletionCandidates(
+  session: CompletionSession,
+  candidates: readonly CompletionCandidate[]
+): CompletionSession | null {
+  // An empty authoritative family means an unconsumed presentation was
+  // dismissed or became ineligible. Only an already-authorized insertion may
+  // retain its immutable session long enough to reverse or continue it.
+  if (session.authorityFrozen) {
+    const selected = selectedCompletionCandidate(session);
+    const remaining = remainingCompletionText(session);
+    const acceptedBytes = new TextEncoder().encode(acceptedCompletionText(session)).byteLength;
+    const nextTarget = selected ? selected.targetByte + acceptedBytes : -1;
+    const oldRunIds = new Set(session.candidates.map((candidate) => candidate.runId));
+    const oldCandidateIds = new Set(session.candidates.map((candidate) => candidate.candidateId));
+    const oldPresentationKeys = new Set(
+      session.candidates.map((candidate) => candidate.presentationKey)
+    );
+    const freshExhaustedFamily = remaining === '' &&
+      candidates.length > 0 &&
+      candidates.every((candidate) =>
+        candidate.targetByte === nextTarget &&
+        !oldRunIds.has(candidate.runId) &&
+        !oldCandidateIds.has(candidate.candidateId) &&
+        !oldPresentationKeys.has(candidate.presentationKey)
+      );
+    return freshExhaustedFamily
+      ? startCompletionSession(session.contextKey, candidates, candidates[0].runId)
+      : session;
+  }
+  if (candidates.length === 0) return null;
+  const snapshots = candidates.map((candidate) => ({ ...candidate }));
+  const selectedRunId = snapshots.some((candidate) => candidate.runId === session.selectedRunId)
+    ? session.selectedRunId
+    : snapshots[0].runId;
+  const unchanged = selectedRunId === session.selectedRunId &&
+    snapshots.length === session.candidates.length &&
+    snapshots.every((candidate, index) => {
+      const previous = session.candidates[index];
+      return previous &&
+        previous.candidateId === candidate.candidateId &&
+        previous.presentationKey === candidate.presentationKey &&
+        previous.text === candidate.text &&
+        previous.runId === candidate.runId &&
+        previous.targetByte === candidate.targetByte &&
+        previous.insertsOnAccept === candidate.insertsOnAccept;
+    });
+  return unchanged ? session : { ...session, candidates: snapshots, selectedRunId };
+}
+
 export function completionPresentation(session: CompletionSession): CompletionCandidate | null {
   const selected = selectedCompletionCandidate(session);
   const remaining = remainingCompletionText(session);
-  if (!selected || remaining === null || !remaining) return null;
+  if (!selected || remaining === null) return null;
   const accepted = acceptedCompletionText(session);
   const acceptedBytes = new TextEncoder().encode(accepted).byteLength;
   return {
@@ -144,6 +214,31 @@ export function completionPresentation(session: CompletionSession): CompletionCa
   };
 }
 
+/**
+ * Prove that a cached session belongs to the exact surface presentation asking
+ * to consume it. A non-null session from another document, mode, candidate, or
+ * accepted offset must never authorize an insertion.
+ */
+export function completionSessionMatchesPresentation(
+  session: CompletionSession,
+  contextKey: string,
+  candidate: CompletionCandidate
+): boolean {
+  if (!contextKey || session.contextKey !== contextKey) return false;
+  const expected = session.acceptedChunks.length === 0
+    ? selectedCompletionCandidate(session)
+    : completionPresentation(session);
+  return Boolean(
+    expected &&
+    expected.candidateId === candidate.candidateId &&
+    expected.presentationKey === candidate.presentationKey &&
+    expected.runId === candidate.runId &&
+    expected.targetByte === candidate.targetByte &&
+    expected.text === candidate.text &&
+    expected.insertsOnAccept === candidate.insertsOnAccept
+  );
+}
+
 export function completionShouldRequestNextBatch(
   session: CompletionSession,
   editorMutationPending: boolean,
@@ -152,6 +247,21 @@ export function completionShouldRequestNextBatch(
   return !editorMutationPending &&
     selectedCandidateReady &&
     remainingCompletionText(session) === '';
+}
+
+export interface CompletionExhaustionLatch {
+  handledKey: string;
+  shouldSchedule: boolean;
+}
+
+/** Edge-trigger exhaustion, resetting authority after rollback or handoff. */
+export function advanceCompletionExhaustionLatch(
+  handledKey: string,
+  currentKey: string
+): CompletionExhaustionLatch {
+  if (!currentKey) return { handledKey: '', shouldSchedule: false };
+  if (currentKey === handledKey) return { handledKey, shouldSchedule: false };
+  return { handledKey: currentKey, shouldSchedule: true };
 }
 
 export function utf8ByteBoundaryToStringIndex(text: string, targetBytes: number): number | null {

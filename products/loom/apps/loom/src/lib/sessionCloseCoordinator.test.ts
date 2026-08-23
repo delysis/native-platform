@@ -11,6 +11,7 @@ function operations(overrides: Partial<Parameters<typeof drainGenerationsAndClos
     disableAutomation: vi.fn(async () => {}),
     cancelKnownBranches: vi.fn(async () => {}),
     closeProject: vi.fn(async () => 'receipt'),
+    validateCloseResult: vi.fn(),
     normalizeFailure: (error: unknown) => error as LoomFailure,
     closeResultMayHaveCommitted: (value: LoomFailure) => value.code === 'command_transport_failed',
     wait: vi.fn(async () => {}),
@@ -96,6 +97,16 @@ describe('drainGenerationsAndClose', () => {
       failure: failure('command_transport_failed', true)
     });
     expect(ops.closeProject).toHaveBeenCalledTimes(1);
+  });
+
+  it('propagates a close receipt identity mismatch without replaying it', async () => {
+    const mismatch = new Error('receipt belongs to another session');
+    const ops = operations({
+      validateCloseResult: vi.fn(() => { throw mismatch; })
+    });
+
+    await expect(drainGenerationsAndClose(ops)).rejects.toBe(mismatch);
+    expect(ops.closeProject).toHaveBeenCalledOnce();
   });
 
   it('never closes a superseded session', async () => {

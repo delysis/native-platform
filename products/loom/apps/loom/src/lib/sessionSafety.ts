@@ -11,6 +11,11 @@ export function failureIsDefiniteContention(failure: LoomFailure): boolean {
   return failure.retryable === true && DEFINITE_CONTENTION_CODES.has(failure.code);
 }
 
+/** Cancellation races are reconciled from stored branch status, not toasted. */
+export function cancellationFailureNeedsUserAttention(failure: LoomFailure): boolean {
+  return !failureIsDefiniteContention(failure) && failure.code !== 'generation_not_active';
+}
+
 /**
  * A close command may have reached the Rust host even when its reply was lost.
  * Keep the editor locked so the caller can retry the same command identity.

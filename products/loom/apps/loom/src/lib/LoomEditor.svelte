@@ -23,7 +23,12 @@
     type VisualCaretBoundaryFailure,
     visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
-  import { nextVisualSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
+  import {
+    nextVisualSuggestionWord,
+    type CompletionInsertionAction,
+    type SuggestionAlternative
+  } from './suggestionInteraction';
+  import type { VisualCompletionAccessibilityWitness } from './completionAccessibility';
   import {
     applyVisualFormat,
     visualFormatState,
@@ -53,7 +58,8 @@
   export let onGhostInsert: (
     candidateId: string,
     presentationKey: string,
-    text: string
+    text: string,
+    action: CompletionInsertionAction
   ) => boolean = () => false;
   export let onGhostCycle: (offset: number) => void = () => {};
   export let onGhostUnconsume: (candidateId: string, presentationKey: string, text: string) => boolean = () => false;
@@ -72,6 +78,9 @@
   ) => void = () => {};
   export let onCaretNavigation: () => void = () => {};
   export let onFormatStateChange: (state: VisualFormatState) => void = () => {};
+  export let onCompletionAccessibilityChange: (
+    witness: VisualCompletionAccessibilityWitness
+  ) => void = () => {};
 
   let mount: HTMLDivElement;
   let scrollViewport: HTMLElement | null = null;
@@ -98,6 +107,26 @@
   let boundaryCacheDiagnostic: string | null = null;
   let formattingSelectionDocument: ProseMirrorNode | null = null;
   let formattingSelection: Selection | null = null;
+  let reportedCompletionAccessibilityIdentity = '';
+
+  function reportCompletionAccessibility(): void {
+    const plan = view ? currentGhostTextPlan(view.state) : null;
+    const witness: VisualCompletionAccessibilityWitness = {
+      available: Boolean(view),
+      optionHeld,
+      fanVisible: Boolean(plan?.fanVisible),
+      inlineHidden: Boolean(plan?.hidden),
+      selectedCandidateId: plan?.candidateId ?? '',
+      selectedPresentationKey: plan?.presentationKey ?? '',
+      alternativeCandidateIds: plan?.alternatives.map((item) => item.candidateId) ?? [],
+      alternativePresentationKeys: plan?.alternatives.map((item) => item.presentationKey) ?? [],
+      alternativeRunIds: plan?.alternatives.map((item) => item.runId ?? '') ?? []
+    };
+    const identity = JSON.stringify(witness);
+    if (identity === reportedCompletionAccessibilityIdentity) return;
+    reportedCompletionAccessibilityIdentity = identity;
+    onCompletionAccessibilityChange(witness);
+  }
 
   function clearBoundaryCache(): void {
     boundaryCacheDocument = null;
@@ -245,6 +274,16 @@
     return applied;
   }
 
+  export function formattingDiagnostic(): string {
+    if (!view) return 'editor_unavailable';
+    const selection = view.state.selection;
+    const ancestors: string[] = [];
+    for (let depth = 0; depth <= selection.$from.depth; depth += 1) {
+      ancestors.push(selection.$from.node(depth).type.name);
+    }
+    return `${selection.constructor.name}:${selection.from}:${selection.to}:${ancestors.join('>')}`;
+  }
+
   export function acceptGhostWord(requireVisible = true): boolean {
     if (!view || readonly || composing || !view.hasFocus()) return false;
     const plan = currentGhostTextPlan(view.state);
@@ -254,7 +293,12 @@
       selectionBoundary(view.state) !== plan.anchorByteOffset
     ) return false;
     const word = nextVisualSuggestionWord(plan.text);
-    if (!word || !authorizeCompletionInsertion(plan.candidateId, plan.presentationKey, word)) return false;
+    if (!word || !authorizeCompletionInsertion(
+      plan.candidateId,
+      plan.presentationKey,
+      word,
+      'shuttle_word'
+    )) return false;
     view.dispatch(view.state.tr.insertText(word));
     return true;
   }
@@ -262,9 +306,10 @@
   function authorizeCompletionInsertion(
     candidateId: string,
     presentationKey: string,
-    text: string
+    text: string,
+    action: CompletionInsertionAction
   ): boolean {
-    const authorized = onGhostInsert(candidateId, presentationKey, text);
+    const authorized = onGhostInsert(candidateId, presentationKey, text, action);
     if (authorized) completionMutationAuthorized = true;
     return authorized;
   }
@@ -311,6 +356,7 @@
           insert: authorizeCompletionInsertion,
           unconsume: authorizeCompletionReversal,
           cycle: onGhostCycle,
+          modifier: setOptionHeld,
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
           visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>
             Boolean(view) &&
@@ -486,12 +532,15 @@
     const anchorByteOffset = ghostAnchorByteOffset;
     const exactAnchor = anchorByteOffset !== null &&
       selectionBoundary(view.state) === anchorByteOffset;
-    const faithful = exactAnchor && visualGhostTextIsFaithfulAtSelection(
-        view.state,
-        lastEmitted,
-        anchorByteOffset!,
-        ghostText
-      );
+    const rollbackOnly = ghostText === '' && ghostUnconsumeText !== '';
+    const faithful = exactAnchor && (
+      rollbackOnly || visualGhostTextIsFaithfulAtSelection(
+          view.state,
+          lastEmitted,
+          anchorByteOffset!,
+          ghostText
+        )
+    );
     const rejectionIdentity = anchorByteOffset === null
       ? ''
       : `${ghostPresentationKey}\u0000${surfaceKey}\u0000${anchorByteOffset}`;
@@ -525,7 +574,7 @@
       text: ghostText,
       insertsOnAccept: ghostInsertsOnAccept,
       alternatives: ghostAlternatives,
-      hidden: ghostHidden,
+      hidden: ghostHidden || rollbackOnly,
       unconsumeText: ghostUnconsumeText,
       // Once a word is consumed the session is locked to one candidate. Do
       // not hide its cached remainder behind a now-empty alternatives fan
@@ -533,6 +582,7 @@
       fanVisible: optionHeld && ghostAlternatives.length > 1
     } : null;
     setGhostText(view, presentation);
+    reportCompletionAccessibility();
     scheduleGhostVisibilityReport();
   }
 
@@ -545,6 +595,17 @@
     if (composing) onCompositionChange(false);
     onSelectionChange(null, 'selection_settling', null);
     if (reportedGhostPresentationKey) onGhostVisibilityChange('');
+    onCompletionAccessibilityChange({
+      available: false,
+      optionHeld: false,
+      fanVisible: false,
+      inlineHidden: true,
+      selectedCandidateId: '',
+      selectedPresentationKey: '',
+      alternativeCandidateIds: [],
+      alternativePresentationKeys: [],
+      alternativeRunIds: []
+    });
     window.removeEventListener('resize', reportGhostVisibility);
     window.removeEventListener('keydown', handleWindowKeyDown, true);
     window.removeEventListener('keyup', handleWindowKeyUp, true);

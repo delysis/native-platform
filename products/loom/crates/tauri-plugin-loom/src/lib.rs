@@ -2349,10 +2349,10 @@ async fn project_open_default(
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
     ensure_application_running(&state, "a project session")?;
-    reserve_project_choice(&state)?;
+    let choice = reserve_project_choice(&state)?;
     let result =
         default_project_path(&state).and_then(|path| open_or_initialize_default_project(&path));
-    finish_project_choice(&state, result)
+    choice.finish(result)
 }
 
 fn default_project_path(state: &PluginState) -> Result<PathBuf, IpcFailure> {
@@ -2376,13 +2376,13 @@ async fn project_choose_create<R: Runtime>(
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
     ensure_application_running(&state, "a project session")?;
-    reserve_project_choice(&state)?;
+    let choice = reserve_project_choice(&state)?;
     let result = choose_project_folder(&app).and_then(|path| initialize_project(&path, title));
-    finish_project_choice(&state, result)
+    choice.finish(result)
 }
 
-fn reserve_project_choice(state: &State<'_, PluginState>) -> Result<(), IpcFailure> {
-    let _application_admission = lock_application_admission(state, "a project session")?;
+fn reserve_project_choice(state: &PluginState) -> Result<ProjectChoiceReservation<'_>, IpcFailure> {
+    let application_admission = lock_application_admission(state, "a project session")?;
     let mut session = lock_session(state)?;
     if session.phase != SessionPhase::Closed {
         return Err(IpcFailure::new(
@@ -2392,49 +2392,63 @@ fn reserve_project_choice(state: &State<'_, PluginState>) -> Result<(), IpcFailu
         ));
     }
     session.phase = SessionPhase::Choosing;
-    Ok(())
+    drop(session);
+    Ok(ProjectChoiceReservation {
+        state,
+        _application_admission: application_admission,
+        committed: false,
+    })
 }
 
-fn finish_project_choice(
-    state: &State<'_, PluginState>,
-    result: Result<ProjectStore, IpcFailure>,
-) -> Result<ProjectSnapshot, IpcFailure> {
-    let store = match result {
-        Ok(store) => store,
-        Err(error) => {
-            release_project_choice(state)?;
-            return Err(error);
-        }
-    };
-    let session_id = CommandId::new();
-    let snapshot = match snapshot_for(&store, session_id) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            release_project_choice(state)?;
-            return Err(error);
-        }
-    };
-    let mut session = lock_session_internal(state)?;
-    if session.phase != SessionPhase::Choosing {
-        return Err(IpcFailure::new(
-            "project_choice_state_changed",
-            "the project chooser lost its reserved session",
-            false,
-        ));
-    }
-    session.store = Some(store);
-    session.active_session_id = Some(session_id);
-    session.agency = AgencyGate::default();
-    session.phase = SessionPhase::Open;
-    Ok(snapshot)
+struct ProjectChoiceReservation<'a> {
+    state: &'a PluginState,
+    _application_admission: MutexGuard<'a, ApplicationPhase>,
+    committed: bool,
 }
 
-fn release_project_choice(state: &State<'_, PluginState>) -> Result<(), IpcFailure> {
-    let mut session = lock_session_internal(state)?;
-    if session.phase == SessionPhase::Choosing {
-        session.phase = SessionPhase::Closed;
+impl ProjectChoiceReservation<'_> {
+    fn finish(
+        mut self,
+        result: Result<ProjectStore, IpcFailure>,
+    ) -> Result<ProjectSnapshot, IpcFailure> {
+        let store = result?;
+        let session_id = CommandId::new();
+        let snapshot = snapshot_for(&store, session_id)?;
+        let mut session = lock_session_internal(self.state)?;
+        if session.phase != SessionPhase::Choosing {
+            return Err(IpcFailure::new(
+                "project_choice_state_changed",
+                "the project chooser lost its reserved session",
+                false,
+            ));
+        }
+        session.store = Some(store);
+        session.active_session_id = Some(session_id);
+        session.agency = AgencyGate::default();
+        session.phase = SessionPhase::Open;
+        drop(session);
+        self.committed = true;
+        Ok(snapshot)
     }
-    Ok(())
+}
+
+impl Drop for ProjectChoiceReservation<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Drop is the last line of defence for a cancelled/erroring/panicking
+        // native chooser. Never leave a false Choosing latch that makes
+        // project_current and close wait forever.
+        let mut session = self
+            .state
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if session.phase == SessionPhase::Choosing {
+            session.phase = SessionPhase::Closed;
+        }
+    }
 }
 
 fn choose_project_folder<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, IpcFailure> {
@@ -2625,7 +2639,7 @@ async fn project_choose_open<R: Runtime>(
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
     ensure_application_running(&state, "a project session")?;
-    reserve_project_choice(&state)?;
+    let choice = reserve_project_choice(&state)?;
     let result = choose_project_folder(&app).and_then(|path| {
         let mut store = ProjectStore::open(path).map_err(IpcFailure::store)?;
         store
@@ -2634,7 +2648,7 @@ async fn project_choose_open<R: Runtime>(
         store.record_open().map_err(IpcFailure::store)?;
         Ok(store)
     });
-    finish_project_choice(&state, result)
+    choice.finish(result)
 }
 
 #[tauri::command]
@@ -2672,7 +2686,7 @@ fn close_project_with_wait(
     generation_wait: Duration,
 ) -> Result<ProjectCloseReceipt, IpcFailure> {
     let (typed_project_id, typed_session_id) = {
-        let mut session = lock_session(state)?;
+        let mut session = lock_session_internal(state)?;
         if session.phase == SessionPhase::Closed {
             if let Some(receipt) = &session.last_close
                 && receipt.command_id == command_id.to_string()
@@ -2728,7 +2742,7 @@ fn close_project_with_wait(
         generation_wait,
     )?;
 
-    let mut session = lock_session(state)?;
+    let mut session = lock_session_internal(state)?;
     if session.phase == SessionPhase::Closed {
         if let Some(receipt) = &session.last_close
             && receipt.command_id == command_id.to_string()
@@ -2828,11 +2842,18 @@ fn cancel_and_drain_generation_session(
 #[tauri::command]
 async fn project_current(state: State<'_, PluginState>) -> Result<ProjectSnapshot, IpcFailure> {
     let session = lock_session(&state)?;
-    if session.phase != SessionPhase::Open {
+    if session.phase == SessionPhase::Closed {
         return Err(IpcFailure::new(
             "project_not_open",
             "there is no live native project session to reattach",
             false,
+        ));
+    }
+    if session.phase != SessionPhase::Open {
+        return Err(IpcFailure::new(
+            "project_transition_in_progress",
+            "the native project chooser or close transition is still settling",
+            true,
         ));
     }
     let session_id = session.active_session_id.ok_or_else(|| {
@@ -2978,21 +2999,18 @@ async fn document_export_choose<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<Option<Receipt>, IpcFailure> {
-    {
-        let mut session = lock_session(&state)?;
-        let store = require_bound_store(&mut session, &project_id, &session_id)?;
-        ensure_registered_document(store, &relative_path, &document_id)?;
-    }
-
     let suggested_name = Path::new(&relative_path)
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or("Loom-export.md");
+        .unwrap_or("Loom-export.md")
+        .to_owned();
+    let reservation =
+        reserve_document_export(&state, project_id, session_id, document_id, relative_path)?;
     let Some(destination) = app
         .dialog()
         .file()
         .set_title("Export a copy")
-        .set_file_name(suggested_name)
+        .set_file_name(&suggested_name)
         .add_filter("Markdown or plain text", &["md", "markdown", "txt"])
         .blocking_save_file()
     else {
@@ -3006,9 +3024,47 @@ async fn document_export_choose<R: Runtime>(
         )
     })?;
 
-    let mut session = lock_session(&state)?;
-    let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    export_registered_document(store, &document_id, &relative_path, &destination).map(Some)
+    reservation.export(&destination).map(Some)
+}
+
+struct DocumentExportReservation<'a> {
+    state: &'a PluginState,
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    relative_path: String,
+    _application_admission: MutexGuard<'a, ApplicationPhase>,
+}
+
+fn reserve_document_export(
+    state: &PluginState,
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    relative_path: String,
+) -> Result<DocumentExportReservation<'_>, IpcFailure> {
+    let application_admission = lock_application_admission(state, "a document export")?;
+    {
+        let mut session = lock_session_internal(state)?;
+        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        ensure_registered_document(store, &relative_path, &document_id)?;
+    }
+    Ok(DocumentExportReservation {
+        state,
+        project_id,
+        session_id,
+        document_id,
+        relative_path,
+        _application_admission: application_admission,
+    })
+}
+
+impl DocumentExportReservation<'_> {
+    fn export(self, destination: &Path) -> Result<Receipt, IpcFailure> {
+        let mut session = lock_session_internal(self.state)?;
+        let store = require_bound_store(&mut session, &self.project_id, &self.session_id)?;
+        export_registered_document(store, &self.document_id, &self.relative_path, destination)
+    }
 }
 
 fn export_registered_document(
@@ -3705,6 +3761,11 @@ async fn model_choose<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<Option<ModelCapabilitySummary>, IpcFailure> {
+    // A file chooser is bounded user-owned work, but it is not a detached
+    // worker that shutdown can join. Hold application admission through every
+    // path mutation so close waits for this already-admitted operation and no
+    // model-library write can race authorized process exit.
+    let application_admission = lock_application_admission(&state, "a local model choice")?;
     let Some(selected_path) = choose_model_file(&app)? else {
         return Ok(None);
     };
@@ -3731,6 +3792,7 @@ async fn model_choose<R: Runtime>(
     }
     remember_user_model_path(&state, selected.resolved_path.clone())?;
     let canonical_path = selected.resolved_path.to_string_lossy().into_owned();
+    drop(application_admission);
     model_list(state)
         .await?
         .into_iter()
@@ -7523,7 +7585,7 @@ fn application_close<R: Runtime>(
         ));
     }
     {
-        let session = lock_session(&state)?;
+        let session = lock_session_internal(&state)?;
         if session.phase != SessionPhase::Closed {
             return Err(IpcFailure::new(
                 "project_must_close_first",
@@ -7850,23 +7912,10 @@ fn registered_document_kind(
 }
 
 fn lock_session(state: &PluginState) -> Result<std::sync::MutexGuard<'_, Session>, IpcFailure> {
-    state.session.try_lock().map_err(|error| match error {
-        TryLockError::WouldBlock => IpcFailure::new(
-            "project_busy",
-            "another bounded project operation is still running; retry shortly",
-            true,
-        ),
-        TryLockError::Poisoned(_) => IpcFailure::new(
-            "session_poisoned",
-            "the project session entered an invalid state; restart Loom",
-            false,
-        ),
-    })
-}
-
-fn lock_session_internal(
-    state: &PluginState,
-) -> Result<std::sync::MutexGuard<'_, Session>, IpcFailure> {
+    // The session mutex is the authoritative admission boundary across every
+    // renderer and renderer reload. Session critical sections are bounded and
+    // never encompass a native chooser or an async generation drain, so wait
+    // here instead of leaking lock timing to the UI as `project_busy`.
     state.session.lock().map_err(|_| {
         IpcFailure::new(
             "session_poisoned",
@@ -7874,6 +7923,12 @@ fn lock_session_internal(
             false,
         )
     })
+}
+
+fn lock_session_internal(
+    state: &PluginState,
+) -> Result<std::sync::MutexGuard<'_, Session>, IpcFailure> {
+    lock_session(state)
 }
 
 fn lock_model_registry(
@@ -8256,6 +8311,57 @@ mod tests {
                 .expect_err("recorded close intent must stop later admission")
                 .code,
             "application_quiescing"
+        );
+    }
+
+    #[test]
+    fn project_choice_owns_application_admission_until_its_session_reservation_is_released() {
+        let state = Arc::new(PluginState::default());
+        let choice = reserve_project_choice(&state).expect("reserve project choice");
+        assert_eq!(
+            state.session.lock().expect("session phase").phase,
+            SessionPhase::Choosing
+        );
+        assert!(!record_application_exit_request(&state));
+
+        let (sent, received) = std::sync::mpsc::channel();
+        let closing_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            let attempt =
+                begin_application_close(&closing_state).expect("begin close after choice");
+            sent.send(*attempt.phase)
+                .expect("send acquired close phase");
+        });
+        assert!(matches!(
+            received.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        drop(choice);
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_secs(1))
+                .expect("close acquires only after choice release"),
+            ApplicationPhase::Closing
+        );
+        worker.join().expect("join close worker");
+    }
+
+    #[test]
+    fn project_choice_unwind_clears_its_reserved_session_phase() {
+        let state = PluginState::default();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _choice = reserve_project_choice(&state).expect("reserve project choice");
+            panic!("injected chooser unwind");
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(
+            state
+                .session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .phase,
+            SessionPhase::Closed
         );
     }
 
@@ -9316,6 +9422,65 @@ mod tests {
         .expect_err("uncheckpointed visible bytes");
         assert_eq!(stale.code, "external_file_change");
         assert!(!stale_destination.exists());
+    }
+
+    #[test]
+    fn export_dialog_reservation_blocks_application_close_until_released() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("exact manuscript\n".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let document_id = store
+            .read_document(INITIAL_DOCUMENT)
+            .expect("document")
+            .document_id
+            .to_string();
+        let project_id = store.manifest().project_id.to_string();
+        let session_id = CommandId::new();
+        let state = Arc::new(PluginState::default());
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+        let reservation = reserve_document_export(
+            &state,
+            project_id,
+            session_id.to_string(),
+            document_id,
+            INITIAL_DOCUMENT.to_owned(),
+        )
+        .expect("reserve export dialog");
+        assert!(!record_application_exit_request(&state));
+
+        let (sent, received) = std::sync::mpsc::channel();
+        let closing_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            let attempt =
+                begin_application_close(&closing_state).expect("begin close after export");
+            sent.send(*attempt.phase)
+                .expect("send acquired close phase");
+        });
+        assert!(matches!(
+            received.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        drop(reservation);
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_secs(1))
+                .expect("close acquires only after export release"),
+            ApplicationPhase::Closing
+        );
+        worker.join().expect("join close worker");
     }
 
     #[test]

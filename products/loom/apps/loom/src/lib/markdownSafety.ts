@@ -9,7 +9,11 @@ import type { Node as ProseMirrorNode } from 'prosemirror-model';
  * or inline code, so unsupported tabbed code stays outside the visual subset.
  */
 export function parseVisualMarkdown(markdown: string): ProseMirrorNode {
-  return defaultMarkdownParser.parse(markdown.replaceAll('\t', '&#9;'));
+  let parserSource = markdown.replaceAll('\t', '&#9;');
+  if (differsOnlyByHarmlessTerminalProseSpace(markdown)) {
+    parserSource = `${parserSource.slice(0, -1)}&#32;`;
+  }
+  return defaultMarkdownParser.parse(parserSource);
 }
 
 export function canRoundTripMarkdownExactly(markdown: string): boolean {
@@ -24,7 +28,7 @@ function differsOnlyByHarmlessTerminalProseSpace(markdown: string): boolean {
   if (!markdown.endsWith(' ') || markdown.endsWith('  ')) return false;
 
   try {
-    const parsed = parseVisualMarkdown(markdown);
+    const parsed = defaultMarkdownParser.parse(markdown.replaceAll('\t', '&#9;'));
     let tail: ProseMirrorNode | null = parsed.lastChild;
     while (tail && !tail.isTextblock && tail.lastChild) tail = tail.lastChild;
 
@@ -39,18 +43,16 @@ function differsOnlyByHarmlessTerminalProseSpace(markdown: string): boolean {
 }
 
 /**
- * Remove the one source byte that the admitted visual dialect cannot display.
+ * Return the canonical byte surface shared by the visual document and store.
  *
- * A terminal ASCII space in prose has no rendered or Markdown meaning, but it
- * changes the backend completion boundary. Leaving that invisible byte in the
- * project while the visual caret sits before it makes every otherwise valid
- * completion look stale. Normalize only after the parser and serializer prove
- * this exact one-byte discrepancy; meaningful whitespace remains untouched.
+ * Loom's parser encodes the one serializer-proven terminal prose space as a
+ * character reference before parsing, so ProseMirror preserves the writer's
+ * separator and serializes it back to the same byte. The function remains the
+ * single normalization boundary for callers, but no longer creates a second,
+ * shorter manuscript identity behind the mounted editor.
  */
 export function normalizeVisualMarkdownSource(markdown: string): string {
-  return differsOnlyByHarmlessTerminalProseSpace(markdown)
-    ? markdown.slice(0, -1)
-    : markdown;
+  return markdown;
 }
 
 /**
@@ -65,12 +67,10 @@ export function serializeVisualMarkdown(document: ProseMirrorNode): string {
 /**
  * Keep an admitted visual editing session mounted across transient serializer
  * states. Source/imported text must still prove an exact dialect round trip,
- * except for one terminal ASCII space that the serializer demonstrably drops
- * from a prose text block. Two spaces can encode a hard break, while code and
- * unsupported syntax remain fail-closed.
+ * including the explicitly preserved single terminal prose space. Two spaces
+ * can encode a hard break, while code and unsupported syntax remain fail-closed.
  */
 export function canUseVisualMarkdown(markdown: string, visualSessionActive: boolean): boolean {
   return visualSessionActive ||
-    canRoundTripMarkdownExactly(markdown) ||
-    differsOnlyByHarmlessTerminalProseSpace(markdown);
+    canRoundTripMarkdownExactly(markdown);
 }

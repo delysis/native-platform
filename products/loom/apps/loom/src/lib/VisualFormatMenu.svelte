@@ -4,6 +4,7 @@
     clearFormattingSelection(): void;
     focusPreservingSelection(): boolean;
     applyFormatting(action: VisualFormatAction, href?: string): boolean;
+    formattingDiagnostic?(): string;
   }
 </script>
 
@@ -12,11 +13,16 @@
 
   export let editor: VisualFormattingEditor | null | undefined;
   export let formatting: VisualFormatState;
+  export let onCommandResult: (
+    action: VisualFormatAction,
+    applied: boolean,
+    diagnostic: string
+  ) => void = () => {};
 
   let menu: HTMLDetailsElement;
   let href = '';
 
-  function preserveSelection(event: MouseEvent): void {
+  function preserveSelection(event: PointerEvent): void {
     editor?.captureFormattingSelection();
     // These controls operate on the editor selection. Prevent WebKit from
     // moving focus before the subsequent click invokes the command.
@@ -24,7 +30,9 @@
   }
 
   function run(action: VisualFormatAction, destination = ''): void {
-    if (!editor?.applyFormatting(action, destination)) return;
+    const applied = editor?.applyFormatting(action, destination) ?? false;
+    onCommandResult(action, applied, editor?.formattingDiagnostic?.() ?? 'editor_unavailable');
+    if (!applied) return;
     if (action === 'link') href = destination.trim();
   }
 
@@ -57,7 +65,7 @@
     class="titlebar-button format-button"
     title="Format text"
     aria-label="Format text"
-    on:mousedown={preserveSelection}
+    on:pointerdown={preserveSelection}
   >Aa</summary>
   <div class="format-popover" aria-label="Text formatting">
     <div class="format-style-grid" aria-label="Paragraph style">
@@ -70,22 +78,22 @@
         <button
           class:active={formatting.block === style[0]}
           type="button"
-          on:mousedown={preserveSelection}
+          on:pointerdown={preserveSelection}
           on:click={() => run(style[0] as VisualFormatAction)}
         >{style[1]}</button>
       {/each}
     </div>
     <div class="format-command-row" aria-label="Inline formatting">
-      <button class:active={formatting.bold} type="button" aria-label="Bold" title="Bold (⌘B)" on:mousedown={preserveSelection} on:click={() => run('bold')}><strong>B</strong></button>
-      <button class:active={formatting.italic} type="button" aria-label="Italic" title="Italic (⌘I)" on:mousedown={preserveSelection} on:click={() => run('italic')}><em>I</em></button>
-      <button class:active={formatting.blockquote} type="button" aria-label="Block quote" on:mousedown={preserveSelection} on:click={() => run('blockquote')}>“”</button>
-      <button class:active={formatting.bulletList} type="button" aria-label="Bulleted list" on:mousedown={preserveSelection} on:click={() => run('bullet_list')}>•≡</button>
-      <button class:active={formatting.orderedList} type="button" aria-label="Numbered list" on:mousedown={preserveSelection} on:click={() => run('ordered_list')}>1≡</button>
+      <button class:active={formatting.bold} type="button" aria-label="Bold" title="Bold (⌘B)" on:pointerdown={preserveSelection} on:click={() => run('bold')}><strong>B</strong></button>
+      <button class:active={formatting.italic} type="button" aria-label="Italic" title="Italic (⌘I)" on:pointerdown={preserveSelection} on:click={() => run('italic')}><em>I</em></button>
+      <button class:active={formatting.blockquote} type="button" aria-label="Block quote" on:pointerdown={preserveSelection} on:click={() => run('blockquote')}>“”</button>
+      <button class:active={formatting.bulletList} type="button" aria-label="Bulleted list" on:pointerdown={preserveSelection} on:click={() => run('bullet_list')}>•≡</button>
+      <button class:active={formatting.orderedList} type="button" aria-label="Numbered list" on:pointerdown={preserveSelection} on:click={() => run('ordered_list')}>1≡</button>
     </div>
     <div class="format-link-row">
       <input bind:value={href} aria-label="Link destination" placeholder="https://…" />
-      <button type="button" disabled={formatting.selectionEmpty || !href.trim()} on:mousedown={preserveSelection} on:click={() => run('link', href)}>Link</button>
-      <button type="button" disabled={formatting.selectionEmpty || !formatting.linkHref} on:mousedown={preserveSelection} on:click={() => run('unlink')}>Remove</button>
+      <button type="button" disabled={formatting.selectionEmpty || !href.trim()} on:pointerdown={preserveSelection} on:click={() => run('link', href)}>Link</button>
+      <button type="button" disabled={formatting.selectionEmpty || !formatting.linkHref} on:pointerdown={preserveSelection} on:click={() => run('unlink')}>Remove</button>
     </div>
   </div>
 </details>
