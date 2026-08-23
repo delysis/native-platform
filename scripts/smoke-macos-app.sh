@@ -976,20 +976,24 @@ func withoutTerminalLineBreaks(_ value: String) -> String {
     return normalized
 }
 
-guard let writingSurface = editor() else {
-    fputs("could not find Loom's accessible manuscript editor for WYSIWYG verification\n", stderr)
-    exit(1)
-}
 let deadline = Date().addingTimeInterval(12)
+var writingSurface: AXUIElement?
 var observedValue = ""
 var observedSelection: CFRange?
 var focused = false
 repeat {
-    observedValue = withoutTerminalLineBreaks(
-        (attribute(writingSurface, kAXValueAttribute as CFString) as? String) ?? ""
-    )
-    observedSelection = rangeAttribute(writingSurface, kAXSelectedTextRangeAttribute as CFString)
-    focused = (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true
+    writingSurface = editor()
+    if let current = writingSurface {
+        observedValue = withoutTerminalLineBreaks(
+            (attribute(current, kAXValueAttribute as CFString) as? String) ?? ""
+        )
+        observedSelection = rangeAttribute(current, kAXSelectedTextRangeAttribute as CFString)
+        focused = (attribute(current, kAXFocusedAttribute as CFString) as? Bool) == true
+    } else {
+        observedValue = ""
+        observedSelection = nil
+        focused = false
+    }
     let selectionMatches: Bool
     switch selectionMode {
     case "caret-end":
@@ -1012,7 +1016,11 @@ case "select-all":
 default:
     selectionMatches = observedSelection != nil
 }
-guard observedValue == expected, focused, selectionMatches, let observedSelection else {
+guard writingSurface != nil,
+      observedValue == expected,
+      focused,
+      selectionMatches,
+      let observedSelection else {
     let location = observedSelection?.location ?? -1
     let length = observedSelection?.length ?? -1
     fputs(
