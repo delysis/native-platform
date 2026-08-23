@@ -74,7 +74,10 @@
     projectedInlinePresentationKey,
     type InlineGhostSuggestion
   } from './lib/inlineSuggestionFamily';
-  import { visualGhostTextMayBePlainProse } from './lib/ghostText';
+  import {
+    visualGhostTextMayBePlainProse,
+    type VisualCaretBoundaryFailure
+  } from './lib/ghostText';
   import { isExtendedGraphemeBoundary } from './lib/graphemeBoundary';
   import {
     verifyBranchBody,
@@ -157,6 +160,11 @@
     type CompletionGenerationIntent,
     type CompletionGenerationTrigger
   } from './lib/completionGenerationIntent';
+  import {
+    automaticCompletionLifecycle,
+    completionLifecycleDescription,
+    retainsScheduledCompletion
+  } from './lib/completionLifecycle';
   import type {
     VisualFormatAction,
     VisualFormatState
@@ -258,7 +266,9 @@
   let suggestionsChanging = false;
   let suggestionsIdleTimer: number | undefined;
   let scheduledSuggestion: SuggestionSchedule | null = null;
+  let suggestionWakeQueued = false;
   let completionGenerationIntent: CompletionGenerationIntent | null = null;
+  let completionNavigationPending = false;
   let suggestionIntentEpoch = 0;
   let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
   let dismissedCandidateIds: string[] = [];
@@ -335,6 +345,8 @@
   let visibleVisualGhostPresentationKey = '';
   let visibleSourceGhostPresentationKey = '';
   let visualSelectionByte: number | null = null;
+  let visualBoundaryFailure: VisualCaretBoundaryFailure | 'selection_settling' | 'uninitialized' | null = 'uninitialized';
+  let visualBoundaryDiagnostic: string | null = null;
   let visualMutationPending = false;
   let verseCodec: VerseEditorCodec | null = null;
   let compositionActive = false;
@@ -342,6 +354,7 @@
   let visualEditor: {
     flushPending: () => boolean;
     focusAtDocumentEnd: () => boolean;
+    focusCurrentSelection: () => boolean;
     focusPreservingSelection: () => boolean;
     captureFormattingSelection: () => boolean;
     clearFormattingSelection: () => void;
@@ -350,6 +363,7 @@
   } | null = null;
   let sourceEditor: {
     focusAtDocumentEnd: () => boolean;
+    focusCurrentSelection: () => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
   } | null = null;
   let componentMounted = false;
@@ -824,31 +838,49 @@
   $: weaveCursorAtStart = mode === 'source'
     ? sourceSelectionStart === 0
     : visualSelectionByte === 0;
-  $: canStartAutomaticSuggestions = Boolean(
-      document &&
-      document.summary.kind !== 'hybrid' &&
-      currentModel &&
-      !modelLoading &&
-      !modelUnloading &&
-      completionAutomationEnabled() &&
-      !uncertainWeave &&
-      !compositionActive &&
-      !visualMutationPending &&
-      !sourceDirty &&
-      !saveInFlight &&
-      !weaveStarting &&
-      !promotionInFlight &&
-      transition === 'idle' &&
-      !editorReadonly &&
-      completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion) &&
-      (saveState === 'clean' || saveState === 'saved') &&
-      editVersion === savedVersion &&
-      document.summary.revision_id &&
-      document.summary.active_blob_id === document.visible_blob_id &&
-      !weaveCursorAtStart &&
-      automaticBoundaryIsExact &&
-      activeBranchCount === 0
-  );
+  $: completionLifecycle = automaticCompletionLifecycle({
+    desktop,
+    automationEnabled: completionAutomationEnabled(),
+    projectAvailable: Boolean(project),
+    documentAvailable: Boolean(document),
+    hybridDocument: document?.summary.kind === 'hybrid',
+    intentArmed: completionGenerationIsArmed(
+      completionGenerationIntent,
+      completionContextKey,
+      editVersion
+    ),
+    modelAvailable: Boolean(currentModel),
+    modelTransitioning: modelLoading || modelUnloading,
+    compositionActive,
+    visualMutationPending,
+    sourceDirty,
+    savePending: Boolean(saveInFlight) || saveState === 'dirty' || saveState === 'saving',
+    weavePending: weaveStarting,
+    promotionPending: promotionInFlight,
+    workspaceIdle: transition === 'idle',
+    editorReadonly,
+    recoveryPending: Boolean(
+      staleDraft || uncertainDraft || uncertainSave || reconciliation || uncertainWeave || uncertainPromotion
+    ),
+    saveSettled: editVersion === savedVersion && (saveState === 'clean' || saveState === 'saved'),
+    revisionAvailable: Boolean(document?.summary.revision_id),
+    visibleBlobCurrent: Boolean(
+      document && document.summary.active_blob_id === document.visible_blob_id
+    ),
+    caretExact: automaticBoundaryIsExact,
+    caretAtStart: weaveCursorAtStart,
+    activeBranchCount
+  });
+  $: canStartAutomaticSuggestions = completionLifecycle.phase === 'ready';
+  $: completionLifecycleHelp = suggestionsChanging
+    ? 'Autocomplete setting is changing'
+    : completionLifecycle.reason === 'caret_unmapped' && mode === 'visual'
+      ? `${completionLifecycleDescription(completionLifecycle)} Boundary proof: ${visualBoundaryFailure ?? 'unknown'}${visualBoundaryDiagnostic ? ` (${visualBoundaryDiagnostic})` : ''}.`
+      : completionLifecycleDescription(completionLifecycle);
+  $: completionSchedulerWakeKey = scheduledSuggestion
+    ? `${completionContextKey}:${editVersion}:${completionLifecycle.phase}:${completionLifecycle.reason ?? 'ready'}`
+    : '';
+  $: resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
   $: retryEvaluationSnapshot = {
     enabled: desktop &&
       branchPromotionReady &&
@@ -2701,6 +2733,13 @@
 
   async function toggleSuggestionsFromTitlebar(): Promise<void> {
     await setSuggestionsEnabled(!suggestionsEnabled);
+    await tick();
+    const focused = mode === 'source'
+      ? sourceEditor?.focusCurrentSelection() ?? false
+      : visualEditor?.focusCurrentSelection() ?? false;
+    if (focused && completionAutomationEnabled()) {
+      scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'explicit_enable');
+    }
   }
 
   function focusableElementsWithin(container: HTMLElement): HTMLElement[] {
@@ -2757,6 +2796,7 @@
     if (completionAutomationEnabled() && loaded.completion && document) {
       await tick();
       if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
+      if (quiet) announce('Suggestions ready');
       scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
     }
     return true;
@@ -3545,6 +3585,8 @@
     visibleVisualGhostPresentationKey = '';
     visibleSourceGhostPresentationKey = '';
     visualSelectionByte = null;
+    visualBoundaryFailure = 'uninitialized';
+    visualBoundaryDiagnostic = null;
     visualMutationPending = false;
     unpresentableVisualGhostPresentationKeys = [];
     if (kind === 'verse') {
@@ -3599,7 +3641,6 @@
     sourceSelectionEnd = textarea.selectionEnd;
     if (
       pendingCompletionText !== null ||
-      !completionWasActive ||
       (previousStart === sourceSelectionStart && previousEnd === sourceSelectionEnd)
     ) return;
     const target = sourceGhostTargetByteFor(
@@ -3616,23 +3657,39 @@
       ? completionSessionPresentation(completionSession)?.targetByte ?? null
       : selectedInlineSuggestion?.targetByte ?? completionGenerationIntent?.anchorByte ?? null;
     if (expected === null && target !== null) {
-      completionGenerationIntent = bindCompletionGenerationAnchor(
-        completionGenerationIntent,
-        completionContextKey,
-        editVersion,
-        target
-      );
+      if (completionWasActive) {
+        completionGenerationIntent = bindCompletionGenerationAnchor(
+          completionGenerationIntent,
+          completionContextKey,
+          editVersion,
+          target
+        );
+      } else {
+        scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'caret_navigation');
+      }
       return;
     }
     if (target !== null && expected !== null && target !== expected) {
       invalidateCompletionForCaretNavigation();
+      scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'caret_navigation');
     }
   }
 
-  function updateVisualSelection(markdownByteOffset: number | null): void {
+  function updateVisualSelection(
+    markdownByteOffset: number | null,
+    failure: VisualCaretBoundaryFailure | 'selection_settling' | null = null,
+    diagnostic: string | null = null
+  ): void {
     const previous = visualSelectionByte;
     const completionWasActive = completionActivityExists();
     visualSelectionByte = markdownByteOffset;
+    visualBoundaryFailure = failure;
+    visualBoundaryDiagnostic = diagnostic;
+    if (completionNavigationPending && markdownByteOffset !== null) {
+      completionNavigationPending = false;
+      scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'caret_navigation');
+      return;
+    }
     if (
       pendingCompletionText !== null ||
       markdownByteOffset === null ||
@@ -3722,17 +3779,41 @@
     if (
       !desktop ||
       !completionAutomationEnabled() ||
-      !currentModel ||
       !project ||
       !document ||
       !completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion) ||
       document.summary.kind === 'hybrid'
     ) return;
     scheduledSuggestion = schedule;
+    queueScheduledSuggestionAttempt(schedule, delay);
+  }
+
+  function queueScheduledSuggestionAttempt(schedule: SuggestionSchedule, delay: number): void {
+    if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
     suggestionsIdleTimer = window.setTimeout(() => {
       suggestionsIdleTimer = undefined;
       void tryStartAutomaticSuggestions(schedule);
     }, delay);
+  }
+
+  function resumeScheduledAutomaticSuggestion(wakeKey: string): void {
+    if (
+      !wakeKey ||
+      suggestionWakeQueued ||
+      suggestionsIdleTimer !== undefined ||
+      !scheduledSuggestion ||
+      completionLifecycle.phase !== 'ready'
+    ) return;
+    const schedule = scheduledSuggestion;
+    suggestionWakeQueued = true;
+    queueMicrotask(() => {
+      suggestionWakeQueued = false;
+      if (
+        scheduledSuggestion === schedule &&
+        suggestionsIdleTimer === undefined &&
+        completionLifecycle.phase === 'ready'
+      ) void tryStartAutomaticSuggestions(schedule);
+    });
   }
 
   function rearmBoundedSuggestionSchedule(
@@ -3740,7 +3821,8 @@
     delay: number
   ): boolean {
     if (schedule.kind === 'edit_pause') {
-      armSuggestionSchedule(schedule, delay);
+      scheduledSuggestion = schedule;
+      queueScheduledSuggestionAttempt(schedule, delay);
       return true;
     }
     if (schedule.ticket.waitsRemaining <= 0) {
@@ -3807,14 +3889,15 @@
       scheduledSuggestion !== schedule ||
       targetEditVersion !== editVersion ||
       !completionAutomationEnabled() ||
-      !currentModel ||
       !project ||
       !document ||
-      !completionGenerationIsArmed(completionGenerationIntent, completionContextKey, targetEditVersion) ||
-      compositionActive ||
-      transition !== 'idle'
+      !completionGenerationIsArmed(completionGenerationIntent, completionContextKey, targetEditVersion)
     ) {
       scheduledSuggestion = null;
+      return;
+    }
+    if (!canStartAutomaticSuggestions) {
+      if (!retainsScheduledCompletion(completionLifecycle)) scheduledSuggestion = null;
       return;
     }
     if (schedule.kind === 'exhausted_retry') {
@@ -3835,22 +3918,16 @@
         return;
       }
     }
-    if (activeBranchCount > 0 || weaveStarting) {
-      rearmBoundedSuggestionSchedule(schedule, 450);
-      return;
+    const attempted = await startAutomaticWeave();
+    if (scheduledSuggestion !== schedule) return;
+    if (attempted || !retainsScheduledCompletion(completionLifecycle)) {
+      scheduledSuggestion = null;
+    } else {
+      // A preflight race (for example, an editor projection completing while
+      // it is flushed) must not erase the only request. Recheck once the
+      // resulting reactive state has settled.
+      queueScheduledSuggestionAttempt(schedule, 100);
     }
-    if (!canStartAutomaticSuggestions) {
-      if (
-        sourceDirty ||
-        saveInFlight ||
-        saveState === 'dirty' ||
-        saveState === 'saving'
-      ) rearmBoundedSuggestionSchedule(schedule, 350);
-      else scheduledSuggestion = null;
-      return;
-    }
-    scheduledSuggestion = null;
-    await startAutomaticWeave();
   }
 
   function scheduleDraftJournal(delay = draftIntervalMs): void {
@@ -4326,6 +4403,7 @@
   }
 
   function invalidateCompletionForCaretNavigation(): void {
+    completionNavigationPending = mode === 'visual';
     if (!completionActivityExists()) return;
     completionSession = null;
     pendingCompletionText = null;
@@ -4764,22 +4842,26 @@
     staleWeaveCleanupTimers.add(timer);
   }
 
-  async function startAutomaticWeave(): Promise<void> {
-    if (weaveStarting || !project || !document || !currentModel) return;
+  async function startAutomaticWeave(): Promise<boolean> {
+    if (weaveStarting || !project || !document || !currentModel) return false;
     const startingEditVersion = editVersion;
-    if (compositionActive || !flushEditors() || editVersion !== startingEditVersion) return;
-    if (!canStartAutomaticSuggestions || uncertainWeave) return;
+    if (compositionActive || !flushEditors()) return false;
+    if (editVersion !== startingEditVersion) {
+      scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'retry');
+      return false;
+    }
+    if (!canStartAutomaticSuggestions || uncertainWeave) return false;
 
     let cursorByte: number;
     try {
       cursorByte = captureWeaveCursorByte();
     } catch (error) {
       recordFailure(error);
-      return;
+      return false;
     }
-    if (cursorByte === 0) return;
+    if (cursorByte === 0) return false;
     const sourceRevisionId = document.summary.revision_id;
-    if (!sourceRevisionId) return;
+    if (!sourceRevisionId) return false;
     const captured: WeaveCapture = {
       commandId: newUlid(),
       epoch: documentEpoch,
@@ -4829,7 +4911,7 @@
         if (captureIsCurrent && failureIsDefiniteContention(failure)) {
           uncertainWeave = null;
           scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'retry');
-          return;
+          return true;
         }
         if (captureIsCurrent) {
           recordFailure(failure);
@@ -4869,6 +4951,7 @@
     } finally {
       weaveStarting = false;
     }
+    return true;
   }
 
   function isBranchActive(branch: BranchCard): boolean {
@@ -5838,6 +5921,7 @@
           class="titlebar-button suggestions-toggle"
           type="button"
           aria-label={suggestionsEnabled ? 'Turn autocomplete off' : 'Turn autocomplete on'}
+          aria-describedby="completion-lifecycle-help"
           aria-pressed={suggestionsEnabled}
           title={suggestionsEnabled ? `Autocomplete: ${suggestionMenuState}` : 'Autocomplete: Off'}
           disabled={!project || suggestionsChanging}
@@ -5845,6 +5929,7 @@
         >
           <svg aria-hidden="true" viewBox="0 0 18 18"><path d="m9 2 .65 2.1L12 5l-2.35.9L9 8l-.65-2.1L6 5l2.35-.9L9 2ZM4.4 8.4l.45 1.45 1.55.55-1.55.55-.45 1.45-.45-1.45-1.55-.55 1.55-.55.45-1.45ZM12.4 9.2l.85 2.55 2.55.85-2.55.85L12.4 16l-.85-2.55L9 12.6l2.55-.85.85-2.55Z"/></svg>
         </button>
+        <span id="completion-lifecycle-help" class="sr-only">{completionLifecycleHelp}</span>
         <button
           class:active={shuttleEnabled}
           class:preparing={shuttleEnabled && !currentModel}

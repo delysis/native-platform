@@ -16,10 +16,11 @@
     clearGhostText,
     createGhostTextPlugin,
     currentGhostTextPlan,
-    exactMarkdownByteOffsetAtSelection,
     setGhostFanVisible,
     setGhostText,
+    visualCaretBoundaryProof,
     visibleGhostWidgetPresentationKey,
+    type VisualCaretBoundaryFailure,
     visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
   import { nextVisualSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
@@ -64,7 +65,11 @@
     anchorByteOffset: number
   ) => void;
   export let onGhostVisibilityChange: (presentationKey: string) => void = () => {};
-  export let onSelectionChange: (markdownByteOffset: number | null) => void = () => {};
+  export let onSelectionChange: (
+    markdownByteOffset: number | null,
+    failure: VisualCaretBoundaryFailure | 'selection_settling' | null,
+    diagnostic: string | null
+  ) => void = () => {};
   export let onCaretNavigation: () => void = () => {};
   export let onFormatStateChange: (state: VisualFormatState) => void = () => {};
 
@@ -89,6 +94,8 @@
   let boundaryCacheFrom = -1;
   let boundaryCacheTo = -1;
   let boundaryCacheValue: number | null = null;
+  let boundaryCacheFailure: VisualCaretBoundaryFailure | null = null;
+  let boundaryCacheDiagnostic: string | null = null;
   let formattingSelectionDocument: ProseMirrorNode | null = null;
   let formattingSelection: Selection | null = null;
 
@@ -98,22 +105,38 @@
     boundaryCacheFrom = -1;
     boundaryCacheTo = -1;
     boundaryCacheValue = null;
+    boundaryCacheFailure = null;
+    boundaryCacheDiagnostic = null;
   }
 
-  function selectionBoundary(state: EditorState): number | null {
+  function selectionBoundaryProof(state: EditorState): {
+    byteOffset: number | null;
+    failure: VisualCaretBoundaryFailure | null;
+    diagnostic: string | null;
+  } {
     if (
       boundaryCacheDocument === state.doc &&
       boundaryCacheCanonical === lastEmitted &&
       boundaryCacheFrom === state.selection.from &&
       boundaryCacheTo === state.selection.to
-    ) return boundaryCacheValue;
-    const boundary = exactMarkdownByteOffsetAtSelection(state, lastEmitted);
+    ) return {
+      byteOffset: boundaryCacheValue,
+      failure: boundaryCacheFailure,
+      diagnostic: boundaryCacheDiagnostic
+    };
+    const proof = visualCaretBoundaryProof(state, lastEmitted);
     boundaryCacheDocument = state.doc;
     boundaryCacheCanonical = lastEmitted;
     boundaryCacheFrom = state.selection.from;
     boundaryCacheTo = state.selection.to;
-    boundaryCacheValue = boundary;
-    return boundary;
+    boundaryCacheValue = proof.byteOffset;
+    boundaryCacheFailure = proof.failure;
+    boundaryCacheDiagnostic = proof.diagnostic;
+    return proof;
+  }
+
+  function selectionBoundary(state: EditorState): number | null {
+    return selectionBoundaryProof(state).byteOffset;
   }
 
   function reportGhostVisibility(): void {
@@ -184,6 +207,13 @@
       view.dispatch(view.state.tr.setSelection(formattingSelection));
     }
     view.focus();
+    return view.hasFocus();
+  }
+
+  export function focusCurrentSelection(): boolean {
+    if (!view || readonly) return false;
+    view.focus();
+    reportSelection(view.state);
     return view.hasFocus();
   }
 
@@ -306,7 +336,8 @@
   }
 
   function reportSelection(state: EditorState): void {
-    onSelectionChange(selectionBoundary(state));
+    const proof = selectionBoundaryProof(state);
+    onSelectionChange(proof.byteOffset, proof.failure, proof.diagnostic);
     onFormatStateChange(visualFormatState(state));
   }
 
@@ -371,10 +402,10 @@
             window.clearTimeout(selectionReportTimer);
             selectionReportTimer = undefined;
           }
-          onSelectionChange(null);
+          onSelectionChange(null, 'selection_settling', null);
         } else if (transaction.selectionSet) {
-          onCaretNavigation();
-          onSelectionChange(null);
+          if (view.hasFocus()) onCaretNavigation();
+          onSelectionChange(null, 'selection_settling', null);
           scheduleSelectionReport();
         }
         if (transaction.docChanged || transaction.selectionSet) {
@@ -512,7 +543,7 @@
     if (visibilityFrame !== undefined) window.cancelAnimationFrame(visibilityFrame);
     if (selectionReportTimer !== undefined) window.clearTimeout(selectionReportTimer);
     if (composing) onCompositionChange(false);
-    onSelectionChange(null);
+    onSelectionChange(null, 'selection_settling', null);
     if (reportedGhostPresentationKey) onGhostVisibilityChange('');
     window.removeEventListener('resize', reportGhostVisibility);
     window.removeEventListener('keydown', handleWindowKeyDown, true);

@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import {
   createGhostTextPlugin,
   exactMarkdownByteOffsetAtSelection,
+  visualCaretBoundaryProof,
   ghostTextPluginKey,
   planGhostText,
   renderedGhostPresentationKey,
@@ -336,6 +337,29 @@ describe('exact visual caret to Markdown boundary', () => {
       cursor,
       'hello\uE000LOOM_CARET_BOUNDARY_7F3A9D2C\uE001'
     )).toBeNull();
+  });
+
+  it('reports the exact invariant that rejected a visual caret proof', () => {
+    const doc = defaultMarkdownParser.parse('hello');
+    const cursor = EditorState.create({ doc, selection: TextSelection.create(doc, 3) });
+    const range = EditorState.create({ doc, selection: TextSelection.create(doc, 2, 4) });
+    const end = EditorState.create({ doc, selection: Selection.atEnd(doc) });
+
+    expect(visualCaretBoundaryProof(cursor, 'different')).toEqual({
+      byteOffset: null,
+      failure: 'canonical_mismatch',
+      diagnostic: 'canonical_utf8=9,restored_utf8=5,first_utf16_difference=0'
+    });
+    expect(visualCaretBoundaryProof(range, 'hello')).toEqual({
+      byteOffset: null,
+      failure: 'selection_range',
+      diagnostic: null
+    });
+    expect(visualCaretBoundaryProof(end, 'hello')).toEqual({
+      byteOffset: 5,
+      failure: null,
+      diagnostic: null
+    });
   });
 });
 
