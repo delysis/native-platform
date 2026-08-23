@@ -354,6 +354,16 @@ func sizeAttribute(_ element: AXUIElement, _ name: CFString) -> CGSize? {
     return AXValueGetValue(value, .cgSize, &size) ? size : nil
 }
 
+func rangeAttribute(_ element: AXUIElement, _ name: CFString) -> CFRange? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else {
+        return nil
+    }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cfRange else { return nil }
+    var range = CFRange()
+    return AXValueGetValue(value, .cfRange, &range) ? range : nil
+}
+
 func frame(_ element: AXUIElement) -> CGRect? {
     guard let origin = pointAttribute(element, kAXPositionAttribute as CFString),
           let size = sizeAttribute(element, kAXSizeAttribute as CFString) else {
@@ -481,10 +491,23 @@ guard observedEditorValue.trimmingCharacters(in: .newlines) == sentinel else {
     fputs("native keyboard input never produced the exact observable editor value\n", stderr)
     exit(1)
 }
+var observedSelection: CFRange?
+for _ in 0..<20 {
+    observedSelection = rangeAttribute(editor, kAXSelectedTextRangeAttribute as CFString)
+    if observedSelection?.location == sentinel.utf16.count && observedSelection?.length == 0 { break }
+    Thread.sleep(forTimeInterval: 0.05)
+}
+guard let observedSelection,
+      observedSelection.location == sentinel.utf16.count,
+      observedSelection.length == 0 else {
+    fputs("native keyboard input did not leave one collapsed caret at the manuscript end\n", stderr)
+    exit(1)
+}
 let evidence: [String: Any] = [
     "dispatch": "PID-targeted Select-All and native keyboard input",
     "observed_editor_value": true,
     "observed_editor_utf8_bytes": observedEditorValue.lengthOfBytes(using: .utf8),
+    "observed_caret_utf16": observedSelection.location,
     "editor_frame": [
         "x": editorFrame.minX,
         "y": editorFrame.minY,
@@ -812,6 +835,74 @@ for _ in 0..<1800 {
 fputs("Loom never exposed the required accessible runtime state: \(expected)\n", stderr)
 exit(1)
 SWIFT
+}
+
+loom_completion_control_state() {
+  target_pid=$1
+  xcrun swift - "$target_pid" <<'SWIFT'
+import ApplicationServices
+import Foundation
+
+let pid = Int32(CommandLine.arguments[1])!
+let application = AXUIElementCreateApplication(pid)
+
+func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
+    return value
+}
+
+var queue = [application]
+var cursor = 0
+while cursor < queue.count && cursor < 4096 {
+    let element = queue[cursor]
+    cursor += 1
+    let values = [kAXDescriptionAttribute, kAXTitleAttribute, kAXHelpAttribute, kAXValueAttribute]
+        .compactMap { attribute(element, $0 as CFString) as? String }
+        .filter { !$0.isEmpty }
+    if values.contains(where: { $0.contains("Turn autocomplete") }) {
+        let evidence: [String: Any] = [
+            "description": values,
+            "enabled": (attribute(element, kAXEnabledAttribute as CFString) as? Bool) ?? false
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+        print(String(data: data, encoding: .utf8)!)
+        exit(0)
+    }
+    if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+        queue.append(contentsOf: children)
+    }
+}
+fputs("could not find Loom's autocomplete control\n", stderr)
+exit(1)
+SWIFT
+}
+
+wait_for_loom_generation_family() {
+  database=$1
+  baseline=$2
+  attempt=0
+  while [ "$attempt" -lt 1800 ]; do
+    count=$(sqlite3 "$database" 'SELECT count(*) FROM generation_runs;' 2>/dev/null || true)
+    case "$count" in
+      ''|*[!0-9]*) ;;
+      *)
+        delta=$((count - baseline))
+        if [ "$delta" -gt 0 ]; then
+          if [ "$delta" -ne 4 ]; then
+            echo "Loom admitted $delta generation runs instead of one four-choice batch" >&2
+            return 1
+          fi
+          printf '{"baseline":%s,"admitted":%s,"family_size":4}\n' "$baseline" "$count"
+          return 0
+        fi
+        ;;
+    esac
+    attempt=$((attempt + 1))
+    sleep 0.2
+  done
+  echo "Loom never durably admitted a four-choice generation family" >&2
+  return 1
 }
 
 wait_for_loom_manuscript_extension() {
@@ -1291,12 +1382,22 @@ run_once() {
       return 1
     fi
     if [ -n "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
+      loom_generation_count_before_batch=$(sqlite3 \
+        "$PRODUCT_STATE/writing/.loom/loom.sqlite3" \
+        'SELECT count(*) FROM generation_runs;')
       if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"; then
         echo "could not establish autocomplete off before refreshing the isolated model library" >&2
         return 1
       fi
       if ! set_loom_completion_toggle "$ACTIVE_PID" "Turn autocomplete on" "Turn autocomplete off"; then
         echo "could not enable autocomplete for the real-model presentation check" >&2
+        return 1
+      fi
+      if ! RUN_1_REAL_GENERATION_EVIDENCE=$(wait_for_loom_generation_family \
+        "$PRODUCT_STATE/writing/.loom/loom.sqlite3" \
+        "$loom_generation_count_before_batch"); then
+        echo "completion control state: $(loom_completion_control_state "$ACTIVE_PID" 2>&1 || true)" >&2
+        echo "application logs: $stdout_log and $stderr_log" >&2
         return 1
       fi
       if ! RUN_1_REAL_GHOST_EVIDENCE=$(wait_for_loom_accessibility_text "$ACTIVE_PID" "Suggestion available."); then
@@ -1307,6 +1408,9 @@ run_once() {
       loom_generation_count_before_reversal=$(sqlite3 \
         "$PRODUCT_STATE/writing/.loom/loom.sqlite3" \
         'SELECT count(*) FROM generation_runs;')
+      loom_expected_generation_count=$((loom_generation_count_before_batch + 4))
+      require_equal "generation-run count before Option reversal" \
+        "$loom_expected_generation_count" "$loom_generation_count_before_reversal"
       if ! RUN_1_REAL_WORD_REVERSAL_EVIDENCE=$(exercise_loom_completion_word_reversal \
         "$ACTIVE_PID" "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL"); then
         echo "Option-Right/Left did not consume and exactly reverse one cached word" >&2
@@ -1473,6 +1577,7 @@ DELYSIS_SMOKE_RUN_1_EDITOR_SENTINEL="${RUN_1_EDITOR_SENTINEL:-}" \
 DELYSIS_SMOKE_RUN_1_FORMATTED_SENTINEL="${RUN_1_FORMATTED_SENTINEL:-}" \
 DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE="${RUN_1_FORMATTING_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE="${RUN_1_REAL_GHOST_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_REAL_GENERATION_EVIDENCE="${RUN_1_REAL_GENERATION_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE="${RUN_1_REAL_WORD_REVERSAL_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_GENERATION_COUNT_BEFORE_REVERSAL="${loom_generation_count_before_reversal:-}" \
 DELYSIS_SMOKE_RUN_1_GENERATION_COUNT_AFTER_REVERSAL="${loom_generation_count_after_reversal:-}" \
@@ -1502,6 +1607,9 @@ const formatting = e.DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE
   : null;
 const completionWordReversal = e.DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE)
+  : null;
+const generationFamily = e.DELYSIS_SMOKE_RUN_1_REAL_GENERATION_EVIDENCE
+  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_REAL_GENERATION_EVIDENCE)
   : null;
 const shuttleText = e.DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_REAL_SHUTTLE_TEXT)
@@ -1537,6 +1645,7 @@ const receipt = {
         observed_persisted_markdown: e.DELYSIS_SMOKE_RUN_1_FORMATTED_SENTINEL,
       } : null,
       real_model_completion: e.DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE ? {
+        generation_family: generationFamily,
         ghost_presentation: e.DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE,
         option_word_reversal: completionWordReversal ? {
           ...completionWordReversal,

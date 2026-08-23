@@ -501,6 +501,15 @@
     return focused;
   }
 
+  export function focusCurrentSelection(): boolean {
+    if (!element || readonly) return false;
+    element.focus({ preventScroll: true });
+    focused = document.activeElement === element;
+    if (focused) onSelectionChange(element);
+    syncGeometry();
+    return focused;
+  }
+
   export function acceptGhostWord(requireVisible = true): boolean {
     const candidate = currentPlan();
     if (

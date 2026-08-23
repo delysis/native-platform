@@ -155,15 +155,22 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /characterDown\.postToPid\(pid\)/);
   assert.match(smoke, /event\.postToPid\(pid\)/);
   assert.match(smoke, /native keyboard input never produced the exact observable editor value/);
+  assert.match(smoke, /native keyboard input did not leave one collapsed caret at the manuscript end/);
   assert.match(smoke, /observed_editor_value/);
+  assert.match(smoke, /observed_caret_utf16/);
   assert.match(smoke, /Option-Right did not persist one cached completion word/);
   assert.match(smoke, /Option-Left did not restore the exact pre-acceptance manuscript bytes/);
   assert.match(smoke, /generation-run count across Option-Right\/Left/);
+  assert.match(smoke, /generation-run count before Option reversal/);
+  assert.match(smoke, /wait_for_loom_generation_family/);
+  assert.match(smoke, /one four-choice batch/);
+  assert.match(smoke, /completion control state:/);
   assert.match(smoke, /var pressed = false/);
   assert.match(smoke, /if description\.contains\(alreadyName\) \{ exit\(0\) \}/);
   assert.match(smoke, /option_word_reversal: completionWordReversal/);
   assert.match(smoke, /generation_runs_before:/);
   assert.match(smoke, /generation_runs_after:/);
+  assert.match(smoke, /generation_family: generationFamily/);
   assert.match(smoke, /editor_input: editorInput/);
 });
 

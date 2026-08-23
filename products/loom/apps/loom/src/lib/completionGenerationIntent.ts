@@ -4,6 +4,7 @@ export type CompletionGenerationTrigger =
   | 'candidate_exhausted'
   | 'document_open'
   | 'model_ready'
+  | 'caret_navigation'
   | 'retry';
 
 export interface CompletionGenerationIntent {

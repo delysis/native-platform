@@ -180,40 +180,88 @@ function utf8BoundaryToUtf16Index(text: string, targetBytes: number): number | n
  * This lets the serializer account for block prefixes, marks, and list
  * structure without maintaining a second handwritten source map.
  */
-export function exactMarkdownByteOffsetAtSelection(
+export type VisualCaretBoundaryFailure =
+  | 'selection_range'
+  | 'selection_not_text'
+  | 'grapheme_boundary_invalid'
+  | 'witness_collision'
+  | 'witness_missing'
+  | 'witness_duplicated'
+  | 'canonical_mismatch'
+  | 'byte_length_mismatch'
+  | 'serialization_failed';
+
+export interface VisualCaretBoundaryProof {
+  byteOffset: number | null;
+  failure: VisualCaretBoundaryFailure | null;
+  diagnostic: string | null;
+}
+
+function rejectedBoundary(
+  failure: VisualCaretBoundaryFailure,
+  diagnostic: string | null = null
+): VisualCaretBoundaryProof {
+  return { byteOffset: null, failure, diagnostic };
+}
+
+export function visualCaretBoundaryProof(
   state: EditorState,
   canonicalMarkdown: string
-): number | null {
-  if (
-    !state.selection.empty ||
-    !(state.selection instanceof TextSelection) ||
-    !visibleCaretIsExtendedGraphemeBoundary(state) ||
-    canonicalMarkdown.includes(CARET_BOUNDARY_WITNESS)
-  ) return null;
+): VisualCaretBoundaryProof {
+  if (!state.selection.empty) return rejectedBoundary('selection_range');
+  if (!(state.selection instanceof TextSelection)) {
+    return rejectedBoundary('selection_not_text', state.selection.constructor.name);
+  }
+  if (!visibleCaretIsExtendedGraphemeBoundary(state)) {
+    return rejectedBoundary('grapheme_boundary_invalid');
+  }
+  if (canonicalMarkdown.includes(CARET_BOUNDARY_WITNESS)) {
+    return rejectedBoundary('witness_collision');
+  }
 
   try {
     const witnessed = defaultMarkdownSerializer.serialize(
       state.tr.insertText(CARET_BOUNDARY_WITNESS).doc
     );
     const boundary = witnessed.indexOf(CARET_BOUNDARY_WITNESS);
-    if (
-      boundary < 0 ||
-      witnessed.lastIndexOf(CARET_BOUNDARY_WITNESS) !== boundary
-    ) return null;
+    if (boundary < 0) return rejectedBoundary('witness_missing');
+    if (witnessed.lastIndexOf(CARET_BOUNDARY_WITNESS) !== boundary) {
+      return rejectedBoundary('witness_duplicated');
+    }
     const restored =
       witnessed.slice(0, boundary) +
       witnessed.slice(boundary + CARET_BOUNDARY_WITNESS.length);
-    if (restored !== canonicalMarkdown) return null;
     const encoder = new TextEncoder();
+    if (restored !== canonicalMarkdown) {
+      let firstDifference = 0;
+      while (
+        firstDifference < restored.length &&
+        firstDifference < canonicalMarkdown.length &&
+        restored[firstDifference] === canonicalMarkdown[firstDifference]
+      ) firstDifference += 1;
+      return rejectedBoundary(
+        'canonical_mismatch',
+        `canonical_utf8=${encoder.encode(canonicalMarkdown).byteLength},restored_utf8=${encoder.encode(restored).byteLength},first_utf16_difference=${firstDifference}`
+      );
+    }
     const prefixBytes = encoder.encode(witnessed.slice(0, boundary)).byteLength;
     const suffixBytes = encoder.encode(
       witnessed.slice(boundary + CARET_BOUNDARY_WITNESS.length)
     ).byteLength;
-    if (prefixBytes + suffixBytes !== encoder.encode(canonicalMarkdown).byteLength) return null;
-    return prefixBytes;
+    if (prefixBytes + suffixBytes !== encoder.encode(canonicalMarkdown).byteLength) {
+      return rejectedBoundary('byte_length_mismatch');
+    }
+    return { byteOffset: prefixBytes, failure: null, diagnostic: null };
   } catch {
-    return null;
+    return rejectedBoundary('serialization_failed');
   }
+}
+
+export function exactMarkdownByteOffsetAtSelection(
+  state: EditorState,
+  canonicalMarkdown: string
+): number | null {
+  return visualCaretBoundaryProof(state, canonicalMarkdown).byteOffset;
 }
 
 /**

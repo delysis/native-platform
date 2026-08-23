@@ -136,7 +136,7 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('Opening your writing…');
   });
 
-  it('disarms completion on caret navigation without scheduling replacement inference', () => {
+  it('rebinds completion after an incompatible caret navigation settles', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const visual = readFileSync(new URL('./LoomEditor.svelte', import.meta.url), 'utf8');
     const invalidate = source.slice(
@@ -154,9 +154,11 @@ describe('App ghost reactivity wiring', () => {
 
     expect(invalidate).toContain('cancelSuggestionTimer()');
     expect(invalidate).toContain('cancelActiveBranches()');
-    expect(invalidate).not.toContain('scheduleAutomaticSuggestions');
     expect(sourceSelection).toContain('invalidateCompletionForCaretNavigation()');
+    expect(sourceSelection).toContain("scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'caret_navigation')");
     expect(visualSelection).toContain('invalidateCompletionForCaretNavigation()');
+    expect(visualSelection).toContain('completionNavigationPending');
+    expect(visualSelection).toContain("scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'caret_navigation')");
     expect(source).toContain('onCaretNavigation={invalidateCompletionForCaretNavigation}');
     expect(visual).toContain('onCaretNavigation();');
     expect(source).toContain('completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion)');
@@ -179,6 +181,26 @@ describe('App ghost reactivity wiring', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const modeChange = source.slice(source.indexOf('async function setMode'), source.indexOf('function announce'));
     expect(modeChange).toContain("scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open')");
+  });
+
+  it('retains one exact completion intent across transient readiness changes', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const arm = source.slice(
+      source.indexOf('function armSuggestionSchedule'),
+      source.indexOf('function queueScheduledSuggestionAttempt')
+    );
+    const start = source.slice(
+      source.indexOf('async function tryStartAutomaticSuggestions'),
+      source.indexOf('function scheduleDraftJournal')
+    );
+
+    expect(source).toContain('automaticCompletionLifecycle({');
+    expect(source).toContain('resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey)');
+    expect(arm).not.toContain('!currentModel');
+    expect(start).toContain('retainsScheduledCompletion(completionLifecycle)');
+    expect(start).not.toContain("saveState === 'dirty'");
+    expect(source).toContain('aria-describedby="completion-lifecycle-help"');
+    expect(source).toContain('{completionLifecycleHelp}</span>');
   });
 
   it('uses the macOS overlay titlebar for one integrated toolbar', () => {
