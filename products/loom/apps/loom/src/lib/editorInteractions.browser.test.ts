@@ -103,7 +103,7 @@ describe('real WebKit editor interactions', () => {
     await keyboard.keyboard('{Meta>}{Shift>}z{/Shift}{/Meta}');
     await expect.poll(serializedMarkdown).toBe('Something else');
 
-    await page.getByText('Aa', { exact: true }).click();
+    await page.getByRole('button', { name: 'Format text' }).click();
     await page.getByRole('button', { name: 'Title' }).click();
     await expect.poll(serializedMarkdown).toBe('# Something else');
     await page.getByRole('button', { name: 'Body' }).click();
@@ -116,7 +116,10 @@ describe('real WebKit editor interactions', () => {
     const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
     await editor.click();
     await userEvent.keyboard('{Meta>}a{/Meta}');
-    await page.getByText('Aa', { exact: true }).click();
+    const formatButton = page.getByRole('button', { name: 'Format text' });
+    await expect.element(formatButton).toHaveAttribute('aria-expanded', 'false');
+    await formatButton.click();
+    await expect.element(formatButton).toHaveAttribute('aria-expanded', 'true');
 
     for (const [label, expected] of [
       ['Title', '# Words'],
@@ -159,7 +162,7 @@ describe('real WebKit editor interactions', () => {
     const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
     await editor.click();
     await keyboard.keyboard('{Meta>}a{/Meta}');
-    await page.getByText('Aa', { exact: true }).click();
+    await page.getByRole('button', { name: 'Format text' }).click();
 
     for (const [label, formatted] of [
       ['Bold', '**Words** '],
@@ -233,7 +236,7 @@ describe('real WebKit editor interactions', () => {
     await userEvent.keyboard('{Meta>}a{/Meta}');
     expect(document.getSelection()?.toString().trim()).toBe('alpha beta gamma');
 
-    await page.getByText('Aa', { exact: true }).click();
+    await page.getByRole('button', { name: 'Format text' }).click();
     expect(document.getSelection()?.toString().trim()).toBe('alpha beta gamma');
     await page.getByRole('button', { name: 'Bold' }).click();
 
@@ -246,7 +249,7 @@ describe('real WebKit editor interactions', () => {
     const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
     await editor.click();
     await userEvent.keyboard('{Meta>}a{/Meta}');
-    await page.getByText('Aa', { exact: true }).click();
+    await page.getByRole('button', { name: 'Format text' }).click();
     await userEvent.fill(
       page.getByRole('textbox', { name: 'Link destination' }),
       'https://example.com'
@@ -262,7 +265,7 @@ describe('real WebKit editor interactions', () => {
     const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
     await editor.click();
     await userEvent.keyboard('{Meta>}a{/Meta}');
-    await page.getByText('Aa', { exact: true }).click();
+    await page.getByRole('button', { name: 'Format text' }).click();
     await userEvent.fill(
       page.getByRole('textbox', { name: 'Link destination' }),
       'https://new.example'

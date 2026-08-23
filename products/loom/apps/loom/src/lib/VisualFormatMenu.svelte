@@ -19,7 +19,8 @@
     diagnostic: string
   ) => void = () => {};
 
-  let menu: HTMLDetailsElement;
+  let menu: HTMLDivElement;
+  let open = false;
   let href = '';
 
   function preserveSelection(event: PointerEvent): void {
@@ -36,23 +37,24 @@
     if (action === 'link') href = destination.trim();
   }
 
-  function handleToggle(): void {
-    if (menu.open) {
-      editor?.captureFormattingSelection();
-      href = formatting.linkHref;
-    } else {
-      editor?.clearFormattingSelection();
+  function toggleOpen(): void {
+    if (open) {
+      close();
+      return;
     }
+    editor?.captureFormattingSelection();
+    href = formatting.linkHref;
+    open = true;
   }
 
   export function close(refocus = true): void {
-    menu.open = false;
+    open = false;
     if (refocus) editor?.focusPreservingSelection();
     editor?.clearFormattingSelection();
   }
 
   export function isOpen(): boolean {
-    return menu.open;
+    return open;
   }
 
   export function contains(target: Node): boolean {
@@ -60,14 +62,19 @@
   }
 </script>
 
-<details class="format-menu" bind:this={menu} on:toggle={handleToggle}>
-  <summary
+<div class="format-menu" bind:this={menu}>
+  <button
     class="titlebar-button format-button"
+    type="button"
     title="Format text"
     aria-label="Format text"
+    aria-controls="visual-format-popover"
+    aria-expanded={open}
     on:pointerdown={preserveSelection}
-  >Aa</summary>
-  <div class="format-popover" aria-label="Text formatting">
+    on:click={toggleOpen}
+  >Aa</button>
+  {#if open}
+  <div id="visual-format-popover" class="format-popover" aria-label="Text formatting">
     <div class="format-style-grid" aria-label="Paragraph style">
       {#each [
         ['body', 'Body'],
@@ -96,4 +103,5 @@
       <button type="button" disabled={formatting.selectionEmpty || !formatting.linkHref} on:pointerdown={preserveSelection} on:click={() => run('unlink')}>Remove</button>
     </div>
   </div>
-</details>
+  {/if}
+</div>

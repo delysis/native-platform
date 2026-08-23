@@ -78,10 +78,10 @@ button:disabled { cursor: default; opacity: .45; }
   cursor: pointer;
 }
 .project-menu { position: relative; }
-.project-menu summary, .format-menu summary { list-style: none; }
-.project-menu summary::-webkit-details-marker, .format-menu summary::-webkit-details-marker { display: none; }
+.project-menu summary { list-style: none; }
+.project-menu summary::-webkit-details-marker { display: none; }
 .more-button { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 7px; color: var(--muted); cursor: pointer; font-size: 11px; letter-spacing: 1px; }
-.titlebar-button:hover, .project-menu[open] .gear-button, .icon-button:hover, .bare-button:hover { color: var(--ink); background: var(--chrome-hover); }
+.titlebar-button:hover, .project-menu[open] .gear-button, .format-button[aria-expanded="true"], .icon-button:hover, .bare-button:hover { color: var(--ink); background: var(--chrome-hover); }
 .project-menu-popover { position: absolute; z-index: 25; top: calc(100% + 6px); right: 0; width: min(245px, calc(100vw - 16px)); padding: 7px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); box-shadow: var(--shadow); }
 .project-menu-popover button { width: 100%; min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 7px 9px; border: 0; border-radius: 6px; color: var(--ink); background: transparent; cursor: pointer; font-size: 12px; text-align: left; }
 .project-menu-popover button:hover, .project-menu-popover button.active { background: var(--paper-deep); }
