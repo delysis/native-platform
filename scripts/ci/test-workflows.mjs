@@ -135,6 +135,12 @@ test("local macOS smoke can verify the exact emitted archive", () => {
   const smoke = read(smokeScriptPath);
   assert.match(release, /exact-archive smoke:/);
   assert.match(smoke, /ditto -x -k "\$INPUT_ARCHIVE" "\$INSTALL_ROOT"/);
+  assert.match(smoke, /BUNDLE=\$\(CDPATH= cd -- "\$BUNDLE" && pwd -P\)/);
+  assert.ok(
+    smoke.indexOf('BUNDLE=$(CDPATH= cd -- "$BUNDLE" && pwd -P)') <
+      smoke.indexOf('EXECUTABLE="$BUNDLE/Contents/MacOS/$BINARY_NAME"'),
+    "the bundle path must be physical before exact executable PID binding",
+  );
   assert.match(smoke, /input_archive_sha256:/);
   assert.match(smoke, /input_release_receipt_sha256:/);
 });
@@ -160,18 +166,104 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /observed_caret_utf16/);
   assert.match(smoke, /Option-Right did not persist one cached completion word/);
   assert.match(smoke, /Option-Left did not restore the exact pre-acceptance manuscript bytes/);
-  assert.match(smoke, /generation-run count across Option-Right\/Left/);
+  assert.match(smoke, /generation-run count across all cached completion interactions/);
   assert.match(smoke, /generation-run count before Option reversal/);
   assert.match(smoke, /wait_for_loom_generation_family/);
   assert.match(smoke, /one four-choice batch/);
+  assert.match(smoke, /four admitted runs did not form one exact source\/anchor\/model family/);
+  assert.match(smoke, /source_revision_id: rows\[0\]\.source_revision_id/);
+  assert.match(smoke, /model_environment_artifact_id: rows\[0\]\.model_environment_artifact_id/);
+  assert.match(smoke, /family_terminal_status: 'completed'/);
+  assert.match(smoke, /generation_terminal_evidence/);
+  assert.match(smoke, /row\.terminal_candidate_id === row\.candidate_id/);
+  assert.match(smoke, /row\.candidate_output_blob_id === row\.evidence_output_blob_id/);
+  assert.match(smoke, /row\.generated_span_artifact_id === row\.output_artifact_id/);
   assert.match(smoke, /completion control state:/);
   assert.match(smoke, /var pressed = false/);
-  assert.match(smoke, /if description\.contains\(alreadyName\) \{ exit\(0\) \}/);
-  assert.match(smoke, /option_word_reversal: completionWordReversal/);
+  assert.match(smoke, /if description\.contains\(alreadyName\) \{/);
+  assert.match(smoke, /guard pressed \|\| !requirePress/);
+  assert.match(smoke, /suggestionLabelPattern/);
+  assert.match(smoke, /strings\(element\)\.contains\("Completion suggestions"\)/);
+  assert.match(smoke, /kAXListRole/);
+  assert.match(smoke, /kAXSelectedAttribute/);
+  assert.match(smoke, /let candidate = candidates\[index - 1\]/);
+  assert.match(smoke, /waitForAccessibleFan/);
+  assert.match(smoke, /fan Return did not persist the selected cached remainder/);
+  assert.match(smoke, /fan Tab did not persist the selected cached remainder/);
+  assert.match(smoke, /shared engine on-to-off did not clear the cached completion session/);
+  assert.match(smoke, /normalizedRunIds/);
+  assert.match(smoke, /cached_completion_interactions: cachedCompletionInteractions/);
   assert.match(smoke, /generation_runs_before:/);
   assert.match(smoke, /generation_runs_after:/);
   assert.match(smoke, /generation_family: generationFamily/);
   assert.match(smoke, /editor_input: editorInput/);
+  for (const stage of [
+    "title",
+    "body",
+    "heading",
+    "heading_body",
+    "subheading",
+    "subheading_body",
+    "bold",
+    "bold_reverse",
+    "italic",
+    "italic_reverse",
+    "block_quote",
+    "block_quote_reverse",
+    "bullet_list",
+    "bullet_list_reverse",
+    "numbered_list",
+    "numbered_list_reverse",
+    "link",
+    "remove_link",
+  ]) {
+    assert.match(smoke, new RegExp(`stage\\('${stage}'`));
+  }
+
+  const autocompleteOff = smoke.indexOf(
+    "RUN_1_AUTOCOMPLETE_OFF_EVIDENCE=$(set_loom_completion_toggle",
+  );
+  const terminalSpaceInput = smoke.indexOf(
+    'type_into_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_INPUT_SENTINEL"',
+  );
+  const autocompleteEnable = smoke.indexOf(
+    "RUN_1_AUTOCOMPLETE_ENABLE_EVIDENCE=$(set_loom_completion_toggle",
+  );
+  assert.ok(autocompleteOff >= 0, "real completion smoke must establish autocomplete off");
+  assert.ok(
+    autocompleteOff < terminalSpaceInput && terminalSpaceInput < autocompleteEnable,
+    "real completion smoke must type with autocomplete off and enable it only afterward",
+  );
+  assert.match(smoke, /RUN_1_EDITOR_CORE_SENTINEL='Loom native smoke: editor persistence\.'/);
+  assert.match(smoke, /RUN_1_EDITOR_INPUT_SENTINEL="\$RUN_1_EDITOR_CORE_SENTINEL "/);
+  assert.match(smoke, /pressed_exactly_once/);
+  assert.match(smoke, /"require-press"/);
+  assert.match(smoke, /observed === expected/);
+  assert.match(smoke, /live_wysiwyg_after_persistence: wysiwyg/);
+
+  assert.match(smoke, /start_loom_generation_guard/);
+  assert.match(smoke, /fifth_run_observed/);
+  assert.match(smoke, /generation_family_guard: generationGuard/);
+  assert.match(smoke, /launch-1-ghost-timeout-diagnostics\.json/);
+  assert.match(smoke, /latest_generation_runs/);
+  assert.match(smoke, /completion diagnostics:/);
+
+  assert.match(smoke, /start_loom_project_busy_monitor/);
+  assert.match(smoke, /another bounded project operation is still running/);
+  assert.match(smoke, /project_busy_regression: projectBusyRegression/);
+  assert.match(smoke, /stdout_and_stderr_scanned_after_exit/);
+  assert.match(smoke, /durable project_busy command-receipt count/);
+
+  for (const action of ["Title", "Body", "Bold", "Bulleted list", "Link", "Remove"]) {
+    assert.match(
+      smoke,
+      new RegExp(`exercise_loom_formatting_palette[^\\n]*\\n?[^\\n]*"${action}"`),
+    );
+  }
+  assert.match(smoke, /PID-targeted Command-A/);
+  assert.match(smoke, /if textField\(named: "Link destination"\) == nil/);
+  assert.match(smoke, /editor_refocused/);
+  assert.match(smoke, /observed_persisted_markdown/);
 });
 
 test("Loom's required macOS lane runs the headless WebKit editor interactions", () => {

@@ -2,13 +2,16 @@ import { defaultMarkdownParser, defaultMarkdownSerializer } from 'prosemirror-ma
 import { EditorState, Selection, TextSelection } from 'prosemirror-state';
 import { DecorationSet, type EditorView } from 'prosemirror-view';
 import { describe, expect, it } from 'vitest';
+import { parseVisualMarkdown } from './markdownSafety';
 import {
+  completionOptionAccessibleLabel,
   createGhostTextPlugin,
   exactMarkdownByteOffsetAtSelection,
   visualCaretBoundaryProof,
   ghostTextPluginKey,
   planGhostText,
   renderedGhostPresentationKey,
+  setCompletionOptionAccessibility,
   setGhostFanVisible,
   setGhostText,
   VISUAL_TAB_INDENT,
@@ -74,6 +77,26 @@ describe('planGhostText', () => {
 });
 
 describe('visual ghost widget', () => {
+  it('gives each fan option a human-readable accessible identity', () => {
+    const attributes = new Map<string, string>();
+    setCompletionOptionAccessibility(
+      { setAttribute: (name, value) => attributes.set(name, value) },
+      2,
+      4,
+      ' there,\n beyond the rain.',
+      true
+    );
+
+    expect(completionOptionAccessibleLabel(2, 4, ' there,\n beyond the rain.'))
+      .toBe('Suggestion 2 of 4: there, beyond the rain.');
+    expect(Object.fromEntries(attributes)).toEqual({
+      role: 'option',
+      'aria-selected': 'true',
+      'aria-label': 'Suggestion 2 of 4: there, beyond the rain.'
+    });
+    expect(attributes.has('aria-description')).toBe(false);
+  });
+
   it('renders one zero-width widget without changing ProseMirror bytes', () => {
     const plugin = createGhostTextPlugin({
       accept: () => true, dismiss() {}, visible: () => true
@@ -97,7 +120,7 @@ describe('visual ghost widget', () => {
     expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(before);
   });
 
-  it('keeps the Option alternatives palette open across streamed presentation updates', () => {
+  it('reconciles the alternatives palette to modifier state across streamed updates', () => {
     const plugin = createGhostTextPlugin({
       accept: () => true, dismiss() {}, visible: () => true
     });
@@ -119,7 +142,12 @@ describe('visual ghost widget', () => {
     };
     setGhostText(view, withAlternatives);
     view.dispatch(state.tr.setMeta(ghostTextPluginKey, { kind: 'fan', visible: true }));
-    setGhostText(view, { ...withAlternatives, presentationKey: 'a:2', text: ' first grows' });
+    setGhostText(view, {
+      ...withAlternatives,
+      presentationKey: 'a:2',
+      text: ' first grows',
+      fanVisible: true
+    });
     expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(true);
     setGhostFanVisible(view, false);
     setGhostText(view, {
@@ -128,7 +156,9 @@ describe('visual ghost widget', () => {
       text: ' first grows again',
       fanVisible: true
     });
-    expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(false);
+    // A real Option-down state arriving with a newly grown family must open
+    // the fan even when the earlier one-candidate plan latched it closed.
+    expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(true);
     setGhostFanVisible(view, true);
     setGhostText(view, {
       ...withAlternatives,
@@ -136,11 +166,79 @@ describe('visual ghost widget', () => {
       text: ' first grows once more',
       fanVisible: false
     });
+    expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(false);
+  });
+
+  it('dispatches only real fan transitions against a live editor view', () => {
+    const plugin = createGhostTextPlugin({
+      accept: () => true, dismiss() {}, visible: () => true
+    });
+    let state = EditorState.create({
+      doc: defaultMarkdownParser.parse('A waits'),
+      plugins: [plugin]
+    });
+    let destroyed = false;
+    let dispatches = 0;
+    const view = {
+      get state() { return state; },
+      get isDestroyed() { return destroyed; },
+      dispatch(transaction: Parameters<EditorState['apply']>[0]) {
+        dispatches += 1;
+        state = state.apply(transaction);
+      }
+    } as unknown as EditorView;
+    setGhostText(view, {
+      ...suggestion,
+      alternatives: [
+        { candidateId: 'a', presentationKey: suggestion.presentationKey, text: ' first' },
+        { candidateId: 'b', presentationKey: 'b:1', text: ' second' }
+      ],
+      fanVisible: false
+    });
+    dispatches = 0;
+
+    setGhostFanVisible(view, false);
+    setGhostFanVisible(view, true);
+    setGhostFanVisible(view, true);
+    destroyed = true;
+    setGhostFanVisible(view, false);
+
+    expect(dispatches).toBe(1);
     expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(true);
+  });
+
+  it('does not treat Command-Option or Control-Option as the fan modifier', () => {
+    const modifierStates: boolean[] = [];
+    const plugin = createGhostTextPlugin({
+      accept: () => true,
+      dismiss() {},
+      visible: () => true,
+      modifier: (held) => modifierStates.push(held)
+    });
+    const state = EditorState.create({
+      doc: defaultMarkdownParser.parse('A waits'),
+      plugins: [plugin]
+    });
+    const view = { state } as unknown as EditorView;
+    const event = (metaKey: boolean, ctrlKey: boolean) => ({
+      key: 'Alt',
+      altKey: true,
+      metaKey,
+      ctrlKey,
+      isComposing: false,
+      keyCode: 18
+    }) as KeyboardEvent;
+
+    plugin.props.handleKeyDown?.call(plugin, view, event(true, false));
+    plugin.props.handleKeyDown?.call(plugin, view, event(false, true));
+    plugin.props.handleKeyDown?.call(plugin, view, event(false, false));
+
+    expect(modifierStates).toEqual([false, false, true]);
   });
 
   it('reverses the exact last accepted word before falling back to macOS navigation', () => {
     const unconsumed: string[] = [];
+    const modifierStates: boolean[] = [];
     const plugin = createGhostTextPlugin({
       accept: () => true,
       dismiss() {},
@@ -148,7 +246,8 @@ describe('visual ghost widget', () => {
       unconsume: (_candidateId, _presentationKey, text) => {
         unconsumed.push(text);
         return true;
-      }
+      },
+      modifier: (held) => modifierStates.push(held)
     });
     const doc = defaultMarkdownParser.parse('A one waits');
     let state = EditorState.create({ doc, selection: TextSelection.create(doc, 6), plugins: [plugin] });
@@ -165,6 +264,7 @@ describe('visual ghost widget', () => {
       isComposing: false, keyCode: 37, preventDefault() {}
     } as unknown as KeyboardEvent);
     expect(handled).toBe(true);
+    expect(modifierStates).toEqual([true]);
     expect(unconsumed).toEqual([' one']);
     expect(state.doc.textContent).toBe('A waits');
     expect(ghostTextPluginKey.getState(state)).toMatchObject({
@@ -173,10 +273,15 @@ describe('visual ghost widget', () => {
     });
     const decorations = plugin.props.decorations?.call(plugin, state) as DecorationSet;
     expect(decorations.find()).toHaveLength(1);
+    plugin.props.handleDOMEvents?.keyup?.call(plugin, view, {
+      key: 'Alt', altKey: false
+    } as KeyboardEvent);
+    expect(modifierStates).toEqual([true, false]);
   });
 
   it('chooses the highlighted alternative with Option-Return while the inline ghost is hidden', () => {
     const inserted: string[] = [];
+    const modifierStates: boolean[] = [];
     const plugin = createGhostTextPlugin({
       accept: () => true,
       dismiss() {},
@@ -184,7 +289,8 @@ describe('visual ghost widget', () => {
       insert: (_candidateId, _presentationKey, text) => {
         inserted.push(text);
         return true;
-      }
+      },
+      modifier: (held) => modifierStates.push(held)
     });
     const doc = defaultMarkdownParser.parse('A waits');
     let state = EditorState.create({ doc, selection: Selection.atEnd(doc), plugins: [plugin] });
@@ -209,6 +315,7 @@ describe('visual ghost widget', () => {
       isComposing: false, keyCode: 13, preventDefault() {}
     } as unknown as KeyboardEvent);
     expect(handled).toBe(true);
+    expect(modifierStates).toEqual([true]);
     expect(inserted).toEqual([' for rain.']);
     expect(state.doc.textContent).toBe('A waits for rain.');
   });
@@ -382,9 +489,9 @@ describe('faithful visual ghost projection', () => {
     )).toBe(true);
   });
 
-  it('admits the next completion after visual source normalization removes an invisible terminal space', () => {
-    const markdown = 'Something';
-    const doc = defaultMarkdownParser.parse(markdown);
+  it('anchors the next completion after an exact terminal prose separator', () => {
+    const markdown = 'Something ';
+    const doc = parseVisualMarkdown(markdown);
     const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
     const anchor = new TextEncoder().encode(markdown).byteLength;
     expect(exactMarkdownByteOffsetAtSelection(state, markdown)).toBe(anchor);
@@ -392,17 +499,17 @@ describe('faithful visual ghost projection', () => {
       state,
       markdown,
       anchor,
-      ' lingers in the hallway.'
+      'lingers in the hallway.'
     )).toBe(true);
   });
 
-  it('admits exact plain paragraph continuations but rejects Markdown controls and the wrong anchor', () => {
+  it('rejects multiline block structure, Markdown controls, and the wrong anchor', () => {
     const markdown = 'The rain waits.';
     const doc = defaultMarkdownParser.parse(markdown);
     const state = EditorState.create({ doc, selection: Selection.atEnd(doc) });
     const anchor = new TextEncoder().encode(markdown).byteLength;
     expect(visualGhostTextMayBePlainProse(' **boldly**')).toBe(false);
-    expect(visualGhostTextMayBePlainProse('\n\nMorning came.\n\nThe bells answered.')).toBe(true);
+    expect(visualGhostTextMayBePlainProse('\n\nMorning came.\n\nThe bells answered.')).toBe(false);
     expect(visualGhostTextMayBePlainProse('\n\n# Morning came.')).toBe(false);
     expect(visualGhostTextMayBePlainProse('\n\n- Morning came.')).toBe(false);
     expect(visualGhostTextIsFaithfulAtSelection(
@@ -410,7 +517,7 @@ describe('faithful visual ghost projection', () => {
       markdown,
       anchor,
       '\n\nMorning came.\n\nThe bells answered.'
-    )).toBe(true);
+    )).toBe(false);
     expect(visualGhostTextIsFaithfulAtSelection(
       state,
       markdown,
@@ -427,6 +534,8 @@ describe('faithful visual ghost projection', () => {
 
   it('surfaces the useful prose prefix when a completion later wanders into markup', () => {
     expect(visualGhostTextSafePrefix(' The door opened.\n# Notes')).toBe(' The door opened.');
+    expect(visualGhostTextSafePrefix(' The door opened.\n\nMorning came.'))
+      .toBe(' The door opened.');
     expect(visualGhostTextSafePrefix(' She waited **boldly**')).toBe(' She waited');
     expect(visualGhostTextSafePrefix(' **boldly**')).toBeNull();
     expect(visualGhostTextSafePrefix(' ordinary prose')).toBe(' ordinary prose');

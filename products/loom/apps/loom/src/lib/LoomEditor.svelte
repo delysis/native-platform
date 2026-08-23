@@ -16,14 +16,18 @@
     clearGhostText,
     createGhostTextPlugin,
     currentGhostTextPlan,
-    setGhostFanVisible,
     setGhostText,
     visualCaretBoundaryProof,
     visibleGhostWidgetPresentationKey,
     type VisualCaretBoundaryFailure,
     visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
-  import { nextVisualSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
+  import {
+    nextVisualSuggestionWord,
+    type CompletionInsertionAction,
+    type SuggestionAlternative
+  } from './suggestionInteraction';
+  import type { VisualCompletionAccessibilityWitness } from './completionAccessibility';
   import {
     applyVisualFormat,
     visualFormatState,
@@ -31,6 +35,8 @@
     type VisualFormatState
   } from './visualFormatting';
   import { visualMarkdownInputRules } from './visualInputRules';
+
+  const formattingSelectionRestoreMeta = 'loomFormattingSelectionRestore';
 
   export let value = '';
   export let label = 'Manuscript editor';
@@ -53,7 +59,8 @@
   export let onGhostInsert: (
     candidateId: string,
     presentationKey: string,
-    text: string
+    text: string,
+    action: CompletionInsertionAction
   ) => boolean = () => false;
   export let onGhostCycle: (offset: number) => void = () => {};
   export let onGhostUnconsume: (candidateId: string, presentationKey: string, text: string) => boolean = () => false;
@@ -72,6 +79,9 @@
   ) => void = () => {};
   export let onCaretNavigation: () => void = () => {};
   export let onFormatStateChange: (state: VisualFormatState) => void = () => {};
+  export let onCompletionAccessibilityChange: (
+    witness: VisualCompletionAccessibilityWitness
+  ) => void = () => {};
 
   let mount: HTMLDivElement;
   let scrollViewport: HTMLElement | null = null;
@@ -98,6 +108,27 @@
   let boundaryCacheDiagnostic: string | null = null;
   let formattingSelectionDocument: ProseMirrorNode | null = null;
   let formattingSelection: Selection | null = null;
+  let formattingRestoreFrame: number | undefined;
+  let reportedCompletionAccessibilityIdentity = '';
+
+  function reportCompletionAccessibility(): void {
+    const plan = view ? currentGhostTextPlan(view.state) : null;
+    const witness: VisualCompletionAccessibilityWitness = {
+      available: Boolean(view),
+      optionHeld,
+      fanVisible: Boolean(plan?.fanVisible),
+      inlineHidden: Boolean(plan?.hidden),
+      selectedCandidateId: plan?.candidateId ?? '',
+      selectedPresentationKey: plan?.presentationKey ?? '',
+      alternativeCandidateIds: plan?.alternatives.map((item) => item.candidateId) ?? [],
+      alternativePresentationKeys: plan?.alternatives.map((item) => item.presentationKey) ?? [],
+      alternativeRunIds: plan?.alternatives.map((item) => item.runId ?? '') ?? []
+    };
+    const identity = JSON.stringify(witness);
+    if (identity === reportedCompletionAccessibilityIdentity) return;
+    reportedCompletionAccessibilityIdentity = identity;
+    onCompletionAccessibilityChange(witness);
+  }
 
   function clearBoundaryCache(): void {
     boundaryCacheDocument = null;
@@ -228,6 +259,10 @@
   }
 
   export function clearFormattingSelection(): void {
+    if (formattingRestoreFrame !== undefined) {
+      window.cancelAnimationFrame(formattingRestoreFrame);
+      formattingRestoreFrame = undefined;
+    }
     formattingSelectionDocument = null;
     formattingSelection = null;
   }
@@ -237,12 +272,54 @@
     focusPreservingSelection();
     const applied = applyVisualFormat(view.state, action, href, (transaction) => view?.dispatch(transaction));
     if (applied) {
-      formattingSelectionDocument = view.state.doc;
-      formattingSelection = view.state.selection;
-      view.focus();
-      onFormatStateChange(visualFormatState(view.state));
+      const formattedView = view;
+      const formattedDocument = formattedView.state.doc;
+      const formattedSelection = formattedView.state.selection;
+      formattingSelectionDocument = formattedDocument;
+      formattingSelection = formattedSelection;
+      formattedView.focus();
+      onFormatStateChange(visualFormatState(formattedView.state));
+      // WebKit may reconcile an Accessibility activation or a structurally
+      // changed contenteditable after the click handler, overwriting both DOM
+      // focus and the mutable palette selection cache. Restore the immutable
+      // post-command selection once activation has settled.
+      if (formattingRestoreFrame !== undefined) {
+        window.cancelAnimationFrame(formattingRestoreFrame);
+      }
+      formattingRestoreFrame = window.requestAnimationFrame(() => {
+        // Give WebKit one render turn to publish any late contenteditable
+        // selection reconciliation before installing the authoritative state.
+        formattingRestoreFrame = window.requestAnimationFrame(() => {
+          formattingRestoreFrame = undefined;
+          if (
+            !view ||
+            view !== formattedView ||
+            readonly ||
+            composing ||
+            formattedView.state.doc !== formattedDocument
+          ) return;
+          if (!formattedView.state.selection.eq(formattedSelection)) {
+            formattedView.dispatch(formattedView.state.tr
+              .setSelection(formattedSelection)
+              .setMeta(formattingSelectionRestoreMeta, true));
+          }
+          formattedView.focus();
+          formattingSelectionDocument = formattedView.state.doc;
+          formattingSelection = formattedView.state.selection;
+        });
+      });
     }
     return applied;
+  }
+
+  export function formattingDiagnostic(): string {
+    if (!view) return 'editor_unavailable';
+    const selection = view.state.selection;
+    const ancestors: string[] = [];
+    for (let depth = 0; depth <= selection.$from.depth; depth += 1) {
+      ancestors.push(selection.$from.node(depth).type.name);
+    }
+    return `${selection.constructor.name}:${selection.from}:${selection.to}:${ancestors.join('>')}`;
   }
 
   export function acceptGhostWord(requireVisible = true): boolean {
@@ -254,7 +331,12 @@
       selectionBoundary(view.state) !== plan.anchorByteOffset
     ) return false;
     const word = nextVisualSuggestionWord(plan.text);
-    if (!word || !authorizeCompletionInsertion(plan.candidateId, plan.presentationKey, word)) return false;
+    if (!word || !authorizeCompletionInsertion(
+      plan.candidateId,
+      plan.presentationKey,
+      word,
+      'shuttle_word'
+    )) return false;
     view.dispatch(view.state.tr.insertText(word));
     return true;
   }
@@ -262,9 +344,10 @@
   function authorizeCompletionInsertion(
     candidateId: string,
     presentationKey: string,
-    text: string
+    text: string,
+    action: CompletionInsertionAction
   ): boolean {
-    const authorized = onGhostInsert(candidateId, presentationKey, text);
+    const authorized = onGhostInsert(candidateId, presentationKey, text, action);
     if (authorized) completionMutationAuthorized = true;
     return authorized;
   }
@@ -311,6 +394,7 @@
           insert: authorizeCompletionInsertion,
           unconsume: authorizeCompletionReversal,
           cycle: onGhostCycle,
+          modifier: setOptionHeld,
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
           visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>
             Boolean(view) &&
@@ -350,34 +434,33 @@
   }
 
   function setOptionHeld(held: boolean): void {
-    const changed = optionHeld !== held;
+    if (optionHeld === held) return;
     optionHeld = held;
-    if (!view || !changed) return;
-    if (!held) {
-      // Clear the raw plugin flag even if a completion-owned document update
-      // temporarily makes the derived plan ineligible. Its decoration can
-      // otherwise survive with a latched hidden/fan state until another edit.
-      setGhostFanVisible(view, false);
-      return;
-    }
-    const plan = currentGhostTextPlan(view.state);
-    if (!plan) return;
-    if (plan.alternatives.length > 1) setGhostFanVisible(view, true);
+  }
+
+  function editorHasExactFocus(): boolean {
+    return Boolean(view && !view.isDestroyed && view.hasFocus());
   }
 
   function handleWindowKeyDown(event: KeyboardEvent): void {
-    if (event.key === 'Alt' || (event.altKey && !event.metaKey && !event.ctrlKey)) {
-      setOptionHeld(true);
+    if (!editorHasExactFocus()) {
+      setOptionHeld(false);
+      return;
     }
+    // Every keydown is a fresh physical-state witness. This recovers from a
+    // swallowed Option-up without guessing from the previous event sequence.
+    setOptionHeld(
+      (event.key === 'Alt' || event.altKey) &&
+      !event.metaKey &&
+      !event.ctrlKey
+    );
   }
 
   function handleWindowKeyUp(event: KeyboardEvent): void {
-    if (event.key === 'Alt' || !event.altKey) {
-      setOptionHeld(false);
-    }
+    if (!editorHasExactFocus() || event.key === 'Alt' || !event.altKey) setOptionHeld(false);
   }
 
-  function handleWindowBlur(): void {
+  function releaseOptionState(): void {
     setOptionHeld(false);
   }
 
@@ -404,7 +487,21 @@
           }
           onSelectionChange(null, 'selection_settling', null);
         } else if (transaction.selectionSet) {
-          if (view.hasFocus()) onCaretNavigation();
+          // An open formatting palette owns a selection snapshot while its
+          // controls have focus. Keep that snapshot synchronized when the
+          // editor itself is still focused, including keyboard and AX-driven
+          // selection changes that do not emit a pointerdown on the palette.
+          if (
+            formattingSelection &&
+            formattingSelectionDocument === next.doc &&
+            view.hasFocus()
+          ) {
+            formattingSelection = next.selection;
+          }
+          if (
+            view.hasFocus() &&
+            transaction.getMeta(formattingSelectionRestoreMeta) !== true
+          ) onCaretNavigation();
           onSelectionChange(null, 'selection_settling', null);
           scheduleSelectionReport();
         }
@@ -430,10 +527,14 @@
       },
       handleDOMEvents: {
         focus() {
+          // Focus acquisition is a new interaction epoch. If Option is still
+          // physically held, its next key event will re-establish that fact.
+          releaseOptionState();
           scheduleGhostVisibilityReport();
           return false;
         },
         blur() {
+          releaseOptionState();
           scheduleGhostVisibilityReport();
           return false;
         },
@@ -464,7 +565,10 @@
     window.addEventListener('resize', reportGhostVisibility);
     window.addEventListener('keydown', handleWindowKeyDown, true);
     window.addEventListener('keyup', handleWindowKeyUp, true);
-    window.addEventListener('blur', handleWindowBlur);
+    window.addEventListener('blur', releaseOptionState);
+    window.addEventListener('pagehide', releaseOptionState);
+    window.addEventListener('pointerdown', releaseOptionState, true);
+    document.addEventListener('visibilitychange', releaseOptionState);
     scrollViewport?.addEventListener('scroll', reportGhostVisibility, { passive: true });
     if (autofocus) view.focus();
   });
@@ -486,12 +590,15 @@
     const anchorByteOffset = ghostAnchorByteOffset;
     const exactAnchor = anchorByteOffset !== null &&
       selectionBoundary(view.state) === anchorByteOffset;
-    const faithful = exactAnchor && visualGhostTextIsFaithfulAtSelection(
-        view.state,
-        lastEmitted,
-        anchorByteOffset!,
-        ghostText
-      );
+    const rollbackOnly = ghostText === '' && ghostUnconsumeText !== '';
+    const faithful = exactAnchor && (
+      rollbackOnly || visualGhostTextIsFaithfulAtSelection(
+          view.state,
+          lastEmitted,
+          anchorByteOffset!,
+          ghostText
+        )
+    );
     const rejectionIdentity = anchorByteOffset === null
       ? ''
       : `${ghostPresentationKey}\u0000${surfaceKey}\u0000${anchorByteOffset}`;
@@ -525,7 +632,7 @@
       text: ghostText,
       insertsOnAccept: ghostInsertsOnAccept,
       alternatives: ghostAlternatives,
-      hidden: ghostHidden,
+      hidden: ghostHidden || rollbackOnly,
       unconsumeText: ghostUnconsumeText,
       // Once a word is consumed the session is locked to one candidate. Do
       // not hide its cached remainder behind a now-empty alternatives fan
@@ -533,6 +640,7 @@
       fanVisible: optionHeld && ghostAlternatives.length > 1
     } : null;
     setGhostText(view, presentation);
+    reportCompletionAccessibility();
     scheduleGhostVisibilityReport();
   }
 
@@ -545,10 +653,24 @@
     if (composing) onCompositionChange(false);
     onSelectionChange(null, 'selection_settling', null);
     if (reportedGhostPresentationKey) onGhostVisibilityChange('');
+    onCompletionAccessibilityChange({
+      available: false,
+      optionHeld: false,
+      fanVisible: false,
+      inlineHidden: true,
+      selectedCandidateId: '',
+      selectedPresentationKey: '',
+      alternativeCandidateIds: [],
+      alternativePresentationKeys: [],
+      alternativeRunIds: []
+    });
     window.removeEventListener('resize', reportGhostVisibility);
     window.removeEventListener('keydown', handleWindowKeyDown, true);
     window.removeEventListener('keyup', handleWindowKeyUp, true);
-    window.removeEventListener('blur', handleWindowBlur);
+    window.removeEventListener('blur', releaseOptionState);
+    window.removeEventListener('pagehide', releaseOptionState);
+    window.removeEventListener('pointerdown', releaseOptionState, true);
+    document.removeEventListener('visibilitychange', releaseOptionState);
     scrollViewport?.removeEventListener('scroll', reportGhostVisibility);
     view?.destroy();
   });

@@ -41,12 +41,14 @@
     ? session.candidates.map((candidate) => ({
         candidateId: candidate.candidateId,
         presentationKey: candidate.presentationKey,
-        text: candidate.text
+        text: candidate.text,
+        runId: candidate.runId
       }))
     : presentation ? [{
         candidateId: presentation.candidateId,
         presentationKey: presentation.presentationKey,
-        text: presentation.text
+        text: presentation.text,
+        runId: presentation.runId
       }] : [];
   $: unconsumeText = session?.acceptedChunks.at(-1) ?? '';
 

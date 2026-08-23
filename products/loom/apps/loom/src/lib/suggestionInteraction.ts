@@ -2,7 +2,16 @@ export interface SuggestionAlternative {
   candidateId: string;
   presentationKey: string;
   text: string;
+  /** Present for a model-backed alternative; omitted only by isolated fixtures. */
+  runId?: string;
 }
+
+export type CompletionInsertionAction =
+  | 'option_word'
+  | 'fan_return'
+  | 'fan_tab'
+  | 'inline_tab'
+  | 'shuttle_word';
 
 /**
  * Return one writer-visible step from a continuation. Leading whitespace stays

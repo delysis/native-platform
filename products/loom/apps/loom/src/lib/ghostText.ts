@@ -6,7 +6,11 @@ import {
   isExtendedGraphemeBoundary
 } from './graphemeBoundary';
 import { parseVisualMarkdown } from './markdownSafety';
-import { nextVisualSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
+import {
+  nextVisualSuggestionWord,
+  type CompletionInsertionAction,
+  type SuggestionAlternative
+} from './suggestionInteraction';
 
 export interface GhostTextPresentation {
   active: boolean;
@@ -42,9 +46,15 @@ export interface GhostTextHandlers {
    * falls back to inserting an ordinary tab into the manuscript.
    */
   accept: (candidateId: string, presentationKey: string) => boolean;
-  insert?: (candidateId: string, presentationKey: string, text: string) => boolean;
+  insert?: (
+    candidateId: string,
+    presentationKey: string,
+    text: string,
+    action: CompletionInsertionAction
+  ) => boolean;
   unconsume?: (candidateId: string, presentationKey: string, text: string) => boolean;
   cycle?: (offset: number) => void;
+  modifier?: (held: boolean) => void;
   dismiss: (candidateId: string, presentationKey: string) => void;
   visible: (
     presentationKey: string,
@@ -74,6 +84,33 @@ export const VISUAL_TAB_INDENT = '\t';
 const CARET_BOUNDARY_WITNESS = '\uE000LOOM_CARET_BOUNDARY_7F3A9D2C\uE001';
 const GHOST_PRESENTATION_ATTRIBUTE = 'data-loom-ghost-presentation';
 
+interface AttributeTarget {
+  setAttribute(name: string, value: string): void;
+}
+
+export function completionOptionAccessibleLabel(
+  index: number,
+  count: number,
+  text: string
+): string {
+  const prose = text.trim().replace(/\s+/gu, ' ');
+  return prose
+    ? `Suggestion ${index} of ${count}: ${prose}`
+    : `Suggestion ${index} of ${count}`;
+}
+
+export function setCompletionOptionAccessibility(
+  target: AttributeTarget,
+  index: number,
+  count: number,
+  text: string,
+  selected: boolean
+): void {
+  target.setAttribute('role', 'option');
+  target.setAttribute('aria-selected', selected ? 'true' : 'false');
+  target.setAttribute('aria-label', completionOptionAccessibleLabel(index, count, text));
+}
+
 function transactionMeta(transaction: Transaction): GhostTextMeta | undefined {
   return transaction.getMeta(ghostTextPluginKey) as GhostTextMeta | undefined;
 }
@@ -82,6 +119,10 @@ export function planGhostText(
   state: EditorState,
   presentation: GhostTextPresentation | null
 ): GhostTextPlan | null {
+  const rollbackOnly = Boolean(
+    presentation?.unconsumeText &&
+    presentation.text === ''
+  );
   if (
     !presentation?.active ||
     !presentation.candidateId ||
@@ -89,8 +130,7 @@ export function planGhostText(
     !presentation.surfaceKey ||
     !Number.isSafeInteger(presentation.anchorByteOffset) ||
     presentation.anchorByteOffset < 0 ||
-    !presentation.text ||
-    !/\S/u.test(presentation.text) ||
+    (!rollbackOnly && (!presentation.text || !/\S/u.test(presentation.text))) ||
     !state.selection.empty ||
     !(state.selection instanceof TextSelection)
   ) return null;
@@ -269,34 +309,33 @@ export function exactMarkdownByteOffsetAtSelection(
  * The exact document-context proof below remains authoritative.
  */
 export function visualGhostTextMayBePlainProse(text: string): boolean {
-  if (!text || !/\S/u.test(text) || /\r/u.test(text)) return false;
-  const prose = text.startsWith('\n\n') ? text.slice(2) : text;
-  if (!prose || prose.startsWith('\n') || prose.endsWith('\n')) return false;
-  const paragraphs = prose.split('\n\n');
-  if (paragraphs.some((paragraph) => !paragraph || paragraph.includes('\n'))) return false;
+  // Visual completion insertion uses one ProseMirror text transaction. A
+  // newline in that transaction would create text bytes that serialize as
+  // blocks without actually creating those block nodes, breaking the mounted
+  // document's parse/serialize identity. Source mode remains the explicit
+  // surface for multiline completion.
+  if (!text || !/\S/u.test(text) || /[\r\n]/u.test(text)) return false;
 
   try {
     const left = '\uE100LOOM_LEFT\uE101';
     const right = '\uE102LOOM_RIGHT\uE103';
-    return paragraphs.every((paragraphText) => {
-      const raw = defaultMarkdownParser.parse(paragraphText);
-      if (raw.childCount !== 1 || raw.firstChild?.type.name !== 'paragraph') return false;
-      const wrapped = `${left}${paragraphText}${right}`;
-      const parsed = defaultMarkdownParser.parse(wrapped);
-      const paragraph = parsed.childCount === 1 ? parsed.firstChild : null;
-      if (
-        !paragraph ||
-        paragraph.type.name !== 'paragraph' ||
-        paragraph.textContent !== wrapped
-      ) {
-        return false;
-      }
-      let plain = true;
-      paragraph.descendants((node) => {
-        if (!node.isText || node.marks.length > 0) plain = false;
-      });
-      return plain && defaultMarkdownSerializer.serialize(parsed) === wrapped;
+    const raw = defaultMarkdownParser.parse(text);
+    if (raw.childCount !== 1 || raw.firstChild?.type.name !== 'paragraph') return false;
+    const wrapped = `${left}${text}${right}`;
+    const parsed = defaultMarkdownParser.parse(wrapped);
+    const paragraph = parsed.childCount === 1 ? parsed.firstChild : null;
+    if (
+      !paragraph ||
+      paragraph.type.name !== 'paragraph' ||
+      paragraph.textContent !== wrapped
+    ) {
+      return false;
+    }
+    let plain = true;
+    paragraph.descendants((node) => {
+      if (!node.isText || node.marks.length > 0) plain = false;
     });
+    return plain && defaultMarkdownSerializer.serialize(parsed) === wrapped;
   } catch {
     return false;
   }
@@ -335,9 +374,8 @@ export function visualGhostTextSafePrefix(text: string): string | null {
 /**
  * Prove that promoting the exact raw bytes yields canonical plain prose at the
  * exact visual caret. Inline text is checked against a literal ProseMirror
- * transaction. Paragraph continuations are checked by parsing and serializing
- * the complete promoted manuscript, so Markdown controls cannot masquerade as
- * prose and no normalization can silently change the admitted bytes.
+ * transaction. Multiline text is projected to a single-block safe prefix
+ * before it can reach this boundary.
  */
 export function visualGhostTextIsFaithfulAtSelection(
   state: EditorState,
@@ -355,10 +393,6 @@ export function visualGhostTextIsFaithfulAtSelection(
   try {
     const promotedMarkdown =
       canonicalMarkdown.slice(0, boundary) + text + canonicalMarkdown.slice(boundary);
-    if (text.includes('\n')) {
-      const promotedDocument = parseVisualMarkdown(promotedMarkdown);
-      return defaultMarkdownSerializer.serialize(promotedDocument) === promotedMarkdown;
-    }
     const literalDocument = state.tr.insertText(text).doc;
     return defaultMarkdownSerializer.serialize(literalDocument) === promotedMarkdown &&
       parseVisualMarkdown(promotedMarkdown).eq(literalDocument);
@@ -483,11 +517,21 @@ function ghostWidget(plan: GhostTextPlan): HTMLElement {
   if (plan.alternatives.length > 1) {
     const fan = document.createElement('span');
     fan.className = 'loom-ghost-fan';
-    fan.setAttribute('aria-hidden', 'true');
+    fan.setAttribute('role', 'listbox');
+    fan.setAttribute('aria-label', 'Completion suggestions');
+    fan.setAttribute('aria-keyshortcuts', 'Alt+ArrowUp Alt+ArrowDown Alt+Enter Alt+Tab');
     plan.alternatives.forEach((alternative, index) => {
       const row = document.createElement('span');
       row.className = 'loom-ghost-fan-row';
-      if (alternative.presentationKey === plan.presentationKey) row.classList.add('active');
+      const selected = alternative.presentationKey === plan.presentationKey;
+      if (selected) row.classList.add('active');
+      setCompletionOptionAccessibility(
+        row,
+        index + 1,
+        plan.alternatives.length,
+        alternative.text,
+        selected
+      );
       const number = document.createElement('span');
       number.className = 'loom-ghost-fan-index';
       number.textContent = String(index + 1);
@@ -498,6 +542,7 @@ function ghostWidget(plan: GhostTextPlan): HTMLElement {
     });
     const hint = document.createElement('span');
     hint.className = 'loom-ghost-fan-hint';
+    hint.setAttribute('aria-hidden', 'true');
     hint.textContent = '↑↓ choose  ·  Return insert  ·  → next word';
     fan.append(hint);
     container.append(fan);
@@ -507,6 +552,9 @@ function ghostWidget(plan: GhostTextPlan): HTMLElement {
 }
 
 export function setGhostFanVisible(view: EditorView, visible: boolean): void {
+  if (view.isDestroyed) return;
+  const current = ghostTextPluginKey.getState(view.state);
+  if (!current || Boolean(current.fanVisible) === visible) return;
   view.dispatch(view.state.tr
     .setMeta(ghostTextPluginKey, { kind: 'fan', visible } satisfies GhostTextMeta)
     .setMeta('addToHistory', false));
@@ -522,6 +570,7 @@ function alternativesMatch(
     const other = rightItems[index];
     return Boolean(other) && item.candidateId === other.candidateId &&
       item.presentationKey === other.presentationKey &&
+      item.runId === other.runId &&
       item.text === other.text;
   });
 }
@@ -561,12 +610,10 @@ export function setGhostText(
   }
   const next = {
     ...presentation,
-    // Candidate text and modifier interaction are independent state axes.
-    // Once a plugin plan exists, a streamed/cached candidate rerender must not
-    // overwrite the fan state established by the actual Option key events.
-    fanVisible: current
-      ? Boolean(current.fanVisible)
-      : Boolean(presentation.fanVisible)
+    // The editor owns the actual modifier state. Reconcile every candidate
+    // update to that state so a 1→4 streamed family opens while Option is held,
+    // and a consumed 4→1 family cannot leave its inline remainder hidden.
+    fanVisible: Boolean(presentation.fanVisible)
   };
   view.dispatch(view.state.tr
     .setMeta(ghostTextPluginKey, { kind: 'set', presentation: next } satisfies GhostTextMeta)
@@ -592,7 +639,21 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
         if (!plan) return null;
         return DecorationSet.create(state.doc, [
           Decoration.widget(plan.position, () => ghostWidget(plan), {
-            key: plan.presentationKey,
+            // ProseMirror reuses widget DOM when this key is unchanged. Fan,
+            // hidden, and streamed-alternative changes are render identity,
+            // not merely plugin metadata; include them so stale pixels cannot
+            // survive Option-up or rollback.
+            key: JSON.stringify([
+              plan.presentationKey,
+              plan.hidden,
+              plan.fanVisible,
+              plan.alternatives.map((item) => [
+                item.candidateId,
+                item.presentationKey,
+                item.runId ?? '',
+                item.text
+              ])
+            ]),
             side: 1,
             ignoreSelection: true
           })
@@ -601,6 +662,12 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
       handleKeyDown(view, event) {
         const plan = planGhostText(view.state, ghostTextPluginKey.getState(view.state) ?? null);
         if (event.isComposing || event.keyCode === 229) return false;
+        if (
+          (event.key === 'Alt' || event.altKey) &&
+          !event.metaKey &&
+          !event.ctrlKey
+        ) handlers.modifier?.(true);
+        else if (!event.altKey || event.metaKey || event.ctrlKey) handlers.modifier?.(false);
         if (event.key === 'Alt' && !event.metaKey && !event.ctrlKey) {
           if (plan && plan.alternatives.length > 1) setGhostFanVisible(view, true);
           return false;
@@ -665,7 +732,12 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           !event.ctrlKey &&
           (event.key === 'Enter' || event.key === 'Tab')
         ) {
-          if (!handlers.insert?.(plan.candidateId, plan.presentationKey, plan.text)) return false;
+          if (!handlers.insert?.(
+            plan.candidateId,
+            plan.presentationKey,
+            plan.text,
+            event.key === 'Enter' ? 'fan_return' : 'fan_tab'
+          )) return false;
           event.preventDefault();
           view.dispatch(view.state.tr.insertText(plan.text));
           return true;
@@ -683,7 +755,12 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           ))
         ) {
           const word = nextVisualSuggestionWord(plan.text);
-          if (!word || !handlers.insert?.(plan.candidateId, plan.presentationKey, word)) return false;
+          if (!word || !handlers.insert?.(
+            plan.candidateId,
+            plan.presentationKey,
+            word,
+            'option_word'
+          )) return false;
           view.dispatch(view.state.tr.insertText(word));
           return true;
         }
@@ -708,7 +785,12 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
             // exists. Clearing first would invalidate every legitimate
             // acceptance before the parent can bind it to durable authority.
             const accepted = plan.insertsOnAccept
-              ? Boolean(handlers.insert?.(plan.candidateId, plan.presentationKey, plan.text))
+              ? Boolean(handlers.insert?.(
+                  plan.candidateId,
+                  plan.presentationKey,
+                  plan.text,
+                  'inline_tab'
+                ))
               : handlers.accept(plan.candidateId, plan.presentationKey);
             if (accepted) {
               view.dispatch(plan.insertsOnAccept
@@ -728,10 +810,14 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
       },
       handleDOMEvents: {
         keyup(view, event) {
-          if (event.key === 'Alt') setGhostFanVisible(view, false);
+          if (event.key === 'Alt' || !event.altKey) {
+            handlers.modifier?.(false);
+            setGhostFanVisible(view, false);
+          }
           return false;
         },
         blur(view) {
+          handlers.modifier?.(false);
           setGhostFanVisible(view, false);
           return false;
         }

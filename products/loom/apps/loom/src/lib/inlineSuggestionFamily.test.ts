@@ -95,7 +95,31 @@ describe('inline suggestion family', () => {
     expect(inlineSuggestionFamily(5, 'visual', state(''))).toEqual([]);
   });
 
-  it('preserves the same editor-owned separator through stream refresh after one word', () => {
+  it('projects multiline model output to one structurally faithful visual text block', () => {
+    expect(projectInlineCandidateText(
+      5,
+      'visual',
+      'hello',
+      ' world.\n\nA new paragraph.',
+      null
+    )).toBe(' world.');
+    expect(projectInlineCandidateText(
+      5,
+      'source',
+      'hello',
+      ' world.\n\nA new paragraph.',
+      null
+    )).toBe(' world.\n\nA new paragraph.');
+    expect(projectInlineCandidateText(
+      5,
+      'visual',
+      'hello',
+      '\n\nA new paragraph.',
+      null
+    )).toBeNull();
+  });
+
+  it('preserves the frozen continuation and editor-owned separator after one word', () => {
     const family = inlineSuggestionFamily(5, 'visual', state('hello'));
     const session = startCompletionSession('context', family, 'run-1');
     expect(session).not.toBeNull();
@@ -118,7 +142,7 @@ describe('inline suggestion family', () => {
     );
     expect(refreshed).not.toBeNull();
     expect(completionPresentation(refreshed!)).toMatchObject({
-      text: ' continues farther',
+      text: ' continues',
       targetByte: 11
     });
     expect(projectInlineCandidateText(

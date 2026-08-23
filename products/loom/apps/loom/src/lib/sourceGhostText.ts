@@ -9,6 +9,7 @@ export interface SourceGhostPresentation {
   candidateId: string;
   presentationKey: string;
   text: string;
+  rollbackOnly?: boolean;
 }
 
 export interface SourceGhostPlan {
@@ -256,12 +257,12 @@ export function sourceGhostPresentationCompatible(
 
 export function planSourceGhostText(input: SourceGhostPlanInput): SourceGhostPlan | null {
   const { presentation } = input;
+  const rollbackOnly = Boolean(presentation?.rollbackOnly && presentation.text === '');
   if (
     !presentation?.active ||
     !presentation.candidateId ||
     !presentation.presentationKey ||
-    !presentation.text ||
-    !/\S/u.test(presentation.text) ||
+    (!rollbackOnly && (!presentation.text || !/\S/u.test(presentation.text))) ||
     !input.focused ||
     input.composing ||
     input.readonly ||
@@ -278,7 +279,11 @@ export function planSourceGhostText(input: SourceGhostPlanInput): SourceGhostPla
   const text = sourceGhostTextForTextarea(presentation.text, input.verseNewline);
   if (
     text === null ||
-    !insertionPreservesExtendedGraphemeEdges(input.value, input.selectionStart, text)
+    (!rollbackOnly && !insertionPreservesExtendedGraphemeEdges(
+      input.value,
+      input.selectionStart,
+      text
+    ))
   ) return null;
   return {
     candidateId: presentation.candidateId,

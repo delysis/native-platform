@@ -5,8 +5,16 @@ import {
   wrapIn
 } from 'prosemirror-commands';
 import { defaultMarkdownSerializer, schema } from 'prosemirror-markdown';
+import type { Node as ProseMirrorNode } from 'prosemirror-model';
 import { liftListItem, wrapInList } from 'prosemirror-schema-list';
-import type { Command, EditorState, Transaction } from 'prosemirror-state';
+import {
+  AllSelection,
+  Selection,
+  TextSelection,
+  type Command,
+  type EditorState,
+  type Transaction
+} from 'prosemirror-state';
 import { parseVisualMarkdown } from './markdownSafety';
 
 export type VisualBlockStyle = 'body' | 'title' | 'heading' | 'subheading';
@@ -38,6 +46,142 @@ function ancestorIs(state: EditorState, nodeName: string): boolean {
   return false;
 }
 
+function structureIsActive(state: EditorState, nodeName: string): boolean {
+  if (state.selection.empty) return ancestorIs(state, nodeName);
+
+  let active = false;
+  state.doc.nodesBetween(state.selection.from, state.selection.to, (node, position) => {
+    if (!node.isTextblock) return true;
+    const inside = state.doc.resolve(Math.min(position + 1, state.doc.content.size));
+    for (let depth = inside.depth; depth >= 0; depth -= 1) {
+      if (inside.node(depth).type.name === nodeName) {
+        active = true;
+        break;
+      }
+    }
+    return !active;
+  });
+  return active;
+}
+
+interface SelectedStructure {
+  node: ProseMirrorNode;
+  position: number;
+}
+
+function selectedStructures(state: EditorState, nodeName: string): SelectedStructure[] {
+  const selected: SelectedStructure[] = [];
+  state.doc.nodesBetween(state.selection.from, state.selection.to, (node, position) => {
+    if (node.type.name !== nodeName) return true;
+    selected.push({ node, position });
+    // The outer selected structure owns its nested content. Replacing nested
+    // matches separately would make their recorded positions stale.
+    return false;
+  });
+  return selected;
+}
+
+function unwrappedContent(node: ProseMirrorNode): readonly ProseMirrorNode[] {
+  const blocks: ProseMirrorNode[] = [];
+  if (node.type === schema.nodes.bullet_list || node.type === schema.nodes.ordered_list) {
+    node.forEach((item) => item.forEach((block) => blocks.push(block)));
+  } else {
+    node.forEach((block) => blocks.push(block));
+  }
+  // Return nodes created by the document's own ProseMirror schema. Importing
+  // and constructing a Fragment here can cross Vite's optimized dependency
+  // instances and fail in WebKit even though the unit runner has one copy.
+  return blocks;
+}
+
+function unwrapSelectedStructures(nodeName: string): Command {
+  return (state, dispatch) => {
+    const selected = selectedStructures(state, nodeName);
+    if (selected.length === 0) return false;
+    if (!dispatch) return true;
+
+    let transaction = state.tr;
+    // Descending positions keep every recorded range stable while earlier
+    // replacements change document size.
+    for (const { node, position } of selected.sort((left, right) => right.position - left.position)) {
+      transaction = transaction.replaceWith(
+        position,
+        position + node.nodeSize,
+        unwrappedContent(node)
+      );
+    }
+    if (!transaction.docChanged) return false;
+    dispatch(transaction);
+    return true;
+  };
+}
+
+function unwrapWithFallback(primary: Command, nodeName: string): Command {
+  const fallback = unwrapSelectedStructures(nodeName);
+  return (state, dispatch, view) => {
+    // A shared ProseMirror lift range cannot represent disjoint containers or
+    // a mixed plain/structured selection. Normalize those selections in one
+    // transaction instead of treating a failed lift as a formatting no-op.
+    if (state.selection instanceof AllSelection || selectedStructures(state, nodeName).length > 1) {
+      return fallback(state, dispatch, view);
+    }
+    return primary(state, dispatch, view) || fallback(state, dispatch, view);
+  };
+}
+
+function withTextSelection(command: Command): Command {
+  return (state, dispatch, view) => {
+    if (!(state.selection instanceof AllSelection)) return command(state, dispatch, view);
+    const from = Selection.atStart(state.doc).from;
+    const to = Selection.atEnd(state.doc).to;
+    const selected = state.apply(state.tr
+      .setSelection(TextSelection.create(state.doc, from, to))
+      .setMeta('addToHistory', false));
+    return command(selected, dispatch, view);
+  };
+}
+
+function trimmedInlineRange(state: EditorState): { from: number; to: number } | null {
+  const selection = state.selection;
+  if (selection.empty) return null;
+  let from: number | null = null;
+  let to: number | null = null;
+  state.doc.nodesBetween(selection.from, selection.to, (node, position) => {
+    if (!node.isText || !node.text) return true;
+    const selectedFrom = Math.max(selection.from, position);
+    const selectedTo = Math.min(selection.to, position + node.nodeSize);
+    const selectedText = node.text.slice(selectedFrom - position, selectedTo - position);
+    const first = selectedText.search(/\S/u);
+    if (first < 0) return false;
+    const trailing = selectedText.match(/\s*$/u)?.[0].length ?? 0;
+    const last = selectedText.length - trailing;
+    from ??= selectedFrom + first;
+    to = selectedFrom + last;
+    return false;
+  });
+  return from !== null && to !== null && from < to ? { from, to } : null;
+}
+
+/**
+ * Markdown delimiters cannot faithfully own leading/trailing whitespace.
+ * Apply an inline command to the writer-visible non-whitespace range, then
+ * restore the exact original selection (including browser Select All).
+ */
+function withTrimmedInlineSelection(command: Command): Command {
+  return (state, dispatch, view) => {
+    if (state.selection.empty) return command(state, dispatch, view);
+    const range = trimmedInlineRange(state);
+    if (!range) return false;
+    const selected = state.apply(state.tr
+      .setSelection(TextSelection.create(state.doc, range.from, range.to))
+      .setMeta('addToHistory', false));
+    return command(selected, dispatch ? (transaction) => {
+      transaction.setSelection(state.selection.map(transaction.doc, transaction.mapping));
+      dispatch(transaction);
+    } : undefined, view);
+  };
+}
+
 function activeMark(state: EditorState, markName: 'strong' | 'em' | 'link') {
   const mark = schema.marks[markName];
   if (state.selection.empty) {
@@ -60,9 +204,9 @@ export function visualFormatState(state: EditorState): VisualFormatState {
     block: level === 1 ? 'title' : level === 2 ? 'heading' : level === 3 ? 'subheading' : 'body',
     bold: Boolean(activeMark(state, 'strong')),
     italic: Boolean(activeMark(state, 'em')),
-    blockquote: ancestorIs(state, 'blockquote'),
-    bulletList: ancestorIs(state, 'bullet_list'),
-    orderedList: ancestorIs(state, 'ordered_list'),
+    blockquote: structureIsActive(state, 'blockquote'),
+    bulletList: structureIsActive(state, 'bullet_list'),
+    orderedList: structureIsActive(state, 'ordered_list'),
     linkHref: typeof link?.attrs.href === 'string' ? link.attrs.href : '',
     selectionEmpty: state.selection.empty
   };
@@ -70,8 +214,8 @@ export function visualFormatState(state: EditorState): VisualFormatState {
 
 function listCommand(state: EditorState, ordered: boolean): Command {
   const activeName = ordered ? 'ordered_list' : 'bullet_list';
-  return ancestorIs(state, activeName)
-    ? liftListItem(schema.nodes.list_item)
+  return structureIsActive(state, activeName)
+    ? unwrapWithFallback(withTextSelection(liftListItem(schema.nodes.list_item)), activeName)
     : wrapInList(
         ordered ? schema.nodes.ordered_list : schema.nodes.bullet_list,
         ordered ? { order: 1, tight: true } : { tight: true }
@@ -88,15 +232,25 @@ export function visualFormatCommand(
     case 'title': return setBlockType(schema.nodes.heading, { level: 1 });
     case 'heading': return setBlockType(schema.nodes.heading, { level: 2 });
     case 'subheading': return setBlockType(schema.nodes.heading, { level: 3 });
-    case 'bold': return toggleMark(schema.marks.strong);
-    case 'italic': return toggleMark(schema.marks.em);
-    case 'blockquote': return ancestorIs(state, 'blockquote') ? lift : wrapIn(schema.nodes.blockquote);
+    case 'bold': return withTrimmedInlineSelection(toggleMark(schema.marks.strong));
+    case 'italic': return withTrimmedInlineSelection(toggleMark(schema.marks.em));
+    case 'blockquote': return structureIsActive(state, 'blockquote')
+      ? unwrapWithFallback(withTextSelection(lift), 'blockquote')
+      : wrapIn(schema.nodes.blockquote);
     case 'bullet_list': return listCommand(state, false);
     case 'ordered_list': return listCommand(state, true);
     case 'link': {
       const normalized = href.trim();
       if (!normalized || /[\u0000-\u001f\u007f\s]/u.test(normalized) || state.selection.empty) return null;
-      return toggleMark(schema.marks.link, { href: normalized, title: null });
+      return (_state, dispatch) => {
+        const range = trimmedInlineRange(_state);
+        if (!range) return false;
+        const mark = schema.marks.link.create({ href: normalized, title: null });
+        dispatch?.(_state.tr
+          .removeMark(range.from, range.to, schema.marks.link)
+          .addMark(range.from, range.to, mark));
+        return true;
+      };
     }
     case 'unlink': {
       if (state.selection.empty) return null;

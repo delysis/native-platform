@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  cancellationFailureNeedsUserAttention,
   captureForIdempotentRetry,
   closeResultMayHaveCommitted,
   failureIsDefiniteContention,
@@ -35,6 +36,24 @@ describe('closeResultMayHaveCommitted', () => {
     expect(failureIsDefiniteContention(busy)).toBe(true);
     expect(resultMayHaveCommitted(busy)).toBe(false);
     expect(captureForIdempotentRetry({ commandId: 'new' }, busy)).toBeNull();
+  });
+
+  it('keeps contention and already-terminal cancellation races out of global errors', () => {
+    expect(cancellationFailureNeedsUserAttention({
+      code: 'project_busy',
+      message: 'busy',
+      retryable: true
+    })).toBe(false);
+    expect(cancellationFailureNeedsUserAttention({
+      code: 'generation_not_active',
+      message: 'finished',
+      retryable: false
+    })).toBe(false);
+    expect(cancellationFailureNeedsUserAttention({
+      code: 'store_failed',
+      message: 'failed',
+      retryable: false
+    })).toBe(true);
   });
 
   it('unlocks only for a typed refusal known not to have committed', () => {

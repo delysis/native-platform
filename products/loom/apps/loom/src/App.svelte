@@ -98,6 +98,7 @@
     type ProjectRestoreScope
   } from './lib/projectScope';
   import {
+    cancellationFailureNeedsUserAttention,
     captureForIdempotentRetry,
     closeResultMayHaveCommitted,
     failureIsDefiniteContention
@@ -113,6 +114,7 @@
     type ProjectCloseOutcome
   } from './lib/applicationCloseCoordinator';
   import { ApplicationCloseRetryScheduler } from './lib/applicationCloseRetry';
+  import { DetachedProjectCloseCoordinator } from './lib/detachedProjectClose';
   import { suggestionsEnabledFromStoredPreference } from './lib/suggestionPreference';
   import {
     appearancePreference,
@@ -126,18 +128,24 @@
     type ProjectCloseAgencySnapshot
   } from './lib/projectCloseAgency';
   import {
+    acquireStartupProject,
+    attachWorkspaceProjectReply,
     restoreBeforeBackgroundWork,
     runCurrentWorkspaceStep,
-    shouldDiscoverModelsOnStartup
+    shouldDiscoverModelsOnStartup,
+    workspaceResumeAction
   } from './lib/startupSafety';
   import { newUlid } from './lib/ulid';
   import {
-    cycleSuggestionIndex
+    cycleSuggestionIndex,
+    type CompletionInsertionAction
   } from './lib/suggestionInteraction';
   import {
+    advanceCompletionExhaustionLatch,
     acceptedCompletionText,
     completionPresentation as completionSessionPresentation,
     completionSessionContextKey,
+    completionSessionMatchesPresentation,
     completionShouldRequestNextBatch,
     consumeCompletionText,
     cycleCompletionSession,
@@ -146,11 +154,21 @@
     removeBeforeUtf8Boundary,
     selectedCompletionCandidate,
     startCompletionSession,
+    synchronizeCompletionCandidates,
     unconsumeCompletionWord,
     updateCompletionCandidate,
     type CompletionSession
   } from './lib/completionSession';
-  import { completionEngineEnabled, inlineGhostHidden } from './lib/completionModes';
+  import {
+    completionEngineBecameDisabled,
+    completionEngineBecameEnabled,
+    completionEngineEnabled,
+    inlineGhostHidden
+  } from './lib/completionModes';
+  import {
+    unavailableVisualCompletionWitness,
+    type VisualCompletionAccessibilityWitness
+  } from './lib/completionAccessibility';
   import { observeNativeFullscreen } from './lib/nativeFullscreen';
   import {
     armCompletionGeneration,
@@ -206,6 +224,7 @@
     ModelDownloadSnapshot,
     LoomFailure,
     OpenDocument,
+    ProjectCloseReceipt,
     ProjectSnapshot,
     ReconciliationPreview,
     SaveState,
@@ -244,6 +263,19 @@
   let modelManagerReturnFocus: HTMLElement | null = null;
   let activeSuggestionRunId: string | null = null;
   let completionSession: CompletionSession | null = null;
+  let visualCompletionAccessibility: VisualCompletionAccessibilityWitness =
+    unavailableVisualCompletionWitness();
+  let completionActionSequence = 0;
+  let lastCompletionAction: {
+    sequence: number;
+    kind: CompletionInsertionAction;
+    context_key: string;
+    run_id: string;
+    candidate_id: string;
+    presentation_key: string;
+    inserted_utf8_bytes: number;
+    accepted_utf8_bytes: number;
+  } | null = null;
   let pendingCompletionText: string | null = null;
   let handledCompletionExhaustionKey = '';
   let projectMenu: HTMLDetailsElement | undefined;
@@ -535,6 +567,18 @@
     cancel: (handle) => window.clearTimeout(handle)
   }, 300);
 
+  const detachedProjectCloseCoordinator = new DetachedProjectCloseCoordinator({
+    currentProject: currentProjectSession,
+    disableAutomation: (projectId, sessionId) => setSuggestionsPolicy(
+      projectId,
+      sessionId,
+      false
+    ),
+    closeProject: closeProjectSession,
+    newCommandId: newUlid,
+    normalizeFailure
+  });
+
   const applicationCloseCoordinator = new ApplicationCloseCoordinator({
     begin: () => {
       applicationClosePhase = 'closing';
@@ -550,10 +594,11 @@
       }
       return true;
     },
-    closeProject: async () => project ? closeProject() : { status: 'closed' },
+    closeProject: async () => project ? closeProject() : detachedProjectCloseCoordinator.close(),
     authorizeNativeClose: requestApplicationClose,
     abortNativeClose: abortApplicationClose,
     reset: () => {
+      detachedProjectCloseCoordinator.reset();
       applicationClosePhase = 'running';
       if (transition === 'idle') requestPreferredWriterForCurrentWorkspace();
     },
@@ -693,6 +738,7 @@
     : mode === 'source'
       ? sourceSuggestionFamily
       : [];
+  $: synchronizeVisibleCompletionSession(completionContextKey, baseSuggestionFamily);
   $: boundCompletionSession = completionSession?.contextKey === completionContextKey
     ? completionSession
     : null;
@@ -751,7 +797,8 @@
   $: ghostAlternatives = activeSuggestionFamily.map((suggestion) => ({
     candidateId: suggestion.candidateId,
     presentationKey: suggestion.presentationKey,
-    text: suggestion.text
+    text: suggestion.text,
+    runId: suggestion.runId
   }));
   $: ghostUnconsumeText = boundCompletionSession?.acceptedChunks.at(-1) ?? '';
   $: activeGhostSuggestion = mode === 'visual'
@@ -763,6 +810,45 @@
         ? sourceGhostSuggestion
         : null
       : null;
+  $: completionWitnessSelected = boundCompletionSession
+    ? selectedCompletionCandidate(boundCompletionSession)
+    : null;
+  $: completionAccessibilityWitness = JSON.stringify({
+    schema: 'delysis.loom-completion-witness.v1',
+    mode,
+    context_key: boundCompletionSession?.contextKey ?? '',
+    session_cached: Boolean(boundCompletionSession),
+    family_count: boundCompletionSession?.candidates.length ?? 0,
+    candidates: boundCompletionSession?.candidates.map((candidate) => ({
+      candidate_id: candidate.candidateId,
+      presentation_key: candidate.presentationKey,
+      run_id: candidate.runId,
+      target_byte: candidate.targetByte,
+      text_utf8_bytes: new TextEncoder().encode(candidate.text).byteLength
+    })) ?? [],
+    selected_run_id: completionWitnessSelected?.runId ?? '',
+    selected_candidate_id: completionWitnessSelected?.candidateId ?? '',
+    selected_presentation_key: completionWitnessSelected?.presentationKey ?? '',
+    rendered_presentation_key: selectedInlineSuggestion?.presentationKey ?? '',
+    accepted_chunk_count: boundCompletionSession?.acceptedChunks.length ?? 0,
+    authority_frozen: boundCompletionSession?.authorityFrozen ?? false,
+    accepted_utf8_bytes: boundCompletionSession
+      ? new TextEncoder().encode(acceptedCompletionText(boundCompletionSession)).byteLength
+      : 0,
+    autocomplete_enabled: suggestionsEnabled,
+    shuttle_enabled: shuttleEnabled,
+    inline_hidden_requested: inlineGhostHidden({
+      autocomplete: suggestionsEnabled,
+      shuttle: shuttleEnabled
+    }),
+    inline_visible_key: mode === 'visual'
+      ? visibleVisualGhostPresentationKey
+      : mode === 'source'
+        ? visibleSourceGhostPresentationKey
+        : '',
+    visual: visualCompletionAccessibility,
+    last_action: lastCompletionAction
+  });
   $: completionExhaustionKey = boundCompletionSession && completionShouldRequestNextBatch(
     boundCompletionSession,
     pendingCompletionText !== null,
@@ -990,13 +1076,23 @@
     };
   });
 
-  function startDesktopWorkspace(): void {
-    if (!componentMounted || desktopWorkspaceStarted) return;
-    desktopWorkspaceStarted = true;
-    void installWindowFocusHandler();
-    void installFileCommandListener();
-    void installGenerationEventListener();
-    void restoreDesktopWorkspace();
+  function startDesktopWorkspace(forceRestore = false): void {
+    if (!componentMounted) return;
+    if (!desktopWorkspaceStarted) {
+      desktopWorkspaceStarted = true;
+      void installWindowFocusHandler();
+      void installFileCommandListener();
+      void installGenerationEventListener();
+      void restoreDesktopWorkspace();
+      return;
+    }
+    if (forceRestore) void restoreDesktopWorkspace();
+  }
+
+  function holdWorkspaceForApplicationClose(): void {
+    if (componentMounted && applicationClosePhase === 'closing') {
+      startupHeldForApplicationClose = true;
+    }
   }
 
   async function syncNativeWindowTitle(title: string): Promise<void> {
@@ -2311,12 +2407,14 @@
     applicationCloseRetry.settle(attemptEpoch, outcome, () => {
       if (componentMounted) void closeWindowGracefully();
     });
-    if (
-      startupHeldForApplicationClose &&
+    const resumeAction = workspaceResumeAction(
+      startupHeldForApplicationClose,
+      desktopWorkspaceStarted,
       applicationStartupDisposition(outcome) === 'continue'
-    ) {
+    );
+    if (resumeAction !== 'none') {
       startupHeldForApplicationClose = false;
-      startDesktopWorkspace();
+      startDesktopWorkspace(resumeAction === 'restore_workspace');
     }
     return outcome;
   }
@@ -2324,6 +2422,7 @@
   function workspaceRestoreIsCurrent(captured: WorkspaceRestoreCapture): boolean {
     return Boolean(
       componentMounted &&
+      applicationClosePhase === 'running' &&
       captured.restoreSerial === workspaceRestoreSerial &&
       project?.project_id === captured.projectId &&
       project.session_id === captured.sessionId
@@ -2667,8 +2766,15 @@
     const boundProject = project;
     const previousEnabled = suggestionsEnabled;
     const previousDismissedCandidateIds = dismissedCandidateIds;
+    const engineBecameEnabled = completionEngineBecameEnabled(
+      { autocomplete: previousEnabled, shuttle: shuttleEnabled },
+      { autocomplete: enabled, shuttle: shuttleEnabled }
+    );
+    const engineBecameDisabled = completionEngineBecameDisabled(
+      { autocomplete: previousEnabled, shuttle: shuttleEnabled },
+      { autocomplete: enabled, shuttle: shuttleEnabled }
+    );
     suggestionsChanging = true;
-    suggestionIntentEpoch += 1;
     if (!enabled && !shuttleEnabled) {
       suggestionsEnabled = false;
       cancelSuggestionTimer();
@@ -2689,6 +2795,7 @@
         project.session_id !== boundProject.session_id
       ) return;
       suggestionsEnabled = enabled;
+      if (engineBecameDisabled) clearCompletionSession();
       if (persist) {
         try {
           window.localStorage.setItem(suggestionPreferenceKey(project.project_id), enabled ? 'on' : 'off');
@@ -2715,7 +2822,7 @@
           ? 'Suggestions on; Loom will quietly prepare private strands when typing pauses'
           : 'Suggestions on; Loom is preparing a tested local writer'
         : 'Suggestions off');
-      if (automationEnabled && writerReady && document) {
+      if (engineBecameEnabled && writerReady && document) {
         scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'explicit_enable');
       }
     } catch (error) {
@@ -2734,12 +2841,8 @@
   async function toggleSuggestionsFromTitlebar(): Promise<void> {
     await setSuggestionsEnabled(!suggestionsEnabled);
     await tick();
-    const focused = mode === 'source'
-      ? sourceEditor?.focusCurrentSelection() ?? false
-      : visualEditor?.focusCurrentSelection() ?? false;
-    if (focused && completionAutomationEnabled()) {
-      scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'explicit_enable');
-    }
+    if (mode === 'source') sourceEditor?.focusCurrentSelection();
+    else visualEditor?.focusCurrentSelection();
   }
 
   function focusableElementsWithin(container: HTMLElement): HTMLElement[] {
@@ -3022,11 +3125,19 @@
   }
 
   async function reattachNativeProject(): Promise<boolean> {
+    const restoreSerial = workspaceRestoreSerial;
     try {
-      const current = await currentProjectSession();
-      const restoreSerial = workspaceRestoreSerial;
-      if (!componentMounted) return false;
-      project = current;
+      const current = await attachWorkspaceProjectReply({
+        open: currentProjectSession,
+        mayAttach: () => Boolean(
+          componentMounted &&
+          applicationClosePhase === 'running' &&
+          restoreSerial === workspaceRestoreSerial
+        ),
+        attach: (opened) => { project = opened; },
+        onHeld: holdWorkspaceForApplicationClose
+      });
+      if (!current) return false;
       if (!(await finishOpeningProject(current, restoreSerial))) return false;
       const captured = currentWorkspaceCapture();
       if (captured) void restoreCompletionBackground(captured);
@@ -3038,48 +3149,42 @@
   }
 
   async function openInitialProject(restoreSerial: number): Promise<WorkspaceRestoreCapture | null> {
-    let current: ProjectSnapshot | null = null;
+    const startupIsCurrent = () => Boolean(
+      componentMounted &&
+      restoreSerial === workspaceRestoreSerial &&
+      applicationClosePhase === 'running'
+    );
     try {
-      current = await currentProjectSession();
-    } catch {
-      // No live native session is the normal first-launch path.
-    }
-    if (current) {
-      if (!componentMounted || restoreSerial !== workspaceRestoreSerial) return null;
-      project = current;
-      if (!(await finishOpeningProject(current, restoreSerial))) return null;
-      if (
-        !componentMounted ||
-        restoreSerial !== workspaceRestoreSerial ||
-        project?.project_id !== current.project_id ||
-        project.session_id !== current.session_id
-      ) return null;
-      announce(`Reattached ${current.title}`);
-      return {
-        restoreSerial,
-        projectId: current.project_id,
-        sessionId: current.session_id
-      };
-    }
-    try {
-      const opened = await openDefaultProject();
-      if (!componentMounted || restoreSerial !== workspaceRestoreSerial) return null;
+      const acquisition = await acquireStartupProject({
+        currentProject: currentProjectSession,
+        openDefaultProject,
+        mayContinue: startupIsCurrent,
+        projectIsAbsent: (error) => normalizeFailure(error).code === 'project_not_open',
+        onHeld: holdWorkspaceForApplicationClose
+      });
+      if (!acquisition || !startupIsCurrent()) {
+        holdWorkspaceForApplicationClose();
+        return null;
+      }
+      const opened = acquisition.project;
       project = opened;
-      if (!(await finishOpeningProject(opened, restoreSerial))) return null;
+      if (!(await finishOpeningProject(opened, restoreSerial)) || !startupIsCurrent()) {
+        holdWorkspaceForApplicationClose();
+        return null;
+      }
       if (
-        !componentMounted ||
-        restoreSerial !== workspaceRestoreSerial ||
         project?.project_id !== opened.project_id ||
         project.session_id !== opened.session_id
       ) return null;
-      announce('Ready to write');
+      announce(acquisition.source === 'current' ? `Reattached ${opened.title}` : 'Ready to write');
       return {
         restoreSerial,
         projectId: opened.project_id,
         sessionId: opened.session_id
       };
     } catch (error) {
-      if (componentMounted && restoreSerial === workspaceRestoreSerial) recordFailure(error);
+      if (startupIsCurrent()) recordFailure(error);
+      else holdWorkspaceForApplicationClose();
       return null;
     }
   }
@@ -3163,14 +3268,25 @@
     const restoreSerial = ++workspaceRestoreSerial;
     await restoreBeforeBackgroundWork({
       restore: () => openInitialProject(restoreSerial),
-      present: async () => {
+      present: async (captured) => {
         await tick();
+        if (!workspaceRestoreIsCurrent(captured)) {
+          holdWorkspaceForApplicationClose();
+          return;
+        }
         await waitForWritingSurfacePaint();
+        if (!workspaceRestoreIsCurrent(captured)) {
+          holdWorkspaceForApplicationClose();
+          return;
+        }
         focusCurrentWritingSurfaceAtEnd();
       },
       isCurrent: workspaceRestoreIsCurrent,
       background: async (captured) => {
         await restoreCompletionBackground(captured);
+      },
+      onInterrupted: () => {
+        holdWorkspaceForApplicationClose();
       }
     });
   }
@@ -3181,15 +3297,35 @@
     opening = true;
     clearFailure();
     try {
-      const opened = await chooseAndOpenProject();
-      if (!componentMounted || restoreSerial !== workspaceRestoreSerial) return;
-      project = opened;
+      const opened = await attachWorkspaceProjectReply({
+        open: chooseAndOpenProject,
+        mayAttach: () => Boolean(
+          componentMounted &&
+          applicationClosePhase === 'running' &&
+          restoreSerial === workspaceRestoreSerial
+        ),
+        attach: (selected) => { project = selected; },
+        onHeld: holdWorkspaceForApplicationClose
+      });
+      if (!opened) return;
       if (await finishOpeningProject(opened, restoreSerial)) {
-        await tick();
-        await waitForWritingSurfacePaint();
-        focusCurrentWritingSurfaceAtEnd();
         const captured = currentWorkspaceCapture();
-        if (captured) void restoreCompletionBackground(captured);
+        if (!captured || !workspaceRestoreIsCurrent(captured)) {
+          holdWorkspaceForApplicationClose();
+          return;
+        }
+        await tick();
+        if (!workspaceRestoreIsCurrent(captured)) {
+          holdWorkspaceForApplicationClose();
+          return;
+        }
+        await waitForWritingSurfacePaint();
+        if (!workspaceRestoreIsCurrent(captured)) {
+          holdWorkspaceForApplicationClose();
+          return;
+        }
+        focusCurrentWritingSurfaceAtEnd();
+        if (workspaceRestoreIsCurrent(captured)) void restoreCompletionBackground(captured);
         announce(`Opened ${opened.title}`);
       }
     } catch (error) {
@@ -3301,6 +3437,7 @@
     outlineOpen = false;
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
+    clearCompletionSession();
     suggestionsEnabled = false;
     shuttleEnabled = false;
     dismissedCandidateIds = [];
@@ -3357,18 +3494,23 @@
     summary: DocumentSummary,
     focusWritingSurface = false
   ): Promise<void> {
-    if (transition !== 'idle' || !project) return;
+    if (transition !== 'idle' || !project || applicationClosePhase !== 'running') return;
     const requestedScope: ProjectRestoreScope = {
       projectId: project.project_id,
       sessionId: project.session_id,
       restoreSerial: workspaceRestoreSerial
     };
+    const projectNavigationIsCurrent = () => Boolean(
+      applicationClosePhase === 'running' &&
+      projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, requestedScope)
+    );
     if (compositionActive) {
       announce('Finish composing text before changing documents');
       return;
     }
     if (!flushEditors()) return;
     cancelSuggestionTimer();
+    clearCompletionSession();
     dismissedCandidateIds = [];
     transition = 'navigation';
     announce('Opening document; editing is briefly locked');
@@ -3376,19 +3518,19 @@
     if (!(await flushDraftJournal())) {
       if (
         requestSerial === navigationSerial &&
-        projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, requestedScope)
+        projectNavigationIsCurrent()
       ) transition = 'idle';
       return;
     }
-    if (!projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, requestedScope)) return;
+    if (!projectNavigationIsCurrent()) return;
     if (!(await flushCurrentDocument())) {
       if (
         requestSerial === navigationSerial &&
-        projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, requestedScope)
+        projectNavigationIsCurrent()
       ) transition = 'idle';
       return;
     }
-    if (!projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, requestedScope)) return;
+    if (!projectNavigationIsCurrent()) return;
     if (branchRefreshTimer !== undefined) {
       window.clearTimeout(branchRefreshTimer);
       branchRefreshTimer = undefined;
@@ -3407,6 +3549,7 @@
       if (summary.externally_modified) {
         const preview = await requestReconciliationPreview(summary, null, source);
         if (
+          applicationClosePhase !== 'running' ||
           requestSerial !== navigationSerial ||
           !navigationScopeIsCurrent(
             project,
@@ -3440,6 +3583,7 @@
         summary.relative_path
       );
       if (
+        applicationClosePhase !== 'running' ||
         requestSerial !== navigationSerial ||
         !navigationScopeIsCurrent(
           project,
@@ -3509,7 +3653,10 @@
         false
       );
     } catch (error) {
-      if (!projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source)) return;
+      if (
+        applicationClosePhase !== 'running' ||
+        !projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source)
+      ) return;
       recordFailure(error);
       if (navigationScopeIsCurrent(
         project,
@@ -3523,6 +3670,7 @@
       }
     } finally {
       if (
+        applicationClosePhase === 'running' &&
         requestSerial === navigationSerial &&
         projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source)
       ) {
@@ -3530,7 +3678,12 @@
         wakePreferredWriterEnsure();
         if (focusWritingSurface && document?.summary.document_id === summary.document_id) {
           await tick();
-          focusCurrentWritingSurfaceAtEnd();
+          if (
+            applicationClosePhase === 'running' &&
+            requestSerial === navigationSerial &&
+            projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) &&
+            document?.summary.document_id === summary.document_id
+          ) focusCurrentWritingSurfaceAtEnd();
         }
       }
     }
@@ -3561,6 +3714,11 @@
     if (!completionMutation) scheduleAutomaticSuggestions(editVersion);
   }
 
+  function clearCompletionSession(): void {
+    completionSession = null;
+    pendingCompletionText = null;
+  }
+
   function invalidateVisualSuggestionImmediately(): void {
     if (transition !== 'idle' || visualMutationPending) return;
     if (pendingCompletionText !== null) return;
@@ -3575,6 +3733,8 @@
   }
 
   function setSourceDocument(text: string, kind: DocumentKind): void {
+    clearCompletionSession();
+    lastCompletionAction = null;
     if (sourceProjectionTimer !== undefined) {
       window.clearTimeout(sourceProjectionTimer);
       sourceProjectionTimer = undefined;
@@ -4383,10 +4543,12 @@
   }
 
   function finishCompletionIfExhausted(key: string): void {
-    if (!key || key === handledCompletionExhaustionKey) return;
-    handledCompletionExhaustionKey = key;
-    completionSession = null;
-    pendingCompletionText = null;
+    const edge = advanceCompletionExhaustionLatch(handledCompletionExhaustionKey, key);
+    handledCompletionExhaustionKey = edge.handledKey;
+    if (!edge.shouldSchedule) return;
+    // An exhausted frozen session is still the exact authority for immediate
+    // Option-Left rollback. Queue the next family independently; deliberate
+    // dismissal, navigation, typing, or shared-engine off clears this cache.
     scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'candidate_exhausted');
   }
 
@@ -4415,12 +4577,35 @@
   }
 
   function sessionForEligibleGhost(eligible: InlineGhostSuggestion): CompletionSession | null {
-    if (completionSession) return completionSession;
+    if (completionSession && completionSessionMatchesPresentation(
+      completionSession,
+      completionContextKey,
+      eligible
+    )) return completionSession;
+    completionSession = null;
     return startCompletionSession(
       completionContextKey,
       activeSuggestionFamily,
       eligible.runId
     );
+  }
+
+  function synchronizeVisibleCompletionSession(
+    contextKey: string,
+    family: readonly InlineGhostSuggestion[]
+  ): void {
+    if (completionSession?.contextKey !== contextKey) {
+      completionSession = null;
+      pendingCompletionText = null;
+    }
+    if (!contextKey) return;
+    if (!completionSession) {
+      if (family.length === 0) return;
+      completionSession = startCompletionSession(contextKey, family, family[0].runId);
+      return;
+    }
+    completionSession = synchronizeCompletionCandidates(completionSession, family);
+    if (!completionSession) pendingCompletionText = null;
   }
 
   function acceptActiveGhost(candidateId: string, presentationKey: string): boolean {
@@ -4444,7 +4629,8 @@
   function authorizeGhostInsertion(
     candidateId: string,
     presentationKey: string,
-    text: string
+    text: string,
+    action: CompletionInsertionAction
   ): boolean {
     const eligible = eligibleGhostForCurrentMode();
     if (
@@ -4463,6 +4649,19 @@
     const expected = insertAtUtf8Boundary(documentText, eligible.targetByte, text);
     if (expected === null) return false;
     completionSession = consumed.session;
+    completionActionSequence += 1;
+    lastCompletionAction = {
+      sequence: completionActionSequence,
+      kind: action,
+      context_key: completionContextKey,
+      run_id: eligible.runId,
+      candidate_id: eligible.candidateId,
+      presentation_key: eligible.presentationKey,
+      inserted_utf8_bytes: new TextEncoder().encode(text).byteLength,
+      accepted_utf8_bytes: new TextEncoder().encode(
+        acceptedCompletionText(consumed.session)
+      ).byteLength
+    };
     pendingCompletionText = expected;
     return true;
   }
@@ -4523,8 +4722,15 @@
     }
     const boundProject = project;
     const previousEnabled = shuttleEnabled;
+    const engineBecameEnabled = completionEngineBecameEnabled(
+      { autocomplete: suggestionsEnabled, shuttle: previousEnabled },
+      { autocomplete: suggestionsEnabled, shuttle: enabled }
+    );
+    const engineBecameDisabled = completionEngineBecameDisabled(
+      { autocomplete: suggestionsEnabled, shuttle: previousEnabled },
+      { autocomplete: suggestionsEnabled, shuttle: enabled }
+    );
     suggestionsChanging = true;
-    suggestionIntentEpoch += 1;
     try {
       await setSuggestionsPolicy(
         boundProject.project_id,
@@ -4537,6 +4743,7 @@
         project.session_id !== boundProject.session_id
       ) return;
       shuttleEnabled = enabled;
+      if (engineBecameDisabled) clearCompletionSession();
       if (!enabled) {
         if (shuttleTimer !== undefined) window.clearTimeout(shuttleTimer);
         shuttleTimer = undefined;
@@ -4559,7 +4766,7 @@
         requestPreferredWriterEnsure(captured);
         writerReady = Boolean(currentModel);
       }
-      if (automationEnabled && writerReady && document) {
+      if (engineBecameEnabled && writerReady && document) {
         scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'explicit_enable');
       }
       announce(enabled
@@ -4574,6 +4781,13 @@
     } finally {
       suggestionsChanging = false;
     }
+  }
+
+  async function toggleShuttleFromTitlebar(): Promise<void> {
+    await setShuttleEnabled(!shuttleEnabled);
+    await tick();
+    if (mode === 'source') sourceEditor?.focusCurrentSelection();
+    else visualEditor?.focusCurrentSelection();
   }
 
   function syncShuttleTimer(key: string): void {
@@ -4605,6 +4819,10 @@
       void setShuttleEnabled(false);
       return;
     }
+    if (
+      completionSession &&
+      completionSessionMatchesPresentation(completionSession, completionContextKey, eligible)
+    ) clearCompletionSession();
     dismissInlineSuggestion(candidateId);
   }
 
@@ -4958,7 +5176,7 @@
     return branch.status === 'queued' || branch.status === 'generating';
   }
 
-  async function cancelBranch(branch: BranchCard): Promise<void> {
+  async function cancelBranch(branch: BranchCard, contentionAttempt = 0): Promise<void> {
     if (!project || !isBranchActive(branch) || cancellingRunIds.includes(branch.run_id)) return;
     const captured = {
       projectId: project.project_id,
@@ -4990,8 +5208,23 @@
         project?.project_id === captured.projectId &&
         project.session_id === captured.sessionId
       ) {
-        recordFailure(error);
-        announce('Cancellation was not confirmed; stored strand state will be checked');
+        const failure = normalizeFailure(error);
+        if (failureIsDefiniteContention(failure)) {
+          if (contentionAttempt < 4) {
+            const delay = 40 * (contentionAttempt + 1);
+            window.setTimeout(() => {
+              if (
+                project?.project_id !== captured.projectId ||
+                project.session_id !== captured.sessionId
+              ) return;
+              const current = branches.find((candidate) => candidate.run_id === captured.runId);
+              if (current && isBranchActive(current)) void cancelBranch(current, contentionAttempt + 1);
+            }, delay);
+          }
+        } else if (cancellationFailureNeedsUserAttention(failure)) {
+          recordFailure(failure);
+          announce('Cancellation was not confirmed; stored strand state will be checked');
+        }
       }
     } finally {
       cancellingRunIds = cancellingRunIds.filter((runId) => runId !== captured.runId);
@@ -5704,12 +5937,12 @@
       editVersion === closingVersion &&
       pendingCloseCommandId === closeCommandId
     );
-    const requestBoundClose = async () => {
-      const receipt = await closeProjectSession(
-        closing.project_id,
-        closing.session_id,
-        closeCommandId
-      );
+    const requestBoundClose = () => closeProjectSession(
+      closing.project_id,
+      closing.session_id,
+      closeCommandId
+    );
+    const validateBoundCloseReceipt = (receipt: ProjectCloseReceipt) => {
       if (
         receipt.command_id !== closeCommandId ||
         receipt.project_id !== closing.project_id ||
@@ -5717,12 +5950,12 @@
       ) {
         throw new Error('The desktop returned a close receipt for a different project session.');
       }
-      return receipt;
     };
 
     if (pendingCloseMayHaveCommitted) {
+      let receipt: ProjectCloseReceipt;
       try {
-        await requestBoundClose();
+        receipt = await requestBoundClose();
       } catch (error) {
         const failure = recordFailure(error);
         if (closeResultMayHaveCommitted(failure)) {
@@ -5734,6 +5967,7 @@
           return await resumeProjectAfterDefinitiveClose(closing);
         }
       }
+      validateBoundCloseReceipt(receipt);
     } else {
       // Stop new automatic admission before native close drains any reserved
       // startup already in flight. Keep the persisted preference unchanged so
@@ -5752,6 +5986,7 @@
         ),
         cancelKnownBranches: cancelActiveBranches,
         closeProject: requestBoundClose,
+        validateCloseResult: validateBoundCloseReceipt,
         normalizeFailure,
         closeResultMayHaveCommitted,
         wait: (delayMs) => new Promise((resolve) => window.setTimeout(resolve, delayMs)),
@@ -5913,6 +6148,11 @@
             bind:this={formatMenu}
             editor={visualEditor}
             formatting={visualFormatting}
+            onCommandResult={(action, applied) => {
+              announce(applied
+                ? 'Formatting applied'
+                : `${action.replaceAll('_', ' ')} could not be applied at this selection`);
+            }}
           />
         {/if}
         <button
@@ -5939,7 +6179,7 @@
           aria-pressed={shuttleEnabled}
           title={shuttleEnabled ? 'Shuttle: accepting one word every four idle seconds' : 'Shuttle: Off'}
           disabled={!project || suggestionsChanging}
-          on:click={() => void setShuttleEnabled(!shuttleEnabled)}
+          on:click={() => void toggleShuttleFromTitlebar()}
         >
           <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M4 4.5 10.5 9 4 13.5v-9ZM13.5 4.5v9"/></svg>
         </button>
@@ -6158,6 +6398,9 @@
                       onGhostPresentationRejected={rejectVisualGhostPresentation}
                       onGhostVisibilityChange={(presentationKey) => {
                         visibleVisualGhostPresentationKey = presentationKey;
+                      }}
+                      onCompletionAccessibilityChange={(witness) => {
+                        visualCompletionAccessibility = witness;
                       }}
                       onSelectionChange={updateVisualSelection}
                       onCaretNavigation={invalidateCompletionForCaretNavigation}
@@ -6552,4 +6795,7 @@
     </div>
   {/if}
   <div class="sr-only" aria-live="polite">{liveRegion}</div>
+  <div class="sr-only" role="note" aria-label="Completion session witness">
+    {completionAccessibilityWitness}
+  </div>
 </div>

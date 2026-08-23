@@ -1,7 +1,11 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
   import type { VerseNewlineKind } from './verseCodec';
-  import { nextSuggestionWord, type SuggestionAlternative } from './suggestionInteraction';
+  import {
+    nextSuggestionWord,
+    type CompletionInsertionAction,
+    type SuggestionAlternative
+  } from './suggestionInteraction';
   import {
     planSourceGhostText,
     renderedSourceGhostPresentationKey,
@@ -41,7 +45,8 @@
   export let onGhostInsert: (
     candidateId: string,
     presentationKey: string,
-    text: string
+    text: string,
+    action: CompletionInsertionAction
   ) => boolean = () => false;
   export let onGhostCycle: (offset: number) => void = () => {};
   export let onGhostUnconsume: (candidateId: string, presentationKey: string, text: string) => boolean = () => false;
@@ -111,7 +116,8 @@
       active: true,
       candidateId: ghostCandidateId,
       presentationKey: ghostPresentationKey,
-      text: ghostText
+      text: ghostText,
+      rollbackOnly: ghostText === '' && ghostUnconsumeText !== ''
     };
   }
 
@@ -364,6 +370,20 @@
       onValueInput(element);
       return;
     }
+    if (
+      candidate &&
+      ghostUnconsumeText &&
+      event.key === 'Escape' &&
+      !event.altKey &&
+      !event.metaKey &&
+      !event.ctrlKey
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      suppressCurrentGhost();
+      onGhostDismiss(candidate.candidateId, candidate.presentationKey);
+      return;
+    }
     const livePresentationKey = renderedGhostPresentationKey(candidate);
     const visible = candidate &&
       renderedSourceGhostPresentationKey(candidate, viewport ? Boolean(viewport.hidden) : true) ===
@@ -379,7 +399,11 @@
       optionFanVisible &&
       event.altKey &&
       (event.key === 'Enter' || event.key === 'Tab') &&
-      insertVisibleGhostText(candidate, candidate.text)
+      insertVisibleGhostText(
+        candidate,
+        candidate.text,
+        event.key === 'Enter' ? 'fan_return' : 'fan_tab'
+      )
     ) {
       event.preventDefault();
       event.stopPropagation();
@@ -406,7 +430,7 @@
       // The parent must consume the exact visibility witness before this
       // component clears it. Its boolean result is the authority to promote.
       const accepted = ghostInsertsOnAccept
-        ? insertVisibleGhostText(visible, visible.text)
+        ? insertVisibleGhostText(visible, visible.text, 'inline_tab')
         : onGhostAccept(visible.candidateId, visible.presentationKey);
       suppressCurrentGhost();
       if (accepted) {
@@ -418,7 +442,7 @@
     const wordCandidate = visible ?? (optionFanVisible ? candidate : null);
     if (action === 'accept_word' && wordCandidate) {
       const word = nextSuggestionWord(wordCandidate.text);
-      if (word && insertVisibleGhostText(wordCandidate, word)) {
+      if (word && insertVisibleGhostText(wordCandidate, word, 'option_word')) {
         event.preventDefault();
         event.stopPropagation();
       }
@@ -463,12 +487,16 @@
     optionFanVisible = false;
   }
 
-  function insertVisibleGhostText(candidate: SourceGhostPlan, text: string): boolean {
+  function insertVisibleGhostText(
+    candidate: SourceGhostPlan,
+    text: string,
+    action: CompletionInsertionAction
+  ): boolean {
     if (
       !element ||
       readonly ||
       !text ||
-      !onGhostInsert(candidate.candidateId, candidate.presentationKey, text)
+      !onGhostInsert(candidate.candidateId, candidate.presentationKey, text, action)
     ) return false;
     const start = element.selectionStart;
     const end = element.selectionEnd;
@@ -519,7 +547,7 @@
     ) return false;
     const word = nextSuggestionWord(candidate.text);
     if (!word) return false;
-    const accepted = insertVisibleGhostText(candidate, word);
+    const accepted = insertVisibleGhostText(candidate, word, 'shuttle_word');
     if (accepted) suppressCurrentGhost();
     return accepted;
   }
