@@ -16,7 +16,6 @@
     clearGhostText,
     createGhostTextPlugin,
     currentGhostTextPlan,
-    setGhostFanVisible,
     setGhostText,
     visualCaretBoundaryProof,
     visibleGhostWidgetPresentationKey,
@@ -396,34 +395,33 @@
   }
 
   function setOptionHeld(held: boolean): void {
-    const changed = optionHeld !== held;
+    if (optionHeld === held) return;
     optionHeld = held;
-    if (!view || !changed) return;
-    if (!held) {
-      // Clear the raw plugin flag even if a completion-owned document update
-      // temporarily makes the derived plan ineligible. Its decoration can
-      // otherwise survive with a latched hidden/fan state until another edit.
-      setGhostFanVisible(view, false);
-      return;
-    }
-    const plan = currentGhostTextPlan(view.state);
-    if (!plan) return;
-    if (plan.alternatives.length > 1) setGhostFanVisible(view, true);
+  }
+
+  function editorHasExactFocus(): boolean {
+    return Boolean(view && !view.isDestroyed && view.hasFocus());
   }
 
   function handleWindowKeyDown(event: KeyboardEvent): void {
-    if (event.key === 'Alt' || (event.altKey && !event.metaKey && !event.ctrlKey)) {
-      setOptionHeld(true);
+    if (!editorHasExactFocus()) {
+      setOptionHeld(false);
+      return;
     }
+    // Every keydown is a fresh physical-state witness. This recovers from a
+    // swallowed Option-up without guessing from the previous event sequence.
+    setOptionHeld(
+      (event.key === 'Alt' || event.altKey) &&
+      !event.metaKey &&
+      !event.ctrlKey
+    );
   }
 
   function handleWindowKeyUp(event: KeyboardEvent): void {
-    if (event.key === 'Alt' || !event.altKey) {
-      setOptionHeld(false);
-    }
+    if (!editorHasExactFocus() || event.key === 'Alt' || !event.altKey) setOptionHeld(false);
   }
 
-  function handleWindowBlur(): void {
+  function releaseOptionState(): void {
     setOptionHeld(false);
   }
 
@@ -476,10 +474,14 @@
       },
       handleDOMEvents: {
         focus() {
+          // Focus acquisition is a new interaction epoch. If Option is still
+          // physically held, its next key event will re-establish that fact.
+          releaseOptionState();
           scheduleGhostVisibilityReport();
           return false;
         },
         blur() {
+          releaseOptionState();
           scheduleGhostVisibilityReport();
           return false;
         },
@@ -510,7 +512,10 @@
     window.addEventListener('resize', reportGhostVisibility);
     window.addEventListener('keydown', handleWindowKeyDown, true);
     window.addEventListener('keyup', handleWindowKeyUp, true);
-    window.addEventListener('blur', handleWindowBlur);
+    window.addEventListener('blur', releaseOptionState);
+    window.addEventListener('pagehide', releaseOptionState);
+    window.addEventListener('pointerdown', releaseOptionState, true);
+    document.addEventListener('visibilitychange', releaseOptionState);
     scrollViewport?.addEventListener('scroll', reportGhostVisibility, { passive: true });
     if (autofocus) view.focus();
   });
@@ -609,7 +614,10 @@
     window.removeEventListener('resize', reportGhostVisibility);
     window.removeEventListener('keydown', handleWindowKeyDown, true);
     window.removeEventListener('keyup', handleWindowKeyUp, true);
-    window.removeEventListener('blur', handleWindowBlur);
+    window.removeEventListener('blur', releaseOptionState);
+    window.removeEventListener('pagehide', releaseOptionState);
+    window.removeEventListener('pointerdown', releaseOptionState, true);
+    document.removeEventListener('visibilitychange', releaseOptionState);
     scrollViewport?.removeEventListener('scroll', reportGhostVisibility);
     view?.destroy();
   });

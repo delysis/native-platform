@@ -44,6 +44,46 @@ describe('real WebKit editor interactions', () => {
     return page.getByRole('status', { name: 'Serialized Markdown' }).element().textContent ?? '';
   }
 
+  function fourChoiceCompletion(): CompletionCandidate[] {
+    return [
+      { candidateId: 'a', presentationKey: 'a:1', text: ' world', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
+      { candidateId: 'b', presentationKey: 'b:1', text: ' there', runId: 'run-b', targetByte: 5, insertsOnAccept: true },
+      { candidateId: 'c', presentationKey: 'c:1', text: ' again', runId: 'run-c', targetByte: 5, insertsOnAccept: true },
+      { candidateId: 'd', presentationKey: 'd:1', text: ' onward', runId: 'run-d', targetByte: 5, insertsOnAccept: true }
+    ];
+  }
+
+  function dispatchOptionDown(target: EventTarget): void {
+    dispatchKey(target, 'keydown', 'Alt', 'AltLeft', true);
+  }
+
+  function dispatchOptionUp(target: EventTarget): void {
+    dispatchKey(target, 'keyup', 'Alt', 'AltLeft', false);
+  }
+
+  function dispatchKey(
+    target: EventTarget,
+    type: 'keydown' | 'keyup',
+    key: string,
+    code: string,
+    altKey: boolean
+  ): void {
+    target.dispatchEvent(new KeyboardEvent(type, {
+      key,
+      code,
+      altKey,
+      bubbles: true,
+      cancelable: true
+    }));
+  }
+
+  function completionFanIsVisible(): boolean {
+    const fan = document.querySelector<HTMLElement>(
+      '[role="listbox"][aria-label="Completion suggestions"]'
+    );
+    return Boolean(fan && getComputedStyle(fan).display !== 'none' && fan.getClientRects().length > 0);
+  }
+
   it('preserves a paused terminal separator for later typing and palette commands', async () => {
     const keyboard = userEvent.setup();
     render('Something');
@@ -333,16 +373,11 @@ describe('real WebKit editor interactions', () => {
   });
 
   it('keeps all four alternatives visible while Option cycles the active candidate', async () => {
-    const keyboard = userEvent.setup();
-    render('hello', [
-      { candidateId: 'a', presentationKey: 'a:1', text: ' world', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
-      { candidateId: 'b', presentationKey: 'b:1', text: ' there', runId: 'run-b', targetByte: 5, insertsOnAccept: true },
-      { candidateId: 'c', presentationKey: 'c:1', text: ' again', runId: 'run-c', targetByte: 5, insertsOnAccept: true },
-      { candidateId: 'd', presentationKey: 'd:1', text: ' onward', runId: 'run-d', targetByte: 5, insertsOnAccept: true }
-    ]);
+    render('hello', fourChoiceCompletion());
     await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' }).element();
 
-    await keyboard.keyboard('{Alt>}{ArrowDown}');
+    dispatchOptionDown(editor);
     const fan = page.getByRole('listbox', { name: 'Completion suggestions' });
     await expect.element(fan).toBeVisible();
     const options = page.getByRole('option');
@@ -352,18 +387,113 @@ describe('real WebKit editor interactions', () => {
     expect(rows.every((row) => row.getClientRects().length > 0)).toBe(true);
     await expect.poll(
       () => document.querySelector<HTMLElement>('.loom-ghost-fan-row.active')?.textContent
+    ).toContain('world');
+
+    dispatchKey(editor, 'keydown', 'ArrowDown', 'ArrowDown', true);
+    dispatchKey(editor, 'keyup', 'ArrowDown', 'ArrowDown', true);
+    await expect.poll(
+      () => document.querySelector<HTMLElement>('.loom-ghost-fan-row.active')?.textContent
     ).toContain('there');
-    expect(document.querySelector('[role="option"][aria-selected="true"]')
-      ?.getAttribute('aria-description')).toContain('"run_id":"run-b"');
+    const selectedDown = document.querySelector<HTMLElement>(
+      '[role="option"][aria-selected="true"]'
+    );
+    expect(selectedDown?.getAttribute('aria-selected')).toBe('true');
+    expect(selectedDown?.getAttribute('aria-label')).toContain('Suggestion 2 of 4: there');
     expect(document.querySelectorAll('.loom-ghost-fan-row')).toHaveLength(4);
-    await keyboard.keyboard('{ArrowUp}');
+    dispatchKey(editor, 'keydown', 'ArrowUp', 'ArrowUp', true);
+    dispatchKey(editor, 'keyup', 'ArrowUp', 'ArrowUp', true);
     await expect.poll(
       () => document.querySelector<HTMLElement>('.loom-ghost-fan-row.active')?.textContent
     ).toContain('world');
-    expect(document.querySelector('[role="option"][aria-selected="true"]')
-      ?.getAttribute('aria-description')).toContain('"run_id":"run-a"');
-    await keyboard.keyboard('{/Alt}');
-    await keyboard.cleanup();
+    const selectedUp = document.querySelector<HTMLElement>(
+      '[role="option"][aria-selected="true"]'
+    );
+    expect(selectedUp?.getAttribute('aria-selected')).toBe('true');
+    expect(selectedUp?.getAttribute('aria-label')).toContain('Suggestion 1 of 4: world');
+    dispatchOptionUp(editor);
+    await expect.poll(completionFanIsVisible).toBe(false);
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+  });
+
+  it('clears a lost Option-up at every interaction boundary and on a fresh key witness', async () => {
+    render('hello', fourChoiceCompletion());
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' }).element();
+
+    const reopenFan = async (): Promise<void> => {
+      dispatchOptionDown(editor);
+      await expect.poll(completionFanIsVisible).toBe(true);
+    };
+    const expectReleased = async (): Promise<void> => {
+      await expect.poll(completionFanIsVisible).toBe(false);
+      await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    };
+
+    await reopenFan();
+    window.dispatchEvent(new Event('blur'));
+    await expectReleased();
+
+    await reopenFan();
+    document.dispatchEvent(new Event('visibilitychange'));
+    await expectReleased();
+
+    await reopenFan();
+    window.dispatchEvent(new Event('pagehide'));
+    await expectReleased();
+
+    await reopenFan();
+    editor.dispatchEvent(new PointerEvent('pointerdown', {
+      bubbles: true,
+      cancelable: true,
+      pointerId: 1,
+      pointerType: 'mouse'
+    }));
+    await expectReleased();
+
+    await reopenFan();
+    editor.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Shift',
+      code: 'ShiftLeft',
+      altKey: false,
+      bubbles: true,
+      cancelable: true
+    }));
+    await expectReleased();
+  });
+
+  it('never lets a global Option event reopen the fan after exact editor focus is lost', async () => {
+    render('hello', fourChoiceCompletion());
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' }).element();
+    const outside = document.createElement('input');
+    outside.setAttribute('aria-label', 'Outside editor control');
+    document.body.append(outside);
+
+    dispatchOptionDown(editor);
+    await expect.poll(completionFanIsVisible).toBe(true);
+    outside.focus();
+    await expect.poll(completionFanIsVisible).toBe(false);
+
+    dispatchOptionDown(outside);
+    await expect.poll(completionFanIsVisible).toBe(false);
+    expect(document.activeElement).toBe(outside);
+  });
+
+  it('starts a remounted visual editor with no inherited Option state', async () => {
+    render('hello', fourChoiceCompletion());
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' }).element();
+    dispatchOptionDown(editor);
+    await expect.poll(completionFanIsVisible).toBe(true);
+
+    if (!mounted) throw new Error('expected the visual editor harness to be mounted');
+    await unmount(mounted);
+    mounted = null;
+    document.body.replaceChildren();
+
+    render('hello', fourChoiceCompletion());
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    await expect.poll(completionFanIsVisible).toBe(false);
   });
 
   it('keeps the cached session across an autosave identity change and requests only after exhaustion', async () => {

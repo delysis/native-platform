@@ -84,6 +84,33 @@ export const VISUAL_TAB_INDENT = '\t';
 const CARET_BOUNDARY_WITNESS = '\uE000LOOM_CARET_BOUNDARY_7F3A9D2C\uE001';
 const GHOST_PRESENTATION_ATTRIBUTE = 'data-loom-ghost-presentation';
 
+interface AttributeTarget {
+  setAttribute(name: string, value: string): void;
+}
+
+export function completionOptionAccessibleLabel(
+  index: number,
+  count: number,
+  text: string
+): string {
+  const prose = text.trim().replace(/\s+/gu, ' ');
+  return prose
+    ? `Suggestion ${index} of ${count}: ${prose}`
+    : `Suggestion ${index} of ${count}`;
+}
+
+export function setCompletionOptionAccessibility(
+  target: AttributeTarget,
+  index: number,
+  count: number,
+  text: string,
+  selected: boolean
+): void {
+  target.setAttribute('role', 'option');
+  target.setAttribute('aria-selected', selected ? 'true' : 'false');
+  target.setAttribute('aria-label', completionOptionAccessibleLabel(index, count, text));
+}
+
 function transactionMeta(transaction: Transaction): GhostTextMeta | undefined {
   return transaction.getMeta(ghostTextPluginKey) as GhostTextMeta | undefined;
 }
@@ -498,17 +525,13 @@ function ghostWidget(plan: GhostTextPlan): HTMLElement {
       row.className = 'loom-ghost-fan-row';
       const selected = alternative.presentationKey === plan.presentationKey;
       if (selected) row.classList.add('active');
-      row.setAttribute('role', 'option');
-      row.setAttribute('aria-selected', selected ? 'true' : 'false');
-      row.setAttribute('aria-label', `Suggestion ${index + 1} of ${plan.alternatives.length}`);
-      row.setAttribute('aria-description', JSON.stringify({
-        schema: 'delysis.loom-completion-option.v1',
-        index: index + 1,
-        count: plan.alternatives.length,
-        run_id: alternative.runId ?? '',
-        candidate_id: alternative.candidateId,
-        presentation_key: alternative.presentationKey
-      }));
+      setCompletionOptionAccessibility(
+        row,
+        index + 1,
+        plan.alternatives.length,
+        alternative.text,
+        selected
+      );
       const number = document.createElement('span');
       number.className = 'loom-ghost-fan-index';
       number.textContent = String(index + 1);
@@ -529,6 +552,9 @@ function ghostWidget(plan: GhostTextPlan): HTMLElement {
 }
 
 export function setGhostFanVisible(view: EditorView, visible: boolean): void {
+  if (view.isDestroyed) return;
+  const current = ghostTextPluginKey.getState(view.state);
+  if (!current || Boolean(current.fanVisible) === visible) return;
   view.dispatch(view.state.tr
     .setMeta(ghostTextPluginKey, { kind: 'fan', visible } satisfies GhostTextMeta)
     .setMeta('addToHistory', false));
@@ -636,7 +662,12 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
       handleKeyDown(view, event) {
         const plan = planGhostText(view.state, ghostTextPluginKey.getState(view.state) ?? null);
         if (event.isComposing || event.keyCode === 229) return false;
-        if (event.key === 'Alt' || event.altKey) handlers.modifier?.(true);
+        if (
+          (event.key === 'Alt' || event.altKey) &&
+          !event.metaKey &&
+          !event.ctrlKey
+        ) handlers.modifier?.(true);
+        else if (!event.altKey || event.metaKey || event.ctrlKey) handlers.modifier?.(false);
         if (event.key === 'Alt' && !event.metaKey && !event.ctrlKey) {
           if (plan && plan.alternatives.length > 1) setGhostFanVisible(view, true);
           return false;

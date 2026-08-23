@@ -173,13 +173,21 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /four admitted runs did not form one exact source\/anchor\/model family/);
   assert.match(smoke, /source_revision_id: rows\[0\]\.source_revision_id/);
   assert.match(smoke, /model_environment_artifact_id: rows\[0\]\.model_environment_artifact_id/);
+  assert.match(smoke, /family_terminal_status: 'completed'/);
+  assert.match(smoke, /generation_terminal_evidence/);
+  assert.match(smoke, /row\.terminal_candidate_id === row\.candidate_id/);
+  assert.match(smoke, /row\.candidate_output_blob_id === row\.evidence_output_blob_id/);
+  assert.match(smoke, /row\.generated_span_artifact_id === row\.output_artifact_id/);
   assert.match(smoke, /completion control state:/);
   assert.match(smoke, /var pressed = false/);
   assert.match(smoke, /if description\.contains\(alreadyName\) \{/);
   assert.match(smoke, /guard pressed \|\| !requirePress/);
-  assert.match(smoke, /schema: "delysis\.loom-completion-option\.v1"/);
-  assert.match(smoke, /values\.contains\(where: \{ \$0 == "Completion suggestions" \}\)/);
+  assert.match(smoke, /suggestionLabelPattern/);
+  assert.match(smoke, /strings\(element\)\.contains\("Completion suggestions"\)/);
+  assert.match(smoke, /kAXListRole/);
   assert.match(smoke, /kAXSelectedAttribute/);
+  assert.match(smoke, /let candidate = candidates\[index - 1\]/);
+  assert.match(smoke, /waitForAccessibleFan/);
   assert.match(smoke, /fan Return did not persist the selected cached remainder/);
   assert.match(smoke, /fan Tab did not persist the selected cached remainder/);
   assert.match(smoke, /shared engine on-to-off did not clear the cached completion session/);
@@ -189,6 +197,28 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /generation_runs_after:/);
   assert.match(smoke, /generation_family: generationFamily/);
   assert.match(smoke, /editor_input: editorInput/);
+  for (const stage of [
+    "title",
+    "body",
+    "heading",
+    "heading_body",
+    "subheading",
+    "subheading_body",
+    "bold",
+    "bold_reverse",
+    "italic",
+    "italic_reverse",
+    "block_quote",
+    "block_quote_reverse",
+    "bullet_list",
+    "bullet_list_reverse",
+    "numbered_list",
+    "numbered_list_reverse",
+    "link",
+    "remove_link",
+  ]) {
+    assert.match(smoke, new RegExp(`stage\\('${stage}'`));
+  }
 
   const autocompleteOff = smoke.indexOf(
     "RUN_1_AUTOCOMPLETE_OFF_EVIDENCE=$(set_loom_completion_toggle",

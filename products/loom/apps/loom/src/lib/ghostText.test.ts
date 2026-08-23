@@ -4,12 +4,14 @@ import { DecorationSet, type EditorView } from 'prosemirror-view';
 import { describe, expect, it } from 'vitest';
 import { parseVisualMarkdown } from './markdownSafety';
 import {
+  completionOptionAccessibleLabel,
   createGhostTextPlugin,
   exactMarkdownByteOffsetAtSelection,
   visualCaretBoundaryProof,
   ghostTextPluginKey,
   planGhostText,
   renderedGhostPresentationKey,
+  setCompletionOptionAccessibility,
   setGhostFanVisible,
   setGhostText,
   VISUAL_TAB_INDENT,
@@ -75,6 +77,26 @@ describe('planGhostText', () => {
 });
 
 describe('visual ghost widget', () => {
+  it('gives each fan option a human-readable accessible identity', () => {
+    const attributes = new Map<string, string>();
+    setCompletionOptionAccessibility(
+      { setAttribute: (name, value) => attributes.set(name, value) },
+      2,
+      4,
+      ' there,\n beyond the rain.',
+      true
+    );
+
+    expect(completionOptionAccessibleLabel(2, 4, ' there,\n beyond the rain.'))
+      .toBe('Suggestion 2 of 4: there, beyond the rain.');
+    expect(Object.fromEntries(attributes)).toEqual({
+      role: 'option',
+      'aria-selected': 'true',
+      'aria-label': 'Suggestion 2 of 4: there, beyond the rain.'
+    });
+    expect(attributes.has('aria-description')).toBe(false);
+  });
+
   it('renders one zero-width widget without changing ProseMirror bytes', () => {
     const plugin = createGhostTextPlugin({
       accept: () => true, dismiss() {}, visible: () => true
@@ -145,6 +167,73 @@ describe('visual ghost widget', () => {
       fanVisible: false
     });
     expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(false);
+  });
+
+  it('dispatches only real fan transitions against a live editor view', () => {
+    const plugin = createGhostTextPlugin({
+      accept: () => true, dismiss() {}, visible: () => true
+    });
+    let state = EditorState.create({
+      doc: defaultMarkdownParser.parse('A waits'),
+      plugins: [plugin]
+    });
+    let destroyed = false;
+    let dispatches = 0;
+    const view = {
+      get state() { return state; },
+      get isDestroyed() { return destroyed; },
+      dispatch(transaction: Parameters<EditorState['apply']>[0]) {
+        dispatches += 1;
+        state = state.apply(transaction);
+      }
+    } as unknown as EditorView;
+    setGhostText(view, {
+      ...suggestion,
+      alternatives: [
+        { candidateId: 'a', presentationKey: suggestion.presentationKey, text: ' first' },
+        { candidateId: 'b', presentationKey: 'b:1', text: ' second' }
+      ],
+      fanVisible: false
+    });
+    dispatches = 0;
+
+    setGhostFanVisible(view, false);
+    setGhostFanVisible(view, true);
+    setGhostFanVisible(view, true);
+    destroyed = true;
+    setGhostFanVisible(view, false);
+
+    expect(dispatches).toBe(1);
+    expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(true);
+  });
+
+  it('does not treat Command-Option or Control-Option as the fan modifier', () => {
+    const modifierStates: boolean[] = [];
+    const plugin = createGhostTextPlugin({
+      accept: () => true,
+      dismiss() {},
+      visible: () => true,
+      modifier: (held) => modifierStates.push(held)
+    });
+    const state = EditorState.create({
+      doc: defaultMarkdownParser.parse('A waits'),
+      plugins: [plugin]
+    });
+    const view = { state } as unknown as EditorView;
+    const event = (metaKey: boolean, ctrlKey: boolean) => ({
+      key: 'Alt',
+      altKey: true,
+      metaKey,
+      ctrlKey,
+      isComposing: false,
+      keyCode: 18
+    }) as KeyboardEvent;
+
+    plugin.props.handleKeyDown?.call(plugin, view, event(true, false));
+    plugin.props.handleKeyDown?.call(plugin, view, event(false, true));
+    plugin.props.handleKeyDown?.call(plugin, view, event(false, false));
+
+    expect(modifierStates).toEqual([false, false, true]);
   });
 
   it('reverses the exact last accepted word before falling back to macOS navigation', () => {

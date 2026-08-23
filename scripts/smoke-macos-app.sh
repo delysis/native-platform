@@ -164,15 +164,28 @@ LOOM_PROJECT_BUSY_MONITOR_STOP=
 LOOM_GENERATION_GUARD_PID=
 LOOM_GENERATION_GUARD_STOP=
 
+settle_background_monitor_for_cleanup() {
+  monitor_pid=$1
+  stop_path=$2
+  [ -n "$monitor_pid" ] || return 0
+  kill -0 "$monitor_pid" 2>/dev/null || return 0
+  if [ -n "$stop_path" ]; then touch "$stop_path"; fi
+  settle_attempt=0
+  while kill -0 "$monitor_pid" 2>/dev/null && [ "$settle_attempt" -lt 100 ]; do
+    settle_attempt=$((settle_attempt + 1))
+    sleep 0.05
+  done
+  if kill -0 "$monitor_pid" 2>/dev/null; then
+    kill "$monitor_pid" 2>/dev/null || true
+  fi
+  wait "$monitor_pid" 2>/dev/null || true
+}
+
 cleanup_failed_process() {
-  if [ -n "$LOOM_PROJECT_BUSY_MONITOR_PID" ] && kill -0 "$LOOM_PROJECT_BUSY_MONITOR_PID" 2>/dev/null; then
-    kill "$LOOM_PROJECT_BUSY_MONITOR_PID" 2>/dev/null || true
-    wait "$LOOM_PROJECT_BUSY_MONITOR_PID" 2>/dev/null || true
-  fi
-  if [ -n "$LOOM_GENERATION_GUARD_PID" ] && kill -0 "$LOOM_GENERATION_GUARD_PID" 2>/dev/null; then
-    kill "$LOOM_GENERATION_GUARD_PID" 2>/dev/null || true
-    wait "$LOOM_GENERATION_GUARD_PID" 2>/dev/null || true
-  fi
+  settle_background_monitor_for_cleanup \
+    "$LOOM_PROJECT_BUSY_MONITOR_PID" "$LOOM_PROJECT_BUSY_MONITOR_STOP"
+  settle_background_monitor_for_cleanup \
+    "$LOOM_GENERATION_GUARD_PID" "$LOOM_GENERATION_GUARD_STOP"
   if [ -n "$ACTIVE_PID" ] && kill -0 "$ACTIVE_PID" 2>/dev/null; then
     kill "$ACTIVE_PID" 2>/dev/null || true
   fi
@@ -1476,6 +1489,7 @@ wait_for_loom_generation_family() {
   database=$1
   baseline=$2
   attempt=0
+  family_evidence=
   while [ "$attempt" -lt 1800 ]; do
     if { [ -n "${LOOM_GENERATION_GUARD_FAILURE:-}" ] && [ -f "$LOOM_GENERATION_GUARD_FAILURE" ]; } ||
       { [ -n "${LOOM_PROJECT_BUSY_MONITOR_FAILURE:-}" ] && [ -f "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" ]; }; then
@@ -1492,14 +1506,16 @@ wait_for_loom_generation_family() {
             echo "Loom admitted $delta generation runs instead of one four-choice batch" >&2
             return 1
           fi
-          family_rows=$(sqlite3 -json "$database" \
-            "SELECT run_id, branch_id, document_id, source_revision_id, source_blob_id, target_start_byte, target_end_byte, model_environment_artifact_id, prompt_recipe_artifact_id, context_recipe_artifact_id, authority_policy_artifact_id, created_at_ms FROM generation_runs ORDER BY created_at_ms, run_id LIMIT 4 OFFSET $baseline;" \
-            2>/dev/null || printf '[]')
-          if ! family_evidence=$(
-            LOOM_FAMILY_ROWS="$family_rows" \
-            LOOM_FAMILY_BASELINE="$baseline" \
-            LOOM_FAMILY_ADMITTED="$count" \
-            node <<'NODE'
+          if [ -z "$family_evidence" ]; then
+            family_rows=$(sqlite3 -json "$database" \
+              "SELECT run_id, branch_id, document_id, source_revision_id, source_blob_id, target_start_byte, target_end_byte, model_environment_artifact_id, prompt_recipe_artifact_id, context_recipe_artifact_id, authority_policy_artifact_id, created_at_ms FROM generation_runs ORDER BY created_at_ms, run_id LIMIT 4 OFFSET $baseline;" \
+              2>/dev/null || true)
+            [ -n "$family_rows" ] || family_rows='[]'
+            if ! family_evidence=$(
+              LOOM_FAMILY_ROWS="$family_rows" \
+              LOOM_FAMILY_BASELINE="$baseline" \
+              LOOM_FAMILY_ADMITTED="$count" \
+              node <<'NODE'
 const rows = JSON.parse(process.env.LOOM_FAMILY_ROWS || '[]');
 const unique = (field) => new Set(rows.map((row) => JSON.stringify(row[field])));
 const same = (field) => unique(field).size === 1;
@@ -1544,19 +1560,73 @@ process.stdout.write(JSON.stringify({
   created_at_ms: rows[0].created_at_ms,
 }));
 NODE
-          ); then
-            echo "Loom's four runs were not one exact source/anchor/model family" >&2
+            ); then
+              echo "Loom's four runs were not one exact source/anchor/model family" >&2
+              return 1
+            fi
+          fi
+
+          terminal_failures=$(sqlite3 -json "$database" \
+            "WITH family AS (SELECT run_id FROM generation_runs ORDER BY created_at_ms, run_id LIMIT 4 OFFSET $baseline) SELECT t.run_id, t.status, t.error, t.created_at_ms FROM generation_terminals t JOIN family f ON f.run_id = t.run_id WHERE t.status <> 'completed' ORDER BY t.created_at_ms, t.run_id;" \
+            2>/dev/null || true)
+          if [ -n "$terminal_failures" ]; then
+            echo "Loom's admitted completion family reached a non-completed terminal: $terminal_failures" >&2
             return 1
           fi
-          printf '%s\n' "$family_evidence"
-          return 0
+
+          completion_rows=$(sqlite3 -json "$database" \
+            "WITH family AS (SELECT run_id, created_at_ms FROM generation_runs ORDER BY created_at_ms, run_id LIMIT 4 OFFSET $baseline) SELECT f.run_id, t.status, t.event_id AS terminal_event_id, t.candidate_id AS terminal_candidate_id, t.created_at_ms AS terminal_created_at_ms, c.candidate_id, c.generated_span_artifact_id, c.token_trace_artifact_id AS candidate_token_trace_artifact_id, c.output_blob_id AS candidate_output_blob_id, e.operation_id, e.output_artifact_id, e.output_blob_id AS evidence_output_blob_id, e.token_trace_artifact_id AS evidence_token_trace_artifact_id, e.candidate_id AS evidence_candidate_id, e.created_at_ms AS evidence_created_at_ms FROM family f JOIN generation_terminals t ON t.run_id = f.run_id AND t.status = 'completed' JOIN generation_candidates c ON c.run_id = f.run_id JOIN generation_terminal_evidence e ON e.run_id = f.run_id ORDER BY f.created_at_ms, f.run_id;" \
+            2>/dev/null || true)
+          [ -n "$completion_rows" ] || completion_rows='[]'
+          if completed_family_evidence=$(
+            LOOM_FAMILY_ADMISSION="$family_evidence" \
+            LOOM_FAMILY_COMPLETIONS="$completion_rows" \
+            node <<'NODE'
+const admission = JSON.parse(process.env.LOOM_FAMILY_ADMISSION || '{}');
+const rows = JSON.parse(process.env.LOOM_FAMILY_COMPLETIONS || '[]');
+const required = (row, field) => typeof row[field] === 'string' && row[field].length > 0;
+const runIds = rows.map((row) => row.run_id);
+const exact = rows.length === 4 &&
+  new Set(runIds).size === 4 &&
+  JSON.stringify([...runIds].sort()) === JSON.stringify([...admission.run_ids].sort()) &&
+  rows.every((row) =>
+    row.status === 'completed' &&
+    required(row, 'terminal_event_id') &&
+    required(row, 'terminal_candidate_id') &&
+    required(row, 'candidate_id') &&
+    required(row, 'evidence_candidate_id') &&
+    row.terminal_candidate_id === row.candidate_id &&
+    row.evidence_candidate_id === row.candidate_id &&
+    required(row, 'generated_span_artifact_id') &&
+    required(row, 'candidate_token_trace_artifact_id') &&
+    required(row, 'evidence_token_trace_artifact_id') &&
+    row.candidate_token_trace_artifact_id === row.evidence_token_trace_artifact_id &&
+    required(row, 'candidate_output_blob_id') &&
+    required(row, 'evidence_output_blob_id') &&
+    row.candidate_output_blob_id === row.evidence_output_blob_id &&
+    required(row, 'operation_id') &&
+    required(row, 'output_artifact_id') &&
+    row.generated_span_artifact_id === row.output_artifact_id
+  );
+if (!exact) process.exit(1);
+process.stdout.write(JSON.stringify({
+  ...admission,
+  family_terminal_status: 'completed',
+  completed_family_size: rows.length,
+  terminals: rows,
+}));
+NODE
+          ); then
+            printf '%s\n' "$completed_family_evidence"
+            return 0
+          fi
         fi
         ;;
     esac
     attempt=$((attempt + 1))
     sleep 0.2
   done
-  echo "Loom never durably admitted a four-choice generation family" >&2
+  echo "Loom never durably completed one exact four-choice generation family" >&2
   return 1
 }
 
@@ -1738,38 +1808,132 @@ func sameFamily(
         integer(witness, "family_count") == 4
 }
 
-func fanAccessibility() -> (listbox: Bool, options: [[String: Any]]) {
-    var listbox = false
-    var byPresentation: [String: [String: Any]] = [:]
-    for element in descendants() {
-        let values = strings(element)
-        if values.contains(where: { $0 == "Completion suggestions" }) {
-            listbox = true
-        }
-        for value in values {
-            guard var option = jsonObject(
-                in: value,
-                schema: "delysis.loom-completion-option.v1"
-            ) else { continue }
-            option["ax_selected"] =
-                (attribute(element, kAXSelectedAttribute as CFString) as? Bool) == true
-            let key = string(option, "presentation_key")
-            if !key.isEmpty { byPresentation[key] = option }
+func actionNames(_ element: AXUIElement) -> [String] {
+    var names: CFArray?
+    guard AXUIElementCopyActionNames(element, &names) == .success else { return [] }
+    return names as? [String] ?? []
+}
+
+func selectedState(_ element: AXUIElement) -> Bool {
+    let value = attribute(element, kAXSelectedAttribute as CFString)
+    if let selected = value as? Bool { return selected }
+    return (value as? NSNumber)?.boolValue ?? false
+}
+
+let suggestionLabelPattern = try! NSRegularExpression(
+    pattern: #"^Suggestion ([1-9][0-9]*) of ([1-9][0-9]*): (.+)$"#
+)
+
+func suggestionOrdinal(_ label: String) -> (index: Int, count: Int)? {
+    let range = NSRange(label.startIndex..<label.endIndex, in: label)
+    guard let match = suggestionLabelPattern.firstMatch(in: label, range: range),
+          let indexRange = Range(match.range(at: 1), in: label),
+          let countRange = Range(match.range(at: 2), in: label),
+          let index = Int(label[indexRange]),
+          let count = Int(label[countRange]) else { return nil }
+    return (index, count)
+}
+
+func subtree(_ root: AXUIElement) -> [AXUIElement] {
+    var queue = [root]
+    var cursor = 0
+    while cursor < queue.count && cursor < 256 {
+        let element = queue[cursor]
+        cursor += 1
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
         }
     }
-    return (listbox, Array(byPresentation.values))
+    return queue
+}
+
+func accessibilityObservation(_ element: AXUIElement) -> [String: Any] {
+    [
+        "role": stringAttribute(element, kAXRoleAttribute as CFString),
+        "subrole": stringAttribute(element, kAXSubroleAttribute as CFString),
+        "strings": strings(element),
+        "selected": selectedState(element),
+        "actions": actionNames(element)
+    ]
+}
+
+func fanAccessibility() -> (
+    listbox: Bool,
+    options: [[String: Any]],
+    observations: [[String: Any]]
+) {
+    let listboxes = descendants().filter { element in
+        stringAttribute(element, kAXRoleAttribute as CFString) == kAXListRole as String &&
+            strings(element).contains("Completion suggestions")
+    }
+    var byIndex: [Int: [String: Any]] = [:]
+    var observations: [[String: Any]] = []
+    for listbox in listboxes {
+        observations.append(accessibilityObservation(listbox))
+        for element in subtree(listbox) {
+            for label in strings(element) {
+                guard let ordinal = suggestionOrdinal(label), ordinal.count == 4 else { continue }
+                let option: [String: Any] = [
+                    "index": ordinal.index,
+                    "count": ordinal.count,
+                    "label": label,
+                    "ax_selected": selectedState(element)
+                ]
+                if byIndex[ordinal.index] == nil || selectedState(element) {
+                    byIndex[ordinal.index] = option
+                }
+                observations.append(accessibilityObservation(element))
+            }
+        }
+    }
+    return (!listboxes.isEmpty, Array(byIndex.values), observations)
 }
 
 func exactAccessibleFan(_ witness: [String: Any]) -> [[String: Any]]? {
     let fan = fanAccessibility()
+    let candidates = witness["candidates"] as? [[String: Any]] ?? []
     guard fan.listbox,
           fan.options.count == 4,
-          fan.options.filter({ bool($0, "ax_selected") }).count == 1,
-          let selected = fan.options.first(where: { bool($0, "ax_selected") }),
+          candidates.count == 4 else {
+        return nil
+    }
+    var enriched: [[String: Any]] = []
+    for option in fan.options.sorted(by: { integer($0, "index") < integer($1, "index") }) {
+        let index = integer(option, "index")
+        guard index == enriched.count + 1 else { return nil }
+        let candidate = candidates[index - 1]
+        var joined = option
+        joined["run_id"] = string(candidate, "run_id")
+        joined["candidate_id"] = string(candidate, "candidate_id")
+        joined["presentation_key"] = string(candidate, "presentation_key")
+        enriched.append(joined)
+    }
+    guard enriched.filter({ bool($0, "ax_selected") }).count == 1,
+          let selected = enriched.first(where: { bool($0, "ax_selected") }),
           string(selected, "run_id") == string(witness, "selected_run_id") else {
         return nil
     }
-    return fan.options.sorted { integer($0, "index") < integer($1, "index") }
+    return enriched
+}
+
+func waitForAccessibleFan(
+    timeout: TimeInterval,
+    _ predicate: ([String: Any]) -> Bool
+) -> (witness: [String: Any], options: [[String: Any]])? {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if asynchronousGuardFailed() { return nil }
+        if let witness = completionWitness(), predicate(witness),
+           let options = exactAccessibleFan(witness) {
+            return (witness, options)
+        }
+        // WebKit publishes the application witness and the rebuilt ARIA
+        // subtree on separate accessibility turns. Require both exact views
+        // to converge instead of sampling the option rows once immediately
+        // after the parent witness changes.
+        Thread.sleep(forTimeInterval: 0.05)
+    } while Date() < deadline
+    return nil
 }
 
 @discardableResult
@@ -1884,49 +2048,65 @@ guard postKey(58, down: true, flags: [.maskAlternate]) else {
 defer { postKey(58, down: false, flags: []) }
 
 func releaseOptionAndFail(_ message: String) -> Never {
+    let fan = fanAccessibility()
+    let diagnostic: [String: Any] = [
+        "completion_witness": completionWitness() ?? [:],
+        "fan_listbox_observed": fan.listbox,
+        "fan_options": fan.options,
+        "fan_observations": fan.observations
+    ]
+    if JSONSerialization.isValidJSONObject(diagnostic),
+       let data = try? JSONSerialization.data(withJSONObject: diagnostic, options: [.sortedKeys]),
+       let json = String(data: data, encoding: .utf8) {
+        fputs("completion fan diagnostics: \(json)\n", stderr)
+    }
     postKey(58, down: false, flags: [])
     fputs("\(message)\n", stderr)
     exit(1)
 }
 
-guard let fanOpened = waitForWitness(timeout: 10, { witness in
+guard let fanOpenedEvidence = waitForAccessibleFan(timeout: 10, { witness in
     let rendered = visual(witness)
     return sameFamily(witness, context: context, runIds: runIds) &&
         bool(rendered, "optionHeld") &&
         bool(rendered, "fanVisible") &&
         stringArray(rendered, "alternativeRunIds") == runIds
-}), let fanOptions = exactAccessibleFan(fanOpened) else {
+}) else {
     releaseOptionAndFail("physical Option-down did not expose one accessible four-choice fan")
 }
+let fanOpened = fanOpenedEvidence.witness
+let fanOptions = fanOpenedEvidence.options
 
 guard postKey(125, down: true, flags: [.maskAlternate]),
       postKey(125, down: false, flags: [.maskAlternate]) else {
     releaseOptionAndFail("could not construct Loom's Option-Down events")
 }
-guard let cycledDown = waitForWitness(timeout: 10, { witness in
+guard let cycledDownEvidence = waitForAccessibleFan(timeout: 10, { witness in
     let rendered = visual(witness)
     return sameFamily(witness, context: context, runIds: runIds) &&
         string(witness, "selected_run_id") != initialRunId &&
         bool(rendered, "optionHeld") &&
         bool(rendered, "fanVisible")
-}), exactAccessibleFan(cycledDown) != nil else {
+}) else {
     releaseOptionAndFail("Option-Down did not select a different run while the four-choice fan stayed visible")
 }
+let cycledDown = cycledDownEvidence.witness
 let cycledRunId = string(cycledDown, "selected_run_id")
 
 guard postKey(126, down: true, flags: [.maskAlternate]),
       postKey(126, down: false, flags: [.maskAlternate]) else {
     releaseOptionAndFail("could not construct Loom's Option-Up events")
 }
-guard let cycledUp = waitForWitness(timeout: 10, { witness in
+guard let cycledUpEvidence = waitForAccessibleFan(timeout: 10, { witness in
     let rendered = visual(witness)
     return sameFamily(witness, context: context, runIds: runIds) &&
         string(witness, "selected_run_id") == initialRunId &&
         bool(rendered, "optionHeld") &&
         bool(rendered, "fanVisible")
-}), exactAccessibleFan(cycledUp) != nil else {
+}) else {
     releaseOptionAndFail("Option-Up did not restore the original run while the four-choice fan stayed visible")
 }
+let cycledUp = cycledUpEvidence.witness
 
 guard postKey(124, down: true, flags: [.maskAlternate]),
       postKey(124, down: false, flags: [.maskAlternate]) else {
@@ -1959,7 +2139,7 @@ guard waitForExactManuscript(original, timeout: 30) else {
     releaseOptionAndFail("Option-Left did not restore the exact pre-acceptance manuscript bytes")
 }
 
-guard let rolledBack = waitForWitness(timeout: 10, { witness in
+guard let rolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
     let rendered = visual(witness)
     return sameFamily(witness, context: context, runIds: runIds) &&
         string(witness, "selected_run_id") == initialRunId &&
@@ -1968,9 +2148,10 @@ guard let rolledBack = waitForWitness(timeout: 10, { witness in
         bool(rendered, "optionHeld") &&
         bool(rendered, "fanVisible") &&
         stringArray(rendered, "alternativeRunIds") == runIds
-}), exactAccessibleFan(rolledBack) != nil else {
+}) else {
     releaseOptionAndFail("Option-Left did not restore the same cached four-choice fan while Option remained held")
 }
+let rolledBack = rolledBackEvidence.witness
 
 postKey(58, down: false, flags: [])
 guard let optionReleased = waitForWitness(timeout: 10, { witness in
@@ -2054,7 +2235,7 @@ guard AXUIElementSetAttributeValue(
     releaseOptionAndFail("could not dispatch Shuttle's exact Option-Left rollback")
 }
 guard waitForExactManuscript(original, timeout: 30),
-      let shuttleRolledBack = waitForWitness(timeout: 10, { witness in
+      let shuttleRolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
               integer(witness, "accepted_chunk_count") == 0 &&
@@ -2062,9 +2243,10 @@ guard waitForExactManuscript(original, timeout: 30),
               bool(rendered, "optionHeld") &&
               bool(rendered, "fanVisible") &&
               stringArray(rendered, "alternativeRunIds") == runIds
-      }), exactAccessibleFan(shuttleRolledBack) != nil else {
+      }) else {
     releaseOptionAndFail("Option-Left did not exactly reverse Shuttle's cached word and restore its fan")
 }
+let shuttleRolledBack = shuttleRolledBackEvidence.witness
 postKey(58, down: false, flags: [])
 guard let shuttleRollbackReleased = waitForWitness(timeout: 10, { witness in
     let rendered = visual(witness)
@@ -2079,21 +2261,22 @@ guard let shuttleRollbackReleased = waitForWitness(timeout: 10, { witness in
 // Prove the documented fan Return action against a deliberately non-default
 // run, then use the exhausted session's rollback-only plan immediately.
 guard postKey(58, down: true, flags: [.maskAlternate]),
-      let returnFan = waitForWitness(timeout: 10, { witness in
+      waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
               bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
-      }), exactAccessibleFan(returnFan) != nil,
+      }) != nil,
       postKey(125, down: true, flags: [.maskAlternate]),
       postKey(125, down: false, flags: [.maskAlternate]),
-      let returnSelected = waitForWitness(timeout: 10, { witness in
+      let returnSelectedEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
               string(witness, "selected_run_id") != initialRunId &&
               bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
-      }), exactAccessibleFan(returnSelected) != nil else {
+      }) else {
     releaseOptionAndFail("could not select a non-default cached run for fan Return")
 }
+let returnSelected = returnSelectedEvidence.witness
 let returnRunId = string(returnSelected, "selected_run_id")
 let returnPreviousSequence = integer(lastAction(returnSelected), "sequence")
 guard postKey(36, down: true, flags: [.maskAlternate]),
@@ -2121,16 +2304,17 @@ guard returnAcceptedBytes.count - original.count == integer(returnAction, "inser
       postKey(123, down: true, flags: [.maskAlternate]),
       postKey(123, down: false, flags: [.maskAlternate]),
       waitForExactManuscript(original, timeout: 30),
-      let returnRolledBack = waitForWitness(timeout: 10, { witness in
+      let returnRolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
               string(witness, "selected_run_id") == returnRunId &&
               integer(witness, "accepted_chunk_count") == 0 &&
               bool(witness, "authority_frozen") &&
               bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
-      }), exactAccessibleFan(returnRolledBack) != nil else {
+      }) else {
     releaseOptionAndFail("fan Return was not exact, focused, or immediately reversible")
 }
+let returnRolledBack = returnRolledBackEvidence.witness
 postKey(58, down: false, flags: [])
 guard let returnReleased = waitForWitness(timeout: 10, { witness in
     let rendered = visual(witness)
@@ -2144,21 +2328,22 @@ guard let returnReleased = waitForWitness(timeout: 10, { witness in
 // Repeat with fan Tab. A literal-tab fallback cannot satisfy the action kind,
 // selected-run identity, or exact authorized byte delta below.
 guard postKey(58, down: true, flags: [.maskAlternate]),
-      let tabFan = waitForWitness(timeout: 10, { witness in
+      waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
               bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
-      }), exactAccessibleFan(tabFan) != nil,
+      }) != nil,
       postKey(125, down: true, flags: [.maskAlternate]),
       postKey(125, down: false, flags: [.maskAlternate]),
-      let tabSelected = waitForWitness(timeout: 10, { witness in
+      let tabSelectedEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
               string(witness, "selected_run_id") != returnRunId &&
               bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
-      }), exactAccessibleFan(tabSelected) != nil else {
+      }) else {
     releaseOptionAndFail("could not select another cached run for fan Tab")
 }
+let tabSelected = tabSelectedEvidence.witness
 let tabRunId = string(tabSelected, "selected_run_id")
 let tabPreviousSequence = integer(lastAction(tabSelected), "sequence")
 guard postKey(48, down: true, flags: [.maskAlternate]),
@@ -2186,16 +2371,17 @@ guard tabAcceptedBytes.count - original.count == integer(tabAction, "inserted_ut
       postKey(123, down: true, flags: [.maskAlternate]),
       postKey(123, down: false, flags: [.maskAlternate]),
       waitForExactManuscript(original, timeout: 30),
-      let tabRolledBack = waitForWitness(timeout: 10, { witness in
+      let tabRolledBackEvidence = waitForAccessibleFan(timeout: 10, { witness in
           let rendered = visual(witness)
           return sameFamily(witness, context: context, runIds: runIds) &&
               string(witness, "selected_run_id") == tabRunId &&
               integer(witness, "accepted_chunk_count") == 0 &&
               bool(witness, "authority_frozen") &&
               bool(rendered, "optionHeld") && bool(rendered, "fanVisible")
-      }), exactAccessibleFan(tabRolledBack) != nil else {
+      }) else {
     releaseOptionAndFail("fan Tab was not exact, focused, or immediately reversible")
 }
+let tabRolledBack = tabRolledBackEvidence.witness
 postKey(58, down: false, flags: [])
 guard let tabReleased = waitForWitness(timeout: 10, { witness in
     let rendered = visual(witness)
@@ -2659,7 +2845,13 @@ run_once() {
       if ! RUN_1_REAL_WORD_REVERSAL_EVIDENCE=$(exercise_loom_completion_word_reversal \
         "$ACTIVE_PID" "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" \
         "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"); then
+        RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-interaction-failure-diagnostics.json"
+        capture_loom_completion_diagnostics \
+          "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
+          "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
         echo "the exact four-choice cache did not survive fan, Shuttle, Return, Tab, and rollback checks" >&2
+        echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
+        cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
         echo "application logs: $stdout_log and $stderr_log" >&2
         return 1
       fi
@@ -2712,6 +2904,32 @@ NODE
       echo "Format text -> Body did not exactly reverse the paragraph style" >&2
       return 1
     fi
+    RUN_1_HEADING_SENTINEL="## $RUN_1_EDITOR_SENTINEL"
+    if ! RUN_1_FORMAT_HEADING_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Heading") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_HEADING_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "caret-end" >/dev/null; then
+      echo "Format text -> Heading did not preserve exact manuscript/AX/focus state" >&2
+      return 1
+    fi
+    if ! RUN_1_FORMAT_HEADING_BODY_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Body") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "caret-end" >/dev/null; then
+      echo "Format text -> Body did not exactly reverse Heading" >&2
+      return 1
+    fi
+    RUN_1_SUBHEADING_SENTINEL="### $RUN_1_EDITOR_SENTINEL"
+    if ! RUN_1_FORMAT_SUBHEADING_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Subheading") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_SUBHEADING_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "caret-end" >/dev/null; then
+      echo "Format text -> Subheading did not preserve exact manuscript/AX/focus state" >&2
+      return 1
+    fi
+    if ! RUN_1_FORMAT_SUBHEADING_BODY_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Body") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "caret-end" >/dev/null; then
+      echo "Format text -> Body did not exactly reverse Subheading" >&2
+      return 1
+    fi
 
     if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
       ! RUN_1_FORMAT_BOLD_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Bold") ||
@@ -2729,6 +2947,36 @@ NODE
     fi
 
     if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
+      ! RUN_1_FORMAT_ITALIC_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Italic") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "*$RUN_1_EDITOR_CORE_SENTINEL* " ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
+      echo "Format text -> Italic did not preserve the exact selected WYSIWYG text" >&2
+      return 1
+    fi
+    if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
+      ! RUN_1_FORMAT_ITALIC_REVERSE_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Italic") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
+      echo "Format text -> Italic did not reverse to the exact manuscript" >&2
+      return 1
+    fi
+
+    if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
+      ! RUN_1_FORMAT_QUOTE_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Block quote") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "> $RUN_1_EDITOR_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
+      echo "Format text -> Block quote did not preserve the exact selected WYSIWYG text" >&2
+      return 1
+    fi
+    if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
+      ! RUN_1_FORMAT_QUOTE_REVERSE_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Block quote") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
+      echo "Format text -> Block quote did not reverse to the exact manuscript" >&2
+      return 1
+    fi
+
+    if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
       ! RUN_1_FORMAT_LIST_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Bulleted list") ||
       ! require_loom_manuscript_text "$loom_manuscript" "* $RUN_1_EDITOR_SENTINEL" ||
       ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
@@ -2740,6 +2988,21 @@ NODE
       ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" ||
       ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
       echo "Format text -> Bulleted list did not reverse to the exact manuscript" >&2
+      return 1
+    fi
+
+    if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
+      ! RUN_1_FORMAT_NUMBERED_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Numbered list") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "1. $RUN_1_EDITOR_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
+      echo "Format text -> Numbered list did not preserve the exact selected WYSIWYG text" >&2
+      return 1
+    fi
+    if ! select_all_in_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" >/dev/null ||
+      ! RUN_1_FORMAT_NUMBERED_REVERSE_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Numbered list") ||
+      ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" ||
+      ! require_loom_editor_state "$ACTIVE_PID" "$RUN_1_EDITOR_SENTINEL" "select-all" >/dev/null; then
+      echo "Format text -> Numbered list did not reverse to the exact manuscript" >&2
       return 1
     fi
 
@@ -2764,10 +3027,20 @@ NODE
     RUN_1_FORMATTING_EVIDENCE=$(
       DELYSIS_FORMAT_TITLE="$RUN_1_FORMAT_TITLE_EVIDENCE" \
       DELYSIS_FORMAT_BODY="$RUN_1_FORMAT_BODY_EVIDENCE" \
+      DELYSIS_FORMAT_HEADING="$RUN_1_FORMAT_HEADING_EVIDENCE" \
+      DELYSIS_FORMAT_HEADING_BODY="$RUN_1_FORMAT_HEADING_BODY_EVIDENCE" \
+      DELYSIS_FORMAT_SUBHEADING="$RUN_1_FORMAT_SUBHEADING_EVIDENCE" \
+      DELYSIS_FORMAT_SUBHEADING_BODY="$RUN_1_FORMAT_SUBHEADING_BODY_EVIDENCE" \
       DELYSIS_FORMAT_BOLD="$RUN_1_FORMAT_BOLD_EVIDENCE" \
       DELYSIS_FORMAT_BOLD_REVERSE="$RUN_1_FORMAT_BOLD_REVERSE_EVIDENCE" \
+      DELYSIS_FORMAT_ITALIC="$RUN_1_FORMAT_ITALIC_EVIDENCE" \
+      DELYSIS_FORMAT_ITALIC_REVERSE="$RUN_1_FORMAT_ITALIC_REVERSE_EVIDENCE" \
+      DELYSIS_FORMAT_QUOTE="$RUN_1_FORMAT_QUOTE_EVIDENCE" \
+      DELYSIS_FORMAT_QUOTE_REVERSE="$RUN_1_FORMAT_QUOTE_REVERSE_EVIDENCE" \
       DELYSIS_FORMAT_LIST="$RUN_1_FORMAT_LIST_EVIDENCE" \
       DELYSIS_FORMAT_LIST_REVERSE="$RUN_1_FORMAT_LIST_REVERSE_EVIDENCE" \
+      DELYSIS_FORMAT_NUMBERED="$RUN_1_FORMAT_NUMBERED_EVIDENCE" \
+      DELYSIS_FORMAT_NUMBERED_REVERSE="$RUN_1_FORMAT_NUMBERED_REVERSE_EVIDENCE" \
       DELYSIS_FORMAT_LINK="$RUN_1_FORMAT_LINK_EVIDENCE" \
       DELYSIS_FORMAT_REMOVE="$RUN_1_FORMAT_REMOVE_EVIDENCE" \
       DELYSIS_FORMAT_CANONICAL="$RUN_1_EDITOR_SENTINEL" \
@@ -2782,10 +3055,20 @@ process.stdout.write(JSON.stringify({
   stages: [
     stage('title', e.DELYSIS_FORMAT_TITLE, `# ${e.DELYSIS_FORMAT_CANONICAL}`),
     stage('body', e.DELYSIS_FORMAT_BODY, e.DELYSIS_FORMAT_CANONICAL),
+    stage('heading', e.DELYSIS_FORMAT_HEADING, `## ${e.DELYSIS_FORMAT_CANONICAL}`),
+    stage('heading_body', e.DELYSIS_FORMAT_HEADING_BODY, e.DELYSIS_FORMAT_CANONICAL),
+    stage('subheading', e.DELYSIS_FORMAT_SUBHEADING, `### ${e.DELYSIS_FORMAT_CANONICAL}`),
+    stage('subheading_body', e.DELYSIS_FORMAT_SUBHEADING_BODY, e.DELYSIS_FORMAT_CANONICAL),
     stage('bold', e.DELYSIS_FORMAT_BOLD, `**${e.DELYSIS_FORMAT_CORE}** `),
     stage('bold_reverse', e.DELYSIS_FORMAT_BOLD_REVERSE, e.DELYSIS_FORMAT_CANONICAL),
+    stage('italic', e.DELYSIS_FORMAT_ITALIC, `*${e.DELYSIS_FORMAT_CORE}* `),
+    stage('italic_reverse', e.DELYSIS_FORMAT_ITALIC_REVERSE, e.DELYSIS_FORMAT_CANONICAL),
+    stage('block_quote', e.DELYSIS_FORMAT_QUOTE, `> ${e.DELYSIS_FORMAT_CANONICAL}`),
+    stage('block_quote_reverse', e.DELYSIS_FORMAT_QUOTE_REVERSE, e.DELYSIS_FORMAT_CANONICAL),
     stage('bullet_list', e.DELYSIS_FORMAT_LIST, `* ${e.DELYSIS_FORMAT_CANONICAL}`),
     stage('bullet_list_reverse', e.DELYSIS_FORMAT_LIST_REVERSE, e.DELYSIS_FORMAT_CANONICAL),
+    stage('numbered_list', e.DELYSIS_FORMAT_NUMBERED, `1. ${e.DELYSIS_FORMAT_CANONICAL}`),
+    stage('numbered_list_reverse', e.DELYSIS_FORMAT_NUMBERED_REVERSE, e.DELYSIS_FORMAT_CANONICAL),
     stage('link', e.DELYSIS_FORMAT_LINK, `[${e.DELYSIS_FORMAT_CORE}](${e.DELYSIS_FORMAT_LINK_DESTINATION}) `),
     stage('remove_link', e.DELYSIS_FORMAT_REMOVE, e.DELYSIS_FORMAT_CANONICAL),
   ],
