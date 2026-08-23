@@ -135,6 +135,12 @@ test("local macOS smoke can verify the exact emitted archive", () => {
   const smoke = read(smokeScriptPath);
   assert.match(release, /exact-archive smoke:/);
   assert.match(smoke, /ditto -x -k "\$INPUT_ARCHIVE" "\$INSTALL_ROOT"/);
+  assert.match(smoke, /BUNDLE=\$\(CDPATH= cd -- "\$BUNDLE" && pwd -P\)/);
+  assert.ok(
+    smoke.indexOf('BUNDLE=$(CDPATH= cd -- "$BUNDLE" && pwd -P)') <
+      smoke.indexOf('EXECUTABLE="$BUNDLE/Contents/MacOS/$BINARY_NAME"'),
+    "the bundle path must be physical before exact executable PID binding",
+  );
   assert.match(smoke, /input_archive_sha256:/);
   assert.match(smoke, /input_release_receipt_sha256:/);
 });

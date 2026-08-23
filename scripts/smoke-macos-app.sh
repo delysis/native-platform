@@ -115,9 +115,17 @@ else
   BUNDLE="$TARGET_DIR/release/bundle/macos/$APP_NAME.app"
 fi
 
+if [ ! -d "$BUNDLE" ]; then
+  echo "expected packaged application is missing or incomplete: $BUNDLE" >&2
+  exit 1
+fi
+# LaunchServices reports executable commands through the physical `/private`
+# path while mktemp commonly returns its `/var` alias. Canonicalize the bundle
+# before launching so exact-PID binding compares one filesystem identity.
+BUNDLE=$(CDPATH= cd -- "$BUNDLE" && pwd -P)
 EXECUTABLE="$BUNDLE/Contents/MacOS/$BINARY_NAME"
 PLIST="$BUNDLE/Contents/Info.plist"
-if [ ! -d "$BUNDLE" ] || [ ! -x "$EXECUTABLE" ] || [ ! -f "$PLIST" ]; then
+if [ ! -x "$EXECUTABLE" ] || [ ! -f "$PLIST" ]; then
   echo "expected packaged application is missing or incomplete: $BUNDLE" >&2
   exit 1
 fi
