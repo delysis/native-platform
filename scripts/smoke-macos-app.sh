@@ -2542,8 +2542,13 @@ require_loom_manuscript_text() {
     if node - "$manuscript" "$expected" <<'NODE'
 const fs = require('fs');
 const [path, expected] = process.argv.slice(2);
-const observed = fs.readFileSync(path, 'utf8');
-process.exit(observed === expected ? 0 : 1);
+try {
+  const observed = fs.readFileSync(path, 'utf8');
+  process.exit(observed === expected ? 0 : 1);
+} catch (error) {
+  if (error?.code === 'ENOENT') process.exit(1);
+  throw error;
+}
 NODE
     then
       return 0

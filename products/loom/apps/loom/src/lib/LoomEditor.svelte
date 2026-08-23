@@ -448,6 +448,17 @@
           }
           onSelectionChange(null, 'selection_settling', null);
         } else if (transaction.selectionSet) {
+          // An open formatting palette owns a selection snapshot while its
+          // controls have focus. Keep that snapshot synchronized when the
+          // editor itself is still focused, including keyboard and AX-driven
+          // selection changes that do not emit a pointerdown on the palette.
+          if (
+            formattingSelection &&
+            formattingSelectionDocument === next.doc &&
+            view.hasFocus()
+          ) {
+            formattingSelection = next.selection;
+          }
           if (view.hasFocus()) onCaretNavigation();
           onSelectionChange(null, 'selection_settling', null);
           scheduleSelectionReport();

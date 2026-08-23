@@ -156,6 +156,23 @@ describe('real WebKit editor interactions', () => {
     await expect.poll(serializedMarkdown).toBe('Words');
   });
 
+  it('applies formatting through click-only semantic activation after a live selection change', async () => {
+    render('Words');
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await editor.click();
+
+    const formatButton = page.getByRole('button', { name: 'Format text' });
+    const formatButtonElement = formatButton.element() as HTMLButtonElement;
+    expect(formatButtonElement.tagName).toBe('BUTTON');
+    formatButtonElement.click();
+    await expect.element(formatButton).toHaveAttribute('aria-expanded', 'true');
+
+    await userEvent.keyboard('{Meta>}a{/Meta}');
+    expect(document.getSelection()?.toString().trim()).toBe('Words');
+    (page.getByRole('button', { name: 'Bold' }).element() as HTMLButtonElement).click();
+    await expect.poll(serializedMarkdown).toBe('**Words**');
+  });
+
   it('keeps one terminal prose space outside inline palette formatting', async () => {
     const keyboard = userEvent.setup();
     render('Words ');
