@@ -35,6 +35,13 @@
     onCommandResult(action, applied, editor?.formattingDiagnostic?.() ?? 'editor_unavailable');
     if (!applied) return;
     if (action === 'link') href = destination.trim();
+    // WebKit can finish an Accessibility activation by reconciling the
+    // button's focus or the contenteditable DOM after the click handler has
+    // returned. Reassert the cached ProseMirror selection on the next frame,
+    // once both activation and structural formatting have settled.
+    window.requestAnimationFrame(() => {
+      if (open) editor?.focusPreservingSelection();
+    });
   }
 
   function toggleOpen(): void {

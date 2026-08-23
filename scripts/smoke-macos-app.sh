@@ -1013,7 +1013,14 @@ default:
     selectionMatches = observedSelection != nil
 }
 guard observedValue == expected, focused, selectionMatches, let observedSelection else {
-    fputs("Loom's live AX editor diverged from the exact canonical manuscript or lost focus/selection\n", stderr)
+    let location = observedSelection?.location ?? -1
+    let length = observedSelection?.length ?? -1
+    fputs(
+        "Loom's live AX editor diverged from the exact canonical manuscript or lost focus/selection " +
+        "(value=\(String(reflecting: observedValue)), expected=\(String(reflecting: expected)), " +
+        "focused=\(focused), selection=\(location):\(length), mode=\(selectionMode))\n",
+        stderr
+    )
     exit(1)
 }
 let evidence: [String: Any] = [

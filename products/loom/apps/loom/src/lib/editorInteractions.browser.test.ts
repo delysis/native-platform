@@ -171,6 +171,9 @@ describe('real WebKit editor interactions', () => {
     expect(document.getSelection()?.toString().trim()).toBe('Words');
     (page.getByRole('button', { name: 'Bold' }).element() as HTMLButtonElement).click();
     await expect.poll(serializedMarkdown).toBe('**Words**');
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    expect(document.activeElement).toBe(editor.element());
+    expect(document.getSelection()?.toString().trim()).toBe('Words');
   });
 
   it('keeps one terminal prose space outside inline palette formatting', async () => {
