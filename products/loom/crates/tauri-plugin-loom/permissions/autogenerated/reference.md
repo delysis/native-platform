@@ -20,6 +20,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-document-reconciliation-preview`
 - `allow-document-reconcile-apply`
 - `allow-build-model-policy-get`
+- `allow-model-catalog-list`
 - `allow-model-list`
 - `allow-model-choose`
 - `allow-model-download-status`
@@ -623,6 +624,32 @@ Enables the generation_cancel command without any pre-configured scope.
 <td>
 
 Denies the generation_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-model-catalog-list`
+
+</td>
+<td>
+
+Enables the model_catalog_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-model-catalog-list`
+
+</td>
+<td>
+
+Denies the model_catalog_list command without any pre-configured scope.
 
 </td>
 </tr>

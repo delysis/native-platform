@@ -8,6 +8,7 @@ import type {
   BuildModelPolicySummary,
   CommandReceipt,
   CompletionSnapshot,
+  CuratedModelCatalogSnapshot,
   DesktopGenerationEnvelope,
   DocumentKind,
   ModelCapabilitySummary,
@@ -36,6 +37,7 @@ const INDEPENDENT_COMMANDS = new Set([
   'application_close_abort',
   'application_close_pending',
   'build_model_policy_get',
+  'model_catalog_list',
   'model_download_cancel',
   'model_download_list',
   'model_download_start',
@@ -303,6 +305,10 @@ export function closeProject(
 
 export function listModels(): Promise<ModelCapabilitySummary[]> {
   return call('model_list');
+}
+
+export function listCuratedModels(): Promise<CuratedModelCatalogSnapshot> {
+  return call('model_catalog_list');
 }
 
 export function chooseModel(): Promise<ModelCapabilitySummary | null> {

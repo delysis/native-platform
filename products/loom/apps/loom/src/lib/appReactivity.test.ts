@@ -119,6 +119,28 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('Private writing model');
   });
 
+  it('binds persisted tri-state appearance and curated downloads to typed boundaries', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const catalogLoad = source.slice(
+      source.indexOf('async function refreshCuratedModels'),
+      source.indexOf('function closeModelManager')
+    );
+    const catalogDownload = source.slice(
+      source.indexOf('async function beginCatalogModelDownload'),
+      source.indexOf('async function beginOrRetryModelDownload')
+    );
+    const appearance = source.slice(
+      source.indexOf('function setAppearance'),
+      source.indexOf('function startTitlebarDrag')
+    );
+
+    expect(catalogLoad).toContain('validateCuratedModelCatalog(await listCuratedModels())');
+    expect(catalogDownload).toContain('catalogDownloadRequest(entry)');
+    expect(catalogDownload).toContain('pendingModelDownload = { commandId: newUlid(), ...request }');
+    expect(appearance).toContain('persistAppearancePreference(window, next)');
+    expect(source).toContain("{#each ['system', 'light', 'dark'] as choice}");
+  });
+
   it('makes an empty writing surface visibly writable in both editor modes', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const visual = readFileSync(new URL('./LoomEditor.svelte', import.meta.url), 'utf8');

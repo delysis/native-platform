@@ -32,6 +32,7 @@
     listenForModelDownloadEvents,
     loadModel,
     loadPolicyModelCandidate,
+    listCuratedModels,
     listModels,
     listModelDownloads,
     openDefaultProject,
@@ -119,11 +120,17 @@
   import { DetachedProjectCloseCoordinator } from './lib/detachedProjectClose';
   import { suggestionsEnabledFromStoredPreference } from './lib/suggestionPreference';
   import {
-    appearancePreference,
+    loadAppearancePreference,
+    persistAppearancePreference,
     resolveAppearance,
     toggledAppearance,
     type AppearancePreference
   } from './lib/appearance';
+  import {
+    catalogDownloadRequest,
+    legacyLocalCatalogMatch,
+    validateCuratedModelCatalog
+  } from './lib/modelCatalog';
   import {
     captureProjectCloseAgency,
     restoreProjectCloseAgency,
@@ -242,6 +249,7 @@
     BranchSummary,
     BuildModelPolicySummary,
     CommandReceipt,
+    CuratedModelCatalogEntry,
     DesktopGenerationEnvelope,
     DocumentKind,
     DocumentSummary,
@@ -297,6 +305,9 @@
   let systemDark = false;
   let appearanceMedia: MediaQueryList | null = null;
   let models: ModelCapabilitySummary[] = [];
+  let curatedModels: CuratedModelCatalogEntry[] = [];
+  let curatedModelsLoading = false;
+  let curatedModelsError = '';
   let selectedModelPath = '';
   let compatibleWriterModels: ModelCapabilitySummary[] = [];
   let otherLocalModels: ModelCapabilitySummary[] = [];
@@ -618,8 +629,6 @@
   const suggestionsRetryDelayMs = 350;
   const maximumAutomaticSuggestionRetries = 1;
   const maximumAutocompleteRetryWaits = 50;
-  const appearancePreferenceKey = 'loom.appearance.v1';
-
   function completionAutomationEnabled(
     autocomplete = suggestionsEnabled,
     shuttle = shuttleEnabled
@@ -988,7 +997,7 @@
 
   onMount(() => {
     componentMounted = true;
-    appearance = appearancePreference(window.localStorage.getItem(appearancePreferenceKey));
+    appearance = loadAppearancePreference(window);
     appearanceMedia = window.matchMedia('(prefers-color-scheme: dark)');
     systemDark = appearanceMedia.matches;
     const syncSystemAppearance = (event: MediaQueryListEvent): void => {
@@ -996,6 +1005,7 @@
     };
     appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
+    if (desktop) void refreshCuratedModels();
     documentContextRevealLabel = desktop
       ? documentRevealLabel(window.navigator.platform, window.navigator.userAgent)
       : null;
@@ -1670,6 +1680,59 @@
       modelDownloadFileName = derived;
     }
     lastDerivedModelFileName = derived;
+  }
+
+  function localCatalogModel(
+    entry: CuratedModelCatalogEntry
+  ): ModelCapabilitySummary | undefined {
+    return models.find((model) => legacyLocalCatalogMatch(entry, model));
+  }
+
+  function loadedCatalogModel(
+    entry: CuratedModelCatalogEntry
+  ): ModelCapabilitySummary | undefined {
+    return models.find((model) =>
+      model.loaded &&
+      model.local &&
+      model.header_verified &&
+      model.model_sha256 === entry.expected_sha256 &&
+      model.file_bytes === entry.expected_bytes
+    );
+  }
+
+  function catalogDownload(
+    entry: CuratedModelCatalogEntry
+  ): ModelDownloadSnapshot | undefined {
+    return modelDownloads.find((download) =>
+      download.expected_sha256 === entry.expected_sha256 &&
+      download.display_name.toLocaleLowerCase('en-US') ===
+        entry.artifact_name.toLocaleLowerCase('en-US')
+    );
+  }
+
+  async function beginCatalogModelDownload(entry: CuratedModelCatalogEntry): Promise<void> {
+    if (
+      pendingModelDownload ||
+      modelDownloadStarting ||
+      modelDownloads.some((download) =>
+        download.expected_sha256 === entry.expected_sha256 &&
+        !modelDownloadIsTerminal(download)
+      )
+    ) return;
+    try {
+      const request = catalogDownloadRequest(entry);
+      updateModelDownloadUrl(request.url);
+      modelDownloadFileName = request.fileName;
+      modelDownloadSha256 = request.sha256;
+      modelDownloadExpectedBytes = String(request.expectedBytes);
+      modelDownloadMaximumGiB = String(request.maxBytes / 1024 ** 3);
+      pendingModelDownload = { commandId: newUlid(), ...request };
+      await beginOrRetryModelDownload();
+    } catch (error) {
+      modelDownloadError = error instanceof Error
+        ? error.message
+        : 'The curated model entry could not be downloaded safely.';
+    }
   }
 
   async function beginOrRetryModelDownload(): Promise<void> {
@@ -2488,8 +2551,9 @@
 
   function setAppearance(next: AppearancePreference): void {
     appearance = next;
-    window.localStorage.setItem(appearancePreferenceKey, next);
-    announce(next === 'system' ? 'Appearance follows the system' : `${next} appearance`);
+    const persisted = persistAppearancePreference(window, next);
+    const label = next === 'system' ? 'Appearance follows the system' : `${next} appearance`;
+    announce(persisted ? label : `${label} for this session`);
   }
 
   function toggleAppearance(): void {
@@ -2510,6 +2574,7 @@
     modelManagerReturnFocus = trigger;
     modelManagerOpen = true;
     modelDownloadError = '';
+    if (curatedModels.length === 0) void refreshCuratedModels();
     void recoverModelDownloads();
     void refreshCurrentModelsAndEnsureWriter();
     void tick().then(() => {
@@ -2519,6 +2584,20 @@
       );
       (preferred ?? focusableElementsWithin(modelManagerPanel)[0] ?? modelManagerPanel).focus();
     });
+  }
+
+  async function refreshCuratedModels(): Promise<void> {
+    if (!desktop || curatedModelsLoading) return;
+    curatedModelsLoading = true;
+    curatedModelsError = '';
+    try {
+      curatedModels = validateCuratedModelCatalog(await listCuratedModels());
+    } catch (error) {
+      curatedModels = [];
+      curatedModelsError = normalizeFailure(error).message;
+    } finally {
+      curatedModelsLoading = false;
+    }
   }
 
   function closeModelManager(focusWritingSurface = false): void {
@@ -6883,6 +6962,70 @@
                     : 'Needs setup'}
               </strong>
             </div>
+          </section>
+
+          <section class="curated-model-catalog" aria-labelledby="curated-model-catalog-title">
+            <div class="section-heading">
+              <div>
+                <h3 id="curated-model-catalog-title">Recommended local model</h3>
+                <p>Publisher artifact, revision, size, and checksum are embedded in this Loom build.</p>
+              </div>
+            </div>
+
+            {#if curatedModelsLoading}
+              <div class="runtime-note" role="status">Reading the embedded catalog…</div>
+            {:else if curatedModelsError}
+              <div class="model-setup-error" role="alert">
+                The embedded catalog is unavailable. No download metadata was accepted.
+                <button class="bare-button compact" type="button" on:click={() => void refreshCuratedModels()}>Retry</button>
+              </div>
+            {:else}
+              {#each curatedModels as entry (entry.catalog_id)}
+                {@const installed = localCatalogModel(entry)}
+                {@const resident = loadedCatalogModel(entry)}
+                {@const transfer = catalogDownload(entry)}
+                <article class="curated-model-card">
+                  <div class="curated-model-copy">
+                    <strong>{entry.display_name}</strong>
+                    <span>{entry.publisher} · {formatByteCount(entry.expected_bytes)} · {entry.context_tokens.toLocaleString()} token context</span>
+                    <span>{formatByteCount(entry.memory_fit.recommended_system_memory_bytes)} or more system memory recommended</span>
+                    <span>Local only · {entry.license.name} · native inspection required before use</span>
+                    <details class="model-technical">
+                      <summary>Pinned artifact details</summary>
+                      <dl class="model-evidence">
+                        <div><dt>Repository</dt><dd><code>{entry.repository}</code></dd></div>
+                        <div><dt>Revision</dt><dd><code>{entry.revision}</code></dd></div>
+                        <div><dt>File</dt><dd><code>{entry.artifact_name}</code></dd></div>
+                        <div><dt>SHA-256</dt><dd><code>{entry.expected_sha256}</code></dd></div>
+                        <div><dt>License</dt><dd>{entry.license.spdx_id}</dd></div>
+                        <div><dt>License source</dt><dd><code>{entry.license.url}</code></dd></div>
+                      </dl>
+                    </details>
+                  </div>
+                  <div class="curated-model-action">
+                    {#if resident}
+                      <button class="secondary-button compact" type="button" disabled>In use</button>
+                    {:else if installed}
+                      <button
+                        class="primary-button compact"
+                        type="button"
+                        on:click={() => void useDiscoveredSuggestionWriter(installed)}
+                        disabled={!desktop || modelLoading || modelChoosing || modelUnloading}
+                      >{modelLoading && selectedModelPath === installed.model_path ? 'Verifying…' : 'Verify local copy'}</button>
+                    {:else if transfer?.status.status === 'completed'}
+                      <button class="secondary-button compact" type="button" on:click={() => void refreshCurrentModelsAndEnsureWriter()}>Refresh installed copy</button>
+                    {:else}
+                      <button
+                        class="primary-button compact"
+                        type="button"
+                        on:click={() => void beginCatalogModelDownload(entry)}
+                        disabled={!desktop || modelDownloadStarting || pendingModelDownload !== null || (transfer !== undefined && !modelDownloadIsTerminal(transfer))}
+                      >{transfer !== undefined && !modelDownloadIsTerminal(transfer) ? 'Downloading…' : transfer?.status.status === 'failed' || transfer?.status.status === 'cancelled' ? 'Retry verified download' : 'Download and verify'}</button>
+                    {/if}
+                  </div>
+                </article>
+              {/each}
+            {/if}
           </section>
 
           {#if suggestionSetupNeeded}

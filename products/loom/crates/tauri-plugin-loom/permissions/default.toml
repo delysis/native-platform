@@ -19,6 +19,7 @@ permissions = [
   "allow-document-reconciliation-preview",
   "allow-document-reconcile-apply",
   "allow-build-model-policy-get",
+  "allow-model-catalog-list",
   "allow-model-list",
   "allow-model-choose",
   "allow-model-download-status",

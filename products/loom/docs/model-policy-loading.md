@@ -21,6 +21,31 @@ After native inspection, Loom repeats the path binding check and requires the na
 
 Branch text crosses an unavoidable runtime IPC boundary. Before that text can enter ghost-suggestion selection, the renderer hashes its UTF-8 bytes and requires an exact match with the canonical lowercase SHA-256, byte length, and run identity recorded by the store. Only the branded verification result is accepted downstream; same-length substituted text and cross-run bodies fail closed.
 
+## Embedded download catalog
+
+The desktop exposes one read-only, versioned catalog snapshot. Its single entry
+pins Google's `gemma-4-12B-it-qat-q4_0-gguf` repository at revision
+`29d097773436b69ff9feafd636ab4cf873786537`, artifact
+`gemma-4-12b-it-qat-q4_0.gguf`, exact byte length, SHA-256, Apache-2.0 license
+information, 262,144-token context metadata, and a 16 GiB system-memory
+recommendation. The download URL names that immutable revision; the hard byte
+ceiling equals the expected byte length.
+
+Catalog display grants no network or model authority. The renderer validates
+the bounded snapshot before constructing the existing verified-download
+command, and only an explicit button press starts HTTPS access. Installation
+still requires the exact cold SHA-256 and GGUF checks, and use still requires
+native inspection. An existing local file with the same artifact name and byte
+length remains a legacy discovery hint only: it is prioritized for inspection
+but never inherits the catalog checksum. The older exact build-policy writer
+remains an independent fallback.
+
+Appearance is a renderer preference with exactly three persisted values:
+`system`, `light`, and `dark`. Missing, invalid, or unavailable preference
+storage resolves to `system`; explicit light or dark remains selected across
+launches until the author explicitly chooses `system` again. It is not project
+or manuscript state.
+
 ## Residual mutation limit
 
 The native loader currently accepts a filesystem path, not Loom's already-open file handle. Another process with write access can therefore race in the small interval between Loom's last pre-native binding check and llama.cpp opening that path. The post-native identity checks prevent that result from being committed under the policy identity, but they cannot guarantee that native code never parsed bytes from a raced replacement.

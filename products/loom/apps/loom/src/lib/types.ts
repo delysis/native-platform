@@ -136,6 +136,49 @@ export interface ModelPolicyProfile {
   rank: number;
 }
 
+export interface CuratedModelLicense {
+  spdx_id: string;
+  name: string;
+  url: string;
+}
+
+export interface CuratedModelMemoryFit {
+  weight_bytes: number;
+  recommended_system_memory_bytes: number;
+  description: string;
+}
+
+export interface CuratedModelCompatibility {
+  local_only: true;
+  hosted_fallback: false;
+  prompt_mode: 'raw_completion';
+  native_inspection_required: true;
+  legacy_local_file_name: string;
+  legacy_local_file_bytes: number;
+}
+
+export interface CuratedModelCatalogEntry {
+  catalog_id: string;
+  display_name: string;
+  publisher: string;
+  repository: string;
+  revision: string;
+  artifact_name: string;
+  download_url: string;
+  expected_sha256: string;
+  expected_bytes: number;
+  max_bytes: number;
+  context_tokens: number;
+  license: CuratedModelLicense;
+  memory_fit: CuratedModelMemoryFit;
+  compatibility: CuratedModelCompatibility;
+}
+
+export interface CuratedModelCatalogSnapshot {
+  schema_version: 1;
+  entries: CuratedModelCatalogEntry[];
+}
+
 export interface ModelUnloadOutcome {
   model_id: string | null;
   resident_slot_released: boolean;

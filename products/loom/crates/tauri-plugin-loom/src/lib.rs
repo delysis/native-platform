@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod model_catalog;
 mod model_download;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,6 +52,7 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 
+use crate::model_catalog::{ModelCatalogSnapshot, embedded_model_catalog};
 use crate::model_download::{
     ModelDownloadRegistry, ModelDownloadRegistryError, ModelDownloadSnapshot, ModelDownloadSpec,
     ModelLibraryError, ReservationOutcome, model_target_path, prepare_model_library,
@@ -1782,6 +1784,7 @@ impl Builder {
                 document_reconciliation_preview,
                 document_reconcile_apply,
                 build_model_policy_get,
+                model_catalog_list,
                 model_list,
                 model_choose,
                 model_load,
@@ -3879,6 +3882,11 @@ fn reconcile_apply_for_store(
 #[allow(clippy::needless_pass_by_value)]
 fn build_model_policy_get(state: State<'_, PluginState>) -> BuildModelPolicyIdentity {
     state.build_model_policy.identity()
+}
+
+#[tauri::command]
+fn model_catalog_list() -> ModelCatalogSnapshot {
+    embedded_model_catalog()
 }
 
 #[tauri::command]

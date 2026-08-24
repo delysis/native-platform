@@ -20,6 +20,7 @@ import {
   getBranch,
   getBranchPage,
   getCompletionSnapshot,
+  listCuratedModels,
   listModels,
   openDocument,
   previewDocumentReconciliation,
@@ -59,6 +60,26 @@ afterEach(() => {
 });
 
 describe('session IPC admission', () => {
+  it('reads the embedded model catalog outside the project session lane', async () => {
+    installDesktopRuntime();
+    const projectRead = deferred<never>();
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'plugin:loom|branch_page') return projectRead.promise;
+      if (command === 'plugin:loom|model_catalog_list') {
+        return Promise.resolve({ schema_version: 1, entries: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    const page = getBranchPage('project', 'session', 'document', null, 10);
+    await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
+    await expect(listCuratedModels()).resolves.toEqual({ schema_version: 1, entries: [] });
+    expect(mocks.invoke).toHaveBeenLastCalledWith('plugin:loom|model_catalog_list', {});
+
+    projectRead.reject(new Error('done'));
+    await expect(page).rejects.toThrow('done');
+  });
+
   it('starts session-bound commands in FIFO order and continues after a failure', async () => {
     installDesktopRuntime();
     const first = deferred<never>();
