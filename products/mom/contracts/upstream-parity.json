@@ -179,6 +179,7 @@
       "evidence": [
         "disabled-by-default macOS/Linux absolute-path stdio adapter",
         "configured MCP executables are disclosed as external unsandboxed processes with OS-account file, secret, and network authority",
+        "Persona review stages content-addressed executable bytes and detects pre/post-spawn pathname drift without claiming atomic inode-bound exec or dynamic dependency identity",
         "bounded timeout and receipt test"
       ]
     },

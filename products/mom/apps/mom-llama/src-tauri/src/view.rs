@@ -23,6 +23,7 @@ pub struct ControlSpec {
 }
 
 const MCP_PROCESS_AUTHORITY_WARNING: &str = "Configured MCP tools run as external, unsandboxed child processes. They may use the network; read files, credentials, and secrets available to your OS account; and write files or perform other irreversible mutations permitted by that account.";
+const PERSONA_MCP_EXECUTABLE_IDENTITY_NOTICE: &str = "Persona tool review stores a content-addressed copy of the selected executable and checks its pathname identity before and after process spawn. Execution remains pathname-based: Mom does not claim atomic inode-to-exec binding or identity of dynamic libraries and plugins.";
 
 const fn mcp_process_ui_supported() -> bool {
     cfg!(any(target_os = "macos", target_os = "linux"))
@@ -619,7 +620,7 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         tauri_command: "mom_llama_mcp_list_tools",
         cli: "mom-llama mcp list-tools --server <name> --json",
         effect: "mom_llama.effects.mcp_stdio.v1",
-        label: "List tools",
+        label: "List, review, and stage tools",
     },
     ControlSpec {
         affordance: "mcp.call_tool",
@@ -2802,6 +2803,7 @@ fn settings_panel(
                     section class="settings-card adapter-form" {
                         h3 { "Native tool adapter" }
                         p class="field-help" { (MCP_PROCESS_AUTHORITY_WARNING) }
+                        p class="field-help" { (PERSONA_MCP_EXECUTABLE_IDENTITY_NOTICE) }
                         div class="native-number-grid" {
                             (command_input("Server name", "mcp_server", "", "mcp.configure"))
                             (command_input("Tool name", "mcp_tool", "", "mcp.call_tool"))
@@ -3028,7 +3030,8 @@ fn persona_settings() -> Markup {
                         data-effect="mom_llama.effects.conversation_store.v1" {}
                     small {
                         "Only these stable bindings may be offered during an invited response. "
-                        (MCP_PROCESS_AUTHORITY_WARNING)
+                        (MCP_PROCESS_AUTHORITY_WARNING) " "
+                        (PERSONA_MCP_EXECUTABLE_IDENTITY_NOTICE)
                     }
                 }
             }
@@ -3205,7 +3208,8 @@ fn tool_approval_modal() -> Markup {
                 h2 id="tool-approval-title" { "Approve this tool call?" }
                 p class="field-help" {
                     "Approval is single-use, expires after five minutes, and is bound to the exact call below. "
-                    (MCP_PROCESS_AUTHORITY_WARNING)
+                    (MCP_PROCESS_AUTHORITY_WARNING) " "
+                    (PERSONA_MCP_EXECUTABLE_IDENTITY_NOTICE)
                 }
                 dl class="tool-approval-summary" {
                     div { dt { "Server" } dd id="tool-approval-server" {} }
@@ -5418,6 +5422,7 @@ mod tests {
         assert!(html.contains("mom_llama_mention_tool_approval_decide"));
         assert!(html.contains("Approval is single-use, expires after five minutes"));
         assert!(html.contains(MCP_PROCESS_AUTHORITY_WARNING));
+        assert!(html.contains(PERSONA_MCP_EXECUTABLE_IDENTITY_NOTICE));
         for authority in [
             "external, unsandboxed child processes",
             "network",
@@ -5437,6 +5442,10 @@ mod tests {
             mcp_process_ui_supported(),
             "Persona MCP bindings must be absent outside macOS and Linux"
         );
+
+        let settings = mcp_settings().into_string();
+        assert!(settings.contains("List, review, and stage tools"));
+        assert!(settings.contains(PERSONA_MCP_EXECUTABLE_IDENTITY_NOTICE));
 
         let js = include_str!("../../ui/coop-hx.js");
         assert!(js.contains("const openPersonaToolApproval = (approval)"));

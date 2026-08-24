@@ -1195,7 +1195,7 @@ fn unknown_persona_tool_effect_receipt(
     let blocker = Blocker::new(
         "mention_tool_effect_outcome_unknown",
         format!(
-            "The exact MCP tool request was dispatched, but its external outcome is unknown: {error}"
+            "The approved external MCP process was spawned, but Mom did not observe one exact terminal outcome. The tool request may or may not have been dispatched: {error}"
         ),
         vec![
             "Do not retry this exact call automatically; inspect the external system and the persisted receipt."
@@ -1210,6 +1210,11 @@ fn unknown_persona_tool_effect_receipt(
         vec![
             format!("persona_tool_approval_id:{}", approval.id),
             format!("persona_tool_call_sha256:{}", approval.call_sha256),
+            "external_process_spawned:yes".to_string(),
+            "tool_effect_dispatch:uncertain".to_string(),
+            "managed_executable_identity:reviewed_content_addressed_bytes_with_pre_post_spawn_path_checks".to_string(),
+            "atomic_path_to_exec_identity:not_asserted".to_string(),
+            "dynamic_dependency_identity:not_asserted".to_string(),
             "external_effect_outcome:unknown".to_string(),
         ],
         false,
@@ -1528,7 +1533,7 @@ fn validate_frozen_persona_tool_approval(
     let Some(frozen_server_config) = continuation.mcp_server_config.as_ref() else {
         return Ok(Some(Blocker::new(
             "mention_tool_approval_frozen_server_missing",
-            "The exact managed MCP executable is missing from this legacy approval.",
+            "The reviewed staged MCP executable is missing from this legacy approval.",
             vec!["Run a new Persona invocation.".to_string()],
         )));
     };
@@ -1623,7 +1628,7 @@ fn validate_current_persona_tool_binding(
     let Some(frozen_server) = continuation.mcp_server_config.as_ref() else {
         return Ok(Err(Blocker::new(
             "mention_tool_approval_frozen_server_missing",
-            "The exact managed MCP executable is missing from this approval.",
+            "The reviewed staged MCP executable is missing from this approval.",
             vec!["Run a new Persona invocation.".to_string()],
         )));
     };
@@ -1736,7 +1741,7 @@ fn resume_persona_tool_approval(
             let server = validated_server.as_ref().ok_or_else(|| {
                 Blocker::new(
                     "mention_tool_approval_server_identity_missing",
-                    "The approved exact MCP server identity is missing.",
+                    "The approved reviewed MCP configuration and staged-byte identity are missing.",
                     vec!["Run a new Persona invocation.".to_string()],
                 )
             })?;
@@ -1810,6 +1815,9 @@ fn resume_persona_tool_approval(
             call.receipt.artifacts_produced.extend([
                 format!("persona_tool_approval_id:{}", claim.approval.id),
                 format!("persona_tool_call_sha256:{}", claim.approval.call_sha256),
+                "managed_executable_identity:reviewed_content_addressed_bytes_with_pre_post_spawn_path_checks".to_string(),
+                "atomic_path_to_exec_identity:not_asserted".to_string(),
+                "dynamic_dependency_identity:not_asserted".to_string(),
             ]);
             if call.status == "blocked" {
                 let blocker = call.blocker.clone().unwrap_or_else(|| {
@@ -5107,7 +5115,8 @@ mod tests {
         mention_tool_manifest, parse_handles, persona_tool_call_sha256,
         persona_tool_decision_schema, persona_tool_resume_lease_is_live,
         reconcile_stored_persona_tool_approvals, resolve_targets_from_registry, sha256_json_value,
-        unregister_exact_mentions, validate_resolved_mention_tools,
+        unknown_persona_tool_effect_receipt, unregister_exact_mentions,
+        validate_resolved_mention_tools,
     };
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::conversation_store::{CONVERSATIONS_NAMESPACE, Message, MessageRole};
@@ -5851,6 +5860,40 @@ mod tests {
             ]
         );
         assert!(interrupted.frozen_tool_continuations.is_empty());
+    }
+
+    #[test]
+    fn unknown_effect_receipt_marks_spawn_boundary_and_identity_limits() {
+        let stored = frozen_approval_record(1_000);
+        let approval = &stored.tool_approvals[0];
+        let receipt = unknown_persona_tool_effect_receipt(
+            approval,
+            "managed MCP pathname identity drifted across process spawn",
+        );
+        assert_eq!(
+            receipt
+                .blocker
+                .as_ref()
+                .expect("unknown outcome blocker")
+                .code,
+            "mention_tool_effect_outcome_unknown"
+        );
+        for artifact in [
+            "external_process_spawned:yes",
+            "tool_effect_dispatch:uncertain",
+            "atomic_path_to_exec_identity:not_asserted",
+            "dynamic_dependency_identity:not_asserted",
+            "external_effect_outcome:unknown",
+        ] {
+            assert!(
+                receipt
+                    .receipt
+                    .artifacts_produced
+                    .iter()
+                    .any(|value| value == artifact),
+                "unknown-effect receipt omitted {artifact}"
+            );
+        }
     }
 
     #[test]

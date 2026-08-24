@@ -121,7 +121,7 @@
     },
     {
       "effect_id": "mom_llama.effects.consult_generate.v1",
-      "reads": ["selected_models", "host_conversation_snapshot", "persona_or_live_chat_snapshots", "persona_group", "settings", "persona_prefix_caches"],
+      "reads": ["selected_models", "host_conversation_snapshot", "persona_or_live_chat_snapshots", "persona_group", "settings", "persona_prefix_caches", "encrypted_reviewed_mcp_tool_catalog", "reviewed_content_addressed_mcp_executable_identity"],
       "writes": ["mention_invocation", "attributed_host_messages", "optional_synthesis", "encrypted_receipts"],
       "network": [],
       "process": [],
@@ -134,7 +134,7 @@
     },
     {
       "effect_id": "mom_llama.effects.mention_tool_approval.v1",
-      "reads": ["encrypted_frozen_mention_invocation", "exact_single_use_approval", "selected_model_identity", "configured_mcp_tool", "configured_mcp_process_may_read_os_permitted_files"],
+      "reads": ["encrypted_frozen_mention_invocation", "exact_single_use_approval", "selected_model_identity", "reviewed_mcp_tool_schema", "reviewed_content_addressed_mcp_executable_bytes", "pre_and_post_spawn_path_identity_detection_without_atomic_exec_claim", "configured_mcp_process_may_read_os_permitted_files"],
       "writes": ["encrypted_mention_invocation", "attributed_host_messages", "encrypted_effect_receipt", "command_receipt", "configured_mcp_process_may_write_os_permitted_files"],
       "network": ["configured_mcp_process_may_access_network"],
       "process": ["configured_external_mcp_stdio_process"],
@@ -330,7 +330,7 @@
     },
     {
       "effect_id": "mom_llama.effects.mcp_stdio.v1",
-      "reads": ["allowlisted_absolute_executable", "encrypted_mcp_config", "typed_request", "configured_mcp_process_may_read_os_permitted_files"],
+      "reads": ["allowlisted_absolute_executable", "encrypted_mcp_config", "typed_request", "reviewed_content_addressed_mcp_executable_bytes", "pre_and_post_spawn_path_identity_detection_without_atomic_exec_claim", "configured_mcp_process_may_read_os_permitted_files"],
       "writes": ["encrypted_reviewed_mcp_tool_catalog", "content_addressed_managed_mcp_executable", "command_receipt", "configured_mcp_process_may_write_os_permitted_files"],
       "network": ["configured_mcp_process_may_access_network"],
       "process": ["configured_external_mcp_stdio_process"],

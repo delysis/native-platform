@@ -123,10 +123,18 @@ impl McpCallSupervisionError {
         }
     }
 
-    fn after_effect_dispatch(error: impl std::fmt::Display) -> Self {
+    fn after_external_process_spawn(error: impl std::fmt::Display) -> Self {
         Self {
             message: error.to_string(),
             outcome_unknown: true,
+        }
+    }
+
+    fn at_process_spawn_boundary(error: impl std::fmt::Display, process_spawned: bool) -> Self {
+        if process_spawned {
+            Self::after_external_process_spawn(error)
+        } else {
+            Self::before_effect(error)
         }
     }
 
@@ -150,11 +158,12 @@ struct McpWriteFailure {
 }
 
 impl McpWriteFailure {
+    #[cfg(test)]
     fn into_before_or_unknown(self) -> McpCallSupervisionError {
         if self.bytes_written == 0 {
             McpCallSupervisionError::before_effect(self.error)
         } else {
-            McpCallSupervisionError::after_effect_dispatch(self.error)
+            McpCallSupervisionError::after_external_process_spawn(self.error)
         }
     }
 }
@@ -379,7 +388,7 @@ pub(crate) fn cached_persona_mcp_tool_contract(
             "blocked_exact_executable_required".to_string(),
             Blocker::new(
                 "mention_tool_server_not_self_contained",
-                "Persona approvals require one self-contained native MCP executable with no arguments.",
+                "Persona approvals require one reviewed direct native MCP executable with no arguments.",
                 vec![
                     "Configure a direct native MCP executable and refresh its tool catalog."
                         .to_string(),
@@ -490,34 +499,143 @@ fn cache_persona_mcp_tool_catalog(
         );
     }
     let settings = resolve_settings()?;
-    let (frozen_server_config, frozen_server_config_sha256) =
-        freeze_mcp_server_for_persona(server, &settings.data_dir, &server_config_sha256)?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    let mut catalog = store
-        .get::<McpToolCatalogDb>(MCP_TOOL_CATALOG_NAMESPACE)?
-        .unwrap_or_default();
-    catalog.servers.retain(|entry| entry.server != server.name);
-    if catalog.servers.len() >= MAX_CACHED_MCP_SERVERS {
-        anyhow::bail!(
-            "MCP tool catalog exceeds the {} reviewed server limit",
-            MAX_CACHED_MCP_SERVERS
-        );
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (server, tools, server_config_sha256, settings, store);
+        anyhow::bail!("reviewed Persona MCP executable staging is unsupported on this platform")
     }
-    catalog.servers.push(McpToolCatalogEntry {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    cache_persona_mcp_tool_catalog_with_persistence(
+        &store,
+        &settings.data_dir,
+        server,
+        tools,
+        &server_config_sha256,
+        persist_persona_mcp_tool_catalog,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn persist_persona_mcp_tool_catalog(
+    store: &RuntimeStore,
+    entry: McpToolCatalogEntry,
+) -> Result<()> {
+    persist_persona_mcp_tool_catalog_with_hook(store, entry, |_| Ok(()))
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+fn persist_persona_mcp_tool_catalog_with_hook(
+    store: &RuntimeStore,
+    entry: McpToolCatalogEntry,
+    before_update: impl FnOnce(&McpToolCatalogDb) -> Result<()>,
+) -> Result<()> {
+    store.mutate(
+        MCP_TOOL_CATALOG_NAMESPACE,
+        McpToolCatalogDb::default,
+        |catalog| {
+            before_update(catalog)?;
+            catalog
+                .servers
+                .retain(|candidate| candidate.server != entry.server);
+            if catalog.servers.len() >= MAX_CACHED_MCP_SERVERS {
+                anyhow::bail!(
+                    "MCP tool catalog exceeds the {} reviewed server limit",
+                    MAX_CACHED_MCP_SERVERS
+                );
+            }
+            catalog.servers.push(entry);
+            catalog
+                .servers
+                .sort_by(|left, right| left.server.cmp(&right.server));
+            Ok(())
+        },
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn cache_persona_mcp_tool_catalog_with_persistence(
+    store: &RuntimeStore,
+    data_dir: &Path,
+    server: &McpServerConfig,
+    tools: &[McpTool],
+    server_config_sha256: &str,
+    persist_catalog: impl FnOnce(&RuntimeStore, McpToolCatalogEntry) -> Result<()>,
+) -> Result<Vec<PathBuf>> {
+    let mut managed_store = lock_managed_mcp_store_for_write(data_dir)?;
+    let (frozen_server_config, frozen_server_config_sha256, newly_staged) =
+        stage_mcp_server_for_persona_locked(server, server_config_sha256, &mut managed_store)?;
+    let entry = McpToolCatalogEntry {
         server: server.name.clone(),
-        server_config_sha256,
+        server_config_sha256: server_config_sha256.to_string(),
         frozen_server_config: frozen_server_config.clone(),
-        frozen_server_config_sha256,
+        frozen_server_config_sha256: frozen_server_config_sha256.clone(),
         tools: tools.to_vec(),
-    });
-    catalog
-        .servers
-        .sort_by(|left, right| left.server.cmp(&right.server));
-    store.put(MCP_TOOL_CATALOG_NAMESPACE, &catalog)?;
+    };
+    if let Err(persist_error) = persist_catalog(store, entry) {
+        let rollback_error = rollback_new_unreferenced_managed_mcp_executable(
+            store,
+            &managed_store.dir,
+            &frozen_server_config.command,
+            newly_staged,
+        )
+        .err();
+        let seal_error = managed_store.seal().err();
+        drop(managed_store);
+        return match (rollback_error, seal_error) {
+            (None, None) => Err(persist_error),
+            (rollback_error, seal_error) => Err(anyhow::anyhow!(
+                "{persist_error:#}; managed MCP rollback error: {}; managed MCP seal error: {}",
+                rollback_error
+                    .map(|error| format!("{error:#}"))
+                    .unwrap_or_else(|| "none".to_string()),
+                seal_error
+                    .map(|error| format!("{error:#}"))
+                    .unwrap_or_else(|| "none".to_string())
+            )),
+        };
+    }
+    managed_store.seal()?;
+    drop(managed_store);
+    validate_frozen_mcp_server(
+        &frozen_server_config,
+        data_dir,
+        &frozen_server_config_sha256,
+    )?;
+    if exact_mcp_server_config_sha256(server)? != server_config_sha256 {
+        anyhow::bail!("configured MCP executable identity drifted while its catalog was reviewed");
+    }
     Ok(vec![
         frozen_server_config.command,
         store.path().to_path_buf(),
     ])
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rollback_new_unreferenced_managed_mcp_executable(
+    store: &RuntimeStore,
+    managed_dir: &Path,
+    managed_path: &Path,
+    newly_staged: bool,
+) -> Result<()> {
+    if !newly_staged {
+        return Ok(());
+    }
+    let referenced = store
+        .get::<McpToolCatalogDb>(MCP_TOOL_CATALOG_NAMESPACE)?
+        .unwrap_or_default()
+        .servers
+        .iter()
+        .any(|entry| entry.frozen_server_config.command == managed_path);
+    if referenced {
+        return Ok(());
+    }
+    match fs::remove_file(managed_path) {
+        Ok(()) => File::open(managed_dir)?.sync_all()?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 fn parse_mcp_tools(response: Value) -> Result<Vec<McpTool>> {
@@ -642,10 +760,10 @@ pub(crate) fn mcp_call_tool_supervised_with_config(
             Blocker::new(
                 "mcp_tool_call_rejected",
                 format!(
-                    "The exact MCP server rejected the tool call: {}",
+                    "The reviewed configured MCP process rejected the tool call: {}",
                     rpc_error_message(&error)
                 ),
-                vec!["Review the persisted exact tool receipt before retrying.".to_string()],
+                vec!["Review the persisted tool receipt before retrying.".to_string()],
             ),
             Vec::new(),
             vec!["external_effect_outcome:known".to_string()],
@@ -1058,12 +1176,31 @@ impl Drop for McpChildSetupGuard {
 impl McpStdioSession {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn spawn(server: &McpServerConfig) -> Result<Self> {
+        Self::spawn_observed(server, None)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn spawn_observed(
+        server: &McpServerConfig,
+        process_spawned: Option<&mut bool>,
+    ) -> Result<Self> {
         let _ = server;
+        if let Some(process_spawned) = process_spawned {
+            *process_spawned = false;
+        }
         anyhow::bail!("joined MCP process-group supervision is not implemented on this platform")
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn spawn(server: &McpServerConfig) -> Result<Self> {
+        Self::spawn_observed(server, None)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn spawn_observed(
+        server: &McpServerConfig,
+        process_spawned: Option<&mut bool>,
+    ) -> Result<Self> {
         let managed_store_guard = managed_mcp_read_guard(&server.command)?;
         let (expected_identity, executable_guard) = if managed_store_guard.is_some() {
             let (identity, executable) = mcp_executable_identity_with_file(&server.command)?;
@@ -1091,6 +1228,13 @@ impl McpStdioSession {
         let child = command
             .spawn()
             .with_context(|| format!("failed to start MCP server {}", command_path.display()))?;
+        if let Some(process_spawned) = process_spawned {
+            // This is the evidence boundary. Once the OS reports a successful
+            // spawn, the unsandboxed process may already have exercised any
+            // authority available to the user's account. Every later failure
+            // is therefore outcome-unknown even if tools/call received no byte.
+            *process_spawned = true;
+        }
         let mut child = McpChildSetupGuard(Some(child));
         let stdin = child
             .child_mut()
@@ -1112,7 +1256,9 @@ impl McpStdioSession {
         if let Some(expected_identity) = expected_identity.as_ref() {
             let actual_identity = mcp_executable_identity(&server.command)?;
             if &actual_identity != expected_identity {
-                anyhow::bail!("managed MCP executable identity changed across process spawn");
+                anyhow::bail!(
+                    "managed MCP pathname identity drifted across process spawn; the executed inode is not asserted"
+                );
             }
         }
         let child = child.disarm();
@@ -1164,7 +1310,17 @@ impl McpStdioSession {
             deadline,
             Some(should_cancel),
         )
-        .map_err(McpWriteFailure::into_before_or_unknown)
+        .map_err(|failure| {
+            let dispatch_detail = if failure.bytes_written == 0 {
+                "no tools/call bytes were observed written"
+            } else {
+                "a partial tools/call frame was written"
+            };
+            McpCallSupervisionError::after_external_process_spawn(format!(
+                "{dispatch_detail}: {}",
+                failure.error
+            ))
+        })
     }
 
     fn receive(
@@ -1405,29 +1561,31 @@ fn execute_mcp_effect_request_supervised(
         ));
     }
     let deadline = mcp_request_deadline().map_err(McpCallSupervisionError::before_effect)?;
+    let mut process_spawned = false;
     let mut session =
-        McpStdioSession::spawn(server).map_err(McpCallSupervisionError::before_effect)?;
+        McpStdioSession::spawn_observed(server, Some(&mut process_spawned)).map_err(|error| {
+            McpCallSupervisionError::at_process_spawn_boundary(error, process_spawned)
+        })?;
     session
         .initialize(deadline, Some(should_cancel))
-        .map_err(McpCallSupervisionError::before_effect)?;
+        .map_err(McpCallSupervisionError::after_external_process_spawn)?;
     session
         .send(
             &json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
             deadline,
             Some(should_cancel),
         )
-        .map_err(McpCallSupervisionError::before_effect)?;
+        .map_err(McpCallSupervisionError::after_external_process_spawn)?;
     let tools = match session
         .receive(2, deadline, Some(should_cancel))
-        .map_err(McpCallSupervisionError::before_effect)?
+        .map_err(McpCallSupervisionError::after_external_process_spawn)?
     {
         McpRpcTerminal::Result(result) => parse_mcp_tools(json!({"result": result}))
-            .map_err(McpCallSupervisionError::before_effect)?,
+            .map_err(McpCallSupervisionError::after_external_process_spawn)?,
         McpRpcTerminal::Error(error) => {
-            return Err(McpCallSupervisionError::before_effect(format!(
-                "MCP tools/list rejected: {}",
-                rpc_error_message(&error)
-            )));
+            return Err(McpCallSupervisionError::after_external_process_spawn(
+                format!("MCP tools/list rejected: {}", rpc_error_message(&error)),
+            ));
         }
     };
     let matching = tools
@@ -1435,30 +1593,30 @@ fn execute_mcp_effect_request_supervised(
         .filter(|tool| tool.name == tool_name)
         .collect::<Vec<_>>();
     if matching.len() != 1 {
-        return Err(McpCallSupervisionError::before_effect(format!(
-            "MCP server did not advertise exactly one tool named {tool_name}"
-        )));
+        return Err(McpCallSupervisionError::after_external_process_spawn(
+            format!("MCP server did not advertise exactly one tool named {tool_name}"),
+        ));
     }
     let schema_sha256 = format!(
         "{:x}",
         Sha256::digest(
             serde_json::to_vec(&matching[0].input_schema)
-                .map_err(McpCallSupervisionError::before_effect)?
+                .map_err(McpCallSupervisionError::after_external_process_spawn)?
         )
     );
     if schema_sha256 != expected_tool_schema_sha256 {
-        return Err(McpCallSupervisionError::before_effect(
+        return Err(McpCallSupervisionError::after_external_process_spawn(
             "MCP tool schema changed in the effect session",
         ));
     }
     if cancellation_requested(Some(should_cancel)) {
-        return Err(McpCallSupervisionError::before_effect(
-            "MCP tool call was cancelled before effect dispatch",
+        return Err(McpCallSupervisionError::after_external_process_spawn(
+            "MCP tool call was cancelled after external process spawn and before tools/call dispatch",
         ));
     }
 
-    // From the first byte of this line onward the external outcome is unknown
-    // unless the same initialized session returns the exact id=3 terminal.
+    // Process spawn is already the unknown-outcome boundary. A complete exact
+    // id=3 terminal is the only observation that restores a known outcome.
     session.send_effect(
         json!({"name": tool_name, "arguments": arguments}),
         deadline,
@@ -1466,10 +1624,10 @@ fn execute_mcp_effect_request_supervised(
     )?;
     match session
         .receive(3, deadline, Some(should_cancel))
-        .map_err(McpCallSupervisionError::after_effect_dispatch)?
+        .map_err(McpCallSupervisionError::after_external_process_spawn)?
     {
         McpRpcTerminal::Result(result) => validate_mcp_call_tool_result(result)
-            .map_err(McpCallSupervisionError::after_effect_dispatch),
+            .map_err(McpCallSupervisionError::after_external_process_spawn),
         McpRpcTerminal::Error(error) => Ok(McpEffectTerminal::Rejected(error)),
     }
 }
@@ -1814,90 +1972,94 @@ pub(crate) fn exact_mcp_server_config_sha256(config: &McpServerConfig) -> Result
     mcp_server_config_sha256_with_identity(config, &executable)
 }
 
-pub(crate) fn freeze_mcp_server_for_persona(
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+fn freeze_mcp_server_for_persona(
     config: &McpServerConfig,
     data_dir: &Path,
     expected_config_sha256: &str,
 ) -> Result<(McpServerConfig, String)> {
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (config, data_dir, expected_config_sha256);
-        anyhow::bail!("exact Persona MCP executables are unsupported on this platform");
+    let mut managed_store = lock_managed_mcp_store_for_write(data_dir)?;
+    let (frozen, frozen_hash, _newly_staged) =
+        stage_mcp_server_for_persona_locked(config, expected_config_sha256, &mut managed_store)?;
+    managed_store.seal()?;
+    drop(managed_store);
+    validate_frozen_mcp_server(&frozen, data_dir, &frozen_hash)?;
+    Ok((frozen, frozen_hash))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn stage_mcp_server_for_persona_locked(
+    config: &McpServerConfig,
+    expected_config_sha256: &str,
+    managed_store: &mut ManagedMcpWriteGuard,
+) -> Result<(McpServerConfig, String, bool)> {
+    if !config.enabled {
+        anyhow::bail!("Persona MCP server is disabled");
+    }
+    if !config.args.is_empty() {
+        anyhow::bail!(
+            "Persona MCP approvals require a reviewed direct native executable with no arguments"
+        );
+    }
+    let source_identity = mcp_executable_identity(&config.command)?;
+    let current_hash = mcp_server_config_sha256_with_identity(config, &source_identity)?;
+    if current_hash != expected_config_sha256 {
+        anyhow::bail!("MCP executable identity drifted before reviewed Persona staging");
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        if !config.enabled {
-            anyhow::bail!("Persona MCP server is disabled");
-        }
-        if !config.args.is_empty() {
-            anyhow::bail!(
-                "Persona MCP approvals require one self-contained native executable with no arguments"
-            );
-        }
-        let source_identity = mcp_executable_identity(&config.command)?;
-        let current_hash = mcp_server_config_sha256_with_identity(config, &source_identity)?;
-        if current_hash != expected_config_sha256 {
-            anyhow::bail!("MCP executable changed before exact Persona staging");
-        }
-
-        let mut managed_store = lock_managed_mcp_store_for_write(data_dir)?;
-        let managed_dir = managed_store.dir.clone();
-        cleanup_stale_managed_mcp_files(&managed_dir)?;
-        validate_managed_mcp_budget(&managed_dir, &source_identity.sha256, source_identity.bytes)?;
-        let managed_path = managed_dir.join(format!("{}.bin", source_identity.sha256));
-        if !managed_path.exists() {
-            let temp_path = managed_dir.join(format!(
-                ".{}.{}.tmp",
-                source_identity.sha256,
-                Uuid::new_v4()
-            ));
-            let mut cleanup = PendingManagedMcpFile::new(temp_path.clone());
-            let mut target = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
-            copy_exact_mcp_executable(&source_identity, &mut target)?;
-            target.sync_all()?;
-            use std::os::unix::fs::PermissionsExt;
-            target.set_permissions(fs::Permissions::from_mode(0o500))?;
-            drop(target);
-            // Link only the fully synced private temp inode into its final
-            // content address. Unlike rename on Unix, this cannot replace an
-            // existing managed executable. The mutable configured source is
-            // never linked, and the temporary name is removed immediately.
-            match fs::hard_link(&temp_path, &managed_path) {
-                Ok(()) => {
-                    fs::remove_file(&temp_path)?;
-                    cleanup.disarm();
-                }
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    fs::remove_file(&temp_path)?;
-                    cleanup.disarm();
-                }
-                Err(error) => return Err(error.into()),
+    let managed_dir = managed_store.dir.clone();
+    cleanup_stale_managed_mcp_files(&managed_dir)?;
+    validate_managed_mcp_budget(&managed_dir, &source_identity.sha256, source_identity.bytes)?;
+    let managed_path = managed_dir.join(format!("{}.bin", source_identity.sha256));
+    let mut newly_staged = false;
+    if !managed_path.exists() {
+        let temp_path = managed_dir.join(format!(
+            ".{}.{}.tmp",
+            source_identity.sha256,
+            Uuid::new_v4()
+        ));
+        let mut cleanup = PendingManagedMcpFile::new(temp_path.clone());
+        let mut target = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        copy_exact_mcp_executable(&source_identity, &mut target)?;
+        target.sync_all()?;
+        use std::os::unix::fs::PermissionsExt;
+        target.set_permissions(fs::Permissions::from_mode(0o500))?;
+        drop(target);
+        // Publish only the fully synced private temp inode. This prevents one
+        // cooperating Mom writer from replacing another writer's final path;
+        // it does not claim atomic pathname-to-exec binding.
+        match fs::hard_link(&temp_path, &managed_path) {
+            Ok(()) => {
+                newly_staged = true;
+                fs::remove_file(&temp_path)?;
+                cleanup.disarm();
             }
-            File::open(&managed_dir)?.sync_all()?;
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                fs::remove_file(&temp_path)?;
+                cleanup.disarm();
+            }
+            Err(error) => return Err(error.into()),
         }
-
-        let frozen = McpServerConfig {
-            name: config.name.clone(),
-            command: managed_path,
-            args: Vec::new(),
-            enabled: true,
-        };
-        let frozen_hash = exact_mcp_server_config_sha256(&frozen)?;
-        managed_store.seal()?;
-        drop(managed_store);
-        validate_frozen_mcp_server(&frozen, data_dir, &frozen_hash)?;
-
-        // A concurrent replacement of the configured source may not retarget
-        // the managed copy and must invalidate the pending approval instead.
-        if exact_mcp_server_config_sha256(config)? != expected_config_sha256 {
-            anyhow::bail!("MCP executable changed while exact Persona staging completed");
-        }
-        Ok((frozen, frozen_hash))
+        File::open(&managed_dir)?.sync_all()?;
     }
+
+    let frozen = McpServerConfig {
+        name: config.name.clone(),
+        command: managed_path,
+        args: Vec::new(),
+        enabled: true,
+    };
+    let frozen_hash = exact_mcp_server_config_sha256(&frozen)?;
+
+    // Rechecking the configured pathname detects drift around the reviewed
+    // copy. It does not assert an fd-bound exec or identity of dynamic inputs.
+    if exact_mcp_server_config_sha256(config)? != expected_config_sha256 {
+        anyhow::bail!("MCP executable identity drifted while reviewed staging completed");
+    }
+    Ok((frozen, frozen_hash, newly_staged))
 }
 
 pub(crate) fn validate_frozen_mcp_server(
@@ -1908,13 +2070,15 @@ pub(crate) fn validate_frozen_mcp_server(
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (config, data_dir, expected_config_sha256);
-        anyhow::bail!("exact Persona MCP executables are unsupported on this platform");
+        anyhow::bail!("reviewed Persona MCP executable staging is unsupported on this platform");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         if !config.enabled || !config.args.is_empty() {
-            anyhow::bail!("frozen Persona MCP configuration is not self-contained");
+            anyhow::bail!(
+                "reviewed Persona MCP configuration is not a direct no-argument executable"
+            );
         }
         let managed_dir = managed_mcp_executable_dir(data_dir)?;
         let command_parent = config
@@ -1936,7 +2100,9 @@ pub(crate) fn validate_frozen_mcp_server(
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::symlink_metadata(&config.command)?.permissions().mode();
         if mode & 0o222 != 0 || mode & 0o111 == 0 {
-            anyhow::bail!("frozen Persona MCP command permissions are not immutable executable");
+            anyhow::bail!(
+                "reviewed Persona MCP command is not read-only and executable at validation"
+            );
         }
         let actual_hash = mcp_server_config_sha256_with_identity(config, &identity)?;
         if actual_hash != expected_config_sha256 {
@@ -2391,14 +2557,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MCP_PROTOCOL_VERSION, McpEffectTerminal, McpServerConfig, exact_mcp_server_config_sha256,
-        execute_mcp_effect_request_supervised, freeze_mcp_server_for_persona,
-        validate_frozen_mcp_server, write_mcp_effect_message,
+        MCP_PROTOCOL_VERSION, MCP_TOOL_CATALOG_NAMESPACE, McpCallSupervisionError,
+        McpEffectTerminal, McpServerConfig, McpTool, McpToolCatalogDb, McpToolCatalogEntry,
+        exact_mcp_server_config_sha256, execute_mcp_effect_request_supervised,
+        persist_persona_mcp_tool_catalog_with_hook, validate_frozen_mcp_server,
+        write_mcp_effect_message,
     };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use super::{
+        cache_persona_mcp_tool_catalog_with_persistence, freeze_mcp_server_for_persona,
+        persist_persona_mcp_tool_catalog,
+    };
+    use crate::store::RuntimeStore;
+    use anyhow::Result;
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::io::{Error, ErrorKind, Write};
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::thread;
 
     struct PartialWriter {
         remaining: usize,
@@ -2438,6 +2615,50 @@ mod tests {
         assert!(error.to_string().contains("before server spawn"));
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn failed_os_spawn_remains_proven_before_external_process_authority() {
+        let server = McpServerConfig {
+            name: "missing".to_string(),
+            command: PathBuf::from("/definitely/not/a/real/mcp/server"),
+            args: Vec::new(),
+            enabled: true,
+        };
+        let error =
+            execute_mcp_effect_request_supervised(&server, "lookup", json!({}), "unused", &|| {
+                false
+            })
+            .expect_err("failed OS spawn must not cross the external-process boundary");
+        assert!(!error.outcome_unknown());
+        assert!(error.to_string().contains("failed to start MCP server"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn successful_spawn_makes_initialize_failure_outcome_unknown() {
+        let server = McpServerConfig {
+            name: "exits-during-initialize".to_string(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            enabled: true,
+        };
+        let error =
+            execute_mcp_effect_request_supervised(&server, "lookup", json!({}), "unused", &|| {
+                false
+            })
+            .expect_err("initialize failure after spawn must be outcome-unknown");
+        assert!(error.outcome_unknown());
+    }
+
+    #[test]
+    fn post_spawn_path_identity_drift_is_outcome_unknown() {
+        let error = McpCallSupervisionError::at_process_spawn_boundary(
+            "managed MCP pathname identity drifted across process spawn",
+            true,
+        );
+        assert!(error.outcome_unknown());
+    }
+
     #[test]
     fn partial_effect_frame_write_is_outcome_unknown() {
         let error = write_mcp_effect_message(
@@ -2456,6 +2677,24 @@ mod tests {
         )
         .expect_err("zero-byte effect frame must fail");
         assert!(!error.outcome_unknown());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn schema_drift_after_spawn_is_outcome_unknown() {
+        let server = standard_shell_server(
+            "printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[]}}\\n'",
+        );
+        let error = execute_mcp_effect_request_supervised(
+            &server,
+            "lookup",
+            json!({"query": "exact"}),
+            "wrong-schema-hash",
+            &|| false,
+        )
+        .expect_err("schema drift is discovered only after process spawn");
+        assert!(error.outcome_unknown());
+        assert!(error.to_string().contains("schema changed"));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2565,9 +2804,151 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reviewed_catalog_updates_serialize_one_mutable_fact() -> Result<()> {
+        let data_dir = std::env::temp_dir().join(format!(
+            "mom-llama-mcp-catalog-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = RuntimeStore::open_with_key(&data_dir, [61_u8; 32])?;
+        let first_store = store.clone();
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first = thread::spawn(move || {
+            persist_persona_mcp_tool_catalog_with_hook(&first_store, catalog_entry("alpha"), |_| {
+                first_entered_tx.send(()).expect("signal first transaction");
+                release_first_rx.recv().expect("release first transaction");
+                Ok(())
+            })
+        });
+        first_entered_rx.recv()?;
+
+        let second_store = store.clone();
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let second = thread::spawn(move || {
+            second_started_tx.send(()).expect("signal second contender");
+            persist_persona_mcp_tool_catalog_with_hook(
+                &second_store,
+                catalog_entry("beta"),
+                |catalog| {
+                    second_entered_tx
+                        .send(())
+                        .expect("signal second transaction");
+                    assert!(
+                        catalog.servers.iter().any(|entry| entry.server == "alpha"),
+                        "the second immediate transaction must observe the first commit"
+                    );
+                    Ok(())
+                },
+            )
+        });
+        second_started_rx.recv()?;
+        assert!(
+            matches!(
+                second_entered_rx.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a second writer must not enter while the first immediate transaction is live"
+        );
+        release_first_tx.send(())?;
+        first.join().expect("first catalog writer")?;
+        second.join().expect("second catalog writer")?;
+        second_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("second transaction entered after the first commit");
+
+        let catalog = store
+            .get::<McpToolCatalogDb>(MCP_TOOL_CATALOG_NAMESPACE)?
+            .expect("reviewed catalog");
+        assert_eq!(
+            catalog
+                .servers
+                .iter()
+                .map(|entry| entry.server.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+        std::fs::remove_dir_all(&data_dir)?;
+        Ok(())
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn persona_effect_executes_a_verified_content_addressed_native_copy() {
+    fn catalog_fault_rolls_back_only_newly_staged_unreferenced_bytes() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "mom-llama-mcp-catalog-fault-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&data_dir)?;
+        let store = RuntimeStore::open_with_key(&data_dir, [62_u8; 32])?;
+        let server = McpServerConfig {
+            name: "reviewed".to_string(),
+            command: std::env::current_exe()?,
+            args: Vec::new(),
+            enabled: true,
+        };
+        let server_hash = exact_mcp_server_config_sha256(&server)?;
+        let tools = vec![McpTool {
+            name: "lookup".to_string(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+        }];
+        let injected = cache_persona_mcp_tool_catalog_with_persistence(
+            &store,
+            &data_dir,
+            &server,
+            &tools,
+            &server_hash,
+            |_, _| anyhow::bail!("injected catalog persistence failure"),
+        )
+        .expect_err("faulted catalog persistence must fail");
+        assert!(
+            injected
+                .to_string()
+                .contains("injected catalog persistence failure")
+        );
+        let managed_dir = data_dir.join(super::PERSONA_MCP_EXECUTABLES_DIR);
+        assert_eq!(std::fs::read_dir(&managed_dir)?.count(), 0);
+
+        let changed = cache_persona_mcp_tool_catalog_with_persistence(
+            &store,
+            &data_dir,
+            &server,
+            &tools,
+            &server_hash,
+            persist_persona_mcp_tool_catalog,
+        )?;
+        let managed_path = changed[0].clone();
+        assert!(managed_path.is_file());
+
+        std::fs::set_permissions(&managed_dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::remove_file(&managed_path)?;
+        std::fs::set_permissions(&managed_dir, std::fs::Permissions::from_mode(0o500))?;
+        cache_persona_mcp_tool_catalog_with_persistence(
+            &store,
+            &data_dir,
+            &server,
+            &tools,
+            &server_hash,
+            |_, _| anyhow::bail!("second injected catalog persistence failure"),
+        )
+        .expect_err("fault after restoring referenced bytes must fail");
+        assert!(
+            managed_path.is_file(),
+            "rollback must preserve newly restored bytes referenced by the durable catalog"
+        );
+
+        std::fs::set_permissions(&managed_dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::remove_dir_all(&data_dir)?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn persona_review_stages_and_revalidates_content_addressed_native_bytes() {
         let data_dir = std::env::temp_dir().join(format!(
             "mom-llama-persona-mcp-freeze-{}",
             uuid::Uuid::new_v4()
@@ -2682,5 +3063,24 @@ mod tests {
             "{:x}",
             Sha256::digest(serde_json::to_vec(&json!({"type":"object"})).expect("schema"))
         )
+    }
+
+    fn catalog_entry(server: &str) -> McpToolCatalogEntry {
+        McpToolCatalogEntry {
+            server: server.to_string(),
+            server_config_sha256: format!("configured-{server}"),
+            frozen_server_config: McpServerConfig {
+                name: server.to_string(),
+                command: PathBuf::from(format!("/managed/{server}.bin")),
+                args: Vec::new(),
+                enabled: true,
+            },
+            frozen_server_config_sha256: format!("frozen-{server}"),
+            tools: vec![McpTool {
+                name: "lookup".to_string(),
+                description: None,
+                input_schema: json!({"type": "object"}),
+            }],
+        }
     }
 }
