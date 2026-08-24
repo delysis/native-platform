@@ -57,6 +57,16 @@ subprocess conversion. Mom may satisfy a typed audio-transcription request with
 `speech-native-kit`, send payload-decoded image/audio bytes only when the pinned
 native model advertises that exact capability, or surface a typed blocker.
 
+## Persona tool authority
+
+Persona answer text is presentation data and is never scanned for JSON or tool
+syntax. A tool-bound Persona drafts ordinary prose, then the resident Native
+worker runs a separate JSON-schema-constrained `PersonaToolDecision` phase.
+Only a complete verified `Call` decision for one attached server/tool and its
+exact input schema can reach MCP policy validation; `Final` leaves the draft
+untouched. Denied and ask-policy tools still fail closed, and one Persona turn
+can execute at most one exact tool call.
+
 ## Enforced negative boundaries
 
 `scripts/check-architecture.sh` rejects copied native/attachment crates,

@@ -3,7 +3,7 @@ use crate::chat::{
     ChatSendInput, ChatSendOptions, ChatSendOutput, ChatStreamEvent, chat_send_stream,
     native_context_messages,
 };
-use crate::config::{Settings, resolve_settings, upstream_setting_i64};
+use crate::config::{Settings, resolve_settings};
 use crate::conversation_store::{
     Conversation, ConversationExecutionProfile, ConversationKind, Message, MessageAttribution,
     MessageRole, MessageSpeakerKind, active_leaf_id, active_path_messages, load_db, save_db,
@@ -21,11 +21,13 @@ use crate::tool_loop::{
 };
 use anyhow::{Result, anyhow};
 use crossbeam_channel::TryRecvError;
-use llama_native_engine::NativeModelHandle;
+use llama_native_engine::{ControlledGenerationSubmission, NativeModelHandle};
 use llama_native_types::{
-    BranchRequest, ChatMessage, ChatRole, ChatTemplateChoice, GenerationEventKind, GenerationInput,
-    GenerationMetrics, GenerationOutput, GenerationRequest, GenerationState,
-    SharedPrefixBatchRequest,
+    BranchRequest, ChatMessage, ChatRole, ChatTemplateChoice, ConstraintArtifactReference,
+    ControlProgram, ControlledGenerationBatchRequest, ControlledGenerationCase,
+    DistributionObservationPolicy, ExactTokenPrompt, ExtendedSamplerProgram, GenerationEventKind,
+    GenerationInput, GenerationMetrics, GenerationOutput, GenerationRequest, GenerationState,
+    SharedPrefixBatchRequest, StructuredConstraint, TerminalSelector,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -39,6 +41,7 @@ use uuid::Uuid;
 
 const INVOCATIONS_NAMESPACE: &str = "mention-invocations.v1";
 const MAX_TARGETS: usize = 4;
+const PERSONA_TOOL_DECISION_MAX_TOKENS: u32 = 512;
 type MentionCancelKey = (String, String);
 type MentionCancelRegistry = BTreeMap<MentionCancelKey, Arc<AtomicBool>>;
 
@@ -1509,7 +1512,18 @@ fn resolve_mention_tools(
     bindings: &[crate::conversation_store::ToolBinding],
 ) -> std::result::Result<Vec<BoundMentionTool>, Blocker> {
     let mut tools = Vec::with_capacity(bindings.len());
+    let mut seen = BTreeSet::new();
     for binding in bindings {
+        if !seen.insert((binding.server.as_str(), binding.tool.as_str())) {
+            return Err(Blocker::new(
+                "mention_tool_binding_duplicate",
+                format!(
+                    "The Persona attaches `{}/{}` more than once.",
+                    binding.server, binding.tool
+                ),
+                vec!["Remove the duplicate tool binding in Settings.".to_string()],
+            ));
+        }
         let contract = resolve_tool_contract(&binding.server, &binding.tool)
             .map_err(|error| {
                 Blocker::new(
@@ -1539,7 +1553,14 @@ fn mention_tool_instructions(tools: &[BoundMentionTool]) -> String {
     if tools.is_empty() {
         return String::new();
     }
-    let manifest = tools
+    format!(
+        " Attached local tools are restricted to this manifest: {}. A denied tool is unavailable. Draft the answer as ordinary prose. Do not encode or imitate a tool call in the answer; a separate constrained local decision phase decides whether one exact attached call is necessary.",
+        serde_json::to_string(&mention_tool_manifest(tools)).unwrap_or_else(|_| "[]".to_string())
+    )
+}
+
+fn mention_tool_manifest(tools: &[BoundMentionTool]) -> Vec<Value> {
+    tools
         .iter()
         .map(|tool| {
             json!({
@@ -1554,24 +1575,257 @@ fn mention_tool_instructions(tools: &[BoundMentionTool]) -> String {
                 }
             })
         })
-        .collect::<Vec<_>>();
-    format!(
-        " Attached local tools are restricted to this manifest: {}. A denied tool is unavailable. If a tool call is necessary, return only {{\"action\":\"call\",\"server\":\"...\",\"tool\":\"...\",\"arguments\":{{...}}}}. Otherwise answer normally.",
-        serde_json::to_string(&manifest).unwrap_or_else(|_| "[]".to_string())
-    )
+        .collect()
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-enum MentionToolDecision {
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum PersonaToolDecision {
     Call {
         server: String,
         tool: String,
         arguments: Value,
     },
-    Final {
-        answer: String,
-    },
+    Final {},
+}
+
+fn persona_tool_decision_schema(tools: &[BoundMentionTool]) -> Value {
+    let mut variants = vec![json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action"],
+        "properties": {
+            "action": {"const": "final"}
+        }
+    })];
+    variants.extend(tools.iter().map(|binding| {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "server", "tool", "arguments"],
+            "properties": {
+                "action": {"const": "call"},
+                "server": {"const": binding.server},
+                "tool": {"const": binding.contract.name},
+                "arguments": binding.contract.input_schema
+            }
+        })
+    }));
+    json!({
+        "title": "PersonaToolDecisionV1",
+        "oneOf": variants
+    })
+}
+
+fn run_persona_tool_decision(
+    target: &PlannedTarget,
+    invocation_id: &str,
+    settings: &Settings,
+) -> std::result::Result<PersonaToolDecision, Blocker> {
+    if mention_cancellation_requested(invocation_id, &target.snapshot.target_id) {
+        return Err(Blocker::new(
+            "mention_tool_decision_cancelled",
+            "The Persona tool decision was cancelled before admission.",
+            vec!["Retry the Persona response if the call is still needed.".to_string()],
+        ));
+    }
+    let schema =
+        serde_json::to_string(&persona_tool_decision_schema(&target.tools)).map_err(|error| {
+            Blocker::new(
+                "mention_tool_decision_schema_failed",
+                format!("The exact Persona tool decision schema could not be encoded: {error}"),
+                vec!["Review the Persona's attached tool schemas.".to_string()],
+            )
+        })?;
+    let schema_sha256 = format!("{:x}", Sha256::digest(schema.as_bytes()));
+    let schema_len = u32::try_from(schema.len()).map_err(|_| {
+        Blocker::new(
+            "mention_tool_decision_schema_too_large",
+            "The exact Persona tool decision schema exceeds the Native artifact bound.",
+            vec!["Remove or simplify attached tool schemas.".to_string()],
+        )
+    })?;
+    let reference = ConstraintArtifactReference::new(
+        format!("persona-tool-decision-v1-{}", &schema_sha256[..16]),
+        schema_sha256,
+        schema_len,
+    )
+    .map_err(|error| {
+        Blocker::new(
+            "mention_tool_decision_schema_invalid",
+            error.message,
+            vec!["Review the Persona's attached tool schemas.".to_string()],
+        )
+    })?;
+    let manifest =
+        serde_json::to_string(&mention_tool_manifest(&target.tools)).map_err(|error| {
+            Blocker::new(
+                "mention_tool_manifest_failed",
+                format!("The attached tool manifest could not be encoded: {error}"),
+                vec!["Review the Persona's attached tools.".to_string()],
+            )
+        })?;
+    let decision_input = serde_json::to_string(&json!({
+        "addressed_message": target
+            .messages
+            .last()
+            .map(|message| message.content.as_str())
+            .unwrap_or_default(),
+    }))
+    .map_err(|error| {
+        Blocker::new(
+            "mention_tool_decision_input_failed",
+            format!("The Persona tool decision input could not be encoded: {error}"),
+            vec!["Retry the Persona response.".to_string()],
+        )
+    })?;
+    let messages = vec![
+        ChatMessage {
+            role: ChatRole::System,
+            content: format!(
+                "You are a constrained local control phase, not the Persona answer. Return exactly one schema-valid decision object. You never receive or inspect the Persona's answer prose. Choose final unless one exact attached local tool call is necessary to answer the addressed message. At most one call is permitted. Attached manifest: {manifest}"
+            ),
+        },
+        ChatMessage {
+            role: ChatRole::User,
+            content: decision_input,
+        },
+    ];
+    let template = profile_chat_template(&target.snapshot.profile);
+    let mut prepared = target
+        .handle
+        .prepare_input(GenerationInput::Chat { messages, template })
+        .map_err(|error| {
+            Blocker::new(
+                "mention_tool_decision_prompt_failed",
+                error.message,
+                vec!["Check the target model's chat template.".to_string()],
+            )
+        })?;
+    if prepared.len() != 1 {
+        return Err(Blocker::new(
+            "mention_tool_decision_prompt_ambiguous",
+            "Native prompt preparation did not return exactly one Persona tool decision prompt.",
+            vec!["Check the target model's chat template.".to_string()],
+        ));
+    }
+    let prepared = prepared.pop().expect("length checked");
+    let writer = target
+        .handle
+        .controlled_model_identity("persona-tool-decision")
+        .map_err(|error| {
+            Blocker::new(
+                "mention_tool_decision_identity_failed",
+                error.message,
+                vec!["Retry after reloading the target model.".to_string()],
+            )
+        })?;
+    let control = ControlProgram::new(
+        writer,
+        Vec::new(),
+        Some(StructuredConstraint::JsonSchema { reference }),
+        Vec::new(),
+        ExtendedSamplerProgram::default(),
+        TerminalSelector::Distribution,
+        DistributionObservationPolicy::default(),
+        Vec::new(),
+    )
+    .map_err(|error| {
+        Blocker::new(
+            "mention_tool_decision_control_failed",
+            error.message,
+            vec!["Review the target model and attached tool schemas.".to_string()],
+        )
+    })?;
+    let mut sampling = target
+        .snapshot
+        .profile
+        .sampling
+        .clone()
+        .unwrap_or_else(|| settings.sampling_config());
+    sampling.max_tokens = sampling
+        .max_tokens
+        .clamp(64, PERSONA_TOOL_DECISION_MAX_TOKENS);
+    sampling.temperature = sampling.temperature.min(0.2);
+    sampling.dynamic_temperature_range = 0.0;
+    sampling.stop.clear();
+    let case = ControlledGenerationCase::new(
+        target.snapshot.target_id.clone(),
+        ExactTokenPrompt::new(prepared.token_ids).map_err(|error| {
+            Blocker::new(
+                "mention_tool_decision_prompt_invalid",
+                error.message,
+                vec!["Reduce the addressed message or Persona context.".to_string()],
+            )
+        })?,
+        None,
+        sampling,
+    )
+    .map_err(|error| {
+        Blocker::new(
+            "mention_tool_decision_case_invalid",
+            error.message,
+            vec!["Review the target model and Persona settings.".to_string()],
+        )
+    })?;
+    let request =
+        ControlledGenerationBatchRequest::new(invocation_id.to_string(), vec![case], control)
+            .map_err(|error| {
+                Blocker::new(
+                    "mention_tool_decision_request_invalid",
+                    error.message,
+                    vec!["Reduce the addressed message or Persona context.".to_string()],
+                )
+            })?;
+    let submission =
+        ControlledGenerationSubmission::new(request, Some(schema)).map_err(|error| {
+            Blocker::new(
+                "mention_tool_decision_constraint_invalid",
+                error.message,
+                vec!["Review the Persona's attached tool schemas.".to_string()],
+            )
+        })?;
+    let verified = target
+        .handle
+        .generate_controlled(submission)
+        .map_err(|error| {
+            Blocker::new(
+                "mention_tool_decision_admission_failed",
+                error.message,
+                vec!["Retry the Persona response.".to_string()],
+            )
+        })?
+        .wait_verified()
+        .map_err(|error| {
+            Blocker::new(
+                "mention_tool_decision_failed",
+                error.message,
+                vec!["Retry the Persona response.".to_string()],
+            )
+        })?;
+    let cases = verified.output().cases();
+    if cases.len() != 1 || cases[0].case_id() != target.snapshot.target_id {
+        return Err(Blocker::new(
+            "mention_tool_decision_output_ambiguous",
+            "Native returned a Persona tool decision for the wrong target.",
+            vec!["Retry after reloading the target model.".to_string()],
+        ));
+    }
+    let generation = cases[0].generation();
+    if !generation.real_engine_invoked || generation.fake_fixture {
+        return Err(Blocker::new(
+            "mention_tool_decision_not_real",
+            "The Persona tool decision lacks real Native execution evidence.",
+            vec!["Run with the configured local model.".to_string()],
+        ));
+    }
+    serde_json::from_str(generation.text.trim()).map_err(|error| {
+        Blocker::new(
+            "mention_tool_decision_invalid",
+            format!("The constrained Persona tool decision was not complete: {error}"),
+            vec!["Retry the Persona response.".to_string()],
+        )
+    })
 }
 
 fn finish_tool_bound_mention(
@@ -1580,136 +1834,116 @@ fn finish_tool_bound_mention(
     invocation_id: &str,
     settings: &Settings,
 ) -> std::result::Result<(GenerationOutput, Vec<String>), Blocker> {
-    let max_turns = upstream_setting_i64(settings, "agenticMaxTurns")
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(4)
-        .clamp(1, 8);
-    let mut messages = target.messages.clone();
-    let mut receipts = Vec::new();
-    for _ in 0..max_turns {
-        let Some(decision) = parse_mention_tool_decision(&output.text) else {
-            return Ok((output, receipts));
-        };
-        match decision {
-            MentionToolDecision::Final { answer } => {
-                output.text = answer;
-                return Ok((output, receipts));
-            }
-            MentionToolDecision::Call {
-                server,
-                tool,
-                arguments,
-            } => {
-                authorize_bound_tool(
-                    &target.tools,
-                    &server,
-                    &tool,
-                    &arguments,
-                    &target.snapshot.handle,
-                )?;
-                let call = mcp_call_tool_supervised(&server, &tool, arguments.clone(), &|| {
-                    mention_cancellation_requested(invocation_id, &target.snapshot.target_id)
-                })
-                .map_err(|error| {
-                    Blocker::new(
-                        "mention_tool_call_failed",
-                        error.to_string(),
-                        vec!["Check the attached MCP server in Settings.".to_string()],
-                    )
-                })?;
-                if call.status == "blocked" {
-                    return Err(call.blocker.unwrap_or_else(|| {
-                        Blocker::new(
-                            "mention_tool_call_blocked",
-                            "The attached local tool was blocked.",
-                            vec!["Check local tool permissions and server status.".to_string()],
-                        )
-                    }));
-                }
-                receipts.push(call.receipt.task_id);
-                let content = call
-                    .result
-                    .map(|result| result.content)
-                    .unwrap_or(Value::Null);
-                messages.push(ChatMessage {
-                    role: ChatRole::Assistant,
-                    content: output.text,
-                });
-                messages.push(ChatMessage {
-                    role: ChatRole::Tool,
-                    content: serde_json::to_string(&json!({
-                        "server": server,
-                        "tool": tool,
-                        "arguments": arguments,
-                        "result": content,
-                    }))
-                    .unwrap_or_else(|_| "Local tool returned an unreadable result.".to_string()),
-                });
-                let ticket = target
-                    .handle
-                    .generate_shared_prefix(SharedPrefixBatchRequest {
-                        request_id: invocation_id.to_string(),
-                        model_id: target.handle.status().model_id,
-                        common_messages: Vec::new(),
-                        chat_template: profile_chat_template(&target.snapshot.profile),
-                        branches: vec![BranchRequest {
-                            branch_id: target.snapshot.target_id.clone(),
-                            label: target.snapshot.label.clone(),
-                            instruction: String::new(),
-                            sampling: target
-                                .snapshot
-                                .profile
-                                .sampling
-                                .clone()
-                                .unwrap_or_else(|| settings.sampling_config()),
-                            messages: messages.clone(),
-                            cached_prefix: None,
-                        }],
-                        cached_prefix: None,
-                    })
-                    .map_err(|error| {
-                        Blocker::new(
-                            "mention_tool_followup_failed",
-                            error.message,
-                            vec!["Retry the Persona response.".to_string()],
-                        )
-                    })?;
-                output = ticket
-                    .wait()
-                    .map_err(|error| {
-                        Blocker::new(
-                            "mention_tool_followup_failed",
-                            error.message,
-                            vec!["Retry the Persona response.".to_string()],
-                        )
-                    })?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        Blocker::new(
-                            "mention_tool_followup_missing",
-                            "The local model returned no answer after the tool call.",
-                            vec!["Retry the Persona response.".to_string()],
-                        )
-                    })?;
-                if output.state != GenerationState::Completed {
-                    return Err(Blocker::new(
-                        "mention_tool_followup_incomplete",
-                        "The local model did not complete after the tool call.",
-                        vec!["Review the partial response before retrying.".to_string()],
-                    ));
-                }
-            }
-        }
+    let decision = run_persona_tool_decision(target, invocation_id, settings)?;
+    let PersonaToolDecision::Call {
+        server,
+        tool,
+        arguments,
+    } = decision
+    else {
+        return Ok((output, Vec::new()));
+    };
+    authorize_bound_tool(
+        &target.tools,
+        &server,
+        &tool,
+        &arguments,
+        &target.snapshot.handle,
+    )?;
+    let call = mcp_call_tool_supervised(&server, &tool, arguments.clone(), &|| {
+        mention_cancellation_requested(invocation_id, &target.snapshot.target_id)
+    })
+    .map_err(|error| {
+        Blocker::new(
+            "mention_tool_call_failed",
+            error.to_string(),
+            vec!["Check the attached MCP server in Settings.".to_string()],
+        )
+    })?;
+    if call.status == "blocked" {
+        return Err(call.blocker.unwrap_or_else(|| {
+            Blocker::new(
+                "mention_tool_call_blocked",
+                "The attached local tool was blocked.",
+                vec!["Check local tool permissions and server status.".to_string()],
+            )
+        }));
     }
-    Err(Blocker::new(
-        "mention_tool_turn_limit_reached",
-        format!(
-            "@{} requested another tool call after the bounded {max_turns}-turn limit.",
-            target.snapshot.handle
-        ),
-        vec!["Simplify the request or raise the bounded tool-turn setting.".to_string()],
-    ))
+    let receipts = vec![call.receipt.task_id];
+    let content = call
+        .result
+        .map(|result| result.content)
+        .unwrap_or(Value::Null);
+    let mut messages = target.messages.clone();
+    messages.push(ChatMessage {
+        role: ChatRole::Assistant,
+        content: output.text,
+    });
+    messages.push(ChatMessage {
+        role: ChatRole::Tool,
+        content: serde_json::to_string(&json!({
+            "server": server,
+            "tool": tool,
+            "arguments": arguments,
+            "result": content,
+        }))
+        .unwrap_or_else(|_| "Local tool returned an unreadable result.".to_string()),
+    });
+    let ticket = target
+        .handle
+        .generate_shared_prefix(SharedPrefixBatchRequest {
+            request_id: invocation_id.to_string(),
+            model_id: target.handle.status().model_id,
+            common_messages: Vec::new(),
+            chat_template: profile_chat_template(&target.snapshot.profile),
+            branches: vec![BranchRequest {
+                branch_id: target.snapshot.target_id.clone(),
+                label: target.snapshot.label.clone(),
+                instruction: String::new(),
+                sampling: target
+                    .snapshot
+                    .profile
+                    .sampling
+                    .clone()
+                    .unwrap_or_else(|| settings.sampling_config()),
+                messages,
+                cached_prefix: None,
+            }],
+            cached_prefix: None,
+        })
+        .map_err(|error| {
+            Blocker::new(
+                "mention_tool_followup_failed",
+                error.message,
+                vec!["Retry the Persona response.".to_string()],
+            )
+        })?;
+    output = ticket
+        .wait()
+        .map_err(|error| {
+            Blocker::new(
+                "mention_tool_followup_failed",
+                error.message,
+                vec!["Retry the Persona response.".to_string()],
+            )
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            Blocker::new(
+                "mention_tool_followup_missing",
+                "The local model returned no answer after the tool call.",
+                vec!["Retry the Persona response.".to_string()],
+            )
+        })?;
+    if output.state != GenerationState::Completed {
+        return Err(Blocker::new(
+            "mention_tool_followup_incomplete",
+            "The local model did not complete after the tool call.",
+            vec!["Review the partial response before retrying.".to_string()],
+        ));
+    }
+    Ok((output, receipts))
 }
 
 fn authorize_bound_tool<'a>(
@@ -1750,13 +1984,6 @@ fn authorize_bound_tool<'a>(
         )),
         ToolPermissionPolicy::AlwaysAllow => Ok(binding),
     }
-}
-
-fn parse_mention_tool_decision(value: &str) -> Option<MentionToolDecision> {
-    let trimmed = value.trim();
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    serde_json::from_str(&trimmed[start..=end]).ok()
 }
 
 fn handoff_messages(
@@ -2231,9 +2458,9 @@ const fn candidate_rank(kind: MentionTargetKind) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundMentionTool, MentionToolDecision, ambiguous_resolution_blocker, authorize_bound_tool,
-        fit_handoff_to_context, parse_handles, parse_mention_tool_decision,
-        resolve_targets_from_registry,
+        BoundMentionTool, PersonaToolDecision, ambiguous_resolution_blocker, authorize_bound_tool,
+        fit_handoff_to_context, mention_tool_instructions, parse_handles,
+        persona_tool_decision_schema, resolve_targets_from_registry,
     };
     use crate::conversation_store::{Conversation, ConversationExecutionProfile, ConversationKind};
     use crate::mcp::McpTool;
@@ -2391,39 +2618,78 @@ mod tests {
     }
 
     #[test]
-    fn unstructured_mention_output_cannot_authorize_a_tool_call() {
-        assert!(parse_mention_tool_decision("Please call local/lookup now").is_none());
+    fn persona_tool_decision_requires_one_complete_strict_control_object() {
         assert!(
-            parse_mention_tool_decision(
+            serde_json::from_str::<PersonaToolDecision>("Please call local/lookup now").is_err()
+        );
+        assert_eq!(
+            serde_json::from_str::<PersonaToolDecision>(
                 r#"{"action":"call","server":"local","tool":"lookup","arguments":{"query":"x"}}"#
             )
-            .is_some()
+            .expect("complete call decision"),
+            PersonaToolDecision::Call {
+                server: "local".to_string(),
+                tool: "lookup".to_string(),
+                arguments: json!({"query": "x"}),
+            }
         );
-    }
-
-    #[test]
-    fn audit_characterization_answer_prose_currently_exposes_embedded_call_json() {
+        assert_eq!(
+            serde_json::from_str::<PersonaToolDecision>(r#"{"action":"final"}"#)
+                .expect("complete final decision"),
+            PersonaToolDecision::Final {}
+        );
         let call =
             r#"{"action":"call","server":"local","tool":"lookup","arguments":{"query":"x"}}"#;
         let prose = format!("Here is an example, not a request: {call} Please explain it.");
         let fenced = format!("A configuration example:\n```json\n{call}\n```");
 
         assert!(
-            matches!(
-                parse_mention_tool_decision(&prose),
-                Some(MentionToolDecision::Call { server, tool, .. })
-                    if server == "local" && tool == "lookup"
-            ),
-            "the current parser scans answer prose from its first opening brace to its last closing brace"
+            serde_json::from_str::<PersonaToolDecision>(&prose).is_err(),
+            "answer prose must never be scanned for an embedded control object"
         );
         assert!(
-            matches!(
-                parse_mention_tool_decision(&fenced),
-                Some(MentionToolDecision::Call { server, tool, .. })
-                    if server == "local" && tool == "lookup"
-            ),
-            "the current parser does not distinguish displayed Markdown examples from control"
+            serde_json::from_str::<PersonaToolDecision>(&fenced).is_err(),
+            "fenced display JSON must remain inert answer prose"
         );
+        assert!(
+            serde_json::from_str::<PersonaToolDecision>(
+                r#"{"action":"final","unexpected":"field"}"#
+            )
+            .is_err(),
+            "unknown fields must invalidate the complete decision"
+        );
+    }
+
+    #[test]
+    fn persona_tool_decision_schema_binds_each_call_to_one_attached_contract() {
+        let tools = vec![BoundMentionTool {
+            server: "local".to_string(),
+            policy: ToolPermissionPolicy::AlwaysAllow,
+            contract: McpTool {
+                name: "lookup".to_string(),
+                description: Some("Look up one exact query".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["query"],
+                    "properties": {"query": {"type": "string"}}
+                }),
+            },
+        }];
+        let schema = persona_tool_decision_schema(&tools);
+        let variants = schema["oneOf"].as_array().expect("oneOf variants");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0]["properties"]["action"]["const"], "final");
+        assert_eq!(variants[1]["properties"]["action"]["const"], "call");
+        assert_eq!(variants[1]["properties"]["server"]["const"], "local");
+        assert_eq!(variants[1]["properties"]["tool"]["const"], "lookup");
+        assert_eq!(
+            variants[1]["properties"]["arguments"],
+            tools[0].contract.input_schema
+        );
+        assert_eq!(variants[1]["additionalProperties"], false);
+        assert!(mention_tool_instructions(&tools).contains("Draft the answer as ordinary prose"));
+        assert!(!mention_tool_instructions(&tools).contains("return only"));
     }
 
     #[test]
