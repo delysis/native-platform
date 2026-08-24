@@ -34,6 +34,14 @@
     (chat() && chat().dataset.currentConversation) || "default";
   const selectedConversationKind = () =>
     (chat() && chat().dataset.conversationKind) || "chat";
+  const composerPolicy = globalThis.MomLlamaComposerKeyPolicy;
+  let composerState = composerPolicy?.initialState?.() || { kind: "idle" };
+  const transitionComposer = (event) => {
+    if (!composerPolicy?.reduce) return [];
+    const transition = composerPolicy.reduce(composerState, event);
+    composerState = transition.state;
+    return transition.effects;
+  };
   const settingEnabled = (key, fallback = false) => {
     const field = document.querySelector(`[data-setting-key="${key}"]`);
     return field ? Boolean(field.checked) : fallback;
@@ -1121,7 +1129,6 @@
   };
 
   let mentionSearchSerial = 0;
-  let mentionActiveIndex = 0;
   const mentionTokenAtCursor = (textarea) => {
     const before = textarea.value.slice(0, textarea.selectionStart);
     const match = before.match(/(?:^|\s)@([\w-]*)$/);
@@ -1129,12 +1136,43 @@
     return { query: match[1], start: textarea.selectionStart - match[1].length - 1, end: textarea.selectionStart };
   };
 
-  const closeMentions = () => {
+  const composerTextarea = () => (
+    document.querySelector("#chat-form textarea[name='message']")
+  );
+
+  const syncMentionAria = () => {
+    const textarea = composerTextarea();
+    const list = document.getElementById("mention-candidates");
+    const options = [...list?.querySelectorAll(".mention-candidate") || []];
+    const open = composerState.kind === "mention"
+      && composerState.optionCount === options.length
+      && !list?.classList.contains("is-hidden");
+    const activeIndex = open ? composerState.activeIndex : -1;
+    options.forEach((option, index) => {
+      const active = index === activeIndex;
+      option.classList.toggle("active", active);
+      option.setAttribute("aria-selected", active ? "true" : "false");
+    });
+    textarea?.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open && options[activeIndex]?.id) {
+      textarea?.setAttribute("aria-activedescendant", options[activeIndex].id);
+    } else {
+      textarea?.removeAttribute("aria-activedescendant");
+    }
+  };
+
+  const hideMentionPresentation = () => {
     mentionSearchSerial += 1;
     const list = document.getElementById("mention-candidates");
     list?.classList.add("is-hidden");
     list?.replaceChildren();
-    mentionActiveIndex = 0;
+    list?.setAttribute("aria-busy", "false");
+    syncMentionAria();
+  };
+
+  const closeMentions = () => {
+    transitionComposer({ type: "mention_close" });
+    hideMentionPresentation();
   };
 
   const insertMention = (textarea, handle) => {
@@ -1151,6 +1189,12 @@
     if (!token) { closeMentions(); return; }
     const conversation = selectedConversation();
     const serial = ++mentionSearchSerial;
+    const list = document.getElementById("mention-candidates");
+    transitionComposer({ type: "mention_close" });
+    list?.classList.add("is-hidden");
+    list?.replaceChildren();
+    list?.setAttribute("aria-busy", "true");
+    syncMentionAria();
     const response = await invoke("mom_llama_mention_candidates", {
       query: token.query,
       conversation,
@@ -1165,14 +1209,15 @@
       closeMentions();
       return;
     }
-    const list = document.getElementById("mention-candidates");
     const candidates = response?.result || [];
     if (!list || !candidates.length) { closeMentions(); return; }
     list.replaceChildren(...candidates.map((candidate, index) => {
       const button = createCommandElement("button", DYNAMIC_CONTROL_SPECS.mentionCandidates);
       button.type = "button";
+      button.id = `mention-candidate-${serial}-${index}`;
       button.className = `mention-candidate${index === 0 ? " active" : ""}`;
       button.setAttribute("role", "option");
+      button.setAttribute("aria-selected", index === 0 ? "true" : "false");
       button.dataset.handle = candidate.handle;
       button.dataset.kind = candidate.kind;
       button.dataset.action = "mention-insert";
@@ -1189,8 +1234,14 @@
       button.append(...(icon ? [icon, copy] : [copy]));
       return button;
     }));
-    mentionActiveIndex = 0;
+    transitionComposer({ type: "mention_open", optionCount: candidates.length });
+    if (composerState.kind !== "mention") {
+      hideMentionPresentation();
+      return;
+    }
+    list.setAttribute("aria-busy", "false");
     list.classList.remove("is-hidden");
+    syncMentionAria();
   };
 
   const onToolLoopEvent = (event) => {
@@ -1957,8 +2008,22 @@
     } catch (error) { reportError(error); }
   });
 
+  document.addEventListener("compositionstart", (event) => {
+    if (!event.target.matches("#chat-form textarea[name='message']")) return;
+    transitionComposer({ type: "composition_start" });
+    hideMentionPresentation();
+  });
+
+  document.addEventListener("compositionend", (event) => {
+    if (!event.target.matches("#chat-form textarea[name='message']")) return;
+    transitionComposer({ type: "composition_end" });
+    scheduleDraft(event.target.value);
+    updateMentionCandidates(event.target).catch(reportError);
+  });
+
   document.addEventListener("input", (event) => {
     if (event.target.matches("#chat-form textarea[name='message']")) {
+      if (event.isComposing || composerState.kind === "composing") return;
       scheduleDraft(event.target.value);
       updateMentionCandidates(event.target).catch(reportError);
     }
@@ -2017,34 +2082,47 @@
     if (!event.target.matches("#chat-form textarea[name='message']")) return;
     const mentionList = document.getElementById("mention-candidates");
     const mentionOptions = [...mentionList?.querySelectorAll(".mention-candidate") || []];
-    const keyDecision = globalThis.MomLlamaComposerKeyPolicy?.decideKey({
+    const mentionPresentationOpen = mentionOptions.length > 0
+      && !mentionList?.classList.contains("is-hidden");
+    if (composerState.kind === "mention" && (
+      !mentionPresentationOpen || composerState.optionCount !== mentionOptions.length
+    )) {
+      transitionComposer({ type: "mention_close" });
+    } else if (composerState.kind !== "mention" && mentionPresentationOpen) {
+      transitionComposer({ type: "mention_open", optionCount: mentionOptions.length });
+      syncMentionAria();
+    }
+    const keyEffects = transitionComposer({
+      type: "key_down",
       key: event.key,
+      keyCode: event.keyCode,
+      isComposing: event.isComposing,
       shiftKey: event.shiftKey,
       metaKey: event.metaKey,
       ctrlKey: event.ctrlKey,
-      mentionOpen: !mentionList?.classList.contains("is-hidden"),
-      mentionCount: mentionOptions.length,
       sendOnEnter: document.querySelector('[data-setting-key="sendOnEnter"]')?.checked !== false,
-    }) || { kind: "unhandled" };
-    if (keyDecision.kind === "mention_next" || keyDecision.kind === "mention_previous") {
-      event.preventDefault();
-      mentionActiveIndex = (mentionActiveIndex + (keyDecision.kind === "mention_next" ? 1 : -1) + mentionOptions.length) % mentionOptions.length;
-      mentionOptions.forEach((option, index) => option.classList.toggle("active", index === mentionActiveIndex));
-      return;
-    }
-    if (keyDecision.kind === "mention_accept") {
-      event.preventDefault();
-      insertMention(event.target, mentionOptions[mentionActiveIndex].dataset.handle || "");
-      return;
-    }
-    if (keyDecision.kind === "mention_dismiss") {
-      event.preventDefault();
-      closeMentions();
-      return;
-    }
-    if (keyDecision.kind === "submit") {
-      event.preventDefault();
-      event.target.form?.requestSubmit();
+    });
+    for (const keyEffect of keyEffects) {
+      if (keyEffect.kind === "mention_active_changed") {
+        event.preventDefault();
+        syncMentionAria();
+      }
+      if (keyEffect.kind === "mention_accept") {
+        event.preventDefault();
+        const option = mentionOptions[keyEffect.activeIndex];
+        if (option) insertMention(event.target, option.dataset.handle || "");
+      }
+      if (keyEffect.kind === "mention_dismiss") {
+        event.preventDefault();
+        hideMentionPresentation();
+      }
+      if (keyEffect.kind === "ai_accept" || keyEffect.kind === "ai_dismiss") {
+        event.preventDefault();
+      }
+      if (keyEffect.kind === "submit") {
+        event.preventDefault();
+        event.target.form?.requestSubmit();
+      }
     }
   });
 

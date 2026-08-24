@@ -1955,6 +1955,11 @@ fn composer(
             textarea name="message"
                 rows="2"
                 aria-label="Message"
+                role="combobox"
+                aria-autocomplete="list"
+                aria-controls="mention-candidates"
+                aria-haspopup="listbox"
+                aria-expanded="false"
                 placeholder="Type a message..."
                 data-affordance="chat.composer.message"
                 data-command="mom_llama.chat_dispatch"
@@ -1975,6 +1980,7 @@ fn composer(
             }
             div id="mention-candidates" class="mention-candidates is-hidden" role="listbox"
                 aria-label="Personas, chats, and consult groups"
+                aria-busy="false"
                 data-affordance="mention.candidates"
                 data-command="mom_llama.mention_candidates"
                 data-tauri-command="mom_llama_mention_candidates"
@@ -4169,6 +4175,19 @@ mod tests {
         assert!(!html.contains("Edits version this template"));
         assert!(!html.contains(r#"class="persona-template-banner""#));
         assert!(html.contains(r#"id="mention-candidates" class="mention-candidates is-hidden""#));
+        for composer_combobox_attribute in [
+            r#"role="combobox""#,
+            r#"aria-autocomplete="list""#,
+            r#"aria-controls="mention-candidates""#,
+            r#"aria-haspopup="listbox""#,
+            r#"aria-expanded="false""#,
+            r#"aria-busy="false""#,
+        ] {
+            assert!(
+                html.contains(composer_combobox_attribute),
+                "missing composer combobox attribute {composer_combobox_attribute}"
+            );
+        }
         let stylesheet = include_str!("../../ui/style.css").replace("\r\n", "\n");
         assert!(
             stylesheet.contains(".composer {\n  position: relative;"),
@@ -4237,6 +4256,20 @@ mod tests {
             "large Rust-rendered fragments must use the raw IPC decoder"
         );
         assert!(js.contains("renderSearchResults"));
+        for composer_reducer_boundary in [
+            r#"document.addEventListener("compositionstart""#,
+            r#"document.addEventListener("compositionend""#,
+            "event.isComposing",
+            "keyCode: event.keyCode",
+            r#"keyEffect.kind === "mention_active_changed""#,
+            r#"option.setAttribute("aria-selected""#,
+            r#"textarea?.setAttribute("aria-activedescendant""#,
+        ] {
+            assert!(
+                js.contains(composer_reducer_boundary),
+                "missing composer reducer boundary {composer_reducer_boundary}"
+            );
+        }
         assert!(
             js.contains("captureChatViewport")
                 && js.contains("restoreChatViewport")
