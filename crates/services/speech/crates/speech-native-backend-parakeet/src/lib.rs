@@ -108,6 +108,19 @@ struct StreamPush {
     reply: oneshot::Sender<Result<(), SpeechError>>,
 }
 
+struct StreamDurationBudget {
+    format: PcmFormat,
+    accepted_frames: u64,
+    next_sequence: u64,
+    max_frames: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamAcceptance {
+    accepted_frames: u64,
+    next_sequence: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamPhase {
     Running,
@@ -127,6 +140,101 @@ enum IdleStreamActorAction {
     Finish(Option<oneshot::Sender<Result<(), SpeechError>>>),
     DownstreamClosed,
     Push(Option<StreamPush>),
+}
+
+impl StreamDurationBudget {
+    fn new(format: PcmFormat, request_id: &SpeechRequestId) -> Result<Self, SpeechError> {
+        let max_frames = u64::from(format.sample_rate_hz)
+            .checked_mul(MAX_AUDIO_MS)
+            .map(|sample_milliseconds| sample_milliseconds / 1_000)
+            .ok_or_else(|| {
+                backend_error(
+                    request_id,
+                    "audio_stream_geometry_overflow",
+                    SpeechErrorClass::InvalidRequest,
+                    false,
+                    "Audio stream duration geometry exceeds this platform",
+                )
+            })?;
+        Ok(Self {
+            format,
+            accepted_frames: 0,
+            next_sequence: 0,
+            max_frames,
+        })
+    }
+
+    fn checked_acceptance(
+        &self,
+        chunk: &AudioChunk,
+        request_id: &SpeechRequestId,
+    ) -> Result<StreamAcceptance, SpeechError> {
+        chunk.validate(request_id)?;
+        if chunk.format != self.format {
+            return Err(backend_error(
+                request_id,
+                "audio_stream_format_changed",
+                SpeechErrorClass::InvalidRequest,
+                false,
+                "A transcription stream must keep one PCM format",
+            ));
+        }
+        if chunk.sequence != self.next_sequence || chunk.sample_offset != self.accepted_frames {
+            return Err(backend_error(
+                request_id,
+                "audio_stream_order_invalid",
+                SpeechErrorClass::InvalidRequest,
+                false,
+                "Audio chunks must arrive in contiguous sequence and sample order",
+            ));
+        }
+        let frames =
+            u64::try_from(chunk.data.len() / self.format.bytes_per_frame()).map_err(|_| {
+                backend_error(
+                    request_id,
+                    "audio_stream_geometry_overflow",
+                    SpeechErrorClass::InvalidRequest,
+                    false,
+                    "Audio stream frame geometry exceeds this platform",
+                )
+            })?;
+        let accepted_frames = self.accepted_frames.checked_add(frames).ok_or_else(|| {
+            backend_error(
+                request_id,
+                "audio_stream_geometry_overflow",
+                SpeechErrorClass::InvalidRequest,
+                false,
+                "Audio stream cumulative frame geometry overflowed",
+            )
+        })?;
+        if accepted_frames > self.max_frames {
+            return Err(backend_error(
+                request_id,
+                "parakeet_audio_too_long",
+                SpeechErrorClass::InvalidRequest,
+                false,
+                "Streaming audio exceeds the embedded Parakeet duration limit",
+            ));
+        }
+        let next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
+            backend_error(
+                request_id,
+                "audio_stream_geometry_overflow",
+                SpeechErrorClass::InvalidRequest,
+                false,
+                "Audio stream chunk sequence overflowed",
+            )
+        })?;
+        Ok(StreamAcceptance {
+            accepted_frames,
+            next_sequence,
+        })
+    }
+
+    fn commit(&mut self, accepted: StreamAcceptance) {
+        self.accepted_frames = accepted.accepted_frames;
+        self.next_sequence = accepted.next_sequence;
+    }
 }
 
 struct BackendOperationLease {
@@ -299,7 +407,8 @@ impl SpeechBackend for ParakeetSpeechBackend {
             TranscriptionInput::Complete { .. } => (None, None, None),
             TranscriptionInput::Stream { format, .. } => {
                 let (audio_sender, receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
-                let control = spawn_stream_actor(&self.state, request_id.clone(), audio_sender)?;
+                let control =
+                    spawn_stream_actor(&self.state, request_id.clone(), *format, audio_sender)?;
                 let sink: Arc<dyn TranscriptionAudioSink> = Arc::new(StreamAudioSink {
                     request_id: request_id.clone(),
                     format: *format,
@@ -451,6 +560,17 @@ impl StreamControl {
 fn spawn_stream_actor(
     state: &BackendState,
     request_id: SpeechRequestId,
+    format: PcmFormat,
+    audio_sender: mpsc::Sender<AudioChunk>,
+) -> Result<Arc<StreamControl>, SpeechError> {
+    let duration = StreamDurationBudget::new(format, &request_id)?;
+    spawn_stream_actor_with_budget(state, request_id, duration, audio_sender)
+}
+
+fn spawn_stream_actor_with_budget(
+    state: &BackendState,
+    request_id: SpeechRequestId,
+    duration: StreamDurationBudget,
     audio_sender: mpsc::Sender<AudioChunk>,
 ) -> Result<Arc<StreamControl>, SpeechError> {
     let (pushes, push_receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
@@ -463,6 +583,7 @@ fn spawn_stream_actor(
         .spawn(format!("parakeet-stream:{request_id}"), async move {
             run_stream_actor(
                 actor_request_id,
+                duration,
                 push_receiver,
                 finish_receiver,
                 cancel_receiver,
@@ -483,6 +604,7 @@ fn spawn_stream_actor(
 
 async fn run_stream_actor(
     request_id: SpeechRequestId,
+    mut duration: StreamDurationBudget,
     mut pushes: mpsc::Receiver<StreamPush>,
     mut finishes: mpsc::Receiver<oneshot::Sender<Result<(), SpeechError>>>,
     mut cancel: watch::Receiver<bool>,
@@ -523,8 +645,16 @@ async fn run_stream_actor(
                 PendingStreamActorAction::Capacity => {
                     if let Some(push) = pending.take() {
                         let StreamPush { chunk, reply } = push;
+                        let accepted = match duration.checked_acceptance(&chunk, &request_id) {
+                            Ok(accepted) => accepted,
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                                continue;
+                            }
+                        };
                         match audio_sender.try_send(chunk) {
                             Ok(()) => {
+                                duration.commit(accepted);
                                 let _ = reply.send(Ok(()));
                             }
                             Err(mpsc::error::TrySendError::Full(chunk)) => {
@@ -1866,8 +1996,8 @@ mod tests {
         let request_id = SpeechRequestId("finished-stream".to_string());
         let state = BackendState::default();
         let (sender, _receiver) = mpsc::channel(1);
-        let control =
-            spawn_stream_actor(&state, request_id.clone(), sender).expect("spawn stream actor");
+        let control = spawn_stream_actor(&state, request_id.clone(), fixture_pcm_format(), sender)
+            .expect("spawn stream actor");
         let sink = StreamAudioSink {
             request_id: request_id.clone(),
             format: fixture_pcm_format(),
@@ -1897,8 +2027,8 @@ mod tests {
         let request_id = SpeechRequestId("finish-push-race".to_owned());
         let state = BackendState::default();
         let (sender, mut receiver) = mpsc::channel(1);
-        let control =
-            spawn_stream_actor(&state, request_id.clone(), sender).expect("spawn stream actor");
+        let control = spawn_stream_actor(&state, request_id.clone(), fixture_pcm_format(), sender)
+            .expect("spawn stream actor");
         let sink = StreamAudioSink {
             request_id: request_id.clone(),
             format: fixture_pcm_format(),
@@ -1945,12 +2075,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_actor_rejects_audio_beyond_its_cumulative_frame_budget() {
+        let request_id = SpeechRequestId("stream-duration-budget".to_owned());
+        let state = BackendState::default();
+        let format = fixture_pcm_format();
+        let duration = StreamDurationBudget {
+            format,
+            accepted_frames: 0,
+            next_sequence: 0,
+            max_frames: 1,
+        };
+        let (sender, mut receiver) = mpsc::channel(2);
+        let control = spawn_stream_actor_with_budget(&state, request_id.clone(), duration, sender)
+            .expect("spawn bounded stream actor");
+        let sink = StreamAudioSink {
+            request_id: request_id.clone(),
+            format,
+            control,
+        };
+
+        sink.push(AudioChunk {
+            sequence: 0,
+            sample_offset: 0,
+            format,
+            data: vec![0, 0],
+            end_of_stream: false,
+        })
+        .await
+        .expect("the exact duration boundary is accepted");
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .expect("receive exact-boundary chunk")
+                .sequence,
+            0
+        );
+
+        let error = sink
+            .push(AudioChunk {
+                sequence: 1,
+                sample_offset: 1,
+                format,
+                data: vec![0, 0],
+                end_of_stream: false,
+            })
+            .await
+            .expect_err("one frame beyond the cumulative budget must fail");
+        assert_eq!(error.code, "parakeet_audio_too_long");
+        assert_eq!(error.class, SpeechErrorClass::InvalidRequest);
+        assert!(
+            receiver.try_recv().is_err(),
+            "rejected audio never reaches inference"
+        );
+
+        sink.push(AudioChunk {
+            sequence: 1,
+            sample_offset: 1,
+            format,
+            data: Vec::new(),
+            end_of_stream: true,
+        })
+        .await
+        .expect("rejection does not consume cumulative frame or sequence state");
+        assert!(
+            receiver
+                .recv()
+                .await
+                .expect("receive zero-frame end marker")
+                .end_of_stream
+        );
+        sink.finish().await.expect("finish bounded stream");
+        state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("stream actor joins");
+    }
+
+    #[test]
+    fn stream_duration_budget_rejects_cumulative_geometry_overflow() {
+        let request_id = SpeechRequestId("stream-duration-overflow".to_owned());
+        let format = fixture_pcm_format();
+        let budget = StreamDurationBudget {
+            format,
+            accepted_frames: u64::MAX,
+            next_sequence: 0,
+            max_frames: u64::MAX,
+        };
+        let error = budget
+            .checked_acceptance(
+                &AudioChunk {
+                    sequence: 0,
+                    sample_offset: u64::MAX,
+                    format,
+                    data: vec![0, 0],
+                    end_of_stream: false,
+                },
+                &request_id,
+            )
+            .expect_err("cumulative frame overflow must fail closed");
+        assert_eq!(error.code, "audio_stream_geometry_overflow");
+        assert_eq!(error.class, SpeechErrorClass::InvalidRequest);
+    }
+
+    #[tokio::test]
     async fn cancellation_closes_the_stream_input_sink() {
         let request_id = SpeechRequestId("cancelled-stream".to_string());
         let state = BackendState::default();
         let (sender, _receiver) = mpsc::channel(1);
-        let control =
-            spawn_stream_actor(&state, request_id.clone(), sender).expect("spawn stream actor");
+        let control = spawn_stream_actor(&state, request_id.clone(), fixture_pcm_format(), sender)
+            .expect("spawn stream actor");
         let sink = StreamAudioSink {
             request_id: request_id.clone(),
             format: PcmFormat {

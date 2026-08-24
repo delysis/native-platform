@@ -75,6 +75,7 @@ pub struct SpeechHost {
     target: PlatformTarget,
     router: SpeechRouter,
     lifecycle: Arc<HostLifecycle>,
+    clock: Arc<dyn DeadlineClock>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,16 +139,62 @@ struct ReservedRoute {
     cancellation: Arc<CancellationSignal>,
 }
 
-#[derive(Clone, Copy)]
-struct RequestBudget {
-    queue_deadline: Option<Instant>,
-    total_deadline: Option<Instant>,
+type DeadlineSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+trait DeadlineClock: Send + Sync {
+    fn now(&self) -> Instant;
+    fn sleep_until(&self, deadline: Instant) -> DeadlineSleep;
+}
+
+struct TokioDeadlineClock;
+
+impl DeadlineClock for TokioDeadlineClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> DeadlineSleep {
+        Box::pin(tokio::time::sleep_until(deadline))
+    }
 }
 
 #[derive(Clone, Copy)]
-enum BudgetDeadline {
-    Queue(Instant),
-    Total(Instant),
+struct RequestBudget {
+    queue_deadline: Option<Instant>,
+    model_load: Option<Duration>,
+    first_result: Option<Duration>,
+    idle_stream: Option<Duration>,
+    total_deadline: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadlineKind {
+    Queue,
+    ModelLoad,
+    FirstResult,
+    IdleStream,
+    Total,
+}
+
+#[derive(Clone, Copy)]
+enum DeadlineStage {
+    Dispatch,
+    Monitor,
+}
+
+#[derive(Clone, Copy)]
+struct BudgetDeadline {
+    kind: DeadlineKind,
+    at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct MonitorBudget {
+    first_result_deadline: Option<Instant>,
+    idle_stream: Option<Duration>,
+    idle_stream_deadline: Option<Instant>,
+    total_deadline: Option<Instant>,
+    saw_result: bool,
 }
 
 struct SetupGuard {
@@ -202,9 +249,14 @@ impl Default for SpeechHost {
 impl SpeechHost {
     #[must_use]
     pub fn new(target: PlatformTarget) -> Self {
+        Self::with_clock(target, Arc::new(TokioDeadlineClock))
+    }
+
+    fn with_clock(target: PlatformTarget, clock: Arc<dyn DeadlineClock>) -> Self {
         Self {
             target,
             router: SpeechRouter,
+            clock,
             lifecycle: Arc::new(HostLifecycle {
                 state: Mutex::new(HostState {
                     phase: HostPhase::Running,
@@ -323,7 +375,7 @@ impl SpeechHost {
         mut request: TranscriptionRequest,
     ) -> Result<TranscriptionTicket, SpeechHostError> {
         let request_id = request.context.request_id.clone();
-        let budget = RequestBudget::new(&request.context.deadline, &request_id)?;
+        let budget = RequestBudget::new(&request.context.deadline, &request_id, self.clock.now())?;
         let ReservedRoute {
             plan,
             backend,
@@ -404,12 +456,14 @@ impl SpeechHost {
         );
         let dispatch_operation = operation.clone();
         let dispatch_cancellation = Arc::clone(&cancellation);
-        let dispatch_outcome = match budget.total_deadline {
+        let dispatch_clock = Arc::clone(&self.clock);
+        let dispatch_deadline = budget.model_load_cutoff(self.clock.now());
+        let dispatch_outcome = match dispatch_deadline {
             Some(deadline) => tokio::select! {
                 biased;
                 () = wait_for_cancellation(&dispatch_operation, &dispatch_cancellation) => FinalOutcome::Cancelled,
                 result = pending.dispatch_mut() => FinalOutcome::Backend(result),
-                _ = tokio::time::sleep_until(deadline) => FinalOutcome::TimedOut,
+                _ = dispatch_clock.sleep_until(deadline.at) => FinalOutcome::TimedOut(deadline.kind),
             },
             None => tokio::select! {
                 biased;
@@ -419,12 +473,12 @@ impl SpeechHost {
         };
         let backend_ticket_result = match dispatch_outcome {
             FinalOutcome::Backend(result) => result,
-            FinalOutcome::TimedOut => {
-                let error = request_timeout_error(
+            FinalOutcome::TimedOut(kind) => {
+                let error = deadline_timeout_error(
                     &request_id,
                     &plan.selected.route.backend_id,
-                    "speech_total_timeout",
-                    "speech request exceeded its total deadline before backend admission completed",
+                    kind,
+                    DeadlineStage::Dispatch,
                 );
                 pending.request_stop(operation_lifecycle::TerminalClass::Failed)?;
                 return Err(error.into());
@@ -471,33 +525,38 @@ impl SpeechHost {
         let monitor_backend_id = plan.selected.route.backend_id.clone();
         let monitor_operation = operation.clone();
         let monitor_cancellation = Arc::clone(&cancellation);
-        let total_deadline = budget.total_deadline;
+        let monitor_clock = Arc::clone(&self.clock);
+        let mut monitor_budget = budget.monitor(self.clock.now());
         self.spawn_monitor(format!("host-final-relay:{request_id}"), async move {
             let backend_final = backend_ticket.final_response();
             tokio::pin!(backend_final);
-            let timeout = async move {
-                match total_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            tokio::pin!(timeout);
             let mut backend_events_open = true;
             let mut backend_terminal = None;
             let outcome = loop {
+                let deadline = monitor_budget.next_deadline();
+                let timeout = wait_for_deadline(Arc::clone(&monitor_clock), deadline);
+                tokio::pin!(timeout);
                 tokio::select! {
                     biased;
                     () = wait_for_cancellation(&monitor_operation, &monitor_cancellation) => break FinalOutcome::Cancelled,
                     result = &mut backend_final => break FinalOutcome::Backend(result),
-                    () = &mut timeout => break FinalOutcome::TimedOut,
                     event = backend_events.recv(), if backend_events_open => match event {
-                        Some(event) => forward_transcription_event(
-                            &event_sender,
-                            event,
-                            &mut backend_terminal,
-                        ),
+                        Some(event) => {
+                            if let Some(kind) = monitor_budget.observe_event(
+                                monitor_clock.now(),
+                                transcription_event_is_result(&event),
+                            ) {
+                                break FinalOutcome::TimedOut(kind);
+                            }
+                            forward_transcription_event(
+                                &event_sender,
+                                event,
+                                &mut backend_terminal,
+                            );
+                        }
                         None => backend_events_open = false,
                     },
+                    kind = &mut timeout => break FinalOutcome::TimedOut(kind),
                 }
             };
             match outcome {
@@ -563,12 +622,12 @@ impl SpeechHost {
                         .map_err(|registry_error| registry_error.to_string())
                         .and(terminal_delivered)
                 }
-                FinalOutcome::TimedOut => {
-                    let error = request_timeout_error(
+                FinalOutcome::TimedOut(kind) => {
+                    let error = deadline_timeout_error(
                         &monitor_request_id,
                         &monitor_backend_id,
-                        "speech_total_timeout",
-                        "speech request exceeded its total deadline",
+                        kind,
+                        DeadlineStage::Monitor,
                     );
                     executor
                         .request_cancel()
@@ -608,7 +667,7 @@ impl SpeechHost {
         mut request: SynthesisRequest,
     ) -> Result<SynthesisTicket, SpeechHostError> {
         let request_id = request.context.request_id.clone();
-        let budget = RequestBudget::new(&request.context.deadline, &request_id)?;
+        let budget = RequestBudget::new(&request.context.deadline, &request_id, self.clock.now())?;
         let ReservedRoute {
             plan,
             backend,
@@ -689,12 +748,14 @@ impl SpeechHost {
         );
         let dispatch_operation = operation.clone();
         let dispatch_cancellation = Arc::clone(&cancellation);
-        let dispatch_outcome = match budget.total_deadline {
+        let dispatch_clock = Arc::clone(&self.clock);
+        let dispatch_deadline = budget.model_load_cutoff(self.clock.now());
+        let dispatch_outcome = match dispatch_deadline {
             Some(deadline) => tokio::select! {
                 biased;
                 () = wait_for_cancellation(&dispatch_operation, &dispatch_cancellation) => FinalOutcome::Cancelled,
                 result = pending.dispatch_mut() => FinalOutcome::Backend(result),
-                _ = tokio::time::sleep_until(deadline) => FinalOutcome::TimedOut,
+                _ = dispatch_clock.sleep_until(deadline.at) => FinalOutcome::TimedOut(deadline.kind),
             },
             None => tokio::select! {
                 biased;
@@ -704,12 +765,12 @@ impl SpeechHost {
         };
         let backend_ticket_result = match dispatch_outcome {
             FinalOutcome::Backend(result) => result,
-            FinalOutcome::TimedOut => {
-                let error = request_timeout_error(
+            FinalOutcome::TimedOut(kind) => {
+                let error = deadline_timeout_error(
                     &request_id,
                     &plan.selected.route.backend_id,
-                    "speech_total_timeout",
-                    "speech request exceeded its total deadline before backend admission completed",
+                    kind,
+                    DeadlineStage::Dispatch,
                 );
                 pending.request_stop(operation_lifecycle::TerminalClass::Failed)?;
                 return Err(error.into());
@@ -755,33 +816,38 @@ impl SpeechHost {
         let monitor_backend_id = plan.selected.route.backend_id.clone();
         let monitor_operation = operation.clone();
         let monitor_cancellation = Arc::clone(&cancellation);
-        let total_deadline = budget.total_deadline;
+        let monitor_clock = Arc::clone(&self.clock);
+        let mut monitor_budget = budget.monitor(self.clock.now());
         self.spawn_monitor(format!("host-final-relay:{request_id}"), async move {
             let backend_final = backend_ticket.final_response();
             tokio::pin!(backend_final);
-            let timeout = async move {
-                match total_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            tokio::pin!(timeout);
             let mut backend_events_open = true;
             let mut backend_terminal = None;
             let outcome = loop {
+                let deadline = monitor_budget.next_deadline();
+                let timeout = wait_for_deadline(Arc::clone(&monitor_clock), deadline);
+                tokio::pin!(timeout);
                 tokio::select! {
                     biased;
                     () = wait_for_cancellation(&monitor_operation, &monitor_cancellation) => break FinalOutcome::Cancelled,
                     result = &mut backend_final => break FinalOutcome::Backend(result),
-                    () = &mut timeout => break FinalOutcome::TimedOut,
                     event = backend_events.recv(), if backend_events_open => match event {
-                        Some(event) => forward_synthesis_event(
-                            &event_sender,
-                            event,
-                            &mut backend_terminal,
-                        ),
+                        Some(event) => {
+                            if let Some(kind) = monitor_budget.observe_event(
+                                monitor_clock.now(),
+                                synthesis_event_is_result(&event),
+                            ) {
+                                break FinalOutcome::TimedOut(kind);
+                            }
+                            forward_synthesis_event(
+                                &event_sender,
+                                event,
+                                &mut backend_terminal,
+                            );
+                        }
                         None => backend_events_open = false,
                     },
+                    kind = &mut timeout => break FinalOutcome::TimedOut(kind),
                 }
             };
             match outcome {
@@ -843,12 +909,12 @@ impl SpeechHost {
                         .map_err(|registry_error| registry_error.to_string())
                         .and(terminal_delivered)
                 }
-                FinalOutcome::TimedOut => {
-                    let error = request_timeout_error(
+                FinalOutcome::TimedOut(kind) => {
+                    let error = deadline_timeout_error(
                         &monitor_request_id,
                         &monitor_backend_id,
-                        "speech_total_timeout",
-                        "speech request exceeded its total deadline",
+                        kind,
+                        DeadlineStage::Monitor,
                     );
                     executor
                         .request_cancel()
@@ -1095,7 +1161,10 @@ impl SpeechHost {
         let acquire = limiter.acquire_owned();
         tokio::pin!(acquire);
         let acquired = match budget.queue_cutoff() {
-            Some(BudgetDeadline::Queue(deadline)) => tokio::select! {
+            Some(BudgetDeadline {
+                kind: DeadlineKind::Queue,
+                at,
+            }) => tokio::select! {
                 biased;
                 () = wait_for_cancellation(operation, cancellation) => Err(SpeechHostError::Backend {
                     error: request_cancelled_error(
@@ -1105,7 +1174,7 @@ impl SpeechHost {
                     ),
                 }),
                 permit = &mut acquire => permit.map_err(|_| SpeechHostError::AdmissionClosed),
-                _ = tokio::time::sleep_until(deadline) => Err(SpeechHostError::Backend {
+                _ = self.clock.sleep_until(at) => Err(SpeechHostError::Backend {
                     error: request_timeout_error(
                         request_id,
                         &plan.selected.route.backend_id,
@@ -1114,7 +1183,10 @@ impl SpeechHost {
                     ),
                 }),
             },
-            Some(BudgetDeadline::Total(deadline)) => tokio::select! {
+            Some(BudgetDeadline {
+                kind: DeadlineKind::Total,
+                at,
+            }) => tokio::select! {
                 biased;
                 () = wait_for_cancellation(operation, cancellation) => Err(SpeechHostError::Backend {
                     error: request_cancelled_error(
@@ -1124,7 +1196,7 @@ impl SpeechHost {
                     ),
                 }),
                 permit = &mut acquire => permit.map_err(|_| SpeechHostError::AdmissionClosed),
-                _ = tokio::time::sleep_until(deadline) => Err(SpeechHostError::Backend {
+                _ = self.clock.sleep_until(at) => Err(SpeechHostError::Backend {
                     error: request_timeout_error(
                         request_id,
                         &plan.selected.route.backend_id,
@@ -1133,6 +1205,7 @@ impl SpeechHost {
                     ),
                 }),
             },
+            Some(_) => return Err(SpeechHostError::StateUnavailable),
             None => tokio::select! {
                 biased;
                 () = wait_for_cancellation(operation, cancellation) => Err(SpeechHostError::Backend {
@@ -1185,7 +1258,7 @@ impl SpeechHost {
 enum FinalOutcome<T> {
     Backend(T),
     Cancelled,
-    TimedOut,
+    TimedOut(DeadlineKind),
 }
 
 impl Default for CancellationSignal {
@@ -1428,6 +1501,14 @@ fn forward_transcription_event(
     }
 }
 
+fn transcription_event_is_result(event: &TranscriptionEvent) -> bool {
+    match event {
+        TranscriptionEvent::Partial { text, .. } => !text.is_empty(),
+        TranscriptionEvent::Segment { segment, .. } => !segment.text.is_empty(),
+        _ => false,
+    }
+}
+
 fn drain_transcription_events(
     public: &mpsc::Sender<TranscriptionEvent>,
     backend: &mut mpsc::Receiver<TranscriptionEvent>,
@@ -1491,6 +1572,14 @@ fn forward_synthesis_event(
     }
 }
 
+fn synthesis_event_is_result(event: &SynthesisEvent) -> bool {
+    match event {
+        SynthesisEvent::Audio { chunk, .. } => !chunk.data.is_empty(),
+        SynthesisEvent::Alignment { alignment, .. } => !alignment.text.is_empty(),
+        _ => false,
+    }
+}
+
 fn drain_synthesis_events(
     public: &mpsc::Sender<SynthesisEvent>,
     backend: &mut mpsc::Receiver<SynthesisEvent>,
@@ -1544,21 +1633,116 @@ impl RequestBudget {
     fn new(
         policy: &SpeechDeadlinePolicy,
         request_id: &SpeechRequestId,
+        started: Instant,
     ) -> Result<Self, SpeechHostError> {
-        let started = Instant::now();
+        checked_deadline(started, policy.model_load_ms, request_id, "model-load")?;
+        checked_deadline(started, policy.first_result_ms, request_id, "first-result")?;
+        checked_deadline(started, policy.idle_stream_ms, request_id, "idle-stream")?;
         Ok(Self {
             queue_deadline: checked_deadline(started, policy.queue_ms, request_id, "queue")?,
+            model_load: policy.model_load_ms.map(Duration::from_millis),
+            first_result: policy.first_result_ms.map(Duration::from_millis),
+            idle_stream: policy.idle_stream_ms.map(Duration::from_millis),
             total_deadline: checked_deadline(started, policy.total_ms, request_id, "total")?,
         })
     }
 
     fn queue_cutoff(self) -> Option<BudgetDeadline> {
-        match (self.queue_deadline, self.total_deadline) {
-            (Some(queue), Some(total)) if total <= queue => Some(BudgetDeadline::Total(total)),
-            (Some(queue), _) => Some(BudgetDeadline::Queue(queue)),
-            (None, Some(total)) => Some(BudgetDeadline::Total(total)),
-            (None, None) => None,
+        earliest_deadline(
+            self.queue_deadline.map(|at| BudgetDeadline {
+                kind: DeadlineKind::Queue,
+                at,
+            }),
+            self.total_deadline,
+        )
+    }
+
+    fn model_load_cutoff(self, started: Instant) -> Option<BudgetDeadline> {
+        earliest_deadline(
+            self.model_load.map(|duration| BudgetDeadline {
+                kind: DeadlineKind::ModelLoad,
+                at: started.checked_add(duration).unwrap_or(started),
+            }),
+            self.total_deadline,
+        )
+    }
+
+    fn monitor(self, started: Instant) -> MonitorBudget {
+        MonitorBudget {
+            first_result_deadline: self
+                .first_result
+                .map(|duration| started.checked_add(duration).unwrap_or(started)),
+            idle_stream: self.idle_stream,
+            idle_stream_deadline: None,
+            total_deadline: self.total_deadline,
+            saw_result: false,
         }
+    }
+}
+
+impl MonitorBudget {
+    fn next_deadline(self) -> Option<BudgetDeadline> {
+        let stage = if self.saw_result {
+            self.idle_stream_deadline.map(|at| BudgetDeadline {
+                kind: DeadlineKind::IdleStream,
+                at,
+            })
+        } else {
+            self.first_result_deadline.map(|at| BudgetDeadline {
+                kind: DeadlineKind::FirstResult,
+                at,
+            })
+        };
+        earliest_deadline(stage, self.total_deadline)
+    }
+
+    fn observe_event(&mut self, now: Instant, is_result: bool) -> Option<DeadlineKind> {
+        if let Some(deadline) = self.next_deadline() {
+            let elapsed = now > deadline.at
+                || (now == deadline.at && (deadline.kind == DeadlineKind::Total || !is_result));
+            if elapsed {
+                return Some(deadline.kind);
+            }
+        }
+        if is_result {
+            self.saw_result = true;
+            self.first_result_deadline = None;
+            self.idle_stream_deadline = self
+                .idle_stream
+                .map(|duration| now.checked_add(duration).unwrap_or(now));
+        }
+        None
+    }
+}
+
+fn earliest_deadline(
+    stage: Option<BudgetDeadline>,
+    total: Option<Instant>,
+) -> Option<BudgetDeadline> {
+    match (stage, total) {
+        (Some(stage), Some(total)) if total <= stage.at => Some(BudgetDeadline {
+            kind: DeadlineKind::Total,
+            at: total,
+        }),
+        (Some(stage), _) => Some(stage),
+        (None, Some(at)) => Some(BudgetDeadline {
+            kind: DeadlineKind::Total,
+            at,
+        }),
+        (None, None) => None,
+    }
+}
+
+async fn wait_for_deadline(
+    clock: Arc<dyn DeadlineClock>,
+    deadline: Option<BudgetDeadline>,
+) -> DeadlineKind {
+    match deadline {
+        Some(deadline) => {
+            clock.sleep_until(deadline.at).await;
+            deadline.kind
+        }
+        None => std::future::pending::<DeadlineKind>().await,
     }
 }
 
@@ -2109,6 +2293,41 @@ fn request_timeout_error(
     }
 }
 
+fn deadline_timeout_error(
+    request_id: &SpeechRequestId,
+    backend_id: &str,
+    kind: DeadlineKind,
+    stage: DeadlineStage,
+) -> SpeechError {
+    let (code, detail) = match (kind, stage) {
+        (DeadlineKind::ModelLoad, _) => (
+            "speech_model_load_timeout",
+            "speech request exceeded its backend model-load deadline",
+        ),
+        (DeadlineKind::FirstResult, _) => (
+            "speech_first_result_timeout",
+            "speech request exceeded its first-result deadline",
+        ),
+        (DeadlineKind::IdleStream, _) => (
+            "speech_idle_stream_timeout",
+            "speech request exceeded its streaming idle deadline",
+        ),
+        (DeadlineKind::Total, DeadlineStage::Dispatch) => (
+            "speech_total_timeout",
+            "speech request exceeded its total deadline before backend admission completed",
+        ),
+        (DeadlineKind::Total, DeadlineStage::Monitor) => (
+            "speech_total_timeout",
+            "speech request exceeded its total deadline",
+        ),
+        (DeadlineKind::Queue, _) => (
+            "speech_queue_timeout",
+            "speech request exceeded its backend queue deadline",
+        ),
+    };
+    request_timeout_error(request_id, backend_id, code, detail)
+}
+
 fn request_cancelled_error(
     request_id: &SpeechRequestId,
     backend_id: &str,
@@ -2594,6 +2813,63 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{mpsc, oneshot};
 
+    #[derive(Clone)]
+    struct ManualClock {
+        state: Arc<ManualClockState>,
+    }
+
+    struct ManualClockState {
+        now: Mutex<Instant>,
+        changed: Notify,
+    }
+
+    impl ManualClock {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(ManualClockState {
+                    now: Mutex::new(Instant::now()),
+                    changed: Notify::new(),
+                }),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut now = self.state.now.lock().expect("lock manual clock");
+            *now = now
+                .checked_add(duration)
+                .expect("fixture clock remains in monotonic range");
+            drop(now);
+            self.state.changed.notify_waiters();
+        }
+    }
+
+    impl DeadlineClock for ManualClock {
+        fn now(&self) -> Instant {
+            *self.state.now.lock().expect("lock manual clock")
+        }
+
+        fn sleep_until(&self, deadline: Instant) -> DeadlineSleep {
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                loop {
+                    let changed = state.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if *state.now.lock().expect("lock manual clock") >= deadline {
+                        return;
+                    }
+                    changed.await;
+                }
+            })
+        }
+    }
+
+    fn host_with_manual_clock() -> (SpeechHost, ManualClock) {
+        let clock = ManualClock::new();
+        let host = SpeechHost::with_clock(PlatformTarget::current(), Arc::new(clock.clone()));
+        (host, clock)
+    }
+
     #[derive(Default)]
     struct FixtureCancellation;
 
@@ -2630,6 +2906,7 @@ mod tests {
     struct DeferredBackend {
         descriptor: SpeechBackendDescriptor,
         finals: Mutex<BTreeMap<SpeechRequestId, oneshot::Sender<SynthesisResponse>>>,
+        events: Mutex<BTreeMap<SpeechRequestId, mpsc::Sender<SynthesisEvent>>>,
         cancel_calls: Arc<AtomicUsize>,
         shutdown_calls: AtomicUsize,
         changed: Notify,
@@ -2657,6 +2934,16 @@ mod tests {
     }
 
     impl DeferredBackend {
+        fn emit(&self, request_id: &SpeechRequestId, event: SynthesisEvent) {
+            self.events
+                .lock()
+                .expect("lock deferred events")
+                .get(request_id)
+                .expect("deferred request must own an event sender")
+                .try_send(event)
+                .expect("deferred event channel has bounded fixture capacity");
+        }
+
         fn complete(&self, request_id: &SpeechRequestId) {
             let sender = self
                 .finals
@@ -2664,6 +2951,10 @@ mod tests {
                 .expect("lock deferred finals")
                 .remove(request_id)
                 .expect("deferred request must exist");
+            self.events
+                .lock()
+                .expect("lock deferred events")
+                .remove(request_id);
             let _ = sender.send(deferred_response(request_id, &self.descriptor.id));
             self.changed.notify_waiters();
         }
@@ -2787,8 +3078,7 @@ mod tests {
             request: SynthesisRequest,
         ) -> Result<SynthesisTicket, SpeechError> {
             let request_id = request.context.request_id;
-            let (event_sender, event_receiver) = mpsc::channel(2);
-            drop(event_sender);
+            let (event_sender, event_receiver) = mpsc::channel(8);
             let (backend_final_sender, backend_final_receiver) = oneshot::channel();
             let (release_sender, release_receiver) = oneshot::channel();
             self.finals
@@ -2801,6 +3091,16 @@ mod tests {
                     )
                 })?
                 .insert(request_id.clone(), release_sender);
+            self.events
+                .lock()
+                .map_err(|_| {
+                    SpeechError::unavailable(
+                        &request_id,
+                        "fixture_state_unavailable",
+                        "fixture state is unavailable",
+                    )
+                })?
+                .insert(request_id.clone(), event_sender);
             self.changed.notify_waiters();
             let response_id = request_id.clone();
             let backend_id = self.descriptor.id.clone();
@@ -3282,6 +3582,20 @@ mod tests {
         deferred_backend_with_capacity(id, None)
     }
 
+    fn deferred_streaming_backend(id: &str) -> Arc<DeferredBackend> {
+        let mut backend = deferred_backend(id);
+        {
+            let backend = Arc::get_mut(&mut backend).expect("new deferred backend has one owner");
+            let SpeechOperationCapability::Synthesis(capability) =
+                &mut backend.descriptor.capabilities[0].operation
+            else {
+                panic!("deferred backend must expose synthesis");
+            };
+            capability.streaming_audio = true;
+        }
+        backend
+    }
+
     fn deferred_backend_with_capacity(
         id: &str,
         max_concurrent_requests: Option<u32>,
@@ -3291,6 +3605,7 @@ mod tests {
         Arc::new(DeferredBackend {
             descriptor,
             finals: Mutex::new(BTreeMap::new()),
+            events: Mutex::new(BTreeMap::new()),
             cancel_calls: Arc::new(AtomicUsize::new(0)),
             shutdown_calls: AtomicUsize::new(0),
             changed: Notify::new(),
@@ -3655,6 +3970,209 @@ mod tests {
         assert_eq!(response.route.voice_id.as_deref(), Some("fixture-voice"));
         assert_eq!(terminal, 1);
         assert_eq!(backend.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn model_load_deadline_cancels_and_joins_a_blocked_dispatch() {
+        let (host, clock) = host_with_manual_clock();
+        let host = Arc::new(host);
+        let backend = deferred_dispatch_backend("model-load-deadline.tts");
+        host.register_backend(backend.clone())
+            .expect("register blocked-dispatch backend");
+        let request_id = SpeechRequestId("model-load-deadline".to_owned());
+        let mut request = exact_request(&request_id.0, "model-load-deadline.tts");
+        request.context.deadline.model_load_ms = Some(10);
+        let dispatch_host = Arc::clone(&host);
+        let dispatch = tokio::spawn(async move { dispatch_host.synthesize(request).await });
+        backend.wait_until_dispatching(&request_id).await;
+
+        clock.advance(Duration::from_millis(10));
+        let error = match dispatch.await.expect("dispatch caller joins") {
+            Err(error) => error,
+            Ok(_ticket) => panic!("model-load deadline must reject an incomplete dispatch"),
+        };
+        let SpeechHostError::Backend { error } = error else {
+            panic!("expected model-load timeout error");
+        };
+        assert_eq!(error.code, "speech_model_load_timeout");
+        assert_eq!(error.class, SpeechErrorClass::Timeout);
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            host.lifecycle
+                .operations
+                .active_count()
+                .expect("read active operations"),
+            1,
+            "timed-out dispatch remains owned until the backend ticket is joined"
+        );
+
+        backend.release(&request_id);
+        wait_for_active_count(&host, 0).await;
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn first_result_deadline_cancels_once_and_joins_a_late_final() {
+        let (host, clock) = host_with_manual_clock();
+        let backend = deferred_backend("first-result-deadline.tts");
+        host.register_backend(backend.clone())
+            .expect("register deferred backend");
+        let request_id = SpeechRequestId("first-result-deadline".to_owned());
+        let mut request = exact_request(&request_id.0, "first-result-deadline.tts");
+        request.context.deadline.first_result_ms = Some(10);
+        let mut ticket = host
+            .synthesize(request)
+            .await
+            .expect("admit deferred request");
+        backend.wait_until_active(&request_id).await;
+
+        clock.advance(Duration::from_millis(10));
+        let event = ticket
+            .events
+            .recv()
+            .await
+            .expect("receive timeout terminal");
+        assert!(matches!(
+            event,
+            SynthesisEvent::Failed { error, .. }
+                if error.code == "speech_first_result_timeout"
+                    && error.class == SpeechErrorClass::Timeout
+        ));
+        let error = ticket
+            .final_response()
+            .await
+            .expect_err("first-result deadline must win before the backend final");
+        assert_eq!(error.code, "speech_first_result_timeout");
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            host.lifecycle
+                .operations
+                .active_count()
+                .expect("read active operations"),
+            1,
+            "late backend work remains supervised after the public timeout"
+        );
+
+        backend.complete(&request_id);
+        wait_for_active_count(&host, 0).await;
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn transcription_first_result_deadline_uses_the_same_host_budget() {
+        let (host, clock) = host_with_manual_clock();
+        let backend = deferred_transcription_backend("first-result-deadline.stt");
+        host.register_backend(backend.clone())
+            .expect("register deferred transcription backend");
+        let request_id = SpeechRequestId("first-result-deadline-stt".to_owned());
+        let mut request =
+            exact_pcm_transcription_request(&request_id.0, "first-result-deadline.stt");
+        request.context.deadline.first_result_ms = Some(10);
+        let mut ticket = host
+            .transcribe(request)
+            .await
+            .expect("admit deferred transcription");
+        backend.wait_until_active(&request_id).await;
+
+        clock.advance(Duration::from_millis(10));
+        let event = ticket
+            .events
+            .recv()
+            .await
+            .expect("receive timeout terminal");
+        assert!(matches!(
+            event,
+            TranscriptionEvent::Failed { error, .. }
+                if error.code == "speech_first_result_timeout"
+        ));
+        let error = ticket
+            .final_response()
+            .await
+            .expect_err("transcription first-result deadline must win");
+        assert_eq!(error.code, "speech_first_result_timeout");
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+
+        backend.complete(&request_id);
+        wait_for_active_count(&host, 0).await;
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_stream_deadline_resets_only_after_observed_results() {
+        let (host, clock) = host_with_manual_clock();
+        let backend = deferred_streaming_backend("idle-stream-deadline.tts");
+        host.register_backend(backend.clone())
+            .expect("register deferred backend");
+        let request_id = SpeechRequestId("idle-stream-deadline".to_owned());
+        let mut request = exact_request(&request_id.0, "idle-stream-deadline.tts");
+        request.stream = true;
+        request.context.deadline = SpeechDeadlinePolicy {
+            first_result_ms: Some(10),
+            idle_stream_ms: Some(5),
+            ..SpeechDeadlinePolicy::default()
+        };
+        let mut ticket = host
+            .synthesize(request)
+            .await
+            .expect("admit streaming request");
+        backend.wait_until_active(&request_id).await;
+
+        for (elapsed_ms, sequence) in [(4_u64, 0_u64), (4, 1)] {
+            clock.advance(Duration::from_millis(elapsed_ms));
+            backend.emit(
+                &request_id,
+                SynthesisEvent::Audio {
+                    request_id: request_id.clone(),
+                    chunk: speech_native_types::AudioChunk {
+                        sequence,
+                        sample_offset: sequence,
+                        format: PcmFormat {
+                            sample_rate_hz: 16_000,
+                            channels: 1,
+                            sample_format: PcmSampleFormat::I16Le,
+                            interleaved: true,
+                        },
+                        data: vec![0, 0],
+                        end_of_stream: false,
+                    },
+                },
+            );
+            assert!(matches!(
+                ticket.events.recv().await,
+                Some(SynthesisEvent::Audio { chunk, .. }) if chunk.sequence == sequence
+            ));
+        }
+
+        clock.advance(Duration::from_millis(4));
+        backend.emit(
+            &request_id,
+            SynthesisEvent::Warning {
+                request_id: request_id.clone(),
+                code: "fixture_warning".to_owned(),
+                message: "warnings are not streaming results".to_owned(),
+            },
+        );
+        assert!(matches!(
+            ticket.events.recv().await,
+            Some(SynthesisEvent::Warning { .. })
+        ));
+        clock.advance(Duration::from_millis(1));
+        let event = ticket.events.recv().await.expect("receive idle terminal");
+        assert!(matches!(
+            event,
+            SynthesisEvent::Failed { error, .. }
+                if error.code == "speech_idle_stream_timeout"
+        ));
+        let error = ticket
+            .final_response()
+            .await
+            .expect_err("idle deadline must win after the last result");
+        assert_eq!(error.code, "speech_idle_stream_timeout");
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+
+        backend.complete(&request_id);
+        wait_for_active_count(&host, 0).await;
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test(start_paused = true)]
