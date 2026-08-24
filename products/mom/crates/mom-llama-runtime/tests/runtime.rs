@@ -8,11 +8,11 @@ use llama_native_types::{
 };
 use mom_llama_runtime::config::{SettingsUpdate, set_data_dir_override_for_tests};
 use mom_llama_runtime::{
-    ChatDispatchOutput, ChatSendInput, ChatSendOptions, ChatSendOutput, ConsultPanel,
-    ConsultPersona, ConsultStartInput, ConsultStartOptions, Conversation,
-    ConversationExecutionProfile, ConversationKind, EngineCheckOptions, KvCachePolicy,
-    MentionDispatchInput, Message, MessageAttribution, MessageRole, MessageSpeakerKind,
-    PersonaFreezeInput, PersonaHistoryMode,
+    AttachmentPreviewAnchor, AttachmentPreviewCatalog, ChatDispatchOutput, ChatSendInput,
+    ChatSendOptions, ChatSendOutput, ConsultPanel, ConsultPersona, ConsultStartInput,
+    ConsultStartOptions, Conversation, ConversationExecutionProfile, ConversationKind,
+    EngineCheckOptions, KvCachePolicy, MentionDispatchInput, Message, MessageAttribution,
+    MessageRole, MessageSpeakerKind, PersonaFreezeInput, PersonaHistoryMode,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -29,6 +29,19 @@ const VALID_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\
     \x00\x00\x00\x09pHYs\x00\x00\x00\x01\x00\x00\x00\x01\x00\x4f\x25\xc4\xd6\
     \x00\x00\x00\x10IDAT\x78\x9c\x63\xfc\xc3\x00\x02\x2c\x0c\x58\x28\x00\x1b\x74\x01\x0a\x5f\x82\xdc\x5d\
     \x00\x00\x00\x00IEND\xae\x42\x60\x82";
+
+fn primary_preview_anchor(catalog: &AttachmentPreviewCatalog) -> Result<AttachmentPreviewAnchor> {
+    let artifact = catalog
+        .primary
+        .as_ref()
+        .ok_or_else(|| anyhow!("canonical preview has no primary artifact"))?;
+    Ok(AttachmentPreviewAnchor {
+        attachment_id: catalog.attachment_id.clone(),
+        root_sha256: catalog.root_sha256.clone(),
+        artifact_id: artifact.artifact_id.clone(),
+        policy_fingerprint: catalog.policy_fingerprint.clone(),
+    })
+}
 
 type EncryptedDocumentSnapshot = BTreeMap<String, (Vec<u8>, Vec<u8>, i64)>;
 
@@ -2175,15 +2188,13 @@ fn attachment_payload_is_encrypted_and_multimodal_is_honestly_blocked() -> Resul
             .windows(payload.len())
             .any(|window| window == payload)
     );
-    let metadata_only = mom_llama_runtime::attachment_preview(&output.attachment.id, false)?
+    let catalog = mom_llama_runtime::attachment_preview(&output.attachment.id)?
         .result
-        .ok_or_else(|| anyhow!("attachment metadata preview missing"))?;
-    assert_eq!(metadata_only.attachment.sha256, output.attachment.sha256);
-    assert!(metadata_only.bytes.is_none());
-    let hydrated = mom_llama_runtime::attachment_preview(&output.attachment.id, true)?
-        .result
-        .ok_or_else(|| anyhow!("attachment payload preview missing"))?;
-    assert_eq!(hydrated.bytes.as_deref(), Some(payload));
+        .ok_or_else(|| anyhow!("attachment preview catalog missing"))?;
+    assert_eq!(catalog.root_sha256, output.attachment.sha256);
+    let media = mom_llama_runtime::attachment_preview_media(&primary_preview_anchor(&catalog)?)?
+        .map_err(|blocker| anyhow!("{}: {}", blocker.code, blocker.message))?;
+    assert_eq!(media.bytes.as_slice(), payload);
     mom_llama_runtime::draft_update(
         Some(&conversation.id),
         "Describe the image.".to_string(),
@@ -2841,10 +2852,13 @@ fn real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_byt
             .as_ref()
             .is_some_and(|fingerprint| { fingerprint.multimodal_projector_sha256.is_some() })
     );
-    let preview = mom_llama_runtime::attachment_preview(&attachment.id, true)?
+    let preview_catalog = mom_llama_runtime::attachment_preview(&attachment.id)?
         .result
-        .ok_or_else(|| anyhow!("decrypted multimodal preview missing"))?;
-    assert_eq!(preview.bytes.as_deref(), Some(image_bytes.as_slice()));
+        .ok_or_else(|| anyhow!("multimodal preview catalog missing"))?;
+    let preview =
+        mom_llama_runtime::attachment_preview_media(&primary_preview_anchor(&preview_catalog)?)?
+            .map_err(|blocker| anyhow!("{}: {}", blocker.code, blocker.message))?;
+    assert_eq!(preview.bytes.as_slice(), image_bytes.as_slice());
     let sqlite = std::fs::read(session.path().join("runtime.sqlite3"))?;
     assert!(
         !sqlite
@@ -2886,10 +2900,13 @@ fn real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_byt
     assert!(audio_result.result.as_ref().is_some_and(|output| {
         !output.assistant_text.trim().is_empty() && output.completion_tokens > 0
     }));
-    let audio_preview = mom_llama_runtime::attachment_preview(&audio_attachment.id, true)?
+    let audio_catalog = mom_llama_runtime::attachment_preview(&audio_attachment.id)?
         .result
-        .ok_or_else(|| anyhow!("decrypted multimodal audio preview missing"))?;
-    assert_eq!(audio_preview.bytes.as_deref(), Some(audio_bytes.as_slice()));
+        .ok_or_else(|| anyhow!("multimodal audio preview catalog missing"))?;
+    let audio_preview =
+        mom_llama_runtime::attachment_preview_media(&primary_preview_anchor(&audio_catalog)?)?
+            .map_err(|blocker| anyhow!("{}: {}", blocker.code, blocker.message))?;
+    assert_eq!(audio_preview.bytes.as_slice(), audio_bytes.as_slice());
     let sqlite = std::fs::read(session.path().join("runtime.sqlite3"))?;
     assert!(
         !sqlite

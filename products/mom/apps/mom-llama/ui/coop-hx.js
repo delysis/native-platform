@@ -181,7 +181,11 @@
     if (entry) URL.revokeObjectURL(entry.url);
     if (media) attachmentObjectUrls.delete(media);
     attachmentPreviewMedia.delete(preview);
-    if (restoreFallback) restoreAttachmentPreviewFallback(preview);
+    if (restoreFallback) {
+      restoreAttachmentPreviewFallback(preview);
+      preview.classList.remove("hydrated-document");
+      preview.removeAttribute("title");
+    }
   };
 
   const enforceAttachmentPreviewLimit = () => {
@@ -226,30 +230,157 @@
     throw new Error("Attachment preview returned serialized JSON instead of raw IPC bytes.");
   };
 
+  const attachmentPreviewResult = (response) => {
+    if (response?.result) return response.result;
+    const blocker = response?.blocker;
+    throw new Error(
+      blocker ? `${blocker.code}: ${blocker.message}` : "Attachment preview is unavailable.",
+    );
+  };
+
+  const attachmentPreviewAnchor = (catalog, artifact) => ({
+    attachment: catalog.attachment_id,
+    rootSha256: catalog.root_sha256,
+    artifact: artifact.artifact_id,
+    policyFingerprint: catalog.policy_fingerprint,
+  });
+
+  const sameAttachmentPreviewAnchor = (actual, expected) => (
+    actual?.attachment_id === expected.attachment
+    && actual?.root_sha256 === expected.rootSha256
+    && actual?.artifact_id === expected.artifact
+    && actual?.policy_fingerprint === expected.policyFingerprint
+  );
+
+  const appendAttachmentPreviewNotices = (container, notices = []) => {
+    if (!notices.length) return;
+    const list = document.createElement("ul");
+    list.className = "attachment-preview-notices";
+    notices.forEach((notice) => {
+      const item = document.createElement("li");
+      item.textContent = notice.message || notice.code || "Preview is incomplete.";
+      list.append(item);
+    });
+    container.append(list);
+  };
+
+  const renderAttachmentPreviewState = (preview, catalog) => {
+    const body = preview.querySelector(".attachment-preview-body");
+    if (!body) return;
+    const state = document.createElement("div");
+    state.className = "attachment-preview-state";
+    const label = document.createElement("strong");
+    label.textContent = catalog.state === "unsupported"
+      ? "Preview unsupported"
+      : "Metadata only";
+    state.append(label);
+    appendAttachmentPreviewNotices(state, catalog.notices);
+    if (catalog.required_transforms?.length) {
+      const transform = document.createElement("p");
+      transform.textContent = `Available bounded transform request: ${catalog.required_transforms.join(", ")}. No transform is running.`;
+      state.append(transform);
+    }
+    body.replaceChildren(state);
+    preview.classList.add("hydrated-document");
+  };
+
+  const renderAttachmentTextPreview = (preview, catalog, content) => {
+    const body = preview.querySelector(".attachment-preview-body");
+    if (!body) return;
+    const documentPreview = document.createElement("div");
+    documentPreview.className = "attachment-document-preview";
+    documentPreview.dataset.textFormat = content.format;
+    content.sections.forEach((section) => {
+      const element = document.createElement("section");
+      element.className = "attachment-text-section";
+      if (section.label || Object.keys(section.coordinates || {}).length) {
+        const heading = document.createElement("strong");
+        const locator = Object.entries(section.coordinates || {})
+          .map(([key, value]) => `${key} ${value}`)
+          .join(" · ");
+        heading.textContent = [section.label, locator].filter(Boolean).join(" · ");
+        element.append(heading);
+      }
+      const text = document.createElement("pre");
+      text.textContent = section.text;
+      element.append(text);
+      documentPreview.append(element);
+    });
+    if (!content.sections.length) {
+      const empty = document.createElement("p");
+      empty.textContent = "The canonical text artifact is empty.";
+      documentPreview.append(empty);
+    }
+    if (content.stats.truncated) {
+      const truncated = document.createElement("p");
+      truncated.className = "attachment-preview-truncation";
+      truncated.textContent = `Preview limit reached: ${content.stats.omitted_bytes} bytes, ${content.stats.omitted_characters} characters, and ${content.stats.omitted_lines} lines omitted.`;
+      documentPreview.append(truncated);
+    }
+    appendAttachmentPreviewNotices(
+      documentPreview,
+      [...(catalog.notices || []), ...(content.notices || [])],
+    );
+    body.replaceChildren(documentPreview);
+    preview.classList.add("hydrated-document");
+  };
+
   const loadAttachmentPreview = async (preview) => {
     if (!preview.isConnected || preview.dataset.previewReleased === "true") return;
-    const kind = preview.dataset.attachmentKind;
-    const mime = preview.dataset.attachmentMime;
     const body = preview.querySelector(".attachment-preview-body");
-    if (!["image", "audio"].includes(kind) || !mime || !body) return;
+    if (!body) return;
     preview.dataset.previewHydrated = "loading";
     try {
-      const response = await invoke("mom_llama_attachment_preview_bytes", {
+      const catalog = attachmentPreviewResult(await invoke("mom_llama_attachment_preview", {
         attachment: preview.dataset.attachmentPreview,
-      });
+      }));
+      if (!preview.isConnected || preview.dataset.previewReleased === "true") return;
+      if (catalog.attachment_id !== preview.dataset.attachmentPreview) {
+        throw new Error("attachment_preview_stale: Preview identity changed during discovery.");
+      }
+      const primary = catalog.primary;
+      if (!primary) {
+        renderAttachmentPreviewState(preview, catalog);
+        preview.dataset.previewHydrated = "true";
+        return;
+      }
+      const anchor = attachmentPreviewAnchor(catalog, primary);
+      if (primary.kind === "text") {
+        const content = attachmentPreviewResult(
+          await invoke("mom_llama_attachment_preview_content", anchor),
+        );
+        if (!preview.isConnected || preview.dataset.previewReleased === "true") return;
+        if (!sameAttachmentPreviewAnchor(content.anchor, anchor)) {
+          throw new Error("attachment_preview_stale: Canonical text identity changed during load.");
+        }
+        renderAttachmentTextPreview(preview, catalog, content);
+        preview.dataset.previewHydrated = "true";
+        return;
+      }
+      if (!["image", "audio", "video"].includes(primary.kind) || !primary.media_type) {
+        renderAttachmentPreviewState(preview, catalog);
+        preview.dataset.previewHydrated = "true";
+        return;
+      }
+      const response = await invoke("mom_llama_attachment_preview_bytes", anchor);
       if (!preview.isConnected || preview.dataset.previewReleased === "true") return;
       const bytes = rawAttachmentBytes(response);
-      const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
-      const media = kind === "image"
+      const url = URL.createObjectURL(new Blob([bytes], { type: primary.media_type }));
+      const media = primary.kind === "image"
         ? document.createElement("img")
-        : createCommandElement("audio", DYNAMIC_CONTROL_SPECS.attachmentPreview);
+        : primary.kind === "audio"
+          ? createCommandElement("audio", DYNAMIC_CONTROL_SPECS.attachmentPreview)
+          : createCommandElement("video", DYNAMIC_CONTROL_SPECS.attachmentPreview);
       media.src = url;
-      if (kind === "image") {
+      if (primary.kind === "image") {
         media.alt = preview.querySelector("figcaption strong")?.textContent || "Local attachment";
       } else {
         media.controls = true;
+        media.autoplay = false;
+        media.preload = "metadata";
       }
       body.replaceChildren(media);
+      appendAttachmentPreviewNotices(body, catalog.notices);
       attachmentPreviewMedia.set(preview, media);
       attachmentObjectUrls.set(media, { preview, url });
       preview.dataset.previewHydrated = "true";
@@ -305,11 +436,6 @@
   const hydrateAttachmentPreviews = async (root = document) => {
     attachmentPreviewsWithin(root).forEach((preview) => {
       delete preview.dataset.previewReleased;
-      const kind = preview.dataset.attachmentKind;
-      if (!["image", "audio"].includes(kind)) {
-        preview.dataset.previewHydrated = "metadata";
-        return;
-      }
       rememberAttachmentPreviewFallback(preview);
       if (attachmentPreviewObserver) {
         attachmentPreviewObserver.observe(preview);

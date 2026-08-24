@@ -19,6 +19,9 @@ or live chat can be invited into an ordinary chat by its unique `@handle`.
 - Mention responses are ordinary attributed messages in the host conversation.
   They never write back to their source Persona/chat.
 - User and assistant edits preserve message branches.
+- Attachment previews are local and content-addressed: canonical text/PDF is
+  escaped and bounded, admitted image/audio/video blobs use revocable object
+  URLs, and stale root/artifact/policy identities fail closed.
 - Product state, receipts and cache policy are Rust-owned.
 
 The exact user-supplied therapeutic Persona templates are documented in

@@ -304,14 +304,14 @@
     },
     {
       "effect_id": "mom_llama.effects.attachment_preview.v1",
-      "reads": ["encrypted_attachment", "attachment_metadata"],
+      "reads": ["encrypted_attachment", "attachment_metadata", "canonical_attachment_manifest", "exact_root_artifact_policy_anchor"],
       "writes": [],
       "network": [],
       "process": [],
       "secrets": [],
       "model_calls": [],
       "persistence": ["encrypted_sqlite"],
-      "memory": ["bounded_decrypted_preview_buffer"],
+      "memory": ["bounded_decrypted_preview_buffer", "bounded_canonical_text_preview"],
       "external_apps": [],
       "destructive": "none"
     },

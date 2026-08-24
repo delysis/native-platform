@@ -1,8 +1,8 @@
 use llama_native_types::NativeDevice;
 use mom_llama_runtime::{
-    ChatDispatchOutput, ChatSendInput, ChatSendOptions, ComposerAutocompleteAnchor,
-    ComposerAutocompleteInput, ConversationExportFormat, EngineCheckOptions, KvCachePolicy,
-    PathSelection, PathSelectionKind, config::SettingsUpdate,
+    AttachmentPreviewAnchor, ChatDispatchOutput, ChatSendInput, ChatSendOptions,
+    ComposerAutocompleteAnchor, ComposerAutocompleteInput, ConversationExportFormat,
+    EngineCheckOptions, KvCachePolicy, PathSelection, PathSelectionKind, config::SettingsUpdate,
 };
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use rfd::AsyncFileDialog;
@@ -14,8 +14,6 @@ use tauri::{Emitter, State, Window};
 
 use crate::app_runtime::{AppRuntimeHandle, AppWorkLease};
 use crate::command_registry::command_spec;
-
-const MAX_ATTACHMENT_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
 
 #[tauri::command]
 pub fn mom_llama_render_app(runtime: State<'_, AppRuntimeHandle>) -> Result<Response, String> {
@@ -846,7 +844,29 @@ pub async fn mom_llama_attachment_preview(
 ) -> Result<Value, String> {
     blocking_command(
         runtime.admit(command_spec("mom_llama_attachment_preview"))?,
-        move || mom_llama_runtime::attachment_preview(&attachment, false),
+        move || mom_llama_runtime::attachment_preview(&attachment),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_attachment_preview_content(
+    runtime: State<'_, AppRuntimeHandle>,
+    attachment: String,
+    root_sha256: String,
+    artifact: String,
+    policy_fingerprint: String,
+) -> Result<Value, String> {
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_attachment_preview_content"))?,
+        move || {
+            mom_llama_runtime::attachment_preview_content(&AttachmentPreviewAnchor {
+                attachment_id: attachment,
+                root_sha256,
+                artifact_id: artifact,
+                policy_fingerprint,
+            })
+        },
     )
     .await
 }
@@ -855,44 +875,29 @@ pub async fn mom_llama_attachment_preview(
 pub async fn mom_llama_attachment_preview_bytes(
     runtime: State<'_, AppRuntimeHandle>,
     attachment: String,
+    root_sha256: String,
+    artifact: String,
+    policy_fingerprint: String,
 ) -> Result<Response, String> {
     blocking_response(
         runtime.admit(command_spec("mom_llama_attachment_preview_bytes"))?,
-        move || attachment_preview_response(&attachment),
+        move || {
+            attachment_preview_response(&AttachmentPreviewAnchor {
+                attachment_id: attachment,
+                root_sha256,
+                artifact_id: artifact,
+                policy_fingerprint,
+            })
+        },
     )
     .await
 }
 
-fn attachment_preview_response(attachment: &str) -> Result<Response, String> {
-    let preview = mom_llama_runtime::attachment_preview(attachment, false).map_err(to_error)?;
-    let metadata = preview.result.ok_or_else(|| {
-        preview
-            .blocker
-            .map(|blocker| format!("{}: {}", blocker.code, blocker.message))
-            .unwrap_or_else(|| {
-                "attachment_preview_unavailable: Preview metadata is unavailable.".to_string()
-            })
-    })?;
-    ensure_attachment_preview_size(&metadata.attachment.file_name, metadata.attachment.bytes)?;
-
-    let bytes = mom_llama_runtime::attachments::attachment_bytes(attachment)
+fn attachment_preview_response(anchor: &AttachmentPreviewAnchor) -> Result<Response, String> {
+    let media = mom_llama_runtime::attachment_preview_media(anchor)
         .map_err(to_error)?
-        .ok_or_else(|| {
-            "attachment_content_missing: The attachment metadata exists, but its content is unavailable."
-                .to_string()
-        })?;
-    let loaded_bytes = u64::try_from(bytes.len()).map_err(|_| {
-        "attachment_preview_too_large: Attachment size does not fit in u64.".to_string()
-    })?;
-    ensure_attachment_preview_size(&metadata.attachment.file_name, loaded_bytes)?;
-    if loaded_bytes != metadata.attachment.bytes {
-        return Err(format!(
-            "attachment_content_size_mismatch: Attachment `{}` declares {} bytes but loaded {} bytes.",
-            metadata.attachment.file_name, metadata.attachment.bytes, loaded_bytes
-        ));
-    }
-
-    Ok(Response::new(bytes))
+        .map_err(|blocker| format!("{}: {}", blocker.code, blocker.message))?;
+    Ok(Response::new(media.bytes))
 }
 
 #[tauri::command]
@@ -1327,15 +1332,6 @@ fn mib_to_bytes(value: u64) -> u64 {
     value.saturating_mul(1024 * 1024)
 }
 
-fn ensure_attachment_preview_size(file_name: &str, bytes: u64) -> Result<(), String> {
-    if bytes <= MAX_ATTACHMENT_PREVIEW_BYTES {
-        return Ok(());
-    }
-    Err(format!(
-        "attachment_preview_too_large: Attachment `{file_name}` is {bytes} bytes; inline previews are limited to {MAX_ATTACHMENT_PREVIEW_BYTES} bytes."
-    ))
-}
-
 fn markup_response(result: anyhow::Result<String>) -> Result<Response, String> {
     result
         .map(|markup| Response::new(markup.into_bytes()))
@@ -1384,7 +1380,7 @@ fn kv_policy_from_str(value: &str) -> KvCachePolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ATTACHMENT_PREVIEW_BYTES, ensure_attachment_preview_size, path_setting_patch};
+    use super::path_setting_patch;
     use std::path::PathBuf;
 
     fn command_body<'a>(source: &'a str, name: &str) -> &'a str {
@@ -1395,17 +1391,6 @@ mod tests {
         let rest = &source[start..];
         let end = rest.find("\n#[tauri::command]").unwrap_or(rest.len());
         &rest[..end]
-    }
-
-    #[test]
-    fn attachment_preview_cap_is_checked_at_the_exact_boundary() {
-        assert!(ensure_attachment_preview_size("within.png", MAX_ATTACHMENT_PREVIEW_BYTES).is_ok());
-        let error = ensure_attachment_preview_size(
-            "too-large.png",
-            MAX_ATTACHMENT_PREVIEW_BYTES.saturating_add(1),
-        )
-        .expect_err("a preview over the hard byte ceiling must fail closed");
-        assert!(error.starts_with("attachment_preview_too_large:"));
     }
 
     #[test]
@@ -1426,6 +1411,7 @@ mod tests {
             "mom_llama_attachment_import_paste",
             "mom_llama_attachment_import",
             "mom_llama_attachment_preview",
+            "mom_llama_attachment_preview_content",
             "mom_llama_persona_update",
             "mom_llama_kv_cache_save",
             "mom_llama_kv_cache_restore",
@@ -1446,7 +1432,13 @@ mod tests {
         }
         assert!(
             command_body(source, "mom_llama_attachment_preview_bytes")
-                .contains("blocking_response("),
+                .contains("blocking_response(")
+                && command_body(source, "mom_llama_attachment_preview_bytes")
+                    .contains("AttachmentPreviewAnchor")
+                && command_body(source, "mom_llama_attachment_preview_bytes")
+                    .contains("root_sha256")
+                && command_body(source, "mom_llama_attachment_preview_bytes")
+                    .contains("policy_fingerprint"),
             "raw attachment previews must read and decrypt outside the async dispatch thread"
         );
     }

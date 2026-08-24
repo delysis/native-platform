@@ -601,6 +601,18 @@ enum AttachmentCommand {
         #[arg(long)]
         json: bool,
     },
+    PreviewContent {
+        #[arg(long)]
+        attachment: String,
+        #[arg(long)]
+        root_sha256: String,
+        #[arg(long)]
+        artifact: String,
+        #[arg(long)]
+        policy_fingerprint: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1322,8 +1334,24 @@ fn run() -> Result<()> {
                 mom_llama_runtime::attachment_list(conversation.as_deref())?,
                 json,
             ),
-            AttachmentCommand::Preview { attachment, json } => print_result(
-                mom_llama_runtime::attachment_preview(&attachment, false)?,
+            AttachmentCommand::Preview { attachment, json } => {
+                print_result(mom_llama_runtime::attachment_preview(&attachment)?, json)
+            }
+            AttachmentCommand::PreviewContent {
+                attachment,
+                root_sha256,
+                artifact,
+                policy_fingerprint,
+                json,
+            } => print_result(
+                mom_llama_runtime::attachment_preview_content(
+                    &mom_llama_runtime::AttachmentPreviewAnchor {
+                        attachment_id: attachment,
+                        root_sha256,
+                        artifact_id: artifact,
+                        policy_fingerprint,
+                    },
+                )?,
                 json,
             ),
         },

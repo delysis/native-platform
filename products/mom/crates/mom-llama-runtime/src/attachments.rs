@@ -9,14 +9,14 @@ use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use anyhow::{Context, Result, anyhow};
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
 use attachment_native_types::{
-    ArtifactPayload, AttachmentGraph, CanonicalArtifact, Coverage, DetectedFormat, MediaFamily,
-    ObjectId,
+    ArtifactPayload, AttachmentGraph, BlobValidationGrade, CanonicalArtifact, Coverage,
+    DetectedFormat, MediaFamily, ObjectId, SegmentKind, TextFormat,
 };
 use llama_native_types::{MediaInput, MediaKind};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -27,7 +27,16 @@ const ATTACHMENTS_NAMESPACE_V2: &str = "attachments.v2";
 const ATTACHMENTS_NAMESPACE: &str = "attachments.v3";
 const ATTACHMENT_DB_SCHEMA: &str = "mom_llama.attachments.v3";
 const ATTACHMENT_MANIFEST_SCHEMA: &str = "mom_llama.attachment_manifest.v1";
+const ATTACHMENT_PREVIEW_CATALOG_SCHEMA: &str = "mom_llama.attachment_preview_catalog.v1";
+const ATTACHMENT_PREVIEW_CONTENT_SCHEMA: &str = "mom_llama.attachment_preview_content.v1";
 const MAX_PASTED_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ATTACHMENT_PREVIEW_MEDIA_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ATTACHMENT_PREVIEW_TEXT_BYTES: usize = 128 * 1024;
+const MAX_ATTACHMENT_PREVIEW_TEXT_LINES: usize = 1_200;
+const MAX_ATTACHMENT_PREVIEW_TEXT_SECTIONS: usize = 256;
+const MAX_ATTACHMENT_PREVIEW_ARTIFACTS: usize = 64;
+const MAX_ATTACHMENT_PREVIEW_NOTICES: usize = 32;
+const MAX_ATTACHMENT_PREVIEW_NOTICE_BYTES: usize = 512;
 const MAX_ACTIVE_ATTACHMENT_REFERENCES: usize = 32;
 const MAX_ACTIVE_ATTACHMENT_TEXT_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ACTIVE_ATTACHMENT_MEDIA_OBJECTS: u32 = 16;
@@ -125,10 +134,126 @@ pub struct AttachmentImportOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AttachmentPreview {
-    pub attachment: AttachmentRecord,
+pub struct AttachmentPreviewAnchor {
+    pub attachment_id: String,
+    pub root_sha256: String,
+    pub artifact_id: String,
+    pub policy_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentPreviewState {
+    Ready,
+    Partial,
+    MetadataOnly,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentPreviewKind {
+    Text,
+    Image,
+    Audio,
+    Video,
+    Opaque,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentPreviewTransform {
+    OcrImage,
+    TranscribeAudio,
+    ExtractVideoAudio,
+    SampleVideoFrames,
+    RasterizePdfPages,
+    ExtractDocumentText,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreviewNotice {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreviewArtifact {
+    pub artifact_id: String,
+    pub source_object_id: String,
+    pub source_label: String,
+    pub kind: AttachmentPreviewKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<Vec<u8>>,
+    pub media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_len: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation: Option<BlobValidationGrade>,
+    pub processor: String,
+    pub processor_version: String,
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocker_code: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreviewCatalog {
+    pub schema: String,
+    pub attachment_id: String,
+    pub root_sha256: String,
+    pub policy_fingerprint: String,
+    pub state: AttachmentPreviewState,
+    pub coverage: Coverage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary: Option<AttachmentPreviewArtifact>,
+    pub artifacts: Vec<AttachmentPreviewArtifact>,
+    pub notices: Vec<AttachmentPreviewNotice>,
+    pub required_transforms: Vec<AttachmentPreviewTransform>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreviewTextStats {
+    pub total_bytes: u64,
+    pub returned_bytes: u64,
+    pub omitted_bytes: u64,
+    pub total_characters: u64,
+    pub returned_characters: u64,
+    pub omitted_characters: u64,
+    pub total_lines: u64,
+    pub returned_lines: u64,
+    pub omitted_lines: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreviewTextSection {
+    pub source_object_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SegmentKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub coordinates: BTreeMap<String, String>,
+    pub text: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreviewContent {
+    pub schema: String,
+    pub anchor: AttachmentPreviewAnchor,
+    pub format: TextFormat,
+    pub sections: Vec<AttachmentPreviewTextSection>,
+    pub stats: AttachmentPreviewTextStats,
+    pub notices: Vec<AttachmentPreviewNotice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentPreviewMedia {
+    pub anchor: AttachmentPreviewAnchor,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -448,11 +573,9 @@ pub fn attachment_list(
     ))
 }
 
-pub fn attachment_preview(
-    attachment_id: &str,
-    include_payload: bool,
-) -> Result<CommandResult<AttachmentPreview>> {
-    let Some(attachment) = load_attachment_db()?
+pub fn attachment_preview(attachment_id: &str) -> Result<CommandResult<AttachmentPreviewCatalog>> {
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let Some(record) = load_attachment_db()?
         .attachments
         .into_iter()
         .find(|attachment| attachment.id == attachment_id)
@@ -460,40 +583,140 @@ pub fn attachment_preview(
         return Ok(CommandResult::blocked(
             "mom_llama.attachment_preview",
             "stub_blocked",
-            Blocker::new(
+            preview_blocker(
                 "attachment_not_found",
                 format!("Attachment {attachment_id} was not found."),
-                vec!["Refresh the conversation and try again.".to_string()],
             ),
         ));
     };
-    let bytes = include_payload
-        .then(|| attachment_bytes(attachment_id))
-        .transpose()?
-        .flatten();
-    if include_payload && bytes.is_none() {
-        return Ok(CommandResult::blocked(
-            "mom_llama.attachment_preview",
-            "stub_blocked",
-            Blocker::new(
-                "attachment_content_missing",
-                "The attachment metadata exists, but its content is unavailable.",
-                vec!["Remove the attachment and import it again.".to_string()],
-            ),
-        ));
-    }
+    let store = RuntimeStore::current()?;
+    let catalog = match validated_preview_manifest(&store, &record)? {
+        Ok(manifest) => preview_catalog(&record, &manifest),
+        Err(problem) => metadata_only_preview_catalog(&record, problem),
+    };
     Ok(CommandResult::passed(
         "mom_llama.attachment_preview",
         "contracted",
-        AttachmentPreview { attachment, bytes },
+        catalog,
         Vec::new(),
-        Vec::new(),
+        vec![format!("attachment-preview:{attachment_id}")],
         false,
         false,
     ))
 }
 
-pub fn attachment_bytes(attachment_id: &str) -> Result<Option<Vec<u8>>> {
+pub fn attachment_preview_content(
+    anchor: &AttachmentPreviewAnchor,
+) -> Result<CommandResult<AttachmentPreviewContent>> {
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let store = RuntimeStore::current()?;
+    let authority = match exact_preview_authority(&store, anchor)? {
+        Ok(authority) => authority,
+        Err(problem) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.attachment_preview_content",
+                "stub_blocked",
+                preview_blocker(&problem.code, problem.message),
+            ));
+        }
+    };
+    let Some(artifact) = authority
+        .manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id.0 == anchor.artifact_id)
+    else {
+        return Ok(CommandResult::blocked(
+            "mom_llama.attachment_preview_content",
+            "stub_blocked",
+            preview_blocker(
+                "attachment_preview_artifact_mismatch",
+                "The requested canonical preview artifact is no longer current.".to_string(),
+            ),
+        ));
+    };
+    let ArtifactPayload::Text {
+        format,
+        text,
+        segments,
+    } = &artifact.payload
+    else {
+        return Ok(CommandResult::blocked(
+            "mom_llama.attachment_preview_content",
+            "stub_blocked",
+            preview_blocker(
+                "attachment_preview_not_text",
+                "The requested canonical artifact is not a text preview.".to_string(),
+            ),
+        ));
+    };
+    let content = bounded_text_preview(
+        anchor.clone(),
+        *format,
+        &artifact.source,
+        text,
+        segments,
+        preview_notices(&authority.record, &authority.manifest, Some(artifact)),
+    );
+    Ok(CommandResult::passed(
+        "mom_llama.attachment_preview_content",
+        "contracted",
+        content,
+        Vec::new(),
+        vec![format!("attachment-artifact:{}", anchor.artifact_id)],
+        false,
+        false,
+    ))
+}
+
+pub fn attachment_preview_media(
+    anchor: &AttachmentPreviewAnchor,
+) -> Result<std::result::Result<AttachmentPreviewMedia, Blocker>> {
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let store = RuntimeStore::current()?;
+    let authority = match exact_preview_authority(&store, anchor)? {
+        Ok(authority) => authority,
+        Err(problem) => return Ok(Err(preview_blocker(&problem.code, problem.message))),
+    };
+    let Some(artifact) = authority
+        .manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id.0 == anchor.artifact_id)
+    else {
+        return Ok(Err(preview_blocker(
+            "attachment_preview_artifact_mismatch",
+            "The requested canonical preview artifact is no longer current.".to_string(),
+        )));
+    };
+    let ArtifactPayload::Media { family, blob, .. } = &artifact.payload else {
+        return Ok(Err(preview_blocker(
+            "attachment_preview_not_media",
+            "The requested canonical artifact is not an admitted media preview.".to_string(),
+        )));
+    };
+    if let Err(problem) = media_preview_admission(*family, &blob.media_type, blob.byte_len) {
+        return Ok(Err(preview_blocker(&problem.code, problem.message)));
+    }
+    let bytes = match load_verified_object(&store, &authority.manifest.graph, &blob.object_id) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Ok(Err(preview_blocker(
+                "attachment_content_mismatch",
+                "The retained media bytes no longer match the inspected attachment graph."
+                    .to_string(),
+            )));
+        }
+    };
+    Ok(Ok(AttachmentPreviewMedia {
+        anchor: anchor.clone(),
+        media_type: blob.media_type.clone(),
+        bytes,
+    }))
+}
+
+#[cfg(test)]
+fn attachment_bytes(attachment_id: &str) -> Result<Option<Vec<u8>>> {
     let Some(record) = load_attachment_db()?
         .attachments
         .into_iter()
@@ -1283,6 +1506,734 @@ fn manifest_object_ids(manifest: &AttachmentManifest) -> BTreeSet<String> {
         .collect()
 }
 
+#[derive(Debug)]
+struct PreviewProblem {
+    code: String,
+    message: String,
+}
+
+impl PreviewProblem {
+    fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+struct PreviewAuthority {
+    record: AttachmentRecord,
+    manifest: AttachmentManifest,
+}
+
+fn validated_preview_manifest(
+    store: &RuntimeStore,
+    record: &AttachmentRecord,
+) -> Result<std::result::Result<AttachmentManifest, PreviewProblem>> {
+    let Some(namespace) = record.manifest_namespace.as_deref() else {
+        return Ok(Err(PreviewProblem::new(
+            "attachment_preview_legacy_metadata_only",
+            "This historical attachment has no canonical manifest and remains metadata-only.",
+        )));
+    };
+    let Some(manifest) = store.get::<AttachmentManifest>(namespace)? else {
+        return Ok(Err(PreviewProblem::new(
+            "attachment_preview_manifest_missing",
+            "The canonical preview manifest is unavailable; the retained metadata remains visible.",
+        )));
+    };
+    if let Err(problem) = validate_preview_manifest(record, &manifest) {
+        return Ok(Err(problem));
+    }
+    let current_policy_fingerprint = attachment_host()?.policy_fingerprint().to_string();
+    if manifest.policy_fingerprint != current_policy_fingerprint {
+        return Ok(Err(PreviewProblem::new(
+            "attachment_preview_policy_mismatch",
+            "The attachment was inspected under a different safety policy and must be re-imported before preview.",
+        )));
+    }
+    Ok(Ok(manifest))
+}
+
+fn validate_preview_manifest(
+    record: &AttachmentRecord,
+    manifest: &AttachmentManifest,
+) -> std::result::Result<(), PreviewProblem> {
+    if manifest.schema != ATTACHMENT_MANIFEST_SCHEMA || manifest.attachment_id != record.id {
+        return Err(PreviewProblem::new(
+            "attachment_preview_manifest_invalid",
+            "Attachment metadata does not match its canonical preview manifest.",
+        ));
+    }
+    manifest.graph.validate().map_err(|_| {
+        PreviewProblem::new(
+            "attachment_preview_graph_invalid",
+            "The retained attachment graph failed canonical validation.",
+        )
+    })?;
+    if record.root_object_id.as_deref() != Some(manifest.graph.root.0.as_str())
+        || record.sha256 != manifest.graph.root.0
+        || record.coverage.as_ref() != Some(&manifest.graph.coverage)
+        || record.policy_fingerprint.as_deref() != Some(manifest.policy_fingerprint.as_str())
+    {
+        return Err(PreviewProblem::new(
+            "attachment_preview_identity_mismatch",
+            "Attachment identity, coverage, or policy no longer matches its canonical graph.",
+        ));
+    }
+    let Some(root) = manifest
+        .graph
+        .objects
+        .iter()
+        .find(|object| object.id == manifest.graph.root)
+    else {
+        return Err(PreviewProblem::new(
+            "attachment_preview_root_missing",
+            "The canonical attachment graph has no root object.",
+        ));
+    };
+    if root.sha256 != record.sha256
+        || root.byte_len != record.bytes
+        || root.detection.selected != record.detected_format
+    {
+        return Err(PreviewProblem::new(
+            "attachment_preview_root_mismatch",
+            "The retained root object no longer matches attachment metadata.",
+        ));
+    }
+
+    let objects = manifest
+        .graph
+        .objects
+        .iter()
+        .map(|object| (&object.id, object))
+        .collect::<HashMap<_, _>>();
+    let mut artifact_ids = BTreeSet::new();
+    let mut artifacts_by_source = BTreeMap::<&ObjectId, BTreeSet<_>>::new();
+    let mut text_bytes = 0_u64;
+    let mut media_objects = 0_u32;
+    let mut media_bytes = 0_u64;
+    for artifact in &manifest.artifacts {
+        artifact.validate().map_err(|_| {
+            PreviewProblem::new(
+                "attachment_preview_artifact_invalid",
+                "A canonical preview artifact failed validation.",
+            )
+        })?;
+        if artifact.processor.policy_fingerprint != manifest.policy_fingerprint
+            || !artifact_ids.insert(&artifact.id)
+        {
+            return Err(PreviewProblem::new(
+                "attachment_preview_artifact_identity_mismatch",
+                "Canonical preview artifact identity or policy is inconsistent.",
+            ));
+        }
+        let Some(source) = objects.get(&artifact.source).copied() else {
+            return Err(PreviewProblem::new(
+                "attachment_preview_artifact_source_missing",
+                "A canonical preview artifact refers to a missing source object.",
+            ));
+        };
+        artifacts_by_source
+            .entry(&artifact.source)
+            .or_default()
+            .insert(&artifact.id);
+        match &artifact.payload {
+            ArtifactPayload::Text { text, .. } => {
+                text_bytes = text_bytes
+                    .checked_add(u64::try_from(text.len()).map_err(|_| {
+                        PreviewProblem::new(
+                            "attachment_preview_accounting_overflow",
+                            "Canonical preview text accounting overflowed.",
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        PreviewProblem::new(
+                            "attachment_preview_accounting_overflow",
+                            "Canonical preview text accounting overflowed.",
+                        )
+                    })?;
+            }
+            ArtifactPayload::Media { blob, .. } => {
+                if blob.byte_len != source.byte_len {
+                    return Err(PreviewProblem::new(
+                        "attachment_preview_media_identity_mismatch",
+                        "Canonical media length no longer matches its source object.",
+                    ));
+                }
+                media_objects = media_objects.checked_add(1).ok_or_else(|| {
+                    PreviewProblem::new(
+                        "attachment_preview_accounting_overflow",
+                        "Canonical preview media accounting overflowed.",
+                    )
+                })?;
+                media_bytes = media_bytes.checked_add(blob.byte_len).ok_or_else(|| {
+                    PreviewProblem::new(
+                        "attachment_preview_accounting_overflow",
+                        "Canonical preview media accounting overflowed.",
+                    )
+                })?;
+            }
+            ArtifactPayload::Opaque { blob } => {
+                if blob.byte_len != source.byte_len {
+                    return Err(PreviewProblem::new(
+                        "attachment_preview_opaque_identity_mismatch",
+                        "Opaque artifact length no longer matches its source object.",
+                    ));
+                }
+            }
+        }
+    }
+    for object in &manifest.graph.objects {
+        let declared = object.artifact_ids.iter().collect::<BTreeSet<_>>();
+        let actual = artifacts_by_source.remove(&object.id).unwrap_or_default();
+        if declared.len() != object.artifact_ids.len() || declared != actual {
+            return Err(PreviewProblem::new(
+                "attachment_preview_artifact_index_mismatch",
+                "The attachment graph and canonical artifact index disagree.",
+            ));
+        }
+    }
+    if !artifacts_by_source.is_empty()
+        || manifest.graph.usage.text_bytes != text_bytes
+        || manifest.graph.usage.media_objects != media_objects
+        || manifest.graph.usage.media_bytes != media_bytes
+        || record.artifact_count != manifest.artifacts.len()
+        || record.canonical_text_bytes != text_bytes
+        || record.media_objects != media_objects
+    {
+        return Err(PreviewProblem::new(
+            "attachment_preview_accounting_mismatch",
+            "Attachment metadata and canonical preview accounting disagree.",
+        ));
+    }
+    Ok(())
+}
+
+fn exact_preview_authority(
+    store: &RuntimeStore,
+    anchor: &AttachmentPreviewAnchor,
+) -> Result<std::result::Result<PreviewAuthority, PreviewProblem>> {
+    let Some(record) = load_attachment_db()?
+        .attachments
+        .into_iter()
+        .find(|record| record.id == anchor.attachment_id)
+    else {
+        return Ok(Err(PreviewProblem::new(
+            "attachment_not_found",
+            "The attachment was removed before its preview completed.",
+        )));
+    };
+    let manifest = match validated_preview_manifest(store, &record)? {
+        Ok(manifest) => manifest,
+        Err(problem) => return Ok(Err(problem)),
+    };
+    if anchor.root_sha256 != record.sha256
+        || anchor.policy_fingerprint != manifest.policy_fingerprint
+    {
+        return Ok(Err(PreviewProblem::new(
+            "attachment_preview_stale",
+            "The attachment root or safety policy changed before its preview completed.",
+        )));
+    }
+    Ok(Ok(PreviewAuthority { record, manifest }))
+}
+
+fn preview_catalog(
+    record: &AttachmentRecord,
+    manifest: &AttachmentManifest,
+) -> AttachmentPreviewCatalog {
+    let mut notices = preview_notices(record, manifest, None);
+    let mut artifacts = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| preview_artifact(manifest, artifact))
+        .collect::<Vec<_>>();
+    let preferred_kind = match record.kind {
+        AttachmentKind::Text | AttachmentKind::Pdf => Some(AttachmentPreviewKind::Text),
+        AttachmentKind::Image => Some(AttachmentPreviewKind::Image),
+        AttachmentKind::Audio => Some(AttachmentPreviewKind::Audio),
+        AttachmentKind::Video => Some(AttachmentPreviewKind::Video),
+        AttachmentKind::Other => None,
+    };
+    let primary = preferred_kind
+        .and_then(|kind| {
+            artifacts
+                .iter()
+                .find(|artifact| artifact.available && artifact.kind == kind)
+        })
+        .or_else(|| artifacts.iter().find(|artifact| artifact.available))
+        .cloned();
+    if artifacts.len() > MAX_ATTACHMENT_PREVIEW_ARTIFACTS {
+        notices.push(AttachmentPreviewNotice {
+            code: "attachment_preview_artifact_list_truncated".to_string(),
+            message: format!(
+                "The preview catalog shows the first {MAX_ATTACHMENT_PREVIEW_ARTIFACTS} canonical artifacts."
+            ),
+        });
+        artifacts.truncate(MAX_ATTACHMENT_PREVIEW_ARTIFACTS);
+        if let Some(primary) = &primary
+            && !artifacts
+                .iter()
+                .any(|artifact| artifact.artifact_id == primary.artifact_id)
+            && let Some(last) = artifacts.last_mut()
+        {
+            *last = primary.clone();
+        }
+    }
+    let required_transforms = preview_required_transforms(record, primary.as_ref());
+    if record.kind == AttachmentKind::Pdf && primary.is_none() {
+        notices.push(AttachmentPreviewNotice {
+            code: "attachment_preview_pdf_text_unavailable".to_string(),
+            message: "The PDF has no canonical extracted text. A separately composed bounded raster/OCR transform is required; no raster page was fabricated."
+                .to_string(),
+        });
+    }
+    let state = if primary.is_some() {
+        if matches!(manifest.graph.coverage, Coverage::Complete) {
+            AttachmentPreviewState::Ready
+        } else {
+            AttachmentPreviewState::Partial
+        }
+    } else if artifacts
+        .iter()
+        .any(|artifact| artifact.kind == AttachmentPreviewKind::Opaque)
+    {
+        AttachmentPreviewState::MetadataOnly
+    } else {
+        AttachmentPreviewState::Unsupported
+    };
+    AttachmentPreviewCatalog {
+        schema: ATTACHMENT_PREVIEW_CATALOG_SCHEMA.to_string(),
+        attachment_id: record.id.clone(),
+        root_sha256: record.sha256.clone(),
+        policy_fingerprint: manifest.policy_fingerprint.clone(),
+        state,
+        coverage: manifest.graph.coverage.clone(),
+        primary,
+        artifacts,
+        notices: bounded_preview_notices(notices),
+        required_transforms,
+    }
+}
+
+fn metadata_only_preview_catalog(
+    record: &AttachmentRecord,
+    problem: PreviewProblem,
+) -> AttachmentPreviewCatalog {
+    AttachmentPreviewCatalog {
+        schema: ATTACHMENT_PREVIEW_CATALOG_SCHEMA.to_string(),
+        attachment_id: record.id.clone(),
+        root_sha256: record.sha256.clone(),
+        policy_fingerprint: record.policy_fingerprint.clone().unwrap_or_default(),
+        state: AttachmentPreviewState::MetadataOnly,
+        coverage: record
+            .coverage
+            .clone()
+            .unwrap_or_else(|| Coverage::Partial {
+                reasons: vec![problem.code.clone()],
+            }),
+        primary: None,
+        artifacts: Vec::new(),
+        notices: bounded_preview_notices(vec![AttachmentPreviewNotice {
+            code: problem.code,
+            message: problem.message,
+        }]),
+        required_transforms: preview_required_transforms(record, None),
+    }
+}
+
+fn preview_artifact(
+    manifest: &AttachmentManifest,
+    artifact: &CanonicalArtifact,
+) -> AttachmentPreviewArtifact {
+    let source_label = preview_source_label(&manifest.graph, &artifact.source);
+    let (kind, media_type, byte_len, validation, admission) = match &artifact.payload {
+        ArtifactPayload::Text { .. } => (AttachmentPreviewKind::Text, None, None, None, Ok(())),
+        ArtifactPayload::Media {
+            family,
+            blob,
+            validation,
+            ..
+        } => {
+            let kind = match family {
+                MediaFamily::Image => AttachmentPreviewKind::Image,
+                MediaFamily::Audio => AttachmentPreviewKind::Audio,
+                MediaFamily::Video => AttachmentPreviewKind::Video,
+            };
+            (
+                kind,
+                Some(blob.media_type.clone()),
+                Some(blob.byte_len),
+                Some(validation.grade),
+                media_preview_admission(*family, &blob.media_type, blob.byte_len),
+            )
+        }
+        ArtifactPayload::Opaque { blob } => (
+            AttachmentPreviewKind::Opaque,
+            Some(blob.media_type.clone()),
+            Some(blob.byte_len),
+            None,
+            Err(PreviewProblem::new(
+                "attachment_preview_opaque",
+                "The canonical artifact remains opaque and is not executed or rendered.",
+            )),
+        ),
+    };
+    let (available, blocker_code) = match admission {
+        Ok(()) => (true, None),
+        Err(problem) => (false, Some(problem.code)),
+    };
+    AttachmentPreviewArtifact {
+        artifact_id: artifact.id.0.clone(),
+        source_object_id: artifact.source.0.clone(),
+        source_label,
+        kind,
+        media_type,
+        byte_len,
+        validation,
+        processor: artifact.processor.name.clone(),
+        processor_version: artifact.processor.version.clone(),
+        available,
+        blocker_code,
+        warnings: artifact
+            .warnings
+            .iter()
+            .take(8)
+            .map(|warning| bounded_preview_string(warning))
+            .collect(),
+    }
+}
+
+fn preview_source_label(graph: &AttachmentGraph, source: &ObjectId) -> String {
+    if source == &graph.root {
+        return bounded_preview_string(&graph.root_name.display);
+    }
+    graph
+        .edges
+        .iter()
+        .find(|edge| edge.child.as_ref() == Some(source))
+        .map(|edge| bounded_preview_string(&edge.name.display))
+        .unwrap_or_else(|| format!("object {}", &source.0[..source.0.len().min(12)]))
+}
+
+fn preview_notices(
+    record: &AttachmentRecord,
+    manifest: &AttachmentManifest,
+    artifact: Option<&CanonicalArtifact>,
+) -> Vec<AttachmentPreviewNotice> {
+    let mut notices = Vec::new();
+    if let Coverage::Partial { reasons } = &manifest.graph.coverage {
+        notices.extend(reasons.iter().map(|reason| AttachmentPreviewNotice {
+            code: "attachment_coverage_partial".to_string(),
+            message: bounded_preview_string(reason),
+        }));
+    }
+    notices.extend(
+        manifest
+            .graph
+            .issues
+            .iter()
+            .map(|issue| AttachmentPreviewNotice {
+                code: issue.code.clone(),
+                message: bounded_preview_string(&issue.safe_message),
+            }),
+    );
+    if let Some(artifact) = artifact {
+        notices.extend(
+            artifact
+                .warnings
+                .iter()
+                .map(|warning| AttachmentPreviewNotice {
+                    code: "attachment_artifact_warning".to_string(),
+                    message: bounded_preview_string(warning),
+                }),
+        );
+    }
+    if record.kind == AttachmentKind::Video {
+        notices.push(AttachmentPreviewNotice {
+            code: "attachment_preview_native_video".to_string(),
+            message: "Video preview uses local native controls over an exact content-addressed blob; it does not autoplay, upload, extract frames, or claim a complete payload decode."
+                .to_string(),
+        });
+    }
+    notices
+}
+
+fn preview_required_transforms(
+    record: &AttachmentRecord,
+    primary: Option<&AttachmentPreviewArtifact>,
+) -> Vec<AttachmentPreviewTransform> {
+    if primary.is_some() {
+        return Vec::new();
+    }
+    match record.kind {
+        AttachmentKind::Text => vec![AttachmentPreviewTransform::ExtractDocumentText],
+        AttachmentKind::Pdf => vec![AttachmentPreviewTransform::RasterizePdfPages],
+        AttachmentKind::Image => vec![AttachmentPreviewTransform::OcrImage],
+        AttachmentKind::Audio => vec![AttachmentPreviewTransform::TranscribeAudio],
+        AttachmentKind::Video => vec![
+            AttachmentPreviewTransform::SampleVideoFrames,
+            AttachmentPreviewTransform::ExtractVideoAudio,
+        ],
+        AttachmentKind::Other => vec![AttachmentPreviewTransform::ExtractDocumentText],
+    }
+}
+
+fn media_preview_admission(
+    family: MediaFamily,
+    media_type: &str,
+    byte_len: u64,
+) -> std::result::Result<(), PreviewProblem> {
+    if byte_len > MAX_ATTACHMENT_PREVIEW_MEDIA_BYTES {
+        return Err(PreviewProblem::new(
+            "attachment_preview_too_large",
+            format!(
+                "The canonical media blob is {byte_len} bytes; local inline preview is limited to {MAX_ATTACHMENT_PREVIEW_MEDIA_BYTES} bytes."
+            ),
+        ));
+    }
+    let admitted = match family {
+        MediaFamily::Image => matches!(
+            media_type,
+            "image/png"
+                | "image/jpeg"
+                | "image/gif"
+                | "image/webp"
+                | "image/bmp"
+                | "image/tiff"
+                | "image/heif"
+                | "image/avif"
+        ),
+        MediaFamily::Audio => matches!(
+            media_type,
+            "audio/wav"
+                | "audio/aiff"
+                | "audio/x-caf"
+                | "audio/flac"
+                | "audio/mpeg"
+                | "audio/ogg"
+                | "audio/mp4"
+        ),
+        MediaFamily::Video => matches!(
+            media_type,
+            "video/mp4" | "video/quicktime" | "video/webm" | "video/ogg"
+        ),
+    };
+    if !admitted {
+        return Err(PreviewProblem::new(
+            "attachment_preview_media_type_not_admitted",
+            format!("Canonical media type {media_type} is not admitted for local native preview."),
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_text_preview(
+    anchor: AttachmentPreviewAnchor,
+    format: TextFormat,
+    source: &ObjectId,
+    text: &str,
+    segments: &[attachment_native_types::TextSegment],
+    notices: Vec<AttachmentPreviewNotice>,
+) -> AttachmentPreviewContent {
+    let target_end = preview_text_prefix_end(
+        text,
+        MAX_ATTACHMENT_PREVIEW_TEXT_BYTES,
+        MAX_ATTACHMENT_PREVIEW_TEXT_LINES,
+    );
+    let mut sections = Vec::new();
+    let mut cursor = 0_usize;
+    for segment in segments {
+        if cursor >= target_end || sections.len() >= MAX_ATTACHMENT_PREVIEW_TEXT_SECTIONS {
+            break;
+        }
+        if segment.start_byte > cursor {
+            push_preview_text_section(
+                &mut sections,
+                source,
+                None,
+                None,
+                BTreeMap::new(),
+                text,
+                cursor,
+                segment.start_byte.min(target_end),
+                segment.start_byte > target_end,
+            );
+            cursor = segment.start_byte.min(target_end);
+        }
+        if sections.len() >= MAX_ATTACHMENT_PREVIEW_TEXT_SECTIONS
+            || segment.start_byte >= target_end
+        {
+            break;
+        }
+        push_preview_text_section(
+            &mut sections,
+            source,
+            Some(segment.kind),
+            segment.label.clone(),
+            segment.coordinates.clone().unwrap_or_default(),
+            text,
+            segment.start_byte,
+            segment.end_byte.min(target_end),
+            segment.end_byte > target_end,
+        );
+        cursor = segment.end_byte;
+    }
+    if segments.is_empty() && target_end > 0 {
+        push_preview_text_section(
+            &mut sections,
+            source,
+            None,
+            None,
+            BTreeMap::new(),
+            text,
+            0,
+            target_end,
+            target_end < text.len(),
+        );
+    } else if cursor < target_end && sections.len() < MAX_ATTACHMENT_PREVIEW_TEXT_SECTIONS {
+        push_preview_text_section(
+            &mut sections,
+            source,
+            None,
+            None,
+            BTreeMap::new(),
+            text,
+            cursor,
+            target_end,
+            target_end < text.len(),
+        );
+    }
+    let returned_bytes = sections.iter().fold(0_usize, |total, section| {
+        total.saturating_add(section.text.len())
+    });
+    let actual_end = returned_bytes.min(text.len());
+    if actual_end < text.len()
+        && let Some(last) = sections.last_mut()
+    {
+        last.truncated = true;
+    }
+    let returned_text = &text[..actual_end];
+    let total_bytes = usize_to_u64(text.len());
+    let returned_bytes = usize_to_u64(actual_end);
+    let total_characters = usize_to_u64(text.chars().count());
+    let returned_characters = usize_to_u64(returned_text.chars().count());
+    let total_lines = usize_to_u64(logical_line_count(text));
+    let returned_lines = usize_to_u64(logical_line_count(returned_text));
+    AttachmentPreviewContent {
+        schema: ATTACHMENT_PREVIEW_CONTENT_SCHEMA.to_string(),
+        anchor,
+        format,
+        sections,
+        stats: AttachmentPreviewTextStats {
+            total_bytes,
+            returned_bytes,
+            omitted_bytes: total_bytes.saturating_sub(returned_bytes),
+            total_characters,
+            returned_characters,
+            omitted_characters: total_characters.saturating_sub(returned_characters),
+            total_lines,
+            returned_lines,
+            omitted_lines: total_lines.saturating_sub(returned_lines),
+            truncated: actual_end < text.len(),
+        },
+        notices: bounded_preview_notices(notices),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_preview_text_section(
+    sections: &mut Vec<AttachmentPreviewTextSection>,
+    source: &ObjectId,
+    kind: Option<SegmentKind>,
+    label: Option<String>,
+    coordinates: BTreeMap<String, String>,
+    text: &str,
+    start: usize,
+    end: usize,
+    truncated: bool,
+) {
+    if start >= end || sections.len() >= MAX_ATTACHMENT_PREVIEW_TEXT_SECTIONS {
+        return;
+    }
+    sections.push(AttachmentPreviewTextSection {
+        source_object_id: source.0.clone(),
+        kind,
+        label: label.map(|label| bounded_preview_string(&label)),
+        coordinates,
+        text: text[start..end].to_string(),
+        truncated,
+    });
+}
+
+fn preview_text_prefix_end(text: &str, max_bytes: usize, max_lines: usize) -> usize {
+    if text.is_empty() || max_bytes == 0 || max_lines == 0 {
+        return 0;
+    }
+    let byte_limit = utf8_prefix_len(text, max_bytes.min(text.len()));
+    let mut lines = 1_usize;
+    for (index, character) in text[..byte_limit].char_indices() {
+        if character == '\n' {
+            if lines >= max_lines {
+                return index;
+            }
+            lines = lines.saturating_add(1);
+        }
+    }
+    byte_limit
+}
+
+fn logical_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            .saturating_add(1)
+    }
+}
+
+fn bounded_preview_notices(notices: Vec<AttachmentPreviewNotice>) -> Vec<AttachmentPreviewNotice> {
+    let mut seen = BTreeSet::new();
+    notices
+        .into_iter()
+        .filter_map(|mut notice| {
+            notice.message = bounded_preview_string(&notice.message);
+            seen.insert((notice.code.clone(), notice.message.clone()))
+                .then_some(notice)
+        })
+        .take(MAX_ATTACHMENT_PREVIEW_NOTICES)
+        .collect()
+}
+
+fn bounded_preview_string(value: &str) -> String {
+    value[..utf8_prefix_len(value, MAX_ATTACHMENT_PREVIEW_NOTICE_BYTES.min(value.len()))]
+        .to_string()
+}
+
+fn utf8_prefix_len(value: &str, max_bytes: usize) -> usize {
+    let mut end = max_bytes.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn preview_blocker(code: &str, message: String) -> Blocker {
+    Blocker::new(
+        code,
+        message,
+        vec!["Refresh the conversation; if the attachment remains unavailable, remove it and import the original file again."
+            .to_string()],
+    )
+}
+
 pub fn load_attachment_db() -> Result<AttachmentDb> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
@@ -1833,6 +2784,7 @@ mod tests {
     const STRUCTURALLY_VALID_WAV: &[u8] = b"RIFF\x26\x00\x00\x00WAVE\
         fmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00\
         data\x02\x00\x00\x00\x00\x00";
+    const STRUCTURALLY_VALID_MP4: &[u8] = b"\0\0\0\x10ftypisom\0\0\0\0\0\0\0\x08mdat";
 
     struct TestDataDir {
         _guard: MutexGuard<'static, ()>,
@@ -1896,6 +2848,19 @@ mod tests {
             .result
             .expect("attachment result")
             .attachment
+    }
+
+    fn preview_anchor(catalog: &AttachmentPreviewCatalog) -> AttachmentPreviewAnchor {
+        let primary = catalog
+            .primary
+            .as_ref()
+            .expect("fixture must have a primary preview artifact");
+        AttachmentPreviewAnchor {
+            attachment_id: catalog.attachment_id.clone(),
+            root_sha256: catalog.root_sha256.clone(),
+            artifact_id: primary.artifact_id.clone(),
+            policy_fingerprint: catalog.policy_fingerprint.clone(),
+        }
     }
 
     fn send_staged_attachment(conversation_id: &str) -> Conversation {
@@ -1997,6 +2962,239 @@ mod tests {
                 .expect("read preserved v2")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn canonical_text_preview_is_path_free_exact_and_stale_after_removal() {
+        let _session = TestDataDir::new("canonical-preview");
+        let hostile = "<script>window.evil = true</script>\n# inert markdown";
+        let attachment = attachment_import_pasted_text("chat", hostile.to_string())
+            .expect("stage hostile text")
+            .result
+            .expect("hostile text result")
+            .attachment;
+        let catalog = attachment_preview(&attachment.id)
+            .expect("load preview catalog")
+            .result
+            .expect("preview catalog");
+        assert_eq!(catalog.state, AttachmentPreviewState::Ready);
+        assert_eq!(catalog.root_sha256, attachment.sha256);
+        assert_eq!(
+            catalog.primary.as_ref().map(|artifact| artifact.kind),
+            Some(AttachmentPreviewKind::Text)
+        );
+        let encoded = serde_json::to_value(&catalog).expect("serialize path-free preview catalog");
+        let object = encoded.as_object().expect("catalog JSON object");
+        assert!(!object.contains_key("source_path"));
+        assert!(!object.contains_key("stored_path"));
+
+        let anchor = preview_anchor(&catalog);
+        let content = attachment_preview_content(&anchor)
+            .expect("load exact canonical text")
+            .result
+            .expect("canonical text preview");
+        let rendered = content
+            .sections
+            .iter()
+            .map(|section| section.text.as_str())
+            .collect::<String>();
+        let store = RuntimeStore::current().expect("open attachment store");
+        let manifest = validated_preview_manifest(&store, &attachment)
+            .expect("read canonical manifest")
+            .expect("validate canonical manifest");
+        let canonical_text = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.id.0 == anchor.artifact_id)
+            .and_then(|artifact| match &artifact.payload {
+                ArtifactPayload::Text { text, .. } => Some(text.as_str()),
+                ArtifactPayload::Media { .. } | ArtifactPayload::Opaque { .. } => None,
+            })
+            .expect("selected preview artifact must contain canonical text");
+        assert_eq!(rendered, canonical_text);
+        assert!(!rendered.contains("<script>"));
+        assert!(!rendered.contains("window.evil"));
+        assert!(rendered.contains("# inert markdown"));
+        assert!(!content.stats.truncated);
+
+        for field in ["root", "artifact", "policy"] {
+            let mut stale = anchor.clone();
+            match field {
+                "root" => stale.root_sha256 = "0".repeat(64),
+                "artifact" => stale.artifact_id = "missing-artifact".to_string(),
+                "policy" => stale.policy_fingerprint = "sha256:stale".to_string(),
+                _ => unreachable!("fixed stale-anchor fixture"),
+            }
+            let blocked = attachment_preview_content(&stale)
+                .expect("stale preview must return a typed blocker");
+            assert!(blocked.result.is_none());
+            assert!(matches!(
+                blocked
+                    .blocker
+                    .as_ref()
+                    .map(|blocker| blocker.code.as_str()),
+                Some("attachment_preview_stale" | "attachment_preview_artifact_mismatch")
+            ));
+        }
+
+        crate::conversation_store::draft_update(Some("chat"), String::new(), Vec::new())
+            .expect("remove staged attachment");
+        let removed = attachment_preview_content(&anchor)
+            .expect("removed preview must return a typed blocker");
+        assert_eq!(
+            removed
+                .blocker
+                .as_ref()
+                .map(|blocker| blocker.code.as_str()),
+            Some("attachment_not_found")
+        );
+    }
+
+    #[test]
+    fn canonical_text_preview_preserves_page_locator_and_exact_caps() {
+        let text = (1..=MAX_ATTACHMENT_PREVIEW_TEXT_LINES + 2)
+            .map(|line| format!("page line {line}\n"))
+            .collect::<String>();
+        let segment = attachment_native_types::TextSegment {
+            kind: SegmentKind::Page,
+            label: Some("Page 1".to_string()),
+            start_byte: 0,
+            end_byte: text.len(),
+            coordinates: Some(BTreeMap::from([("page".to_string(), "1".to_string())])),
+        };
+        let content = bounded_text_preview(
+            AttachmentPreviewAnchor {
+                attachment_id: "attachment".to_string(),
+                root_sha256: "a".repeat(64),
+                artifact_id: "artifact".to_string(),
+                policy_fingerprint: "sha256:policy".to_string(),
+            },
+            TextFormat::Markdown,
+            &ObjectId("a".repeat(64)),
+            &text,
+            &[segment],
+            Vec::new(),
+        );
+        assert!(content.stats.truncated);
+        assert_eq!(
+            content.stats.returned_lines,
+            usize_to_u64(MAX_ATTACHMENT_PREVIEW_TEXT_LINES)
+        );
+        assert!(content.stats.omitted_bytes > 0);
+        assert!(content.stats.omitted_characters > 0);
+        assert!(content.stats.omitted_lines > 0);
+        assert_eq!(content.sections[0].kind, Some(SegmentKind::Page));
+        assert_eq!(content.sections[0].label.as_deref(), Some("Page 1"));
+        assert_eq!(
+            content.sections[0]
+                .coordinates
+                .get("page")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(content.sections[0].truncated);
+    }
+
+    #[test]
+    fn exact_media_preview_adds_bounded_native_video_without_transform_execution() {
+        let session = TestDataDir::new("media-preview");
+        for (name, bytes, kind) in [
+            ("image.png", VALID_PNG, AttachmentPreviewKind::Image),
+            (
+                "clip.mp4",
+                STRUCTURALLY_VALID_MP4,
+                AttachmentPreviewKind::Video,
+            ),
+        ] {
+            let path = session.path.join(name);
+            std::fs::write(&path, bytes).expect("write media preview fixture");
+            let attachment = attachment_import("chat", &path)
+                .expect("import media preview fixture")
+                .result
+                .expect("media import result")
+                .attachment;
+            let catalog = attachment_preview(&attachment.id)
+                .expect("load media preview catalog")
+                .result
+                .expect("media preview catalog");
+            assert_eq!(
+                catalog.primary.as_ref().map(|artifact| artifact.kind),
+                Some(kind)
+            );
+            assert!(catalog.required_transforms.is_empty());
+            if kind == AttachmentPreviewKind::Video {
+                assert!(catalog.notices.iter().any(|notice| {
+                    notice.code == "attachment_preview_native_video"
+                        && notice.message.contains("does not autoplay")
+                }));
+            }
+            let anchor = preview_anchor(&catalog);
+            let media = attachment_preview_media(&anchor)
+                .expect("load exact media preview")
+                .expect("media preview admitted");
+            assert_eq!(media.bytes.as_slice(), bytes);
+            assert_eq!(media.anchor, anchor);
+        }
+        assert!(
+            media_preview_admission(
+                MediaFamily::Video,
+                "video/mp4",
+                MAX_ATTACHMENT_PREVIEW_MEDIA_BYTES
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            media_preview_admission(
+                MediaFamily::Video,
+                "video/mp4",
+                MAX_ATTACHMENT_PREVIEW_MEDIA_BYTES.saturating_add(1)
+            )
+            .expect_err("one media byte beyond the cap must block")
+            .code,
+            "attachment_preview_too_large"
+        );
+    }
+
+    #[test]
+    fn pdf_without_canonical_text_is_explicitly_metadata_only() {
+        let record = AttachmentRecord {
+            id: "pdf".to_string(),
+            conversation_id: "chat".to_string(),
+            message_id: String::new(),
+            kind: AttachmentKind::Pdf,
+            file_name: "scan.pdf".to_string(),
+            source_path: "/must/not/escape".to_string(),
+            stored_path: "encrypted://root".to_string(),
+            mime: "application/pdf".to_string(),
+            bytes: 10,
+            sha256: "a".repeat(64),
+            created_at: "1".to_string(),
+            state: AttachmentState::Staged,
+            root_object_id: Some("a".repeat(64)),
+            detected_format: Some(DetectedFormat::Pdf),
+            coverage: Some(Coverage::Partial {
+                reasons: vec!["pdf_text_unavailable".to_string()],
+            }),
+            manifest_namespace: None,
+            policy_fingerprint: Some("sha256:policy".to_string()),
+            artifact_count: 0,
+            canonical_text_bytes: 0,
+            media_objects: 0,
+        };
+        let catalog = metadata_only_preview_catalog(
+            &record,
+            PreviewProblem::new(
+                "attachment_preview_pdf_text_unavailable",
+                "No canonical PDF text is available.",
+            ),
+        );
+        assert_eq!(catalog.state, AttachmentPreviewState::MetadataOnly);
+        assert_eq!(
+            catalog.required_transforms,
+            vec![AttachmentPreviewTransform::RasterizePdfPages]
+        );
+        let encoded = serde_json::to_string(&catalog).expect("serialize PDF metadata preview");
+        assert!(!encoded.contains(&record.source_path));
     }
 
     #[test]

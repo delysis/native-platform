@@ -282,11 +282,17 @@ fn cli_attachment_preview_returns_metadata_without_decrypted_payload() -> Result
     )?)?;
     assert_eq!(
         preview
-            .pointer("/result/attachment/id")
+            .pointer("/result/attachment_id")
             .and_then(Value::as_str),
         Some(attachment_id)
     );
+    assert_eq!(
+        preview.pointer("/result/schema").and_then(Value::as_str),
+        Some("mom_llama.attachment_preview_catalog.v1")
+    );
     assert!(preview.pointer("/result/bytes").is_none());
+    assert!(preview.pointer("/result/source_path").is_none());
+    assert!(preview.pointer("/result/stored_path").is_none());
     let database = std::fs::read(root.join("runtime.sqlite3"))?;
     assert!(
         !database

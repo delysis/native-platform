@@ -4706,12 +4706,16 @@ mod tests {
             "normal success toasts must not expose scaffold readiness jargon"
         );
         assert!(
-            js.contains("mom_llama_attachment_preview_bytes")
+            js.contains("mom_llama_attachment_preview_content")
+                && js.contains("mom_llama_attachment_preview_bytes")
+                && js.contains("rootSha256: catalog.root_sha256")
+                && js.contains("artifact: artifact.artifact_id")
+                && js.contains("policyFingerprint: catalog.policy_fingerprint")
                 && js.contains("response instanceof ArrayBuffer")
                 && js.contains(
                     "Attachment preview returned serialized JSON instead of raw IPC bytes."
                 ),
-            "attachment payloads must cross Tauri IPC as raw bounded bytes, never JSON arrays"
+            "attachment preview hydration must re-present exact artifact authority and keep media bytes out of JSON"
         );
         assert!(
             js.contains("const ATTACHMENT_PREVIEW_CONCURRENCY = 2;")
@@ -4721,12 +4725,17 @@ mod tests {
                 && js.contains("releaseAttachmentObjectUrls(current)"),
             "attachment previews must hydrate lazily with bounded concurrency and object-URL lifetime"
         );
-        let commands = include_str!("commands.rs");
+        let runtime_attachments =
+            include_str!("../../../../crates/mom-llama-runtime/src/attachments.rs");
         assert!(
-            commands.contains("const MAX_ATTACHMENT_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;")
-                && commands.contains("attachment_preview(&attachment, false)")
-                && commands.contains("Ok(Response::new(bytes))"),
-            "the native preview path must check metadata before returning a raw bounded IPC body"
+            runtime_attachments
+                .contains("const MAX_ATTACHMENT_PREVIEW_MEDIA_BYTES: u64 = 16 * 1024 * 1024;")
+                && runtime_attachments
+                    .contains("const MAX_ATTACHMENT_PREVIEW_TEXT_BYTES: usize = 128 * 1024;")
+                && runtime_attachments
+                    .contains("const MAX_ATTACHMENT_PREVIEW_TEXT_LINES: usize = 1_200;")
+                && runtime_attachments.contains("exact_preview_authority(&store, anchor)"),
+            "Rust must bound preview media and canonical text behind an exact stored identity"
         );
         assert!(
             js.contains("result?.blocker?.code !== \"no_active_tool_loop\""),
@@ -5076,6 +5085,7 @@ mod tests {
             r#"document.createElement("button")"#,
             r#"document.createElement("textarea")"#,
             r#"document.createElement("audio")"#,
+            r#"document.createElement("video")"#,
             r#"document.createElement("details")"#,
             r#"document.createElement("summary")"#,
         ] {
@@ -5097,6 +5107,7 @@ mod tests {
 
         for creation in [
             r#"createCommandElement("audio", DYNAMIC_CONTROL_SPECS.attachmentPreview)"#,
+            r#"createCommandElement("video", DYNAMIC_CONTROL_SPECS.attachmentPreview)"#,
             r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.conversationSelect)"#,
             r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.mentionCancel)"#,
             r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.mentionCandidates)"#,

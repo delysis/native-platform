@@ -21,8 +21,12 @@ pub mod tool_loop;
 pub mod upstream_status;
 
 pub use attachments::{
-    AttachmentImportOutput, AttachmentKind, AttachmentPreview, AttachmentRecord, AttachmentState,
-    attachment_import, attachment_import_pasted_text, attachment_list, attachment_preview,
+    AttachmentImportOutput, AttachmentKind, AttachmentPreviewAnchor, AttachmentPreviewArtifact,
+    AttachmentPreviewCatalog, AttachmentPreviewContent, AttachmentPreviewKind,
+    AttachmentPreviewMedia, AttachmentPreviewNotice, AttachmentPreviewState,
+    AttachmentPreviewTextSection, AttachmentPreviewTextStats, AttachmentPreviewTransform,
+    AttachmentRecord, AttachmentState, attachment_import, attachment_import_pasted_text,
+    attachment_list, attachment_preview, attachment_preview_content, attachment_preview_media,
 };
 pub use chat::{
     ChatCancelOutput, ChatRequestState, ChatSendInput, ChatSendOptions, ChatSendOutput,

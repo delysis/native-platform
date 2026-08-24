@@ -548,6 +548,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .attachment-preview-body > .icon { width: 28px; height: 28px; }
 .attachment-preview img { display: block; width: 100%; max-height: 360px; object-fit: contain; }
 .attachment-preview audio { width: calc(100% - 24px); margin: 24px 12px; }
+.attachment-preview video { display: block; width: 100%; max-height: 360px; background: #000; }
 .attachment-preview figcaption { display: grid; gap: 2px; padding: 0 12px 12px; }
 .attachment-preview figcaption strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-preview figcaption small { color: var(--faint); }
@@ -566,6 +567,42 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .attachment-preview.pdf .attachment-preview-body > .icon { width: 21px; height: 21px; }
 .attachment-preview.text figcaption,
 .attachment-preview.pdf figcaption { min-width: 0; padding: 0; }
+.attachment-preview.hydrated-document {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+  gap: 0;
+  padding: 0;
+}
+.attachment-preview.hydrated-document .attachment-preview-body {
+  display: block;
+  max-height: 420px;
+  min-height: 0;
+  overflow: auto;
+  background: var(--surface);
+}
+.attachment-preview.hydrated-document figcaption { padding: 10px 12px 12px; }
+.attachment-document-preview,
+.attachment-preview-state { display: grid; gap: 10px; padding: 12px; color: var(--text); }
+.attachment-text-section { display: grid; gap: 5px; }
+.attachment-text-section > strong { color: var(--muted); font-size: 11px; }
+.attachment-text-section pre {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font: 12px/1.55 var(--mono);
+  white-space: pre-wrap;
+}
+.attachment-preview-truncation,
+.attachment-preview-state p { margin: 0; color: var(--muted); font-size: 11px; }
+.attachment-preview-notices {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 8px 12px 8px 28px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.attachment-document-preview > .attachment-preview-notices { padding: 8px 0 0 16px; }
 .tool-turn-stats { color: var(--faint); font-size: 12px; margin: 8px 0 0; }
 .build-version {
   position: fixed;

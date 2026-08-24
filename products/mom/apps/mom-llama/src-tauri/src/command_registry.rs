@@ -140,6 +140,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_attachment_import", true, false),
     read("mom_llama_attachment_list", true, false),
     long("mom_llama_attachment_preview", true, false),
+    long("mom_llama_attachment_preview_content", true, false),
     long("mom_llama_attachment_preview_bytes", false, false),
     read("mom_llama_settings_get", true, false),
     mutation("mom_llama_settings_reset", true, true),

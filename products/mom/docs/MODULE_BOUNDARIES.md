@@ -55,7 +55,15 @@ validation and typed transform requests.
 The core never performs OCR, transcription, video decoding, network fallback or
 subprocess conversion. Mom may satisfy a typed audio-transcription request with
 `speech-native-kit`, send payload-decoded image/audio bytes only when the pinned
-native model advertises that exact capability, or surface a typed blocker.
+native model advertises that exact capability, or surface a typed blocker. The
+preview edge is narrower than model input: Rust first returns a path-free
+canonical artifact catalog, then requires the exact attachment ID, root SHA,
+artifact ID and policy fingerprint again before returning bounded text or an
+admitted content-addressed media blob. Canonical Markdown/HTML/SVG is displayed
+only as inert text. PDF is text-first with page locators and honest partial/OCR
+warnings; video uses local native controls without autoplay. Preview does not
+execute OCR, rasterization, transcription, frame extraction, network or a
+subprocess.
 
 ## Persona tool authority
 

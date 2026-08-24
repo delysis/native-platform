@@ -455,6 +455,7 @@ fn main() {
             commands::mom_llama_attachment_import,
             commands::mom_llama_attachment_list,
             commands::mom_llama_attachment_preview,
+            commands::mom_llama_attachment_preview_content,
             commands::mom_llama_attachment_preview_bytes,
             commands::mom_llama_settings_get,
             commands::mom_llama_settings_reset,
