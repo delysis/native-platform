@@ -49,6 +49,9 @@ pub struct AppShutdownSummary {
     pub operation_supervisor_phase: OperationLifecyclePhase,
     pub active_operation_count: usize,
     pub retained_operation_task_count: usize,
+    /// Runtime-local chat/mention/MCP/tool-loop controls still registered
+    /// after every admitted application lease drained.
+    pub active_product_operation_count: usize,
     pub expected_operation_worker_count: usize,
     pub joined_operation_worker_count: usize,
     /// Resident native workers owned at the terminal drain boundary.
@@ -94,7 +97,7 @@ struct AppRuntime {
     native_host: Arc<NativeHost>,
     _native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
     cancellation_sweeps: AtomicU64,
-    product_canceller: Arc<dyn ProductCanceller>,
+    operation_scope: mom_llama_runtime::OperationScope,
     shutdown: OnceCell<Result<AppShutdownSummary, AppShutdownError>>,
     joined_native_host: Mutex<Option<ProcessExitJoinedNativeHost>>,
     native_finalizer: Arc<dyn NativeFinalizer>,
@@ -119,10 +122,6 @@ trait NativeFinalizer: Send + Sync {
         &self,
         host: &Arc<NativeHost>,
     ) -> Result<ProcessExitJoinedNativeHost, mom_llama_runtime::ProductShutdownError>;
-}
-
-trait ProductCanceller: Send + Sync {
-    fn cancel_all(&self) -> usize;
 }
 
 trait PersonaApprovalReconciler: Send + Sync {
@@ -365,14 +364,6 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
-struct RuntimeProductCanceller;
-
-impl ProductCanceller for RuntimeProductCanceller {
-    fn cancel_all(&self) -> usize {
-        mom_llama_runtime::request_product_cancellation()
-    }
-}
-
 struct ProductNativeFinalizer;
 
 impl NativeFinalizer for ProductNativeFinalizer {
@@ -527,7 +518,7 @@ impl Drop for AppWorkLease {
 struct AppRuntimeConstruction {
     native_host: Arc<NativeHost>,
     native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
-    product_canceller: Arc<dyn ProductCanceller>,
+    operation_scope: mom_llama_runtime::OperationScope,
     native_finalizer: Arc<dyn NativeFinalizer>,
     operation_supervisor: OperationSupervisor,
     persona_approval_reconciler: Arc<dyn PersonaApprovalReconciler>,
@@ -543,9 +534,9 @@ impl AppRuntimeHandle {
         let native_host = native_owner.host();
         let persona_approval_authority = persona_approval_recovery.clone();
         Self::with_operation_supervisor(AppRuntimeConstruction {
+            operation_scope: mom_llama_runtime::OperationScope::for_native_host(&native_host),
             native_host,
             native_owner: Some(native_owner),
-            product_canceller: Arc::new(RuntimeProductCanceller),
             native_finalizer: Arc::new(ProductNativeFinalizer),
             operation_supervisor: OperationSupervisor::new(),
             persona_approval_reconciler: Arc::new(RuntimePersonaApprovalReconciler {
@@ -560,13 +551,12 @@ impl AppRuntimeHandle {
     fn with_finalizers(
         native_host: Arc<NativeHost>,
         native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
-        product_canceller: Arc<dyn ProductCanceller>,
         native_finalizer: Arc<dyn NativeFinalizer>,
     ) -> Self {
         Self::with_operation_supervisor(AppRuntimeConstruction {
+            operation_scope: mom_llama_runtime::OperationScope::for_native_host(&native_host),
             native_host,
             native_owner,
-            product_canceller,
             native_finalizer,
             operation_supervisor: OperationSupervisor::new(),
             persona_approval_reconciler: Arc::new(NoopPersonaApprovalReconciler),
@@ -579,7 +569,7 @@ impl AppRuntimeHandle {
         let AppRuntimeConstruction {
             native_host,
             native_owner,
-            product_canceller,
+            operation_scope,
             native_finalizer,
             operation_supervisor,
             persona_approval_reconciler,
@@ -600,7 +590,7 @@ impl AppRuntimeHandle {
             native_host,
             _native_owner: native_owner,
             cancellation_sweeps: AtomicU64::new(0),
-            product_canceller,
+            operation_scope,
             shutdown: OnceCell::new(),
             joined_native_host: Mutex::new(None),
             native_finalizer,
@@ -688,6 +678,10 @@ impl AppRuntimeHandle {
             supervised,
             native_request_id,
         })
+    }
+
+    pub fn operation_scope(&self) -> mom_llama_runtime::OperationScope {
+        self.0.operation_scope.clone()
     }
 
     pub fn cancel_speculative(&self) -> Result<usize, String> {
@@ -800,7 +794,16 @@ impl AppRuntimeHandle {
                     );
                 }
                 let operation_error =
-                    (!operation_errors.is_empty()).then(|| operation_errors.join("; "));
+                    {
+                        let active_product_operations =
+                            self.0.operation_scope.active_operation_count();
+                        if active_product_operations != 0 {
+                            operation_errors.push(format!(
+                                "{active_product_operations} runtime-local product operation controls remained after application work drained"
+                            ));
+                        }
+                        (!operation_errors.is_empty()).then(|| operation_errors.join("; "))
+                    };
                 let approval_recovery_errors = persona_approval_recovery
                     .structural_error
                     .iter()
@@ -837,6 +840,8 @@ impl AppRuntimeHandle {
                 let operation_supervisor_phase = supervisor.phase;
                 let active_operation_count = supervisor.active_operations;
                 let retained_operation_task_count = supervisor.retained_tasks;
+                let active_product_operation_count =
+                    self.0.operation_scope.active_operation_count();
                 let expected_operation_worker_count = supervisor.expected_worker_ids.len();
                 let joined_operation_worker_count = supervisor.joined_worker_ids.len();
                 let mut expected_worker_ids = supervisor.expected_worker_ids;
@@ -862,6 +867,7 @@ impl AppRuntimeHandle {
                     operation_supervisor_phase,
                     active_operation_count,
                     retained_operation_task_count,
+                    active_product_operation_count,
                     expected_operation_worker_count,
                     joined_operation_worker_count,
                     expected_native_worker_count,
@@ -916,7 +922,7 @@ impl AppRuntimeHandle {
 
     fn request_product_cancellation(&self) {
         self.0.cancellation_sweeps.fetch_add(1, Ordering::AcqRel);
-        let _ = self.0.product_canceller.cancel_all();
+        let _ = self.0.operation_scope.request_cancellation();
     }
 }
 
@@ -933,7 +939,7 @@ mod tests {
     use super::{
         AppRuntimeConstruction, AppRuntimeHandle, NativeFinalizer,
         PERSONA_APPROVAL_RECOVERY_WORKER_ID, PersonaApprovalReconciler,
-        PersonaApprovalRecoveryWorker, ProductCanceller,
+        PersonaApprovalRecoveryWorker,
     };
     use crate::command_registry::command_spec;
     use crate::operation_supervisor::OperationSupervisor;
@@ -955,8 +961,6 @@ mod tests {
         called: Arc<AtomicBool>,
     }
 
-    struct NoopProductCanceller;
-
     struct RecordingPersonaApprovalReconciler {
         calls: AtomicUsize,
         called: std::sync::mpsc::SyncSender<usize>,
@@ -973,31 +977,6 @@ mod tests {
                 Some(error) => Err(error.clone()),
                 None => Ok(()),
             }
-        }
-    }
-
-    impl ProductCanceller for NoopProductCanceller {
-        fn cancel_all(&self) -> usize {
-            0
-        }
-    }
-
-    struct RecordingProductCanceller {
-        sweeps: AtomicUsize,
-    }
-
-    impl RecordingProductCanceller {
-        const fn new() -> Self {
-            Self {
-                sweeps: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl ProductCanceller for RecordingProductCanceller {
-        fn cancel_all(&self) -> usize {
-            self.sweeps.fetch_add(1, Ordering::AcqRel);
-            0
         }
     }
 
@@ -1037,20 +1016,8 @@ mod tests {
     }
 
     fn runtime_with_finalizer(called: Arc<AtomicBool>) -> AppRuntimeHandle {
-        runtime_with_canceller(called, Arc::new(NoopProductCanceller))
-    }
-
-    fn runtime_with_canceller(
-        called: Arc<AtomicBool>,
-        product_canceller: Arc<dyn ProductCanceller>,
-    ) -> AppRuntimeHandle {
         let host = Arc::new(NativeHost::new(NativeHostConfig::default()));
-        AppRuntimeHandle::with_finalizers(
-            host,
-            None,
-            product_canceller,
-            Arc::new(RecordingFinalizer { called }),
-        )
+        AppRuntimeHandle::with_finalizers(host, None, Arc::new(RecordingFinalizer { called }))
     }
 
     #[test]
@@ -1099,9 +1066,9 @@ mod tests {
         let reconciled = Arc::new(AtomicBool::new(false));
         let native_called = Arc::new(AtomicBool::new(false));
         let runtime = AppRuntimeHandle::with_operation_supervisor(AppRuntimeConstruction {
+            operation_scope: mom_llama_runtime::OperationScope::for_native_host(&host),
             native_host: host,
             native_owner: None,
-            product_canceller: Arc::new(NoopProductCanceller),
             native_finalizer: Arc::new(ReconciliationOrderingFinalizer {
                 reconciled: Arc::clone(&reconciled),
                 called: Arc::clone(&native_called),
@@ -1205,11 +1172,8 @@ mod tests {
 
     #[test]
     fn two_runtime_characterization_keeps_injected_admission_and_cancel_seams_isolated() {
-        let left_canceller = Arc::new(RecordingProductCanceller::new());
-        let right_canceller = Arc::new(RecordingProductCanceller::new());
-        let left = runtime_with_canceller(Arc::new(AtomicBool::new(false)), left_canceller.clone());
-        let right =
-            runtime_with_canceller(Arc::new(AtomicBool::new(false)), right_canceller.clone());
+        let left = runtime();
+        let right = runtime();
         let barrier = Arc::new(std::sync::Barrier::new(3));
 
         let close_left = {
@@ -1239,8 +1203,8 @@ mod tests {
 
         assert!(left.admit(command_spec("mom_llama_chat_send")).is_err());
         assert!(!right_lease.cancellation_requested());
-        assert_eq!(left_canceller.sweeps.load(Ordering::Acquire), 1);
-        assert_eq!(right_canceller.sweeps.load(Ordering::Acquire), 0);
+        assert_eq!(left.0.cancellation_sweeps.load(Ordering::Acquire), 1);
+        assert_eq!(right.0.cancellation_sweeps.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
@@ -1367,6 +1331,7 @@ mod tests {
             .expect_err("the injected native finalizer fails")
             .summary
             .clone();
+        assert_eq!(summary.active_product_operation_count, 0);
         assert!(
             summary
                 .expected_worker_ids

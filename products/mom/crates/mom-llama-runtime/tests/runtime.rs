@@ -3216,7 +3216,8 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
         max_tokens: Some(64),
         ..SettingsUpdate::default()
     })?;
-    let _native_owner = initialize_product_runtime()?;
+    let native_owner = initialize_product_runtime()?;
+    let operation_scope = mom_llama_runtime::OperationScope::for_native_host(&native_owner.host());
     let source = mom_llama_runtime::conversation_new(Some("Group source".to_string()))?
         .result
         .ok_or_else(|| anyhow!("group source missing"))?;
@@ -3263,8 +3264,10 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
         .ok_or_else(|| anyhow!("group host missing"))?;
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let host_id = host.id.clone();
+    let dispatch_scope = operation_scope.clone();
     let handle = std::thread::spawn(move || {
-        mom_llama_runtime::chat_dispatch_stream(
+        mom_llama_runtime::chat_dispatch_stream_in_scope(
+            &dispatch_scope,
             MentionDispatchInput {
                 conversation_id: host_id,
                 message: format!("@{} offer four concise views", group.mention_handle),
@@ -3283,7 +3286,11 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
     let invocation_id = started_rx
         .recv_timeout(Duration::from_mins(2))
         .map_err(|error| anyhow!("persona group did not start streaming: {error}"))?;
-    let cancelled = mom_llama_runtime::mention_cancel(&invocation_id, Some(&cancelled_persona_id))?;
+    let cancelled = mom_llama_runtime::mention_cancel_in_scope(
+        &operation_scope,
+        &invocation_id,
+        Some(&cancelled_persona_id),
+    )?;
     assert_eq!(
         cancelled
             .result
@@ -3473,14 +3480,16 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
         max_tokens: Some(512),
         ..SettingsUpdate::default()
     })?;
-    let _native_owner = initialize_product_runtime()?;
+    let native_owner = initialize_product_runtime()?;
+    let operation_scope = mom_llama_runtime::OperationScope::for_native_host(&native_owner.host());
     configure_mcp_fixture(&session)?;
     let conversation_id = "real-tool-loop-cancel";
     let prompt =
         "Use the tool result, then write a very long detailed response with many paragraphs."
             .to_string();
     let arguments = json!({"value":"ready"});
-    let prepared = mom_llama_runtime::tool_loop_prepare(
+    let prepared = mom_llama_runtime::tool_loop_prepare_in_scope(
+        &operation_scope,
         conversation_id,
         prompt.clone(),
         "fixture".to_string(),
@@ -3494,8 +3503,10 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
         .ok_or_else(|| anyhow!("tool loop approval missing"))?;
     let prompt_for_worker = prompt.clone();
     let arguments_for_worker = arguments.clone();
+    let worker_scope = operation_scope.clone();
     let worker = std::thread::spawn(move || {
-        mom_llama_runtime::tool_loop_run(
+        mom_llama_runtime::tool_loop_run_in_scope(
+            &worker_scope,
             conversation_id,
             prompt_for_worker,
             "fixture".to_string(),
@@ -3534,7 +3545,8 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
     };
     assert!(active.current_model_request_id.is_some());
 
-    let cancelled = mom_llama_runtime::tool_loop_cancel(conversation_id)?;
+    let cancelled =
+        mom_llama_runtime::tool_loop_cancel_in_scope(&operation_scope, conversation_id)?;
     assert_eq!(cancelled.status, "contracted");
     assert_eq!(
         cancelled

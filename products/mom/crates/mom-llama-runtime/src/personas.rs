@@ -7,6 +7,7 @@ use crate::conversation_store::{
 };
 use crate::native_runtime::resident_model_for_profile;
 use crate::now_ms;
+use crate::operation_scope::OperationScope;
 use crate::persona_library::{LIBRARY_REVISION, builtin_panels, builtin_personas};
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
@@ -661,14 +662,23 @@ fn sha256_json(value: &impl Serialize) -> Result<String> {
 }
 
 pub fn persona_removal_preview(persona_id: &str) -> Result<CommandResult<PersonaRemovalImpact>> {
+    let scope = OperationScope::for_current_product_host();
+    persona_removal_preview_in_scope(&scope, persona_id)
+}
+
+pub fn persona_removal_preview_in_scope(
+    scope: &OperationScope,
+    persona_id: &str,
+) -> Result<CommandResult<PersonaRemovalImpact>> {
     const COMMAND: &str = "mom_llama.persona_removal_preview";
     migrate_legacy_consult()?;
     let store = RuntimeStore::current()?;
-    let impact = crate::mentions::with_persona_invocation_registry(persona_id, |live_ids| {
-        store.read_documents(|snapshot| {
-            build_persona_removal_impact_from_snapshot(snapshot, persona_id, live_ids)
-        })
-    })?;
+    let impact =
+        crate::mentions::with_persona_invocation_registry(scope, persona_id, |live_ids| {
+            store.read_documents(|snapshot| {
+                build_persona_removal_impact_from_snapshot(snapshot, persona_id, live_ids)
+            })
+        })?;
     let Some(impact) = impact else {
         return Ok(blocked_persona(
             COMMAND,
@@ -690,10 +700,28 @@ pub fn persona_removal_preview(persona_id: &str) -> Result<CommandResult<Persona
 pub fn persona_remove_from_library(
     input: PersonaRemovalCommitInput,
 ) -> Result<CommandResult<PersonaRemovalOutput>> {
-    persona_remove_from_library_inner(input, false)
+    let scope = OperationScope::for_current_product_host();
+    persona_remove_from_library_in_scope(&scope, input)
 }
 
+pub fn persona_remove_from_library_in_scope(
+    scope: &OperationScope,
+    input: PersonaRemovalCommitInput,
+) -> Result<CommandResult<PersonaRemovalOutput>> {
+    persona_remove_from_library_inner_in_scope(scope, input, false)
+}
+
+#[cfg(test)]
 fn persona_remove_from_library_inner(
+    input: PersonaRemovalCommitInput,
+    inject_failure_after_mutations: bool,
+) -> Result<CommandResult<PersonaRemovalOutput>> {
+    let scope = OperationScope::for_current_product_host();
+    persona_remove_from_library_inner_in_scope(&scope, input, inject_failure_after_mutations)
+}
+
+fn persona_remove_from_library_inner_in_scope(
+    scope: &OperationScope,
     input: PersonaRemovalCommitInput,
     inject_failure_after_mutations: bool,
 ) -> Result<CommandResult<PersonaRemovalOutput>> {
@@ -714,7 +742,7 @@ fn persona_remove_from_library_inner(
     }
     migrate_legacy_consult()?;
     let store = RuntimeStore::current()?;
-    crate::mentions::with_persona_invocation_registry(&input.persona_id, |live_ids| {
+    crate::mentions::with_persona_invocation_registry(scope, &input.persona_id, |live_ids| {
         // The registry lock is held across the authoritative transaction. A
         // frozen invocation that registered first may finish; once this commit
         // wins, later registrations see the tombstone and fail closed.

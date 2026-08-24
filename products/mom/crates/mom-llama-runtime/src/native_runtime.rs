@@ -137,6 +137,13 @@ fn product_host() -> &'static Mutex<ProductRuntimeState> {
     })
 }
 
+pub(crate) fn current_product_host() -> Option<Arc<NativeHost>> {
+    product_host()
+        .lock()
+        .ok()
+        .and_then(|runtime| runtime.host.as_ref()?.host.upgrade())
+}
+
 fn host_key(settings: &Settings) -> ProductHostKey {
     ProductHostKey {
         memory_budget_bytes: settings.resident_memory_budget_bytes,

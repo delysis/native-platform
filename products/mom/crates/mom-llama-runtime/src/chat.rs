@@ -9,10 +9,9 @@ use crate::conversation_store::{
 use crate::kv_cache::{
     compatible_cached_prefix, ensure_persona_prefix, invalidate_cache, persist_session_checkpoint,
 };
-use crate::native_runtime::{
-    cancel_native_request, resident_model_for_profile, skip_native_reasoning,
-};
+use crate::native_runtime::resident_model_for_profile;
 use crate::now_ms;
+use crate::operation_scope::{ChatOperationLease, OperationScope};
 use crate::receipts::{Blocker, CommandResult};
 use crate::skill_store::applied_skill_prompt;
 use crate::store::RuntimeStore;
@@ -67,6 +66,7 @@ where
     data_dir: PathBuf,
     options: ChatSendOptions,
     on_event: &'a mut Option<F>,
+    operation: ChatOperationLease,
     terminal_emitted: bool,
     real_engine_invoked: bool,
 }
@@ -81,6 +81,7 @@ where
         data_dir: &Path,
         options: ChatSendOptions,
         on_event: &'a mut Option<F>,
+        operation: ChatOperationLease,
     ) -> Self {
         Self {
             request_id: request_id.to_string(),
@@ -88,6 +89,7 @@ where
             data_dir: data_dir.to_path_buf(),
             options,
             on_event,
+            operation,
             terminal_emitted: false,
             real_engine_invoked: false,
         }
@@ -99,6 +101,32 @@ where
 
     fn mark_engine_invoked(&mut self) {
         self.real_engine_invoked = true;
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.operation.cancellation_requested()
+    }
+
+    fn arbitrate_terminal(&self) -> bool {
+        self.operation.arbitrate_terminal()
+    }
+
+    fn with_native_admission<R>(&self, admit: impl FnOnce() -> R) -> Result<Option<R>> {
+        self.operation.with_native_admission(admit)
+    }
+
+    fn finish_cancelled(&mut self) -> Result<()> {
+        self.operation.request_cancel();
+        self.operation.arbitrate_terminal();
+        mark_request_state(
+            &self.data_dir,
+            &self.request_id,
+            ChatRequestState::Cancelled,
+        )?;
+        self.finish(
+            "cancelled",
+            Some("The local model request was cancelled.".to_string()),
+        )
     }
 
     fn finish(&mut self, event: &'static str, message: Option<String>) -> Result<()> {
@@ -132,11 +160,23 @@ where
         if self.terminal_emitted {
             return;
         }
-        let _ = mark_request_state(&self.data_dir, &self.request_id, ChatRequestState::Failed);
-        let _ = self.finish(
-            "failed",
-            Some("Generation ended before producing a completed response.".to_string()),
-        );
+        if self.operation.arbitrate_terminal() {
+            let _ = mark_request_state(
+                &self.data_dir,
+                &self.request_id,
+                ChatRequestState::Cancelled,
+            );
+            let _ = self.finish(
+                "cancelled",
+                Some("The local model request was cancelled.".to_string()),
+            );
+        } else {
+            let _ = mark_request_state(&self.data_dir, &self.request_id, ChatRequestState::Failed);
+            let _ = self.finish(
+                "failed",
+                Some("Generation ended before producing a completed response.".to_string()),
+            );
+        }
     }
 }
 
@@ -358,7 +398,17 @@ pub fn chat_send(
     input: ChatSendInput,
     options: ChatSendOptions,
 ) -> Result<CommandResult<ChatSendOutput>> {
+    let scope = OperationScope::for_current_product_host();
+    chat_send_in_scope(&scope, input, options)
+}
+
+pub fn chat_send_in_scope(
+    scope: &OperationScope,
+    input: ChatSendInput,
+    options: ChatSendOptions,
+) -> Result<CommandResult<ChatSendOutput>> {
     chat_send_supervised(
+        scope,
         input,
         options,
         None,
@@ -374,10 +424,32 @@ pub fn chat_send_stream<F>(
 where
     F: FnMut(ChatStreamEvent) -> Result<()>,
 {
-    chat_send_supervised(input, options, None, Some(on_event))
+    let scope = OperationScope::for_current_product_host();
+    chat_send_stream_in_scope(&scope, input, options, on_event)
+}
+
+pub fn chat_send_stream_in_scope<F>(
+    scope: &OperationScope,
+    input: ChatSendInput,
+    options: ChatSendOptions,
+    on_event: F,
+) -> Result<CommandResult<ChatSendOutput>>
+where
+    F: FnMut(ChatStreamEvent) -> Result<()>,
+{
+    chat_send_supervised(scope, input, options, None, Some(on_event))
 }
 
 pub fn chat_regenerate(
+    conversation_id: &str,
+    options: ChatSendOptions,
+) -> Result<CommandResult<ChatSendOutput>> {
+    let scope = OperationScope::for_current_product_host();
+    chat_regenerate_in_scope(&scope, conversation_id, options)
+}
+
+pub fn chat_regenerate_in_scope(
+    scope: &OperationScope,
     conversation_id: &str,
     options: ChatSendOptions,
 ) -> Result<CommandResult<ChatSendOutput>> {
@@ -405,6 +477,7 @@ pub fn chat_regenerate(
     };
     let message_id = message.id.clone();
     let mut result = chat_send_supervised(
+        scope,
         ChatSendInput {
             conversation_id: conversation_id.to_string(),
             message: message.content,
@@ -418,6 +491,15 @@ pub fn chat_regenerate(
 }
 
 pub fn chat_continue(
+    conversation_id: &str,
+    options: ChatSendOptions,
+) -> Result<CommandResult<ChatSendOutput>> {
+    let scope = OperationScope::for_current_product_host();
+    chat_continue_in_scope(&scope, conversation_id, options)
+}
+
+pub fn chat_continue_in_scope(
+    scope: &OperationScope,
     conversation_id: &str,
     options: ChatSendOptions,
 ) -> Result<CommandResult<ChatSendOutput>> {
@@ -443,7 +525,8 @@ pub fn chat_continue(
             ),
         ));
     }
-    let mut result = chat_send(
+    let mut result = chat_send_in_scope(
+        scope,
         ChatSendInput {
             conversation_id: conversation_id.to_string(),
             message: "Please continue the previous answer.".to_string(),
@@ -455,6 +538,7 @@ pub fn chat_continue(
 }
 
 fn chat_send_supervised<F>(
+    scope: &OperationScope,
     input: ChatSendInput,
     options: ChatSendOptions,
     regenerate_user_id: Option<String>,
@@ -586,6 +670,7 @@ where
             cancel_path: cancel_path.clone(),
         },
     )?;
+    let operation = scope.register_chat(&request_id, &conversation.id)?;
     emit(
         &mut on_event,
         stream_event(
@@ -607,7 +692,12 @@ where
         &settings.data_dir,
         options,
         &mut on_event,
+        operation,
     );
+    if stream.cancellation_requested() {
+        stream.finish_cancelled()?;
+        return Ok(chat_cancelled_result());
+    }
     let started = Instant::now();
     let model_path = settings.model_path.clone().unwrap_or_default();
     let (
@@ -631,6 +721,10 @@ where
             false,
         )
     } else {
+        if stream.cancellation_requested() {
+            stream.finish_cancelled()?;
+            return Ok(chat_cancelled_result());
+        }
         let handle = match resident_model_for_profile(
             &settings,
             &model_path,
@@ -651,6 +745,10 @@ where
             conversation.execution_profile.chat_template,
             ChatTemplatePolicy::ModelDefault
         );
+        if stream.cancellation_requested() {
+            stream.finish_cancelled()?;
+            return Ok(chat_cancelled_result());
+        }
         let (cached_prefix, cache_was_preexisting) = if media.is_empty() && default_template {
             if let Some(owner_id) = skill_prompt.cache_owner_id.as_deref() {
                 let stable_messages = messages
@@ -703,10 +801,14 @@ where
         };
         let attempted_cache_id = cached_prefix.as_ref().map(|(id, _)| id.clone());
         let first_prefix = cached_prefix.as_ref().map(|(_, state)| state.clone());
+        let Some(first_ticket) =
+            stream.with_native_admission(|| handle.generate(build_request(first_prefix)))?
+        else {
+            stream.finish_cancelled()?;
+            return Ok(chat_cancelled_result());
+        };
         stream.mark_engine_invoked();
-        let first_ticket = handle
-            .generate(build_request(first_prefix))
-            .map_err(|error| anyhow::anyhow!(error))?;
+        let first_ticket = first_ticket.map_err(|error| anyhow::anyhow!(error))?;
         let (outputs, cache_reused) = match consume_chat_ticket(
             first_ticket,
             &request_id,
@@ -726,9 +828,13 @@ where
                 if let Some(cache_id) = attempted_cache_id.as_deref() {
                     invalidate_cache(cache_id)?;
                 }
-                let retry = handle
-                    .generate(build_request(None))
-                    .map_err(|error| anyhow::anyhow!(error))?;
+                let Some(retry) =
+                    stream.with_native_admission(|| handle.generate(build_request(None)))?
+                else {
+                    stream.finish_cancelled()?;
+                    return Ok(chat_cancelled_result());
+                };
+                let retry = retry.map_err(|error| anyhow::anyhow!(error))?;
                 (
                     consume_chat_ticket(
                         retry,
@@ -757,20 +863,8 @@ where
             ));
         };
         if output.state == GenerationState::Cancelled {
-            mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Cancelled)?;
-            stream.finish(
-                "cancelled",
-                Some("The local model request was cancelled.".to_string()),
-            )?;
-            return Ok(CommandResult::blocked(
-                "mom_llama.chat_send",
-                "stub_blocked",
-                Blocker::new(
-                    "chat_cancelled",
-                    "The local model request was cancelled.",
-                    vec!["Send the message again to retry.".to_string()],
-                ),
-            ));
+            stream.finish_cancelled()?;
+            return Ok(chat_cancelled_result());
         }
         if media.is_empty()
             && default_template
@@ -790,6 +884,10 @@ where
             cache_reused,
         )
     };
+    if stream.arbitrate_terminal() {
+        stream.finish_cancelled()?;
+        return Ok(chat_cancelled_result());
+    }
     if assistant_text.trim().is_empty() {
         mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Failed)?;
         return Ok(empty_native_response_result(
@@ -905,6 +1003,18 @@ where
     ))
 }
 
+fn chat_cancelled_result() -> CommandResult<ChatSendOutput> {
+    CommandResult::blocked(
+        "mom_llama.chat_send",
+        "stub_blocked",
+        Blocker::new(
+            "chat_cancelled",
+            "The local model request was cancelled.",
+            vec!["Send the message again to retry.".to_string()],
+        ),
+    )
+}
+
 fn empty_native_response_result(
     reasoning_content: Option<&str>,
     fake_fixture: bool,
@@ -945,6 +1055,14 @@ fn user_turn_is_empty(message: &str, attachments: &ChatAttachmentContext) -> boo
 }
 
 pub fn chat_cancel(conversation_id: &str) -> Result<CommandResult<ChatCancelOutput>> {
+    let scope = OperationScope::for_current_product_host();
+    chat_cancel_in_scope(&scope, conversation_id)
+}
+
+pub fn chat_cancel_in_scope(
+    scope: &OperationScope,
+    conversation_id: &str,
+) -> Result<CommandResult<ChatCancelOutput>> {
     let settings = resolve_settings()?;
     let db = load_active_requests(&settings.data_dir)?;
     let Some(request) = db
@@ -953,6 +1071,7 @@ pub fn chat_cancel(conversation_id: &str) -> Result<CommandResult<ChatCancelOutp
         .rev()
         .find(|request| {
             request.conversation_id == conversation_id
+                && scope.chat_request_is_active(&request.request_id, conversation_id)
                 && matches!(
                     request.state,
                     ChatRequestState::Running | ChatRequestState::CancelRequested
@@ -970,8 +1089,9 @@ pub fn chat_cancel(conversation_id: &str) -> Result<CommandResult<ChatCancelOutp
             ),
         ));
     };
-    let cancelled = cancel_native_request(&request.request_id, None);
-    if cancelled == 0 {
+    let cancellation_accepted = scope.request_chat_cancellation(&request.request_id);
+    let native_sequences_cancelled = scope.cancel_native(&request.request_id, None);
+    if !cancellation_accepted && native_sequences_cancelled == 0 {
         return Ok(CommandResult::blocked(
             "mom_llama.chat_cancel",
             "stub_blocked",
@@ -1002,27 +1122,15 @@ pub fn chat_cancel(conversation_id: &str) -> Result<CommandResult<ChatCancelOutp
     ))
 }
 
-pub(crate) fn request_all_chat_cancellation() -> usize {
-    let Ok(settings) = resolve_settings() else {
-        return 0;
-    };
-    let Ok(db) = load_active_requests(&settings.data_dir) else {
-        return 0;
-    };
-    db.requests
-        .iter()
-        .filter(|request| {
-            matches!(
-                request.state,
-                ChatRequestState::Running | ChatRequestState::CancelRequested
-            )
-        })
-        .fold(0_usize, |total, request| {
-            total.saturating_add(cancel_native_request(&request.request_id, None))
-        })
+pub fn chat_skip_reasoning(
+    conversation_id: &str,
+) -> Result<CommandResult<ChatSkipReasoningOutput>> {
+    let scope = OperationScope::for_current_product_host();
+    chat_skip_reasoning_in_scope(&scope, conversation_id)
 }
 
-pub fn chat_skip_reasoning(
+pub fn chat_skip_reasoning_in_scope(
+    scope: &OperationScope,
     conversation_id: &str,
 ) -> Result<CommandResult<ChatSkipReasoningOutput>> {
     let settings = resolve_settings()?;
@@ -1032,7 +1140,9 @@ pub fn chat_skip_reasoning(
         .iter()
         .rev()
         .find(|request| {
-            request.conversation_id == conversation_id && request.state == ChatRequestState::Running
+            request.conversation_id == conversation_id
+                && request.state == ChatRequestState::Running
+                && scope.chat_request_is_active(&request.request_id, conversation_id)
         })
         .cloned()
     else {
@@ -1049,7 +1159,7 @@ pub fn chat_skip_reasoning(
         ));
     };
     let branch_id = "assistant";
-    if skip_native_reasoning(&request.request_id, Some(branch_id)) == 0 {
+    if scope.skip_native_reasoning(&request.request_id, Some(branch_id)) == 0 {
         return Ok(CommandResult::blocked(
             "mom_llama.chat_skip_reasoning",
             "stub_blocked",
@@ -1403,6 +1513,7 @@ mod tests {
         native_context_messages, parse_reasoning_output, register_active_request,
         user_turn_is_empty,
     };
+    use crate::OperationScope;
     use crate::conversation_store::{MessageAttribution, MessageSpeakerKind};
     use std::path::{Path, PathBuf};
 
@@ -1531,6 +1642,7 @@ mod tests {
             events.push(event);
             Ok(())
         });
+        let scope = OperationScope::detached();
         {
             let mut stream = ChatStreamLifecycle::new(
                 "request",
@@ -1538,6 +1650,9 @@ mod tests {
                 data_dir.path(),
                 ChatSendOptions::default(),
                 &mut callback,
+                scope
+                    .register_chat("request", "conversation")
+                    .expect("register live chat operation"),
             );
             stream.mark_engine_invoked();
         }
@@ -1558,6 +1673,7 @@ mod tests {
             events.push(event);
             Ok(())
         });
+        let scope = OperationScope::detached();
         {
             let mut stream = ChatStreamLifecycle::new(
                 "request",
@@ -1565,6 +1681,9 @@ mod tests {
                 data_dir.path(),
                 ChatSendOptions::default(),
                 &mut callback,
+                scope
+                    .register_chat("request", "conversation")
+                    .expect("register live chat operation"),
             );
             stream
                 .finish("completed", Some("answer".to_string()))

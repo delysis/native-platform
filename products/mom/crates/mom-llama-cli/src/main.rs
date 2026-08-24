@@ -963,12 +963,17 @@ fn run() -> Result<()> {
         let recovery = mom_llama_runtime::reconcile_persona_tool_approvals_command()?;
         mom_llama_runtime::persist_command_receipt(&recovery)?;
     }
-    let _native_owner = command_uses_native(&cli.command)
+    let native_owner = command_uses_native(&cli.command)
         .then(|| {
             let settings = mom_llama_runtime::config::resolve_settings()?;
             mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(&settings)
         })
         .transpose()?;
+    let operation_scope = native_owner
+        .as_ref()
+        .map_or_else(mom_llama_runtime::OperationScope::detached, |owner| {
+            mom_llama_runtime::OperationScope::for_native_host(&owner.host())
+        });
     match cli.command {
         Command::Engine { command } => match command {
             EngineCommand::Check { json } => print_result(
@@ -1025,7 +1030,8 @@ fn run() -> Result<()> {
                     fake_fixture: false,
                 };
                 if stream_jsonl {
-                    let result = mom_llama_runtime::chat_send_stream(
+                    let result = mom_llama_runtime::chat_send_stream_in_scope(
+                        &operation_scope,
                         ChatSendInput {
                             conversation_id: conversation,
                             message,
@@ -1039,7 +1045,8 @@ fn run() -> Result<()> {
                     print_json_line_result(result)
                 } else {
                     print_result(
-                        mom_llama_runtime::chat_send(
+                        mom_llama_runtime::chat_send_in_scope(
+                            &operation_scope,
                             ChatSendInput {
                                 conversation_id: conversation,
                                 message,
@@ -1066,7 +1073,8 @@ fn run() -> Result<()> {
                     fake_fixture: false,
                 };
                 if stream_jsonl {
-                    let result = mom_llama_runtime::chat_dispatch_stream(
+                    let result = mom_llama_runtime::chat_dispatch_stream_in_scope(
+                        &operation_scope,
                         input,
                         options,
                         Some(|event| {
@@ -1076,21 +1084,31 @@ fn run() -> Result<()> {
                     )?;
                     print_json_line_result(result)
                 } else {
-                    print_result(mom_llama_runtime::chat_dispatch(input, options)?, json)
+                    print_result(
+                        mom_llama_runtime::chat_dispatch_in_scope(
+                            &operation_scope,
+                            input,
+                            options,
+                        )?,
+                        json,
+                    )
                 }
             }
-            ChatCommand::Cancel { conversation, json } => {
-                print_result(mom_llama_runtime::chat_cancel(&conversation)?, json)
-            }
-            ChatCommand::SkipReasoning { conversation, json } => {
-                print_result(mom_llama_runtime::chat_skip_reasoning(&conversation)?, json)
-            }
+            ChatCommand::Cancel { conversation, json } => print_result(
+                mom_llama_runtime::chat_cancel_in_scope(&operation_scope, &conversation)?,
+                json,
+            ),
+            ChatCommand::SkipReasoning { conversation, json } => print_result(
+                mom_llama_runtime::chat_skip_reasoning_in_scope(&operation_scope, &conversation)?,
+                json,
+            ),
             ChatCommand::Regenerate {
                 conversation,
                 timeout_s,
                 json,
             } => print_result(
-                mom_llama_runtime::chat_regenerate(
+                mom_llama_runtime::chat_regenerate_in_scope(
+                    &operation_scope,
                     &conversation,
                     ChatSendOptions {
                         timeout_s: timeout_s
@@ -1105,7 +1123,8 @@ fn run() -> Result<()> {
                 timeout_s,
                 json,
             } => print_result(
-                mom_llama_runtime::chat_continue(
+                mom_llama_runtime::chat_continue_in_scope(
+                    &operation_scope,
                     &conversation,
                     ChatSendOptions {
                         timeout_s: timeout_s
@@ -1148,16 +1167,18 @@ fn run() -> Result<()> {
                 mom_llama_runtime::persona_update(serde_json::from_value(profile)?)?,
                 json,
             ),
-            PersonaCommand::RemovalPreview { persona, json } => {
-                print_result(mom_llama_runtime::persona_removal_preview(&persona)?, json)
-            }
+            PersonaCommand::RemovalPreview { persona, json } => print_result(
+                mom_llama_runtime::persona_removal_preview_in_scope(&operation_scope, &persona)?,
+                json,
+            ),
             PersonaCommand::RemoveFromLibrary {
                 persona,
                 version,
                 impact_sha256,
                 json,
             } => print_result(
-                mom_llama_runtime::persona_remove_from_library(
+                mom_llama_runtime::persona_remove_from_library_in_scope(
+                    &operation_scope,
                     mom_llama_runtime::PersonaRemovalCommitInput {
                         persona_id: persona,
                         persona_version: version,
@@ -1208,7 +1229,8 @@ fn run() -> Result<()> {
                 message,
                 json,
             } => print_result(
-                mom_llama_runtime::mention_dispatch(
+                mom_llama_runtime::mention_dispatch_in_scope(
+                    &operation_scope,
                     mom_llama_runtime::MentionDispatchInput {
                         conversation_id: conversation,
                         message,
@@ -1230,7 +1252,11 @@ fn run() -> Result<()> {
                 target,
                 json,
             } => print_result(
-                mom_llama_runtime::mention_cancel(&invocation, target.as_deref())?,
+                mom_llama_runtime::mention_cancel_in_scope(
+                    &operation_scope,
+                    &invocation,
+                    target.as_deref(),
+                )?,
                 json,
             ),
             MentionCommand::Synthesize { invocation, json } => {
@@ -1246,7 +1272,8 @@ fn run() -> Result<()> {
                 decision,
                 json,
             } => print_result(
-                mom_llama_runtime::mention_tool_approval_decide(
+                mom_llama_runtime::mention_tool_approval_decide_in_scope(
+                    &operation_scope,
                     &invocation,
                     &approval,
                     decision.into(),
@@ -1534,25 +1561,34 @@ fn run() -> Result<()> {
             McpCommand::ListServers { json } => {
                 print_result(mom_llama_runtime::mcp_list_servers()?, json)
             }
-            McpCommand::ListTools { server, json } => {
-                print_result(mom_llama_runtime::mcp_list_tools(&server)?, json)
-            }
-            McpCommand::ListResources { server, json } => {
-                print_result(mom_llama_runtime::mcp_list_resources(&server)?, json)
-            }
-            McpCommand::ReadResource { server, uri, json } => {
-                print_result(mom_llama_runtime::mcp_read_resource(&server, &uri)?, json)
-            }
-            McpCommand::ListPrompts { server, json } => {
-                print_result(mom_llama_runtime::mcp_list_prompts(&server)?, json)
-            }
+            McpCommand::ListTools { server, json } => print_result(
+                mom_llama_runtime::mcp_list_tools_in_scope(&operation_scope, &server)?,
+                json,
+            ),
+            McpCommand::ListResources { server, json } => print_result(
+                mom_llama_runtime::mcp_list_resources_in_scope(&operation_scope, &server)?,
+                json,
+            ),
+            McpCommand::ReadResource { server, uri, json } => print_result(
+                mom_llama_runtime::mcp_read_resource_in_scope(&operation_scope, &server, &uri)?,
+                json,
+            ),
+            McpCommand::ListPrompts { server, json } => print_result(
+                mom_llama_runtime::mcp_list_prompts_in_scope(&operation_scope, &server)?,
+                json,
+            ),
             McpCommand::GetPrompt {
                 server,
                 prompt,
                 arguments,
                 json,
             } => print_result(
-                mom_llama_runtime::mcp_get_prompt(&server, &prompt, arguments)?,
+                mom_llama_runtime::mcp_get_prompt_in_scope(
+                    &operation_scope,
+                    &server,
+                    &prompt,
+                    arguments,
+                )?,
                 json,
             ),
             McpCommand::CallTool {
@@ -1561,7 +1597,12 @@ fn run() -> Result<()> {
                 arguments,
                 json,
             } => print_result(
-                mom_llama_runtime::mcp_call_tool(&server, &tool, arguments)?,
+                mom_llama_runtime::mcp_call_tool_in_scope(
+                    &operation_scope,
+                    &server,
+                    &tool,
+                    arguments,
+                )?,
                 json,
             ),
         },
@@ -1575,7 +1616,8 @@ fn run() -> Result<()> {
                 max_turns,
                 json,
             } => print_result(
-                mom_llama_runtime::tool_loop_prepare(
+                mom_llama_runtime::tool_loop_prepare_in_scope(
+                    &operation_scope,
                     &conversation,
                     prompt,
                     server,
@@ -1597,7 +1639,8 @@ fn run() -> Result<()> {
                 json,
             } => {
                 if stream_jsonl {
-                    let result = mom_llama_runtime::tool_loop_run_stream(
+                    let result = mom_llama_runtime::tool_loop_run_stream_in_scope(
+                        &operation_scope,
                         mom_llama_runtime::ToolLoopRunInput {
                             conversation_id: conversation,
                             prompt,
@@ -1615,7 +1658,8 @@ fn run() -> Result<()> {
                     print_json_line_result(result)
                 } else {
                     print_result(
-                        mom_llama_runtime::tool_loop_run(
+                        mom_llama_runtime::tool_loop_run_in_scope(
+                            &operation_scope,
                             &conversation,
                             prompt,
                             server,
@@ -1628,9 +1672,10 @@ fn run() -> Result<()> {
                     )
                 }
             }
-            ToolLoopCommand::Cancel { conversation, json } => {
-                print_result(mom_llama_runtime::tool_loop_cancel(&conversation)?, json)
-            }
+            ToolLoopCommand::Cancel { conversation, json } => print_result(
+                mom_llama_runtime::tool_loop_cancel_in_scope(&operation_scope, &conversation)?,
+                json,
+            ),
             ToolLoopCommand::Status { conversation, json } => print_result(
                 mom_llama_runtime::tool_loop_status(conversation.as_deref())?,
                 json,

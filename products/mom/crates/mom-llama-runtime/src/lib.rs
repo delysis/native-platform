@@ -10,6 +10,7 @@ pub mod mcp;
 pub mod mentions;
 pub mod models;
 pub mod native_runtime;
+mod operation_scope;
 pub mod path_selection;
 mod persona_library;
 pub mod personas;
@@ -30,8 +31,10 @@ pub use attachments::{
 };
 pub use chat::{
     ChatCancelOutput, ChatRequestState, ChatSendInput, ChatSendOptions, ChatSendOutput,
-    ChatSkipReasoningOutput, ChatStreamEvent, chat_cancel, chat_continue, chat_regenerate,
-    chat_send, chat_send_stream, chat_skip_reasoning,
+    ChatSkipReasoningOutput, ChatStreamEvent, chat_cancel, chat_cancel_in_scope, chat_continue,
+    chat_continue_in_scope, chat_regenerate, chat_regenerate_in_scope, chat_send,
+    chat_send_in_scope, chat_send_stream, chat_send_stream_in_scope, chat_skip_reasoning,
+    chat_skip_reasoning_in_scope,
 };
 pub use composer::{
     ComposerAutocompleteAcceptOutput, ComposerAutocompleteAnchor, ComposerAutocompleteCancelOutput,
@@ -64,8 +67,10 @@ pub use kv_cache::{kv_cache_clear, kv_cache_restore, kv_cache_save, kv_cache_sta
 pub use mcp::{
     McpCallToolOutput, McpGetPromptOutput, McpPrompt, McpPromptArgument, McpReadResourceOutput,
     McpResource, McpResourceContent, McpServerConfig, McpStatus, McpTool, mcp_call_tool,
-    mcp_configure, mcp_get_prompt, mcp_list_prompts, mcp_list_resources, mcp_list_servers,
-    mcp_list_tools, mcp_read_resource, mcp_status,
+    mcp_call_tool_in_scope, mcp_configure, mcp_get_prompt, mcp_get_prompt_in_scope,
+    mcp_list_prompts, mcp_list_prompts_in_scope, mcp_list_resources, mcp_list_resources_in_scope,
+    mcp_list_servers, mcp_list_tools, mcp_list_tools_in_scope, mcp_read_resource,
+    mcp_read_resource_in_scope, mcp_status,
 };
 pub use mentions::{
     ChatDispatchOutput, ChatDispatchStreamEvent, MentionCancelOutput, MentionCandidate,
@@ -73,16 +78,19 @@ pub use mentions::{
     MentionSynthesisOutput, MentionTargetKind, MentionTargetResult, MentionTargetSnapshot,
     MentionToolApproval, MentionToolApprovalDecision, MentionToolApprovalResolution,
     MentionToolApprovalState, MentionToolEffectOutcome, PersonaToolApprovalRecovery, chat_dispatch,
-    chat_dispatch_stream, mention_cancel, mention_candidates, mention_dispatch, mention_synthesize,
-    mention_tool_approval_decide, mention_tool_approval_decide_with_recovery,
-    mention_tool_approval_list, reconcile_persona_tool_approvals,
-    reconcile_persona_tool_approvals_command,
+    chat_dispatch_in_scope, chat_dispatch_stream, chat_dispatch_stream_in_scope, mention_cancel,
+    mention_cancel_in_scope, mention_candidates, mention_dispatch, mention_dispatch_in_scope,
+    mention_synthesize, mention_tool_approval_decide, mention_tool_approval_decide_in_scope,
+    mention_tool_approval_decide_with_recovery,
+    mention_tool_approval_decide_with_recovery_in_scope, mention_tool_approval_list,
+    reconcile_persona_tool_approvals, reconcile_persona_tool_approvals_command,
 };
 pub use models::{hugging_face_hub_cache_dir, model_list, model_select};
 pub use native_runtime::{
     ProductShutdownError, resident_model_for_profile, resident_status,
     shutdown_product_runtime_for_process_exit, unload_resident_model,
 };
+pub use operation_scope::OperationScope;
 pub use path_selection::{PathSelection, PathSelectionKind, path_select};
 pub use personas::{
     PersonaFreezeInput, PersonaGroup, PersonaHistoryMode, PersonaRemovalAttachmentImpact,
@@ -90,8 +98,9 @@ pub use personas::{
     PersonaRemovalGroupImpact, PersonaRemovalHistoryImpact, PersonaRemovalImpact,
     PersonaRemovalOutput, PersonaUpdateInput, PersonaVersion, persona_freeze, persona_get,
     persona_group_create, persona_group_delete, persona_group_list, persona_group_update,
-    persona_instantiate, persona_list, persona_removal_preview, persona_remove_from_library,
-    persona_update, persona_versions,
+    persona_instantiate, persona_list, persona_removal_preview, persona_removal_preview_in_scope,
+    persona_remove_from_library, persona_remove_from_library_in_scope, persona_update,
+    persona_versions,
 };
 pub use receipts::{Blocker, CommandReceipt, CommandResult, persist_command_receipt};
 pub use server::{
@@ -101,21 +110,12 @@ pub use server::{
 pub use tool_loop::{
     ActiveToolLoop, ToolLoopApproval, ToolLoopCancelOutput, ToolLoopOutput, ToolLoopRunInput,
     ToolLoopState, ToolLoopStep, ToolLoopStreamEvent, ToolPermission, ToolPermissionPolicy,
-    tool_loop_cancel, tool_loop_prepare, tool_loop_run, tool_loop_run_stream, tool_loop_status,
-    tool_permission_list, tool_permission_revoke, tool_permission_set,
+    tool_loop_cancel, tool_loop_cancel_in_scope, tool_loop_prepare, tool_loop_prepare_in_scope,
+    tool_loop_run, tool_loop_run_in_scope, tool_loop_run_stream, tool_loop_run_stream_in_scope,
+    tool_loop_status, tool_permission_list, tool_permission_revoke, tool_permission_set,
 };
 pub const RESULT_SCHEMA: &str = "mom_llama.command_result.v1";
 pub const RECEIPT_SCHEMA: &str = "mom_llama.command_receipt.v1";
-
-/// Requests cancellation from every product operation registry without
-/// waiting for completion. The application composition root calls this after
-/// closing admission and before it drains services and application leases.
-pub fn request_product_cancellation() -> usize {
-    mcp::request_all_mcp_cancellation();
-    chat::request_all_chat_cancellation()
-        .saturating_add(mentions::request_all_mention_cancellation())
-        .saturating_add(tool_loop::request_all_tool_loop_cancellation())
-}
 
 /// Allows an explicit startup retry to ask the OS credential store again after
 /// a denied or cancelled first attempt. Successfully cached installation keys

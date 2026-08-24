@@ -908,6 +908,7 @@ mod tests {
             operation_supervisor_phase: crate::operation_supervisor::LifecyclePhase::Closed,
             active_operation_count: 0,
             retained_operation_task_count: 0,
+            active_product_operation_count: 0,
             expected_operation_worker_count: 0,
             joined_operation_worker_count: 0,
             expected_native_worker_count: 0,

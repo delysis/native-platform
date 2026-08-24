@@ -3,9 +3,10 @@ use crate::conversation_store::{
     ChatTemplatePolicy, Conversation, Message, MessageRole, active_leaf_id, active_path_messages,
     get_or_create_conversation, upsert_conversation,
 };
-use crate::mcp::{McpTool, mcp_call_tool_supervised, mcp_list_tools};
-use crate::native_runtime::{cancel_native_request, resident_model_for_profile};
+use crate::mcp::{McpTool, mcp_call_tool_supervised, mcp_list_tools_in_scope};
+use crate::native_runtime::resident_model_for_profile;
 use crate::now_ms;
+use crate::operation_scope::{OperationScope, ToolLoopControl, ToolLoopOperationLease};
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::Result;
@@ -16,10 +17,7 @@ use llama_native_types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -114,12 +112,6 @@ pub struct ToolLoopCancelOutput {
     pub conversation_id: String,
     pub current_model_request_id: Option<String>,
     pub native_sequences_cancelled: usize,
-}
-
-#[derive(Clone)]
-struct ToolLoopControl {
-    cancel_requested: Arc<AtomicBool>,
-    current_model_request_id: Arc<Mutex<Option<String>>>,
 }
 
 struct ToolModelWaitContext<'a> {
@@ -220,12 +212,12 @@ struct ToolLoopLifecycle {
     data_dir: PathBuf,
     request_id: String,
     finished: bool,
+    _operation: ToolLoopOperationLease,
 }
 
 impl ToolLoopLifecycle {
     fn finish(&mut self, state: ToolLoopState) -> Result<()> {
         set_tool_loop_state(&self.data_dir, &self.request_id, state)?;
-        unregister_tool_loop_control(&self.request_id);
         self.finished = true;
         Ok(())
     }
@@ -235,7 +227,6 @@ impl Drop for ToolLoopLifecycle {
     fn drop(&mut self) {
         if !self.finished {
             let _ = set_tool_loop_state(&self.data_dir, &self.request_id, ToolLoopState::Failed);
-            unregister_tool_loop_control(&self.request_id);
         }
     }
 }
@@ -350,6 +341,27 @@ pub fn tool_loop_prepare(
     arguments: Value,
     max_turns: u32,
 ) -> Result<CommandResult<ToolLoopApproval>> {
+    let scope = OperationScope::for_current_product_host();
+    tool_loop_prepare_in_scope(
+        &scope,
+        conversation_id,
+        prompt,
+        server,
+        tool,
+        arguments,
+        max_turns,
+    )
+}
+
+pub fn tool_loop_prepare_in_scope(
+    scope: &OperationScope,
+    conversation_id: &str,
+    prompt: String,
+    server: String,
+    tool: String,
+    arguments: Value,
+    max_turns: u32,
+) -> Result<CommandResult<ToolLoopApproval>> {
     if let Some(blocked) = validate_loop_input(&prompt, &arguments, max_turns) {
         return Ok(CommandResult::blocked(
             "mom_llama.tool_loop_prepare",
@@ -357,7 +369,7 @@ pub fn tool_loop_prepare(
             blocked,
         ));
     }
-    let tool_contract = match resolve_tool_contract(&server, &tool)? {
+    let tool_contract = match resolve_tool_contract(scope, &server, &tool)? {
         Ok(tool_contract) => tool_contract,
         Err((readiness, blocker)) => {
             return Ok(CommandResult::blocked(
@@ -434,7 +446,32 @@ pub fn tool_loop_run(
     max_turns: u32,
     approval_id: Option<String>,
 ) -> Result<CommandResult<ToolLoopOutput>> {
+    let scope = OperationScope::for_current_product_host();
+    tool_loop_run_in_scope(
+        &scope,
+        conversation_id,
+        prompt,
+        server,
+        tool,
+        arguments,
+        max_turns,
+        approval_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn tool_loop_run_in_scope(
+    scope: &OperationScope,
+    conversation_id: &str,
+    prompt: String,
+    server: String,
+    tool: String,
+    arguments: Value,
+    max_turns: u32,
+    approval_id: Option<String>,
+) -> Result<CommandResult<ToolLoopOutput>> {
     tool_loop_run_with_events(
+        scope,
         ToolLoopRunInput {
             conversation_id: conversation_id.to_string(),
             prompt,
@@ -450,15 +487,28 @@ pub fn tool_loop_run(
 
 pub fn tool_loop_run_stream<F>(
     input: ToolLoopRunInput,
+    on_event: F,
+) -> Result<CommandResult<ToolLoopOutput>>
+where
+    F: FnMut(ToolLoopStreamEvent) -> Result<()>,
+{
+    let scope = OperationScope::for_current_product_host();
+    tool_loop_run_stream_in_scope(&scope, input, on_event)
+}
+
+pub fn tool_loop_run_stream_in_scope<F>(
+    scope: &OperationScope,
+    input: ToolLoopRunInput,
     mut on_event: F,
 ) -> Result<CommandResult<ToolLoopOutput>>
 where
     F: FnMut(ToolLoopStreamEvent) -> Result<()>,
 {
-    tool_loop_run_with_events(input, Some(&mut on_event))
+    tool_loop_run_with_events(scope, input, Some(&mut on_event))
 }
 
 fn tool_loop_run_with_events(
+    scope: &OperationScope,
     input: ToolLoopRunInput,
     mut on_event: Option<&mut dyn FnMut(ToolLoopStreamEvent) -> Result<()>>,
 ) -> Result<CommandResult<ToolLoopOutput>> {
@@ -479,7 +529,7 @@ fn tool_loop_run_with_events(
             blocked,
         ));
     }
-    let tool_contract = match resolve_tool_contract(&server, &tool)? {
+    let tool_contract = match resolve_tool_contract(scope, &server, &tool)? {
         Ok(tool_contract) => tool_contract,
         Err((readiness, blocker)) => {
             return Ok(CommandResult::blocked(
@@ -513,7 +563,8 @@ fn tool_loop_run_with_events(
     }
     let settings = resolve_settings()?;
     let request_id = Uuid::new_v4().to_string();
-    let control = register_tool_loop(&settings.data_dir, &request_id, conversation_id)?;
+    let (control, operation) =
+        register_tool_loop(scope, &settings.data_dir, &request_id, conversation_id)?;
     emit_tool_loop_event(
         &mut on_event,
         ToolLoopStreamEvent::new(&request_id, conversation_id, "started", None),
@@ -522,6 +573,7 @@ fn tool_loop_run_with_events(
         data_dir: settings.data_dir.clone(),
         request_id: request_id.clone(),
         finished: false,
+        _operation: operation,
     };
     let (_, source_conversation) = get_or_create_conversation(conversation_id)?;
     let model_path = source_conversation
@@ -608,6 +660,7 @@ fn tool_loop_run_with_events(
             tool_loop_cancel_requested(&settings.data_dir, &request_id, &control).unwrap_or(true)
         };
         let step = match execute_tool_step(
+            scope,
             turn,
             &server,
             &tool,
@@ -918,6 +971,14 @@ fn tool_loop_run_with_events(
 }
 
 pub fn tool_loop_cancel(conversation_id: &str) -> Result<CommandResult<ToolLoopCancelOutput>> {
+    let scope = OperationScope::for_current_product_host();
+    tool_loop_cancel_in_scope(&scope, conversation_id)
+}
+
+pub fn tool_loop_cancel_in_scope(
+    scope: &OperationScope,
+    conversation_id: &str,
+) -> Result<CommandResult<ToolLoopCancelOutput>> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
     let db = store
@@ -929,6 +990,7 @@ pub fn tool_loop_cancel(conversation_id: &str) -> Result<CommandResult<ToolLoopC
         .rev()
         .find(|active| {
             active.conversation_id == conversation_id
+                && scope.tool_loop_control(&active.request_id).is_some()
                 && matches!(
                     active.state,
                     ToolLoopState::Running | ToolLoopState::CancelRequested
@@ -947,31 +1009,21 @@ pub fn tool_loop_cancel(conversation_id: &str) -> Result<CommandResult<ToolLoopC
         ));
     };
 
-    let control = tool_loop_controls()
-        .lock()
-        .ok()
-        .and_then(|registry| registry.get(&active.request_id).cloned());
-    if let Some(control) = &control {
-        control.cancel_requested.store(true, Ordering::Release);
-    }
+    let control = scope
+        .tool_loop_control(&active.request_id)
+        .expect("the selected durable tool loop was proven active in this scope");
+    control.request_cancel();
     set_tool_loop_state(
         &settings.data_dir,
         &active.request_id,
         ToolLoopState::CancelRequested,
     )?;
     let current_model_request_id = control
-        .as_ref()
-        .and_then(|control| {
-            control
-                .current_model_request_id
-                .lock()
-                .ok()
-                .and_then(|request| request.clone())
-        })
+        .current_model_request_id()
         .or(active.current_model_request_id);
     let native_sequences_cancelled = current_model_request_id
         .as_deref()
-        .map(|request_id| cancel_native_request(request_id, None))
+        .map(|request_id| scope.cancel_native(request_id, None))
         .unwrap_or_default();
 
     Ok(CommandResult::passed(
@@ -988,23 +1040,6 @@ pub fn tool_loop_cancel(conversation_id: &str) -> Result<CommandResult<ToolLoopC
         false,
         false,
     ))
-}
-
-pub(crate) fn request_all_tool_loop_cancellation() -> usize {
-    let controls = tool_loop_controls()
-        .lock()
-        .map(|registry| registry.values().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    controls.iter().fold(0_usize, |total, control| {
-        control.cancel_requested.store(true, Ordering::Release);
-        let cancelled = control
-            .current_model_request_id
-            .lock()
-            .ok()
-            .and_then(|request_id| request_id.clone())
-            .map_or(0, |request_id| cancel_native_request(&request_id, None));
-        total.saturating_add(cancelled)
-    })
 }
 
 pub fn tool_loop_status(
@@ -1140,18 +1175,12 @@ fn emit_tool_loop_event(
 }
 
 fn register_tool_loop(
+    scope: &OperationScope,
     data_dir: &Path,
     request_id: &str,
     conversation_id: &str,
-) -> Result<ToolLoopControl> {
-    let control = ToolLoopControl {
-        cancel_requested: Arc::new(AtomicBool::new(false)),
-        current_model_request_id: Arc::new(Mutex::new(None)),
-    };
-    tool_loop_controls()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("tool-loop control registry is unavailable"))?
-        .insert(request_id.to_string(), control.clone());
+) -> Result<(ToolLoopControl, ToolLoopOperationLease)> {
+    let (control, operation) = scope.register_tool_loop(request_id)?;
     let now = now_ms();
     RuntimeStore::open(data_dir)?.mutate(
         ACTIVE_TOOL_LOOPS_NAMESPACE,
@@ -1174,7 +1203,7 @@ fn register_tool_loop(
             Ok(())
         },
     )?;
-    Ok(control)
+    Ok((control, operation))
 }
 
 fn set_current_model_request(
@@ -1183,9 +1212,7 @@ fn set_current_model_request(
     control: &ToolLoopControl,
     model_request_id: Option<String>,
 ) -> Result<()> {
-    if let Ok(mut current) = control.current_model_request_id.lock() {
-        *current = model_request_id.clone();
-    }
+    control.set_current_model_request_id(model_request_id.clone());
     mutate_active_tool_loop(data_dir, request_id, |active| {
         active.current_model_request_id = model_request_id;
     })
@@ -1230,7 +1257,7 @@ fn tool_loop_cancel_requested(
     request_id: &str,
     control: &ToolLoopControl,
 ) -> Result<bool> {
-    if control.cancel_requested.load(Ordering::Acquire) {
+    if control.cancellation_requested() {
         return Ok(true);
     }
     let persisted = RuntimeStore::open(data_dir)?
@@ -1246,20 +1273,9 @@ fn tool_loop_cancel_requested(
             )
         });
     if persisted {
-        control.cancel_requested.store(true, Ordering::Release);
+        control.request_cancel();
     }
     Ok(persisted)
-}
-
-fn unregister_tool_loop_control(request_id: &str) {
-    if let Ok(mut registry) = tool_loop_controls().lock() {
-        registry.remove(request_id);
-    }
-}
-
-fn tool_loop_controls() -> &'static Mutex<HashMap<String, ToolLoopControl>> {
-    static CONTROLS: OnceLock<Mutex<HashMap<String, ToolLoopControl>>> = OnceLock::new();
-    CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn validate_loop_input(prompt: &str, arguments: &Value, max_turns: u32) -> Option<Blocker> {
@@ -1391,10 +1407,11 @@ fn sha256_json(value: &Value) -> Result<String> {
 }
 
 pub(crate) fn resolve_tool_contract(
+    scope: &OperationScope,
     server: &str,
     tool: &str,
 ) -> Result<std::result::Result<McpTool, (String, Blocker)>> {
-    let tools = mcp_list_tools(server)?;
+    let tools = mcp_list_tools_in_scope(scope, server)?;
     if tools.status == "blocked" {
         return Ok(Err((
             tools.readiness,
@@ -1426,6 +1443,7 @@ pub(crate) fn resolve_tool_contract(
 }
 
 fn execute_tool_step(
+    scope: &OperationScope,
     turn: u32,
     server: &str,
     tool: &str,
@@ -1436,7 +1454,8 @@ fn execute_tool_step(
     if let Some(blocker) = validate_tool_arguments(input_schema, &arguments) {
         return Ok(Err(("stub_blocked".to_string(), blocker)));
     }
-    let call = match mcp_call_tool_supervised(server, tool, arguments.clone(), should_cancel) {
+    let call = match mcp_call_tool_supervised(scope, server, tool, arguments.clone(), should_cancel)
+    {
         Ok(call) => call,
         Err(_) if should_cancel() => {
             return Ok(Err((
@@ -1685,11 +1704,10 @@ fn push_unique_path(paths: &mut Vec<String>, path: PathBuf) {
 mod tests {
     use super::{
         ToolDecision, ToolLoopState, parse_tool_decision, register_tool_loop, set_tool_loop_state,
-        tool_loop_cancel_requested, tool_loop_controls, unregister_tool_loop_control, utf8_prefix,
-        validate_tool_arguments,
+        tool_loop_cancel_requested, utf8_prefix, validate_tool_arguments,
     };
+    use crate::OperationScope;
     use serde_json::json;
-    use std::sync::atomic::Ordering;
 
     #[test]
     fn parses_only_the_bounded_call_shape_as_a_tool_request() {
@@ -1749,8 +1767,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&data_dir).expect("create isolated cancellation store");
         let request_id = uuid::Uuid::new_v4().to_string();
-        let control =
-            register_tool_loop(&data_dir, &request_id, "conversation").expect("register tool loop");
+        let scope = OperationScope::detached();
+        let (control, operation) =
+            register_tool_loop(&scope, &data_dir, &request_id, "conversation")
+                .expect("register tool loop");
         assert!(
             !tool_loop_cancel_requested(&data_dir, &request_id, &control)
                 .expect("read initial cancellation state")
@@ -1762,13 +1782,9 @@ mod tests {
             tool_loop_cancel_requested(&data_dir, &request_id, &control)
                 .expect("read persisted cancellation state")
         );
-        assert!(control.cancel_requested.load(Ordering::Acquire));
-        assert!(
-            tool_loop_controls()
-                .lock()
-                .expect("read control registry")
-                .contains_key(&request_id)
-        );
-        unregister_tool_loop_control(&request_id);
+        assert!(control.cancellation_requested());
+        assert_eq!(scope.active_operation_count(), 1);
+        drop(operation);
+        assert_eq!(scope.active_operation_count(), 0);
     }
 }

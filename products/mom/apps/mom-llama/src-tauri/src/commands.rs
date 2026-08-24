@@ -179,9 +179,11 @@ pub async fn mom_llama_chat_send(
     message: String,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_chat_send"))?;
+    let operations = runtime.operation_scope();
     let events = window.clone();
     blocking_command(lease, move || {
-        mom_llama_runtime::chat_send_stream(
+        mom_llama_runtime::chat_send_stream_in_scope(
+            &operations,
             ChatSendInput {
                 conversation_id: conversation,
                 message,
@@ -282,10 +284,12 @@ pub async fn mom_llama_chat_dispatch(
     message: String,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_chat_dispatch"))?;
+    let operations = runtime.operation_scope();
     let runtime = runtime.inner().clone();
     let events = window.clone();
     blocking_command(lease, move || {
-        let result = mom_llama_runtime::chat_dispatch_stream(
+        let result = mom_llama_runtime::chat_dispatch_stream_in_scope(
+            &operations,
             mom_llama_runtime::MentionDispatchInput {
                 conversation_id: conversation,
                 message,
@@ -312,10 +316,12 @@ pub async fn mom_llama_mention_dispatch(
     message: String,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_mention_dispatch"))?;
+    let operations = runtime.operation_scope();
     let runtime = runtime.inner().clone();
     let events = window.clone();
     blocking_command(lease, move || {
-        let mut result = mom_llama_runtime::chat_dispatch_stream(
+        let mut result = mom_llama_runtime::chat_dispatch_stream_in_scope(
+            &operations,
             mom_llama_runtime::MentionDispatchInput {
                 conversation_id: conversation,
                 message,
@@ -370,7 +376,8 @@ pub fn mom_llama_mention_cancel(
     target: Option<String>,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_mention_cancel"))?;
-    command_value(mom_llama_runtime::mention_cancel(
+    command_value(mom_llama_runtime::mention_cancel_in_scope(
+        &runtime.operation_scope(),
         &invocation,
         target.as_deref(),
     ))
@@ -405,10 +412,12 @@ pub async fn mom_llama_mention_tool_approval_decide(
     decision: mom_llama_runtime::MentionToolApprovalDecision,
 ) -> Result<Value, String> {
     let recovery = runtime.persona_tool_approval_recovery()?;
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mention_tool_approval_decide"))?,
         move || {
-            mom_llama_runtime::mention_tool_approval_decide_with_recovery(
+            mom_llama_runtime::mention_tool_approval_decide_with_recovery_in_scope(
+                &operations,
                 &invocation,
                 &approval,
                 decision,
@@ -477,7 +486,10 @@ pub fn mom_llama_persona_removal_preview(
     persona: String,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_persona_removal_preview"))?;
-    command_value(mom_llama_runtime::persona_removal_preview(&persona))
+    command_value(mom_llama_runtime::persona_removal_preview_in_scope(
+        &runtime.operation_scope(),
+        &persona,
+    ))
 }
 
 #[tauri::command]
@@ -486,7 +498,10 @@ pub fn mom_llama_persona_remove_from_library(
     input: mom_llama_runtime::PersonaRemovalCommitInput,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_persona_remove_from_library"))?;
-    command_value(mom_llama_runtime::persona_remove_from_library(input))
+    command_value(mom_llama_runtime::persona_remove_from_library_in_scope(
+        &runtime.operation_scope(),
+        input,
+    ))
 }
 
 #[tauri::command]
@@ -547,7 +562,10 @@ pub fn mom_llama_chat_cancel(
     conversation: String,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_chat_cancel"))?;
-    command_value(mom_llama_runtime::chat_cancel(&conversation))
+    command_value(mom_llama_runtime::chat_cancel_in_scope(
+        &runtime.operation_scope(),
+        &conversation,
+    ))
 }
 
 #[tauri::command]
@@ -556,7 +574,10 @@ pub fn mom_llama_chat_skip_reasoning(
     conversation: String,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_chat_skip_reasoning"))?;
-    command_value(mom_llama_runtime::chat_skip_reasoning(&conversation))
+    command_value(mom_llama_runtime::chat_skip_reasoning_in_scope(
+        &runtime.operation_scope(),
+        &conversation,
+    ))
 }
 
 #[tauri::command]
@@ -564,10 +585,16 @@ pub async fn mom_llama_chat_regenerate(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
 ) -> Result<Value, String> {
-    blocking_command(
-        runtime.admit(command_spec("mom_llama_chat_regenerate"))?,
-        move || mom_llama_runtime::chat_regenerate(&conversation, ChatSendOptions::default()),
-    )
+    blocking_command(runtime.admit(command_spec("mom_llama_chat_regenerate"))?, {
+        let operations = runtime.operation_scope();
+        move || {
+            mom_llama_runtime::chat_regenerate_in_scope(
+                &operations,
+                &conversation,
+                ChatSendOptions::default(),
+            )
+        }
+    })
     .await
 }
 
@@ -576,10 +603,16 @@ pub async fn mom_llama_chat_continue(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
 ) -> Result<Value, String> {
-    blocking_command(
-        runtime.admit(command_spec("mom_llama_chat_continue"))?,
-        move || mom_llama_runtime::chat_continue(&conversation, ChatSendOptions::default()),
-    )
+    blocking_command(runtime.admit(command_spec("mom_llama_chat_continue"))?, {
+        let operations = runtime.operation_scope();
+        move || {
+            mom_llama_runtime::chat_continue_in_scope(
+                &operations,
+                &conversation,
+                ChatSendOptions::default(),
+            )
+        }
+    })
     .await
 }
 
@@ -1091,9 +1124,10 @@ pub async fn mom_llama_mcp_list_tools(
     runtime: State<'_, AppRuntimeHandle>,
     server: String,
 ) -> Result<Value, String> {
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mcp_list_tools"))?,
-        move || mom_llama_runtime::mcp_list_tools(&server),
+        move || mom_llama_runtime::mcp_list_tools_in_scope(&operations, &server),
     )
     .await
 }
@@ -1105,9 +1139,10 @@ pub async fn mom_llama_mcp_call_tool(
     tool: String,
     arguments: Value,
 ) -> Result<Value, String> {
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mcp_call_tool"))?,
-        move || mom_llama_runtime::mcp_call_tool(&server, &tool, arguments),
+        move || mom_llama_runtime::mcp_call_tool_in_scope(&operations, &server, &tool, arguments),
     )
     .await
 }
@@ -1117,9 +1152,10 @@ pub async fn mom_llama_mcp_list_resources(
     runtime: State<'_, AppRuntimeHandle>,
     server: String,
 ) -> Result<Value, String> {
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mcp_list_resources"))?,
-        move || mom_llama_runtime::mcp_list_resources(&server),
+        move || mom_llama_runtime::mcp_list_resources_in_scope(&operations, &server),
     )
     .await
 }
@@ -1130,9 +1166,10 @@ pub async fn mom_llama_mcp_read_resource(
     server: String,
     uri: String,
 ) -> Result<Value, String> {
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mcp_read_resource"))?,
-        move || mom_llama_runtime::mcp_read_resource(&server, &uri),
+        move || mom_llama_runtime::mcp_read_resource_in_scope(&operations, &server, &uri),
     )
     .await
 }
@@ -1142,9 +1179,10 @@ pub async fn mom_llama_mcp_list_prompts(
     runtime: State<'_, AppRuntimeHandle>,
     server: String,
 ) -> Result<Value, String> {
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mcp_list_prompts"))?,
-        move || mom_llama_runtime::mcp_list_prompts(&server),
+        move || mom_llama_runtime::mcp_list_prompts_in_scope(&operations, &server),
     )
     .await
 }
@@ -1156,9 +1194,12 @@ pub async fn mom_llama_mcp_get_prompt(
     prompt: String,
     arguments: Value,
 ) -> Result<Value, String> {
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mcp_get_prompt"))?,
-        move || mom_llama_runtime::mcp_get_prompt(&server, &prompt, arguments),
+        move || {
+            mom_llama_runtime::mcp_get_prompt_in_scope(&operations, &server, &prompt, arguments)
+        },
     )
     .await
 }
@@ -1174,7 +1215,8 @@ pub fn mom_llama_tool_loop_prepare(
     max_turns: Option<u32>,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_tool_loop_prepare"))?;
-    command_value(mom_llama_runtime::tool_loop_prepare(
+    command_value(mom_llama_runtime::tool_loop_prepare_in_scope(
+        &runtime.operation_scope(),
         &conversation,
         prompt,
         server,
@@ -1203,9 +1245,11 @@ pub async fn mom_llama_tool_loop_run(
     input: ToolLoopCommandInput,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_tool_loop_run"))?;
+    let operations = runtime.operation_scope();
     let events = window.clone();
     blocking_command(lease, move || {
-        mom_llama_runtime::tool_loop_run_stream(
+        mom_llama_runtime::tool_loop_run_stream_in_scope(
+            &operations,
             mom_llama_runtime::ToolLoopRunInput {
                 conversation_id: input.conversation,
                 prompt: input.prompt,
@@ -1232,7 +1276,10 @@ pub fn mom_llama_tool_loop_cancel(
     conversation: String,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_tool_loop_cancel"))?;
-    command_value(mom_llama_runtime::tool_loop_cancel(&conversation))
+    command_value(mom_llama_runtime::tool_loop_cancel_in_scope(
+        &runtime.operation_scope(),
+        &conversation,
+    ))
 }
 
 #[tauri::command]

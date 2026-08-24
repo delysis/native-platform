@@ -1,4 +1,5 @@
 use crate::config::{resolve_settings, upstream_setting_i64};
+use crate::operation_scope::OperationScope;
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::{Context, Result};
@@ -16,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use uuid::Uuid;
@@ -47,7 +47,6 @@ const PERSONA_MCP_EXECUTABLES_LOCK: &str = ".persona-mcp-executables-v1.lock";
 const MAX_MANAGED_MCP_DIRECTORY_ENTRIES: usize = MAX_PERSONA_MCP_EXECUTABLES * 2;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const MANAGED_MCP_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
-static MCP_PRODUCT_CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerConfig {
@@ -322,6 +321,14 @@ pub fn mcp_list_servers() -> Result<CommandResult<Vec<McpServerConfig>>> {
 }
 
 pub fn mcp_list_tools(server_name: &str) -> Result<CommandResult<Vec<McpTool>>> {
+    let scope = OperationScope::for_current_product_host();
+    mcp_list_tools_in_scope(&scope, server_name)
+}
+
+pub fn mcp_list_tools_in_scope(
+    scope: &OperationScope,
+    server_name: &str,
+) -> Result<CommandResult<Vec<McpTool>>> {
     let server = match enabled_server(server_name)? {
         Ok(server) => server,
         Err((readiness, blocker)) => {
@@ -332,7 +339,7 @@ pub fn mcp_list_tools(server_name: &str) -> Result<CommandResult<Vec<McpTool>>> 
             ));
         }
     };
-    let response = execute_mcp_request(&server, "tools/list", json!({}))?;
+    let response = execute_mcp_request(scope, &server, "tools/list", json!({}))?;
     let tools = parse_mcp_tools(response)?;
     let changed_paths = cache_persona_mcp_tool_catalog(&server, &tools)?
         .into_iter()
@@ -696,19 +703,37 @@ pub fn mcp_call_tool(
     tool_name: &str,
     arguments: Value,
 ) -> Result<CommandResult<McpCallToolOutput>> {
-    mcp_call_tool_impl(server_name, tool_name, arguments, None)
+    let scope = OperationScope::for_current_product_host();
+    mcp_call_tool_in_scope(&scope, server_name, tool_name, arguments)
+}
+
+pub fn mcp_call_tool_in_scope(
+    scope: &OperationScope,
+    server_name: &str,
+    tool_name: &str,
+    arguments: Value,
+) -> Result<CommandResult<McpCallToolOutput>> {
+    mcp_call_tool_impl(scope, server_name, tool_name, arguments, None)
 }
 
 pub(crate) fn mcp_call_tool_supervised(
+    scope: &OperationScope,
     server_name: &str,
     tool_name: &str,
     arguments: Value,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<CommandResult<McpCallToolOutput>> {
-    mcp_call_tool_impl(server_name, tool_name, arguments, Some(should_cancel))
+    mcp_call_tool_impl(
+        scope,
+        server_name,
+        tool_name,
+        arguments,
+        Some(should_cancel),
+    )
 }
 
 pub(crate) fn mcp_call_tool_supervised_with_config(
+    scope: &OperationScope,
     server: &McpServerConfig,
     tool_name: &str,
     arguments: Value,
@@ -716,6 +741,10 @@ pub(crate) fn mcp_call_tool_supervised_with_config(
     expected_tool_schema_sha256: &str,
     should_cancel: &dyn Fn() -> bool,
 ) -> std::result::Result<CommandResult<McpCallToolOutput>, McpCallSupervisionError> {
+    let operation = scope
+        .register_mcp()
+        .map_err(McpCallSupervisionError::before_effect)?;
+    let scoped_cancel = || operation.cancellation_requested() || should_cancel();
     if !server.enabled {
         return Err(McpCallSupervisionError::before_effect(
             "frozen MCP server is disabled",
@@ -738,7 +767,7 @@ pub(crate) fn mcp_call_tool_supervised_with_config(
         tool_name,
         arguments,
         expected_tool_schema_sha256,
-        should_cancel,
+        &scoped_cancel,
     )?;
     match response {
         McpEffectTerminal::Success(content) => Ok(CommandResult::passed(
@@ -774,6 +803,7 @@ pub(crate) fn mcp_call_tool_supervised_with_config(
 }
 
 fn mcp_call_tool_impl(
+    scope: &OperationScope,
     server_name: &str,
     tool_name: &str,
     arguments: Value,
@@ -789,7 +819,12 @@ fn mcp_call_tool_impl(
             ));
         }
     };
-    mcp_call_tool_with_server(&server, tool_name, arguments, should_cancel)
+    let operation = scope.register_mcp()?;
+    let scoped_cancel = || {
+        operation.cancellation_requested()
+            || should_cancel.is_some_and(|should_cancel| should_cancel())
+    };
+    mcp_call_tool_with_server(&server, tool_name, arguments, Some(&scoped_cancel))
 }
 
 fn mcp_call_tool_with_server(
@@ -834,6 +869,14 @@ fn mcp_call_tool_with_server(
 }
 
 pub fn mcp_list_resources(server_name: &str) -> Result<CommandResult<Vec<McpResource>>> {
+    let scope = OperationScope::for_current_product_host();
+    mcp_list_resources_in_scope(&scope, server_name)
+}
+
+pub fn mcp_list_resources_in_scope(
+    scope: &OperationScope,
+    server_name: &str,
+) -> Result<CommandResult<Vec<McpResource>>> {
     let server = match enabled_server(server_name)? {
         Ok(server) => server,
         Err((readiness, blocker)) => {
@@ -844,7 +887,7 @@ pub fn mcp_list_resources(server_name: &str) -> Result<CommandResult<Vec<McpReso
             ));
         }
     };
-    let response = execute_mcp_request(&server, "resources/list", json!({}))?;
+    let response = execute_mcp_request(scope, &server, "resources/list", json!({}))?;
     let resources = response
         .pointer("/result/resources")
         .and_then(Value::as_array)
@@ -885,6 +928,15 @@ pub fn mcp_read_resource(
     server_name: &str,
     uri: &str,
 ) -> Result<CommandResult<McpReadResourceOutput>> {
+    let scope = OperationScope::for_current_product_host();
+    mcp_read_resource_in_scope(&scope, server_name, uri)
+}
+
+pub fn mcp_read_resource_in_scope(
+    scope: &OperationScope,
+    server_name: &str,
+    uri: &str,
+) -> Result<CommandResult<McpReadResourceOutput>> {
     let server = match enabled_server(server_name)? {
         Ok(server) => server,
         Err((readiness, blocker)) => {
@@ -906,7 +958,7 @@ pub fn mcp_read_resource(
             ),
         ));
     }
-    let response = execute_mcp_request(&server, "resources/read", json!({ "uri": uri }))?;
+    let response = execute_mcp_request(scope, &server, "resources/read", json!({ "uri": uri }))?;
     let contents = response
         .pointer("/result/contents")
         .and_then(Value::as_array)
@@ -948,6 +1000,14 @@ pub fn mcp_read_resource(
 }
 
 pub fn mcp_list_prompts(server_name: &str) -> Result<CommandResult<Vec<McpPrompt>>> {
+    let scope = OperationScope::for_current_product_host();
+    mcp_list_prompts_in_scope(&scope, server_name)
+}
+
+pub fn mcp_list_prompts_in_scope(
+    scope: &OperationScope,
+    server_name: &str,
+) -> Result<CommandResult<Vec<McpPrompt>>> {
     let server = match enabled_server(server_name)? {
         Ok(server) => server,
         Err((readiness, blocker)) => {
@@ -958,7 +1018,7 @@ pub fn mcp_list_prompts(server_name: &str) -> Result<CommandResult<Vec<McpPrompt
             ));
         }
     };
-    let response = execute_mcp_request(&server, "prompts/list", json!({}))?;
+    let response = execute_mcp_request(scope, &server, "prompts/list", json!({}))?;
     let prompts = response
         .pointer("/result/prompts")
         .and_then(Value::as_array)
@@ -1014,6 +1074,16 @@ pub fn mcp_get_prompt(
     prompt_name: &str,
     arguments: Value,
 ) -> Result<CommandResult<McpGetPromptOutput>> {
+    let scope = OperationScope::for_current_product_host();
+    mcp_get_prompt_in_scope(&scope, server_name, prompt_name, arguments)
+}
+
+pub fn mcp_get_prompt_in_scope(
+    scope: &OperationScope,
+    server_name: &str,
+    prompt_name: &str,
+    arguments: Value,
+) -> Result<CommandResult<McpGetPromptOutput>> {
     let server = match enabled_server(server_name)? {
         Ok(server) => server,
         Err((readiness, blocker)) => {
@@ -1036,6 +1106,7 @@ pub fn mcp_get_prompt(
         ));
     }
     let response = execute_mcp_request(
+        scope,
         &server,
         "prompts/get",
         json!({
@@ -1121,8 +1192,19 @@ fn enabled_server(name: &str) -> Result<std::result::Result<McpServerConfig, (St
     Ok(Ok(server))
 }
 
-fn execute_mcp_request(server: &McpServerConfig, method: &str, params: Value) -> Result<Value> {
-    execute_mcp_request_supervised(server, method, params, None)
+fn execute_mcp_request(
+    scope: &OperationScope,
+    server: &McpServerConfig,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let operation = scope.register_mcp()?;
+    execute_mcp_request_supervised(
+        server,
+        method,
+        params,
+        Some(&|| operation.cancellation_requested()),
+    )
 }
 
 #[derive(Debug)]
@@ -1683,12 +1765,7 @@ fn write_mcp_effect_message(
 }
 
 fn cancellation_requested(should_cancel: Option<&dyn Fn() -> bool>) -> bool {
-    MCP_PRODUCT_CANCELLATION_REQUESTED.load(Ordering::Acquire)
-        || should_cancel.is_some_and(|should_cancel| should_cancel())
-}
-
-pub(crate) fn request_all_mcp_cancellation() {
-    MCP_PRODUCT_CANCELLATION_REQUESTED.store(true, Ordering::Release);
+    should_cancel.is_some_and(|should_cancel| should_cancel())
 }
 
 fn serialize_mcp_message(value: &Value) -> Result<Vec<u8>> {

@@ -1,7 +1,6 @@
 use crate::attachments::{commit_generated_exchange_with_journal, prepare_chat_attachments};
 use crate::chat::{
-    ChatSendInput, ChatSendOptions, ChatSendOutput, ChatStreamEvent, chat_send_stream,
-    native_context_messages,
+    ChatSendInput, ChatSendOptions, ChatSendOutput, ChatStreamEvent, native_context_messages,
 };
 use crate::config::{Settings, resolve_settings};
 use crate::conversation_store::{
@@ -16,10 +15,13 @@ use crate::mcp::{
     validate_frozen_mcp_server,
 };
 use crate::native_runtime::{
-    cancel_native_request, model_configuration_for_profile, resident_model_for_configuration,
+    model_configuration_for_profile, resident_model_for_configuration,
     resident_model_for_fingerprint, resident_model_for_frozen_config, resident_model_for_profile,
 };
 use crate::now_ms;
+use crate::operation_scope::{
+    MentionCancelControl, MentionCancelKey, MentionCancelRegistry, OperationScope,
+};
 use crate::personas::{
     MAX_PERSONA_TOOL_BINDINGS, conversation_and_group_handles, persona_instantiate,
 };
@@ -46,8 +48,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -61,54 +62,6 @@ const MAX_ACTIVE_APPROVAL_INVOCATIONS: usize = 64;
 const MAX_VISIBLE_TOOL_APPROVALS: usize = 16;
 const MAX_PERSONA_TOOL_INPUT_SCHEMA_BYTES: usize = 64 * 1024;
 const MAX_PERSONA_TOOL_MANIFEST_BYTES: usize = 128 * 1024;
-type MentionCancelKey = (String, String);
-type MentionCancelRegistry = BTreeMap<MentionCancelKey, Arc<MentionCancelControl>>;
-
-const MENTION_RUNNING: u8 = 0;
-const MENTION_CANCELLED: u8 = 1;
-const MENTION_TERMINAL: u8 = 2;
-
-struct MentionCancelControl(AtomicU8);
-
-impl MentionCancelControl {
-    fn running() -> Self {
-        Self(AtomicU8::new(MENTION_RUNNING))
-    }
-
-    fn request_cancel(&self) -> bool {
-        self.0
-            .compare_exchange(
-                MENTION_RUNNING,
-                MENTION_CANCELLED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    fn cancellation_requested(&self) -> bool {
-        self.0.load(Ordering::Acquire) == MENTION_CANCELLED
-    }
-
-    fn arbitrate_terminal(&self) -> bool {
-        match self.0.compare_exchange(
-            MENTION_RUNNING,
-            MENTION_TERMINAL,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => false,
-            Err(MENTION_CANCELLED) => true,
-            Err(_) => false,
-        }
-    }
-}
-
-fn mention_cancel_registry() -> &'static Mutex<MentionCancelRegistry> {
-    static REGISTRY: OnceLock<Mutex<MentionCancelRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MentionTargetKind {
@@ -317,20 +270,20 @@ pub(crate) struct PersonaInvocationRemovalImpact {
 }
 
 pub(crate) fn with_persona_invocation_registry<R>(
+    scope: &OperationScope,
     persona_id: &str,
     operation: impl FnOnce(&[String]) -> Result<R>,
 ) -> Result<R> {
-    let registry = mention_cancel_registry()
-        .lock()
-        .map_err(|_| anyhow!("Persona cancellation registry is unavailable"))?;
-    let mut live_invocation_ids = registry
-        .keys()
-        .filter(|(_, target_id)| target_id == persona_id)
-        .map(|(invocation_id, _)| invocation_id.clone())
-        .collect::<Vec<_>>();
-    live_invocation_ids.sort();
-    live_invocation_ids.dedup();
-    operation(&live_invocation_ids)
+    scope.with_mention_registry(|registry, _| {
+        let mut live_invocation_ids = registry
+            .keys()
+            .filter(|(_, target_id)| target_id == persona_id)
+            .map(|(invocation_id, _)| invocation_id.clone())
+            .collect::<Vec<_>>();
+        live_invocation_ids.sort();
+        live_invocation_ids.dedup();
+        operation(&live_invocation_ids)
+    })
 }
 
 pub(crate) fn persona_invocation_impact_from_snapshot(
@@ -709,7 +662,17 @@ pub fn chat_dispatch(
     input: MentionDispatchInput,
     options: ChatSendOptions,
 ) -> Result<CommandResult<ChatDispatchOutput>> {
-    chat_dispatch_stream(
+    let scope = OperationScope::for_current_product_host();
+    chat_dispatch_in_scope(&scope, input, options)
+}
+
+pub fn chat_dispatch_in_scope(
+    scope: &OperationScope,
+    input: MentionDispatchInput,
+    options: ChatSendOptions,
+) -> Result<CommandResult<ChatDispatchOutput>> {
+    chat_dispatch_stream_in_scope(
+        scope,
         input,
         options,
         None::<fn(ChatDispatchStreamEvent) -> Result<()>>,
@@ -720,13 +683,35 @@ pub fn mention_dispatch(
     input: MentionDispatchInput,
     options: ChatSendOptions,
 ) -> Result<CommandResult<ChatDispatchOutput>> {
-    let mut result = chat_dispatch(input, options)?;
+    let scope = OperationScope::for_current_product_host();
+    mention_dispatch_in_scope(&scope, input, options)
+}
+
+pub fn mention_dispatch_in_scope(
+    scope: &OperationScope,
+    input: MentionDispatchInput,
+    options: ChatSendOptions,
+) -> Result<CommandResult<ChatDispatchOutput>> {
+    let mut result = chat_dispatch_in_scope(scope, input, options)?;
     result.command = "mom_llama.mention_dispatch".to_string();
     result.receipt.command = "mom_llama.mention_dispatch".to_string();
     Ok(result)
 }
 
 pub fn chat_dispatch_stream<F>(
+    input: MentionDispatchInput,
+    options: ChatSendOptions,
+    on_event: Option<F>,
+) -> Result<CommandResult<ChatDispatchOutput>>
+where
+    F: FnMut(ChatDispatchStreamEvent) -> Result<()>,
+{
+    let scope = OperationScope::for_current_product_host();
+    chat_dispatch_stream_in_scope(&scope, input, options, on_event)
+}
+
+pub fn chat_dispatch_stream_in_scope<F>(
+    scope: &OperationScope,
     mut input: MentionDispatchInput,
     options: ChatSendOptions,
     mut on_event: Option<F>,
@@ -795,7 +780,8 @@ where
     }
     if resolved.is_empty() {
         let conversation_id = input.conversation_id.clone();
-        let output = chat_send_stream(
+        let output = crate::chat::chat_send_stream_in_scope(
+            scope,
             ChatSendInput {
                 conversation_id: conversation_id.clone(),
                 message: input.message,
@@ -834,15 +820,24 @@ where
             output.receipt.fake_fixture,
         ));
     }
-    dispatch_mentions(input, resolved, options, &mut on_event)
+    dispatch_mentions(scope, input, resolved, options, &mut on_event)
 }
 
 pub fn mention_cancel(
     invocation_id: &str,
     target_id: Option<&str>,
 ) -> Result<CommandResult<MentionCancelOutput>> {
-    let flagged = request_mention_cancellation(invocation_id, target_id);
-    let native = cancel_native_request(invocation_id, target_id);
+    let scope = OperationScope::for_current_product_host();
+    mention_cancel_in_scope(&scope, invocation_id, target_id)
+}
+
+pub fn mention_cancel_in_scope(
+    scope: &OperationScope,
+    invocation_id: &str,
+    target_id: Option<&str>,
+) -> Result<CommandResult<MentionCancelOutput>> {
+    let flagged = request_mention_cancellation(scope, invocation_id, target_id);
+    let native = scope.cancel_native(invocation_id, target_id);
     let count = flagged.max(native);
     if count == 0 {
         return Ok(CommandResult::blocked(
@@ -868,27 +863,6 @@ pub fn mention_cancel(
         false,
         false,
     ))
-}
-
-pub(crate) fn request_all_mention_cancellation() -> usize {
-    let controls = mention_cancel_registry()
-        .lock()
-        .map(|registry| {
-            registry
-                .iter()
-                .filter(|(_, control)| control.request_cancel())
-                .map(|((invocation_id, target_id), _)| (invocation_id.clone(), target_id.clone()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    controls
-        .iter()
-        .fold(0_usize, |total, (invocation_id, target_id)| {
-            total.saturating_add(1.max(cancel_native_request(
-                invocation_id,
-                Some(target_id.as_str()),
-            )))
-        })
 }
 
 pub fn mention_tool_approval_list(
@@ -957,12 +931,45 @@ pub fn mention_tool_approval_decide(
     approval_id: &str,
     decision: MentionToolApprovalDecision,
 ) -> Result<CommandResult<MentionToolApprovalResolution>> {
+    let scope = OperationScope::for_current_product_host();
+    mention_tool_approval_decide_in_scope(&scope, invocation_id, approval_id, decision)
+}
+
+pub fn mention_tool_approval_decide_in_scope(
+    scope: &OperationScope,
+    invocation_id: &str,
+    approval_id: &str,
+    decision: MentionToolApprovalDecision,
+) -> Result<CommandResult<MentionToolApprovalResolution>> {
     let settings = resolve_settings()?;
     let recovery = PersonaToolApprovalRecovery::bind(&settings.data_dir)?;
-    mention_tool_approval_decide_with_recovery(invocation_id, approval_id, decision, &recovery)
+    mention_tool_approval_decide_with_recovery_in_scope(
+        scope,
+        invocation_id,
+        approval_id,
+        decision,
+        &recovery,
+    )
 }
 
 pub fn mention_tool_approval_decide_with_recovery(
+    invocation_id: &str,
+    approval_id: &str,
+    decision: MentionToolApprovalDecision,
+    recovery: &PersonaToolApprovalRecovery,
+) -> Result<CommandResult<MentionToolApprovalResolution>> {
+    let scope = OperationScope::for_current_product_host();
+    mention_tool_approval_decide_with_recovery_in_scope(
+        &scope,
+        invocation_id,
+        approval_id,
+        decision,
+        recovery,
+    )
+}
+
+pub fn mention_tool_approval_decide_with_recovery_in_scope(
+    scope: &OperationScope,
     invocation_id: &str,
     approval_id: &str,
     decision: MentionToolApprovalDecision,
@@ -993,16 +1000,17 @@ pub fn mention_tool_approval_decide_with_recovery(
         }
     };
     let target_id = preflight.target_id.clone();
-    let cancellation = match MentionCancelLifecycle::register_target(invocation_id, &target_id)? {
-        Ok(cancellation) => cancellation,
-        Err(blocker) => {
-            return Ok(CommandResult::blocked(
-                "mom_llama.mention_tool_approval_decide",
-                "stub_blocked",
-                blocker,
-            ));
-        }
-    };
+    let cancellation =
+        match MentionCancelLifecycle::register_target(scope, invocation_id, &target_id)? {
+            Ok(cancellation) => cancellation,
+            Err(blocker) => {
+                return Ok(CommandResult::blocked(
+                    "mom_llama.mention_tool_approval_decide",
+                    "stub_blocked",
+                    blocker,
+                ));
+            }
+        };
     if cancellation.requested() {
         return Ok(CommandResult::blocked(
             "mom_llama.mention_tool_approval_decide",
@@ -1073,7 +1081,7 @@ pub fn mention_tool_approval_decide_with_recovery(
         }
     };
     let resumed = if claim.continuation.resume_lease_id.as_deref() == Some(resume_lease.id()) {
-        resume_persona_tool_approval(&claim, &settings)
+        resume_persona_tool_approval(scope, &claim, &settings)
     } else {
         Err(Blocker::new(
             "mention_tool_approval_resume_lease_mismatch",
@@ -1741,10 +1749,15 @@ fn validate_current_persona_tool_binding(
 }
 
 fn resume_persona_tool_approval(
+    scope: &OperationScope,
     claim: &ClaimedMentionToolApproval,
     settings: &Settings,
 ) -> std::result::Result<PersonaToolResumeSuccess, PersonaToolResumeFailure> {
-    if mention_cancellation_requested(&claim.approval.invocation_id, &claim.approval.target_id) {
+    if mention_cancellation_requested(
+        scope,
+        &claim.approval.invocation_id,
+        &claim.approval.target_id,
+    ) {
         return Err(cancelled_persona_tool_resume(None));
     }
     if claim.approval.decision == Some(MentionToolApprovalDecision::Approve)
@@ -1776,6 +1789,7 @@ fn resume_persona_tool_approval(
             &settings.data_dir,
             &|| {
                 mention_cancellation_requested(
+                    scope,
                     &claim.approval.invocation_id,
                     &claim.approval.target_id,
                 )
@@ -1785,6 +1799,7 @@ fn resume_persona_tool_approval(
             Ok(validation) => validation,
             Err(_)
                 if mention_cancellation_requested(
+                    scope,
                     &claim.approval.invocation_id,
                     &claim.approval.target_id,
                 ) =>
@@ -1807,12 +1822,20 @@ fn resume_persona_tool_approval(
     } else {
         None
     };
-    if mention_cancellation_requested(&claim.approval.invocation_id, &claim.approval.target_id) {
+    if mention_cancellation_requested(
+        scope,
+        &claim.approval.invocation_id,
+        &claim.approval.target_id,
+    ) {
         return Err(cancelled_persona_tool_resume(None));
     }
     let handle = resident_model_for_fingerprint(settings, &claim.continuation.model_fingerprint)
         .map_err(|blocked| blocked.blocker)?;
-    if mention_cancellation_requested(&claim.approval.invocation_id, &claim.approval.target_id) {
+    if mention_cancellation_requested(
+        scope,
+        &claim.approval.invocation_id,
+        &claim.approval.target_id,
+    ) {
         return Err(cancelled_persona_tool_resume(None));
     }
     let status = handle.status();
@@ -1827,6 +1850,7 @@ fn resume_persona_tool_approval(
     let (tool_content, effect_receipt) = match claim.approval.decision {
         Some(MentionToolApprovalDecision::Approve) => {
             if mention_cancellation_requested(
+                scope,
                 &claim.approval.invocation_id,
                 &claim.approval.target_id,
             ) {
@@ -1869,6 +1893,7 @@ fn resume_persona_tool_approval(
                 .into());
             }
             let mut call = mcp_call_tool_supervised_with_config(
+                scope,
                 server,
                 &claim.approval.tool,
                 claim.approval.arguments.clone(),
@@ -1876,6 +1901,7 @@ fn resume_persona_tool_approval(
                 &claim.approval.tool_schema_sha256,
                 &|| {
                     mention_cancellation_requested(
+                        scope,
                         &claim.approval.invocation_id,
                         &claim.approval.target_id,
                     )
@@ -1885,6 +1911,7 @@ fn resume_persona_tool_approval(
                 if error.outcome_unknown() {
                     unknown_persona_tool_effect(claim, error)
                 } else if mention_cancellation_requested(
+                    scope,
                     &claim.approval.invocation_id,
                     &claim.approval.target_id,
                 ) {
@@ -1953,7 +1980,11 @@ fn resume_persona_tool_approval(
             .into());
         }
     };
-    if mention_cancellation_requested(&claim.approval.invocation_id, &claim.approval.target_id) {
+    if mention_cancellation_requested(
+        scope,
+        &claim.approval.invocation_id,
+        &claim.approval.target_id,
+    ) {
         return Err(cancelled_persona_tool_resume(effect_receipt));
     }
     let mut messages = claim.continuation.messages.clone();
@@ -1981,7 +2012,11 @@ fn resume_persona_tool_approval(
         role: ChatRole::Tool,
         content: tool_message,
     });
-    if mention_cancellation_requested(&claim.approval.invocation_id, &claim.approval.target_id) {
+    if mention_cancellation_requested(
+        scope,
+        &claim.approval.invocation_id,
+        &claim.approval.target_id,
+    ) {
         return Err(cancelled_persona_tool_resume(effect_receipt));
     }
     // Keep the child request identity identical to the invocation/target pair
@@ -2049,7 +2084,11 @@ fn resume_persona_tool_approval(
             generation_state: GenerationState::Failed,
         });
     }
-    if mention_cancellation_requested(&claim.approval.invocation_id, &claim.approval.target_id) {
+    if mention_cancellation_requested(
+        scope,
+        &claim.approval.invocation_id,
+        &claim.approval.target_id,
+    ) {
         return Err(cancelled_persona_tool_resume(effect_receipt));
     }
     Ok(PersonaToolResumeSuccess {
@@ -2921,6 +2960,7 @@ pub fn mention_synthesize(invocation_id: &str) -> Result<CommandResult<MentionSy
 }
 
 fn dispatch_mentions<F>(
+    scope: &OperationScope,
     input: MentionDispatchInput,
     targets: Vec<ResolvedTarget>,
     options: ChatSendOptions,
@@ -3011,7 +3051,7 @@ where
         .map(snapshot_target)
         .collect::<Result<Vec<_>>>()?;
     let _cancel_lifecycle =
-        match MentionCancelLifecycle::register_snapshots(&invocation_id, &snapshots)? {
+        match MentionCancelLifecycle::register_snapshots(scope, &invocation_id, &snapshots)? {
             Ok(lifecycle) => lifecycle,
             Err(blocker) => {
                 return Ok(CommandResult::blocked(
@@ -3388,6 +3428,7 @@ where
                             && !target.tools.is_empty()
                         {
                             match finish_tool_bound_mention(
+                                scope,
                                 target,
                                 output,
                                 &invocation_id,
@@ -3409,6 +3450,7 @@ where
                                 }
                                 Err(blocker) => {
                                     let state = if mention_cancellation_requested(
+                                        scope,
                                         &invocation_id,
                                         &target.snapshot.target_id,
                                     ) {
@@ -3616,60 +3658,67 @@ enum ToolBoundMentionFinish {
 }
 
 struct MentionCancelLifecycle {
+    scope: OperationScope,
     registrations: Vec<(MentionCancelKey, Arc<MentionCancelControl>)>,
 }
 
 impl MentionCancelLifecycle {
     fn register_snapshots(
+        scope: &OperationScope,
         invocation_id: &str,
         targets: &[MentionTargetSnapshot],
     ) -> Result<std::result::Result<Self, Blocker>> {
-        let mut registry = mention_cancel_registry()
-            .lock()
-            .map_err(|_| anyhow!("Persona cancellation registry is unavailable"))?;
-        let persona_ids = targets
-            .iter()
-            .filter(|target| target.kind == MentionTargetKind::Persona)
-            .map(|target| target.target_id.clone())
-            .collect::<Vec<_>>();
-        let removed = crate::personas::persona_ids_are_removed(&persona_ids)?;
-        if !removed.is_empty() {
-            return Ok(Err(Blocker::new(
-                "persona_removed_before_invocation_admission",
-                "A selected Persona was removed from the library before this invocation could be admitted.",
-                vec!["Refresh mentions and choose a discoverable Persona.".to_string()],
-            )));
-        }
-        let mut registrations = Vec::with_capacity(targets.len());
-        for target in targets {
-            let key = (invocation_id.to_string(), target.target_id.clone());
-            let flag = Arc::new(MentionCancelControl::running());
-            registry.insert(key.clone(), Arc::clone(&flag));
-            registrations.push((key, flag));
-        }
-        Ok(Ok(Self { registrations }))
+        scope.with_mention_registry(|registry, quiescing| {
+            let persona_ids = targets
+                .iter()
+                .filter(|target| target.kind == MentionTargetKind::Persona)
+                .map(|target| target.target_id.clone())
+                .collect::<Vec<_>>();
+            let removed = crate::personas::persona_ids_are_removed(&persona_ids)?;
+            if !removed.is_empty() {
+                return Ok(Err(Blocker::new(
+                    "persona_removed_before_invocation_admission",
+                    "A selected Persona was removed from the library before this invocation could be admitted.",
+                    vec!["Refresh mentions and choose a discoverable Persona.".to_string()],
+                )));
+            }
+            let mut registrations = Vec::with_capacity(targets.len());
+            for target in targets {
+                let key = (invocation_id.to_string(), target.target_id.clone());
+                let flag = Arc::new(MentionCancelControl::running(quiescing));
+                registry.insert(key.clone(), Arc::clone(&flag));
+                registrations.push((key, flag));
+            }
+            Ok(Ok(Self {
+                scope: scope.clone(),
+                registrations,
+            }))
+        })
     }
 
     fn register_target(
+        scope: &OperationScope,
         invocation_id: &str,
         target_id: &str,
     ) -> Result<std::result::Result<Self, Blocker>> {
-        let key = (invocation_id.to_string(), target_id.to_string());
-        let flag = Arc::new(MentionCancelControl::running());
-        let mut registrations = Vec::new();
-        let mut registry = mention_cancel_registry()
-            .lock()
-            .map_err(|_| anyhow!("Persona cancellation registry is unavailable"))?;
-        if registry.contains_key(&key) {
-            return Ok(Err(Blocker::new(
-                "mention_tool_approval_target_active",
-                "This Persona target already has an active operation.",
-                vec!["Wait for the active operation to finish.".to_string()],
-            )));
-        }
-        registry.insert(key.clone(), Arc::clone(&flag));
-        registrations.push((key, flag));
-        Ok(Ok(Self { registrations }))
+        scope.with_mention_registry(|registry, quiescing| {
+            let key = (invocation_id.to_string(), target_id.to_string());
+            let flag = Arc::new(MentionCancelControl::running(quiescing));
+            let mut registrations = Vec::new();
+            if registry.contains_key(&key) {
+                return Ok(Err(Blocker::new(
+                    "mention_tool_approval_target_active",
+                    "This Persona target already has an active operation.",
+                    vec!["Wait for the active operation to finish.".to_string()],
+                )));
+            }
+            registry.insert(key.clone(), Arc::clone(&flag));
+            registrations.push((key, flag));
+            Ok(Ok(Self {
+                scope: scope.clone(),
+                registrations,
+            }))
+        })
     }
 
     fn arbitrate_terminal(&self, invocation_id: &str, target_id: &str) -> bool {
@@ -3688,9 +3737,10 @@ impl MentionCancelLifecycle {
 
 impl Drop for MentionCancelLifecycle {
     fn drop(&mut self) {
-        if let Ok(mut registry) = mention_cancel_registry().lock() {
-            unregister_exact_mentions(&mut registry, &self.registrations);
-        }
+        let _ = self.scope.with_mention_registry(|registry, _| {
+            unregister_exact_mentions(registry, &self.registrations);
+            Ok(())
+        });
     }
 }
 
@@ -3708,31 +3758,38 @@ fn unregister_exact_mentions(
     }
 }
 
-fn request_mention_cancellation(invocation_id: &str, target_id: Option<&str>) -> usize {
-    mention_cancel_registry()
-        .lock()
-        .map(|registry| {
-            registry
+fn request_mention_cancellation(
+    scope: &OperationScope,
+    invocation_id: &str,
+    target_id: Option<&str>,
+) -> usize {
+    scope
+        .with_mention_registry(|registry, _| {
+            Ok(registry
                 .iter()
                 .filter(|((candidate_invocation, candidate_target), _)| {
                     candidate_invocation == invocation_id
                         && target_id.is_none_or(|target| candidate_target == target)
                 })
                 .map(|(_, control)| usize::from(control.request_cancel()))
-                .sum()
+                .sum())
         })
         .unwrap_or_default()
 }
 
-fn mention_cancellation_requested(invocation_id: &str, target_id: &str) -> bool {
-    mention_cancel_registry()
-        .lock()
-        .ok()
-        .and_then(|registry| {
-            registry
+fn mention_cancellation_requested(
+    scope: &OperationScope,
+    invocation_id: &str,
+    target_id: &str,
+) -> bool {
+    scope
+        .with_mention_registry(|registry, _| {
+            Ok(registry
                 .get(&(invocation_id.to_string(), target_id.to_string()))
-                .cloned()
+                .cloned())
         })
+        .ok()
+        .flatten()
         .is_some_and(|control| control.cancellation_requested())
 }
 
@@ -4083,11 +4140,12 @@ fn persona_tool_decision_schema(tools: &[BoundMentionTool]) -> Value {
 }
 
 fn run_persona_tool_decision(
+    scope: &OperationScope,
     target: &PlannedTarget,
     invocation_id: &str,
     settings: &Settings,
 ) -> std::result::Result<PersonaToolDecision, Blocker> {
-    if mention_cancellation_requested(invocation_id, &target.snapshot.target_id) {
+    if mention_cancellation_requested(scope, invocation_id, &target.snapshot.target_id) {
         return Err(Blocker::new(
             "mention_tool_decision_cancelled",
             "The Persona tool decision was cancelled before admission.",
@@ -4294,6 +4352,7 @@ fn run_persona_tool_decision(
 }
 
 fn finish_tool_bound_mention(
+    scope: &OperationScope,
     target: &PlannedTarget,
     output: GenerationOutput,
     invocation_id: &str,
@@ -4301,7 +4360,7 @@ fn finish_tool_bound_mention(
     user_message_id: &str,
     settings: &Settings,
 ) -> std::result::Result<ToolBoundMentionFinish, Blocker> {
-    let decision = run_persona_tool_decision(target, invocation_id, settings)?;
+    let decision = run_persona_tool_decision(scope, target, invocation_id, settings)?;
     let PersonaToolDecision::Call {
         server,
         tool,
@@ -6165,9 +6224,9 @@ mod tests {
     fn cancellation_lifecycle_removes_only_the_exact_registered_target_and_generation() {
         let first_key = ("invocation".to_string(), "first".to_string());
         let second_key = ("invocation".to_string(), "second".to_string());
-        let first = Arc::new(MentionCancelControl::running());
-        let replacement = Arc::new(MentionCancelControl::running());
-        let second = Arc::new(MentionCancelControl::running());
+        let first = Arc::new(MentionCancelControl::running(false));
+        let replacement = Arc::new(MentionCancelControl::running(false));
+        let second = Arc::new(MentionCancelControl::running(false));
         let mut registry = BTreeMap::from([
             (first_key.clone(), Arc::clone(&replacement)),
             (second_key.clone(), Arc::clone(&second)),
@@ -6184,12 +6243,12 @@ mod tests {
 
     #[test]
     fn cancellation_terminal_arbitration_is_monotonic() {
-        let cancelled = MentionCancelControl::running();
+        let cancelled = MentionCancelControl::running(false);
         assert!(cancelled.request_cancel());
         assert!(cancelled.arbitrate_terminal());
         assert!(!cancelled.request_cancel());
 
-        let completed = MentionCancelControl::running();
+        let completed = MentionCancelControl::running(false);
         assert!(!completed.arbitrate_terminal());
         assert!(!completed.request_cancel());
     }
