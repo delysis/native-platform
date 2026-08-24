@@ -1,8 +1,8 @@
 # Module and Repository Map
 
 Free Token Energy owns the text/model provider gateway and its desktop
-consumer. Local speech is an independently versioned sibling, not a workspace
-member or implicit desktop capability.
+consumer. Local Speech is a sibling service in the workspace, not an implicit
+FTE desktop capability.
 
 ## Text and model gateway
 
@@ -19,13 +19,17 @@ member or implicit desktop capability.
 
 ## Speech sibling
 
-[`delysis/speech-native-kit`](https://github.com/delysis/speech-native-kit)
-owns STT/TTS contracts, routing, resident local backends, cancellation,
-lifecycle, and its optional Tauri plugin. Its default Tauri permission is
-status-only; synthesis, file transcription, and live transcription are
-separate explicit grants.
+<!-- current-service-surface: speech -->
+<!-- retired-edge-parent: 84f65a9c1313bc0e4218156507cedd9fd905903f -->
 
-The FTE desktop does not install that plugin. This keeps ONNX, platform speech
+`crates/services/speech/crates/speech-native-host` owns STT/TTS routing,
+admission, cancellation, and lifecycle over the sibling types/platform/backend
+crates. There is no current
+`crates/services/speech/crates/tauri-plugin-speech-native` permission surface;
+its last-present source is historical at exact parent
+[`84f65a9c1313bc0e4218156507cedd9fd905903f`](https://github.com/delysis/native-platform/tree/84f65a9c1313bc0e4218156507cedd9fd905903f/crates/services/speech/crates/tauri-plugin-speech-native).
+
+The FTE desktop does not compose Speech. This keeps platform speech
 frameworks, live-audio IPC, and microphone-adjacent authority out of a desktop
 that has no speech UI.
 
@@ -38,7 +42,7 @@ that has no speech UI.
   OpenAI-compatible `/v1/audio/*` endpoints by depending on
   `speech-native-kit`.
 - Product applications own conversation state, microphone permissions,
-  playback UX, and the decision to install either plugin.
+  playback UX, and any narrow product-specific Speech command surface.
 
 `scripts/check-module-boundaries.sh` enforces that speech does not drift back
 into the FTE core plugin or desktop capability surface.

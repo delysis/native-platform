@@ -4,6 +4,9 @@ This file distinguishes implemented proof from architectural reach.
 
 ## Initial release target
 
+<!-- current-service-surface: information -->
+<!-- retired-edge-parent: 5390edfcfb6b8412ae45f1e51d44644be3f7e8e3 -->
+
 - versioned resource/release/representation, rights, use-policy, install,
   query, evidence, and locator contracts;
 - strict JSON catalogue validation and deterministic install planning;
@@ -24,9 +27,18 @@ This file distinguishes implemented proof from architectural reach.
 - federated bounded lexical retrieval with reciprocal-rank fusion;
 - strict Alexandria, Community Archive v28, encyclopedia-article, and Scripture
   citation SQLite backends with stable profile-specific locators;
-- operator CLI and optional permissioned Tauri plugin;
+- operator `crates/services/information/crates/information-native-cli` and
+  transport-neutral `crates/services/information/crates/information-native-host`;
 - real zero-write smoke against Christian and MPC Alexandria, Community Archive
   v28, the encyclopedia archive, and the Scripture citation index.
+
+No current
+`crates/services/information/crates/tauri-plugin-information-native` crate or
+permission surface is shipped. The deleted leaf remains historical at exact
+parent
+[`5390edfcfb6b8412ae45f1e51d44644be3f7e8e3`](https://github.com/delysis/native-platform/tree/5390edfcfb6b8412ae45f1e51d44644be3f7e8e3/crates/services/information/crates/tauri-plugin-information-native).
+A future product edge must be re-derived from one named product vertical and
+its exact opaque grants; this roadmap does not reserve generic renderer IPC.
 
 ## Next adapters, in order
 

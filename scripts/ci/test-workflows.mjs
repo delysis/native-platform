@@ -519,8 +519,21 @@ test("Mom exposes the frontend syntax check used by PR CI", () => {
   const scripts = JSON.parse(read(momPackagePath)).scripts;
   assert.equal(
     scripts["check:frontend"],
-    "node --check ui/cache-inspector.js && node --check ui/coop-hx.js",
+    "node --check ui/cache-inspector.js && node --check ui/composer-key-policy.js && node --check ui/coop-hx.js",
   );
+});
+
+test("PR and full CI enforce current service documentation paths", () => {
+  const pr = read(prPath);
+  const full = read(fullPath);
+  const prPolicy = pr.match(/^  policy:[\s\S]*?(?=^  root-linux:)/m)?.[0];
+  const fullRoot = full.match(/^  root:[\s\S]*?(?=^  attachment:)/m)?.[0];
+  for (const block of [prPolicy, fullRoot]) {
+    assert.ok(block, "documentation policy job block is missing");
+    assert.match(block, /node --test scripts\/ci\/test-current-docs\.mjs/);
+    assert.match(block, /node scripts\/ci\/validate-current-docs\.mjs/);
+  }
+  assert.match(fullRoot, /if: runner\.os == 'Linux'/);
 });
 
 test("full frontend coverage remains unchanged", () => {

@@ -17,7 +17,21 @@ trusted native producer -> managed.documents.v1 -> staged SQLite/FTS5
 The contract, catalogue, and retrieval crates are pure policy layers.
 Filesystem mutation begins in `information-native-store`; network authority is
 isolated in `information-native-acquire`; SQLite authority is isolated in the
-four compiled SQLite `information-native-backend-*` crates; Tauri is a leaf.
+four compiled SQLite `information-native-backend-*` crates. The current product
+boundary is the transport-neutral
+`crates/services/information/crates/information-native-host` plus the operator
+`crates/services/information/crates/information-native-cli`; there is no Tauri
+leaf in the current workspace.
+
+<!-- current-service-surface: information -->
+<!-- retired-edge-parent: 5390edfcfb6b8412ae45f1e51d44644be3f7e8e3 -->
+
+The former
+`crates/services/information/crates/tauri-plugin-information-native` edge is
+historical. Its last-present tree is retained at exact parent
+[`5390edfcfb6b8412ae45f1e51d44644be3f7e8e3`](https://github.com/delysis/native-platform/tree/5390edfcfb6b8412ae45f1e51d44644be3f7e8e3/crates/services/information/crates/tauri-plugin-information-native);
+commit `5f98777d1bad8b9399978931418531080e5336fb` deleted the unconsumed edge.
+Historical permissions and receipts prove only that historical implementation.
 The Overture backend has read-only local-file authority but no network, SQLite,
 process, or renderer authority.
 

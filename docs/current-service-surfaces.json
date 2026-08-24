@@ -1,0 +1,43 @@
+{
+  "schema": "delysis.current-service-surfaces.v1",
+  "surfaces": [
+    {
+      "id": "speech",
+      "documents": [
+        "crates/services/speech/docs/ARCHITECTURE.md",
+        "products/fte/README.md",
+        "products/fte/docs/MODULE_MAP.md",
+        "products/fte/docs/SPEECH_BRIDGE.md"
+      ],
+      "current_paths": [
+        "crates/services/speech/crates/speech-native-host",
+        "crates/services/speech/crates/speech-native-platform",
+        "crates/services/speech/crates/speech-native-backend-parakeet"
+      ],
+      "retired_edges": [
+        {
+          "path": "crates/services/speech/crates/tauri-plugin-speech-native",
+          "last_present_commit": "84f65a9c1313bc0e4218156507cedd9fd905903f"
+        }
+      ]
+    },
+    {
+      "id": "information",
+      "documents": [
+        "crates/services/information/docs/ARCHITECTURE.md",
+        "crates/services/information/docs/ROADMAP.md",
+        "crates/services/information/docs/INTEGRATION.md"
+      ],
+      "current_paths": [
+        "crates/services/information/crates/information-native-host",
+        "crates/services/information/crates/information-native-cli"
+      ],
+      "retired_edges": [
+        {
+          "path": "crates/services/information/crates/tauri-plugin-information-native",
+          "last_present_commit": "5390edfcfb6b8412ae45f1e51d44644be3f7e8e3"
+        }
+      ]
+    }
+  ]
+}
