@@ -105,6 +105,12 @@ impl MemoryCacheState {
         if self.generation(value.metadata.owner_id.as_deref()) != expected {
             return false;
         }
+        if !value.is_valid() || value.metadata.state_bytes > self.cache.capacity_bytes() {
+            return false;
+        }
+        if self.cache.contains_id(&value.metadata.id) {
+            self.global_generation = self.global_generation.saturating_add(1);
+        }
         self.cache.insert(value);
         true
     }
@@ -525,14 +531,16 @@ fn compatible_cached_prefix_for_owner(
         if !lease.validate()? {
             return Ok(None);
         }
-        let value = memory_cache().lock().ok().and_then(|mut state| {
-            (state.generation(owner_id) == lease.memory_generation)
-                .then(|| state.cache.get(&selected.id, now))
-                .flatten()
-        });
-        return Ok(value
-            .filter(PrefixCacheValue::is_valid)
-            .map(|value| (value.metadata.id, value.sequence)));
+        return Ok(selected_memory_value(
+            memory_cache(),
+            &selected,
+            lease.memory_generation,
+            owner_id,
+            &fingerprint,
+            &tokenized.token_ids,
+            now,
+        )
+        .map(|value| (value.metadata.id, value.sequence)));
     }
     let Some(index) = db.entries.iter().position(|entry| entry.id == selected.id) else {
         return Ok(None);
@@ -1217,6 +1225,33 @@ fn memory_generation(owner_id: Option<&str>) -> Result<MemoryCacheGeneration> {
         .generation(owner_id))
 }
 
+fn selected_memory_value(
+    cache: &Mutex<MemoryCacheState>,
+    selected: &CacheMatch,
+    expected_generation: MemoryCacheGeneration,
+    owner_id: Option<&str>,
+    fingerprint: &CacheFingerprint,
+    prompt_token_ids: &[i32],
+    now: u128,
+) -> Option<PrefixCacheValue> {
+    let mut state = cache.lock().ok()?;
+    if state.generation(owner_id) != expected_generation {
+        return None;
+    }
+    let value = state.cache.get(&selected.id, now)?;
+    let matched_tokens = value.metadata.token_ids.len();
+    (value.is_valid()
+        && value.metadata.id == selected.id
+        && value.metadata.tier == selected.tier
+        && value.metadata.owner_id.as_deref() == owner_id
+        && &value.metadata.fingerprint == fingerprint
+        && matched_tokens == selected.matched_tokens
+        && matched_tokens < prompt_token_ids.len()
+        && prompt_token_ids.starts_with(&value.metadata.token_ids)
+        && selected.exact == (matched_tokens.saturating_add(1) == prompt_token_ids.len()))
+    .then_some(value)
+}
+
 fn promote_to_memory_if_current(
     value: PrefixCacheValue,
     expected: MemoryCacheGeneration,
@@ -1274,6 +1309,8 @@ mod tests {
     use super::*;
     use crate::conversation_store::{Conversation, ConversationDb};
     use sha2::{Digest, Sha256};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[derive(Debug, Deserialize)]
     struct W1CacheCorruptionFixture {
@@ -1443,6 +1480,111 @@ mod tests {
         );
         assert_eq!(store.get_bytes(&blob_namespace(&cache_id))?, None);
         Ok(())
+    }
+
+    #[test]
+    fn same_id_owned_ownerless_replacement_invalidates_selected_memory_authority() {
+        const OWNER: &str = "persona-memory-owner-race";
+        let cache = Arc::new(Mutex::new(MemoryCacheState::new()));
+        let prompt_token_ids = vec![1, 2];
+        let ownerless = test_cache_value("same-id-owner-race", "fingerprint");
+        let fingerprint = ownerless.metadata.fingerprint.clone();
+        {
+            let mut state = cache.lock().expect("memory cache lock");
+            let generation = state.generation(None);
+            assert!(state.promote_if_current(ownerless.clone(), generation));
+        }
+
+        let (selected_ownerless, ownerless_generation) = {
+            let state = cache.lock().expect("memory cache lock");
+            (
+                state
+                    .cache
+                    .best_match(&fingerprint, &prompt_token_ids)
+                    .expect("ownerless selection"),
+                state.generation(None),
+            )
+        };
+        let before_ownerless_fetch = Arc::new(Barrier::new(2));
+        let release_ownerless_fetch = Arc::new(Barrier::new(2));
+        let worker_cache = Arc::clone(&cache);
+        let worker_before = Arc::clone(&before_ownerless_fetch);
+        let worker_release = Arc::clone(&release_ownerless_fetch);
+        let worker_fingerprint = fingerprint.clone();
+        let worker_prompt = prompt_token_ids.clone();
+        let ownerless_worker = thread::spawn(move || {
+            worker_before.wait();
+            worker_release.wait();
+            selected_memory_value(
+                worker_cache.as_ref(),
+                &selected_ownerless,
+                ownerless_generation,
+                None,
+                &worker_fingerprint,
+                &worker_prompt,
+                now_ms(),
+            )
+        });
+
+        before_ownerless_fetch.wait();
+        let mut owned = ownerless.clone();
+        owned.metadata = owned.metadata.with_owner(OWNER);
+        {
+            let mut state = cache.lock().expect("memory cache lock");
+            let generation = state.generation(Some(OWNER));
+            assert!(state.promote_if_current(owned.clone(), generation));
+        }
+        release_ownerless_fetch.wait();
+        assert!(
+            ownerless_worker
+                .join()
+                .expect("ownerless fetch worker")
+                .is_none(),
+            "an owned replacement must not inherit a prior ownerless selection"
+        );
+
+        let (selected_owned, owned_generation) = {
+            let state = cache.lock().expect("memory cache lock");
+            (
+                state
+                    .cache
+                    .best_match_for_owner(&fingerprint, &prompt_token_ids, OWNER)
+                    .expect("owned selection"),
+                state.generation(Some(OWNER)),
+            )
+        };
+        let before_owned_fetch = Arc::new(Barrier::new(2));
+        let release_owned_fetch = Arc::new(Barrier::new(2));
+        let worker_cache = Arc::clone(&cache);
+        let worker_before = Arc::clone(&before_owned_fetch);
+        let worker_release = Arc::clone(&release_owned_fetch);
+        let worker_fingerprint = fingerprint.clone();
+        let worker_prompt = prompt_token_ids.clone();
+        let owned_worker = thread::spawn(move || {
+            worker_before.wait();
+            worker_release.wait();
+            selected_memory_value(
+                worker_cache.as_ref(),
+                &selected_owned,
+                owned_generation,
+                Some(OWNER),
+                &worker_fingerprint,
+                &worker_prompt,
+                now_ms(),
+            )
+        });
+
+        before_owned_fetch.wait();
+        {
+            let mut state = cache.lock().expect("memory cache lock");
+            let generation = state.generation(None);
+            assert!(state.promote_if_current(ownerless, generation));
+        }
+        release_owned_fetch.wait();
+        assert!(
+            owned_worker.join().expect("owned fetch worker").is_none(),
+            "an ownerless replacement must not inherit a prior owned selection"
+        );
     }
 
     #[test]

@@ -298,6 +298,11 @@ impl MemoryPrefixCache {
         self.values.is_empty()
     }
 
+    #[must_use]
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.values.contains_key(id)
+    }
+
     pub fn insert(&mut self, mut value: PrefixCacheValue) -> Vec<String> {
         if !value.is_valid() || value.metadata.state_bytes > self.capacity_bytes {
             return Vec::new();
