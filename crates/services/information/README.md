@@ -15,10 +15,14 @@ articles, and Scripture citation occurrences/passages in SQLite. Kiwix OPDS
 and exact Metalink discovery feed a bounded native OpenZIM v6 producer: it
 binds one exact local archive size/SHA-256, validates directory identities,
 decodes modern uncompressed or Zstandard clusters, strips article HTML to
-inert text, and activates `managed.documents.v1`. Overture STAC remains a
-discovery surface; OSM/Overture materialization and query backends remain
-future work. This Kiwix core is not Mom UI, a network fallback, or real-corpus
-product acceptance.
+inert text, and activates `managed.documents.v1`. The Overture core separately
+pins one immutable release catalog and exact STAC items, verifies already-
+acquired local GeoParquet files by length and SHA-256, and admits only an
+explicit bbox/theme/type query through a typed heavy-engine interface. That
+interface requires a predicate-pushdown receipt and validates bounded WKB
+features with canonical UUID GERS locators and byte-level provenance. No
+production GeoParquet engine, Overture download command, Mom composition, or
+real-partition acceptance is included yet.
 
 ## Workspace
 
@@ -40,6 +44,8 @@ product acceptance.
   v28 messages/FTS adapter.
 - `information-native-backend-encyclopedia`: origin-aware Encarta, Britannica,
   and Wikipedia article adapter.
+- `information-native-backend-overture`: exact STAC/partition admission plus a
+  narrow typed GeoParquet engine and predicate-proof boundary.
 - `information-native-backend-scripture`: normalized Scripture-passage and
   citation-occurrence adapter.
 - `information-native-backend-zim`: safe first-party bounded random-access
@@ -68,6 +74,13 @@ product acceptance.
   libzim FFI, `xz2`, sidecar, subprocess, active archive HTML, or network
   fallback. Historical OpenZIM v5, LZMA/zip/bzip2 clusters, split archives,
   and non-UTF-8 article decoding are explicitly unsupported in this slice.
+- Overture never resolves the mutable STAC root as release authority. A caller
+  supplies exact bytes, length, and SHA-256 for a release-specific catalog,
+  each selected item, and every already-acquired local partition. The query
+  engine receives bounded random-access reads over open file leases and a fixed bbox-intersection
+  predicate, not paths, URLs, raw SQL, or network authority. Engine receipts
+  are checked against exact partition identities and selected row groups, and
+  each bounded feature retains release/item/partition/predicate provenance.
 - `managed.documents.v1` inputs bind exact immutable source artifacts,
   source-record hashes, typed locators, lineage, rights, and use policy. The
   default is private: local search allowed, model use unknown and therefore

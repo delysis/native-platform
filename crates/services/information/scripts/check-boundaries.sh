@@ -38,6 +38,15 @@ if [ -d "$zim_crate" ]; then
     fi
 fi
 
+overture_crate="$repo_dir/crates/information-native-backend-overture"
+if [ -d "$overture_crate" ]; then
+    if rg -n '\b(reqwest|rusqlite|tauri|std::net|std::process|Command::new)\b' \
+        "$overture_crate/src"; then
+        echo "network, process, SQLite, or renderer authority found in Overture backend" >&2
+        exit 1
+    fi
+fi
+
 if rg -n '(^|[^[:alnum:]_])unsafe([[:space:]]|\{|fn|trait|impl)' \
     "$repo_dir/crates" --glob '*.rs' --glob '!**/target/**'; then
     echo "unsafe Rust found in workspace" >&2

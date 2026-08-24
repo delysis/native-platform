@@ -38,6 +38,9 @@ receipt can be audited.
 Discovery and manifest expressiveness are not backend claims. A separate
 native-only OpenZIM producer can read an already acquired exact Kiwix archive
 and create inert-text `managed.documents.v1`; OPDS metadata alone never invokes
-it or proves product acceptance. This release still does not materialize or
-query OSM PBF or Overture GeoParquet. Those adapters must produce exact derived
-bytes, provenance, and receipts before their operations can be advertised.
+it or proves product acceptance. Overture follows a different, typed spatial
+path: exact release and item STAC bytes bind exact already-acquired GeoParquet
+partition bytes, while bbox/theme/type and row-group predicate receipts bind a
+bounded query result. It does not write a text-library representation. The
+current slice is an engine interface with deterministic fixtures, not a
+production engine or real Overture corpus acceptance. OSM PBF remains absent.

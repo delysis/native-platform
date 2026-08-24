@@ -1,0 +1,24 @@
+[package]
+name = "information-native-backend-overture"
+version = "0.1.0"
+edition.workspace = true
+description = "Exact-byte Overture GeoParquet admission and typed query boundary"
+license.workspace = true
+readme = "../../README.md"
+rust-version.workspace = true
+
+[dependencies]
+information-native-catalog.workspace = true
+information-native-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

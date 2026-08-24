@@ -3123,6 +3123,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "information-native-backend-overture"
+version = "0.1.0"
+dependencies = [
+ "information-native-catalog",
+ "information-native-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.20",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "information-native-backend-scripture"
 version = "0.1.0"
 dependencies = [

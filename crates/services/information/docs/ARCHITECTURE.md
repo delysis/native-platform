@@ -16,8 +16,10 @@ trusted native producer -> managed.documents.v1 -> staged SQLite/FTS5
 
 The contract, catalogue, and retrieval crates are pure policy layers.
 Filesystem mutation begins in `information-native-store`; network authority is
-isolated in `information-native-acquire`; SQLite authority is isolated in
-the four compiled `information-native-backend-*` crates; Tauri is a leaf.
+isolated in `information-native-acquire`; SQLite authority is isolated in the
+four compiled SQLite `information-native-backend-*` crates; Tauri is a leaf.
+The Overture backend has read-only local-file authority but no network, SQLite,
+process, or renderer authority.
 
 A catalogue's declared trust is data, not authority. Parsing JSON always yields
 an unverified `CatalogAuthority`; only a pinned digest or an explicit local
@@ -43,10 +45,14 @@ artifacts, size, digest, and optional subset dimensions.
 
 This separation matters. English Wikipedia is one resource with many releases
 and representations. A full-text ZIM and a title-only ZIM are not interchangeable.
-An Overture release is global, while a bounding-box/theme selection would be a
-derived representation. The contract models that selection, but this release
-rejects it until a materializer can produce deterministic artifacts and record
-their derivation.
+An Overture release is global, while an explicit bounding-box/theme/type query
+selects exact GeoParquet partitions. The Overture boundary does not reinterpret
+the mutable root's `latest` marker as authority: it separately binds the bytes,
+length, SHA-256, URI, and release ID of a release-specific catalog, then binds
+each STAC item and acquired partition. Partitions remain source representations,
+not `managed.documents.v1` text. A heavy engine receives only bounded
+random-access reads over open file leases plus a fixed bbox intersection predicate and must return an exact
+row-group/predicate receipt before bounded typed features are accepted.
 
 ## Installation state machine
 

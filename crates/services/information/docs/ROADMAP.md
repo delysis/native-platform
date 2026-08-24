@@ -12,6 +12,9 @@ This file distinguishes implemented proof from architectural reach.
 - bounded native OpenZIM v6 reading for exact local archive size/SHA-256,
   directory identity validation, uncompressed/Zstandard cluster decoding,
   inert HTML/text extraction, and typed `managed.documents.v1` production;
+- immutable Overture release/item STAC identity, exact local GeoParquet
+  partition admission, explicit bbox/theme/type selection, and a bounded typed
+  engine interface with predicate receipts and GERS provenance;
 - policy-bounded HTTP/file acquisition, durable HTTP resume, and exact size and
   SHA-256 verification with source attestations;
 - managed staging, same-filesystem activation, receipts, and external read-only mounts;
@@ -31,8 +34,9 @@ This file distinguishes implemented proof from architectural reach.
    Kiwix archives, extend only with bounded audited pure-Rust codecs where real
    evidence requires them, and add a typed article retrieval/conversation-grant
    surface. A `kiwix-serve` sidecar or unsafe libzim FFI is not approved.
-2. Overture STAC traversal plus bounding-box/theme GeoParquet materialization,
-   then DataFusion-style predicate pushdown and GERS locators.
+2. Bind a production safe-Rust GeoParquet engine to the shipped Overture typed
+   boundary, accept exact real partitions, then compose only the typed spatial
+   result in Mom. Do not add raw SQL or route Overture through a text library.
 3. Raw OSM PBF regional installs and replication receipts; PMTiles is a
    rendering backend, not the semantic data source.
 4. OPDS 2, Data Package, RO-Crate, Croissant, BagIt, and IIIF import adapters.
@@ -52,6 +56,8 @@ Zstandard clusters; v5, historical LZMA/zip/bzip2, split archives, non-UTF-8
 article decoding, active HTML, and dictionary/skippable Zstandard extensions
 remain unsupported.
 
-Concretely, the current release still has no OSM PBF query backend and no
-Overture GeoParquet materializer or query backend. STAC discovery results are
-catalogue evidence only until those adapters are implemented and verified.
+Concretely, the current release still has no OSM PBF query backend. Overture has
+an exact-byte admission and query contract, but no bundled production
+GeoParquet engine, acquisition command, real-partition runtime evidence, or Mom
+surface. STAC discovery alone remains catalogue evidence; deterministic fixture
+proof for the typed boundary is not product acceptance.
