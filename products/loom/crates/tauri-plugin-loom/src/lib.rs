@@ -5429,10 +5429,8 @@ fn ensure_registered_completion_document(
     document_id: DocumentId,
 ) -> Result<(), IpcFailure> {
     if store
-        .list_documents()
+        .document_is_registered(document_id)
         .map_err(IpcFailure::store)?
-        .iter()
-        .any(|document| document.document_id == document_id)
     {
         return Ok(());
     }
@@ -5539,7 +5537,6 @@ fn completion_snapshot_for(
     let (project_identity, session_identity) = {
         let mut session = lock_session(state)?;
         let store = require_bound_store(&mut session, project_id, session_id)?;
-        ensure_registered_completion_document(store, document_id)?;
         (store.manifest().project_id, parse_command_id(session_id)?)
     };
 
@@ -10579,6 +10576,85 @@ mod tests {
         )
         .expect_err("foreign document identity must fail");
         assert_eq!(foreign_document.code, "document_not_found");
+    }
+
+    #[test]
+    fn completion_snapshot_recovers_one_observed_terminal_beyond_the_first_page() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Paged Completion Snapshot Novel");
+        let mut store = initialize_project(&root, "Paged Completion Snapshot Novel".to_owned())
+            .expect("initialize");
+        let project_id = store.manifest().project_id;
+        let session_id = CommandId::new();
+        let mut runs = Vec::with_capacity(COMPLETION_SNAPSHOT_BRANCH_LIMIT + 1);
+        let mut expected_document_id = None;
+        let mut first_branch_id = None;
+        for index in 0..=COMPLETION_SNAPSHOT_BRANCH_LIMIT {
+            let (run_id, branch_id, document_id) = start_persisted_test_generation(&mut store);
+            assert!(expected_document_id.is_none_or(|expected| expected == document_id));
+            expected_document_id = Some(document_id);
+            if first_branch_id.is_none() {
+                first_branch_id = Some(branch_id);
+            }
+            let error = format!("terminal failure {index}");
+            store
+                .finish_generation(run_id, GenerationTerminalStatus::Failed, Some(error))
+                .expect("persist terminal generation");
+            runs.push(run_id);
+        }
+        let document_id = expected_document_id.expect("one exact document");
+        let observed_run_id = runs[0];
+        let observed_branch_id = first_branch_id.expect("first branch identity");
+        let observed_run_id_text = observed_run_id.to_string();
+        let first_page = store
+            .branch_page(document_id, None, COMPLETION_SNAPSHOT_BRANCH_LIMIT)
+            .expect("read bounded first page");
+        assert!(first_page.has_more);
+        assert!(
+            first_page
+                .branches
+                .iter()
+                .all(|branch| branch.run_id != observed_run_id)
+        );
+        let expected_cursor = first_page.next_cursor.expect("first-page cursor");
+
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+        let snapshot = completion_snapshot_for(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            &document_id.to_string(),
+            std::slice::from_ref(&observed_run_id_text),
+        )
+        .expect("recover observed terminal beyond first page");
+
+        assert!(snapshot.active_operations.is_empty());
+        assert!(snapshot.has_more);
+        assert_eq!(
+            snapshot.branches.len(),
+            COMPLETION_SNAPSHOT_BRANCH_LIMIT + 1
+        );
+        let snapshot_cursor = snapshot.next_cursor.expect("snapshot cursor");
+        assert_eq!(
+            snapshot_cursor.sequence,
+            expected_cursor.sequence.to_string()
+        );
+        assert_eq!(snapshot_cursor.run_id, expected_cursor.run_id.to_string());
+        let observed = snapshot
+            .branches
+            .iter()
+            .filter(|branch| branch.run_id == observed_run_id_text)
+            .collect::<Vec<_>>();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].branch_id, observed_branch_id.to_string());
+        assert_eq!(observed[0].status, "failed");
+        assert_eq!(observed[0].error.as_deref(), Some("terminal failure 0"));
     }
 
     #[test]

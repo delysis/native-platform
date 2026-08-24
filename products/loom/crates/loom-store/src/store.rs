@@ -970,6 +970,21 @@ impl ProjectStore {
         })
     }
 
+    /// Probes the primary-key document index without allocating or scanning
+    /// the project's document catalogue. This is the bounded identity check
+    /// for frequently refreshed, document-scoped projections.
+    pub fn document_is_registered(&self, document_id: DocumentId) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM documents WHERE document_id = ?1 LIMIT 1",
+                [document_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    }
+
     pub fn list_documents(&self) -> Result<Vec<DocumentSummary>> {
         let mut statement = self.connection.prepare(
             "SELECT d.document_id, d.relative_path, d.document_kind,
@@ -2093,6 +2108,48 @@ mod tests {
                 .mode()
                 & 0o777,
             0o750
+        );
+    }
+
+    #[test]
+    fn registered_document_probe_is_exact_and_survives_reopen() {
+        let (_directory, mut store) = new_store();
+        let root = store.root().to_path_buf();
+        store
+            .create_document_if_absent(
+                "manuscript/001.md",
+                DocumentContent::Prose("exact indexed identity\n".into()),
+                "register exact document",
+            )
+            .expect("create indexed document");
+        let registered = store
+            .read_document("manuscript/001.md")
+            .expect("read registered document")
+            .document_id;
+        let foreign = DocumentId::new();
+
+        assert!(
+            store
+                .document_is_registered(registered)
+                .expect("probe registered document")
+        );
+        assert!(
+            !store
+                .document_is_registered(foreign)
+                .expect("probe foreign document")
+        );
+
+        drop(store);
+        let reopened = ProjectStore::open(&root).expect("reopen project");
+        assert!(
+            reopened
+                .document_is_registered(registered)
+                .expect("probe registered document after reopen")
+        );
+        assert!(
+            !reopened
+                .document_is_registered(foreign)
+                .expect("probe foreign document after reopen")
         );
     }
 
