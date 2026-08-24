@@ -159,9 +159,10 @@ describe('App ghost reactivity wiring', () => {
   it('rebinds completion after an incompatible caret navigation settles', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const visual = readFileSync(new URL('./LoomEditor.svelte', import.meta.url), 'utf8');
+    const controller = readFileSync(new URL('./completionController.ts', import.meta.url), 'utf8');
     const invalidate = source.slice(
       source.indexOf('function invalidateCompletionForCaretNavigation'),
-      source.indexOf('function sessionForEligibleGhost')
+      source.indexOf('function acceptActiveGhost')
     );
     const sourceSelection = source.slice(
       source.indexOf('function updateSourceSelection'),
@@ -172,16 +173,33 @@ describe('App ghost reactivity wiring', () => {
       source.indexOf('function scheduleSourceProjection')
     );
 
-    expect(invalidate).toContain('cancelSuggestionTimer()');
-    expect(invalidate).toContain('cancelActiveBranches()');
+    expect(invalidate).toContain('invalidateControllerNavigation(');
+    expect(invalidate).toContain('clearSuggestionTimerHandle()');
+    expect(invalidate).toContain('applyCompletionEffects(invalidated.effects)');
+    expect(controller).toContain("{ kind: 'cancel_active_branches' }");
     expect(sourceSelection).toContain('invalidateCompletionForCaretNavigation()');
     expect(sourceSelection).toContain("scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'caret_navigation')");
     expect(visualSelection).toContain('invalidateCompletionForCaretNavigation()');
-    expect(visualSelection).toContain('completionNavigationPending');
+    expect(visualSelection).toContain('settleCompletionNavigation(');
     expect(visualSelection).toContain("scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'caret_navigation')");
     expect(source).toContain('onCaretNavigation={invalidateCompletionForCaretNavigation}');
     expect(visual).toContain('onCaretNavigation();');
     expect(source).toContain('completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion)');
+  });
+
+  it('keeps completion state and transition authority in one private pure controller', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const controller = readFileSync(new URL('./completionController.ts', import.meta.url), 'utf8');
+
+    expect(source).toContain('let completionController = initialCompletionControllerState();');
+    expect(source).not.toContain('let completionSession:');
+    expect(source).not.toContain('let pendingCompletionText:');
+    expect(source).not.toContain('let scheduledSuggestion:');
+    expect(source).toContain('authorizeCompletionInsertion(completionController');
+    expect(source).toContain('completionExhausted(');
+    expect(controller).not.toContain('window.');
+    expect(controller).not.toContain('invoke(');
+    expect(controller).toContain('export type CompletionControllerEffect');
   });
 
   it('keeps source completion echoes synchronous and source surface identity stable across autosave', () => {

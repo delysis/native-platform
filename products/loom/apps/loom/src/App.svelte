@@ -51,8 +51,7 @@
   import {
     decodeVerseForEditor,
     encodeVerseFromEditor,
-    type VerseEditorCodec,
-    type VerseNewlineKind
+    type VerseEditorCodec
   } from './lib/verseCodec';
   import { canUseVisualMarkdown } from './lib/markdownSafety';
   import {
@@ -139,26 +138,14 @@
   } from './lib/startupSafety';
   import { newUlid } from './lib/ulid';
   import {
-    cycleSuggestionIndex,
     type CompletionInsertionAction
   } from './lib/suggestionInteraction';
   import {
-    advanceCompletionExhaustionLatch,
     acceptedCompletionText,
     completionPresentation as completionSessionPresentation,
     completionSessionContextKey,
-    completionSessionMatchesPresentation,
     completionShouldRequestNextBatch,
-    consumeCompletionText,
-    cycleCompletionSession,
-    insertAtUtf8Boundary,
-    remainingCompletionText,
-    removeBeforeUtf8Boundary,
     selectedCompletionCandidate,
-    startCompletionSession,
-    synchronizeCompletionCandidates,
-    unconsumeCompletionWord,
-    updateCompletionCandidate,
     type CompletionSession
   } from './lib/completionSession';
   import {
@@ -173,13 +160,39 @@
   } from './lib/completionAccessibility';
   import { observeNativeFullscreen } from './lib/nativeFullscreen';
   import {
-    armCompletionGeneration,
-    bindCompletionGenerationAnchor,
     completionGenerationIsArmed,
-    disarmCompletionGeneration,
-    type CompletionGenerationIntent,
     type CompletionGenerationTrigger
   } from './lib/completionGenerationIntent';
+  import {
+    armCompletionScheduleIntent,
+    authorizeCompletionInsertion,
+    authorizeCompletionUnconsume,
+    bindCompletionAnchor,
+    cancelCompletionSchedule,
+    clearCompletionSession as clearCompletionControllerSession,
+    clearUnpresentableVisualKeys,
+    completionActivityExists as controllerHasCompletionActivity,
+    completionControllerView,
+    completionExhausted,
+    cycleCompletion,
+    dismissCompletion,
+    initialCompletionControllerState,
+    invalidateCompletionNavigation as invalidateControllerNavigation,
+    invalidateVisualMutation,
+    observeTextMutation,
+    reconcileCompletionController,
+    refreshCompletionCandidate,
+    rejectVisualPresentation,
+    resetCompletionDiscovery,
+    resetCompletionSurface,
+    setCompletionSchedule,
+    setDismissedCompletionCandidates,
+    settleCompletionNavigation,
+    shuttleScheduleKey as completionShuttleScheduleKey,
+    type AutocompleteRetryTicket,
+    type CompletionControllerEffect,
+    type CompletionSchedule
+  } from './lib/completionController';
   import {
     automaticCompletionLifecycle,
     completionLifecycleDescription,
@@ -263,23 +276,9 @@
   let modelManagerOpen = false;
   let modelManagerPanel: HTMLElement | undefined;
   let modelManagerReturnFocus: HTMLElement | null = null;
-  let activeSuggestionRunId: string | null = null;
-  let completionSession: CompletionSession | null = null;
+  let completionController = initialCompletionControllerState();
   let visualCompletionAccessibility: VisualCompletionAccessibilityWitness =
     unavailableVisualCompletionWitness();
-  let completionActionSequence = 0;
-  let lastCompletionAction: {
-    sequence: number;
-    kind: CompletionInsertionAction;
-    context_key: string;
-    run_id: string;
-    candidate_id: string;
-    presentation_key: string;
-    inserted_utf8_bytes: number;
-    accepted_utf8_bytes: number;
-  } | null = null;
-  let pendingCompletionText: string | null = null;
-  let handledCompletionExhaustionKey = '';
   let projectMenu: HTMLDetailsElement | undefined;
   let projectMenuTrigger: HTMLElement | undefined;
   let formatMenu: VisualFormatMenu | undefined;
@@ -299,14 +298,8 @@
   let suggestionsEnabled = false;
   let suggestionsChanging = false;
   let suggestionsIdleTimer: number | undefined;
-  let scheduledSuggestion: SuggestionSchedule | null = null;
   let suggestionWakeQueued = false;
-  let completionGenerationIntent: CompletionGenerationIntent | null = null;
-  let completionNavigationPending = false;
-  let suggestionIntentEpoch = 0;
   let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
-  let dismissedCandidateIds: string[] = [];
-  let unpresentableVisualGhostPresentationKeys: string[] = [];
   let announcedGhostPresentationKey = '';
   let modelDownloadUrl = '';
   let modelDownloadFileName = '';
@@ -511,26 +504,6 @@
     modelId: string;
   }
 
-  interface AutocompleteRetryTicket {
-    projectId: string;
-    sessionId: string;
-    documentId: string;
-    sourceRevisionId: string;
-    visibleBlobId: string;
-    documentEpoch: number;
-    editVersion: number;
-    intentEpoch: number;
-    mode: 'visual' | 'source';
-    targetByte: number;
-    modelId: string;
-    sourceNewline: VerseNewlineKind | null;
-    waitsRemaining: number;
-  }
-
-  type SuggestionSchedule =
-    | { kind: 'edit_pause'; editVersion: number }
-    | { kind: 'exhausted_retry'; ticket: AutocompleteRetryTicket };
-
   interface ModelDownloadCapture extends VerifiedDownloadForm {
     commandId: string;
   }
@@ -620,6 +593,13 @@
   ): boolean {
     return completionEngineEnabled({ autocomplete, shuttle });
   }
+
+  $: completionSession = completionController.session;
+  $: pendingCompletionText = completionController.pendingText;
+  $: completionGenerationIntent = completionController.generationIntent;
+  $: dismissedCandidateIds = completionController.dismissedCandidateIds;
+  $: unpresentableVisualGhostPresentationKeys = completionController.unpresentableVisualKeys;
+  $: scheduledSuggestion = completionController.scheduled;
 
   $: visibleDocuments = project?.documents.filter((candidate) => {
     const query = search.trim().toLocaleLowerCase();
@@ -732,10 +712,13 @@
     : mode === 'source'
       ? sourceSuggestionFamily
       : [];
-  $: synchronizeVisibleCompletionSession(completionContextKey, baseSuggestionFamily);
-  $: boundCompletionSession = completionSession?.contextKey === completionContextKey
-    ? completionSession
-    : null;
+  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily);
+  $: completionView = completionControllerView(
+    completionController,
+    completionContextKey,
+    baseSuggestionFamily
+  );
+  $: boundCompletionSession = completionView.boundSession;
   $: if (boundCompletionSession) {
     const selected = selectedCompletionCandidate(boundCompletionSession);
     const branch = selected
@@ -759,42 +742,20 @@
     if (selected && text && candidateTextIsSurfaceable(text)) {
       const rawPresentationKey = verified?.presentationKey ??
         `branch:${selected.runId}:${new TextEncoder().encode(rawText).byteLength}`;
-      const updated = updateCompletionCandidate(
+      refreshVisibleCompletionCandidate(
         boundCompletionSession,
         selected.runId,
         text,
         projectedInlinePresentationKey(rawPresentationKey, rawText, text)
       );
-      syncCompletionCandidate(boundCompletionSession, updated);
     }
   }
-  $: sessionSuggestion = boundCompletionSession
-    ? completionSessionPresentation(boundCompletionSession) as InlineGhostSuggestion | null
-    : null;
-  $: sessionSuggestionFamily = boundCompletionSession
-    ? boundCompletionSession.acceptedChunks.length === 0
-      ? boundCompletionSession.candidates as InlineGhostSuggestion[]
-      : sessionSuggestion ? [sessionSuggestion] : []
-    : [];
-  $: activeSuggestionFamily = pendingCompletionText !== null
-    ? []
-    : boundCompletionSession ? sessionSuggestionFamily : baseSuggestionFamily;
-  $: if (
-    activeSuggestionFamily.length > 0 &&
-    !activeSuggestionFamily.some((suggestion) => suggestion.runId === activeSuggestionRunId)
-  ) activeSuggestionRunId = activeSuggestionFamily[0].runId;
-  $: selectedInlineSuggestion = activeSuggestionFamily.find(
-    (suggestion) => suggestion.runId === activeSuggestionRunId
-  ) ?? activeSuggestionFamily[0] ?? null;
+  $: activeSuggestionFamily = completionView.activeFamily;
+  $: selectedInlineSuggestion = completionView.selected;
   $: ghostSuggestion = mode === 'visual' ? selectedInlineSuggestion : null;
   $: sourceGhostSuggestion = mode === 'source' ? selectedInlineSuggestion : null;
-  $: ghostAlternatives = activeSuggestionFamily.map((suggestion) => ({
-    candidateId: suggestion.candidateId,
-    presentationKey: suggestion.presentationKey,
-    text: suggestion.text,
-    runId: suggestion.runId
-  }));
-  $: ghostUnconsumeText = boundCompletionSession?.acceptedChunks.at(-1) ?? '';
+  $: ghostAlternatives = completionView.alternatives;
+  $: ghostUnconsumeText = completionView.unconsumeText;
   $: activeGhostSuggestion = mode === 'visual'
     ? ghostSuggestion?.presentationKey === visibleVisualGhostPresentationKey
       ? ghostSuggestion
@@ -804,9 +765,7 @@
         ? sourceGhostSuggestion
         : null
       : null;
-  $: completionWitnessSelected = boundCompletionSession
-    ? selectedCompletionCandidate(boundCompletionSession)
-    : null;
+  $: completionWitnessSelected = completionView.witnessSelected;
   $: completionAccessibilityWitness = JSON.stringify({
     schema: 'delysis.loom-completion-witness.v1',
     mode,
@@ -841,7 +800,7 @@
         ? visibleSourceGhostPresentationKey
         : '',
     visual: visualCompletionAccessibility,
-    last_action: lastCompletionAction
+    last_action: completionController.lastAction
   });
   $: completionExhaustionKey = boundCompletionSession && completionShouldRequestNextBatch(
     boundCompletionSession,
@@ -905,9 +864,14 @@
     announce('Suggestion available. Tab accepts all; Option Right accepts one word; Option Up or Down switches.');
   }
   $: shuttleCandidate = shuttleEnabled ? selectedInlineSuggestion : activeGhostSuggestion;
-  $: shuttleScheduleKey = shuttleEnabled && windowFocused && shuttleCandidate
-    ? `${shuttleCandidate.candidateId}:${boundCompletionSession?.acceptedChunks.length ?? 0}:${editVersion}:${mode}`
-    : '';
+  $: shuttleScheduleKey = completionShuttleScheduleKey(
+    shuttleEnabled,
+    windowFocused,
+    shuttleCandidate,
+    boundCompletionSession?.acceptedChunks.length ?? 0,
+    editVersion,
+    mode
+  );
   $: syncShuttleTimer(shuttleScheduleKey);
   $: automaticBoundaryIsExact = mode === 'visual'
     ? visualSelectionByte !== null
@@ -1131,7 +1095,7 @@
     stopBranchPolling();
     for (const timer of weaveStatusPollTimers) window.clearTimeout(timer);
     weaveStatusPollTimers.clear();
-    unpresentableVisualGhostPresentationKeys = [];
+    completionController = clearUnpresentableVisualKeys(completionController);
     branchRefreshSerial += 1;
     branchRefreshQueued = false;
     branchNextCursor = null;
@@ -1965,7 +1929,7 @@
         visibleBlobId: document.visible_blob_id,
         documentEpoch,
         editVersion,
-        intentEpoch: suggestionIntentEpoch,
+        intentEpoch: completionController.intentEpoch,
         mode: retryMode,
         targetByte,
         modelId: currentModel.model_id,
@@ -2602,12 +2566,14 @@
     }
   }
 
-  function cancelSuggestionTimer(): void {
+  function clearSuggestionTimerHandle(): void {
     if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
     suggestionsIdleTimer = undefined;
-    scheduledSuggestion = null;
-    completionGenerationIntent = disarmCompletionGeneration();
-    suggestionIntentEpoch += 1;
+  }
+
+  function cancelSuggestionTimer(): void {
+    clearSuggestionTimerHandle();
+    completionController = cancelCompletionSchedule(completionController);
   }
 
   async function setSuggestionsEnabled(enabled: boolean, persist = true): Promise<void> {
@@ -2622,7 +2588,7 @@
     }
     const boundProject = project;
     const previousEnabled = suggestionsEnabled;
-    const previousDismissedCandidateIds = dismissedCandidateIds;
+    const previousDismissedCandidateIds = completionController.dismissedCandidateIds;
     const engineBecameEnabled = completionEngineBecameEnabled(
       { autocomplete: previousEnabled, shuttle: shuttleEnabled },
       { autocomplete: enabled, shuttle: shuttleEnabled }
@@ -2635,9 +2601,12 @@
     if (!enabled && !shuttleEnabled) {
       suggestionsEnabled = false;
       cancelSuggestionTimer();
-      dismissedCandidateIds = currentReadyBranches
-        .map((branch) => branch.candidate_id)
-        .filter((candidateId): candidateId is string => Boolean(candidateId));
+      completionController = setDismissedCompletionCandidates(
+        completionController,
+        currentReadyBranches
+          .map((branch) => branch.candidate_id)
+          .filter((candidateId): candidateId is string => Boolean(candidateId))
+      );
     }
     try {
       const automationEnabled = completionAutomationEnabled(enabled, shuttleEnabled);
@@ -2684,7 +2653,10 @@
       }
     } catch (error) {
       suggestionsEnabled = previousEnabled;
-      dismissedCandidateIds = previousDismissedCandidateIds;
+      completionController = setDismissedCompletionCandidates(
+        completionController,
+        previousDismissedCandidateIds
+      );
       clearPreferredWriterRequest();
       cancelSuggestionTimer();
       if (!enabled && activeBranchCount > 0) void cancelActiveBranches();
@@ -3297,7 +3269,7 @@
     clearCompletionSession();
     suggestionsEnabled = false;
     shuttleEnabled = false;
-    dismissedCandidateIds = [];
+    completionController = resetCompletionDiscovery(completionController);
     if (opened.pending_recovery > 0) {
       const recovered = await runCurrentWorkspaceStep({
         capture: captured,
@@ -3368,7 +3340,7 @@
     if (!flushEditors()) return;
     cancelSuggestionTimer();
     clearCompletionSession();
-    dismissedCandidateIds = [];
+    completionController = resetCompletionDiscovery(completionController);
     transition = 'navigation';
     announce('Opening document; editing is briefly locked');
     const requestSerial = ++navigationSerial;
@@ -3548,50 +3520,45 @@
 
   function updateText(text: string): void {
     if (transition !== 'idle') return;
-    const completionMutation = pendingCompletionText === text;
-    pendingCompletionText = null;
     const mutationWasInvalidated = visualMutationPending;
+    const mutation = observeTextMutation(
+      completionController,
+      text,
+      documentText,
+      mutationWasInvalidated
+    );
+    completionController = mutation.state;
     visualMutationPending = false;
     if (text === documentText) return;
     documentText = text;
     editVersion += 1;
-    if (!completionMutation && !mutationWasInvalidated) suggestionIntentEpoch += 1;
     uncertainWeave = null;
     saveState = 'dirty';
     saveMessage = saveInFlight ? 'Saving earlier changes…' : 'Unsaved changes';
     promotionArmedCandidateId = null;
-    if (!completionMutation) {
-      completionSession = null;
-      dismissedCandidateIds = [];
-      unpresentableVisualGhostPresentationKeys = [];
-      if (activeBranchCount > 0) void cancelActiveBranches();
-    }
+    if (mutation.cancelActiveBranches && activeBranchCount > 0) void cancelActiveBranches();
     scheduleDraftJournal();
     scheduleSave();
-    if (!completionMutation) scheduleAutomaticSuggestions(editVersion);
+    if (!mutation.completionOwned) scheduleAutomaticSuggestions(editVersion);
   }
 
   function clearCompletionSession(): void {
-    completionSession = null;
-    pendingCompletionText = null;
+    completionController = clearCompletionControllerSession(completionController);
   }
 
   function invalidateVisualSuggestionImmediately(): void {
     if (transition !== 'idle' || visualMutationPending) return;
     if (pendingCompletionText !== null) return;
     visualMutationPending = true;
-    completionSession = null;
-    suggestionIntentEpoch += 1;
+    const invalidated = invalidateVisualMutation(completionController);
+    completionController = invalidated.state;
     uncertainWeave = null;
     promotionArmedCandidateId = null;
-    dismissedCandidateIds = [];
-    unpresentableVisualGhostPresentationKeys = [];
-    if (activeBranchCount > 0) void cancelActiveBranches();
+    applyCompletionEffects(invalidated.effects);
   }
 
   function setSourceDocument(text: string, kind: DocumentKind): void {
-    clearCompletionSession();
-    lastCompletionAction = null;
+    completionController = resetCompletionSurface(completionController);
     if (sourceProjectionTimer !== undefined) {
       window.clearTimeout(sourceProjectionTimer);
       sourceProjectionTimer = undefined;
@@ -3605,7 +3572,6 @@
     visualBoundaryFailure = 'uninitialized';
     visualBoundaryDiagnostic = null;
     visualMutationPending = false;
-    unpresentableVisualGhostPresentationKeys = [];
     if (kind === 'verse') {
       const decoded = decodeVerseForEditor(text);
       verseCodec = decoded.codec;
@@ -3675,8 +3641,8 @@
       : selectedInlineSuggestion?.targetByte ?? completionGenerationIntent?.anchorByte ?? null;
     if (expected === null && target !== null) {
       if (completionWasActive) {
-        completionGenerationIntent = bindCompletionGenerationAnchor(
-          completionGenerationIntent,
+        completionController = bindCompletionAnchor(
+          completionController,
           completionContextKey,
           editVersion,
           target
@@ -3702,8 +3668,12 @@
     visualSelectionByte = markdownByteOffset;
     visualBoundaryFailure = failure;
     visualBoundaryDiagnostic = diagnostic;
-    if (completionNavigationPending && markdownByteOffset !== null) {
-      completionNavigationPending = false;
+    const settledNavigation = settleCompletionNavigation(
+      completionController,
+      markdownByteOffset !== null
+    );
+    completionController = settledNavigation.state;
+    if (settledNavigation.scheduleFresh) {
       scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'caret_navigation');
       return;
     }
@@ -3717,8 +3687,8 @@
       ? completionSessionPresentation(completionSession)?.targetByte ?? null
       : selectedInlineSuggestion?.targetByte ?? completionGenerationIntent?.anchorByte ?? null;
     if (expected === null) {
-      completionGenerationIntent = bindCompletionGenerationAnchor(
-        completionGenerationIntent,
+      completionController = bindCompletionAnchor(
+        completionController,
         completionContextKey,
         editVersion,
         markdownByteOffset
@@ -3767,19 +3737,21 @@
     delay = suggestionsIdleDelayMs,
     trigger: CompletionGenerationTrigger = 'document_edit'
   ): void {
-    completionGenerationIntent = armCompletionGeneration(
+    const armed = armCompletionScheduleIntent(
+      completionController,
       completionContextKey,
       targetEditVersion,
       trigger,
       mode === 'visual' ? visualSelectionByte : sourceGhostTargetByte
     );
-    if (!completionGenerationIntent) return;
+    completionController = armed;
+    if (!armed.generationIntent) return;
     armSuggestionSchedule({ kind: 'edit_pause', editVersion: targetEditVersion }, delay);
   }
 
   function scheduleAutocompleteRetry(ticket: AutocompleteRetryTicket): void {
     if (!completionGenerationIsArmed(
-      completionGenerationIntent,
+      completionController.generationIntent,
       completionContextKey,
       ticket.editVersion
     )) return;
@@ -3789,23 +3761,26 @@
     );
   }
 
-  function armSuggestionSchedule(schedule: SuggestionSchedule, delay: number): void {
-    if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
-    suggestionsIdleTimer = undefined;
-    scheduledSuggestion = null;
+  function armSuggestionSchedule(schedule: CompletionSchedule, delay: number): void {
+    clearSuggestionTimerHandle();
+    completionController = setCompletionSchedule(completionController, null);
     if (
       !desktop ||
       !completionAutomationEnabled() ||
       !project ||
       !document ||
-      !completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion) ||
+      !completionGenerationIsArmed(
+        completionController.generationIntent,
+        completionContextKey,
+        editVersion
+      ) ||
       document.summary.kind === 'hybrid'
     ) return;
-    scheduledSuggestion = schedule;
+    completionController = setCompletionSchedule(completionController, schedule);
     queueScheduledSuggestionAttempt(schedule, delay);
   }
 
-  function queueScheduledSuggestionAttempt(schedule: SuggestionSchedule, delay: number): void {
+  function queueScheduledSuggestionAttempt(schedule: CompletionSchedule, delay: number): void {
     if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
     suggestionsIdleTimer = window.setTimeout(() => {
       suggestionsIdleTimer = undefined;
@@ -3818,15 +3793,15 @@
       !wakeKey ||
       suggestionWakeQueued ||
       suggestionsIdleTimer !== undefined ||
-      !scheduledSuggestion ||
+      !completionController.scheduled ||
       completionLifecycle.phase !== 'ready'
     ) return;
-    const schedule = scheduledSuggestion;
+    const schedule = completionController.scheduled;
     suggestionWakeQueued = true;
     queueMicrotask(() => {
       suggestionWakeQueued = false;
       if (
-        scheduledSuggestion === schedule &&
+        completionController.scheduled === schedule &&
         suggestionsIdleTimer === undefined &&
         completionLifecycle.phase === 'ready'
       ) void tryStartAutomaticSuggestions(schedule);
@@ -3834,16 +3809,16 @@
   }
 
   function rearmBoundedSuggestionSchedule(
-    schedule: SuggestionSchedule,
+    schedule: CompletionSchedule,
     delay: number
   ): boolean {
     if (schedule.kind === 'edit_pause') {
-      scheduledSuggestion = schedule;
+      completionController = setCompletionSchedule(completionController, schedule);
       queueScheduledSuggestionAttempt(schedule, delay);
       return true;
     }
     if (schedule.ticket.waitsRemaining <= 0) {
-      scheduledSuggestion = null;
+      completionController = setCompletionSchedule(completionController, null);
       return false;
     }
     armSuggestionSchedule({
@@ -3871,7 +3846,7 @@
       document.visible_blob_id !== ticket.visibleBlobId ||
       documentEpoch !== ticket.documentEpoch ||
       editVersion !== ticket.editVersion ||
-      suggestionIntentEpoch !== ticket.intentEpoch ||
+      completionController.intentEpoch !== ticket.intentEpoch ||
       mode !== ticket.mode ||
       currentModel.model_id !== ticket.modelId ||
       sourceGhostNewline !== ticket.sourceNewline ||
@@ -3898,33 +3873,39 @@
     });
   }
 
-  async function tryStartAutomaticSuggestions(schedule: SuggestionSchedule): Promise<void> {
+  async function tryStartAutomaticSuggestions(schedule: CompletionSchedule): Promise<void> {
     const targetEditVersion = schedule.kind === 'edit_pause'
       ? schedule.editVersion
       : schedule.ticket.editVersion;
     if (
-      scheduledSuggestion !== schedule ||
+      completionController.scheduled !== schedule ||
       targetEditVersion !== editVersion ||
       !completionAutomationEnabled() ||
       !project ||
       !document ||
-      !completionGenerationIsArmed(completionGenerationIntent, completionContextKey, targetEditVersion)
+      !completionGenerationIsArmed(
+        completionController.generationIntent,
+        completionContextKey,
+        targetEditVersion
+      )
     ) {
-      scheduledSuggestion = null;
+      completionController = setCompletionSchedule(completionController, null);
       return;
     }
     if (!canStartAutomaticSuggestions) {
-      if (!retainsScheduledCompletion(completionLifecycle)) scheduledSuggestion = null;
+      if (!retainsScheduledCompletion(completionLifecycle)) {
+        completionController = setCompletionSchedule(completionController, null);
+      }
       return;
     }
     if (schedule.kind === 'exhausted_retry') {
       const disposition = retryTicketDisposition(schedule.ticket);
       if (!disposition) {
-        scheduledSuggestion = null;
+        completionController = setCompletionSchedule(completionController, null);
         return;
       }
       if (disposition.kind === 'available' || disposition.kind === 'inactive') {
-        scheduledSuggestion = null;
+        completionController = setCompletionSchedule(completionController, null);
         return;
       }
       if (
@@ -3936,9 +3917,9 @@
       }
     }
     const attempted = await startAutomaticWeave();
-    if (scheduledSuggestion !== schedule) return;
+    if (completionController.scheduled !== schedule) return;
     if (attempted || !retainsScheduledCompletion(completionLifecycle)) {
-      scheduledSuggestion = null;
+      completionController = setCompletionSchedule(completionController, null);
     } else {
       // A preflight race (for example, an editor projection completing while
       // it is flushed) must not erase the only request. Recheck once the
@@ -4350,30 +4331,21 @@
     }
   }
 
-  function dismissInlineSuggestion(candidateId: string | null | undefined): void {
-    if (!candidateId || dismissedCandidateIds.includes(candidateId)) return;
-    dismissedCandidateIds = [...dismissedCandidateIds, candidateId];
-    announce('Suggestion dismissed');
-  }
-
   function rejectVisualGhostPresentation(
     candidateId: string,
     presentationKey: string,
     surfaceKey: string,
     anchorByteOffset: number
   ): void {
-    if (
-      mode !== 'visual' ||
-      ghostSuggestion?.candidateId !== candidateId ||
-      ghostSuggestion.presentationKey !== presentationKey ||
-      ghostSuggestion.targetByte !== anchorByteOffset ||
-      surfaceKey !== visualGhostSurfaceKey ||
-      unpresentableVisualGhostPresentationKeys.includes(presentationKey)
-    ) return;
-    unpresentableVisualGhostPresentationKeys = [
-      ...unpresentableVisualGhostPresentationKeys,
-      presentationKey
-    ].slice(-64);
+    completionController = rejectVisualPresentation(completionController, {
+      mode,
+      eligible: ghostSuggestion,
+      candidateId,
+      presentationKey,
+      surfaceKey,
+      currentSurfaceKey: visualGhostSurfaceKey,
+      anchorByte: anchorByteOffset
+    });
   }
 
   async function acceptInlineSuggestion(branch: BranchCard): Promise<void> {
@@ -4390,79 +4362,86 @@
         : null;
   }
 
-  function syncCompletionCandidate(
-    expected: CompletionSession,
-    updated: CompletionSession | null
-  ): void {
-    if (completionSession !== expected) return;
-    completionSession = updated;
-    if (!updated) pendingCompletionText = null;
-  }
-
-  function finishCompletionIfExhausted(key: string): void {
-    const edge = advanceCompletionExhaustionLatch(handledCompletionExhaustionKey, key);
-    handledCompletionExhaustionKey = edge.handledKey;
-    if (!edge.shouldSchedule) return;
-    // An exhausted frozen session is still the exact authority for immediate
-    // Option-Left rollback. Queue the next family independently; deliberate
-    // dismissal, navigation, typing, or shared-engine off clears this cache.
-    scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'candidate_exhausted');
-  }
-
-  function completionActivityExists(): boolean {
-    return Boolean(
-      completionGenerationIntent ||
-      completionSession ||
-      pendingCompletionText !== null ||
-      scheduledSuggestion ||
-      weaveStarting ||
-      activeBranchCount > 0 ||
-      selectedInlineSuggestion
-    );
-  }
-
-  function invalidateCompletionForCaretNavigation(): void {
-    completionNavigationPending = mode === 'visual';
-    if (!completionActivityExists()) return;
-    completionSession = null;
-    pendingCompletionText = null;
-    promotionArmedCandidateId = null;
-    dismissedCandidateIds = [];
-    unpresentableVisualGhostPresentationKeys = [];
-    cancelSuggestionTimer();
-    if (activeBranchCount > 0) void cancelActiveBranches();
-  }
-
-  function sessionForEligibleGhost(eligible: InlineGhostSuggestion): CompletionSession | null {
-    if (completionSession && completionSessionMatchesPresentation(
-      completionSession,
-      completionContextKey,
-      eligible
-    )) return completionSession;
-    completionSession = null;
-    return startCompletionSession(
-      completionContextKey,
-      activeSuggestionFamily,
-      eligible.runId
-    );
-  }
-
-  function synchronizeVisibleCompletionSession(
+  function reconcileVisibleCompletionController(
     contextKey: string,
     family: readonly InlineGhostSuggestion[]
   ): void {
-    if (completionSession?.contextKey !== contextKey) {
-      completionSession = null;
-      pendingCompletionText = null;
+    const reconciled = reconcileCompletionController(
+      completionController,
+      contextKey,
+      family
+    );
+    if (reconciled !== completionController) completionController = reconciled;
+  }
+
+  function refreshVisibleCompletionCandidate(
+    expected: CompletionSession,
+    runId: string,
+    text: string,
+    presentationKey: string
+  ): void {
+    const refreshed = refreshCompletionCandidate(
+      completionController,
+      expected,
+      runId,
+      text,
+      presentationKey
+    );
+    if (refreshed !== completionController) completionController = refreshed;
+  }
+
+  function applyCompletionEffects(effects: readonly CompletionControllerEffect[]): void {
+    for (const effect of effects) {
+      switch (effect.kind) {
+        case 'announce':
+          announce(effect.message);
+          break;
+        case 'cancel_active_branches':
+          if (activeBranchCount > 0) void cancelActiveBranches();
+          break;
+        case 'schedule_generation':
+          scheduleAutomaticSuggestions(
+            effect.editVersion,
+            effect.delayMs,
+            effect.trigger
+          );
+          break;
+      }
     }
-    if (!contextKey) return;
-    if (!completionSession) {
-      if (family.length === 0) return;
-      completionSession = startCompletionSession(contextKey, family, family[0].runId);
-      return;
-    }
-    completionSession = synchronizeCompletionCandidates(completionSession, family);
-    if (!completionSession) pendingCompletionText = null;
+  }
+
+  function finishCompletionIfExhausted(key: string): void {
+    const exhausted = completionExhausted(
+      completionController,
+      key,
+      editVersion,
+      suggestionsIdleDelayMs
+    );
+    completionController = exhausted.state;
+    applyCompletionEffects(exhausted.effects);
+  }
+
+  function completionActivityExists(): boolean {
+    return controllerHasCompletionActivity(completionController, {
+      weaveStarting,
+      activeBranchCount,
+      selected: selectedInlineSuggestion
+    });
+  }
+
+  function invalidateCompletionForCaretNavigation(): void {
+    const active = completionActivityExists();
+    const invalidated = invalidateControllerNavigation(
+      completionController,
+      mode,
+      active,
+      activeBranchCount
+    );
+    completionController = invalidated.state;
+    if (!active) return;
+    promotionArmedCandidateId = null;
+    clearSuggestionTimerHandle();
+    applyCompletionEffects(invalidated.effects);
   }
 
   function acceptActiveGhost(candidateId: string, presentationKey: string): boolean {
@@ -4489,38 +4468,19 @@
     text: string,
     action: CompletionInsertionAction
   ): boolean {
-    const eligible = eligibleGhostForCurrentMode();
-    if (
-      !eligible ||
-      eligible.candidateId !== candidateId ||
-      eligible.presentationKey !== presentationKey ||
-      !text ||
-      !eligible.text.startsWith(text) ||
-      pendingCompletionText !== null ||
-      (!completionSession && !branchPromotionReady)
-    ) return false;
-    const initial = sessionForEligibleGhost(eligible);
-    if (!initial) return false;
-    const consumed = consumeCompletionText(initial, text);
-    if (!consumed) return false;
-    const expected = insertAtUtf8Boundary(documentText, eligible.targetByte, text);
-    if (expected === null) return false;
-    completionSession = consumed.session;
-    completionActionSequence += 1;
-    lastCompletionAction = {
-      sequence: completionActionSequence,
-      kind: action,
-      context_key: completionContextKey,
-      run_id: eligible.runId,
-      candidate_id: eligible.candidateId,
-      presentation_key: eligible.presentationKey,
-      inserted_utf8_bytes: new TextEncoder().encode(text).byteLength,
-      accepted_utf8_bytes: new TextEncoder().encode(
-        acceptedCompletionText(consumed.session)
-      ).byteLength
-    };
-    pendingCompletionText = expected;
-    return true;
+    const authorization = authorizeCompletionInsertion(completionController, {
+      contextKey: completionContextKey,
+      family: activeSuggestionFamily,
+      eligible: eligibleGhostForCurrentMode(),
+      candidateId,
+      presentationKey,
+      text,
+      action,
+      manuscriptText: documentText,
+      promotionReady: branchPromotionReady
+    });
+    completionController = authorization.state;
+    return authorization.authorized;
   }
 
   function authorizeGhostUnconsume(
@@ -4528,43 +4488,27 @@
     presentationKey: string,
     text: string
   ): boolean {
-    const eligible = eligibleGhostForCurrentMode();
-    if (
-      !completionSession ||
-      !eligible ||
-      eligible.candidateId !== candidateId ||
-      eligible.presentationKey !== presentationKey ||
-      pendingCompletionText !== null
-    ) return false;
-    const step = unconsumeCompletionWord(completionSession);
-    if (!step || step.text !== text) return false;
-    const expected = removeBeforeUtf8Boundary(documentText, eligible.targetByte, text);
-    if (expected === null) return false;
-    completionSession = step.session;
-    pendingCompletionText = expected;
-    return true;
+    const authorization = authorizeCompletionUnconsume(completionController, {
+      eligible: eligibleGhostForCurrentMode(),
+      candidateId,
+      presentationKey,
+      text,
+      manuscriptText: documentText
+    });
+    completionController = authorization.state;
+    return authorization.authorized;
   }
 
   function cycleActiveSuggestion(offset: number): void {
-    if (completionSession) {
-      const next = cycleCompletionSession(completionSession, offset);
-      if (next === completionSession) return;
-      completionSession = next;
-      activeSuggestionRunId = next.selectedRunId;
-      promotionArmedCandidateId = null;
-      const index = next.candidates.findIndex((candidate) => candidate.runId === next.selectedRunId);
-      announce(`Suggestion ${index + 1} of ${next.candidates.length}`);
-      return;
-    }
-    if (activeSuggestionFamily.length < 2) return;
-    const current = activeSuggestionFamily.findIndex(
-      (suggestion) => suggestion.runId === activeSuggestionRunId
+    const cycled = cycleCompletion(
+      completionController,
+      activeSuggestionFamily,
+      offset
     );
-    const next = cycleSuggestionIndex(activeSuggestionFamily.length, current, offset);
-    if (next < 0) return;
-    activeSuggestionRunId = activeSuggestionFamily[next].runId;
+    if (cycled.state === completionController) return;
+    completionController = cycled.state;
     promotionArmedCandidateId = null;
-    announce(`Suggestion ${next + 1} of ${activeSuggestionFamily.length}`);
+    applyCompletionEffects(cycled.effects);
   }
 
   async function setShuttleEnabled(enabled: boolean): Promise<void> {
@@ -4676,11 +4620,15 @@
       void setShuttleEnabled(false);
       return;
     }
-    if (
-      completionSession &&
-      completionSessionMatchesPresentation(completionSession, completionContextKey, eligible)
-    ) clearCompletionSession();
-    dismissInlineSuggestion(candidateId);
+    const dismissed = dismissCompletion(
+      completionController,
+      completionContextKey,
+      eligible,
+      candidateId,
+      presentationKey
+    );
+    completionController = dismissed.state;
+    if (dismissed.authorized) announce('Suggestion dismissed');
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
@@ -4804,7 +4752,7 @@
       document.visible_blob_id === captured.visibleBlobId &&
       documentEpoch === captured.epoch &&
       editVersion === captured.editVersion &&
-      suggestionIntentEpoch === captured.intentEpoch &&
+      completionController.intentEpoch === captured.intentEpoch &&
       currentModel?.model_id === captured.modelId &&
       completionAutomationEnabled()
     );
@@ -4949,7 +4897,7 @@
       visibleBlobId: document.visible_blob_id,
       cursorByte,
       editVersion,
-      intentEpoch: suggestionIntentEpoch,
+      intentEpoch: completionController.intentEpoch,
       modelId: currentModel.model_id
     };
     weaveStarting = true;
@@ -5913,7 +5861,7 @@
     shuttleEnabled = false;
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
-    dismissedCandidateIds = [];
+    completionController = resetCompletionDiscovery(completionController);
     pendingCloseCommandId = null;
     pendingCloseMayHaveCommitted = false;
     pendingCloseAgency = null;
