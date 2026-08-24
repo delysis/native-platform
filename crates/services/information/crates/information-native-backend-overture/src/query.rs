@@ -1,13 +1,14 @@
 use crate::identity::{bbox_intersects, validate_simple_id};
 use crate::{
-    OVERTURE_BACKEND_CONTRACT, OvertureError, OverturePartitionIdentity, OvertureReleaseIdentity,
-    VerifiedOverturePartition,
+    AdmittedOvertureRelease, OVERTURE_BACKEND_CONTRACT, OvertureError, OverturePartitionIdentity,
+    OvertureReleaseProvenance, VerifiedOverturePartition,
 };
 use information_native_types::{BoundingBox, EvidenceLocator};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -55,6 +56,8 @@ pub struct OvertureQueryLimits {
     pub max_features: usize,
     pub max_geometry_bytes_per_feature: usize,
     pub max_attributes_bytes_per_feature: usize,
+    /// Maximum compact JSON byte length of the complete returned object,
+    /// including its proof and all repeated feature provenance.
     pub max_output_bytes: usize,
 }
 
@@ -222,7 +225,7 @@ impl OvertureEngineError {
 /// predicate, never a path, mutable seek cursor, URL fetch capability, or raw
 /// SQL string.
 pub struct OvertureEngineRequest<'a> {
-    release: &'a OvertureReleaseIdentity,
+    release: &'a OvertureReleaseProvenance,
     selection: &'a OvertureSelection,
     predicate: &'a PushdownPredicate,
     partitions: &'a [VerifiedOverturePartition],
@@ -231,7 +234,7 @@ pub struct OvertureEngineRequest<'a> {
 
 impl<'a> OvertureEngineRequest<'a> {
     #[must_use]
-    pub fn release(&self) -> &'a OvertureReleaseIdentity {
+    pub fn release(&self) -> &'a OvertureReleaseProvenance {
         self.release
     }
 
@@ -300,7 +303,7 @@ pub struct OvertureFeature {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct OvertureQueryResult {
-    pub release: OvertureReleaseIdentity,
+    pub release: OvertureReleaseProvenance,
     pub selection: OvertureSelection,
     pub predicate: PushdownPredicate,
     pub proof: PushdownReceipt,
@@ -308,13 +311,14 @@ pub struct OvertureQueryResult {
 }
 
 pub fn execute_overture_query<B: OvertureHeavyBackend + ?Sized>(
-    release: &OvertureReleaseIdentity,
+    release: &AdmittedOvertureRelease,
     selection: &OvertureSelection,
     mut partitions: Vec<VerifiedOverturePartition>,
     limits: OvertureQueryLimits,
     backend: &B,
 ) -> Result<OvertureQueryResult, OvertureError> {
     release.validate_for_query()?;
+    let release_provenance = release.provenance();
     selection.validate()?;
     limits.validate()?;
     if partitions.is_empty() {
@@ -329,7 +333,7 @@ pub fn execute_overture_query<B: OvertureHeavyBackend + ?Sized>(
     let mut partition_bytes = 0_u64;
     let mut row_groups = 0_u64;
     for partition in &mut partitions {
-        validate_partition_binding(release, selection, partition.identity())?;
+        validate_partition_binding(release_provenance, selection, partition.identity())?;
         let identity_sha256 = partition.identity().identity_sha256();
         if !seen.insert(identity_sha256) {
             return Err(OvertureError::InvalidPartition(
@@ -353,7 +357,7 @@ pub fn execute_overture_query<B: OvertureHeavyBackend + ?Sized>(
 
     let predicate = PushdownPredicate::from_selection(selection)?;
     let engine_result = backend.query(OvertureEngineRequest {
-        release,
+        release: release_provenance,
         selection,
         predicate: &predicate,
         partitions: &partitions,
@@ -377,14 +381,14 @@ pub fn execute_overture_query<B: OvertureHeavyBackend + ?Sized>(
             "engine returned more features than its decoded-row receipt".to_string(),
         ));
     }
-    let selected_groups = validate_proof(&output.proof, &predicate, &partitions, limits)?;
+    let partition_proofs = validate_proof(&output.proof, &predicate, &partitions, limits)?;
     let mut features = validate_features(
         output.features,
-        release,
+        release_provenance,
         selection,
         &predicate,
         &partitions,
-        &selected_groups,
+        &partition_proofs,
         limits,
     )?;
     features.sort_by(|left, right| {
@@ -399,17 +403,19 @@ pub fn execute_overture_query<B: OvertureHeavyBackend + ?Sized>(
             .then_with(|| left.provenance.row_index.cmp(&right.provenance.row_index))
     });
 
-    Ok(OvertureQueryResult {
-        release: release.clone(),
+    let result = OvertureQueryResult {
+        release: release_provenance.clone(),
         selection: selection.clone(),
         predicate,
         proof: output.proof,
         features,
-    })
+    };
+    bounded_serialized_len(&result, limits.max_output_bytes)?;
+    Ok(result)
 }
 
 fn validate_partition_binding(
-    release: &OvertureReleaseIdentity,
+    release: &OvertureReleaseProvenance,
     selection: &OvertureSelection,
     partition: &OverturePartitionIdentity,
 ) -> Result<(), OvertureError> {
@@ -434,7 +440,7 @@ fn validate_proof(
     predicate: &PushdownPredicate,
     partitions: &[VerifiedOverturePartition],
     limits: OvertureQueryLimits,
-) -> Result<BTreeMap<String, BTreeSet<u32>>, OvertureError> {
+) -> Result<BTreeMap<String, ValidatedPartitionPushdown>, OvertureError> {
     if proof.contract != OVERTURE_BACKEND_CONTRACT
         || proof.predicate_sha256 != predicate.sha256
         || proof.mechanism != PushdownMechanism::ParquetStatisticsAndRowFilter
@@ -487,7 +493,13 @@ fn validate_proof(
             .checked_add(receipt.rows_decoded)
             .ok_or(OvertureError::LimitExceeded("decoded row count"))?;
         if selected
-            .insert(receipt.partition_identity_sha256.clone(), groups)
+            .insert(
+                receipt.partition_identity_sha256.clone(),
+                ValidatedPartitionPushdown {
+                    selected_row_groups: groups,
+                    rows_decoded: receipt.rows_decoded,
+                },
+            )
             .is_some()
         {
             return Err(OvertureError::InvalidEngineOutput(
@@ -506,14 +518,19 @@ fn validate_proof(
     Ok(selected)
 }
 
+struct ValidatedPartitionPushdown {
+    selected_row_groups: BTreeSet<u32>,
+    rows_decoded: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_features(
     engine_features: Vec<EngineFeature>,
-    release: &OvertureReleaseIdentity,
+    release: &OvertureReleaseProvenance,
     selection: &OvertureSelection,
     predicate: &PushdownPredicate,
     partitions: &[VerifiedOverturePartition],
-    selected_groups: &BTreeMap<String, BTreeSet<u32>>,
+    partition_proofs: &BTreeMap<String, ValidatedPartitionPushdown>,
     limits: OvertureQueryLimits,
 ) -> Result<Vec<OvertureFeature>, OvertureError> {
     if engine_features.len() > limits.max_features {
@@ -524,6 +541,7 @@ fn validate_features(
         .map(|partition| (partition.identity().identity_sha256(), partition.identity()))
         .collect::<BTreeMap<_, _>>();
     let mut seen_ids = BTreeSet::new();
+    let mut returned_by_partition = BTreeMap::<String, u64>::new();
     let mut output_bytes = 0_usize;
     let mut features = Vec::with_capacity(engine_features.len());
     for feature in engine_features {
@@ -538,16 +556,35 @@ fn validate_features(
             .ok_or_else(|| {
                 OvertureError::InvalidEngineOutput("feature names an unknown partition".to_string())
             })?;
-        let groups = selected_groups
+        let partition_proof = partition_proofs
             .get(&feature.partition_identity_sha256)
             .ok_or_else(|| {
                 OvertureError::InvalidEngineOutput(
                     "feature partition has no pushdown receipt".to_string(),
                 )
             })?;
-        if !groups.contains(&feature.row_group) {
+        if !partition_proof
+            .selected_row_groups
+            .contains(&feature.row_group)
+        {
             return Err(OvertureError::InvalidEngineOutput(
                 "feature came from a row group not selected by pushdown".to_string(),
+            ));
+        }
+        if feature.row_index >= partition.row_count {
+            return Err(OvertureError::InvalidEngineOutput(
+                "feature row index is outside the exact partition row count".to_string(),
+            ));
+        }
+        let returned = returned_by_partition
+            .entry(feature.partition_identity_sha256.clone())
+            .or_default();
+        *returned = returned
+            .checked_add(1)
+            .ok_or(OvertureError::LimitExceeded("returned row count"))?;
+        if *returned > partition_proof.rows_decoded {
+            return Err(OvertureError::InvalidEngineOutput(
+                "partition returned more features than its decoded-row receipt".to_string(),
             ));
         }
         feature.bbox.validate().map_err(|_| {
@@ -575,20 +612,7 @@ fn validate_features(
         if attributes_bytes > limits.max_attributes_bytes_per_feature {
             return Err(OvertureError::LimitExceeded("feature attribute bytes"));
         }
-        let feature_bytes = feature
-            .gers_id
-            .len()
-            .checked_add(feature.geometry_wkb.len())
-            .and_then(|value| value.checked_add(attributes_bytes))
-            .ok_or(OvertureError::LimitExceeded("output bytes"))?;
-        output_bytes = output_bytes
-            .checked_add(feature_bytes)
-            .ok_or(OvertureError::LimitExceeded("output bytes"))?;
-        if output_bytes > limits.max_output_bytes {
-            return Err(OvertureError::LimitExceeded("output bytes"));
-        }
-
-        features.push(OvertureFeature {
+        let feature = OvertureFeature {
             locator: EvidenceLocator::OvertureFeature {
                 gers_id: feature.gers_id,
             },
@@ -613,7 +637,16 @@ fn validate_features(
                 row_index: feature.row_index,
                 predicate_sha256: predicate.sha256.clone(),
             },
-        });
+        };
+        let remaining = limits
+            .max_output_bytes
+            .checked_sub(output_bytes)
+            .ok_or(OvertureError::LimitExceeded("output bytes"))?;
+        let feature_bytes = bounded_serialized_len(&feature, remaining)?;
+        output_bytes = output_bytes
+            .checked_add(feature_bytes)
+            .ok_or(OvertureError::LimitExceeded("output bytes"))?;
+        features.push(feature);
     }
     Ok(features)
 }
@@ -697,6 +730,44 @@ fn add_bytes(total: &mut usize, additional: usize) -> Result<(), OvertureError> 
         .checked_add(additional)
         .ok_or(OvertureError::LimitExceeded("feature attribute bytes"))?;
     Ok(())
+}
+
+struct BoundedByteCounter {
+    bytes: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl Write for BoundedByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.bytes.checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("serialized output byte count overflow"));
+        };
+        if next > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::other("serialized output exceeds byte limit"));
+        }
+        self.bytes = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_serialized_len<T: Serialize>(value: &T, limit: usize) -> Result<usize, OvertureError> {
+    let mut counter = BoundedByteCounter {
+        bytes: 0,
+        limit,
+        exceeded: false,
+    };
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => Ok(counter.bytes),
+        Err(_) if counter.exceeded => Err(OvertureError::LimitExceeded("output bytes")),
+        Err(error) => Err(OvertureError::Json(error)),
+    }
 }
 
 fn predicate_fingerprint(predicate: &PushdownPredicate) -> Result<String, OvertureError> {

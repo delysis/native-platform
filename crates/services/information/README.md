@@ -76,9 +76,12 @@ real-partition acceptance is included yet.
   and non-UTF-8 article decoding are explicitly unsupported in this slice.
 - Overture never resolves the mutable STAC root as release authority. A caller
   supplies exact bytes, length, and SHA-256 for a release-specific catalog,
-  each selected item, and every already-acquired local partition. The query
-  engine receives bounded random-access reads over open file leases and a fixed bbox-intersection
-  predicate, not paths, URLs, raw SQL, or network authority. Engine receipts
+  each selected item, and every already-acquired local partition. Successful
+  catalog admission yields an opaque, non-serializable capability; persisted
+  release provenance is audit data and cannot be replayed as authority. The
+  query engine receives bounded random-access reads over open file leases and a
+  fixed bbox-intersection predicate, not paths, URLs, raw SQL, or network
+  authority. Engine receipts
   are checked against exact partition identities and selected row groups, and
   each bounded feature retains release/item/partition/predicate provenance.
 - `managed.documents.v1` inputs bind exact immutable source artifacts,

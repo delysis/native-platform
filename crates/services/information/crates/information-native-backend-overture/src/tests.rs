@@ -40,7 +40,7 @@ fn release_fixture() -> (ExactStacDocument, Vec<u8>) {
     (exact(source_uri, &bytes), bytes)
 }
 
-fn release_identity() -> OvertureReleaseIdentity {
+fn admitted_release() -> AdmittedOvertureRelease {
     let (expectation, bytes) = release_fixture();
     admit_overture_release(RELEASE, &expectation, &bytes)
         .unwrap_or_else(|error| panic!("release fixture must be valid: {error}"))
@@ -60,18 +60,22 @@ fn selection() -> OvertureSelection {
 }
 
 fn item_fixture() -> (ExactStacDocument, Vec<u8>) {
+    item_fixture_named("00000", "part-00000-fixture-c000.zstd.parquet")
+}
+
+fn item_fixture_named(item_id: &str, partition_file: &str) -> (ExactStacDocument, Vec<u8>) {
     let source_uri =
-        format!("https://stac.overturemaps.org/{RELEASE}/places/place/00000/00000.json");
+        format!("https://stac.overturemaps.org/{RELEASE}/places/place/{item_id}/{item_id}.json");
     let root_uri = format!("https://stac.overturemaps.org/{RELEASE}/catalog.json");
     let collection_uri =
         format!("https://stac.overturemaps.org/{RELEASE}/places/place/collection.json");
     let partition_uri = format!(
-        "https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com/release/{RELEASE}/theme=places/type=place/part-00000-fixture-c000.zstd.parquet"
+        "https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com/release/{RELEASE}/theme=places/type=place/{partition_file}"
     );
     let bytes = serde_json::to_vec(&json!({
         "type": "Feature",
         "stac_version": "1.1.0",
-        "id": "00000",
+        "id": item_id,
         "geometry": {"type": "Polygon", "coordinates": []},
         "bbox": [-130.0, 30.0, -110.0, 45.0],
         "properties": {
@@ -103,11 +107,27 @@ fn parquet_bytes() -> Vec<u8> {
 
 fn admitted_partition(temp: &TempDir) -> VerifiedOverturePartition {
     let bytes = parquet_bytes();
-    let path = temp.path().join("partition.parquet");
-    fs::write(&path, &bytes).unwrap_or_else(|error| panic!("write fixture: {error}"));
-    let (item, item_bytes) = item_fixture();
+    admitted_partition_named(
+        temp,
+        "00000",
+        "part-00000-fixture-c000.zstd.parquet",
+        "partition.parquet",
+        &bytes,
+    )
+}
+
+fn admitted_partition_named(
+    temp: &TempDir,
+    item_id: &str,
+    partition_file: &str,
+    local_file: &str,
+    bytes: &[u8],
+) -> VerifiedOverturePartition {
+    let path = temp.path().join(local_file);
+    fs::write(&path, bytes).unwrap_or_else(|error| panic!("write fixture: {error}"));
+    let (item, item_bytes) = item_fixture_named(item_id, partition_file);
     admit_overture_partition(
-        &release_identity(),
+        &admitted_release(),
         &selection(),
         OverturePartitionAdmission {
             item,
@@ -115,7 +135,7 @@ fn admitted_partition(temp: &TempDir) -> VerifiedOverturePartition {
             asset_key: "aws".to_string(),
             local_partition_path: path,
             expected_partition_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            expected_partition_sha256: digest(&bytes),
+            expected_partition_sha256: digest(bytes),
         },
     )
     .unwrap_or_else(|error| panic!("partition fixture must be valid: {error}"))
@@ -134,6 +154,7 @@ enum MockMode {
     WrongPredicate,
     UnselectedRowGroup,
     OutsideBbox,
+    OutOfRangeRowIndex,
     DuplicateId,
     DeepAttributes,
 }
@@ -205,7 +226,11 @@ impl OvertureHeavyBackend for MockBackend {
             attributes,
             partition_identity_sha256: identity_sha256.clone(),
             row_group,
-            row_index: 9,
+            row_index: if matches!(self.mode, MockMode::OutOfRangeRowIndex) {
+                partition.identity().row_count
+            } else {
+                9
+            },
         };
         let mut features = vec![feature.clone()];
         if matches!(self.mode, MockMode::DuplicateId) {
@@ -232,6 +257,60 @@ struct MutatingBackend {
     path: PathBuf,
 }
 
+struct DecodedOnOtherPartitionBackend;
+
+impl OvertureHeavyBackend for DecodedOnOtherPartitionBackend {
+    fn query(
+        &self,
+        request: OvertureEngineRequest<'_>,
+    ) -> Result<EngineOutput, OvertureEngineError> {
+        let [feature_partition, other_partition] = request.partitions() else {
+            return Err(OvertureEngineError::new(
+                EngineErrorClass::Internal,
+                "expected exactly two fixture partitions",
+            ));
+        };
+        let feature_partition_sha256 = feature_partition.identity().identity_sha256();
+        let other_partition_sha256 = other_partition.identity().identity_sha256();
+        Ok(EngineOutput {
+            proof: PushdownReceipt {
+                contract: OVERTURE_BACKEND_CONTRACT.to_string(),
+                predicate_sha256: request.predicate().sha256.clone(),
+                mechanism: PushdownMechanism::ParquetStatisticsAndRowFilter,
+                partitions: vec![
+                    PartitionPushdownReceipt {
+                        partition_identity_sha256: feature_partition_sha256.clone(),
+                        total_row_groups: feature_partition.identity().row_group_count,
+                        selected_row_groups: vec![1],
+                        rows_decoded: 0,
+                    },
+                    PartitionPushdownReceipt {
+                        partition_identity_sha256: other_partition_sha256,
+                        total_row_groups: other_partition.identity().row_group_count,
+                        selected_row_groups: vec![1],
+                        rows_decoded: 1,
+                    },
+                ],
+            },
+            features: vec![EngineFeature {
+                gers_id: GERS_ID.to_string(),
+                bbox: BoundingBox {
+                    west: -122.1,
+                    south: 37.9,
+                    east: -121.9,
+                    north: 38.1,
+                },
+                geometry_wkb: point_wkb(),
+                version: 7,
+                attributes: BTreeMap::new(),
+                partition_identity_sha256: feature_partition_sha256,
+                row_group: 1,
+                row_index: 9,
+            }],
+        })
+    }
+}
+
 impl OvertureHeavyBackend for MutatingBackend {
     fn query(
         &self,
@@ -251,12 +330,17 @@ impl OvertureHeavyBackend for MutatingBackend {
 }
 
 #[test]
-fn release_identity_is_exact_and_never_admits_mutable_latest() {
+fn admitted_release_is_opaque_while_provenance_is_serializable() {
     let (expectation, bytes) = release_fixture();
     let identity = admit_overture_release(RELEASE, &expectation, &bytes)
         .unwrap_or_else(|error| panic!("release admission: {error}"));
-    assert_eq!(identity.release_id, RELEASE);
-    assert_eq!(identity.catalog_sha256, digest(&bytes));
+    assert_eq!(identity.provenance().release_id, RELEASE);
+    assert_eq!(identity.provenance().catalog_sha256, digest(&bytes));
+    let snapshot_bytes = serde_json::to_vec(identity.provenance())
+        .unwrap_or_else(|error| panic!("serialize release provenance: {error}"));
+    let snapshot: OvertureReleaseProvenance = serde_json::from_slice(&snapshot_bytes)
+        .unwrap_or_else(|error| panic!("deserialize release provenance: {error}"));
+    assert_eq!(&snapshot, identity.provenance());
 
     let mut changed = bytes.clone();
     changed.push(b' ');
@@ -328,7 +412,7 @@ fn partition_admission_rejects_changed_item_and_partition_bytes() {
     let (item, mut item_bytes) = item_fixture();
     item_bytes.push(b' ');
     let result = admit_overture_partition(
-        &release_identity(),
+        &admitted_release(),
         &selection(),
         OverturePartitionAdmission {
             item,
@@ -346,7 +430,7 @@ fn partition_admission_rejects_changed_item_and_partition_bytes() {
 
     let (item, item_bytes) = item_fixture();
     let result = admit_overture_partition(
-        &release_identity(),
+        &admitted_release(),
         &selection(),
         OverturePartitionAdmission {
             item,
@@ -376,7 +460,7 @@ fn partition_admission_rejects_symlinks() {
     symlink(&target, &alias).unwrap_or_else(|error| panic!("symlink fixture: {error}"));
     let (item, item_bytes) = item_fixture();
     let result = admit_overture_partition(
-        &release_identity(),
+        &admitted_release(),
         &selection(),
         OverturePartitionAdmission {
             item,
@@ -393,7 +477,7 @@ fn partition_admission_rejects_symlinks() {
 #[test]
 fn typed_query_returns_gers_locator_and_full_provenance() {
     let temp = TempDir::new().unwrap_or_else(|error| panic!("tempdir: {error}"));
-    let release = release_identity();
+    let release = admitted_release();
     let result = execute_overture_query(
         &release,
         &selection(),
@@ -424,11 +508,78 @@ fn typed_query_returns_gers_locator_and_full_provenance() {
 }
 
 #[test]
+fn output_limit_counts_complete_serialized_result_and_repeated_provenance() {
+    let mut limits = OvertureQueryLimits {
+        max_geometry_bytes_per_feature: 64,
+        max_attributes_bytes_per_feature: 64,
+        max_output_bytes: 1024 * 1024,
+        ..OvertureQueryLimits::default()
+    };
+    let first_temp = TempDir::new().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let result = execute_overture_query(
+        &admitted_release(),
+        &selection(),
+        vec![admitted_partition(&first_temp)],
+        limits,
+        &MockBackend {
+            mode: MockMode::Good,
+        },
+    )
+    .unwrap_or_else(|error| panic!("unbounded fixture query: {error}"));
+    let serialized = serde_json::to_vec(&result)
+        .unwrap_or_else(|error| panic!("serialize bounded result: {error}"));
+    let serialized_text = std::str::from_utf8(&serialized)
+        .unwrap_or_else(|error| panic!("result JSON is UTF-8: {error}"));
+    assert!(
+        serialized_text
+            .matches("https://stac.overturemaps.org/")
+            .count()
+            >= 3
+    );
+    assert!(serialized.len() > limits.max_attributes_bytes_per_feature);
+
+    limits.max_output_bytes = serialized.len();
+    let exact_temp = TempDir::new().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let exact = execute_overture_query(
+        &admitted_release(),
+        &selection(),
+        vec![admitted_partition(&exact_temp)],
+        limits,
+        &MockBackend {
+            mode: MockMode::Good,
+        },
+    )
+    .unwrap_or_else(|error| panic!("exact output byte limit: {error}"));
+    assert_eq!(
+        serde_json::to_vec(&exact)
+            .unwrap_or_else(|error| panic!("serialize exact bounded result: {error}"))
+            .len(),
+        serialized.len()
+    );
+
+    limits.max_output_bytes = serialized.len().saturating_sub(1);
+    let second_temp = TempDir::new().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let result = execute_overture_query(
+        &admitted_release(),
+        &selection(),
+        vec![admitted_partition(&second_temp)],
+        limits,
+        &MockBackend {
+            mode: MockMode::Good,
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(OvertureError::LimitExceeded("output bytes"))
+    ));
+}
+
+#[test]
 fn query_rejects_mismatched_pushdown_proof_and_unselected_rows() {
     for mode in [MockMode::WrongPredicate, MockMode::UnselectedRowGroup] {
         let temp = TempDir::new().unwrap_or_else(|error| panic!("tempdir: {error}"));
         let result = execute_overture_query(
-            &release_identity(),
+            &admitted_release(),
             &selection(),
             vec![admitted_partition(&temp)],
             OvertureQueryLimits::default(),
@@ -447,7 +598,7 @@ fn query_rejects_out_of_bbox_duplicates_and_hostile_attributes() {
     ] {
         let temp = TempDir::new().unwrap_or_else(|error| panic!("tempdir: {error}"));
         let result = execute_overture_query(
-            &release_identity(),
+            &admitted_release(),
             &selection(),
             vec![admitted_partition(&temp)],
             OvertureQueryLimits::default(),
@@ -455,6 +606,61 @@ fn query_rejects_out_of_bbox_duplicates_and_hostile_attributes() {
         );
         assert!(result.is_err());
     }
+}
+
+#[test]
+fn query_rejects_row_index_at_partition_row_count() {
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let result = execute_overture_query(
+        &admitted_release(),
+        &selection(),
+        vec![admitted_partition(&temp)],
+        OvertureQueryLimits::default(),
+        &MockBackend {
+            mode: MockMode::OutOfRangeRowIndex,
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(OvertureError::InvalidEngineOutput(message))
+            if message.contains("row index")
+    ));
+}
+
+#[test]
+fn query_enforces_decoded_rows_per_partition_not_only_in_aggregate() {
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let first_bytes = parquet_bytes();
+    let mut second_bytes = parquet_bytes();
+    second_bytes[8] ^= 0x10;
+    let partitions = vec![
+        admitted_partition_named(
+            &temp,
+            "00000",
+            "part-00000-fixture-c000.zstd.parquet",
+            "first.parquet",
+            &first_bytes,
+        ),
+        admitted_partition_named(
+            &temp,
+            "00001",
+            "part-00001-fixture-c000.zstd.parquet",
+            "second.parquet",
+            &second_bytes,
+        ),
+    ];
+    let result = execute_overture_query(
+        &admitted_release(),
+        &selection(),
+        partitions,
+        OvertureQueryLimits::default(),
+        &DecodedOnOtherPartitionBackend,
+    );
+    assert!(matches!(
+        result,
+        Err(OvertureError::InvalidEngineOutput(message))
+            if message.contains("partition returned more features")
+    ));
 }
 
 #[test]
@@ -466,7 +672,7 @@ fn query_rehashes_partition_before_engine_admission() {
     changed[5] ^= 0x20;
     fs::write(path, changed).unwrap_or_else(|error| panic!("mutate fixture: {error}"));
     let result = execute_overture_query(
-        &release_identity(),
+        &admitted_release(),
         &selection(),
         vec![partition],
         OvertureQueryLimits::default(),
@@ -483,7 +689,7 @@ fn query_rehashes_partition_after_engine_returns() {
     let partition = admitted_partition(&temp);
     let path = temp.path().join("partition.parquet");
     let result = execute_overture_query(
-        &release_identity(),
+        &admitted_release(),
         &selection(),
         vec![partition],
         OvertureQueryLimits::default(),

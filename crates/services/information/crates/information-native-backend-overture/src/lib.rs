@@ -11,9 +11,9 @@ mod identity;
 mod query;
 
 pub use identity::{
-    ExactStacDocument, OverturePartitionAdmission, OverturePartitionIdentity,
-    OvertureReleaseIdentity, VerifiedOverturePartition, admit_overture_partition,
-    admit_overture_release,
+    AdmittedOvertureRelease, ExactStacDocument, OverturePartitionAdmission,
+    OverturePartitionIdentity, OvertureReleaseProvenance, VerifiedOverturePartition,
+    admit_overture_partition, admit_overture_release,
 };
 pub use query::{
     EngineErrorClass, EngineFeature, EngineOutput, OvertureEngineError, OvertureEngineRequest,

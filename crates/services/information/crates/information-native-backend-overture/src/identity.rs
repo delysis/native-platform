@@ -25,10 +25,11 @@ pub struct ExactStacDocument {
     pub expected_sha256: String,
 }
 
-/// Immutable identity of one release-specific Overture STAC catalog.
+/// Serializable audit data for one admitted release. This snapshot is data,
+/// never admission authority, and cannot be passed to partition/query APIs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct OvertureReleaseIdentity {
+pub struct OvertureReleaseProvenance {
     pub release_id: String,
     pub catalog_source_uri: String,
     pub catalog_bytes: u64,
@@ -36,15 +37,43 @@ pub struct OvertureReleaseIdentity {
     pub stac_version: String,
 }
 
-impl OvertureReleaseIdentity {
+/// Opaque in-process authority proving that exact release STAC bytes passed
+/// admission. It deliberately implements neither `Serialize` nor
+/// `Deserialize`; persisted provenance cannot be replayed as authority.
+///
+/// ```compile_fail
+/// use information_native_backend_overture::AdmittedOvertureRelease;
+///
+/// let _: Result<AdmittedOvertureRelease, _> = serde_json::from_str("{}");
+/// ```
+///
+/// ```compile_fail
+/// use information_native_backend_overture::AdmittedOvertureRelease;
+///
+/// fn persist(authority: &AdmittedOvertureRelease) {
+///     let _ = serde_json::to_vec(authority);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct AdmittedOvertureRelease {
+    provenance: OvertureReleaseProvenance,
+}
+
+impl AdmittedOvertureRelease {
+    #[must_use]
+    pub fn provenance(&self) -> &OvertureReleaseProvenance {
+        &self.provenance
+    }
+
     pub(crate) fn validate_for_query(&self) -> Result<(), OvertureError> {
-        validate_release_id(&self.release_id)?;
-        let source = validate_stac_uri(&self.catalog_source_uri)?;
-        if source.path() != format!("/{}/catalog.json", self.release_id)
-            || self.catalog_bytes == 0
-            || self.catalog_bytes > MAX_STAC_DOCUMENT_BYTES as u64
-            || normalize_sha256(&self.catalog_sha256)? != self.catalog_sha256
-            || self.stac_version != OVERTURE_STAC_VERSION
+        let provenance = &self.provenance;
+        validate_release_id(&provenance.release_id)?;
+        let source = validate_stac_uri(&provenance.catalog_source_uri)?;
+        if source.path() != format!("/{}/catalog.json", provenance.release_id)
+            || provenance.catalog_bytes == 0
+            || provenance.catalog_bytes > MAX_STAC_DOCUMENT_BYTES as u64
+            || normalize_sha256(&provenance.catalog_sha256)? != provenance.catalog_sha256
+            || provenance.stac_version != OVERTURE_STAC_VERSION
         {
             return Err(OvertureError::InvalidStacIdentity(
                 "release identity is not exact and canonical".to_string(),
@@ -174,7 +203,7 @@ pub fn admit_overture_release(
     release_id: &str,
     expectation: &ExactStacDocument,
     bytes: &[u8],
-) -> Result<OvertureReleaseIdentity, OvertureError> {
+) -> Result<AdmittedOvertureRelease, OvertureError> {
     validate_release_id(release_id)?;
     let source = validate_stac_uri(&expectation.source_uri)?;
     let expected_path = format!("/{release_id}/catalog.json");
@@ -205,22 +234,25 @@ pub fn admit_overture_release(
     require_exact_link(&document, "self", &expectation.source_uri)?;
     require_exact_link(&document, "root", &expectation.source_uri)?;
 
-    Ok(OvertureReleaseIdentity {
-        release_id: release_id.to_string(),
-        catalog_source_uri: expectation.source_uri.clone(),
-        catalog_bytes: expectation.expected_bytes,
-        catalog_sha256: digest,
-        stac_version: OVERTURE_STAC_VERSION.to_string(),
+    Ok(AdmittedOvertureRelease {
+        provenance: OvertureReleaseProvenance {
+            release_id: release_id.to_string(),
+            catalog_source_uri: expectation.source_uri.clone(),
+            catalog_bytes: expectation.expected_bytes,
+            catalog_sha256: digest,
+            stac_version: OVERTURE_STAC_VERSION.to_string(),
+        },
     })
 }
 
 /// Bind an exact STAC item to one explicit selection and one exact local file.
 pub fn admit_overture_partition(
-    release: &OvertureReleaseIdentity,
+    release: &AdmittedOvertureRelease,
     selection: &OvertureSelection,
     admission: OverturePartitionAdmission,
 ) -> Result<VerifiedOverturePartition, OvertureError> {
     release.validate_for_query()?;
+    let release = release.provenance();
     selection.validate()?;
     let item_source = validate_stac_uri(&admission.item.source_uri)?;
     let item_sha256 = verify_exact_bytes(
@@ -312,7 +344,7 @@ pub fn admit_overture_partition(
 }
 
 fn validate_partition_item(
-    release: &OvertureReleaseIdentity,
+    release: &OvertureReleaseProvenance,
     selection: &OvertureSelection,
     document: &StacDocument,
     source: &Url,
@@ -366,7 +398,7 @@ fn validate_partition_item(
 fn validate_partition_asset_uri(
     asset_key: &str,
     uri: &str,
-    release: &OvertureReleaseIdentity,
+    release: &OvertureReleaseProvenance,
     selection: &OvertureSelection,
 ) -> Result<(), OvertureError> {
     let url = Url::parse(uri).map_err(|_| {
