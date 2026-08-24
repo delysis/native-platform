@@ -53,6 +53,12 @@ it would be dishonest to claim live audio streaming or pre-emptive native
 cancellation. Those capabilities remain false until a truly asynchronous
 bridge is implemented and tested.
 
+Synthesis responses carry an explicit output disposition. `Complete` owns the
+returned bytes and format; `Streamed` records the format and byte count already
+delivered through bounded audio events. An empty final audio buffer is never a
+compatibility marker for streaming. Apple advertises and returns WAV bytes
+only; playback remains a product responsibility.
+
 The reusable speech crates have no Tauri dependency. W9 removed the generic
 speech Tauri plugin because no current product installs it. A product that
 ships speech must own its narrow IPC commands, permissions, capture/playback

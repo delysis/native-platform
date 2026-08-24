@@ -21,6 +21,11 @@ backpressure, cancellation, platform permission semantics, voice/model
 discovery, and real-audio tests. Text generation and hosted-provider routing do
 not live here.
 
+Synthesis finals distinguish complete returned audio from already-delivered
+streamed audio with explicit `Complete` and `Streamed` output variants. No
+empty byte buffer stands in for a stream, and platform backends never own
+speaker playback.
+
 ## Composition
 
 ```text

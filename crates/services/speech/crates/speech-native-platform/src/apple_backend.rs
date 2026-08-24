@@ -18,8 +18,8 @@ use speech_native_types::{
     PlatformTarget, SpeechBackend, SpeechBackendDescriptor, SpeechBackendKind,
     SpeechBackendReadiness, SpeechCancellation, SpeechError, SpeechErrorClass, SpeechRequestId,
     SpeechResolvedRoute, SpeechRouteSelector, SpeechUsage, SynthesisEvent, SynthesisInput,
-    SynthesisRequest, SynthesisResponse, SynthesisTicket, TaskSupervisor, TaskSupervisorError,
-    TranscriptionRequest, TranscriptionTicket, UsageProvenance, VoiceSelector,
+    SynthesisOutput, SynthesisRequest, SynthesisResponse, SynthesisTicket, TaskSupervisor,
+    TaskSupervisorError, TranscriptionRequest, TranscriptionTicket, UsageProvenance, VoiceSelector,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -564,8 +564,10 @@ fn run_synthesis(
         SynthesisResponse {
             request_id: request_id.clone(),
             route,
-            audio,
-            format: AudioOutputFormat::Wav,
+            output: SynthesisOutput::Complete {
+                audio,
+                format: AudioOutputFormat::Wav,
+            },
             duration_ms: Some(duration_ms),
             alignments: Vec::new(),
             usage: SpeechUsage {
@@ -966,9 +968,13 @@ mod tests {
             }
         }
         let response = ticket.final_response().await.expect("final WAV response");
-        assert!(response.audio.starts_with(b"RIFF"));
-        assert_eq!(response.audio.get(8..12), Some(b"WAVE".as_slice()));
-        assert!(response.audio.len() > 44);
+        let SynthesisOutput::Complete { audio, format } = &response.output else {
+            panic!("Apple buffer synthesis must return complete audio");
+        };
+        assert_eq!(*format, AudioOutputFormat::Wav);
+        assert!(audio.starts_with(b"RIFF"));
+        assert_eq!(audio.get(8..12), Some(b"WAVE".as_slice()));
+        assert!(audio.len() > 44);
         assert!(response.duration_ms.is_some_and(|duration| duration > 0));
         assert!(response.usage.real_local_inference);
         assert_eq!(events.len(), 2);

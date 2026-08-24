@@ -90,7 +90,7 @@ fn probe_synthesis(observed_at_unix_ms: u64) -> SpeechBackendDescriptor {
                         phoneme_alignment: false,
                         pause_resume: false,
                         voice_selection: true,
-                        returned_audio: vec![AudioOutputKind::Wav, AudioOutputKind::DirectPlayback],
+                        returned_audio: vec![AudioOutputKind::Wav],
                     }),
                     availability: CapabilityAvailability::Available,
                     network: NetworkBehavior::Never,

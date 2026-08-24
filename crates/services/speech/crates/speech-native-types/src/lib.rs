@@ -572,11 +572,37 @@ pub struct TranscriptionResponse {
 pub struct SynthesisResponse {
     pub request_id: SpeechRequestId,
     pub route: SpeechResolvedRoute,
-    pub audio: Vec<u8>,
-    pub format: AudioOutputFormat,
+    pub output: SynthesisOutput,
     pub duration_ms: Option<u64>,
     pub alignments: Vec<SpeechAlignment>,
     pub usage: SpeechUsage,
+}
+
+/// The authoritative disposition of synthesized audio.
+///
+/// A complete response owns the returned bytes. A streamed response records
+/// that the bytes were already delivered through [`SynthesisEvent::Audio`]
+/// and never represents that state with an empty compatibility buffer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SynthesisOutput {
+    Complete {
+        audio: Vec<u8>,
+        format: AudioOutputFormat,
+    },
+    Streamed {
+        format: AudioOutputFormat,
+        emitted_bytes: u64,
+    },
+}
+
+impl SynthesisOutput {
+    #[must_use]
+    pub const fn format(&self) -> &AudioOutputFormat {
+        match self {
+            Self::Complete { format, .. } | Self::Streamed { format, .. } => format,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1017,7 +1043,6 @@ pub enum AudioOutputKind {
     Wav,
     Mp3,
     OggOpus,
-    DirectPlayback,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1582,6 +1607,35 @@ mod tests {
             request.context.routing.privacy,
             SpeechPrivacyPolicy::LocalOnly
         );
+    }
+
+    #[test]
+    fn synthesis_output_distinguishes_complete_bytes_from_stream_delivery() {
+        let complete = SynthesisOutput::Complete {
+            audio: b"RIFFfixtureWAVE".to_vec(),
+            format: AudioOutputFormat::Wav,
+        };
+        let streamed = SynthesisOutput::Streamed {
+            format: AudioOutputFormat::Pcm {
+                format: PcmFormat {
+                    sample_rate_hz: 24_000,
+                    channels: 1,
+                    sample_format: PcmSampleFormat::I16Le,
+                    interleaved: true,
+                },
+            },
+            emitted_bytes: 4_096,
+        };
+
+        let complete_json = serde_json::to_value(&complete).expect("serialize complete output");
+        let streamed_json = serde_json::to_value(&streamed).expect("serialize streamed output");
+        assert_eq!(complete_json["kind"], "complete");
+        assert!(complete_json.get("audio").is_some());
+        assert_eq!(streamed_json["kind"], "streamed");
+        assert_eq!(streamed_json["emitted_bytes"], 4_096);
+        assert!(streamed_json.get("audio").is_none());
+        assert!(matches!(complete.format(), &AudioOutputFormat::Wav));
+        assert!(matches!(streamed.format(), &AudioOutputFormat::Pcm { .. }));
     }
 
     #[test]

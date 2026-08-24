@@ -2587,9 +2587,9 @@ mod tests {
         SpeechBackendReadiness, SpeechCancellation, SpeechCapability, SpeechCapabilityLimits,
         SpeechDeadlinePolicy, SpeechOperationCapability, SpeechRequestContext, SpeechResolvedRoute,
         SpeechRoutingPolicy, SpeechUsage, SynthesisCapabilities, SynthesisEvent, SynthesisInput,
-        SynthesisResponse, TimestampGranularity, TranscriptionCapabilities, TranscriptionInput,
-        TranscriptionResponse, TranscriptionTask, UsageProvenance, VoiceDescriptor, VoiceQuality,
-        VoiceSelector,
+        SynthesisOutput, SynthesisResponse, TimestampGranularity, TranscriptionCapabilities,
+        TranscriptionInput, TranscriptionResponse, TranscriptionTask, UsageProvenance,
+        VoiceDescriptor, VoiceQuality, VoiceSelector,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{mpsc, oneshot};
@@ -3147,8 +3147,10 @@ mod tests {
             let response = SynthesisResponse {
                 request_id: request_id.clone(),
                 route: route.clone(),
-                audio: b"RIFFfixtureWAVE".to_vec(),
-                format: AudioOutputFormat::Wav,
+                output: SynthesisOutput::Complete {
+                    audio: b"RIFFfixtureWAVE".to_vec(),
+                    format: AudioOutputFormat::Wav,
+                },
                 duration_ms: Some(1),
                 alignments: Vec::new(),
                 usage: SpeechUsage {
@@ -3378,8 +3380,10 @@ mod tests {
                 backend_kind: SpeechBackendKind::EmbeddedModel,
                 network: NetworkBehavior::Never,
             },
-            audio: b"RIFFfixtureWAVE".to_vec(),
-            format: AudioOutputFormat::Wav,
+            output: SynthesisOutput::Complete {
+                audio: b"RIFFfixtureWAVE".to_vec(),
+                format: AudioOutputFormat::Wav,
+            },
             duration_ms: Some(1),
             alignments: Vec::new(),
             usage: SpeechUsage::default(),
