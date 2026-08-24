@@ -611,26 +611,58 @@ pub(crate) fn commit_generated_exchange(
     expected_draft: Option<&DraftMessage>,
 ) -> Result<PathBuf> {
     let _lifecycle = lock_attachment_lifecycle()?;
-    let (store, conversation_db, attachment_db, drafts) = prepare_generated_exchange_documents(
-        fallback_db,
-        &conversation,
-        expected_active_leaf,
-        generated_message_ids,
-        staged_ids,
-        user_message_id,
-        expected_draft,
+    let settings = resolve_settings()?;
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    let migrated_conversation_db = load_db().unwrap_or(fallback_db);
+    let migrated_attachment_db = load_attachment_db()?;
+    let migrated_drafts = load_drafts()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        || migrated_conversation_db,
+        |conversation_db, documents| {
+            crate::personas::reject_removed_conversation_id_from_documents(
+                &conversation.id,
+                documents,
+            )?;
+            crate::personas::reject_removed_conversation_writes_from_documents(
+                conversation_db,
+                documents,
+            )?;
+            merge_generated_conversation(
+                conversation_db,
+                &conversation,
+                expected_active_leaf,
+                generated_message_ids,
+            )?;
+
+            let mut attachment_db = documents
+                .get(ATTACHMENTS_NAMESPACE)?
+                .unwrap_or(migrated_attachment_db);
+            for attachment_id in staged_ids {
+                let record = attachment_db
+                    .attachments
+                    .iter_mut()
+                    .find(|record| record.id == *attachment_id)
+                    .ok_or_else(|| {
+                        anyhow!("staged attachment {attachment_id} disappeared before commit")
+                    })?;
+                if record.conversation_id != conversation.id
+                    || record.state != AttachmentState::Staged
+                {
+                    return Err(anyhow!(
+                        "staged attachment {attachment_id} changed ownership or state before commit"
+                    ));
+                }
+                record.state = AttachmentState::Committed;
+                record.message_id = user_message_id.to_string();
+            }
+            let mut drafts = documents.get(DRAFTS_NAMESPACE)?.unwrap_or(migrated_drafts);
+            consume_exact_draft(&mut drafts, expected_draft, staged_ids);
+            documents.put_bytes(ATTACHMENTS_NAMESPACE, &serde_json::to_vec(&attachment_db)?)?;
+            documents.put_bytes(DRAFTS_NAMESPACE, &serde_json::to_vec(&drafts)?)?;
+            Ok(())
+        },
     )?;
-    store.put_documents_atomically([
-        (
-            CONVERSATIONS_NAMESPACE.to_string(),
-            serde_json::to_vec(&conversation_db)?,
-        ),
-        (
-            ATTACHMENTS_NAMESPACE.to_string(),
-            serde_json::to_vec(&attachment_db)?,
-        ),
-        (DRAFTS_NAMESPACE.to_string(), serde_json::to_vec(&drafts)?),
-    ])?;
     Ok(store.path().to_path_buf())
 }
 
@@ -667,6 +699,14 @@ where
             let mut conversation_db = documents
                 .get(CONVERSATIONS_NAMESPACE)?
                 .unwrap_or(migrated_conversation_db);
+            crate::personas::reject_removed_conversation_id_from_documents(
+                &conversation.id,
+                documents,
+            )?;
+            crate::personas::reject_removed_conversation_writes_from_documents(
+                &conversation_db,
+                documents,
+            )?;
             merge_generated_conversation(
                 &mut conversation_db,
                 &conversation,
@@ -712,46 +752,6 @@ where
     Ok((store.path().to_path_buf(), result))
 }
 
-fn prepare_generated_exchange_documents(
-    fallback_db: ConversationDb,
-    conversation: &Conversation,
-    expected_active_leaf: Option<&str>,
-    generated_message_ids: &[String],
-    staged_ids: &[String],
-    user_message_id: &str,
-    expected_draft: Option<&DraftMessage>,
-) -> Result<(RuntimeStore, ConversationDb, AttachmentDb, DraftDb)> {
-    let settings = resolve_settings()?;
-    let store = RuntimeStore::open(&settings.data_dir)?;
-    let mut conversation_db = load_db().unwrap_or(fallback_db);
-    merge_generated_conversation(
-        &mut conversation_db,
-        conversation,
-        expected_active_leaf,
-        generated_message_ids,
-    )?;
-    let mut attachment_db = load_attachment_db()?;
-    for attachment_id in staged_ids {
-        let record = attachment_db
-            .attachments
-            .iter_mut()
-            .find(|record| record.id == *attachment_id)
-            .ok_or_else(|| {
-                anyhow!("staged attachment {attachment_id} disappeared before commit")
-            })?;
-        if record.conversation_id != conversation.id || record.state != AttachmentState::Staged {
-            return Err(anyhow!(
-                "staged attachment {attachment_id} changed ownership or state before commit"
-            ));
-        }
-        record.state = AttachmentState::Committed;
-        record.message_id = user_message_id.to_string();
-    }
-    let mut drafts = load_drafts()?;
-    consume_exact_draft(&mut drafts, expected_draft, staged_ids);
-    Ok((store, conversation_db, attachment_db, drafts))
-}
-
 fn consume_exact_draft(
     drafts: &mut DraftDb,
     expected_draft: Option<&DraftMessage>,
@@ -779,15 +779,50 @@ pub(crate) fn snapshot_message_attachments(
     messages: &mut [Message],
 ) -> Result<()> {
     let _lifecycle = lock_attachment_lifecycle()?;
-    let mut db = load_attachment_db()?;
+    let migrated = load_attachment_db()?;
+    RuntimeStore::current()?.mutate_documents(
+        ATTACHMENTS_NAMESPACE,
+        || migrated,
+        |db, documents| {
+            snapshot_message_attachments_in_documents(
+                target_conversation_id,
+                messages,
+                db,
+                documents,
+            )
+        },
+    )
+}
+
+pub(crate) fn snapshot_message_attachments_from_documents(
+    target_conversation_id: &str,
+    messages: &mut [Message],
+    documents: &mut DocumentMutations<'_, '_, '_>,
+) -> Result<()> {
+    let mut db = documents
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default();
+    snapshot_message_attachments_in_documents(
+        target_conversation_id,
+        messages,
+        &mut db,
+        documents,
+    )?;
+    documents.put_bytes(ATTACHMENTS_NAMESPACE, &serde_json::to_vec(&db)?)
+}
+
+fn snapshot_message_attachments_in_documents(
+    target_conversation_id: &str,
+    messages: &mut [Message],
+    db: &mut AttachmentDb,
+    documents: &mut DocumentMutations<'_, '_, '_>,
+) -> Result<()> {
     let by_id = db
         .attachments
         .iter()
         .cloned()
         .map(|record| (record.id.clone(), record))
         .collect::<HashMap<_, _>>();
-    let store = RuntimeStore::current()?;
-    let mut manifests = Vec::new();
     for message in messages {
         let mut replacements = Vec::with_capacity(message.attachment_ids.len());
         for source_id in &message.attachment_ids {
@@ -804,22 +839,19 @@ pub(crate) fn snapshot_message_attachments(
             snapshot.message_id = message.id.clone();
             snapshot.created_at = now_ms().to_string();
             if let Some(namespace) = source.manifest_namespace.as_deref() {
-                let mut manifest = store
+                let mut manifest = documents
                     .get::<AttachmentManifest>(namespace)?
                     .ok_or_else(|| anyhow!("source attachment manifest is missing"))?;
                 let new_namespace = format!("attachment.manifest.{snapshot_id}");
                 manifest.attachment_id = snapshot_id.clone();
                 snapshot.manifest_namespace = Some(new_namespace.clone());
-                manifests.push((new_namespace, serde_json::to_vec(&manifest)?));
+                documents.put_bytes(&new_namespace, &serde_json::to_vec(&manifest)?)?;
             }
             db.attachments.push(snapshot);
             replacements.push(snapshot_id);
         }
         message.attachment_ids = replacements;
     }
-    let mut documents = vec![(ATTACHMENTS_NAMESPACE.to_string(), serde_json::to_vec(&db)?)];
-    documents.extend(manifests);
-    store.put_documents_atomically(documents)?;
     Ok(())
 }
 
@@ -1164,9 +1196,9 @@ fn persist_state_with_attachment_gc(state: AttachmentGcState<'_>) -> Result<Path
                 }
             }
 
-            if let Some(mut conversations) = conversations_to_write.clone() {
-                crate::personas::filter_removed_personas_from_documents(
-                    &mut conversations,
+            if let Some(conversations) = conversations_to_write.clone() {
+                crate::personas::reject_removed_conversation_writes_from_documents(
+                    &conversations,
                     documents,
                 )?;
                 documents.put_bytes(
@@ -1325,7 +1357,7 @@ fn attachment_kind(format: Option<DetectedFormat>) -> AttachmentKind {
     }
 }
 
-fn lock_attachment_lifecycle() -> Result<MutexGuard<'static, ()>> {
+pub(crate) fn lock_attachment_lifecycle() -> Result<MutexGuard<'static, ()>> {
     ATTACHMENT_LIFECYCLE_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()

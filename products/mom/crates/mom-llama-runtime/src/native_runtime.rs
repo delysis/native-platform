@@ -5,8 +5,8 @@ use crate::store::{DocumentMutations, DocumentSnapshot};
 use llama_native_cache::PrefixCacheValue;
 use llama_native_engine::NativeModelHandle;
 use llama_native_host::{
-    HostCachePolicy, NativeHost, NativeHostConfig, PrefixCacheStore, ProcessExitJoinedNativeHost,
-    SystemClock,
+    HostCachePolicy, NativeHost, NativeHostConfig, PrefixCachePromotionLease, PrefixCacheStore,
+    ProcessExitJoinedNativeHost, SystemClock,
 };
 use llama_native_types::{NativeError, NativeErrorCode, NativeModelConfig, ResidentModelStatus};
 use serde::{Deserialize, Serialize};
@@ -150,6 +150,26 @@ struct ProductPrefixCacheStore {
     store: crate::store::RuntimeStore,
 }
 
+struct ProductPrefixCachePromotionLease {
+    lease: crate::personas::PersonaCacheOwnerLease,
+}
+
+impl PrefixCachePromotionLease for ProductPrefixCachePromotionLease {
+    fn owner_generation(&self) -> u64 {
+        self.lease.owner_generation()
+    }
+
+    fn validate(&self) -> Result<(), NativeError> {
+        match self.lease.validate().map_err(prefix_store_error)? {
+            true => Ok(()),
+            false => Err(NativeError::new(
+                NativeErrorCode::CacheIncompatible,
+                "Persona cache owner generation changed before live promotion",
+            )),
+        }
+    }
+}
+
 impl ProductPrefixCacheStore {
     fn document(namespace: &str) -> String {
         format!("native-host-prefix-cache.{namespace}")
@@ -261,6 +281,21 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
                     Ok(())
                 },
             )
+            .map_err(prefix_store_error)
+    }
+
+    fn acquire_owner_promotion_lease(
+        &self,
+        _namespace: &str,
+        owner_id: &str,
+    ) -> Result<Option<Box<dyn PrefixCachePromotionLease>>, NativeError> {
+        crate::personas::acquire_persona_cache_owner_lease(&self.store, owner_id)
+            .map(|lease| {
+                lease.map(|lease| {
+                    Box::new(ProductPrefixCachePromotionLease { lease })
+                        as Box<dyn PrefixCachePromotionLease>
+                })
+            })
             .map_err(prefix_store_error)
     }
 

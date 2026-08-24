@@ -1447,10 +1447,18 @@ pub fn load_db() -> Result<ConversationDb> {
     let legacy_path = settings.data_dir.join(CONVERSATIONS_FILE);
     store.import_json_once::<ConversationDb>(CONVERSATIONS_NAMESPACE, &legacy_path)?;
     let mut db = store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default();
-    if repair_inline_attribution_prefixes(&mut db) {
-        store.put(CONVERSATIONS_NAMESPACE, &db)?;
+    if !repair_inline_attribution_prefixes(&mut db) {
+        return Ok(db);
     }
-    Ok(db)
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |current, documents| {
+            repair_inline_attribution_prefixes(current);
+            crate::personas::reject_removed_conversation_writes_from_documents(current, documents)?;
+            Ok(current.clone())
+        },
+    )
 }
 
 pub fn save_db(db: &ConversationDb) -> Result<PathBuf> {
@@ -1460,8 +1468,8 @@ pub fn save_db(db: &ConversationDb) -> Result<PathBuf> {
         CONVERSATIONS_NAMESPACE,
         ConversationDb::default,
         |stored, documents| {
-            let mut next = db.clone();
-            crate::personas::filter_removed_personas_from_documents(&mut next, documents)?;
+            let next = db.clone();
+            crate::personas::reject_removed_conversation_writes_from_documents(&next, documents)?;
             *stored = next;
             Ok(())
         },
@@ -1477,10 +1485,12 @@ pub fn get_or_create_conversation(id: &str) -> Result<(ConversationDb, Conversat
         .any(|conversation| conversation.id == id);
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    store.mutate(
+    store.mutate_documents(
         CONVERSATIONS_NAMESPACE,
         || imported,
-        |db: &mut ConversationDb| {
+        |db: &mut ConversationDb, documents| {
+            crate::personas::reject_removed_conversation_id_from_documents(id, documents)?;
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
             if let Some(conversation) = db
                 .conversations
                 .iter()
@@ -1525,10 +1535,15 @@ pub fn upsert_conversation(db: ConversationDb, conversation: Conversation) -> Re
         CONVERSATIONS_NAMESPACE,
         &settings.data_dir.join(CONVERSATIONS_FILE),
     )?;
-    store.mutate(
+    store.mutate_documents(
         CONVERSATIONS_NAMESPACE,
         || db,
-        |current: &mut ConversationDb| {
+        |current: &mut ConversationDb, documents| {
+            crate::personas::reject_removed_conversation_id_from_documents(
+                &conversation.id,
+                documents,
+            )?;
+            crate::personas::reject_removed_conversation_writes_from_documents(current, documents)?;
             if let Some(existing) = current
                 .conversations
                 .iter_mut()

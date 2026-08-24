@@ -7,7 +7,7 @@ use crate::config::{Settings, resolve_settings};
 use crate::conversation_store::{
     CONVERSATIONS_NAMESPACE, Conversation, ConversationDb, ConversationExecutionProfile,
     ConversationKind, Message, MessageAttribution, MessageRole, MessageSpeakerKind, active_leaf_id,
-    active_path_messages, load_db, save_db, strip_reserved_attribution_prefix,
+    active_path_messages, load_db, strip_reserved_attribution_prefix, upsert_conversation,
 };
 use crate::kv_cache::ensure_persona_prefix;
 use crate::mcp::{
@@ -2134,6 +2134,10 @@ fn finalize_persona_tool_approval(
             finish_stored_mention_invocation(stored, &mut conversations);
             let invocation = stored.invocation.clone();
             write_active_approval_index(db, documents)?;
+            crate::personas::reject_removed_conversation_writes_from_documents(
+                &conversations,
+                documents,
+            )?;
             documents.put_bytes(
                 CONVERSATIONS_NAMESPACE,
                 &serde_json::to_vec(&conversations)?,
@@ -2469,6 +2473,10 @@ fn reconcile_persona_tool_approval_set(
             }
             if changed {
                 write_active_approval_index(db, documents)?;
+                crate::personas::reject_removed_conversation_writes_from_documents(
+                    &conversations,
+                    documents,
+                )?;
                 documents.put_bytes(
                     CONVERSATIONS_NAMESPACE,
                     &serde_json::to_vec(&conversations)?,
@@ -2867,7 +2875,8 @@ pub fn mention_synthesize(invocation_id: &str) -> Result<CommandResult<MentionSy
     });
     host.active_leaf_message_id = Some(message_id.clone());
     host.updated_at = now_ms().to_string();
-    let conversation_path = save_db(&db)?;
+    let updated_host = host.clone();
+    let conversation_path = upsert_conversation(db, updated_host)?;
     let synthesis_sha256 = format!("{:x}", Sha256::digest(output.text.as_bytes()));
     store.mutate(INVOCATIONS_NAMESPACE, MentionInvocationDb::default, |db| {
         if let Some(stored) = db

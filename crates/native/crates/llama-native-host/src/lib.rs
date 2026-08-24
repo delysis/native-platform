@@ -46,12 +46,46 @@ pub trait PrefixCacheStore: Send + Sync {
     fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError>;
     fn delete(&self, namespace: &str, id: &str) -> Result<(), NativeError>;
 
+    /// Acquires the product-owned authority needed to expose one owner's
+    /// persistent cache bytes as a live in-memory capability. A product that
+    /// has revocable owners must keep this lease valid through the final live
+    /// insertion. `None` means the owner no longer has cache authority.
+    fn acquire_owner_promotion_lease(
+        &self,
+        _namespace: &str,
+        _owner_id: &str,
+    ) -> Result<Option<Box<dyn PrefixCachePromotionLease>>, NativeError> {
+        Ok(Some(Box::new(UnrestrictedPrefixCachePromotionLease)))
+    }
+
     fn clear(&self, namespace: &str) -> Result<usize, NativeError> {
         let values = self.load(namespace)?;
         for value in &values {
             self.delete(namespace, &value.metadata.id)?;
         }
         Ok(values.len())
+    }
+}
+
+/// Product-owned proof that one exact cache owner generation remains live.
+///
+/// This is deliberately opaque to the host. The product may back it with a
+/// tombstone transaction, a cross-process lock, or both. The host only holds
+/// and revalidates it at the live-capability boundary.
+pub trait PrefixCachePromotionLease {
+    fn owner_generation(&self) -> u64;
+    fn validate(&self) -> Result<(), NativeError>;
+}
+
+struct UnrestrictedPrefixCachePromotionLease;
+
+impl PrefixCachePromotionLease for UnrestrictedPrefixCachePromotionLease {
+    fn owner_generation(&self) -> u64 {
+        0
+    }
+
+    fn validate(&self) -> Result<(), NativeError> {
+        Ok(())
     }
 }
 
@@ -266,6 +300,7 @@ struct ResidentEntry {
 struct HostState {
     slots: BTreeMap<usize, ResidentEntry>,
     cache: MemoryPrefixCache,
+    cache_owner_generations: BTreeMap<String, u64>,
     phase: HostPhase,
     joined_worker_count: usize,
 }
@@ -342,6 +377,7 @@ impl NativeHost {
             state: Mutex::new(HostState {
                 slots: BTreeMap::new(),
                 cache: MemoryPrefixCache::new(config.memory_cache_bytes),
+                cache_owner_generations: BTreeMap::new(),
                 phase: HostPhase::Running,
                 joined_worker_count: 0,
             }),
@@ -841,6 +877,17 @@ impl NativeHost {
         if !self.config.cache_policy.allows_memory() {
             return None;
         }
+        let promotion_lease = match (self.persistent_cache.as_ref(), owner_scope) {
+            (Some(store), CacheOwnerScope::Exact(owner_id)) => Some(
+                store
+                    .acquire_owner_promotion_lease(&self.config.cache_namespace, owner_id)
+                    .ok()??,
+            ),
+            _ => None,
+        };
+        if let Some(lease) = &promotion_lease {
+            lease.validate().ok()?;
+        }
         let now = self.clock.now_ms();
         self.state.lock().ok()?.cache.lookup_in_scope(
             fingerprint,
@@ -867,17 +914,43 @@ impl NativeHost {
         if !self.config.cache_policy.allows_memory() {
             return Ok(Vec::new());
         }
+        let owner_generation = value.metadata.owner_id.as_deref().map(|owner_id| {
+            self.state
+                .lock()
+                .map(|state| cache_owner_generation(&state, owner_id))
+                .map_err(host_poisoned)
+        });
+        let owner_generation = owner_generation.transpose()?;
+        let promotion_lease = match (
+            self.persistent_cache.as_ref(),
+            value.metadata.owner_id.as_deref(),
+        ) {
+            (Some(store), Some(owner_id)) => {
+                let Some(lease) =
+                    store.acquire_owner_promotion_lease(&self.config.cache_namespace, owner_id)?
+                else {
+                    return Ok(Vec::new());
+                };
+                Some(lease)
+            }
+            _ => None,
+        };
         if self.config.cache_policy.allows_persistent()
             && let Some(store) = &self.persistent_cache
         {
             store.save(&self.config.cache_namespace, &value)?;
         }
-        let evicted = self
-            .state
-            .lock()
-            .map_err(host_poisoned)?
-            .cache
-            .insert(value);
+        if let Some(lease) = &promotion_lease {
+            lease.validate()?;
+        }
+        let mut state = self.state.lock().map_err(host_poisoned)?;
+        if let (Some(owner_id), Some(expected_generation)) =
+            (value.metadata.owner_id.as_deref(), owner_generation)
+            && cache_owner_generation(&state, owner_id) != expected_generation
+        {
+            return Ok(Vec::new());
+        }
+        let evicted = state.cache.insert(value);
         Ok(evicted)
     }
 
@@ -885,12 +958,13 @@ impl NativeHost {
     /// Product-owned persistence must be changed by the product transaction
     /// that removes the corresponding authority.
     pub fn invalidate_live_cache_owner(&self, owner_id: &str) -> Result<usize, NativeError> {
-        let removed = self
-            .state
-            .lock()
-            .map_err(host_poisoned)?
-            .cache
-            .invalidate_owner(owner_id);
+        let mut state = self.state.lock().map_err(host_poisoned)?;
+        let generation = state
+            .cache_owner_generations
+            .entry(owner_id.to_string())
+            .or_default();
+        *generation = generation.saturating_add(1);
+        let removed = state.cache.invalidate_owner(owner_id);
         Ok(removed.len())
     }
 
@@ -902,13 +976,51 @@ impl NativeHost {
             return Ok(0);
         };
         let values = store.load(&self.config.cache_namespace)?;
-        let mut state = self.state.lock().map_err(host_poisoned)?;
         let mut restored = 0;
-        for value in values {
-            if value.is_valid() {
-                state.cache.insert(value);
-                restored += 1;
+        for candidate in values {
+            if !candidate.is_valid() {
+                continue;
             }
+            let owner_generation = candidate.metadata.owner_id.as_deref().map(|owner_id| {
+                self.state
+                    .lock()
+                    .map(|state| cache_owner_generation(&state, owner_id))
+                    .map_err(host_poisoned)
+            });
+            let owner_generation = owner_generation.transpose()?;
+            let promotion_lease = match candidate.metadata.owner_id.as_deref() {
+                Some(owner_id) => {
+                    let Some(lease) = store
+                        .acquire_owner_promotion_lease(&self.config.cache_namespace, owner_id)?
+                    else {
+                        continue;
+                    };
+                    Some(lease)
+                }
+                None => None,
+            };
+            let Some(value) = store
+                .load(&self.config.cache_namespace)?
+                .into_iter()
+                .find(|value| value.metadata.id == candidate.metadata.id)
+            else {
+                continue;
+            };
+            if !value.is_valid() || value != candidate {
+                continue;
+            }
+            if let Some(lease) = &promotion_lease {
+                lease.validate()?;
+            }
+            let mut state = self.state.lock().map_err(host_poisoned)?;
+            if let (Some(owner_id), Some(expected_generation)) =
+                (value.metadata.owner_id.as_deref(), owner_generation)
+                && cache_owner_generation(&state, owner_id) != expected_generation
+            {
+                continue;
+            }
+            state.cache.insert(value);
+            restored += 1;
         }
         Ok(restored)
     }
@@ -931,6 +1043,14 @@ impl NativeHost {
         let persistent_entries = store.clear(&self.config.cache_namespace)?;
         Ok(memory_entries.saturating_add(persistent_entries))
     }
+}
+
+fn cache_owner_generation(state: &HostState, owner_id: &str) -> u64 {
+    state
+        .cache_owner_generations
+        .get(owner_id)
+        .copied()
+        .unwrap_or_default()
 }
 
 fn host_poisoned<T>(_error: std::sync::PoisonError<T>) -> NativeError {
@@ -1097,6 +1217,70 @@ mod tests {
         }
 
         fn delete(&self, _namespace: &str, _id: &str) -> Result<(), NativeError> {
+            Ok(())
+        }
+    }
+
+    struct BlockingSavePrefixStore {
+        values: Mutex<Vec<PrefixCacheValue>>,
+        save_committed: Arc<Barrier>,
+        release_save: Arc<Barrier>,
+    }
+
+    impl PrefixCacheStore for BlockingSavePrefixStore {
+        fn load(&self, _namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
+            Ok(self.values.lock().expect("test store lock").clone())
+        }
+
+        fn save(&self, _namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
+            let mut values = self.values.lock().expect("test store lock");
+            values.retain(|candidate| candidate.metadata.id != value.metadata.id);
+            values.push(value.clone());
+            drop(values);
+            self.save_committed.wait();
+            self.release_save.wait();
+            Ok(())
+        }
+
+        fn delete(&self, _namespace: &str, id: &str) -> Result<(), NativeError> {
+            self.values
+                .lock()
+                .expect("test store lock")
+                .retain(|candidate| candidate.metadata.id != id);
+            Ok(())
+        }
+    }
+
+    struct BlockingRestorePrefixStore {
+        values: Mutex<Vec<PrefixCacheValue>>,
+        load_calls: AtomicUsize,
+        authoritative_reload: Arc<Barrier>,
+        release_reload: Arc<Barrier>,
+    }
+
+    impl PrefixCacheStore for BlockingRestorePrefixStore {
+        fn load(&self, _namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
+            let call = self.load_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 1 {
+                self.authoritative_reload.wait();
+                self.release_reload.wait();
+            }
+            Ok(self.values.lock().expect("test store lock").clone())
+        }
+
+        fn save(&self, _namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
+            self.values
+                .lock()
+                .expect("test store lock")
+                .push(value.clone());
+            Ok(())
+        }
+
+        fn delete(&self, _namespace: &str, id: &str) -> Result<(), NativeError> {
+            self.values
+                .lock()
+                .expect("test store lock")
+                .retain(|candidate| candidate.metadata.id != id);
             Ok(())
         }
     }
@@ -1678,6 +1862,148 @@ mod tests {
         assert!(
             host.cache_lookup(&value.metadata.fingerprint, &[1, 2])
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn owner_invalidation_generation_rejects_post_save_live_promotion() {
+        let save_committed = Arc::new(Barrier::new(2));
+        let release_save = Arc::new(Barrier::new(2));
+        let store = Arc::new(BlockingSavePrefixStore {
+            values: Mutex::new(Vec::new()),
+            save_committed: Arc::clone(&save_committed),
+            release_save: Arc::clone(&release_save),
+        });
+        let host = Arc::new(NativeHost::with_dependencies(
+            NativeHostConfig::default(),
+            Arc::new(SystemClock),
+            Some(store),
+        ));
+        let mut value = cache_value("generation-race", 1);
+        value.metadata = value.metadata.with_owner("persona-generation-race");
+        let worker_host = Arc::clone(&host);
+        let worker_value = value.clone();
+        let worker = thread::spawn(move || worker_host.cache_insert(worker_value));
+
+        save_committed.wait();
+        assert_eq!(
+            host.invalidate_live_cache_owner("persona-generation-race")
+                .expect("invalidate exact owner"),
+            0
+        );
+        release_save.wait();
+        assert!(
+            worker
+                .join()
+                .expect("cache insertion worker")
+                .expect("cache insertion result")
+                .is_empty()
+        );
+        assert!(
+            host.cache_lookup_for_owner(
+                &value.metadata.fingerprint,
+                &value.sequence.token_ids,
+                "persona-generation-race",
+            )
+            .is_none(),
+            "an invalidation generation must overtake a stale post-save promotion"
+        );
+    }
+
+    #[test]
+    fn owner_invalidation_generation_rejects_post_load_restore() {
+        let authoritative_reload = Arc::new(Barrier::new(2));
+        let release_reload = Arc::new(Barrier::new(2));
+        let mut value = cache_value("restore-generation-race", 1);
+        value.metadata = value.metadata.with_owner("persona-restore-generation-race");
+        let store = Arc::new(BlockingRestorePrefixStore {
+            values: Mutex::new(vec![value.clone()]),
+            load_calls: AtomicUsize::new(0),
+            authoritative_reload: Arc::clone(&authoritative_reload),
+            release_reload: Arc::clone(&release_reload),
+        });
+        let host = Arc::new(NativeHost::with_dependencies(
+            NativeHostConfig::default(),
+            Arc::new(SystemClock),
+            Some(store),
+        ));
+        let worker_host = Arc::clone(&host);
+        let worker = thread::spawn(move || worker_host.restore_persistent_cache());
+
+        authoritative_reload.wait();
+        assert_eq!(
+            host.invalidate_live_cache_owner("persona-restore-generation-race")
+                .expect("invalidate exact owner"),
+            0
+        );
+        release_reload.wait();
+        assert_eq!(
+            worker
+                .join()
+                .expect("cache restore worker")
+                .expect("cache restore result"),
+            0
+        );
+        assert!(
+            host.cache_lookup_for_owner(
+                &value.metadata.fingerprint,
+                &value.sequence.token_ids,
+                "persona-restore-generation-race",
+            )
+            .is_none(),
+            "an invalidation generation must overtake a stale persistent restore"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_same_id_owner_replacement_after_lease_capture() {
+        let authoritative_reload = Arc::new(Barrier::new(2));
+        let release_reload = Arc::new(Barrier::new(2));
+        let mut original = cache_value("restore-owner-race", 1);
+        original.metadata = original.metadata.with_owner("persona-original-owner");
+        let store = Arc::new(BlockingRestorePrefixStore {
+            values: Mutex::new(vec![original.clone()]),
+            load_calls: AtomicUsize::new(0),
+            authoritative_reload: Arc::clone(&authoritative_reload),
+            release_reload: Arc::clone(&release_reload),
+        });
+        let host = Arc::new(NativeHost::with_dependencies(
+            NativeHostConfig::default(),
+            Arc::new(SystemClock),
+            Some(Arc::clone(&store) as Arc<dyn PrefixCacheStore>),
+        ));
+        let worker_host = Arc::clone(&host);
+        let worker = thread::spawn(move || worker_host.restore_persistent_cache());
+
+        authoritative_reload.wait();
+        let mut replacement = original.clone();
+        replacement.metadata = replacement.metadata.with_owner("persona-replacement-owner");
+        *store.values.lock().expect("test store lock") = vec![replacement];
+        release_reload.wait();
+
+        assert_eq!(
+            worker
+                .join()
+                .expect("cache restore worker")
+                .expect("cache restore result"),
+            0
+        );
+        assert!(
+            host.cache_lookup_for_owner(
+                &original.metadata.fingerprint,
+                &original.sequence.token_ids,
+                "persona-original-owner",
+            )
+            .is_none()
+        );
+        assert!(
+            host.cache_lookup_for_owner(
+                &original.metadata.fingerprint,
+                &original.sequence.token_ids,
+                "persona-replacement-owner",
+            )
+            .is_none(),
+            "a same-ID owner replacement must not inherit the captured owner's lease"
         );
     }
 }
