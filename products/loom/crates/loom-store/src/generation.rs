@@ -3691,6 +3691,66 @@ mod tests {
         forbidden_primary_chrome: Vec<String>,
     }
 
+    #[derive(Deserialize)]
+    struct CompletionRecoveryFixture {
+        schema_version: u32,
+        fixture_id: String,
+        evidence_class: String,
+        source: CompletionRecoverySource,
+        autosave: CompletionRecoveryAutosave,
+        models: CompletionRecoveryModels,
+        family: Vec<CompletionRecoveryRun>,
+    }
+
+    #[derive(Deserialize)]
+    struct CompletionRecoverySource {
+        relative_path: String,
+        revision_text: String,
+        caret_byte: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct CompletionRecoveryAutosave {
+        revision_text: String,
+    }
+
+    #[derive(Deserialize)]
+    struct CompletionRecoveryModels {
+        initial: String,
+        replacement: String,
+    }
+
+    #[derive(Deserialize)]
+    struct CompletionRecoveryRun {
+        run_id: String,
+        branch_id: String,
+        seed: u64,
+        terminal: CompletionRecoveryTerminal,
+    }
+
+    #[derive(Deserialize)]
+    struct CompletionRecoveryTerminal {
+        status: String,
+        candidate_id: Option<String>,
+        text: Option<String>,
+        sha256: Option<BlobId>,
+        error: Option<String>,
+    }
+
+    struct CompletionRecoveryWitness {
+        logical_run_id: String,
+        logical_branch_id: String,
+        run_id: GenerationRunId,
+        branch_id: BranchId,
+        seed: u64,
+        status: StoredBranchStatus,
+        terminal_status: GenerationTerminalStatus,
+        candidate_id: Option<CandidateId>,
+        output_blob_id: Option<BlobId>,
+        output_text: Option<String>,
+        error: Option<String>,
+    }
+
     struct W1FamilyReopenWitness {
         run_id: GenerationRunId,
         output_blob_id: BlobId,
@@ -4961,6 +5021,242 @@ mod tests {
         assert_eq!(interrupted_record.status, StoredBranchStatus::Interrupted);
         assert!(interrupted_record.candidate_id.is_none());
         assert!(interrupted_record.output_text.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn completion_recovery_fixture_survives_autosave_and_store_reopen() {
+        let specification: CompletionRecoveryFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/compat/completion-recovery-v1.json"
+        ))
+        .expect("parse completion recovery fixture");
+        assert_eq!(specification.schema_version, 1);
+        assert_eq!(specification.fixture_id, "loom-completion-recovery-v1");
+        assert_eq!(specification.evidence_class, "model_free_characterization");
+        assert_eq!(specification.models.initial, "test/writer");
+        assert_ne!(
+            specification.models.initial,
+            specification.models.replacement
+        );
+        assert_eq!(specification.family.len(), 6);
+
+        let mut fixture = Fixture::with_source(
+            &specification.source.relative_path,
+            &specification.source.revision_text,
+        );
+        let source_revision_id = fixture.loaded.revision_id;
+        let source_blob_id = fixture.loaded.blob_id;
+        assert_eq!(fixture.loaded.text, specification.source.revision_text);
+        assert_eq!(
+            u64::try_from(fixture.loaded.text.len()).expect("fixture source length"),
+            specification.source.caret_byte
+        );
+
+        let mut witnesses = Vec::with_capacity(specification.family.len());
+        for run in &specification.family {
+            assert!(!run.run_id.is_empty());
+            assert!(!run.branch_id.is_empty());
+            let generation = fixture.generation_start(
+                fixture.writer_environment,
+                ByteRange {
+                    start: specification.source.caret_byte,
+                    end: specification.source.caret_byte,
+                },
+                run.seed,
+            );
+            let started = fixture
+                .store
+                .start_generation(generation)
+                .expect("start recovery fixture generation");
+            let (status, terminal_status, candidate_id, output_blob_id, output_text) =
+                match run.terminal.status.as_str() {
+                    "ready" => {
+                        let expected_candidate = run
+                            .terminal
+                            .candidate_id
+                            .as_deref()
+                            .expect("ready fixture candidate alias");
+                        assert!(!expected_candidate.is_empty());
+                        assert!(run.terminal.error.is_none());
+                        let text = run.terminal.text.as_deref().expect("ready fixture text");
+                        let expected_blob_id = run.terminal.sha256.expect("ready fixture digest");
+                        let outcome = fixture.finish(started.generation.run_id, text);
+                        assert_eq!(outcome.candidate.output_blob_id, expected_blob_id);
+                        assert_eq!(
+                            outcome.terminal_event.candidate_id,
+                            Some(outcome.candidate.candidate_id)
+                        );
+                        (
+                            StoredBranchStatus::Completed,
+                            GenerationTerminalStatus::Completed,
+                            Some(outcome.candidate.candidate_id),
+                            Some(outcome.candidate.output_blob_id),
+                            Some(text.to_owned()),
+                        )
+                    }
+                    "failed" => {
+                        assert!(run.terminal.candidate_id.is_none());
+                        assert!(run.terminal.text.is_none());
+                        assert!(run.terminal.sha256.is_none());
+                        let terminal = fixture
+                            .store
+                            .finish_generation(
+                                started.generation.run_id,
+                                GenerationTerminalStatus::Failed,
+                                run.terminal.error.clone(),
+                            )
+                            .expect("finish failed recovery fixture generation");
+                        assert_eq!(terminal.error, run.terminal.error);
+                        (
+                            StoredBranchStatus::Failed,
+                            GenerationTerminalStatus::Failed,
+                            None,
+                            None,
+                            None,
+                        )
+                    }
+                    "cancelled" => {
+                        assert!(run.terminal.candidate_id.is_none());
+                        assert!(run.terminal.text.is_none());
+                        assert!(run.terminal.sha256.is_none());
+                        assert!(run.terminal.error.is_none());
+                        fixture
+                            .store
+                            .finish_generation(
+                                started.generation.run_id,
+                                GenerationTerminalStatus::Cancelled,
+                                None,
+                            )
+                            .expect("finish cancelled recovery fixture generation");
+                        (
+                            StoredBranchStatus::Cancelled,
+                            GenerationTerminalStatus::Cancelled,
+                            None,
+                            None,
+                            None,
+                        )
+                    }
+                    status => panic!("unsupported recovery fixture terminal `{status}`"),
+                };
+            assert_eq!(
+                fixture
+                    .store
+                    .generation_terminal_count(started.generation.run_id)
+                    .expect("count fixture terminal"),
+                1
+            );
+            witnesses.push(CompletionRecoveryWitness {
+                logical_run_id: run.run_id.clone(),
+                logical_branch_id: run.branch_id.clone(),
+                run_id: started.generation.run_id,
+                branch_id: started.generation.branch_id,
+                seed: run.seed,
+                status,
+                terminal_status,
+                candidate_id,
+                output_blob_id,
+                output_text,
+                error: run.terminal.error.clone(),
+            });
+        }
+
+        fixture
+            .store
+            .save_document(
+                &specification.source.relative_path,
+                DocumentContent::Prose(specification.autosave.revision_text.clone()),
+                "completion recovery autosave characterization",
+            )
+            .expect("autosave after completion family");
+        let autosaved = fixture
+            .store
+            .read_document(&specification.source.relative_path)
+            .expect("read autosaved fixture document");
+        assert_ne!(autosaved.revision_id, source_revision_id);
+        assert_ne!(autosaved.blob_id, source_blob_id);
+        assert_eq!(autosaved.text, specification.autosave.revision_text);
+
+        let (_directory, reopened) = fixture.reopen();
+        let reopened_document = reopened
+            .read_document(&specification.source.relative_path)
+            .expect("read document after renderer/store recovery");
+        assert_eq!(reopened_document.revision_id, autosaved.revision_id);
+        assert_eq!(reopened_document.blob_id, autosaved.blob_id);
+        assert_eq!(reopened_document.text, specification.autosave.revision_text);
+
+        let page = reopened
+            .branch_page(reopened_document.document_id, None, MAX_BRANCH_PAGE_SIZE)
+            .expect("rebuild exact terminal projection after reopen");
+        assert_eq!(page.branches.len(), witnesses.len());
+        assert!(!page.has_more);
+        assert!(page.next_cursor.is_none());
+
+        for witness in witnesses {
+            let summary = page
+                .branches
+                .iter()
+                .find(|branch| branch.run_id == witness.run_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing durable run {} ({})",
+                        witness.logical_run_id, witness.logical_branch_id
+                    )
+                });
+            assert_eq!(summary.branch_id, witness.branch_id);
+            assert_eq!(summary.document_id, reopened_document.document_id);
+            assert_eq!(summary.source_revision_id, source_revision_id);
+            assert_ne!(summary.source_revision_id, reopened_document.revision_id);
+            assert_eq!(summary.target_range.start, specification.source.caret_byte);
+            assert_eq!(summary.target_range.end, specification.source.caret_byte);
+            assert_eq!(summary.model_identifier.as_deref(), Some("test/writer"));
+            assert_eq!(summary.seed, Some(witness.seed));
+            assert_eq!(summary.status, witness.status);
+            assert_eq!(summary.candidate_id, witness.candidate_id);
+            assert_eq!(summary.output_blob_id, witness.output_blob_id);
+            assert_eq!(
+                summary.output_byte_len,
+                witness
+                    .output_text
+                    .as_ref()
+                    .map(|text| u64::try_from(text.len()).expect("fixture output length"))
+            );
+            assert_eq!(summary.error, witness.error);
+
+            let record = reopened
+                .branch_record(
+                    reopened_document.document_id,
+                    witness.run_id,
+                    MAX_BRANCH_BODY_BYTES,
+                )
+                .expect("read exact branch record after reopen")
+                .expect("durable branch record");
+            assert_eq!(record.status, witness.status);
+            assert_eq!(record.candidate_id, witness.candidate_id);
+            assert_eq!(record.output_blob_id, witness.output_blob_id);
+            assert_eq!(record.output_text, witness.output_text);
+            assert_eq!(record.error, witness.error);
+
+            let terminal = reopened
+                .generation_terminal_evidence(witness.run_id)
+                .expect("read exact terminal evidence after reopen")
+                .expect("durable terminal evidence");
+            assert_eq!(terminal.evidence.status, witness.terminal_status);
+            assert_eq!(terminal.evidence.candidate_id, witness.candidate_id);
+            assert_eq!(
+                terminal.output_bytes,
+                witness
+                    .output_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes()
+            );
+            assert_eq!(
+                reopened
+                    .generation_terminal_count(witness.run_id)
+                    .expect("count terminal after reopen"),
+                1
+            );
+        }
     }
 
     #[test]
