@@ -372,7 +372,7 @@ fn compatible_cached_prefix_for_owner(
             &db.entries,
             &fingerprint,
             &tokenized.token_ids,
-            Some(owner),
+            owner,
         ),
         None => longest_compatible_prefix(&db.entries, &fingerprint, &tokenized.token_ids),
     };

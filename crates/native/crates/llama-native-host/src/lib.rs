@@ -6,7 +6,7 @@
 //! optional persistent cache storage, then route typed requests to its model
 //! handles.
 
-use llama_native_cache::{CacheFingerprint, MemoryPrefixCache, PrefixCacheValue};
+use llama_native_cache::{CacheFingerprint, CacheOwnerScope, MemoryPrefixCache, PrefixCacheValue};
 use llama_native_engine::{
     GenerationTicket, JoinedNativeModel, NativeModelHandle, NativeModelOwner,
 };
@@ -829,15 +829,25 @@ impl NativeHost {
         fingerprint: &CacheFingerprint,
         prompt_token_ids: &[i32],
     ) -> Option<PrefixCacheValue> {
+        self.cache_lookup_in_scope(fingerprint, prompt_token_ids, CacheOwnerScope::Unowned)
+    }
+
+    pub fn cache_lookup_in_scope(
+        &self,
+        fingerprint: &CacheFingerprint,
+        prompt_token_ids: &[i32],
+        owner_scope: CacheOwnerScope<'_>,
+    ) -> Option<PrefixCacheValue> {
         if !self.config.cache_policy.allows_memory() {
             return None;
         }
         let now = self.clock.now_ms();
-        self.state
-            .lock()
-            .ok()?
-            .cache
-            .lookup(fingerprint, prompt_token_ids, now)
+        self.state.lock().ok()?.cache.lookup_in_scope(
+            fingerprint,
+            prompt_token_ids,
+            owner_scope,
+            now,
+        )
     }
 
     pub fn cache_lookup_for_owner(
@@ -846,15 +856,11 @@ impl NativeHost {
         prompt_token_ids: &[i32],
         owner_id: &str,
     ) -> Option<PrefixCacheValue> {
-        if !self.config.cache_policy.allows_memory() {
-            return None;
-        }
-        let now = self.clock.now_ms();
-        let mut state = self.state.lock().ok()?;
-        let matched = state
-            .cache
-            .best_match_for_owner(fingerprint, prompt_token_ids, owner_id)?;
-        state.cache.get(&matched.id, now)
+        self.cache_lookup_in_scope(
+            fingerprint,
+            prompt_token_ids,
+            CacheOwnerScope::Exact(owner_id),
+        )
     }
 
     pub fn cache_insert(&self, value: PrefixCacheValue) -> Result<Vec<String>, NativeError> {
@@ -1458,6 +1464,51 @@ mod tests {
                 .expect("persistent load")
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn host_cache_lookup_requires_an_exact_owner_scope() {
+        let host = NativeHost::new(NativeHostConfig {
+            cache_policy: HostCachePolicy::MemoryOnly,
+            memory_cache_bytes: 64,
+            ..NativeHostConfig::default()
+        });
+        let unowned = cache_value("unowned", 1);
+        let mut owned = cache_value("persona", 1);
+        owned.metadata.token_ids.push(2);
+        owned.metadata.token_sha256 = llama_native_cache::token_sha256(&owned.metadata.token_ids);
+        owned.metadata.state_bytes = 16;
+        owned.metadata.owner_id = Some("persona:archived:v7".to_owned());
+        owned.sequence.token_ids.push(2);
+        owned.sequence.token_count = 2;
+        owned.sequence.bytes.resize(16, 2);
+
+        host.cache_insert(unowned).expect("insert unowned artifact");
+        host.cache_insert(owned).expect("insert owned artifact");
+        let fingerprint = cache_value("fingerprint", 1).metadata.fingerprint;
+
+        assert_eq!(
+            host.cache_lookup(&fingerprint, &[1, 2, 3])
+                .expect("ownerless artifact")
+                .metadata
+                .id,
+            "unowned"
+        );
+        assert_eq!(
+            host.cache_lookup_for_owner(&fingerprint, &[1, 2, 3], "persona:archived:v7")
+                .expect("exact owner artifact")
+                .metadata
+                .id,
+            "persona"
+        );
+        assert!(
+            host.cache_lookup_in_scope(
+                &fingerprint,
+                &[1, 2, 3],
+                CacheOwnerScope::Exact("persona:other:v1"),
+            )
+            .is_none()
         );
     }
 
