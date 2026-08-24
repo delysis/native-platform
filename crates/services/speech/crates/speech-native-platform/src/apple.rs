@@ -25,6 +25,41 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const APPLE_RUNTIME_SOURCE_ID: &str = "apple-runtime";
 static APPLE_RUNTIME_LOCK: Mutex<()> = Mutex::new(());
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AppleSynthesisContract {
+    pub(crate) streaming_audio: bool,
+    pub(crate) ssml: bool,
+    pub(crate) word_alignment: bool,
+    pub(crate) phoneme_alignment: bool,
+    pub(crate) pause_resume: bool,
+    pub(crate) voice_selection: bool,
+    pub(crate) returned_audio: &'static [AudioOutputKind],
+}
+
+pub(crate) const APPLE_SYNTHESIS_CONTRACT: AppleSynthesisContract = AppleSynthesisContract {
+    streaming_audio: false,
+    ssml: true,
+    word_alignment: false,
+    phoneme_alignment: false,
+    pause_resume: false,
+    voice_selection: true,
+    returned_audio: &[AudioOutputKind::Wav],
+};
+
+impl AppleSynthesisContract {
+    pub(crate) fn descriptor(self) -> SynthesisCapabilities {
+        SynthesisCapabilities {
+            streaming_audio: self.streaming_audio,
+            ssml: self.ssml,
+            word_alignment: self.word_alignment,
+            phoneme_alignment: self.phoneme_alignment,
+            pause_resume: self.pause_resume,
+            voice_selection: self.voice_selection,
+            returned_audio: self.returned_audio.to_vec(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppleCapabilitySource;
 
@@ -83,15 +118,9 @@ fn probe_synthesis(observed_at_unix_ms: u64) -> SpeechBackendDescriptor {
                     id: "apple.av-speech.synthesis".to_string(),
                     backend_id: "apple.av-speech".to_string(),
                     model_id: None,
-                    operation: SpeechOperationCapability::Synthesis(SynthesisCapabilities {
-                        streaming_audio: false,
-                        ssml: true,
-                        word_alignment: false,
-                        phoneme_alignment: false,
-                        pause_resume: false,
-                        voice_selection: true,
-                        returned_audio: vec![AudioOutputKind::Wav],
-                    }),
+                    operation: SpeechOperationCapability::Synthesis(
+                        APPLE_SYNTHESIS_CONTRACT.descriptor(),
+                    ),
                     availability: CapabilityAvailability::Available,
                     network: NetworkBehavior::Never,
                     languages,

@@ -6,7 +6,9 @@
 //! adapter advertises non-streaming synthesis and checks cancellation before
 //! and after the native call without claiming pre-emptive interruption.
 
-use crate::apple::{AppleCapabilitySource, lock_apple_runtime};
+use crate::apple::{
+    APPLE_SYNTHESIS_CONTRACT, AppleCapabilitySource, AppleSynthesisContract, lock_apple_runtime,
+};
 use crate::{PlatformCapabilitySource, PlatformProbeError};
 use async_trait::async_trait;
 use avspeechsynthesizer::{
@@ -14,8 +16,8 @@ use avspeechsynthesizer::{
     SpeechSynthesizer, SpeechUtterance,
 };
 use speech_native_types::{
-    AlignmentGranularity, AudioOutputFormat, DEFAULT_SPEECH_EVENT_CAPACITY, NetworkBehavior,
-    PlatformTarget, SpeechBackend, SpeechBackendDescriptor, SpeechBackendKind,
+    AlignmentGranularity, AudioOutputFormat, AudioOutputKind, DEFAULT_SPEECH_EVENT_CAPACITY,
+    NetworkBehavior, PlatformTarget, SpeechBackend, SpeechBackendDescriptor, SpeechBackendKind,
     SpeechBackendReadiness, SpeechCancellation, SpeechError, SpeechErrorClass, SpeechRequestId,
     SpeechResolvedRoute, SpeechRouteSelector, SpeechUsage, SynthesisEvent, SynthesisInput,
     SynthesisOutput, SynthesisRequest, SynthesisResponse, SynthesisTicket, TaskSupervisor,
@@ -382,7 +384,8 @@ fn task_supervisor_error(request_id: &SpeechRequestId, error: TaskSupervisorErro
 
 fn validate_request(request: &SynthesisRequest) -> Result<(), SpeechError> {
     request.validate()?;
-    if request.stream {
+    let contract = APPLE_SYNTHESIS_CONTRACT;
+    if request.stream && !contract.streaming_audio {
         return Err(backend_error(
             &request.context.request_id,
             "apple_tts_streaming_unsupported",
@@ -391,7 +394,7 @@ fn validate_request(request: &SynthesisRequest) -> Result<(), SpeechError> {
             "Apple buffer synthesis is currently exposed as a non-streaming WAV operation",
         ));
     }
-    if request.output != AudioOutputFormat::Wav {
+    if !contract.supports_output(&request.output) {
         return Err(backend_error(
             &request.context.request_id,
             "apple_tts_output_unsupported",
@@ -400,13 +403,31 @@ fn validate_request(request: &SynthesisRequest) -> Result<(), SpeechError> {
             "Apple buffer synthesis currently returns WAV audio",
         ));
     }
-    if request.alignment != AlignmentGranularity::None {
+    if !contract.supports_alignment(request.alignment) {
         return Err(backend_error(
             &request.context.request_id,
             "apple_tts_alignment_unsupported",
             SpeechErrorClass::Capability,
             false,
             "Apple buffer synthesis does not expose the requested alignment granularity",
+        ));
+    }
+    if matches!(request.input, SynthesisInput::Ssml { .. }) && !contract.ssml {
+        return Err(backend_error(
+            &request.context.request_id,
+            "apple_tts_ssml_unsupported",
+            SpeechErrorClass::Capability,
+            false,
+            "Apple buffer synthesis does not accept SSML input",
+        ));
+    }
+    if !matches!(request.voice, VoiceSelector::Auto) && !contract.voice_selection {
+        return Err(backend_error(
+            &request.context.request_id,
+            "apple_tts_voice_selection_unsupported",
+            SpeechErrorClass::Capability,
+            false,
+            "Apple buffer synthesis does not accept explicit voice selection",
         ));
     }
     if let SpeechRouteSelector::ExactBackend { backend_id, .. } = &request.context.route
@@ -442,6 +463,26 @@ fn validate_request(request: &SynthesisRequest) -> Result<(), SpeechError> {
         ));
     }
     Ok(())
+}
+
+impl AppleSynthesisContract {
+    fn supports_output(self, output: &AudioOutputFormat) -> bool {
+        let kind = match output {
+            AudioOutputFormat::Wav => AudioOutputKind::Wav,
+            AudioOutputFormat::Pcm { .. } => AudioOutputKind::Pcm,
+            AudioOutputFormat::Mp3 { .. } => AudioOutputKind::Mp3,
+            AudioOutputFormat::OggOpus { .. } => AudioOutputKind::OggOpus,
+        };
+        self.returned_audio.contains(&kind)
+    }
+
+    const fn supports_alignment(self, alignment: AlignmentGranularity) -> bool {
+        match alignment {
+            AlignmentGranularity::None => true,
+            AlignmentGranularity::Word => self.word_alignment,
+            AlignmentGranularity::Phoneme => self.phoneme_alignment,
+        }
+    }
 }
 
 fn resolve_voice(request: &SynthesisRequest) -> Result<SpeechSynthesisVoice, SpeechError> {
@@ -533,6 +574,26 @@ fn run_synthesis(
     event_sender: &mpsc::Sender<SynthesisEvent>,
     final_sender: oneshot::Sender<Result<SynthesisResponse, SpeechError>>,
 ) {
+    run_synthesis_with_call(
+        request,
+        route,
+        cancelled,
+        event_sender,
+        final_sender,
+        move |request| synthesize_wav(request, voice),
+    );
+}
+
+/// Runs one indivisible native adapter transaction. Cancellation can suppress
+/// publication before or after `synthesis_call`, but cannot interrupt the call.
+fn run_synthesis_with_call(
+    request: SynthesisRequest,
+    route: SpeechResolvedRoute,
+    cancelled: Arc<AtomicBool>,
+    event_sender: &mpsc::Sender<SynthesisEvent>,
+    final_sender: oneshot::Sender<Result<SynthesisResponse, SpeechError>>,
+    synthesis_call: impl FnOnce(&SynthesisRequest) -> Result<(Vec<u8>, u64), SpeechError>,
+) {
     let request_id = request.context.request_id.clone();
     let started_at = Instant::now();
     if cancelled.load(Ordering::Acquire) {
@@ -555,7 +616,7 @@ fn run_synthesis(
         return;
     }
 
-    let result = synthesize_wav(&request, voice).map(|(audio, duration_ms)| {
+    let result = synthesis_call(&request).map(|(audio, duration_ms)| {
         let total_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let input_characters = match &request.input {
             SynthesisInput::Text { text } => text.chars().count(),
@@ -919,8 +980,19 @@ fn backend_error(
 mod tests {
     use super::*;
     use speech_native_types::{
-        SpeechDeadlinePolicy, SpeechRequestContext, SpeechRoutingPolicy, SynthesisInput,
+        PcmFormat, PcmSampleFormat, SpeechDeadlinePolicy, SpeechRequestContext,
+        SpeechRoutingPolicy, SynthesisInput,
     };
+
+    struct ControlledAppleOperation {
+        state: Arc<AppleBackendState>,
+        request_id: SpeechRequestId,
+        cancelled: Arc<AtomicBool>,
+        entered: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+        events: mpsc::Receiver<SynthesisEvent>,
+        final_response: oneshot::Receiver<Result<SynthesisResponse, SpeechError>>,
+    }
 
     fn request(id: &str) -> SynthesisRequest {
         SynthesisRequest {
@@ -947,6 +1019,272 @@ mod tests {
             alignment: AlignmentGranularity::None,
             stream: false,
         }
+    }
+
+    fn fixture_route() -> SpeechResolvedRoute {
+        SpeechResolvedRoute {
+            backend_id: APPLE_TTS_BACKEND_ID.to_owned(),
+            model_id: None,
+            voice_id: Some("fixture.apple.voice".to_owned()),
+            backend_kind: SpeechBackendKind::PlatformOnDevice,
+            network: NetworkBehavior::Never,
+        }
+    }
+
+    fn fixture_backend(state: Arc<AppleBackendState>) -> AppleSpeechBackend {
+        AppleSpeechBackend {
+            descriptor: SpeechBackendDescriptor {
+                id: APPLE_TTS_BACKEND_ID.to_owned(),
+                display_name: "Controlled Apple fixture".to_owned(),
+                kind: SpeechBackendKind::PlatformOnDevice,
+                readiness: SpeechBackendReadiness::Unavailable {
+                    reason: "deterministic lifecycle fixture".to_owned(),
+                },
+                capabilities: Vec::new(),
+                models: Vec::new(),
+                voices: Vec::new(),
+            },
+            state,
+        }
+    }
+
+    fn spawn_controlled_apple_operation(id: &str) -> ControlledAppleOperation {
+        let state = Arc::new(AppleBackendState::default());
+        let request = request(id);
+        let request_id = request.context.request_id.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (entered_sender, entered) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        let (event_sender, events) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
+        let (final_sender, final_response) = oneshot::channel();
+        state
+            .spawn_operation(request_id.clone(), Arc::clone(&cancelled), move || {
+                run_synthesis_with_call(
+                    request,
+                    fixture_route(),
+                    worker_cancelled,
+                    &event_sender,
+                    final_sender,
+                    move |_| {
+                        entered_sender.send(()).expect("signal native call entry");
+                        release_receiver.recv().expect("release native call");
+                        Ok((b"RIFFfixtureWAVE".to_vec(), 17))
+                    },
+                );
+            })
+            .expect("spawn controlled Apple adapter operation");
+        ControlledAppleOperation {
+            state,
+            request_id,
+            cancelled,
+            entered,
+            release,
+            events,
+            final_response,
+        }
+    }
+
+    fn assert_only_started_is_visible(
+        operation: &mut ControlledAppleOperation,
+    ) -> Vec<SynthesisEvent> {
+        let started = operation
+            .events
+            .try_recv()
+            .expect("adapter publishes Started before entering the native call");
+        assert!(matches!(started, SynthesisEvent::Started { .. }));
+        assert!(matches!(
+            operation.events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            operation.final_response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        vec![started]
+    }
+
+    async fn collect_operation(
+        mut operation: ControlledAppleOperation,
+        mut events: Vec<SynthesisEvent>,
+    ) -> (Vec<SynthesisEvent>, Result<SynthesisResponse, SpeechError>) {
+        while let Some(event) = operation.events.recv().await {
+            events.push(event);
+        }
+        let final_response = operation
+            .final_response
+            .await
+            .expect("controlled adapter sends one final response");
+        (events, final_response)
+    }
+
+    fn assert_cancelled_without_audio(
+        events: &[SynthesisEvent],
+        final_response: &Result<SynthesisResponse, SpeechError>,
+    ) {
+        assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
+        assert!(matches!(
+            events.last(),
+            Some(SynthesisEvent::Cancelled { .. })
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SynthesisEvent::Audio { .. } | SynthesisEvent::Completed { .. }
+        )));
+        assert_eq!(
+            final_response
+                .as_ref()
+                .err()
+                .map(|error| error.code.as_str()),
+            Some("speech_request_cancelled")
+        );
+    }
+
+    #[test]
+    fn descriptor_and_request_validation_share_the_exact_apple_contract() {
+        let capabilities = APPLE_SYNTHESIS_CONTRACT.descriptor();
+        assert!(!capabilities.streaming_audio);
+        assert!(capabilities.ssml);
+        assert!(!capabilities.word_alignment);
+        assert!(!capabilities.phoneme_alignment);
+        assert!(!capabilities.pause_resume);
+        assert!(capabilities.voice_selection);
+        assert_eq!(capabilities.returned_audio, vec![AudioOutputKind::Wav]);
+
+        let mut accepted = request("apple-contract-accepted");
+        validate_request(&accepted).expect("complete WAV text request matches descriptor");
+        accepted.input = SynthesisInput::Ssml {
+            ssml: "<speak>Contract fixture.</speak>".to_owned(),
+        };
+        validate_request(&accepted).expect("descriptor-advertised SSML is accepted");
+        accepted.input = SynthesisInput::Text {
+            text: "Contract fixture.".to_owned(),
+        };
+        accepted.voice = VoiceSelector::Exact {
+            voice_id: "fixture.apple.voice".to_owned(),
+        };
+        validate_request(&accepted).expect("descriptor-advertised voice selection is accepted");
+
+        for output in [
+            AudioOutputFormat::Pcm {
+                format: PcmFormat {
+                    sample_rate_hz: 24_000,
+                    channels: 1,
+                    sample_format: PcmSampleFormat::I16Le,
+                    interleaved: true,
+                },
+            },
+            AudioOutputFormat::Mp3 { bitrate_kbps: None },
+            AudioOutputFormat::OggOpus { bitrate_kbps: None },
+        ] {
+            let mut rejected = request("apple-contract-output-rejected");
+            rejected.output = output;
+            assert_eq!(
+                validate_request(&rejected)
+                    .expect_err("unadvertised output must be rejected")
+                    .code,
+                "apple_tts_output_unsupported"
+            );
+        }
+
+        let mut streaming = request("apple-contract-stream-rejected");
+        streaming.stream = true;
+        assert_eq!(
+            validate_request(&streaming)
+                .expect_err("unadvertised streaming must be rejected")
+                .code,
+            "apple_tts_streaming_unsupported"
+        );
+        for alignment in [AlignmentGranularity::Word, AlignmentGranularity::Phoneme] {
+            let mut rejected = request("apple-contract-alignment-rejected");
+            rejected.alignment = alignment;
+            assert_eq!(
+                validate_request(&rejected)
+                    .expect_err("unadvertised alignment must be rejected")
+                    .code,
+                "apple_tts_alignment_unsupported"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_during_native_call_suppresses_audio_after_the_call_returns() {
+        let mut operation = spawn_controlled_apple_operation("apple-controlled-cancel");
+        operation
+            .entered
+            .recv()
+            .expect("controlled native call is blocking");
+        assert_eq!(cancel_request(&operation.state, &operation.request_id), 1);
+        assert!(operation.cancelled.load(Ordering::Acquire));
+        let events = assert_only_started_is_visible(&mut operation);
+        assert_eq!(
+            operation
+                .state
+                .tasks
+                .snapshot()
+                .expect("read active controlled worker")
+                .active,
+            1,
+            "cancellation marks the indivisible native call; it does not interrupt it"
+        );
+
+        operation.release.send(()).expect("release native call");
+        operation
+            .state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("controlled native call joins");
+        let (events, final_response) = collect_operation(operation, events).await;
+        assert_cancelled_without_audio(&events, &final_response);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_native_call_then_suppresses_audio_and_joins() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let mut operation = spawn_controlled_apple_operation("apple-controlled-shutdown");
+        operation
+            .entered
+            .recv()
+            .expect("controlled native call is blocking");
+        let backend = fixture_backend(Arc::clone(&operation.state));
+        let mut shutdown = Box::pin(backend.shutdown());
+        let first_poll =
+            std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+        assert!(matches!(first_poll, Poll::Pending));
+        assert!(operation.cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            operation.state.data.lock().expect("read phase").phase,
+            AppleBackendPhase::Quiescing
+        );
+        let events = assert_only_started_is_visible(&mut operation);
+        assert_eq!(
+            operation
+                .state
+                .tasks
+                .snapshot()
+                .expect("read active controlled worker")
+                .active,
+            1,
+            "shutdown remains pending while the native call is still blocked"
+        );
+
+        operation.release.send(()).expect("release native call");
+        shutdown
+            .await
+            .expect("shutdown joins the completed native call");
+        let (events, final_response) = collect_operation(operation, events).await;
+        assert_cancelled_without_audio(&events, &final_response);
+
+        let state = backend.state.data.lock().expect("read closed state");
+        assert_eq!(state.phase, AppleBackendPhase::Closed);
+        assert!(state.active.is_empty());
+        drop(state);
+        let tasks = backend.state.tasks.snapshot().expect("read joined workers");
+        assert_eq!(tasks.active, 0);
+        assert_eq!(tasks.expected_worker_ids, tasks.joined_worker_ids);
     }
 
     #[tokio::test]
