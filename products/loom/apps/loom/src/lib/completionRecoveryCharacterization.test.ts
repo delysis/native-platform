@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { branchIsActionableOnShelf } from './branchShelf';
 import { mergeNewestPage } from './branchPaging';
 import { verifyBranchBody, type VerifiedBranchBody } from './branchBodyProof';
+import { completionSnapshotFacts } from './completionSnapshot';
 import {
   armCompletionGeneration,
   completionGenerationIsArmed
@@ -24,6 +25,7 @@ import { inlineSuggestionFamily } from './inlineSuggestionFamily';
 import type {
   BranchBody,
   BranchCard,
+  CompletionSnapshot,
   DesktopGenerationEnvelope,
   GenerationEventKind,
   ModelCapabilitySummary,
@@ -174,6 +176,22 @@ function durableMetadata(): BranchCard[] {
   }));
 }
 
+function durableCompletionSnapshot(): CompletionSnapshot {
+  return {
+    project_id: scope.projectId,
+    session_id: scope.sessionId,
+    document_id: scope.documentId,
+    active_operations: [],
+    branches: durableMetadata().map((branch) => {
+      const { text, ...summary } = branch;
+      void text;
+      return summary;
+    }),
+    next_cursor: null,
+    has_more: false
+  };
+}
+
 async function hydrateDurableProjection(branches: BranchCard[]): Promise<{
   branches: BranchCard[];
   verifiedBodyByRun: Record<string, VerifiedBranchBody>;
@@ -265,57 +283,6 @@ function eventEnvelope(
   };
 }
 
-function eventOnlyProjection(
-  delivery: CompletionRecoveryFixture['delivery_cases'][number],
-  activeScope: GenerationScope = scope
-): { branch: BranchCard; appliedSequences: number[] } {
-  let branch: BranchCard = {
-    ...durableMetadata()[0],
-    candidate_id: null,
-    output_blob_id: null,
-    output_byte_len: null,
-    status: 'queued',
-    text: '',
-    error: null
-  };
-  let previousSequence: number | undefined;
-  const appliedSequences: number[] = [];
-  for (const index of delivery.event_indexes) {
-    const envelope = eventEnvelope(fixture.primary_event_stream[index]);
-    if (!generationEventBelongsToScope(envelope, activeScope)) continue;
-    const stream = envelope.event;
-    const generation = stream.payload;
-    if (previousSequence !== undefined && generation.sequence <= previousSequence) continue;
-    previousSequence = generation.sequence;
-    appliedSequences.push(generation.sequence);
-    if (stream.event === 'generation_terminal') {
-      branch = {
-        ...branch,
-        candidate_id: stream.payload.candidate_id ?? branch.candidate_id,
-        status: stream.payload.status === 'completed' ? 'ready' : stream.payload.status,
-        error: stream.payload.error ?? branch.error
-      };
-      continue;
-    }
-    const kind = stream.payload.kind;
-    switch (kind.kind) {
-      case 'queued': branch = { ...branch, status: 'queued' }; break;
-      case 'prefilling':
-      case 'generating':
-      case 'token': branch = { ...branch, status: 'generating' }; break;
-      case 'text_delta':
-        branch = { ...branch, status: 'generating', text: `${branch.text}${kind.text}` };
-        break;
-      case 'warning': branch = { ...branch, error: kind.message }; break;
-      case 'cancellation_requested': branch = { ...branch, status: 'generating' }; break;
-      case 'candidate_ready':
-        branch = { ...branch, candidate_id: kind.candidate_id, status: 'ready' };
-        break;
-    }
-  }
-  return { branch, appliedSequences };
-}
-
 function terminalDigest(branches: BranchCard[]) {
   return branches.map((branch) => ({
     run_id: branch.run_id,
@@ -396,31 +363,38 @@ function suggestionFamily(
 }
 
 describe('model-free completion recovery characterization', () => {
-  it('freezes dropped, duplicated, and reordered event-only projections', () => {
+  it('treats dropped, duplicated, and reordered events as scoped wakeups only', () => {
     expect(fixture.schema_version).toBe(1);
     expect(fixture.fixture_id).toBe('loom-completion-recovery-v1');
     expect(fixture.evidence_class).toBe('model_free_characterization');
     for (const delivery of fixture.delivery_cases) {
-      const projected = eventOnlyProjection(delivery);
-      expect(projected.appliedSequences, delivery.case_id)
-        .toEqual(delivery.expected_applied_sequences);
-      expect({
-        status: projected.branch.status,
-        candidate_id: projected.branch.candidate_id,
-        text: projected.branch.text
-      }, delivery.case_id).toEqual(delivery.expected_event_projection);
+      const wakeupSequences = delivery.event_indexes
+        .map((index) => eventEnvelope(fixture.primary_event_stream[index]))
+        .filter((envelope) => generationEventBelongsToScope(envelope, scope))
+        .map((envelope) => envelope.event.payload.sequence);
+      expect(wakeupSequences, delivery.case_id).toEqual(
+        delivery.event_indexes.map((index) => fixture.primary_event_stream[index].sequence)
+      );
+      expect(terminalDigest(durableMetadata()), delivery.case_id)
+        .toEqual(expectedTerminalDigest());
     }
 
-    const crossSession = eventOnlyProjection(fixture.delivery_cases[0], {
-      ...scope,
-      sessionId: 'superseded-session'
-    });
-    expect(crossSession.appliedSequences).toEqual([]);
-    expect(crossSession.branch.status).toBe('queued');
+    const crossSession = fixture.delivery_cases[0].event_indexes
+      .map((index) => eventEnvelope(fixture.primary_event_stream[index]))
+      .filter((envelope) => generationEventBelongsToScope(envelope, {
+        ...scope,
+        sessionId: 'superseded-session'
+      }));
+    expect(crossSession).toEqual([]);
   });
 
-  it('rebuilds the same exact terminal family from durable rows after every delivery and reload', async () => {
-    const metadata = durableMetadata();
+  it('rebuilds the exact terminal family from the scoped snapshot after every wakeup delivery and reload', async () => {
+    const snapshot = durableCompletionSnapshot();
+    expect(completionSnapshotFacts(snapshot, scope)).toEqual({
+      activeRunIds: [],
+      cancellationRequestedRunIds: []
+    });
+    const metadata = snapshot.branches.map((branch) => ({ ...branch, text: '' }));
     const hydrated = await hydrateDurableProjection(metadata);
     const expectedDigest = expectedTerminalDigest();
     const expectedReadyRuns = fixture.family
@@ -428,23 +402,32 @@ describe('model-free completion recovery characterization', () => {
       .map((item) => item.run_id);
 
     for (const delivery of fixture.delivery_cases) {
-      const eventProjection = eventOnlyProjection(delivery);
-      const reconciledMetadata = mergeNewestPage(metadata, [eventProjection.branch]);
-      expect(terminalDigest(reconciledMetadata), delivery.case_id).toEqual(expectedDigest);
+      const wakeups = delivery.event_indexes
+        .map((index) => eventEnvelope(fixture.primary_event_stream[index]))
+        .filter((envelope) => generationEventBelongsToScope(envelope, scope));
+      expect(wakeups).toHaveLength(delivery.event_indexes.length);
+      const afterWakeup = JSON.parse(JSON.stringify(snapshot)) as CompletionSnapshot;
+      expect(completionSnapshotFacts(afterWakeup, scope).activeRunIds, delivery.case_id)
+        .toEqual([]);
+      expect(terminalDigest(afterWakeup.branches.map((branch) => ({
+        ...branch,
+        text: ''
+      }))), delivery.case_id).toEqual(expectedDigest);
 
-      const afterReload = mergeNewestPage(metadata, []);
+      const afterReload = mergeNewestPage(
+        (JSON.parse(JSON.stringify(snapshot)) as CompletionSnapshot).branches.map((branch) => ({
+          ...branch,
+          text: ''
+        })),
+        []
+      );
       expect(terminalDigest(afterReload), delivery.case_id).toEqual(expectedDigest);
 
-      const reconciledBodies = mergeNewestPage(hydrated.branches, [eventProjection.branch]);
-      const liveTextByRun = eventProjection.branch.text
-        ? { [eventProjection.branch.run_id]: eventProjection.branch.text }
-        : {};
       const family = suggestionFamily(
-        reconciledBodies,
+        hydrated.branches,
         hydrated.verifiedBodyByRun,
         openDocument(),
-        model(),
-        liveTextByRun
+        model()
       );
       expect(family.map((candidate) => candidate.runId), delivery.case_id)
         .toEqual(expectedReadyRuns);
@@ -454,6 +437,11 @@ describe('model-free completion recovery characterization', () => {
           .map((item) => item.terminal.text)
       );
     }
+
+    expect(() => completionSnapshotFacts({
+      ...snapshot,
+      session_id: 'superseded-session'
+    }, scope)).toThrow('stale manuscript scope');
 
     const forgedEventProjection = {
       ...hydrated.branches[0],
@@ -487,6 +475,36 @@ describe('model-free completion recovery characterization', () => {
       'run-ready-d',
       'run-failed'
     ]);
+  });
+
+  it('validates active supervisor facts without replacing durable terminal identity', () => {
+    const snapshot = durableCompletionSnapshot();
+    snapshot.active_operations = [{
+      request_id: 'request-active',
+      attempt_id: 'request-active:1',
+      operation_sequence: '18446744073709551615',
+      phase: 'running',
+      cancellation_requested: true,
+      authoritative_terminal: null,
+      final_projection: null,
+      progress_sequences: ['0', '18446744073709551615'],
+      branches: [{
+        run_id: fixture.family[0].run_id,
+        branch_id: fixture.family[0].branch_id
+      }]
+    }];
+    expect(completionSnapshotFacts(snapshot, scope)).toEqual({
+      activeRunIds: [fixture.family[0].run_id],
+      cancellationRequestedRunIds: [fixture.family[0].run_id]
+    });
+    expect(snapshot.branches[0]).toMatchObject({
+      status: 'ready',
+      candidate_id: 'candidate-a'
+    });
+
+    snapshot.active_operations[0].branches[0].branch_id = 'foreign-branch';
+    expect(() => completionSnapshotFacts(snapshot, scope))
+      .toThrow('active route without its durable branch identity');
   });
 
   it('keeps frozen rollback authority across autosave while excluding the old revision family', async () => {

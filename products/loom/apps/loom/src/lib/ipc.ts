@@ -7,6 +7,7 @@ import type {
   BranchSummary,
   BuildModelPolicySummary,
   CommandReceipt,
+  CompletionSnapshot,
   DesktopGenerationEnvelope,
   DocumentKind,
   ModelCapabilitySummary,
@@ -358,6 +359,20 @@ export function getBranchPage(
   limit: number
 ): Promise<BranchPage> {
   return call('branch_page', { projectId, sessionId, documentId, after, limit });
+}
+
+export function getCompletionSnapshot(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  observedRunIds: string[]
+): Promise<CompletionSnapshot> {
+  return call('completion_snapshot', {
+    projectId,
+    sessionId,
+    documentId,
+    observedRunIds
+  });
 }
 
 export function getBranch(

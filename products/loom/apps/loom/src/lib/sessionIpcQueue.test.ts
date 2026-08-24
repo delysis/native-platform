@@ -19,6 +19,7 @@ import {
   exportDocumentCopy,
   getBranch,
   getBranchPage,
+  getCompletionSnapshot,
   listModels
 } from './ipc';
 
@@ -68,6 +69,12 @@ describe('session IPC admission', () => {
     const page = getBranchPage('project', 'session', 'document', null, 10);
     await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
     const branch = getBranch('project', 'session', 'document', 'run');
+    const snapshot = getCompletionSnapshot(
+      'project',
+      'session',
+      'document',
+      ['run']
+    );
 
     await Promise.resolve();
     expect(mocks.invoke).toHaveBeenCalledTimes(1);
@@ -75,10 +82,18 @@ describe('session IPC admission', () => {
 
     await expect(page).rejects.toThrow('page failed');
     await expect(branch).resolves.toBeNull();
+    await expect(snapshot).resolves.toBeNull();
     expect(order).toEqual([
       'plugin:loom|branch_page',
-      'plugin:loom|branch_get'
+      'plugin:loom|branch_get',
+      'plugin:loom|completion_snapshot'
     ]);
+    expect(mocks.invoke).toHaveBeenLastCalledWith('plugin:loom|completion_snapshot', {
+      projectId: 'project',
+      sessionId: 'session',
+      documentId: 'document',
+      observedRunIds: ['run']
+    });
   });
 
   it('waits for a detached native chooser or close transition to settle', async () => {

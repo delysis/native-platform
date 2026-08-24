@@ -58,6 +58,23 @@ project may already contain those tables. They preserve readable history; no
 default production code recreates the deleted research authority or schedules
 research work. Migration 11 records ordinary foreground writing commands.
 
+## Completion recovery boundary
+
+The renderer rebuilds its newest completion shelf through one project/session/
+document-scoped `completion_snapshot` read. That response is a bounded join of
+existing `loom-store` branch projections and the process-local generation
+registry/supervisor: durable terminal and candidate rows remain terminal truth,
+while active operation phase, cancellation, attempt identity, and progress
+sequence remain supervisor facts. Previously observed active run IDs may be
+included in the same read so a terminal that fell behind the newest page is
+recovered exactly.
+
+Generation events are lossy wakeups for that read. They do not supply renderer
+text, candidate, or lifecycle authority, and this boundary adds no table or
+second lifecycle state machine. The deterministic fixture coverage is
+model-free characterization and recovery evidence; it is not a new real-model
+or native desktop acceptance receipt.
+
 ## Local verification
 
 The final Rust source checkpoint for the W1 compatibility retirement is commit

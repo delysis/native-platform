@@ -23,6 +23,7 @@ const COMMANDS: &[&str] = &[
     "model_download_cancel",
     "model_download_status",
     "model_download_list",
+    "completion_snapshot",
     "branch_page",
     "branch_get",
     "branch_body",

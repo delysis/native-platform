@@ -21,6 +21,7 @@
     getBranch,
     getBranchBody,
     getBranchPage,
+    getCompletionSnapshot,
     getBuildModelPolicy,
     getModelDownloadStatus,
     getWeaveStatus,
@@ -89,6 +90,7 @@
     branchBodyDisposition,
     mergeNewestPage
   } from './lib/branchPaging';
+  import { completionSnapshotFacts } from './lib/completionSnapshot';
   import { writeRebindsStaleDraft } from './lib/draftRecovery';
   import { documentProjectionDecision } from './lib/projectionState';
   import {
@@ -350,9 +352,7 @@
   let branchPollInFlight = false;
   let branchPollAttempt = 0;
   let branchPollEpoch = 0;
-  let liveBranchText: Record<string, string> = {};
-  let liveBranchState: Record<string, BranchEventOverlay> = {};
-  let generationSequenceByRun: Record<string, number> = {};
+  let completionActiveRunIds: string[] = [];
   let cancellingRunIds: string[] = [];
   let cancellationCommandByRun: Record<string, string> = {};
   let promotionArmedCandidateId: string | null = null;
@@ -482,13 +482,6 @@
     sessionId: string;
   }
 
-  interface BranchEventOverlay {
-    branchId: string;
-    status?: BranchCard['status'];
-    candidateId?: string;
-    error?: string;
-  }
-
   interface PromotionCapture {
     commandId: string;
     restoreSerial: number;
@@ -562,6 +555,7 @@
   const branchPollMaxMs = 4_000;
   const branchPageSize = 24;
   const branchShelfBodyMaxBytes = 1024 * 1024;
+  const noLiveBranchText: Record<string, string> = {};
   const applicationCloseRetry = new ApplicationCloseRetryScheduler({
     schedule: (callback, delayMs) => window.setTimeout(callback, delayMs),
     cancel: (handle) => window.clearTimeout(handle)
@@ -710,7 +704,7 @@
   $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual', {
     branches,
     verifiedBodyByRun: verifiedBranchBodyByRun,
-    liveTextByRun: liveBranchText,
+    liveTextByRun: noLiveBranchText,
     currentModel,
     document,
     suggestionsEnabled: completionAutomationEnabled(),
@@ -723,7 +717,7 @@
   $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source', {
     branches,
     verifiedBodyByRun: verifiedBranchBodyByRun,
-    liveTextByRun: liveBranchText,
+    liveTextByRun: noLiveBranchText,
     currentModel,
     document,
     suggestionsEnabled: completionAutomationEnabled(),
@@ -751,7 +745,7 @@
       ? verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[selected.runId])
       : null;
     const rawText = selected && branch
-      ? verified?.text ?? liveBranchText[selected.runId] ?? branch.text
+      ? verified?.text ?? branch.text
       : '';
     const text = selected
       ? projectInlineCandidateText(
@@ -764,7 +758,7 @@
       : null;
     if (selected && text && candidateTextIsSurfaceable(text)) {
       const rawPresentationKey = verified?.presentationKey ??
-        `stream:${selected.runId}:${new TextEncoder().encode(rawText).byteLength}`;
+        `branch:${selected.runId}:${new TextEncoder().encode(rawText).byteLength}`;
       const updated = updateCompletionCandidate(
         boundCompletionSession,
         selected.runId,
@@ -1149,9 +1143,7 @@
     branchBodyBlobByRun = {};
     verifiedBranchBodyByRun = {};
     branchBodyErrorByRun = {};
-    liveBranchText = {};
-    liveBranchState = {};
-    generationSequenceByRun = {};
+    completionActiveRunIds = [];
     cancellingRunIds = [];
     cancellationCommandByRun = {};
     uncertainWeave = null;
@@ -1767,154 +1759,10 @@
       sessionId: project.session_id,
       documentId: document.summary.document_id
     })) return;
-
-    const stream = envelope.event;
-    const generation = stream.payload;
-    if (!Number.isSafeInteger(generation.sequence) || generation.sequence < 0) {
-      recordLocalFailure(
-        'unsafe_generation_sequence',
-        'Loom ignored a generation event whose sequence cannot be represented safely.'
-      );
-      return;
-    }
-    const previousSequence = generationSequenceByRun[generation.run_id];
-    if (previousSequence !== undefined && generation.sequence <= previousSequence) return;
-    const nextSequences = {
-      ...generationSequenceByRun,
-      [generation.run_id]: generation.sequence
-    };
-    const sequencedRunIds = Object.keys(nextSequences);
-    while (sequencedRunIds.length > 64) delete nextSequences[sequencedRunIds.shift() as string];
-    generationSequenceByRun = nextSequences;
-
-    if (stream.event === 'generation_terminal') {
-      const status = stream.payload.status === 'completed' ? 'ready' : stream.payload.status;
-      recordLiveBranchState(generation.run_id, generation.branch_id, {
-        status,
-        candidateId: stream.payload.candidate_id,
-        error: stream.payload.error
-      });
-      updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
-        ...branch,
-        candidate_id: stream.payload.candidate_id ?? branch.candidate_id,
-        status,
-        error: stream.payload.error ?? branch.error,
-        text: liveBranchText[generation.run_id] ?? branch.text
-      }));
-      cancellingRunIds = cancellingRunIds.filter((runId) => runId !== generation.run_id);
-      scheduleBranchRefresh();
-      if (status !== 'ready') announce(`A private strand ${status}`);
-      return;
-    }
-
-    const kind = stream.payload.kind;
-    switch (kind.kind) {
-      case 'queued':
-        recordLiveBranchState(generation.run_id, generation.branch_id, { status: 'queued' });
-        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
-          ...branch,
-          status: 'queued'
-        }));
-        break;
-      case 'prefilling':
-      case 'generating':
-      case 'token':
-        recordLiveBranchState(generation.run_id, generation.branch_id, { status: 'generating' });
-        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
-          ...branch,
-          status: 'generating'
-        }));
-        break;
-      case 'text_delta': {
-        const text = `${liveBranchText[generation.run_id] ?? ''}${kind.text}`;
-        recordLiveBranchText(generation.run_id, text);
-        recordLiveBranchState(generation.run_id, generation.branch_id, { status: 'generating' });
-        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
-          ...branch,
-          status: 'generating',
-          text
-        }));
-        break;
-      }
-      case 'warning':
-        recordLiveBranchState(generation.run_id, generation.branch_id, { error: kind.message });
-        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
-          ...branch,
-          error: kind.message
-        }));
-        break;
-      case 'cancellation_requested':
-        recordLiveBranchState(generation.run_id, generation.branch_id, { status: 'generating' });
-        if (!cancellingRunIds.includes(generation.run_id)) {
-          cancellingRunIds = [...cancellingRunIds, generation.run_id];
-        }
-        break;
-      case 'candidate_ready':
-        recordLiveBranchState(generation.run_id, generation.branch_id, {
-          status: 'ready',
-          candidateId: kind.candidate_id
-        });
-        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
-          ...branch,
-          candidate_id: kind.candidate_id,
-          status: 'ready',
-          text: liveBranchText[generation.run_id] ?? branch.text
-        }));
-        break;
-    }
-  }
-
-  function recordLiveBranchText(runId: string, text: string): void {
-    const next = { ...liveBranchText, [runId]: text };
-    const runIds = Object.keys(next);
-    while (runIds.length > 32) delete next[runIds.shift() as string];
-    liveBranchText = next;
-  }
-
-  function recordLiveBranchState(
-    runId: string,
-    branchId: string,
-    patch: Omit<BranchEventOverlay, 'branchId'>
-  ): void {
-    const next = {
-      ...liveBranchState,
-      [runId]: {
-        ...liveBranchState[runId],
-        ...patch,
-        branchId
-      }
-    };
-    const runIds = Object.keys(next);
-    while (runIds.length > 32) delete next[runIds.shift() as string];
-    liveBranchState = next;
-  }
-
-  function applyLiveBranchState(branch: BranchCard, persisted: boolean): BranchCard {
-    const overlay = liveBranchState[branch.run_id];
-    if (!overlay || overlay.branchId !== branch.branch_id) return branch;
-    const storedIsTerminal = branch.status !== 'queued' && branch.status !== 'generating';
-    if (persisted && storedIsTerminal) return branch;
-    return {
-      ...branch,
-      candidate_id: overlay.candidateId ?? branch.candidate_id,
-      status: overlay.status ?? branch.status,
-      error: overlay.error ?? branch.error,
-      text: liveBranchText[branch.run_id] ?? branch.text
-    };
-  }
-
-  function updateBranchFromEvent(
-    runId: string,
-    branchId: string,
-    update: (branch: BranchCard) => BranchCard
-  ): void {
-    let matched = false;
-    const next = branches.map((branch) => {
-      if (branch.run_id !== runId || branch.branch_id !== branchId) return branch;
-      matched = true;
-      return update(branch);
-    });
-    if (matched) branches = next;
+    // Desktop delivery is intentionally lossy. A scoped event only wakes the
+    // identity-bound completion snapshot; it never projects lifecycle,
+    // candidate, terminal, or text facts into renderer state.
+    if (branchRefreshTimer === undefined) scheduleBranchRefresh();
   }
 
   function validateBranchSnapshots(
@@ -1971,8 +1819,8 @@
       const verifiedBody = verifiedBranchBodyByRun[summary.run_id];
       const text = verifiedBodyMatchesBranch(verifiedBody, summary)
         ? verifiedBody.text
-        : liveBranchText[summary.run_id] ?? '';
-      return applyLiveBranchState({ ...summary, text }, true);
+        : '';
+      return { ...summary, text };
     });
   }
 
@@ -2147,12 +1995,11 @@
     const refreshSerial = ++branchRefreshSerial;
     branchRefreshInFlightCount += 1;
     try {
-      const page = await getBranchPage(
+      const snapshot = await getCompletionSnapshot(
         projectId,
         sessionId,
         documentId,
-        null,
-        branchPageSize
+        [...completionActiveRunIds]
       );
       if (!branchScopeMatches(
         projectId,
@@ -2161,22 +2008,32 @@
         expectedViewEpoch,
         refreshSerial
       )) return false;
-      validateBranchSnapshots(page.branches, documentId);
-      validateBranchCursor(page.next_cursor);
-      if (page.has_more !== (page.next_cursor !== null)) {
+      const completionFacts = completionSnapshotFacts(snapshot, {
+        projectId,
+        sessionId,
+        documentId
+      });
+      validateBranchSnapshots(snapshot.branches, documentId);
+      validateBranchCursor(snapshot.next_cursor);
+      if (snapshot.has_more !== (snapshot.next_cursor !== null)) {
         throw new Error('The desktop returned inconsistent branch page metadata.');
       }
-      const firstPageCards = cardsFromSummaries(page.branches);
+      completionActiveRunIds = completionFacts.activeRunIds;
+      cancellingRunIds = [...new Set([
+        ...cancellingRunIds,
+        ...completionFacts.cancellationRequestedRunIds
+      ])];
+      const firstPageCards = cardsFromSummaries(snapshot.branches);
       branches = mergeNewestPage(firstPageCards, branches);
       const firstPageCursorChanged =
-        page.next_cursor?.sequence !== branchFirstPageCursor?.sequence ||
-        page.next_cursor?.run_id !== branchFirstPageCursor?.run_id;
+        snapshot.next_cursor?.sequence !== branchFirstPageCursor?.sequence ||
+        snapshot.next_cursor?.run_id !== branchFirstPageCursor?.run_id;
       if (!branchLoadedPastFirstPage || firstPageCursorChanged) {
-        branchNextCursor = page.next_cursor;
-        branchHasMore = page.has_more;
+        branchNextCursor = snapshot.next_cursor;
+        branchHasMore = snapshot.has_more;
         branchLoadedPastFirstPage = false;
       }
-      branchFirstPageCursor = page.next_cursor;
+      branchFirstPageCursor = snapshot.next_cursor;
       const hydration = await hydrateBranchBodies(
         projectId,
         sessionId,
@@ -2198,7 +2055,7 @@
       branchBodyErrorByRun = hydration.bodyErrorByRun;
       branches = branches.map((branch) => hydratedByRun.get(branch.run_id) ?? branch);
       reconcileBranchActionState();
-      if (branches.some(isBranchActive)) scheduleActiveBranchPoll();
+      if (completionActiveRunIds.length > 0) scheduleActiveBranchPoll();
       return true;
     } catch (error) {
       const failure = normalizeFailure(error);
@@ -2331,7 +2188,7 @@
       branchPollInFlight ||
       !project ||
       !document ||
-      !branches.some(isBranchActive)
+      completionActiveRunIds.length === 0
     ) return;
     const pollEpoch = branchPollEpoch;
     const scope = {
@@ -2375,7 +2232,7 @@
       project.session_id !== scope.sessionId ||
       document?.summary.document_id !== scope.documentId
     ) return;
-    if (!refreshed || branches.some(isBranchActive)) {
+    if (!refreshed || completionActiveRunIds.length > 0) {
       branchPollAttempt += 1;
       scheduleActiveBranchPoll();
       return;
@@ -4927,7 +4784,7 @@
     if (!weaveCaptureStillCurrent(captured)) return false;
     const runIds = new Set(started.branches.map((branch) => branch.run_id));
     branches = [
-      ...started.branches.map((branch) => applyLiveBranchState(branch, false)),
+      ...started.branches,
       ...branches.filter((branch) => !runIds.has(branch.run_id))
     ];
     // A lost-reply replay may already be terminal. Only the authoritative body

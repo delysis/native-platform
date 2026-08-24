@@ -23,6 +23,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-model-choose`
 - `allow-model-download-status`
 - `allow-model-download-list`
+- `allow-completion-snapshot`
 - `allow-branch-page`
 - `allow-branch-get`
 - `allow-branch-body`
@@ -309,6 +310,32 @@ Enables the candidate_promote command without any pre-configured scope.
 <td>
 
 Denies the candidate_promote command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-completion-snapshot`
+
+</td>
+<td>
+
+Enables the completion_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-completion-snapshot`
+
+</td>
+<td>
+
+Denies the completion_snapshot command without any pre-configured scope.
 
 </td>
 </tr>

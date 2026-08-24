@@ -58,6 +58,26 @@ describe('App ghost reactivity wiring', () => {
     expect(context).not.toContain('visible_blob_id');
   });
 
+  it('treats generation events only as coalesced completion snapshot wakeups', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const handler = source.slice(
+      source.indexOf('function handleGenerationEnvelope'),
+      source.indexOf('function validateBranchSnapshots')
+    );
+    const refresh = source.slice(
+      source.indexOf('async function refreshBranchesFor'),
+      source.indexOf('function refreshCurrentBranches')
+    );
+
+    expect(handler).toContain('generationEventBelongsToScope');
+    expect(handler).toContain('branchRefreshTimer === undefined');
+    expect(handler).toContain('scheduleBranchRefresh()');
+    expect(handler).not.toContain('envelope.event');
+    expect(handler).not.toContain('text_delta');
+    expect(refresh).toContain('getCompletionSnapshot');
+    expect(refresh).toContain('completionSnapshotFacts');
+  });
+
   it('keeps suggestion review and implementation evidence out of the quiet titlebar', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     expect(source).not.toContain('Skip to manuscript');

@@ -22,6 +22,7 @@ permissions = [
   "allow-model-choose",
   "allow-model-download-status",
   "allow-model-download-list",
+  "allow-completion-snapshot",
   "allow-branch-page",
   "allow-branch-get",
   "allow-branch-body",

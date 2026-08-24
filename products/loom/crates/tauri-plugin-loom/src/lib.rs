@@ -24,16 +24,18 @@ use loom_backend_llama::{
 };
 use loom_document::{DocumentContent, MergeError, MergeOutcome, three_way_merge};
 use loom_host::{
-    AgencyGate, BranchCancellation, DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES,
-    ForegroundCommandRegistry, ForegroundWindowId, GenerationFamilyIdentity, GenerationRegistry,
+    ActiveGenerationRoute, AgencyGate, BranchCancellation, DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES,
+    ForegroundCommandRegistry, ForegroundWindowId, GenerationFamilyIdentity,
+    GenerationOperationPhase, GenerationOperationSnapshot, GenerationRegistry,
     GenerationRegistryError, GenerationSupervisor, GenerationTerminalClass,
+    GenerationTerminalRecord,
 };
 use loom_store::{
     BranchPageCursor, DocumentReconciliationSnapshot, ExternalReconciliationOutcome,
     ExternalReconciliationRequest, IdempotentSaveOutcome, LoadedDocument, MAX_BRANCH_BODY_BYTES,
-    ProjectStore, StoredBranchBody, StoredBranchRecord, StoredBranchStatus, StoredBranchSummary,
-    TerminalCandidateInput, TerminalEvidenceInput, TerminalGenerationInput, TransientDraft,
-    VisibleProjectionState,
+    ProjectStore, StoredBranchBody, StoredBranchPage, StoredBranchRecord, StoredBranchStatus,
+    StoredBranchSummary, TerminalCandidateInput, TerminalEvidenceInput, TerminalGenerationInput,
+    TransientDraft, VisibleProjectionState,
 };
 use loom_types::{
     AuthorityPolicy, BlobId, BranchId, BuildModelPolicy, BuildModelPolicyIdentity,
@@ -61,6 +63,8 @@ const PROJECT_CLOSE_GENERATION_WAIT: Duration = Duration::from_secs(3);
 const MAX_MODEL_DOWNLOAD_URL_BYTES: usize = 16 * 1024;
 const POLICY_MODEL_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_TRACKED_GENERATION_WORKERS: usize = DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES;
+const COMPLETION_SNAPSHOT_BRANCH_LIMIT: usize = 24;
+const COMPLETION_SNAPSHOT_CAPTURE_ATTEMPTS: usize = 3;
 #[cfg(test)]
 const FOREGROUND_COMMAND_TEST_TTL: Duration = Duration::from_secs(30);
 pub const APPLICATION_QUIT_MENU_ID: &str = "loom.application.quit";
@@ -1784,6 +1788,7 @@ impl Builder {
                 model_download_cancel,
                 model_download_status,
                 model_download_list,
+                completion_snapshot,
                 branch_page,
                 branch_get,
                 branch_body,
@@ -2258,6 +2263,49 @@ pub struct BranchSummarySnapshot {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct BranchPageSnapshot {
+    branches: Vec<BranchSummarySnapshot>,
+    next_cursor: Option<BranchCursorSnapshot>,
+    has_more: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionOperationBranchSnapshot {
+    run_id: String,
+    branch_id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionTerminalSnapshot {
+    operation_id: String,
+    attempt_id: String,
+    /// Decimal u64, preserved as text across the JavaScript boundary.
+    sequence: String,
+    class: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionOperationSnapshot {
+    request_id: String,
+    attempt_id: String,
+    /// Decimal u64, preserved as text across the JavaScript boundary.
+    operation_sequence: String,
+    phase: &'static str,
+    cancellation_requested: bool,
+    authoritative_terminal: Option<CompletionTerminalSnapshot>,
+    final_projection: Option<CompletionTerminalSnapshot>,
+    /// Decimal u64 values, preserved as text across the JavaScript boundary.
+    progress_sequences: Vec<String>,
+    branches: Vec<CompletionOperationBranchSnapshot>,
+}
+
+/// One identity-scoped, read-only join over the process-local supervisor and
+/// durable store projections. It creates no lifecycle or persistence state.
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionSnapshot {
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    active_operations: Vec<CompletionOperationSnapshot>,
     branches: Vec<BranchSummarySnapshot>,
     next_cursor: Option<BranchCursorSnapshot>,
     has_more: bool,
@@ -5257,6 +5305,333 @@ fn policy_candidate_summary(
         })
 }
 
+fn completion_operation_phase(phase: GenerationOperationPhase) -> &'static str {
+    match phase {
+        GenerationOperationPhase::Reserved => "reserved",
+        GenerationOperationPhase::Queued => "queued",
+        GenerationOperationPhase::Running => "running",
+        GenerationOperationPhase::Terminal => "terminal",
+        GenerationOperationPhase::Released => "released",
+    }
+}
+
+fn completion_terminal_class(class: GenerationTerminalClass) -> &'static str {
+    match class {
+        GenerationTerminalClass::Completed => "completed",
+        GenerationTerminalClass::Cancelled => "cancelled",
+        GenerationTerminalClass::Failed => "failed",
+    }
+}
+
+fn completion_terminal_snapshot(terminal: GenerationTerminalRecord) -> CompletionTerminalSnapshot {
+    CompletionTerminalSnapshot {
+        operation_id: terminal.identity.operation_id,
+        attempt_id: terminal.identity.attempt_id,
+        sequence: terminal.identity.sequence.to_string(),
+        class: completion_terminal_class(terminal.class),
+    }
+}
+
+fn completion_operation_snapshots(
+    state: &PluginState,
+    routes: &[ActiveGenerationRoute],
+) -> Result<Option<Vec<CompletionOperationSnapshot>>, IpcFailure> {
+    let mut families = BTreeMap::<
+        String,
+        (
+            GenerationFamilyIdentity,
+            Vec<CompletionOperationBranchSnapshot>,
+        ),
+    >::new();
+    for route in routes {
+        let request_id = route.identity.request_id.clone();
+        let family = families
+            .entry(request_id)
+            .or_insert_with(|| (route.identity.clone(), Vec::new()));
+        if family.0 != route.identity {
+            return Err(IpcFailure::new(
+                "generation_lifecycle_identity_mismatch",
+                "active generation routes disagree about their owning family",
+                false,
+            ));
+        }
+        family.1.push(CompletionOperationBranchSnapshot {
+            run_id: route.run_id.to_string(),
+            branch_id: route.branch_id.to_string(),
+        });
+    }
+
+    let mut snapshots = Vec::with_capacity(families.len());
+    for (request_id, (_identity, branches)) in families {
+        let Some(operation) = state
+            .generation_lifecycle
+            .current_snapshot(&request_id)
+            .map_err(|error| {
+                IpcFailure::new(
+                    "generation_lifecycle_observation_failed",
+                    error.to_string(),
+                    false,
+                )
+            })?
+        else {
+            return Ok(None);
+        };
+        snapshots.push(completion_operation_snapshot(
+            request_id, operation, branches,
+        )?);
+    }
+    Ok(Some(snapshots))
+}
+
+fn completion_operation_snapshot(
+    request_id: String,
+    operation: GenerationOperationSnapshot,
+    branches: Vec<CompletionOperationBranchSnapshot>,
+) -> Result<CompletionOperationSnapshot, IpcFailure> {
+    if operation.identity.operation_id != request_id
+        || operation.authoritative_terminal != operation.final_projection
+        || operation
+            .authoritative_terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.identity != operation.identity)
+        || operation
+            .final_projection
+            .as_ref()
+            .is_some_and(|terminal| terminal.identity != operation.identity)
+    {
+        return Err(IpcFailure::new(
+            "generation_lifecycle_identity_mismatch",
+            "the generation supervisor returned facts for another operation attempt",
+            false,
+        ));
+    }
+    Ok(CompletionOperationSnapshot {
+        request_id,
+        attempt_id: operation.identity.attempt_id,
+        operation_sequence: operation.identity.sequence.to_string(),
+        phase: completion_operation_phase(operation.phase),
+        cancellation_requested: operation.cancellation_requested,
+        authoritative_terminal: operation
+            .authoritative_terminal
+            .map(completion_terminal_snapshot),
+        final_projection: operation.final_projection.map(completion_terminal_snapshot),
+        progress_sequences: operation
+            .progress_projection
+            .into_iter()
+            .map(|sequence| sequence.to_string())
+            .collect(),
+        branches,
+    })
+}
+
+fn ensure_registered_completion_document(
+    store: &ProjectStore,
+    document_id: DocumentId,
+) -> Result<(), IpcFailure> {
+    if store
+        .list_documents()
+        .map_err(IpcFailure::store)?
+        .iter()
+        .any(|document| document.document_id == document_id)
+    {
+        return Ok(());
+    }
+    Err(IpcFailure::new(
+        "document_not_found",
+        "the requested completion document is not registered in this project",
+        false,
+    ))
+}
+
+fn parse_observed_completion_runs(
+    observed_run_ids: &[String],
+) -> Result<BTreeSet<GenerationRunId>, IpcFailure> {
+    if observed_run_ids.len() > DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES {
+        return Err(IpcFailure::new(
+            "completion_snapshot_observed_limit",
+            "the completion snapshot observes at most the active-generation capacity",
+            false,
+        ));
+    }
+    let parsed = observed_run_ids
+        .iter()
+        .map(|run_id| parse_generation_run_id(run_id))
+        .collect::<Result<BTreeSet<_>, IpcFailure>>()?;
+    if parsed.len() != observed_run_ids.len() {
+        return Err(IpcFailure::new(
+            "completion_snapshot_duplicate_run",
+            "the completion snapshot repeated an observed generation run",
+            false,
+        ));
+    }
+    Ok(parsed)
+}
+
+struct CompletionStoreProjection {
+    page: StoredBranchPage,
+    requested_summaries: Vec<StoredBranchSummary>,
+}
+
+fn read_completion_store_projection(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    document_id: DocumentId,
+    routes: &[ActiveGenerationRoute],
+    observed_run_ids: &BTreeSet<GenerationRunId>,
+) -> Result<CompletionStoreProjection, IpcFailure> {
+    let mut session = lock_session(state)?;
+    let store = require_bound_store(&mut session, project_id, session_id)?;
+    ensure_registered_completion_document(store, document_id)?;
+    let page = store
+        .branch_page(document_id, None, COMPLETION_SNAPSHOT_BRANCH_LIMIT)
+        .map_err(IpcFailure::store)?;
+    let active_routes_by_run = routes
+        .iter()
+        .map(|route| (route.run_id, route))
+        .collect::<BTreeMap<_, _>>();
+    let requested_run_ids = active_routes_by_run
+        .keys()
+        .copied()
+        .chain(observed_run_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let requested_summaries = requested_run_ids
+        .into_iter()
+        .map(|run_id| {
+            let summary = store
+                .branch_summary(document_id, run_id)
+                .map_err(IpcFailure::store)?
+                .ok_or_else(|| {
+                    IpcFailure::new(
+                        "generation_provenance_missing",
+                        "an observed generation run has no durable branch occurrence",
+                        false,
+                    )
+                })?;
+            if active_routes_by_run
+                .get(&run_id)
+                .is_some_and(|route| summary.branch_id != route.branch_id)
+            {
+                return Err(IpcFailure::new(
+                    "generation_lifecycle_identity_mismatch",
+                    "an active generation route disagrees with its durable branch identity",
+                    false,
+                ));
+            }
+            Ok(summary)
+        })
+        .collect::<Result<Vec<_>, IpcFailure>>()?;
+    Ok(CompletionStoreProjection {
+        page,
+        requested_summaries,
+    })
+}
+
+fn completion_snapshot_for(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    document_id: &str,
+    observed_run_ids: &[String],
+) -> Result<CompletionSnapshot, IpcFailure> {
+    let document_id = parse_document_id(document_id)?;
+    let observed_run_ids = parse_observed_completion_runs(observed_run_ids)?;
+    let (project_identity, session_identity) = {
+        let mut session = lock_session(state)?;
+        let store = require_bound_store(&mut session, project_id, session_id)?;
+        ensure_registered_completion_document(store, document_id)?;
+        (store.manifest().project_id, parse_command_id(session_id)?)
+    };
+
+    for _ in 0..COMPLETION_SNAPSHOT_CAPTURE_ATTEMPTS {
+        let routes_before = state
+            .generations
+            .active_routes_for_document(project_identity, session_identity, document_id)
+            .map_err(|error| IpcFailure::generation_registry(&error))?;
+        let projection = read_completion_store_projection(
+            state,
+            project_id,
+            session_id,
+            document_id,
+            &routes_before,
+            &observed_run_ids,
+        )?;
+        let routes_after = state
+            .generations
+            .active_routes_for_document(project_identity, session_identity, document_id)
+            .map_err(|error| IpcFailure::generation_registry(&error))?;
+        if routes_before != routes_after {
+            continue;
+        }
+        let Some(active_operations) = completion_operation_snapshots(state, &routes_after)? else {
+            let current_routes = state
+                .generations
+                .active_routes_for_document(project_identity, session_identity, document_id)
+                .map_err(|registry_error| IpcFailure::generation_registry(&registry_error))?;
+            if current_routes != routes_after {
+                continue;
+            }
+            return Err(IpcFailure::new(
+                "generation_lifecycle_missing",
+                "an active generation family has no authoritative supervisor operation",
+                false,
+            ));
+        };
+        let active_run_ids = routes_after
+            .iter()
+            .map(|route| route.run_id)
+            .collect::<BTreeSet<_>>();
+        let mut durable_summaries = projection.page.branches;
+        let mut included_run_ids = durable_summaries
+            .iter()
+            .map(|summary| summary.run_id)
+            .collect::<BTreeSet<_>>();
+        for summary in projection.requested_summaries {
+            if included_run_ids.insert(summary.run_id) {
+                durable_summaries.push(summary);
+            }
+        }
+        let branches = durable_summaries
+            .into_iter()
+            .map(|summary| {
+                let active = active_run_ids.contains(&summary.run_id);
+                branch_summary_snapshot(summary, active)
+            })
+            .collect();
+        return Ok(CompletionSnapshot {
+            project_id: project_identity.to_string(),
+            session_id: session_identity.to_string(),
+            document_id: document_id.to_string(),
+            active_operations,
+            branches,
+            next_cursor: projection.page.next_cursor.map(BranchCursorSnapshot::from),
+            has_more: projection.page.has_more,
+        });
+    }
+    Err(IpcFailure::new(
+        "completion_snapshot_changed",
+        "generation routes changed while the completion snapshot was captured; retry the read",
+        true,
+    ))
+}
+
+#[tauri::command]
+async fn completion_snapshot(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    observed_run_ids: Vec<String>,
+    state: State<'_, PluginState>,
+) -> Result<CompletionSnapshot, IpcFailure> {
+    completion_snapshot_for(
+        &state,
+        &project_id,
+        &session_id,
+        &document_id,
+        &observed_run_ids,
+    )
+}
+
 #[tauri::command]
 async fn branch_page(
     project_id: String,
@@ -5469,10 +5844,8 @@ fn branch_body_snapshot(
 }
 
 fn branch_status(status: StoredBranchStatus, active: bool) -> &'static str {
-    if active {
-        return "generating";
-    }
     match status {
+        StoredBranchStatus::Interrupted if active => "generating",
         StoredBranchStatus::Interrupted => "interrupted",
         StoredBranchStatus::Completed => "ready",
         StoredBranchStatus::Cancelled => "cancelled",
@@ -10058,6 +10431,154 @@ mod tests {
             std::fs::read(&outside).expect("outside target survives"),
             outside_bytes
         );
+    }
+
+    #[test]
+    fn completion_snapshot_joins_scoped_supervisor_and_durable_terminal_facts() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Completion Snapshot Novel");
+        let mut store =
+            initialize_project(&root, "Completion Snapshot Novel".to_owned()).expect("initialize");
+        let project_id = store.manifest().project_id;
+        let session_id = CommandId::new();
+        let (run_id, branch_id, document_id) = start_persisted_test_generation(&mut store);
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+        let identity = GenerationFamilyIdentity {
+            request_id: "completion-snapshot-active".to_owned(),
+            project_id,
+            session_id,
+            document_id,
+        };
+        state
+            .generations
+            .register(loom_host::GenerationFamilyRegistration {
+                identity: identity.clone(),
+                branches: vec![(run_id, branch_id)],
+                cancellation: Arc::new(RecordingCancellation::default()),
+            })
+            .expect("register active family");
+        let lifecycle =
+            start_test_generation_lifecycle(&state.generation_lifecycle, &identity.request_id);
+        state
+            .generation_lifecycle
+            .publish_progress(&lifecycle, u64::MAX)
+            .expect("publish bounded supervisor progress");
+        state
+            .generation_lifecycle
+            .request_cancel(lifecycle.identity())
+            .expect("request supervisor cancellation");
+
+        let active = completion_snapshot_for(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            &document_id.to_string(),
+            &[],
+        )
+        .expect("capture active completion snapshot");
+        assert_eq!(active.project_id, project_id.to_string());
+        assert_eq!(active.session_id, session_id.to_string());
+        assert_eq!(active.document_id, document_id.to_string());
+        assert_eq!(active.active_operations.len(), 1);
+        let operation = &active.active_operations[0];
+        assert_eq!(operation.request_id, identity.request_id);
+        assert_eq!(operation.phase, "running");
+        assert!(operation.cancellation_requested);
+        assert_eq!(operation.progress_sequences, vec![u64::MAX.to_string()]);
+        assert_eq!(operation.branches.len(), 1);
+        assert_eq!(operation.branches[0].run_id, run_id.to_string());
+        assert_eq!(operation.branches[0].branch_id, branch_id.to_string());
+        assert_eq!(active.branches.len(), 1);
+        assert_eq!(active.branches[0].status, "generating");
+
+        terminalize_open_runs(
+            &state,
+            &identity,
+            &[(run_id, branch_id)],
+            "fixture terminal failure",
+        )
+        .expect("persist authoritative terminal without releasing route");
+        let terminal = completion_snapshot_for(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            &document_id.to_string(),
+            &[run_id.to_string()],
+        )
+        .expect("capture durable terminal completion snapshot");
+        assert_eq!(terminal.active_operations.len(), 1);
+        assert_eq!(terminal.branches[0].status, "failed");
+        assert_eq!(
+            terminal.branches[0].error.as_deref(),
+            Some("fixture terminal failure")
+        );
+
+        release_family_after_terminal_persistence(
+            &state,
+            &identity,
+            &[(run_id, branch_id)],
+            GenerationTerminalClass::Failed,
+        )
+        .expect("release terminal family after its durable write");
+        let recovered = completion_snapshot_for(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            &document_id.to_string(),
+            &[run_id.to_string()],
+        )
+        .expect("recover the formerly active run by observed identity");
+        assert!(recovered.active_operations.is_empty());
+        assert_eq!(recovered.branches[0].status, "failed");
+    }
+
+    #[test]
+    fn completion_snapshot_rejects_stale_session_and_foreign_document_scope() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Scoped Completion Snapshot Novel");
+        let store = initialize_project(&root, "Scoped Completion Snapshot Novel".to_owned())
+            .expect("initialize");
+        let project_id = store.manifest().project_id;
+        let document_id = store
+            .list_documents()
+            .expect("list documents")
+            .first()
+            .expect("initial document")
+            .document_id;
+        let session_id = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+
+        let stale_session_error = completion_snapshot_for(
+            &state,
+            &project_id.to_string(),
+            &CommandId::new().to_string(),
+            &document_id.to_string(),
+            &[],
+        )
+        .expect_err("stale renderer session must fail");
+        assert_eq!(stale_session_error.code, "stale_project_session");
+
+        let foreign_document = completion_snapshot_for(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            &DocumentId::new().to_string(),
+            &[],
+        )
+        .expect_err("foreign document identity must fail");
+        assert_eq!(foreign_document.code, "document_not_found");
     }
 
     #[test]

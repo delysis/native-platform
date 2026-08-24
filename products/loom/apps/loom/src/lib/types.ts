@@ -223,6 +223,49 @@ export interface BranchPage {
   has_more: boolean;
 }
 
+export type CompletionOperationPhase =
+  | 'reserved'
+  | 'queued'
+  | 'running'
+  | 'terminal'
+  | 'released';
+
+export type CompletionTerminalClass = 'completed' | 'cancelled' | 'failed';
+
+export interface CompletionTerminalSnapshot {
+  operation_id: string;
+  attempt_id: string;
+  /** Decimal u64, preserved as text across the JavaScript boundary. */
+  sequence: string;
+  class: CompletionTerminalClass;
+}
+
+export interface CompletionOperationBranchSnapshot {
+  run_id: string;
+  branch_id: string;
+}
+
+export interface CompletionOperationSnapshot {
+  request_id: string;
+  attempt_id: string;
+  /** Decimal u64, preserved as text across the JavaScript boundary. */
+  operation_sequence: string;
+  phase: CompletionOperationPhase;
+  cancellation_requested: boolean;
+  authoritative_terminal: CompletionTerminalSnapshot | null;
+  final_projection: CompletionTerminalSnapshot | null;
+  /** Decimal u64 values, preserved as text across the JavaScript boundary. */
+  progress_sequences: string[];
+  branches: CompletionOperationBranchSnapshot[];
+}
+
+export interface CompletionSnapshot extends BranchPage {
+  project_id: string;
+  session_id: string;
+  document_id: string;
+  active_operations: CompletionOperationSnapshot[];
+}
+
 export interface BranchBody {
   run_id: string;
   branch_id: string;
