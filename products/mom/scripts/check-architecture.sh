@@ -25,6 +25,12 @@ then
   exit 1
 fi
 
+if rg -n '(fte-[a-z-]+|free-token-energy|tauri-plugin-free-token-energy)' --glob 'Cargo.toml' crates apps
+then
+  echo "Mom Llama must not compose the standalone FTE product or plugin" >&2
+  exit 1
+fi
+
 if rg -n '(llama|attachment)-native-[a-z-]+\s*=\s*\{\s*path\s*=\s*"\.\.' --glob 'Cargo.toml' .
 then
   echo "Mom child manifests must inherit imported dependencies from the root workspace" >&2
@@ -58,6 +64,11 @@ then
 fi
 
 mom_tree=$(cargo tree --locked -p mom-llama-app --prefix none)
+if printf '%s\n' "$mom_tree" | rg -n '^(fte-|free-token-energy|tauri-plugin-free-token-energy)'
+then
+  echo "Mom Llama's resolved graph still contains the standalone FTE product" >&2
+  exit 1
+fi
 if printf '%s\n' "$mom_tree" | rg -n '^(fte-speech-|speech-native-|tauri-plugin-(free-token-energy-speech|speech-native))'
 then
   echo "Mom Llama must not resolve speech packages without deliberate speech UX" >&2
@@ -107,4 +118,4 @@ then
   exit 1
 fi
 
-echo "architecture ok: Mom owns product code and resolves Native, Attachment, and FTE from imported root paths"
+echo "architecture ok: Mom owns product code, resolves Native and Attachment, and does not compose standalone FTE"

@@ -14,15 +14,10 @@ anyhow = "1"
 mom-llama-runtime.workspace = true
 llama-native-types = { workspace = true }
 llama-native-host = { workspace = true }
-fte-backend-llama.workspace = true
-fte-router.workspace = true
-fte-store.workspace = true
-fte-types.workspace = true
 maud = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
-tauri-plugin-free-token-energy.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 

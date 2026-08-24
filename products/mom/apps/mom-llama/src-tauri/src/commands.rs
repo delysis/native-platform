@@ -146,17 +146,15 @@ pub fn mom_llama_engine_configure(
     max_parallel_sequences: Option<u32>,
     memory_budget_mib: Option<u64>,
 ) -> Result<Value, String> {
-    let lease = runtime.admit(command_spec("mom_llama_engine_configure"))?;
-    let value = command_value(mom_llama_runtime::configure_engine(
+    let _lease = runtime.admit(command_spec("mom_llama_engine_configure"))?;
+    command_value(mom_llama_runtime::configure_engine(
         PathBuf::from(model_path),
         device.as_deref().map(native_device_from_str),
         context_tokens,
         batch_tokens,
         max_parallel_sequences,
         memory_budget_mib.map(mib_to_bytes),
-    ))?;
-    runtime.refresh_native_model(&lease)?;
-    Ok(value)
+    ))
 }
 
 #[tauri::command]
@@ -170,10 +168,8 @@ pub fn mom_llama_model_select(
     runtime: State<'_, AppRuntimeHandle>,
     model_path: String,
 ) -> Result<Value, String> {
-    let lease = runtime.admit(command_spec("mom_llama_model_select"))?;
-    let value = command_value(mom_llama_runtime::model_select(PathBuf::from(model_path)))?;
-    runtime.refresh_native_model(&lease)?;
-    Ok(value)
+    let _lease = runtime.admit(command_spec("mom_llama_model_select"))?;
+    command_value(mom_llama_runtime::model_select(PathBuf::from(model_path)))
 }
 
 #[tauri::command]
@@ -821,10 +817,8 @@ pub fn mom_llama_settings_get(runtime: State<'_, AppRuntimeHandle>) -> Result<Va
 
 #[tauri::command]
 pub fn mom_llama_settings_reset(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
-    let lease = runtime.admit(command_spec("mom_llama_settings_reset"))?;
-    let value = command_value(mom_llama_runtime::settings_reset())?;
-    runtime.refresh_native_model(&lease)?;
-    Ok(value)
+    let _lease = runtime.admit(command_spec("mom_llama_settings_reset"))?;
+    command_value(mom_llama_runtime::settings_reset())
 }
 
 #[tauri::command]
@@ -832,8 +826,8 @@ pub fn mom_llama_settings_update(
     runtime: State<'_, AppRuntimeHandle>,
     input: SettingsUpdateInput,
 ) -> Result<Value, String> {
-    let lease = runtime.admit(command_spec("mom_llama_settings_update"))?;
-    let value = command_value(mom_llama_runtime::settings_update(SettingsUpdate {
+    let _lease = runtime.admit(command_spec("mom_llama_settings_update"))?;
+    command_value(mom_llama_runtime::settings_update(SettingsUpdate {
         model_path: path_setting_patch(input.model_path),
         mmproj_path: path_setting_patch(input.mmproj_path),
         native_device: input.device.as_deref().map(native_device_from_str),
@@ -846,9 +840,7 @@ pub fn mom_llama_settings_update(
         max_tokens: input.max_tokens,
         kv_cache_policy: input.kv_cache_policy.as_deref().map(kv_policy_from_str),
         upstream_settings: input.upstream_settings.and_then(value_to_settings_map),
-    }))?;
-    runtime.refresh_native_model(&lease)?;
-    Ok(value)
+    }))
 }
 
 #[derive(Debug, Deserialize)]

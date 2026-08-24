@@ -238,6 +238,7 @@ impl RuntimeStore {
             .transpose()
     }
 
+    #[cfg(test)]
     pub(crate) fn put_bytes(&self, namespace: &str, value: &[u8]) -> Result<()> {
         let connection = self.connection()?;
         let (nonce, ciphertext) = self.encrypt_bytes(namespace, value)?;
@@ -957,7 +958,7 @@ mod tests {
                 values: vec!["old".to_string()],
             },
         )?;
-        store.put_bytes("blob.old", b"old bytes")?;
+        store.put_documents_atomically([("blob.old", b"old bytes")])?;
 
         let failed: Result<()> = store.mutate_documents(
             "metadata",

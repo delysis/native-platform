@@ -5,19 +5,13 @@ mod operation_supervisor;
 mod view;
 use anyhow::Result;
 use app_runtime::AppRuntimeHandle;
-use fte_backend_llama::LlamaNativeBackend;
-use fte_router::{Gateway, GatewayDefaults};
-use fte_store::ResponseStore;
-use fte_types::{GatewayError, GatewayResponse, RequestId};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{any::Any, panic::AssertUnwindSafe};
 use tauri::menu::{
     AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID,
 };
-use tauri::plugin::TauriPlugin;
 use tauri::{AppHandle, Manager, Runtime, State};
 
 const APPLICATION_QUIT_MENU_ID: &str = "mom-llama.application.quit";
@@ -28,7 +22,6 @@ pub(crate) static APP_DATA_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
 struct StartupController {
-    gateway: Arc<Gateway>,
     state: Arc<Mutex<StartupState>>,
 }
 
@@ -42,7 +35,6 @@ enum StartupState {
     QuiescingSafe(Option<AppRuntimeHandle>),
     QuiescingDuringBuild,
     QuiescingBlocked(AppRuntimeHandle),
-    QuiescingBuildCleanupBlocked(mom_llama_runtime::native_runtime::ProductRuntimeOwner),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +54,6 @@ enum FinalExitTarget {
     NoRuntime,
     Runtime(AppRuntimeHandle),
     WaitForBuild,
-    AbortWithoutRustTeardown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,80 +62,13 @@ enum FinalExitDecision {
     AbortWithoutRustTeardown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailedBuildDisposition {
-    Retryable,
-    RestartRequired,
-    ExitSafe,
-    RetainAndAbortOnFinalExit,
-}
-
-enum FailedBuildCompletion {
-    PreOwner,
-    PostOwnerCleaned,
-    PostOwnerCleanupBlocked(mom_llama_runtime::native_runtime::ProductRuntimeOwner),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailedBuildKind {
-    PreOwner,
-    PostOwnerCleaned,
-    PostOwnerCleanupBlocked,
-}
-
-impl FailedBuildCompletion {
-    const fn kind(&self) -> FailedBuildKind {
-        match self {
-            Self::PreOwner => FailedBuildKind::PreOwner,
-            Self::PostOwnerCleaned => FailedBuildKind::PostOwnerCleaned,
-            Self::PostOwnerCleanupBlocked(_) => FailedBuildKind::PostOwnerCleanupBlocked,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NativeBuildCleanupEvidence {
-    native_host_joined: bool,
-    joined_native_worker_count: usize,
-    error: Option<String>,
-}
-
-struct NativeBuildCleanup {
-    evidence: NativeBuildCleanupEvidence,
-    blocked_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
-}
-
-#[derive(Debug)]
-enum PostOwnerBuildCause<E> {
-    Error(E),
-    Panic(String),
-}
-
-struct PostOwnerBuildFailure<E> {
-    cause: PostOwnerBuildCause<E>,
-    cleanup: NativeBuildCleanup,
-}
-
 struct RuntimeBuildError {
     message: String,
-    cleanup: Option<NativeBuildCleanupEvidence>,
-    completion: FailedBuildCompletion,
 }
 
 impl std::fmt::Display for RuntimeBuildError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)?;
-        if let Some(cleanup) = &self.cleanup {
-            write!(
-                formatter,
-                "; native cleanup: joined={}, workers={}",
-                cleanup.native_host_joined, cleanup.joined_native_worker_count
-            )?;
-            if let Some(error) = &cleanup.error {
-                write!(formatter, ", error={error}")?;
-            }
-        }
-        Ok(())
+        formatter.write_str(&self.message)
     }
 }
 
@@ -155,16 +79,13 @@ impl std::fmt::Debug for RuntimeBuildError {
         formatter
             .debug_struct("RuntimeBuildError")
             .field("message", &self.message)
-            .field("cleanup", &self.cleanup)
-            .field("completion", &self.completion.kind())
             .finish()
     }
 }
 
 impl StartupController {
-    fn new(gateway: Arc<Gateway>) -> Self {
+    fn new() -> Self {
         Self {
-            gateway,
             state: Arc::new(Mutex::new(StartupState::Idle)),
         }
     }
@@ -181,10 +102,7 @@ impl StartupController {
             }
             StartupState::QuiescingSafe(_)
             | StartupState::QuiescingDuringBuild
-            | StartupState::QuiescingBlocked(_)
-            | StartupState::QuiescingBuildCleanupBlocked(_) => {
-                Err("Mom Llama is shutting down".to_string())
-            }
+            | StartupState::QuiescingBlocked(_) => Err("Mom Llama is shutting down".to_string()),
             StartupState::RestartRequired => Err(
                 "Mom Llama must be restarted before local runtime startup can retry".to_string(),
             ),
@@ -256,9 +174,7 @@ impl StartupController {
                 StartupShutdownAction::WaitForBuild
             }
             StartupState::QuiescingDuringBuild => StartupShutdownAction::AlreadyQuiescing,
-            StartupState::QuiescingSafe(_)
-            | StartupState::QuiescingBlocked(_)
-            | StartupState::QuiescingBuildCleanupBlocked(_) => {
+            StartupState::QuiescingSafe(_) | StartupState::QuiescingBlocked(_) => {
                 StartupShutdownAction::AlreadyQuiescing
             }
             _ => {
@@ -291,33 +207,13 @@ impl StartupController {
         };
     }
 
-    fn finish_failed_build(&self, completion: FailedBuildCompletion) {
-        let Ok(mut state) = self.state.lock() else {
-            if let FailedBuildCompletion::PostOwnerCleanupBlocked(owner) = completion {
-                // A poisoned state lock cannot safely publish join evidence.
-                // Intentionally retain the sole native owner for process life;
-                // dropping it would silently repeat the failed finalizer.
-                std::mem::forget(owner);
-            }
-            return;
-        };
-        let disposition = failed_build_disposition(
-            matches!(&*state, StartupState::QuiescingDuringBuild),
-            completion.kind(),
-        );
-        *state = match (disposition, completion) {
-            (FailedBuildDisposition::Retryable, FailedBuildCompletion::PreOwner) => {
-                StartupState::Failed
-            }
-            (FailedBuildDisposition::RestartRequired, FailedBuildCompletion::PostOwnerCleaned) => {
-                StartupState::RestartRequired
-            }
-            (FailedBuildDisposition::ExitSafe, _) => StartupState::QuiescingSafe(None),
-            (
-                FailedBuildDisposition::RetainAndAbortOnFinalExit,
-                FailedBuildCompletion::PostOwnerCleanupBlocked(owner),
-            ) => StartupState::QuiescingBuildCleanupBlocked(owner),
-            _ => unreachable!("failed-build disposition and completion must agree"),
+    fn finish_failed_build(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = match &*state {
+                StartupState::QuiescingDuringBuild => StartupState::QuiescingSafe(None),
+                StartupState::Building => StartupState::Failed,
+                _ => return,
+            };
         }
     }
 
@@ -330,8 +226,7 @@ impl StartupController {
                 match &*state {
                     StartupState::QuiescingDuringBuild => None,
                     StartupState::QuiescingSafe(_) => Some(true),
-                    StartupState::QuiescingBlocked(_)
-                    | StartupState::QuiescingBuildCleanupBlocked(_) => Some(false),
+                    StartupState::QuiescingBlocked(_) => Some(false),
                     _ => Some(false),
                 }
             };
@@ -354,10 +249,6 @@ impl StartupController {
             }
             StartupState::QuiescingSafe(Some(runtime))
             | StartupState::QuiescingBlocked(runtime) => FinalExitTarget::Runtime(runtime.clone()),
-            StartupState::QuiescingBuildCleanupBlocked(owner) => {
-                let _keep_owner_alive = owner;
-                FinalExitTarget::AbortWithoutRustTeardown
-            }
             StartupState::Building => {
                 *state = StartupState::QuiescingDuringBuild;
                 FinalExitTarget::WaitForBuild
@@ -372,20 +263,6 @@ impl StartupController {
             }
             StartupState::QuiescingSafe(None) => FinalExitTarget::NoRuntime,
         }
-    }
-}
-
-const fn failed_build_disposition(
-    quit_waiting: bool,
-    completion: FailedBuildKind,
-) -> FailedBuildDisposition {
-    match (quit_waiting, completion) {
-        (_, FailedBuildKind::PostOwnerCleanupBlocked) => {
-            FailedBuildDisposition::RetainAndAbortOnFinalExit
-        }
-        (true, _) => FailedBuildDisposition::ExitSafe,
-        (false, FailedBuildKind::PreOwner) => FailedBuildDisposition::Retryable,
-        (false, FailedBuildKind::PostOwnerCleaned) => FailedBuildDisposition::RestartRequired,
     }
 }
 
@@ -450,13 +327,10 @@ async fn mom_llama_runtime_initialize(
     startup.begin_runtime_build()?;
     let runtime_data_dir = settings.data_dir.clone();
 
-    let gateway = Arc::clone(&startup.gateway);
-    let built = match tauri::async_runtime::spawn_blocking(move || build_runtime(gateway, settings))
-        .await
-    {
+    let built = match tauri::async_runtime::spawn_blocking(move || build_runtime(settings)).await {
         Ok(built) => built,
         Err(error) => {
-            startup.finish_failed_build(FailedBuildCompletion::PreOwner);
+            startup.finish_failed_build();
             return Err(format!("Mom Llama startup worker failed: {error}"));
         }
     };
@@ -478,7 +352,7 @@ async fn mom_llama_runtime_initialize(
         },
         Err(error) => {
             let message = format!("Mom Llama could not initialize its local runtime: {error:#}");
-            startup.finish_failed_build(error.completion);
+            startup.finish_failed_build();
             Err(message)
         }
     }
@@ -509,12 +383,8 @@ fn main() {
     // Constructing the product runtime opens the encrypted store and may ask
     // macOS Keychain for authorization. The webview invokes the initializer
     // only after this visible window and AppKit's event loop are live.
-    let gateway = Arc::new(Gateway::new(GatewayDefaults {
-        catalog_version: "mom-llama-local-v1".to_string(),
-    }));
-    let startup = StartupController::new(Arc::clone(&gateway));
+    let startup = StartupController::new();
     let event_startup = startup.clone();
-    let gateway_plugin = build_gateway_plugin(gateway);
     let exit_allowed = Arc::new(AtomicBool::new(false));
     let event_exit_allowed = Arc::clone(&exit_allowed);
     let app = tauri::Builder::default()
@@ -524,7 +394,6 @@ fn main() {
         .enable_macos_default_menu(false)
         .menu(build_desktop_menu)
         .manage(startup)
-        .plugin(gateway_plugin)
         .invoke_handler(tauri::generate_handler![
             mom_llama_runtime_initialize,
             commands::mom_llama_render_app,
@@ -819,7 +688,6 @@ fn decide_final_exit_target(
         FinalExitTarget::NoRuntime => true,
         FinalExitTarget::Runtime(runtime) => shutdown_runtime(runtime),
         FinalExitTarget::WaitForBuild => wait_for_build(),
-        FinalExitTarget::AbortWithoutRustTeardown => false,
     };
     final_exit_decision(safe_to_return)
 }
@@ -875,7 +743,6 @@ fn log_shutdown_result(
 }
 
 fn build_runtime(
-    gateway: Arc<Gateway>,
     settings: mom_llama_runtime::config::Settings,
 ) -> std::result::Result<AppRuntimeHandle, RuntimeBuildError> {
     let persona_approval_recovery =
@@ -886,172 +753,17 @@ fn build_runtime(
             })
             .map_err(|error| RuntimeBuildError {
                 message: format!("persona approval recovery initialization failed: {error:#}"),
-                cleanup: None,
-                completion: FailedBuildCompletion::PreOwner,
             })?;
     let native_owner = mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(
         &settings,
     )
     .map_err(|error| RuntimeBuildError {
         message: format!("native runtime owner initialization failed: {error:#}"),
-        cleanup: None,
-        completion: FailedBuildCompletion::PreOwner,
-    })?;
-    let attempt = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<_> {
-        let (host, model) = mom_llama_runtime::gateway_native_configuration()?;
-        let backend = Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host)));
-        backend
-            .replace_configuration(Arc::clone(&host), model)
-            .map_err(anyhow::Error::msg)?;
-        gateway
-            .register_backend(backend.clone())
-            .map_err(anyhow::Error::msg)?;
-        Ok(backend)
-    }));
-    let (backend, native_owner) = finish_post_owner_build(attempt, native_owner, |owner| {
-        cleanup_rejected_native_owner(owner)
-    })
-    .map_err(|failure| {
-        let message = match failure.cause {
-            PostOwnerBuildCause::Error(error) => {
-                format!("native runtime composition failed: {error:#}")
-            }
-            PostOwnerBuildCause::Panic(message) => {
-                format!("native runtime composition panicked: {message}")
-            }
-        };
-        let NativeBuildCleanup {
-            evidence,
-            blocked_owner,
-        } = failure.cleanup;
-        let completion = match blocked_owner {
-            Some(owner) => FailedBuildCompletion::PostOwnerCleanupBlocked(owner),
-            None => FailedBuildCompletion::PostOwnerCleaned,
-        };
-        RuntimeBuildError {
-            message,
-            cleanup: Some(evidence),
-            completion,
-        }
     })?;
     Ok(AppRuntimeHandle::new(
-        gateway,
-        backend,
         native_owner,
         persona_approval_recovery,
     ))
-}
-
-fn finish_post_owner_build<T, E, O>(
-    attempt: std::thread::Result<std::result::Result<T, E>>,
-    owner: O,
-    cleanup: impl FnOnce(O) -> NativeBuildCleanup,
-) -> std::result::Result<(T, O), PostOwnerBuildFailure<E>> {
-    match attempt {
-        Ok(Ok(value)) => Ok((value, owner)),
-        Ok(Err(error)) => Err(PostOwnerBuildFailure {
-            cause: PostOwnerBuildCause::Error(error),
-            cleanup: cleanup(owner),
-        }),
-        Err(payload) => Err(PostOwnerBuildFailure {
-            cause: PostOwnerBuildCause::Panic(panic_message(payload)),
-            cleanup: cleanup(owner),
-        }),
-    }
-}
-
-fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|message| (*message).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "non-string panic payload".to_string())
-}
-
-fn cleanup_rejected_native_owner(
-    owner: mom_llama_runtime::native_runtime::ProductRuntimeOwner,
-) -> NativeBuildCleanup {
-    let host = owner.host();
-    match mom_llama_runtime::shutdown_product_runtime_for_process_exit(&host) {
-        Ok(receipt) => NativeBuildCleanup {
-            evidence: NativeBuildCleanupEvidence {
-                native_host_joined: true,
-                joined_native_worker_count: receipt.joined_worker_count(),
-                error: None,
-            },
-            blocked_owner: None,
-        },
-        Err(error) => NativeBuildCleanup {
-            evidence: NativeBuildCleanupEvidence {
-                native_host_joined: false,
-                joined_native_worker_count: 0,
-                error: Some(error.to_string()),
-            },
-            // Keep the sole owner and its strong host reference alive. Final
-            // Exit will abort without Rust teardown rather than dropping live
-            // native resources after a failed join.
-            blocked_owner: Some(owner),
-        },
-    }
-}
-
-fn build_gateway_plugin(gateway: Arc<Gateway>) -> TauriPlugin<tauri::Wry> {
-    let mut builder = tauri_plugin_free_token_energy::Builder::new()
-        .with_gateway(gateway)
-        .with_store(Arc::new(MomGatewayStore))
-        .with_default_loopback();
-    if let Some(app_data_dir) =
-        gateway_app_data_dir_override(std::env::var_os("LLAMA_NATIVE_KIT_DATA_DIR"))
-    {
-        builder = builder.with_app_data_dir(app_data_dir);
-    }
-    builder.build()
-}
-
-fn gateway_app_data_dir_override(
-    configured: Option<std::ffi::OsString>,
-) -> Option<std::path::PathBuf> {
-    configured
-        .filter(|path| !path.is_empty())
-        .map(std::path::PathBuf::from)
-}
-
-struct MomGatewayStore;
-
-impl ResponseStore for MomGatewayStore {
-    fn put(&self, response: &GatewayResponse) -> Result<(), GatewayError> {
-        let bytes = serde_json::to_vec(response).map_err(gateway_store_error)?;
-        mom_llama_runtime::gateway_document_put(&gateway_response_namespace(&response.id), &bytes)
-            .map_err(gateway_store_error)
-    }
-
-    fn get(&self, id: &str) -> Result<Option<GatewayResponse>, GatewayError> {
-        mom_llama_runtime::gateway_document_get(&gateway_response_namespace(id))
-            .map_err(gateway_store_error)?
-            .map(|bytes| serde_json::from_slice(&bytes).map_err(gateway_store_error))
-            .transpose()
-    }
-
-    fn delete(&self, id: &str) -> Result<bool, GatewayError> {
-        mom_llama_runtime::gateway_document_delete(&gateway_response_namespace(id))
-            .map_err(gateway_store_error)
-    }
-}
-
-fn gateway_response_namespace(id: &str) -> String {
-    format!("fte.response.v1:{id}")
-}
-
-fn gateway_store_error(error: impl std::fmt::Display) -> GatewayError {
-    GatewayError {
-        code: "mom_llama_gateway_store_error".to_string(),
-        class: fte_types::ErrorClass::Internal,
-        retryable: false,
-        http_status: 500,
-        request_id: RequestId::new(),
-        provider: None,
-        safe_detail: format!("Mom Llama gateway storage failed: {error}"),
-    }
 }
 
 fn smoke() -> Result<()> {
@@ -1090,21 +802,14 @@ fn smoke_receipt(rendered_html_bytes: usize) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailedBuildCompletion, FailedBuildKind, FinalExitDecision, FinalExitTarget,
-        NativeBuildCleanup, NativeBuildCleanupEvidence, PostOwnerBuildCause, StartupAction,
-        StartupController, StartupShutdownAction, decide_final_exit_target,
-        failed_build_disposition, final_exit_decision, finish_post_owner_build,
-        gateway_app_data_dir_override, rejected_build_disposition, safe_to_exit_after_shutdown,
-        smoke_receipt,
+        FinalExitDecision, FinalExitTarget, StartupAction, StartupController,
+        StartupShutdownAction, decide_final_exit_target, final_exit_decision,
+        rejected_build_disposition, safe_to_exit_after_shutdown, smoke_receipt,
     };
     use crate::app_runtime::{AppShutdownError, AppShutdownSummary};
-    use fte_router::{Gateway, GatewayDefaults};
-    use std::sync::Arc;
 
     fn startup_controller() -> StartupController {
-        StartupController::new(Arc::new(Gateway::new(GatewayDefaults {
-            catalog_version: "startup-test".to_string(),
-        })))
+        StartupController::new()
     }
 
     #[test]
@@ -1149,7 +854,7 @@ mod tests {
             startup.begin_shutdown(),
             StartupShutdownAction::AlreadyQuiescing
         ));
-        startup.finish_failed_build(FailedBuildCompletion::PostOwnerCleaned);
+        startup.finish_failed_build();
         assert!(startup.wait_for_build().await);
         assert!(matches!(
             startup.begin_shutdown(),
@@ -1158,52 +863,16 @@ mod tests {
     }
 
     #[test]
-    fn only_pre_owner_failure_is_retryable() {
+    fn failed_runtime_build_is_retryable_before_owner_publication() {
+        let startup = startup_controller();
+        assert!(startup.begin_initialization().is_ok());
+        assert!(startup.begin_runtime_build().is_ok());
+        startup.finish_failed_build();
         assert_eq!(
-            failed_build_disposition(false, FailedBuildKind::PreOwner),
-            super::FailedBuildDisposition::Retryable
-        );
-        assert_eq!(
-            failed_build_disposition(true, FailedBuildKind::PreOwner),
-            super::FailedBuildDisposition::ExitSafe
-        );
-        assert_eq!(
-            failed_build_disposition(false, FailedBuildKind::PostOwnerCleaned),
-            super::FailedBuildDisposition::RestartRequired
-        );
-        assert_eq!(
-            failed_build_disposition(true, FailedBuildKind::PostOwnerCleaned),
-            super::FailedBuildDisposition::ExitSafe
-        );
-        assert_eq!(
-            failed_build_disposition(false, FailedBuildKind::PostOwnerCleanupBlocked),
-            super::FailedBuildDisposition::RetainAndAbortOnFinalExit
-        );
-        assert_eq!(
-            failed_build_disposition(true, FailedBuildKind::PostOwnerCleanupBlocked),
-            super::FailedBuildDisposition::RetainAndAbortOnFinalExit
-        );
-
-        let pre_owner = startup_controller();
-        assert!(pre_owner.begin_initialization().is_ok());
-        assert!(pre_owner.begin_runtime_build().is_ok());
-        pre_owner.finish_failed_build(FailedBuildCompletion::PreOwner);
-        assert_eq!(
-            pre_owner.begin_initialization(),
+            startup.begin_initialization(),
             Ok(StartupAction::Initialize {
                 retry_cached_failure: true
             })
-        );
-
-        let post_owner = startup_controller();
-        assert!(post_owner.begin_initialization().is_ok());
-        assert!(post_owner.begin_runtime_build().is_ok());
-        post_owner.finish_failed_build(FailedBuildCompletion::PostOwnerCleaned);
-        assert!(
-            post_owner
-                .begin_initialization()
-                .expect_err("closed product lifecycle must not advertise retry")
-                .contains("restarted")
         );
 
         assert_eq!(
@@ -1230,7 +899,6 @@ mod tests {
             started_at_unix_ms: 1,
             completed_at_unix_ms: 2,
             elapsed_ms: 1,
-            gateway_drained: true,
             native_host_joined: false,
             operation_supervisor_phase: crate::operation_supervisor::LifecyclePhase::Closed,
             active_operation_count: 0,
@@ -1248,22 +916,9 @@ mod tests {
             summary: summary.clone(),
             operation_error: None,
             approval_recovery_error: None,
-            gateway_error: None,
             native_error: Some("native join failed".to_string()),
         });
         assert!(!safe_to_exit_after_shutdown(&failure));
-
-        let gateway_only_failure = Err(AppShutdownError {
-            summary: AppShutdownSummary {
-                native_host_joined: true,
-                ..summary.clone()
-            },
-            operation_error: None,
-            approval_recovery_error: None,
-            gateway_error: Some("gateway drain failed".to_string()),
-            native_error: None,
-        });
-        assert!(safe_to_exit_after_shutdown(&gateway_only_failure));
 
         let recovery_failure = Err(AppShutdownError {
             summary: AppShutdownSummary {
@@ -1273,7 +928,6 @@ mod tests {
             },
             operation_error: None,
             approval_recovery_error: Some("final approval sweep failed".to_string()),
-            gateway_error: None,
             native_error: None,
         });
         assert!(!safe_to_exit_after_shutdown(&recovery_failure));
@@ -1284,72 +938,11 @@ mod tests {
         assert_eq!(final_exit_decision(true), FinalExitDecision::ReturnToTauri);
         assert_eq!(
             decide_final_exit_target(
-                FinalExitTarget::AbortWithoutRustTeardown,
-                |_| panic!("blocked final exit must not run a runtime finalizer"),
-                || panic!("blocked final exit must not wait for a build")
-            ),
-            FinalExitDecision::AbortWithoutRustTeardown
-        );
-        assert_eq!(
-            decide_final_exit_target(
                 FinalExitTarget::WaitForBuild,
                 |_| panic!("build wait target has no ready runtime"),
                 || false
             ),
             FinalExitDecision::AbortWithoutRustTeardown
-        );
-    }
-
-    #[test]
-    fn post_owner_error_and_panic_are_terminal_after_cleanup() {
-        let failed_cleanup = || NativeBuildCleanup {
-            evidence: NativeBuildCleanupEvidence {
-                native_host_joined: false,
-                joined_native_worker_count: 0,
-                error: Some("injected finalizer failure".to_string()),
-            },
-            blocked_owner: None,
-        };
-        let attempt: std::thread::Result<Result<(), &str>> = Ok(Err("post-owner error"));
-        let error = finish_post_owner_build(attempt, 7, |_| failed_cleanup())
-            .expect_err("post-owner error must fail the build");
-        assert!(matches!(
-            error.cause,
-            PostOwnerBuildCause::Error("post-owner error")
-        ));
-        assert!(!error.cleanup.evidence.native_host_joined);
-        assert_eq!(
-            error.cleanup.evidence.error.as_deref(),
-            Some("injected finalizer failure")
-        );
-
-        let panic =
-            finish_post_owner_build::<(), &str, _>(Err(Box::new("post-owner panic")), 9, |_| {
-                NativeBuildCleanup {
-                    evidence: NativeBuildCleanupEvidence {
-                        native_host_joined: true,
-                        joined_native_worker_count: 1,
-                        error: None,
-                    },
-                    blocked_owner: None,
-                }
-            })
-            .expect_err("post-owner panic must fail the build");
-        assert!(matches!(
-            panic.cause,
-            PostOwnerBuildCause::Panic(ref message) if message == "post-owner panic"
-        ));
-        assert!(panic.cleanup.evidence.native_host_joined);
-
-        let startup = startup_controller();
-        assert!(startup.begin_initialization().is_ok());
-        assert!(startup.begin_runtime_build().is_ok());
-        startup.finish_failed_build(FailedBuildCompletion::PostOwnerCleaned);
-        assert!(
-            startup
-                .begin_initialization()
-                .expect_err("a cleaned-up post-owner panic must require process restart")
-                .contains("restarted")
         );
     }
 
@@ -1380,20 +973,6 @@ mod tests {
         assert!(!source.contains(predefined_quit));
         assert!(!source.contains(predefined_quit_with_text));
         assert!(!source.contains(default_menu));
-    }
-
-    #[test]
-    fn explicit_runtime_data_directory_also_owns_gateway_plugin_state() {
-        let root = std::path::PathBuf::from("/tmp/mom-llama-acceptance");
-        assert_eq!(
-            gateway_app_data_dir_override(Some(root.clone().into_os_string())),
-            Some(root)
-        );
-        assert_eq!(
-            gateway_app_data_dir_override(Some(std::ffi::OsString::new())),
-            None
-        );
-        assert_eq!(gateway_app_data_dir_override(None), None);
     }
 
     #[test]

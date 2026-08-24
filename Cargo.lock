@@ -4095,10 +4095,6 @@ name = "mom-llama-app"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "fte-backend-llama",
- "fte-router",
- "fte-store",
- "fte-types",
  "llama-native-host",
  "llama-native-types",
  "maud",
@@ -4108,7 +4104,6 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
- "tauri-plugin-free-token-energy",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -4136,9 +4131,6 @@ dependencies = [
  "chacha20poly1305",
  "crossbeam-channel",
  "fs2",
- "fte-backend-llama",
- "fte-router",
- "fte-types",
  "getrandom 0.3.4",
  "llama-native-cache",
  "llama-native-engine",

@@ -1,10 +1,6 @@
-use fte_backend_llama::LlamaNativeBackend;
-use fte_router::Gateway;
 use llama_native_host::{NativeHost, ProcessExitJoinedNativeHost};
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -46,7 +42,6 @@ pub struct AppShutdownSummary {
     pub started_at_unix_ms: u64,
     pub completed_at_unix_ms: u64,
     pub elapsed_ms: u64,
-    pub gateway_drained: bool,
     pub native_host_joined: bool,
     /// Product-owned operation-supervisor facts at the terminal boundary.
     pub operation_supervisor_phase: OperationLifecyclePhase,
@@ -70,7 +65,6 @@ pub struct AppShutdownError {
     pub summary: AppShutdownSummary,
     pub operation_error: Option<String>,
     pub approval_recovery_error: Option<String>,
-    pub gateway_error: Option<String>,
     pub native_error: Option<String>,
 }
 
@@ -82,9 +76,6 @@ impl std::fmt::Display for AppShutdownError {
         }
         if let Some(error) = &self.approval_recovery_error {
             write!(formatter, "; Persona approval recovery: {error}")?;
-        }
-        if let Some(error) = &self.gateway_error {
-            write!(formatter, "; gateway: {error}")?;
         }
         if let Some(error) = &self.native_error {
             write!(formatter, "; native: {error}")?;
@@ -98,8 +89,6 @@ impl std::error::Error for AppShutdownError {}
 struct AppRuntime {
     lifecycle: Mutex<AppLifecycle>,
     work_drained: Notify,
-    gateway_finalizer: Arc<dyn GatewayFinalizer>,
-    native_backend: Arc<LlamaNativeBackend>,
     native_host: Arc<NativeHost>,
     _native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
     cancellation_sweeps: AtomicU64,
@@ -127,10 +116,6 @@ trait NativeFinalizer: Send + Sync {
         &self,
         host: &Arc<NativeHost>,
     ) -> Result<ProcessExitJoinedNativeHost, mom_llama_runtime::ProductShutdownError>;
-}
-
-trait GatewayFinalizer: Send + Sync {
-    fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 }
 
 trait ProductCanceller: Send + Sync {
@@ -385,14 +370,6 @@ impl ProductCanceller for RuntimeProductCanceller {
     }
 }
 
-struct ProductGatewayFinalizer(Arc<Gateway>);
-
-impl GatewayFinalizer for ProductGatewayFinalizer {
-    fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
-        Box::pin(async { self.0.shutdown().await.map_err(|error| error.to_string()) })
-    }
-}
-
 struct ProductNativeFinalizer;
 
 impl NativeFinalizer for ProductNativeFinalizer {
@@ -537,8 +514,6 @@ impl Drop for AppWorkLease {
 }
 
 struct AppRuntimeConstruction {
-    gateway_finalizer: Arc<dyn GatewayFinalizer>,
-    native_backend: Arc<LlamaNativeBackend>,
     native_host: Arc<NativeHost>,
     native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
     product_canceller: Arc<dyn ProductCanceller>,
@@ -551,17 +526,12 @@ struct AppRuntimeConstruction {
 
 impl AppRuntimeHandle {
     pub fn new(
-        gateway: Arc<Gateway>,
-        native_backend: Arc<LlamaNativeBackend>,
         native_owner: mom_llama_runtime::native_runtime::ProductRuntimeOwner,
         persona_approval_recovery: mom_llama_runtime::PersonaToolApprovalRecovery,
     ) -> Self {
         let native_host = native_owner.host();
-        let gateway_finalizer = Arc::new(ProductGatewayFinalizer(Arc::clone(&gateway)));
         let persona_approval_authority = persona_approval_recovery.clone();
         Self::with_operation_supervisor(AppRuntimeConstruction {
-            gateway_finalizer,
-            native_backend,
             native_host,
             native_owner: Some(native_owner),
             product_canceller: Arc::new(RuntimeProductCanceller),
@@ -577,16 +547,12 @@ impl AppRuntimeHandle {
 
     #[cfg(test)]
     fn with_finalizers(
-        gateway_finalizer: Arc<dyn GatewayFinalizer>,
-        native_backend: Arc<LlamaNativeBackend>,
         native_host: Arc<NativeHost>,
         native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
         product_canceller: Arc<dyn ProductCanceller>,
         native_finalizer: Arc<dyn NativeFinalizer>,
     ) -> Self {
         Self::with_operation_supervisor(AppRuntimeConstruction {
-            gateway_finalizer,
-            native_backend,
             native_host,
             native_owner,
             product_canceller,
@@ -600,8 +566,6 @@ impl AppRuntimeHandle {
 
     fn with_operation_supervisor(construction: AppRuntimeConstruction) -> Self {
         let AppRuntimeConstruction {
-            gateway_finalizer,
-            native_backend,
             native_host,
             native_owner,
             product_canceller,
@@ -622,8 +586,6 @@ impl AppRuntimeHandle {
                 active_work: BTreeMap::new(),
             }),
             work_drained: Notify::new(),
-            gateway_finalizer,
-            native_backend,
             native_host,
             _native_owner: native_owner,
             cancellation_sweeps: AtomicU64::new(0),
@@ -726,15 +688,6 @@ impl AppRuntimeHandle {
         true
     }
 
-    pub fn refresh_native_model(&self, _lease: &AppWorkLease) -> Result<(), String> {
-        let model = mom_llama_runtime::gateway_native_model_configuration(&self.0.native_host)
-            .map_err(|error| format!("local gateway configuration failed: {error}"))?;
-        self.0
-            .native_backend
-            .replace_configuration(Arc::clone(&self.0.native_host), model)
-            .map_err(|error| format!("local gateway configuration failed: {error}"))
-    }
-
     pub async fn shutdown(&self) -> Result<AppShutdownSummary, AppShutdownError> {
         self.begin_quiesce();
         self.0
@@ -743,9 +696,8 @@ impl AppRuntimeHandle {
                 let started = Instant::now();
                 let started_at_unix_ms = unix_time_ms();
                 // Closing app admission publishes cancellation to every long
-                // operation before service owners begin their own drain. The
-                // service drain and application lease drain may proceed in
-                // parallel, but both precede the sole terminal native join.
+                // operation before application work drains. That drain
+                // precedes the sole terminal native join.
                 self.request_product_cancellation();
                 let persona_approval_worker = Arc::clone(&self.0.persona_approval_recovery);
                 let worker_to_stop = Arc::clone(&persona_approval_worker);
@@ -762,10 +714,7 @@ impl AppRuntimeHandle {
                             )),
                         },
                     };
-                let gateway_shutdown = self.0.gateway_finalizer.shutdown();
-                let app_work_drain = self.wait_for_work_drained();
-                let (gateway_result, ()) = tokio::join!(gateway_shutdown, app_work_drain);
-                let gateway_error = gateway_result.err();
+                self.wait_for_work_drained().await;
                 let supervisor = self.0.operation_supervisor.shutdown();
                 let final_recovery_worker = Arc::clone(&persona_approval_worker);
                 let final_persona_approval_recovery = match tokio::task::spawn_blocking(move || {
@@ -795,8 +744,8 @@ impl AppRuntimeHandle {
                     .collect::<Vec<_>>();
                 let approval_recovery_error = (!approval_recovery_errors.is_empty())
                     .then(|| approval_recovery_errors.join("; "));
-                // Admission is closed and every application lease plus the
-                // gateway has drained, so the resident set cannot grow after
+                // Admission is closed and every application lease has drained,
+                // so the resident set cannot grow after
                 // this observation. Preserve its cardinality even if the
                 // finalizer fails before returning joined evidence.
                 let native_worker_ids = self
@@ -844,7 +793,6 @@ impl AppRuntimeHandle {
                     started_at_unix_ms,
                     completed_at_unix_ms: unix_time_ms(),
                     elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    gateway_drained: gateway_error.is_none(),
                     native_host_joined: native_error.is_none(),
                     operation_supervisor_phase,
                     active_operation_count,
@@ -860,7 +808,6 @@ impl AppRuntimeHandle {
                 };
                 if operation_error.is_none()
                     && approval_recovery_error.is_none()
-                    && gateway_error.is_none()
                     && native_error.is_none()
                 {
                     Ok(summary)
@@ -869,7 +816,6 @@ impl AppRuntimeHandle {
                         summary,
                         operation_error,
                         approval_recovery_error,
-                        gateway_error,
                         native_error,
                     })
                 }
@@ -920,21 +866,16 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppRuntimeConstruction, AppRuntimeHandle, GatewayFinalizer, NativeFinalizer,
+        AppRuntimeConstruction, AppRuntimeHandle, NativeFinalizer,
         PERSONA_APPROVAL_RECOVERY_WORKER_ID, PersonaApprovalReconciler,
-        PersonaApprovalRecoveryWorker, ProductCanceller, ProductGatewayFinalizer,
+        PersonaApprovalRecoveryWorker, ProductCanceller,
     };
     use crate::command_registry::command_spec;
     use crate::operation_supervisor::OperationSupervisor;
-    use fte_backend_llama::LlamaNativeBackend;
-    use fte_router::{Gateway, GatewayDefaults};
     use llama_native_host::{NativeHost, NativeHostConfig, ProcessExitJoinedNativeHost};
-    use std::future::Future;
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tokio::sync::Notify;
 
     fn runtime() -> AppRuntimeHandle {
         runtime_with_finalizer(Arc::new(AtomicBool::new(false)))
@@ -1039,32 +980,12 @@ mod tests {
         product_canceller: Arc<dyn ProductCanceller>,
     ) -> AppRuntimeHandle {
         let host = Arc::new(NativeHost::new(NativeHostConfig::default()));
-        let gateway = Arc::new(Gateway::new(GatewayDefaults {
-            catalog_version: "test".to_string(),
-        }));
         AppRuntimeHandle::with_finalizers(
-            Arc::new(ProductGatewayFinalizer(gateway)),
-            Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host))),
             host,
             None,
             product_canceller,
             Arc::new(RecordingFinalizer { called }),
         )
-    }
-
-    struct BlockingGatewayFinalizer {
-        entered: Arc<AtomicBool>,
-        release: Arc<Notify>,
-    }
-
-    impl GatewayFinalizer for BlockingGatewayFinalizer {
-        fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
-            Box::pin(async {
-                self.entered.store(true, Ordering::Release);
-                self.release.notified().await;
-                Ok(())
-            })
-        }
     }
 
     #[test]
@@ -1112,14 +1033,7 @@ mod tests {
         let host = Arc::new(NativeHost::new(NativeHostConfig::default()));
         let reconciled = Arc::new(AtomicBool::new(false));
         let native_called = Arc::new(AtomicBool::new(false));
-        let gateway_entered = Arc::new(AtomicBool::new(false));
-        let gateway_release = Arc::new(Notify::new());
         let runtime = AppRuntimeHandle::with_operation_supervisor(AppRuntimeConstruction {
-            gateway_finalizer: Arc::new(BlockingGatewayFinalizer {
-                entered: Arc::clone(&gateway_entered),
-                release: Arc::clone(&gateway_release),
-            }),
-            native_backend: Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host))),
             native_host: host,
             native_owner: None,
             product_canceller: Arc::new(NoopProductCanceller),
@@ -1140,10 +1054,6 @@ mod tests {
         let shutdown_runtime = runtime.clone();
         let shutdown = tokio::spawn(async move { shutdown_runtime.shutdown().await });
 
-        while !gateway_entered.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-        gateway_release.notify_waiters();
         tokio::task::yield_now().await;
         assert!(!reconciled.load(Ordering::Acquire));
         assert!(!native_called.load(Ordering::Acquire));
@@ -1325,35 +1235,6 @@ mod tests {
         assert!(lease.cancellation_requested());
         assert!(!finalizer_called.load(Ordering::Acquire));
         drop(lease);
-        let _ = shutdown.await.expect("shutdown task");
-        assert!(finalizer_called.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn gateway_operation_drains_before_final_join() {
-        let gateway_entered = Arc::new(AtomicBool::new(false));
-        let gateway_release = Arc::new(Notify::new());
-        let finalizer_called = Arc::new(AtomicBool::new(false));
-        let host = Arc::new(NativeHost::new(NativeHostConfig::default()));
-        let runtime = AppRuntimeHandle::with_finalizers(
-            Arc::new(BlockingGatewayFinalizer {
-                entered: Arc::clone(&gateway_entered),
-                release: Arc::clone(&gateway_release),
-            }),
-            Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host))),
-            host,
-            None,
-            Arc::new(NoopProductCanceller),
-            Arc::new(RecordingFinalizer {
-                called: Arc::clone(&finalizer_called),
-            }),
-        );
-        let shutdown = tokio::spawn(async move { runtime.shutdown().await });
-        while !gateway_entered.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-        assert!(!finalizer_called.load(Ordering::Acquire));
-        gateway_release.notify_one();
         let _ = shutdown.await.expect("shutdown task");
         assert!(finalizer_called.load(Ordering::Acquire));
     }

@@ -33,9 +33,6 @@ nix.workspace = true
 security-framework = "3.7"
 
 [dev-dependencies]
-fte-backend-llama.workspace = true
-fte-router.workspace = true
-fte-types.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

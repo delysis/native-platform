@@ -556,14 +556,14 @@
       "platforms": ["linux", "macos", "windows"]
     },
     {
-      "test_id": "real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_corruption",
+      "test_id": "real_product_native_chat_cache_reuses_clears_and_disables_without_fte",
       "package": "mom-llama-runtime",
       "target": "test:runtime",
       "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
       "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
       "required_environment": ["MOM_LLAMA_MODEL_PATH"],
       "evidence_class": "real-product-model-runtime",
-      "promotion_prohibition": "Passing this runtime test cannot promote visible cache UX, packaged-app, cross-platform, or release readiness.",
+      "promotion_prohibition": "Passing this direct Native chat test cannot promote visible cache UX, persistence/corruption recovery, packaged-app, cross-platform, or release readiness.",
       "platforms": ["linux", "macos", "windows"]
     },
     {

@@ -70,8 +70,7 @@ pub use mentions::{
 };
 pub use models::{hugging_face_hub_cache_dir, model_list, model_select};
 pub use native_runtime::{
-    ProductShutdownError, gateway_native_configuration, gateway_native_host_and_model,
-    gateway_native_model_configuration, resident_model_for_profile, resident_status,
+    ProductShutdownError, resident_model_for_profile, resident_status,
     shutdown_product_runtime_for_process_exit, unload_resident_model,
 };
 pub use path_selection::{PathSelection, PathSelectionKind, path_select};
@@ -94,7 +93,6 @@ pub use tool_loop::{
 };
 pub const RESULT_SCHEMA: &str = "mom_llama.command_result.v1";
 pub const RECEIPT_SCHEMA: &str = "mom_llama.command_receipt.v1";
-const GATEWAY_RESPONSE_NAMESPACE_PREFIX: &str = "fte.response.v1:";
 
 /// Requests cancellation from every product operation registry without
 /// waiting for completion. The application composition root calls this after
@@ -118,39 +116,4 @@ pub fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
-}
-
-/// Encrypted product-store adapter for embedded gateway response state.
-pub fn gateway_document_get(namespace: &str) -> anyhow::Result<Option<Vec<u8>>> {
-    validate_gateway_document_namespace(namespace)?;
-    store::RuntimeStore::current()?.get_bytes(namespace)
-}
-
-/// Encrypted product-store adapter for embedded gateway response state.
-pub fn gateway_document_put(namespace: &str, value: &[u8]) -> anyhow::Result<()> {
-    validate_gateway_document_namespace(namespace)?;
-    store::RuntimeStore::current()?.put_bytes(namespace, value)
-}
-
-/// Encrypted product-store adapter for embedded gateway response state.
-pub fn gateway_document_delete(namespace: &str) -> anyhow::Result<bool> {
-    validate_gateway_document_namespace(namespace)?;
-    store::RuntimeStore::current()?.delete(namespace)
-}
-
-fn validate_gateway_document_namespace(namespace: &str) -> anyhow::Result<()> {
-    let Some(response_id) = namespace.strip_prefix(GATEWAY_RESPONSE_NAMESPACE_PREFIX) else {
-        anyhow::bail!(
-            "gateway documents must use the `{GATEWAY_RESPONSE_NAMESPACE_PREFIX}` namespace"
-        );
-    };
-    if response_id.is_empty()
-        || response_id.len() > 256
-        || !response_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        anyhow::bail!("gateway response IDs must be non-empty safe ASCII identifiers");
-    }
-    Ok(())
 }

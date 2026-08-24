@@ -10,7 +10,8 @@ It does **not** contain a copied llama.cpp engine or a generic provider gateway:
 - [`delysis/llama-native-kit`](https://github.com/delysis/llama-native-kit)
   owns the in-process GGUF runtime.
 - [`delysis/free-token-energy`](https://github.com/delysis/free-token-energy)
-  owns protocol routing, hosted providers and optional loopback compatibility.
+  remains a separate product for protocol routing, hosted providers and
+  optional loopback compatibility; Mom does not compose it.
 - [`delysis/speech-native-kit`](https://github.com/delysis/speech-native-kit)
   owns local STT/TTS contracts, routing, backends and optional Tauri IPC.
 - [`delysis/attachment-native-kit`](https://github.com/delysis/attachment-native-kit)
@@ -35,9 +36,10 @@ dependency graph and the exact present status of speech.
   current proof only when it is explicitly source-bound; older path/date-only
   receipts remain informative.
 
-Native, Attachment, Free Token Energy, and the shared platform contracts are
-resolved from their imported monorepo paths and one root lock. No retired
-first-party Git source remains in Mom's dependency graph.
+Native, Attachment, and the shared platform contracts are resolved from their
+imported monorepo paths and one root lock. FTE remains in the root workspace for
+its standalone product, but no FTE crate or permission is in Mom's dependency
+graph. No retired first-party Git source remains in Mom's dependency graph.
 
 ## Gates
 

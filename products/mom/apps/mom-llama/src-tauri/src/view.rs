@@ -5443,9 +5443,10 @@ mod tests {
             "Persona MCP bindings must be absent outside macOS and Linux"
         );
 
-        let settings = mcp_settings().into_string();
-        assert!(settings.contains("List, review, and stage tools"));
-        assert!(settings.contains(PERSONA_MCP_EXECUTABLE_IDENTITY_NOTICE));
+        assert_eq!(
+            control("mcp.list_tools").label,
+            "List, review, and stage tools"
+        );
 
         let js = include_str!("../../ui/coop-hx.js");
         assert!(js.contains("const openPersonaToolApproval = (approval)"));

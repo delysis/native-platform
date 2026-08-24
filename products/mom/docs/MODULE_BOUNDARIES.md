@@ -1,8 +1,8 @@
 # Ecosystem module boundaries
 
 ```text
-llama-native-kit ───────> free-token-energy ──> mom-llama
-       └───────────────────────────────────────────^
+llama-native-kit ─────────────────────────────> mom-llama
+       └──────────────> free-token-energy (standalone)
 
 speech-native-kit ────────────────────────────────> mom-llama (only when UX ships)
 
@@ -18,7 +18,7 @@ graph.
 | Repository | Authoritative ownership |
 |---|---|
 | `llama-native-kit` | in-process llama.cpp DTOs, engine, resident host and cache contracts |
-| `free-token-energy` | text gateway, protocols, hosted providers and optional authenticated loopback |
+| `free-token-energy` | standalone text gateway, protocols, hosted providers and optional authenticated loopback; not composed by Mom |
 | `speech-native-kit` | STT/TTS contracts, routing, and local/platform backends |
 | `attachment-native-kit` | content-first bounded inspection, recursive container graph, canonical artifacts, provenance and capability-aware media/transform planning |
 | `mom-llama` | product runtime, CLI, Personas, contracts, receipts and native interface |
@@ -37,8 +37,8 @@ this app or bundled into the provider gateway:
   cache.
 
 Mom Llama does not yet register a speech backend or expose microphone/read-aloud
-UX. Consequently it installs only the FTE text gateway plugin and grants no
-speech IPC permissions. When speech UX ships, Mom Llama may consume the speech
+UX. It installs neither the FTE gateway plugin nor a speech plugin and grants no
+permissions for either. When speech UX ships, Mom Llama may consume the speech
 crates directly and own the narrow IPC/permission edge without inheriting
 hosted providers or loopback authority. Audio attachments for multimodal
 llama.cpp input are a separate product feature and are not STT.
@@ -70,6 +70,6 @@ can execute at most one exact tool call.
 ## Enforced negative boundaries
 
 `scripts/check-architecture.sh` rejects copied native/attachment crates,
-undeclared speech dependencies, retired first-party Git sources in Mom's
-locked graph, child-manifest path overrides, and product network/process
+FTE or undeclared speech dependencies, retired first-party Git sources in
+Mom's locked graph, child-manifest path overrides, and product network/process
 authority outside the bounded MCP adapter.
