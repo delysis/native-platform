@@ -9,6 +9,9 @@ catalogue bytes -> normalized release -> install plan -> staged blobs -> receipt
 external read-only library --------------------> installed representation
                                                                |
 query/tool call -> capability routing -> backend -> evidence + stable locators
+
+trusted native producer -> managed.documents.v1 -> staged SQLite/FTS5
+                                                  -> immutable activation
 ```
 
 The contract, catalogue, and retrieval crates are pure policy layers.
@@ -114,6 +117,32 @@ External imports never enter this state machine: they are registrations of a
 caller-granted path with an observed identity and an explicit live-read-only or
 immutable-read-only policy.
 
+## Managed documents v1
+
+`managed.documents.v1` is the source-neutral derived-text boundary. It is not
+an Alexandria schema and it does not flatten source-specific query
+capabilities. A complete materialization binds resource/release/representation
+identity, exact immutable source artifacts, provenance, immutable documents,
+ordered zero-based text segments, typed document/segment/source locators,
+source-record hashes, transformation lineage, rights, and operational use
+policy. Inputs are fingerprinted and bounded to 10,000 documents, 250,000
+segments, one MiB per segment, and one GiB of text per activation.
+
+The store builds a strict SQLite database and FTS5 index in a private staging
+directory. It file-syncs the database and manifest/receipt, then activates the
+three-file representation with one same-filesystem rename. Exact retries are
+idempotent; reusing a materialization ID for different content fails. Searches
+bind the requested content hash, open the database read-only, and accept only a
+bounded literal-term query. The default promoted policy is private local
+search: model context remains unknown and therefore forbidden at enforcement,
+while excerpt export and redistribution are explicitly forbidden.
+
+Removal planning reveals only an Information-derived relative path and exact
+content/database hashes. Commit accepts those identities rather than a path,
+atomically hides the active directory, and removes only the managed database,
+manifest, and receipt. Source archives are never opened by materialization and
+are outside the removal target by construction.
+
 Managed installation is currently a synchronous host operation. The acquire
 layer accepts a cooperative progress callback, but a durable job identifier,
 progress subscription, and cancel command are not yet part of the Tauri or CLI
@@ -150,8 +179,8 @@ deadlines so long queries are interrupted inside the database engine.
 
 ## SQLite boundary
 
-SQLite adapters inspect schema before querying and accept only four compiled
-profiles:
+Canonical-source SQLite adapters inspect schema before querying and accept only
+four compiled profiles:
 
 - `alexandria.blocks.v1`: Alexandria blocks and FTS;
 - `community-archive.messages.v28`: Community Archive v28 messages and FTS;
@@ -174,6 +203,11 @@ rejected in live mode.
 Writable sidecars, if introduced by a backend, must be placed under the managed
 root and link to the canonical source by fingerprint. They may never share the
 canonical database path.
+
+The managed-document database is a separate Information-owned derived format,
+not a fifth external profile. Its schema is created only by the store from a
+validated `managed.documents.v1` value and is never applied to a canonical
+source database.
 
 On Unix, the store enforces owner-only directory and file modes for managed
 state. The portable path/symlink/identity checks still run on Windows, but this

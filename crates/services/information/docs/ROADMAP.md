@@ -12,6 +12,9 @@ This file distinguishes implemented proof from architectural reach.
 - policy-bounded HTTP/file acquisition, durable HTTP resume, and exact size and
   SHA-256 verification with source attestations;
 - managed staging, same-filesystem activation, receipts, and external read-only mounts;
+- strict `managed.documents.v1` materialization with immutable documents,
+  ordered segments, FTS5, provenance/lineage, private fail-closed defaults, and
+  exact managed-byte-only removal;
 - federated bounded lexical retrieval with reciprocal-rank fusion;
 - strict Alexandria, Community Archive v28, encyclopedia-article, and Scripture
   citation SQLite backends with stable profile-specific locators;
@@ -37,6 +40,11 @@ This file distinguishes implemented proof from architectural reach.
 
 No item in the second list should be reported as shipped merely because the
 manifest format can describe it.
+
+The generic managed-document materializer is shipped infrastructure, not proof
+of any source adapter. Kiwix and other producers remain unimplemented until
+their exact reader/extraction contracts produce and verify real
+`managed.documents.v1` inputs.
 
 Concretely, the current release has no Kiwix ZIM content reader, no OSM PBF
 query backend, and no Overture GeoParquet materializer or query backend. OPDS

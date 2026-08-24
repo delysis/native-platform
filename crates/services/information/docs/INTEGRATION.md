@@ -27,6 +27,22 @@ returns `EvidenceSet`; it does not manufacture prose or merge source text with
 system instructions. Backend-native query syntax should not be exposed to a
 model unless the app grants that capability deliberately.
 
+## Managed-document boundary
+
+Trusted native integrations may call the host's narrow
+`materialize_documents`, `search_managed_documents`,
+`plan_managed_documents_removal`, and `remove_managed_documents` methods. The
+caller supplies typed content and identities, never an output database path.
+Materialization does not read the source URI: a source-specific adapter must
+already have verified and bounded the inert text and must retain exact artifact
+and record lineage in the contract.
+
+Managed search is local-UI-only. It does not appear in the model tool surface,
+and the default use policy leaves model context unknown/fail-closed while
+forbidding export and redistribution. A product that later grants a specific
+conversation access must do so through a separate exact capability rather than
+changing this storage default.
+
 ## Loom
 
 Global library payloads stay outside `.loom` projects. A Loom branch records the

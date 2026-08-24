@@ -21,8 +21,17 @@ pub const INSTALL_RECEIPT_SCHEMA: &str = "information_native.install_receipt.v1"
 pub const EXTERNAL_REGISTRATION_SCHEMA: &str = "information_native.external_registration.v1";
 pub const QUERY_SCHEMA: &str = "information_native.query.v1";
 pub const EVIDENCE_SCHEMA: &str = "information_native.evidence.v1";
+pub const MANAGED_DOCUMENTS_SCHEMA: &str = "managed.documents.v1";
+pub const MANAGED_DOCUMENTS_RECEIPT_SCHEMA: &str = "managed.documents.receipt.v1";
+pub const MANAGED_DOCUMENTS_SEARCH_SCHEMA: &str = "managed.documents.search.v1";
+pub const MANAGED_DOCUMENTS_REMOVAL_SCHEMA: &str = "managed.documents.removal.v1";
 pub const MAX_RETRIEVAL_TIMEOUT_MS: u64 = 300_000;
 pub const MAX_ACQUISITION_ATTEMPTS: usize = 128;
+pub const MAX_MANAGED_DOCUMENTS_PER_MATERIALIZATION: usize = 10_000;
+pub const MAX_MANAGED_SEGMENTS_PER_MATERIALIZATION: usize = 250_000;
+pub const MAX_MANAGED_SEGMENTS_PER_DOCUMENT: usize = 10_000;
+pub const MAX_MANAGED_SEGMENT_BYTES: usize = 1024 * 1024;
+pub const MAX_MANAGED_TEXT_BYTES: u64 = 1024 * 1024 * 1024;
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -81,6 +90,9 @@ string_id!(RepresentationId);
 string_id!(ArtifactId);
 string_id!(InstallationId);
 string_id!(QueryId);
+string_id!(ManagedMaterializationId);
+string_id!(ManagedDocumentId);
+string_id!(ManagedSegmentId);
 
 impl InstallationId {
     #[must_use]
@@ -103,6 +115,20 @@ impl QueryId {
 }
 
 impl Default for QueryId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManagedMaterializationId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::parse(Uuid::new_v4().to_string())
+            .expect("UUID managed materialization ids are always valid")
+    }
+}
+
+impl Default for ManagedMaterializationId {
     fn default() -> Self {
         Self::new()
     }
@@ -521,6 +547,606 @@ pub enum RetrievalPurpose {
     LocalUi,
     ModelContext,
     ExcerptExport,
+}
+
+/// One immutable, source-neutral text materialization owned by Information.
+///
+/// A materialization is a complete activation unit. Producers supply exact
+/// source-artifact identities and stable source locators; the Information
+/// store owns the derived SQLite/FTS representation and never writes the
+/// source artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDocumentsV1 {
+    pub schema: String,
+    pub materialization_id: ManagedMaterializationId,
+    pub resource_id: ResourceId,
+    pub release_id: ReleaseId,
+    pub representation_id: RepresentationId,
+    pub created_at: DateTime<Utc>,
+    pub provenance: Provenance,
+    pub source_artifacts: Vec<ManagedSourceArtifact>,
+    pub documents: Vec<ManagedDocument>,
+    pub content_sha256: String,
+}
+
+impl ManagedDocumentsV1 {
+    pub fn compute_content_sha256(&self) -> Result<String, ContractError> {
+        let mut canonical = self.clone();
+        canonical.content_sha256 = "0".repeat(64);
+        let encoded = serde_json::to_vec(&canonical)
+            .map_err(|error| ContractError::Serialization(error.to_string()))?;
+        Ok(format!("{:x}", Sha256::digest(encoded)))
+    }
+
+    pub fn refresh_content_sha256(&mut self) -> Result<(), ContractError> {
+        self.content_sha256 = self.compute_content_sha256()?;
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), ContractError> {
+        require_schema(MANAGED_DOCUMENTS_SCHEMA, &self.schema)?;
+        validate_identifier(
+            "managed.materialization_id",
+            self.materialization_id.as_str(),
+        )?;
+        validate_identifier("managed.resource_id", self.resource_id.as_str())?;
+        validate_identifier("managed.release_id", self.release_id.as_str())?;
+        validate_identifier("managed.representation_id", self.representation_id.as_str())?;
+        self.provenance.validate()?;
+        validate_sha256(&self.content_sha256)?;
+        if self.compute_content_sha256()? != self.content_sha256 {
+            return Err(ContractError::InvalidContract(
+                "managed documents content fingerprint does not match its contents".to_string(),
+            ));
+        }
+        if self.source_artifacts.is_empty() {
+            return Err(ContractError::InvalidContract(
+                "managed documents have no immutable source artifacts".to_string(),
+            ));
+        }
+        let mut source_artifacts = BTreeSet::new();
+        for artifact in &self.source_artifacts {
+            artifact.validate()?;
+            if !source_artifacts.insert(&artifact.artifact_id) {
+                return Err(ContractError::DuplicateIdentifier(
+                    artifact.artifact_id.to_string(),
+                ));
+            }
+        }
+        if self.documents.is_empty()
+            || self.documents.len() > MAX_MANAGED_DOCUMENTS_PER_MATERIALIZATION
+        {
+            return Err(ContractError::LimitExceeded(format!(
+                "managed document count must be between 1 and {MAX_MANAGED_DOCUMENTS_PER_MATERIALIZATION}"
+            )));
+        }
+
+        let mut document_ids = BTreeSet::new();
+        let mut segment_ids = BTreeSet::new();
+        let mut segment_count = 0_usize;
+        let mut text_bytes = 0_u64;
+        for document in &self.documents {
+            document.validate(&source_artifacts)?;
+            if !document_ids.insert(&document.document_id) {
+                return Err(ContractError::DuplicateIdentifier(
+                    document.document_id.to_string(),
+                ));
+            }
+            segment_count = segment_count
+                .checked_add(document.segments.len())
+                .ok_or(ContractError::IntegerOverflow)?;
+            if segment_count > MAX_MANAGED_SEGMENTS_PER_MATERIALIZATION {
+                return Err(ContractError::LimitExceeded(format!(
+                    "managed segment count exceeds {MAX_MANAGED_SEGMENTS_PER_MATERIALIZATION}"
+                )));
+            }
+            for segment in &document.segments {
+                if !segment_ids.insert(&segment.segment_id) {
+                    return Err(ContractError::DuplicateIdentifier(
+                        segment.segment_id.to_string(),
+                    ));
+                }
+                let bytes = u64::try_from(segment.text.len())
+                    .map_err(|_| ContractError::IntegerOverflow)?;
+                text_bytes = text_bytes
+                    .checked_add(bytes)
+                    .ok_or(ContractError::IntegerOverflow)?;
+            }
+        }
+        if text_bytes > MAX_MANAGED_TEXT_BYTES {
+            return Err(ContractError::LimitExceeded(format!(
+                "managed text exceeds {MAX_MANAGED_TEXT_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedSourceArtifact {
+    pub artifact_id: ArtifactId,
+    pub source_uri: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub immutable: bool,
+}
+
+impl ManagedSourceArtifact {
+    fn validate(&self) -> Result<(), ContractError> {
+        validate_identifier("managed.source_artifact_id", self.artifact_id.as_str())?;
+        validate_durable_fetch_uri("managed.source_artifact_uri", &self.source_uri)?;
+        validate_sha256(&self.sha256)?;
+        if self.bytes == 0 || !self.immutable {
+            return Err(ContractError::InvalidContract(
+                "managed source artifacts must be non-empty and immutable".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedDocumentVisibility {
+    #[default]
+    Private,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDocument {
+    pub document_id: ManagedDocumentId,
+    pub title: String,
+    pub creator: Option<String>,
+    pub source_uri: Option<String>,
+    pub locator: EvidenceLocator,
+    pub immutable: bool,
+    #[serde(default)]
+    pub visibility: ManagedDocumentVisibility,
+    pub lineage: Vec<ManagedDocumentLineage>,
+    #[serde(default = "default_managed_document_rights")]
+    pub rights: Vec<RightsStatement>,
+    #[serde(default = "default_managed_document_use_policy")]
+    pub use_policy: UsePolicy,
+    pub segments: Vec<ManagedTextSegment>,
+}
+
+impl ManagedDocument {
+    fn validate(&self, source_artifacts: &BTreeSet<&ArtifactId>) -> Result<(), ContractError> {
+        validate_identifier("managed.document_id", self.document_id.as_str())?;
+        require_bounded_text("managed.document.title", &self.title, 8_192)?;
+        if let Some(creator) = &self.creator {
+            require_bounded_text("managed.document.creator", creator, 2_048)?;
+        }
+        if let Some(source_uri) = &self.source_uri {
+            validate_durable_fetch_uri("managed.document.source_uri", source_uri)?;
+        }
+        validate_bounded_locator("managed.document.locator", &self.locator)?;
+        if !self.immutable {
+            return Err(ContractError::InvalidContract(
+                "managed documents must be immutable".to_string(),
+            ));
+        }
+        if self.lineage.is_empty() || self.lineage.len() > 32 {
+            return Err(ContractError::LimitExceeded(
+                "managed document lineage must contain between 1 and 32 entries".to_string(),
+            ));
+        }
+        let mut lineage_keys = BTreeSet::new();
+        for lineage in &self.lineage {
+            lineage.validate(source_artifacts)?;
+            let encoded = serde_json::to_string(lineage)
+                .map_err(|error| ContractError::Serialization(error.to_string()))?;
+            if !lineage_keys.insert(encoded) {
+                return Err(ContractError::InvalidContract(
+                    "managed document contains duplicate lineage".to_string(),
+                ));
+            }
+        }
+        if self.rights.is_empty() || self.rights.len() > 32 {
+            return Err(ContractError::LimitExceeded(
+                "managed document rights must contain between 1 and 32 statements".to_string(),
+            ));
+        }
+        for statement in &self.rights {
+            statement.validate()?;
+        }
+        self.use_policy.validate_with_rights(&self.rights)?;
+        if self.segments.is_empty() || self.segments.len() > MAX_MANAGED_SEGMENTS_PER_DOCUMENT {
+            return Err(ContractError::LimitExceeded(format!(
+                "managed document segment count must be between 1 and {MAX_MANAGED_SEGMENTS_PER_DOCUMENT}"
+            )));
+        }
+        for (index, segment) in self.segments.iter().enumerate() {
+            segment.validate()?;
+            let ordinal = u32::try_from(index).map_err(|_| ContractError::IntegerOverflow)?;
+            if segment.ordinal != ordinal {
+                return Err(ContractError::InvalidContract(
+                    "managed document segments must be in contiguous zero-based ordinal order"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDocumentLineage {
+    pub source_artifact_id: ArtifactId,
+    pub source_record_id: String,
+    pub source_record_sha256: String,
+    pub source_locator: EvidenceLocator,
+    pub transformation: String,
+}
+
+impl ManagedDocumentLineage {
+    fn validate(&self, source_artifacts: &BTreeSet<&ArtifactId>) -> Result<(), ContractError> {
+        if !source_artifacts.contains(&self.source_artifact_id) {
+            return Err(ContractError::InvalidContract(format!(
+                "managed lineage references undeclared source artifact {}",
+                self.source_artifact_id
+            )));
+        }
+        require_bounded_text(
+            "managed.lineage.source_record_id",
+            &self.source_record_id,
+            8_192,
+        )?;
+        validate_sha256(&self.source_record_sha256)?;
+        validate_bounded_locator("managed.lineage.source_locator", &self.source_locator)?;
+        require_bounded_text(
+            "managed.lineage.transformation",
+            &self.transformation,
+            2_048,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedTextSegment {
+    pub segment_id: ManagedSegmentId,
+    pub ordinal: u32,
+    pub text: String,
+    pub text_sha256: String,
+    pub locator: EvidenceLocator,
+}
+
+impl ManagedTextSegment {
+    #[must_use]
+    pub fn compute_text_sha256(&self) -> String {
+        managed_text_sha256(&self.text)
+    }
+
+    pub fn refresh_text_sha256(&mut self) {
+        self.text_sha256 = self.compute_text_sha256();
+    }
+
+    fn validate(&self) -> Result<(), ContractError> {
+        validate_identifier("managed.segment_id", self.segment_id.as_str())?;
+        if self.text.trim().is_empty() || self.text.len() > MAX_MANAGED_SEGMENT_BYTES {
+            return Err(ContractError::LimitExceeded(format!(
+                "managed segment text must contain between 1 and {MAX_MANAGED_SEGMENT_BYTES} bytes"
+            )));
+        }
+        validate_sha256(&self.text_sha256)?;
+        if !sha256_equal(&self.text_sha256, &self.compute_text_sha256()) {
+            return Err(ContractError::InvalidContract(
+                "managed segment text digest does not match its text".to_string(),
+            ));
+        }
+        validate_bounded_locator("managed.segment.locator", &self.locator)
+    }
+}
+
+#[must_use]
+pub fn managed_text_sha256(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"managed.documents.v1.text\0");
+    let text_len = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    hasher.update(text_len.to_le_bytes());
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[must_use]
+pub fn default_managed_document_rights() -> Vec<RightsStatement> {
+    vec![RightsStatement {
+        scope: "managed local representation".to_string(),
+        expression:
+            "Private local representation; upstream rights remain unknown and are not expanded."
+                .to_string(),
+        license_url: None,
+        license_text_sha256: None,
+        attribution: None,
+        obligations: Vec::new(),
+        redistribution: RedistributionPolicy::PrivateUseOnly,
+    }]
+}
+
+/// Default promotion policy: local search is allowed, model use is unknown and
+/// therefore fails closed, and export/redistribution are forbidden.
+#[must_use]
+pub fn default_managed_document_use_policy() -> UsePolicy {
+    UsePolicy {
+        local_search: UsePermission::Allowed,
+        model_context: UsePermission::Unknown,
+        excerpt_export: UsePermission::Forbidden,
+        redistribution: UsePermission::Forbidden,
+        attribution_required: false,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDocumentsReceipt {
+    pub schema: String,
+    pub materialization_id: ManagedMaterializationId,
+    pub resource_id: ResourceId,
+    pub release_id: ReleaseId,
+    pub representation_id: RepresentationId,
+    pub content_sha256: String,
+    pub database_sha256: String,
+    pub document_count: u64,
+    pub segment_count: u64,
+    pub text_bytes: u64,
+    pub managed_relative_path: String,
+    pub activated_at: DateTime<Utc>,
+}
+
+impl ManagedDocumentsReceipt {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        require_schema(MANAGED_DOCUMENTS_RECEIPT_SCHEMA, &self.schema)?;
+        validate_sha256(&self.content_sha256)?;
+        validate_sha256(&self.database_sha256)?;
+        if self.document_count == 0
+            || self.document_count
+                > u64::try_from(MAX_MANAGED_DOCUMENTS_PER_MATERIALIZATION)
+                    .map_err(|_| ContractError::IntegerOverflow)?
+            || self.segment_count == 0
+            || self.segment_count
+                > u64::try_from(MAX_MANAGED_SEGMENTS_PER_MATERIALIZATION)
+                    .map_err(|_| ContractError::IntegerOverflow)?
+            || self.text_bytes > MAX_MANAGED_TEXT_BYTES
+        {
+            return Err(ContractError::InvalidContract(
+                "managed documents receipt accounting is invalid".to_string(),
+            ));
+        }
+        require_text(
+            "managed_documents_receipt.managed_relative_path",
+            &self.managed_relative_path,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDocumentsSearchRequest {
+    pub schema: String,
+    pub materialization_id: ManagedMaterializationId,
+    pub content_sha256: String,
+    pub query: String,
+    pub max_hits: u16,
+    pub max_snippet_chars: u32,
+}
+
+impl ManagedDocumentsSearchRequest {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        require_schema(MANAGED_DOCUMENTS_SEARCH_SCHEMA, &self.schema)?;
+        validate_sha256(&self.content_sha256)?;
+        require_bounded_text("managed_documents_search.query", &self.query, 4_096)?;
+        let term_count = self.query.split_whitespace().count();
+        if self.max_hits == 0
+            || self.max_hits > 100
+            || self.max_snippet_chars == 0
+            || self.max_snippet_chars > 4_096
+            || term_count == 0
+            || term_count > 64
+        {
+            return Err(ContractError::InvalidBudget);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDocumentsSearchResult {
+    pub schema: String,
+    pub materialization_id: ManagedMaterializationId,
+    pub content_sha256: String,
+    pub complete: bool,
+    pub hits: Vec<ManagedDocumentsSearchHit>,
+}
+
+impl ManagedDocumentsSearchResult {
+    pub fn validate(&self, request: &ManagedDocumentsSearchRequest) -> Result<(), ContractError> {
+        require_schema(MANAGED_DOCUMENTS_SEARCH_SCHEMA, &self.schema)?;
+        if self.materialization_id != request.materialization_id
+            || !sha256_equal(&self.content_sha256, &request.content_sha256)
+            || self.hits.len() > usize::from(request.max_hits)
+        {
+            return Err(ContractError::InvalidContract(
+                "managed documents search result disagrees with its request".to_string(),
+            ));
+        }
+        for (index, hit) in self.hits.iter().enumerate() {
+            hit.validate(request.max_snippet_chars)?;
+            let rank = u32::try_from(index + 1).map_err(|_| ContractError::IntegerOverflow)?;
+            if hit.rank != rank {
+                return Err(ContractError::InvalidContract(
+                    "managed documents search ranks are not contiguous".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDocumentsSearchHit {
+    pub rank: u32,
+    pub document_id: ManagedDocumentId,
+    pub segment_id: ManagedSegmentId,
+    pub ordinal: u32,
+    pub title: String,
+    pub creator: Option<String>,
+    pub snippet: String,
+    pub segment_text_sha256: String,
+    pub document_locator: EvidenceLocator,
+    pub segment_locator: EvidenceLocator,
+    pub provenance: Provenance,
+    pub source_artifacts: Vec<ManagedSourceArtifact>,
+    pub lineage: Vec<ManagedDocumentLineage>,
+    pub rights: Vec<RightsStatement>,
+    pub use_policy: UsePolicy,
+}
+
+impl ManagedDocumentsSearchHit {
+    fn validate(&self, max_snippet_chars: u32) -> Result<(), ContractError> {
+        if self.rank == 0
+            || self.snippet.chars().count()
+                > usize::try_from(max_snippet_chars).map_err(|_| ContractError::IntegerOverflow)?
+        {
+            return Err(ContractError::InvalidBudget);
+        }
+        require_bounded_text("managed_documents_hit.title", &self.title, 8_192)?;
+        validate_sha256(&self.segment_text_sha256)?;
+        validate_bounded_locator(
+            "managed_documents_hit.document_locator",
+            &self.document_locator,
+        )?;
+        validate_bounded_locator(
+            "managed_documents_hit.segment_locator",
+            &self.segment_locator,
+        )?;
+        self.provenance.validate()?;
+        if self.source_artifacts.is_empty() || self.lineage.is_empty() || self.rights.is_empty() {
+            return Err(ContractError::InvalidContract(
+                "managed documents search hit lacks source artifacts, lineage, or rights"
+                    .to_string(),
+            ));
+        }
+        let mut source_artifacts = BTreeSet::new();
+        for artifact in &self.source_artifacts {
+            artifact.validate()?;
+            if !source_artifacts.insert(&artifact.artifact_id) {
+                return Err(ContractError::DuplicateIdentifier(
+                    artifact.artifact_id.to_string(),
+                ));
+            }
+        }
+        for lineage in &self.lineage {
+            lineage.validate(&source_artifacts)?;
+        }
+        for statement in &self.rights {
+            statement.validate()?;
+        }
+        self.use_policy.validate_with_rights(&self.rights)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDocumentsRemovalPlan {
+    pub schema: String,
+    pub materialization_id: ManagedMaterializationId,
+    pub content_sha256: String,
+    pub database_sha256: String,
+    pub managed_relative_path: String,
+    pub observed_managed_bytes: u64,
+    pub external_source_bytes_removed: bool,
+    pub requires_exact_confirmation: bool,
+}
+
+impl ManagedDocumentsRemovalPlan {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        require_schema(MANAGED_DOCUMENTS_REMOVAL_SCHEMA, &self.schema)?;
+        validate_sha256(&self.content_sha256)?;
+        validate_sha256(&self.database_sha256)?;
+        require_text(
+            "managed_documents_removal.managed_relative_path",
+            &self.managed_relative_path,
+        )?;
+        if self.external_source_bytes_removed || !self.requires_exact_confirmation {
+            return Err(ContractError::InvalidContract(
+                "managed document removal may target only managed representation bytes".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDocumentsRemovalRequest {
+    pub schema: String,
+    pub materialization_id: ManagedMaterializationId,
+    pub content_sha256: String,
+    pub database_sha256: String,
+}
+
+impl ManagedDocumentsRemovalRequest {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        require_schema(MANAGED_DOCUMENTS_REMOVAL_SCHEMA, &self.schema)?;
+        validate_sha256(&self.content_sha256)?;
+        validate_sha256(&self.database_sha256)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDocumentsRemovalReceipt {
+    pub schema: String,
+    pub materialization_id: ManagedMaterializationId,
+    pub content_sha256: String,
+    pub database_sha256: String,
+    pub removed_managed_bytes: u64,
+    pub external_source_bytes_removed: bool,
+    pub removed_at: DateTime<Utc>,
+}
+
+impl ManagedDocumentsRemovalReceipt {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        require_schema(MANAGED_DOCUMENTS_REMOVAL_SCHEMA, &self.schema)?;
+        validate_sha256(&self.content_sha256)?;
+        validate_sha256(&self.database_sha256)?;
+        if self.external_source_bytes_removed {
+            return Err(ContractError::InvalidContract(
+                "managed document removal receipt cannot claim external source deletion"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn require_bounded_text(field: &str, value: &str, max_bytes: usize) -> Result<(), ContractError> {
+    require_text(field, value)?;
+    if value.len() > max_bytes {
+        return Err(ContractError::LimitExceeded(format!(
+            "{field} exceeds {max_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_bounded_locator(field: &str, locator: &EvidenceLocator) -> Result<(), ContractError> {
+    locator.validate()?;
+    let encoded = serde_json::to_vec(locator)
+        .map_err(|error| ContractError::Serialization(error.to_string()))?;
+    if encoded.len() > 16_384 {
+        return Err(ContractError::LimitExceeded(format!(
+            "{field} exceeds 16384 encoded bytes"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2553,6 +3179,41 @@ mod tests {
                 .validate_with_rights(&[rights(RedistributionPolicy::PrivateUseOnly)])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn managed_document_defaults_are_private_and_fail_closed_for_model_use() {
+        let rights = default_managed_document_rights();
+        let policy = default_managed_document_use_policy();
+        assert_eq!(rights.len(), 1);
+        assert_eq!(
+            rights[0].redistribution,
+            RedistributionPolicy::PrivateUseOnly
+        );
+        assert_eq!(policy.local_search, UsePermission::Allowed);
+        assert_eq!(policy.model_context, UsePermission::Unknown);
+        assert_eq!(policy.excerpt_export, UsePermission::Forbidden);
+        assert_eq!(policy.redistribution, UsePermission::Forbidden);
+        assert!(policy.validate_with_rights(&rights).is_ok());
+    }
+
+    #[test]
+    fn managed_segment_hash_binds_exact_text() -> Result<(), ContractError> {
+        let mut segment = ManagedTextSegment {
+            segment_id: ManagedSegmentId::parse("segment-1")?,
+            ordinal: 0,
+            text: "source text".to_string(),
+            text_sha256: String::new(),
+            locator: EvidenceLocator::Record {
+                collection: None,
+                key: "record-1".to_string(),
+            },
+        };
+        segment.refresh_text_sha256();
+        assert!(segment.validate().is_ok());
+        segment.text.push('!');
+        assert!(segment.validate().is_err());
+        Ok(())
     }
 
     #[test]

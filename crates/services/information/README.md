@@ -13,16 +13,22 @@ Query support in this release is deliberately narrower: the compiled backends
 cover Alexandria blocks, Community Archive v28 messages, encyclopedia
 articles, and Scripture citation occurrences/passages in SQLite. Kiwix OPDS
 and Overture STAC are discovery surfaces. ZIM reading and OSM/Overture
-materialization or query backends remain future work.
+materialization or query backends remain future work. The source-neutral
+`managed.documents.v1` materializer is shipped: trusted native producers can
+activate bounded immutable documents and ordered inert-text segments into an
+Information-owned FTS5 representation without granting a source-specific
+reader or product integration.
 
 ## Workspace
 
 - `information-native-types`: versioned resource, release, representation,
-  install, query, evidence, citation, trust, and tool contracts.
+  install, query, evidence, citation, trust, managed-document, and tool
+  contracts.
 - `information-native-catalog`: validation and normalization for built-in
   manifests and remote catalogue providers such as OPDS and STAC.
-- `information-native-store`: private staging, same-filesystem activation, external
-  read-only imports, full-byte verification, and append-only receipts.
+- `information-native-store`: private staging, same-filesystem activation,
+  external read-only imports, full-byte verification, append-only receipts,
+  and the strict source-neutral managed-document/FTS5 materializer.
 - `information-native-acquire`: the sole network-authority crate; bounded
   streaming fetch, durable HTTP resume, redirect/DNS attestations, and
   digest/length verification.
@@ -54,6 +60,15 @@ materialization or query backends remain future work.
   with no pending WAL or rollback journal; immutable-read-only additionally
   pins full-file identity and SHA-256.
 - Managed state, indexes, and receipts are physically separate from sources.
+- `managed.documents.v1` inputs bind exact immutable source artifacts,
+  source-record hashes, typed locators, lineage, rights, and use policy. The
+  default is private: local search allowed, model use unknown and therefore
+  fail-closed, excerpt export forbidden, and redistribution forbidden.
+- Managed-document activation publishes one immutable database, manifest, and
+  receipt directory by same-filesystem rename. Removal requires the exact
+  materialization/content/database hashes and deletes only those three
+  Information-owned representation files; source paths are evidence, never
+  deletion targets.
 - Managed installation is crash-recoverable at verified staging and atomic
   activation boundaries. Verified acquisitions are published as immutable,
   per-artifact journal entries; the staging manifest is never rewritten. Each

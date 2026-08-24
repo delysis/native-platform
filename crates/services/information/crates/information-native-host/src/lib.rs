@@ -35,8 +35,11 @@ use information_native_types::{
     ArtifactAcquisition, ArtifactId, ArtifactRole, CatalogAuthority, ErrorClass, EvidenceSet,
     ExternalAccessMode, ExternalRegistration, FormatKind, InformationCatalog, InformationError,
     InformationQuery, InstallPlan, InstallReceipt, InstallationId, InstallationState,
-    PlannedArtifact, ReleaseId, RepresentationFormat, RepresentationId, ResourceId, ResourceRecord,
-    RetrievalPurpose, RightsStatement, SourceIdentity, UsePolicy,
+    ManagedDocumentsReceipt, ManagedDocumentsRemovalPlan, ManagedDocumentsRemovalReceipt,
+    ManagedDocumentsRemovalRequest, ManagedDocumentsSearchRequest, ManagedDocumentsSearchResult,
+    ManagedDocumentsV1, ManagedMaterializationId, PlannedArtifact, ReleaseId, RepresentationFormat,
+    RepresentationId, ResourceId, ResourceRecord, RetrievalPurpose, RightsStatement,
+    SourceIdentity, UsePolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -904,6 +907,40 @@ impl InformationHost {
         Ok(self.store.plan_removal(installation_id)?)
     }
 
+    /// Materialize a strict source-neutral document set inside Information's
+    /// managed root. Product and renderer code never receives a database path.
+    pub fn materialize_documents(
+        &self,
+        materialization: &ManagedDocumentsV1,
+    ) -> Result<ManagedDocumentsReceipt, HostError> {
+        Ok(self.store.materialize_documents(materialization)?)
+    }
+
+    /// Search one exact immutable managed-document representation for local UI
+    /// use. Model-context and export grants remain separate policy decisions.
+    pub fn search_managed_documents(
+        &self,
+        request: &ManagedDocumentsSearchRequest,
+    ) -> Result<ManagedDocumentsSearchResult, HostError> {
+        Ok(self.store.search_managed_documents(request)?)
+    }
+
+    pub fn plan_managed_documents_removal(
+        &self,
+        materialization_id: &ManagedMaterializationId,
+    ) -> Result<ManagedDocumentsRemovalPlan, HostError> {
+        Ok(self
+            .store
+            .plan_managed_documents_removal(materialization_id)?)
+    }
+
+    pub fn remove_managed_documents(
+        &self,
+        request: &ManagedDocumentsRemovalRequest,
+    ) -> Result<ManagedDocumentsRemovalReceipt, HostError> {
+        Ok(self.store.remove_managed_documents(request)?)
+    }
+
     pub fn execute_tool(
         &self,
         call: InformationToolCall,
@@ -1287,7 +1324,9 @@ fn store_information_error(error: &StoreError) -> InformationError {
             "information_store_conflict",
             false,
         ),
-        StoreError::InstallationNotFound(_) | StoreError::StageNotFound(_) => {
+        StoreError::InstallationNotFound(_)
+        | StoreError::StageNotFound(_)
+        | StoreError::ManagedDocumentsNotFound(_) => {
             (ErrorClass::NotFound, "information_store_not_found", false)
         }
         StoreError::Contract(_)
@@ -1310,9 +1349,20 @@ fn store_information_error(error: &StoreError) -> InformationError {
         | StoreError::ArtifactSizeMismatch { .. }
         | StoreError::ArtifactDigestMismatch { .. }
         | StoreError::SourceChanged(_)
-        | StoreError::RegistryCorrupt(_) => (
+        | StoreError::RegistryCorrupt(_)
+        | StoreError::ManagedDocumentsIdentityMismatch => (
             ErrorClass::Integrity,
             "information_store_integrity_failure",
+            false,
+        ),
+        StoreError::ManagedDocumentsConflict(_) => (
+            ErrorClass::ResourceBusy,
+            "information_managed_documents_conflict",
+            false,
+        ),
+        StoreError::ManagedDocumentsSqlite { .. } => (
+            ErrorClass::Backend,
+            "information_managed_documents_database_failure",
             false,
         ),
         StoreError::CommittedDurabilityUnknown { .. } => (
