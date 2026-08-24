@@ -2231,7 +2231,7 @@ const fn candidate_rank(kind: MentionTargetKind) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundMentionTool, ambiguous_resolution_blocker, authorize_bound_tool,
+        BoundMentionTool, MentionToolDecision, ambiguous_resolution_blocker, authorize_bound_tool,
         fit_handoff_to_context, parse_handles, parse_mention_tool_decision,
         resolve_targets_from_registry,
     };
@@ -2398,6 +2398,31 @@ mod tests {
                 r#"{"action":"call","server":"local","tool":"lookup","arguments":{"query":"x"}}"#
             )
             .is_some()
+        );
+    }
+
+    #[test]
+    fn audit_characterization_answer_prose_currently_exposes_embedded_call_json() {
+        let call =
+            r#"{"action":"call","server":"local","tool":"lookup","arguments":{"query":"x"}}"#;
+        let prose = format!("Here is an example, not a request: {call} Please explain it.");
+        let fenced = format!("A configuration example:\n```json\n{call}\n```");
+
+        assert!(
+            matches!(
+                parse_mention_tool_decision(&prose),
+                Some(MentionToolDecision::Call { server, tool, .. })
+                    if server == "local" && tool == "lookup"
+            ),
+            "the current parser scans answer prose from its first opening brace to its last closing brace"
+        );
+        assert!(
+            matches!(
+                parse_mention_tool_decision(&fenced),
+                Some(MentionToolDecision::Call { server, tool, .. })
+                    if server == "local" && tool == "lookup"
+            ),
+            "the current parser does not distinguish displayed Markdown examples from control"
         );
     }
 

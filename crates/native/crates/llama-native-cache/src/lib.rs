@@ -466,6 +466,20 @@ mod tests {
     }
 
     #[test]
+    fn audit_characterization_ownerless_lookup_currently_admits_owned_prefixes() {
+        let unowned = value("unowned", CacheTier::SessionPersistent, &[1], 3, 1).metadata;
+        let owned = value("persona", CacheTier::PersonaPack, &[1, 2], 3, 2)
+            .metadata
+            .with_owner("persona:archived:v7");
+
+        let matched = longest_compatible_prefix(&[unowned, owned], &fingerprint(), &[1, 2, 3])
+            .expect("the current ownerless path considers every owner namespace");
+
+        assert_eq!(matched.id, "persona");
+        assert_eq!(matched.matched_tokens, 2);
+    }
+
+    #[test]
     fn revised_persona_prompt_cannot_reuse_a_stale_incompatible_prefix() {
         let stale = value("persona-v1", CacheTier::PersonaPack, &[10, 20, 30], 3, 1).metadata;
         assert!(

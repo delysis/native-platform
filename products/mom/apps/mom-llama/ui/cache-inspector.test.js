@@ -47,6 +47,7 @@ test("the app loads visible cache feedback before handlers and exposes no generi
   const index = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
   const handlers = fs.readFileSync(path.join(__dirname, "coop-hx.js"), "utf8");
   assert.ok(index.indexOf("cache-inspector.js") < index.indexOf("coop-hx.js"));
+  assert.ok(index.indexOf("composer-key-policy.js") < index.indexOf("coop-hx.js"));
   assert.match(handlers, /"kv-status": async \(\) => refreshCacheInspector/);
   assert.match(handlers, /refreshCacheInspector\("clear"/);
   assert.doesNotMatch(handlers, /"kv-save":/);

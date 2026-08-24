@@ -570,7 +570,7 @@ mod tests {
     use llama_native_host::{NativeHost, NativeHostConfig, ProcessExitJoinedNativeHost};
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::Notify;
 
@@ -590,6 +590,25 @@ mod tests {
         }
     }
 
+    struct RecordingProductCanceller {
+        sweeps: AtomicUsize,
+    }
+
+    impl RecordingProductCanceller {
+        const fn new() -> Self {
+            Self {
+                sweeps: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ProductCanceller for RecordingProductCanceller {
+        fn cancel_all(&self) -> usize {
+            self.sweeps.fetch_add(1, Ordering::AcqRel);
+            0
+        }
+    }
+
     impl NativeFinalizer for RecordingFinalizer {
         fn shutdown(
             &self,
@@ -601,6 +620,13 @@ mod tests {
     }
 
     fn runtime_with_finalizer(called: Arc<AtomicBool>) -> AppRuntimeHandle {
+        runtime_with_canceller(called, Arc::new(NoopProductCanceller))
+    }
+
+    fn runtime_with_canceller(
+        called: Arc<AtomicBool>,
+        product_canceller: Arc<dyn ProductCanceller>,
+    ) -> AppRuntimeHandle {
         let host = Arc::new(NativeHost::new(NativeHostConfig::default()));
         let gateway = Arc::new(Gateway::new(GatewayDefaults {
             catalog_version: "test".to_string(),
@@ -610,7 +636,7 @@ mod tests {
             Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host))),
             host,
             None,
-            Arc::new(NoopProductCanceller),
+            product_canceller,
             Arc::new(RecordingFinalizer { called }),
         )
     }
@@ -651,6 +677,46 @@ mod tests {
                 .admit(command_spec("mom_llama_settings_update"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn two_runtime_characterization_keeps_injected_admission_and_cancel_seams_isolated() {
+        let left_canceller = Arc::new(RecordingProductCanceller::new());
+        let right_canceller = Arc::new(RecordingProductCanceller::new());
+        let left = runtime_with_canceller(Arc::new(AtomicBool::new(false)), left_canceller.clone());
+        let right =
+            runtime_with_canceller(Arc::new(AtomicBool::new(false)), right_canceller.clone());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let close_left = {
+            let barrier = Arc::clone(&barrier);
+            let left = left.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                assert!(left.begin_quiesce());
+                left.request_product_cancellation();
+            })
+        };
+        let admit_right = {
+            let barrier = Arc::clone(&barrier);
+            let right = right.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                right.admit(command_spec("mom_llama_chat_send"))
+            })
+        };
+
+        barrier.wait();
+        close_left.join().expect("left quiesce thread");
+        let right_lease = admit_right
+            .join()
+            .expect("right admission thread")
+            .expect("the peer runtime must remain open");
+
+        assert!(left.admit(command_spec("mom_llama_chat_send")).is_err());
+        assert!(!right_lease.cancellation_requested());
+        assert_eq!(left_canceller.sweeps.load(Ordering::Acquire), 1);
+        assert_eq!(right_canceller.sweeps.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

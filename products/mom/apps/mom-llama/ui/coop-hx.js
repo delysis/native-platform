@@ -2017,25 +2017,32 @@
     if (!event.target.matches("#chat-form textarea[name='message']")) return;
     const mentionList = document.getElementById("mention-candidates");
     const mentionOptions = [...mentionList?.querySelectorAll(".mention-candidate") || []];
-    if (!mentionList?.classList.contains("is-hidden") && mentionOptions.length) {
-      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-        event.preventDefault();
-        mentionActiveIndex = (mentionActiveIndex + (event.key === "ArrowDown" ? 1 : -1) + mentionOptions.length) % mentionOptions.length;
-        mentionOptions.forEach((option, index) => option.classList.toggle("active", index === mentionActiveIndex));
-        return;
-      }
-      if (event.key === "Enter" && !event.shiftKey) {
-        event.preventDefault();
-        insertMention(event.target, mentionOptions[mentionActiveIndex].dataset.handle || "");
-        return;
-      }
-      if (event.key === "Escape") { event.preventDefault(); closeMentions(); return; }
+    const keyDecision = globalThis.MomLlamaComposerKeyPolicy?.decideKey({
+      key: event.key,
+      shiftKey: event.shiftKey,
+      metaKey: event.metaKey,
+      ctrlKey: event.ctrlKey,
+      mentionOpen: !mentionList?.classList.contains("is-hidden"),
+      mentionCount: mentionOptions.length,
+      sendOnEnter: document.querySelector('[data-setting-key="sendOnEnter"]')?.checked !== false,
+    }) || { kind: "unhandled" };
+    if (keyDecision.kind === "mention_next" || keyDecision.kind === "mention_previous") {
+      event.preventDefault();
+      mentionActiveIndex = (mentionActiveIndex + (keyDecision.kind === "mention_next" ? 1 : -1) + mentionOptions.length) % mentionOptions.length;
+      mentionOptions.forEach((option, index) => option.classList.toggle("active", index === mentionActiveIndex));
+      return;
     }
-    const sendOnEnter = document.querySelector('[data-setting-key="sendOnEnter"]')?.checked !== false;
-    const submit = sendOnEnter
-      ? event.key === "Enter" && !event.shiftKey && !event.metaKey && !event.ctrlKey
-      : event.key === "Enter" && (event.metaKey || event.ctrlKey);
-    if (submit) {
+    if (keyDecision.kind === "mention_accept") {
+      event.preventDefault();
+      insertMention(event.target, mentionOptions[mentionActiveIndex].dataset.handle || "");
+      return;
+    }
+    if (keyDecision.kind === "mention_dismiss") {
+      event.preventDefault();
+      closeMentions();
+      return;
+    }
+    if (keyDecision.kind === "submit") {
       event.preventDefault();
       event.target.form?.requestSubmit();
     }
