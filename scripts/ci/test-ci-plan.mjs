@@ -82,7 +82,12 @@ test("CI policy changes use root Linux and macOS without expanding to full", () 
   assert.equal(result.flags.root, true);
   assert.equal(result.flags.platform_macos, true);
   assert.equal(result.flags.full, false);
-  assert.deepEqual(result.jobs, ["policy", "root-linux", "platform-macos"]);
+  assert.deepEqual(result.jobs, [
+    "policy",
+    "root-linux",
+    "platform-macos",
+    "ignored-tests",
+  ]);
   assert.deepEqual(result.macos_matrix, ["release", "root"]);
 });
 
@@ -208,7 +213,53 @@ test("the PR 22 Mom diff has the focused product, frontend, and macOS plan", () 
     "mom-linux",
     "frontend",
     "platform-macos",
+    "ignored-tests",
   ]);
+});
+
+test("ignored-test sources, targets, and registry changes select authoritative reconciliation", () => {
+  for (const relativePath of [
+    "ci/ignored-tests.json",
+    "crates/services/information/crates/information-native-backend-sqlite/src/lib.rs",
+    "products/mom/crates/mom-llama-runtime/Cargo.toml",
+  ]) {
+    const { result } = fixture(relativePath, {
+      present: ["products/mom/Cargo.toml"],
+    });
+    assert.equal(result.flags.ignored_tests, true, relativePath);
+    assert.ok(result.jobs.includes("ignored-tests"), relativePath);
+  }
+});
+
+test("new and deleted ignore attributes select authoritative reconciliation", () => {
+  const added = fixture(
+    "crates/native/crates/llama-native-types/src/new_ignored.rs",
+    { contents: "#[test]\n#[ignore]\nfn newly_ignored() {}\n" },
+  ).result;
+  assert.equal(added.flags.full, false);
+  assert.equal(added.flags.ignored_tests, true);
+  assert.ok(added.jobs.includes("ignored-tests"));
+
+  const { repo } = makeRepo();
+  const source = "crates/services/attachment/crates/attachment-native-types/src/removed.rs";
+  write(repo, source, "#[test]\n#[ignore]\nfn removed_ignored() {}\n");
+  const withIgnored = commit(repo, "add ignored test");
+  fs.rmSync(path.join(repo, source));
+  const withoutIgnored = commit(repo, "remove ignored test");
+  const removed = plan(repo, withIgnored, withoutIgnored);
+  assert.equal(removed.flags.full, false);
+  assert.equal(removed.flags.ignored_tests, true);
+  assert.ok(removed.jobs.includes("ignored-tests"));
+});
+
+test("ordinary Rust sources do not select ignored-test reconciliation", () => {
+  const { result } = fixture(
+    "crates/native/crates/llama-native-types/src/ordinary.rs",
+    { contents: "pub fn ordinary() {}\n" },
+  );
+  assert.equal(result.flags.full, false);
+  assert.equal(result.flags.ignored_tests, false);
+  assert.ok(!result.jobs.includes("ignored-tests"));
 });
 
 test("product package scripts select their owned frontend checks", () => {

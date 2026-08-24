@@ -16,11 +16,19 @@ not be treated as substitutes for operational acceptance.
 ## Ignored-test registry
 
 `ci/ignored-tests.json` is the machine-readable inventory of opt-in tests. Each
-entry binds the exact Cargo test ID to a workspace package and source file,
-states its prerequisite and evidence class, and explicitly records what that
-test cannot promote. The structural validator runs in ordinary policy CI. Full
-macOS CI additionally runs the exact locked workspace `--ignored --list`
-command and reconciles all 37 IDs without executing them.
+entry binds the exact Cargo test ID to a workspace package, source file, exact
+Cargo target identity, and explicit platform availability. Target records are
+validated against locked Cargo metadata by package, target name, target kinds,
+target source, and manifest. Entries also state their prerequisite and evidence
+class and explicitly record what that test cannot promote. The registry has 37
+tests: 37 are available on macOS, 36 on Linux, and 33 on Windows.
+
+The structural validator runs in ordinary policy CI. Relevant pull requests and
+full macOS CI additionally build test harnesses with locked `cargo test
+--no-run --message-format=json-render-diagnostics`, then invoke each emitted
+harness only with `--ignored --list`. The resulting full test ID and real Cargo
+target tuple is reconciled against the expected current-platform subset. No
+ignored test body is executed by this inventory gate.
 
 ## Reverse-dependency shadow
 

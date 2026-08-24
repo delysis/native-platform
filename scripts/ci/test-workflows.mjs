@@ -395,6 +395,23 @@ test("full macOS CI reconciles ignored-test metadata without running ignored tes
   assert.doesNotMatch(source, /cargo test[^\n]*--ignored(?! --list)/);
 });
 
+test("relevant PRs require exact list-only ignored-test reconciliation", () => {
+  const source = read(prPath);
+  assert.match(
+    source,
+    /^\s{6}ignored_tests: \$\{\{ steps\.plan\.outputs\.ignored_tests \}\}$/m,
+  );
+  const block = source.match(/^  ignored-tests:[\s\S]*?(?=^  fuzz-build:)/m)?.[0];
+  assert.ok(block, "ignored-tests PR job block is missing");
+  assert.match(block, /runs-on: macos-latest/);
+  assert.match(block, /needs\.plan\.outputs\.ignored_tests == 'true'/);
+  assert.match(block, /name: Reconcile exact ignored-test inventory without executing tests/);
+  assert.match(block, /node scripts\/ci\/validate-ignored-tests\.mjs --cargo-list/);
+  assert.doesNotMatch(block, /cargo test[^\n]*--ignored(?! --list)/);
+  const required = source.match(/^  ci-required:[\s\S]*$/m)?.[0];
+  assert.match(required, /^\s{6}- ignored-tests$/m);
+});
+
 test("PR workflow exposes every targeted partition and future product guards", () => {
   const source = read(prPath);
   for (const job of [
@@ -410,6 +427,7 @@ test("PR workflow exposes every targeted partition and future product guards", (
     "loom-linux",
     "frontend",
     "platform-macos",
+    "ignored-tests",
     "dependency-graph",
     "fuzz-build",
   ]) {

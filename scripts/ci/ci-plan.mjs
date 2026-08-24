@@ -2,6 +2,7 @@
 
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import {
   computeReverseDependencyShadow,
   readCargoMetadata,
@@ -17,6 +18,30 @@ function requiredEnv(name) {
 const base = requiredEnv("CI_BASE_SHA");
 const head = requiredEnv("CI_HEAD_SHA");
 const eventName = process.env.GITHUB_EVENT_NAME ?? "local";
+const plannerRoot = path.resolve(import.meta.dirname, "../..");
+const ignoredRegistry = JSON.parse(
+  fs.readFileSync(path.join(plannerRoot, "ci/ignored-tests.json"), "utf8"),
+);
+const ignoredTestSources = new Set(
+  ignoredRegistry.entries.map((entry) => entry.source),
+);
+const ignoredTargetManifests = new Set(
+  ignoredRegistry.cargo_targets.map((target) => target.manifest_path),
+);
+const ignoredInventoryInfrastructure = new Set([
+  ".github/workflows/ci-full.yml",
+  ".github/workflows/ci-pr.yml",
+  "Cargo.lock",
+  "Cargo.toml",
+  "ci/ignored-tests.json",
+  "scripts/ci/ci-plan.mjs",
+  "scripts/ci/ci-required.mjs",
+  "scripts/ci/test-ci-plan.mjs",
+  "scripts/ci/test-ci-required.mjs",
+  "scripts/ci/test-ignored-tests.mjs",
+  "scripts/ci/test-workflows.mjs",
+  "scripts/ci/validate-ignored-tests.mjs",
+]);
 
 // Include deletions. A removed build, policy, or dependency file can be at
 // least as consequential as an addition, and must never disappear from the
@@ -62,6 +87,7 @@ const flags = {
   fuzz: false,
   platform_linux: false,
   platform_macos: false,
+  ignored_tests: false,
   full: false,
 };
 
@@ -98,6 +124,7 @@ function forceFull(nextRisk = "dependency") {
   flags.frontend_loom = presence.loom;
   flags.dependency_graph = true;
   flags.fuzz = true;
+  flags.ignored_tests = true;
   markPlatform();
   risk = nextRisk;
 }
@@ -132,8 +159,38 @@ function isMomContractDependencyChange(changedPath) {
   );
 }
 
+function gitBlobContains(revision, changedPath, pattern) {
+  try {
+    const source = execFileSync("git", ["show", `${revision}:${changedPath}`], {
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return pattern.test(source);
+  } catch {
+    return false;
+  }
+}
+
+function isIgnoredInventoryChange(changedPath) {
+  if (
+    ignoredInventoryInfrastructure.has(changedPath) ||
+    ignoredTestSources.has(changedPath) ||
+    ignoredTargetManifests.has(changedPath)
+  ) {
+    return true;
+  }
+  if (!changedPath.endsWith(".rs")) return false;
+  const ignoredAttribute = /#\s*\[\s*ignore\b/;
+  return (
+    gitBlobContains(base, changedPath, ignoredAttribute) ||
+    gitBlobContains(head, changedPath, ignoredAttribute)
+  );
+}
+
 for (const changedPath of changed) {
   let recognized = false;
+
+  if (isIgnoredInventoryChange(changedPath)) flags.ignored_tests = true;
 
   if (
     changedPath.endsWith(".md") ||
@@ -368,6 +425,7 @@ if (flags.frontend_fte || flags.frontend_mom || flags.frontend_loom || flags.ful
   jobs.push("frontend");
 }
 if (flags.platform_macos || flags.full) jobs.push("platform-macos");
+if (flags.ignored_tests || flags.full) jobs.push("ignored-tests");
 if (flags.dependency_graph || flags.full) jobs.push("dependency-graph");
 if (flags.fuzz || flags.full) jobs.push("fuzz-build");
 

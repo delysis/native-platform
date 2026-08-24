@@ -77,6 +77,23 @@ test("matrix-backed job IDs are consumed as one fail-closed aggregate result", (
   }
 });
 
+test("a selected ignored-test reconciliation is an authoritative required job", () => {
+  const ignoredPlan = {
+    ...docsPlan,
+    risk: "behavior",
+    flags: { full: false, ignored_tests: true },
+    jobs: ["policy", "ignored-tests"],
+  };
+  const needs = {
+    plan: { result: "success" },
+    policy: { result: "success" },
+    "ignored-tests": { result: "success" },
+  };
+  assert.equal(run(ignoredPlan, needs).status, 0);
+  needs["ignored-tests"] = { result: "skipped" };
+  assert.notEqual(run(ignoredPlan, needs).status, 0);
+});
+
 test("a required skipped, failed, or missing job fails", () => {
   for (const resultName of ["skipped", "failure", undefined]) {
     const needs = {

@@ -25,6 +25,7 @@ const knownJobs = [
   "loom-linux",
   "frontend",
   "platform-macos",
+  "ignored-tests",
   "dependency-graph",
   "fuzz-build",
 ];
@@ -61,6 +62,7 @@ if (plan.flags?.full === true) {
     "speech-linux",
     "frontend",
     "platform-macos",
+    "ignored-tests",
     "dependency-graph",
     "fuzz-build",
   ];
