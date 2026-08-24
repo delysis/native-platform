@@ -16,7 +16,51 @@ const requiredText = (value, label) => {
   }
 };
 const sameSet = (left, right) =>
-  left.length === right.length && left.every((value) => right.includes(value));
+  left.length === right.length &&
+  new Set(left).size === left.length &&
+  left.every((value) => right.includes(value));
+
+const externalMcpEffectIds = new Set([
+  "mom_llama.effects.mcp_stdio.v1",
+  "mom_llama.effects.mention_tool_approval.v1",
+  "mom_llama.effects.tool_loop.v1",
+]);
+const externalMcpNetwork = ["configured_mcp_process_may_access_network"];
+const externalMcpProcess = ["configured_external_mcp_stdio_process"];
+const externalMcpSecrets = ["configured_mcp_process_may_access_os_permitted_secrets"];
+const externalMcpPlatforms = ["macos", "linux"];
+const approvalRecoveryEffectId = "mom_llama.effects.mention_tool_approval_recovery.v1";
+const approvalRecoveryReads = [
+  "encrypted_persona_tool_approval_active_index",
+  "encrypted_frozen_mention_invocations",
+  "persisted_approval_deadline_clocks",
+  "exact_os_process_lease_state",
+];
+const approvalRecoveryWrites = [
+  "encrypted_terminal_persona_tool_approvals",
+  "encrypted_terminal_mention_invocations",
+  "encrypted_conversations",
+  "encrypted_persona_tool_approval_active_index",
+  "encrypted_unknown_effect_receipts",
+  "command_receipt",
+];
+const unixMcpCommandIds = new Set([
+  "mom_llama.mention_tool_approval_decide",
+  "mom_llama.mcp_status",
+  "mom_llama.mcp_configure",
+  "mom_llama.mcp_list_servers",
+  "mom_llama.mcp_list_tools",
+  "mom_llama.mcp_call_tool",
+  "mom_llama.mcp_list_resources",
+  "mom_llama.mcp_read_resource",
+  "mom_llama.mcp_list_prompts",
+  "mom_llama.mcp_get_prompt",
+  "mom_llama.tool_loop_prepare",
+  "mom_llama.tool_loop_run",
+  "mom_llama.tool_loop_cancel",
+  "mom_llama.tool_loop_status",
+]);
+const lifecycleCommandIds = new Set(["mom_llama.persona_tool_approval_recover"]);
 
 const commandsDocument = readJson("contracts/commands.json");
 const effectsDocument = readJson("contracts/effects.json");
@@ -45,15 +89,55 @@ for (const effect of effectsDocument.effects ?? []) {
   ]) {
     if (!Array.isArray(effect[key])) fail(`${effect.effect_id}.${key} must be an array`);
   }
-  if (effect.network.length !== 0) {
-    fail(`${effect.effect_id} violates the native-local no-network profile`);
+  if (externalMcpEffectIds.has(effect.effect_id)) {
+    if (!sameSet(effect.network, externalMcpNetwork)) {
+      fail(`${effect.effect_id} must declare the exact external MCP network authority`);
+    }
+    if (!sameSet(effect.process, externalMcpProcess)) {
+      fail(`${effect.effect_id} must declare the exact external MCP process authority`);
+    }
+    if (!sameSet(effect.secrets, externalMcpSecrets)) {
+      fail(`${effect.effect_id} must declare the exact external MCP secret boundary`);
+    }
+    if (!sameSet(effect.platforms ?? [], externalMcpPlatforms)) {
+      fail(`${effect.effect_id} must remain limited to macOS and Linux`);
+    }
+    for (const authority of [
+      "configured_mcp_process_may_read_os_permitted_files",
+      "configured_mcp_process_may_write_os_permitted_files",
+    ]) {
+      const declared = authority.includes("may_read") ? effect.reads : effect.writes;
+      if (!declared.includes(authority)) {
+        fail(`${effect.effect_id} omits ${authority}`);
+      }
+    }
+    if (!sameSet(effect.external_apps, ["configured_external_mcp_process"])) {
+      fail(`${effect.effect_id} must name only the configured external MCP process`);
+    }
+  } else {
+    if (effect.network.length !== 0) {
+      fail(`${effect.effect_id} violates the zero-network product boundary`);
+    }
+    if (effect.process.length !== 0) {
+      fail(`${effect.effect_id} has process authority outside the MCP boundary`);
+    }
+    if (effect.platforms !== undefined) {
+      fail(`${effect.effect_id} has an unreviewed platform restriction`);
+    }
   }
-  const processAllowed = new Set([
-    "mom_llama.effects.mcp_stdio.v1",
-    "mom_llama.effects.tool_loop.v1",
-  ]);
-  if (effect.process.length !== 0 && !processAllowed.has(effect.effect_id)) {
-    fail(`${effect.effect_id} has process authority outside the MCP boundary`);
+  if (effect.effect_id === approvalRecoveryEffectId) {
+    if (!sameSet(effect.reads, approvalRecoveryReads)) {
+      fail(`${effect.effect_id} reads disagree with the recovery boundary`);
+    }
+    if (!sameSet(effect.writes, approvalRecoveryWrites)) {
+      fail(`${effect.effect_id} writes disagree with the recovery boundary`);
+    }
+    if (!sameSet(effect.persistence, ["encrypted_sqlite", "encrypted_receipts"])) {
+      fail(`${effect.effect_id} persistence must remain encrypted`);
+    }
+    if (effect.destructive !== "irreversible") {
+      fail(`${effect.effect_id} must disclose terminal recovery transitions`);
+    }
   }
   if (!["none", "reversible", "irreversible"].includes(effect.destructive)) {
     fail(`${effect.effect_id}.destructive is invalid`);
@@ -108,6 +192,40 @@ for (const command of commandsDocument.commands ?? []) {
   }
   if (command.blocker_behavior !== "typed_result") {
     fail(`${command.command_id} must fail through a typed result`);
+  }
+  const expectedPlatforms = unixMcpCommandIds.has(command.command_id)
+    ? externalMcpPlatforms
+    : [];
+  if (!sameSet(command.platforms ?? [], expectedPlatforms)) {
+    fail(
+      `${command.command_id} platform boundary disagrees: contract=${(command.platforms ?? []).join(",")} expected=${expectedPlatforms.join(",")}`,
+    );
+  }
+  const surface = command.surface ?? "native_view";
+  if (!lifecycleCommandIds.has(command.command_id) && surface !== "native_view") {
+    fail(`${command.command_id} has an unreviewed command surface ${surface}`);
+  }
+  if (lifecycleCommandIds.has(command.command_id) !== (surface === "lifecycle")) {
+    fail(`${command.command_id} lifecycle classification disagrees`);
+  }
+  if (surface === "lifecycle") {
+    if (command.tauri_command !== "lifecycle_only") {
+      fail(`${command.command_id} must not expose a Tauri handler`);
+    }
+    if (!command.affordances.every((affordance) => affordance.startsWith("cli."))) {
+      fail(`${command.command_id} lifecycle affordances must be CLI-only`);
+    }
+    if (
+      command.effect_spec_id !== approvalRecoveryEffectId ||
+      command.cli !== "automatic before mom-llama mention approval-list/approval-decide" ||
+      !sameSet(command.affordances, ["cli.persona_tool_approval_recovery"])
+    ) {
+      fail(`${command.command_id} lifecycle recovery contract disagrees`);
+    }
+    if (controls.some((control) => control.command === command.command_id)) {
+      fail(`${command.command_id} lifecycle command must not have a native view projection`);
+    }
+    continue;
   }
   if (!tauriSource.match(new RegExp(`pub (?:async )?fn ${command.tauri_command}\\b`))) {
     fail(`${command.command_id} has no Tauri handler ${command.tauri_command}`);

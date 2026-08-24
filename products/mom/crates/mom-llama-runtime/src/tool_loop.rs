@@ -1443,7 +1443,7 @@ fn execute_tool_step(
                 "cancelled".to_string(),
                 Blocker::new(
                     "tool_loop_cancelled",
-                    "The approved tool loop was cancelled while the local tool was running.",
+                    "The approved tool loop was cancelled while the configured external-process tool was running.",
                     vec!["Review the partial local transcript before retrying.".to_string()],
                 ),
             )));
@@ -1486,7 +1486,7 @@ fn build_model_messages(conversation: &Conversation, tool: &McpTool) -> Vec<Chat
     let mut messages = vec![ChatMessage {
         role: ChatRole::System,
         content: format!(
-            "You are a bounded local tool planner. The user explicitly authorized only the MCP tool `{}` for this run. Its JSON input schema is: {schema}\n\
+            "You are a bounded external-process tool planner. The user explicitly authorized only the MCP tool `{}` for this run. Its JSON input schema is: {schema}\n\
              Use the tool result already present in the conversation. If another call to that same tool is strictly required, return only one JSON object in this exact shape: \
              {{\"action\":\"call\",\"arguments\":{{...}}}}. Otherwise return only one JSON object in this exact shape: \
              {{\"action\":\"final\",\"answer\":\"your complete answer to the user\"}}. \

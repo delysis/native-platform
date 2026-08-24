@@ -360,6 +360,37 @@ enum MentionCommand {
         #[arg(long)]
         json: bool,
     },
+    ApprovalList {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        json: bool,
+    },
+    ApprovalDecide {
+        #[arg(long)]
+        invocation: String,
+        #[arg(long)]
+        approval: String,
+        #[arg(long, value_enum)]
+        decision: MentionToolApprovalDecisionArg,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MentionToolApprovalDecisionArg {
+    Approve,
+    Deny,
+}
+
+impl From<MentionToolApprovalDecisionArg> for mom_llama_runtime::MentionToolApprovalDecision {
+    fn from(value: MentionToolApprovalDecisionArg) -> Self {
+        match value {
+            MentionToolApprovalDecisionArg::Approve => Self::Approve,
+            MentionToolApprovalDecisionArg::Deny => Self::Deny,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -906,6 +937,10 @@ fn main() -> Result<()> {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if command_requires_persona_approval_recovery(&cli.command) {
+        let recovery = mom_llama_runtime::reconcile_persona_tool_approvals_command()?;
+        mom_llama_runtime::persist_command_receipt(&recovery)?;
+    }
     let _native_owner = command_uses_native(&cli.command)
         .then(|| {
             let settings = mom_llama_runtime::config::resolve_settings()?;
@@ -1164,6 +1199,23 @@ fn run() -> Result<()> {
             MentionCommand::Synthesize { invocation, json } => {
                 print_result(mom_llama_runtime::mention_synthesize(&invocation)?, json)
             }
+            MentionCommand::ApprovalList { conversation, json } => print_result(
+                mom_llama_runtime::mention_tool_approval_list(&conversation)?,
+                json,
+            ),
+            MentionCommand::ApprovalDecide {
+                invocation,
+                approval,
+                decision,
+                json,
+            } => print_result(
+                mom_llama_runtime::mention_tool_approval_decide(
+                    &invocation,
+                    &approval,
+                    decision.into(),
+                )?,
+                json,
+            ),
         },
         Command::Consult { command } => match command {
             ConsultCommand::PanelList { json } => {
@@ -1613,6 +1665,15 @@ fn run() -> Result<()> {
     }
 }
 
+fn command_requires_persona_approval_recovery(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Mention {
+            command: MentionCommand::ApprovalList { .. } | MentionCommand::ApprovalDecide { .. }
+        }
+    )
+}
+
 fn command_uses_native(command: &Command) -> bool {
     match command {
         Command::Engine { .. } | Command::Chat { .. } | Command::Server { .. } => true,
@@ -1621,7 +1682,10 @@ fn command_uses_native(command: &Command) -> bool {
             ModelCommand::Status { .. } | ModelCommand::Load { .. } | ModelCommand::Unload { .. }
         ),
         Command::Persona { command } => matches!(command, PersonaCommand::Update { .. }),
-        Command::Mention { command } => !matches!(command, MentionCommand::Candidates { .. }),
+        Command::Mention { command } => !matches!(
+            command,
+            MentionCommand::Candidates { .. } | MentionCommand::ApprovalList { .. }
+        ),
         Command::ToolLoop { command } => matches!(
             command,
             ToolLoopCommand::Run { .. } | ToolLoopCommand::Cancel { .. }

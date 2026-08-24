@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -39,13 +39,32 @@ pub(crate) struct RuntimeStore {
     key: [u8; 32],
 }
 
-pub(crate) struct DocumentMutations<'a> {
-    store: &'a RuntimeStore,
+pub(crate) struct DocumentMutations<'store, 'transaction, 'connection> {
+    store: &'store RuntimeStore,
+    transaction: &'transaction Transaction<'connection>,
     writes: Vec<(String, Vec<u8>, Vec<u8>)>,
     deletes: Vec<String>,
+    receipt_writes: Vec<(String, String, Vec<u8>, Vec<u8>)>,
 }
 
-impl DocumentMutations<'_> {
+impl DocumentMutations<'_, '_, '_> {
+    pub(crate) fn get<T>(&self, namespace: &str) -> Result<Option<T>>
+    where
+        T: DeserializeOwned,
+    {
+        let encrypted = self
+            .transaction
+            .query_row(
+                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
+                [namespace],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        encrypted
+            .map(|(nonce, ciphertext)| self.store.decrypt_json(namespace, &nonce, &ciphertext))
+            .transpose()
+    }
+
     pub(crate) fn put_bytes(&mut self, namespace: &str, value: &[u8]) -> Result<()> {
         let (nonce, ciphertext) = self.store.encrypt_bytes(namespace, value)?;
         self.writes.push((namespace.to_string(), nonce, ciphertext));
@@ -59,6 +78,26 @@ impl DocumentMutations<'_> {
         if !self.deletes.iter().any(|candidate| candidate == namespace) {
             self.deletes.push(namespace.to_string());
         }
+    }
+
+    pub(crate) fn put_receipt<T>(
+        &mut self,
+        receipt_id: &str,
+        command_id: &str,
+        receipt: &T,
+    ) -> Result<()>
+    where
+        T: Serialize,
+    {
+        let namespace = format!("receipt:{receipt_id}");
+        let (nonce, ciphertext) = self.store.encrypt_json(&namespace, receipt)?;
+        self.receipt_writes.push((
+            receipt_id.to_string(),
+            command_id.to_string(),
+            nonce,
+            ciphertext,
+        ));
+        Ok(())
     }
 }
 
@@ -294,11 +333,78 @@ impl RuntimeStore {
         Ok(result)
     }
 
+    /// Mutate two encrypted documents under one immediate SQLite transaction.
+    ///
+    /// This is the narrow boundary for product facts that must become visible
+    /// together, while retaining a separate typed owner for each document.
+    #[cfg(test)]
+    pub(crate) fn mutate_pair<A, B, R>(
+        &self,
+        first_namespace: &str,
+        first_default: impl FnOnce() -> A,
+        second_namespace: &str,
+        second_default: impl FnOnce() -> B,
+        mutation: impl FnOnce(&mut A, &mut B) -> Result<R>,
+    ) -> Result<R>
+    where
+        A: Serialize + DeserializeOwned,
+        B: Serialize + DeserializeOwned,
+    {
+        if first_namespace == second_namespace {
+            anyhow::bail!("paired encrypted document namespaces must be distinct");
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let first_encrypted = transaction
+            .query_row(
+                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
+                [first_namespace],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let second_encrypted = transaction
+            .query_row(
+                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
+                [second_namespace],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let mut first = match first_encrypted {
+            Some((nonce, ciphertext)) => self.decrypt_json(first_namespace, &nonce, &ciphertext)?,
+            None => first_default(),
+        };
+        let mut second = match second_encrypted {
+            Some((nonce, ciphertext)) => {
+                self.decrypt_json(second_namespace, &nonce, &ciphertext)?
+            }
+            None => second_default(),
+        };
+        let result = mutation(&mut first, &mut second)?;
+        let (first_nonce, first_ciphertext) = self.encrypt_json(first_namespace, &first)?;
+        let (second_nonce, second_ciphertext) = self.encrypt_json(second_namespace, &second)?;
+        for (namespace, nonce, ciphertext) in [
+            (first_namespace, first_nonce, first_ciphertext),
+            (second_namespace, second_nonce, second_ciphertext),
+        ] {
+            transaction.execute(
+                "INSERT INTO encrypted_documents(namespace, nonce, ciphertext, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(namespace) DO UPDATE SET
+                   nonce = excluded.nonce,
+                   ciphertext = excluded.ciphertext,
+                   updated_at = excluded.updated_at",
+                params![namespace, nonce, ciphertext, timestamp_i64()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(result)
+    }
+
     pub(crate) fn mutate_documents<T, R>(
         &self,
         namespace: &str,
         default: impl FnOnce() -> T,
-        mutation: impl FnOnce(&mut T, &mut DocumentMutations<'_>) -> Result<R>,
+        mutation: impl FnOnce(&mut T, &mut DocumentMutations<'_, '_, '_>) -> Result<R>,
     ) -> Result<R>
     where
         T: Serialize + DeserializeOwned,
@@ -318,19 +424,27 @@ impl RuntimeStore {
         };
         let mut documents = DocumentMutations {
             store: self,
+            transaction: &transaction,
             writes: Vec::new(),
             deletes: Vec::new(),
+            receipt_writes: Vec::new(),
         };
         let result = mutation(&mut value, &mut documents)?;
         let (nonce, ciphertext) = self.encrypt_json(namespace, &value)?;
 
-        for deleted in documents.deletes {
+        let DocumentMutations {
+            writes,
+            deletes,
+            receipt_writes,
+            ..
+        } = documents;
+        for deleted in deletes {
             transaction.execute(
                 "DELETE FROM encrypted_documents WHERE namespace = ?1",
                 [deleted],
             )?;
         }
-        for (document_namespace, document_nonce, document_ciphertext) in documents.writes {
+        for (document_namespace, document_nonce, document_ciphertext) in writes {
             transaction.execute(
                 "INSERT INTO encrypted_documents(namespace, nonce, ciphertext, updated_at)
                  VALUES (?1, ?2, ?3, ?4)
@@ -342,6 +456,19 @@ impl RuntimeStore {
                     document_namespace,
                     document_nonce,
                     document_ciphertext,
+                    timestamp_i64()
+                ],
+            )?;
+        }
+        for (receipt_id, command_id, receipt_nonce, receipt_ciphertext) in receipt_writes {
+            transaction.execute(
+                "INSERT INTO receipts(receipt_id, command_id, nonce, ciphertext, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    receipt_id,
+                    command_id,
+                    receipt_nonce,
+                    receipt_ciphertext,
                     timestamp_i64()
                 ],
             )?;
@@ -754,6 +881,73 @@ mod tests {
     }
 
     #[test]
+    fn paired_document_mutation_has_one_commit_and_rollback_boundary() -> Result<()> {
+        let data_dir = test_dir("paired-documents");
+        let store = RuntimeStore::open_with_key(&data_dir, [31_u8; 32])?;
+        store.put(
+            "first",
+            &SecretDocument {
+                values: vec!["first-old".to_string()],
+            },
+        )?;
+        store.put(
+            "second",
+            &SecretDocument {
+                values: vec!["second-old".to_string()],
+            },
+        )?;
+        let failed: Result<()> = store.mutate_pair(
+            "first",
+            SecretDocument::default,
+            "second",
+            SecretDocument::default,
+            |first, second| {
+                first.values = vec!["first-rolled-back".to_string()];
+                second.values = vec!["second-rolled-back".to_string()];
+                Err(anyhow!("force paired rollback"))
+            },
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            store.get::<SecretDocument>("first")?.expect("first"),
+            SecretDocument {
+                values: vec!["first-old".to_string()]
+            }
+        );
+        assert_eq!(
+            store.get::<SecretDocument>("second")?.expect("second"),
+            SecretDocument {
+                values: vec!["second-old".to_string()]
+            }
+        );
+
+        store.mutate_pair(
+            "first",
+            SecretDocument::default,
+            "second",
+            SecretDocument::default,
+            |first, second| {
+                first.values = vec!["first-new".to_string()];
+                second.values = vec!["second-new".to_string()];
+                Ok(())
+            },
+        )?;
+        assert_eq!(
+            store.get::<SecretDocument>("first")?.expect("first"),
+            SecretDocument {
+                values: vec!["first-new".to_string()]
+            }
+        );
+        assert_eq!(
+            store.get::<SecretDocument>("second")?.expect("second"),
+            SecretDocument {
+                values: vec!["second-new".to_string()]
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
     fn metadata_and_blob_mutations_commit_or_roll_back_together() -> Result<()> {
         let data_dir = test_dir("multi-document");
         let store = RuntimeStore::open_with_key(&data_dir, [10_u8; 32])?;
@@ -784,6 +978,88 @@ mod tests {
         );
         assert_eq!(store.get_bytes("blob.old")?, Some(b"old bytes".to_vec()));
         assert_eq!(store.get_bytes("blob.new")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_effect_receipt_and_terminal_journal_commit_once_or_roll_back_together() -> Result<()> {
+        let data_dir = test_dir("exact-effect-receipt");
+        let store = RuntimeStore::open_with_key(&data_dir, [44_u8; 32])?;
+        store.put(
+            "approval-journal",
+            &SecretDocument {
+                values: vec!["resuming".to_string()],
+            },
+        )?;
+        let receipt = SecretDocument {
+            values: vec!["approval-id".to_string(), "call-sha256".to_string()],
+        };
+
+        let rolled_back: Result<()> = store.mutate_documents(
+            "approval-journal",
+            SecretDocument::default,
+            |journal, documents| {
+                journal.values = vec!["failed-but-rolled-back".to_string()];
+                documents.put_receipt("exact-receipt", "mcp-call", &receipt)?;
+                Err(anyhow!("inject failure after queued receipt"))
+            },
+        );
+        assert!(rolled_back.is_err());
+        assert_eq!(
+            store
+                .get::<SecretDocument>("approval-journal")?
+                .expect("approval journal"),
+            SecretDocument {
+                values: vec!["resuming".to_string()]
+            }
+        );
+        let receipt_count = |store: &RuntimeStore| -> Result<i64> {
+            Ok(store.connection()?.query_row(
+                "SELECT COUNT(*) FROM receipts WHERE receipt_id = 'exact-receipt'",
+                [],
+                |row| row.get(0),
+            )?)
+        };
+        assert_eq!(receipt_count(&store)?, 0);
+
+        store.mutate_documents(
+            "approval-journal",
+            SecretDocument::default,
+            |journal, documents| {
+                journal.values = vec!["failed-outcome-unknown".to_string()];
+                documents.put_receipt("exact-receipt", "mcp-call", &receipt)?;
+                Ok(())
+            },
+        )?;
+        assert_eq!(receipt_count(&store)?, 1);
+        assert_eq!(
+            store
+                .get::<SecretDocument>("approval-journal")?
+                .expect("terminal approval journal"),
+            SecretDocument {
+                values: vec!["failed-outcome-unknown".to_string()]
+            }
+        );
+
+        let duplicate: Result<()> = store.mutate_documents(
+            "approval-journal",
+            SecretDocument::default,
+            |journal, documents| {
+                journal.values = vec!["illegitimate-rewrite".to_string()];
+                documents.put_receipt("exact-receipt", "mcp-call", &receipt)?;
+                Ok(())
+            },
+        );
+        assert!(duplicate.is_err(), "exact receipt identity is insert-only");
+        assert_eq!(receipt_count(&store)?, 1);
+        assert_eq!(
+            store
+                .get::<SecretDocument>("approval-journal")?
+                .expect("unchanged terminal journal"),
+            SecretDocument {
+                values: vec!["failed-outcome-unknown".to_string()]
+            }
+        );
         Ok(())
     }
 

@@ -176,7 +176,11 @@
       "id": "mcp_stdio",
       "classification": "p0_implemented",
       "commands": ["mom_llama.mcp_status", "mom_llama.mcp_configure", "mom_llama.mcp_list_servers", "mom_llama.mcp_list_tools", "mom_llama.mcp_call_tool", "mom_llama.mcp_list_resources", "mom_llama.mcp_read_resource", "mom_llama.mcp_list_prompts", "mom_llama.mcp_get_prompt"],
-      "evidence": ["disabled-by-default absolute-path stdio adapter", "bounded timeout and receipt test"]
+      "evidence": [
+        "disabled-by-default macOS/Linux absolute-path stdio adapter",
+        "configured MCP executables are disclosed as external unsandboxed processes with OS-account file, secret, and network authority",
+        "bounded timeout and receipt test"
+      ]
     },
     {
       "id": "remote_mcp_transports",
@@ -249,7 +253,7 @@
     {
       "id": "cors_proxy",
       "classification": "rejected_for_constraint_violation",
-      "reason": "The native app exposes no general network proxy."
+      "reason": "The native app exposes no general network proxy; explicitly configured external MCP processes retain their OS-account network authority."
     },
     {
       "id": "sveltekit_runtime",
@@ -289,7 +293,9 @@
         "mom_llama.mention_candidates",
         "mom_llama.chat_dispatch",
         "mom_llama.mention_cancel",
-        "mom_llama.mention_synthesize"
+        "mom_llama.mention_synthesize",
+        "mom_llama.mention_tool_approval_list",
+        "mom_llama.mention_tool_approval_decide"
       ],
       "evidence": [
         "Personas are encrypted versioned conversation templates with immutable profile and transcript hashes.",
@@ -297,6 +303,7 @@
         "Ordered groups expand to at most four unique Personas and generate concurrently through bounded resident model slots.",
         "Attributed responses are written only to the host chat; source chats and Persona templates are unchanged.",
         "Per-target cancellation preserves completed peers, and explicit synthesis requires two real terminal responses.",
+        "Ask-bound Persona tools use five-minute, one-use approval over the exact frozen turn, Persona version and snapshot, arguments, call hash, and model fingerprint; approve or deny resumes without target resolution.",
         "The ordinary composer provides Lucide-backed @handle autocomplete; Persona and group editing live in Settings.",
         "The previous four-card Consult dashboard is absent from rendered desktop and compact native views.",
         "Real GGUF tests prove exact-version prefix reuse, fingerprint mismatch fallback, four-Persona dispatch, independent cancellation, source isolation, and attributed synthesis."

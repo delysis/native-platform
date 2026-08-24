@@ -2206,6 +2206,11 @@ fn attachment_payload_is_encrypted_and_multimodal_is_honestly_blocked() -> Resul
         .result
         .ok_or_else(|| anyhow!("attachment payload preview missing"))?;
     assert_eq!(hydrated.bytes.as_deref(), Some(payload));
+    mom_llama_runtime::draft_update(
+        Some(&conversation.id),
+        "Describe the image.".to_string(),
+        vec![output.attachment.id.clone()],
+    )?;
     let chat = mom_llama_runtime::chat_send(
         ChatSendInput {
             conversation_id: conversation.id.clone(),
@@ -2255,6 +2260,11 @@ fn long_paste_becomes_an_encrypted_text_attachment_without_a_plaintext_file() ->
         .result
         .ok_or_else(|| anyhow!("pasted attachment draft missing"))?;
     assert_eq!(draft.attachment_ids, vec![output.attachment.id.clone()]);
+    mom_llama_runtime::draft_update(
+        Some(&conversation.id),
+        "Summarize this attachment.".to_string(),
+        vec![output.attachment.id.clone()],
+    )?;
     let sent = mom_llama_runtime::chat_send(
         ChatSendInput {
             conversation_id: conversation.id.clone(),
@@ -2487,16 +2497,24 @@ fn configure_mcp_fixture(session: &TestSession) -> Result<()> {
                     "properties":{"value":{"type":"string"}}
                 }
             }],
-            "content": [{"type":"text","text":"fixture tool result"}]
         }
     });
     let body = serde_json::to_string(&response)?;
+    let initialize = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fixture", "version": "1"}
+        }
+    }))?;
     let executable = session.path().join("mcp-fixture");
     std::fs::write(
         &executable,
         format!(
-            "#!/bin/sh\ncat >/dev/null\nprintf 'Content-Length: {}\\r\\n\\r\\n{}'\n",
-            body.len(),
+            "#!/bin/sh\nIFS= read -r initialize\nprintf '%s\\n' '{}'\nIFS= read -r initialized\nIFS= read -r request\nprintf '%s\\n' '{}'\n",
+            initialize.replace('\'', "'\\''"),
             body.replace('\'', "'\\''")
         ),
     )?;

@@ -357,29 +357,25 @@ fn selected_model_config(settings: &Settings) -> anyhow::Result<Option<NativeMod
         .model_path
         .as_deref()
         .map(|model_path| -> anyhow::Result<NativeModelConfig> {
-            validate_model_path(model_path)
-                .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))?;
-            Ok(model_config(
-                settings,
-                model_path,
-                settings.mmproj_path.as_deref(),
-            ))
+            model_configuration_for_profile(settings, model_path, settings.mmproj_path.as_deref())
+                .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))
         })
         .transpose()
 }
 
-fn model_config(
+pub(crate) fn model_configuration_for_profile(
     settings: &Settings,
     model_path: &Path,
     mmproj_path: Option<&Path>,
-) -> NativeModelConfig {
+) -> Result<NativeModelConfig, ValidationBlocker> {
+    validate_model_path(model_path)?;
     let mut config = NativeModelConfig::local(model_path.to_path_buf());
     config.device = settings.native_device;
     config.context_tokens = settings.context_tokens;
     config.batch_tokens = settings.batch_tokens;
     config.max_sequences = settings.max_parallel_sequences.clamp(1, 4);
     config.mmproj_path = mmproj_path.map(Path::to_path_buf);
-    config
+    Ok(config)
 }
 
 pub fn resident_model(settings: &Settings) -> Result<NativeModelHandle, ValidationBlocker> {
@@ -391,9 +387,79 @@ pub fn resident_model_for_profile(
     model_path: &Path,
     mmproj_path: Option<&Path>,
 ) -> Result<NativeModelHandle, ValidationBlocker> {
-    validate_model_path(model_path)?;
-    let config = model_config(settings, model_path, mmproj_path);
-    with_host(settings, |host| host.acquire(config))
+    let config = model_configuration_for_profile(settings, model_path, mmproj_path)?;
+    resident_model_for_configuration(settings, &config)
+}
+
+pub(crate) fn resident_model_for_configuration(
+    settings: &Settings,
+    config: &NativeModelConfig,
+) -> Result<NativeModelHandle, ValidationBlocker> {
+    validate_model_path(&config.model_path)?;
+    with_host(settings, |host| host.acquire(config.clone()))
+}
+
+/// Reuses the exact frozen resident identity or reloads only the exact private
+/// configuration captured before an approval was made durable. Current model
+/// tuning settings are intentionally ignored; only the AppRuntime host identity
+/// and its process-level ownership policy come from `settings`.
+pub(crate) fn resident_model_for_frozen_config(
+    settings: &Settings,
+    config: &NativeModelConfig,
+    expected: &llama_native_types::ModelFingerprint,
+) -> Result<NativeModelHandle, ValidationBlocker> {
+    validate_model_path(&config.model_path)?;
+    with_host(settings, |host| {
+        if let Some(slot_id) = host
+            .slots()
+            .into_iter()
+            .find(|slot| slot.status.fingerprint.as_ref() == Some(expected))
+            .map(|slot| slot.slot_id)
+        {
+            return host.handle(slot_id).ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ModelMissing,
+                    "the exact frozen Persona model handle disappeared",
+                )
+            });
+        }
+        let handle = host.acquire(config.clone())?;
+        if handle.status().fingerprint.as_ref() != Some(expected) {
+            return Err(NativeError::new(
+                NativeErrorCode::ModelInvalid,
+                "the frozen Persona model configuration no longer resolves to its exact fingerprint",
+            ));
+        }
+        Ok(handle)
+    })
+}
+
+/// Returns only an already-resident model with the exact immutable identity.
+/// Approval resumption must never start an uncancellable model load after an
+/// external-effect intent has been durably consumed.
+pub fn resident_model_for_fingerprint(
+    settings: &Settings,
+    expected: &llama_native_types::ModelFingerprint,
+) -> Result<NativeModelHandle, ValidationBlocker> {
+    with_host(settings, |host| {
+        let slot_id = host
+            .slots()
+            .into_iter()
+            .find(|slot| slot.status.fingerprint.as_ref() == Some(expected))
+            .map(|slot| slot.slot_id)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ModelMissing,
+                    "the exact frozen Persona model is no longer resident",
+                )
+            })?;
+        host.handle(slot_id).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ModelMissing,
+                "the exact frozen Persona model handle is no longer available",
+            )
+        })
+    })
 }
 
 pub fn resident_model_for_slot(
@@ -433,8 +499,8 @@ pub fn resident_model_for_slot(
             ),
         });
     };
-    validate_model_path(model_path)?;
-    let config = model_config(settings, model_path, settings.mmproj_path.as_deref());
+    let config =
+        model_configuration_for_profile(settings, model_path, settings.mmproj_path.as_deref())?;
     with_host(settings, |host| host.load_into_slot(slot_id, config))
 }
 

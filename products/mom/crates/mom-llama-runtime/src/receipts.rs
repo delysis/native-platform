@@ -71,19 +71,27 @@ impl<T> CommandResult<T>
 where
     T: Serialize,
 {
-    /// True only for the closed product result emitted after the native chat
-    /// owner has reported an actual cancelled terminal. Generic blockers and
-    /// caller-supplied errors are not lifecycle cancellation evidence.
+    /// True only for a closed product result whose exact operation owner has
+    /// durably arbitrated cancellation. Generic blockers, effect-outcome-unknown
+    /// failures, and caller-supplied errors are not cancellation evidence.
     pub fn has_authoritative_cancellation_evidence(&self) -> bool {
-        self.command == "mom_llama.chat_send"
+        let exact_cancel = self.blocker.as_ref().is_some_and(|blocker| {
+            (self.command == "mom_llama.chat_send" && blocker.code == "chat_cancelled")
+                || (self.command == "mom_llama.mention_tool_approval_decide"
+                    && matches!(
+                        blocker.code.as_str(),
+                        "mention_tool_approval_cancelled"
+                            | "mention_tool_followup_cancelled_after_effect"
+                    ))
+        });
+        exact_cancel
             && self.status == "blocked"
             && self.result.is_none()
             && self.receipt.command == self.command
             && self.receipt.status == self.status
             && self.receipt.readiness == self.readiness
             && self.blocker.as_ref().is_some_and(|blocker| {
-                blocker.code == "chat_cancelled"
-                    && self.receipt.blockers.as_slice() == std::slice::from_ref(blocker)
+                self.receipt.blockers.as_slice() == std::slice::from_ref(blocker)
             })
     }
 
@@ -241,7 +249,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_closed_chat_cancel_result_is_authoritative_cancellation_evidence() {
+    fn only_exact_closed_operation_results_are_authoritative_cancellation_evidence() {
         let cancelled = CommandResult::<()>::blocked(
             "mom_llama.chat_send",
             "stub_blocked",
@@ -266,5 +274,23 @@ mod tests {
         let mut inconsistent_receipt = cancelled;
         inconsistent_receipt.receipt.status = "passed".to_string();
         assert!(!inconsistent_receipt.has_authoritative_cancellation_evidence());
+
+        for blocker_code in [
+            "mention_tool_approval_cancelled",
+            "mention_tool_followup_cancelled_after_effect",
+        ] {
+            let approval_cancelled = CommandResult::<()>::blocked(
+                "mom_llama.mention_tool_approval_decide",
+                "blocked_native_runtime",
+                Blocker::new(blocker_code, "cancelled", Vec::new()),
+            );
+            assert!(approval_cancelled.has_authoritative_cancellation_evidence());
+        }
+        let unknown_effect = CommandResult::<()>::blocked(
+            "mom_llama.mention_tool_approval_decide",
+            "effect_outcome_unknown",
+            Blocker::new("mention_tool_effect_outcome_unknown", "unknown", Vec::new()),
+        );
+        assert!(!unknown_effect.has_authoritative_cancellation_evidence());
     }
 }

@@ -72,6 +72,8 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     read("mom_llama_mention_candidates", true, false),
     mutation("mom_llama_mention_cancel", true, true),
     long("mom_llama_mention_synthesize", true, true),
+    read("mom_llama_mention_tool_approval_list", true, false),
+    long("mom_llama_mention_tool_approval_decide", true, true),
     mutation("mom_llama_persona_freeze", true, false),
     read("mom_llama_persona_list", true, false),
     read("mom_llama_persona_get", true, false),
@@ -204,6 +206,14 @@ mod tests {
             .as_array()
             .expect("command contracts array")
         {
+            if command["surface"].as_str() == Some("lifecycle") {
+                assert_eq!(
+                    command["tauri_command"].as_str(),
+                    Some("lifecycle_only"),
+                    "lifecycle commands must not be exposed through Tauri"
+                );
+                continue;
+            }
             let tauri_command = command["tauri_command"]
                 .as_str()
                 .expect("contract Tauri command");
@@ -240,6 +250,7 @@ mod tests {
             "mom_llama_mention_dispatch",
             "mom_llama_mention_cancel",
             "mom_llama_mention_synthesize",
+            "mom_llama_mention_tool_approval_decide",
             "mom_llama_persona_update",
             "mom_llama_chat_cancel",
             "mom_llama_chat_skip_reasoning",

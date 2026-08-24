@@ -492,6 +492,21 @@ where
             ));
         }
     };
+    if attachment_context
+        .draft_snapshot
+        .as_ref()
+        .is_some_and(|draft| draft.message != input.message)
+    {
+        return Ok(CommandResult::blocked(
+            "mom_llama.chat_send",
+            "stub_blocked",
+            Blocker::new(
+                "draft_changed_before_send",
+                "The saved draft changed before this exact message could be admitted.",
+                vec!["Refresh the composer and send the current draft.".to_string()],
+            ),
+        ));
+    }
     if user_turn_is_empty(&input.message, &attachment_context) {
         return Ok(CommandResult::blocked(
             "mom_llama.chat_send",
@@ -828,9 +843,12 @@ where
         attachment_ids: Vec::new(),
     };
     let assistant_message_id = assistant_message.id.clone();
+    let mut generated_message_ids = Vec::with_capacity(2);
     if let Some(user_message) = user_message {
+        generated_message_ids.push(user_message.id.clone());
         conversation.messages.push(user_message);
     }
+    generated_message_ids.push(assistant_message_id.clone());
     conversation.messages.push(assistant_message);
     conversation.active_leaf_message_id = Some(assistant_message_id.clone());
     if upstream_setting_bool(&settings, "titleGenerationUseFirstLine")
@@ -846,9 +864,10 @@ where
         db,
         conversation.clone(),
         expected_active_leaf.as_deref(),
+        &generated_message_ids,
         &attachment_context.staged_ids,
         &user_message_id,
-        regenerate_user_id.is_none(),
+        attachment_context.draft_snapshot.as_ref(),
     )?;
     mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Completed)?;
     let result = ChatSendOutput {
@@ -1604,6 +1623,7 @@ mod tests {
     fn attachment_only_turns_are_valid_but_empty_turns_are_not() {
         let empty = ChatAttachmentContext {
             staged_ids: Vec::new(),
+            draft_snapshot: None,
             text_by_message_id: Default::default(),
             current_text: String::new(),
             media: Vec::new(),

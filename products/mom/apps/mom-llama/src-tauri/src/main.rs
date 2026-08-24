@@ -546,6 +546,8 @@ fn main() {
             commands::mom_llama_mention_candidates,
             commands::mom_llama_mention_cancel,
             commands::mom_llama_mention_synthesize,
+            commands::mom_llama_mention_tool_approval_list,
+            commands::mom_llama_mention_tool_approval_decide,
             commands::mom_llama_persona_freeze,
             commands::mom_llama_persona_list,
             commands::mom_llama_persona_get,
@@ -787,7 +789,11 @@ fn safe_to_exit_after_shutdown(
 ) -> bool {
     match result {
         Ok(_) => true,
-        Err(error) => error.summary.native_host_joined,
+        Err(error) => {
+            error.summary.native_host_joined
+                && error.summary.persona_approval_recovery_complete
+                && error.approval_recovery_error.is_none()
+        }
     }
 }
 
@@ -872,6 +878,17 @@ fn build_runtime(
     gateway: Arc<Gateway>,
     settings: mom_llama_runtime::config::Settings,
 ) -> std::result::Result<AppRuntimeHandle, RuntimeBuildError> {
+    let persona_approval_recovery =
+        mom_llama_runtime::PersonaToolApprovalRecovery::bind(&settings.data_dir)
+            .and_then(|recovery| {
+                recovery.reconcile()?;
+                Ok(recovery)
+            })
+            .map_err(|error| RuntimeBuildError {
+                message: format!("persona approval recovery initialization failed: {error:#}"),
+                cleanup: None,
+                completion: FailedBuildCompletion::PreOwner,
+            })?;
     let native_owner = mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(
         &settings,
     )
@@ -917,7 +934,12 @@ fn build_runtime(
             completion,
         }
     })?;
-    Ok(AppRuntimeHandle::new(gateway, backend, native_owner))
+    Ok(AppRuntimeHandle::new(
+        gateway,
+        backend,
+        native_owner,
+        persona_approval_recovery,
+    ))
 }
 
 fn finish_post_owner_build<T, E, O>(
@@ -1220,10 +1242,12 @@ mod tests {
             expected_worker_ids: Vec::new(),
             joined_worker_ids: Vec::new(),
             application_work_drained: true,
+            persona_approval_recovery_complete: true,
         };
         let failure = Err(AppShutdownError {
             summary: summary.clone(),
             operation_error: None,
+            approval_recovery_error: None,
             gateway_error: None,
             native_error: Some("native join failed".to_string()),
         });
@@ -1232,13 +1256,27 @@ mod tests {
         let gateway_only_failure = Err(AppShutdownError {
             summary: AppShutdownSummary {
                 native_host_joined: true,
-                ..summary
+                ..summary.clone()
             },
             operation_error: None,
+            approval_recovery_error: None,
             gateway_error: Some("gateway drain failed".to_string()),
             native_error: None,
         });
         assert!(safe_to_exit_after_shutdown(&gateway_only_failure));
+
+        let recovery_failure = Err(AppShutdownError {
+            summary: AppShutdownSummary {
+                native_host_joined: true,
+                persona_approval_recovery_complete: false,
+                ..summary
+            },
+            operation_error: None,
+            approval_recovery_error: Some("final approval sweep failed".to_string()),
+            gateway_error: None,
+            native_error: None,
+        });
+        assert!(!safe_to_exit_after_shutdown(&recovery_failure));
         assert_eq!(
             final_exit_decision(false),
             FinalExitDecision::AbortWithoutRustTeardown

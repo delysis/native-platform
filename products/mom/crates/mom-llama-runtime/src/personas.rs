@@ -20,6 +20,7 @@ use uuid::Uuid;
 const GROUPS_NAMESPACE: &str = "persona-groups.v1";
 const PERSONA_VERSIONS_NAMESPACE: &str = "persona-versions.v1";
 const MAX_GROUP_MEMBERS: usize = 4;
+pub(crate) const MAX_PERSONA_TOOL_BINDINGS: usize = 8;
 const PERSONA_STATE_MIGRATION_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,6 +144,17 @@ pub fn persona_freeze(input: PersonaFreezeInput) -> Result<CommandResult<Convers
             "Choose a message on the chat's active branch.",
         ));
     };
+    let mut profile = source.execution_profile.clone();
+    profile.tool_bindings = match normalize_tools(profile.tool_bindings) {
+        Ok(tools) => tools,
+        Err(blocker) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.persona_freeze",
+                "stub_blocked",
+                blocker,
+            ));
+        }
+    };
     let handle = match validate_available_handle(
         &db,
         None,
@@ -172,7 +184,6 @@ pub fn persona_freeze(input: PersonaFreezeInput) -> Result<CommandResult<Convers
     };
     let mut messages = remap_messages(&persona_id, selected);
     crate::attachments::snapshot_message_attachments(&persona_id, &mut messages)?;
-    let mut profile = source.execution_profile.clone();
     profile.mention_handle = handle;
     profile.model_path = profile
         .model_path
@@ -257,6 +268,16 @@ pub fn persona_get(persona_id: &str) -> Result<CommandResult<Conversation>> {
 }
 
 pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Conversation>> {
+    let tool_bindings = match normalize_tools(input.tool_bindings) {
+        Ok(tools) => tools,
+        Err(blocker) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.persona_update",
+                "stub_blocked",
+                blocker,
+            ));
+        }
+    };
     migrate_legacy_consult()?;
     let mut db = load_db()?;
     let groups = load_group_db()?.groups;
@@ -356,7 +377,7 @@ pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Convers
             .filter(|value| !value.trim().is_empty()),
         sampling: input.sampling,
         chat_template: input.chat_template,
-        tool_bindings: normalize_tools(input.tool_bindings),
+        tool_bindings,
         source_history_tokens: input.source_history_tokens.clamp(0, 32768),
         host_context_tokens: input.host_context_tokens.clamp(0, 32768),
         version: persona.execution_profile.version.saturating_add(1),
@@ -497,11 +518,21 @@ pub fn persona_instantiate(
             "The persona no longer exists.",
         ));
     };
+    let mut profile = persona.execution_profile.clone();
+    profile.tool_bindings = match normalize_tools(profile.tool_bindings) {
+        Ok(tools) => tools,
+        Err(blocker) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.persona_instantiate",
+                "stub_blocked",
+                blocker,
+            ));
+        }
+    };
     let id = Uuid::new_v4().to_string();
     let mut messages = remap_messages(&id, active_path_messages(&persona));
     crate::attachments::snapshot_message_attachments(&id, &mut messages)?;
     let now = now_ms().to_string();
-    let mut profile = persona.execution_profile.clone();
     profile.mention_handle = unique_handle(
         &db,
         &load_group_db()?.groups,
@@ -1343,9 +1374,18 @@ fn remap_messages(conversation_id: &str, messages: Vec<Message>) -> Vec<Message>
         .collect()
 }
 
-fn normalize_tools(tools: Vec<ToolBinding>) -> Vec<ToolBinding> {
+fn normalize_tools(tools: Vec<ToolBinding>) -> std::result::Result<Vec<ToolBinding>, Blocker> {
+    if tools.len() > MAX_PERSONA_TOOL_BINDINGS {
+        return Err(Blocker::new(
+            "persona_tool_binding_limit_exceeded",
+            format!("A Persona may attach at most {MAX_PERSONA_TOOL_BINDINGS} tools."),
+            vec![format!(
+                "Remove tool bindings until no more than {MAX_PERSONA_TOOL_BINDINGS} remain."
+            )],
+        ));
+    }
     let mut seen = BTreeSet::new();
-    tools
+    Ok(tools
         .into_iter()
         .filter_map(|tool| {
             let tool = ToolBinding {
@@ -1357,7 +1397,7 @@ fn normalize_tools(tools: Vec<ToolBinding>) -> Vec<ToolBinding> {
                 && seen.insert((tool.server.clone(), tool.tool.clone())))
             .then_some(tool)
         })
-        .collect()
+        .collect())
 }
 
 fn clean_name(value: &str, fallback: &str) -> String {
@@ -1384,14 +1424,22 @@ fn blocked_persona(command: &str, code: &str, message: &str) -> CommandResult<Co
 #[cfg(test)]
 mod tests {
     use super::{
-        BuiltinPersonaOwnership, PersonaGroupDb, builtin_persona_content_sha256, normalize_handle,
+        BuiltinPersonaOwnership, MAX_PERSONA_TOOL_BINDINGS, PersonaGroupDb,
+        builtin_persona_content_sha256, normalize_handle, normalize_tools,
         reconcile_builtin_personas, repair_legacy_handles, slug, validate_available_handle,
     };
     use crate::consult::ConsultPersona;
     use crate::conversation_store::{
         Conversation, ConversationDb, ConversationExecutionProfile, ConversationKind, Message,
-        MessageRole,
+        MessageRole, ToolBinding,
     };
+
+    fn tool_binding(server: &str, tool: &str) -> ToolBinding {
+        ToolBinding {
+            server: server.to_string(),
+            tool: tool.to_string(),
+        }
+    }
 
     fn legacy_conversation(id: &str, title: &str, created_at: &str, handle: &str) -> Conversation {
         Conversation {
@@ -1448,6 +1496,36 @@ mod tests {
     fn mention_handles_are_stable_and_human_readable() {
         assert_eq!(normalize_handle("@Evidence-Lens"), "evidence-lens");
         assert_eq!(slug("  Whole-person lens  "), "whole-person-lens");
+    }
+
+    #[test]
+    fn persona_tool_normalization_preserves_a_bounded_stable_set() {
+        let mut bindings = (0..MAX_PERSONA_TOOL_BINDINGS)
+            .map(|index| tool_binding(" local-server ", &format!(" tool-{index} ")))
+            .collect::<Vec<_>>();
+        bindings[1] = tool_binding(" local-server ", " tool-0 ");
+
+        let normalized = normalize_tools(bindings).expect("bounded bindings must normalize");
+
+        assert_eq!(normalized.len(), MAX_PERSONA_TOOL_BINDINGS - 1);
+        assert_eq!(normalized[0], tool_binding("local-server", "tool-0"));
+        assert_eq!(normalized[1], tool_binding("local-server", "tool-2"));
+    }
+
+    #[test]
+    fn persona_tool_normalization_rejects_instead_of_truncating_over_limit() {
+        let bindings = (0..=MAX_PERSONA_TOOL_BINDINGS)
+            .map(|index| tool_binding("local-server", &format!("tool-{index}")))
+            .collect::<Vec<_>>();
+
+        let blocker = normalize_tools(bindings).expect_err("over-limit bindings must be rejected");
+
+        assert_eq!(blocker.code, "persona_tool_binding_limit_exceeded");
+        assert!(
+            blocker
+                .message
+                .contains(&MAX_PERSONA_TOOL_BINDINGS.to_string())
+        );
     }
 
     #[test]

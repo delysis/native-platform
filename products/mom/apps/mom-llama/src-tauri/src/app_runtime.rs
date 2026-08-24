@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, OnceCell};
 
@@ -22,6 +24,9 @@ enum AppPhase {
     Quiescing,
     Closed,
 }
+
+const PERSONA_APPROVAL_RECOVERY_WORKER_ID: &str = "mom-persona-approval-recovery";
+const PERSONA_APPROVAL_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct AppLifecycle {
@@ -52,17 +57,19 @@ pub struct AppShutdownSummary {
     /// Resident native workers owned at the terminal drain boundary.
     pub expected_native_worker_count: usize,
     pub joined_native_worker_count: usize,
-    /// All operation and native workers owned by this application lifetime.
+    /// All product-owned workers expected during this application lifetime.
     pub expected_worker_ids: Vec<String>,
     /// Exact workers whose handles reached a joined terminal boundary.
     pub joined_worker_ids: Vec<String>,
     pub application_work_drained: bool,
+    pub persona_approval_recovery_complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AppShutdownError {
     pub summary: AppShutdownSummary,
     pub operation_error: Option<String>,
+    pub approval_recovery_error: Option<String>,
     pub gateway_error: Option<String>,
     pub native_error: Option<String>,
 }
@@ -72,6 +79,9 @@ impl std::fmt::Display for AppShutdownError {
         write!(formatter, "Mom Llama shutdown did not fully succeed")?;
         if let Some(error) = &self.operation_error {
             write!(formatter, "; operation supervisor: {error}")?;
+        }
+        if let Some(error) = &self.approval_recovery_error {
+            write!(formatter, "; Persona approval recovery: {error}")?;
         }
         if let Some(error) = &self.gateway_error {
             write!(formatter, "; gateway: {error}")?;
@@ -98,6 +108,8 @@ struct AppRuntime {
     joined_native_host: Mutex<Option<ProcessExitJoinedNativeHost>>,
     native_finalizer: Arc<dyn NativeFinalizer>,
     operation_supervisor: OperationSupervisor,
+    persona_approval_recovery: Arc<PersonaApprovalRecoveryWorker>,
+    persona_approval_authority: Option<mom_llama_runtime::PersonaToolApprovalRecovery>,
 }
 
 #[derive(Clone)]
@@ -123,6 +135,246 @@ trait GatewayFinalizer: Send + Sync {
 
 trait ProductCanceller: Send + Sync {
     fn cancel_all(&self) -> usize;
+}
+
+trait PersonaApprovalReconciler: Send + Sync {
+    fn reconcile(&self) -> Result<(), String>;
+
+    fn observe_invocation(&self, _invocation_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct RuntimePersonaApprovalReconciler {
+    recovery: mom_llama_runtime::PersonaToolApprovalRecovery,
+}
+
+impl PersonaApprovalReconciler for RuntimePersonaApprovalReconciler {
+    fn reconcile(&self) -> Result<(), String> {
+        self.recovery
+            .reconcile()
+            .map_err(|error| format!("persona approval recovery failed: {error:#}"))
+    }
+
+    fn observe_invocation(&self, invocation_id: &str) -> Result<(), String> {
+        self.recovery
+            .observe_invocation(invocation_id)
+            .map_err(|error| format!("persona approval deadline registration failed: {error:#}"))
+    }
+}
+
+#[cfg(test)]
+struct NoopPersonaApprovalReconciler;
+
+#[cfg(test)]
+impl PersonaApprovalReconciler for NoopPersonaApprovalReconciler {
+    fn reconcile(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersonaApprovalRecoveryShutdown {
+    joined: bool,
+    error: Option<String>,
+    structural_error: Option<String>,
+}
+
+enum PersonaApprovalRecoveryControl {
+    Stop,
+    #[cfg(test)]
+    Tick,
+}
+
+struct PersonaApprovalRecoveryWorker {
+    reconciler: Arc<dyn PersonaApprovalReconciler>,
+    control: SyncSender<PersonaApprovalRecoveryControl>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+    terminal: OnceLock<PersonaApprovalRecoveryShutdown>,
+    start_error: Option<String>,
+    last_reconcile_error: Arc<Mutex<Option<String>>>,
+}
+
+impl PersonaApprovalRecoveryWorker {
+    fn start(reconciler: Arc<dyn PersonaApprovalReconciler>, interval: Duration) -> Self {
+        let (control, receiver) = std::sync::mpsc::sync_channel(1);
+        let last_reconcile_error = Arc::new(Mutex::new(None));
+        let worker_error = Arc::clone(&last_reconcile_error);
+        let worker_reconciler = Arc::clone(&reconciler);
+        // A single joined thread keeps recovery single-flight. A slow sweep
+        // delays the next tick instead of spawning overlapping store work.
+        let handle = std::thread::Builder::new()
+            .name(PERSONA_APPROVAL_RECOVERY_WORKER_ID.to_owned())
+            .spawn(move || {
+                run_persona_approval_recovery(worker_reconciler, receiver, interval, &worker_error);
+            });
+        let (handle, start_error) = match handle {
+            Ok(handle) => (Some(handle), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "could not start {PERSONA_APPROVAL_RECOVERY_WORKER_ID}: {error}"
+                )),
+            ),
+        };
+        Self {
+            reconciler,
+            control,
+            handle: Mutex::new(handle),
+            terminal: OnceLock::new(),
+            start_error,
+            last_reconcile_error,
+        }
+    }
+
+    fn shutdown(&self) -> PersonaApprovalRecoveryShutdown {
+        self.terminal.get_or_init(|| self.shutdown_once()).clone()
+    }
+
+    fn current_error(&self) -> Option<String> {
+        self.start_error.clone().or_else(|| {
+            self.last_reconcile_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+    }
+
+    fn reconcile_now(&self) -> Result<(), String> {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.reconciler.reconcile()))
+                .unwrap_or_else(|panic| {
+                    Err(format!(
+                        "{PERSONA_APPROVAL_RECOVERY_WORKER_ID} final sweep panicked: {}",
+                        panic_message(panic)
+                    ))
+                });
+        record_persona_approval_reconciliation(result.clone(), &self.last_reconcile_error);
+        result
+    }
+
+    fn observe_invocation(&self, invocation_id: &str) -> Result<(), String> {
+        self.reconciler.observe_invocation(invocation_id)
+    }
+
+    #[cfg(test)]
+    fn tick(&self) {
+        self.control
+            .send(PersonaApprovalRecoveryControl::Tick)
+            .expect("approval recovery worker accepts a deterministic tick");
+    }
+
+    fn shutdown_once(&self) -> PersonaApprovalRecoveryShutdown {
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let mut errors = self.start_error.iter().cloned().collect::<Vec<_>>();
+        let joined = match handle {
+            Some(handle) => {
+                let _ = self.control.send(PersonaApprovalRecoveryControl::Stop);
+                let panic = handle.join().err();
+                if let Some(panic) = panic {
+                    errors.push(format!(
+                        "{PERSONA_APPROVAL_RECOVERY_WORKER_ID} panicked: {}",
+                        panic_message(panic)
+                    ));
+                }
+                true
+            }
+            None => false,
+        };
+        let structural_error = (!errors.is_empty()).then(|| errors.join("; "));
+        if let Some(error) = self
+            .last_reconcile_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            errors.push(error);
+        }
+        PersonaApprovalRecoveryShutdown {
+            joined,
+            error: (!errors.is_empty()).then(|| errors.join("; ")),
+            structural_error,
+        }
+    }
+}
+
+impl Drop for PersonaApprovalRecoveryWorker {
+    fn drop(&mut self) {
+        let terminal = self.shutdown();
+        if let Some(error) = terminal.error {
+            eprintln!("Mom Llama approval recovery teardown: {error}");
+        }
+    }
+}
+
+fn run_persona_approval_recovery(
+    reconciler: Arc<dyn PersonaApprovalReconciler>,
+    receiver: Receiver<PersonaApprovalRecoveryControl>,
+    interval: Duration,
+    last_error: &Mutex<Option<String>>,
+) {
+    loop {
+        match receiver.recv_timeout(interval) {
+            Ok(PersonaApprovalRecoveryControl::Stop) | Err(RecvTimeoutError::Disconnected) => {
+                return;
+            }
+            #[cfg(test)]
+            Ok(PersonaApprovalRecoveryControl::Tick) => {
+                reconcile_persona_approvals_once(&reconciler, last_error)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                reconcile_persona_approvals_once(&reconciler, last_error)
+            }
+        }
+    }
+}
+
+fn reconcile_persona_approvals_once(
+    reconciler: &Arc<dyn PersonaApprovalReconciler>,
+    last_error: &Mutex<Option<String>>,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reconciler.reconcile()))
+        .unwrap_or_else(|panic| {
+            Err(format!(
+                "{PERSONA_APPROVAL_RECOVERY_WORKER_ID} sweep panicked: {}",
+                panic_message(panic)
+            ))
+        });
+    record_persona_approval_reconciliation(result, last_error);
+}
+
+fn record_persona_approval_reconciliation(
+    result: Result<(), String>,
+    last_error: &Mutex<Option<String>>,
+) {
+    let mut recorded_error = last_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match result {
+        Ok(()) => {
+            if recorded_error.take().is_some() {
+                eprintln!("Mom Llama persona approval recovery resumed");
+            }
+        }
+        Err(error) => {
+            if recorded_error.as_deref() != Some(error.as_str()) {
+                eprintln!("Mom Llama persona approval recovery: {error}");
+                *recorded_error = Some(error);
+            }
+        }
+    }
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
 struct RuntimeProductCanceller;
@@ -284,24 +536,46 @@ impl Drop for AppWorkLease {
     }
 }
 
+struct AppRuntimeConstruction {
+    gateway_finalizer: Arc<dyn GatewayFinalizer>,
+    native_backend: Arc<LlamaNativeBackend>,
+    native_host: Arc<NativeHost>,
+    native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
+    product_canceller: Arc<dyn ProductCanceller>,
+    native_finalizer: Arc<dyn NativeFinalizer>,
+    operation_supervisor: OperationSupervisor,
+    persona_approval_reconciler: Arc<dyn PersonaApprovalReconciler>,
+    persona_approval_recovery_interval: Duration,
+    persona_approval_authority: Option<mom_llama_runtime::PersonaToolApprovalRecovery>,
+}
+
 impl AppRuntimeHandle {
     pub fn new(
         gateway: Arc<Gateway>,
         native_backend: Arc<LlamaNativeBackend>,
         native_owner: mom_llama_runtime::native_runtime::ProductRuntimeOwner,
+        persona_approval_recovery: mom_llama_runtime::PersonaToolApprovalRecovery,
     ) -> Self {
         let native_host = native_owner.host();
         let gateway_finalizer = Arc::new(ProductGatewayFinalizer(Arc::clone(&gateway)));
-        Self::with_finalizers(
+        let persona_approval_authority = persona_approval_recovery.clone();
+        Self::with_operation_supervisor(AppRuntimeConstruction {
             gateway_finalizer,
             native_backend,
             native_host,
-            Some(native_owner),
-            Arc::new(RuntimeProductCanceller),
-            Arc::new(ProductNativeFinalizer),
-        )
+            native_owner: Some(native_owner),
+            product_canceller: Arc::new(RuntimeProductCanceller),
+            native_finalizer: Arc::new(ProductNativeFinalizer),
+            operation_supervisor: OperationSupervisor::new(),
+            persona_approval_reconciler: Arc::new(RuntimePersonaApprovalReconciler {
+                recovery: persona_approval_recovery,
+            }),
+            persona_approval_recovery_interval: PERSONA_APPROVAL_RECOVERY_INTERVAL,
+            persona_approval_authority: Some(persona_approval_authority),
+        })
     }
 
+    #[cfg(test)]
     fn with_finalizers(
         gateway_finalizer: Arc<dyn GatewayFinalizer>,
         native_backend: Arc<LlamaNativeBackend>,
@@ -310,26 +584,37 @@ impl AppRuntimeHandle {
         product_canceller: Arc<dyn ProductCanceller>,
         native_finalizer: Arc<dyn NativeFinalizer>,
     ) -> Self {
-        Self::with_operation_supervisor(
+        Self::with_operation_supervisor(AppRuntimeConstruction {
             gateway_finalizer,
             native_backend,
             native_host,
             native_owner,
             product_canceller,
             native_finalizer,
-            OperationSupervisor::new(),
-        )
+            operation_supervisor: OperationSupervisor::new(),
+            persona_approval_reconciler: Arc::new(NoopPersonaApprovalReconciler),
+            persona_approval_recovery_interval: PERSONA_APPROVAL_RECOVERY_INTERVAL,
+            persona_approval_authority: None,
+        })
     }
 
-    fn with_operation_supervisor(
-        gateway_finalizer: Arc<dyn GatewayFinalizer>,
-        native_backend: Arc<LlamaNativeBackend>,
-        native_host: Arc<NativeHost>,
-        native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
-        product_canceller: Arc<dyn ProductCanceller>,
-        native_finalizer: Arc<dyn NativeFinalizer>,
-        operation_supervisor: OperationSupervisor,
-    ) -> Self {
+    fn with_operation_supervisor(construction: AppRuntimeConstruction) -> Self {
+        let AppRuntimeConstruction {
+            gateway_finalizer,
+            native_backend,
+            native_host,
+            native_owner,
+            product_canceller,
+            native_finalizer,
+            operation_supervisor,
+            persona_approval_reconciler,
+            persona_approval_recovery_interval,
+            persona_approval_authority,
+        } = construction;
+        let persona_approval_recovery = Arc::new(PersonaApprovalRecoveryWorker::start(
+            persona_approval_reconciler,
+            persona_approval_recovery_interval,
+        ));
         Self(Arc::new(AppRuntime {
             lifecycle: Mutex::new(AppLifecycle {
                 phase: AppPhase::Running,
@@ -347,10 +632,17 @@ impl AppRuntimeHandle {
             joined_native_host: Mutex::new(None),
             native_finalizer,
             operation_supervisor,
+            persona_approval_recovery,
+            persona_approval_authority,
         }))
     }
 
     pub fn admit(&self, command: &'static CommandSpec) -> Result<AppWorkLease, String> {
+        if let Some(error) = self.0.persona_approval_recovery.current_error() {
+            return Err(format!(
+                "Mom Llama's persona approval recovery worker is unavailable: {error}"
+            ));
+        }
         let mut lifecycle = self
             .0
             .lifecycle
@@ -391,6 +683,24 @@ impl AppRuntimeHandle {
             cancellation,
             supervised,
         })
+    }
+
+    pub fn observe_persona_tool_approval_invocation(
+        &self,
+        invocation_id: &str,
+    ) -> Result<(), String> {
+        self.0
+            .persona_approval_recovery
+            .observe_invocation(invocation_id)
+    }
+
+    pub fn persona_tool_approval_recovery(
+        &self,
+    ) -> Result<mom_llama_runtime::PersonaToolApprovalRecovery, String> {
+        self.0
+            .persona_approval_authority
+            .clone()
+            .ok_or_else(|| "Mom Llama's Persona approval authority is unavailable".to_string())
     }
 
     /// Returns true only to the caller that closes application admission.
@@ -437,15 +747,54 @@ impl AppRuntimeHandle {
                 // service drain and application lease drain may proceed in
                 // parallel, but both precede the sole terminal native join.
                 self.request_product_cancellation();
+                let persona_approval_worker = Arc::clone(&self.0.persona_approval_recovery);
+                let worker_to_stop = Arc::clone(&persona_approval_worker);
+                let persona_approval_recovery =
+                    match tokio::task::spawn_blocking(move || worker_to_stop.shutdown()).await {
+                        Ok(terminal) => terminal,
+                        Err(error) => PersonaApprovalRecoveryShutdown {
+                            joined: false,
+                            error: Some(format!(
+                                "{PERSONA_APPROVAL_RECOVERY_WORKER_ID} join task failed: {error}"
+                            )),
+                            structural_error: Some(format!(
+                                "{PERSONA_APPROVAL_RECOVERY_WORKER_ID} join task failed: {error}"
+                            )),
+                        },
+                    };
                 let gateway_shutdown = self.0.gateway_finalizer.shutdown();
                 let app_work_drain = self.wait_for_work_drained();
                 let (gateway_result, ()) = tokio::join!(gateway_shutdown, app_work_drain);
                 let gateway_error = gateway_result.err();
                 let supervisor = self.0.operation_supervisor.shutdown();
-                let operation_error = (!validate_worker_sets(&supervisor)).then(|| {
-                    "operation worker join identities did not match admitted worker identities"
-                        .to_owned()
-                });
+                let final_recovery_worker = Arc::clone(&persona_approval_worker);
+                let final_persona_approval_recovery = match tokio::task::spawn_blocking(move || {
+                    final_recovery_worker.reconcile_now()
+                })
+                .await
+                {
+                    Ok(result) => result.err(),
+                    Err(error) => Some(format!(
+                        "{PERSONA_APPROVAL_RECOVERY_WORKER_ID} final sweep task failed: {error}"
+                    )),
+                };
+                let mut operation_errors = Vec::new();
+                if !validate_worker_sets(&supervisor) {
+                    operation_errors.push(
+                        "operation worker join identities did not match admitted worker identities"
+                            .to_owned(),
+                    );
+                }
+                let operation_error =
+                    (!operation_errors.is_empty()).then(|| operation_errors.join("; "));
+                let approval_recovery_errors = persona_approval_recovery
+                    .structural_error
+                    .iter()
+                    .cloned()
+                    .chain(final_persona_approval_recovery)
+                    .collect::<Vec<_>>();
+                let approval_recovery_error = (!approval_recovery_errors.is_empty())
+                    .then(|| approval_recovery_errors.join("; "));
                 // Admission is closed and every application lease plus the
                 // gateway has drained, so the resident set cannot grow after
                 // this observation. Preserve its cardinality even if the
@@ -478,9 +827,13 @@ impl AppRuntimeHandle {
                 let joined_operation_worker_count = supervisor.joined_worker_ids.len();
                 let mut expected_worker_ids = supervisor.expected_worker_ids;
                 expected_worker_ids.extend(native_worker_ids.iter().cloned());
+                expected_worker_ids.push(PERSONA_APPROVAL_RECOVERY_WORKER_ID.to_owned());
                 let mut joined_worker_ids = supervisor.joined_worker_ids;
                 if joined_native_worker_count == native_worker_ids.len() {
                     joined_worker_ids.extend(native_worker_ids);
+                }
+                if persona_approval_recovery.joined {
+                    joined_worker_ids.push(PERSONA_APPROVAL_RECOVERY_WORKER_ID.to_owned());
                 }
                 self.0
                     .lifecycle
@@ -503,13 +856,19 @@ impl AppRuntimeHandle {
                     expected_worker_ids,
                     joined_worker_ids,
                     application_work_drained: true,
+                    persona_approval_recovery_complete: approval_recovery_error.is_none(),
                 };
-                if operation_error.is_none() && gateway_error.is_none() && native_error.is_none() {
+                if operation_error.is_none()
+                    && approval_recovery_error.is_none()
+                    && gateway_error.is_none()
+                    && native_error.is_none()
+                {
                     Ok(summary)
                 } else {
                     Err(AppShutdownError {
                         summary,
                         operation_error,
+                        approval_recovery_error,
                         gateway_error,
                         native_error,
                     })
@@ -561,10 +920,12 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppRuntimeHandle, GatewayFinalizer, NativeFinalizer, ProductCanceller,
-        ProductGatewayFinalizer,
+        AppRuntimeConstruction, AppRuntimeHandle, GatewayFinalizer, NativeFinalizer,
+        PERSONA_APPROVAL_RECOVERY_WORKER_ID, PersonaApprovalReconciler,
+        PersonaApprovalRecoveryWorker, ProductCanceller, ProductGatewayFinalizer,
     };
     use crate::command_registry::command_spec;
+    use crate::operation_supervisor::OperationSupervisor;
     use fte_backend_llama::LlamaNativeBackend;
     use fte_router::{Gateway, GatewayDefaults};
     use llama_native_host::{NativeHost, NativeHostConfig, ProcessExitJoinedNativeHost};
@@ -572,6 +933,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::sync::Notify;
 
     fn runtime() -> AppRuntimeHandle {
@@ -582,7 +944,31 @@ mod tests {
         called: Arc<AtomicBool>,
     }
 
+    struct ReconciliationOrderingFinalizer {
+        reconciled: Arc<AtomicBool>,
+        called: Arc<AtomicBool>,
+    }
+
     struct NoopProductCanceller;
+
+    struct RecordingPersonaApprovalReconciler {
+        calls: AtomicUsize,
+        called: std::sync::mpsc::SyncSender<usize>,
+        error: Option<String>,
+    }
+
+    impl PersonaApprovalReconciler for RecordingPersonaApprovalReconciler {
+        fn reconcile(&self) -> Result<(), String> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if call <= 2 {
+                let _ = self.called.send(call);
+            }
+            match &self.error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
+        }
+    }
 
     impl ProductCanceller for NoopProductCanceller {
         fn cancel_all(&self) -> usize {
@@ -616,6 +1002,31 @@ mod tests {
         ) -> Result<ProcessExitJoinedNativeHost, mom_llama_runtime::ProductShutdownError> {
             self.called.store(true, Ordering::Release);
             Err(mom_llama_runtime::ProductShutdownError::HostMissing)
+        }
+    }
+
+    impl NativeFinalizer for ReconciliationOrderingFinalizer {
+        fn shutdown(
+            &self,
+            _host: &Arc<NativeHost>,
+        ) -> Result<ProcessExitJoinedNativeHost, mom_llama_runtime::ProductShutdownError> {
+            assert!(
+                self.reconciled.load(Ordering::Acquire),
+                "final Persona approval recovery must precede Native finalization"
+            );
+            self.called.store(true, Ordering::Release);
+            Err(mom_llama_runtime::ProductShutdownError::HostMissing)
+        }
+    }
+
+    struct FlagPersonaApprovalReconciler {
+        reconciled: Arc<AtomicBool>,
+    }
+
+    impl PersonaApprovalReconciler for FlagPersonaApprovalReconciler {
+        fn reconcile(&self) -> Result<(), String> {
+            self.reconciled.store(true, Ordering::Release);
+            Ok(())
         }
     }
 
@@ -654,6 +1065,93 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    #[test]
+    fn persona_approval_recovery_runs_after_startup_and_joins_without_sleeping() {
+        let (called, calls) = std::sync::mpsc::sync_channel(2);
+        let worker = PersonaApprovalRecoveryWorker::start(
+            Arc::new(RecordingPersonaApprovalReconciler {
+                calls: AtomicUsize::new(0),
+                called,
+                error: None,
+            }),
+            Duration::from_secs(60),
+        );
+
+        worker.tick();
+        assert_eq!(calls.recv_timeout(Duration::from_secs(1)), Ok(1));
+        worker.tick();
+        assert_eq!(calls.recv_timeout(Duration::from_secs(1)), Ok(2));
+        let terminal = worker.shutdown();
+        assert!(terminal.joined);
+        assert_eq!(terminal.error, None);
+    }
+
+    #[test]
+    fn persona_approval_recovery_retains_terminal_error_evidence() {
+        let (called, calls) = std::sync::mpsc::sync_channel(1);
+        let worker = PersonaApprovalRecoveryWorker::start(
+            Arc::new(RecordingPersonaApprovalReconciler {
+                calls: AtomicUsize::new(0),
+                called,
+                error: Some("locked store".to_owned()),
+            }),
+            Duration::from_secs(60),
+        );
+
+        worker.tick();
+        assert_eq!(calls.recv_timeout(Duration::from_secs(1)), Ok(1));
+        let terminal = worker.shutdown();
+        assert!(terminal.joined);
+        assert_eq!(terminal.error.as_deref(), Some("locked store"));
+    }
+
+    #[tokio::test]
+    async fn final_persona_approval_recovery_waits_for_admitted_work_and_precedes_native_join() {
+        let host = Arc::new(NativeHost::new(NativeHostConfig::default()));
+        let reconciled = Arc::new(AtomicBool::new(false));
+        let native_called = Arc::new(AtomicBool::new(false));
+        let gateway_entered = Arc::new(AtomicBool::new(false));
+        let gateway_release = Arc::new(Notify::new());
+        let runtime = AppRuntimeHandle::with_operation_supervisor(AppRuntimeConstruction {
+            gateway_finalizer: Arc::new(BlockingGatewayFinalizer {
+                entered: Arc::clone(&gateway_entered),
+                release: Arc::clone(&gateway_release),
+            }),
+            native_backend: Arc::new(LlamaNativeBackend::new_borrowed(Arc::clone(&host))),
+            native_host: host,
+            native_owner: None,
+            product_canceller: Arc::new(NoopProductCanceller),
+            native_finalizer: Arc::new(ReconciliationOrderingFinalizer {
+                reconciled: Arc::clone(&reconciled),
+                called: Arc::clone(&native_called),
+            }),
+            operation_supervisor: OperationSupervisor::new(),
+            persona_approval_reconciler: Arc::new(FlagPersonaApprovalReconciler {
+                reconciled: Arc::clone(&reconciled),
+            }),
+            persona_approval_recovery_interval: Duration::from_secs(60),
+            persona_approval_authority: None,
+        });
+        let lease = runtime
+            .admit(command_spec("mom_llama_settings_update"))
+            .expect("admitted work");
+        let shutdown_runtime = runtime.clone();
+        let shutdown = tokio::spawn(async move { shutdown_runtime.shutdown().await });
+
+        while !gateway_entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        gateway_release.notify_waiters();
+        tokio::task::yield_now().await;
+        assert!(!reconciled.load(Ordering::Acquire));
+        assert!(!native_called.load(Ordering::Acquire));
+
+        drop(lease);
+        assert!(shutdown.await.expect("shutdown task").is_err());
+        assert!(reconciled.load(Ordering::Acquire));
+        assert!(native_called.load(Ordering::Acquire));
     }
 
     #[test]
@@ -867,6 +1365,23 @@ mod tests {
         let (first, second) = tokio::join!(runtime.shutdown(), runtime.shutdown());
         assert_eq!(first, second);
         assert!(finalizer_called.load(Ordering::Acquire));
+        let summary = first
+            .as_ref()
+            .expect_err("the injected native finalizer fails")
+            .summary
+            .clone();
+        assert!(
+            summary
+                .expected_worker_ids
+                .iter()
+                .any(|worker| worker == PERSONA_APPROVAL_RECOVERY_WORKER_ID)
+        );
+        assert!(
+            summary
+                .joined_worker_ids
+                .iter()
+                .any(|worker| worker == PERSONA_APPROVAL_RECOVERY_WORKER_ID)
+        );
     }
 
     fn command_vs_quit_has_one_winner(command: &'static str) {

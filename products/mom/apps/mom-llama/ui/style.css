@@ -722,6 +722,19 @@ kbd { padding: 2px 6px; border-radius: 4px; color: #c5c5c5; background: #2a2a2a;
 #settings-modal[data-active-section="consult"] .receipt-panel {
   display: none;
 }
+.persona-tool-approval-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 12px 22px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+}
+.persona-tool-approval-banner p { margin: 4px 0 0; color: var(--muted); }
+.persona-tool-approval-banner.terminal { border-color: var(--warning, #9a6b20); }
 .tool-approval-dialog {
   width: min(620px, 94vw);
   max-height: 86vh;

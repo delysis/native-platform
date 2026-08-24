@@ -1460,38 +1460,52 @@ pub fn save_db(db: &ConversationDb) -> Result<PathBuf> {
 }
 
 pub fn get_or_create_conversation(id: &str) -> Result<(ConversationDb, Conversation)> {
-    let mut db = load_db()?;
-    if let Some(conversation) = db
+    let imported = load_db()?;
+    let initially_present = imported
         .conversations
         .iter()
-        .find(|conversation| conversation.id == id)
-        .cloned()
-    {
-        return Ok((db, conversation));
-    }
-    let now = now_ms().to_string();
+        .any(|conversation| conversation.id == id);
     let settings = resolve_settings()?;
-    let conversation = Conversation {
-        id: id.to_string(),
-        title: if id == "default" {
-            "Default chat".to_string()
-        } else {
-            id.to_string()
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    store.mutate(
+        CONVERSATIONS_NAMESPACE,
+        || imported,
+        |db: &mut ConversationDb| {
+            if let Some(conversation) = db
+                .conversations
+                .iter()
+                .find(|conversation| conversation.id == id)
+                .cloned()
+            {
+                return Ok((db.clone(), conversation));
+            }
+            if initially_present {
+                anyhow::bail!("conversation was removed before chat admission");
+            }
+            let now = now_ms().to_string();
+            let conversation = Conversation {
+                id: id.to_string(),
+                title: if id == "default" {
+                    "Default chat".to_string()
+                } else {
+                    id.to_string()
+                },
+                created_at: now.clone(),
+                updated_at: now,
+                kind: ConversationKind::Chat,
+                execution_profile: ConversationExecutionProfile::default(),
+                selected_model_path: settings.model_path.clone(),
+                source_conversation_id: None,
+                source_message_id: None,
+                branch_root_message_id: None,
+                active_leaf_message_id: None,
+                current_skill_ids: Vec::new(),
+                messages: Vec::new(),
+            };
+            db.conversations.insert(0, conversation.clone());
+            Ok((db.clone(), conversation))
         },
-        created_at: now.clone(),
-        updated_at: now,
-        kind: ConversationKind::Chat,
-        execution_profile: ConversationExecutionProfile::default(),
-        selected_model_path: settings.model_path,
-        source_conversation_id: None,
-        source_message_id: None,
-        branch_root_message_id: None,
-        active_leaf_message_id: None,
-        current_skill_ids: Vec::new(),
-        messages: Vec::new(),
-    };
-    db.conversations.insert(0, conversation.clone());
-    Ok((db, conversation))
+    )
 }
 
 pub fn upsert_conversation(db: ConversationDb, conversation: Conversation) -> Result<PathBuf> {

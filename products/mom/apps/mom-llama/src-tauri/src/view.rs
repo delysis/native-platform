@@ -2,7 +2,8 @@ use anyhow::Result;
 use maud::{Markup, PreEscaped, html};
 use mom_llama_runtime::{
     AttachmentKind, AttachmentRecord, Blocker, CommandResult, Conversation, ConversationKind,
-    DraftMessage, KvCachePolicy, Message, MessageRole, Settings,
+    DraftMessage, KvCachePolicy, MentionToolApprovalState, MentionToolEffectOutcome, Message,
+    MessageRole, Settings,
     engine::EngineCheckOutput,
     kv_cache::{CacheEntryState, CacheTier, KvCacheStatus},
     models::ModelInfo,
@@ -19,6 +20,12 @@ pub struct ControlSpec {
     pub cli: &'static str,
     pub effect: &'static str,
     pub label: &'static str,
+}
+
+const MCP_PROCESS_AUTHORITY_WARNING: &str = "Configured MCP tools run as external, unsandboxed child processes. They may use the network; read files, credentials, and secrets available to your OS account; and write files or perform other irreversible mutations permitted by that account.";
+
+const fn mcp_process_ui_supported() -> bool {
+    cfg!(any(target_os = "macos", target_os = "linux"))
 }
 
 pub const CONTROL_SPECS: &[ControlSpec] = &[
@@ -237,6 +244,22 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         cli: "mom-llama mention synthesize --invocation <id> --json",
         effect: "mom_llama.effects.consult_generate.v1",
         label: "Synthesize",
+    },
+    ControlSpec {
+        affordance: "mention.tool_approval.list",
+        command: "mom_llama.mention_tool_approval_list",
+        tauri_command: "mom_llama_mention_tool_approval_list",
+        cli: "mom-llama mention approval-list --conversation <id> --json",
+        effect: "mom_llama.effects.mention_tool_approval_read.v1",
+        label: "List pending Persona tool approvals",
+    },
+    ControlSpec {
+        affordance: "mention.tool_approval.decide",
+        command: "mom_llama.mention_tool_approval_decide",
+        tauri_command: "mom_llama_mention_tool_approval_decide",
+        cli: "mom-llama mention approval-decide --invocation <id> --approval <id> --decision <approve|deny> --json",
+        effect: "mom_llama.effects.mention_tool_approval.v1",
+        label: "Decide exact Persona tool call",
     },
     ControlSpec {
         affordance: "chat.message.regenerate",
@@ -720,6 +743,17 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
     },
 ];
 
+const fn persona_tool_approval_state_label(state: MentionToolApprovalState) -> &'static str {
+    match state {
+        MentionToolApprovalState::Pending => "pending",
+        MentionToolApprovalState::Resuming => "resuming",
+        MentionToolApprovalState::Completed => "completed",
+        MentionToolApprovalState::Cancelled => "cancelled",
+        MentionToolApprovalState::Failed => "failed",
+        MentionToolApprovalState::Expired => "expired",
+    }
+}
+
 struct SettingsSectionSpec {
     slug: &'static str,
     title: &'static str,
@@ -735,6 +769,10 @@ struct SettingsFieldSpec {
     help: &'static str,
     options: &'static [(&'static str, &'static str)],
     blocker: Option<&'static str>,
+}
+
+fn settings_section_visible(section: &SettingsSectionSpec) -> bool {
+    mcp_process_ui_supported() || !matches!(section.slug, "agentic" | "tools" | "mcp")
 }
 
 const SETTINGS_SECTIONS: &[SettingsSectionSpec] = &[
@@ -778,7 +816,7 @@ const SETTINGS_SECTIONS: &[SettingsSectionSpec] = &[
         slug: "agentic",
         title: "Agentic",
         icon: "list-restart",
-        blocker: Some("Tool loops are bounded and run only through configured MCP stdio tools."),
+        blocker: Some(MCP_PROCESS_AUTHORITY_WARNING),
     },
     SettingsSectionSpec {
         slug: "tools",
@@ -957,7 +995,7 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         key: "alwaysShowToolCallContent",
         label: "Always show tool call content",
         kind: "checkbox",
-        help: "Expand tool arguments and technical details in completed local tool cards.",
+        help: "Expand tool arguments and technical details in completed external-process tool cards.",
         options: EMPTY_OPTIONS,
         blocker: None,
     },
@@ -1353,9 +1391,9 @@ const NATIVE_SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
     SettingsFieldSpec {
         section: "mcp",
         key: "mcpNativeEnabled",
-        label: "Enable local MCP adapters",
+        label: "Enable configured MCP processes (macOS/Linux)",
         kind: "checkbox",
-        help: "Native-only authority switch for explicitly configured local MCP stdio executables.",
+        help: MCP_PROCESS_AUTHORITY_WARNING,
         options: EMPTY_OPTIONS,
         blocker: None,
     },
@@ -1506,7 +1544,8 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             data-always-show-sidebar=(always_show_sidebar)
             data-custom-css=(custom_css)
             data-runtime="tauri-maud-htmx"
-            data-native-core-only="true" {
+            data-native-core-only="true"
+            data-mcp-process-ui-supported=(mcp_process_ui_supported()) {
             (sidebar(conversations, active.as_ref().map(|conversation| conversation.id.as_str())))
             header class="chrome" {
                 (button("layout.sidebar_toggle", Some("sidebar-toggle"), "icon-button sidebar-toggle", false))
@@ -1515,7 +1554,9 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             (chat_view_with_draft(settings, engine, active.as_ref(), Some(draft)))
             (settings_modal(settings, engine, models, skills, kv, active.as_ref()))
             (persona_freeze_modal())
-            (tool_approval_modal())
+            @if mcp_process_ui_supported() {
+                (tool_approval_modal())
+            }
             @if show_build_version {
                 small class="build-version" { "Mom Llama " (env!("CARGO_PKG_VERSION")) }
             }
@@ -1552,6 +1593,22 @@ fn chat_view_with_draft(
         "attachment_store_unavailable",
         "Attachments could not be loaded from local storage.",
     );
+    let StoreProjection {
+        value: tool_approvals,
+        blocker: tool_approval_blocker,
+    } = if mcp_process_ui_supported() {
+        store_projection(
+            mom_llama_runtime::mention_tool_approval_list(current_id),
+            "mention_tool_approval_store_unavailable",
+            "Persona external-process tool approvals could not be loaded from encrypted storage.",
+        )
+    } else {
+        StoreProjection {
+            value: Vec::new(),
+            blocker: None,
+        }
+    };
+    let approval_control = control("mention.tool_approval.decide");
     html! {
         main id="chat" class=(format!(
                 "chat-main {}{}",
@@ -1568,6 +1625,65 @@ fn chat_view_with_draft(
             }
             @if let Some(blocker) = &attachment_blocker {
                 (store_blocker(blocker))
+            }
+            @if let Some(blocker) = &tool_approval_blocker {
+                (store_blocker(blocker))
+            }
+            @for approval in &tool_approvals {
+                @if approval.state == MentionToolApprovalState::Pending {
+                    section class="persona-tool-approval-banner" role="status"
+                        data-approval=(approval.id.clone()) {
+                        div {
+                            strong { "@" (approval.handle.clone()) " v" (approval.persona_version) " requests a configured external-process tool" }
+                            p {
+                                code { (approval.server.clone()) "/" (approval.tool.clone()) }
+                                " · snapshot " (approval.snapshot_sha256.chars().take(12).collect::<String>())
+                                " · call " (approval.call_sha256.chars().take(12).collect::<String>())
+                                " · expires after five minutes"
+                            }
+                            p class="field-help" { (MCP_PROCESS_AUTHORITY_WARNING) }
+                        }
+                        button type="button" class="small-button"
+                            data-affordance=(approval_control.affordance)
+                            data-command=(approval_control.command)
+                            data-tauri-command=(approval_control.tauri_command)
+                            data-cli=(approval_control.cli)
+                            data-effect=(approval_control.effect)
+                            data-action="mention-tool-approval-open"
+                            data-approval-json=(serde_json::to_string(approval).unwrap_or_else(|_| "{}".to_string())) {
+                            "Review exact call"
+                        }
+                    }
+                } @else {
+                    section class="persona-tool-approval-banner terminal" role="alert"
+                        data-approval=(approval.id.clone()) {
+                        div {
+                            strong {
+                                "@" (approval.handle.clone()) " v" (approval.persona_version)
+                                " tool approval " (persona_tool_approval_state_label(approval.state))
+                            }
+                            p {
+                                code { (approval.server.clone()) "/" (approval.tool.clone()) }
+                                " · call " (approval.call_sha256.chars().take(12).collect::<String>())
+                                @if let Some(receipt_id) = &approval.effect_receipt_id {
+                                    @match approval.effect_outcome {
+                                        Some(MentionToolEffectOutcome::Unknown) => {
+                                            " · external outcome unknown · receipt "
+                                            code { (receipt_id) }
+                                        }
+                                        Some(MentionToolEffectOutcome::Known) => {
+                                            " · exact effect receipt "
+                                            code { (receipt_id) }
+                                        }
+                                        None => {
+                                            " · receipt identity unavailable"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             @if empty {
                 section class="landing" aria-label="Empty chat" {
@@ -1753,7 +1869,9 @@ fn sidebar(conversations: &CommandResult<Vec<Conversation>>, active_id: Option<&
                     }
                     (button("conversation.search.close", Some("conversation-search-close"), "icon-button search-close", false))
                 }
-                (button("mcp.status", Some("mcp-status"), "nav-button", false))
+                @if mcp_process_ui_supported() {
+                    (button("mcp.status", Some("mcp-status"), "nav-button", false))
+                }
             }
             div class="sidebar-sections" {
                 section class="sidebar-section conversation-block" aria-label="Conversations" data-sidebar-section="conversations" {
@@ -2175,7 +2293,7 @@ fn tool_message_content(message: &Message, expand: bool, show_stats: bool) -> Ma
                 header {
                     (icon_markup("wrench"))
                     div {
-                        strong { "Local tool result" }
+                        strong { "External-process tool result" }
                         span { "Stored transcript" }
                     }
                 }
@@ -2400,7 +2518,7 @@ fn settings_modal(
             section class="settings-dialog" aria-label="Settings" {
                 div class="settings-sections" {
                     h2 { "llama.cpp" }
-                    @for section in SETTINGS_SECTIONS {
+                    @for section in SETTINGS_SECTIONS.iter().filter(|section| settings_section_visible(section)) {
                         button type="button"
                             class=(if section.slug == "general" { "section-tab active" } else { "section-tab" })
                             data-affordance="settings.section"
@@ -2426,7 +2544,7 @@ fn settings_modal(
                         data-tauri-command="mom_llama_settings_update"
                         data-cli="mom-llama settings update"
                         data-effect="mom_llama.effects.settings_store.v1" {
-                        @for section in SETTINGS_SECTIONS {
+                        @for section in SETTINGS_SECTIONS.iter().filter(|section| settings_section_visible(section)) {
                             (settings_panel(section, settings, active))
                         }
                     }
@@ -2539,7 +2657,9 @@ fn settings_modal(
                             p { (readiness_short_label(engine)) }
                             div class="button-strip" {
                                 (button("readiness.engine_check", Some("engine-check"), "small-button", false))
-                                (button("mcp.status", Some("mcp-status"), "small-button", false))
+                                @if mcp_process_ui_supported() {
+                                    (button("mcp.status", Some("mcp-status"), "small-button", false))
+                                }
                             }
                         }
                     }
@@ -2642,7 +2762,9 @@ fn settings_panel(
                 section class="settings-card" {
                     h3 { "Tool permissions" }
                     p class="field-help" {
-                        "Choose whether each configured local tool asks every time, runs automatically, or is denied. Revoking returns it to Ask."
+                        "Choose whether each configured external-process tool asks every time, runs automatically, or is denied. "
+                        (MCP_PROCESS_AUTHORITY_WARNING)
+                        " Revoking returns a tool to Ask."
                     }
                     div class="native-number-grid" {
                         (command_input("Server name", "permission_server", "", "tool_permission.set"))
@@ -2679,6 +2801,7 @@ fn settings_panel(
             @if section.slug == "mcp" {
                     section class="settings-card adapter-form" {
                         h3 { "Native tool adapter" }
+                        p class="field-help" { (MCP_PROCESS_AUTHORITY_WARNING) }
                         div class="native-number-grid" {
                             (command_input("Server name", "mcp_server", "", "mcp.configure"))
                             (command_input("Tool name", "mcp_tool", "", "mcp.call_tool"))
@@ -2896,13 +3019,18 @@ fn persona_settings() -> Markup {
                 (command_input("Persona history tokens", "persona_source_tokens", "4096", "persona.update"))
                 (command_input("Host context tokens", "persona_host_tokens", "2048", "persona.update"))
             }
-            label class="field" { span { "Attached tools" }
-                textarea name="persona_tools" rows="3" placeholder="server/tool, one per line"
-                    data-affordance="persona.update" data-command="mom_llama.persona_update"
-                    data-tauri-command="mom_llama_persona_update"
-                    data-cli="mom-llama persona update --profile <json> --json"
-                    data-effect="mom_llama.effects.conversation_store.v1" {}
-                small { "Only these stable tool bindings may be offered during an invited response." }
+            @if mcp_process_ui_supported() {
+                label class="field" { span { "Attached external-process tools" }
+                    textarea name="persona_tools" rows="3" placeholder="server/tool, one per line"
+                        data-affordance="persona.update" data-command="mom_llama.persona_update"
+                        data-tauri-command="mom_llama_persona_update"
+                        data-cli="mom-llama persona update --profile <json> --json"
+                        data-effect="mom_llama.effects.conversation_store.v1" {}
+                    small {
+                        "Only these stable bindings may be offered during an invited response. "
+                        (MCP_PROCESS_AUTHORITY_WARNING)
+                    }
+                }
             }
             div class="button-strip" {
                 (button("persona.update", Some("persona-update"), "primary-button", false))
@@ -3068,14 +3196,16 @@ fn persona_freeze_modal() -> Markup {
 }
 
 fn tool_approval_modal() -> Markup {
+    let persona_decide = control("mention.tool_approval.decide");
     html! {
         div id="tool-approval-modal" class="modal-backdrop is-hidden" hidden[true] aria-hidden="true" {
             section class="tool-approval-dialog" role="dialog" aria-modal="true"
                 aria-labelledby="tool-approval-title" {
-                p class="eyebrow" { "LOCAL TOOL AUTHORITY" }
+                p class="eyebrow" { "EXTERNAL PROCESS AUTHORITY" }
                 h2 id="tool-approval-title" { "Approve this tool call?" }
                 p class="field-help" {
-                    "Approval is single-use, expires after five minutes, and is bound to the exact call below."
+                    "Approval is single-use, expires after five minutes, and is bound to the exact call below. "
+                    (MCP_PROCESS_AUTHORITY_WARNING)
                 }
                 dl class="tool-approval-summary" {
                     div { dt { "Server" } dd id="tool-approval-server" {} }
@@ -3089,15 +3219,31 @@ fn tool_approval_modal() -> Markup {
                     aria-live="polite" aria-label="Live tool activity" {
                     header {
                         (icon_markup("wrench"))
-                        strong { "Local tool activity" }
+                        strong { "External-process tool activity" }
                         span id="tool-loop-live-state" { "Waiting for approval" }
                     }
                     div id="tool-loop-live-events" class="tool-loop-live-events" {}
                 }
                 div class="button-strip approval-actions" {
                     (button("settings.close", Some("tool-approval-close"), "small-button", false))
-                    (button("tool_loop.cancel", Some("tool-loop-cancel"), "small-button danger", true))
-                    (button("tool_loop.run", Some("tool-loop-run"), "primary-button", true))
+                    (button("tool_loop.cancel", Some("tool-loop-cancel"), "small-button danger tool-loop-approval-action", true))
+                    (button("tool_loop.run", Some("tool-loop-run"), "primary-button tool-loop-approval-action", true))
+                    button type="button" class="small-button danger persona-tool-approval-action is-hidden"
+                        disabled[true]
+                        data-affordance=(persona_decide.affordance)
+                        data-command=(persona_decide.command)
+                        data-tauri-command=(persona_decide.tauri_command)
+                        data-cli=(persona_decide.cli)
+                        data-effect=(persona_decide.effect)
+                        data-action="mention-tool-deny" { "Deny" }
+                    button type="button" class="primary-button persona-tool-approval-action is-hidden"
+                        disabled[true]
+                        data-affordance=(persona_decide.affordance)
+                        data-command=(persona_decide.command)
+                        data-tauri-command=(persona_decide.tauri_command)
+                        data-cli=(persona_decide.cli)
+                        data-effect=(persona_decide.effect)
+                        data-action="mention-tool-approve" { "Approve exact call" }
                 }
             }
         }
@@ -5261,6 +5407,46 @@ mod tests {
             .take_while(|token| !token.starts_with("--") && !token.starts_with('<'))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    #[test]
+    fn persona_tool_approval_uses_one_exact_review_and_decision_surface() {
+        let html = tool_approval_modal().into_string();
+        assert!(html.contains(r#"data-action="mention-tool-approve""#));
+        assert!(html.contains(r#"data-action="mention-tool-deny""#));
+        assert!(html.contains("mom_llama.mention_tool_approval_decide"));
+        assert!(html.contains("mom_llama_mention_tool_approval_decide"));
+        assert!(html.contains("Approval is single-use, expires after five minutes"));
+        assert!(html.contains(MCP_PROCESS_AUTHORITY_WARNING));
+        for authority in [
+            "external, unsandboxed child processes",
+            "network",
+            "files, credentials, and secrets",
+            "irreversible mutations permitted by that account",
+        ] {
+            assert!(
+                html.contains(authority),
+                "Persona MCP approval omitted process authority warning: {authority}"
+            );
+        }
+        assert_interactive_tags_have_metadata(&html, "button");
+
+        let editor = persona_settings().into_string();
+        assert_eq!(
+            editor.contains(r#"name="persona_tools""#),
+            mcp_process_ui_supported(),
+            "Persona MCP bindings must be absent outside macOS and Linux"
+        );
+
+        let js = include_str!("../../ui/coop-hx.js");
+        assert!(js.contains("const openPersonaToolApproval = (approval)"));
+        assert!(js.contains(r#"invoke("mom_llama_mention_tool_approval_decide""#));
+        assert!(js.contains("const mcpProcessUiSupported = () =>"));
+        assert!(js.contains("MCP_PROCESS_ACTIONS.has(button.dataset.action)"));
+        assert!(js.contains("invocation,"));
+        assert!(js.contains("approval,"));
+        assert!(js.contains("decision,"));
+        assert!(!js.contains("mention_tool_approval_decide\", {\n        persona"));
     }
 
     fn assert_buttons_use_approved_components(html: &str) {

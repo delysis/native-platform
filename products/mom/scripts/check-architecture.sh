@@ -97,7 +97,7 @@ fi
 
 if rg -n 'std::net|tokio::net|reqwest|ureq|TcpStream|127\.0\.0\.1|localhost|https?://' crates/mom-llama-runtime/src/mcp.rs
 then
-  echo "network authority is not allowed in the native-local MCP adapter" >&2
+  echo "undeclared network authority is not allowed in the MCP adapter" >&2
   exit 1
 fi
 

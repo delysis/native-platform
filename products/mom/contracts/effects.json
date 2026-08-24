@@ -69,7 +69,7 @@
     },
     {
       "effect_id": "mom_llama.effects.chat_send.v1",
-      "reads": ["selected_model", "conversation", "skills", "settings", "compatible_prefix_cache"],
+      "reads": ["selected_model", "conversation", "skills", "settings", "compatible_prefix_cache", "encrypted_reviewed_mcp_tool_catalog"],
       "writes": ["conversation", "encrypted_receipt", "optional_session_cache"],
       "network": [],
       "process": [],
@@ -133,6 +133,20 @@
       "destructive": "none"
     },
     {
+      "effect_id": "mom_llama.effects.mention_tool_approval.v1",
+      "reads": ["encrypted_frozen_mention_invocation", "exact_single_use_approval", "selected_model_identity", "configured_mcp_tool", "configured_mcp_process_may_read_os_permitted_files"],
+      "writes": ["encrypted_mention_invocation", "attributed_host_messages", "encrypted_effect_receipt", "command_receipt", "configured_mcp_process_may_write_os_permitted_files"],
+      "network": ["configured_mcp_process_may_access_network"],
+      "process": ["configured_external_mcp_stdio_process"],
+      "secrets": ["configured_mcp_process_may_access_os_permitted_secrets"],
+      "model_calls": ["in_process_llama_cpp"],
+      "persistence": ["encrypted_sqlite", "encrypted_receipts"],
+      "memory": ["resident_model", "active_mention_registry", "native_child_request"],
+      "external_apps": ["configured_external_mcp_process"],
+      "platforms": ["macos", "linux"],
+      "destructive": "irreversible"
+    },
+    {
       "effect_id": "mom_llama.effects.consult_cancel.v1",
       "reads": ["active_mention_registry", "legacy_active_consult_registry"],
       "writes": ["target_cancellation_flag", "command_receipt"],
@@ -157,6 +171,32 @@
       "memory": [],
       "external_apps": [],
       "destructive": "reversible"
+    },
+    {
+      "effect_id": "mom_llama.effects.mention_tool_approval_read.v1",
+      "reads": ["encrypted_mention_invocation_journal"],
+      "writes": ["command_receipt"],
+      "network": [],
+      "process": [],
+      "secrets": [],
+      "model_calls": [],
+      "persistence": ["encrypted_receipts"],
+      "memory": [],
+      "external_apps": [],
+      "destructive": "none"
+    },
+    {
+      "effect_id": "mom_llama.effects.mention_tool_approval_recovery.v1",
+      "reads": ["encrypted_persona_tool_approval_active_index", "encrypted_frozen_mention_invocations", "persisted_approval_deadline_clocks", "exact_os_process_lease_state"],
+      "writes": ["encrypted_terminal_persona_tool_approvals", "encrypted_terminal_mention_invocations", "encrypted_conversations", "encrypted_persona_tool_approval_active_index", "encrypted_unknown_effect_receipts", "command_receipt"],
+      "network": [],
+      "process": [],
+      "secrets": [],
+      "model_calls": [],
+      "persistence": ["encrypted_sqlite", "encrypted_receipts"],
+      "memory": ["persona_tool_approval_deadline_tracker"],
+      "external_apps": [],
+      "destructive": "irreversible"
     },
     {
       "effect_id": "mom_llama.effects.attachment_import_text.v1",
@@ -290,16 +330,17 @@
     },
     {
       "effect_id": "mom_llama.effects.mcp_stdio.v1",
-      "reads": ["allowlisted_absolute_executable", "encrypted_mcp_config", "typed_request"],
-      "writes": ["command_receipt"],
-      "network": [],
-      "process": ["configured_mcp_stdio_only"],
-      "secrets": [],
+      "reads": ["allowlisted_absolute_executable", "encrypted_mcp_config", "typed_request", "configured_mcp_process_may_read_os_permitted_files"],
+      "writes": ["encrypted_reviewed_mcp_tool_catalog", "content_addressed_managed_mcp_executable", "command_receipt", "configured_mcp_process_may_write_os_permitted_files"],
+      "network": ["configured_mcp_process_may_access_network"],
+      "process": ["configured_external_mcp_stdio_process"],
+      "secrets": ["configured_mcp_process_may_access_os_permitted_secrets"],
       "model_calls": [],
-      "persistence": ["encrypted_receipts"],
+      "persistence": ["encrypted_sqlite", "content_addressed_managed_executables", "encrypted_receipts"],
       "memory": ["bounded_request_response_buffers"],
-      "external_apps": ["configured_mcp_server"],
-      "destructive": "none"
+      "external_apps": ["configured_external_mcp_process"],
+      "platforms": ["macos", "linux"],
+      "destructive": "irreversible"
     },
     {
       "effect_id": "mom_llama.effects.tool_permission_store.v1",
@@ -316,16 +357,17 @@
     },
     {
       "effect_id": "mom_llama.effects.tool_loop.v1",
-      "reads": ["selected_model", "conversation", "advertised_mcp_tool_schema", "exact_single_use_approval"],
-      "writes": ["encrypted_tool_approval", "encrypted_active_tool_loop_state", "tool_messages", "assistant_message", "encrypted_receipts"],
-      "network": [],
-      "process": ["configured_mcp_stdio_only"],
-      "secrets": [],
+      "reads": ["selected_model", "conversation", "advertised_mcp_tool_schema", "exact_single_use_approval", "configured_mcp_process_may_read_os_permitted_files"],
+      "writes": ["encrypted_tool_approval", "encrypted_active_tool_loop_state", "tool_messages", "assistant_message", "encrypted_receipts", "configured_mcp_process_may_write_os_permitted_files"],
+      "network": ["configured_mcp_process_may_access_network"],
+      "process": ["configured_external_mcp_stdio_process"],
+      "secrets": ["configured_mcp_process_may_access_os_permitted_secrets"],
       "model_calls": ["in_process_llama_cpp"],
       "persistence": ["encrypted_sqlite", "encrypted_single_use_approval", "encrypted_tool_loop_supervision", "encrypted_receipts"],
       "memory": ["resident_model", "bounded_tool_result_preview", "tool_loop_cancellation_registry"],
-      "external_apps": ["configured_mcp_server"],
-      "destructive": "none"
+      "external_apps": ["configured_external_mcp_process"],
+      "platforms": ["macos", "linux"],
+      "destructive": "irreversible"
     },
     {
       "effect_id": "mom_llama.effects.model_slot.v1",

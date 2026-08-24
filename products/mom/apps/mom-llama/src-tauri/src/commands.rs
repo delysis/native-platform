@@ -1,7 +1,7 @@
 use llama_native_types::NativeDevice;
 use mom_llama_runtime::{
-    ChatSendInput, ChatSendOptions, ConversationExportFormat, EngineCheckOptions, KvCachePolicy,
-    PathSelection, PathSelectionKind, config::SettingsUpdate,
+    ChatDispatchOutput, ChatSendInput, ChatSendOptions, ConversationExportFormat,
+    EngineCheckOptions, KvCachePolicy, PathSelection, PathSelectionKind, config::SettingsUpdate,
 };
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use rfd::AsyncFileDialog;
@@ -211,9 +211,10 @@ pub async fn mom_llama_chat_dispatch(
     message: String,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_chat_dispatch"))?;
+    let runtime = runtime.inner().clone();
     let events = window.clone();
     blocking_command(lease, move || {
-        mom_llama_runtime::chat_dispatch_stream(
+        let result = mom_llama_runtime::chat_dispatch_stream(
             mom_llama_runtime::MentionDispatchInput {
                 conversation_id: conversation,
                 message,
@@ -225,7 +226,9 @@ pub async fn mom_llama_chat_dispatch(
                     .map_err(anyhow::Error::new)?;
                 Ok(())
             }),
-        )
+        )?;
+        observe_dispatch_approvals(&runtime, &result)?;
+        Ok(result)
     })
     .await
 }
@@ -238,6 +241,7 @@ pub async fn mom_llama_mention_dispatch(
     message: String,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_mention_dispatch"))?;
+    let runtime = runtime.inner().clone();
     let events = window.clone();
     blocking_command(lease, move || {
         let mut result = mom_llama_runtime::chat_dispatch_stream(
@@ -253,11 +257,26 @@ pub async fn mom_llama_mention_dispatch(
                 Ok(())
             }),
         )?;
+        observe_dispatch_approvals(&runtime, &result)?;
         result.command = "mom_llama.mention_dispatch".to_string();
         result.receipt.command = "mom_llama.mention_dispatch".to_string();
         Ok(result)
     })
     .await
+}
+
+fn observe_dispatch_approvals(
+    runtime: &AppRuntimeHandle,
+    result: &mom_llama_runtime::CommandResult<ChatDispatchOutput>,
+) -> anyhow::Result<()> {
+    if let Some(ChatDispatchOutput::Mention { invocation, .. }) = result.result.as_ref()
+        && !invocation.tool_approvals.is_empty()
+    {
+        runtime
+            .observe_persona_tool_approval_invocation(&invocation.id)
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -294,6 +313,37 @@ pub async fn mom_llama_mention_synthesize(
     blocking_command(
         runtime.admit(command_spec("mom_llama_mention_synthesize"))?,
         move || mom_llama_runtime::mention_synthesize(&invocation),
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn mom_llama_mention_tool_approval_list(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_mention_tool_approval_list"))?;
+    command_value(mom_llama_runtime::mention_tool_approval_list(&conversation))
+}
+
+#[tauri::command]
+pub async fn mom_llama_mention_tool_approval_decide(
+    runtime: State<'_, AppRuntimeHandle>,
+    invocation: String,
+    approval: String,
+    decision: mom_llama_runtime::MentionToolApprovalDecision,
+) -> Result<Value, String> {
+    let recovery = runtime.persona_tool_approval_recovery()?;
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_mention_tool_approval_decide"))?,
+        move || {
+            mom_llama_runtime::mention_tool_approval_decide_with_recovery(
+                &invocation,
+                &approval,
+                decision,
+                &recovery,
+            )
+        },
     )
     .await
 }

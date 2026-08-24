@@ -5,7 +5,7 @@ use crate::conversation_store::{
 };
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
-use crate::store::RuntimeStore;
+use crate::store::{DocumentMutations, RuntimeStore};
 use anyhow::{Context, Result, anyhow};
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
 use attachment_native_types::{
@@ -13,6 +13,7 @@ use attachment_native_types::{
     ObjectId,
 };
 use llama_native_types::{MediaInput, MediaKind};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
@@ -133,6 +134,7 @@ pub struct AttachmentPreview {
 #[derive(Debug, Clone)]
 pub(crate) struct ChatAttachmentContext {
     pub staged_ids: Vec<String>,
+    pub draft_snapshot: Option<DraftMessage>,
     pub text_by_message_id: HashMap<String, String>,
     pub current_text: String,
     pub media: Vec<MediaInput>,
@@ -521,12 +523,18 @@ pub(crate) fn prepare_chat_attachments(
         .iter()
         .map(|record| (record.id.as_str(), record))
         .collect::<HashMap<_, _>>();
-    let draft_ids = if regenerate_user_id.is_none() {
+    let draft_snapshot = if regenerate_user_id.is_none() {
         load_drafts()?
             .drafts
             .into_iter()
             .find(|draft| draft.conversation_id.as_deref() == Some(conversation_id))
-            .map(|draft| draft.attachment_ids)
+    } else {
+        None
+    };
+    let draft_ids = if regenerate_user_id.is_none() {
+        draft_snapshot
+            .as_ref()
+            .map(|draft| draft.attachment_ids.clone())
             .unwrap_or_default()
     } else {
         active_messages
@@ -586,6 +594,7 @@ pub(crate) fn prepare_chat_attachments(
         } else {
             Vec::new()
         },
+        draft_snapshot,
         text_by_message_id,
         current_text: current.text,
         media,
@@ -596,15 +605,131 @@ pub(crate) fn commit_generated_exchange(
     fallback_db: ConversationDb,
     conversation: Conversation,
     expected_active_leaf: Option<&str>,
+    generated_message_ids: &[String],
     staged_ids: &[String],
     user_message_id: &str,
-    clear_draft: bool,
+    expected_draft: Option<&DraftMessage>,
 ) -> Result<PathBuf> {
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let (store, conversation_db, attachment_db, drafts) = prepare_generated_exchange_documents(
+        fallback_db,
+        &conversation,
+        expected_active_leaf,
+        generated_message_ids,
+        staged_ids,
+        user_message_id,
+        expected_draft,
+    )?;
+    store.put_documents_atomically([
+        (
+            CONVERSATIONS_NAMESPACE.to_string(),
+            serde_json::to_vec(&conversation_db)?,
+        ),
+        (
+            ATTACHMENTS_NAMESPACE.to_string(),
+            serde_json::to_vec(&attachment_db)?,
+        ),
+        (DRAFTS_NAMESPACE.to_string(), serde_json::to_vec(&drafts)?),
+    ])?;
+    Ok(store.path().to_path_buf())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_generated_exchange_with_journal<T, R>(
+    fallback_db: ConversationDb,
+    conversation: Conversation,
+    expected_active_leaf: Option<&str>,
+    generated_message_ids: &[String],
+    staged_ids: &[String],
+    user_message_id: &str,
+    expected_draft: Option<&DraftMessage>,
+    journal_namespace: &str,
+    journal_default: impl FnOnce() -> T,
+    journal_mutation: impl FnOnce(&mut T) -> Result<R>,
+    journal_projection: impl FnOnce(&T, &mut DocumentMutations<'_, '_, '_>) -> Result<()>,
+) -> Result<(PathBuf, R)>
+where
+    T: Serialize + DeserializeOwned,
+{
     let _lifecycle = lock_attachment_lifecycle()?;
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
+
+    // Complete one-time imports and schema repair before opening the journal
+    // transaction. The authoritative reads still happen through that same
+    // transaction below, so another process cannot be overwritten with a
+    // stale pre-transaction snapshot.
+    let migrated_conversation_db = load_db().unwrap_or(fallback_db);
+    let migrated_attachment_db = load_attachment_db()?;
+    let migrated_drafts = load_drafts()?;
+    let result =
+        store.mutate_documents(journal_namespace, journal_default, |journal, documents| {
+            let mut conversation_db = documents
+                .get(CONVERSATIONS_NAMESPACE)?
+                .unwrap_or(migrated_conversation_db);
+            merge_generated_conversation(
+                &mut conversation_db,
+                &conversation,
+                expected_active_leaf,
+                generated_message_ids,
+            )?;
+
+            let mut attachment_db = documents
+                .get(ATTACHMENTS_NAMESPACE)?
+                .unwrap_or(migrated_attachment_db);
+            for attachment_id in staged_ids {
+                let record = attachment_db
+                    .attachments
+                    .iter_mut()
+                    .find(|record| record.id == *attachment_id)
+                    .ok_or_else(|| {
+                        anyhow!("staged attachment {attachment_id} disappeared before commit")
+                    })?;
+                if record.conversation_id != conversation.id
+                    || record.state != AttachmentState::Staged
+                {
+                    return Err(anyhow!(
+                        "staged attachment {attachment_id} changed ownership or state before commit"
+                    ));
+                }
+                record.state = AttachmentState::Committed;
+                record.message_id = user_message_id.to_string();
+            }
+
+            let mut drafts = documents.get(DRAFTS_NAMESPACE)?.unwrap_or(migrated_drafts);
+            consume_exact_draft(&mut drafts, expected_draft, staged_ids);
+
+            let result = journal_mutation(journal)?;
+            journal_projection(journal, documents)?;
+            documents.put_bytes(
+                CONVERSATIONS_NAMESPACE,
+                &serde_json::to_vec(&conversation_db)?,
+            )?;
+            documents.put_bytes(ATTACHMENTS_NAMESPACE, &serde_json::to_vec(&attachment_db)?)?;
+            documents.put_bytes(DRAFTS_NAMESPACE, &serde_json::to_vec(&drafts)?)?;
+            Ok(result)
+        })?;
+    Ok((store.path().to_path_buf(), result))
+}
+
+fn prepare_generated_exchange_documents(
+    fallback_db: ConversationDb,
+    conversation: &Conversation,
+    expected_active_leaf: Option<&str>,
+    generated_message_ids: &[String],
+    staged_ids: &[String],
+    user_message_id: &str,
+    expected_draft: Option<&DraftMessage>,
+) -> Result<(RuntimeStore, ConversationDb, AttachmentDb, DraftDb)> {
+    let settings = resolve_settings()?;
+    let store = RuntimeStore::open(&settings.data_dir)?;
     let mut conversation_db = load_db().unwrap_or(fallback_db);
-    merge_generated_conversation(&mut conversation_db, &conversation, expected_active_leaf);
+    merge_generated_conversation(
+        &mut conversation_db,
+        conversation,
+        expected_active_leaf,
+        generated_message_ids,
+    )?;
     let mut attachment_db = load_attachment_db()?;
     for attachment_id in staged_ids {
         let record = attachment_db
@@ -623,23 +748,30 @@ pub(crate) fn commit_generated_exchange(
         record.message_id = user_message_id.to_string();
     }
     let mut drafts = load_drafts()?;
-    if clear_draft {
-        drafts
-            .drafts
-            .retain(|draft| draft.conversation_id.as_deref() != Some(conversation.id.as_str()));
-    }
-    store.put_documents_atomically([
-        (
-            CONVERSATIONS_NAMESPACE.to_string(),
-            serde_json::to_vec(&conversation_db)?,
-        ),
-        (
-            ATTACHMENTS_NAMESPACE.to_string(),
-            serde_json::to_vec(&attachment_db)?,
-        ),
-        (DRAFTS_NAMESPACE.to_string(), serde_json::to_vec(&drafts)?),
-    ])?;
-    Ok(store.path().to_path_buf())
+    consume_exact_draft(&mut drafts, expected_draft, staged_ids);
+    Ok((store, conversation_db, attachment_db, drafts))
+}
+
+fn consume_exact_draft(
+    drafts: &mut DraftDb,
+    expected_draft: Option<&DraftMessage>,
+    committed_attachment_ids: &[String],
+) {
+    let Some(expected_draft) = expected_draft else {
+        return;
+    };
+    let committed_attachment_ids = committed_attachment_ids.iter().collect::<BTreeSet<_>>();
+    drafts.drafts.retain_mut(|draft| {
+        if draft == expected_draft {
+            return false;
+        }
+        if draft.conversation_id == expected_draft.conversation_id {
+            draft
+                .attachment_ids
+                .retain(|attachment_id| !committed_attachment_ids.contains(attachment_id));
+        }
+        true
+    });
 }
 
 pub(crate) fn snapshot_message_attachments(
@@ -1317,51 +1449,68 @@ fn merge_generated_conversation(
     db: &mut ConversationDb,
     conversation: &Conversation,
     expected_active_leaf: Option<&str>,
-) {
-    if let Some(existing) = db
+    generated_message_ids: &[String],
+) -> Result<()> {
+    let existing = db
         .conversations
         .iter_mut()
         .find(|candidate| candidate.id == conversation.id)
-    {
-        let new_messages = conversation
-            .messages
-            .iter()
-            .filter(|message| {
-                !existing
-                    .messages
-                    .iter()
-                    .any(|candidate| candidate.id == message.id)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let generation_message_ids = new_messages
-            .iter()
-            .map(|message| message.id.as_str())
-            .collect::<BTreeSet<_>>();
-        let active_branch_is_unchanged = existing.active_leaf_message_id.as_deref()
-            == expected_active_leaf
-            || existing
-                .active_leaf_message_id
-                .as_deref()
-                .is_some_and(|active| generation_message_ids.contains(active));
-        existing.messages.extend(new_messages);
-        if active_branch_is_unchanged {
-            existing.active_leaf_message_id = conversation.active_leaf_message_id.clone();
-        }
-        if is_placeholder_title(&existing.title, &existing.id)
-            && !is_placeholder_title(&conversation.title, &conversation.id)
+        .ok_or_else(|| anyhow!("host conversation was removed before generation committed"))?;
+    let generated_ids = generated_message_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if generated_ids.len() != generated_message_ids.len() {
+        anyhow::bail!("generated message identities must be unique");
+    }
+    let generated_messages = conversation
+        .messages
+        .iter()
+        .filter(|message| generated_ids.contains(message.id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if generated_messages.len() != generated_ids.len() {
+        anyhow::bail!("one or more exact generated messages disappeared before commit");
+    }
+    let existing_ids = existing
+        .messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<BTreeSet<_>>();
+    for message in &generated_messages {
+        if let Some(parent_id) = message.parent_id.as_deref()
+            && !existing_ids.contains(parent_id)
+            && !generated_ids.contains(parent_id)
         {
-            existing.title = conversation.title.clone();
-        }
-        if timestamp_value(&conversation.updated_at) > timestamp_value(&existing.updated_at) {
-            existing.updated_at = conversation.updated_at.clone();
-        }
-    } else {
-        db.conversations.insert(0, conversation.clone());
-        if db.selected_conversation_id.is_none() {
-            db.selected_conversation_id = Some(conversation.id.clone());
+            anyhow::bail!(
+                "generated message {} lost its exact parent before commit",
+                message.id
+            );
         }
     }
+    let active_branch_is_unchanged = existing.active_leaf_message_id.as_deref()
+        == expected_active_leaf
+        || existing
+            .active_leaf_message_id
+            .as_deref()
+            .is_some_and(|active| generated_ids.contains(active));
+    existing.messages.extend(
+        generated_messages
+            .into_iter()
+            .filter(|message| !existing_ids.contains(&message.id)),
+    );
+    if active_branch_is_unchanged {
+        existing.active_leaf_message_id = conversation.active_leaf_message_id.clone();
+    }
+    if is_placeholder_title(&existing.title, &existing.id)
+        && !is_placeholder_title(&conversation.title, &conversation.id)
+    {
+        existing.title = conversation.title.clone();
+    }
+    if timestamp_value(&conversation.updated_at) > timestamp_value(&existing.updated_at) {
+        existing.updated_at = conversation.updated_at.clone();
+    }
+    Ok(())
 }
 
 fn is_placeholder_title(title: &str, conversation_id: &str) -> bool {
@@ -1521,6 +1670,16 @@ mod tests {
     }
 
     fn send_staged_attachment(conversation_id: &str) -> Conversation {
+        let draft = crate::conversation_store::draft_get(Some(conversation_id))
+            .expect("load staged attachment draft")
+            .result
+            .expect("staged attachment draft");
+        crate::conversation_store::draft_update(
+            Some(conversation_id),
+            "Use the attached material.".to_string(),
+            draft.attachment_ids,
+        )
+        .expect("bind exact sent text to staged attachment draft");
         crate::chat::chat_send(
             crate::chat::ChatSendInput {
                 conversation_id: conversation_id.to_string(),
@@ -2239,7 +2398,13 @@ mod tests {
             selected_conversation_id: Some("another-chat".to_string()),
         };
 
-        merge_generated_conversation(&mut db, &stale_generation, Some("base"));
+        merge_generated_conversation(
+            &mut db,
+            &stale_generation,
+            Some("base"),
+            &["generated-user".to_string(), generated_assistant.id.clone()],
+        )
+        .expect("merge exact generated messages");
         existing = db.conversations.remove(0);
         assert_eq!(existing.title, "Renamed while generating");
         assert_eq!(
@@ -2262,6 +2427,105 @@ mod tests {
                 .any(|message| message.id == generated_assistant.id)
         );
         assert_eq!(db.selected_conversation_id.as_deref(), Some("another-chat"));
+    }
+
+    #[test]
+    fn generation_merge_never_resurrects_deleted_messages_or_deleted_hosts() {
+        let base = message("base", Vec::new());
+        let deleted = message("deleted-concurrently", Vec::new());
+        let mut generated_user = message("generated-user", Vec::new());
+        generated_user.parent_id = Some(base.id.clone());
+        let mut generated_assistant = message("generated-assistant", Vec::new());
+        generated_assistant.role = crate::conversation_store::MessageRole::Assistant;
+        generated_assistant.parent_id = Some(generated_user.id.clone());
+        let stale_generation = Conversation {
+            id: "chat".to_string(),
+            title: "Chat".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "2".to_string(),
+            kind: crate::conversation_store::ConversationKind::Chat,
+            execution_profile: crate::conversation_store::ConversationExecutionProfile::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: Some(generated_assistant.id.clone()),
+            current_skill_ids: Vec::new(),
+            messages: vec![
+                base.clone(),
+                deleted.clone(),
+                generated_user.clone(),
+                generated_assistant.clone(),
+            ],
+        };
+        let mut db = ConversationDb {
+            conversations: vec![Conversation {
+                messages: vec![base],
+                active_leaf_message_id: Some("base".to_string()),
+                ..stale_generation.clone()
+            }],
+            selected_conversation_id: Some("chat".to_string()),
+        };
+        merge_generated_conversation(
+            &mut db,
+            &stale_generation,
+            Some("base"),
+            &[generated_user.id.clone(), generated_assistant.id.clone()],
+        )
+        .expect("merge exact generated allowlist");
+        let committed = &db.conversations[0];
+        assert!(
+            !committed
+                .messages
+                .iter()
+                .any(|message| message.id == deleted.id)
+        );
+        assert!(
+            committed
+                .messages
+                .iter()
+                .any(|message| message.id == generated_assistant.id)
+        );
+
+        db.conversations.clear();
+        assert!(
+            merge_generated_conversation(
+                &mut db,
+                &stale_generation,
+                Some("base"),
+                &[generated_user.id, generated_assistant.id],
+            )
+            .expect_err("deleted host must remain deleted")
+            .to_string()
+            .contains("host conversation was removed")
+        );
+    }
+
+    #[test]
+    fn concurrent_draft_edit_keeps_new_text_and_releases_sent_attachment_ids() {
+        let expected = crate::conversation_store::DraftMessage {
+            conversation_id: Some("chat".to_string()),
+            message: "sent text".to_string(),
+            attachment_ids: vec!["sent".to_string()],
+            updated_at: "1".to_string(),
+        };
+        let newer = crate::conversation_store::DraftMessage {
+            conversation_id: Some("chat".to_string()),
+            message: "newer unsent text".to_string(),
+            attachment_ids: vec!["sent".to_string(), "new".to_string()],
+            updated_at: "2".to_string(),
+        };
+        let mut drafts = crate::conversation_store::DraftDb {
+            drafts: vec![newer],
+        };
+        consume_exact_draft(&mut drafts, Some(&expected), &["sent".to_string()]);
+        assert_eq!(drafts.drafts.len(), 1);
+        assert_eq!(drafts.drafts[0].message, "newer unsent text");
+        assert_eq!(drafts.drafts[0].attachment_ids, vec!["new"]);
+
+        drafts.drafts = vec![expected.clone()];
+        consume_exact_draft(&mut drafts, Some(&expected), &["sent".to_string()]);
+        assert!(drafts.drafts.is_empty(), "the exact sent draft is consumed");
     }
 
     #[test]
@@ -2313,9 +2577,14 @@ mod tests {
             mutated_fallback,
             generated.clone(),
             None,
+            &[
+                user.id.clone(),
+                "mention-first".to_string(),
+                second.id.clone(),
+            ],
             &[],
             &user.id,
-            true,
+            None,
         )
         .expect("commit attributed generation");
 
@@ -2336,6 +2605,69 @@ mod tests {
                 .map(|attribution| attribution.label.as_str())
                 .collect::<Vec<_>>(),
             vec!["First", "Second"]
+        );
+    }
+
+    #[test]
+    fn generated_exchange_and_private_journal_roll_back_as_one_fact() {
+        #[derive(Default, Serialize, Deserialize)]
+        struct Journal {
+            invocation_ids: Vec<String>,
+        }
+
+        let _session = TestDataDir::new("generated-journal-rollback");
+        let mut generated = new_conversation("Journal host");
+        let staged = stage_text(&generated.id, "staged journal text");
+        let mut user = message("journal-user", vec![staged.id.clone()]);
+        user.conversation_id = generated.id.clone();
+        generated.messages.push(user.clone());
+        generated.active_leaf_message_id = Some(user.id.clone());
+
+        let failed = commit_generated_exchange_with_journal(
+            load_db().expect("fallback db"),
+            generated.clone(),
+            None,
+            std::slice::from_ref(&user.id),
+            std::slice::from_ref(&staged.id),
+            &user.id,
+            None,
+            "test.mention-journal",
+            Journal::default,
+            |journal| {
+                journal.invocation_ids.push("invocation".to_string());
+                Ok(())
+            },
+            |_, documents| {
+                documents.put_bytes("test.mention-active-index", b"derived")?;
+                Err(anyhow!("force derived projection rollback"))
+            },
+        );
+        assert!(failed.is_err());
+        let conversation = crate::conversation_store::conversation_select(&generated.id)
+            .expect("select unchanged host")
+            .result
+            .expect("unchanged host");
+        assert!(conversation.messages.is_empty());
+        let attachment = load_attachment_db()
+            .expect("load attachments")
+            .attachments
+            .into_iter()
+            .find(|record| record.id == staged.id)
+            .expect("staged attachment remains");
+        assert_eq!(attachment.state, AttachmentState::Staged);
+        assert!(
+            RuntimeStore::current()
+                .expect("store")
+                .get::<Journal>("test.mention-journal")
+                .expect("journal read")
+                .is_none()
+        );
+        assert!(
+            RuntimeStore::current()
+                .expect("store")
+                .get_bytes("test.mention-active-index")
+                .expect("derived projection read")
+                .is_none()
         );
     }
 

@@ -61,8 +61,12 @@ pub use mentions::{
     ChatDispatchOutput, ChatDispatchStreamEvent, MentionCancelOutput, MentionCandidate,
     MentionDispatchInput, MentionInvocation, MentionInvocationState, MentionStreamEvent,
     MentionSynthesisOutput, MentionTargetKind, MentionTargetResult, MentionTargetSnapshot,
-    chat_dispatch, chat_dispatch_stream, mention_cancel, mention_candidates, mention_dispatch,
-    mention_synthesize,
+    MentionToolApproval, MentionToolApprovalDecision, MentionToolApprovalResolution,
+    MentionToolApprovalState, MentionToolEffectOutcome, PersonaToolApprovalRecovery, chat_dispatch,
+    chat_dispatch_stream, mention_cancel, mention_candidates, mention_dispatch, mention_synthesize,
+    mention_tool_approval_decide, mention_tool_approval_decide_with_recovery,
+    mention_tool_approval_list, reconcile_persona_tool_approvals,
+    reconcile_persona_tool_approvals_command,
 };
 pub use models::{hugging_face_hub_cache_dir, model_list, model_select};
 pub use native_runtime::{

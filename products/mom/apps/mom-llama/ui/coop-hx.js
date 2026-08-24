@@ -1,6 +1,8 @@
 (() => {
   "use strict";
 
+  const MAX_PERSONA_TOOL_BINDINGS = 8;
+
   const tauri = () => window.__TAURI__;
   const invoke = (command, payload = {}) => {
     const core = tauri() && tauri().core;
@@ -111,6 +113,20 @@
       }
     }
     console.error(message);
+  };
+
+  const mcpProcessUiSupported = () =>
+    shell()?.dataset.mcpProcessUiSupported === "true";
+  const requireMcpProcessUi = () => {
+    if (mcpProcessUiSupported()) return true;
+    report({
+      status: "blocked",
+      blocker: {
+        code: "mcp_platform_unsupported",
+        message: "Configured external MCP child processes are available only on macOS and Linux.",
+      },
+    });
+    return false;
   };
 
   const parseFragment = (markup) => {
@@ -592,11 +608,17 @@
     formField(modal, "freeze_name")?.focus();
   };
 
-  const personaTools = (value) => String(value || "").split(/\r?\n/)
-    .map((line) => line.trim()).filter(Boolean).map((line) => {
-      const [server, ...tool] = line.split("/");
-      return { server: server.trim(), tool: tool.join("/").trim() };
-    }).filter((binding) => binding.server && binding.tool);
+  const personaTools = (value) => {
+    const bindings = String(value || "").split(/\r?\n/)
+      .map((line) => line.trim()).filter(Boolean).map((line) => {
+        const [server, ...tool] = line.split("/");
+        return { server: server.trim(), tool: tool.join("/").trim() };
+      }).filter((binding) => binding.server && binding.tool);
+    if (bindings.length > MAX_PERSONA_TOOL_BINDINGS) {
+      throw new Error(`A Persona may attach at most ${MAX_PERSONA_TOOL_BINDINGS} tools.`);
+    }
+    return bindings;
+  };
 
   const setPersonaEditor = (persona) => {
     const editor = document.getElementById("persona-editor");
@@ -612,8 +634,11 @@
     formField(editor, "persona_system_message").value = profile.system_message || "";
     formField(editor, "persona_source_tokens").value = profile.source_history_tokens ?? 4096;
     formField(editor, "persona_host_tokens").value = profile.host_context_tokens ?? 2048;
-    formField(editor, "persona_tools").value = (profile.tool_bindings || [])
-      .map((binding) => `${binding.server}/${binding.tool}`).join("\n");
+    const toolsField = formField(editor, "persona_tools");
+    if (toolsField) {
+      toolsField.value = (profile.tool_bindings || [])
+        .map((binding) => `${binding.server}/${binding.tool}`).join("\n");
+    }
     const frozen = profile.chat_template && typeof profile.chat_template === "object"
       ? profile.chat_template.frozen_source : null;
     formField(editor, "persona_chat_template_policy").value = frozen == null ? "model_default" : "frozen_source";
@@ -697,7 +722,9 @@
       system_message: formValue(editor, "persona_system_message") || null,
       sampling: profile.sampling || null,
       chat_template: template,
-      tool_bindings: personaTools(formValue(editor, "persona_tools")),
+      tool_bindings: mcpProcessUiSupported()
+        ? personaTools(formValue(editor, "persona_tools"))
+        : (profile.tool_bindings || []),
       source_history_tokens: Math.max(0, Math.trunc(Number(formValue(editor, "persona_source_tokens") || 4096))),
       host_context_tokens: Math.max(0, Math.trunc(Number(formValue(editor, "persona_host_tokens") || 2048))),
     };
@@ -719,6 +746,7 @@
   };
 
   const openToolApproval = (approval) => {
+    if (!mcpProcessUiSupported()) return;
     const modal = document.getElementById("tool-approval-modal");
     if (!modal || !approval) return;
     modal.dataset.approvalId = approval.id || "";
@@ -728,6 +756,8 @@
     modal.dataset.tool = approval.tool || "";
     modal.dataset.arguments = JSON.stringify(approval.arguments || {});
     modal.dataset.maxTurns = String(approval.max_turns || 1);
+    modal.dataset.mode = "tool-loop";
+    modal.dataset.invocationId = "";
     const setText = (id, value) => {
       const node = document.getElementById(id);
       if (node) node.textContent = String(value);
@@ -748,11 +778,55 @@
     if (approve) approve.disabled = !approval.id;
     if (cancel) cancel.disabled = true;
     if (close) close.disabled = false;
+    modal.querySelectorAll(".tool-loop-approval-action").forEach((button) => button.classList.remove("is-hidden"));
+    modal.querySelectorAll(".persona-tool-approval-action").forEach((button) => button.classList.add("is-hidden"));
+    const title = document.getElementById("tool-approval-title");
+    if (title) title.textContent = "Approve this tool call?";
     modal.dataset.running = "false";
     modal.hidden = false;
     modal.classList.remove("is-hidden");
     modal.setAttribute("aria-hidden", "false");
     approve?.focus();
+  };
+
+  const openPersonaToolApproval = (approval) => {
+    if (!mcpProcessUiSupported()) return;
+    const modal = document.getElementById("tool-approval-modal");
+    if (!modal || !approval?.id || !approval?.invocation_id) return;
+    modal.dataset.mode = "persona";
+    modal.dataset.approvalId = approval.id;
+    modal.dataset.invocationId = approval.invocation_id;
+    modal.dataset.conversation = approval.host_conversation_id || selectedConversation();
+    modal.dataset.server = approval.server || "";
+    modal.dataset.tool = approval.tool || "";
+    modal.dataset.arguments = JSON.stringify(approval.arguments || {});
+    const setText = (id, value) => {
+      const node = document.getElementById(id);
+      if (node) node.textContent = String(value);
+    };
+    const title = document.getElementById("tool-approval-title");
+    if (title) title.textContent = `Allow ${approval.label || approval.handle || "this Persona"} to call a configured external-process tool?`;
+    setText("tool-approval-server", approval.server || "");
+    setText("tool-approval-tool", approval.tool || "");
+    const snapshot = String(approval.snapshot_sha256 || "").slice(0, 12);
+    const call = String(approval.call_sha256 || "").slice(0, 12);
+    setText(
+      "tool-approval-prompt",
+      `@${approval.handle || "persona"} v${approval.persona_version || 0} · frozen turn ${approval.user_message_id || ""} · snapshot ${snapshot} · call ${call}`,
+    );
+    setText("tool-approval-turns", "One exact call");
+    setText("tool-approval-arguments", JSON.stringify(approval.arguments || {}, null, 2));
+    document.getElementById("tool-loop-live")?.classList.add("is-hidden");
+    modal.querySelectorAll(".tool-loop-approval-action").forEach((button) => button.classList.add("is-hidden"));
+    modal.querySelectorAll(".persona-tool-approval-action").forEach((button) => {
+      button.classList.remove("is-hidden");
+      button.disabled = false;
+    });
+    modal.dataset.running = "false";
+    modal.hidden = false;
+    modal.classList.remove("is-hidden");
+    modal.setAttribute("aria-hidden", "false");
+    modal.querySelector('[data-action="mention-tool-approve"]')?.focus();
   };
 
   const closeToolApproval = () => {
@@ -762,6 +836,38 @@
     modal.classList.add("is-hidden");
     modal.setAttribute("aria-hidden", "true");
     modal.dataset.approvalId = "";
+    modal.dataset.invocationId = "";
+    modal.dataset.mode = "";
+  };
+
+  const decidePersonaToolApproval = async (decision) => {
+    if (!requireMcpProcessUi()) return;
+    const modal = document.getElementById("tool-approval-modal");
+    if (modal?.dataset.mode !== "persona") return;
+    const invocation = modal.dataset.invocationId || "";
+    const approval = modal.dataset.approvalId || "";
+    if (!invocation || !approval || !["approve", "deny"].includes(decision)) {
+      throw new Error("The frozen Persona tool approval is incomplete.");
+    }
+    const lease = acquireChatBusy(`mention-tool-approval:${approval}`);
+    modal.dataset.running = "true";
+    modal.querySelectorAll(".persona-tool-approval-action").forEach((button) => { button.disabled = true; });
+    try {
+      const result = await invoke("mom_llama_mention_tool_approval_decide", {
+        invocation,
+        approval,
+        decision,
+      });
+      report(result);
+      closeToolApproval();
+      await refreshConversationProjection();
+    } finally {
+      releaseChatBusy(lease);
+      modal.dataset.running = "false";
+      if (!modal.hidden) {
+        modal.querySelectorAll(".persona-tool-approval-action").forEach((button) => { button.disabled = false; });
+      }
+    }
   };
 
   const switchSettingsSection = (section) => {
@@ -1343,6 +1449,28 @@
     textarea.focus();
   };
 
+  const MCP_PROCESS_ACTIONS = new Set([
+    "mcp-status",
+    "mcp-command-browse",
+    "mcp-configure",
+    "mcp-list-servers",
+    "mcp-list-tools",
+    "mcp-call-tool",
+    "mcp-list-resources",
+    "mcp-read-resource",
+    "mcp-list-prompts",
+    "mcp-get-prompt",
+    "tool-loop-prepare",
+    "tool-loop-run",
+    "tool-loop-cancel",
+    "tool-permission-list",
+    "tool-permission-set",
+    "tool-permission-revoke",
+    "mention-tool-approval-open",
+    "mention-tool-approve",
+    "mention-tool-deny",
+  ]);
+
   const actionHandlers = {
     "sidebar-toggle": async () => {
       await invoke("mom_llama_conversation_list");
@@ -1462,6 +1590,11 @@
         releaseChatBusy(lease);
       }
     },
+    "mention-tool-approval-open": async (button) => {
+      openPersonaToolApproval(JSON.parse(button.dataset.approvalJson || "{}"));
+    },
+    "mention-tool-approve": async () => decidePersonaToolApproval("approve"),
+    "mention-tool-deny": async () => decidePersonaToolApproval("deny"),
     "conversation-new": async () => {
       const result = await invoke("mom_llama_conversation_new", { title: "New chat" });
       report(result); await refreshConversationProjection();
@@ -1812,7 +1945,7 @@
       if (result?.status !== "blocked") {
         openToolApproval(result?.result);
         if (result?.result?.requires_confirmation === false) {
-          await actions["tool-loop-run"]();
+          await actionHandlers["tool-loop-run"]();
         }
       }
     },
@@ -1907,6 +2040,7 @@
   document.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-action]");
     if (!button || button.disabled) return;
+    if (MCP_PROCESS_ACTIONS.has(button.dataset.action) && !requireMcpProcessUi()) return;
     const handler = actionHandlers[button.dataset.action];
     if (!handler) return;
     event.preventDefault();
@@ -1976,6 +2110,12 @@
           }
           report(result);
           releaseMentionInvocationBusy(result?.result?.invocation?.id);
+          const pendingApproval = result?.result?.invocation?.tool_approvals?.find(
+            (approval) => approval.state === "pending",
+          );
+          if (pendingApproval && mcpProcessUiSupported()) {
+            openPersonaToolApproval(pendingApproval);
+          }
           if (result?.status === "blocked" && textarea && !textarea.value) {
             textarea.value = message;
             await persistDraftNow(message, attachmentIds);
