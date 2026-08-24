@@ -20,7 +20,10 @@ import {
   getBranch,
   getBranchPage,
   getCompletionSnapshot,
-  listModels
+  listModels,
+  openDocument,
+  previewDocumentReconciliation,
+  revealDocument
 } from './ipc';
 
 const priorWindow = globalThis.window;
@@ -122,7 +125,7 @@ describe('session IPC admission', () => {
 
     mocks.invoke.mockRejectedValueOnce({ code: 'project_busy', retryable: true });
     await expect(
-      exportDocumentCopy('project', 'session', 'document', 'draft.md')
+      exportDocumentCopy('project', 'session', 'document', 'revision', 'a'.repeat(64))
     ).rejects.toMatchObject({ code: 'project_busy' });
 
     mocks.invoke.mockRejectedValueOnce({ code: 'project_busy', retryable: true });
@@ -130,6 +133,59 @@ describe('session IPC admission', () => {
       code: 'project_busy'
     });
     expect(mocks.invoke).toHaveBeenCalledTimes(3);
+  });
+
+  it('sends only captured immutable identity for document context operations', async () => {
+    installDesktopRuntime();
+    mocks.invoke.mockResolvedValue(null);
+    const blob = 'a'.repeat(64);
+
+    await openDocument('project', 'session', 'document', 'revision', blob);
+    await exportDocumentCopy('project', 'session', 'document', 'revision', blob);
+    await revealDocument('project', 'session', 'document', 'revision', blob);
+    await previewDocumentReconciliation(
+      'project',
+      'session',
+      'document',
+      'revision',
+      blob,
+      null
+    );
+
+    expect(mocks.invoke.mock.calls).toEqual([
+      ['plugin:loom|document_open', {
+        projectId: 'project',
+        sessionId: 'session',
+        documentId: 'document',
+        expectedRevisionId: 'revision',
+        expectedBlobId: blob
+      }],
+      ['plugin:loom|document_export_choose', {
+        projectId: 'project',
+        sessionId: 'session',
+        documentId: 'document',
+        expectedRevisionId: 'revision',
+        expectedBlobId: blob
+      }],
+      ['plugin:loom|document_reveal', {
+        projectId: 'project',
+        sessionId: 'session',
+        documentId: 'document',
+        expectedRevisionId: 'revision',
+        expectedBlobId: blob
+      }],
+      ['plugin:loom|document_reconciliation_preview', {
+        projectId: 'project',
+        sessionId: 'session',
+        documentId: 'document',
+        expectedRevisionId: 'revision',
+        expectedBaseBlobId: blob,
+        appText: null
+      }]
+    ]);
+    for (const [, args] of mocks.invoke.mock.calls) {
+      expect(args).not.toHaveProperty('relativePath');
+    }
   });
 
   it('keeps model and application lifecycle calls outside the session FIFO', async () => {

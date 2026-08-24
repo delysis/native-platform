@@ -39,6 +39,7 @@
     previewDocumentReconciliation,
     promoteCandidate,
     recoverProject,
+    revealDocument,
     requestApplicationClose,
     setFocusMode,
     setSuggestions as setSuggestionsPolicy,
@@ -160,6 +161,17 @@
   } from './lib/completionAccessibility';
   import { observeNativeFullscreen } from './lib/nativeFullscreen';
   import {
+    captureDocumentTarget,
+    capturedDocumentBelongsToSession,
+    clampDocumentMenuPoint,
+    documentMenuKeyAction,
+    documentRevealLabel,
+    isDocumentContextTriggerKey,
+    type CapturedDocumentTarget,
+    type DocumentContextAction,
+    type MenuPoint
+  } from './lib/documentContextActions';
+  import {
     completionGenerationIsArmed,
     type CompletionGenerationTrigger
   } from './lib/completionGenerationIntent';
@@ -262,6 +274,25 @@
   let search = '';
   let outlineOpen = false;
   let outlineToggle: HTMLButtonElement | undefined;
+  const documentContextLongPressMilliseconds = 550;
+  const documentContextLongPressSlop = 10;
+  let documentContextTarget: CapturedDocumentTarget | null = null;
+  let documentContextTrigger: HTMLButtonElement | null = null;
+  let documentContextMenu: HTMLDivElement | undefined;
+  let documentContextPoint: MenuPoint = { x: 8, y: 8 };
+  let documentContextFocusIndex = 0;
+  let documentContextActionInFlight = false;
+  let documentContextRevealLabel: string | null = null;
+  let documentContextLongPressTimer: number | undefined;
+  let documentContextLongPress: {
+    pointerId: number;
+    x: number;
+    y: number;
+    target: CapturedDocumentTarget;
+    trigger: HTMLButtonElement;
+  } | null = null;
+  let documentContextSuppressClickId: string | null = null;
+  let documentContextSuppressClickTimer: number | undefined;
   let appearance: AppearancePreference = 'system';
   let systemDark = false;
   let appearanceMedia: MediaQueryList | null = null;
@@ -549,6 +580,8 @@
   const applicationCloseCoordinator = new ApplicationCloseCoordinator({
     begin: () => {
       applicationClosePhase = 'closing';
+      clearDocumentContextLongPress();
+      closeDocumentContextMenu(false);
       clearPreferredWriterRequest();
       cancelSuggestionTimer();
       if (compositionActive) {
@@ -963,6 +996,9 @@
     };
     appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
+    documentContextRevealLabel = desktop
+      ? documentRevealLabel(window.navigator.platform, window.navigator.userAgent)
+      : null;
     if (desktop) {
       stopNativeFullscreenObservation = observeNativeFullscreen(
         getCurrentWindow(),
@@ -1005,6 +1041,12 @@
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
       appearanceMedia?.removeEventListener('change', syncSystemAppearance);
       appearanceMedia = null;
+      clearDocumentContextLongPress();
+      if (documentContextSuppressClickTimer !== undefined) {
+        window.clearTimeout(documentContextSuppressClickTimer);
+        documentContextSuppressClickTimer = undefined;
+      }
+      closeDocumentContextMenu(false);
       stopNativeFullscreenObservation?.();
       stopNativeFullscreenObservation = undefined;
       if (saveTimer !== undefined) window.clearTimeout(saveTimer);
@@ -1182,7 +1224,7 @@
   }
 
   async function requestReconciliationPreview(
-    summary: Pick<DocumentSummary, 'document_id' | 'relative_path' | 'kind' | 'revision_id' | 'active_blob_id'>,
+    summary: Pick<DocumentSummary, 'document_id' | 'kind' | 'revision_id' | 'active_blob_id'>,
     appText: string | null,
     expectedScope?: ProjectRestoreScope
   ): Promise<ReconciliationPreview> {
@@ -1203,7 +1245,6 @@
       scope.projectId,
       scope.sessionId,
       summary.document_id,
-      summary.relative_path,
       summary.revision_id,
       summary.active_blob_id,
       appText
@@ -1215,7 +1256,6 @@
       preview.project_id !== scope.projectId ||
       preview.session_id !== scope.sessionId ||
       preview.document_id !== summary.document_id ||
-      preview.relative_path !== summary.relative_path ||
       preview.kind !== summary.kind ||
       preview.active_revision_id !== summary.revision_id ||
       preview.base_blob_id !== summary.active_blob_id
@@ -2441,6 +2481,7 @@
   }
 
   async function setOutlineOpen(open: boolean): Promise<void> {
+    if (!open) closeDocumentContextMenu(false);
     outlineOpen = open;
     await tick();
   }
@@ -2499,6 +2540,336 @@
     if (!target?.isConnected || target.hidden || target.getClientRects().length === 0) return false;
     target.focus();
     return window.document.activeElement === target;
+  }
+
+  function clearDocumentContextLongPress(): void {
+    if (documentContextLongPressTimer !== undefined) {
+      window.clearTimeout(documentContextLongPressTimer);
+      documentContextLongPressTimer = undefined;
+    }
+    const pending = documentContextLongPress;
+    if (pending?.trigger.hasPointerCapture(pending.pointerId)) {
+      pending.trigger.releasePointerCapture(pending.pointerId);
+    }
+    documentContextLongPress = null;
+  }
+
+  function closeDocumentContextMenu(refocus = true): void {
+    clearDocumentContextLongPress();
+    const trigger = documentContextTrigger;
+    documentContextTarget = null;
+    documentContextTrigger = null;
+    documentContextFocusIndex = 0;
+    if (!refocus) return;
+    void tick().then(() => {
+      if (focusConnectedControl(trigger)) return;
+      if (focusConnectedControl(outlineToggle)) return;
+      focusCurrentWritingSurfaceAtEnd();
+    });
+  }
+
+  function documentContextMenuItems(): HTMLButtonElement[] {
+    if (!documentContextMenu) return [];
+    return Array.from(
+      documentContextMenu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not([disabled])')
+    );
+  }
+
+  async function focusDocumentContextMenu(
+    target: CapturedDocumentTarget,
+    requestedIndex = 0
+  ): Promise<void> {
+    await tick();
+    if (documentContextTarget !== target || !documentContextMenu) return;
+    const bounds = documentContextMenu.getBoundingClientRect();
+    documentContextPoint = clampDocumentMenuPoint(
+      documentContextPoint,
+      bounds.width,
+      bounds.height,
+      window.innerWidth,
+      window.innerHeight
+    );
+    await tick();
+    if (documentContextTarget !== target) return;
+    const items = documentContextMenuItems();
+    if (items.length === 0) return;
+    documentContextFocusIndex = Math.min(Math.max(requestedIndex, 0), items.length - 1);
+    items[documentContextFocusIndex]?.focus();
+  }
+
+  function openDocumentContextMenu(
+    target: CapturedDocumentTarget,
+    trigger: HTMLButtonElement,
+    point: MenuPoint
+  ): void {
+    if (
+      documentContextActionInFlight ||
+      fileCommandInFlight ||
+      applicationClosePhase !== 'running' ||
+      transition !== 'idle'
+    ) return;
+    closeProjectMenu();
+    closeFormatMenu(false);
+    closeDocumentContextMenu(false);
+    documentContextTarget = target;
+    documentContextTrigger = trigger;
+    documentContextPoint = point;
+    documentContextFocusIndex = 0;
+    void focusDocumentContextMenu(target);
+  }
+
+  function captureDocumentContextTarget(summary: DocumentSummary): CapturedDocumentTarget | null {
+    if (!project) return null;
+    const target = captureDocumentTarget(project, summary);
+    if (!target) {
+      announce(`${summary.title} does not expose a complete active revision yet`);
+    }
+    return target;
+  }
+
+  function handleDocumentContextPointer(
+    event: MouseEvent,
+    summary: DocumentSummary
+  ): void {
+    event.preventDefault();
+    event.stopPropagation();
+    clearDocumentContextLongPress();
+    const target = captureDocumentContextTarget(summary);
+    if (!target) return;
+    openDocumentContextMenu(target, event.currentTarget as HTMLButtonElement, {
+      x: event.clientX,
+      y: event.clientY
+    });
+  }
+
+  function handleDocumentContextKey(
+    event: KeyboardEvent,
+    summary: DocumentSummary
+  ): void {
+    if (!isDocumentContextTriggerKey(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = captureDocumentContextTarget(summary);
+    if (!target) return;
+    const trigger = event.currentTarget as HTMLButtonElement;
+    const bounds = trigger.getBoundingClientRect();
+    openDocumentContextMenu(target, trigger, {
+      x: bounds.left + 12,
+      y: bounds.top + Math.min(bounds.height, 28)
+    });
+  }
+
+  function beginDocumentContextLongPress(
+    event: PointerEvent,
+    summary: DocumentSummary
+  ): void {
+    if (event.pointerType !== 'touch' || event.button !== 0) return;
+    clearDocumentContextLongPress();
+    const target = captureDocumentContextTarget(summary);
+    if (!target) return;
+    const trigger = event.currentTarget as HTMLButtonElement;
+    const pending = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      target,
+      trigger
+    };
+    documentContextLongPress = pending;
+    try {
+      trigger.setPointerCapture(event.pointerId);
+    } catch {
+      // A detached row cancels through the session/menu guards below.
+    }
+    documentContextLongPressTimer = window.setTimeout(() => {
+      if (documentContextLongPress !== pending) return;
+      documentContextLongPressTimer = undefined;
+      clearDocumentContextLongPress();
+      documentContextSuppressClickId = pending.target.documentId;
+      if (documentContextSuppressClickTimer !== undefined) {
+        window.clearTimeout(documentContextSuppressClickTimer);
+      }
+      documentContextSuppressClickTimer = window.setTimeout(() => {
+        if (documentContextSuppressClickId === pending.target.documentId) {
+          documentContextSuppressClickId = null;
+        }
+        documentContextSuppressClickTimer = undefined;
+      }, 1_000);
+      openDocumentContextMenu(pending.target, pending.trigger, {
+        x: pending.x,
+        y: pending.y
+      });
+    }, documentContextLongPressMilliseconds);
+  }
+
+  function updateDocumentContextLongPress(event: PointerEvent): void {
+    const pending = documentContextLongPress;
+    if (!pending || pending.pointerId !== event.pointerId) return;
+    if (
+      Math.abs(event.clientX - pending.x) > documentContextLongPressSlop ||
+      Math.abs(event.clientY - pending.y) > documentContextLongPressSlop
+    ) clearDocumentContextLongPress();
+  }
+
+  function finishDocumentContextLongPress(event: PointerEvent): void {
+    if (documentContextLongPress?.pointerId === event.pointerId) {
+      clearDocumentContextLongPress();
+    }
+  }
+
+  function handleDocumentRowClick(event: MouseEvent, summary: DocumentSummary): void {
+    if (documentContextSuppressClickId === summary.document_id) {
+      documentContextSuppressClickId = null;
+      if (documentContextSuppressClickTimer !== undefined) {
+        window.clearTimeout(documentContextSuppressClickTimer);
+        documentContextSuppressClickTimer = undefined;
+      }
+      event.preventDefault();
+      return;
+    }
+    void selectDocument(summary, true);
+  }
+
+  function handleDocumentContextMenuKeydown(event: KeyboardEvent): void {
+    const items = documentContextMenuItems();
+    const action = documentMenuKeyAction(event, documentContextFocusIndex, items.length);
+    switch (action.kind) {
+      case 'focus':
+        event.preventDefault();
+        documentContextFocusIndex = action.index;
+        items[action.index]?.focus();
+        return;
+      case 'activate':
+        event.preventDefault();
+        items[action.index]?.click();
+        return;
+      case 'dismiss':
+        event.preventDefault();
+        closeDocumentContextMenu();
+        return;
+      case 'none':
+        return;
+      default: {
+        const unreachable: never = action;
+        return unreachable;
+      }
+    }
+  }
+
+  function recordDocumentContextFailure(
+    target: CapturedDocumentTarget,
+    error: unknown
+  ): void {
+    if (
+      applicationClosePhase !== 'running' ||
+      !capturedDocumentBelongsToSession(target, project)
+    ) return;
+    const failure = normalizeFailure(error);
+    if (
+      failure.code === 'application_quiescing' ||
+      failure.code === 'application_close_in_progress' ||
+      failure.code === 'application_exit_authorized'
+    ) return;
+    if (
+      failure.code === 'stale_document_action' ||
+      failure.code === 'document_not_found' ||
+      failure.code === 'source_revision_conflict' ||
+      failure.code === 'source_blob_conflict'
+    ) {
+      recordLocalFailure(
+        failure.code,
+        `${target.title} changed after its menu was opened. Open the current outline entry and try again.`
+      );
+      return;
+    }
+    if (
+      failure.code === 'external_file_change' ||
+      failure.code === 'external_file_deleted' ||
+      failure.code === 'external_file_conflict'
+    ) {
+      recordLocalFailure(
+        failure.code,
+        `${target.title} changed outside Loom. Open it from the outline to review the exact external bytes before continuing.`
+      );
+      return;
+    }
+    if (
+      failure.code === 'document_reveal_path_changed' ||
+      failure.code === 'document_reveal_path_refused' ||
+      failure.code === 'document_reveal_path_unavailable'
+    ) {
+      recordLocalFailure(
+        failure.code,
+        `${target.title} could not be revealed from its current registered file. Open it from the outline and try again.`
+      );
+      return;
+    }
+    recordFailure(error);
+  }
+
+  async function runDocumentContextAction(action: DocumentContextAction): Promise<void> {
+    if (documentContextActionInFlight || fileCommandInFlight) return;
+    const target = documentContextTarget;
+    const trigger = documentContextTrigger;
+    if (!target) return;
+    documentContextActionInFlight = true;
+    closeDocumentContextMenu(false);
+    if (
+      applicationClosePhase !== 'running' ||
+      !capturedDocumentBelongsToSession(target, project)
+    ) {
+      documentContextActionInFlight = false;
+      return;
+    }
+
+    let restoreTrigger = action !== 'open';
+    try {
+      switch (action) {
+        case 'open':
+          await selectCapturedDocument(target, true, true);
+          restoreTrigger =
+            document?.summary.document_id !== target.documentId &&
+            reconciliation?.document_id !== target.documentId;
+          break;
+        case 'export_text': {
+          fileCommandInFlight = true;
+          const receipt = await exportDocumentCopy(
+            target.projectId,
+            target.sessionId,
+            target.documentId,
+            target.expectedRevisionId,
+            target.expectedBlobId
+          );
+          if (receipt) announce(`Exported ${target.title} as text`);
+          break;
+        }
+        case 'reveal':
+          fileCommandInFlight = true;
+          await revealDocument(
+            target.projectId,
+            target.sessionId,
+            target.documentId,
+            target.expectedRevisionId,
+            target.expectedBlobId
+          );
+          announce(`${target.title} revealed in its containing folder`);
+          break;
+        default: {
+          const unreachable: never = action;
+          return unreachable;
+        }
+      }
+    } catch (error) {
+      recordDocumentContextFailure(target, error);
+      restoreTrigger = action !== 'open';
+    } finally {
+      fileCommandInFlight = false;
+      documentContextActionInFlight = false;
+      if (restoreTrigger) {
+        await tick();
+        if (!focusConnectedControl(trigger)) focusConnectedControl(outlineToggle);
+      }
+    }
   }
 
   function suggestionPreferenceKey(projectId: string): string {
@@ -3210,13 +3581,17 @@
     try {
       await saveNow();
       if (!project || !document || uncertainSave || saveState === 'error' || saveState === 'uncertain') return;
+      if (!document.summary.revision_id || !document.summary.active_blob_id) {
+        throw new Error('The active document does not expose a complete export identity.');
+      }
       const receipt = await exportDocumentCopy(
         project.project_id,
         project.session_id,
         document.summary.document_id,
-        document.summary.relative_path
+        document.summary.revision_id,
+        document.summary.active_blob_id
       );
-      if (receipt) announce(`Exported a copy of ${document.summary.title}`);
+      if (receipt) announce(`Exported ${document.summary.title} as text`);
     } catch (error) {
       recordFailure(error);
     } finally {
@@ -3263,6 +3638,7 @@
       sessionId: opened.session_id
     };
     if (!workspaceRestoreIsCurrent(captured)) return false;
+    closeDocumentContextMenu(false);
     outlineOpen = false;
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
@@ -3323,15 +3699,41 @@
     summary: DocumentSummary,
     focusWritingSurface = false
   ): Promise<void> {
-    if (transition !== 'idle' || !project || applicationClosePhase !== 'running') return;
+    if (!project) return;
+    const target = captureDocumentTarget(project, summary);
+    if (!target) {
+      recordLocalFailure(
+        'incomplete_document_identity',
+        `${summary.title} does not expose the complete active revision required to open it safely.`
+      );
+      return;
+    }
+    await selectCapturedDocument(target, focusWritingSurface);
+  }
+
+  async function selectCapturedDocument(
+    target: CapturedDocumentTarget,
+    focusWritingSurface = false,
+    fromContextMenu = false
+  ): Promise<void> {
+    if (
+      transition !== 'idle' ||
+      applicationClosePhase !== 'running' ||
+      !capturedDocumentBelongsToSession(target, project)
+    ) return;
     const requestedScope: ProjectRestoreScope = {
-      projectId: project.project_id,
-      sessionId: project.session_id,
+      projectId: target.projectId,
+      sessionId: target.sessionId,
       restoreSerial: workspaceRestoreSerial
     };
     const projectNavigationIsCurrent = () => Boolean(
       applicationClosePhase === 'running' &&
       projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, requestedScope)
+    );
+    const targetWasCurrent = Boolean(
+      document?.summary.document_id === target.documentId &&
+      document.summary.revision_id === target.expectedRevisionId &&
+      document.summary.active_blob_id === target.expectedBlobId
     );
     if (compositionActive) {
       announce('Finish composing text before changing documents');
@@ -3352,7 +3754,7 @@
       return;
     }
     if (!projectNavigationIsCurrent()) return;
-    if (!(await flushCurrentDocument())) {
+    if (!targetWasCurrent && !(await flushCurrentDocument())) {
       if (
         requestSerial === navigationSerial &&
         projectNavigationIsCurrent()
@@ -3375,8 +3777,13 @@
     };
     clearFailure();
     try {
-      if (summary.externally_modified) {
-        const preview = await requestReconciliationPreview(summary, null, source);
+      if (target.externallyModified) {
+        const preview = await requestReconciliationPreview({
+          document_id: target.documentId,
+          kind: target.kind,
+          revision_id: target.expectedRevisionId,
+          active_blob_id: target.expectedBlobId
+        }, null, source);
         if (
           applicationClosePhase !== 'running' ||
           requestSerial !== navigationSerial ||
@@ -3408,8 +3815,9 @@
       const opened = await openDocument(
         source.projectId,
         source.sessionId,
-        summary.document_id,
-        summary.relative_path
+        target.documentId,
+        target.expectedRevisionId,
+        target.expectedBlobId
       );
       if (
         applicationClosePhase !== 'running' ||
@@ -3423,10 +3831,14 @@
           source
         )
       ) return;
-      if (opened.summary.document_id !== summary.document_id) {
+      if (
+        opened.summary.document_id !== target.documentId ||
+        opened.summary.revision_id !== target.expectedRevisionId ||
+        opened.summary.active_blob_id !== target.expectedBlobId
+      ) {
         throw new Error('The desktop returned a different document identity.');
       }
-      if (summary.active_blob_id && opened.visible_blob_id !== summary.active_blob_id) {
+      if (opened.visible_blob_id !== target.expectedBlobId) {
         throw new Error('The desktop returned document bytes from a different active revision.');
       }
       documentEpoch += 1;
@@ -3466,13 +3878,13 @@
         saveState = 'dirty';
         saveMessage = 'Recovered an unsaved local draft';
         scheduleSave();
-        announce(`Recovered a local draft for ${summary.title}`);
+        announce(`Recovered a local draft for ${target.title}`);
       } else {
         saveState = 'clean';
         saveMessage = 'All changes saved';
-        announce(`Opened ${summary.title}`);
+        announce(`Opened ${target.title}`);
       }
-      mode = summary.kind === 'prose' && canUseVisualMarkdown(effectiveText, false)
+      mode = opened.summary.kind === 'prose' && canUseVisualMarkdown(effectiveText, false)
         ? preferredProseMode
         : 'source';
       void refreshBranchesFor(
@@ -3486,7 +3898,56 @@
         applicationClosePhase !== 'running' ||
         !projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source)
       ) return;
-      recordFailure(error);
+      let reportedError = error;
+      if (normalizeFailure(error).code === 'external_file_change') {
+        try {
+          const refreshed = await currentProjectSession();
+          if (
+            refreshed.project_id === target.projectId &&
+            refreshed.session_id === target.sessionId &&
+            requestSerial === navigationSerial &&
+            navigationScopeIsCurrent(
+              project,
+              document,
+              documentEpoch,
+              editVersion,
+              workspaceRestoreSerial,
+              source
+            )
+          ) {
+            const changedTarget = refreshed.documents.find(
+              (candidate) => candidate.document_id === target.documentId
+            );
+            if (
+              changedTarget?.externally_modified &&
+              changedTarget.revision_id === target.expectedRevisionId &&
+              changedTarget.active_blob_id === target.expectedBlobId
+            ) {
+              project = refreshed;
+              const preview = await requestReconciliationPreview(changedTarget, null, source);
+              if (
+                requestSerial === navigationSerial &&
+                navigationScopeIsCurrent(
+                  project,
+                  document,
+                  documentEpoch,
+                  editVersion,
+                  workspaceRestoreSerial,
+                  source
+                )
+              ) {
+                documentEpoch += 1;
+                activateReconciliation(preview);
+                return;
+              }
+            }
+          }
+        } catch (reconciliationError) {
+          reportedError = reconciliationError;
+        }
+      }
+      if (fromContextMenu) recordDocumentContextFailure(target, reportedError);
+      else recordFailure(reportedError);
       if (navigationScopeIsCurrent(
         project,
         document,
@@ -3505,13 +3966,13 @@
       ) {
         transition = 'idle';
         wakePreferredWriterEnsure();
-        if (focusWritingSurface && document?.summary.document_id === summary.document_id) {
+        if (focusWritingSurface && document?.summary.document_id === target.documentId) {
           await tick();
           if (
             applicationClosePhase === 'running' &&
             requestSerial === navigationSerial &&
             projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) &&
-            document?.summary.document_id === summary.document_id
+            document?.summary.document_id === target.documentId
           ) focusCurrentWritingSurfaceAtEnd();
         }
       }
@@ -4249,7 +4710,6 @@
         try {
           const preview = await requestReconciliationPreview({
             document_id: captured.documentId,
-            relative_path: captured.relativePath,
             kind: captured.kind,
             revision_id: captured.revisionId,
             active_blob_id: captured.visibleBlobId
@@ -4632,6 +5092,11 @@
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Escape' && documentContextTarget) {
+      event.preventDefault();
+      closeDocumentContextMenu();
+      return;
+    }
     if (event.key === 'Escape' && modelManagerOpen) {
       event.preventDefault();
       closeModelManager();
@@ -4672,6 +5137,11 @@
   }
 
   function handleGlobalPointerdown(event: PointerEvent): void {
+    if (
+      documentContextTarget &&
+      event.target instanceof Node &&
+      !documentContextMenu?.contains(event.target)
+    ) closeDocumentContextMenu(false);
     if (
       projectMenu?.open &&
       event.target instanceof Node &&
@@ -5267,7 +5737,8 @@
       captured.projectId,
       captured.sessionId,
       captured.documentId,
-      captured.relativePath
+      target.revision_id,
+      target.active_blob_id
     );
     if (
       opened.summary.document_id !== captured.documentId ||
@@ -5639,6 +6110,8 @@
 
   async function closeProject(): Promise<ProjectCloseOutcome> {
     if (closeInFlight) return closeInFlight;
+    clearDocumentContextLongPress();
+    closeDocumentContextMenu(false);
     const operation = performCloseProject();
     closeInFlight = operation;
     try {
@@ -5856,6 +6329,7 @@
     resetLiveGenerationView();
     saveState = 'clean';
     saveMessage = 'No project open';
+    closeDocumentContextMenu(false);
     outlineOpen = false;
     suggestionsEnabled = false;
     shuttleEnabled = false;
@@ -6058,7 +6532,15 @@
               class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}
               type="button"
               disabled={editorReadonly}
-              on:click={() => void selectDocument(candidate, true)}
+              aria-haspopup="menu"
+              aria-expanded={documentContextTarget?.documentId === candidate.document_id}
+              on:click={(event) => handleDocumentRowClick(event, candidate)}
+              on:contextmenu={(event) => handleDocumentContextPointer(event, candidate)}
+              on:keydown={(event) => handleDocumentContextKey(event, candidate)}
+              on:pointerdown={(event) => beginDocumentContextLongPress(event, candidate)}
+              on:pointermove={updateDocumentContextLongPress}
+              on:pointerup={finishDocumentContextLongPress}
+              on:pointercancel={finishDocumentContextLongPress}
             >
               <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
               <span class="document-label">
@@ -6070,6 +6552,45 @@
             <p class="empty-copy">No notes.</p>
           {/each}
         </nav>
+        {#if documentContextTarget}
+          <div
+            bind:this={documentContextMenu}
+            class="document-context-menu"
+            role="menu"
+            tabindex="-1"
+            aria-label={`Actions for ${documentContextTarget.title}`}
+            style={`left: ${documentContextPoint.x}px; top: ${documentContextPoint.y}px;`}
+            on:keydown={handleDocumentContextMenuKeydown}
+            on:contextmenu|preventDefault={() => {}}
+          >
+            <button
+              type="button"
+              role="menuitem"
+              tabindex={documentContextFocusIndex === 0 ? 0 : -1}
+              disabled={editorReadonly || fileCommandInFlight || documentContextActionInFlight}
+              on:focus={() => documentContextFocusIndex = 0}
+              on:click={() => void runDocumentContextAction('open')}
+            >Open</button>
+            <button
+              type="button"
+              role="menuitem"
+              tabindex={documentContextFocusIndex === 1 ? 0 : -1}
+              disabled={fileCommandInFlight || documentContextActionInFlight}
+              on:focus={() => documentContextFocusIndex = 1}
+              on:click={() => void runDocumentContextAction('export_text')}
+            >Export Text…</button>
+            {#if documentContextRevealLabel}
+              <button
+                type="button"
+                role="menuitem"
+                tabindex={documentContextFocusIndex === 2 ? 0 : -1}
+                disabled={fileCommandInFlight || documentContextActionInFlight}
+                on:focus={() => documentContextFocusIndex = 2}
+                on:click={() => void runDocumentContextAction('reveal')}
+              >{documentContextRevealLabel}</button>
+            {/if}
+          </div>
+        {/if}
       </aside>
 
       <main id="manuscript" class="manuscript-area" tabindex="-1">

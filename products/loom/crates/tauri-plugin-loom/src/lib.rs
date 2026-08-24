@@ -33,9 +33,9 @@ use loom_host::{
 use loom_store::{
     BranchPageCursor, DocumentReconciliationSnapshot, ExternalReconciliationOutcome,
     ExternalReconciliationRequest, IdempotentSaveOutcome, LoadedDocument, MAX_BRANCH_BODY_BYTES,
-    ProjectStore, StoredBranchBody, StoredBranchPage, StoredBranchRecord, StoredBranchStatus,
-    StoredBranchSummary, TerminalCandidateInput, TerminalEvidenceInput, TerminalGenerationInput,
-    TransientDraft, VisibleProjectionState,
+    MAX_DOCUMENT_BYTES, ProjectStore, StoredBranchBody, StoredBranchPage, StoredBranchRecord,
+    StoredBranchStatus, StoredBranchSummary, TerminalCandidateInput, TerminalEvidenceInput,
+    TerminalGenerationInput, TransientDraft, VisibleProjectionState,
 };
 use loom_types::{
     AuthorityPolicy, BlobId, BranchId, BuildModelPolicy, BuildModelPolicyIdentity,
@@ -1758,6 +1758,8 @@ impl Builder {
         self
     }
 
+    // Keep the renderer authority surface as one explicit, auditable registry.
+    #[allow(clippy::too_many_lines)]
     pub fn build<R: Runtime>(self) -> TauriPlugin<R> {
         let build_model_policy = self.build_model_policy;
         let app_local_data_root = self.app_local_data_root;
@@ -1774,6 +1776,7 @@ impl Builder {
                 document_open,
                 document_checkpoint,
                 document_export_choose,
+                document_reveal,
                 document_draft_upsert,
                 document_draft_clear,
                 document_reconciliation_preview,
@@ -3012,17 +3015,18 @@ async fn document_open(
     project_id: String,
     session_id: String,
     document_id: String,
-    relative_path: String,
+    expected_revision_id: String,
+    expected_blob_id: String,
     state: State<'_, PluginState>,
 ) -> Result<OpenDocument, IpcFailure> {
+    let _application_admission = lock_application_admission(&state, "a document open")?;
+    let identity =
+        parse_document_action_identity(&document_id, &expected_revision_id, &expected_blob_id)?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    let document = store
-        .read_document(&relative_path)
-        .map_err(IpcFailure::store)?;
-    ensure_document_id(&document, &document_id)?;
+    let document = resolve_document_action(store, identity)?;
     let mut draft = store
-        .load_transient_draft(&relative_path)
+        .load_transient_draft(&document.relative_path)
         .map_err(IpcFailure::store)?;
     if let Some(existing) = &draft
         && existing.document_id == document.document_id
@@ -3030,7 +3034,7 @@ async fn document_open(
         && existing.blob_id == document.blob_id
     {
         store
-            .clear_transient_draft(&relative_path, existing.version)
+            .clear_transient_draft(&document.relative_path, existing.version)
             .map_err(IpcFailure::store)?;
         draft = None;
     }
@@ -3043,21 +3047,23 @@ async fn document_export_choose<R: Runtime>(
     project_id: String,
     session_id: String,
     document_id: String,
-    relative_path: String,
+    expected_revision_id: String,
+    expected_blob_id: String,
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<Option<Receipt>, IpcFailure> {
-    let suggested_name = Path::new(&relative_path)
+    let identity =
+        parse_document_action_identity(&document_id, &expected_revision_id, &expected_blob_id)?;
+    let reservation = reserve_document_export(&state, project_id, session_id, identity)?;
+    let suggested_name = Path::new(reservation.suggested_relative_path())
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("Loom-export.md")
         .to_owned();
-    let reservation =
-        reserve_document_export(&state, project_id, session_id, document_id, relative_path)?;
     let Some(destination) = app
         .dialog()
         .file()
-        .set_title("Export a copy")
+        .set_title("Export Text")
         .set_file_name(&suggested_name)
         .add_filter("Markdown or plain text", &["md", "markdown", "txt"])
         .blocking_save_file()
@@ -3075,12 +3081,288 @@ async fn document_export_choose<R: Runtime>(
     reservation.export(&destination).map(Some)
 }
 
+#[tauri::command]
+async fn document_reveal(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    expected_revision_id: String,
+    expected_blob_id: String,
+    state: State<'_, PluginState>,
+) -> Result<(), IpcFailure> {
+    let _application_admission = lock_application_admission(&state, "a document reveal")?;
+    let identity =
+        parse_document_action_identity(&document_id, &expected_revision_id, &expected_blob_id)?;
+    let path = {
+        let mut session = lock_session(&state)?;
+        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        let document = resolve_document_action(store, identity)?;
+        validated_document_reveal_path(store.root(), &document)?
+    };
+    tauri_plugin_opener::reveal_item_in_dir(&path).map_err(|error| match error {
+        tauri_plugin_opener::Error::UnsupportedPlatform => IpcFailure::new(
+            "document_reveal_unsupported",
+            "revealing a document is not available on this platform",
+            false,
+        ),
+        tauri_plugin_opener::Error::Io(error) => IpcFailure::new(
+            "document_reveal_path_changed",
+            format!("the validated document path changed before reveal: {error}"),
+            false,
+        ),
+        other => IpcFailure::new(
+            "document_reveal_failed",
+            format!("the operating system could not reveal the validated document: {other}"),
+            true,
+        ),
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DocumentActionIdentity {
+    document: DocumentId,
+    revision: RevisionId,
+    blob: BlobId,
+}
+
+fn parse_document_action_identity(
+    document_id: &str,
+    expected_revision_id: &str,
+    expected_blob_id: &str,
+) -> Result<DocumentActionIdentity, IpcFailure> {
+    let document_id = document_id.parse::<DocumentId>().map_err(|_| {
+        IpcFailure::new(
+            "invalid_document_id",
+            "the captured document ID is invalid",
+            false,
+        )
+    })?;
+    let expected_revision_id = expected_revision_id.parse::<RevisionId>().map_err(|_| {
+        IpcFailure::new(
+            "invalid_revision_id",
+            "the captured document revision ID is invalid",
+            false,
+        )
+    })?;
+    let expected_blob_id = expected_blob_id.parse::<BlobId>().map_err(|_| {
+        IpcFailure::new(
+            "invalid_blob_id",
+            "the captured document blob ID is invalid",
+            false,
+        )
+    })?;
+    Ok(DocumentActionIdentity {
+        document: document_id,
+        revision: expected_revision_id,
+        blob: expected_blob_id,
+    })
+}
+
+fn resolve_document_action(
+    store: &ProjectStore,
+    identity: DocumentActionIdentity,
+) -> Result<LoadedDocument, IpcFailure> {
+    let relative_path = registered_document_action_path(store, identity)?;
+    let loaded = store
+        .read_document(&relative_path)
+        .map_err(IpcFailure::store)?;
+    if loaded.document_id != identity.document
+        || loaded.revision_id != identity.revision
+        || loaded.blob_id != identity.blob
+    {
+        return Err(stale_document_action_failure());
+    }
+    Ok(loaded)
+}
+
+fn registered_document_action_path(
+    store: &ProjectStore,
+    identity: DocumentActionIdentity,
+) -> Result<String, IpcFailure> {
+    let registered = store
+        .registered_document(identity.document)
+        .map_err(IpcFailure::store)?
+        .ok_or_else(|| {
+            IpcFailure::new(
+                "document_not_found",
+                "the captured document is not registered in this project",
+                false,
+            )
+        })?;
+    if registered.active_revision_id != Some(identity.revision) {
+        return Err(stale_document_action_failure());
+    }
+    Ok(registered.relative_path)
+}
+
+fn stale_document_action_failure() -> IpcFailure {
+    IpcFailure::new(
+        "stale_document_action",
+        "the captured document revision is no longer the active store identity",
+        false,
+    )
+}
+
+fn validated_document_reveal_path(
+    project_root: &Path,
+    document: &LoadedDocument,
+) -> Result<PathBuf, IpcFailure> {
+    let canonical_root = project_root.canonicalize().map_err(|error| {
+        IpcFailure::new(
+            "document_reveal_path_unavailable",
+            format!("the project root could not be resolved for reveal: {error}"),
+            true,
+        )
+    })?;
+    let candidate = project_root.join(&document.relative_path);
+    let metadata = candidate.symlink_metadata().map_err(|error| {
+        IpcFailure::new(
+            "document_reveal_path_unavailable",
+            format!("the document path could not be inspected for reveal: {error}"),
+            true,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(IpcFailure::new(
+            "document_reveal_path_refused",
+            "the registered document path is not a regular non-symbolic file",
+            false,
+        ));
+    }
+    let canonical_path = candidate.canonicalize().map_err(|error| {
+        IpcFailure::new(
+            "document_reveal_path_unavailable",
+            format!("the document path could not be resolved for reveal: {error}"),
+            true,
+        )
+    })?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(IpcFailure::new(
+            "document_reveal_path_refused",
+            "the registered document resolved outside its project root",
+            false,
+        ));
+    }
+    verify_reveal_file_identity(&canonical_path, document.blob_id)?;
+    Ok(canonical_path)
+}
+
+fn verify_reveal_file_identity(path: &Path, expected_blob_id: BlobId) -> Result<(), IpcFailure> {
+    let mut file = File::open(path).map_err(|error| {
+        IpcFailure::new(
+            "document_reveal_path_unavailable",
+            format!("the document could not be opened for reveal validation: {error}"),
+            true,
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        IpcFailure::new(
+            "document_reveal_path_unavailable",
+            format!("the document metadata could not be read for reveal: {error}"),
+            true,
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() > MAX_DOCUMENT_BYTES {
+        return Err(IpcFailure::new(
+            "document_reveal_path_refused",
+            "the document reveal target is not a bounded regular file",
+            false,
+        ));
+    }
+    let opened_identity = FileIdentityHandle::from_file(file.try_clone().map_err(|error| {
+        IpcFailure::new(
+            "document_reveal_path_unavailable",
+            format!("the document identity could not be retained for reveal: {error}"),
+            true,
+        )
+    })?)
+    .map_err(|error| {
+        IpcFailure::new(
+            "document_reveal_path_unavailable",
+            format!("the open document identity could not be inspected: {error}"),
+            true,
+        )
+    })?;
+    let path_identity = FileIdentityHandle::from_path(path).map_err(|error| {
+        IpcFailure::new(
+            "document_reveal_path_unavailable",
+            format!("the resolved document identity could not be inspected: {error}"),
+            true,
+        )
+    })?;
+    if opened_identity != path_identity {
+        return Err(IpcFailure::new(
+            "document_reveal_path_changed",
+            "the document path changed while Loom prepared the reveal",
+            false,
+        ));
+    }
+
+    if hash_bounded_reveal_file(&mut file)? != expected_blob_id {
+        return Err(IpcFailure::new(
+            "external_file_change",
+            "the visible document bytes changed before reveal",
+            false,
+        ));
+    }
+    let final_path_identity = FileIdentityHandle::from_path(path).map_err(|error| {
+        IpcFailure::new(
+            "document_reveal_path_unavailable",
+            format!("the document identity could not be rechecked for reveal: {error}"),
+            true,
+        )
+    })?;
+    if opened_identity != final_path_identity {
+        return Err(IpcFailure::new(
+            "document_reveal_path_changed",
+            "the document path changed while Loom verified its bytes",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn hash_bounded_reveal_file(file: &mut File) -> Result<BlobId, IpcFailure> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            IpcFailure::new(
+                "document_reveal_path_unavailable",
+                format!("the document could not be verified for reveal: {error}"),
+                true,
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        let read_bytes = u64::try_from(read).map_err(|_| {
+            IpcFailure::new(
+                "document_reveal_path_refused",
+                "the document read size exceeded Loom's addressable reveal limit",
+                false,
+            )
+        })?;
+        total = total.saturating_add(read_bytes);
+        if total > MAX_DOCUMENT_BYTES {
+            return Err(IpcFailure::new(
+                "document_reveal_path_refused",
+                "the document grew beyond Loom's bounded reveal limit",
+                false,
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(BlobId::from_bytes(hasher.finalize().into()))
+}
+
 struct DocumentExportReservation<'a> {
     state: &'a PluginState,
     project_id: String,
     session_id: String,
-    document_id: String,
-    relative_path: String,
+    identity: DocumentActionIdentity,
+    suggested_relative_path: String,
     _application_admission: MutexGuard<'a, ApplicationPhase>,
 }
 
@@ -3088,42 +3370,44 @@ fn reserve_document_export(
     state: &PluginState,
     project_id: String,
     session_id: String,
-    document_id: String,
-    relative_path: String,
+    identity: DocumentActionIdentity,
 ) -> Result<DocumentExportReservation<'_>, IpcFailure> {
     let application_admission = lock_application_admission(state, "a document export")?;
-    {
+    let suggested_relative_path = {
         let mut session = lock_session_internal(state)?;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;
-        ensure_registered_document(store, &relative_path, &document_id)?;
-    }
+        resolve_document_action(store, identity)?.relative_path
+    };
     Ok(DocumentExportReservation {
         state,
         project_id,
         session_id,
-        document_id,
-        relative_path,
+        identity,
+        suggested_relative_path,
         _application_admission: application_admission,
     })
 }
 
 impl DocumentExportReservation<'_> {
+    fn suggested_relative_path(&self) -> &str {
+        &self.suggested_relative_path
+    }
+
     fn export(self, destination: &Path) -> Result<Receipt, IpcFailure> {
         let mut session = lock_session_internal(self.state)?;
         let store = require_bound_store(&mut session, &self.project_id, &self.session_id)?;
-        export_registered_document(store, &self.document_id, &self.relative_path, destination)
+        export_registered_document(store, self.identity, destination)
     }
 }
 
 fn export_registered_document(
     store: &mut ProjectStore,
-    document_id: &str,
-    relative_path: &str,
+    identity: DocumentActionIdentity,
     destination: &Path,
 ) -> Result<Receipt, IpcFailure> {
-    ensure_registered_document(store, relative_path, document_id)?;
+    let document = resolve_document_action(store, identity)?;
     store
-        .export_document(relative_path, destination)
+        .export_document(&document.relative_path, destination)
         .map(Receipt::from)
         .map_err(IpcFailure::store)
 }
@@ -3387,28 +3671,21 @@ async fn document_reconciliation_preview(
     project_id: String,
     session_id: String,
     document_id: String,
-    relative_path: String,
     expected_revision_id: String,
     expected_base_blob_id: String,
     app_text: Option<String>,
     state: State<'_, PluginState>,
 ) -> Result<ReconciliationPreview, IpcFailure> {
-    let expected_revision_id = expected_revision_id.parse::<RevisionId>().map_err(|_| {
-        IpcFailure::new(
-            "invalid_revision_id",
-            "reconciliation source revision ID is invalid",
-            false,
-        )
-    })?;
-    let expected_base_blob_id = expected_base_blob_id.parse::<BlobId>().map_err(|_| {
-        IpcFailure::new(
-            "invalid_blob_id",
-            "reconciliation base-blob ID is invalid",
-            false,
-        )
-    })?;
+    let _application_admission =
+        lock_application_admission(&state, "a document reconciliation preview")?;
+    let identity = parse_document_action_identity(
+        &document_id,
+        &expected_revision_id,
+        &expected_base_blob_id,
+    )?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    let relative_path = registered_document_action_path(store, identity)?;
     reconciliation_preview_for_store(
         store,
         PreviewRequest {
@@ -3416,8 +3693,8 @@ async fn document_reconciliation_preview(
             session_id,
             document_id,
             relative_path,
-            expected_revision_id,
-            expected_base_blob_id,
+            expected_revision_id: identity.revision,
+            expected_base_blob_id: identity.blob,
             app_text,
         },
     )
@@ -9755,15 +10032,15 @@ mod tests {
             )
             .expect("initial document");
         let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let identity = DocumentActionIdentity {
+            document: document.document_id,
+            revision: document.revision_id,
+            blob: document.blob_id,
+        };
         let destination = temporary.path().join("copy.md");
 
-        let receipt = export_registered_document(
-            &mut store,
-            &document.document_id.to_string(),
-            INITIAL_DOCUMENT,
-            &destination,
-        )
-        .expect("export copy");
+        let receipt =
+            export_registered_document(&mut store, identity, &destination).expect("export copy");
         assert_eq!(receipt.command_kind, "export");
         assert_eq!(
             std::fs::read_to_string(&destination).expect("exported bytes"),
@@ -9773,25 +10050,216 @@ mod tests {
         let wrong_destination = temporary.path().join("wrong.md");
         let wrong_identity = export_registered_document(
             &mut store,
-            &DocumentId::new().to_string(),
-            INITIAL_DOCUMENT,
+            DocumentActionIdentity {
+                document: DocumentId::new(),
+                ..identity
+            },
             &wrong_destination,
         )
         .expect_err("foreign document identity");
-        assert_eq!(wrong_identity.code, "document_identity_mismatch");
+        assert_eq!(wrong_identity.code, "document_not_found");
         assert!(!wrong_destination.exists());
+
+        let stale_revision_destination = temporary.path().join("stale-revision.md");
+        let stale_revision = export_registered_document(
+            &mut store,
+            DocumentActionIdentity {
+                revision: RevisionId::new(),
+                ..identity
+            },
+            &stale_revision_destination,
+        )
+        .expect_err("stale captured revision");
+        assert_eq!(stale_revision.code, "stale_document_action");
+        assert!(!stale_revision_destination.exists());
+
+        let stale_blob_destination = temporary.path().join("stale-blob.md");
+        let stale_blob = export_registered_document(
+            &mut store,
+            DocumentActionIdentity {
+                blob: BlobId::digest(b"other bytes"),
+                ..identity
+            },
+            &stale_blob_destination,
+        )
+        .expect_err("stale captured blob");
+        assert_eq!(stale_blob.code, "stale_document_action");
+        assert!(!stale_blob_destination.exists());
 
         std::fs::write(root.join(INITIAL_DOCUMENT), "external edit\n").expect("external edit");
         let stale_destination = temporary.path().join("stale.md");
-        let stale = export_registered_document(
-            &mut store,
-            &document.document_id.to_string(),
-            INITIAL_DOCUMENT,
-            &stale_destination,
-        )
-        .expect_err("uncheckpointed visible bytes");
+        let stale = export_registered_document(&mut store, identity, &stale_destination)
+            .expect_err("uncheckpointed visible bytes");
         assert_eq!(stale.code, "external_file_change");
         assert!(!stale_destination.exists());
+    }
+
+    #[test]
+    fn document_action_resolves_only_the_explicit_captured_document_id() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                "manuscript/first.md",
+                DocumentContent::Prose("first document\n".to_owned()),
+                "first",
+            )
+            .expect("first document");
+        store
+            .create_document_if_absent(
+                "manuscript/second.md",
+                DocumentContent::Prose("second document\n".to_owned()),
+                "second",
+            )
+            .expect("second document");
+        let captured = store
+            .read_document("manuscript/first.md")
+            .expect("captured first document");
+        let other = store
+            .read_document("manuscript/second.md")
+            .expect("other document");
+        assert_ne!(captured.document_id, other.document_id);
+        let resolved = resolve_document_action(
+            &store,
+            DocumentActionIdentity {
+                document: captured.document_id,
+                revision: captured.revision_id,
+                blob: captured.blob_id,
+            },
+        )
+        .expect("resolve captured document");
+
+        assert_eq!(resolved.document_id, captured.document_id);
+        assert_eq!(resolved.relative_path, "manuscript/first.md");
+        assert_eq!(resolved.text, "first document\n");
+    }
+
+    #[test]
+    fn reveal_path_is_store_derived_contained_and_bound_to_external_bytes() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("exact manuscript\n".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let path =
+            validated_document_reveal_path(store.root(), &document).expect("validated reveal path");
+        assert_eq!(
+            path,
+            root.join(INITIAL_DOCUMENT)
+                .canonicalize()
+                .expect("canonical document")
+        );
+
+        let outside = temporary.path().join("outside.md");
+        std::fs::write(&outside, "exact manuscript\n").expect("outside file");
+        let mut escaped = document.clone();
+        escaped.relative_path = "../outside.md".to_owned();
+        let escaped_error =
+            validated_document_reveal_path(store.root(), &escaped).expect_err("path escape");
+        assert_eq!(escaped_error.code, "document_reveal_path_refused");
+
+        std::fs::write(root.join(INITIAL_DOCUMENT), "external edit\n").expect("external edit");
+        let reveal_external_error = validated_document_reveal_path(store.root(), &document)
+            .expect_err("external reveal bytes");
+        assert_eq!(reveal_external_error.code, "external_file_change");
+        let external_error = resolve_document_action(
+            &store,
+            DocumentActionIdentity {
+                document: document.document_id,
+                revision: document.revision_id,
+                blob: document.blob_id,
+            },
+        )
+        .expect_err("external bytes");
+        assert_eq!(external_error.code, "external_file_change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reveal_path_refuses_a_symbolic_document_target() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("exact manuscript\n".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let outside = temporary.path().join("outside.md");
+        std::fs::write(&outside, "exact manuscript\n").expect("outside file");
+        let link = root.join("manuscript/link.md");
+        symlink(&outside, &link).expect("symbolic document");
+        let mut symbolic = document;
+        symbolic.relative_path = "manuscript/link.md".to_owned();
+
+        let error = validated_document_reveal_path(store.root(), &symbolic)
+            .expect_err("symbolic reveal target");
+        assert_eq!(error.code, "document_reveal_path_refused");
+    }
+
+    #[test]
+    fn export_dialog_reservation_revalidates_the_captured_identity_before_writing() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("captured manuscript\n".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let identity = DocumentActionIdentity {
+            document: document.document_id,
+            revision: document.revision_id,
+            blob: document.blob_id,
+        };
+        let project_id = store.manifest().project_id.to_string();
+        let session_id = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+        let reservation =
+            reserve_document_export(&state, project_id, session_id.to_string(), identity)
+                .expect("reserve export dialog");
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session
+                .store
+                .as_mut()
+                .expect("bound store")
+                .save_document(
+                    INITIAL_DOCUMENT,
+                    DocumentContent::Prose("new active manuscript\n".to_owned()),
+                    "edit while export dialog is open",
+                )
+                .expect("new active revision");
+        }
+        let destination = temporary.path().join("stale-export.md");
+
+        let error = reservation
+            .export(&destination)
+            .expect_err("captured revision changed while dialog was open");
+
+        assert_eq!(error.code, "stale_document_action");
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -9806,11 +10274,12 @@ mod tests {
                 "initial manuscript",
             )
             .expect("initial document");
-        let document_id = store
-            .read_document(INITIAL_DOCUMENT)
-            .expect("document")
-            .document_id
-            .to_string();
+        let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let identity = DocumentActionIdentity {
+            document: document.document_id,
+            revision: document.revision_id,
+            blob: document.blob_id,
+        };
         let project_id = store.manifest().project_id.to_string();
         let session_id = CommandId::new();
         let state = Arc::new(PluginState::default());
@@ -9820,14 +10289,9 @@ mod tests {
             session.store = Some(store);
             session.active_session_id = Some(session_id);
         }
-        let reservation = reserve_document_export(
-            &state,
-            project_id,
-            session_id.to_string(),
-            document_id,
-            INITIAL_DOCUMENT.to_owned(),
-        )
-        .expect("reserve export dialog");
+        let reservation =
+            reserve_document_export(&state, project_id, session_id.to_string(), identity)
+                .expect("reserve export dialog");
         assert!(!record_application_exit_request(&state));
 
         let (sent, received) = std::sync::mpsc::channel();

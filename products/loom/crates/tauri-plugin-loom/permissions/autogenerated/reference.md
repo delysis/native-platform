@@ -14,6 +14,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-document-open`
 - `allow-document-checkpoint`
 - `allow-document-export-choose`
+- `allow-document-reveal`
 - `allow-document-draft-upsert`
 - `allow-document-draft-clear`
 - `allow-document-reconciliation-preview`
@@ -544,6 +545,32 @@ Enables the document_reconciliation_preview command without any pre-configured s
 <td>
 
 Denies the document_reconciliation_preview command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-reveal`
+
+</td>
+<td>
+
+Enables the document_reveal command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-reveal`
+
+</td>
+<td>
+
+Denies the document_reveal command without any pre-configured scope.
 
 </td>
 </tr>

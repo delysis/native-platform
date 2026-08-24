@@ -9,6 +9,7 @@ const COMMANDS: &[&str] = &[
     "document_open",
     "document_checkpoint",
     "document_export_choose",
+    "document_reveal",
     "document_draft_upsert",
     "document_draft_clear",
     "document_reconciliation_preview",

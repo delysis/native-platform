@@ -272,4 +272,34 @@ describe('App ghost reactivity wiring', () => {
     expect(source).not.toContain("await setOutlineOpen(false);\n                await selectDocument");
   });
 
+  it('binds an accessible document context menu to one captured immutable target', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const ipc = readFileSync(new URL('./ipc.ts', import.meta.url), 'utf8');
+    const sidebar = source.slice(source.indexOf('<aside'), source.indexOf('</aside>') + '</aside>'.length);
+    const action = source.slice(
+      source.indexOf('async function runDocumentContextAction'),
+      source.indexOf('function suggestionPreferenceKey')
+    );
+    const documentCalls = ipc.slice(
+      ipc.indexOf('export function openDocument'),
+      ipc.indexOf('export function checkpointDocument')
+    );
+
+    expect(sidebar).toContain('aria-haspopup="menu"');
+    expect(sidebar).toContain('on:contextmenu={(event) => handleDocumentContextPointer(event, candidate)}');
+    expect(sidebar).toContain('on:keydown={(event) => handleDocumentContextKey(event, candidate)}');
+    expect(sidebar).toContain('role="menu"');
+    expect(sidebar).toContain('role="menuitem"');
+    expect(sidebar).toContain('>Open</button>');
+    expect(sidebar).toContain('>Export Text…</button>');
+    expect(sidebar).toContain('{documentContextRevealLabel}</button>');
+    expect(action).toContain('const target = documentContextTarget;');
+    expect(action).toContain('closeDocumentContextMenu(false);');
+    expect(action.indexOf('closeDocumentContextMenu(false);'))
+      .toBeLessThan(action.indexOf('await exportDocumentCopy('));
+    expect(documentCalls).toContain('expectedRevisionId');
+    expect(documentCalls).toContain('expectedBlobId');
+    expect(documentCalls).not.toContain('relativePath');
+  });
+
 });

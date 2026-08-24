@@ -135,18 +135,48 @@ export function openDocument(
   projectId: string,
   sessionId: string,
   documentId: string,
-  relativePath: string
+  expectedRevisionId: string,
+  expectedBlobId: string
 ): Promise<OpenDocument> {
-  return call('document_open', { projectId, sessionId, documentId, relativePath });
+  return call('document_open', {
+    projectId,
+    sessionId,
+    documentId,
+    expectedRevisionId,
+    expectedBlobId
+  });
 }
 
 export function exportDocumentCopy(
   projectId: string,
   sessionId: string,
   documentId: string,
-  relativePath: string
+  expectedRevisionId: string,
+  expectedBlobId: string
 ): Promise<CommandReceipt | null> {
-  return call('document_export_choose', { projectId, sessionId, documentId, relativePath });
+  return call('document_export_choose', {
+    projectId,
+    sessionId,
+    documentId,
+    expectedRevisionId,
+    expectedBlobId
+  });
+}
+
+export function revealDocument(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  expectedRevisionId: string,
+  expectedBlobId: string
+): Promise<void> {
+  return call('document_reveal', {
+    projectId,
+    sessionId,
+    documentId,
+    expectedRevisionId,
+    expectedBlobId
+  });
 }
 
 export function checkpointDocument(
@@ -217,7 +247,6 @@ export function previewDocumentReconciliation(
   projectId: string,
   sessionId: string,
   documentId: string,
-  relativePath: string,
   expectedRevisionId: string,
   expectedBaseBlobId: string,
   appText: string | null
@@ -226,7 +255,6 @@ export function previewDocumentReconciliation(
     projectId,
     sessionId,
     documentId,
-    relativePath,
     expectedRevisionId,
     expectedBaseBlobId,
     appText

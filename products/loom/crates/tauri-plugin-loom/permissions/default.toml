@@ -13,6 +13,7 @@ permissions = [
   "allow-document-open",
   "allow-document-checkpoint",
   "allow-document-export-choose",
+  "allow-document-reveal",
   "allow-document-draft-upsert",
   "allow-document-draft-clear",
   "allow-document-reconciliation-preview",

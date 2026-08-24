@@ -985,6 +985,33 @@ impl ProjectStore {
             .is_some())
     }
 
+    /// Resolves one registered document through the primary-key index.
+    ///
+    /// This is the bounded authority lookup for commands that capture a
+    /// document ID and must derive its current path and revision natively.
+    pub fn registered_document(&self, document_id: DocumentId) -> Result<Option<DocumentSummary>> {
+        let row: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT relative_path, document_kind FROM documents WHERE document_id = ?1",
+                [document_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((relative_path, kind)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(DocumentSummary {
+            document_id,
+            relative_path,
+            kind: DocumentKind::from_str(&kind)
+                .map_err(|error| StoreError::CorruptDatabase(error.to_string()))?,
+            active_revision_id: self
+                .active_revision(document_id)?
+                .map(|active| active.revision_id),
+        }))
+    }
+
     pub fn list_documents(&self) -> Result<Vec<DocumentSummary>> {
         let mut statement = self.connection.prepare(
             "SELECT d.document_id, d.relative_path, d.document_kind,
@@ -2122,10 +2149,10 @@ mod tests {
                 "register exact document",
             )
             .expect("create indexed document");
-        let registered = store
+        let loaded = store
             .read_document("manuscript/001.md")
-            .expect("read registered document")
-            .document_id;
+            .expect("read registered document");
+        let registered = loaded.document_id;
         let foreign = DocumentId::new();
 
         assert!(
@@ -2137,6 +2164,24 @@ mod tests {
             !store
                 .document_is_registered(foreign)
                 .expect("probe foreign document")
+        );
+        assert_eq!(
+            store
+                .registered_document(registered)
+                .expect("resolve registered document")
+                .expect("registered document"),
+            DocumentSummary {
+                document_id: registered,
+                relative_path: "manuscript/001.md".to_owned(),
+                kind: DocumentKind::Prose,
+                active_revision_id: Some(loaded.revision_id),
+            }
+        );
+        assert_eq!(
+            store
+                .registered_document(foreign)
+                .expect("resolve foreign document"),
+            None
         );
 
         drop(store);
@@ -2150,6 +2195,14 @@ mod tests {
             !reopened
                 .document_is_registered(foreign)
                 .expect("probe foreign document after reopen")
+        );
+        assert_eq!(
+            reopened
+                .registered_document(registered)
+                .expect("resolve registered document after reopen")
+                .expect("registered document after reopen")
+                .active_revision_id,
+            Some(loaded.revision_id)
         );
     }
 
