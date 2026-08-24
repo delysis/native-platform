@@ -424,6 +424,19 @@ pub fn resident_model_for_profile(
     resident_model_for_configuration(settings, &config)
 }
 
+/// Resolves the exact profile only when its worker is already resident. This
+/// boundary never loads a model and is used by speculative product work that
+/// must disappear rather than compete for residency.
+pub(crate) fn resident_model_for_profile_if_loaded(
+    settings: &Settings,
+    model_path: &Path,
+    mmproj_path: Option<&Path>,
+) -> Result<Option<NativeModelHandle>, ValidationBlocker> {
+    let config = model_configuration_for_profile(settings, model_path, mmproj_path)?;
+    validate_model_path(&config.model_path)?;
+    with_host(settings, |host| host.resident(&config))
+}
+
 pub(crate) fn resident_model_for_configuration(
     settings: &Settings,
     config: &NativeModelConfig,

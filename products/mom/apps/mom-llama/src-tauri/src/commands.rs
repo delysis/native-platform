@@ -1,7 +1,8 @@
 use llama_native_types::NativeDevice;
 use mom_llama_runtime::{
-    ChatDispatchOutput, ChatSendInput, ChatSendOptions, ConversationExportFormat,
-    EngineCheckOptions, KvCachePolicy, PathSelection, PathSelectionKind, config::SettingsUpdate,
+    ChatDispatchOutput, ChatSendInput, ChatSendOptions, ComposerAutocompleteAnchor,
+    ComposerAutocompleteInput, ConversationExportFormat, EngineCheckOptions, KvCachePolicy,
+    PathSelection, PathSelectionKind, config::SettingsUpdate,
 };
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use rfd::AsyncFileDialog;
@@ -197,6 +198,82 @@ pub async fn mom_llama_chat_send(
         )
     })
     .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn mom_llama_composer_autocomplete(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    draft: String,
+    active_leaf_message_id: Option<String>,
+    execution_profile_version: u64,
+    selection_start_utf16: u32,
+    selection_end_utf16: u32,
+    attachment_ids: Option<Vec<String>>,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_composer_autocomplete"))?;
+    let request_id = lease
+        .native_request_id()
+        .ok_or_else(|| "speculative autocomplete has no native request identity".to_string())?
+        .to_string();
+    let cancellation = lease
+        .cancellation_control()
+        .ok_or_else(|| "speculative autocomplete has no cancellation control".to_string())?;
+    lease
+        .run_blocking(move || {
+            let result = mom_llama_runtime::composer_autocomplete_supervised(
+                ComposerAutocompleteInput {
+                    conversation_id: conversation,
+                    draft,
+                    active_leaf_message_id,
+                    execution_profile_version,
+                    selection_start_utf16,
+                    selection_end_utf16,
+                    attachment_ids: attachment_ids.unwrap_or_default(),
+                },
+                request_id,
+                || cancellation.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .map_err(to_error)?;
+            to_value(result).map_err(to_error)
+        })
+        .await
+}
+
+#[tauri::command]
+pub fn mom_llama_composer_autocomplete_cancel(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_composer_autocomplete_cancel"))?;
+    let result = mom_llama_runtime::CommandResult::passed(
+        "mom_llama.composer_autocomplete_cancel",
+        "host_integrated",
+        mom_llama_runtime::ComposerAutocompleteCancelOutput {
+            cancellation_requested_for: runtime.cancel_speculative()?,
+        },
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    );
+    to_value(result).map_err(to_error)
+}
+
+#[tauri::command]
+pub async fn mom_llama_composer_autocomplete_accept(
+    runtime: State<'_, AppRuntimeHandle>,
+    anchor: ComposerAutocompleteAnchor,
+    suffix: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_composer_autocomplete_accept"))?;
+    lease
+        .run_blocking(move || {
+            let result = mom_llama_runtime::composer_autocomplete_accept(anchor, suffix)
+                .map_err(to_error)?;
+            to_value(result).map_err(to_error)
+        })
+        .await
 }
 
 #[tauri::command]

@@ -81,6 +81,45 @@
       "destructive": "none"
     },
     {
+      "effect_id": "mom_llama.effects.composer_autocomplete.v1",
+      "reads": ["selected_resident_model", "active_conversation_path", "skills", "settings", "encrypted_draft_anchor"],
+      "writes": [],
+      "network": [],
+      "process": [],
+      "secrets": [],
+      "model_calls": ["in_process_llama_cpp"],
+      "persistence": ["encrypted_sqlite_read_only"],
+      "memory": ["resident_model", "single_preemptible_speculative_generation"],
+      "external_apps": [],
+      "destructive": "none"
+    },
+    {
+      "effect_id": "mom_llama.effects.composer_autocomplete_cancel.v1",
+      "reads": ["active_speculative_generation_registry"],
+      "writes": ["speculative_cancellation_flag"],
+      "network": [],
+      "process": [],
+      "secrets": [],
+      "model_calls": [],
+      "persistence": [],
+      "memory": ["active_speculative_generation_registry"],
+      "external_apps": [],
+      "destructive": "reversible"
+    },
+    {
+      "effect_id": "mom_llama.effects.composer_autocomplete_accept.v1",
+      "reads": ["selected_resident_model_identity", "active_conversation_leaf", "execution_profile_version", "encrypted_draft_anchor"],
+      "writes": ["encrypted_draft"],
+      "network": [],
+      "process": [],
+      "secrets": [],
+      "model_calls": [],
+      "persistence": ["encrypted_sqlite"],
+      "memory": ["resident_model_registry_read"],
+      "external_apps": [],
+      "destructive": "reversible"
+    },
+    {
       "effect_id": "mom_llama.effects.chat_cancel.v1",
       "reads": ["active_generation_registry"],
       "writes": ["cancellation_or_reasoning_force_flag", "command_receipt"],

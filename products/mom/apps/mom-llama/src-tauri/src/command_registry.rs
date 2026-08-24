@@ -6,6 +6,12 @@ pub enum CommandClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionClass {
+    Foreground,
+    Speculative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandSpec {
     pub name: &'static str,
     pub class: CommandClass,
@@ -15,6 +21,7 @@ pub struct CommandSpec {
     pub uses_native: bool,
     pub allowed_during_quiesce: bool,
     pub permission: &'static str,
+    pub admission: AdmissionClass,
 }
 
 const fn read(name: &'static str, writes_receipt: bool, uses_native: bool) -> CommandSpec {
@@ -27,6 +34,7 @@ const fn read(name: &'static str, writes_receipt: bool, uses_native: bool) -> Co
         uses_native,
         allowed_during_quiesce: false,
         permission: "default",
+        admission: AdmissionClass::Foreground,
     }
 }
 
@@ -40,6 +48,7 @@ const fn mutation(name: &'static str, mutates_store: bool, uses_native: bool) ->
         uses_native,
         allowed_during_quiesce: false,
         permission: "default",
+        admission: AdmissionClass::Foreground,
     }
 }
 
@@ -53,6 +62,21 @@ const fn long(name: &'static str, mutates_store: bool, uses_native: bool) -> Com
         uses_native,
         allowed_during_quiesce: false,
         permission: "default",
+        admission: AdmissionClass::Foreground,
+    }
+}
+
+const fn speculative(name: &'static str, uses_native: bool) -> CommandSpec {
+    CommandSpec {
+        name,
+        class: CommandClass::LongOperation,
+        mutates_store: false,
+        starts_operation: true,
+        uses_gateway: false,
+        uses_native,
+        allowed_during_quiesce: false,
+        permission: "default",
+        admission: AdmissionClass::Speculative,
     }
 }
 
@@ -67,6 +91,9 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     read("mom_llama_model_list", true, false),
     mutation("mom_llama_model_select", true, true),
     long("mom_llama_chat_send", true, true),
+    speculative("mom_llama_composer_autocomplete", true),
+    mutation("mom_llama_composer_autocomplete_cancel", false, true),
+    long("mom_llama_composer_autocomplete_accept", true, true),
     long("mom_llama_chat_dispatch", true, true),
     long("mom_llama_mention_dispatch", true, true),
     read("mom_llama_mention_candidates", true, false),
@@ -247,6 +274,9 @@ mod tests {
             "mom_llama_engine_configure",
             "mom_llama_model_select",
             "mom_llama_chat_send",
+            "mom_llama_composer_autocomplete",
+            "mom_llama_composer_autocomplete_cancel",
+            "mom_llama_composer_autocomplete_accept",
             "mom_llama_chat_dispatch",
             "mom_llama_mention_dispatch",
             "mom_llama_mention_cancel",
@@ -293,7 +323,8 @@ mod tests {
             {
                 let expected_store_mutation = body.contains("command_value(")
                     || body.contains("blocking_command(")
-                    || body.contains("picker_blocked(");
+                    || body.contains("picker_blocked(")
+                    || body.contains("composer_autocomplete_accept(");
                 assert_eq!(
                     spec.mutates_store, expected_store_mutation,
                     "{} implementation {} store authority",
@@ -375,11 +406,13 @@ pub async fn sample(runtime: Runtime) {
                 );
                 let starts_long_work = body.contains("blocking_command(")
                     || body.contains("blocking_response(")
+                    || body.contains(".run_blocking(")
                     || body.contains("AsyncFileDialog::");
                 if starts_long_work {
                     assert!(
                         body.contains("blocking_command(")
                             || body.contains("blocking_response(")
+                            || body.contains(".run_blocking(")
                             || body.contains("lease.cancellation")
                             || body.contains("lease.cancelled()"),
                         "{} implementation {} must carry an application cancellation control",

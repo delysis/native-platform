@@ -103,6 +103,30 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         label: "Send",
     },
     ControlSpec {
+        affordance: "chat.composer.autocomplete",
+        command: "mom_llama.composer_autocomplete",
+        tauri_command: "mom_llama_composer_autocomplete",
+        cli: "app-only; no standalone CLI because autocomplete never loads a model",
+        effect: "mom_llama.effects.composer_autocomplete.v1",
+        label: "Predict a local continuation",
+    },
+    ControlSpec {
+        affordance: "chat.composer.autocomplete_cancel",
+        command: "mom_llama.composer_autocomplete_cancel",
+        tauri_command: "mom_llama_composer_autocomplete_cancel",
+        cli: "automatic in the Mom composer; no standalone CLI",
+        effect: "mom_llama.effects.composer_autocomplete_cancel.v1",
+        label: "Cancel the transient continuation",
+    },
+    ControlSpec {
+        affordance: "chat.composer.autocomplete_accept",
+        command: "mom_llama.composer_autocomplete_accept",
+        tauri_command: "mom_llama_composer_autocomplete_accept",
+        cli: "automatic on Right Arrow; no standalone CLI",
+        effect: "mom_llama.effects.composer_autocomplete_accept.v1",
+        label: "Accept the exact continuation as one draft edit",
+    },
+    ControlSpec {
         affordance: "mention.candidates",
         command: "mom_llama.mention_candidates",
         tauri_command: "mom_llama_mention_candidates",
@@ -2081,32 +2105,57 @@ fn composer(
                     }
                 }
             }
-            textarea name="message"
-                rows="2"
-                aria-label="Message"
-                role="combobox"
-                aria-autocomplete="list"
-                aria-controls="mention-candidates"
-                aria-haspopup="listbox"
-                aria-expanded="false"
-                placeholder="Type a message..."
-                data-affordance="chat.composer.message"
-                data-command="mom_llama.chat_dispatch"
-                data-tauri-command="mom_llama_chat_dispatch"
-                data-cli="mom-llama chat dispatch --conversation <id> --message <text> --json"
-                data-effect="mom_llama.effects.chat_send.v1"
-                data-draft-affordance="conversation.draft_update"
-                data-draft-command="mom_llama.draft_update"
-                data-draft-tauri-command="mom_llama_draft_update"
-                data-draft-cli="mom-llama conversation draft-update --conversation <id> --message <text> --json"
-                data-draft-effect="mom_llama.effects.conversation_store.v1"
-                data-paste-affordance="attachment.import_paste"
-                data-paste-command="mom_llama.attachment_import_paste"
-                data-paste-tauri-command="mom_llama_attachment_import_paste"
-                data-paste-cli="mom-llama attachment import-paste --conversation <id> --text <text> --json"
-                data-paste-effect="mom_llama.effects.attachment_import_paste.v1" {
-                (draft_message)
+            div class="composer-editor" {
+                div id="composer-ai-ghost" class="composer-ai-ghost" aria-hidden="true" hidden {
+                    span class="composer-ai-anchor" {}
+                    span class="composer-ai-suffix" {}
+                }
+                textarea name="message"
+                    rows="2"
+                    aria-label="Message"
+                    role="combobox"
+                    aria-autocomplete="list"
+                    aria-controls="mention-candidates"
+                    aria-describedby="composer-ai-status"
+                    aria-haspopup="listbox"
+                    aria-expanded="false"
+                    placeholder="Type a message..."
+                    data-affordance="chat.composer.message"
+                    data-command="mom_llama.chat_dispatch"
+                    data-tauri-command="mom_llama_chat_dispatch"
+                    data-cli="mom-llama chat dispatch --conversation <id> --message <text> --json"
+                    data-effect="mom_llama.effects.chat_send.v1"
+                    data-autocomplete-affordance="chat.composer.autocomplete"
+                    data-autocomplete-command="mom_llama.composer_autocomplete"
+                    data-autocomplete-tauri-command="mom_llama_composer_autocomplete"
+                    data-autocomplete-cli="app-only; no standalone CLI because autocomplete never loads a model"
+                    data-autocomplete-effect="mom_llama.effects.composer_autocomplete.v1"
+                    data-autocomplete-cancel-affordance="chat.composer.autocomplete_cancel"
+                    data-autocomplete-cancel-command="mom_llama.composer_autocomplete_cancel"
+                    data-autocomplete-cancel-tauri-command="mom_llama_composer_autocomplete_cancel"
+                    data-autocomplete-cancel-cli="automatic in the Mom composer; no standalone CLI"
+                    data-autocomplete-cancel-effect="mom_llama.effects.composer_autocomplete_cancel.v1"
+                    data-autocomplete-accept-affordance="chat.composer.autocomplete_accept"
+                    data-autocomplete-accept-command="mom_llama.composer_autocomplete_accept"
+                    data-autocomplete-accept-tauri-command="mom_llama_composer_autocomplete_accept"
+                    data-autocomplete-accept-cli="automatic on Right Arrow; no standalone CLI"
+                    data-autocomplete-accept-effect="mom_llama.effects.composer_autocomplete_accept.v1"
+                    data-active-leaf=(active.and_then(|conversation| conversation.active_leaf_message_id.as_deref()).unwrap_or_default())
+                    data-execution-profile-version=(active.map(|conversation| conversation.execution_profile.version).unwrap_or_default())
+                    data-draft-affordance="conversation.draft_update"
+                    data-draft-command="mom_llama.draft_update"
+                    data-draft-tauri-command="mom_llama_draft_update"
+                    data-draft-cli="mom-llama conversation draft-update --conversation <id> --message <text> --json"
+                    data-draft-effect="mom_llama.effects.conversation_store.v1"
+                    data-paste-affordance="attachment.import_paste"
+                    data-paste-command="mom_llama.attachment_import_paste"
+                    data-paste-tauri-command="mom_llama_attachment_import_paste"
+                    data-paste-cli="mom-llama attachment import-paste --conversation <id> --text <text> --json"
+                    data-paste-effect="mom_llama.effects.attachment_import_paste.v1" {
+                    (draft_message)
+                }
             }
+            output id="composer-ai-status" class="sr-only" aria-live="polite" aria-atomic="true" {}
             div id="mention-candidates" class="mention-candidates is-hidden" role="listbox"
                 aria-label="Personas, chats, and consult groups"
                 aria-busy="false"

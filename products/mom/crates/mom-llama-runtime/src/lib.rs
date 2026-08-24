@@ -1,5 +1,6 @@
 pub mod attachments;
 pub mod chat;
+pub mod composer;
 pub mod config;
 pub mod consult;
 pub mod conversation_store;
@@ -27,6 +28,11 @@ pub use chat::{
     ChatCancelOutput, ChatRequestState, ChatSendInput, ChatSendOptions, ChatSendOutput,
     ChatSkipReasoningOutput, ChatStreamEvent, chat_cancel, chat_continue, chat_regenerate,
     chat_send, chat_send_stream, chat_skip_reasoning,
+};
+pub use composer::{
+    ComposerAutocompleteAcceptOutput, ComposerAutocompleteAnchor, ComposerAutocompleteCancelOutput,
+    ComposerAutocompleteInput, ComposerAutocompleteOutput, composer_autocomplete_accept,
+    composer_autocomplete_supervised,
 };
 pub use config::{
     GenerationDefaults, KvCachePolicy, Settings, configure_engine, settings_get, settings_reset,

@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, OnceCell};
 
-use crate::command_registry::{CommandClass, CommandSpec};
+use crate::command_registry::{AdmissionClass, CommandClass, CommandSpec};
 use crate::operation_supervisor::{
     LifecyclePhase as OperationLifecyclePhase, OperationReservation, OperationSupervisor,
     TerminalClass, validate_worker_sets,
@@ -35,6 +35,8 @@ struct AppLifecycle {
 struct ActiveWork {
     command: &'static str,
     cancellation: Option<Arc<AtomicBool>>,
+    admission: AdmissionClass,
+    native_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -109,6 +111,7 @@ pub struct AppWorkLease {
     occurrence: u64,
     cancellation: Option<Arc<AtomicBool>>,
     supervised: Option<OperationReservation>,
+    native_request_id: Option<String>,
 }
 
 trait NativeFinalizer: Send + Sync {
@@ -382,6 +385,14 @@ impl NativeFinalizer for ProductNativeFinalizer {
 }
 
 impl AppWorkLease {
+    pub fn native_request_id(&self) -> Option<&str> {
+        self.native_request_id.as_deref()
+    }
+
+    pub fn cancellation_control(&self) -> Option<Arc<AtomicBool>> {
+        self.cancellation.clone()
+    }
+
     pub fn cancellation_requested(&self) -> bool {
         self.cancellation
             .as_ref()
@@ -613,11 +624,29 @@ impl AppRuntimeHandle {
         if lifecycle.phase != AppPhase::Running {
             return Err("Mom Llama is shutting down; new work is not admitted".to_string());
         }
+        if command.admission == AdmissionClass::Speculative && !lifecycle.active_work.is_empty() {
+            return Err(
+                "Mom Llama is busy with foreground work; speculative autocomplete was not admitted"
+                    .to_string(),
+            );
+        }
+        let preempted = if command.admission == AdmissionClass::Foreground {
+            lifecycle
+                .active_work
+                .values()
+                .filter(|work| work.admission == AdmissionClass::Speculative)
+                .map(|work| (work.cancellation.clone(), work.native_request_id.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let occurrence = lifecycle
             .next_occurrence
             .checked_add(1)
             .ok_or_else(|| "Mom Llama has too many active operations".to_string())?;
         lifecycle.next_occurrence = occurrence;
+        let native_request_id = (command.admission == AdmissionClass::Speculative)
+            .then(|| format!("mom-composer-autocomplete:{occurrence}"));
         let cancellation = (command.class == CommandClass::LongOperation)
             .then(|| Arc::new(AtomicBool::new(false)));
         let supervised = if command.class == CommandClass::LongOperation {
@@ -631,20 +660,56 @@ impl AppRuntimeHandle {
         } else {
             None
         };
+        for (cancellation, _) in &preempted {
+            if let Some(cancellation) = cancellation {
+                cancellation.store(true, Ordering::Release);
+            }
+        }
         let replaced = lifecycle.active_work.insert(
             occurrence,
             ActiveWork {
                 command: command.name,
                 cancellation: cancellation.clone(),
+                admission: command.admission,
+                native_request_id: native_request_id.clone(),
             },
         );
         debug_assert!(replaced.is_none());
+        drop(lifecycle);
+        for (_, request_id) in preempted {
+            if let Some(request_id) = request_id {
+                self.0.native_host.cancel(&request_id, None);
+            }
+        }
         Ok(AppWorkLease {
             runtime: Some(Arc::clone(&self.0)),
             occurrence,
             cancellation,
             supervised,
+            native_request_id,
         })
+    }
+
+    pub fn cancel_speculative(&self) -> Result<usize, String> {
+        let request_ids = self
+            .0
+            .lifecycle
+            .lock()
+            .map_err(|_| "Mom Llama's operation registry is unavailable".to_string())?
+            .active_work
+            .values()
+            .filter(|work| work.admission == AdmissionClass::Speculative)
+            .filter_map(|work| {
+                if let Some(cancellation) = &work.cancellation {
+                    cancellation.store(true, Ordering::Release);
+                }
+                work.native_request_id.clone()
+            })
+            .collect::<Vec<_>>();
+        for request_id in &request_ids {
+            self.0.native_host.cancel(request_id, None);
+        }
+        Ok(request_ids.len())
     }
 
     pub fn observe_persona_tool_approval_invocation(
@@ -1085,6 +1150,57 @@ mod tests {
                 .admit(command_spec("mom_llama_settings_update"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn speculative_admission_is_single_flight_and_yields_to_foreground() {
+        let runtime = runtime();
+        let speculative = runtime
+            .admit(command_spec("mom_llama_composer_autocomplete"))
+            .expect("first speculative admission");
+        assert!(speculative.native_request_id().is_some());
+        assert!(
+            runtime
+                .admit(command_spec("mom_llama_composer_autocomplete"))
+                .is_err(),
+            "a second speculative request must not queue behind the first"
+        );
+
+        let foreground = runtime
+            .admit(command_spec("mom_llama_settings_update"))
+            .expect("foreground overtakes speculative work");
+        assert!(speculative.cancellation_requested());
+        assert!(
+            runtime
+                .admit(command_spec("mom_llama_composer_autocomplete"))
+                .is_err(),
+            "speculation must remain closed while foreground work is active"
+        );
+
+        drop(speculative);
+        drop(foreground);
+        drop(
+            runtime
+                .admit(command_spec("mom_llama_composer_autocomplete"))
+                .expect("speculation reopens only after foreground drain"),
+        );
+    }
+
+    #[test]
+    fn explicit_speculative_cancel_is_runtime_local_and_idempotent() {
+        let left = runtime();
+        let right = runtime();
+        let left_lease = left
+            .admit(command_spec("mom_llama_composer_autocomplete"))
+            .expect("left speculative admission");
+        let right_lease = right
+            .admit(command_spec("mom_llama_composer_autocomplete"))
+            .expect("right speculative admission");
+
+        assert_eq!(left.cancel_speculative().expect("cancel left"), 1);
+        assert!(left_lease.cancellation_requested());
+        assert!(!right_lease.cancellation_requested());
+        assert_eq!(left.cancel_speculative().expect("repeat cancel left"), 1);
     }
 
     #[test]

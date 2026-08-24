@@ -626,7 +626,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   flex: 0 0 auto;
 }
 .chat-main.has-messages .composer { position: absolute; bottom: 46px; left: 50%; transform: translateX(-50%); }
+.composer-editor {
+  position: relative;
+}
 .composer textarea {
+  position: relative;
+  z-index: 1;
   display: block;
   width: 100%;
   min-height: 70px;
@@ -638,6 +643,27 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   background: transparent;
   font-size: 17px;
   line-height: 1.5;
+}
+.composer-ai-ghost {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  min-height: 70px;
+  max-height: 220px;
+  overflow: hidden;
+  color: transparent;
+  font-size: 17px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  padding: 2px;
+  pointer-events: none;
+  user-select: none;
+}
+.composer-ai-ghost[hidden] { display: none; }
+.composer-ai-suffix {
+  color: var(--muted);
+  opacity: .92;
 }
 .composer textarea::placeholder { color: var(--muted); }
 .composer-attachments {

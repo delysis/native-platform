@@ -95,8 +95,12 @@
     {
       "id": "composer_drafts",
       "classification": "p0_implemented",
-      "commands": ["mom_llama.draft_get", "mom_llama.draft_update", "mom_llama.draft_clear"],
-      "evidence": ["encrypted per-conversation draft persistence"]
+      "commands": ["mom_llama.draft_get", "mom_llama.draft_update", "mom_llama.draft_clear", "mom_llama.composer_autocomplete", "mom_llama.composer_autocomplete_cancel", "mom_llama.composer_autocomplete_accept"],
+      "evidence": [
+        "encrypted per-conversation draft persistence",
+        "resident-only bounded continuation prediction over the exact draft and conversation template",
+        "Right Arrow acceptance performs one normal draft edit while Enter and Tab retain their composer semantics"
+      ]
     },
     {
       "id": "jsonl_zip_legacy_settings_import_export",

@@ -1079,7 +1079,7 @@ fn sampling_config(settings: &crate::config::Settings) -> SamplingConfig {
     settings.sampling_config()
 }
 
-fn build_native_messages(
+pub(crate) fn build_native_messages(
     system_message: &str,
     skill_prefix: &str,
     messages: &[Message],
@@ -1178,7 +1178,7 @@ fn model_name(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn upstream_setting_bool(settings: &crate::config::Settings, key: &str) -> bool {
+pub(crate) fn upstream_setting_bool(settings: &crate::config::Settings, key: &str) -> bool {
     settings
         .upstream_settings
         .get(key)

@@ -362,6 +362,7 @@
   };
 
   const refreshChat = async () => {
+    cancelComposerAutocomplete({ native: true, announce: false });
     const viewport = captureChatViewport();
     const replacement = await swap("#chat", "mom_llama_render_chat_fragment");
     if (replacement) await hydrateAttachmentPreviews(replacement);
@@ -1134,6 +1135,211 @@
     }, 300);
   };
 
+  let autocompleteTimer = null;
+  let autocompleteSerial = 0;
+  let presentedAutocomplete = null;
+  const autocompleteEncoder = new TextEncoder();
+
+  const composerLogicalAnchor = (textarea = composerTextarea()) => {
+    if (!textarea || selectedConversationKind() !== "chat") return null;
+    const draft = textarea.value;
+    const attachmentIds = draftAttachmentIds(textarea.form);
+    const collapsedAtEnd = textarea.selectionStart === draft.length
+      && textarea.selectionEnd === draft.length;
+    const version = Number(textarea.dataset.executionProfileVersion || 0);
+    if (
+      !draft
+      || autocompleteEncoder.encode(draft).byteLength > 16 * 1024
+      || !collapsedAtEnd
+      || attachmentIds.length > 0
+      || mentionTokenAtCursor(textarea)
+      || composerState.kind === "composing"
+      || !Number.isSafeInteger(version)
+      || version < 1
+    ) return null;
+    return Object.freeze({
+      conversation_id: selectedConversation(),
+      active_leaf_message_id: textarea.dataset.activeLeaf || null,
+      execution_profile_version: version,
+      draft,
+      selection_start_utf16: textarea.selectionStart,
+      selection_end_utf16: textarea.selectionEnd,
+      attachment_ids: Object.freeze([...attachmentIds]),
+    });
+  };
+
+  const autocompleteAnchorKey = (anchor) => JSON.stringify({
+    conversation_id: anchor?.conversation_id || "",
+    active_leaf_message_id: anchor?.active_leaf_message_id || null,
+    execution_profile_version: anchor?.execution_profile_version || 0,
+    draft: anchor?.draft || "",
+    selection_start_utf16: anchor?.selection_start_utf16 ?? -1,
+    selection_end_utf16: anchor?.selection_end_utf16 ?? -1,
+    attachment_ids: anchor?.attachment_ids || [],
+  });
+
+  const hideComposerAutocomplete = (announce = false) => {
+    const ghost = document.getElementById("composer-ai-ghost");
+    ghost?.setAttribute("hidden", "");
+    ghost?.querySelector(".composer-ai-anchor")?.replaceChildren();
+    ghost?.querySelector(".composer-ai-suffix")?.replaceChildren();
+    const status = document.getElementById("composer-ai-status");
+    if (status) status.textContent = announce ? "Suggestion dismissed." : "";
+    presentedAutocomplete = null;
+  };
+
+  const cancelComposerAutocomplete = ({ native = true, announce = false, forceNative = false } = {}) => {
+    window.clearTimeout(autocompleteTimer);
+    autocompleteTimer = null;
+    autocompleteSerial += 1;
+    const active = forceNative
+      || composerState.kind === "ai_pending"
+      || composerState.kind === "ai_presented";
+    transitionComposer({ type: "ai_dismiss" });
+    hideComposerAutocomplete(announce);
+    if (native && active) {
+      invoke("mom_llama_composer_autocomplete_cancel").catch(() => {});
+    }
+  };
+
+  const syncComposerAutocompleteScroll = (textarea = composerTextarea()) => {
+    const ghost = document.getElementById("composer-ai-ghost");
+    if (!ghost || !textarea) return;
+    ghost.scrollLeft = textarea.scrollLeft;
+    ghost.scrollTop = textarea.scrollTop;
+  };
+
+  const showComposerAutocomplete = (textarea, requestId, anchor, suffix) => {
+    const ghost = document.getElementById("composer-ai-ghost");
+    if (!ghost) return false;
+    ghost.querySelector(".composer-ai-anchor").textContent = anchor.draft;
+    ghost.querySelector(".composer-ai-suffix").textContent = suffix;
+    ghost.removeAttribute("hidden");
+    syncComposerAutocompleteScroll(textarea);
+    const status = document.getElementById("composer-ai-status");
+    if (status) status.textContent = "Suggestion available. Press Right Arrow to accept.";
+    presentedAutocomplete = Object.freeze({ requestId, anchor, suffix });
+    return true;
+  };
+
+  const scheduleComposerAutocomplete = (textarea) => {
+    window.clearTimeout(autocompleteTimer);
+    const initial = composerLogicalAnchor(textarea);
+    if (!initial || composerState.kind !== "idle") return;
+    const serial = ++autocompleteSerial;
+    const initialKey = autocompleteAnchorKey(initial);
+    autocompleteTimer = window.setTimeout(async () => {
+      autocompleteTimer = null;
+      try {
+        const beforePersist = composerLogicalAnchor(textarea);
+        if (serial !== autocompleteSerial || autocompleteAnchorKey(beforePersist) !== initialKey) return;
+        const persisted = await persistDraftNow(
+          beforePersist.draft,
+          beforePersist.attachment_ids,
+          beforePersist.conversation_id,
+        );
+        if (persisted?.status === "blocked") return;
+        const anchor = composerLogicalAnchor(textarea);
+        if (serial !== autocompleteSerial || autocompleteAnchorKey(anchor) !== initialKey) return;
+        const requestId = `composer-${serial}`;
+        const pending = transitionComposer({
+          type: "ai_request",
+          requestId,
+          anchor: initialKey,
+        });
+        if (composerState.kind !== "ai_pending") return;
+        for (const effect of pending) {
+          if (effect.kind === "ai_cancel") cancelComposerAutocomplete();
+        }
+        const response = await invoke("mom_llama_composer_autocomplete", {
+          conversation: anchor.conversation_id,
+          draft: anchor.draft,
+          activeLeafMessageId: anchor.active_leaf_message_id,
+          executionProfileVersion: anchor.execution_profile_version,
+          selectionStartUtf16: anchor.selection_start_utf16,
+          selectionEndUtf16: anchor.selection_end_utf16,
+          attachmentIds: anchor.attachment_ids,
+        });
+        if (serial !== autocompleteSerial) return;
+        if (response?.status !== "passed") {
+          cancelComposerAutocomplete({ native: false });
+          return;
+        }
+        const result = response.result;
+        const current = composerLogicalAnchor(textarea);
+        const serverKey = autocompleteAnchorKey(result?.anchor);
+        if (
+          !result
+          || autocompleteAnchorKey(current) !== initialKey
+          || serverKey !== initialKey
+          || typeof result.suffix !== "string"
+          || result.suffix.includes("\n")
+          || result.suffix.includes("\r")
+          || autocompleteEncoder.encode(result.suffix).byteLength > 512
+        ) {
+          cancelComposerAutocomplete({ native: false });
+          return;
+        }
+        transitionComposer({
+          type: "ai_present",
+          requestId,
+          anchor: initialKey,
+          suffix: result.suffix,
+        });
+        if (composerState.kind !== "ai_presented"
+          || !showComposerAutocomplete(textarea, requestId, result.anchor, result.suffix)) {
+          cancelComposerAutocomplete({ native: false });
+        }
+      } catch {
+        if (serial === autocompleteSerial) cancelComposerAutocomplete({ native: false });
+      }
+    }, 350);
+  };
+
+  const acceptComposerAutocomplete = async (textarea, effect) => {
+    const presented = presentedAutocomplete;
+    const current = composerLogicalAnchor(textarea);
+    if (
+      !presented
+      || presented.requestId !== effect.requestId
+      || presented.suffix !== effect.suffix
+      || autocompleteAnchorKey(presented.anchor) !== effect.anchor
+      || autocompleteAnchorKey(current) !== effect.anchor
+    ) {
+      cancelComposerAutocomplete({ native: false });
+      return false;
+    }
+    textarea.readOnly = true;
+    try {
+      const acceptance = await invoke("mom_llama_composer_autocomplete_accept", {
+        anchor: presented.anchor,
+        suffix: presented.suffix,
+      });
+      const accepted = acceptance?.result;
+      const revalidatedCurrent = composerLogicalAnchor(textarea);
+      if (
+        acceptance?.status !== "passed"
+        || presentedAutocomplete !== presented
+        || autocompleteAnchorKey(revalidatedCurrent) !== effect.anchor
+        || autocompleteAnchorKey(accepted?.anchor) !== effect.anchor
+        || accepted?.anchor?.model_fingerprint_sha256 !== presented.anchor.model_fingerprint_sha256
+        || accepted?.message !== `${presented.anchor.draft}${presented.suffix}`
+      ) {
+        cancelComposerAutocomplete({ native: false });
+        return false;
+      }
+      const insertion = textarea.selectionEnd;
+      transitionComposer({ type: "ai_dismiss" });
+      hideComposerAutocomplete(false);
+      textarea.dataset.autocompleteCommittedDraft = accepted.message;
+      textarea.setRangeText(effect.suffix, insertion, insertion, "end");
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    } finally {
+      textarea.readOnly = false;
+    }
+  };
+
   const ensureMessageStream = () => {
     const chatElement = chat();
     if (!chatElement) return null;
@@ -1444,7 +1650,13 @@
       button.append(...(icon ? [icon, copy] : [copy]));
       return button;
     }));
-    transitionComposer({ type: "mention_open", optionCount: candidates.length });
+    const mentionEffects = transitionComposer({
+      type: "mention_open",
+      optionCount: candidates.length,
+    });
+    if (mentionEffects.some((effect) => effect.kind === "ai_cancel")) {
+      cancelComposerAutocomplete({ forceNative: true });
+    }
     if (composerState.kind !== "mention") {
       hideMentionPresentation();
       return;
@@ -2176,6 +2388,7 @@
     try {
       if (form.id === "chat-form") {
         if (form.dataset.busy === "true") return;
+        cancelComposerAutocomplete();
         const message = formValue(form, "message");
         const attachmentIds = draftAttachmentIds(form);
         if (!message && !attachmentIds.length) return;
@@ -2273,6 +2486,7 @@
 
   document.addEventListener("compositionstart", (event) => {
     if (!event.target.matches("#chat-form textarea[name='message']")) return;
+    cancelComposerAutocomplete();
     transitionComposer({ type: "composition_start" });
     hideMentionPresentation();
   });
@@ -2282,13 +2496,19 @@
     transitionComposer({ type: "composition_end" });
     scheduleDraft(event.target.value);
     updateMentionCandidates(event.target).catch(reportError);
+    scheduleComposerAutocomplete(event.target);
   });
 
   document.addEventListener("input", (event) => {
     if (event.target.matches("#chat-form textarea[name='message']")) {
       if (event.isComposing || composerState.kind === "composing") return;
-      scheduleDraft(event.target.value);
+      const committedAutocomplete = event.target.dataset.autocompleteCommittedDraft;
+      const alreadyPersisted = committedAutocomplete === event.target.value;
+      delete event.target.dataset.autocompleteCommittedDraft;
+      cancelComposerAutocomplete();
+      if (!alreadyPersisted) scheduleDraft(event.target.value);
       updateMentionCandidates(event.target).catch(reportError);
+      if (!alreadyPersisted) scheduleComposerAutocomplete(event.target);
     }
     if (event.target.matches('[name="freeze_name"]') && !formValue(document.getElementById("persona-freeze-modal"), "freeze_handle")) {
       formField(document.getElementById("persona-freeze-modal"), "freeze_handle").value = slugHandle(event.target.value);
@@ -2308,6 +2528,10 @@
   });
 
   document.addEventListener("scroll", (event) => {
+    if (event.target.matches?.("#chat-form textarea[name='message']")) {
+      syncComposerAutocompleteScroll(event.target);
+      return;
+    }
     const stream = event.target;
     if (!(stream instanceof Element) || !stream.matches(".message-stream")) return;
     const distanceFromTail = stream.scrollHeight - stream.scrollTop - stream.clientHeight;
@@ -2408,13 +2632,39 @@
         event.preventDefault();
         hideMentionPresentation();
       }
-      if (keyEffect.kind === "ai_accept" || keyEffect.kind === "ai_dismiss") {
+      if (keyEffect.kind === "ai_accept") {
         event.preventDefault();
+        acceptComposerAutocomplete(event.target, keyEffect).catch(() => {
+          cancelComposerAutocomplete({ native: false });
+          refreshChat().catch(() => {});
+        });
+      }
+      if (keyEffect.kind === "ai_dismiss") {
+        event.preventDefault();
+        cancelComposerAutocomplete({ native: false, announce: true });
+      }
+      if (keyEffect.kind === "ai_cancel") {
+        cancelComposerAutocomplete({ forceNative: true });
       }
       if (keyEffect.kind === "submit") {
         event.preventDefault();
         event.target.form?.requestSubmit();
       }
+    }
+  });
+
+  document.addEventListener("selectionchange", () => {
+    const textarea = composerTextarea();
+    if (document.activeElement !== textarea) return;
+    if (!presentedAutocomplete) return;
+    if (autocompleteAnchorKey(composerLogicalAnchor(textarea)) !== autocompleteAnchorKey(presentedAutocomplete.anchor)) {
+      cancelComposerAutocomplete({ native: false });
+    }
+  });
+
+  document.addEventListener("focusout", (event) => {
+    if (event.target.matches?.("#chat-form textarea[name='message']")) {
+      cancelComposerAutocomplete();
     }
   });
 
