@@ -665,6 +665,110 @@
     return result;
   };
 
+  let personaMenuReturnFocus = null;
+
+  const closePersonaMenu = (restoreFocus = true) => {
+    const menu = document.getElementById("persona-context-menu");
+    if (!menu || menu.hidden) return;
+    menu.hidden = true;
+    menu.classList.add("is-hidden");
+    personaMenuReturnFocus?.setAttribute("aria-expanded", "false");
+    if (restoreFocus) personaMenuReturnFocus?.focus();
+    personaMenuReturnFocus = null;
+  };
+
+  const openPersonaMenu = (target, point = null) => {
+    const menu = document.getElementById("persona-context-menu");
+    if (!menu || !target?.dataset.persona) return;
+    closePersonaMenu(false);
+    const trigger = target.matches(".persona-menu-trigger")
+      ? target
+      : target.querySelector(".persona-menu-trigger");
+    personaMenuReturnFocus = trigger || null;
+    trigger?.setAttribute("aria-expanded", "true");
+    menu.dataset.persona = target.dataset.persona;
+    menu.dataset.personaTitle = target.dataset.personaTitle || "Persona";
+    menu.dataset.personaVersion = target.dataset.personaVersion || "";
+    menu.hidden = false;
+    menu.classList.remove("is-hidden");
+    const anchor = point || (() => {
+      const rect = (trigger || target).getBoundingClientRect();
+      return { x: rect.right, y: rect.bottom };
+    })();
+    const bounds = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(anchor.x, window.innerWidth - bounds.width - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(anchor.y, window.innerHeight - bounds.height - 8))}px`;
+    menu.querySelector('[role="menuitem"]')?.focus();
+  };
+
+  const impactList = (values, fallback = "None") => values?.length ? values.join(", ") : fallback;
+
+  const openPersonaRemoval = async (personaId) => {
+    const result = await invoke("mom_llama_persona_removal_preview", { persona: personaId });
+    report(result);
+    if (result?.status === "blocked" || !result?.result) return false;
+    const impact = result.result;
+    const modal = document.getElementById("persona-removal-modal");
+    if (!modal) return false;
+    formField(modal, "persona_removal_id").value = impact.persona_id;
+    formField(modal, "persona_removal_version").value = String(impact.persona_version);
+    formField(modal, "persona_removal_impact_sha256").value = impact.impact_sha256;
+    const text = (id, value) => {
+      const element = document.getElementById(id);
+      if (element) element.textContent = value;
+    };
+    text(
+      "persona-removal-persona",
+      `${impact.persona_title} · version ${impact.persona_version} · snapshot ${impact.persona_snapshot_sha256}`,
+    );
+    text(
+      "persona-removal-groups",
+      impactList(impact.groups?.map((group) => `${group.group_name} (${group.group_id}, position ${group.member_index + 1})`)),
+    );
+    text(
+      "persona-removal-draft",
+      impactList(impact.drafts?.map((draft) => `${draft.message_sha256}; attachments ${impactList(draft.attachment_ids)}`)),
+    );
+    text(
+      "persona-removal-attachments",
+      `Remove ${impactList(impact.attachments?.removed_draft_only_unshared_attachment_ids)}; retain supporting ${impactList(impact.attachments?.retained_supporting_attachment_ids)}`,
+    );
+    text(
+      "persona-removal-caches",
+      `Mom ${impactList(impact.caches?.mom_persistent_cache_ids)}; Native ${impactList(impact.caches?.native_persistent_cache_ids)}`,
+    );
+    text("persona-removal-active", impactList(impact.active_invocation_ids));
+    text(
+      "persona-removal-retained",
+      `messages ${impactList(impact.retained_history?.retained_message_ids)}; versions ${impactList(impact.retained_history?.retained_persona_versions?.map(String))}; invocations ${impactList(impact.retained_history?.retained_invocation_ids)}`,
+    );
+    text("persona-removal-impact-sha256", impact.impact_sha256);
+    closePersonaMenu(false);
+    setModalVisibility("persona-removal-modal", true);
+    modal.querySelector('[data-action="persona-removal-commit"]')?.focus();
+    return true;
+  };
+
+  const commitPersonaRemoval = async () => {
+    const modal = document.getElementById("persona-removal-modal");
+    const result = await invoke("mom_llama_persona_remove_from_library", {
+      input: {
+        persona_id: formValue(modal, "persona_removal_id"),
+        persona_version: Number(formValue(modal, "persona_removal_version")),
+        impact_sha256: formValue(modal, "persona_removal_impact_sha256"),
+      },
+    });
+    report(result);
+    if (result?.status === "blocked") return result;
+    setModalVisibility("persona-removal-modal", false);
+    await Promise.all([
+      refreshSettings("personas"),
+      refreshSidebar(),
+      refreshConversationProjection(),
+    ]);
+    return result;
+  };
+
   const persistCurrentDraftBeforeNavigation = async () => {
     const conversation = selectedConversation();
     const form = document.getElementById("chat-form");
@@ -1677,6 +1781,27 @@
     },
     "persona-edit": async (button) => openPersonaProfile(button.dataset.persona),
     "persona-profile-open": async (button) => openPersonaProfile(button.dataset.persona),
+    "persona-menu-open": async (button) => openPersonaMenu(button),
+    "persona-menu-start": async () => {
+      const persona = document.getElementById("persona-context-menu")?.dataset.persona;
+      closePersonaMenu(false);
+      const result = await instantiatePersona(persona);
+      if (result?.status !== "blocked") {
+        closeSettings();
+        await refreshConversationProjection();
+      }
+    },
+    "persona-menu-edit": async () => {
+      const persona = document.getElementById("persona-context-menu")?.dataset.persona;
+      closePersonaMenu(false);
+      await openPersonaProfile(persona);
+    },
+    "persona-menu-removal-preview": async () => {
+      const persona = document.getElementById("persona-context-menu")?.dataset.persona;
+      await openPersonaRemoval(persona);
+    },
+    "persona-removal-close": async () => setModalVisibility("persona-removal-modal", false),
+    "persona-removal-commit": async () => commitPersonaRemoval(),
     "persona-instantiate": async (button) => {
       const result = await instantiatePersona(button.dataset.persona);
       if (result?.status !== "blocked") {
@@ -1686,18 +1811,6 @@
     },
     "persona-update": async () => {
       const result = await invoke("mom_llama_persona_update", { profile: personaProfileFromEditor() });
-      report(result);
-      if (result?.status !== "blocked") {
-        await Promise.all([
-          refreshSettings("personas"),
-          refreshConversationProjection(),
-        ]);
-      }
-    },
-    "persona-delete": async (button) => {
-      if (!armDestructiveAction(button)) return;
-      const persona = formValue(document.getElementById("persona-editor"), "persona_id");
-      const result = await invoke("mom_llama_persona_delete", { persona });
       report(result);
       if (result?.status !== "blocked") {
         await Promise.all([
@@ -2038,6 +2151,9 @@
   };
 
   document.addEventListener("click", async (event) => {
+    if (!event.target.closest("#persona-context-menu, .persona-menu-trigger")) {
+      closePersonaMenu(false);
+    }
     const button = event.target.closest("[data-action]");
     if (!button || button.disabled) return;
     if (MCP_PROCESS_ACTIONS.has(button.dataset.action) && !requireMcpProcessUi()) return;
@@ -2045,6 +2161,13 @@
     if (!handler) return;
     event.preventDefault();
     try { await handler(button); } catch (error) { reportError(error); }
+  });
+
+  document.addEventListener("contextmenu", (event) => {
+    const target = event.target.closest('[data-persona-menu-target="true"]');
+    if (!target) return;
+    event.preventDefault();
+    openPersonaMenu(target, { x: event.clientX, y: event.clientY });
   });
 
   document.addEventListener("submit", async (event) => {
@@ -2209,6 +2332,35 @@
   });
 
   document.addEventListener("keydown", (event) => {
+    const personaMenu = document.getElementById("persona-context-menu");
+    if (event.target.matches(".persona-menu-trigger") && event.key === "ArrowDown") {
+      event.preventDefault();
+      openPersonaMenu(event.target);
+      return;
+    }
+    if (personaMenu && !personaMenu.hidden && event.target.closest("#persona-context-menu")) {
+      const items = [...personaMenu.querySelectorAll('[role="menuitem"]')];
+      const current = items.indexOf(event.target);
+      if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+        event.preventDefault();
+        const next = event.key === "Home" ? 0
+          : event.key === "End" ? items.length - 1
+            : (current + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+        items[next]?.focus();
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closePersonaMenu(true);
+        return;
+      }
+      if (event.key === "Tab") closePersonaMenu(false);
+    }
+    if (event.key === "Escape" && !document.getElementById("persona-removal-modal")?.hidden) {
+      event.preventDefault();
+      setModalVisibility("persona-removal-modal", false);
+      return;
+    }
     if (event.key === "Escape" && !document.getElementById("tool-approval-modal")?.hidden) {
       event.preventDefault();
       closeToolApproval();

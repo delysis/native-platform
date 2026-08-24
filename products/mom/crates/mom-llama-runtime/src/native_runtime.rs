@@ -1,6 +1,7 @@
 use crate::config::{KvCachePolicy, Settings};
 use crate::engine::{ValidationBlocker, validate_model_path};
 use crate::receipts::Blocker;
+use crate::store::{DocumentMutations, DocumentSnapshot};
 use llama_native_cache::PrefixCacheValue;
 use llama_native_engine::NativeModelHandle;
 use llama_native_host::{
@@ -23,6 +24,7 @@ pub struct ResidentSlotStatus {
 
 const PERSISTENT_PREFIX_CACHE_MAX_ENTRIES: usize = 128;
 const PERSISTENT_PREFIX_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+const PRODUCT_PREFIX_CACHE_NAMESPACE: &str = "mom-llama";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProductHostKey {
@@ -154,6 +156,72 @@ impl ProductPrefixCacheStore {
     }
 }
 
+pub(crate) fn persona_native_cache_ids_from_snapshot(
+    snapshot: &DocumentSnapshot<'_, '_, '_>,
+    owner_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let values = snapshot
+        .get::<Vec<PrefixCacheValue>>(&ProductPrefixCacheStore::document(
+            PRODUCT_PREFIX_CACHE_NAMESPACE,
+        ))?
+        .unwrap_or_default();
+    Ok(prefix_cache_ids_for_owner(&values, owner_id))
+}
+
+pub(crate) fn persona_native_cache_ids_from_documents(
+    documents: &DocumentMutations<'_, '_, '_>,
+    owner_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let values = documents
+        .get::<Vec<PrefixCacheValue>>(&ProductPrefixCacheStore::document(
+            PRODUCT_PREFIX_CACHE_NAMESPACE,
+        ))?
+        .unwrap_or_default();
+    Ok(prefix_cache_ids_for_owner(&values, owner_id))
+}
+
+pub(crate) fn remove_persona_native_cache_from_documents(
+    documents: &mut DocumentMutations<'_, '_, '_>,
+    owner_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let namespace = ProductPrefixCacheStore::document(PRODUCT_PREFIX_CACHE_NAMESPACE);
+    let mut values = documents
+        .get::<Vec<PrefixCacheValue>>(&namespace)?
+        .unwrap_or_default();
+    let removed = prefix_cache_ids_for_owner(&values, owner_id);
+    values.retain(|value| value.metadata.owner_id.as_deref() != Some(owner_id));
+    documents.put_bytes(&namespace, &serde_json::to_vec(&values)?)?;
+    Ok(removed)
+}
+
+fn prefix_cache_ids_for_owner(values: &[PrefixCacheValue], owner_id: &str) -> Vec<String> {
+    let mut ids = values
+        .iter()
+        .filter(|value| value.metadata.owner_id.as_deref() == Some(owner_id))
+        .map(|value| value.metadata.id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+pub(crate) fn invalidate_loaded_native_cache_owner(owner_id: &str) -> anyhow::Result<usize> {
+    let current = product_host()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("The native model host is unavailable."))?;
+    if current.phase != ProductPhase::Running {
+        anyhow::bail!("The product runtime is shutting down.");
+    }
+    let Some(host) = current
+        .host
+        .as_ref()
+        .and_then(|product| product.host.upgrade())
+    else {
+        return Ok(0);
+    };
+    host.invalidate_live_cache_owner(owner_id)
+        .map_err(|error| anyhow::anyhow!(error.message))
+}
+
 impl PrefixCacheStore for ProductPrefixCacheStore {
     fn load(&self, namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
         self.store
@@ -165,21 +233,34 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
     fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
         let document = Self::document(namespace);
         self.store
-            .mutate(&document, Vec::<PrefixCacheValue>::new, |values| {
-                values.retain(|candidate| candidate.metadata.id != value.metadata.id);
-                values.push(value.clone());
-                values.sort_by_key(|candidate| candidate.metadata.last_used_at_ms);
-                while values.len() > PERSISTENT_PREFIX_CACHE_MAX_ENTRIES
-                    || values
-                        .iter()
-                        .map(|candidate| candidate.metadata.state_bytes)
-                        .sum::<usize>()
-                        > PERSISTENT_PREFIX_CACHE_MAX_BYTES
-                {
-                    values.remove(0);
-                }
-                Ok(())
-            })
+            .mutate_documents(
+                &document,
+                Vec::<PrefixCacheValue>::new,
+                |values, documents| {
+                    if let Some(owner_id) = value.metadata.owner_id.as_deref()
+                        && crate::personas::persona_cache_owner_is_removed_from_documents(
+                            documents, owner_id,
+                        )?
+                    {
+                        anyhow::bail!(
+                            "refusing to restore cache authority for removed Persona owner {owner_id}"
+                        );
+                    }
+                    values.retain(|candidate| candidate.metadata.id != value.metadata.id);
+                    values.push(value.clone());
+                    values.sort_by_key(|candidate| candidate.metadata.last_used_at_ms);
+                    while values.len() > PERSISTENT_PREFIX_CACHE_MAX_ENTRIES
+                        || values
+                            .iter()
+                            .map(|candidate| candidate.metadata.state_bytes)
+                            .sum::<usize>()
+                            > PERSISTENT_PREFIX_CACHE_MAX_BYTES
+                    {
+                        values.remove(0);
+                    }
+                    Ok(())
+                },
+            )
             .map_err(prefix_store_error)
     }
 
@@ -219,7 +300,7 @@ fn create_product_host(key: &ProductHostKey) -> Result<Arc<NativeHost>, NativeEr
         NativeHostConfig {
             memory_budget_bytes: key.memory_budget_bytes,
             max_slots: key.max_slots,
-            cache_namespace: "mom-llama".to_string(),
+            cache_namespace: PRODUCT_PREFIX_CACHE_NAMESPACE.to_string(),
             cache_policy: host_cache_policy(key.cache_policy),
             ..NativeHostConfig::default()
         },

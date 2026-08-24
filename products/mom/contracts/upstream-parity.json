@@ -288,6 +288,8 @@
       "commands": [
         "mom_llama.persona_freeze",
         "mom_llama.persona_update",
+        "mom_llama.persona_removal_preview",
+        "mom_llama.persona_remove_from_library",
         "mom_llama.persona_instantiate",
         "mom_llama.persona_group_create",
         "mom_llama.persona_group_update",
@@ -306,6 +308,7 @@
         "Per-target cancellation preserves completed peers, and explicit synthesis requires two real terminal responses.",
         "Ask-bound Persona tools use five-minute, one-use approval over the exact frozen turn, Persona version and snapshot, arguments, call hash, and model fingerprint; approve or deny resumes without target resolution.",
         "The ordinary composer provides Lucide-backed @handle autocomplete; Persona and group editing live in Settings.",
+        "Remove from Library uses an exact Persona ID, version, and impact SHA-256; one atomic tombstone transaction removes discoverability, group membership, draft-only state, and Persona-owned caches while retaining frozen history and invocations.",
         "The previous four-card Consult dashboard is absent from rendered desktop and compact native views.",
         "Real GGUF tests prove exact-version prefix reuse, fingerprint mismatch fallback, four-Persona dispatch, independent cancellation, source isolation, and attributed synthesis."
       ]

@@ -269,9 +269,19 @@ enum PersonaCommand {
         #[arg(long)]
         json: bool,
     },
-    Delete {
+    RemovalPreview {
         #[arg(long)]
         persona: String,
+        #[arg(long)]
+        json: bool,
+    },
+    RemoveFromLibrary {
+        #[arg(long)]
+        persona: String,
+        #[arg(long)]
+        version: u64,
+        #[arg(long = "impact-sha256")]
+        impact_sha256: String,
         #[arg(long)]
         json: bool,
     },
@@ -1126,9 +1136,24 @@ fn run() -> Result<()> {
                 mom_llama_runtime::persona_update(serde_json::from_value(profile)?)?,
                 json,
             ),
-            PersonaCommand::Delete { persona, json } => {
-                print_result(mom_llama_runtime::persona_delete(&persona)?, json)
+            PersonaCommand::RemovalPreview { persona, json } => {
+                print_result(mom_llama_runtime::persona_removal_preview(&persona)?, json)
             }
+            PersonaCommand::RemoveFromLibrary {
+                persona,
+                version,
+                impact_sha256,
+                json,
+            } => print_result(
+                mom_llama_runtime::persona_remove_from_library(
+                    mom_llama_runtime::PersonaRemovalCommitInput {
+                        persona_id: persona,
+                        persona_version: version,
+                        impact_sha256,
+                    },
+                )?,
+                json,
+            ),
             PersonaCommand::Instantiate {
                 persona,
                 title,
@@ -1681,7 +1706,10 @@ fn command_uses_native(command: &Command) -> bool {
             command,
             ModelCommand::Status { .. } | ModelCommand::Load { .. } | ModelCommand::Unload { .. }
         ),
-        Command::Persona { command } => matches!(command, PersonaCommand::Update { .. }),
+        Command::Persona { command } => matches!(
+            command,
+            PersonaCommand::Update { .. } | PersonaCommand::RemoveFromLibrary { .. }
+        ),
         Command::Mention { command } => !matches!(
             command,
             MentionCommand::Candidates { .. } | MentionCommand::ApprovalList { .. }

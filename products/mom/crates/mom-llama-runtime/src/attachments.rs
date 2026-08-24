@@ -5,7 +5,7 @@ use crate::conversation_store::{
 };
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
-use crate::store::{DocumentMutations, RuntimeStore};
+use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use anyhow::{Context, Result, anyhow};
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
 use attachment_native_types::{
@@ -839,6 +839,199 @@ struct AttachmentGcState<'a> {
     mode: AttachmentGcMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersonaAttachmentRemovalImpact {
+    pub draft_attachment_ids: Vec<String>,
+    pub draft_only_unshared_attachment_ids: Vec<String>,
+    pub retained_supporting_attachment_ids: Vec<String>,
+}
+
+pub(crate) fn persona_attachment_impact_from_snapshot(
+    snapshot: &DocumentSnapshot<'_, '_, '_>,
+    persona: &Conversation,
+    conversations: &ConversationDb,
+    drafts: &DraftDb,
+) -> Result<PersonaAttachmentRemovalImpact> {
+    let attachment_db = snapshot
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(persona_attachment_impact(
+        &attachment_db,
+        persona,
+        conversations,
+        drafts,
+    ))
+}
+
+pub(crate) fn persona_attachment_impact_from_documents(
+    documents: &DocumentMutations<'_, '_, '_>,
+    persona: &Conversation,
+    conversations: &ConversationDb,
+    drafts: &DraftDb,
+) -> Result<PersonaAttachmentRemovalImpact> {
+    let attachment_db = documents
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(persona_attachment_impact(
+        &attachment_db,
+        persona,
+        conversations,
+        drafts,
+    ))
+}
+
+fn persona_attachment_impact(
+    attachment_db: &AttachmentDb,
+    persona: &Conversation,
+    conversations: &ConversationDb,
+    drafts: &DraftDb,
+) -> PersonaAttachmentRemovalImpact {
+    let draft_attachment_ids = drafts
+        .drafts
+        .iter()
+        .filter(|draft| draft.conversation_id.as_deref() == Some(persona.id.as_str()))
+        .flat_map(|draft| draft.attachment_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let retained_supporting_attachment_ids = persona
+        .messages
+        .iter()
+        .flat_map(|message| message.attachment_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let shared = conversations
+        .conversations
+        .iter()
+        .flat_map(|conversation| conversation.messages.iter())
+        .flat_map(|message| message.attachment_ids.iter())
+        .chain(
+            drafts
+                .drafts
+                .iter()
+                .filter(|draft| draft.conversation_id.as_deref() != Some(persona.id.as_str()))
+                .flat_map(|draft| draft.attachment_ids.iter()),
+        )
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let draft_only_unshared_attachment_ids = attachment_db
+        .attachments
+        .iter()
+        .filter(|record| {
+            record.conversation_id == persona.id
+                && record.state == AttachmentState::Staged
+                && draft_attachment_ids.contains(&record.id)
+                && !shared.contains(&record.id)
+        })
+        .map(|record| record.id.clone())
+        .collect::<BTreeSet<_>>();
+    PersonaAttachmentRemovalImpact {
+        draft_attachment_ids: draft_attachment_ids.into_iter().collect(),
+        draft_only_unshared_attachment_ids: draft_only_unshared_attachment_ids
+            .into_iter()
+            .collect(),
+        retained_supporting_attachment_ids: retained_supporting_attachment_ids
+            .into_iter()
+            .collect(),
+    }
+}
+
+pub(crate) fn remove_persona_draft_attachments_from_documents(
+    documents: &mut DocumentMutations<'_, '_, '_>,
+    expected_ids: &[String],
+) -> Result<Vec<String>> {
+    let expected = expected_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if expected.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut attachment_db = documents
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default();
+    let manifests = load_manifests_for_gc_from_documents(documents, &attachment_db)?;
+    let mut removed_ids = BTreeSet::new();
+    let mut removed_manifests = BTreeSet::new();
+    let mut removed_objects = BTreeSet::new();
+    attachment_db.attachments.retain(|record| {
+        if !expected.contains(&record.id) || record.state != AttachmentState::Staged {
+            return true;
+        }
+        removed_ids.insert(record.id.clone());
+        if let Some((namespace, manifest)) = record
+            .manifest_namespace
+            .as_ref()
+            .and_then(|namespace| {
+                manifests
+                    .get(namespace)
+                    .map(|manifest| (namespace, manifest))
+            })
+            .filter(|(_, manifest)| {
+                manifest.schema == ATTACHMENT_MANIFEST_SCHEMA && manifest.attachment_id == record.id
+            })
+        {
+            removed_objects.extend(manifest_object_ids(manifest));
+            removed_manifests.insert(namespace.clone());
+        }
+        false
+    });
+    if removed_ids != expected {
+        anyhow::bail!("Persona draft attachment impact changed before removal commit");
+    }
+
+    let mut retained_objects = BTreeSet::new();
+    let mut object_gc_is_safe = true;
+    for record in &attachment_db.attachments {
+        match record
+            .manifest_namespace
+            .as_ref()
+            .and_then(|namespace| manifests.get(namespace))
+        {
+            Some(manifest)
+                if manifest.schema == ATTACHMENT_MANIFEST_SCHEMA
+                    && manifest.attachment_id == record.id =>
+            {
+                retained_objects.extend(manifest_object_ids(manifest));
+            }
+            _ if record.state == AttachmentState::LegacyCommitted
+                && record.root_object_id.is_none()
+                && !record
+                    .stored_path
+                    .starts_with("encrypted://attachment.object.") => {}
+            _ => {
+                object_gc_is_safe = false;
+                if let Some(root) = &record.root_object_id {
+                    retained_objects.insert(root.clone());
+                }
+            }
+        }
+    }
+    documents.put_bytes(ATTACHMENTS_NAMESPACE, &serde_json::to_vec(&attachment_db)?)?;
+    for namespace in removed_manifests {
+        documents.delete(&namespace);
+    }
+    if object_gc_is_safe {
+        for object_id in removed_objects.difference(&retained_objects) {
+            documents.delete(&object_namespace_str(object_id));
+        }
+    }
+    Ok(removed_ids.into_iter().collect())
+}
+
+fn load_manifests_for_gc_from_documents(
+    documents: &DocumentMutations<'_, '_, '_>,
+    db: &AttachmentDb,
+) -> Result<HashMap<String, AttachmentManifest>> {
+    let mut manifests = HashMap::new();
+    for namespace in db
+        .attachments
+        .iter()
+        .filter_map(|record| record.manifest_namespace.as_ref())
+    {
+        if !manifests.contains_key(namespace)
+            && let Some(manifest) = documents.get::<AttachmentManifest>(namespace)?
+        {
+            manifests.insert(namespace.clone(), manifest);
+        }
+    }
+    Ok(manifests)
+}
+
 /// Persist a draft mutation and reclaim only staged attachments explicitly
 /// unlinked by that mutation. The attachment index, draft, manifests, and
 /// content-addressed objects change in one SQLite transaction.
@@ -893,11 +1086,8 @@ fn persist_state_with_attachment_gc(state: AttachmentGcState<'_>) -> Result<Path
     let manifests = load_manifests_for_gc(&store, &attachment_snapshot)?;
     let referenced =
         referenced_attachment_ids(state.effective_conversations, state.effective_drafts);
-    let encoded_conversations = state
-        .conversations_to_write
-        .map(serde_json::to_vec)
-        .transpose()?;
-    let encoded_drafts = state.drafts_to_write.map(serde_json::to_vec).transpose()?;
+    let conversations_to_write = state.conversations_to_write.cloned();
+    let drafts_to_write = state.drafts_to_write.cloned();
 
     store.mutate_documents(
         ATTACHMENTS_NAMESPACE,
@@ -974,11 +1164,22 @@ fn persist_state_with_attachment_gc(state: AttachmentGcState<'_>) -> Result<Path
                 }
             }
 
-            if let Some(encoded) = &encoded_conversations {
-                documents.put_bytes(CONVERSATIONS_NAMESPACE, encoded)?;
+            if let Some(mut conversations) = conversations_to_write.clone() {
+                crate::personas::filter_removed_personas_from_documents(
+                    &mut conversations,
+                    documents,
+                )?;
+                documents.put_bytes(
+                    CONVERSATIONS_NAMESPACE,
+                    &serde_json::to_vec(&conversations)?,
+                )?;
             }
-            if let Some(encoded) = &encoded_drafts {
-                documents.put_bytes(DRAFTS_NAMESPACE, encoded)?;
+            if let Some(mut drafts) = drafts_to_write.clone() {
+                crate::personas::filter_removed_persona_drafts_from_documents(
+                    &mut drafts,
+                    documents,
+                )?;
+                documents.put_bytes(DRAFTS_NAMESPACE, &serde_json::to_vec(&drafts)?)?;
             }
             for namespace in removed_manifests {
                 documents.delete(&namespace);
@@ -1589,8 +1790,8 @@ fn multimodal_readiness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::set_data_dir_override_for_tests;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use crate::config::{lock_data_dir_override_for_tests, set_data_dir_override_for_tests};
+    use std::sync::MutexGuard;
 
     const VALID_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\
         \x00\x00\x00\x0dIHDR\x00\x00\x00\x02\x00\x00\x00\x04\x08\x02\x00\x00\x00\x2b\x8d\x79\x6e\
@@ -1608,11 +1809,7 @@ mod tests {
 
     impl TestDataDir {
         fn new(label: &str) -> Self {
-            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let guard = LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let guard = lock_data_dir_override_for_tests();
             let path = std::env::temp_dir().join(format!(
                 "mom-llama-attachment-unit-{label}-{}",
                 Uuid::new_v4().simple()
@@ -2229,7 +2426,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_persona_reclaims_only_its_snapshot_records() {
+    fn removing_a_persona_preserves_supporting_snapshot_records() {
         let _session = TestDataDir::new("persona-snapshot-gc");
         let source = new_conversation("Persona source");
         let source_attachment = stage_text(&source.id, "persona source notes");
@@ -2257,20 +2454,29 @@ mod tests {
             .expect("persona snapshot")
             .clone();
         let snapshot = load_attachment_db()
-            .expect("attachment db before persona delete")
+            .expect("attachment db before Persona removal")
             .attachments
             .into_iter()
             .find(|record| record.id == snapshot_id)
             .expect("persona snapshot record");
 
-        crate::personas::persona_delete(&persona.id).expect("delete persona");
-        let db = load_attachment_db().expect("attachment db after persona deletion");
+        let impact = crate::personas::persona_removal_preview(&persona.id)
+            .expect("preview Persona removal")
+            .result
+            .expect("Persona removal impact");
+        crate::personas::persona_remove_from_library(crate::personas::PersonaRemovalCommitInput {
+            persona_id: persona.id.clone(),
+            persona_version: impact.persona_version,
+            impact_sha256: impact.impact_sha256,
+        })
+        .expect("remove Persona from library");
+        let db = load_attachment_db().expect("attachment db after Persona removal");
         assert!(
             db.attachments
                 .iter()
                 .any(|record| record.id == source_attachment.id)
         );
-        assert!(db.attachments.iter().all(|record| record.id != snapshot_id));
+        assert!(db.attachments.iter().any(|record| record.id == snapshot_id));
         assert_eq!(
             attachment_bytes(&source_attachment.id).expect("source blob after persona deletion"),
             Some(b"persona source notes".to_vec())
@@ -2284,8 +2490,38 @@ mod tests {
                         .as_deref()
                         .expect("snapshot manifest"),
                 )
-                .expect("read deleted snapshot manifest")
-                .is_none()
+                .expect("read retained snapshot manifest")
+                .is_some()
+        );
+        assert_eq!(
+            attachment_bytes(&snapshot_id).expect("Persona snapshot blob after removal"),
+            Some(b"persona source notes".to_vec())
+        );
+
+        crate::conversation_store::conversation_delete(&source.id)
+            .expect("delete original source after Persona removal");
+        let db = load_attachment_db().expect("attachment db after source deletion");
+        assert!(
+            db.attachments
+                .iter()
+                .all(|record| record.id != source_attachment.id)
+        );
+        assert!(db.attachments.iter().any(|record| record.id == snapshot_id));
+        assert!(
+            RuntimeStore::current()
+                .expect("store")
+                .get::<AttachmentManifest>(
+                    snapshot
+                        .manifest_namespace
+                        .as_deref()
+                        .expect("snapshot manifest"),
+                )
+                .expect("read snapshot manifest after source deletion")
+                .is_some()
+        );
+        assert_eq!(
+            attachment_bytes(&snapshot_id).expect("Persona snapshot blob after source deletion"),
+            Some(b"persona source notes".to_vec())
         );
     }
 

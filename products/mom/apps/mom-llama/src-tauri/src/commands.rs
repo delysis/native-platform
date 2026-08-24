@@ -397,12 +397,21 @@ pub async fn mom_llama_persona_update(
 }
 
 #[tauri::command]
-pub fn mom_llama_persona_delete(
+pub fn mom_llama_persona_removal_preview(
     runtime: State<'_, AppRuntimeHandle>,
     persona: String,
 ) -> Result<Value, String> {
-    let _lease = runtime.admit(command_spec("mom_llama_persona_delete"))?;
-    command_value(mom_llama_runtime::persona_delete(&persona))
+    let _lease = runtime.admit(command_spec("mom_llama_persona_removal_preview"))?;
+    command_value(mom_llama_runtime::persona_removal_preview(&persona))
+}
+
+#[tauri::command]
+pub fn mom_llama_persona_remove_from_library(
+    runtime: State<'_, AppRuntimeHandle>,
+    input: mom_llama_runtime::PersonaRemovalCommitInput,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_persona_remove_from_library"))?;
+    command_value(mom_llama_runtime::persona_remove_from_library(input))
 }
 
 #[tauri::command]

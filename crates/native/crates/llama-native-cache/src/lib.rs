@@ -410,6 +410,19 @@ impl MemoryPrefixCache {
         true
     }
 
+    pub fn invalidate_owner(&mut self, owner_id: &str) -> Vec<String> {
+        let ids = self
+            .values
+            .values()
+            .filter(|value| value.metadata.owner_id.as_deref() == Some(owner_id))
+            .map(|value| value.metadata.id.clone())
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.invalidate(id);
+        }
+        ids
+    }
+
     pub fn clear(&mut self) {
         self.used_bytes = 0;
         self.values.clear();
@@ -478,6 +491,18 @@ mod tests {
                 token_ids: tokens.to_vec(),
             },
         }
+    }
+
+    fn owned_value(
+        id: &str,
+        owner_id: &str,
+        tokens: &[i32],
+        bytes: usize,
+        now_ms: u128,
+    ) -> PrefixCacheValue {
+        let mut value = value(id, CacheTier::PersonaPack, tokens, bytes, now_ms);
+        value.metadata.owner_id = Some(owner_id.to_string());
+        value
     }
 
     #[test]
@@ -644,6 +669,22 @@ mod tests {
         assert!(cache.lookup(&fingerprint(), &[1, 9], 5).is_some());
         assert!(cache.lookup(&fingerprint(), &[3, 9], 5).is_some());
         assert_eq!(cache.used_bytes(), 8);
+    }
+
+    #[test]
+    fn memory_owner_invalidation_is_exact_and_updates_capacity_accounting() {
+        let mut cache = MemoryPrefixCache::new(16);
+        cache.insert(owned_value("alice-a", "alice", &[1], 4, 1));
+        cache.insert(owned_value("alice-b", "alice", &[2], 4, 2));
+        cache.insert(owned_value("bob", "bob", &[3], 4, 3));
+
+        let mut removed = cache.invalidate_owner("alice");
+        removed.sort();
+        assert_eq!(removed, ["alice-a".to_string(), "alice-b".to_string()]);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.used_bytes(), 4);
+        assert!(cache.get("bob", 4).is_some());
+        assert!(cache.get("alice-a", 4).is_none());
     }
 
     #[test]

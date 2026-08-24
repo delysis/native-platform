@@ -1,15 +1,15 @@
 use crate::config::{resolve_settings, upstream_setting_string};
 use crate::consult::{ConsultPanel, ConsultPersona, stored_legacy_panels};
 use crate::conversation_store::{
-    ChatTemplatePolicy, Conversation, ConversationDb, ConversationExecutionProfile,
-    ConversationKind, Message, MessageRole, ToolBinding, active_path_messages, load_db,
-    load_drafts, save_db,
+    CONVERSATIONS_NAMESPACE, ChatTemplatePolicy, Conversation, ConversationDb,
+    ConversationExecutionProfile, ConversationKind, DRAFTS_NAMESPACE, DraftDb, Message,
+    MessageRole, ToolBinding, active_path_messages, load_db, save_db,
 };
 use crate::native_runtime::resident_model_for_profile;
 use crate::now_ms;
 use crate::persona_library::{LIBRARY_REVISION, builtin_panels, builtin_personas};
 use crate::receipts::{Blocker, CommandResult};
-use crate::store::RuntimeStore;
+use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use anyhow::Result;
 use llama_native_types::{ChatMessage, ChatRole, ChatTemplateChoice};
 use serde::{Deserialize, Serialize};
@@ -19,9 +19,11 @@ use uuid::Uuid;
 
 const GROUPS_NAMESPACE: &str = "persona-groups.v1";
 const PERSONA_VERSIONS_NAMESPACE: &str = "persona-versions.v1";
+const PERSONA_REMOVALS_NAMESPACE: &str = "persona-removals.v1";
+const PERSONA_REMOVAL_SCHEMA: &str = "mom_llama.persona_removal_impact.v1";
 const MAX_GROUP_MEMBERS: usize = 4;
 pub(crate) const MAX_PERSONA_TOOL_BINDINGS: usize = 8;
-const PERSONA_STATE_MIGRATION_VERSION: u32 = 3;
+const PERSONA_STATE_MIGRATION_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +120,103 @@ struct PersonaVersionDb {
     versions: Vec<PersonaVersion>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaRemovalCommitInput {
+    pub persona_id: String,
+    pub persona_version: u64,
+    pub impact_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaRemovalGroupImpact {
+    pub group_id: String,
+    pub group_name: String,
+    pub member_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaRemovalDraftImpact {
+    pub updated_at: String,
+    pub message_sha256: String,
+    pub attachment_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaRemovalAttachmentImpact {
+    pub draft_attachment_ids: Vec<String>,
+    pub removed_draft_only_unshared_attachment_ids: Vec<String>,
+    pub retained_supporting_attachment_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaRemovalCacheImpact {
+    pub owner_id: String,
+    pub mom_persistent_cache_ids: Vec<String>,
+    pub native_persistent_cache_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaRemovalHistoryImpact {
+    pub retained_message_ids: Vec<String>,
+    pub retained_persona_versions: Vec<u64>,
+    pub retained_invocation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaRemovalImpact {
+    pub schema: String,
+    pub persona_id: String,
+    pub persona_version: u64,
+    pub persona_title: String,
+    pub persona_snapshot_sha256: String,
+    pub groups: Vec<PersonaRemovalGroupImpact>,
+    pub drafts: Vec<PersonaRemovalDraftImpact>,
+    pub attachments: PersonaRemovalAttachmentImpact,
+    pub caches: PersonaRemovalCacheImpact,
+    pub active_invocation_ids: Vec<String>,
+    pub retained_history: PersonaRemovalHistoryImpact,
+    pub impact_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersonaRemovalOutput {
+    pub impact: PersonaRemovalImpact,
+    pub removed_at: String,
+    pub already_removed: bool,
+    pub evicted_memory_cache_entries: usize,
+    pub evicted_native_live_cache_entries: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct PersonaRemovalLedger {
+    removals: Vec<PersonaRemovalRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PersonaRemovalRecord {
+    persona_id: String,
+    persona_version: Option<u64>,
+    impact_sha256: String,
+    impact: Option<PersonaRemovalImpact>,
+    removed_at: String,
+    #[serde(default)]
+    persona_snapshot: Option<Conversation>,
+    #[serde(default)]
+    migration_tombstone: bool,
+}
+
+enum PersonaRemovalAttempt {
+    Committed {
+        impact: PersonaRemovalImpact,
+        removed_at: String,
+    },
+    AlreadyCommitted {
+        impact: PersonaRemovalImpact,
+        removed_at: String,
+    },
+    Blocked(Blocker),
+}
+
 pub fn persona_freeze(input: PersonaFreezeInput) -> Result<CommandResult<Conversation>> {
     migrate_legacy_consult()?;
     let mut db = load_db()?;
@@ -212,8 +311,7 @@ pub fn persona_freeze(input: PersonaFreezeInput) -> Result<CommandResult<Convers
         messages,
     };
     db.conversations.insert(0, persona.clone());
-    let path = save_db(&db)?;
-    record_persona_version(&persona)?;
+    let path = save_persona_with_version(&db, &persona)?;
     Ok(CommandResult::passed(
         "mom_llama.persona_freeze",
         "contracted",
@@ -268,7 +366,20 @@ pub fn persona_get(persona_id: &str) -> Result<CommandResult<Conversation>> {
 }
 
 pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Conversation>> {
-    let tool_bindings = match normalize_tools(input.tool_bindings) {
+    let PersonaUpdateInput {
+        persona_id,
+        name,
+        mention_handle,
+        model_path,
+        mmproj_path,
+        system_message,
+        sampling,
+        chat_template,
+        tool_bindings,
+        source_history_tokens,
+        host_context_tokens,
+    } = input;
+    let tool_bindings = match normalize_tools(tool_bindings) {
         Ok(tools) => tools,
         Err(blocker) => {
             return Ok(CommandResult::blocked(
@@ -279,25 +390,7 @@ pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Convers
         }
     };
     migrate_legacy_consult()?;
-    let mut db = load_db()?;
-    let groups = load_group_db()?.groups;
-    let handle = match validate_available_handle(
-        &db,
-        Some(&input.persona_id),
-        None,
-        &input.mention_handle,
-        &groups,
-    ) {
-        Ok(handle) => handle,
-        Err(blocker) => {
-            return Ok(CommandResult::blocked(
-                "mom_llama.persona_update",
-                "stub_blocked",
-                blocker,
-            ));
-        }
-    };
-    if let ChatTemplatePolicy::FrozenSource(template) = &input.chat_template {
+    if let ChatTemplatePolicy::FrozenSource(template) = &chat_template {
         if template.trim().is_empty() {
             return Ok(CommandResult::blocked(
                 "mom_llama.persona_update",
@@ -310,11 +403,7 @@ pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Convers
             ));
         }
         let settings = resolve_settings()?;
-        let Some(model_path) = input
-            .model_path
-            .as_deref()
-            .or(settings.model_path.as_deref())
-        else {
+        let Some(model_path) = model_path.as_deref().or(settings.model_path.as_deref()) else {
             return Ok(CommandResult::blocked(
                 "mom_llama.persona_update",
                 "blocked_missing_model",
@@ -325,17 +414,17 @@ pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Convers
                 ),
             ));
         };
-        let model =
-            match resident_model_for_profile(&settings, model_path, input.mmproj_path.as_deref()) {
-                Ok(model) => model,
-                Err(blocked) => {
-                    return Ok(CommandResult::blocked(
-                        "mom_llama.persona_update",
-                        &blocked.readiness,
-                        blocked.blocker,
-                    ));
-                }
-            };
+        let model = match resident_model_for_profile(&settings, model_path, mmproj_path.as_deref())
+        {
+            Ok(model) => model,
+            Err(blocked) => {
+                return Ok(CommandResult::blocked(
+                    "mom_llama.persona_update",
+                    &blocked.readiness,
+                    blocked.blocker,
+                ));
+            }
+        };
         if let Err(error) = model.tokenize_messages_with_template(
             vec![ChatMessage {
                 role: ChatRole::User,
@@ -357,41 +446,86 @@ pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Convers
             ));
         }
     }
-    let Some(persona) = db.conversations.iter_mut().find(|conversation| {
-        conversation.id == input.persona_id
-            && conversation.kind == ConversationKind::PersonaTemplate
-    }) else {
-        return Ok(blocked_persona(
-            "mom_llama.persona_update",
-            "persona_not_found",
-            "The persona no longer exists.",
-        ));
+    let store = RuntimeStore::current()?;
+    let updated = store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |conversations, documents| {
+            if persona_cache_owner_is_removed_from_documents(documents, &persona_id)? {
+                return Ok(Err(Blocker::new(
+                    "persona_not_found",
+                    "The Persona is no longer discoverable in the library.",
+                    vec!["Refresh the Persona library.".to_string()],
+                )));
+            }
+            let groups = documents
+                .get::<PersonaGroupDb>(GROUPS_NAMESPACE)?
+                .unwrap_or_default();
+            let handle = match validate_available_handle(
+                conversations,
+                Some(&persona_id),
+                None,
+                &mention_handle,
+                &groups.groups,
+            ) {
+                Ok(handle) => handle,
+                Err(blocker) => return Ok(Err(blocker)),
+            };
+            let Some(persona) = conversations.conversations.iter_mut().find(|conversation| {
+                conversation.id == persona_id
+                    && conversation.kind == ConversationKind::PersonaTemplate
+            }) else {
+                return Ok(Err(Blocker::new(
+                    "persona_not_found",
+                    "The Persona no longer exists.",
+                    vec!["Refresh the Persona library.".to_string()],
+                )));
+            };
+            persona.title = clean_name(&name, "Persona");
+            persona.execution_profile = ConversationExecutionProfile {
+                mention_handle: handle,
+                model_path: model_path.clone(),
+                mmproj_path: mmproj_path.clone(),
+                system_message: system_message
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
+                sampling: sampling.clone(),
+                chat_template: chat_template.clone(),
+                tool_bindings: tool_bindings.clone(),
+                source_history_tokens: source_history_tokens.clamp(0, 32768),
+                host_context_tokens: host_context_tokens.clamp(0, 32768),
+                version: persona.execution_profile.version.saturating_add(1),
+            };
+            persona.selected_model_path = model_path.clone();
+            persona.updated_at = now_ms().to_string();
+            let output = persona.clone();
+            let version = build_persona_version(&output)?;
+            let mut versions = documents
+                .get::<PersonaVersionDb>(PERSONA_VERSIONS_NAMESPACE)?
+                .unwrap_or_default();
+            versions.versions.retain(|candidate| {
+                candidate.persona_id != version.persona_id || candidate.version != version.version
+            });
+            versions.versions.push(version);
+            documents.put_bytes(PERSONA_VERSIONS_NAMESPACE, &serde_json::to_vec(&versions)?)?;
+            Ok(Ok(output))
+        },
+    )?;
+    let output = match updated {
+        Ok(output) => output,
+        Err(blocker) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.persona_update",
+                "stub_blocked",
+                blocker,
+            ));
+        }
     };
-    persona.title = clean_name(&input.name, "Persona");
-    persona.execution_profile = ConversationExecutionProfile {
-        mention_handle: handle,
-        model_path: input.model_path.clone(),
-        mmproj_path: input.mmproj_path,
-        system_message: input
-            .system_message
-            .filter(|value| !value.trim().is_empty()),
-        sampling: input.sampling,
-        chat_template: input.chat_template,
-        tool_bindings,
-        source_history_tokens: input.source_history_tokens.clamp(0, 32768),
-        host_context_tokens: input.host_context_tokens.clamp(0, 32768),
-        version: persona.execution_profile.version.saturating_add(1),
-    };
-    persona.selected_model_path = input.model_path;
-    persona.updated_at = now_ms().to_string();
-    let output = persona.clone();
-    let path = save_db(&db)?;
-    record_persona_version(&output)?;
     Ok(CommandResult::passed(
         "mom_llama.persona_update",
         "contracted",
         output,
-        vec![path.display().to_string()],
+        vec![store.path().display().to_string()],
         Vec::new(),
         false,
         false,
@@ -399,6 +533,56 @@ pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Convers
 }
 
 pub(crate) fn record_persona_version(persona: &Conversation) -> Result<PersonaVersion> {
+    let version = build_persona_version(persona)?;
+    RuntimeStore::current()?.mutate(
+        PERSONA_VERSIONS_NAMESPACE,
+        PersonaVersionDb::default,
+        |db| {
+            db.versions.retain(|candidate| {
+                candidate.persona_id != version.persona_id || candidate.version != version.version
+            });
+            db.versions.push(version.clone());
+            Ok(())
+        },
+    )?;
+    Ok(version)
+}
+
+pub(crate) fn save_persona_with_version(
+    conversations: &ConversationDb,
+    persona: &Conversation,
+) -> Result<PathBuf> {
+    let version = build_persona_version(persona)?;
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |stored, documents| {
+            let mut next = conversations.clone();
+            filter_removed_personas_from_documents(&mut next, documents)?;
+            if !next.conversations.iter().any(|conversation| {
+                conversation.id == persona.id
+                    && conversation.kind == ConversationKind::PersonaTemplate
+                    && conversation.execution_profile.version == version.version
+            }) {
+                anyhow::bail!("Persona changed or was removed before its version could commit");
+            }
+            *stored = next;
+            let mut versions = documents
+                .get::<PersonaVersionDb>(PERSONA_VERSIONS_NAMESPACE)?
+                .unwrap_or_default();
+            versions.versions.retain(|candidate| {
+                candidate.persona_id != version.persona_id || candidate.version != version.version
+            });
+            versions.versions.push(version.clone());
+            documents.put_bytes(PERSONA_VERSIONS_NAMESPACE, &serde_json::to_vec(&versions)?)?;
+            Ok(())
+        },
+    )?;
+    Ok(store.path().to_path_buf())
+}
+
+fn build_persona_version(persona: &Conversation) -> Result<PersonaVersion> {
     if persona.kind != ConversationKind::PersonaTemplate {
         anyhow::bail!("only Persona templates have Persona version records");
     }
@@ -416,17 +600,6 @@ pub(crate) fn record_persona_version(persona: &Conversation) -> Result<PersonaVe
         conversation_sha256,
         created_at: now_ms().to_string(),
     };
-    RuntimeStore::current()?.mutate(
-        PERSONA_VERSIONS_NAMESPACE,
-        PersonaVersionDb::default,
-        |db| {
-            db.versions.retain(|candidate| {
-                candidate.persona_id != version.persona_id || candidate.version != version.version
-            });
-            db.versions.push(version.clone());
-            Ok(())
-        },
-    )?;
     Ok(version)
 }
 
@@ -447,55 +620,531 @@ fn sha256_json(value: &impl Serialize) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
 }
 
-pub fn persona_delete(persona_id: &str) -> Result<CommandResult<Conversation>> {
+pub fn persona_removal_preview(persona_id: &str) -> Result<CommandResult<PersonaRemovalImpact>> {
+    const COMMAND: &str = "mom_llama.persona_removal_preview";
     migrate_legacy_consult()?;
-    let mut db = load_db()?;
-    let Some(index) = db.conversations.iter().position(|conversation| {
-        conversation.id == persona_id && conversation.kind == ConversationKind::PersonaTemplate
-    }) else {
+    let store = RuntimeStore::current()?;
+    let impact = crate::mentions::with_persona_invocation_registry(persona_id, |live_ids| {
+        store.read_documents(|snapshot| {
+            build_persona_removal_impact_from_snapshot(snapshot, persona_id, live_ids)
+        })
+    })?;
+    let Some(impact) = impact else {
         return Ok(blocked_persona(
-            "mom_llama.persona_delete",
+            COMMAND,
             "persona_not_found",
-            "The persona no longer exists.",
+            "The Persona is not currently discoverable in the library.",
         ));
     };
-    let removed = db.conversations.remove(index);
-    let mut removed_attachment_ids = removed
-        .messages
-        .iter()
-        .flat_map(|message| message.attachment_ids.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    let mut drafts = load_drafts()?;
-    drafts.drafts.retain(|draft| {
-        if draft.conversation_id.as_deref() == Some(persona_id) {
-            removed_attachment_ids.extend(draft.attachment_ids.iter().cloned());
-            false
-        } else {
-            true
-        }
-    });
-    let path = crate::attachments::persist_conversations_with_attachment_gc(
-        &db,
-        Some(&drafts),
-        &removed_attachment_ids,
-        &BTreeSet::from([persona_id.to_string()]),
-    )?;
-    let store = RuntimeStore::current()?;
-    store.mutate(GROUPS_NAMESPACE, PersonaGroupDb::default, |groups| {
-        for group in &mut groups.groups {
-            group.persona_ids.retain(|id| id != persona_id);
-        }
-        Ok(())
-    })?;
     Ok(CommandResult::passed(
-        "mom_llama.persona_delete",
+        COMMAND,
         "contracted",
-        removed,
-        vec![path.display().to_string()],
+        impact,
+        Vec::new(),
         Vec::new(),
         false,
         false,
     ))
+}
+
+pub fn persona_remove_from_library(
+    input: PersonaRemovalCommitInput,
+) -> Result<CommandResult<PersonaRemovalOutput>> {
+    persona_remove_from_library_inner(input, false)
+}
+
+fn persona_remove_from_library_inner(
+    input: PersonaRemovalCommitInput,
+    inject_failure_after_mutations: bool,
+) -> Result<CommandResult<PersonaRemovalOutput>> {
+    const COMMAND: &str = "mom_llama.persona_remove_from_library";
+    if input.persona_id.trim().is_empty()
+        || input.persona_version == 0
+        || !is_sha256(&input.impact_sha256)
+    {
+        return Ok(CommandResult::blocked(
+            COMMAND,
+            "stub_blocked",
+            Blocker::new(
+                "persona_removal_identity_invalid",
+                "Remove from Library requires an exact Persona ID, version, and impact SHA-256.",
+                vec!["Preview the current removal impact again.".to_string()],
+            ),
+        ));
+    }
+    migrate_legacy_consult()?;
+    let store = RuntimeStore::current()?;
+    crate::mentions::with_persona_invocation_registry(&input.persona_id, |live_ids| {
+        // The registry lock is held across the authoritative transaction. A
+        // frozen invocation that registered first may finish; once this commit
+        // wins, later registrations see the tombstone and fail closed.
+        let attempt = store.mutate_documents(
+            PERSONA_REMOVALS_NAMESPACE,
+            PersonaRemovalLedger::default,
+            |ledger, documents| {
+                if let Some(record) = ledger.removals.iter().find(|record| {
+                    record.persona_id == input.persona_id
+                        && record.persona_version == Some(input.persona_version)
+                        && record.impact_sha256 == input.impact_sha256
+                }) {
+                    let impact = record.impact.clone().ok_or_else(|| {
+                        anyhow::anyhow!("matching Persona removal ledger entry has no exact impact")
+                    })?;
+                    return Ok(PersonaRemovalAttempt::AlreadyCommitted {
+                        impact,
+                        removed_at: record.removed_at.clone(),
+                    });
+                }
+
+                let Some(impact) = build_persona_removal_impact_from_documents(
+                    documents,
+                    &input.persona_id,
+                    live_ids,
+                )? else {
+                    return Ok(PersonaRemovalAttempt::Blocked(Blocker::new(
+                        "persona_not_found",
+                        "The Persona is not currently discoverable in the library.",
+                        vec!["Refresh the Persona library.".to_string()],
+                    )));
+                };
+                if impact.persona_version != input.persona_version {
+                    return Ok(PersonaRemovalAttempt::Blocked(Blocker::new(
+                        "persona_removal_version_changed",
+                        format!(
+                            "The Persona is now version {}; the confirmed preview was version {}.",
+                            impact.persona_version, input.persona_version
+                        ),
+                        vec!["Preview the current removal impact again.".to_string()],
+                    )));
+                }
+                if impact.impact_sha256 != input.impact_sha256 {
+                    return Ok(PersonaRemovalAttempt::Blocked(Blocker::new(
+                        "persona_removal_impact_changed",
+                        "The groups, draft, attachments, cache, or invocation impact changed after preview.",
+                        vec!["Review and confirm the updated removal impact.".to_string()],
+                    )));
+                }
+
+                let mut conversations = documents
+                    .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?
+                    .unwrap_or_default();
+                let Some(index) = conversations.conversations.iter().position(|conversation| {
+                    conversation.id == input.persona_id
+                        && conversation.kind == ConversationKind::PersonaTemplate
+                }) else {
+                    anyhow::bail!("Persona disappeared inside its removal transaction");
+                };
+                let persona_snapshot = conversations.conversations.remove(index);
+                if conversations.selected_conversation_id.as_deref()
+                    == Some(input.persona_id.as_str())
+                {
+                    conversations.selected_conversation_id = conversations
+                        .conversations
+                        .iter()
+                        .find(|conversation| conversation.kind == ConversationKind::Chat)
+                        .map(|conversation| conversation.id.clone());
+                }
+
+                let mut drafts = documents
+                    .get::<DraftDb>(DRAFTS_NAMESPACE)?
+                    .unwrap_or_default();
+                drafts.drafts.retain(|draft| {
+                    draft.conversation_id.as_deref() != Some(input.persona_id.as_str())
+                });
+                let mut groups = documents
+                    .get::<PersonaGroupDb>(GROUPS_NAMESPACE)?
+                    .unwrap_or_default();
+                for group in &mut groups.groups {
+                    group.persona_ids.retain(|id| id != &input.persona_id);
+                }
+                if let Some(provenance) = groups
+                    .builtin_persona_provenance
+                    .iter_mut()
+                    .find(|provenance| provenance.persona_id == input.persona_id)
+                {
+                    provenance.ownership = BuiltinPersonaOwnership::UserModified;
+                    provenance.observed_persona_sha256 = "deleted".to_string();
+                }
+
+                let removed_attachments =
+                    crate::attachments::remove_persona_draft_attachments_from_documents(
+                        documents,
+                        &impact
+                            .attachments
+                            .removed_draft_only_unshared_attachment_ids,
+                    )?;
+                if removed_attachments
+                    != impact
+                        .attachments
+                        .removed_draft_only_unshared_attachment_ids
+                {
+                    anyhow::bail!("Persona draft attachment removal changed inside transaction");
+                }
+                let removed_mom_cache =
+                    crate::kv_cache::remove_persona_cache_from_documents(
+                        documents,
+                        &input.persona_id,
+                    )?;
+                let removed_native_cache =
+                    crate::native_runtime::remove_persona_native_cache_from_documents(
+                        documents,
+                        &input.persona_id,
+                    )?;
+                if removed_mom_cache != impact.caches.mom_persistent_cache_ids
+                    || removed_native_cache != impact.caches.native_persistent_cache_ids
+                {
+                    anyhow::bail!("Persona cache impact changed inside removal transaction");
+                }
+
+                documents.put_bytes(
+                    CONVERSATIONS_NAMESPACE,
+                    &serde_json::to_vec(&conversations)?,
+                )?;
+                documents.put_bytes(DRAFTS_NAMESPACE, &serde_json::to_vec(&drafts)?)?;
+                documents.put_bytes(GROUPS_NAMESPACE, &serde_json::to_vec(&groups)?)?;
+                let removed_at = now_ms().to_string();
+                ledger
+                    .removals
+                    .retain(|record| record.persona_id != input.persona_id);
+                ledger.removals.push(PersonaRemovalRecord {
+                    persona_id: input.persona_id.clone(),
+                    persona_version: Some(input.persona_version),
+                    impact_sha256: input.impact_sha256.clone(),
+                    impact: Some(impact.clone()),
+                    removed_at: removed_at.clone(),
+                    persona_snapshot: Some(persona_snapshot),
+                    migration_tombstone: false,
+                });
+                if inject_failure_after_mutations {
+                    anyhow::bail!("injected Persona removal transaction failure");
+                }
+                Ok(PersonaRemovalAttempt::Committed { impact, removed_at })
+            },
+        )?;
+
+        let (impact, removed_at, already_removed) = match attempt {
+            PersonaRemovalAttempt::Blocked(blocker) => {
+                return Ok(CommandResult::blocked(COMMAND, "stub_blocked", blocker));
+            }
+            PersonaRemovalAttempt::Committed { impact, removed_at } => (impact, removed_at, false),
+            PersonaRemovalAttempt::AlreadyCommitted { impact, removed_at } => {
+                (impact, removed_at, true)
+            }
+        };
+        let post_memory = crate::kv_cache::invalidate_persona_memory_cache(&input.persona_id)?;
+        let post_native =
+            crate::native_runtime::invalidate_loaded_native_cache_owner(&input.persona_id)?;
+        Ok(CommandResult::passed(
+            COMMAND,
+            "contracted",
+            PersonaRemovalOutput {
+                impact,
+                removed_at,
+                already_removed,
+                evicted_memory_cache_entries: post_memory,
+                evicted_native_live_cache_entries: post_native,
+            },
+            vec![store.path().display().to_string()],
+            Vec::new(),
+            false,
+            false,
+        ))
+    })
+}
+
+fn build_persona_removal_impact_from_snapshot(
+    snapshot: &DocumentSnapshot<'_, '_, '_>,
+    persona_id: &str,
+    live_invocation_ids: &[String],
+) -> Result<Option<PersonaRemovalImpact>> {
+    let conversations = snapshot
+        .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?
+        .unwrap_or_default();
+    let Some(persona) = conversations.conversations.iter().find(|conversation| {
+        conversation.id == persona_id && conversation.kind == ConversationKind::PersonaTemplate
+    }) else {
+        return Ok(None);
+    };
+    let drafts = snapshot
+        .get::<DraftDb>(DRAFTS_NAMESPACE)?
+        .unwrap_or_default();
+    let groups = snapshot
+        .get::<PersonaGroupDb>(GROUPS_NAMESPACE)?
+        .unwrap_or_default();
+    let versions = snapshot
+        .get::<PersonaVersionDb>(PERSONA_VERSIONS_NAMESPACE)?
+        .unwrap_or_default();
+    let attachment_impact = crate::attachments::persona_attachment_impact_from_snapshot(
+        snapshot,
+        persona,
+        &conversations,
+        &drafts,
+    )?;
+    let invocation_impact = crate::mentions::persona_invocation_impact_from_snapshot(
+        snapshot,
+        persona_id,
+        live_invocation_ids,
+    )?;
+    build_persona_removal_impact(
+        persona,
+        &drafts,
+        &groups,
+        &versions,
+        attachment_impact,
+        crate::kv_cache::persona_cache_ids_from_snapshot(snapshot, persona_id)?,
+        crate::native_runtime::persona_native_cache_ids_from_snapshot(snapshot, persona_id)?,
+        invocation_impact,
+    )
+    .map(Some)
+}
+
+fn build_persona_removal_impact_from_documents(
+    documents: &DocumentMutations<'_, '_, '_>,
+    persona_id: &str,
+    live_invocation_ids: &[String],
+) -> Result<Option<PersonaRemovalImpact>> {
+    let conversations = documents
+        .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?
+        .unwrap_or_default();
+    let Some(persona) = conversations.conversations.iter().find(|conversation| {
+        conversation.id == persona_id && conversation.kind == ConversationKind::PersonaTemplate
+    }) else {
+        return Ok(None);
+    };
+    let drafts = documents
+        .get::<DraftDb>(DRAFTS_NAMESPACE)?
+        .unwrap_or_default();
+    let groups = documents
+        .get::<PersonaGroupDb>(GROUPS_NAMESPACE)?
+        .unwrap_or_default();
+    let versions = documents
+        .get::<PersonaVersionDb>(PERSONA_VERSIONS_NAMESPACE)?
+        .unwrap_or_default();
+    let attachment_impact = crate::attachments::persona_attachment_impact_from_documents(
+        documents,
+        persona,
+        &conversations,
+        &drafts,
+    )?;
+    let invocation_impact = crate::mentions::persona_invocation_impact_from_documents(
+        documents,
+        persona_id,
+        live_invocation_ids,
+    )?;
+    build_persona_removal_impact(
+        persona,
+        &drafts,
+        &groups,
+        &versions,
+        attachment_impact,
+        crate::kv_cache::persona_cache_ids_from_documents(documents, persona_id)?,
+        crate::native_runtime::persona_native_cache_ids_from_documents(documents, persona_id)?,
+        invocation_impact,
+    )
+    .map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_persona_removal_impact(
+    persona: &Conversation,
+    drafts: &DraftDb,
+    groups: &PersonaGroupDb,
+    versions: &PersonaVersionDb,
+    attachment_impact: crate::attachments::PersonaAttachmentRemovalImpact,
+    mut mom_persistent_cache_ids: Vec<String>,
+    mut native_persistent_cache_ids: Vec<String>,
+    invocation_impact: crate::mentions::PersonaInvocationRemovalImpact,
+) -> Result<PersonaRemovalImpact> {
+    let mut group_impact = groups
+        .groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .persona_ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| id.as_str() == persona.id.as_str())
+                .map(|(member_index, _)| PersonaRemovalGroupImpact {
+                    group_id: group.id.clone(),
+                    group_name: group.name.clone(),
+                    member_index,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    group_impact.sort_by(|left, right| {
+        (&left.group_id, left.member_index).cmp(&(&right.group_id, right.member_index))
+    });
+    let mut draft_impact = drafts
+        .drafts
+        .iter()
+        .filter(|draft| draft.conversation_id.as_deref() == Some(persona.id.as_str()))
+        .map(|draft| {
+            let mut attachment_ids = draft.attachment_ids.clone();
+            attachment_ids.sort();
+            Ok(PersonaRemovalDraftImpact {
+                updated_at: draft.updated_at.clone(),
+                message_sha256: sha256_json(&draft.message)?,
+                attachment_ids,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    draft_impact.sort_by(|left, right| {
+        (&left.updated_at, &left.message_sha256, &left.attachment_ids).cmp(&(
+            &right.updated_at,
+            &right.message_sha256,
+            &right.attachment_ids,
+        ))
+    });
+    let mut retained_message_ids = persona
+        .messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    retained_message_ids.sort();
+    let mut retained_persona_versions = versions
+        .versions
+        .iter()
+        .filter(|version| version.persona_id == persona.id.as_str())
+        .map(|version| version.version)
+        .collect::<Vec<_>>();
+    retained_persona_versions.sort_unstable();
+    retained_persona_versions.dedup();
+    mom_persistent_cache_ids.sort();
+    native_persistent_cache_ids.sort();
+
+    let mut impact = PersonaRemovalImpact {
+        schema: PERSONA_REMOVAL_SCHEMA.to_string(),
+        persona_id: persona.id.clone(),
+        persona_version: persona.execution_profile.version,
+        persona_title: persona.title.clone(),
+        persona_snapshot_sha256: sha256_json(persona)?,
+        groups: group_impact,
+        drafts: draft_impact,
+        attachments: PersonaRemovalAttachmentImpact {
+            draft_attachment_ids: attachment_impact.draft_attachment_ids,
+            removed_draft_only_unshared_attachment_ids: attachment_impact
+                .draft_only_unshared_attachment_ids,
+            retained_supporting_attachment_ids: attachment_impact
+                .retained_supporting_attachment_ids,
+        },
+        caches: PersonaRemovalCacheImpact {
+            owner_id: persona.id.clone(),
+            mom_persistent_cache_ids,
+            native_persistent_cache_ids,
+        },
+        active_invocation_ids: invocation_impact.active_invocation_ids,
+        retained_history: PersonaRemovalHistoryImpact {
+            retained_message_ids,
+            retained_persona_versions,
+            retained_invocation_ids: invocation_impact.retained_invocation_ids,
+        },
+        impact_sha256: String::new(),
+    };
+    impact.impact_sha256 = sha256_json(&impact)?;
+    Ok(impact)
+}
+
+pub(crate) fn persona_cache_owner_is_removed(owner_id: &str) -> Result<bool> {
+    let ledger = RuntimeStore::current()?
+        .get::<PersonaRemovalLedger>(PERSONA_REMOVALS_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(persona_is_tombstoned(&ledger, owner_id))
+}
+
+pub(crate) fn persona_cache_owner_is_removed_from_documents(
+    documents: &DocumentMutations<'_, '_, '_>,
+    owner_id: &str,
+) -> Result<bool> {
+    let ledger = documents
+        .get::<PersonaRemovalLedger>(PERSONA_REMOVALS_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(persona_is_tombstoned(&ledger, owner_id))
+}
+
+pub(crate) fn persona_ids_are_removed(persona_ids: &[String]) -> Result<Vec<String>> {
+    let ledger = RuntimeStore::current()?
+        .get::<PersonaRemovalLedger>(PERSONA_REMOVALS_NAMESPACE)?
+        .unwrap_or_default();
+    let mut removed = persona_ids
+        .iter()
+        .filter(|id| persona_is_tombstoned(&ledger, id))
+        .cloned()
+        .collect::<Vec<_>>();
+    removed.sort();
+    removed.dedup();
+    Ok(removed)
+}
+
+pub(crate) fn filter_removed_personas_from_documents(
+    conversations: &mut ConversationDb,
+    documents: &DocumentMutations<'_, '_, '_>,
+) -> Result<Vec<String>> {
+    let ledger = documents
+        .get::<PersonaRemovalLedger>(PERSONA_REMOVALS_NAMESPACE)?
+        .unwrap_or_default();
+    let mut filtered = conversations
+        .conversations
+        .iter()
+        .filter(|conversation| {
+            conversation.kind == ConversationKind::PersonaTemplate
+                && persona_is_tombstoned(&ledger, &conversation.id)
+        })
+        .map(|conversation| conversation.id.clone())
+        .collect::<Vec<_>>();
+    conversations.conversations.retain(|conversation| {
+        conversation.kind != ConversationKind::PersonaTemplate
+            || !persona_is_tombstoned(&ledger, &conversation.id)
+    });
+    if conversations
+        .selected_conversation_id
+        .as_ref()
+        .is_some_and(|selected| filtered.contains(selected))
+    {
+        conversations.selected_conversation_id = conversations
+            .conversations
+            .iter()
+            .find(|conversation| conversation.kind == ConversationKind::Chat)
+            .map(|conversation| conversation.id.clone());
+    }
+    filtered.sort();
+    Ok(filtered)
+}
+
+pub(crate) fn filter_removed_persona_drafts_from_documents(
+    drafts: &mut DraftDb,
+    documents: &DocumentMutations<'_, '_, '_>,
+) -> Result<Vec<String>> {
+    let ledger = documents
+        .get::<PersonaRemovalLedger>(PERSONA_REMOVALS_NAMESPACE)?
+        .unwrap_or_default();
+    let mut filtered = drafts
+        .drafts
+        .iter()
+        .filter_map(|draft| draft.conversation_id.as_deref())
+        .filter(|conversation_id| persona_is_tombstoned(&ledger, conversation_id))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    drafts.drafts.retain(|draft| {
+        !draft
+            .conversation_id
+            .as_deref()
+            .is_some_and(|conversation_id| persona_is_tombstoned(&ledger, conversation_id))
+    });
+    filtered.sort();
+    filtered.dedup();
+    Ok(filtered)
+}
+
+fn persona_is_tombstoned(ledger: &PersonaRemovalLedger, persona_id: &str) -> bool {
+    ledger
+        .removals
+        .iter()
+        .any(|record| record.persona_id == persona_id)
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub fn persona_instantiate(
@@ -656,7 +1305,6 @@ fn write_group(
     command: &str,
 ) -> Result<CommandResult<PersonaGroup>> {
     migrate_legacy_consult()?;
-    let conversation_db = load_db()?;
     let persona_ids = persona_ids
         .into_iter()
         .filter(|id| !id.trim().is_empty())
@@ -673,13 +1321,7 @@ fn write_group(
         ));
     }
     let unique = persona_ids.iter().collect::<BTreeSet<_>>();
-    if unique.len() != persona_ids.len()
-        || persona_ids.iter().any(|id| {
-            !conversation_db.conversations.iter().any(|conversation| {
-                conversation.id == *id && conversation.kind == ConversationKind::PersonaTemplate
-            })
-        })
-    {
+    if unique.len() != persona_ids.len() {
         return Ok(CommandResult::blocked(
             command,
             "stub_blocked",
@@ -690,37 +1332,61 @@ fn write_group(
             ),
         ));
     }
-    let mut db = load_group_db()?;
-    let handle = match validate_available_handle(
-        &conversation_db,
-        None,
-        group_id.as_deref(),
-        &mention_handle,
-        &db.groups,
-    ) {
-        Ok(handle) => handle,
+    let id = group_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let store = RuntimeStore::current()?;
+    let written = store.mutate_documents(
+        GROUPS_NAMESPACE,
+        PersonaGroupDb::default,
+        |groups, documents| {
+            let conversations = documents
+                .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?
+                .unwrap_or_default();
+            if persona_ids.iter().any(|persona_id| {
+                !conversations.conversations.iter().any(|conversation| {
+                    conversation.id == *persona_id
+                        && conversation.kind == ConversationKind::PersonaTemplate
+                })
+            }) {
+                return Ok(Err(Blocker::new(
+                    "persona_group_member_invalid",
+                    "Every consult-group member must be a distinct discoverable Persona.",
+                    vec!["Refresh Personas and choose valid members.".to_string()],
+                )));
+            }
+            let handle = match validate_available_handle(
+                &conversations,
+                None,
+                Some(&id),
+                &mention_handle,
+                &groups.groups,
+            ) {
+                Ok(handle) => handle,
+                Err(blocker) => return Ok(Err(blocker)),
+            };
+            let now = now_ms().to_string();
+            let created_at = groups
+                .groups
+                .iter()
+                .find(|group| group.id == id)
+                .map(|group| group.created_at.clone())
+                .unwrap_or_else(|| now.clone());
+            let group = PersonaGroup {
+                id: id.clone(),
+                name: clean_name(&name, "Consult group"),
+                mention_handle: handle,
+                persona_ids: persona_ids.clone(),
+                created_at,
+                updated_at: now,
+            };
+            groups.groups.retain(|candidate| candidate.id != id);
+            groups.groups.insert(0, group.clone());
+            Ok(Ok(group))
+        },
+    )?;
+    let group = match written {
+        Ok(group) => group,
         Err(blocker) => return Ok(CommandResult::blocked(command, "stub_blocked", blocker)),
     };
-    let now = now_ms().to_string();
-    let id = group_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let created_at = db
-        .groups
-        .iter()
-        .find(|group| group.id == id)
-        .map(|group| group.created_at.clone())
-        .unwrap_or_else(|| now.clone());
-    let group = PersonaGroup {
-        id: id.clone(),
-        name: clean_name(&name, "Consult group"),
-        mention_handle: handle,
-        persona_ids,
-        created_at,
-        updated_at: now,
-    };
-    db.groups.retain(|candidate| candidate.id != id);
-    db.groups.insert(0, group.clone());
-    let store = RuntimeStore::current()?;
-    store.put(GROUPS_NAMESPACE, &db)?;
     Ok(CommandResult::passed(
         command,
         "contracted",
@@ -827,6 +1493,7 @@ fn migrate_legacy_consult() -> Result<()> {
         }
     }
     repair_legacy_handles(&mut conversations, &mut groups);
+    let dangling_persona_ids = repair_dangling_group_members(&conversations, &mut groups);
     groups.legacy_consult_migrated = true;
     groups.migration_version = PERSONA_STATE_MIGRATION_VERSION;
     groups.catalog_revision = Some(LIBRARY_REVISION.to_string());
@@ -844,7 +1511,96 @@ fn migrate_legacy_consult() -> Result<()> {
         }
         record_persona_version(&persona)?;
     }
-    RuntimeStore::current()?.put(GROUPS_NAMESPACE, &groups)?;
+    persist_persona_removal_migration(&conversations, &groups, &dangling_persona_ids)?;
+    Ok(())
+}
+
+fn repair_dangling_group_members(
+    conversations: &ConversationDb,
+    groups: &mut PersonaGroupDb,
+) -> Vec<String> {
+    let valid_persona_ids = conversations
+        .conversations
+        .iter()
+        .filter(|conversation| conversation.kind == ConversationKind::PersonaTemplate)
+        .map(|conversation| conversation.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut removed_persona_ids = Vec::new();
+    for group in &mut groups.groups {
+        let before = group.persona_ids.len();
+        let mut retained = Vec::with_capacity(group.persona_ids.len());
+        for id in group.persona_ids.drain(..) {
+            if valid_persona_ids.contains(id.as_str()) {
+                retained.push(id);
+            } else {
+                removed_persona_ids.push(id);
+            }
+        }
+        if retained.len() != before {
+            group.updated_at = now_ms().to_string();
+        }
+        group.persona_ids = retained;
+    }
+    groups.groups.retain(|group| !group.persona_ids.is_empty());
+    removed_persona_ids.sort();
+    removed_persona_ids.dedup();
+    removed_persona_ids
+}
+
+fn persist_persona_removal_migration(
+    conversations: &ConversationDb,
+    groups: &PersonaGroupDb,
+    dangling_persona_ids: &[String],
+) -> Result<()> {
+    let present = conversations
+        .conversations
+        .iter()
+        .filter(|conversation| conversation.kind == ConversationKind::PersonaTemplate)
+        .map(|conversation| conversation.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut absent_persona_ids = groups
+        .builtin_persona_provenance
+        .iter()
+        .filter(|provenance| {
+            provenance.observed_persona_sha256 == "deleted"
+                && !present.contains(provenance.persona_id.as_str())
+        })
+        .map(|provenance| provenance.persona_id.clone())
+        .chain(dangling_persona_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    absent_persona_ids.sort();
+    absent_persona_ids.dedup();
+    let store = RuntimeStore::current()?;
+    store.mutate_documents(
+        PERSONA_REMOVALS_NAMESPACE,
+        PersonaRemovalLedger::default,
+        |ledger, documents| {
+            for persona_id in &absent_persona_ids {
+                if !persona_is_tombstoned(ledger, persona_id) {
+                    let removed_at = now_ms().to_string();
+                    ledger.removals.push(PersonaRemovalRecord {
+                        persona_id: persona_id.clone(),
+                        persona_version: None,
+                        impact_sha256: sha256_json(&("persona_removal_migration.v1", persona_id))?,
+                        impact: None,
+                        removed_at,
+                        persona_snapshot: None,
+                        migration_tombstone: true,
+                    });
+                }
+                crate::kv_cache::remove_persona_cache_from_documents(documents, persona_id)?;
+                crate::native_runtime::remove_persona_native_cache_from_documents(
+                    documents, persona_id,
+                )?;
+            }
+            documents.put_bytes(GROUPS_NAMESPACE, &serde_json::to_vec(groups)?)?;
+            Ok(())
+        },
+    )?;
+    for persona_id in absent_persona_ids {
+        crate::kv_cache::invalidate_persona_memory_cache(&persona_id)?;
+        crate::native_runtime::invalidate_loaded_native_cache_owner(&persona_id)?;
+    }
     Ok(())
 }
 
@@ -1409,7 +2165,10 @@ fn clean_name(value: &str, fallback: &str) -> String {
     }
 }
 
-fn blocked_persona(command: &str, code: &str, message: &str) -> CommandResult<Conversation> {
+fn blocked_persona<T>(command: &str, code: &str, message: &str) -> CommandResult<T>
+where
+    T: Serialize,
+{
     CommandResult::blocked(
         command,
         "stub_blocked",
@@ -1424,15 +2183,143 @@ fn blocked_persona(command: &str, code: &str, message: &str) -> CommandResult<Co
 #[cfg(test)]
 mod tests {
     use super::{
-        BuiltinPersonaOwnership, MAX_PERSONA_TOOL_BINDINGS, PersonaGroupDb,
-        builtin_persona_content_sha256, normalize_handle, normalize_tools,
-        reconcile_builtin_personas, repair_legacy_handles, slug, validate_available_handle,
+        BuiltinPersonaOwnership, GROUPS_NAMESPACE, MAX_PERSONA_TOOL_BINDINGS,
+        PERSONA_REMOVALS_NAMESPACE, PERSONA_STATE_MIGRATION_VERSION, PERSONA_VERSIONS_NAMESPACE,
+        PersonaGroupDb, PersonaRemovalCommitInput, PersonaRemovalLedger, PersonaVersion,
+        PersonaVersionDb, builtin_persona_content_sha256, normalize_handle, normalize_tools,
+        persona_removal_preview, persona_remove_from_library, persona_remove_from_library_inner,
+        reconcile_builtin_personas, repair_dangling_group_members, repair_legacy_handles, slug,
+        validate_available_handle,
     };
+    use crate::config::{lock_data_dir_override_for_tests, set_data_dir_override_for_tests};
     use crate::consult::ConsultPersona;
     use crate::conversation_store::{
-        Conversation, ConversationDb, ConversationExecutionProfile, ConversationKind, Message,
-        MessageRole, ToolBinding,
+        CONVERSATIONS_NAMESPACE, Conversation, ConversationDb, ConversationExecutionProfile,
+        ConversationKind, DRAFTS_NAMESPACE, DraftDb, DraftMessage, Message, MessageRole,
+        ToolBinding, load_db, save_db,
     };
+    use crate::persona_library::LIBRARY_REVISION;
+    use crate::store::RuntimeStore;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::sync::MutexGuard;
+    use uuid::Uuid;
+
+    struct TestDataDir {
+        _guard: MutexGuard<'static, ()>,
+        path: PathBuf,
+    }
+
+    impl TestDataDir {
+        fn new(label: &str) -> Self {
+            let guard = lock_data_dir_override_for_tests();
+            let path = std::env::temp_dir().join(format!(
+                "mom-llama-persona-removal-{label}-{}",
+                Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&path).expect("create Persona removal test data dir");
+            set_data_dir_override_for_tests(Some(path.clone()));
+            Self {
+                _guard: guard,
+                path,
+            }
+        }
+    }
+
+    impl Drop for TestDataDir {
+        fn drop(&mut self) {
+            set_data_dir_override_for_tests(None);
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn removal_persona(id: &str) -> Conversation {
+        Conversation {
+            id: id.to_string(),
+            title: "Removal fixture".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "2".to_string(),
+            kind: ConversationKind::PersonaTemplate,
+            execution_profile: ConversationExecutionProfile {
+                mention_handle: "removal-fixture".to_string(),
+                version: 7,
+                ..ConversationExecutionProfile::default()
+            },
+            selected_model_path: None,
+            source_conversation_id: Some("source-chat".to_string()),
+            source_message_id: Some("source-message".to_string()),
+            branch_root_message_id: Some("retained-message".to_string()),
+            active_leaf_message_id: Some("retained-message".to_string()),
+            current_skill_ids: Vec::new(),
+            messages: vec![Message {
+                id: "retained-message".to_string(),
+                conversation_id: id.to_string(),
+                role: MessageRole::User,
+                content: "Retain this frozen history.".to_string(),
+                created_at: "1".to_string(),
+                parent_id: None,
+                model: None,
+                receipt_id: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                reasoning_content: None,
+                reasoning_incomplete: false,
+                branch_index: None,
+                branch_count: None,
+                attribution: None,
+                attachment_ids: Vec::new(),
+            }],
+        }
+    }
+
+    fn seed_removal_fixture() -> (RuntimeStore, Conversation, ConversationDb) {
+        let store = RuntimeStore::current().expect("open removal store");
+        let persona = removal_persona(&Uuid::new_v4().to_string());
+        let conversations = ConversationDb {
+            conversations: vec![persona.clone()],
+            selected_conversation_id: Some(persona.id.clone()),
+        };
+        let groups = PersonaGroupDb {
+            groups: vec![super::PersonaGroup {
+                id: "fixture-group".to_string(),
+                name: "Fixture group".to_string(),
+                mention_handle: "fixture-group".to_string(),
+                persona_ids: vec![persona.id.clone()],
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            }],
+            legacy_consult_migrated: true,
+            migration_version: PERSONA_STATE_MIGRATION_VERSION,
+            catalog_revision: Some(LIBRARY_REVISION.to_string()),
+            builtin_persona_provenance: Vec::new(),
+        };
+        let drafts = DraftDb {
+            drafts: vec![DraftMessage {
+                conversation_id: Some(persona.id.clone()),
+                message: "Draft that must be removed".to_string(),
+                attachment_ids: Vec::new(),
+                updated_at: "3".to_string(),
+            }],
+        };
+        let versions = PersonaVersionDb {
+            versions: vec![PersonaVersion {
+                persona_id: persona.id.clone(),
+                version: 7,
+                profile_sha256: "profile".to_string(),
+                conversation_sha256: "conversation".to_string(),
+                created_at: "2".to_string(),
+            }],
+        };
+        store
+            .put(CONVERSATIONS_NAMESPACE, &conversations)
+            .expect("seed conversations");
+        store.put(GROUPS_NAMESPACE, &groups).expect("seed groups");
+        store.put(DRAFTS_NAMESPACE, &drafts).expect("seed draft");
+        store
+            .put(PERSONA_VERSIONS_NAMESPACE, &versions)
+            .expect("seed Persona versions");
+        (store, persona, conversations)
+    }
 
     fn tool_binding(server: &str, tool: &str) -> ToolBinding {
         ToolBinding {
@@ -1791,5 +2678,291 @@ mod tests {
         let provenance = &groups.builtin_persona_provenance[0];
         assert_eq!(provenance.ownership, BuiltinPersonaOwnership::UserModified);
         assert_eq!(provenance.observed_persona_sha256, "deleted");
+    }
+
+    #[test]
+    fn removal_commit_is_exact_idempotent_and_preserves_history() {
+        let _session = TestDataDir::new("commit");
+        let (store, persona, stale_conversations) = seed_removal_fixture();
+        let stale_drafts = store
+            .get::<DraftDb>(DRAFTS_NAMESPACE)
+            .expect("read stale drafts")
+            .expect("stale draft document");
+        let impact = persona_removal_preview(&persona.id)
+            .expect("preview removal")
+            .result
+            .expect("removal impact");
+        assert_eq!(impact.persona_version, 7);
+        assert_eq!(impact.groups.len(), 1);
+        assert_eq!(impact.drafts.len(), 1);
+        assert_eq!(
+            impact.retained_history.retained_message_ids.as_slice(),
+            &["retained-message".to_string()]
+        );
+        assert_eq!(
+            impact.retained_history.retained_persona_versions.as_slice(),
+            &[7]
+        );
+        let input = PersonaRemovalCommitInput {
+            persona_id: persona.id.clone(),
+            persona_version: impact.persona_version,
+            impact_sha256: impact.impact_sha256.clone(),
+        };
+
+        let first = persona_remove_from_library(input.clone())
+            .expect("commit removal")
+            .result
+            .expect("removal output");
+        assert!(!first.already_removed);
+        assert!(
+            load_db()
+                .expect("load conversations")
+                .conversations
+                .iter()
+                .all(|conversation| conversation.id != persona.id)
+        );
+        assert!(
+            store
+                .get::<DraftDb>(DRAFTS_NAMESPACE)
+                .expect("read drafts")
+                .expect("draft document")
+                .drafts
+                .iter()
+                .all(|draft| draft.conversation_id.as_deref() != Some(persona.id.as_str()))
+        );
+        assert!(
+            store
+                .get::<PersonaGroupDb>(GROUPS_NAMESPACE)
+                .expect("read groups")
+                .expect("group document")
+                .groups[0]
+                .persona_ids
+                .is_empty()
+        );
+        let ledger = store
+            .get::<PersonaRemovalLedger>(PERSONA_REMOVALS_NAMESPACE)
+            .expect("read removal ledger")
+            .expect("removal ledger");
+        let record = ledger
+            .removals
+            .iter()
+            .find(|record| record.persona_id == persona.id)
+            .expect("removal tombstone");
+        assert_eq!(record.persona_snapshot.as_ref(), Some(&persona));
+        assert_eq!(
+            store
+                .get::<PersonaVersionDb>(PERSONA_VERSIONS_NAMESPACE)
+                .expect("read versions")
+                .expect("version document")
+                .versions
+                .len(),
+            1
+        );
+
+        save_db(&stale_conversations).expect("attempt stale Persona resurrection");
+        assert!(
+            load_db()
+                .expect("reload conversations")
+                .conversations
+                .iter()
+                .all(|conversation| conversation.id != persona.id),
+            "a generic stale save must not resurrect a removed Persona"
+        );
+        crate::attachments::persist_drafts_with_attachment_gc(&stale_drafts, &BTreeSet::new())
+            .expect("attempt stale Persona draft resurrection");
+        assert!(
+            store
+                .get::<DraftDb>(DRAFTS_NAMESPACE)
+                .expect("reload drafts")
+                .unwrap_or_default()
+                .drafts
+                .iter()
+                .all(|draft| draft.conversation_id.as_deref() != Some(persona.id.as_str())),
+            "a generic stale draft save must not resurrect a removed Persona draft"
+        );
+
+        let group_update = super::persona_group_update(
+            "fixture-group".to_string(),
+            "Fixture group".to_string(),
+            "fixture-group".to_string(),
+            vec![persona.id.clone()],
+        )
+        .expect("stale group update returns a typed blocker");
+        assert_eq!(
+            group_update.blocker.expect("stale group blocker").code,
+            "persona_group_member_invalid"
+        );
+
+        let update = super::persona_update(super::PersonaUpdateInput {
+            persona_id: persona.id.clone(),
+            name: "Removed Persona".to_string(),
+            mention_handle: "removed-persona".to_string(),
+            model_path: None,
+            mmproj_path: None,
+            system_message: None,
+            sampling: None,
+            chat_template: crate::conversation_store::ChatTemplatePolicy::ModelDefault,
+            tool_bindings: Vec::new(),
+            source_history_tokens: 4096,
+            host_context_tokens: 2048,
+        })
+        .expect("stale Persona update returns a typed blocker");
+        assert_eq!(
+            update.blocker.expect("stale Persona update blocker").code,
+            "persona_not_found"
+        );
+        assert_eq!(
+            store
+                .get::<PersonaVersionDb>(PERSONA_VERSIONS_NAMESPACE)
+                .expect("reload versions")
+                .expect("version document")
+                .versions
+                .len(),
+            1,
+            "a removed Persona cannot acquire a post-removal version"
+        );
+
+        let repeated = persona_remove_from_library(input)
+            .expect("repeat exact removal")
+            .result
+            .expect("idempotent removal output");
+        assert!(repeated.already_removed);
+        assert_eq!(repeated.impact, impact);
+    }
+
+    #[test]
+    fn removal_hash_revalidates_every_mutable_impact_fact() {
+        let _session = TestDataDir::new("hash-cas");
+        let (store, persona, _) = seed_removal_fixture();
+        let impact = persona_removal_preview(&persona.id)
+            .expect("preview removal")
+            .result
+            .expect("removal impact");
+        store
+            .mutate(DRAFTS_NAMESPACE, DraftDb::default, |drafts| {
+                drafts.drafts[0].message = "Draft changed after preview".to_string();
+                Ok(())
+            })
+            .expect("change exact impact");
+
+        let blocked = persona_remove_from_library(PersonaRemovalCommitInput {
+            persona_id: persona.id.clone(),
+            persona_version: impact.persona_version,
+            impact_sha256: impact.impact_sha256,
+        })
+        .expect("stale commit returns typed blocker");
+        assert_eq!(
+            blocked.blocker.expect("impact blocker").code,
+            "persona_removal_impact_changed"
+        );
+        assert!(
+            load_db()
+                .expect("load unchanged Persona")
+                .conversations
+                .iter()
+                .any(|conversation| conversation.id == persona.id)
+        );
+        assert!(
+            store
+                .get::<PersonaRemovalLedger>(PERSONA_REMOVALS_NAMESPACE)
+                .expect("read ledger")
+                .unwrap_or_default()
+                .removals
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn removal_transaction_rolls_back_every_document_on_fault() {
+        let _session = TestDataDir::new("fault-rollback");
+        let (store, persona, before_conversations) = seed_removal_fixture();
+        let before_groups = store
+            .get::<PersonaGroupDb>(GROUPS_NAMESPACE)
+            .expect("read groups")
+            .expect("groups");
+        let before_drafts = store
+            .get::<DraftDb>(DRAFTS_NAMESPACE)
+            .expect("read drafts")
+            .expect("drafts");
+        let impact = persona_removal_preview(&persona.id)
+            .expect("preview removal")
+            .result
+            .expect("removal impact");
+
+        assert!(
+            persona_remove_from_library_inner(
+                PersonaRemovalCommitInput {
+                    persona_id: persona.id,
+                    persona_version: impact.persona_version,
+                    impact_sha256: impact.impact_sha256,
+                },
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store
+                .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)
+                .expect("read conversations")
+                .expect("conversations"),
+            before_conversations
+        );
+        assert_eq!(
+            store
+                .get::<PersonaGroupDb>(GROUPS_NAMESPACE)
+                .expect("read groups")
+                .expect("groups"),
+            before_groups
+        );
+        assert_eq!(
+            store
+                .get::<DraftDb>(DRAFTS_NAMESPACE)
+                .expect("read drafts")
+                .expect("drafts"),
+            before_drafts
+        );
+        assert!(
+            store
+                .get::<PersonaRemovalLedger>(PERSONA_REMOVALS_NAMESPACE)
+                .expect("read ledger")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn migration_repairs_dangling_group_persona_ids() {
+        let persona = removal_persona("present");
+        let conversations = ConversationDb {
+            conversations: vec![persona],
+            selected_conversation_id: None,
+        };
+        let mut groups = PersonaGroupDb {
+            groups: vec![
+                super::PersonaGroup {
+                    id: "mixed".to_string(),
+                    name: "Mixed".to_string(),
+                    mention_handle: "mixed".to_string(),
+                    persona_ids: vec!["missing".to_string(), "present".to_string()],
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                },
+                super::PersonaGroup {
+                    id: "empty-after-repair".to_string(),
+                    name: "Missing".to_string(),
+                    mention_handle: "missing".to_string(),
+                    persona_ids: vec!["missing-two".to_string()],
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                },
+            ],
+            ..PersonaGroupDb::default()
+        };
+
+        assert_eq!(
+            repair_dangling_group_members(&conversations, &mut groups),
+            vec!["missing".to_string(), "missing-two".to_string()]
+        );
+        assert_eq!(groups.groups.len(), 1);
+        assert_eq!(groups.groups[0].persona_ids, vec!["present".to_string()]);
     }
 }

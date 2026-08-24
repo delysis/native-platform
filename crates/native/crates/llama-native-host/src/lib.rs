@@ -867,18 +867,31 @@ impl NativeHost {
         if !self.config.cache_policy.allows_memory() {
             return Ok(Vec::new());
         }
-        let evicted = self
-            .state
-            .lock()
-            .map_err(host_poisoned)?
-            .cache
-            .insert(value.clone());
         if self.config.cache_policy.allows_persistent()
             && let Some(store) = &self.persistent_cache
         {
             store.save(&self.config.cache_namespace, &value)?;
         }
+        let evicted = self
+            .state
+            .lock()
+            .map_err(host_poisoned)?
+            .cache
+            .insert(value);
         Ok(evicted)
+    }
+
+    /// Evicts only live in-memory prefix capabilities for one exact owner.
+    /// Product-owned persistence must be changed by the product transaction
+    /// that removes the corresponding authority.
+    pub fn invalidate_live_cache_owner(&self, owner_id: &str) -> Result<usize, NativeError> {
+        let removed = self
+            .state
+            .lock()
+            .map_err(host_poisoned)?
+            .cache
+            .invalidate_owner(owner_id);
+        Ok(removed.len())
     }
 
     pub fn restore_persistent_cache(&self) -> Result<usize, NativeError> {
@@ -1064,6 +1077,26 @@ mod tests {
                 .lock()
                 .expect("test store lock")
                 .retain(|candidate| candidate.metadata.id != id);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RejectingPrefixStore;
+
+    impl PrefixCacheStore for RejectingPrefixStore {
+        fn load(&self, _namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
+            Ok(Vec::new())
+        }
+
+        fn save(&self, _namespace: &str, _value: &PrefixCacheValue) -> Result<(), NativeError> {
+            Err(NativeError::new(
+                NativeErrorCode::Internal,
+                "test persistence rejection",
+            ))
+        }
+
+        fn delete(&self, _namespace: &str, _id: &str) -> Result<(), NativeError> {
             Ok(())
         }
     }
@@ -1630,6 +1663,21 @@ mod tests {
                 .load("llama-native-host")
                 .expect("store read")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn persistent_rejection_prevents_live_cache_authority_from_being_installed() {
+        let host = NativeHost::with_dependencies(
+            NativeHostConfig::default(),
+            Arc::new(SystemClock),
+            Some(Arc::new(RejectingPrefixStore)),
+        );
+        let value = cache_value("rejected", 1);
+        assert!(host.cache_insert(value.clone()).is_err());
+        assert!(
+            host.cache_lookup(&value.metadata.fingerprint, &[1, 2])
+                .is_none()
         );
     }
 }

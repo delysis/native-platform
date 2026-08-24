@@ -75,10 +75,13 @@ pub use native_runtime::{
 };
 pub use path_selection::{PathSelection, PathSelectionKind, path_select};
 pub use personas::{
-    PersonaFreezeInput, PersonaGroup, PersonaHistoryMode, PersonaUpdateInput, PersonaVersion,
-    persona_delete, persona_freeze, persona_get, persona_group_create, persona_group_delete,
-    persona_group_list, persona_group_update, persona_instantiate, persona_list, persona_update,
-    persona_versions,
+    PersonaFreezeInput, PersonaGroup, PersonaHistoryMode, PersonaRemovalAttachmentImpact,
+    PersonaRemovalCacheImpact, PersonaRemovalCommitInput, PersonaRemovalDraftImpact,
+    PersonaRemovalGroupImpact, PersonaRemovalHistoryImpact, PersonaRemovalImpact,
+    PersonaRemovalOutput, PersonaUpdateInput, PersonaVersion, persona_freeze, persona_get,
+    persona_group_create, persona_group_delete, persona_group_list, persona_group_update,
+    persona_instantiate, persona_list, persona_removal_preview, persona_remove_from_library,
+    persona_update, persona_versions,
 };
 pub use receipts::{Blocker, CommandReceipt, CommandResult, persist_command_receipt};
 pub use server::{

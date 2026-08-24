@@ -48,12 +48,22 @@ jq -e '
 ' "$acceptance_dir/started.json" >/dev/null
 
 cargo run -q -p mom-llama-app -- --dump-html > "$acceptance_dir/app.html"
-rg -q 'data-action="personas-open"' "$acceptance_dir/app.html"
-rg -q 'Open a saved Persona or start a new chat.' "$acceptance_dir/app.html"
-rg -q 'data-action="persona-open" data-conversation="persona-judith_herman"' \
+rg -q 'data-persona-menu-target="true" data-persona="persona-judith_herman"' \
   "$acceptance_dir/app.html"
-rg -q 'data-action="persona-instantiate" data-persona="persona-judith_herman"' \
-  "$acceptance_dir/app.html"
+rg -q 'data-action="persona-menu-open"' "$acceptance_dir/app.html"
+rg -q 'id="persona-context-menu"' "$acceptance_dir/app.html"
+test "$(rg -o 'role="menuitem"' "$acceptance_dir/app.html" | wc -l | tr -d ' ')" = "3"
+for action in persona-menu-start persona-menu-edit persona-menu-removal-preview; do
+  rg -q "data-action=\"$action\"" "$acceptance_dir/app.html"
+done
+for forbidden in 'Duplicate' 'Export Persona' 'Quit Persona'; do
+  if rg -q "$forbidden" "$acceptance_dir/app.html"; then
+    echo "uncontracted Persona menu action remains: $forbidden" >&2
+    exit 1
+  fi
+done
+rg -q 'id="persona-removal-modal"' "$acceptance_dir/app.html"
+rg -q 'data-action="persona-removal-commit"' "$acceptance_dir/app.html"
 if rg -q 'data-action="skills-open"|Body &amp; trauma lens|Safety &amp; recovery stages lens' \
   "$acceptance_dir/app.html"; then
   echo "obsolete primary navigation or abstract Persona seeds remain" >&2

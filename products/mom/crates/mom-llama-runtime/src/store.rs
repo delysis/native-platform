@@ -47,22 +47,26 @@ pub(crate) struct DocumentMutations<'store, 'transaction, 'connection> {
     receipt_writes: Vec<(String, String, Vec<u8>, Vec<u8>)>,
 }
 
+pub(crate) struct DocumentSnapshot<'store, 'transaction, 'connection> {
+    store: &'store RuntimeStore,
+    transaction: &'transaction Transaction<'connection>,
+}
+
+impl DocumentSnapshot<'_, '_, '_> {
+    pub(crate) fn get<T>(&self, namespace: &str) -> Result<Option<T>>
+    where
+        T: DeserializeOwned,
+    {
+        get_document(self.store, self.transaction, namespace)
+    }
+}
+
 impl DocumentMutations<'_, '_, '_> {
     pub(crate) fn get<T>(&self, namespace: &str) -> Result<Option<T>>
     where
         T: DeserializeOwned,
     {
-        let encrypted = self
-            .transaction
-            .query_row(
-                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
-                [namespace],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()?;
-        encrypted
-            .map(|(nonce, ciphertext)| self.store.decrypt_json(namespace, &nonce, &ciphertext))
-            .transpose()
+        get_document(self.store, self.transaction, namespace)
     }
 
     pub(crate) fn put_bytes(&mut self, namespace: &str, value: &[u8]) -> Result<()> {
@@ -487,6 +491,19 @@ impl RuntimeStore {
         Ok(result)
     }
 
+    pub(crate) fn read_documents<R>(
+        &self,
+        read: impl FnOnce(&DocumentSnapshot<'_, '_, '_>) -> Result<R>,
+    ) -> Result<R> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let snapshot = DocumentSnapshot {
+            store: self,
+            transaction: &transaction,
+        };
+        read(&snapshot)
+    }
+
     pub(crate) fn import_json_once<T>(&self, namespace: &str, legacy_path: &Path) -> Result<bool>
     where
         T: Serialize + DeserializeOwned,
@@ -583,6 +600,26 @@ impl RuntimeStore {
             )
             .map_err(|_| anyhow!("encrypted record authentication failed"))
     }
+}
+
+fn get_document<T>(
+    store: &RuntimeStore,
+    transaction: &Transaction<'_>,
+    namespace: &str,
+) -> Result<Option<T>>
+where
+    T: DeserializeOwned,
+{
+    let encrypted = transaction
+        .query_row(
+            "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
+            [namespace],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    encrypted
+        .map(|(nonce, ciphertext)| store.decrypt_json(namespace, &nonce, &ciphertext))
+        .transpose()
 }
 
 fn timestamp_i64() -> i64 {

@@ -940,6 +940,14 @@ pub fn set_data_dir_override_for_tests(path: Option<PathBuf>) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn lock_data_dir_override_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn data_dir_override() -> &'static Mutex<Option<PathBuf>> {
     static DATA_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
     DATA_DIR_OVERRIDE.get_or_init(|| Mutex::new(None))

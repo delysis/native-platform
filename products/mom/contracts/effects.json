@@ -173,6 +173,32 @@
       "destructive": "reversible"
     },
     {
+      "effect_id": "mom_llama.effects.persona_removal_preview.v1",
+      "reads": ["encrypted_persona_template", "encrypted_persona_versions", "encrypted_persona_groups", "encrypted_draft", "encrypted_attachment_index", "encrypted_prefix_cache_metadata", "encrypted_mention_invocations", "active_mention_registry", "encrypted_persona_removal_ledger"],
+      "writes": ["one_time_persona_migration_repair", "command_receipt"],
+      "network": [],
+      "process": [],
+      "secrets": [],
+      "model_calls": [],
+      "persistence": ["encrypted_sqlite", "encrypted_receipts"],
+      "memory": ["active_mention_registry_read"],
+      "external_apps": [],
+      "destructive": "none"
+    },
+    {
+      "effect_id": "mom_llama.effects.persona_remove_from_library.v1",
+      "reads": ["exact_persona_id_version_and_impact_sha256", "encrypted_persona_template", "encrypted_persona_versions", "encrypted_persona_groups", "encrypted_draft", "encrypted_attachment_index", "encrypted_prefix_cache_metadata", "encrypted_mention_invocations", "active_mention_registry", "encrypted_persona_removal_ledger"],
+      "writes": ["encrypted_persona_removal_tombstone_and_snapshot", "encrypted_persona_discoverability", "encrypted_persona_groups", "encrypted_draft", "draft_only_unshared_attachment_records_and_bytes", "persona_owned_persistent_prefix_cache", "command_receipt"],
+      "network": [],
+      "process": [],
+      "secrets": [],
+      "model_calls": [],
+      "persistence": ["encrypted_sqlite", "encrypted_receipts", "encrypted_cache_blobs"],
+      "memory": ["active_mention_registry_read", "persona_owned_memory_prefix_cache_eviction", "native_live_persona_owner_eviction"],
+      "external_apps": [],
+      "destructive": "irreversible"
+    },
+    {
       "effect_id": "mom_llama.effects.mention_tool_approval_read.v1",
       "reads": ["encrypted_mention_invocation_journal"],
       "writes": ["command_receipt"],

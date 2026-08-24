@@ -458,7 +458,41 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 .persona-select small { color: var(--muted); }
 .persona-editor, .persona-group-editor { margin-top: 12px; }
+.persona-context-menu {
+  position: fixed;
+  z-index: 140;
+  display: grid;
+  min-width: 220px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-raised);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .42);
+}
+.persona-context-menu button {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+.persona-context-menu button:hover,
+.persona-context-menu button:focus-visible { background: var(--surface-active); }
+.persona-context-menu button.danger { color: var(--danger); }
+.persona-context-menu svg { width: 17px; height: 17px; }
 .compact-dialog { width: min(500px, calc(100vw - 32px)); padding: 20px; border: 1px solid var(--border); border-radius: 18px; background: var(--surface-raised); }
+.persona-removal-dialog { width: min(720px, calc(100vw - 32px)); max-height: 86vh; overflow: auto; }
+.persona-removal-impact { display: grid; gap: 8px; margin: 16px 0; }
+.persona-removal-impact div { display: grid; grid-template-columns: minmax(130px, .35fr) minmax(0, 1fr); gap: 10px; }
+.persona-removal-impact dt { color: var(--muted); }
+.persona-removal-impact dd { margin: 0; overflow-wrap: anywhere; }
+.danger-button { color: #fff; background: var(--danger); }
 .history-mode { display: grid; gap: 8px; margin: 14px 0; border: 0; padding: 0; }
 .history-mode label { display: flex; gap: 8px; align-items: center; }
 .tool-result-card { display: grid; gap: 12px; }

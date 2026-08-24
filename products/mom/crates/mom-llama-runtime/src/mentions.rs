@@ -24,7 +24,7 @@ use crate::personas::{
     MAX_PERSONA_TOOL_BINDINGS, conversation_and_group_handles, persona_instantiate,
 };
 use crate::receipts::{Blocker, CommandResult};
-use crate::store::{DocumentMutations, RuntimeStore};
+use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use crate::tool_loop::{ToolPermissionPolicy, tool_permission_policy, validate_tool_arguments};
 use anyhow::{Result, anyhow};
 use crossbeam_channel::TryRecvError;
@@ -308,6 +308,100 @@ impl DerefMut for StoredMentionInvocation {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct MentionInvocationDb {
     invocations: Vec<StoredMentionInvocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersonaInvocationRemovalImpact {
+    pub active_invocation_ids: Vec<String>,
+    pub retained_invocation_ids: Vec<String>,
+}
+
+pub(crate) fn with_persona_invocation_registry<R>(
+    persona_id: &str,
+    operation: impl FnOnce(&[String]) -> Result<R>,
+) -> Result<R> {
+    let registry = mention_cancel_registry()
+        .lock()
+        .map_err(|_| anyhow!("Persona cancellation registry is unavailable"))?;
+    let mut live_invocation_ids = registry
+        .keys()
+        .filter(|(_, target_id)| target_id == persona_id)
+        .map(|(invocation_id, _)| invocation_id.clone())
+        .collect::<Vec<_>>();
+    live_invocation_ids.sort();
+    live_invocation_ids.dedup();
+    operation(&live_invocation_ids)
+}
+
+pub(crate) fn persona_invocation_impact_from_snapshot(
+    snapshot: &DocumentSnapshot<'_, '_, '_>,
+    persona_id: &str,
+    live_invocation_ids: &[String],
+) -> Result<PersonaInvocationRemovalImpact> {
+    let db = snapshot
+        .get::<MentionInvocationDb>(INVOCATIONS_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(persona_invocation_impact(
+        &db,
+        persona_id,
+        live_invocation_ids,
+    ))
+}
+
+pub(crate) fn persona_invocation_impact_from_documents(
+    documents: &DocumentMutations<'_, '_, '_>,
+    persona_id: &str,
+    live_invocation_ids: &[String],
+) -> Result<PersonaInvocationRemovalImpact> {
+    let db = documents
+        .get::<MentionInvocationDb>(INVOCATIONS_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(persona_invocation_impact(
+        &db,
+        persona_id,
+        live_invocation_ids,
+    ))
+}
+
+fn persona_invocation_impact(
+    db: &MentionInvocationDb,
+    persona_id: &str,
+    live_invocation_ids: &[String],
+) -> PersonaInvocationRemovalImpact {
+    let mut retained_invocation_ids = db
+        .invocations
+        .iter()
+        .filter(|invocation| {
+            invocation
+                .targets
+                .iter()
+                .any(|target| target.target_id == persona_id)
+        })
+        .map(|invocation| invocation.id.clone())
+        .collect::<Vec<_>>();
+    retained_invocation_ids.sort();
+    retained_invocation_ids.dedup();
+    let mut active_invocation_ids = db
+        .invocations
+        .iter()
+        .filter(|invocation| {
+            matches!(
+                invocation.state,
+                MentionInvocationState::Running | MentionInvocationState::AwaitingApproval
+            ) && invocation
+                .targets
+                .iter()
+                .any(|target| target.target_id == persona_id)
+        })
+        .map(|invocation| invocation.id.clone())
+        .chain(live_invocation_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    active_invocation_ids.sort();
+    active_invocation_ids.dedup();
+    PersonaInvocationRemovalImpact {
+        active_invocation_ids,
+        retained_invocation_ids,
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2907,6 +3001,17 @@ where
         .iter()
         .map(snapshot_target)
         .collect::<Result<Vec<_>>>()?;
+    let _cancel_lifecycle =
+        match MentionCancelLifecycle::register_snapshots(&invocation_id, &snapshots)? {
+            Ok(lifecycle) => lifecycle,
+            Err(blocker) => {
+                return Ok(CommandResult::blocked(
+                    "mom_llama.chat_dispatch",
+                    "stub_blocked",
+                    blocker,
+                ));
+            }
+        };
     let now = now_ms().to_string();
     let mut invocation = MentionInvocation {
         id: invocation_id.clone(),
@@ -3124,7 +3229,6 @@ where
     }
 
     let mut groups = BTreeMap::<String, Vec<PlannedTarget>>::new();
-    let _cancel_lifecycle = MentionCancelLifecycle::register(&invocation_id, &planned);
     for target in planned {
         let template_hash = format!(
             "{:x}",
@@ -3507,17 +3611,34 @@ struct MentionCancelLifecycle {
 }
 
 impl MentionCancelLifecycle {
-    fn register(invocation_id: &str, targets: &[PlannedTarget]) -> Self {
-        let mut registrations = Vec::with_capacity(targets.len());
-        if let Ok(mut registry) = mention_cancel_registry().lock() {
-            for target in targets {
-                let key = (invocation_id.to_string(), target.snapshot.target_id.clone());
-                let flag = Arc::new(MentionCancelControl::running());
-                registry.insert(key.clone(), Arc::clone(&flag));
-                registrations.push((key, flag));
-            }
+    fn register_snapshots(
+        invocation_id: &str,
+        targets: &[MentionTargetSnapshot],
+    ) -> Result<std::result::Result<Self, Blocker>> {
+        let mut registry = mention_cancel_registry()
+            .lock()
+            .map_err(|_| anyhow!("Persona cancellation registry is unavailable"))?;
+        let persona_ids = targets
+            .iter()
+            .filter(|target| target.kind == MentionTargetKind::Persona)
+            .map(|target| target.target_id.clone())
+            .collect::<Vec<_>>();
+        let removed = crate::personas::persona_ids_are_removed(&persona_ids)?;
+        if !removed.is_empty() {
+            return Ok(Err(Blocker::new(
+                "persona_removed_before_invocation_admission",
+                "A selected Persona was removed from the library before this invocation could be admitted.",
+                vec!["Refresh mentions and choose a discoverable Persona.".to_string()],
+            )));
         }
-        Self { registrations }
+        let mut registrations = Vec::with_capacity(targets.len());
+        for target in targets {
+            let key = (invocation_id.to_string(), target.target_id.clone());
+            let flag = Arc::new(MentionCancelControl::running());
+            registry.insert(key.clone(), Arc::clone(&flag));
+            registrations.push((key, flag));
+        }
+        Ok(Ok(Self { registrations }))
     }
 
     fn register_target(

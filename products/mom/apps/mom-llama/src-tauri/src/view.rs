@@ -159,12 +159,20 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         label: "Save persona",
     },
     ControlSpec {
-        affordance: "persona.delete",
-        command: "mom_llama.persona_delete",
-        tauri_command: "mom_llama_persona_delete",
-        cli: "mom-llama persona delete --persona <id> --json",
-        effect: "mom_llama.effects.conversation_store.v1",
-        label: "Delete persona",
+        affordance: "persona.removal_preview",
+        command: "mom_llama.persona_removal_preview",
+        tauri_command: "mom_llama_persona_removal_preview",
+        cli: "mom-llama persona removal-preview --persona <id> --json",
+        effect: "mom_llama.effects.persona_removal_preview.v1",
+        label: "Remove from Library",
+    },
+    ControlSpec {
+        affordance: "persona.remove_from_library",
+        command: "mom_llama.persona_remove_from_library",
+        tauri_command: "mom_llama_persona_remove_from_library",
+        cli: "mom-llama persona remove-from-library --persona <id> --version <n> --impact-sha256 <sha256> --json",
+        effect: "mom_llama.effects.persona_remove_from_library.v1",
+        label: "Confirm removal",
     },
     ControlSpec {
         affordance: "persona.instantiate",
@@ -1555,6 +1563,8 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             (chat_view_with_draft(settings, engine, active.as_ref(), Some(draft)))
             (settings_modal(settings, engine, models, skills, kv, active.as_ref()))
             (persona_freeze_modal())
+            (persona_context_menu())
+            (persona_removal_modal())
             @if mcp_process_ui_supported() {
                 (tool_approval_modal())
             }
@@ -2800,44 +2810,7 @@ fn settings_panel(
                 }
             }
             @if section.slug == "mcp" {
-                    section class="settings-card adapter-form" {
-                        h3 { "Native tool adapter" }
-                        p class="field-help" { (MCP_PROCESS_AUTHORITY_WARNING) }
-                        p class="field-help" { (PERSONA_MCP_EXECUTABLE_IDENTITY_NOTICE) }
-                        div class="native-number-grid" {
-                            (command_input("Server name", "mcp_server", "", "mcp.configure"))
-                            (command_input("Tool name", "mcp_tool", "", "mcp.call_tool"))
-                            (command_input("Resource URI", "mcp_uri", "", "mcp.read_resource"))
-                            (command_input("Prompt name", "mcp_prompt", "", "mcp.get_prompt"))
-                        }
-                        (command_path_input("Executable", "mcp_command", "", "mcp-command-browse", "mcp.configure"))
-                        label class="field" { span { "Arguments (JSON)" }
-                            textarea name="mcp_arguments" rows="3"
-                                data-affordance="mcp.call_tool" data-command="mom_llama.mcp_call_tool"
-                                data-tauri-command="mom_llama_mcp_call_tool"
-                                data-cli="mom-llama mcp call-tool --arguments <json> --json"
-                                data-effect="mom_llama.effects.mcp_stdio.v1" { "{}" }
-                        }
-                        label class="field" { span { "Consult prompt" }
-                            textarea name="tool_loop_prompt" rows="3"
-                                data-affordance="tool_loop.prepare" data-command="mom_llama.tool_loop_prepare"
-                                data-tauri-command="mom_llama_tool_loop_prepare"
-                                data-cli="mom-llama tool-loop prepare --prompt <text> --json"
-                                data-effect="mom_llama.effects.tool_loop.v1" {}
-                        }
-                    }
-                    div class="button-strip" {
-                        (button("mcp.status", Some("mcp-status"), "small-button", false))
-                        (button("mcp.configure", Some("mcp-configure"), "small-button", false))
-                        (button("mcp.list_servers", Some("mcp-list-servers"), "small-button", false))
-                        (button("mcp.list_tools", Some("mcp-list-tools"), "small-button", false))
-                        (button("mcp.list_resources", Some("mcp-list-resources"), "small-button", false))
-                        (button("mcp.read_resource", Some("mcp-read-resource"), "small-button", false))
-                        (button("mcp.list_prompts", Some("mcp-list-prompts"), "small-button", false))
-                        (button("mcp.get_prompt", Some("mcp-get-prompt"), "small-button", false))
-                        (button("mcp.call_tool", Some("mcp-call-tool"), "small-button", false))
-                        (button("tool_loop.prepare", Some("tool-loop-prepare"), "primary-button", false))
-                    }
+                (mcp_settings())
             }
             @if section.slug == "developer" {
                 section class="settings-card cache-preferences" {
@@ -2929,6 +2902,49 @@ fn current_chat_instructions(active: Option<&Conversation>) -> Markup {
     }
 }
 
+fn mcp_settings() -> Markup {
+    html! {
+        section class="settings-card adapter-form" {
+            h3 { "Native tool adapter" }
+            p class="field-help" { (MCP_PROCESS_AUTHORITY_WARNING) }
+            p class="field-help" { (PERSONA_MCP_EXECUTABLE_IDENTITY_NOTICE) }
+            div class="native-number-grid" {
+                (command_input("Server name", "mcp_server", "", "mcp.configure"))
+                (command_input("Tool name", "mcp_tool", "", "mcp.call_tool"))
+                (command_input("Resource URI", "mcp_uri", "", "mcp.read_resource"))
+                (command_input("Prompt name", "mcp_prompt", "", "mcp.get_prompt"))
+            }
+            (command_path_input("Executable", "mcp_command", "", "mcp-command-browse", "mcp.configure"))
+            label class="field" { span { "Arguments (JSON)" }
+                textarea name="mcp_arguments" rows="3"
+                    data-affordance="mcp.call_tool" data-command="mom_llama.mcp_call_tool"
+                    data-tauri-command="mom_llama_mcp_call_tool"
+                    data-cli="mom-llama mcp call-tool --arguments <json> --json"
+                    data-effect="mom_llama.effects.mcp_stdio.v1" { "{}" }
+            }
+            label class="field" { span { "Consult prompt" }
+                textarea name="tool_loop_prompt" rows="3"
+                    data-affordance="tool_loop.prepare" data-command="mom_llama.tool_loop_prepare"
+                    data-tauri-command="mom_llama_tool_loop_prepare"
+                    data-cli="mom-llama tool-loop prepare --prompt <text> --json"
+                    data-effect="mom_llama.effects.tool_loop.v1" {}
+            }
+        }
+        div class="button-strip" {
+            (button("mcp.status", Some("mcp-status"), "small-button", false))
+            (button("mcp.configure", Some("mcp-configure"), "small-button", false))
+            (button("mcp.list_servers", Some("mcp-list-servers"), "small-button", false))
+            (button("mcp.list_tools", Some("mcp-list-tools"), "small-button", false))
+            (button("mcp.list_resources", Some("mcp-list-resources"), "small-button", false))
+            (button("mcp.read_resource", Some("mcp-read-resource"), "small-button", false))
+            (button("mcp.list_prompts", Some("mcp-list-prompts"), "small-button", false))
+            (button("mcp.get_prompt", Some("mcp-get-prompt"), "small-button", false))
+            (button("mcp.call_tool", Some("mcp-call-tool"), "small-button", false))
+            (button("tool_loop.prepare", Some("tool-loop-prepare"), "primary-button", false))
+        }
+    }
+}
+
 fn persona_settings() -> Markup {
     let StoreProjection {
         value: personas,
@@ -2939,6 +2955,7 @@ fn persona_settings() -> Markup {
         "Saved Personas could not be loaded from local storage.",
     );
     let edit = control("persona.get");
+    let list = control("persona.list");
     html! {
         section class="settings-card persona-library" {
             h3 { "Personas" }
@@ -2952,7 +2969,10 @@ fn persona_settings() -> Markup {
                     p class="empty-line" { "Freeze any message from its context menu to create a persona." }
                 }
                 @for persona in &personas {
-                    div class="persona-row" {
+                    div class="persona-row" data-persona-menu-target="true"
+                        data-persona=(persona.id.clone())
+                        data-persona-title=(persona.title.clone())
+                        data-persona-version=(persona.execution_profile.version) {
                         button type="button" class="persona-select"
                             data-affordance=(edit.affordance)
                             data-command=(edit.command)
@@ -2964,17 +2984,20 @@ fn persona_settings() -> Markup {
                             span { (persona.title.clone()) }
                             small { "@" (persona.execution_profile.mention_handle.clone()) }
                         }
-                        button type="button" class="icon-button"
-                            aria-label=(format!("Edit {} profile", persona.title))
-                            data-affordance="persona.get"
-                            data-command="mom_llama.persona_get"
-                            data-tauri-command="mom_llama_persona_get"
-                            data-cli="mom-llama persona get --persona <id> --json"
-                            data-effect="mom_llama.effects.conversation_store.v1"
-                            data-action="persona-edit"
+                        button type="button" class="icon-button persona-menu-trigger"
+                            aria-label=(format!("Actions for {}", persona.title))
+                            aria-haspopup="menu" aria-expanded="false"
+                            aria-controls="persona-context-menu"
+                            data-affordance=(list.affordance)
+                            data-command=(list.command)
+                            data-tauri-command=(list.tauri_command)
+                            data-cli=(list.cli)
+                            data-effect=(list.effect)
+                            data-action="persona-menu-open"
                             data-persona=(persona.id.clone())
-                            data-persona-json=(serde_json::to_string(persona).unwrap_or_else(|_| "{}".to_string())) {
-                            (icon_markup("pencil"))
+                            data-persona-title=(persona.title.clone())
+                            data-persona-version=(persona.execution_profile.version) {
+                            (icon_markup("circle-ellipsis"))
                         }
                     }
                 }
@@ -3037,7 +3060,6 @@ fn persona_settings() -> Markup {
             }
             div class="button-strip" {
                 (button("persona.update", Some("persona-update"), "primary-button", false))
-                (button("persona.delete", Some("persona-delete"), "small-button danger", false))
             }
         }
     }
@@ -3192,6 +3214,99 @@ fn persona_freeze_modal() -> Markup {
                     data-tauri-command=(freeze.tauri_command) data-cli=(freeze.cli)
                     data-effect=(freeze.effect) data-action="persona-freeze-save" {
                     (icon_markup("snowflake")) "Freeze as persona"
+                }
+            }
+        }
+    }
+}
+
+fn persona_context_menu() -> Markup {
+    let start = control("persona.instantiate");
+    let edit = control("persona.get");
+    let remove = control("persona.removal_preview");
+    html! {
+        div id="persona-context-menu" class="persona-context-menu is-hidden" hidden[true]
+            role="menu" aria-label="Persona actions" {
+            button type="button" role="menuitem" class="small-button persona-menu-item"
+                data-affordance=(start.affordance) data-command=(start.command)
+                data-tauri-command=(start.tauri_command) data-cli=(start.cli)
+                data-effect=(start.effect) data-action="persona-menu-start" {
+                (icon_markup("message-circle")) span { "Start Conversation" }
+            }
+            button type="button" role="menuitem" class="small-button persona-menu-item"
+                data-affordance=(edit.affordance) data-command=(edit.command)
+                data-tauri-command=(edit.tauri_command) data-cli=(edit.cli)
+                data-effect=(edit.effect) data-action="persona-menu-edit" {
+                (icon_markup("pencil")) span { "Edit" }
+            }
+            button type="button" role="menuitem" class="small-button persona-menu-item danger"
+                data-affordance=(remove.affordance) data-command=(remove.command)
+                data-tauri-command=(remove.tauri_command) data-cli=(remove.cli)
+                data-effect=(remove.effect) data-action="persona-menu-removal-preview" {
+                (icon_markup("trash-2")) span { "Remove from Library" }
+            }
+        }
+    }
+}
+
+fn persona_removal_modal() -> Markup {
+    let preview = control("persona.removal_preview");
+    let commit = control("persona.remove_from_library");
+    html! {
+        div id="persona-removal-modal" class="modal-backdrop is-hidden" hidden[true]
+            aria-hidden="true" {
+            section class="compact-dialog persona-removal-dialog" role="dialog" aria-modal="true"
+                aria-labelledby="persona-removal-title" aria-describedby="persona-removal-description" {
+                header class="modal-title-row" {
+                    div {
+                        p class="eyebrow" { "PERSONA LIBRARY" }
+                        h2 id="persona-removal-title" { "Remove from Library?" }
+                    }
+                    button type="button" class="icon-button" aria-label="Close removal preview"
+                        data-affordance=(preview.affordance) data-command=(preview.command)
+                        data-tauri-command=(preview.tauri_command) data-cli=(preview.cli)
+                        data-effect=(preview.effect) data-action="persona-removal-close" {
+                        (icon_markup("x"))
+                    }
+                }
+                p id="persona-removal-description" class="field-help" {
+                    "This removes discoverability, group memberships, its draft, draft-only unshared attachments, and Persona-owned prefix caches. Frozen work may finish; history and supporting attachments remain attributed."
+                }
+                input type="hidden" name="persona_removal_id"
+                    data-affordance=(commit.affordance) data-command=(commit.command)
+                    data-tauri-command=(commit.tauri_command) data-cli=(commit.cli)
+                    data-effect=(commit.effect);
+                input type="hidden" name="persona_removal_version"
+                    data-affordance=(commit.affordance) data-command=(commit.command)
+                    data-tauri-command=(commit.tauri_command) data-cli=(commit.cli)
+                    data-effect=(commit.effect);
+                input type="hidden" name="persona_removal_impact_sha256"
+                    data-affordance=(commit.affordance) data-command=(commit.command)
+                    data-tauri-command=(commit.tauri_command) data-cli=(commit.cli)
+                    data-effect=(commit.effect);
+                dl class="persona-removal-impact" {
+                    div { dt { "Persona" } dd id="persona-removal-persona" {} }
+                    div { dt { "Groups" } dd id="persona-removal-groups" {} }
+                    div { dt { "Draft" } dd id="persona-removal-draft" {} }
+                    div { dt { "Attachments removed" } dd id="persona-removal-attachments" {} }
+                    div { dt { "Caches evicted" } dd id="persona-removal-caches" {} }
+                    div { dt { "Active frozen work" } dd id="persona-removal-active" {} }
+                    div { dt { "Retained history" } dd id="persona-removal-retained" {} }
+                    div { dt { "Impact SHA-256" } dd { code id="persona-removal-impact-sha256" {} } }
+                }
+                div class="button-strip" {
+                    button type="button" class="small-button"
+                        data-affordance=(preview.affordance) data-command=(preview.command)
+                        data-tauri-command=(preview.tauri_command) data-cli=(preview.cli)
+                        data-effect=(preview.effect) data-action="persona-removal-close" {
+                        "Cancel"
+                    }
+                    button type="button" class="primary-button danger-button"
+                        data-affordance=(commit.affordance) data-command=(commit.command)
+                        data-tauri-command=(commit.tauri_command) data-cli=(commit.cli)
+                        data-effect=(commit.effect) data-action="persona-removal-commit" {
+                        "Remove from Library"
+                    }
                 }
             }
         }
@@ -4722,6 +4837,44 @@ mod tests {
         assert!(context.contains(r#"data-action="persona-instantiate""#));
         assert!(!context.contains("Sending starts a separate chat"));
         assert!(!context.contains("Edits version this template"));
+    }
+
+    #[test]
+    fn persona_menu_captures_one_target_and_exposes_only_approved_actions() {
+        let menu = persona_context_menu().into_string();
+        assert!(menu.contains(r#"id="persona-context-menu""#));
+        assert!(menu.contains(r#"role="menu""#));
+        assert_eq!(menu.matches(r#"role="menuitem""#).count(), 3);
+        for action in ["Start Conversation", "Edit", "Remove from Library"] {
+            assert!(
+                menu.contains(action),
+                "missing Persona menu action {action}"
+            );
+        }
+        for forbidden in ["Duplicate", "Export", "Quit"] {
+            assert!(
+                !menu.contains(forbidden),
+                "Persona menu must omit uncontracted action {forbidden}"
+            );
+        }
+        assert!(menu.contains(r#"data-action="persona-menu-start""#));
+        assert!(menu.contains(r#"data-action="persona-menu-edit""#));
+        assert!(menu.contains(r#"data-action="persona-menu-removal-preview""#));
+
+        let modal = persona_removal_modal().into_string();
+        assert!(modal.contains(r#"id="persona-removal-modal""#));
+        assert!(modal.contains(r#"hidden aria-hidden="true""#));
+        assert!(modal.contains(r#"data-action="persona-removal-commit""#));
+        assert!(modal.contains("Impact SHA-256"));
+
+        let js = include_str!("../../ui/coop-hx.js");
+        assert!(js.contains("menu.dataset.persona = target.dataset.persona"));
+        assert!(
+            js.contains("persona_version: Number(formValue(modal, \"persona_removal_version\"))")
+        );
+        assert!(js.contains("impact_sha256: formValue(modal, \"persona_removal_impact_sha256\")"));
+        assert!(js.contains(r#"document.addEventListener("contextmenu""#));
+        assert!(js.contains(r#"[role="menuitem"]"#));
     }
 
     #[test]

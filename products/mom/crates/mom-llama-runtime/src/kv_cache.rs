@@ -3,7 +3,7 @@ use crate::native_runtime::{clear_native_prefix_cache, resident_model};
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
 use crate::skill_store::load_skill_db;
-use crate::store::RuntimeStore;
+use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use anyhow::{Result, anyhow};
 pub use llama_native_cache::{CacheEntryState, CacheFingerprint, CacheTier};
 use llama_native_cache::{
@@ -168,7 +168,17 @@ pub fn kv_cache_save(skill_id: Option<String>) -> Result<CommandResult<KvCacheMe
             ),
         ));
     }
-    persist_value(&settings, &value)?;
+    if !persist_value(&settings, &value)? {
+        return Ok(CommandResult::blocked(
+            "mom_llama.kv_cache_save",
+            "stub_blocked",
+            Blocker::new(
+                "kv_cache_owner_removed",
+                "The selected cache owner was removed from the Persona library.",
+                vec!["Choose an available Persona or Skill.".to_string()],
+            ),
+        ));
+    }
     promote_to_memory(value.clone());
     Ok(CommandResult::passed(
         "mom_llama.kv_cache_save",
@@ -425,6 +435,9 @@ pub(crate) fn ensure_persona_prefix(
     if !settings.kv_cache_policy.allows_prefix_reuse() {
         return Ok(None);
     }
+    if crate::personas::persona_cache_owner_is_removed(owner_id)? {
+        return Ok(None);
+    }
     if let Some(value) =
         compatible_cached_prefix_for_owner(handle, target_messages, Some(owner_id))?
     {
@@ -441,7 +454,9 @@ pub(crate) fn ensure_persona_prefix(
         label.to_string(),
         stable_messages,
     )?;
-    persist_value(&settings, &value)?;
+    if !persist_value(&settings, &value)? {
+        return Ok(None);
+    }
     promote_to_memory(value);
     Ok(
         compatible_cached_prefix_for_owner(handle, target_messages, Some(owner_id))?.map(
@@ -486,7 +501,9 @@ pub fn persist_session_checkpoint(
     if !value.is_valid() {
         return Ok(None);
     }
-    persist_value(&settings, &value)?;
+    if !persist_value(&settings, &value)? {
+        return Ok(None);
+    }
     promote_to_memory(value.clone());
     Ok(Some(value.metadata.id))
 }
@@ -704,7 +721,7 @@ fn skill_label(skill_id: Option<&str>) -> Result<String> {
     Ok("Built-in kind local assistant".to_string())
 }
 
-fn persist_value(settings: &Settings, value: &PrefixCacheValue) -> Result<()> {
+fn persist_value(settings: &Settings, value: &PrefixCacheValue) -> Result<bool> {
     persist_value_to_store(
         &RuntimeStore::open(&settings.data_dir)?,
         value,
@@ -718,7 +735,7 @@ fn persist_value_to_store(
     value: &PrefixCacheValue,
     max_entries: usize,
     max_bytes: usize,
-) -> Result<()> {
+) -> Result<bool> {
     if !value.is_valid() {
         return Err(anyhow!(
             "refusing to persist an invalid native prefix cache"
@@ -733,6 +750,13 @@ fn persist_value_to_store(
         KV_CACHE_NAMESPACE,
         KvCacheDb::default,
         |db: &mut KvCacheDb, documents| {
+            if let Some(owner_id) = value.metadata.owner_id.as_deref()
+                && crate::personas::persona_cache_owner_is_removed_from_documents(
+                    documents, owner_id,
+                )?
+            {
+                return Ok(false);
+            }
             let replaced_ids = db
                 .entries
                 .iter()
@@ -761,9 +785,65 @@ fn persist_value_to_store(
                 documents.delete(&blob_namespace(id));
             }
             db.entries.retain(|entry| !evicted.contains(&entry.id));
-            Ok(())
+            Ok(true)
         },
     )
+}
+
+pub(crate) fn persona_cache_ids_from_snapshot(
+    snapshot: &DocumentSnapshot<'_, '_, '_>,
+    owner_id: &str,
+) -> Result<Vec<String>> {
+    let db = snapshot
+        .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(cache_ids_for_owner(&db, owner_id))
+}
+
+pub(crate) fn persona_cache_ids_from_documents(
+    documents: &DocumentMutations<'_, '_, '_>,
+    owner_id: &str,
+) -> Result<Vec<String>> {
+    let db = documents
+        .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(cache_ids_for_owner(&db, owner_id))
+}
+
+pub(crate) fn remove_persona_cache_from_documents(
+    documents: &mut DocumentMutations<'_, '_, '_>,
+    owner_id: &str,
+) -> Result<Vec<String>> {
+    let mut db = documents
+        .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+        .unwrap_or_default();
+    let removed = cache_ids_for_owner(&db, owner_id);
+    db.entries
+        .retain(|entry| entry.owner_id.as_deref() != Some(owner_id));
+    for id in &removed {
+        documents.delete(&blob_namespace(id));
+    }
+    documents.put_bytes(KV_CACHE_NAMESPACE, &serde_json::to_vec(&db)?)?;
+    Ok(removed)
+}
+
+pub(crate) fn invalidate_persona_memory_cache(owner_id: &str) -> Result<usize> {
+    let removed = memory_cache()
+        .lock()
+        .map_err(|_| anyhow!("Persona prefix memory cache is unavailable"))?
+        .invalidate_owner(owner_id);
+    Ok(removed.len())
+}
+
+fn cache_ids_for_owner(db: &KvCacheDb, owner_id: &str) -> Vec<String> {
+    let mut ids = db
+        .entries
+        .iter()
+        .filter(|entry| entry.owner_id.as_deref() == Some(owner_id))
+        .map(|entry| entry.id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
 }
 
 fn load_persistent_value_or_invalidate(

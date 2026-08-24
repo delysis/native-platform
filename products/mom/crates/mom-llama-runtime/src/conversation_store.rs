@@ -683,10 +683,11 @@ pub fn message_edit(
     }
     let persona_version =
         (conversation.kind == ConversationKind::PersonaTemplate).then(|| conversation.clone());
-    let path = save_db(&db)?;
-    if let Some(persona) = persona_version {
-        crate::personas::record_persona_version(&persona)?;
-    }
+    let path = if let Some(persona) = persona_version {
+        crate::personas::save_persona_with_version(&db, &persona)?
+    } else {
+        save_db(&db)?
+    };
     Ok(CommandResult::passed(
         "mom_llama.message_edit",
         "contracted",
@@ -1455,7 +1456,16 @@ pub fn load_db() -> Result<ConversationDb> {
 pub fn save_db(db: &ConversationDb) -> Result<PathBuf> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    store.put(CONVERSATIONS_NAMESPACE, db)?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |stored, documents| {
+            let mut next = db.clone();
+            crate::personas::filter_removed_personas_from_documents(&mut next, documents)?;
+            *stored = next;
+            Ok(())
+        },
+    )?;
     Ok(store.path().to_path_buf())
 }
 
