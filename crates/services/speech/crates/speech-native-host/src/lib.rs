@@ -17,6 +17,7 @@ use speech_native_types::{
 };
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -86,12 +87,19 @@ enum HostPhase {
 struct ActiveRoute {
     backend: Arc<dyn SpeechBackend>,
     identity: operation_lifecycle::OperationIdentity,
+    cancellation: Arc<CancellationSignal>,
 }
 
 struct RegisteredBackend {
     backend: Arc<dyn SpeechBackend>,
-    descriptor: SpeechBackendDescriptor,
+    registration_id: String,
+    admission_capacity: usize,
     limiter: Arc<Semaphore>,
+}
+
+struct CancellationSignal {
+    changed: Notify,
+    backend_cancel_accepted: Mutex<bool>,
 }
 
 struct HostState {
@@ -127,6 +135,7 @@ struct ReservedRoute {
     consumer: operation_lifecycle::ConsumerGuard,
     operation: operation_lifecycle::OperationLease,
     limiter: Arc<Semaphore>,
+    cancellation: Arc<CancellationSignal>,
 }
 
 #[derive(Clone, Copy)]
@@ -152,10 +161,27 @@ struct ExecutorOperation {
     lifecycle: Arc<HostLifecycle>,
     request_id: SpeechRequestId,
     backend: Arc<dyn SpeechBackend>,
+    cancellation: Arc<CancellationSignal>,
     _backend_lease: OwnedSemaphorePermit,
     operation: operation_lifecycle::OperationLease,
     attempt: Option<operation_lifecycle::AttemptLease>,
     finished: bool,
+}
+
+type DispatchFuture<T> = Pin<Box<dyn Future<Output = Result<T, SpeechError>> + Send + 'static>>;
+type TicketJoin<T> = fn(T) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+struct PendingDispatch<T: Send + 'static> {
+    lifecycle: Arc<HostLifecycle>,
+    label: String,
+    request_id: SpeechRequestId,
+    backend: Arc<dyn SpeechBackend>,
+    cancellation: Arc<CancellationSignal>,
+    dispatch: Option<DispatchFuture<T>>,
+    executor: Option<ExecutorOperation>,
+    join_ticket: TicketJoin<T>,
+    terminal: operation_lifecycle::TerminalClass,
+    stop_requested: bool,
 }
 
 impl std::fmt::Debug for SpeechHost {
@@ -215,11 +241,13 @@ impl SpeechHost {
             });
         }
         let capacity = conservative_backend_capacity(&descriptor)?;
+        let registration_id = descriptor.id.clone();
         state.backends.insert(
-            descriptor.id.clone(),
+            registration_id.clone(),
             RegisteredBackend {
                 backend,
-                descriptor,
+                registration_id,
+                admission_capacity: capacity,
                 limiter: Arc::new(Semaphore::new(capacity)),
             },
         );
@@ -234,15 +262,31 @@ impl SpeechHost {
     }
 
     pub fn descriptors(&self) -> Result<Vec<SpeechBackendDescriptor>, SpeechHostError> {
-        let state = self.lifecycle.state.lock().map_err(|_| {
-            self.lifecycle.mark_faulted();
-            SpeechHostError::StateUnavailable
-        })?;
-        Ok(state
-            .backends
-            .values()
-            .map(|backend| backend.descriptor.clone())
-            .collect())
+        let registered = {
+            let state = self.lifecycle.state.lock().map_err(|_| {
+                self.lifecycle.mark_faulted();
+                SpeechHostError::StateUnavailable
+            })?;
+            state
+                .backends
+                .values()
+                .map(|registered| {
+                    (
+                        registered.registration_id.clone(),
+                        registered.admission_capacity,
+                        Arc::clone(&registered.backend),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        registered
+            .into_iter()
+            .map(|(registration_id, admission_capacity, backend)| {
+                let descriptor = backend.descriptor();
+                validate_observed_descriptor(&registration_id, admission_capacity, &descriptor)?;
+                Ok(descriptor)
+            })
+            .collect()
     }
 
     pub fn snapshot(&self) -> Result<PlatformCapabilitySnapshot, SpeechHostError> {
@@ -286,6 +330,7 @@ impl SpeechHost {
             consumer,
             operation,
             limiter,
+            cancellation,
         } = self.reserve_transcription(&request)?;
         pin_route(&mut request.context.route, &plan);
         let mut setup = SetupGuard::new(
@@ -297,9 +342,24 @@ impl SpeechHost {
             self.lifecycle.mark_faulted();
             map_registry_error(error)
         })?;
-        let backend_lease = self
-            .acquire_backend_lease(limiter, budget, &request_id, &plan)
-            .await?;
+        let backend_lease = match self
+            .acquire_backend_lease(
+                limiter,
+                budget,
+                &request_id,
+                &plan,
+                &operation,
+                &cancellation,
+            )
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) if is_cancelled_host_error(&error) => {
+                setup.cancel_and_release()?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         let attempt = operation
             .start()
             .and_then(|()| operation.start_attempt())
@@ -311,21 +371,51 @@ impl SpeechHost {
             lifecycle: Arc::clone(&self.lifecycle),
             request_id: request_id.clone(),
             backend: Arc::clone(&backend),
+            cancellation: Arc::clone(&cancellation),
             _backend_lease: backend_lease,
             operation: operation.clone(),
             attempt: Some(attempt),
             finished: false,
         };
         setup.disarm();
+        if operation_cancelled(&operation)? {
+            let error = request_cancelled_error(
+                &request_id,
+                &plan.selected.route.backend_id,
+                "speech request was cancelled before backend dispatch",
+            );
+            executor
+                .finish(operation_lifecycle::TerminalClass::Cancelled)
+                .map_err(map_registry_error)?;
+            return Err(error.into());
+        }
         let dispatch_backend = Arc::clone(&backend);
-        let mut dispatch = Box::pin(async move { dispatch_backend.transcribe(request).await });
+        let dispatch: DispatchFuture<TranscriptionTicket> =
+            Box::pin(async move { dispatch_backend.transcribe(request).await });
+        let mut pending = PendingDispatch::new(
+            Arc::clone(&self.lifecycle),
+            format!("host-abandoned-dispatch-join:{request_id}"),
+            request_id.clone(),
+            Arc::clone(&backend),
+            Arc::clone(&cancellation),
+            dispatch,
+            executor,
+            boxed_join_transcription_ticket,
+        );
+        let dispatch_operation = operation.clone();
+        let dispatch_cancellation = Arc::clone(&cancellation);
         let dispatch_outcome = match budget.total_deadline {
             Some(deadline) => tokio::select! {
                 biased;
-                result = &mut dispatch => FinalOutcome::Backend(result),
+                () = wait_for_cancellation(&dispatch_operation, &dispatch_cancellation) => FinalOutcome::Cancelled,
+                result = pending.dispatch_mut() => FinalOutcome::Backend(result),
                 _ = tokio::time::sleep_until(deadline) => FinalOutcome::TimedOut,
             },
-            None => FinalOutcome::Backend(dispatch.as_mut().await),
+            None => tokio::select! {
+                biased;
+                () = wait_for_cancellation(&dispatch_operation, &dispatch_cancellation) => FinalOutcome::Cancelled,
+                result = pending.dispatch_mut() => FinalOutcome::Backend(result),
+            },
         };
         let backend_ticket_result = match dispatch_outcome {
             FinalOutcome::Backend(result) => result,
@@ -336,52 +426,42 @@ impl SpeechHost {
                     "speech_total_timeout",
                     "speech request exceeded its total deadline before backend admission completed",
                 );
-                executor
-                    .operation
-                    .request_cancel()
-                    .map_err(map_registry_error)?;
-                let cancellation_accepted = backend.cancel(&request_id) != 0;
-                let cleanup_backend = Arc::clone(&backend);
-                let cleanup_request_id = request_id.clone();
-                self.spawn_monitor(
-                    format!("host-dispatch-timeout-join:{request_id}"),
-                    async move {
-                        if let Ok(ticket) = dispatch.await {
-                            if !cancellation_accepted {
-                                cleanup_backend.cancel(&cleanup_request_id);
-                            }
-                            join_transcription_ticket(ticket).await;
-                        }
-                        executor
-                            .finish(operation_lifecycle::TerminalClass::Failed)
-                            .map_err(|registry_error| registry_error.to_string())
-                    },
-                )?;
+                pending.request_stop(operation_lifecycle::TerminalClass::Failed)?;
+                return Err(error.into());
+            }
+            FinalOutcome::Cancelled => {
+                let error = request_cancelled_error(
+                    &request_id,
+                    &plan.selected.route.backend_id,
+                    "speech request was cancelled during backend dispatch",
+                );
+                pending.request_stop(operation_lifecycle::TerminalClass::Cancelled)?;
                 return Err(error.into());
             }
         };
+        let mut executor = pending.complete();
         let mut backend_ticket = match backend_ticket_result {
             Ok(ticket) => ticket,
             Err(error) => {
-                executor
-                    .finish(terminal_for_error(&error))
+                let finished = executor
+                    .finish_backend(terminal_for_error(&error))
                     .map_err(map_registry_error)?;
+                if finished.cancellation_requested {
+                    return Err(request_cancelled_error(
+                        &request_id,
+                        &plan.selected.route.backend_id,
+                        "speech request was cancelled before backend dispatch completed",
+                    )
+                    .into());
+                }
                 return Err(error.into());
             }
         };
-        if operation
-            .snapshot()
-            .map_err(map_registry_error)?
-            .is_some_and(|snapshot| snapshot.cancellation_requested)
-        {
-            backend.cancel(&request_id);
-        }
-
         let mut backend_events = std::mem::replace(&mut backend_ticket.events, mpsc::channel(1).1);
         let (event_sender, events) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
         let audio_sink = backend_ticket.audio_sink.take();
         let (final_sender, final_receiver) = oneshot::channel();
-        let cancellation = Arc::new(HostCancellation {
+        let ticket_cancellation = Arc::new(HostCancellation {
             lifecycle: Arc::downgrade(&self.lifecycle),
             request_id: request_id.clone(),
             identity: operation.identity(),
@@ -389,7 +469,8 @@ impl SpeechHost {
         });
         let monitor_request_id = request_id.clone();
         let monitor_backend_id = plan.selected.route.backend_id.clone();
-        let monitor_backend = Arc::clone(&backend);
+        let monitor_operation = operation.clone();
+        let monitor_cancellation = Arc::clone(&cancellation);
         let total_deadline = budget.total_deadline;
         self.spawn_monitor(format!("host-final-relay:{request_id}"), async move {
             let backend_final = backend_ticket.final_response();
@@ -406,6 +487,7 @@ impl SpeechHost {
             let outcome = loop {
                 tokio::select! {
                     biased;
+                    () = wait_for_cancellation(&monitor_operation, &monitor_cancellation) => break FinalOutcome::Cancelled,
                     result = &mut backend_final => break FinalOutcome::Backend(result),
                     () = &mut timeout => break FinalOutcome::TimedOut,
                     event = backend_events.recv(), if backend_events_open => match event {
@@ -425,10 +507,17 @@ impl SpeechHost {
                         &mut backend_events,
                         &mut backend_terminal,
                     );
-                    let finalized = executor.finish(terminal_for_result(&result));
-                    let delivered = match finalized {
-                        Ok(()) => result,
-                        Err(ref error) => Err(lifecycle_speech_error(&monitor_request_id, error)),
+                    let finalized = executor.finish_backend(terminal_for_result(&result));
+                    let delivered = match &finalized {
+                        Ok(finished) if finished.cancellation_requested => {
+                            Err(request_cancelled_error(
+                                &monitor_request_id,
+                                &monitor_backend_id,
+                                "speech request cancellation won final arbitration",
+                            ))
+                        }
+                        Ok(_) => result,
+                        Err(error) => Err(lifecycle_speech_error(&monitor_request_id, error)),
                     };
                     let terminal = transcription_terminal_event(
                         &monitor_request_id,
@@ -438,7 +527,40 @@ impl SpeechHost {
                     let terminal_delivered = send_transcription_terminal(&event_sender, terminal);
                     let _consumer_gone = final_sender.send(delivered).is_err();
                     finalized
+                        .map(|_| ())
                         .map_err(|error| error.to_string())
+                        .and(terminal_delivered)
+                }
+                FinalOutcome::Cancelled => {
+                    let cancellation_error = request_cancelled_error(
+                        &monitor_request_id,
+                        &monitor_backend_id,
+                        "speech request was cancelled before its backend final",
+                    );
+                    executor
+                        .request_cancel()
+                        .map_err(|registry_error| registry_error.to_string())?;
+                    drain_transcription_until_final(
+                        &mut backend_final,
+                        &mut backend_events,
+                        &mut backend_events_open,
+                    )
+                    .await;
+                    let finalized = executor.finish(operation_lifecycle::TerminalClass::Cancelled);
+                    let delivered = match &finalized {
+                        Ok(()) => Err(cancellation_error),
+                        Err(error) => Err(lifecycle_speech_error(&monitor_request_id, error)),
+                    };
+                    let terminal = transcription_terminal_event(
+                        &monitor_request_id,
+                        &delivered,
+                        backend_terminal,
+                    );
+                    let terminal_delivered =
+                        send_transcription_terminal(&event_sender, terminal);
+                    let _consumer_gone = final_sender.send(delivered).is_err();
+                    finalized
+                        .map_err(|registry_error| registry_error.to_string())
                         .and(terminal_delivered)
                 }
                 FinalOutcome::TimedOut => {
@@ -449,10 +571,8 @@ impl SpeechHost {
                         "speech request exceeded its total deadline",
                     );
                     executor
-                        .operation
                         .request_cancel()
                         .map_err(|registry_error| registry_error.to_string())?;
-                    monitor_backend.cancel(&monitor_request_id);
                     let terminal_delivered = send_transcription_terminal(
                         &event_sender,
                         TranscriptionEvent::Failed {
@@ -461,17 +581,12 @@ impl SpeechHost {
                         },
                     );
                     let _consumer_gone = final_sender.send(Err(error)).is_err();
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _result = &mut backend_final => break,
-                            event = backend_events.recv(), if backend_events_open => {
-                                if event.is_none() {
-                                    backend_events_open = false;
-                                }
-                            },
-                        }
-                    }
+                    drain_transcription_until_final(
+                        &mut backend_final,
+                        &mut backend_events,
+                        &mut backend_events_open,
+                    )
+                    .await;
                     executor
                         .finish(operation_lifecycle::TerminalClass::Failed)
                         .map_err(|registry_error| registry_error.to_string())
@@ -483,7 +598,7 @@ impl SpeechHost {
             request_id,
             events,
             final_receiver,
-            cancellation,
+            ticket_cancellation,
             audio_sink,
         ))
     }
@@ -500,6 +615,7 @@ impl SpeechHost {
             consumer,
             operation,
             limiter,
+            cancellation,
         } = self.reserve_synthesis(&request)?;
         pin_route(&mut request.context.route, &plan);
         let mut setup = SetupGuard::new(
@@ -511,9 +627,24 @@ impl SpeechHost {
             self.lifecycle.mark_faulted();
             map_registry_error(error)
         })?;
-        let backend_lease = self
-            .acquire_backend_lease(limiter, budget, &request_id, &plan)
-            .await?;
+        let backend_lease = match self
+            .acquire_backend_lease(
+                limiter,
+                budget,
+                &request_id,
+                &plan,
+                &operation,
+                &cancellation,
+            )
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) if is_cancelled_host_error(&error) => {
+                setup.cancel_and_release()?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         let attempt = operation
             .start()
             .and_then(|()| operation.start_attempt())
@@ -525,21 +656,51 @@ impl SpeechHost {
             lifecycle: Arc::clone(&self.lifecycle),
             request_id: request_id.clone(),
             backend: Arc::clone(&backend),
+            cancellation: Arc::clone(&cancellation),
             _backend_lease: backend_lease,
             operation: operation.clone(),
             attempt: Some(attempt),
             finished: false,
         };
         setup.disarm();
+        if operation_cancelled(&operation)? {
+            let error = request_cancelled_error(
+                &request_id,
+                &plan.selected.route.backend_id,
+                "speech request was cancelled before backend dispatch",
+            );
+            executor
+                .finish(operation_lifecycle::TerminalClass::Cancelled)
+                .map_err(map_registry_error)?;
+            return Err(error.into());
+        }
         let dispatch_backend = Arc::clone(&backend);
-        let mut dispatch = Box::pin(async move { dispatch_backend.synthesize(request).await });
+        let dispatch: DispatchFuture<SynthesisTicket> =
+            Box::pin(async move { dispatch_backend.synthesize(request).await });
+        let mut pending = PendingDispatch::new(
+            Arc::clone(&self.lifecycle),
+            format!("host-abandoned-dispatch-join:{request_id}"),
+            request_id.clone(),
+            Arc::clone(&backend),
+            Arc::clone(&cancellation),
+            dispatch,
+            executor,
+            boxed_join_synthesis_ticket,
+        );
+        let dispatch_operation = operation.clone();
+        let dispatch_cancellation = Arc::clone(&cancellation);
         let dispatch_outcome = match budget.total_deadline {
             Some(deadline) => tokio::select! {
                 biased;
-                result = &mut dispatch => FinalOutcome::Backend(result),
+                () = wait_for_cancellation(&dispatch_operation, &dispatch_cancellation) => FinalOutcome::Cancelled,
+                result = pending.dispatch_mut() => FinalOutcome::Backend(result),
                 _ = tokio::time::sleep_until(deadline) => FinalOutcome::TimedOut,
             },
-            None => FinalOutcome::Backend(dispatch.as_mut().await),
+            None => tokio::select! {
+                biased;
+                () = wait_for_cancellation(&dispatch_operation, &dispatch_cancellation) => FinalOutcome::Cancelled,
+                result = pending.dispatch_mut() => FinalOutcome::Backend(result),
+            },
         };
         let backend_ticket_result = match dispatch_outcome {
             FinalOutcome::Backend(result) => result,
@@ -550,51 +711,41 @@ impl SpeechHost {
                     "speech_total_timeout",
                     "speech request exceeded its total deadline before backend admission completed",
                 );
-                executor
-                    .operation
-                    .request_cancel()
-                    .map_err(map_registry_error)?;
-                let cancellation_accepted = backend.cancel(&request_id) != 0;
-                let cleanup_backend = Arc::clone(&backend);
-                let cleanup_request_id = request_id.clone();
-                self.spawn_monitor(
-                    format!("host-dispatch-timeout-join:{request_id}"),
-                    async move {
-                        if let Ok(ticket) = dispatch.await {
-                            if !cancellation_accepted {
-                                cleanup_backend.cancel(&cleanup_request_id);
-                            }
-                            join_synthesis_ticket(ticket).await;
-                        }
-                        executor
-                            .finish(operation_lifecycle::TerminalClass::Failed)
-                            .map_err(|registry_error| registry_error.to_string())
-                    },
-                )?;
+                pending.request_stop(operation_lifecycle::TerminalClass::Failed)?;
+                return Err(error.into());
+            }
+            FinalOutcome::Cancelled => {
+                let error = request_cancelled_error(
+                    &request_id,
+                    &plan.selected.route.backend_id,
+                    "speech request was cancelled during backend dispatch",
+                );
+                pending.request_stop(operation_lifecycle::TerminalClass::Cancelled)?;
                 return Err(error.into());
             }
         };
+        let mut executor = pending.complete();
         let mut backend_ticket = match backend_ticket_result {
             Ok(ticket) => ticket,
             Err(error) => {
-                executor
-                    .finish(terminal_for_error(&error))
+                let finished = executor
+                    .finish_backend(terminal_for_error(&error))
                     .map_err(map_registry_error)?;
+                if finished.cancellation_requested {
+                    return Err(request_cancelled_error(
+                        &request_id,
+                        &plan.selected.route.backend_id,
+                        "speech request was cancelled before backend dispatch completed",
+                    )
+                    .into());
+                }
                 return Err(error.into());
             }
         };
-        if operation
-            .snapshot()
-            .map_err(map_registry_error)?
-            .is_some_and(|snapshot| snapshot.cancellation_requested)
-        {
-            backend.cancel(&request_id);
-        }
-
         let mut backend_events = std::mem::replace(&mut backend_ticket.events, mpsc::channel(1).1);
         let (event_sender, events) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
         let (final_sender, final_receiver) = oneshot::channel();
-        let cancellation = Arc::new(HostCancellation {
+        let ticket_cancellation = Arc::new(HostCancellation {
             lifecycle: Arc::downgrade(&self.lifecycle),
             request_id: request_id.clone(),
             identity: operation.identity(),
@@ -602,7 +753,8 @@ impl SpeechHost {
         });
         let monitor_request_id = request_id.clone();
         let monitor_backend_id = plan.selected.route.backend_id.clone();
-        let monitor_backend = Arc::clone(&backend);
+        let monitor_operation = operation.clone();
+        let monitor_cancellation = Arc::clone(&cancellation);
         let total_deadline = budget.total_deadline;
         self.spawn_monitor(format!("host-final-relay:{request_id}"), async move {
             let backend_final = backend_ticket.final_response();
@@ -619,6 +771,7 @@ impl SpeechHost {
             let outcome = loop {
                 tokio::select! {
                     biased;
+                    () = wait_for_cancellation(&monitor_operation, &monitor_cancellation) => break FinalOutcome::Cancelled,
                     result = &mut backend_final => break FinalOutcome::Backend(result),
                     () = &mut timeout => break FinalOutcome::TimedOut,
                     event = backend_events.recv(), if backend_events_open => match event {
@@ -638,17 +791,56 @@ impl SpeechHost {
                         &mut backend_events,
                         &mut backend_terminal,
                     );
-                    let finalized = executor.finish(terminal_for_result(&result));
-                    let delivered = match finalized {
-                        Ok(()) => result,
-                        Err(ref error) => Err(lifecycle_speech_error(&monitor_request_id, error)),
+                    let finalized = executor.finish_backend(terminal_for_result(&result));
+                    let delivered = match &finalized {
+                        Ok(finished) if finished.cancellation_requested => {
+                            Err(request_cancelled_error(
+                                &monitor_request_id,
+                                &monitor_backend_id,
+                                "speech request cancellation won final arbitration",
+                            ))
+                        }
+                        Ok(_) => result,
+                        Err(error) => Err(lifecycle_speech_error(&monitor_request_id, error)),
                     };
                     let terminal =
                         synthesis_terminal_event(&monitor_request_id, &delivered, backend_terminal);
                     let terminal_delivered = send_synthesis_terminal(&event_sender, terminal);
                     let _consumer_gone = final_sender.send(delivered).is_err();
                     finalized
+                        .map(|_| ())
                         .map_err(|error| error.to_string())
+                        .and(terminal_delivered)
+                }
+                FinalOutcome::Cancelled => {
+                    let cancellation_error = request_cancelled_error(
+                        &monitor_request_id,
+                        &monitor_backend_id,
+                        "speech request was cancelled before its backend final",
+                    );
+                    executor
+                        .request_cancel()
+                        .map_err(|registry_error| registry_error.to_string())?;
+                    drain_synthesis_until_final(
+                        &mut backend_final,
+                        &mut backend_events,
+                        &mut backend_events_open,
+                    )
+                    .await;
+                    let finalized = executor.finish(operation_lifecycle::TerminalClass::Cancelled);
+                    let delivered = match &finalized {
+                        Ok(()) => Err(cancellation_error),
+                        Err(error) => Err(lifecycle_speech_error(&monitor_request_id, error)),
+                    };
+                    let terminal = synthesis_terminal_event(
+                        &monitor_request_id,
+                        &delivered,
+                        backend_terminal,
+                    );
+                    let terminal_delivered = send_synthesis_terminal(&event_sender, terminal);
+                    let _consumer_gone = final_sender.send(delivered).is_err();
+                    finalized
+                        .map_err(|registry_error| registry_error.to_string())
                         .and(terminal_delivered)
                 }
                 FinalOutcome::TimedOut => {
@@ -659,10 +851,8 @@ impl SpeechHost {
                         "speech request exceeded its total deadline",
                     );
                     executor
-                        .operation
                         .request_cancel()
                         .map_err(|registry_error| registry_error.to_string())?;
-                    monitor_backend.cancel(&monitor_request_id);
                     let terminal_delivered = send_synthesis_terminal(
                         &event_sender,
                         SynthesisEvent::Failed {
@@ -671,17 +861,12 @@ impl SpeechHost {
                         },
                     );
                     let _consumer_gone = final_sender.send(Err(error)).is_err();
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _result = &mut backend_final => break,
-                            event = backend_events.recv(), if backend_events_open => {
-                                if event.is_none() {
-                                    backend_events_open = false;
-                                }
-                            },
-                        }
-                    }
+                    drain_synthesis_until_final(
+                        &mut backend_final,
+                        &mut backend_events,
+                        &mut backend_events_open,
+                    )
+                    .await;
                     executor
                         .finish(operation_lifecycle::TerminalClass::Failed)
                         .map_err(|registry_error| registry_error.to_string())
@@ -693,7 +878,7 @@ impl SpeechHost {
             request_id,
             events,
             final_receiver,
-            cancellation,
+            ticket_cancellation,
         ))
     }
 
@@ -703,7 +888,7 @@ impl SpeechHost {
     }
 
     pub fn quiesce(&self) -> Result<(), SpeechHostError> {
-        let active = {
+        let (active, limiters) = {
             let mut state = self.lifecycle.state.lock().map_err(|_| {
                 self.lifecycle.mark_faulted();
                 SpeechHostError::StateUnavailable
@@ -711,28 +896,21 @@ impl SpeechHost {
             if state.phase != HostPhase::Running {
                 return Ok(());
             }
-            let cancelled = self
-                .lifecycle
-                .operations
-                .request_cancel_all()
-                .map_err(map_registry_error)?;
             state.phase = HostPhase::Quiescing;
-            for backend in state.backends.values() {
-                backend.limiter.close();
-            }
-            cancelled
-                .into_iter()
-                .filter_map(|operation_id| {
-                    let request_id = SpeechRequestId(operation_id);
-                    state
-                        .routes
-                        .get(&request_id)
-                        .map(|route| (request_id, Arc::clone(&route.backend)))
-                })
-                .collect::<Vec<_>>()
+            (
+                state.routes.keys().cloned().collect::<Vec<_>>(),
+                state
+                    .backends
+                    .values()
+                    .map(|backend| Arc::clone(&backend.limiter))
+                    .collect::<Vec<_>>(),
+            )
         };
-        for (request_id, backend) in active {
-            backend.cancel(&request_id);
+        for request_id in active {
+            self.lifecycle.cancel(&request_id, None);
+        }
+        for limiter in limiters {
+            limiter.close();
         }
         Ok(())
     }
@@ -745,31 +923,24 @@ impl SpeechHost {
             })?;
             match state.phase {
                 HostPhase::Running => {
-                    let cancelled = self
-                        .lifecycle
-                        .operations
-                        .request_cancel_all()
-                        .map_err(map_registry_error)?;
                     state.phase = HostPhase::Quiescing;
                     state.shutdown_started = true;
-                    for backend in state.backends.values() {
-                        backend.limiter.close();
-                    }
                     Some((
                         state
                             .backends
                             .values()
-                            .map(|backend| Arc::clone(&backend.backend))
-                            .collect::<Vec<_>>(),
-                        cancelled
-                            .into_iter()
-                            .filter_map(|operation_id| {
-                                let request_id = SpeechRequestId(operation_id);
-                                state
-                                    .routes
-                                    .get(&request_id)
-                                    .map(|route| (request_id, Arc::clone(&route.backend)))
+                            .map(|backend| {
+                                (
+                                    backend.registration_id.clone(),
+                                    Arc::clone(&backend.backend),
+                                )
                             })
+                            .collect::<Vec<_>>(),
+                        state.routes.keys().cloned().collect::<Vec<_>>(),
+                        state
+                            .backends
+                            .values()
+                            .map(|backend| Arc::clone(&backend.limiter))
                             .collect::<Vec<_>>(),
                     ))
                 }
@@ -779,14 +950,18 @@ impl SpeechHost {
                         state
                             .backends
                             .values()
-                            .map(|backend| Arc::clone(&backend.backend))
-                            .collect::<Vec<_>>(),
-                        state
-                            .routes
-                            .iter()
-                            .map(|(request_id, route)| {
-                                (request_id.clone(), Arc::clone(&route.backend))
+                            .map(|backend| {
+                                (
+                                    backend.registration_id.clone(),
+                                    Arc::clone(&backend.backend),
+                                )
                             })
+                            .collect::<Vec<_>>(),
+                        state.routes.keys().cloned().collect::<Vec<_>>(),
+                        state
+                            .backends
+                            .values()
+                            .map(|backend| Arc::clone(&backend.limiter))
                             .collect::<Vec<_>>(),
                     ))
                 }
@@ -799,15 +974,21 @@ impl SpeechHost {
                 }
             }
         };
-        if let Some((backends, active)) = start
-            && let Err(error) = HostLifecycle::spawn_shutdown_coordinator(
+        if let Some((backends, active, limiters)) = start {
+            for request_id in &active {
+                self.lifecycle.cancel(request_id, None);
+            }
+            for limiter in limiters {
+                limiter.close();
+            }
+            if let Err(error) = HostLifecycle::spawn_shutdown_coordinator(
                 Arc::clone(&self.lifecycle),
                 backends,
                 active,
-            )
-        {
-            self.lifecycle
-                .publish_shutdown(HostShutdownCompletion { result: Err(error) });
+            ) {
+                self.lifecycle
+                    .publish_shutdown(HostShutdownCompletion { result: Err(error) });
+            }
         }
         self.wait_for_shutdown().await
     }
@@ -846,7 +1027,7 @@ impl SpeechHost {
             &PlatformCapabilitySnapshot,
         ) -> Result<(), SpeechHostError>,
     ) -> Result<ReservedRoute, SpeechHostError> {
-        let snapshot = {
+        {
             let state = self.lifecycle.state.lock().map_err(|_| {
                 self.lifecycle.mark_faulted();
                 SpeechHostError::StateUnavailable
@@ -854,8 +1035,8 @@ impl SpeechHost {
             if state.phase != HostPhase::Running {
                 return Err(SpeechHostError::AdmissionClosed);
             }
-            snapshot_from_backends(self.target.clone(), &state.backends)
-        };
+        }
+        let snapshot = self.snapshot()?;
         let route = plan(&snapshot)?;
         preflight(&route, &snapshot)?;
         let mut state = self.lifecycle.state.lock().map_err(|_| {
@@ -878,6 +1059,7 @@ impl SpeechHost {
                 })?;
         let backend = Arc::clone(&registered.backend);
         let limiter = Arc::clone(&registered.limiter);
+        let cancellation = Arc::new(CancellationSignal::default());
         let (consumer, operation) = self
             .lifecycle
             .operations
@@ -888,6 +1070,7 @@ impl SpeechHost {
             ActiveRoute {
                 backend: Arc::clone(&backend),
                 identity: operation.identity(),
+                cancellation: Arc::clone(&cancellation),
             },
         );
         Ok(ReservedRoute {
@@ -896,6 +1079,7 @@ impl SpeechHost {
             consumer,
             operation,
             limiter,
+            cancellation,
         })
     }
 
@@ -905,12 +1089,21 @@ impl SpeechHost {
         budget: RequestBudget,
         request_id: &SpeechRequestId,
         plan: &SpeechRoutePlan,
+        operation: &operation_lifecycle::OperationLease,
+        cancellation: &CancellationSignal,
     ) -> Result<OwnedSemaphorePermit, SpeechHostError> {
         let acquire = limiter.acquire_owned();
         tokio::pin!(acquire);
         let acquired = match budget.queue_cutoff() {
             Some(BudgetDeadline::Queue(deadline)) => tokio::select! {
                 biased;
+                () = wait_for_cancellation(operation, cancellation) => Err(SpeechHostError::Backend {
+                    error: request_cancelled_error(
+                        request_id,
+                        &plan.selected.route.backend_id,
+                        "speech request was cancelled while queued for backend capacity",
+                    ),
+                }),
                 permit = &mut acquire => permit.map_err(|_| SpeechHostError::AdmissionClosed),
                 _ = tokio::time::sleep_until(deadline) => Err(SpeechHostError::Backend {
                     error: request_timeout_error(
@@ -923,6 +1116,13 @@ impl SpeechHost {
             },
             Some(BudgetDeadline::Total(deadline)) => tokio::select! {
                 biased;
+                () = wait_for_cancellation(operation, cancellation) => Err(SpeechHostError::Backend {
+                    error: request_cancelled_error(
+                        request_id,
+                        &plan.selected.route.backend_id,
+                        "speech request was cancelled while queued for backend capacity",
+                    ),
+                }),
                 permit = &mut acquire => permit.map_err(|_| SpeechHostError::AdmissionClosed),
                 _ = tokio::time::sleep_until(deadline) => Err(SpeechHostError::Backend {
                     error: request_timeout_error(
@@ -933,7 +1133,17 @@ impl SpeechHost {
                     ),
                 }),
             },
-            None => acquire.await.map_err(|_| SpeechHostError::AdmissionClosed),
+            None => tokio::select! {
+                biased;
+                () = wait_for_cancellation(operation, cancellation) => Err(SpeechHostError::Backend {
+                    error: request_cancelled_error(
+                        request_id,
+                        &plan.selected.route.backend_id,
+                        "speech request was cancelled while queued for backend capacity",
+                    ),
+                }),
+                permit = &mut acquire => permit.map_err(|_| SpeechHostError::AdmissionClosed),
+            },
         }?;
         Ok(acquired)
     }
@@ -974,7 +1184,198 @@ impl SpeechHost {
 
 enum FinalOutcome<T> {
     Backend(T),
+    Cancelled,
     TimedOut,
+}
+
+impl Default for CancellationSignal {
+    fn default() -> Self {
+        Self {
+            changed: Notify::new(),
+            backend_cancel_accepted: Mutex::new(false),
+        }
+    }
+}
+
+impl CancellationSignal {
+    fn notify(&self) {
+        self.changed.notify_waiters();
+    }
+
+    fn cancel_backend(
+        &self,
+        backend: &Arc<dyn SpeechBackend>,
+        request_id: &SpeechRequestId,
+    ) -> Result<(), ()> {
+        let mut accepted = self.backend_cancel_accepted.lock().map_err(|_| ())?;
+        if !*accepted && backend.cancel(request_id) != 0 {
+            *accepted = true;
+        }
+        Ok(())
+    }
+}
+
+impl<T: Send + 'static> PendingDispatch<T> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        lifecycle: Arc<HostLifecycle>,
+        label: String,
+        request_id: SpeechRequestId,
+        backend: Arc<dyn SpeechBackend>,
+        cancellation: Arc<CancellationSignal>,
+        dispatch: DispatchFuture<T>,
+        executor: ExecutorOperation,
+        join_ticket: TicketJoin<T>,
+    ) -> Self {
+        Self {
+            lifecycle,
+            label,
+            request_id,
+            backend,
+            cancellation,
+            dispatch: Some(dispatch),
+            executor: Some(executor),
+            join_ticket,
+            terminal: operation_lifecycle::TerminalClass::Cancelled,
+            stop_requested: false,
+        }
+    }
+
+    fn dispatch_mut(&mut self) -> Pin<&mut (dyn Future<Output = Result<T, SpeechError>> + Send)> {
+        self.dispatch
+            .as_mut()
+            .expect("pending dispatch owns its future")
+            .as_mut()
+    }
+
+    fn request_stop(
+        &mut self,
+        terminal: operation_lifecycle::TerminalClass,
+    ) -> Result<(), SpeechHostError> {
+        self.terminal = terminal;
+        let executor = self
+            .executor
+            .as_mut()
+            .ok_or(SpeechHostError::StateUnavailable)?;
+        if operation_cancelled(&executor.operation)? {
+            executor.cancellation.notify();
+        } else {
+            executor.request_cancel().map_err(map_registry_error)?;
+        }
+        self.stop_requested = true;
+        Ok(())
+    }
+
+    fn complete(mut self) -> ExecutorOperation {
+        self.dispatch.take();
+        self.executor
+            .take()
+            .expect("completed dispatch owns its executor")
+    }
+}
+
+impl<T: Send + 'static> Drop for PendingDispatch<T> {
+    fn drop(&mut self) {
+        let (Some(dispatch), Some(mut executor)) = (self.dispatch.take(), self.executor.take())
+        else {
+            return;
+        };
+        if !self.stop_requested && executor.request_cancel().is_err() {
+            self.lifecycle.mark_faulted();
+        }
+        let cancellation = Arc::clone(&self.cancellation);
+        let backend = Arc::clone(&self.backend);
+        let request_id = self.request_id.clone();
+        let join_ticket = self.join_ticket;
+        let terminal = self.terminal;
+        let monitor = async move {
+            if let Ok(ticket) = dispatch.await {
+                cancellation
+                    .cancel_backend(&backend, &request_id)
+                    .map_err(|()| "speech cancellation state is unavailable".to_owned())?;
+                join_ticket(ticket).await;
+            }
+            executor
+                .finish(terminal)
+                .map_err(|registry_error| registry_error.to_string())
+        };
+        if self
+            .lifecycle
+            .tasks
+            .spawn(self.label.clone(), monitor)
+            .is_err()
+        {
+            self.lifecycle.mark_faulted();
+        }
+    }
+}
+
+async fn wait_for_cancellation(
+    operation: &operation_lifecycle::OperationLease,
+    cancellation: &CancellationSignal,
+) {
+    loop {
+        let changed = cancellation.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        match operation.snapshot() {
+            Ok(Some(snapshot)) if snapshot.cancellation_requested => return,
+            Ok(Some(_)) => changed.await,
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
+fn boxed_join_transcription_ticket(
+    ticket: TranscriptionTicket,
+) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+    Box::pin(join_transcription_ticket(ticket))
+}
+
+fn boxed_join_synthesis_ticket(
+    ticket: SynthesisTicket,
+) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+    Box::pin(join_synthesis_ticket(ticket))
+}
+
+async fn drain_transcription_until_final<F>(
+    backend_final: &mut Pin<&mut F>,
+    backend_events: &mut mpsc::Receiver<TranscriptionEvent>,
+    backend_events_open: &mut bool,
+) where
+    F: Future,
+{
+    loop {
+        tokio::select! {
+            biased;
+            _result = backend_final.as_mut() => break,
+            event = backend_events.recv(), if *backend_events_open => {
+                if event.is_none() {
+                    *backend_events_open = false;
+                }
+            },
+        }
+    }
+}
+
+async fn drain_synthesis_until_final<F>(
+    backend_final: &mut Pin<&mut F>,
+    backend_events: &mut mpsc::Receiver<SynthesisEvent>,
+    backend_events_open: &mut bool,
+) where
+    F: Future,
+{
+    loop {
+        tokio::select! {
+            biased;
+            _result = backend_final.as_mut() => break,
+            event = backend_events.recv(), if *backend_events_open => {
+                if event.is_none() {
+                    *backend_events_open = false;
+                }
+            },
+        }
+    }
 }
 
 async fn join_transcription_ticket(mut ticket: TranscriptionTicket) {
@@ -1207,6 +1608,35 @@ fn conservative_backend_capacity(
     })
 }
 
+fn validate_observed_descriptor(
+    registration_id: &str,
+    admission_capacity: usize,
+    descriptor: &SpeechBackendDescriptor,
+) -> Result<(), SpeechHostError> {
+    descriptor
+        .validate()
+        .map_err(|error| SpeechHostError::BackendInvalid {
+            detail: error.to_string(),
+        })?;
+    if descriptor.id != registration_id {
+        return Err(SpeechHostError::BackendInvalid {
+            detail: format!(
+                "registered backend {registration_id} changed its stable backend identity to {}",
+                descriptor.id
+            ),
+        });
+    }
+    let observed_capacity = conservative_backend_capacity(descriptor)?;
+    if observed_capacity != admission_capacity {
+        return Err(SpeechHostError::BackendInvalid {
+            detail: format!(
+                "registered backend {registration_id} changed its admission capacity from {admission_capacity} to {observed_capacity}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn exact_selected_capability<'a>(
     plan: &SpeechRoutePlan,
     snapshot: &'a PlatformCapabilitySnapshot,
@@ -1301,6 +1731,8 @@ fn wav_duration_ms(
 ) -> Result<u64, SpeechHostError> {
     const RIFF_HEADER_BYTES: usize = 12;
     const CHUNK_HEADER_BYTES: usize = 8;
+    const MAX_WAV_CHUNKS: usize = 4_096;
+    const MAX_WAV_METADATA_BYTES: usize = 1_048_576;
     if bytes.len() < RIFF_HEADER_BYTES || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(invalid_audio_error(
             request_id,
@@ -1332,7 +1764,25 @@ fn wav_duration_ms(
     let mut format = None;
     let mut data_bytes = None;
     let mut offset = RIFF_HEADER_BYTES;
+    let mut chunk_count = 0_usize;
+    let mut metadata_bytes = 0_usize;
     while offset < riff_end {
+        chunk_count = chunk_count.checked_add(1).ok_or_else(|| {
+            invalid_audio_error(
+                request_id,
+                backend_id,
+                "speech_wav_geometry_invalid",
+                "WAV chunk count overflowed",
+            )
+        })?;
+        if chunk_count > MAX_WAV_CHUNKS {
+            return Err(invalid_audio_error(
+                request_id,
+                backend_id,
+                "speech_wav_geometry_invalid",
+                "WAV contains too many chunks for bounded preflight",
+            ));
+        }
         let header_end = offset.checked_add(CHUNK_HEADER_BYTES).ok_or_else(|| {
             invalid_audio_error(
                 request_id,
@@ -1375,6 +1825,28 @@ fn wav_duration_ms(
             ));
         }
         let chunk_id = &bytes[offset..offset + 4];
+        if chunk_id != b"data" {
+            metadata_bytes = metadata_bytes
+                .checked_add(CHUNK_HEADER_BYTES)
+                .and_then(|total| total.checked_add(chunk_size))
+                .and_then(|total| total.checked_add(chunk_size % 2))
+                .ok_or_else(|| {
+                    invalid_audio_error(
+                        request_id,
+                        backend_id,
+                        "speech_wav_geometry_invalid",
+                        "WAV metadata size overflowed",
+                    )
+                })?;
+            if metadata_bytes > MAX_WAV_METADATA_BYTES {
+                return Err(invalid_audio_error(
+                    request_id,
+                    backend_id,
+                    "speech_wav_geometry_invalid",
+                    "WAV metadata exceeds the bounded preflight allowance",
+                ));
+            }
+        }
         if chunk_id == b"fmt " {
             if format.is_some() {
                 return Err(invalid_audio_error(
@@ -1470,7 +1942,11 @@ fn parse_wav_format(
     let byte_rate = read_u32_le(bytes, 8).unwrap_or_default();
     let block_align = read_u16_le(bytes, 12).unwrap_or_default();
     let bits_per_sample = read_u16_le(bytes, 14).unwrap_or_default();
-    if channels == 0 || sample_rate_hz == 0 || block_align == 0 || bits_per_sample == 0 {
+    if !(1..=32).contains(&channels)
+        || !(8_000..=384_000).contains(&sample_rate_hz)
+        || block_align == 0
+        || bits_per_sample == 0
+    {
         return Err(invalid_audio_error(
             request_id,
             backend_id,
@@ -1479,7 +1955,21 @@ fn parse_wav_format(
         ));
     }
     let effective_encoding = match encoding {
-        1 | 3 => encoding,
+        1 | 3 => {
+            if bytes.len() != 16 {
+                let extra_bytes = usize::from(read_u16_le(bytes, 16).unwrap_or_default());
+                let declared_end = 18_usize.checked_add(extra_bytes);
+                if bytes.len() < 18 || declared_end != Some(bytes.len()) {
+                    return Err(invalid_audio_error(
+                        request_id,
+                        backend_id,
+                        "speech_wav_geometry_invalid",
+                        "classic WAV format extension does not bind the complete format chunk",
+                    ));
+                }
+            }
+            encoding
+        }
         0xfffe => parse_extensible_wav_encoding(bytes, bits_per_sample, request_id, backend_id)?,
         _ => {
             return Err(invalid_audio_error(
@@ -1490,12 +1980,17 @@ fn parse_wav_format(
             ));
         }
     };
-    if effective_encoding == 3 && !matches!(bits_per_sample, 32 | 64) {
+    let width_supported = match effective_encoding {
+        1 => matches!(bits_per_sample, 8 | 16 | 24 | 32),
+        3 => bits_per_sample == 32,
+        _ => false,
+    };
+    if !width_supported {
         return Err(invalid_audio_error(
             request_id,
             backend_id,
             "speech_wav_geometry_invalid",
-            "IEEE-float WAV samples must be 32 or 64 bits",
+            "WAV sample width is not supported by the private decoder boundary",
         ));
     }
     let expected_block_align = u32::from(channels)
@@ -1533,9 +2028,7 @@ fn parse_extensible_wav_encoding(
     ];
     let extra_bytes = usize::from(read_u16_le(bytes, 16).unwrap_or_default());
     let declared_end = EXTENSIBLE_BASE_BYTES.checked_add(extra_bytes);
-    if extra_bytes < EXTENSIBLE_MINIMUM_EXTRA_BYTES
-        || declared_end.is_none_or(|end| end > bytes.len())
-    {
+    if extra_bytes < EXTENSIBLE_MINIMUM_EXTRA_BYTES || declared_end != Some(bytes.len()) {
         return Err(invalid_audio_error(
             request_id,
             backend_id,
@@ -1544,24 +2037,32 @@ fn parse_extensible_wav_encoding(
         ));
     }
     let valid_bits = read_u16_le(bytes, 18).unwrap_or_default();
-    if valid_bits == 0 || valid_bits > bits_per_sample {
+    let encoding = match bytes.get(24..40) {
+        Some(subformat) if subformat == PCM_SUBFORMAT => 1,
+        Some(subformat) if subformat == FLOAT_SUBFORMAT => 3,
+        _ => {
+            return Err(invalid_audio_error(
+                request_id,
+                backend_id,
+                "speech_wav_geometry_invalid",
+                "extensible WAV subformat is not PCM or IEEE float",
+            ));
+        }
+    };
+    let valid_bits_supported = match encoding {
+        1 => matches!(valid_bits, 8 | 16 | 24 | 32) && valid_bits <= bits_per_sample,
+        3 => valid_bits == 32 && bits_per_sample == 32,
+        _ => false,
+    };
+    if !valid_bits_supported {
         return Err(invalid_audio_error(
             request_id,
             backend_id,
             "speech_wav_geometry_invalid",
-            "extensible WAV valid-bit geometry is inconsistent",
+            "extensible WAV valid-bit geometry is unsupported or inconsistent",
         ));
     }
-    match bytes.get(24..40) {
-        Some(subformat) if subformat == PCM_SUBFORMAT => Ok(1),
-        Some(subformat) if subformat == FLOAT_SUBFORMAT => Ok(3),
-        _ => Err(invalid_audio_error(
-            request_id,
-            backend_id,
-            "speech_wav_geometry_invalid",
-            "extensible WAV subformat is not PCM or IEEE float",
-        )),
-    }
+    Ok(encoding)
 }
 
 fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -1608,6 +2109,38 @@ fn request_timeout_error(
     }
 }
 
+fn request_cancelled_error(
+    request_id: &SpeechRequestId,
+    backend_id: &str,
+    detail: &str,
+) -> SpeechError {
+    SpeechError {
+        code: "speech_request_cancelled".to_owned(),
+        class: SpeechErrorClass::Cancelled,
+        retryable: false,
+        request_id: request_id.clone(),
+        backend_id: Some(backend_id.to_owned()),
+        safe_detail: detail.to_owned(),
+    }
+}
+
+fn is_cancelled_host_error(error: &SpeechHostError) -> bool {
+    matches!(
+        error,
+        SpeechHostError::Backend { error }
+            if error.class == SpeechErrorClass::Cancelled
+    )
+}
+
+fn operation_cancelled(
+    operation: &operation_lifecycle::OperationLease,
+) -> Result<bool, SpeechHostError> {
+    Ok(operation
+        .snapshot()
+        .map_err(map_registry_error)?
+        .is_some_and(|snapshot| snapshot.cancellation_requested))
+}
+
 fn map_task_supervisor_error(error: TaskSupervisorError) -> SpeechHostError {
     match error {
         TaskSupervisorError::AdmissionClosed => SpeechHostError::AdmissionClosed,
@@ -1641,8 +2174,8 @@ fn lifecycle_speech_error(
 impl HostLifecycle {
     fn spawn_shutdown_coordinator(
         lifecycle: Arc<Self>,
-        backends: Vec<Arc<dyn SpeechBackend>>,
-        active: Vec<(SpeechRequestId, Arc<dyn SpeechBackend>)>,
+        backends: Vec<(String, Arc<dyn SpeechBackend>)>,
+        active: Vec<SpeechRequestId>,
     ) -> Result<(), SpeechHostError> {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| SpeechHostError::StateUnavailable)?;
@@ -1668,16 +2201,16 @@ impl HostLifecycle {
 
     async fn run_shutdown(
         lifecycle: Arc<Self>,
-        backends: Vec<Arc<dyn SpeechBackend>>,
-        active: Vec<(SpeechRequestId, Arc<dyn SpeechBackend>)>,
+        backends: Vec<(String, Arc<dyn SpeechBackend>)>,
+        active: Vec<SpeechRequestId>,
     ) -> HostShutdownCompletion {
         let mut infrastructure_error = None;
-        for (request_id, backend) in active {
-            backend.cancel(&request_id);
+        for request_id in active {
+            lifecycle.cancel(&request_id, None);
         }
         let mut failures = Vec::new();
-        for backend in backends {
-            let request_id = SpeechRequestId(format!("{}.shutdown", backend.descriptor().id));
+        for (registration_id, backend) in backends {
+            let request_id = SpeechRequestId(format!("{registration_id}.shutdown"));
             let error = match tokio::spawn(async move { backend.shutdown().await }).await {
                 Ok(result) => result.err(),
                 Err(join_error) => Some(SpeechError::unavailable(
@@ -1779,17 +2312,23 @@ impl HostLifecycle {
             Ok(state) => state.routes.get(request_id).and_then(|route| {
                 identity
                     .is_none_or(|identity| identity == &route.identity)
-                    .then(|| (Arc::clone(&route.backend), route.identity.clone()))
+                    .then(|| {
+                        (
+                            Arc::clone(&route.backend),
+                            route.identity.clone(),
+                            Arc::clone(&route.cancellation),
+                        )
+                    })
             }),
             Err(_) => {
                 self.mark_faulted();
                 return 0;
             }
         };
-        let Some((backend, route_identity)) = route else {
+        let Some((backend, route_identity, cancellation)) = route else {
             return 0;
         };
-        self.cancel_captured(request_id, route_identity, backend, identity)
+        self.cancel_captured(request_id, route_identity, backend, cancellation, identity)
     }
 
     fn cancel_captured(
@@ -1797,6 +2336,7 @@ impl HostLifecycle {
         request_id: &SpeechRequestId,
         route_identity: operation_lifecycle::OperationIdentity,
         backend: Arc<dyn SpeechBackend>,
+        cancellation: Arc<CancellationSignal>,
         identity: Option<&operation_lifecycle::OperationIdentity>,
     ) -> usize {
         let operation = match self.operations.current_lease(&request_id.0) {
@@ -1810,15 +2350,32 @@ impl HostLifecycle {
         if route_identity != operation.identity() {
             return 0;
         }
-        if identity.is_some_and(|identity| identity != &operation.identity())
-            || operation.request_cancel().is_err()
-        {
-            if self.operations.diagnostic_faulted() {
-                self.mark_faulted();
-            }
+        if identity.is_some_and(|identity| identity != &operation.identity()) {
             return 0;
         }
-        backend.cancel(request_id);
+        let newly_requested = match operation.request_cancel_once() {
+            Ok(newly_requested) => newly_requested,
+            Err(_) => {
+                if self.operations.diagnostic_faulted() {
+                    self.mark_faulted();
+                }
+                return 0;
+            }
+        };
+        if !newly_requested {
+            return 0;
+        }
+        cancellation.notify();
+        let phase = operation
+            .snapshot()
+            .ok()
+            .flatten()
+            .map(|snapshot| snapshot.phase);
+        if matches!(phase, Some(operation_lifecycle::OperationPhase::Running))
+            && cancellation.cancel_backend(&backend, request_id).is_err()
+        {
+            self.mark_faulted();
+        }
         1
     }
 
@@ -1874,6 +2431,16 @@ impl SetupGuard {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn cancel_and_release(&mut self) -> Result<(), SpeechHostError> {
+        self.operation
+            .cancel_setup_and_release()
+            .map_err(map_registry_error)?;
+        self.lifecycle
+            .release_route(&self.request_id, &self.operation.identity())?;
+        self.armed = false;
+        Ok(())
+    }
 }
 
 impl Drop for SetupGuard {
@@ -1892,12 +2459,22 @@ impl Drop for SetupGuard {
 }
 
 impl ExecutorOperation {
+    fn request_cancel(&mut self) -> Result<(), operation_lifecycle::RegistryError> {
+        self.operation.request_cancel_once()?;
+        self.cancellation.notify();
+        self.cancellation
+            .cancel_backend(&self.backend, &self.request_id)
+            .map_err(|()| {
+                self.lifecycle.mark_faulted();
+                operation_lifecycle::RegistryError::StateUnavailable
+            })
+    }
+
     fn cancel_and_finish(
         &mut self,
         terminal: operation_lifecycle::TerminalClass,
     ) -> Result<(), operation_lifecycle::RegistryError> {
-        self.operation.request_cancel()?;
-        self.backend.cancel(&self.request_id);
+        self.request_cancel()?;
         self.finish(terminal)
     }
 
@@ -1905,6 +2482,21 @@ impl ExecutorOperation {
         &mut self,
         terminal: operation_lifecycle::TerminalClass,
     ) -> Result<(), operation_lifecycle::RegistryError> {
+        self.finish_inner(terminal, false).map(|_| ())
+    }
+
+    fn finish_backend(
+        &mut self,
+        terminal: operation_lifecycle::TerminalClass,
+    ) -> Result<operation_lifecycle::OperationSnapshot, operation_lifecycle::RegistryError> {
+        self.finish_inner(terminal, true)
+    }
+
+    fn finish_inner(
+        &mut self,
+        terminal: operation_lifecycle::TerminalClass,
+        cancellation_wins: bool,
+    ) -> Result<operation_lifecycle::OperationSnapshot, operation_lifecycle::RegistryError> {
         if self.finished {
             return Err(operation_lifecycle::RegistryError::Stale);
         }
@@ -1912,17 +2504,20 @@ impl ExecutorOperation {
             .attempt
             .as_ref()
             .ok_or(operation_lifecycle::RegistryError::Stale)?;
-        if let Err(error) = self.operation.finish_attempt_and_release(attempt, terminal) {
-            self.lifecycle.mark_faulted();
-            return Err(error);
+        let finished = if cancellation_wins {
+            self.operation
+                .finish_backend_attempt_and_release(attempt, terminal)
+        } else {
+            self.operation.finish_attempt_and_release(attempt, terminal)
         }
+        .inspect_err(|_| self.lifecycle.mark_faulted())?;
         self.attempt.take();
         let identity = self.operation.identity();
         self.lifecycle
             .release_route(&self.request_id, &identity)
             .map_err(|_| operation_lifecycle::RegistryError::StateUnavailable)?;
         self.finished = true;
-        Ok(())
+        Ok(finished)
     }
 }
 
@@ -1950,27 +2545,6 @@ const fn terminal_for_error(error: &SpeechError) -> operation_lifecycle::Termina
         operation_lifecycle::TerminalClass::Cancelled
     } else {
         operation_lifecycle::TerminalClass::Failed
-    }
-}
-
-fn snapshot_from_backends(
-    target: PlatformTarget,
-    backends: &BTreeMap<String, RegisteredBackend>,
-) -> PlatformCapabilitySnapshot {
-    PlatformCapabilitySnapshot {
-        schema: SPEECH_CAPABILITY_SCHEMA.to_string(),
-        captured_at_unix_ms: unix_time_ms(),
-        target,
-        adapter_candidates: Vec::new(),
-        source_reports: vec![CapabilitySourceReport {
-            source_id: REGISTERED_SOURCE_ID.to_string(),
-            status: ProbeSourceStatus::Succeeded,
-            detail: None,
-            backends: backends
-                .values()
-                .map(|backend| backend.descriptor.clone())
-                .collect(),
-        }],
     }
 }
 
@@ -2014,7 +2588,8 @@ mod tests {
         SpeechDeadlinePolicy, SpeechOperationCapability, SpeechRequestContext, SpeechResolvedRoute,
         SpeechRoutingPolicy, SpeechUsage, SynthesisCapabilities, SynthesisEvent, SynthesisInput,
         SynthesisResponse, TimestampGranularity, TranscriptionCapabilities, TranscriptionInput,
-        TranscriptionTask, UsageProvenance, VoiceDescriptor, VoiceQuality, VoiceSelector,
+        TranscriptionResponse, TranscriptionTask, UsageProvenance, VoiceDescriptor, VoiceQuality,
+        VoiceSelector,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{mpsc, oneshot};
@@ -2060,11 +2635,25 @@ mod tests {
         changed: Notify,
     }
 
+    struct DeferredTranscriptionBackend {
+        descriptor: SpeechBackendDescriptor,
+        finals: Mutex<BTreeMap<SpeechRequestId, oneshot::Sender<TranscriptionResponse>>>,
+        calls: AtomicUsize,
+        cancel_calls: Arc<AtomicUsize>,
+        changed: Notify,
+    }
+
+    struct MutableDescriptorBackend {
+        descriptor: Mutex<SpeechBackendDescriptor>,
+    }
+
     struct DeferredDispatchBackend {
         descriptor: SpeechBackendDescriptor,
         dispatches: Mutex<BTreeMap<SpeechRequestId, oneshot::Sender<()>>>,
         cancel_calls: Arc<AtomicUsize>,
+        shutdown_calls: AtomicUsize,
         changed: Notify,
+        shutdown_changed: Notify,
     }
 
     impl DeferredBackend {
@@ -2097,6 +2686,39 @@ mod tests {
         }
     }
 
+    impl DeferredTranscriptionBackend {
+        fn complete(&self, request_id: &SpeechRequestId) {
+            let sender = self
+                .finals
+                .lock()
+                .expect("lock deferred transcription finals")
+                .remove(request_id)
+                .expect("deferred transcription request must exist");
+            let _ = sender.send(deferred_transcription_response(
+                request_id,
+                &self.descriptor.id,
+            ));
+            self.changed.notify_waiters();
+        }
+
+        async fn wait_until_active(&self, request_id: &SpeechRequestId) {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self
+                    .finals
+                    .lock()
+                    .expect("lock deferred transcription finals")
+                    .contains_key(request_id)
+                {
+                    return;
+                }
+                changed.await;
+            }
+        }
+    }
+
     impl DeferredDispatchBackend {
         fn release(&self, request_id: &SpeechRequestId) {
             let sender = self
@@ -2120,6 +2742,18 @@ mod tests {
                     .expect("lock deferred dispatches")
                     .contains_key(request_id)
                 {
+                    return;
+                }
+                changed.await;
+            }
+        }
+
+        async fn wait_until_shutdown(&self) {
+            loop {
+                let changed = self.shutdown_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.shutdown_calls.load(Ordering::Acquire) != 0 {
                     return;
                 }
                 changed.await;
@@ -2214,6 +2848,135 @@ mod tests {
     }
 
     #[async_trait]
+    impl SpeechBackend for DeferredTranscriptionBackend {
+        fn descriptor(&self) -> SpeechBackendDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn readiness(&self) -> SpeechBackendReadiness {
+            self.descriptor.readiness.clone()
+        }
+
+        async fn transcribe(
+            &self,
+            request: TranscriptionRequest,
+        ) -> Result<TranscriptionTicket, SpeechError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let request_id = request.context.request_id;
+            let (event_sender, event_receiver) = mpsc::channel(2);
+            drop(event_sender);
+            let (backend_final_sender, backend_final_receiver) = oneshot::channel();
+            let (release_sender, release_receiver) = oneshot::channel();
+            self.finals
+                .lock()
+                .map_err(|_| {
+                    SpeechError::unavailable(
+                        &request_id,
+                        "fixture_state_unavailable",
+                        "fixture state is unavailable",
+                    )
+                })?
+                .insert(request_id.clone(), release_sender);
+            self.changed.notify_waiters();
+            let response_id = request_id.clone();
+            tokio::spawn(async move {
+                let result = release_receiver.await.map_or_else(
+                    |_| {
+                        Err(SpeechError::unavailable(
+                            &response_id,
+                            "fixture_release_closed",
+                            "fixture release closed",
+                        ))
+                    },
+                    Ok,
+                );
+                let _ = backend_final_sender.send(result);
+            });
+            Ok(TranscriptionTicket::new(
+                request_id,
+                event_receiver,
+                backend_final_receiver,
+                Arc::new(DeferredCancellation {
+                    calls: Arc::clone(&self.cancel_calls),
+                }),
+                None,
+            ))
+        }
+
+        async fn synthesize(
+            &self,
+            request: SynthesisRequest,
+        ) -> Result<SynthesisTicket, SpeechError> {
+            Err(SpeechError::unavailable(
+                &request.context.request_id,
+                "fixture_synthesis_unsupported",
+                "fixture supports only transcription",
+            ))
+        }
+
+        fn cancel(&self, request_id: &SpeechRequestId) -> usize {
+            if self
+                .finals
+                .lock()
+                .is_ok_and(|finals| finals.contains_key(request_id))
+            {
+                self.cancel_calls.fetch_add(1, Ordering::AcqRel);
+                1
+            } else {
+                0
+            }
+        }
+
+        async fn shutdown(&self) -> Result<(), SpeechError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SpeechBackend for MutableDescriptorBackend {
+        fn descriptor(&self) -> SpeechBackendDescriptor {
+            self.descriptor
+                .lock()
+                .expect("lock mutable descriptor")
+                .clone()
+        }
+
+        fn readiness(&self) -> SpeechBackendReadiness {
+            self.descriptor().readiness
+        }
+
+        async fn transcribe(
+            &self,
+            request: TranscriptionRequest,
+        ) -> Result<TranscriptionTicket, SpeechError> {
+            Err(SpeechError::unavailable(
+                &request.context.request_id,
+                "fixture_transcription_unsupported",
+                "mutable descriptor fixture does not execute speech",
+            ))
+        }
+
+        async fn synthesize(
+            &self,
+            request: SynthesisRequest,
+        ) -> Result<SynthesisTicket, SpeechError> {
+            Err(SpeechError::unavailable(
+                &request.context.request_id,
+                "fixture_synthesis_unsupported",
+                "mutable descriptor fixture does not execute speech",
+            ))
+        }
+
+        fn cancel(&self, _request_id: &SpeechRequestId) -> usize {
+            0
+        }
+
+        async fn shutdown(&self) -> Result<(), SpeechError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
     impl SpeechBackend for DeferredDispatchBackend {
         fn descriptor(&self) -> SpeechBackendDescriptor {
             self.descriptor.clone()
@@ -2287,6 +3050,8 @@ mod tests {
         }
 
         async fn shutdown(&self) -> Result<(), SpeechError> {
+            self.shutdown_calls.fetch_add(1, Ordering::AcqRel);
+            self.shutdown_changed.notify_waiters();
             Ok(())
         }
     }
@@ -2530,12 +3295,36 @@ mod tests {
         })
     }
 
-    fn deferred_dispatch_backend(id: &str) -> Arc<DeferredDispatchBackend> {
-        Arc::new(DeferredDispatchBackend {
-            descriptor: fixture_backend(id).descriptor(),
-            dispatches: Mutex::new(BTreeMap::new()),
+    fn deferred_transcription_backend(id: &str) -> Arc<DeferredTranscriptionBackend> {
+        let mut descriptor = duration_probe_backend(id, 10_000).descriptor.clone();
+        descriptor.capabilities[0].limits.max_concurrent_requests = Some(1);
+        Arc::new(DeferredTranscriptionBackend {
+            descriptor,
+            finals: Mutex::new(BTreeMap::new()),
+            calls: AtomicUsize::new(0),
             cancel_calls: Arc::new(AtomicUsize::new(0)),
             changed: Notify::new(),
+        })
+    }
+
+    fn mutable_descriptor_backend(id: &str) -> Arc<MutableDescriptorBackend> {
+        let mut descriptor = fixture_backend(id).descriptor();
+        descriptor.capabilities[0].limits.max_concurrent_requests = Some(1);
+        Arc::new(MutableDescriptorBackend {
+            descriptor: Mutex::new(descriptor),
+        })
+    }
+
+    fn deferred_dispatch_backend(id: &str) -> Arc<DeferredDispatchBackend> {
+        let mut descriptor = fixture_backend(id).descriptor();
+        descriptor.capabilities[0].limits.max_concurrent_requests = Some(1);
+        Arc::new(DeferredDispatchBackend {
+            descriptor,
+            dispatches: Mutex::new(BTreeMap::new()),
+            cancel_calls: Arc::new(AtomicUsize::new(0)),
+            shutdown_calls: AtomicUsize::new(0),
+            changed: Notify::new(),
+            shutdown_changed: Notify::new(),
         })
     }
 
@@ -2593,6 +3382,26 @@ mod tests {
             format: AudioOutputFormat::Wav,
             duration_ms: Some(1),
             alignments: Vec::new(),
+            usage: SpeechUsage::default(),
+        }
+    }
+
+    fn deferred_transcription_response(
+        request_id: &SpeechRequestId,
+        backend_id: &str,
+    ) -> TranscriptionResponse {
+        TranscriptionResponse {
+            request_id: request_id.clone(),
+            route: SpeechResolvedRoute {
+                backend_id: backend_id.to_owned(),
+                model_id: Some("fixture-transcription-model".to_owned()),
+                voice_id: None,
+                backend_kind: SpeechBackendKind::EmbeddedModel,
+                network: NetworkBehavior::Never,
+            },
+            text: "fixture transcript".to_owned(),
+            language: Some("en".to_owned()),
+            segments: Vec::new(),
             usage: SpeechUsage::default(),
         }
     }
@@ -2666,25 +3475,7 @@ mod tests {
     }
 
     fn exact_wav_transcription_request(request_id: &str, backend_id: &str) -> TranscriptionRequest {
-        let sample_bytes = vec![0_u8; 64];
-        let data_size = u32::try_from(sample_bytes.len()).expect("fixture data size fits u32");
-        let riff_size = 36_u32
-            .checked_add(data_size)
-            .expect("fixture RIFF size fits u32");
-        let mut wav = Vec::with_capacity(44 + sample_bytes.len());
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&riff_size.to_le_bytes());
-        wav.extend_from_slice(b"WAVEfmt ");
-        wav.extend_from_slice(&16_u32.to_le_bytes());
-        wav.extend_from_slice(&1_u16.to_le_bytes());
-        wav.extend_from_slice(&1_u16.to_le_bytes());
-        wav.extend_from_slice(&16_000_u32.to_le_bytes());
-        wav.extend_from_slice(&32_000_u32.to_le_bytes());
-        wav.extend_from_slice(&2_u16.to_le_bytes());
-        wav.extend_from_slice(&16_u16.to_le_bytes());
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_size.to_le_bytes());
-        wav.extend_from_slice(&sample_bytes);
+        let wav = classic_wav(1, 1, 16_000, 16, vec![0_u8; 64]);
         let mut request = exact_pcm_transcription_request(request_id, backend_id);
         request.input = TranscriptionInput::Complete {
             audio: AudioInput::Encoded {
@@ -2693,6 +3484,110 @@ mod tests {
             },
         };
         request
+    }
+
+    fn wav_request(request_id: &str, backend_id: &str, wav: Vec<u8>) -> TranscriptionRequest {
+        let mut request = exact_pcm_transcription_request(request_id, backend_id);
+        request.input = TranscriptionInput::Complete {
+            audio: AudioInput::Encoded {
+                format: EncodedAudioFormat::Wav,
+                data: wav,
+            },
+        };
+        request
+    }
+
+    fn classic_wav(
+        encoding: u16,
+        channels: u16,
+        sample_rate_hz: u32,
+        bits_per_sample: u16,
+        data: Vec<u8>,
+    ) -> Vec<u8> {
+        let bytes_per_sample = bits_per_sample.div_ceil(8);
+        let block_align = channels
+            .checked_mul(bytes_per_sample)
+            .expect("fixture block alignment fits u16");
+        let byte_rate = sample_rate_hz
+            .checked_mul(u32::from(block_align))
+            .expect("fixture byte rate fits u32");
+        let mut format = Vec::with_capacity(16);
+        format.extend_from_slice(&encoding.to_le_bytes());
+        format.extend_from_slice(&channels.to_le_bytes());
+        format.extend_from_slice(&sample_rate_hz.to_le_bytes());
+        format.extend_from_slice(&byte_rate.to_le_bytes());
+        format.extend_from_slice(&block_align.to_le_bytes());
+        format.extend_from_slice(&bits_per_sample.to_le_bytes());
+        wav_from_chunks(vec![(*b"fmt ", format), (*b"data", data)])
+    }
+
+    fn extensible_wav(
+        subformat_encoding: u16,
+        channels: u16,
+        sample_rate_hz: u32,
+        bits_per_sample: u16,
+        valid_bits_per_sample: u16,
+        data: Vec<u8>,
+    ) -> Vec<u8> {
+        let bytes_per_sample = bits_per_sample.div_ceil(8);
+        let block_align = channels
+            .checked_mul(bytes_per_sample)
+            .expect("fixture block alignment fits u16");
+        let byte_rate = sample_rate_hz
+            .checked_mul(u32::from(block_align))
+            .expect("fixture byte rate fits u32");
+        let mut format = Vec::with_capacity(40);
+        format.extend_from_slice(&0xfffe_u16.to_le_bytes());
+        format.extend_from_slice(&channels.to_le_bytes());
+        format.extend_from_slice(&sample_rate_hz.to_le_bytes());
+        format.extend_from_slice(&byte_rate.to_le_bytes());
+        format.extend_from_slice(&block_align.to_le_bytes());
+        format.extend_from_slice(&bits_per_sample.to_le_bytes());
+        format.extend_from_slice(&22_u16.to_le_bytes());
+        format.extend_from_slice(&valid_bits_per_sample.to_le_bytes());
+        format.extend_from_slice(&0_u32.to_le_bytes());
+        format.extend_from_slice(&subformat_encoding.to_le_bytes());
+        format.extend_from_slice(&0_u16.to_le_bytes());
+        format.extend_from_slice(&0_u16.to_le_bytes());
+        format.extend_from_slice(&0x0010_u16.to_le_bytes());
+        format.extend_from_slice(&[0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]);
+        wav_from_chunks(vec![(*b"fmt ", format), (*b"data", data)])
+    }
+
+    fn wav_from_chunks(chunks: Vec<([u8; 4], Vec<u8>)>) -> Vec<u8> {
+        let payload_size = chunks.iter().fold(4_usize, |total, (_, payload)| {
+            total
+                .checked_add(8)
+                .and_then(|total| total.checked_add(payload.len()))
+                .and_then(|total| total.checked_add(payload.len() % 2))
+                .expect("fixture RIFF length fits usize")
+        });
+        let riff_size = u32::try_from(payload_size).expect("fixture RIFF length fits u32");
+        let mut wav = Vec::with_capacity(payload_size + 8);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_size.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        for (id, payload) in chunks {
+            wav.extend_from_slice(&id);
+            wav.extend_from_slice(
+                &u32::try_from(payload.len())
+                    .expect("fixture chunk size fits u32")
+                    .to_le_bytes(),
+            );
+            wav.extend_from_slice(&payload);
+            if !payload.len().is_multiple_of(2) {
+                wav.push(0);
+            }
+        }
+        wav
+    }
+
+    fn assert_wav_preflight_error(error: SpeechHostError) {
+        let SpeechHostError::Backend { error } = error else {
+            panic!("expected WAV preflight backend error");
+        };
+        assert_eq!(error.code, "speech_wav_geometry_invalid");
+        assert_eq!(error.class, SpeechErrorClass::InvalidRequest);
     }
 
     async fn wait_for_operation_phase(
@@ -2848,6 +3743,88 @@ mod tests {
         assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
     }
 
+    #[tokio::test]
+    async fn aborted_pending_dispatch_remains_supervised_until_shutdown_joins_it() {
+        let host = Arc::new(SpeechHost::default());
+        let backend = deferred_dispatch_backend("abandoned-dispatch.tts");
+        host.register_backend(backend.clone())
+            .expect("register deferred-dispatch backend");
+        let request_id = SpeechRequestId("abandoned-dispatch".to_owned());
+        let dispatch_host = Arc::clone(&host);
+        let dispatch_request_id = request_id.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_host
+                .synthesize(exact_request(
+                    &dispatch_request_id.0,
+                    "abandoned-dispatch.tts",
+                ))
+                .await
+        });
+        backend.wait_until_dispatching(&request_id).await;
+
+        dispatch.abort();
+        let join_error = match dispatch.await {
+            Err(error) => error,
+            Ok(_) => panic!("aborted caller must not return a ticket"),
+        };
+        assert!(join_error.is_cancelled());
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            host.lifecycle
+                .operations
+                .active_count()
+                .expect("read active operations"),
+            1,
+            "caller abort cannot release the route while backend dispatch is live"
+        );
+        {
+            let state = host.lifecycle.state.lock().expect("lock host state");
+            let registered = state
+                .backends
+                .get("abandoned-dispatch.tts")
+                .expect("registered deferred backend");
+            assert_eq!(registered.limiter.available_permits(), 0);
+            assert!(state.routes.contains_key(&request_id));
+        }
+
+        let shutdown_host = Arc::clone(&host);
+        let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+        backend.wait_until_shutdown().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown cannot finish while abandoned dispatch remains blocked"
+        );
+
+        backend.release(&request_id);
+        shutdown
+            .await
+            .expect("shutdown caller joins")
+            .expect("shutdown drains abandoned dispatch");
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            host.lifecycle
+                .operations
+                .active_count()
+                .expect("read drained operations"),
+            0
+        );
+        assert!(
+            host.lifecycle
+                .state
+                .lock()
+                .expect("lock closed host state")
+                .routes
+                .is_empty()
+        );
+        let tasks = host
+            .lifecycle
+            .tasks
+            .snapshot()
+            .expect("read joined task evidence");
+        assert_eq!(tasks.active, 0);
+        assert!(tasks.completed_tasks >= 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn backend_final_ready_at_total_deadline_wins_without_cancellation() {
         let host = SpeechHost::default();
@@ -2937,7 +3914,261 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_capacity_is_a_fair_fifo_admission_gate() {
+    async fn queued_synthesis_cancellation_releases_fifo_slot_without_dispatch() {
+        let host = Arc::new(SpeechHost::default());
+        let backend = deferred_backend_with_capacity("queued-cancel.tts", Some(1));
+        host.register_backend(backend.clone())
+            .expect("register single-capacity synthesis backend");
+        let holder_id = SpeechRequestId("queued-cancel-holder".to_owned());
+        let queued_id = SpeechRequestId("queued-cancel-waiter".to_owned());
+        let successor_id = SpeechRequestId("queued-cancel-successor".to_owned());
+        let holder = host
+            .synthesize(exact_request(&holder_id.0, "queued-cancel.tts"))
+            .await
+            .expect("admit synthesis holder");
+        let queued_host = Arc::clone(&host);
+        let queued_request_id = queued_id.clone();
+        let queued = tokio::spawn(async move {
+            queued_host
+                .synthesize(exact_request(&queued_request_id.0, "queued-cancel.tts"))
+                .await
+        });
+        wait_for_operation_phase(
+            &host,
+            &queued_id,
+            operation_lifecycle::OperationPhase::Queued,
+        )
+        .await;
+        let successor_host = Arc::clone(&host);
+        let successor_request_id = successor_id.clone();
+        let successor = tokio::spawn(async move {
+            successor_host
+                .synthesize(exact_request(&successor_request_id.0, "queued-cancel.tts"))
+                .await
+        });
+        wait_for_operation_phase(
+            &host,
+            &successor_id,
+            operation_lifecycle::OperationPhase::Queued,
+        )
+        .await;
+
+        assert_eq!(host.cancel(&queued_id), 1);
+        let error = match queued.await.expect("queued synthesis caller joins") {
+            Err(error) => error,
+            Ok(_ticket) => panic!("queued synthesis cancellation must reject admission"),
+        };
+        let SpeechHostError::Backend { error } = error else {
+            panic!("expected typed queued cancellation");
+        };
+        assert_eq!(error.code, "speech_request_cancelled");
+        assert_eq!(error.class, SpeechErrorClass::Cancelled);
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            backend.finals.lock().expect("lock synthesis finals").len(),
+            1
+        );
+        assert!(!successor.is_finished());
+
+        backend.complete(&holder_id);
+        holder
+            .final_response()
+            .await
+            .expect("synthesis holder completes");
+        backend.wait_until_active(&successor_id).await;
+        let successor = successor
+            .await
+            .expect("successor synthesis caller joins")
+            .expect("successor takes the released FIFO slot");
+        backend.complete(&successor_id);
+        successor
+            .final_response()
+            .await
+            .expect("successor synthesis completes");
+        wait_for_active_count(&host, 0).await;
+    }
+
+    #[tokio::test]
+    async fn queued_transcription_cancellation_releases_fifo_slot_without_dispatch() {
+        let host = Arc::new(SpeechHost::default());
+        let backend = deferred_transcription_backend("queued-cancel.asr");
+        host.register_backend(backend.clone())
+            .expect("register single-capacity transcription backend");
+        let holder_id = SpeechRequestId("queued-transcription-holder".to_owned());
+        let queued_id = SpeechRequestId("queued-transcription-waiter".to_owned());
+        let successor_id = SpeechRequestId("queued-transcription-successor".to_owned());
+        let holder = host
+            .transcribe(exact_pcm_transcription_request(
+                &holder_id.0,
+                "queued-cancel.asr",
+            ))
+            .await
+            .expect("admit transcription holder");
+        let queued_host = Arc::clone(&host);
+        let queued_request_id = queued_id.clone();
+        let queued = tokio::spawn(async move {
+            queued_host
+                .transcribe(exact_pcm_transcription_request(
+                    &queued_request_id.0,
+                    "queued-cancel.asr",
+                ))
+                .await
+        });
+        wait_for_operation_phase(
+            &host,
+            &queued_id,
+            operation_lifecycle::OperationPhase::Queued,
+        )
+        .await;
+        let successor_host = Arc::clone(&host);
+        let successor_request_id = successor_id.clone();
+        let successor = tokio::spawn(async move {
+            successor_host
+                .transcribe(exact_pcm_transcription_request(
+                    &successor_request_id.0,
+                    "queued-cancel.asr",
+                ))
+                .await
+        });
+        wait_for_operation_phase(
+            &host,
+            &successor_id,
+            operation_lifecycle::OperationPhase::Queued,
+        )
+        .await;
+
+        assert_eq!(host.cancel(&queued_id), 1);
+        let error = match queued.await.expect("queued transcription caller joins") {
+            Err(error) => error,
+            Ok(_ticket) => panic!("queued transcription cancellation must reject admission"),
+        };
+        let SpeechHostError::Backend { error } = error else {
+            panic!("expected typed queued cancellation");
+        };
+        assert_eq!(error.code, "speech_request_cancelled");
+        assert_eq!(error.class, SpeechErrorClass::Cancelled);
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 0);
+        assert_eq!(backend.calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            backend
+                .finals
+                .lock()
+                .expect("lock transcription finals")
+                .len(),
+            1
+        );
+        assert!(!successor.is_finished());
+
+        backend.complete(&holder_id);
+        holder
+            .final_response()
+            .await
+            .expect("transcription holder completes");
+        backend.wait_until_active(&successor_id).await;
+        let successor = successor
+            .await
+            .expect("successor transcription caller joins")
+            .expect("successor takes the released FIFO slot");
+        backend.complete(&successor_id);
+        successor
+            .final_response()
+            .await
+            .expect("successor transcription completes");
+        wait_for_active_count(&host, 0).await;
+    }
+
+    #[tokio::test]
+    async fn accepted_synthesis_cancel_wins_late_success_but_not_committed_success() {
+        let host = SpeechHost::default();
+        let backend = deferred_backend_with_capacity("cancel-race.tts", Some(1));
+        host.register_backend(backend.clone())
+            .expect("register synthesis race backend");
+
+        let cancel_first_id = SpeechRequestId("synthesis-cancel-first".to_owned());
+        let mut cancelled = host
+            .synthesize(exact_request(&cancel_first_id.0, "cancel-race.tts"))
+            .await
+            .expect("admit cancel-first synthesis");
+        assert_eq!(host.cancel(&cancel_first_id), 1);
+        backend.complete(&cancel_first_id);
+        assert!(matches!(
+            cancelled.events.recv().await,
+            Some(SynthesisEvent::Cancelled { request_id, .. }) if request_id == cancel_first_id
+        ));
+        let error = cancelled
+            .final_response()
+            .await
+            .expect_err("accepted cancellation owns the public final");
+        assert_eq!(error.code, "speech_request_cancelled");
+        assert_eq!(error.class, SpeechErrorClass::Cancelled);
+        wait_for_active_count(&host, 0).await;
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+
+        let success_first_id = SpeechRequestId("synthesis-success-first".to_owned());
+        let success = host
+            .synthesize(exact_request(&success_first_id.0, "cancel-race.tts"))
+            .await
+            .expect("admit success-first synthesis");
+        backend.complete(&success_first_id);
+        success
+            .final_response()
+            .await
+            .expect("backend success commits before late cancellation");
+        wait_for_active_count(&host, 0).await;
+        assert_eq!(host.cancel(&success_first_id), 0);
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_transcription_cancel_wins_late_success_but_not_committed_success() {
+        let host = SpeechHost::default();
+        let backend = deferred_transcription_backend("cancel-race.asr");
+        host.register_backend(backend.clone())
+            .expect("register transcription race backend");
+
+        let cancel_first_id = SpeechRequestId("transcription-cancel-first".to_owned());
+        let mut cancelled = host
+            .transcribe(exact_pcm_transcription_request(
+                &cancel_first_id.0,
+                "cancel-race.asr",
+            ))
+            .await
+            .expect("admit cancel-first transcription");
+        assert_eq!(host.cancel(&cancel_first_id), 1);
+        backend.complete(&cancel_first_id);
+        assert!(matches!(
+            cancelled.events.recv().await,
+            Some(TranscriptionEvent::Cancelled { request_id, .. }) if request_id == cancel_first_id
+        ));
+        let error = cancelled
+            .final_response()
+            .await
+            .expect_err("accepted cancellation owns the public final");
+        assert_eq!(error.code, "speech_request_cancelled");
+        assert_eq!(error.class, SpeechErrorClass::Cancelled);
+        wait_for_active_count(&host, 0).await;
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+
+        let success_first_id = SpeechRequestId("transcription-success-first".to_owned());
+        let success = host
+            .transcribe(exact_pcm_transcription_request(
+                &success_first_id.0,
+                "cancel-race.asr",
+            ))
+            .await
+            .expect("admit success-first transcription");
+        backend.complete(&success_first_id);
+        success
+            .final_response()
+            .await
+            .expect("backend success commits before late cancellation");
+        wait_for_active_count(&host, 0).await;
+        assert_eq!(host.cancel(&success_first_id), 0);
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn single_capacity_backend_holds_n_plus_one_behind_one_fifo_lease() {
         let host = Arc::new(SpeechHost::default());
         let backend = deferred_backend_with_capacity("capacity-gate.tts", Some(1));
         host.register_backend(backend.clone())
@@ -3036,6 +4267,61 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn live_descriptor_status_and_planning_change_without_resizing_admission() {
+        let host = SpeechHost::default();
+        let backend = mutable_descriptor_backend("mutable-status.tts");
+        host.register_backend(backend.clone())
+            .expect("register mutable descriptor fixture");
+        host.plan_synthesis(&exact_request("mutable-before", "mutable-status.tts"))
+            .expect("initial live descriptor plans");
+
+        {
+            let mut descriptor = backend.descriptor.lock().expect("lock live descriptor");
+            descriptor.display_name = "Live status changed".to_owned();
+            descriptor.capabilities[0].availability = CapabilityAvailability::Unavailable;
+        }
+        let status = host.status().expect("observe current descriptor status");
+        assert_eq!(status.backends[0].display_name, "Live status changed");
+        assert_eq!(
+            status.backends[0].capabilities[0]
+                .limits
+                .max_concurrent_requests,
+            Some(1)
+        );
+        assert!(
+            host.plan_synthesis(&exact_request("mutable-unavailable", "mutable-status.tts",))
+                .is_err(),
+            "planning must use the current unavailable capability"
+        );
+
+        let state = host.lifecycle.state.lock().expect("lock host state");
+        assert_eq!(
+            state
+                .backends
+                .get("mutable-status.tts")
+                .expect("registered mutable backend")
+                .limiter
+                .available_permits(),
+            1,
+            "registration freezes the independently owned admission capacity"
+        );
+        drop(state);
+
+        backend
+            .descriptor
+            .lock()
+            .expect("lock live descriptor capacity")
+            .capabilities[0]
+            .limits
+            .max_concurrent_requests = Some(2);
+        assert!(matches!(
+            host.status(),
+            Err(SpeechHostError::BackendInvalid { detail })
+                if detail.contains("changed its admission capacity from 1 to 2")
+        ));
+    }
+
     #[tokio::test]
     async fn complete_pcm_duration_is_preflighted_before_backend_dispatch() {
         let host = SpeechHost::default();
@@ -3129,6 +4415,238 @@ mod tests {
         assert_eq!(backend.calls.load(Ordering::Acquire), 0);
     }
 
+    #[tokio::test]
+    async fn hostile_wav_geometry_is_bounded_and_never_reaches_the_backend() {
+        let host = SpeechHost::default();
+        let backend = duration_probe_backend("wav-hostile.asr", 10_000);
+        host.register_backend(backend.clone())
+            .expect("register hostile WAV fixture");
+        let valid = classic_wav(1, 1, 16_000, 16, vec![0; 32]);
+        let valid_format = valid[20..36].to_vec();
+        let mut cases = Vec::new();
+
+        let mut maximum_riff = b"RIFF".to_vec();
+        maximum_riff.extend_from_slice(&u32::MAX.to_le_bytes());
+        maximum_riff.extend_from_slice(b"WAVE");
+        cases.push(("maximum-riff-size", maximum_riff));
+
+        let mut maximum_chunk = b"RIFF".to_vec();
+        maximum_chunk.extend_from_slice(&12_u32.to_le_bytes());
+        maximum_chunk.extend_from_slice(b"WAVEJUNK");
+        maximum_chunk.extend_from_slice(&u32::MAX.to_le_bytes());
+        cases.push(("maximum-chunk-size", maximum_chunk));
+
+        let mut too_many_chunks = vec![(*b"fmt ", valid_format.clone())];
+        too_many_chunks.extend((0..4_095).map(|_| (*b"JUNK", Vec::new())));
+        too_many_chunks.push((*b"data", vec![0; 2]));
+        cases.push(("excessive-chunk-count", wav_from_chunks(too_many_chunks)));
+
+        cases.push((
+            "excessive-metadata",
+            wav_from_chunks(vec![
+                (*b"fmt ", valid_format.clone()),
+                (*b"JUNK", vec![0; 1_048_577]),
+                (*b"data", vec![0; 2]),
+            ]),
+        ));
+
+        for (name, offset, value) in [
+            ("zero-channels", 22, 0_u16),
+            ("too-many-channels", 22, 33_u16),
+            ("unsupported-pcm-width", 34, 12_u16),
+            ("inconsistent-block-align", 32, 4_u16),
+        ] {
+            let mut wav = valid.clone();
+            wav[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+            cases.push((name, wav));
+        }
+        for (name, value) in [
+            ("sample-rate-below-bound", 7_999_u32),
+            ("sample-rate-above-bound", 384_001_u32),
+        ] {
+            let mut wav = valid.clone();
+            wav[24..28].copy_from_slice(&value.to_le_bytes());
+            cases.push((name, wav));
+        }
+        let mut unsupported_encoding = valid.clone();
+        unsupported_encoding[20..22].copy_from_slice(&2_u16.to_le_bytes());
+        cases.push(("unsupported-encoding", unsupported_encoding));
+
+        let unsupported_float = classic_wav(3, 1, 16_000, 64, vec![0; 8]);
+        cases.push(("unsupported-float-width", unsupported_float));
+
+        let mut incomplete_classic_format = valid_format.clone();
+        incomplete_classic_format.push(0);
+        cases.push((
+            "incomplete-classic-extension",
+            wav_from_chunks(vec![
+                (*b"fmt ", incomplete_classic_format),
+                (*b"data", vec![0; 2]),
+            ]),
+        ));
+
+        let mut inconsistent_byte_rate = valid.clone();
+        inconsistent_byte_rate[28..32].copy_from_slice(&1_u32.to_le_bytes());
+        cases.push(("inconsistent-byte-rate", inconsistent_byte_rate));
+
+        let mut overflowing_byte_rate = valid.clone();
+        overflowing_byte_rate[24..28].copy_from_slice(&384_000_u32.to_le_bytes());
+        overflowing_byte_rate[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        overflowing_byte_rate[32..34].copy_from_slice(&u16::MAX.to_le_bytes());
+        cases.push(("byte-rate-overflow", overflowing_byte_rate));
+
+        cases.push((
+            "incomplete-data-frame",
+            classic_wav(1, 2, 16_000, 16, vec![0; 3]),
+        ));
+        cases.push((
+            "extensible-valid-bits-mismatch",
+            extensible_wav(1, 1, 16_000, 24, 20, vec![0; 3]),
+        ));
+        let mut unknown_extensible = extensible_wav(1, 1, 16_000, 16, 16, vec![0; 2]);
+        unknown_extensible[44..46].copy_from_slice(&2_u16.to_le_bytes());
+        cases.push(("unknown-extensible-subformat", unknown_extensible));
+        let extensible = extensible_wav(1, 1, 16_000, 16, 16, vec![0; 2]);
+        let mut trailing_extensible_format = extensible[20..60].to_vec();
+        trailing_extensible_format.push(0);
+        cases.push((
+            "trailing-extensible-format-bytes",
+            wav_from_chunks(vec![
+                (*b"fmt ", trailing_extensible_format),
+                (*b"data", vec![0; 2]),
+            ]),
+        ));
+
+        let mut short_extensible = extensible;
+        short_extensible[16..20].copy_from_slice(&18_u32.to_le_bytes());
+        let remove_start = 38;
+        let remove_end = 60;
+        short_extensible.drain(remove_start..remove_end);
+        let short_riff_size = u32::try_from(short_extensible.len() - 8)
+            .expect("short extensible fixture length fits u32");
+        short_extensible[4..8].copy_from_slice(&short_riff_size.to_le_bytes());
+        cases.push(("truncated-extensible-format", short_extensible));
+
+        cases.push(("truncated-riff-header", valid[..11].to_vec()));
+        let mut truncated_chunk_header = b"RIFF".to_vec();
+        truncated_chunk_header.extend_from_slice(&8_u32.to_le_bytes());
+        truncated_chunk_header.extend_from_slice(b"WAVEfmt ");
+        cases.push(("truncated-chunk-header", truncated_chunk_header));
+        let mut truncated_chunk = valid.clone();
+        truncated_chunk.pop();
+        let truncated_riff_size =
+            u32::try_from(truncated_chunk.len() - 8).expect("truncated fixture length fits u32");
+        truncated_chunk[4..8].copy_from_slice(&truncated_riff_size.to_le_bytes());
+        cases.push(("truncated-chunk-payload", truncated_chunk));
+
+        let mut missing_padding =
+            wav_from_chunks(vec![(*b"fmt ", valid_format.clone()), (*b"JUNK", vec![0])]);
+        missing_padding.pop();
+        let missing_padding_size =
+            u32::try_from(missing_padding.len() - 8).expect("padding fixture length fits u32");
+        missing_padding[4..8].copy_from_slice(&missing_padding_size.to_le_bytes());
+        cases.push(("truncated-chunk-padding", missing_padding));
+
+        cases.push((
+            "duplicate-format",
+            wav_from_chunks(vec![
+                (*b"fmt ", valid_format.clone()),
+                (*b"fmt ", valid_format),
+                (*b"data", vec![0; 2]),
+            ]),
+        ));
+        cases.push((
+            "duplicate-data",
+            wav_from_chunks(vec![
+                (*b"fmt ", valid[20..36].to_vec()),
+                (*b"data", vec![0; 2]),
+                (*b"data", vec![0; 2]),
+            ]),
+        ));
+
+        for (index, (name, wav)) in cases.into_iter().enumerate() {
+            let request_id = format!("wav-hostile-{index}-{name}");
+            let error = match host
+                .transcribe(wav_request(&request_id, "wav-hostile.asr", wav))
+                .await
+            {
+                Err(error) => error,
+                Ok(_ticket) => panic!("hostile WAV case {name} reached backend dispatch"),
+            };
+            assert_wav_preflight_error(error);
+        }
+        assert_eq!(
+            backend.calls.load(Ordering::Acquire),
+            0,
+            "all hostile inputs stop at private host preflight"
+        );
+    }
+
+    #[test]
+    fn valid_classic_and_extensible_wav_boundaries_have_exact_duration() {
+        let request_id = SpeechRequestId("wav-valid-boundaries".to_owned());
+        let backend_id = "wav-valid.asr";
+        let classic_minimum = classic_wav(1, 1, 8_000, 8, vec![0; 8_000]);
+        assert_eq!(
+            wav_duration_ms(&classic_minimum, &request_id, backend_id),
+            Ok(1_000)
+        );
+        let classic_maximum = classic_wav(1, 32, 384_000, 32, vec![0; 128]);
+        assert_eq!(
+            wav_duration_ms(&classic_maximum, &request_id, backend_id),
+            Ok(1)
+        );
+        let extensible_pcm = extensible_wav(1, 2, 48_000, 32, 24, vec![0; 384_000]);
+        assert_eq!(
+            wav_duration_ms(&extensible_pcm, &request_id, backend_id),
+            Ok(1_000)
+        );
+        let extensible_float = extensible_wav(3, 1, 48_000, 32, 32, vec![0; 192_000]);
+        assert_eq!(
+            wav_duration_ms(&extensible_float, &request_id, backend_id),
+            Ok(1_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_wav_duration_boundary_dispatches_and_one_frame_over_does_not() {
+        let host = SpeechHost::default();
+        let backend = duration_probe_backend("wav-boundary.asr", 1_000);
+        host.register_backend(backend.clone())
+            .expect("register WAV boundary fixture");
+        let exact = classic_wav(1, 1, 8_000, 16, vec![0; 16_000]);
+        let exact_error = match host
+            .transcribe(wav_request("wav-exact-boundary", "wav-boundary.asr", exact))
+            .await
+        {
+            Err(error) => error,
+            Ok(_ticket) => panic!("duration probe fixture never returns a ticket"),
+        };
+        assert!(matches!(
+            exact_error,
+            SpeechHostError::Backend { ref error } if error.code == "duration_probe_reached"
+        ));
+        assert_eq!(backend.calls.load(Ordering::Acquire), 1);
+
+        let over = classic_wav(1, 1, 8_000, 16, vec![0; 16_002]);
+        let over_error = match host
+            .transcribe(wav_request("wav-over-boundary", "wav-boundary.asr", over))
+            .await
+        {
+            Err(error) => error,
+            Ok(_ticket) => panic!("one-frame-over WAV must fail preflight"),
+        };
+        assert!(matches!(
+            over_error,
+            SpeechHostError::Backend { ref error } if error.code == "speech_audio_too_long"
+        ));
+        assert_eq!(
+            backend.calls.load(Ordering::Acquire),
+            1,
+            "over-boundary WAV does not add a backend dispatch"
+        );
+    }
+
     #[test]
     fn duplicate_backend_registration_fails_closed() {
         let gateway = SpeechHost::default();
@@ -3190,8 +4708,8 @@ mod tests {
                 .await,
             Err(SpeechHostError::RequestDuplicate { .. })
         ));
-        assert_eq!(host.cancel(&request_id), 1);
-        assert_eq!(backend_a.cancel_calls.load(Ordering::Acquire), 2);
+        assert_eq!(host.cancel(&request_id), 0);
+        assert_eq!(backend_a.cancel_calls.load(Ordering::Acquire), 1);
         assert_eq!(backend_b.cancel_calls.load(Ordering::Acquire), 0);
 
         backend_a.complete(&request_id);
@@ -3556,6 +5074,7 @@ mod tests {
                 &request_id,
                 old_identity.clone(),
                 backend.clone(),
+                Arc::clone(&old.cancellation),
                 None,
             ),
             0
@@ -3565,6 +5084,7 @@ mod tests {
                 &request_id,
                 old_identity.clone(),
                 backend.clone(),
+                Arc::clone(&old.cancellation),
                 Some(&old_identity),
             ),
             0

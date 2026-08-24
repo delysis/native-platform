@@ -321,6 +321,23 @@ impl OperationLease {
         attempt: &AttemptLease,
         terminal: TerminalClass,
     ) -> Result<OperationSnapshot, RegistryError> {
+        self.finish_attempt_and_release_inner(attempt, terminal, false)
+    }
+
+    pub(crate) fn finish_backend_attempt_and_release(
+        &self,
+        attempt: &AttemptLease,
+        terminal: TerminalClass,
+    ) -> Result<OperationSnapshot, RegistryError> {
+        self.finish_attempt_and_release_inner(attempt, terminal, true)
+    }
+
+    fn finish_attempt_and_release_inner(
+        &self,
+        attempt: &AttemptLease,
+        terminal: TerminalClass,
+        cancellation_wins: bool,
+    ) -> Result<OperationSnapshot, RegistryError> {
         if attempt.operation != self.identity {
             return Err(RegistryError::Stale);
         }
@@ -335,7 +352,11 @@ impl OperationLease {
             return Err(RegistryError::InvalidTransition);
         }
         record.attempts.remove(&attempt.identity.sequence);
-        record.terminal = Some(terminal);
+        record.terminal = Some(if cancellation_wins && record.cancellation_requested {
+            TerminalClass::Cancelled
+        } else {
+            terminal
+        });
         record.phase = OperationPhase::Released;
         let released = snapshot(record);
         state.operations.remove(&self.identity.operation_id);
@@ -347,14 +368,25 @@ impl OperationLease {
     /// This is one checked rollback transaction; it never reports a successful
     /// terminal and never leaves a route admitted after setup failure.
     pub fn fail_setup_and_release(&self) -> Result<OperationSnapshot, RegistryError> {
+        self.finish_setup_and_release(TerminalClass::Failed)
+    }
+
+    /// Cancel and release an operation that has not reached backend dispatch.
+    pub(crate) fn cancel_setup_and_release(&self) -> Result<OperationSnapshot, RegistryError> {
+        self.finish_setup_and_release(TerminalClass::Cancelled)
+    }
+
+    fn finish_setup_and_release(
+        &self,
+        terminal: TerminalClass,
+    ) -> Result<OperationSnapshot, RegistryError> {
         let mut released_slot = self.registry.released_lock(&self.released)?;
         let mut state = self.registry.lock()?;
         let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
-        if record.terminal.is_some() {
+        if record.terminal.is_some() || !record.attempts.is_empty() {
             return Err(RegistryError::InvalidTransition);
         }
-        record.attempts.clear();
-        record.terminal = Some(TerminalClass::Failed);
+        record.terminal = Some(terminal);
         record.phase = OperationPhase::Released;
         let released = snapshot(record);
         state.operations.remove(&self.identity.operation_id);
@@ -363,9 +395,15 @@ impl OperationLease {
     }
 
     pub fn request_cancel(&self) -> Result<(), RegistryError> {
+        self.request_cancel_once().map(|_| ())
+    }
+
+    pub(crate) fn request_cancel_once(&self) -> Result<bool, RegistryError> {
         let mut state = self.registry.lock()?;
-        OperationRegistry::record_mut(&mut state, &self.identity)?.cancellation_requested = true;
-        Ok(())
+        let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
+        let newly_requested = !record.cancellation_requested;
+        record.cancellation_requested = true;
+        Ok(newly_requested)
     }
 
     pub fn publish_progress(&self, sequence: u64) -> Result<(), RegistryError> {
@@ -506,6 +544,23 @@ mod tests {
     }
 
     #[test]
+    fn queued_cancellation_is_cancelled_released_and_empty() {
+        let registry = OperationRegistry::default();
+        let (_consumer, lease) = registry.reserve("queued-cancel").expect("reserve");
+        lease.queue().expect("queue");
+        assert_eq!(lease.request_cancel_once(), Ok(true));
+        assert_eq!(lease.request_cancel_once(), Ok(false));
+        let snapshot = lease
+            .cancel_setup_and_release()
+            .expect("release queued cancellation");
+
+        assert_eq!(snapshot.phase, OperationPhase::Released);
+        assert!(snapshot.cancellation_requested);
+        assert_eq!(snapshot.terminal, Some(TerminalClass::Cancelled));
+        assert_eq!(registry.active_count(), Ok(0));
+    }
+
+    #[test]
     fn executor_finalization_commits_attempt_terminal_and_release_together() {
         let registry = OperationRegistry::default();
         let (_consumer, lease) = registry.reserve("finalize").expect("reserve");
@@ -520,6 +575,23 @@ mod tests {
         assert_eq!(snapshot.terminal, Some(TerminalClass::Completed));
         assert_eq!(registry.active_count(), Ok(0));
         assert_eq!(attempt.finish(), Err(RegistryError::Stale));
+    }
+
+    #[test]
+    fn accepted_cancellation_arbitrates_backend_success_in_the_commit_lock() {
+        let registry = OperationRegistry::default();
+        let (_consumer, lease) = registry.reserve("cancel-final-race").expect("reserve");
+        lease.queue().expect("queue");
+        lease.start().expect("start");
+        let attempt = lease.start_attempt().expect("attempt");
+        assert_eq!(lease.request_cancel_once(), Ok(true));
+
+        let snapshot = lease
+            .finish_backend_attempt_and_release(&attempt, TerminalClass::Completed)
+            .expect("arbitrate backend success");
+        assert_eq!(snapshot.terminal, Some(TerminalClass::Cancelled));
+        assert!(snapshot.cancellation_requested);
+        assert_eq!(registry.active_count(), Ok(0));
     }
 
     #[test]

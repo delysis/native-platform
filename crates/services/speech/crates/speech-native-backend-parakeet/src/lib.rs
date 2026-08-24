@@ -1286,7 +1286,7 @@ fn descriptor(
             languages: vec!["en".to_string()],
             limits: SpeechCapabilityLimits {
                 max_audio_ms: Some(MAX_AUDIO_MS),
-                max_concurrent_requests: Some(4),
+                max_concurrent_requests: Some(1),
                 ..SpeechCapabilityLimits::default()
             },
             evidence,
@@ -1566,6 +1566,20 @@ mod tests {
         ));
         assert!(!descriptor.capabilities[0].eligible_for_local_only());
         assert!(!descriptor.models[0].resident);
+    }
+
+    #[test]
+    fn every_initial_parakeet_descriptor_advertises_one_request() {
+        for descriptor in [
+            ready_descriptor(),
+            asset_required_descriptor(),
+            unavailable_descriptor("fixture unavailable".to_owned()),
+        ] {
+            assert_eq!(
+                descriptor.capabilities[0].limits.max_concurrent_requests,
+                Some(1)
+            );
+        }
     }
 
     #[tokio::test]
