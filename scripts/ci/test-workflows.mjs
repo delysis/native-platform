@@ -387,9 +387,12 @@ test("PR workflow is always triggered and has one truthful aggregate", () => {
   );
 });
 
-test("full CI reconciles each current-platform ignored-test subset without test bodies", () => {
+test("full CI reconciles each current-platform ignored-test subset through guarded listing", () => {
   const source = read(fullPath);
-  assert.match(source, /name: Reconcile ignored-test evidence registry/);
+  assert.match(
+    source,
+    /name: Reconcile ignored-test evidence registry with guarded list arguments/,
+  );
   assert.match(source, /os: \[ubuntu-latest, macos-latest, windows-latest\]/);
   const reconciliation = source.match(
     /- name: Reconcile ignored-test evidence registry[\s\S]*?--cargo-list/,
@@ -397,10 +400,11 @@ test("full CI reconciles each current-platform ignored-test subset without test 
   assert.ok(reconciliation, "full ignored-test reconciliation step is missing");
   assert.doesNotMatch(reconciliation, /if: runner\.os/);
   assert.match(source, /node scripts\/ci\/validate-ignored-tests\.mjs --cargo-list/);
+  assert.doesNotMatch(source, /without executing test bodies/);
   assert.doesNotMatch(source, /cargo test[^\n]*--ignored(?! --list)/);
 });
 
-test("relevant PRs require exact list-only ignored-test reconciliation", () => {
+test("relevant PRs require exact guarded-list ignored-test reconciliation", () => {
   const source = read(prPath);
   assert.match(
     source,
@@ -416,9 +420,10 @@ test("relevant PRs require exact list-only ignored-test reconciliation", () => {
   assert.match(block, /needs\.plan\.outputs\.ignored_tests == 'true'/);
   assert.match(
     block,
-    /name: Reconcile exact ignored-test inventory without executing test bodies/,
+    /name: Reconcile exact ignored-test inventory with guarded list arguments/,
   );
   assert.match(block, /node scripts\/ci\/validate-ignored-tests\.mjs --cargo-list/);
+  assert.doesNotMatch(block, /without executing test bodies/);
   assert.doesNotMatch(block, /cargo test[^\n]*--ignored(?! --list)/);
   const required = source.match(/^  ci-required:[\s\S]*$/m)?.[0];
   assert.match(required, /^\s{6}- ignored-tests$/m);

@@ -68,7 +68,7 @@ jobs:
           shared-key: full-root-${{ runner.os }}
       - run: cargo fmt --all -- --check
       - run: cargo test --locked --workspace --all-targets
-      - name: Reconcile ignored-test evidence registry
+      - name: Reconcile ignored-test evidence registry with guarded list arguments
         run: node scripts/ci/validate-ignored-tests.mjs --cargo-list
       - if: runner.os == 'Linux'
         run: cargo clippy --locked --workspace --all-targets -- -D warnings

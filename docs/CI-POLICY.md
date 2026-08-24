@@ -28,18 +28,33 @@ canonical private `fn` or `async fn` form, an explicit `#[test]` or
 `#[tokio::test(...)]`, and `#[ignore = "reason"]`. Conditional, public, and
 macro-generated ignore syntax is rejected. Comments and strings are tokenized
 as non-code, not counted as test declarations. Workspace manifests may not
-configure custom Cargo harnesses; only metadata-confirmed standard libtest
-targets are eligible for listing.
+configure custom Cargo harnesses. Crate-level `no_main`, custom test framework,
+test-runner, generated harness-main, `include!`, and workspace proc-macro paths
+are rejected, including raw-identifier and conditional forms. Every workspace
+build script is bound to an explicitly reviewed SHA-256.
 
 Every Rust source, Cargo manifest or lock, build script, proc-macro source,
 toolchain file, and Cargo configuration change selects exact reconciliation.
 The blocking pull-request job is a Linux, macOS, and Windows matrix, and full CI
 also reconciles on all three operating systems. Each lane builds test harnesses
-with locked `cargo test --no-run --message-format=json-render-diagnostics`,
-then invokes standard libtest harnesses only with `--ignored --list` and a
-30-second per-harness timeout. The resulting full test ID and real Cargo target
-tuple is reconciled against the expected current-platform subset. Harness mains
-run in list-only mode; no ignored test body is executed by this inventory gate.
+with locked `cargo test --no-run --message-format=json-render-diagnostics`
+through `rustup run 1.92.0`, independent of the ambient `cargo` on `PATH`.
+Compiler identity is recorded. Effective Cargo configuration and environment
+overrides for compilers, wrappers, bootstrap, targets, linkers, loaders,
+Rustflags, and Rustdoc flags are rejected. Source, manifests, build scripts,
+lock, toolchain, registry, and Cargo configuration are hashed before the build
+and must remain unchanged afterward.
+
+Cargo test-profile artifacts must be regular nonsymlink files inside Cargo's
+metadata target directory. They are hashed, invoked from an empty temporary
+working directory with only `--ignored --list`, bounded by a 30-second timeout,
+hard-terminated on timeout, then hashed again. The resulting full test ID and
+real Cargo target tuple is reconciled against the expected current-platform
+subset. This gate records that
+Cargo requested rustc test mode and that the validator supplied list arguments;
+it does not claim cryptographic proof of stock libtest or that trusted compiler,
+build-script, proc-macro, linker, or loader code cannot misbehave. It never
+requests an ignored test body and cannot promote runtime or product evidence.
 
 ## Reverse-dependency shadow
 

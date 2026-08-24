@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,6 +19,53 @@ export const CARGO_BUILD_ARGUMENTS = [
 ];
 export const TEST_HARNESS_LIST_ARGUMENTS = ["--ignored", "--list"];
 export const TEST_HARNESS_TIMEOUT_MS = 30_000;
+
+const CUSTOM_TEST_FRAMEWORK_ATTRIBUTES = new Set([
+  "crate_type",
+  "custom_test_frameworks",
+  "no_main",
+  "reexport_test_harness_main",
+  "test_runner",
+]);
+const FORBIDDEN_HARNESS_ENVIRONMENT = new Set([
+  "CARGO",
+  "CARGO_ENCODED_RUSTDOCFLAGS",
+  "CARGO_ENCODED_RUSTFLAGS",
+  "CARGO_TARGET_DIR",
+  "DYLD_FRAMEWORK_PATH",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "LD_LIBRARY_PATH",
+  "LD_PRELOAD",
+  "RUSTC",
+  "RUSTC_BOOTSTRAP",
+  "RUSTC_WORKSPACE_WRAPPER",
+  "RUSTC_WRAPPER",
+  "RUSTDOC",
+  "RUSTDOCFLAGS",
+  "RUSTFLAGS",
+]);
+const FORBIDDEN_CARGO_CONFIG_WORDS = [
+  "RUSTC",
+  "RUSTC_BOOTSTRAP",
+  "RUSTDOC",
+  "RUSTDOCFLAGS",
+  "RUSTFLAGS",
+  "linker",
+  "paths",
+  "replace-with",
+  "runner",
+  "rustc",
+  "rustc-workspace-wrapper",
+  "rustc-wrapper",
+  "rustdoc",
+  "rustdocflags",
+  "rustflags",
+  "source",
+  "target",
+  "target-dir",
+];
+const STANDARD_LIBTEST_GUARD = Symbol("standard-libtest-guard");
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -47,6 +96,10 @@ function repoRelative(repoRoot, candidate) {
     ? candidate
     : path.resolve(repoRoot, candidate);
   return path.relative(repoRoot, absolute).split(path.sep).join("/");
+}
+
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 function canonicalKinds(kinds) {
@@ -146,6 +199,167 @@ export function assertNoCustomHarnessManifest(manifestSource, label = "Cargo.tom
   );
 }
 
+export function assertSafeHarnessEnvironment(environment = process.env) {
+  const forbidden = [];
+  for (const [name, value] of Object.entries(environment)) {
+    if (value === undefined || value === "") continue;
+    const canonical = name.toUpperCase();
+    if (
+      FORBIDDEN_HARNESS_ENVIRONMENT.has(canonical) ||
+      canonical.startsWith("DYLD_") ||
+      /^CARGO_BUILD_(?:RUSTC(?:_WORKSPACE_WRAPPER|_WRAPPER)?|RUSTDOC|RUSTDOCFLAGS|RUSTFLAGS)$/.test(
+        canonical,
+      ) ||
+      canonical === "CARGO_BUILD_TARGET" ||
+      /^CARGO_TARGET_[A-Z0-9_]+_(?:LINKER|RUNNER|RUSTDOCFLAGS|RUSTFLAGS)$/.test(
+        canonical,
+      )
+    ) {
+      forbidden.push(name);
+    }
+  }
+  assert(
+    forbidden.length === 0,
+    `standard-libtest guard rejects compiler, runner, loader, bootstrap, target, and flag environment overrides: ${sorted(forbidden).join(", ")}`,
+  );
+}
+
+export function assertSafeCargoConfig(configSource, label = ".cargo/config.toml") {
+  assert(
+    !/\\(?:u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})/.test(configSource),
+    `${label}: TOML Unicode escapes are prohibited by the standard-libtest policy`,
+  );
+  for (const word of FORBIDDEN_CARGO_CONFIG_WORDS) {
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    assert(
+      !new RegExp(`(^|[^A-Za-z0-9_-])${escaped}(?=$|[^A-Za-z0-9_-])`).test(
+        configSource,
+      ),
+      `${label}: compiler, runner, bootstrap, rustflags, and rustdocflags configuration is prohibited (${word})`,
+    );
+  }
+}
+
+function cargoConfigurationCandidates(repoRoot, environment) {
+  const candidates = new Set();
+  let directory = path.resolve(repoRoot);
+  while (true) {
+    candidates.add(path.join(directory, ".cargo", "config"));
+    candidates.add(path.join(directory, ".cargo", "config.toml"));
+    const parent = path.dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+
+  const configuredCargoHome = environment.CARGO_HOME;
+  const home = environment.HOME ?? environment.USERPROFILE ?? os.homedir();
+  const cargoHome = configuredCargoHome
+    ? path.resolve(repoRoot, configuredCargoHome)
+    : path.join(home, ".cargo");
+  candidates.add(path.join(cargoHome, "config"));
+  candidates.add(path.join(cargoHome, "config.toml"));
+  return sorted(candidates);
+}
+
+function validateCargoConfiguration(repoRoot, environment) {
+  const configs = cargoConfigurationCandidates(repoRoot, environment).filter((candidate) =>
+    fs.existsSync(candidate),
+  );
+  for (const config of configs) {
+    assertSafeCargoConfig(fs.readFileSync(config, "utf8"), config);
+  }
+  return configs;
+}
+
+export function parsePinnedRustToolchain(source, label = "rust-toolchain.toml") {
+  assert(
+    !/\\(?:u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})/.test(source),
+    `${label}: TOML Unicode escapes are prohibited in the pinned toolchain`,
+  );
+  const channels = [...source.matchAll(/^\s*channel\s*=\s*"([^"]+)"\s*$/gm)].map(
+    (match) => match[1],
+  );
+  assert(channels.length === 1, `${label}: exactly one toolchain channel is required`);
+  assert(
+    /^\d+\.\d+\.\d+$/.test(channels[0]),
+    `${label}: toolchain channel must be an exact stable Rust version`,
+  );
+  return channels[0];
+}
+
+function pinnedRustToolchain(repoRoot) {
+  const toolchainPath = path.join(repoRoot, "rust-toolchain.toml");
+  assert(fs.existsSync(toolchainPath), "rust-toolchain.toml is required");
+  return parsePinnedRustToolchain(fs.readFileSync(toolchainPath, "utf8"));
+}
+
+function runPinnedRustTool(tool, arguments_, { repoRoot, environment }) {
+  const channel = pinnedRustToolchain(repoRoot);
+  return spawnSync("rustup", ["run", channel, tool, ...arguments_], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: environment,
+    maxBuffer: 256 * 1024 * 1024,
+  });
+}
+
+function pinnedToolPath(tool, channel, { repoRoot, environment }) {
+  const result = spawnSync(
+    "rustup",
+    ["which", "--toolchain", channel, tool],
+    {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: environment,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  assert(!result.error, `rustup could not resolve pinned ${tool}: ${result.error?.message}`);
+  assert(result.status === 0, result.stderr || `rustup could not resolve pinned ${tool}`);
+  const resolved = result.stdout.trim();
+  assert(path.isAbsolute(resolved), `rustup returned a non-absolute ${tool} path`);
+  const real = fs.realpathSync(resolved);
+  assert(fs.statSync(real).isFile(), `pinned ${tool} is not a regular file: ${real}`);
+  return real;
+}
+
+function pinnedToolVersion(tool, channel, { repoRoot, environment }) {
+  const result = runPinnedRustTool(tool, ["--version", "--verbose"], {
+    repoRoot,
+    environment,
+  });
+  assert(!result.error, `pinned ${tool} identity failed to start: ${result.error?.message}`);
+  assert(result.status === 0, result.stderr || `pinned ${tool} identity failed`);
+  const firstLine = result.stdout.split(/\r?\n/, 1)[0];
+  assert(
+    firstLine.startsWith(`${tool} ${channel} `) || firstLine === `${tool} ${channel}`,
+    `pinned ${tool} reports ${firstLine}, expected ${channel}`,
+  );
+  return firstLine;
+}
+
+export function readPinnedToolIdentity({
+  repoRoot,
+  environment = process.env,
+}) {
+  assertSafeHarnessEnvironment(environment);
+  validateCargoConfiguration(repoRoot, environment);
+  const channel = pinnedRustToolchain(repoRoot);
+  return {
+    channel,
+    cargo_path: pinnedToolPath("cargo", channel, { repoRoot, environment }),
+    cargo_version: pinnedToolVersion("cargo", channel, {
+      repoRoot,
+      environment,
+    }),
+    rustc_path: pinnedToolPath("rustc", channel, { repoRoot, environment }),
+    rustc_version: pinnedToolVersion("rustc", channel, {
+      repoRoot,
+      environment,
+    }),
+  };
+}
+
 function validateWorkspaceLibtestManifests(metadata, repoRoot) {
   const manifests = new Set(
     [...workspacePackages(metadata).values()].map((candidate) => candidate.manifest_path),
@@ -155,6 +369,116 @@ function validateWorkspaceLibtestManifests(metadata, repoRoot) {
     assertNoCustomHarnessManifest(fs.readFileSync(manifest, "utf8"), relative);
   }
   return manifests.size;
+}
+
+function workspaceCustomBuildTargets(metadata, repoRoot) {
+  const targets = [];
+  for (const workspacePackage of workspacePackages(metadata).values()) {
+    for (const target of workspacePackage.targets) {
+      if (!target.kind.includes("custom-build")) continue;
+      targets.push({
+        package: workspacePackage.name,
+        src_path: repoRelative(repoRoot, target.src_path),
+      });
+    }
+  }
+  return targets.sort((left, right) =>
+    `${left.package}:${left.src_path}`.localeCompare(`${right.package}:${right.src_path}`),
+  );
+}
+
+function assertReviewedBuildScriptSource(source, label) {
+  for (const directive of [
+    "rustc-cfg",
+    "rustc-flags",
+    "rustc-link-arg-tests",
+  ]) {
+    assert(
+      !source.includes(directive),
+      `${label}: reviewed build scripts may not emit ${directive}`,
+    );
+  }
+}
+
+function validateReviewedBuildScripts(registry, metadata, repoRoot) {
+  assert(
+    Array.isArray(registry.reviewed_build_scripts),
+    "reviewed_build_scripts must be an array",
+  );
+  const reviewed = [];
+  for (const entry of registry.reviewed_build_scripts) {
+    for (const field of ["package", "src_path", "sha256"]) {
+      assert(
+        typeof entry[field] === "string" && entry[field].trim(),
+        `reviewed build script is missing ${field}`,
+      );
+    }
+    assert(
+      /^[0-9a-f]{64}$/.test(entry.sha256),
+      `${entry.package}:${entry.src_path}: invalid reviewed build-script SHA-256`,
+    );
+    const sourcePath = path.resolve(repoRoot, entry.src_path);
+    assert(
+      repoRelative(repoRoot, sourcePath) === entry.src_path && fs.existsSync(sourcePath),
+      `${entry.package}:${entry.src_path}: reviewed build script is missing`,
+    );
+    const source = fs.readFileSync(sourcePath);
+    assertReviewedBuildScriptSource(source.toString("utf8"), entry.src_path);
+    const actual = sha256(source);
+    assert(
+      actual === entry.sha256,
+      `${entry.package}:${entry.src_path}: build-script digest ${actual} != reviewed ${entry.sha256}`,
+    );
+    reviewed.push({ package: entry.package, src_path: entry.src_path });
+  }
+
+  const actual = workspaceCustomBuildTargets(metadata, repoRoot);
+  const canonicalReviewed = reviewed.sort((left, right) =>
+    `${left.package}:${left.src_path}`.localeCompare(`${right.package}:${right.src_path}`),
+  );
+  assert(
+    JSON.stringify(canonicalReviewed) === JSON.stringify(actual),
+    [
+      "workspace build scripts differ from the reviewed standard-libtest set",
+      `unreviewed: ${actual
+        .filter(
+          (candidate) =>
+            !canonicalReviewed.some(
+              (entry) =>
+                entry.package === candidate.package && entry.src_path === candidate.src_path,
+            ),
+        )
+        .map((entry) => `${entry.package}:${entry.src_path}`)
+        .join(", ")}`,
+      `stale: ${canonicalReviewed
+        .filter(
+          (entry) =>
+            !actual.some(
+              (candidate) =>
+                candidate.package === entry.package && candidate.src_path === entry.src_path,
+            ),
+        )
+        .map((entry) => `${entry.package}:${entry.src_path}`)
+        .join(", ")}`,
+    ].join("; "),
+  );
+  return actual.length;
+}
+
+function validateNoWorkspaceProcMacros(metadata) {
+  const procMacros = [];
+  for (const workspacePackage of workspacePackages(metadata).values()) {
+    for (const target of workspacePackage.targets) {
+      if (target.kind.includes("proc-macro")) {
+        procMacros.push(`${workspacePackage.name}:${target.name}`);
+      }
+    }
+  }
+  assert(
+    procMacros.length === 0,
+    `workspace procedural macros are outside the standard-libtest guard boundary: ${procMacros.join(", ")}`,
+  );
+  return procMacros.length;
 }
 
 function validateCargoTargets(registry, metadata, repoRoot) {
@@ -233,7 +557,7 @@ function validateCargoTargets(registry, metadata, repoRoot) {
     if (target.selector === "lib") {
       assert(
         metadataTarget.kind.some((kind) =>
-          ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"].includes(kind),
+          ["lib", "rlib", "dylib", "cdylib", "staticlib"].includes(kind),
         ),
         `${reference}: lib selector does not resolve to a library target`,
       );
@@ -425,6 +749,7 @@ function rustAttributes(tokens, label) {
       start: index,
       end: cursor - 1,
       inner,
+      identifiers,
       canonical_ignore: canonicalIgnore,
       contains_ignore: identifiers.some((token) => token.value === "ignore"),
       test_marker:
@@ -465,6 +790,42 @@ function macroTokenRanges(tokens, label) {
     ranges.push({ start: open, end: cursor - 1 });
   }
   return ranges;
+}
+
+export function assertStandardLibtestRustSource(source, label = "Rust source") {
+  const tokens = tokenizeRust(source, label);
+  const attributes = rustAttributes(tokens, label);
+  const macroRanges = macroTokenRanges(tokens, label);
+
+  for (const attribute of attributes) {
+    const forbidden = attribute.identifiers
+      .map((token) => token.value)
+      .filter((identifier) => CUSTOM_TEST_FRAMEWORK_ATTRIBUTES.has(identifier));
+    assert(
+      forbidden.length === 0,
+      `${label}: custom test-framework crate attributes are prohibited (${sorted(new Set(forbidden)).join(", ")})`,
+    );
+    assert(
+      !(
+        attribute.inner &&
+        macroRanges.some(
+          (range) => attribute.start > range.start && attribute.start < range.end,
+        )
+      ),
+      `${label}: macro-generated crate attributes are outside the standard-libtest guard boundary`,
+    );
+  }
+
+  for (let index = 0; index < tokens.length - 1; index += 1) {
+    assert(
+      !(
+        tokens[index].kind === "identifier" &&
+        tokens[index].value === "include" &&
+        tokens[index + 1].value === "!"
+      ),
+      `${label}: include! can inject generated Rust outside the standard-libtest source guard`,
+    );
+  }
 }
 
 export function discoverCanonicalIgnoredTests(source, label = "Rust source") {
@@ -514,7 +875,7 @@ export function discoverCanonicalIgnoredTests(source, label = "Rust source") {
   return tests;
 }
 
-function ignoredTestsInSource(repoRoot, packageRoots) {
+function workspaceRustFiles(packageRoots) {
   const rustFiles = new Set();
   const visit = (directory) => {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -525,6 +886,11 @@ function ignoredTestsInSource(repoRoot, packageRoots) {
     }
   };
   for (const packageRoot of new Set(packageRoots.values())) visit(packageRoot);
+  return sorted(rustFiles);
+}
+
+function ignoredTestsInSource(repoRoot, packageRoots) {
+  const rustFiles = workspaceRustFiles(packageRoots);
 
   const results = [];
   for (const source of rustFiles) {
@@ -542,6 +908,98 @@ function ignoredTestsInSource(repoRoot, packageRoots) {
   );
 }
 
+function standardLibtestSnapshotPaths(repoRoot, metadata, rustFiles, cargoConfigs) {
+  const files = new Set(rustFiles.map((candidate) => path.resolve(candidate)));
+  for (const workspacePackage of workspacePackages(metadata).values()) {
+    files.add(path.resolve(workspacePackage.manifest_path));
+  }
+  for (const relative of [
+    "Cargo.lock",
+    "Cargo.toml",
+    "ci/ignored-tests.json",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+  ]) {
+    const candidate = path.resolve(repoRoot, relative);
+    if (fs.existsSync(candidate)) files.add(candidate);
+  }
+  for (const config of cargoConfigs) files.add(path.resolve(config));
+  return sorted(files);
+}
+
+function standardLibtestSnapshot(paths) {
+  return paths.map((candidate) => [candidate, sha256(fs.readFileSync(candidate))]);
+}
+
+export function createStandardLibtestGuard({
+  registry,
+  metadata,
+  repoRoot,
+  environment = process.env,
+}) {
+  assertSafeHarnessEnvironment(environment);
+  const cargoConfigs = validateCargoConfiguration(repoRoot, environment);
+  const manifestCount = validateWorkspaceLibtestManifests(metadata, repoRoot);
+  const reviewedBuildScriptCount = validateReviewedBuildScripts(
+    registry,
+    metadata,
+    repoRoot,
+  );
+  const workspaceProcMacroCount = validateNoWorkspaceProcMacros(metadata);
+  const rustFiles = workspaceRustFiles(workspacePackageRoots(metadata));
+  for (const source of rustFiles) {
+    assertStandardLibtestRustSource(
+      fs.readFileSync(source, "utf8"),
+      repoRelative(repoRoot, source),
+    );
+  }
+  const snapshotPaths = standardLibtestSnapshotPaths(
+    repoRoot,
+    metadata,
+    rustFiles,
+    cargoConfigs,
+  );
+  return Object.freeze({
+    [STANDARD_LIBTEST_GUARD]: true,
+    repo_root: path.resolve(repoRoot),
+    cargo_config_count: cargoConfigs.length,
+    default_libtest_manifest_count: manifestCount,
+    reviewed_build_script_count: reviewedBuildScriptCount,
+    standard_libtest_source_count: rustFiles.length,
+    workspace_proc_macro_count: workspaceProcMacroCount,
+    snapshot: standardLibtestSnapshot(snapshotPaths),
+    validated_after_cargo_build: false,
+  });
+}
+
+export function validateStandardLibtestGuardAfterBuild({
+  guard,
+  registry,
+  metadata,
+  repoRoot,
+  environment,
+}) {
+  assert(
+    guard?.[STANDARD_LIBTEST_GUARD] === true && guard.repo_root === path.resolve(repoRoot),
+    "standard-libtest guard is missing or belongs to a different workspace",
+  );
+  const current = createStandardLibtestGuard({
+    registry,
+    metadata,
+    repoRoot,
+    environment,
+  });
+  assert(
+    JSON.stringify(current.snapshot) === JSON.stringify(guard.snapshot),
+    "standard-libtest source, manifest, lock, toolchain, registry, or Cargo configuration changed during the Cargo build",
+  );
+  return Object.freeze({
+    ...current,
+    [STANDARD_LIBTEST_GUARD]: true,
+    validated_after_cargo_build: true,
+  });
+}
+
 export function registryPlatform(nodePlatform = process.platform) {
   const aliases = { darwin: "macos", win32: "windows" };
   const platform = aliases[nodePlatform] ?? nodePlatform;
@@ -552,7 +1010,12 @@ export function registryPlatform(nodePlatform = process.platform) {
   return platform;
 }
 
-export function validateRegistry({ registry, metadata, repoRoot }) {
+export function validateRegistry({
+  registry,
+  metadata,
+  repoRoot,
+  environment = process.env,
+}) {
   assert(
     registry.schema === REGISTRY_SCHEMA,
     `unexpected ignored-test schema: ${registry.schema}`,
@@ -565,7 +1028,12 @@ export function validateRegistry({ registry, metadata, repoRoot }) {
   );
 
   const packageRoots = workspacePackageRoots(metadata);
-  const libtestManifestCount = validateWorkspaceLibtestManifests(metadata, repoRoot);
+  const standardLibtestGuard = createStandardLibtestGuard({
+    registry,
+    metadata,
+    repoRoot,
+    environment,
+  });
   const cargoTargets = validateCargoTargets(registry, metadata, repoRoot);
   const entryKeys = registry.entries.map(
     (entry) => `${entry.package}:${entry.target}:${entry.test_id}`,
@@ -665,7 +1133,15 @@ export function validateRegistry({ registry, metadata, repoRoot }) {
     registry_count: registry.entries.length,
     source_ignored_count: sourceIgnored.length,
     cargo_target_count: cargoTargets.size,
-    default_libtest_manifest_count: libtestManifestCount,
+    cargo_config_count: standardLibtestGuard.cargo_config_count,
+    default_libtest_manifest_count:
+      standardLibtestGuard.default_libtest_manifest_count,
+    reviewed_build_script_count:
+      standardLibtestGuard.reviewed_build_script_count,
+    standard_libtest_source_count:
+      standardLibtestGuard.standard_libtest_source_count,
+    workspace_proc_macro_count:
+      standardLibtestGuard.workspace_proc_macro_count,
     platform_counts: Object.fromEntries(
       SUPPORTED_PLATFORMS.map((platform) => [
         platform,
@@ -697,6 +1173,7 @@ export function parseCargoTestArtifacts(stdout, { metadata, repoRoot }) {
     if (
       message.reason !== "compiler-artifact" ||
       message.profile?.test !== true ||
+      typeof message.fresh !== "boolean" ||
       typeof message.executable !== "string"
     ) {
       continue;
@@ -719,6 +1196,7 @@ export function parseCargoTestArtifacts(stdout, { metadata, repoRoot }) {
     );
     artifacts.set(`${targetIdentityKey(identity)}\u0000${message.executable}`, {
       executable: message.executable,
+      fresh: message.fresh,
       target: identity,
     });
   }
@@ -730,13 +1208,59 @@ export function parseCargoTestArtifacts(stdout, { metadata, repoRoot }) {
   );
 }
 
-export function selectStandardLibtestArtifacts(artifacts, { metadata, repoRoot }) {
-  const safeTargetIdentities = new Set();
+export function assertSuccessfulCargoBuildFinished(stdout) {
+  const finished = [];
+  for (const [index, line] of stdout.split(/\r?\n/).entries()) {
+    if (!line.trim()) continue;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch (error) {
+      throw new Error(`Cargo JSON line ${index + 1} is invalid: ${error.message}`);
+    }
+    if (message.reason === "build-finished") finished.push(message.success);
+  }
+  assert(
+    JSON.stringify(finished) === JSON.stringify([true]),
+    `Cargo JSON must contain exactly one successful build-finished message; found ${JSON.stringify(finished)}`,
+  );
+}
+
+export function validateArtifactExecutable(executable, targetDirectory) {
+  assert(path.isAbsolute(executable), `Cargo artifact path is not absolute: ${executable}`);
+  const direct = fs.lstatSync(executable);
+  assert(!direct.isSymbolicLink(), `Cargo artifact must not be a symbolic link: ${executable}`);
+  assert(direct.isFile(), `Cargo artifact is not a regular file: ${executable}`);
+  const targetRoot = fs.realpathSync(targetDirectory);
+  const real = fs.realpathSync(executable);
+  const relative = path.relative(targetRoot, real);
+  assert(
+    relative !== "" && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative),
+    `Cargo artifact is outside the metadata target directory: ${executable}`,
+  );
+  return {
+    path: real,
+    sha256: sha256(fs.readFileSync(real)),
+  };
+}
+
+export function selectGuardedTestProfileArtifacts(
+  artifacts,
+  { metadata, repoRoot, guard },
+) {
+  assert(
+    guard?.[STANDARD_LIBTEST_GUARD] === true &&
+      guard.repo_root === path.resolve(repoRoot) &&
+      guard.validated_after_cargo_build === true,
+    "artifact execution requires an unchanged post-build standard-libtest guard",
+  );
+  const guardedTargetIdentities = new Set();
   for (const workspacePackage of workspacePackages(metadata).values()) {
     for (const target of workspacePackage.targets) {
       if (target.test !== true) continue;
       if (target.kind.includes("custom-build")) continue;
-      safeTargetIdentities.add(
+      if (target.kind.includes("proc-macro")) continue;
+      guardedTargetIdentities.add(
         targetIdentityKey(
           metadataTargetIdentity(workspacePackage.name, target, repoRoot),
         ),
@@ -745,14 +1269,14 @@ export function selectStandardLibtestArtifacts(artifacts, { metadata, repoRoot }
   }
 
   const selected = artifacts.filter((artifact) =>
-    safeTargetIdentities.has(targetIdentityKey(artifact.target)),
+    guardedTargetIdentities.has(targetIdentityKey(artifact.target)),
   );
   const duplicateTargets = duplicates(
     selected.map((artifact) => targetIdentityKey(artifact.target)),
   );
   assert(
     duplicateTargets.length === 0,
-    `Cargo produced multiple executables for a standard libtest target: ${duplicateTargets.join(", ")}`,
+    `Cargo produced multiple executables for a guarded test-profile target: ${duplicateTargets.join(", ")}`,
   );
   return selected;
 }
@@ -841,51 +1365,82 @@ export function collectCargoIgnoredInventory({
   repoRoot,
   metadata,
   registry,
-  cargo = process.env.CARGO ?? "cargo",
+  environment = process.env,
 }) {
-  validateWorkspaceLibtestManifests(metadata, repoRoot);
+  const prebuildGuard = createStandardLibtestGuard({
+    registry,
+    metadata,
+    repoRoot,
+    environment,
+  });
   validateCargoTargets(registry, metadata, repoRoot);
-  const build = spawnSync(cargo, CARGO_BUILD_ARGUMENTS, {
-    cwd: repoRoot,
-    encoding: "utf8",
-    maxBuffer: 256 * 1024 * 1024,
+  const tool_identity = readPinnedToolIdentity({ repoRoot, environment });
+  const build = runPinnedRustTool("cargo", CARGO_BUILD_ARGUMENTS, {
+    repoRoot,
+    environment,
   });
   assert(!build.error, `Cargo test-list build failed to start: ${build.error?.message}`);
   assert(build.status === 0, build.stderr || "Cargo test-list build failed");
+  assertSuccessfulCargoBuildFinished(build.stdout);
   const artifacts = parseCargoTestArtifacts(build.stdout, { metadata, repoRoot });
   assert(artifacts.length > 0, "Cargo produced no workspace test executables");
-  const standardLibtestArtifacts = selectStandardLibtestArtifacts(artifacts, {
+  const postbuildGuard = validateStandardLibtestGuardAfterBuild({
+    guard: prebuildGuard,
+    registry,
     metadata,
     repoRoot,
+    environment,
+  });
+  const guardedArtifacts = selectGuardedTestProfileArtifacts(artifacts, {
+    metadata,
+    repoRoot,
+    guard: postbuildGuard,
   });
   assert(
-    standardLibtestArtifacts.length > 0,
-    "Cargo produced no standard libtest executables",
+    guardedArtifacts.length > 0,
+    "Cargo produced no guarded test-profile executables",
   );
 
   const inventory = [];
-  for (const artifact of standardLibtestArtifacts) {
-    const listed = spawnSync(artifact.executable, TEST_HARNESS_LIST_ARGUMENTS, {
-      cwd: repoRoot,
-      encoding: "utf8",
-      maxBuffer: 64 * 1024 * 1024,
-      timeout: TEST_HARNESS_TIMEOUT_MS,
-    });
-    assert(
-      listed.error?.code !== "ETIMEDOUT",
-      `standard libtest harness list timed out after ${TEST_HARNESS_TIMEOUT_MS}ms: ${artifact.executable}`,
-    );
-    assert(
-      !listed.error,
-      `test harness failed to start: ${artifact.executable}: ${listed.error?.message}`,
-    );
-    assert(
-      listed.status === 0,
-      listed.stderr || `test harness list failed: ${artifact.executable}`,
-    );
-    for (const testId of parseTestHarnessIgnoredList(listed.stdout)) {
-      inventory.push({ test_id: testId, target: artifact.target });
+  const listingCwd = fs.mkdtempSync(path.join(os.tmpdir(), "ignored-list-cwd-"));
+  try {
+    for (const artifact of guardedArtifacts) {
+      const before = validateArtifactExecutable(
+        artifact.executable,
+        metadata.target_directory,
+      );
+      const listed = spawnSync(before.path, TEST_HARNESS_LIST_ARGUMENTS, {
+        cwd: listingCwd,
+        encoding: "utf8",
+        env: environment,
+        killSignal: "SIGKILL",
+        maxBuffer: 64 * 1024 * 1024,
+        timeout: TEST_HARNESS_TIMEOUT_MS,
+        windowsHide: true,
+      });
+      assert(
+        listed.error?.code !== "ETIMEDOUT",
+        `guarded test-profile artifact list timed out after ${TEST_HARNESS_TIMEOUT_MS}ms: ${before.path}`,
+      );
+      assert(
+        !listed.error,
+        `guarded test-profile artifact failed to start: ${before.path}: ${listed.error?.message}`,
+      );
+      assert(
+        listed.status === 0,
+        listed.stderr || `guarded test-profile artifact list failed: ${before.path}`,
+      );
+      const after = validateArtifactExecutable(before.path, metadata.target_directory);
+      assert(
+        after.sha256 === before.sha256,
+        `guarded test-profile artifact changed while it was listed: ${before.path}`,
+      );
+      for (const testId of parseTestHarnessIgnoredList(listed.stdout)) {
+        inventory.push({ test_id: testId, target: artifact.target });
+      }
     }
+  } finally {
+    fs.rmSync(listingCwd, { force: true, recursive: true });
   }
   inventory.sort((left, right) =>
     describeInventory(left).localeCompare(describeInventory(right)),
@@ -893,15 +1448,22 @@ export function collectCargoIgnoredInventory({
   return {
     inventory,
     cargo_test_artifact_count: artifacts.length,
-    listed_standard_libtest_harness_count: standardLibtestArtifacts.length,
+    guarded_test_profile_artifact_count: guardedArtifacts.length,
+    fresh_guarded_artifact_count: guardedArtifacts.filter((artifact) => artifact.fresh).length,
+    rebuilt_guarded_artifact_count: guardedArtifacts.filter((artifact) => !artifact.fresh).length,
+    standard_libtest_guard_after_build:
+      postbuildGuard.validated_after_cargo_build,
+    tool_identity,
   };
 }
 
-export function readMetadata(repoRoot) {
-  const result = spawnSync(
-    process.env.CARGO ?? "cargo",
+export function readMetadata(repoRoot, environment = process.env) {
+  assertSafeHarnessEnvironment(environment);
+  validateCargoConfiguration(repoRoot, environment);
+  const result = runPinnedRustTool(
+    "cargo",
     ["metadata", "--locked", "--no-deps", "--format-version", "1"],
-    { cwd: repoRoot, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+    { repoRoot, environment },
   );
   assert(!result.error, `cargo metadata failed to start: ${result.error?.message}`);
   assert(result.status === 0, result.stderr || "cargo metadata failed");
@@ -910,6 +1472,8 @@ export function readMetadata(repoRoot) {
 
 function main() {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  assertSafeHarnessEnvironment(process.env);
+  validateCargoConfiguration(repoRoot, process.env);
   const registry = JSON.parse(
     fs.readFileSync(path.join(repoRoot, "ci/ignored-tests.json"), "utf8"),
   );
@@ -924,11 +1488,20 @@ function main() {
     );
     report.cargo_reconciliation.cargo_test_artifact_count =
       collection.cargo_test_artifact_count;
-    report.cargo_reconciliation.listed_standard_libtest_harness_count =
-      collection.listed_standard_libtest_harness_count;
+    report.cargo_reconciliation.guarded_test_profile_artifact_count =
+      collection.guarded_test_profile_artifact_count;
+    report.cargo_reconciliation.fresh_guarded_artifact_count =
+      collection.fresh_guarded_artifact_count;
+    report.cargo_reconciliation.rebuilt_guarded_artifact_count =
+      collection.rebuilt_guarded_artifact_count;
+    report.cargo_reconciliation.standard_libtest_guard_after_build =
+      collection.standard_libtest_guard_after_build;
+    report.cargo_reconciliation.tool_identity = collection.tool_identity;
     report.cargo_reconciliation.harness_timeout_ms = TEST_HARNESS_TIMEOUT_MS;
-    report.cargo_reconciliation.harness_list_only = true;
-    report.cargo_reconciliation.no_test_body_execution = true;
+    report.cargo_reconciliation.cargo_rustc_test_mode_requested = true;
+    report.cargo_reconciliation.guarded_list_execution = true;
+    report.cargo_reconciliation.guarded_harness_arguments =
+      TEST_HARNESS_LIST_ARGUMENTS;
   }
 
   console.log(JSON.stringify(report, null, 2));

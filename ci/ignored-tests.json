@@ -143,6 +143,43 @@
       "harness": "libtest"
     }
   ],
+  "reviewed_build_scripts": [
+    {
+      "package": "llama-native-engine",
+      "src_path": "crates/native/crates/llama-native-engine/build.rs",
+      "sha256": "c28035ab5a321cbd583f2b62e0abc07f9c107aee0daec43bfd2b7b022ba345b3"
+    },
+    {
+      "package": "speech-native-platform",
+      "src_path": "crates/services/speech/crates/speech-native-platform/build.rs",
+      "sha256": "d6fa47b4ac3f9fe1ad259f92b529cd47b2aa0b3ecb1292096d20668cfcaf5273"
+    },
+    {
+      "package": "tauri-plugin-free-token-energy",
+      "src_path": "products/fte/crates/tauri-plugin-free-token-energy/build.rs",
+      "sha256": "b35899adb11b28ab5d0e501a1a48ee3ac0a5f182f68c00343e7452f8fe3bf760"
+    },
+    {
+      "package": "free-token-energy",
+      "src_path": "products/fte/src-tauri/build.rs",
+      "sha256": "a66830ac0e368d0795f5d3fb238f2eb44fd897ce5c24acfc8f65eab3e7323296"
+    },
+    {
+      "package": "loom-app",
+      "src_path": "products/loom/apps/loom/src-tauri/build.rs",
+      "sha256": "3f1fc3b9ad8e86f1ff9857337de3d201a8395ea72c3c91030229e9f4f6b492d4"
+    },
+    {
+      "package": "tauri-plugin-loom",
+      "src_path": "products/loom/crates/tauri-plugin-loom/build.rs",
+      "sha256": "89f448c244afa175fdb8de52c2f21ebaf45e950381940a8bc8b850ac2af83322"
+    },
+    {
+      "package": "mom-llama-app",
+      "src_path": "products/mom/apps/mom-llama/src-tauri/build.rs",
+      "sha256": "487059eaf8a947b80f20a9aacac038a5047b2ad69d2401b827376c67d6fe847f"
+    }
+  ],
   "entries": [
     {
       "test_id": "controlled_runtime::tests::real_small_gguf_controlled_generation_proves_baseline_cfg_constraints_and_samplers",

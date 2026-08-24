@@ -382,7 +382,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: ignored-tests-${{ runner.os }}
-      - name: Reconcile exact ignored-test inventory without executing test bodies
+      - name: Reconcile exact ignored-test inventory with guarded list arguments
         run: node scripts/ci/validate-ignored-tests.mjs --cargo-list
 
   fuzz-build:
