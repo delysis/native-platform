@@ -3,6 +3,7 @@ mod build_identity;
 pub mod control_math;
 mod controlled_runtime;
 mod embedding_runtime;
+mod generation_admission;
 mod operation_registry;
 mod state_buffer;
 
@@ -11,6 +12,9 @@ pub use controlled_runtime::{
     VerifiedControlledGenerationBatch, VerifiedControlledGenerationTerminal,
 };
 pub use embedding_runtime::{VerifiedEmbeddingBatch, VerifiedEmbeddingTerminal};
+pub use generation_admission::SpeculativeAdmissionStatus;
+
+use generation_admission::{SpeculativeAdmission, SpeculativePermit, SystemAdmissionClock};
 
 use operation_registry::{
     ActiveRequest, RequestClass, RequestControls, RequestLease, RequestRegistry,
@@ -72,6 +76,7 @@ pub const LLAMA_CPP_REV: &str = "5f55650a78f92aff4d48d671423e888fac0469ff";
 /// ```
 pub const LLAMA_NATIVE_BUILD_MANIFEST_SHA256: &str = env!("LLAMA_NATIVE_BUILD_MANIFEST_SHA256");
 const COMMAND_CAPACITY: usize = 32;
+const SPECULATIVE_COMMAND_CAPACITY: usize = 1;
 const EVENT_CAPACITY: usize = 256;
 
 static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
@@ -770,28 +775,44 @@ impl Drop for NativeModelOwner {
 #[derive(Debug)]
 struct WorkerBootstrapGuard {
     command_tx: Option<Sender<WorkerCommand>>,
+    speculative_tx: Option<Sender<SpeculativeWorkerCommand>>,
     shutdown_tx: Option<Sender<()>>,
     join: Option<JoinHandle<()>>,
+}
+
+struct WorkerBootstrapParts {
+    command_tx: Sender<WorkerCommand>,
+    speculative_tx: Sender<SpeculativeWorkerCommand>,
+    shutdown_tx: Sender<()>,
+    join: JoinHandle<()>,
 }
 
 impl WorkerBootstrapGuard {
     fn new(
         command_tx: Sender<WorkerCommand>,
+        speculative_tx: Sender<SpeculativeWorkerCommand>,
         shutdown_tx: Sender<()>,
         join: JoinHandle<()>,
     ) -> Self {
         Self {
             command_tx: Some(command_tx),
+            speculative_tx: Some(speculative_tx),
             shutdown_tx: Some(shutdown_tx),
             join: Some(join),
         }
     }
 
-    fn into_parts(mut self) -> NativeResult<(Sender<WorkerCommand>, Sender<()>, JoinHandle<()>)> {
+    fn into_parts(mut self) -> NativeResult<WorkerBootstrapParts> {
         let command_tx = self.command_tx.take().ok_or_else(|| {
             NativeError::new(
                 NativeErrorCode::Internal,
                 "native model bootstrap lost its command sender",
+            )
+        })?;
+        let speculative_tx = self.speculative_tx.take().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "native model bootstrap lost its speculative sender",
             )
         })?;
         let shutdown_tx = self.shutdown_tx.take().ok_or_else(|| {
@@ -806,7 +827,12 @@ impl WorkerBootstrapGuard {
                 "native model bootstrap lost its worker join handle",
             )
         })?;
-        Ok((command_tx, shutdown_tx, join))
+        Ok(WorkerBootstrapParts {
+            command_tx,
+            speculative_tx,
+            shutdown_tx,
+            join,
+        })
     }
 
     fn shutdown_and_join(&mut self) -> NativeResult<()> {
@@ -814,6 +840,7 @@ impl WorkerBootstrapGuard {
             let _ = shutdown_tx.try_send(());
         }
         self.command_tx.take();
+        self.speculative_tx.take();
         self.shutdown_tx.take();
         let Some(join) = self.join.take() else {
             return Ok(());
@@ -838,9 +865,11 @@ struct NativeModelInner {
     worker_identity: Arc<WorkerIdentity>,
     worker_id: String,
     command_tx: Sender<WorkerCommand>,
+    speculative_tx: Sender<SpeculativeWorkerCommand>,
     shutdown_tx: Sender<()>,
     closing: AtomicBool,
-    admission: Mutex<()>,
+    admission: Arc<Mutex<()>>,
+    speculative_admission: Arc<SpeculativeAdmission>,
     requests: Arc<RequestRegistry>,
     status: Arc<RwLock<ResidentModelStatus>>,
 }
@@ -915,6 +944,110 @@ impl NativeModelInner {
                 };
                 drop(command);
                 Err(NativeError::new(code, message))
+            }
+        }
+    }
+
+    fn admit_foreground_generation(
+        &self,
+        request_id: String,
+        class: RequestClass,
+        controls: RequestControls,
+        build: impl FnOnce(RequestLease) -> WorkerCommand,
+        context: &str,
+    ) -> NativeResult<Arc<ActiveRequest>> {
+        let _admission = self.admission.lock().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "native model admission lock is poisoned",
+            )
+        })?;
+        self.ensure_accepting()?;
+        let (control, lease) = self.requests.reserve(request_id, class, controls)?;
+        lease.queued()?;
+        match self.command_tx.try_send(build(lease)) {
+            Ok(()) => {
+                self.speculative_admission
+                    .preempt_for_foreground(control.identity().sequence);
+                Ok(control)
+            }
+            Err(error) => {
+                let (code, message, command) = match error {
+                    crossbeam_channel::TrySendError::Full(command) => (
+                        NativeErrorCode::QueueFull,
+                        format!("native model command queue is full while {context}"),
+                        command,
+                    ),
+                    crossbeam_channel::TrySendError::Disconnected(command) => (
+                        NativeErrorCode::WorkerStopped,
+                        format!("native model worker stopped while {context}"),
+                        command,
+                    ),
+                };
+                drop(command);
+                Err(NativeError::new(code, message))
+            }
+        }
+    }
+
+    fn admit_speculative_generation(
+        &self,
+        request_id: String,
+        class: RequestClass,
+        controls: RequestControls,
+        build: impl FnOnce(RequestLease) -> WorkerCommand,
+        context: &str,
+    ) -> NativeResult<Arc<ActiveRequest>> {
+        let _admission = self.admission.lock().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "native model admission lock is poisoned",
+            )
+        })?;
+        self.ensure_accepting()?;
+        let (control, lease) = self.requests.reserve(request_id, class, controls)?;
+        lease.queued()?;
+        let permit = Arc::clone(&self.speculative_admission).reserve(Arc::clone(&control))?;
+        let admitted = SpeculativeWorkerCommand {
+            command: build(lease),
+            _permit: permit,
+        };
+        match self.speculative_tx.try_send(admitted) {
+            Ok(()) => Ok(control),
+            Err(error) => {
+                let (code, message, command) = match error {
+                    crossbeam_channel::TrySendError::Full(command) => (
+                        NativeErrorCode::QueueFull,
+                        format!("native speculative command lane is full while {context}"),
+                        command,
+                    ),
+                    crossbeam_channel::TrySendError::Disconnected(command) => (
+                        NativeErrorCode::WorkerStopped,
+                        format!("native model worker stopped while {context}"),
+                        command,
+                    ),
+                };
+                drop(command);
+                Err(NativeError::new(code, message))
+            }
+        }
+    }
+
+    fn admit_generation(
+        &self,
+        admission: GenerationAdmissionClass,
+        request_id: String,
+        class: RequestClass,
+        controls: RequestControls,
+        build: impl FnOnce(RequestLease) -> WorkerCommand,
+        context: &str,
+    ) -> NativeResult<Arc<ActiveRequest>> {
+        match admission {
+            GenerationAdmissionClass::Foreground => {
+                self.admit_foreground_generation(request_id, class, controls, build, context)
+            }
+            GenerationAdmissionClass::Speculative => {
+                self.admit_speculative_generation(request_id, class, controls, build, context)
             }
         }
     }
@@ -1004,6 +1137,24 @@ enum WorkerCommand {
     },
 }
 
+#[derive(Debug)]
+struct SpeculativeWorkerCommand {
+    command: WorkerCommand,
+    _permit: SpeculativePermit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationAdmissionClass {
+    Foreground,
+    Speculative,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerCommandClass {
+    Foreground,
+    Speculative,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GenerationBatchAdmission {
     Compatibility,
@@ -1016,8 +1167,20 @@ impl NativeModelHandle {
     ) -> NativeResult<(Arc<NativeModelInner>, JoinHandle<()>)> {
         validate_config(&config)?;
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let (speculative_tx, speculative_rx) = bounded(SPECULATIVE_COMMAND_CAPACITY);
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let (ready_tx, ready_rx) = bounded(1);
+        let admission = Arc::new(Mutex::new(()));
+        let speculative_admission = Arc::new(SpeculativeAdmission::new(Arc::new(
+            SystemAdmissionClock::default(),
+        )));
+        let worker_lanes = WorkerLanes {
+            command_rx,
+            speculative_rx,
+            shutdown_rx,
+            admission: Arc::clone(&admission),
+            speculative_admission: Arc::clone(&speculative_admission),
+        };
         let status = Arc::new(RwLock::new(ResidentModelStatus {
             model_id: config.model_id.clone(),
             model_path: config.model_path.clone(),
@@ -1037,8 +1200,7 @@ impl NativeModelHandle {
             .spawn(move || {
                 run_worker(
                     config,
-                    command_rx,
-                    shutdown_rx,
+                    worker_lanes,
                     ready_tx,
                     worker_status,
                     owner_worker_identity,
@@ -1050,7 +1212,8 @@ impl NativeModelHandle {
                     format!("failed to start native model worker: {error}"),
                 )
             })?;
-        let mut bootstrap = WorkerBootstrapGuard::new(command_tx, shutdown_tx, worker);
+        let mut bootstrap =
+            WorkerBootstrapGuard::new(command_tx, speculative_tx, shutdown_tx, worker);
         let readiness = ready_rx.recv_timeout(Duration::from_mins(5));
         match readiness {
             Ok(Ok(())) => {}
@@ -1081,15 +1244,22 @@ impl NativeModelHandle {
                 return Err(load_error);
             }
         }
-        let (command_tx, shutdown_tx, worker) = bootstrap.into_parts()?;
+        let WorkerBootstrapParts {
+            command_tx,
+            speculative_tx,
+            shutdown_tx,
+            join: worker,
+        } = bootstrap.into_parts()?;
         Ok((
             Arc::new(NativeModelInner {
                 worker_identity,
                 worker_id,
                 command_tx,
+                speculative_tx,
                 shutdown_tx,
                 closing: AtomicBool::new(false),
-                admission: Mutex::new(()),
+                admission,
+                speculative_admission,
                 requests,
                 status,
             }),
@@ -1120,6 +1290,14 @@ impl NativeModelHandle {
     /// requests for one resident profile must reuse the same worker allocation.
     pub fn is_same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Returns the bounded speculative-lane state for this exact resident
+    /// worker. No queue depths or timing measurements are exposed.
+    pub fn speculative_admission_status(&self) -> SpeculativeAdmissionStatus {
+        self.inner
+            .speculative_admission
+            .status(self.inner.closing.load(Ordering::Acquire))
     }
 
     /// Submit exact token IDs for in-process embedding on this model's owner
@@ -1153,8 +1331,25 @@ impl NativeModelHandle {
     }
 
     pub fn generate(&self, request: GenerationRequest) -> NativeResult<GenerationTicket> {
+        self.generate_with_admission(request, GenerationAdmissionClass::Foreground)
+    }
+
+    /// Submit one preemptible generation to the resident worker's single
+    /// speculative lane. A foreground generation cancels this exact request.
+    pub fn generate_speculative(
+        &self,
+        request: GenerationRequest,
+    ) -> NativeResult<GenerationTicket> {
+        self.generate_with_admission(request, GenerationAdmissionClass::Speculative)
+    }
+
+    fn generate_with_admission(
+        &self,
+        request: GenerationRequest,
+        generation_admission: GenerationAdmissionClass,
+    ) -> NativeResult<GenerationTicket> {
         if matches!(&request.input, GenerationInput::Chat { .. }) && !request.media.is_empty() {
-            return self.generate_multimodal(request);
+            return self.generate_multimodal(request, generation_admission);
         }
         if !request.media.is_empty() {
             return Err(NativeError::new(
@@ -1211,6 +1406,7 @@ impl NativeModelHandle {
                 cases,
             },
             GenerationBatchAdmission::Compatibility,
+            generation_admission,
         )
     }
 
@@ -1219,13 +1415,18 @@ impl NativeModelHandle {
         &self,
         request: GenerationBatchRequest,
     ) -> NativeResult<GenerationTicket> {
-        self.submit_generation_batch(request, GenerationBatchAdmission::ExactBatch)
+        self.submit_generation_batch(
+            request,
+            GenerationBatchAdmission::ExactBatch,
+            GenerationAdmissionClass::Foreground,
+        )
     }
 
     fn submit_generation_batch(
         &self,
         request: GenerationBatchRequest,
         admission: GenerationBatchAdmission,
+        generation_admission: GenerationAdmissionClass,
     ) -> NativeResult<GenerationTicket> {
         let status = self.status();
         validate_generation_batch_request(&request, &status)?;
@@ -1251,7 +1452,8 @@ impl NativeModelHandle {
             .zip(&reasoning_forces)
             .map(|(case, flag)| (case.case_id.clone(), Arc::clone(flag)))
             .collect();
-        let control = self.inner.admit_command(
+        let control = self.inner.admit_generation(
+            generation_admission,
             request_id.clone(),
             RequestClass::Generation,
             RequestControls::Generation {
@@ -1278,7 +1480,11 @@ impl NativeModelHandle {
         })
     }
 
-    fn generate_multimodal(&self, request: GenerationRequest) -> NativeResult<GenerationTicket> {
+    fn generate_multimodal(
+        &self,
+        request: GenerationRequest,
+        generation_admission: GenerationAdmissionClass,
+    ) -> NativeResult<GenerationTicket> {
         validate_generation_request(&request, &self.status())?;
         let cancellation = Arc::new(AtomicBool::new(false));
         let reasoning_force = Arc::new(AtomicBool::new(false));
@@ -1287,7 +1493,8 @@ impl NativeModelHandle {
         let request_id = request.request_id.clone();
         let owned_cancellations = vec![("assistant".to_owned(), Arc::clone(&cancellation))];
         let owned_reasoning_forces = vec![("assistant".to_owned(), Arc::clone(&reasoning_force))];
-        let control = self.inner.admit_command(
+        let control = self.inner.admit_generation(
+            generation_admission,
             request_id.clone(),
             RequestClass::Generation,
             RequestControls::Generation {
@@ -1338,7 +1545,7 @@ impl NativeModelHandle {
             .zip(&reasoning_flags)
             .map(|(branch, flag)| (branch.branch_id.clone(), Arc::clone(flag)))
             .collect();
-        let control = self.inner.admit_command(
+        let control = self.inner.admit_foreground_generation(
             request_id.clone(),
             RequestClass::Generation,
             RequestControls::Generation {
@@ -1890,14 +2097,28 @@ fn artifact_changed_error(label: &str, path: &std::path::Path, detail: &str) -> 
     )
 }
 
+struct WorkerLanes {
+    command_rx: Receiver<WorkerCommand>,
+    speculative_rx: Receiver<SpeculativeWorkerCommand>,
+    shutdown_rx: Receiver<()>,
+    admission: Arc<Mutex<()>>,
+    speculative_admission: Arc<SpeculativeAdmission>,
+}
+
 fn run_worker(
     config: NativeModelConfig,
-    command_rx: Receiver<WorkerCommand>,
-    shutdown_rx: Receiver<()>,
+    lanes: WorkerLanes,
     ready_tx: Sender<NativeResult<()>>,
     status: Arc<RwLock<ResidentModelStatus>>,
     worker_identity: Arc<WorkerIdentity>,
 ) {
+    let WorkerLanes {
+        command_rx,
+        speculative_rx,
+        shutdown_rx,
+        admission,
+        speculative_admission,
+    } = lanes;
     let backend = match backend() {
         Ok(backend) => backend,
         Err(error) => {
@@ -2055,16 +2276,28 @@ fn run_worker(
     let mut embedding_call_sequence = 0_u64;
     let mut controlled_call_sequence = 0_u64;
     loop {
-        let command = crossbeam_channel::select_biased! {
-            recv(shutdown_rx) -> _ => {
-                reject_queued_commands(&command_rx);
-                break;
-            },
-            recv(command_rx) -> command => match command {
-                Ok(command) => command,
-                Err(_) => break,
-            },
-        };
+        let (command, command_class, speculative_permit) =
+            match receive_worker_command(&command_rx, &speculative_rx, &shutdown_rx) {
+                Some(ReceivedWorkerCommand {
+                    command,
+                    class,
+                    speculative_permit,
+                }) => (command, class, speculative_permit),
+                None => {
+                    reject_queued_commands(&command_rx, &speculative_rx);
+                    break;
+                }
+            };
+        let _speculative_permit = speculative_permit;
+        // Admission sends the command and commits any exact speculative
+        // preemption while holding this lock. A dequeued worker crosses the
+        // same boundary before publishing Running, so measurement cannot race
+        // ahead of cancellation.
+        drop(
+            admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         match command {
             WorkerCommand::EmbedBatch {
                 request,
@@ -2173,7 +2406,9 @@ fn run_worker(
                 reasoning_forces,
                 request_lease,
             } => {
-                if let Err(error) = request_lease.running() {
+                if let Err(error) =
+                    begin_generation_command(&request_lease, command_class, &speculative_admission)
+                {
                     let _ = result_tx.send(Err(error));
                     continue;
                 }
@@ -2279,7 +2514,9 @@ fn run_worker(
                 reasoning_forces,
                 request_lease,
             } => {
-                if let Err(error) = request_lease.running() {
+                if let Err(error) =
+                    begin_generation_command(&request_lease, command_class, &speculative_admission)
+                {
                     let _ = result_tx.send(Err(error));
                     continue;
                 }
@@ -2322,7 +2559,9 @@ fn run_worker(
                 reasoning_force,
                 request_lease,
             } => {
-                if let Err(error) = request_lease.running() {
+                if let Err(error) =
+                    begin_generation_command(&request_lease, command_class, &speculative_admission)
+                {
                     let _ = result_tx.send(Err(error));
                     continue;
                 }
@@ -2359,7 +2598,9 @@ fn run_worker(
                 cancellations,
                 request_lease,
             } => {
-                if let Err(error) = request_lease.running() {
+                if let Err(error) =
+                    begin_generation_command(&request_lease, command_class, &speculative_admission)
+                {
                     let _ = result_tx.send(Err(error));
                     continue;
                 }
@@ -2511,8 +2752,58 @@ fn run_worker(
     set_status_state(&status, ModelRuntimeState::Stopped, 0);
 }
 
-fn reject_queued_commands(command_rx: &Receiver<WorkerCommand>) {
+struct ReceivedWorkerCommand {
+    command: WorkerCommand,
+    class: WorkerCommandClass,
+    speculative_permit: Option<SpeculativePermit>,
+}
+
+fn receive_worker_command(
+    command_rx: &Receiver<WorkerCommand>,
+    speculative_rx: &Receiver<SpeculativeWorkerCommand>,
+    shutdown_rx: &Receiver<()>,
+) -> Option<ReceivedWorkerCommand> {
+    crossbeam_channel::select_biased! {
+        recv(shutdown_rx) -> _ => None,
+        recv(command_rx) -> command => match command {
+            Ok(command) => Some(ReceivedWorkerCommand {
+                command,
+                class: WorkerCommandClass::Foreground,
+                speculative_permit: None,
+            }),
+            Err(_) => None,
+        },
+        recv(speculative_rx) -> command => match command {
+            Ok(SpeculativeWorkerCommand { command, _permit }) => Some(ReceivedWorkerCommand {
+                command,
+                class: WorkerCommandClass::Speculative,
+                speculative_permit: Some(_permit),
+            }),
+            Err(_) => None,
+        },
+    }
+}
+
+fn begin_generation_command(
+    request_lease: &RequestLease,
+    command_class: WorkerCommandClass,
+    speculative_admission: &SpeculativeAdmission,
+) -> NativeResult<()> {
+    request_lease.running()?;
+    if command_class == WorkerCommandClass::Foreground {
+        speculative_admission.observe_foreground_running(request_lease.sequence());
+    }
+    Ok(())
+}
+
+fn reject_queued_commands(
+    command_rx: &Receiver<WorkerCommand>,
+    speculative_rx: &Receiver<SpeculativeWorkerCommand>,
+) {
     while let Ok(command) = command_rx.try_recv() {
+        reject_queued_command(command);
+    }
+    while let Ok(SpeculativeWorkerCommand { command, .. }) = speculative_rx.try_recv() {
         reject_queued_command(command);
     }
 }
@@ -5761,8 +6052,9 @@ fn native_decode_error(context: &str, error: impl std::fmt::Display) -> NativeEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generation_admission::{AdmissionClock, SPECULATIVE_PREEMPTION_LIMIT};
     use llama_native_types::EmbeddingInput;
-    use std::sync::{Mutex, atomic::AtomicU64};
+    use std::sync::{Barrier, Mutex, atomic::AtomicU64};
 
     type TestSealFixture = (
         GenerationBatchRequest,
@@ -5775,6 +6067,23 @@ mod tests {
 
     static TEST_ARTIFACT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
     static REAL_MODEL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Debug, Default)]
+    struct TestAdmissionClock {
+        millis: AtomicU64,
+    }
+
+    impl TestAdmissionClock {
+        fn set(&self, millis: u64) {
+            self.millis.store(millis, Ordering::Release);
+        }
+    }
+
+    impl AdmissionClock for TestAdmissionClock {
+        fn now(&self) -> Duration {
+            Duration::from_millis(self.millis.load(Ordering::Acquire))
+        }
+    }
 
     #[test]
     fn inspected_name_replaces_generic_hf_label_with_declared_base_model() {
@@ -5847,24 +6156,94 @@ mod tests {
     fn test_admission_handle(
         status: ResidentModelStatus,
         queue_capacity: usize,
-    ) -> (NativeModelHandle, Receiver<WorkerCommand>) {
+    ) -> (
+        NativeModelHandle,
+        Receiver<WorkerCommand>,
+        Receiver<SpeculativeWorkerCommand>,
+    ) {
         let (command_tx, command_rx) = bounded(queue_capacity);
+        let (speculative_tx, speculative_rx) = bounded(SPECULATIVE_COMMAND_CAPACITY);
         let (shutdown_tx, _shutdown_rx) = bounded(1);
+        let speculative_admission = Arc::new(SpeculativeAdmission::new(Arc::new(
+            TestAdmissionClock::default(),
+        )));
         (
             NativeModelHandle {
                 inner: Arc::new(NativeModelInner {
                     worker_identity: Arc::new(WorkerIdentity),
                     worker_id: "admission-test-worker".to_owned(),
                     command_tx,
+                    speculative_tx,
                     shutdown_tx,
                     closing: AtomicBool::new(false),
-                    admission: Mutex::new(()),
+                    admission: Arc::new(Mutex::new(())),
+                    speculative_admission,
                     requests: Arc::new(RequestRegistry::new()),
                     status: Arc::new(RwLock::new(status)),
                 }),
             },
             command_rx,
+            speculative_rx,
         )
+    }
+
+    fn admission_test_status() -> ResidentModelStatus {
+        ResidentModelStatus {
+            model_id: "model".to_owned(),
+            model_path: PathBuf::new(),
+            state: ModelRuntimeState::Ready,
+            fingerprint: Some(test_model_fingerprint("model")),
+            descriptor: None,
+            active_sequences: 0,
+            max_sequences: 4,
+        }
+    }
+
+    fn admission_generation_request(request_id: &str) -> GenerationRequest {
+        let (batch, _, _, _, _, _) = seal_fixture();
+        let case = batch
+            .cases
+            .into_iter()
+            .next()
+            .expect("admission fixture has one case");
+        GenerationRequest {
+            request_id: request_id.to_owned(),
+            model_id: batch.model_id,
+            input: case.input,
+            sampling: case.sampling,
+            media: Vec::new(),
+            cached_prefix: case.cached_prefix,
+        }
+    }
+
+    fn complete_test_generation_as_cancelled(
+        command: WorkerCommand,
+        class: WorkerCommandClass,
+        admission: &SpeculativeAdmission,
+    ) {
+        let WorkerCommand::GenerateBatch {
+            result_tx,
+            cancellations,
+            request_lease,
+            ..
+        } = command
+        else {
+            panic!("compatibility generation uses GenerateBatch")
+        };
+        begin_generation_command(&request_lease, class, admission)
+            .expect("test executor publishes Running");
+        for cancellation in cancellations {
+            cancellation.store(true, Ordering::Release);
+        }
+        request_lease
+            .completed_or_failed(false)
+            .expect("test executor publishes cancellation terminal");
+        result_tx
+            .send(Err(NativeError::new(
+                NativeErrorCode::Cancelled,
+                "test executor cancelled dequeued generation",
+            )))
+            .expect("generation ticket receives test terminal");
     }
 
     fn test_worker_owner(
@@ -5872,12 +6251,14 @@ mod tests {
         stopped: Arc<AtomicBool>,
     ) -> (NativeModelOwner, NativeModelHandle) {
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let (speculative_tx, speculative_rx) = bounded(SPECULATIVE_COMMAND_CAPACITY);
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let worker_id = format!("test-worker-{model_id}");
         let join = std::thread::spawn(move || {
             crossbeam_channel::select_biased! {
                 recv(shutdown_rx) -> _ => {},
                 recv(command_rx) -> _ => {},
+                recv(speculative_rx) -> _ => {},
             }
             stopped.store(true, Ordering::Release);
         });
@@ -5885,9 +6266,13 @@ mod tests {
             worker_identity: Arc::new(WorkerIdentity),
             worker_id: worker_id.clone(),
             command_tx,
+            speculative_tx,
             shutdown_tx,
             closing: AtomicBool::new(false),
-            admission: Mutex::new(()),
+            admission: Arc::new(Mutex::new(())),
+            speculative_admission: Arc::new(SpeculativeAdmission::new(Arc::new(
+                SystemAdmissionClock::default(),
+            ))),
             requests: Arc::new(RequestRegistry::with_external_worker(worker_id)),
             status: Arc::new(RwLock::new(ResidentModelStatus {
                 model_id: model_id.to_string(),
@@ -5909,6 +6294,291 @@ mod tests {
             },
             handle,
         )
+    }
+
+    #[test]
+    fn foreground_cancels_queued_speculative_and_is_dequeued_next() {
+        let (handle, command_rx, speculative_rx) =
+            test_admission_handle(admission_test_status(), COMMAND_CAPACITY);
+        let speculative = handle
+            .generate_speculative(admission_generation_request("queued-speculative"))
+            .expect("one speculative request is admitted");
+        assert_eq!(
+            handle.speculative_admission_status(),
+            SpeculativeAdmissionStatus::Occupied
+        );
+        assert_eq!(
+            handle
+                .generate_speculative(admission_generation_request("second-speculative"))
+                .expect_err("a resident worker admits at most one speculative request")
+                .code,
+            NativeErrorCode::QueueFull
+        );
+
+        let foreground = handle
+            .generate(admission_generation_request("queued-foreground"))
+            .expect("foreground request is admitted");
+        assert!(
+            speculative.control.snapshot().cancellation_requested,
+            "foreground admission cancels the exact queued speculative request"
+        );
+
+        let start = Arc::new(Barrier::new(2));
+        let worker_start = Arc::clone(&start);
+        let worker_admission = Arc::clone(&handle.inner.speculative_admission);
+        let (_shutdown_tx, shutdown_rx) = bounded(1);
+        let worker = std::thread::spawn(move || {
+            worker_start.wait();
+            let class = match receive_worker_command(&command_rx, &speculative_rx, &shutdown_rx) {
+                Some(ReceivedWorkerCommand {
+                    command,
+                    class,
+                    speculative_permit: _,
+                }) => {
+                    complete_test_generation_as_cancelled(command, class, &worker_admission);
+                    class
+                }
+                None => {
+                    panic!("both command lanes remain connected")
+                }
+            };
+            reject_queued_commands(&command_rx, &speculative_rx);
+            class
+        });
+        start.wait();
+        assert_eq!(
+            worker.join().expect("barrier worker joins"),
+            WorkerCommandClass::Foreground
+        );
+        assert_eq!(
+            foreground
+                .wait()
+                .expect_err("test worker rejects queued foreground")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        assert_eq!(
+            speculative
+                .wait()
+                .expect_err("test worker rejects queued speculative")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        assert_eq!(
+            handle.speculative_admission_status(),
+            SpeculativeAdmissionStatus::Available
+        );
+    }
+
+    #[test]
+    fn foreground_cancels_running_speculative_across_barrier() {
+        let (handle, command_rx, speculative_rx) =
+            test_admission_handle(admission_test_status(), COMMAND_CAPACITY);
+        let speculative = handle
+            .generate_speculative(admission_generation_request("running-speculative"))
+            .expect("speculative request is admitted");
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_started = Arc::clone(&started);
+        let worker_release = Arc::clone(&release);
+        let worker = std::thread::spawn(move || {
+            let SpeculativeWorkerCommand {
+                command,
+                _permit: _speculative_permit,
+            } = speculative_rx.recv().expect("speculative worker command");
+            let WorkerCommand::GenerateBatch {
+                result_tx,
+                cancellations,
+                request_lease,
+                ..
+            } = command
+            else {
+                panic!("compatibility generation uses GenerateBatch")
+            };
+            request_lease
+                .running()
+                .expect("speculative executor publishes Running");
+            worker_started.wait();
+            worker_release.wait();
+            assert!(
+                cancellations
+                    .iter()
+                    .all(|flag| flag.load(Ordering::Acquire)),
+                "foreground cancellation reaches the running speculative executor"
+            );
+            request_lease
+                .completed_or_failed(false)
+                .expect("cancelled running request reaches terminal");
+            result_tx
+                .send(Err(NativeError::new(
+                    NativeErrorCode::Cancelled,
+                    "barrier test observed speculative cancellation",
+                )))
+                .expect("ticket receives cancellation terminal");
+        });
+
+        started.wait();
+        let foreground = handle
+            .generate(admission_generation_request("running-foreground"))
+            .expect("foreground overtakes running speculative work");
+        assert!(speculative.control.snapshot().cancellation_requested);
+        release.wait();
+        worker.join().expect("speculative barrier worker joins");
+        complete_test_generation_as_cancelled(
+            command_rx.recv().expect("queued foreground command"),
+            WorkerCommandClass::Foreground,
+            &handle.inner.speculative_admission,
+        );
+        assert_eq!(
+            speculative
+                .wait()
+                .expect_err("running speculative request is cancelled")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        assert_eq!(
+            foreground
+                .wait()
+                .expect_err("test worker rejects queued foreground")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        assert_eq!(
+            handle.speculative_admission_status(),
+            SpeculativeAdmissionStatus::Available
+        );
+    }
+
+    #[test]
+    fn slow_cancel_to_foreground_running_disables_resident_fingerprint() {
+        let clock = Arc::new(TestAdmissionClock::default());
+        let admission = Arc::new(SpeculativeAdmission::new(clock.clone()));
+        let registry = Arc::new(RequestRegistry::new());
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (control, lease) = registry
+            .reserve(
+                "timed-speculative",
+                RequestClass::Generation,
+                RequestControls::Generation {
+                    cancellations: vec![("assistant".to_owned(), Arc::clone(&cancellation))],
+                    reasoning_forces: Vec::new(),
+                },
+            )
+            .expect("timed speculative identity reserves");
+        lease.queued().expect("timed speculative queues");
+        let permit = Arc::clone(&admission)
+            .reserve(control)
+            .expect("timed speculative lane reserves");
+
+        assert_eq!(admission.preempt_for_foreground(41), 1);
+        assert!(cancellation.load(Ordering::Acquire));
+        clock.set(
+            u64::try_from(SPECULATIVE_PREEMPTION_LIMIT.as_millis()).expect("200ms fits u64") + 1,
+        );
+        let observe = Arc::new(Barrier::new(2));
+        let observer_barrier = Arc::clone(&observe);
+        let observer_admission = Arc::clone(&admission);
+        let observer = std::thread::spawn(move || {
+            observer_barrier.wait();
+            observer_admission.observe_foreground_running(41);
+        });
+        observe.wait();
+        observer.join().expect("clock observer joins");
+        assert_eq!(
+            admission.status(false),
+            SpeculativeAdmissionStatus::DisabledForResidentFingerprint
+        );
+
+        drop(permit);
+        lease.cancel_queued().expect("timed speculative releases");
+        let (next_control, next_lease) = registry
+            .reserve(
+                "later-speculative",
+                RequestClass::Generation,
+                RequestControls::Generation {
+                    cancellations: Vec::new(),
+                    reasoning_forces: Vec::new(),
+                },
+            )
+            .expect("later identity may reserve in the request registry");
+        next_lease.queued().expect("later identity queues");
+        assert_eq!(
+            Arc::clone(&admission)
+                .reserve(next_control)
+                .expect_err("disabled fingerprint rejects later speculative admission")
+                .code,
+            NativeErrorCode::QueueFull
+        );
+        drop(next_lease);
+    }
+
+    #[test]
+    fn joined_shutdown_rejects_and_drains_both_generation_lanes() {
+        let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let (speculative_tx, speculative_rx) = bounded(SPECULATIVE_COMMAND_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let admission = Arc::new(Mutex::new(()));
+        let speculative_admission = Arc::new(SpeculativeAdmission::new(Arc::new(
+            SystemAdmissionClock::default(),
+        )));
+        let worker_id = "two-lane-shutdown-worker".to_owned();
+        let requests = Arc::new(RequestRegistry::with_external_worker(worker_id.clone()));
+        let release = Arc::new(Barrier::new(2));
+        let worker_release = Arc::clone(&release);
+        let join = std::thread::spawn(move || {
+            worker_release.wait();
+            assert!(receive_worker_command(&command_rx, &speculative_rx, &shutdown_rx).is_none());
+            reject_queued_commands(&command_rx, &speculative_rx);
+        });
+        let inner = Arc::new(NativeModelInner {
+            worker_identity: Arc::new(WorkerIdentity),
+            worker_id,
+            command_tx,
+            speculative_tx,
+            shutdown_tx,
+            closing: AtomicBool::new(false),
+            admission,
+            speculative_admission,
+            requests,
+            status: Arc::new(RwLock::new(admission_test_status())),
+        });
+        let owner = NativeModelOwner {
+            inner: Arc::clone(&inner),
+            join: Some(join),
+        };
+        let handle = owner.handle();
+        let speculative = handle
+            .generate_speculative(admission_generation_request("shutdown-speculative"))
+            .expect("shutdown fixture admits speculative work");
+        let foreground = handle
+            .generate(admission_generation_request("shutdown-foreground"))
+            .expect("shutdown fixture admits foreground work");
+
+        owner.begin_shutdown();
+        assert_eq!(
+            handle.speculative_admission_status(),
+            SpeculativeAdmissionStatus::Closing
+        );
+        release.wait();
+        let joined = owner
+            .shutdown_joined()
+            .expect("joined shutdown drains both command lanes");
+        assert_eq!(joined.expected_worker_count(), 1);
+        assert_eq!(joined.joined_worker_count(), 1);
+        assert_eq!(
+            foreground
+                .wait()
+                .expect_err("queued foreground is rejected during shutdown")
+                .code,
+            NativeErrorCode::Cancelled
+        );
+        assert_eq!(
+            speculative
+                .wait()
+                .expect_err("queued speculative is rejected during shutdown")
+                .code,
+            NativeErrorCode::Cancelled
+        );
     }
 
     #[test]
@@ -6062,7 +6732,7 @@ mod tests {
             active_sequences: 0,
             max_sequences: 4,
         };
-        let (handle, command_rx) = test_admission_handle(status, COMMAND_CAPACITY);
+        let (handle, command_rx, _speculative_rx) = test_admission_handle(status, COMMAND_CAPACITY);
 
         let ticket = handle
             .generate_batch(request.clone())
@@ -6136,6 +6806,7 @@ mod tests {
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = Arc::clone(&stopped);
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let (speculative_tx, _speculative_rx) = bounded(SPECULATIVE_COMMAND_CAPACITY);
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let join = std::thread::spawn(move || {
             crossbeam_channel::select_biased! {
@@ -6145,13 +6816,19 @@ mod tests {
             worker_stopped.store(true, Ordering::Release);
         });
 
-        drop(WorkerBootstrapGuard::new(command_tx, shutdown_tx, join));
+        drop(WorkerBootstrapGuard::new(
+            command_tx,
+            speculative_tx,
+            shutdown_tx,
+            join,
+        ));
         assert!(stopped.load(Ordering::Acquire));
     }
 
     #[test]
     fn worker_panic_cannot_mint_joined_shutdown_authority() {
         let (command_tx, _command_rx) = bounded(COMMAND_CAPACITY);
+        let (speculative_tx, _speculative_rx) = bounded(SPECULATIVE_COMMAND_CAPACITY);
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let join = std::thread::spawn(move || {
             let _ = shutdown_rx.recv();
@@ -6161,9 +6838,13 @@ mod tests {
             worker_identity: Arc::new(WorkerIdentity),
             worker_id: "panicking-owner-test-worker".to_owned(),
             command_tx,
+            speculative_tx,
             shutdown_tx,
             closing: AtomicBool::new(false),
-            admission: Mutex::new(()),
+            admission: Arc::new(Mutex::new(())),
+            speculative_admission: Arc::new(SpeculativeAdmission::new(Arc::new(
+                SystemAdmissionClock::default(),
+            ))),
             requests: Arc::new(RequestRegistry::new()),
             status: Arc::new(RwLock::new(ResidentModelStatus {
                 model_id: "panicking-worker".to_string(),
@@ -6479,7 +7160,7 @@ mod tests {
 
     #[test]
     fn generic_cancel_cancels_embedding() {
-        let (handle, _command_rx) = test_admission_handle(
+        let (handle, _command_rx, _speculative_rx) = test_admission_handle(
             ResidentModelStatus {
                 model_id: "model".to_string(),
                 model_path: PathBuf::new(),
@@ -7718,9 +8399,13 @@ mod tests {
                 worker_identity: Arc::new(WorkerIdentity),
                 worker_id: "embedding-duplicate-test-worker".to_owned(),
                 command_tx,
+                speculative_tx: bounded(SPECULATIVE_COMMAND_CAPACITY).0,
                 shutdown_tx,
                 closing: AtomicBool::new(false),
-                admission: Mutex::new(()),
+                admission: Arc::new(Mutex::new(())),
+                speculative_admission: Arc::new(SpeculativeAdmission::new(Arc::new(
+                    SystemAdmissionClock::default(),
+                ))),
                 requests,
                 status: Arc::new(RwLock::new(ResidentModelStatus {
                     model_id: "model".to_string(),
@@ -7752,7 +8437,7 @@ mod tests {
             active_sequences: 0,
             max_sequences: 4,
         };
-        let (handle, command_rx) = test_admission_handle(status, COMMAND_CAPACITY);
+        let (handle, command_rx, _speculative_rx) = test_admission_handle(status, COMMAND_CAPACITY);
         let request = embedding_request("model", vec![1]);
 
         let ticket = handle
@@ -7790,7 +8475,7 @@ mod tests {
             active_sequences: 0,
             max_sequences: 4,
         };
-        let (handle, _command_rx) = test_admission_handle(status, 0);
+        let (handle, _command_rx, _speculative_rx) = test_admission_handle(status, 0);
         let error = handle
             .embed_batch(embedding_request("model", vec![1]))
             .expect_err("zero-capacity queue rejects without a waiting worker");

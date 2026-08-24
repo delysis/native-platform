@@ -7,6 +7,7 @@
 //! handles.
 
 use llama_native_cache::{CacheFingerprint, CacheOwnerScope, MemoryPrefixCache, PrefixCacheValue};
+pub use llama_native_engine::SpeculativeAdmissionStatus;
 use llama_native_engine::{
     GenerationTicket, JoinedNativeModel, NativeModelHandle, NativeModelOwner,
 };
@@ -536,6 +537,16 @@ impl NativeHost {
         Ok(slot_id.and_then(|slot_id| state.slots.get(&slot_id).map(|entry| entry.owner.handle())))
     }
 
+    /// Return the exact matching resident without loading or touching model
+    /// bytes. Digest assertions are checked against the resident fingerprint.
+    pub fn resident(
+        &self,
+        model: &NativeModelConfig,
+    ) -> Result<Option<NativeModelHandle>, NativeError> {
+        validate_digest_assertions(model)?;
+        self.resident_handle(model)
+    }
+
     fn with_load_gate<T>(
         &self,
         operation: impl FnOnce() -> Result<T, NativeError>,
@@ -563,6 +574,32 @@ impl NativeHost {
         request: GenerationBatchRequest,
     ) -> Result<GenerationTicket, NativeError> {
         self.acquire(model)?.generate_batch(request)
+    }
+
+    /// Submit speculative generation only when the exact requested resident is
+    /// already loaded. This path never triggers model loading.
+    pub fn generate_speculative(
+        &self,
+        model: NativeModelConfig,
+        request: GenerationRequest,
+    ) -> Result<GenerationTicket, NativeError> {
+        let handle = self.resident(&model)?.ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ModelNotLoaded,
+                "speculative generation requires an exact matching resident model",
+            )
+        })?;
+        handle.generate_speculative(request)
+    }
+
+    /// Read speculative availability for an exact resident without loading it.
+    pub fn speculative_admission_status(
+        &self,
+        model: &NativeModelConfig,
+    ) -> Result<Option<SpeculativeAdmissionStatus>, NativeError> {
+        Ok(self
+            .resident(model)?
+            .map(|handle| handle.speculative_admission_status()))
     }
 
     pub fn generate_shared_prefix(
@@ -1489,6 +1526,51 @@ mod tests {
         )
         .expect_err("a wrong assertion rejects the resident");
         assert_eq!(error.code, NativeErrorCode::ModelInvalid);
+    }
+
+    #[test]
+    fn resident_lookup_and_speculative_submission_never_load_missing_bytes() {
+        let host = NativeHost::new(NativeHostConfig::default());
+        let config = resident_test_config(None);
+        assert!(
+            host.resident(&config)
+                .expect("resident lookup validates without loading")
+                .is_none()
+        );
+        assert_eq!(
+            host.speculative_admission_status(&config)
+                .expect("status lookup is resident-only"),
+            None
+        );
+        let request = GenerationRequest {
+            request_id: "resident-only-speculative".to_owned(),
+            model_id: config.model_id.clone(),
+            input: llama_native_types::GenerationInput::Completion {
+                prompts: vec![llama_native_types::CompletionPrompt::Tokens { token_ids: vec![1] }],
+            },
+            sampling: llama_native_types::SamplingConfig::default(),
+            media: Vec::new(),
+            cached_prefix: None,
+        };
+        assert_eq!(
+            host.generate_speculative(config, request)
+                .expect_err("speculative host API never falls through to model loading")
+                .code,
+            NativeErrorCode::ModelNotLoaded
+        );
+    }
+
+    #[test]
+    fn resident_lookup_rejects_malformed_digest_without_file_access() {
+        let host = NativeHost::new(NativeHostConfig::default());
+        let mut config = resident_test_config(Some("NOT-A-DIGEST"));
+        config.model_path = PathBuf::from("/private/NEVER_STAT_THIS_MODEL.gguf");
+        assert_eq!(
+            host.resident(&config)
+                .expect_err("malformed resident assertion fails closed")
+                .code,
+            NativeErrorCode::InvalidConfig
+        );
     }
 
     #[test]
