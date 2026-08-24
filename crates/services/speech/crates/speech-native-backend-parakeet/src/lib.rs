@@ -1410,6 +1410,62 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use speech_native_types::{SpeechDeadlinePolicy, SpeechRequestContext, SpeechRoutingPolicy};
+    use std::sync::atomic::AtomicUsize;
+
+    fn fixture_pcm_format() -> PcmFormat {
+        PcmFormat {
+            sample_rate_hz: TARGET_SAMPLE_RATE,
+            channels: 1,
+            sample_format: PcmSampleFormat::I16Le,
+            interleaved: true,
+        }
+    }
+
+    fn complete_pcm_request(data: Vec<u8>) -> TranscriptionRequest {
+        TranscriptionRequest {
+            context: SpeechRequestContext {
+                request_id: SpeechRequestId("parakeet-characterization".to_owned()),
+                client_id: "test".to_owned(),
+                route: SpeechRouteSelector::ExactBackend {
+                    backend_id: PARAKEET_BACKEND_ID.to_owned(),
+                    model_id: Some(PARAKEET_MODEL_ID.to_owned()),
+                    voice_id: None,
+                },
+                routing: SpeechRoutingPolicy::default(),
+                deadline: SpeechDeadlinePolicy::default(),
+            },
+            input: TranscriptionInput::Complete {
+                audio: AudioInput::Pcm {
+                    format: fixture_pcm_format(),
+                    data,
+                },
+            },
+            language: Some("en".to_owned()),
+            task: TranscriptionTask::Transcribe,
+            timestamps: TimestampGranularity::None,
+            diarization: DiarizationPolicy::Disabled,
+            partial_results: false,
+            punctuation: true,
+            hotwords: Vec::new(),
+        }
+    }
+
+    fn temporary_fixture_root(label: &str) -> PathBuf {
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "speech-native-{label}-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn write_named_model_files(path: &Path) {
+        std::fs::create_dir_all(path).expect("create model fixture directory");
+        for filename in ["encoder.onnx", "decoder_joint.onnx", "tokenizer.json"] {
+            std::fs::write(path.join(filename), []).expect("write named model fixture file");
+        }
+    }
 
     #[test]
     fn i24_sign_extension_is_correct() {
@@ -1440,6 +1496,65 @@ mod tests {
         std::fs::create_dir_all(&path).expect("create fixture directory");
         assert!(!model_dir_is_complete(&path));
         std::fs::remove_dir_all(path).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn artifact_discovery_currently_trusts_mutable_ref_and_filenames_without_hash() {
+        let root = temporary_fixture_root("mutable-artifact-identity");
+        let repository = root.join("models--altunenes--parakeet-rs");
+        let first = repository
+            .join("snapshots")
+            .join("snapshot-a")
+            .join(PARAKEET_HF_SUBDIRECTORY);
+        let second = repository
+            .join("snapshots")
+            .join("snapshot-b")
+            .join(PARAKEET_HF_SUBDIRECTORY);
+        write_named_model_files(&first);
+        write_named_model_files(&second);
+        std::fs::create_dir_all(repository.join("refs")).expect("create fixture refs");
+
+        std::fs::write(repository.join("refs/main"), "snapshot-a\n")
+            .expect("point mutable ref at first snapshot");
+        assert_eq!(discover_in_hf_root(&root), Some(first.clone()));
+        std::fs::write(repository.join("refs/main"), "snapshot-b\n")
+            .expect("repoint mutable ref at second snapshot");
+        assert_eq!(discover_in_hf_root(&root), Some(second.clone()));
+        assert!(model_dir_is_complete(&first));
+        assert!(model_dir_is_complete(&second));
+        assert_eq!(
+            ready_descriptor().models[0].content_hash,
+            None,
+            "current ready identity records neither per-file nor combined content hash"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove artifact identity fixture");
+    }
+
+    #[test]
+    fn duration_limit_is_currently_a_post_decode_finalization_check() {
+        let request = complete_pcm_request(vec![0, 0]);
+        validate_request(&request).expect("request validation does not enforce duration");
+        let TranscriptionInput::Complete { audio } = &request.input else {
+            panic!("fixture is complete audio");
+        };
+        assert_eq!(
+            decode_complete(audio, &request.context.request_id)
+                .expect("decode occurs before duration rejection")
+                .len(),
+            1
+        );
+
+        let error = build_response(
+            &request,
+            String::new(),
+            MAX_AUDIO_MS + 1,
+            Instant::now(),
+            None,
+            resolved_route(),
+        )
+        .expect_err("duration is rejected only while building the final response");
+        assert_eq!(error.code, "parakeet_audio_too_long");
     }
 
     #[test]
@@ -1579,6 +1694,54 @@ mod tests {
             .await
             .expect_err("push after finish must fail");
         assert_eq!(error.code, "audio_stream_finished");
+    }
+
+    #[tokio::test]
+    async fn acknowledged_finish_currently_allows_a_waiting_push_to_deliver() {
+        let request_id = SpeechRequestId("finish-push-race".to_owned());
+        let (sender, mut receiver) = mpsc::channel(1);
+        let sink = StreamAudioSink {
+            request_id: request_id.clone(),
+            format: fixture_pcm_format(),
+            control: Arc::new(StreamControl {
+                sender: Mutex::new(Some(sender)),
+                finished: AtomicBool::new(false),
+            }),
+        };
+        let chunk = |sequence| AudioChunk {
+            sequence,
+            sample_offset: sequence,
+            format: sink.format,
+            data: vec![0, 0],
+            end_of_stream: false,
+        };
+        sink.push(chunk(0)).await.expect("fill bounded channel");
+
+        let waiting_push = sink.push(chunk(1));
+        tokio::pin!(waiting_push);
+        tokio::select! {
+            biased;
+            result = &mut waiting_push => panic!("second push unexpectedly completed: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        sink.finish().await.expect("finish is acknowledged");
+
+        assert_eq!(
+            receiver.recv().await.expect("receive first chunk").sequence,
+            0
+        );
+        let error = waiting_push
+            .await
+            .expect_err("waiting push reports the stream closed after sending");
+        assert_eq!(error.code, "audio_stream_closed");
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .expect("current sink delivers the late chunk after finish")
+                .sequence,
+            1
+        );
     }
 
     #[tokio::test]

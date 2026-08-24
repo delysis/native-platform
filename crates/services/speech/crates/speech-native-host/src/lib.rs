@@ -961,12 +961,14 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use speech_native_types::{
-        AlignmentGranularity, AudioOutputFormat, AudioOutputKind, CapabilityAvailability,
-        CapabilityEvidence, EvidenceKind, EvidenceOutcome, NetworkBehavior, SpeechBackendKind,
+        AcceptedAudio, AlignmentGranularity, AudioInput, AudioOutputFormat, AudioOutputKind,
+        CapabilityAvailability, CapabilityEvidence, DiarizationPolicy, EvidenceKind,
+        EvidenceOutcome, NetworkBehavior, PcmFormat, PcmSampleFormat, SpeechBackendKind,
         SpeechBackendReadiness, SpeechCancellation, SpeechCapability, SpeechCapabilityLimits,
         SpeechDeadlinePolicy, SpeechOperationCapability, SpeechRequestContext, SpeechResolvedRoute,
         SpeechRoutingPolicy, SpeechUsage, SynthesisCapabilities, SynthesisEvent, SynthesisInput,
-        SynthesisResponse, UsageProvenance, VoiceDescriptor, VoiceQuality, VoiceSelector,
+        SynthesisResponse, TimestampGranularity, TranscriptionCapabilities, TranscriptionInput,
+        TranscriptionTask, UsageProvenance, VoiceDescriptor, VoiceQuality, VoiceSelector,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{mpsc, oneshot};
@@ -986,6 +988,11 @@ mod tests {
         shutdown_calls: AtomicUsize,
         fail_shutdown: bool,
         panic_shutdown: bool,
+    }
+
+    struct DurationProbeBackend {
+        descriptor: SpeechBackendDescriptor,
+        calls: AtomicUsize,
     }
 
     struct DeferredCancellation {
@@ -1099,6 +1106,48 @@ mod tests {
 
         async fn shutdown(&self) -> Result<(), SpeechError> {
             self.shutdown_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SpeechBackend for DurationProbeBackend {
+        fn descriptor(&self) -> SpeechBackendDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn readiness(&self) -> SpeechBackendReadiness {
+            self.descriptor.readiness.clone()
+        }
+
+        async fn transcribe(
+            &self,
+            request: TranscriptionRequest,
+        ) -> Result<TranscriptionTicket, SpeechError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Err(SpeechError::unavailable(
+                &request.context.request_id,
+                "duration_probe_reached",
+                "fixture proves the host dispatched audio above the advertised duration limit",
+            ))
+        }
+
+        async fn synthesize(
+            &self,
+            request: SynthesisRequest,
+        ) -> Result<SynthesisTicket, SpeechError> {
+            Err(SpeechError::unavailable(
+                &request.context.request_id,
+                "fixture_synthesis_unsupported",
+                "fixture supports only transcription",
+            ))
+        }
+
+        fn cancel(&self, _request_id: &SpeechRequestId) -> usize {
+            0
+        }
+
+        async fn shutdown(&self) -> Result<(), SpeechError> {
             Ok(())
         }
     }
@@ -1282,12 +1331,60 @@ mod tests {
     }
 
     fn deferred_backend(id: &str) -> Arc<DeferredBackend> {
-        let descriptor = fixture_backend(id).descriptor();
+        deferred_backend_with_capacity(id, None)
+    }
+
+    fn deferred_backend_with_capacity(
+        id: &str,
+        max_concurrent_requests: Option<u32>,
+    ) -> Arc<DeferredBackend> {
+        let mut descriptor = fixture_backend(id).descriptor();
+        descriptor.capabilities[0].limits.max_concurrent_requests = max_concurrent_requests;
         Arc::new(DeferredBackend {
             descriptor,
             finals: Mutex::new(BTreeMap::new()),
             cancel_calls: Arc::new(AtomicUsize::new(0)),
             shutdown_calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn duration_probe_backend(id: &str, max_audio_ms: u64) -> Arc<DurationProbeBackend> {
+        Arc::new(DurationProbeBackend {
+            descriptor: SpeechBackendDescriptor {
+                id: id.to_owned(),
+                display_name: id.to_owned(),
+                kind: SpeechBackendKind::EmbeddedModel,
+                readiness: SpeechBackendReadiness::Ready,
+                capabilities: vec![SpeechCapability {
+                    id: format!("{id}.transcription"),
+                    backend_id: id.to_owned(),
+                    model_id: Some("fixture-transcription-model".to_owned()),
+                    operation: SpeechOperationCapability::Transcription(
+                        TranscriptionCapabilities {
+                            accepted_audio: vec![AcceptedAudio::Pcm],
+                            ..TranscriptionCapabilities::default()
+                        },
+                    ),
+                    availability: CapabilityAvailability::Available,
+                    network: NetworkBehavior::Never,
+                    languages: vec!["en".to_owned()],
+                    limits: SpeechCapabilityLimits {
+                        max_audio_ms: Some(max_audio_ms),
+                        ..SpeechCapabilityLimits::default()
+                    },
+                    evidence: vec![CapabilityEvidence {
+                        source_id: "fixture".to_owned(),
+                        source_version: Some("1".to_owned()),
+                        kind: EvidenceKind::RuntimeApi,
+                        outcome: EvidenceOutcome::Confirmed,
+                        observed_at_unix_ms: 1,
+                        detail: "duration preflight fixture".to_owned(),
+                    }],
+                }],
+                models: Vec::new(),
+                voices: Vec::new(),
+            },
+            calls: AtomicUsize::new(0),
         })
     }
 
@@ -1343,6 +1440,40 @@ mod tests {
         request
     }
 
+    fn exact_pcm_transcription_request(request_id: &str, backend_id: &str) -> TranscriptionRequest {
+        TranscriptionRequest {
+            context: SpeechRequestContext {
+                request_id: SpeechRequestId(request_id.to_owned()),
+                client_id: "test".to_owned(),
+                route: SpeechRouteSelector::ExactBackend {
+                    backend_id: backend_id.to_owned(),
+                    model_id: Some("fixture-transcription-model".to_owned()),
+                    voice_id: None,
+                },
+                routing: SpeechRoutingPolicy::default(),
+                deadline: SpeechDeadlinePolicy::default(),
+            },
+            input: TranscriptionInput::Complete {
+                audio: AudioInput::Pcm {
+                    format: PcmFormat {
+                        sample_rate_hz: 16_000,
+                        channels: 1,
+                        sample_format: PcmSampleFormat::I16Le,
+                        interleaved: true,
+                    },
+                    data: vec![0; 64],
+                },
+            },
+            language: Some("en".to_owned()),
+            task: TranscriptionTask::Transcribe,
+            timestamps: TimestampGranularity::None,
+            diarization: DiarizationPolicy::Disabled,
+            partial_results: false,
+            punctuation: true,
+            hotwords: Vec::new(),
+        }
+    }
+
     #[tokio::test]
     async fn service_plans_pins_and_executes_registered_backend() {
         let gateway = SpeechHost::default();
@@ -1367,6 +1498,121 @@ mod tests {
         assert_eq!(response.route.voice_id.as_deref(), Some("fixture-voice"));
         assert_eq!(terminal, 1);
         assert_eq!(backend.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_deadlines_are_currently_metadata_only_after_admission() {
+        let host = SpeechHost::default();
+        let backend = deferred_backend("deadline-metadata.tts");
+        host.register_backend(backend.clone())
+            .expect("register deferred backend");
+        let request_id = SpeechRequestId("deadline-metadata".to_owned());
+        let mut request = exact_request(&request_id.0, "deadline-metadata.tts");
+        request.context.deadline = SpeechDeadlinePolicy {
+            queue_ms: Some(1),
+            model_load_ms: Some(1),
+            first_result_ms: Some(1),
+            idle_stream_ms: Some(1),
+            total_ms: Some(1),
+        };
+
+        let ticket = host
+            .synthesize(request)
+            .await
+            .expect("current host admits request with deadline metadata");
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            host.lifecycle
+                .operations
+                .active_count()
+                .expect("read active operations"),
+            1,
+            "elapsed Tokio time does not currently enforce any request deadline"
+        );
+        backend.complete(&request_id);
+        ticket
+            .final_response()
+            .await
+            .expect("deferred response still succeeds after every configured deadline");
+    }
+
+    #[tokio::test]
+    async fn advertised_backend_capacity_is_currently_not_an_admission_gate() {
+        let host = SpeechHost::default();
+        let backend = deferred_backend_with_capacity("capacity-metadata.tts", Some(1));
+        host.register_backend(backend.clone())
+            .expect("register capacity fixture");
+        let first_id = SpeechRequestId("capacity-first".to_owned());
+        let second_id = SpeechRequestId("capacity-second".to_owned());
+
+        let first = host
+            .synthesize(exact_request(&first_id.0, "capacity-metadata.tts"))
+            .await
+            .expect("admit first request");
+        let second = host
+            .synthesize(exact_request(&second_id.0, "capacity-metadata.tts"))
+            .await
+            .expect("current host admits a second request above advertised capacity");
+
+        assert_eq!(backend.finals.lock().expect("lock fixture finals").len(), 2);
+        assert_eq!(
+            host.lifecycle
+                .operations
+                .active_count()
+                .expect("read active operations"),
+            2
+        );
+
+        backend.complete(&first_id);
+        backend.complete(&second_id);
+        first
+            .final_response()
+            .await
+            .expect("first fixture response");
+        second
+            .final_response()
+            .await
+            .expect("second fixture response");
+    }
+
+    #[tokio::test]
+    async fn advertised_audio_duration_is_currently_not_preflighted_by_the_host() {
+        let host = SpeechHost::default();
+        let backend = duration_probe_backend("duration-probe.asr", 1);
+        host.register_backend(backend.clone())
+            .expect("register duration fixture");
+        let request = exact_pcm_transcription_request("duration-over-limit", "duration-probe.asr");
+        let TranscriptionInput::Complete {
+            audio: AudioInput::Pcm { format, data },
+        } = &request.input
+        else {
+            panic!("duration fixture must be complete PCM");
+        };
+        let frames = data.len() / format.bytes_per_frame();
+        let duration_ms = u64::try_from(frames).expect("fixture frame count fits u64") * 1_000
+            / u64::from(format.sample_rate_hz);
+        assert_eq!(duration_ms, 2);
+
+        let error = match host.transcribe(request).await {
+            Err(error) => error,
+            Ok(_ticket) => panic!("fixture backend must return its observable probe error"),
+        };
+        let SpeechHostError::Backend { error } = error else {
+            panic!("expected backend probe error");
+        };
+        assert_eq!(error.code, "duration_probe_reached");
+        assert_eq!(backend.calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            host.lifecycle
+                .operations
+                .active_count()
+                .expect("read active operations"),
+            0,
+            "failed probe request is still finalized"
+        );
     }
 
     #[test]
