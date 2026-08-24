@@ -37,6 +37,13 @@ pub(crate) struct ModelCatalogEntry {
     compatibility: ModelCatalogCompatibility,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogModelIdentity {
+    pub(crate) catalog_id: &'static str,
+    pub(crate) model_sha256: &'static str,
+    pub(crate) model_file_bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct ModelCatalogLicense {
     spdx_id: &'static str,
@@ -98,6 +105,14 @@ pub(crate) fn embedded_model_catalog() -> ModelCatalogSnapshot {
     }
 }
 
+pub(crate) fn catalog_model_identity(catalog_id: &str) -> Option<CatalogModelIdentity> {
+    (catalog_id == GEMMA_CATALOG_ID).then_some(CatalogModelIdentity {
+        catalog_id: GEMMA_CATALOG_ID,
+        model_sha256: GEMMA_SHA256,
+        model_file_bytes: GEMMA_ARTIFACT_BYTES,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +143,14 @@ mod tests {
             model.compatibility.legacy_local_file_bytes,
             model.expected_bytes
         );
+        assert_eq!(
+            catalog_model_identity(GEMMA_CATALOG_ID),
+            Some(CatalogModelIdentity {
+                catalog_id: "google.gemma-4-12b-it-qat-q4_0",
+                model_sha256: "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+                model_file_bytes: 6_975_879_296,
+            })
+        );
+        assert_eq!(catalog_model_identity("unknown.catalog-model"), None);
     }
 }

@@ -44,6 +44,7 @@ const INDEPENDENT_COMMANDS = new Set([
   'model_download_status',
   'model_list',
   'model_load',
+  'model_load_catalog_candidate',
   'model_load_policy_candidate',
   'model_unload'
 ]);
@@ -317,6 +318,13 @@ export function chooseModel(): Promise<ModelCapabilitySummary | null> {
 
 export function loadModel(modelPath: string): Promise<ModelCapabilitySummary> {
   return call('model_load', { modelPath });
+}
+
+export function loadCatalogModelCandidate(
+  catalogId: string,
+  modelPath: string
+): Promise<ModelCapabilitySummary> {
+  return call('model_load_catalog_candidate', { catalogId, modelPath });
 }
 
 export function loadPolicyModelCandidate(

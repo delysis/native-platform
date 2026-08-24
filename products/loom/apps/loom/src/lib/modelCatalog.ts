@@ -92,6 +92,24 @@ export function legacyLocalCatalogMatch(
     model.file_bytes === entry.compatibility.legacy_local_file_bytes;
 }
 
+/**
+ * The renderer independently checks the exact identity returned by native
+ * catalog admission before it selects the model for the writing session.
+ */
+export function isVerifiedCatalogWriter(
+  entry: CuratedModelCatalogEntry,
+  model: ModelCapabilitySummary
+): boolean {
+  return model.local &&
+    model.loaded &&
+    model.header_verified &&
+    model.model_sha256 === entry.expected_sha256 &&
+    model.file_bytes === entry.expected_bytes &&
+    model.completion &&
+    model.output_tokens &&
+    !isVisionAdapter(model);
+}
+
 export function catalogDownloadRequest(entry: CuratedModelCatalogEntry): {
   url: string;
   fileName: string;

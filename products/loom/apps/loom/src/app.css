@@ -66,6 +66,7 @@ button:disabled { cursor: default; opacity: .45; }
 .mode-toggle { width: 27px; }
 .mode-toggle[aria-pressed="true"] { color: var(--ink); background: var(--chrome-hover); }
 .mode-toggle .markdown-monogram { font-size: 8px; font-weight: 800; letter-spacing: -.04em; }
+.suggestions-toggle { touch-action: manipulation; }
 .suggestions-toggle.active, .shuttle-toggle.active { color: var(--moss); background: color-mix(in srgb, var(--moss-soft) 72%, transparent); }
 .suggestions-toggle.preparing { color: #a16d22; }
 .suggestions-toggle svg { stroke-width: 1.2; }

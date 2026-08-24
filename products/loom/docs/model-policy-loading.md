@@ -35,16 +35,29 @@ Catalog display grants no network or model authority. The renderer validates
 the bounded snapshot before constructing the existing verified-download
 command, and only an explicit button press starts HTTPS access. Installation
 still requires the exact cold SHA-256 and GGUF checks, and use still requires
-native inspection. An existing local file with the same artifact name and byte
-length remains a legacy discovery hint only: it is prioritized for inspection
-but never inherits the catalog checksum. The older exact build-policy writer
-remains an independent fallback.
+native inspection through the catalog identity. Native admission re-hashes the
+canonical file against the embedded SHA-256 and byte length, rechecks the path
+binding around inspection, and requires the returned native descriptor to
+carry the same identity. The renderer compares that returned digest again
+before selecting the model. An existing local file with the same artifact name
+and byte length remains a legacy discovery hint only: it can offer the exact
+catalog-verification action but never enters generic admission or inherits the
+catalog checksum. The older exact build-policy writer remains an independent
+fallback.
+
+The autocomplete control remains a direct on/off switch. Its native context
+gesture (secondary click or touch/pen hold) and keyboard context gesture (Menu
+or Shift-F10) open the same local-model dialog exposed through Settings. The
+Settings gear remains present because it also owns the independent appearance
+choices.
 
 Appearance is a renderer preference with exactly three persisted values:
 `system`, `light`, and `dark`. Missing, invalid, or unavailable preference
 storage resolves to `system`; explicit light or dark remains selected across
 launches until the author explicitly chooses `system` again. It is not project
-or manuscript state.
+or manuscript state. A same-origin synchronous bootstrap applies the stored or
+system-resolved theme in the document head before application code and the
+first paint.
 
 ## Residual mutation limit
 

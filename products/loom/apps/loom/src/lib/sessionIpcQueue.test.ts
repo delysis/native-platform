@@ -22,6 +22,7 @@ import {
   getCompletionSnapshot,
   listCuratedModels,
   listModels,
+  loadCatalogModelCandidate,
   openDocument,
   previewDocumentReconciliation,
   revealDocument
@@ -68,6 +69,9 @@ describe('session IPC admission', () => {
       if (command === 'plugin:loom|model_catalog_list') {
         return Promise.resolve({ schema_version: 1, entries: [] });
       }
+      if (command === 'plugin:loom|model_load_catalog_candidate') {
+        return Promise.resolve({ model_id: 'catalog-model' });
+      }
       return Promise.resolve(null);
     });
 
@@ -75,6 +79,12 @@ describe('session IPC admission', () => {
     await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
     await expect(listCuratedModels()).resolves.toEqual({ schema_version: 1, entries: [] });
     expect(mocks.invoke).toHaveBeenLastCalledWith('plugin:loom|model_catalog_list', {});
+    await expect(loadCatalogModelCandidate('catalog-id', '/models/catalog.gguf'))
+      .resolves.toEqual({ model_id: 'catalog-model' });
+    expect(mocks.invoke).toHaveBeenLastCalledWith(
+      'plugin:loom|model_load_catalog_candidate',
+      { catalogId: 'catalog-id', modelPath: '/models/catalog.gguf' }
+    );
 
     projectRead.reject(new Error('done'));
     await expect(page).rejects.toThrow('done');

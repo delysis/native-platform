@@ -839,6 +839,32 @@ Denies the model_load command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-model-load-catalog-candidate`
+
+</td>
+<td>
+
+Enables the model_load_catalog_candidate command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-model-load-catalog-candidate`
+
+</td>
+<td>
+
+Denies the model_load_catalog_candidate command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-model-load-policy-candidate`
 
 </td>

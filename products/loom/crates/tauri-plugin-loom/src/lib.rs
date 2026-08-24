@@ -52,7 +52,7 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::model_catalog::{ModelCatalogSnapshot, embedded_model_catalog};
+use crate::model_catalog::{ModelCatalogSnapshot, catalog_model_identity, embedded_model_catalog};
 use crate::model_download::{
     ModelDownloadRegistry, ModelDownloadRegistryError, ModelDownloadSnapshot, ModelDownloadSpec,
     ModelLibraryError, ReservationOutcome, model_target_path, prepare_model_library,
@@ -1788,6 +1788,7 @@ impl Builder {
                 model_list,
                 model_choose,
                 model_load,
+                model_load_catalog_candidate,
                 model_load_policy_candidate,
                 model_unload,
                 model_download_start,
@@ -4101,10 +4102,37 @@ async fn model_load_policy_candidate<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ModelCapabilitySummary, IpcFailure> {
+    // Resolve authority before touching the renderer-supplied path. Unknown
+    // identities therefore cannot be used as filesystem-probing oracles.
+    let expectation = policy_writer_expectation(&state.build_model_policy, &profile_id)?;
+    model_load_exact_writer(expectation, model_path, app, state).await
+}
+
+/// Loads one local artifact through the exact identity embedded in the model
+/// catalog. A legacy filename/size discovery hint cannot reach generic model
+/// admission through this command.
+#[tauri::command]
+async fn model_load_catalog_candidate<R: Runtime>(
+    catalog_id: String,
+    model_path: String,
+    app: AppHandle<R>,
+    state: State<'_, PluginState>,
+) -> Result<ModelCapabilitySummary, IpcFailure> {
+    // Resolve catalog authority before touching the renderer-supplied path.
+    let expectation = catalog_writer_expectation(&catalog_id)?;
+    model_load_exact_writer(expectation, model_path, app, state).await
+}
+
+async fn model_load_exact_writer<R: Runtime>(
+    expectation: PolicyWriterExpectation,
+    model_path: String,
+    app: AppHandle<R>,
+    state: State<'_, PluginState>,
+) -> Result<ModelCapabilitySummary, IpcFailure> {
     let (model_load, plan) = {
         let application_admission = lock_application_admission(&state, "local model verification")?;
         let model_load = state.model_loads.reserve(&application_admission)?;
-        let plan = prepare_policy_model_load(&profile_id, &model_path, &state)?;
+        let plan = prepare_exact_model_load(expectation, &model_path, &state)?;
         (model_load, plan)
     };
     let (canonical_path, profile, expectation) = match plan {
@@ -4165,20 +4193,17 @@ async fn model_load_policy_candidate<R: Runtime>(
     .map_err(|error| {
         IpcFailure::new(
             "model_worker_failed",
-            format!("the policy model verification worker stopped: {error}"),
+            format!("the exact model verification worker stopped: {error}"),
             true,
         )
     })?
 }
 
-fn prepare_policy_model_load(
-    profile_id: &str,
+fn prepare_exact_model_load(
+    expectation: PolicyWriterExpectation,
     model_path: &str,
     state: &State<'_, PluginState>,
 ) -> Result<PolicyModelLoadPlan, IpcFailure> {
-    // Resolve the profile before touching the path so an unknown policy name
-    // cannot be used as a filesystem-probing oracle.
-    let expectation = policy_writer_expectation(&state.build_model_policy, profile_id)?;
     let requested = PathBuf::from(model_path);
     let canonical_path = requested.canonicalize().map_err(|error| {
         IpcFailure::new(
@@ -4271,6 +4296,31 @@ fn policy_writer_expectation(
         prompt_mode: writer.prompt_mode(),
         model_sha256: writer.model_sha256(),
         model_file_bytes: writer.model_file_bytes(),
+    })
+}
+
+fn catalog_writer_expectation(catalog_id: &str) -> Result<PolicyWriterExpectation, IpcFailure> {
+    let identity = catalog_model_identity(catalog_id).ok_or_else(|| {
+        IpcFailure::new(
+            "unknown_catalog_model",
+            "the requested model is not in this Loom catalog",
+            false,
+        )
+    })?;
+    let model_sha256 = identity.model_sha256.parse::<BlobId>().map_err(|_| {
+        IpcFailure::new(
+            "invalid_embedded_catalog_model",
+            "the embedded model catalog contains an invalid SHA-256 identity",
+            false,
+        )
+    })?;
+    Ok(PolicyWriterExpectation {
+        profile_id: identity.catalog_id.to_owned(),
+        rank: 0,
+        role: ModelRole::Writer,
+        prompt_mode: PromptMode::Completion,
+        model_sha256,
+        model_file_bytes: identity.model_file_bytes,
     })
 }
 
@@ -9561,6 +9611,31 @@ mod tests {
         assert_eq!(expected.rank, 0);
         assert_eq!(candidate.rank, expected.rank);
         assert_eq!(candidate.profile_id, expected.profile_id);
+    }
+
+    #[test]
+    fn catalog_candidate_requires_the_embedded_digest_before_admission() {
+        let expectation = catalog_writer_expectation("google.gemma-4-12b-it-qat-q4_0")
+            .expect("embedded catalog identity");
+        assert_eq!(expectation.profile_id, "google.gemma-4-12b-it-qat-q4_0");
+        assert_eq!(expectation.model_file_bytes, 6_975_879_296);
+        assert_eq!(
+            expectation.model_sha256.to_string(),
+            "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b"
+        );
+        assert_eq!(
+            catalog_writer_expectation("unknown.catalog-model")
+                .expect_err("unknown catalog identity must fail before path admission")
+                .code,
+            "unknown_catalog_model"
+        );
+
+        let path = Path::new("/tmp/catalog-writer.gguf");
+        let mut substituted = test_descriptor(path, &expectation, "substituted-catalog-model");
+        substituted.model_sha256 = BlobId::digest(b"same-size-substitution").to_string();
+        let error = validate_policy_model_descriptor(&substituted, path, &expectation)
+            .expect_err("catalog admission must reject a substituted digest");
+        assert_eq!(error.code, "policy_model_native_identity_mismatch");
     }
 
     #[test]

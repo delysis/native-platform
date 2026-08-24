@@ -6,6 +6,7 @@ import type {
 } from './types';
 import {
   catalogDownloadRequest,
+  isVerifiedCatalogWriter,
   legacyLocalCatalogMatch,
   validateCuratedModelCatalog
 } from './modelCatalog';
@@ -111,6 +112,28 @@ describe('curated model catalog', () => {
       model_path: `/models/mmproj-${entry.artifact_name}`
     }))).toBe(false);
     expect(localModel().model_sha256).toBeNull();
+  });
+
+  it('selects only the exact native-returned catalog digest and capabilities', () => {
+    const verified = localModel({
+      loaded: true,
+      completion: true,
+      output_tokens: true,
+      model_sha256: entry.expected_sha256
+    });
+    expect(isVerifiedCatalogWriter(entry, verified)).toBe(true);
+    expect(isVerifiedCatalogWriter(entry, {
+      ...verified,
+      model_sha256: '0'.repeat(64)
+    })).toBe(false);
+    expect(isVerifiedCatalogWriter(entry, {
+      ...verified,
+      file_bytes: entry.expected_bytes - 1
+    })).toBe(false);
+    expect(isVerifiedCatalogWriter(entry, {
+      ...verified,
+      output_tokens: false
+    })).toBe(false);
   });
 
   it('rejects any second curated identity in schema version one', () => {

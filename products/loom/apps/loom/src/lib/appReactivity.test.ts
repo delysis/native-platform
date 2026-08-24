@@ -109,10 +109,20 @@ describe('App ghost reactivity wiring', () => {
     expect(source).not.toContain('>Shuttle</button>');
     const toggle = source.slice(
       source.indexOf('async function toggleSuggestionsFromTitlebar'),
-      source.indexOf('function focusableElementsWithin')
+      source.indexOf('function clearAutocompleteModelMenuLongPress')
     );
     expect(toggle).toContain('setSuggestionsEnabled(!suggestionsEnabled)');
     expect(toggle).not.toContain('openModelManager');
+    const modelMenu = source.slice(
+      source.indexOf('function clearAutocompleteModelMenuLongPress'),
+      source.indexOf('function focusableElementsWithin')
+    );
+    expect(modelMenu).toContain('isAutocompleteModelMenuKey(event)');
+    expect(modelMenu).toContain('openModelManager(event.currentTarget as HTMLButtonElement)');
+    expect(modelMenu).toContain('AUTOCOMPLETE_MODEL_MENU_LONG_PRESS_MS');
+    expect(source).toContain('on:contextmenu={openAutocompleteModelMenu}');
+    expect(source).toContain('aria-keyshortcuts="Shift+F10"');
+    expect(source).toContain('class="titlebar-button gear-button"');
     expect(source).not.toContain('class="writer-onboarding"');
     expect(source).not.toContain('Set up private writing suggestions');
     expect(source).toContain('class="model-setup-callout"');
@@ -133,10 +143,20 @@ describe('App ghost reactivity wiring', () => {
       source.indexOf('function setAppearance'),
       source.indexOf('function startTitlebarDrag')
     );
+    const catalogAdmission = source.slice(
+      source.indexOf('async function activateSuggestionWriter'),
+      source.indexOf('async function chooseSuggestionWriterModel')
+    );
 
     expect(catalogLoad).toContain('validateCuratedModelCatalog(await listCuratedModels())');
     expect(catalogDownload).toContain('catalogDownloadRequest(entry)');
     expect(catalogDownload).toContain('pendingModelDownload = { commandId: newUlid(), ...request }');
+    expect(catalogAdmission).toContain(
+      'await loadCatalogModelCandidate(catalogEntry.catalog_id, selected.model_path)'
+    );
+    expect(catalogAdmission).toContain('!isVerifiedCatalogWriter(catalogEntry, loaded)');
+    expect(source).toContain('useCatalogSuggestionWriter(entry, installed)');
+    expect(source).not.toContain('useDiscoveredSuggestionWriter(installed)');
     expect(appearance).toContain('persistAppearancePreference(window, next)');
     expect(source).toContain("{#each ['system', 'light', 'dark'] as choice}");
   });
@@ -259,7 +279,9 @@ describe('App ghost reactivity wiring', () => {
     expect(arm).not.toContain('!currentModel');
     expect(start).toContain('retainsScheduledCompletion(completionLifecycle)');
     expect(start).not.toContain("saveState === 'dirty'");
-    expect(source).toContain('aria-describedby="completion-lifecycle-help"');
+    expect(source).toContain(
+      'aria-describedby="completion-lifecycle-help autocomplete-model-menu-help"'
+    );
     expect(source).toContain('{completionLifecycleHelp}</span>');
   });
 

@@ -30,6 +30,7 @@
     listenForFileCommands,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
+    loadCatalogModelCandidate,
     loadModel,
     loadPolicyModelCandidate,
     listCuratedModels,
@@ -128,9 +129,16 @@
   } from './lib/appearance';
   import {
     catalogDownloadRequest,
+    isVerifiedCatalogWriter,
     legacyLocalCatalogMatch,
     validateCuratedModelCatalog
   } from './lib/modelCatalog';
+  import {
+    AUTOCOMPLETE_MODEL_MENU_LONG_PRESS_MS,
+    autocompleteModelMenuLongPressMoved,
+    canStartAutocompleteModelMenuLongPress,
+    isAutocompleteModelMenuKey
+  } from './lib/autocompleteModelMenu';
   import {
     captureProjectCloseAgency,
     restoreProjectCloseAgency,
@@ -339,6 +347,15 @@
   let appliedNativeTitle = '';
   let suggestionsEnabled = false;
   let suggestionsChanging = false;
+  let autocompleteModelMenuLongPressTimer: number | undefined;
+  let autocompleteModelMenuLongPress: {
+    pointerId: number;
+    x: number;
+    y: number;
+    trigger: HTMLButtonElement;
+  } | null = null;
+  let suppressAutocompleteToggleClick = false;
+  let suppressAutocompleteToggleClickTimer: number | undefined;
   let suggestionsIdleTimer: number | undefined;
   let suggestionWakeQueued = false;
   let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
@@ -1051,6 +1068,11 @@
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
       appearanceMedia?.removeEventListener('change', syncSystemAppearance);
       appearanceMedia = null;
+      clearAutocompleteModelMenuLongPress();
+      if (suppressAutocompleteToggleClickTimer !== undefined) {
+        window.clearTimeout(suppressAutocompleteToggleClickTimer);
+        suppressAutocompleteToggleClickTimer = undefined;
+      }
       clearDocumentContextLongPress();
       if (documentContextSuppressClickTimer !== undefined) {
         window.clearTimeout(documentContextSuppressClickTimer);
@@ -1691,13 +1713,7 @@
   function loadedCatalogModel(
     entry: CuratedModelCatalogEntry
   ): ModelCapabilitySummary | undefined {
-    return models.find((model) =>
-      model.loaded &&
-      model.local &&
-      model.header_verified &&
-      model.model_sha256 === entry.expected_sha256 &&
-      model.file_bytes === entry.expected_bytes
-    );
+    return models.find((model) => isVerifiedCatalogWriter(entry, model));
   }
 
   function catalogDownload(
@@ -3124,6 +3140,97 @@
     else visualEditor?.focusCurrentSelection();
   }
 
+  function clearAutocompleteModelMenuLongPress(): void {
+    if (autocompleteModelMenuLongPressTimer !== undefined) {
+      window.clearTimeout(autocompleteModelMenuLongPressTimer);
+      autocompleteModelMenuLongPressTimer = undefined;
+    }
+    const pending = autocompleteModelMenuLongPress;
+    if (pending?.trigger.hasPointerCapture(pending.pointerId)) {
+      pending.trigger.releasePointerCapture(pending.pointerId);
+    }
+    autocompleteModelMenuLongPress = null;
+  }
+
+  function suppressNextAutocompleteToggleClick(): void {
+    suppressAutocompleteToggleClick = true;
+    if (suppressAutocompleteToggleClickTimer !== undefined) {
+      window.clearTimeout(suppressAutocompleteToggleClickTimer);
+    }
+    suppressAutocompleteToggleClickTimer = window.setTimeout(() => {
+      suppressAutocompleteToggleClick = false;
+      suppressAutocompleteToggleClickTimer = undefined;
+    }, 1_000);
+  }
+
+  function handleAutocompleteToggleClick(event: MouseEvent): void {
+    if (suppressAutocompleteToggleClick) {
+      event.preventDefault();
+      event.stopPropagation();
+      suppressAutocompleteToggleClick = false;
+      if (suppressAutocompleteToggleClickTimer !== undefined) {
+        window.clearTimeout(suppressAutocompleteToggleClickTimer);
+        suppressAutocompleteToggleClickTimer = undefined;
+      }
+      return;
+    }
+    void toggleSuggestionsFromTitlebar();
+  }
+
+  function openAutocompleteModelMenu(event: MouseEvent | KeyboardEvent): void {
+    event.preventDefault();
+    event.stopPropagation();
+    clearAutocompleteModelMenuLongPress();
+    openModelManager(event.currentTarget as HTMLButtonElement);
+  }
+
+  function handleAutocompleteModelMenuKey(event: KeyboardEvent): void {
+    if (isAutocompleteModelMenuKey(event)) openAutocompleteModelMenu(event);
+  }
+
+  function beginAutocompleteModelMenuLongPress(event: PointerEvent): void {
+    if (!canStartAutocompleteModelMenuLongPress(event)) return;
+    clearAutocompleteModelMenuLongPress();
+    const trigger = event.currentTarget as HTMLButtonElement;
+    const pending = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      trigger
+    };
+    autocompleteModelMenuLongPress = pending;
+    try {
+      trigger.setPointerCapture(event.pointerId);
+    } catch {
+      // A detached titlebar button cancels through the identity check below.
+    }
+    autocompleteModelMenuLongPressTimer = window.setTimeout(() => {
+      autocompleteModelMenuLongPressTimer = undefined;
+      if (autocompleteModelMenuLongPress !== pending || !pending.trigger.isConnected) {
+        clearAutocompleteModelMenuLongPress();
+        return;
+      }
+      clearAutocompleteModelMenuLongPress();
+      suppressNextAutocompleteToggleClick();
+      openModelManager(pending.trigger);
+    }, AUTOCOMPLETE_MODEL_MENU_LONG_PRESS_MS);
+  }
+
+  function updateAutocompleteModelMenuLongPress(event: PointerEvent): void {
+    const pending = autocompleteModelMenuLongPress;
+    if (!pending || pending.pointerId !== event.pointerId) return;
+    if (autocompleteModelMenuLongPressMoved(
+      { x: pending.x, y: pending.y },
+      { x: event.clientX, y: event.clientY }
+    )) clearAutocompleteModelMenuLongPress();
+  }
+
+  function finishAutocompleteModelMenuLongPress(event: PointerEvent): void {
+    if (autocompleteModelMenuLongPress?.pointerId === event.pointerId) {
+      clearAutocompleteModelMenuLongPress();
+    }
+  }
+
   function focusableElementsWithin(container: HTMLElement): HTMLElement[] {
     return Array.from(container.querySelectorAll<HTMLElement>(
       'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [href], [tabindex]:not([tabindex="-1"])'
@@ -3251,9 +3358,15 @@
 
   async function activateSuggestionWriter(
     selected: ModelCapabilitySummary,
-    captured: WorkspaceRestoreCapture
+    captured: WorkspaceRestoreCapture,
+    catalogEntry: CuratedModelCatalogEntry | null = null
   ): Promise<boolean> {
     if (modelLoading || modelUnloading || !workspaceRestoreIsCurrent(captured)) return false;
+    if (catalogEntry && !legacyLocalCatalogMatch(catalogEntry, selected)) {
+      modelSetupError = 'That local file no longer matches the embedded catalog hint.';
+      announce('The catalog model changed before verification');
+      return false;
+    }
     const policyCandidate = selected.policy_candidate;
     if (looksLikeVisionAdapter(selected)) {
       modelSetupError = 'That file is a vision or projector adapter, not a standalone writing model.';
@@ -3268,18 +3381,22 @@
     modelSetupError = '';
     announce('Inspecting the writing model locally');
     try {
-      const loaded = policyCandidate
-        ? await loadPolicyModelCandidate(policyCandidate.profile_id, selected.model_path)
-        : await loadModel(selected.model_path);
+      const loaded = catalogEntry
+        ? await loadCatalogModelCandidate(catalogEntry.catalog_id, selected.model_path)
+        : policyCandidate
+          ? await loadPolicyModelCandidate(policyCandidate.profile_id, selected.model_path)
+          : await loadModel(selected.model_path);
       if (
         !componentMounted ||
         !applicationAllowsModelPreparation(applicationClosePhase) ||
         loadSerial !== modelLoadSerial ||
         !workspaceRestoreIsCurrent(captured)
       ) return false;
-      if (policyCandidate
-        ? !isVerifiedPolicyWriter(loaded, policyCandidate.profile_id)
-        : !isUsableSuggestionWriter(loaded)) {
+      if (catalogEntry
+        ? !isVerifiedCatalogWriter(catalogEntry, loaded)
+        : policyCandidate
+          ? !isVerifiedPolicyWriter(loaded, policyCandidate.profile_id)
+          : !isUsableSuggestionWriter(loaded)) {
         throw new Error('Native inspection did not find a text-completion model suitable for writing suggestions.');
       }
       if (!(await installLoadedModel(loaded, true, captured))) {
@@ -3342,6 +3459,15 @@
     const captured = currentWorkspaceCapture();
     if (!captured) return;
     await activateSuggestionWriter(model, captured);
+  }
+
+  async function useCatalogSuggestionWriter(
+    entry: CuratedModelCatalogEntry,
+    model: ModelCapabilitySummary
+  ): Promise<void> {
+    const captured = currentWorkspaceCapture();
+    if (!captured) return;
+    await activateSuggestionWriter(model, captured, entry);
   }
 
   async function unloadCurrentModel(): Promise<void> {
@@ -6519,15 +6645,25 @@
           class="titlebar-button suggestions-toggle"
           type="button"
           aria-label={suggestionsEnabled ? 'Turn autocomplete off' : 'Turn autocomplete on'}
-          aria-describedby="completion-lifecycle-help"
+          aria-describedby="completion-lifecycle-help autocomplete-model-menu-help"
+          aria-haspopup="dialog"
+          aria-keyshortcuts="Shift+F10"
           aria-pressed={suggestionsEnabled}
-          title={suggestionsEnabled ? `Autocomplete: ${suggestionMenuState}` : 'Autocomplete: Off'}
+          title={`${suggestionsEnabled ? `Autocomplete: ${suggestionMenuState}` : 'Autocomplete: Off'} · right-click or hold for models`}
           disabled={!project || suggestionsChanging}
-          on:click={() => void toggleSuggestionsFromTitlebar()}
+          on:click={handleAutocompleteToggleClick}
+          on:contextmenu={openAutocompleteModelMenu}
+          on:keydown={handleAutocompleteModelMenuKey}
+          on:pointerdown={beginAutocompleteModelMenuLongPress}
+          on:pointermove={updateAutocompleteModelMenuLongPress}
+          on:pointerup={finishAutocompleteModelMenuLongPress}
+          on:pointercancel={finishAutocompleteModelMenuLongPress}
+          on:lostpointercapture={finishAutocompleteModelMenuLongPress}
         >
           <svg aria-hidden="true" viewBox="0 0 18 18"><path d="m9 2 .65 2.1L12 5l-2.35.9L9 8l-.65-2.1L6 5l2.35-.9L9 2ZM4.4 8.4l.45 1.45 1.55.55-1.55.55-.45 1.45-.45-1.45-1.55-.55 1.55-.55.45-1.45ZM12.4 9.2l.85 2.55 2.55.85-2.55.85L12.4 16l-.85-2.55L9 12.6l2.55-.85.85-2.55Z"/></svg>
         </button>
         <span id="completion-lifecycle-help" class="sr-only">{completionLifecycleHelp}</span>
+        <span id="autocomplete-model-menu-help" class="sr-only">Right-click, touch and hold, or press the Menu key or Shift F10 to open local writing model setup.</span>
         <button
           class:active={shuttleEnabled}
           class:preparing={shuttleEnabled && !currentModel}
@@ -7009,7 +7145,7 @@
                       <button
                         class="primary-button compact"
                         type="button"
-                        on:click={() => void useDiscoveredSuggestionWriter(installed)}
+                        on:click={() => void useCatalogSuggestionWriter(entry, installed)}
                         disabled={!desktop || modelLoading || modelChoosing || modelUnloading}
                       >{modelLoading && selectedModelPath === installed.model_path ? 'Verifying…' : 'Verify local copy'}</button>
                     {:else if transfer?.status.status === 'completed'}
