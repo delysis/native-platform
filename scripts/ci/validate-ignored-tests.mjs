@@ -16,6 +16,7 @@ export const CARGO_BUILD_ARGUMENTS = [
   "--message-format=json-render-diagnostics",
 ];
 export const TEST_HARNESS_LIST_ARGUMENTS = ["--ignored", "--list"];
+export const TEST_HARNESS_TIMEOUT_MS = 30_000;
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -134,6 +135,28 @@ function workspacePackageRoots(metadata) {
   );
 }
 
+export function assertNoCustomHarnessManifest(manifestSource, label = "Cargo.toml") {
+  assert(
+    !/\\(?:u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})/.test(manifestSource),
+    `${label}: TOML Unicode escapes are prohibited by the default-libtest policy`,
+  );
+  assert(
+    !/(^|[^A-Za-z0-9_-])harness(?=$|[^A-Za-z0-9_-])/.test(manifestSource),
+    `${label}: explicit Cargo harness configuration is prohibited; standard libtest is required`,
+  );
+}
+
+function validateWorkspaceLibtestManifests(metadata, repoRoot) {
+  const manifests = new Set(
+    [...workspacePackages(metadata).values()].map((candidate) => candidate.manifest_path),
+  );
+  for (const manifest of manifests) {
+    const relative = repoRelative(repoRoot, manifest);
+    assertNoCustomHarnessManifest(fs.readFileSync(manifest, "utf8"), relative);
+  }
+  return manifests.size;
+}
+
 function validateCargoTargets(registry, metadata, repoRoot) {
   assert(Array.isArray(registry.cargo_targets), "cargo_targets must be an array");
   const packages = workspacePackages(metadata);
@@ -141,12 +164,23 @@ function validateCargoTargets(registry, metadata, repoRoot) {
   const identities = [];
 
   for (const target of registry.cargo_targets) {
-    for (const field of ["package", "selector", "name", "src_path", "manifest_path"]) {
+    for (const field of [
+      "package",
+      "selector",
+      "name",
+      "src_path",
+      "manifest_path",
+      "harness",
+    ]) {
       assert(
         typeof target[field] === "string" && target[field].trim(),
         `Cargo target is missing ${field}`,
       );
     }
+    assert(
+      target.harness === "libtest",
+      `${target.package}:${target.selector}: only the standard libtest harness is supported`,
+    );
     assert(
       Array.isArray(target.kinds) && target.kinds.length > 0,
       `${target.package}:${target.selector}: kinds must be a non-empty array`,
@@ -187,6 +221,29 @@ function validateCargoTargets(registry, metadata, repoRoot) {
       `${reference}: Cargo target not found for name=${target.name}, ` +
         `kinds=${target.kinds.join("+")}, src_path=${target.src_path}`,
     );
+    const [metadataTarget] = matches;
+    assert(
+      metadataTarget.test === true,
+      `${reference}: Cargo metadata does not enable this target for standard tests`,
+    );
+    assert(
+      !metadataTarget.kind.includes("custom-build"),
+      `${reference}: build-script targets cannot own ignored libtest entries`,
+    );
+    if (target.selector === "lib") {
+      assert(
+        metadataTarget.kind.some((kind) =>
+          ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"].includes(kind),
+        ),
+        `${reference}: lib selector does not resolve to a library target`,
+      );
+    } else {
+      assert(
+        target.selector === `test:${target.name}` &&
+          JSON.stringify(metadataTarget.kind) === JSON.stringify(["test"]),
+        `${reference}: only exact test:<name> integration selectors are supported`,
+      );
+    }
 
     references.set(reference, target);
     identities.push(targetIdentityKey(expectedIdentity));
@@ -198,6 +255,263 @@ function validateCargoTargets(registry, metadata, repoRoot) {
     `Cargo target identities have multiple selectors: ${duplicateIdentities.join(", ")}`,
   );
   return references;
+}
+
+function isRustIdentifierStart(character) {
+  return character !== undefined && /[A-Za-z_]/.test(character);
+}
+
+function isRustIdentifierContinue(character) {
+  return character !== undefined && /[A-Za-z0-9_]/.test(character);
+}
+
+function rawStringPrefixLength(source, offset) {
+  if (source[offset] === "r") return 1;
+  if (["b", "c"].includes(source[offset]) && source[offset + 1] === "r") return 2;
+  return 0;
+}
+
+function tokenizeRust(source, label) {
+  const tokens = [];
+  let offset = 0;
+  while (offset < source.length) {
+    const character = source[offset];
+    if (/\s/.test(character)) {
+      offset += 1;
+      continue;
+    }
+    if (source.startsWith("//", offset)) {
+      offset = source.indexOf("\n", offset + 2);
+      if (offset === -1) break;
+      continue;
+    }
+    if (source.startsWith("/*", offset)) {
+      let depth = 1;
+      offset += 2;
+      while (offset < source.length && depth > 0) {
+        if (source.startsWith("/*", offset)) {
+          depth += 1;
+          offset += 2;
+        } else if (source.startsWith("*/", offset)) {
+          depth -= 1;
+          offset += 2;
+        } else {
+          offset += 1;
+        }
+      }
+      assert(depth === 0, `${label}: unterminated Rust block comment`);
+      continue;
+    }
+
+    const rawPrefix = rawStringPrefixLength(source, offset);
+    if (rawPrefix > 0) {
+      let cursor = offset + rawPrefix;
+      let hashes = 0;
+      while (source[cursor] === "#") {
+        hashes += 1;
+        cursor += 1;
+      }
+      if (source[cursor] === '"') {
+        const terminator = `"${"#".repeat(hashes)}`;
+        const end = source.indexOf(terminator, cursor + 1);
+        assert(end !== -1, `${label}: unterminated Rust raw string`);
+        tokens.push({ kind: "string", value: "string" });
+        offset = end + terminator.length;
+        continue;
+      }
+    }
+
+    const stringPrefix = ["b", "c"].includes(character) && source[offset + 1] === '"' ? 1 : 0;
+    if (character === '"' || stringPrefix > 0) {
+      let cursor = offset + stringPrefix + 1;
+      let closed = false;
+      while (cursor < source.length) {
+        if (source[cursor] === "\\") {
+          cursor += 2;
+        } else if (source[cursor] === '"') {
+          cursor += 1;
+          closed = true;
+          break;
+        } else {
+          cursor += 1;
+        }
+      }
+      assert(closed, `${label}: unterminated Rust string`);
+      tokens.push({ kind: "string", value: "string" });
+      offset = cursor;
+      continue;
+    }
+
+    const charPrefix = character === "b" && source[offset + 1] === "'" ? 1 : 0;
+    if (character === "'" || charPrefix > 0) {
+      const start = offset + charPrefix;
+      let cursor = start + 1;
+      if (source[cursor] === "\\") cursor += 2;
+      else cursor += 1;
+      if (source[cursor] === "'") {
+        tokens.push({ kind: "char", value: "char" });
+        offset = cursor + 1;
+        continue;
+      }
+    }
+
+    if (
+      character === "r" &&
+      source[offset + 1] === "#" &&
+      isRustIdentifierStart(source[offset + 2])
+    ) {
+      let cursor = offset + 3;
+      while (isRustIdentifierContinue(source[cursor])) cursor += 1;
+      tokens.push({
+        kind: "identifier",
+        value: source.slice(offset + 2, cursor),
+        raw: true,
+      });
+      offset = cursor;
+      continue;
+    }
+    if (isRustIdentifierStart(character)) {
+      let cursor = offset + 1;
+      while (isRustIdentifierContinue(source[cursor])) cursor += 1;
+      tokens.push({
+        kind: "identifier",
+        value: source.slice(offset, cursor),
+        raw: false,
+      });
+      offset = cursor;
+      continue;
+    }
+
+    tokens.push({ kind: "punctuation", value: character });
+    offset += 1;
+  }
+  return tokens;
+}
+
+function rustAttributes(tokens, label) {
+  const attributes = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (tokens[index].value !== "#") continue;
+    let cursor = index + 1;
+    const inner = tokens[cursor]?.value === "!";
+    if (inner) cursor += 1;
+    if (tokens[cursor]?.value !== "[") continue;
+
+    let depth = 1;
+    const contents = [];
+    cursor += 1;
+    for (; cursor < tokens.length && depth > 0; cursor += 1) {
+      if (tokens[cursor].value === "[") depth += 1;
+      if (tokens[cursor].value === "]") depth -= 1;
+      if (depth > 0) contents.push(tokens[cursor]);
+    }
+    assert(depth === 0, `${label}: unterminated Rust attribute`);
+
+    const identifiers = contents.filter((token) => token.kind === "identifier");
+    const head = identifiers[0];
+    const pathIdentifiers = [];
+    for (const token of contents) {
+      if (["(", "="].includes(token.value)) break;
+      if (token.kind === "identifier") pathIdentifiers.push(token);
+    }
+    const canonicalIgnore =
+      !inner &&
+      contents.length === 3 &&
+      head?.value === "ignore" &&
+      head.raw === false &&
+      contents[1].value === "=" &&
+      contents[2].kind === "string";
+    attributes.push({
+      start: index,
+      end: cursor - 1,
+      inner,
+      canonical_ignore: canonicalIgnore,
+      contains_ignore: identifiers.some((token) => token.value === "ignore"),
+      test_marker:
+        (JSON.stringify(pathIdentifiers.map((token) => token.value)) ===
+          JSON.stringify(["test"]) ||
+          JSON.stringify(pathIdentifiers.map((token) => token.value)) ===
+            JSON.stringify(["tokio", "test"])) &&
+        pathIdentifiers.every((token) => token.raw === false),
+    });
+    index = cursor - 1;
+  }
+  return attributes;
+}
+
+function macroTokenRanges(tokens, label) {
+  const closing = { "(": ")", "[": "]", "{": "}" };
+  const ranges = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (tokens[index].value !== "!") continue;
+    let open = index + 1;
+    if (
+      tokens[index - 1]?.value === "macro_rules" &&
+      tokens[open]?.kind === "identifier"
+    ) {
+      open += 1;
+    }
+    const expectedClose = closing[tokens[open]?.value];
+    if (!expectedClose) continue;
+
+    const stack = [expectedClose];
+    let cursor = open + 1;
+    for (; cursor < tokens.length && stack.length > 0; cursor += 1) {
+      const nextClose = closing[tokens[cursor].value];
+      if (nextClose) stack.push(nextClose);
+      else if (tokens[cursor].value === stack.at(-1)) stack.pop();
+    }
+    assert(stack.length === 0, `${label}: unterminated Rust macro token tree`);
+    ranges.push({ start: open, end: cursor - 1 });
+  }
+  return ranges;
+}
+
+export function discoverCanonicalIgnoredTests(source, label = "Rust source") {
+  const tokens = tokenizeRust(source, label);
+  const attributes = rustAttributes(tokens, label);
+  const macroRanges = macroTokenRanges(tokens, label);
+  const groups = [];
+  for (const attribute of attributes) {
+    const current = groups.at(-1);
+    if (current && current.at(-1).end + 1 === attribute.start) current.push(attribute);
+    else groups.push([attribute]);
+  }
+
+  const tests = [];
+  for (const group of groups) {
+    if (!group.some((attribute) => attribute.contains_ignore)) continue;
+    assert(
+      !macroRanges.some(
+        (range) => group[0].start > range.start && group[0].start < range.end,
+      ),
+      `${label}: macro-generated ignored tests are prohibited`,
+    );
+    for (const attribute of group) {
+      assert(
+        !attribute.contains_ignore || attribute.canonical_ignore,
+        `${label}: noncanonical ignore syntax is prohibited`,
+      );
+    }
+    const ignored = group.filter((attribute) => attribute.canonical_ignore);
+    assert(ignored.length === 1, `${label}: exactly one canonical ignore attribute is required`);
+    assert(
+      group.some((attribute) => attribute.test_marker),
+      `${label}: canonical ignore must accompany an explicit test attribute`,
+    );
+
+    let cursor = group.at(-1).end + 1;
+    assert(tokens[cursor]?.value !== "pub", `${label}: ignored tests must be private functions`);
+    if (tokens[cursor]?.value === "async") cursor += 1;
+    assert(
+      tokens[cursor]?.value === "fn" &&
+        tokens[cursor + 1]?.kind === "identifier" &&
+        tokens[cursor + 1]?.raw === false,
+      `${label}: canonical ignore must annotate a private fn or async fn`,
+    );
+    tests.push(tokens[cursor + 1].value);
+  }
+  return tests;
 }
 
 function ignoredTestsInSource(repoRoot, packageRoots) {
@@ -213,14 +527,13 @@ function ignoredTestsInSource(repoRoot, packageRoots) {
   for (const packageRoot of new Set(packageRoots.values())) visit(packageRoot);
 
   const results = [];
-  const pattern =
-    /#\[ignore(?:\s*=\s*"[^"]*")?\]\s*(?:#\[[^\]]+\]\s*)*(?:async\s+)?fn\s+([A-Za-z0-9_]+)/g;
   for (const source of rustFiles) {
     const sourceText = fs.readFileSync(source, "utf8");
-    for (const match of sourceText.matchAll(pattern)) {
+    const relative = repoRelative(repoRoot, source);
+    for (const functionName of discoverCanonicalIgnoredTests(sourceText, relative)) {
       results.push({
-        source: repoRelative(repoRoot, source),
-        function_name: match[1],
+        source: relative,
+        function_name: functionName,
       });
     }
   }
@@ -252,6 +565,7 @@ export function validateRegistry({ registry, metadata, repoRoot }) {
   );
 
   const packageRoots = workspacePackageRoots(metadata);
+  const libtestManifestCount = validateWorkspaceLibtestManifests(metadata, repoRoot);
   const cargoTargets = validateCargoTargets(registry, metadata, repoRoot);
   const entryKeys = registry.entries.map(
     (entry) => `${entry.package}:${entry.target}:${entry.test_id}`,
@@ -315,10 +629,9 @@ export function validateRegistry({ registry, metadata, repoRoot }) {
     assert(fs.existsSync(source), `${entry.test_id}: missing source ${entry.source}`);
     const sourceText = fs.readFileSync(source, "utf8");
     const functionName = entry.test_id.split("::").at(-1);
-    assert(sourceText.includes("#[ignore"), `${entry.test_id}: source has no ignored test`);
     assert(
-      new RegExp(`\\bfn\\s+${functionName}\\b`).test(sourceText),
-      `${entry.test_id}: source does not contain the named function`,
+      discoverCanonicalIgnoredTests(sourceText, entry.source).includes(functionName),
+      `${entry.test_id}: source does not contain the canonical ignored function`,
     );
   }
 
@@ -352,6 +665,7 @@ export function validateRegistry({ registry, metadata, repoRoot }) {
     registry_count: registry.entries.length,
     source_ignored_count: sourceIgnored.length,
     cargo_target_count: cargoTargets.size,
+    default_libtest_manifest_count: libtestManifestCount,
     platform_counts: Object.fromEntries(
       SUPPORTED_PLATFORMS.map((platform) => [
         platform,
@@ -414,6 +728,33 @@ export function parseCargoTestArtifacts(stdout, { metadata, repoRoot }) {
       `${targetIdentityKey(right.target)}:${right.executable}`,
     ),
   );
+}
+
+export function selectStandardLibtestArtifacts(artifacts, { metadata, repoRoot }) {
+  const safeTargetIdentities = new Set();
+  for (const workspacePackage of workspacePackages(metadata).values()) {
+    for (const target of workspacePackage.targets) {
+      if (target.test !== true) continue;
+      if (target.kind.includes("custom-build")) continue;
+      safeTargetIdentities.add(
+        targetIdentityKey(
+          metadataTargetIdentity(workspacePackage.name, target, repoRoot),
+        ),
+      );
+    }
+  }
+
+  const selected = artifacts.filter((artifact) =>
+    safeTargetIdentities.has(targetIdentityKey(artifact.target)),
+  );
+  const duplicateTargets = duplicates(
+    selected.map((artifact) => targetIdentityKey(artifact.target)),
+  );
+  assert(
+    duplicateTargets.length === 0,
+    `Cargo produced multiple executables for a standard libtest target: ${duplicateTargets.join(", ")}`,
+  );
+  return selected;
 }
 
 export function parseTestHarnessIgnoredList(stdout) {
@@ -499,8 +840,11 @@ export function reconcileCargoInventory(
 export function collectCargoIgnoredInventory({
   repoRoot,
   metadata,
+  registry,
   cargo = process.env.CARGO ?? "cargo",
 }) {
+  validateWorkspaceLibtestManifests(metadata, repoRoot);
+  validateCargoTargets(registry, metadata, repoRoot);
   const build = spawnSync(cargo, CARGO_BUILD_ARGUMENTS, {
     cwd: repoRoot,
     encoding: "utf8",
@@ -510,14 +854,27 @@ export function collectCargoIgnoredInventory({
   assert(build.status === 0, build.stderr || "Cargo test-list build failed");
   const artifacts = parseCargoTestArtifacts(build.stdout, { metadata, repoRoot });
   assert(artifacts.length > 0, "Cargo produced no workspace test executables");
+  const standardLibtestArtifacts = selectStandardLibtestArtifacts(artifacts, {
+    metadata,
+    repoRoot,
+  });
+  assert(
+    standardLibtestArtifacts.length > 0,
+    "Cargo produced no standard libtest executables",
+  );
 
   const inventory = [];
-  for (const artifact of artifacts) {
+  for (const artifact of standardLibtestArtifacts) {
     const listed = spawnSync(artifact.executable, TEST_HARNESS_LIST_ARGUMENTS, {
       cwd: repoRoot,
       encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
+      timeout: TEST_HARNESS_TIMEOUT_MS,
     });
+    assert(
+      listed.error?.code !== "ETIMEDOUT",
+      `standard libtest harness list timed out after ${TEST_HARNESS_TIMEOUT_MS}ms: ${artifact.executable}`,
+    );
     assert(
       !listed.error,
       `test harness failed to start: ${artifact.executable}: ${listed.error?.message}`,
@@ -530,9 +887,14 @@ export function collectCargoIgnoredInventory({
       inventory.push({ test_id: testId, target: artifact.target });
     }
   }
-  return inventory.sort((left, right) =>
+  inventory.sort((left, right) =>
     describeInventory(left).localeCompare(describeInventory(right)),
   );
+  return {
+    inventory,
+    cargo_test_artifact_count: artifacts.length,
+    listed_standard_libtest_harness_count: standardLibtestArtifacts.length,
+  };
 }
 
 export function readMetadata(repoRoot) {
@@ -555,9 +917,18 @@ function main() {
   const report = validateRegistry({ registry, metadata, repoRoot });
 
   if (process.argv.includes("--cargo-list")) {
-    const actualInventory = collectCargoIgnoredInventory({ repoRoot, metadata });
-    report.cargo_reconciliation = reconcileCargoInventory(registry, actualInventory);
-    report.cargo_reconciliation.no_test_execution = true;
+    const collection = collectCargoIgnoredInventory({ repoRoot, metadata, registry });
+    report.cargo_reconciliation = reconcileCargoInventory(
+      registry,
+      collection.inventory,
+    );
+    report.cargo_reconciliation.cargo_test_artifact_count =
+      collection.cargo_test_artifact_count;
+    report.cargo_reconciliation.listed_standard_libtest_harness_count =
+      collection.listed_standard_libtest_harness_count;
+    report.cargo_reconciliation.harness_timeout_ms = TEST_HARNESS_TIMEOUT_MS;
+    report.cargo_reconciliation.harness_list_only = true;
+    report.cargo_reconciliation.no_test_body_execution = true;
   }
 
   console.log(JSON.stringify(report, null, 2));

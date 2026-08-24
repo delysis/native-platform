@@ -22,26 +22,9 @@ const plannerRoot = path.resolve(import.meta.dirname, "../..");
 const ignoredRegistry = JSON.parse(
   fs.readFileSync(path.join(plannerRoot, "ci/ignored-tests.json"), "utf8"),
 );
-const ignoredTestSources = new Set(
-  ignoredRegistry.entries.map((entry) => entry.source),
-);
-const ignoredTargetManifests = new Set(
-  ignoredRegistry.cargo_targets.map((target) => target.manifest_path),
-);
-const ignoredInventoryInfrastructure = new Set([
-  ".github/workflows/ci-full.yml",
-  ".github/workflows/ci-pr.yml",
-  "Cargo.lock",
-  "Cargo.toml",
-  "ci/ignored-tests.json",
-  "scripts/ci/ci-plan.mjs",
-  "scripts/ci/ci-required.mjs",
-  "scripts/ci/test-ci-plan.mjs",
-  "scripts/ci/test-ci-required.mjs",
-  "scripts/ci/test-ignored-tests.mjs",
-  "scripts/ci/test-workflows.mjs",
-  "scripts/ci/validate-ignored-tests.mjs",
-]);
+if (ignoredRegistry.schema !== "native-platform.ignored-tests.v2") {
+  throw new Error("CI planner requires ignored-test registry schema v2");
+}
 
 // Include deletions. A removed build, policy, or dependency file can be at
 // least as consequential as an addition, and must never disappear from the
@@ -159,31 +142,17 @@ function isMomContractDependencyChange(changedPath) {
   );
 }
 
-function gitBlobContains(revision, changedPath, pattern) {
-  try {
-    const source = execFileSync("git", ["show", `${revision}:${changedPath}`], {
-      encoding: "utf8",
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    return pattern.test(source);
-  } catch {
-    return false;
-  }
-}
-
 function isIgnoredInventoryChange(changedPath) {
-  if (
-    ignoredInventoryInfrastructure.has(changedPath) ||
-    ignoredTestSources.has(changedPath) ||
-    ignoredTargetManifests.has(changedPath)
-  ) {
-    return true;
-  }
-  if (!changedPath.endsWith(".rs")) return false;
-  const ignoredAttribute = /#\s*\[\s*ignore\b/;
+  const basename = path.posix.basename(changedPath);
   return (
-    gitBlobContains(base, changedPath, ignoredAttribute) ||
-    gitBlobContains(head, changedPath, ignoredAttribute)
+    under(changedPath, ".github/workflows") ||
+    under(changedPath, "ci") ||
+    under(changedPath, "scripts/ci") ||
+    changedPath.endsWith(".rs") ||
+    ["Cargo.toml", "Cargo.lock", "build.rs"].includes(basename) ||
+    changedPath === "rust-toolchain" ||
+    changedPath === "rust-toolchain.toml" ||
+    under(changedPath, ".cargo")
   );
 }
 

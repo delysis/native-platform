@@ -69,7 +69,6 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --locked --workspace --all-targets
       - name: Reconcile ignored-test evidence registry
-        if: runner.os == 'macOS'
         run: node scripts/ci/validate-ignored-tests.mjs --cargo-list
       - if: runner.os == 'Linux'
         run: cargo clippy --locked --workspace --all-targets -- -D warnings

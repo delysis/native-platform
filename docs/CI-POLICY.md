@@ -23,12 +23,23 @@ target source, and manifest. Entries also state their prerequisite and evidence
 class and explicitly record what that test cannot promote. The registry has 37
 tests: 37 are available on macOS, 36 on Linux, and 33 on Windows.
 
-The structural validator runs in ordinary policy CI. Relevant pull requests and
-full macOS CI additionally build test harnesses with locked `cargo test
---no-run --message-format=json-render-diagnostics`, then invoke each emitted
-harness only with `--ignored --list`. The resulting full test ID and real Cargo
-target tuple is reconciled against the expected current-platform subset. No
-ignored test body is executed by this inventory gate.
+The structural validator runs in ordinary policy CI. Ignored tests must use the
+canonical private `fn` or `async fn` form, an explicit `#[test]` or
+`#[tokio::test(...)]`, and `#[ignore = "reason"]`. Conditional, public, and
+macro-generated ignore syntax is rejected. Comments and strings are tokenized
+as non-code, not counted as test declarations. Workspace manifests may not
+configure custom Cargo harnesses; only metadata-confirmed standard libtest
+targets are eligible for listing.
+
+Every Rust source, Cargo manifest or lock, build script, proc-macro source,
+toolchain file, and Cargo configuration change selects exact reconciliation.
+The blocking pull-request job is a Linux, macOS, and Windows matrix, and full CI
+also reconciles on all three operating systems. Each lane builds test harnesses
+with locked `cargo test --no-run --message-format=json-render-diagnostics`,
+then invokes standard libtest harnesses only with `--ignored --list` and a
+30-second per-harness timeout. The resulting full test ID and real Cargo target
+tuple is reconciled against the expected current-platform subset. Harness mains
+run in list-only mode; no ignored test body is executed by this inventory gate.
 
 ## Reverse-dependency shadow
 

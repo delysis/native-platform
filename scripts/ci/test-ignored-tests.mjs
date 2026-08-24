@@ -7,11 +7,15 @@ import test from "node:test";
 import {
   CARGO_BUILD_ARGUMENTS,
   TEST_HARNESS_LIST_ARGUMENTS,
+  TEST_HARNESS_TIMEOUT_MS,
+  assertNoCustomHarnessManifest,
+  discoverCanonicalIgnoredTests,
   expectedCargoInventory,
   parseCargoTestArtifacts,
   parseTestHarnessIgnoredList,
   readMetadata,
   reconcileCargoInventory,
+  selectStandardLibtestArtifacts,
   validateRegistry,
 } from "./validate-ignored-tests.mjs";
 
@@ -19,16 +23,130 @@ const root = path.resolve(import.meta.dirname, "../..");
 const registry = JSON.parse(fs.readFileSync(path.join(root, "ci/ignored-tests.json"), "utf8"));
 const metadata = readMetadata(root);
 
-test("authoritative inventory builds without running and lists harnesses only", () => {
+test("authoritative inventory builds without test bodies and lists standard harnesses only", () => {
   assert.ok(CARGO_BUILD_ARGUMENTS.includes("--no-run"));
   assert.ok(!CARGO_BUILD_ARGUMENTS.includes("--ignored"));
   assert.deepEqual(TEST_HARNESS_LIST_ARGUMENTS, ["--ignored", "--list"]);
+  assert.equal(TEST_HARNESS_TIMEOUT_MS, 30_000);
+  const validatorSource = fs.readFileSync(
+    path.join(root, "scripts/ci/validate-ignored-tests.mjs"),
+    "utf8",
+  );
+  assert.match(validatorSource, /harness_list_only = true/);
+  assert.match(validatorSource, /no_test_body_execution = true/);
+  assert.doesNotMatch(validatorSource, /\.no_test_execution\s*=/);
+});
+
+test("custom Cargo harness configuration is rejected before executable listing", () => {
+  for (const manifest of [
+    "[lib]\nharness = false\n",
+    "[[test]]\nname = 'custom'\n'harness' = false\n",
+    String.raw`[[test]]
+name = "escaped"
+"h\u0061rness" = false
+`,
+  ]) {
+    assert.throws(
+      () => assertNoCustomHarnessManifest(manifest, "fixture/Cargo.toml"),
+      /default-libtest policy|standard libtest is required/,
+    );
+  }
+});
+
+test("only metadata-confirmed standard libtest artifacts are executable candidates", () => {
+  const syntheticMetadata = {
+    workspace_members: ["safe-package 0.1.0"],
+    packages: [
+      {
+        id: "safe-package 0.1.0",
+        name: "safe-package",
+        manifest_path: path.join(root, "Cargo.toml"),
+        targets: [
+          {
+            name: "safe_package",
+            kind: ["lib"],
+            src_path: path.join(root, "safe.rs"),
+            test: true,
+          },
+          {
+            name: "build-script-build",
+            kind: ["custom-build"],
+            src_path: path.join(root, "build.rs"),
+            test: true,
+          },
+        ],
+      },
+    ],
+  };
+  const artifacts = [
+    {
+      executable: "/tmp/safe",
+      target: {
+        package: "safe-package",
+        name: "safe_package",
+        kinds: ["lib"],
+        src_path: "safe.rs",
+      },
+    },
+    {
+      executable: "/tmp/arbitrary-main",
+      target: {
+        package: "safe-package",
+        name: "build-script-build",
+        kinds: ["custom-build"],
+        src_path: "build.rs",
+      },
+    },
+  ];
+  assert.deepEqual(
+    selectStandardLibtestArtifacts(artifacts, {
+      metadata: syntheticMetadata,
+      repoRoot: root,
+    }).map((artifact) => artifact.executable),
+    ["/tmp/safe"],
+  );
+});
+
+test("canonical source discovery ignores decoys and finds private libtest functions", () => {
+  const source = String.raw`
+// #[test] #[ignore = "comment"] fn comment_decoy() {}
+const TEXT: &str = r#"#[test] #[ignore = "string"] fn string_decoy() {}"#;
+
+#[cfg(unix)]
+#[test]
+#[ignore = "fixture"]
+fn private_test() {}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "fixture"]
+async fn private_async_test() {}
+`;
+  assert.deepEqual(discoverCanonicalIgnoredTests(source, "fixture.rs"), [
+    "private_test",
+    "private_async_test",
+  ]);
+});
+
+test("noncanonical cfg_attr, macro, and public ignored tests fail closed", () => {
+  const adversarial = [
+    "#[test]\n#[cfg_attr(any(), ignore = \"conditional\")]\nfn conditional() {}\n",
+    "macro_rules! ignored { () => { #[test] #[ignore = \"macro\"] fn generated() {} }; }\n",
+    "#[test]\n#[ignore = \"public\"]\npub fn public_test() {}\n",
+    "#[test]\n#[ignore]\nfn reasonless() {}\n",
+  ];
+  for (const source of adversarial) {
+    assert.throws(
+      () => discoverCanonicalIgnoredTests(source, "adversarial.rs"),
+      /noncanonical|macro-generated|private functions/,
+    );
+  }
 });
 
 test("all ignored tests carry exact target, platform, evidence, and non-promotion metadata", () => {
   const report = validateRegistry({ registry, metadata, repoRoot: root });
   assert.equal(report.registry_count, 37);
   assert.equal(report.cargo_target_count, 14);
+  assert.ok(registry.cargo_targets.every((target) => target.harness === "libtest"));
   assert.deepEqual(report.platform_counts, { linux: 36, macos: 37, windows: 33 });
   assert.ok(report.evidence_classes.includes("real-model-runtime"));
   assert.ok(report.evidence_classes.includes("real-corpus-read-only"));

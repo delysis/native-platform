@@ -387,10 +387,15 @@ test("PR workflow is always triggered and has one truthful aggregate", () => {
   );
 });
 
-test("full macOS CI reconciles ignored-test metadata without running ignored tests", () => {
+test("full CI reconciles each current-platform ignored-test subset without test bodies", () => {
   const source = read(fullPath);
   assert.match(source, /name: Reconcile ignored-test evidence registry/);
-  assert.match(source, /if: runner\.os == 'macOS'/);
+  assert.match(source, /os: \[ubuntu-latest, macos-latest, windows-latest\]/);
+  const reconciliation = source.match(
+    /- name: Reconcile ignored-test evidence registry[\s\S]*?--cargo-list/,
+  )?.[0];
+  assert.ok(reconciliation, "full ignored-test reconciliation step is missing");
+  assert.doesNotMatch(reconciliation, /if: runner\.os/);
   assert.match(source, /node scripts\/ci\/validate-ignored-tests\.mjs --cargo-list/);
   assert.doesNotMatch(source, /cargo test[^\n]*--ignored(?! --list)/);
 });
@@ -403,9 +408,16 @@ test("relevant PRs require exact list-only ignored-test reconciliation", () => {
   );
   const block = source.match(/^  ignored-tests:[\s\S]*?(?=^  fuzz-build:)/m)?.[0];
   assert.ok(block, "ignored-tests PR job block is missing");
-  assert.match(block, /runs-on: macos-latest/);
+  assert.match(block, /fail-fast: false/);
+  assert.match(block, /os: \[ubuntu-latest, macos-latest, windows-latest\]/);
+  assert.match(block, /runs-on: \$\{\{ matrix\.os \}\}/);
+  assert.match(block, /if: runner\.os == 'Windows'/);
+  assert.match(block, /if: runner\.os == 'Linux'/);
   assert.match(block, /needs\.plan\.outputs\.ignored_tests == 'true'/);
-  assert.match(block, /name: Reconcile exact ignored-test inventory without executing tests/);
+  assert.match(
+    block,
+    /name: Reconcile exact ignored-test inventory without executing test bodies/,
+  );
   assert.match(block, /node scripts\/ci\/validate-ignored-tests\.mjs --cargo-list/);
   assert.doesNotMatch(block, /cargo test[^\n]*--ignored(?! --list)/);
   const required = source.match(/^  ci-required:[\s\S]*$/m)?.[0];
@@ -594,10 +606,12 @@ test("full workflow covers main, nightly, dispatch, products, policy, and fuzz",
   assert.match(source, /^\s{4}if: always\(\)$/m);
 });
 
-test("Windows compatibility remains in full CI, not the blocking PR lane", () => {
+test("Windows remains full CI plus the exact ignored-inventory PR matrix only", () => {
   const pr = read(prPath);
   const full = read(fullPath);
-  assert.doesNotMatch(pr, /windows-latest/);
+  const ignored = pr.match(/^  ignored-tests:[\s\S]*?(?=^  fuzz-build:)/m)?.[0];
+  assert.match(ignored, /windows-latest/);
+  assert.doesNotMatch(pr.replace(ignored, ""), /windows-latest/);
   assert.match(full, /windows-latest/);
   assert.match(full, /ci-full-/);
 });

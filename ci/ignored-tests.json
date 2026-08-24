@@ -9,7 +9,8 @@
       "kinds": ["lib"],
       "src_path": "crates/native/crates/llama-native-engine/src/lib.rs",
       "manifest_path": "crates/native/crates/llama-native-engine/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "llama-native-host",
@@ -18,7 +19,8 @@
       "kinds": ["lib"],
       "src_path": "crates/native/crates/llama-native-host/src/lib.rs",
       "manifest_path": "crates/native/crates/llama-native-host/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "information-native-backend-community",
@@ -27,7 +29,8 @@
       "kinds": ["lib"],
       "src_path": "crates/services/information/crates/information-native-backend-community/src/lib.rs",
       "manifest_path": "crates/services/information/crates/information-native-backend-community/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "information-native-backend-encyclopedia",
@@ -36,7 +39,8 @@
       "kinds": ["lib"],
       "src_path": "crates/services/information/crates/information-native-backend-encyclopedia/src/lib.rs",
       "manifest_path": "crates/services/information/crates/information-native-backend-encyclopedia/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "information-native-backend-scripture",
@@ -45,7 +49,8 @@
       "kinds": ["lib"],
       "src_path": "crates/services/information/crates/information-native-backend-scripture/src/lib.rs",
       "manifest_path": "crates/services/information/crates/information-native-backend-scripture/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "information-native-backend-sqlite",
@@ -54,7 +59,8 @@
       "kinds": ["lib"],
       "src_path": "crates/services/information/crates/information-native-backend-sqlite/src/lib.rs",
       "manifest_path": "crates/services/information/crates/information-native-backend-sqlite/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "speech-native-backend-parakeet",
@@ -63,7 +69,8 @@
       "kinds": ["test"],
       "src_path": "crates/services/speech/crates/speech-native-backend-parakeet/tests/real_parakeet.rs",
       "manifest_path": "crates/services/speech/crates/speech-native-backend-parakeet/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "speech-native-platform",
@@ -72,7 +79,8 @@
       "kinds": ["lib"],
       "src_path": "crates/services/speech/crates/speech-native-platform/src/lib.rs",
       "manifest_path": "crates/services/speech/crates/speech-native-platform/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "fte-backend-llama",
@@ -81,7 +89,8 @@
       "kinds": ["test"],
       "src_path": "products/fte/crates/fte-backend-llama/tests/real.rs",
       "manifest_path": "products/fte/crates/fte-backend-llama/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "free-token-energy",
@@ -90,7 +99,8 @@
       "kinds": ["cdylib", "rlib", "staticlib"],
       "src_path": "products/fte/src-tauri/src/lib.rs",
       "manifest_path": "products/fte/src-tauri/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "loom-backend-llama",
@@ -99,7 +109,8 @@
       "kinds": ["lib"],
       "src_path": "products/loom/crates/loom-backend-llama/src/lib.rs",
       "manifest_path": "products/loom/crates/loom-backend-llama/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "loom-store",
@@ -108,7 +119,8 @@
       "kinds": ["test"],
       "src_path": "products/loom/crates/loom-store/tests/legacy_python_fixture.rs",
       "manifest_path": "products/loom/crates/loom-store/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "mom-llama-cli",
@@ -117,7 +129,8 @@
       "kinds": ["test"],
       "src_path": "products/mom/crates/mom-llama-cli/tests/cli.rs",
       "manifest_path": "products/mom/crates/mom-llama-cli/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     },
     {
       "package": "mom-llama-runtime",
@@ -126,7 +139,8 @@
       "kinds": ["test"],
       "src_path": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
       "manifest_path": "products/mom/crates/mom-llama-runtime/Cargo.toml",
-      "platforms": ["linux", "macos", "windows"]
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     }
   ],
   "entries": [

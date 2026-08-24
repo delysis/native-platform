@@ -187,7 +187,12 @@ test("Mom native source selects its product and macOS parity without root duplic
   assert.equal(result.flags.mom, true);
   assert.equal(result.flags.root, false);
   assert.equal(result.flags.platform_macos, true);
-  assert.deepEqual(result.jobs, ["policy", "mom-linux", "platform-macos"]);
+  assert.deepEqual(result.jobs, [
+    "policy",
+    "mom-linux",
+    "platform-macos",
+    "ignored-tests",
+  ]);
   assert.deepEqual(result.macos_matrix, ["release", "mom"]);
 });
 
@@ -231,7 +236,7 @@ test("ignored-test sources, targets, and registry changes select authoritative r
   }
 });
 
-test("new and deleted ignore attributes select authoritative reconciliation", () => {
+test("new and deleted Rust sources select authoritative reconciliation", () => {
   const added = fixture(
     "crates/native/crates/llama-native-types/src/new_ignored.rs",
     { contents: "#[test]\n#[ignore]\nfn newly_ignored() {}\n" },
@@ -252,14 +257,38 @@ test("new and deleted ignore attributes select authoritative reconciliation", ()
   assert.ok(removed.jobs.includes("ignored-tests"));
 });
 
-test("ordinary Rust sources do not select ignored-test reconciliation", () => {
-  const { result } = fixture(
-    "crates/native/crates/llama-native-types/src/ordinary.rs",
-    { contents: "pub fn ordinary() {}\n" },
-  );
-  assert.equal(result.flags.full, false);
-  assert.equal(result.flags.ignored_tests, false);
-  assert.ok(!result.jobs.includes("ignored-tests"));
+test("all Rust syntax shapes select ignored-test reconciliation fail closed", () => {
+  for (const [name, contents] of [
+    ["ordinary", "pub fn ordinary() {}\n"],
+    ["comment-decoy", "// #[ignore]\npub fn comment_decoy() {}\n"],
+    ["cfg-attr", "#[cfg_attr(any(), ignore)]\nfn conditional() {}\n"],
+    ["macro", "macro_rules! tests { () => { #[ignore] fn made() {} } }\n"],
+    ["public", "#[ignore]\npub fn public_test() {}\n"],
+  ]) {
+    const { result } = fixture(
+      `crates/native/crates/llama-native-types/src/${name}.rs`,
+      { contents },
+    );
+    assert.equal(result.flags.full, false, name);
+    assert.equal(result.flags.ignored_tests, true, name);
+    assert.ok(result.jobs.includes("ignored-tests"), name);
+  }
+});
+
+test("Cargo, build-script, proc-macro, and toolchain inputs select reconciliation", () => {
+  for (const relativePath of [
+    "crates/native/crates/llama-native-engine/Cargo.toml",
+    "crates/native/crates/llama-native-engine/build.rs",
+    "crates/native/crates/example-proc-macro/src/lib.rs",
+    ".cargo/config.toml",
+    "Cargo.lock",
+    "ci/package-groups.json",
+    "rust-toolchain.toml",
+  ]) {
+    const { result } = fixture(relativePath);
+    assert.equal(result.flags.ignored_tests, true, relativePath);
+    assert.ok(result.jobs.includes("ignored-tests"), relativePath);
+  }
 });
 
 test("product package scripts select their owned frontend checks", () => {
@@ -289,6 +318,7 @@ test("Mom dependency metadata remains conservative", () => {
     "root-linux",
     "mom-linux",
     "platform-macos",
+    "ignored-tests",
     "dependency-graph",
   ]);
   assert.deepEqual(result.macos_matrix, ["release", "root", "mom"]);
