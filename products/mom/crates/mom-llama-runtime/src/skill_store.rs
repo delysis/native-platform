@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 const SKILLS_FILE: &str = "skills.json";
-const SKILLS_NAMESPACE: &str = "skills.v2";
+pub(crate) const SKILLS_NAMESPACE: &str = "skills.v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Skill {
@@ -226,6 +226,13 @@ pub fn save_skill_db(db: &SkillDb) -> Result<PathBuf> {
 
 pub fn applied_skill_prompt(skill_ids: &[String]) -> Result<AppliedSkillPrompt> {
     let db = load_skill_db()?;
+    Ok(applied_skill_prompt_from_db(skill_ids, &db))
+}
+
+pub(crate) fn applied_skill_prompt_from_db(
+    skill_ids: &[String],
+    db: &SkillDb,
+) -> AppliedSkillPrompt {
     let skills = skill_ids
         .iter()
         .filter_map(|id| db.skills.iter().find(|skill| &skill.id == id))
@@ -264,9 +271,9 @@ pub fn applied_skill_prompt(skill_ids: &[String]) -> Result<AppliedSkillPrompt> 
                 .join(", ")
         )
     };
-    Ok(AppliedSkillPrompt {
+    AppliedSkillPrompt {
         prompt,
         cache_owner_id,
         cache_label,
-    })
+    }
 }

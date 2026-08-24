@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 const SETTINGS_FILE: &str = "settings.json";
-const SETTINGS_NAMESPACE: &str = "settings.v2";
+pub(crate) const SETTINGS_NAMESPACE: &str = "settings.v2";
 const DEFAULT_MAX_TOKENS: u32 = 512;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -453,7 +453,7 @@ pub fn resolve_settings() -> Result<Settings> {
         .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
     let path = data_dir.join(SETTINGS_FILE);
     let store = RuntimeStore::open(&data_dir)?;
-    let mut settings = if let Some(settings) = store.get::<Settings>(SETTINGS_NAMESPACE)? {
+    let settings = if let Some(settings) = store.get::<Settings>(SETTINGS_NAMESPACE)? {
         settings
     } else if path.exists() {
         let (migrated, legacy_engine_path) = read_settings_file(&path, data_dir.clone())?;
@@ -474,6 +474,11 @@ pub fn resolve_settings() -> Result<Settings> {
     } else {
         Settings::defaults_for_data_dir(data_dir.clone())
     };
+    Ok(settings_from_document(data_dir, Some(settings)))
+}
+
+pub(crate) fn settings_from_document(data_dir: PathBuf, stored: Option<Settings>) -> Settings {
+    let mut settings = stored.unwrap_or_else(|| Settings::defaults_for_data_dir(data_dir.clone()));
     settings.data_dir = data_dir;
     merge_missing_setting_defaults(&mut settings);
     let cache_policy = settings.kv_cache_policy;
@@ -483,7 +488,7 @@ pub fn resolve_settings() -> Result<Settings> {
     {
         settings.model_path = Some(PathBuf::from(model));
     }
-    Ok(settings)
+    settings
 }
 
 fn read_settings_file(path: &Path, data_dir: PathBuf) -> Result<(Settings, Option<PathBuf>)> {

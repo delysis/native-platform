@@ -1138,6 +1138,7 @@
   let autocompleteTimer = null;
   let autocompleteSerial = 0;
   let presentedAutocomplete = null;
+  let autocompleteAccepting = false;
   const autocompleteEncoder = new TextEncoder();
 
   const composerLogicalAnchor = (textarea = composerTextarea()) => {
@@ -1309,6 +1310,7 @@
       cancelComposerAutocomplete({ native: false });
       return false;
     }
+    autocompleteAccepting = true;
     textarea.readOnly = true;
     try {
       const acceptance = await invoke("mom_llama_composer_autocomplete_accept", {
@@ -1316,17 +1318,20 @@
         suffix: presented.suffix,
       });
       const accepted = acceptance?.result;
-      const revalidatedCurrent = composerLogicalAnchor(textarea);
-      if (
-        acceptance?.status !== "passed"
-        || presentedAutocomplete !== presented
-        || autocompleteAnchorKey(revalidatedCurrent) !== effect.anchor
-        || autocompleteAnchorKey(accepted?.anchor) !== effect.anchor
-        || accepted?.anchor?.model_fingerprint_sha256 !== presented.anchor.model_fingerprint_sha256
-        || accepted?.message !== `${presented.anchor.draft}${presented.suffix}`
-      ) {
+      if (acceptance?.status !== "passed") {
         cancelComposerAutocomplete({ native: false });
         return false;
+      }
+      const revalidatedCurrent = composerLogicalAnchor(textarea);
+      const responseIsExact = autocompleteAnchorKey(accepted?.anchor) === effect.anchor
+        && accepted?.anchor?.model_fingerprint_sha256 === presented.anchor.model_fingerprint_sha256
+        && accepted?.anchor?.generation_input_sha256 === presented.anchor.generation_input_sha256
+        && accepted?.message === `${presented.anchor.draft}${presented.suffix}`;
+      const viewIsExact = presentedAutocomplete === presented
+        && autocompleteAnchorKey(revalidatedCurrent) === effect.anchor;
+      if (!responseIsExact || !viewIsExact) {
+        await refreshChat();
+        return true;
       }
       const insertion = textarea.selectionEnd;
       transitionComposer({ type: "ai_dismiss" });
@@ -1336,6 +1341,7 @@
       textarea.dispatchEvent(new Event("input", { bubbles: true }));
       return true;
     } finally {
+      autocompleteAccepting = false;
       textarea.readOnly = false;
     }
   };
@@ -2387,6 +2393,7 @@
     const form = event.target;
     try {
       if (form.id === "chat-form") {
+        if (autocompleteAccepting) return;
         if (form.dataset.busy === "true") return;
         cancelComposerAutocomplete();
         const message = formValue(form, "message");
@@ -2486,6 +2493,7 @@
 
   document.addEventListener("compositionstart", (event) => {
     if (!event.target.matches("#chat-form textarea[name='message']")) return;
+    if (autocompleteAccepting) return;
     cancelComposerAutocomplete();
     transitionComposer({ type: "composition_start" });
     hideMentionPresentation();
@@ -2501,6 +2509,7 @@
 
   document.addEventListener("input", (event) => {
     if (event.target.matches("#chat-form textarea[name='message']")) {
+      if (autocompleteAccepting) return;
       if (event.isComposing || composerState.kind === "composing") return;
       const committedAutocomplete = event.target.dataset.autocompleteCommittedDraft;
       const alreadyPersisted = committedAutocomplete === event.target.value;
@@ -2540,6 +2549,10 @@
 
   document.addEventListener("paste", async (event) => {
     if (!event.target.matches("#chat-form textarea[name='message']")) return;
+    if (autocompleteAccepting) {
+      event.preventDefault();
+      return;
+    }
     const threshold = Math.max(0, Math.trunc(settingNumber("pasteLongTextToFileLen", 2500)));
     const text = event.clipboardData?.getData("text/plain") || "";
     if (threshold === 0 || text.length < threshold) return;
@@ -2654,6 +2667,7 @@
   });
 
   document.addEventListener("selectionchange", () => {
+    if (autocompleteAccepting) return;
     const textarea = composerTextarea();
     if (document.activeElement !== textarea) return;
     if (!presentedAutocomplete) return;
@@ -2663,6 +2677,7 @@
   });
 
   document.addEventListener("focusout", (event) => {
+    if (autocompleteAccepting) return;
     if (event.target.matches?.("#chat-form textarea[name='message']")) {
       cancelComposerAutocomplete();
     }

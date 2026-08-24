@@ -1,18 +1,21 @@
 use crate::chat::{build_native_messages, upstream_setting_bool};
-use crate::config::{resolve_settings, upstream_setting_string};
+use crate::config::{
+    SETTINGS_NAMESPACE, Settings, resolve_settings, settings_from_document, upstream_setting_string,
+};
 use crate::conversation_store::{
-    CONVERSATIONS_NAMESPACE, ChatTemplatePolicy, ConversationDb, ConversationKind,
+    CONVERSATIONS_NAMESPACE, ChatTemplatePolicy, Conversation, ConversationDb, ConversationKind,
     DRAFTS_NAMESPACE, active_path_messages, load_db, load_drafts,
 };
 use crate::native_runtime::resident_model_for_profile_if_loaded;
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
-use crate::skill_store::applied_skill_prompt;
+use crate::skill_store::{SKILLS_NAMESPACE, SkillDb, applied_skill_prompt_from_db, load_skill_db};
 use crate::store::RuntimeStore;
 use anyhow::Result;
 use llama_native_engine::WaitOutcome;
 use llama_native_types::{
-    ChatTemplateChoice, GenerationInput, GenerationRequest, GenerationState, ModelFingerprint,
+    ChatMessage, ChatTemplateChoice, GenerationInput, GenerationRequest, GenerationState,
+    ModelFingerprint, SamplingConfig,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -61,6 +64,22 @@ pub struct ComposerAutocompleteAnchor {
     pub selection_end_utf16: u32,
     pub attachment_ids: Vec<String>,
     pub model_fingerprint_sha256: String,
+    pub generation_input_sha256: String,
+}
+
+struct PreparedComposerGeneration {
+    messages: Vec<ChatMessage>,
+    template: ChatTemplateChoice,
+    sampling: SamplingConfig,
+    input_sha256: String,
+}
+
+#[derive(Serialize)]
+struct ComposerGenerationBinding<'a> {
+    schema: &'static str,
+    messages: &'a [ChatMessage],
+    template: &'a ChatTemplateChoice,
+    sampling: &'a SamplingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,21 +206,46 @@ pub fn composer_autocomplete_accept(
 
     let migrated_drafts = load_drafts()?;
     let store = RuntimeStore::current()?;
+    let data_dir = settings.data_dir.clone();
     let accepted_message = format!("{}{suffix}", anchor.draft);
     let accepted = store.mutate_documents(
         CONVERSATIONS_NAMESPACE,
         || migrated_db,
         |conversations: &mut ConversationDb, documents| {
-            let exact_conversation = conversations.selected_conversation_id.as_deref()
-                == Some(anchor.conversation_id.as_str())
-                && conversations.conversations.iter().any(|conversation| {
+            if conversations.selected_conversation_id.as_deref()
+                != Some(anchor.conversation_id.as_str())
+            {
+                return Err(anyhow::Error::new(StaleAutocompleteAnchor));
+            }
+            let Some(exact_conversation) = conversations
+                .conversations
+                .iter()
+                .find(|conversation| {
                     conversation.id == anchor.conversation_id
                         && conversation.kind == ConversationKind::Chat
                         && conversation.active_leaf_message_id == anchor.active_leaf_message_id
                         && conversation.execution_profile.version
                             == anchor.execution_profile_version
-                });
-            if !exact_conversation {
+                })
+                .cloned()
+            else {
+                return Err(anyhow::Error::new(StaleAutocompleteAnchor));
+            };
+            let transaction_settings = settings_from_document(
+                data_dir.clone(),
+                documents.get::<Settings>(SETTINGS_NAMESPACE)?,
+            );
+            let skill_db = documents
+                .get::<SkillDb>(SKILLS_NAMESPACE)?
+                .unwrap_or_default();
+            let prepared = prepare_composer_generation(
+                &exact_conversation,
+                &transaction_settings,
+                &skill_db,
+                &anchor.draft,
+            )?
+            .map_err(|_| anyhow::Error::new(StaleAutocompleteAnchor))?;
+            if prepared.input_sha256 != anchor.generation_input_sha256 {
                 return Err(anyhow::Error::new(StaleAutocompleteAnchor));
             }
             let mut drafts = documents.get(DRAFTS_NAMESPACE)?.unwrap_or(migrated_drafts);
@@ -337,38 +381,13 @@ pub fn composer_autocomplete_supervised(
         ));
     };
     let model_fingerprint_sha256 = fingerprint_sha256(fingerprint)?;
-    let active_messages = active_path_messages(&conversation);
-    if let Some(blocker) = context_bound_blocker(&active_messages) {
-        return Ok(CommandResult::blocked(COMMAND, "host_integrated", blocker));
-    }
-    let skill_prompt = applied_skill_prompt(&conversation.current_skill_ids)?;
-    let system_message = conversation
-        .execution_profile
-        .system_message
-        .clone()
-        .unwrap_or_else(|| upstream_setting_string(&settings, "systemMessage").unwrap_or_default());
-    let prediction_prompt = prediction_prompt(&input.draft);
-    let messages = build_native_messages(
-        &system_message,
-        &skill_prompt.prompt,
-        &active_messages,
-        &prediction_prompt,
-        upstream_setting_bool(&settings, "excludeReasoningFromContext"),
-        &std::collections::HashMap::new(),
-        "",
-    );
-    if let Some(blocker) =
-        native_input_bound_blocker(&messages, &conversation.execution_profile.chat_template)
-    {
-        return Ok(CommandResult::blocked(COMMAND, "host_integrated", blocker));
-    }
-    let mut sampling = conversation
-        .execution_profile
-        .sampling
-        .clone()
-        .unwrap_or_else(|| settings.sampling_config());
-    sampling.max_tokens = MAX_COMPLETION_TOKENS;
-    sampling.stop = vec!["\n".to_string(), "\r".to_string()];
+    let skill_db = load_skill_db()?;
+    let prepared =
+        match prepare_composer_generation(&conversation, &settings, &skill_db, &input.draft)? {
+            Ok(prepared) => prepared,
+            Err(blocker) => return Ok(CommandResult::blocked(COMMAND, "host_integrated", blocker)),
+        };
+    let generation_input_sha256 = prepared.input_sha256.clone();
     if cancellation_requested() {
         return Ok(cancelled(false));
     }
@@ -382,15 +401,10 @@ pub fn composer_autocomplete_supervised(
         request_id: request_id.clone(),
         model_id: status.model_id,
         input: GenerationInput::Chat {
-            messages,
-            template: match &conversation.execution_profile.chat_template {
-                ChatTemplatePolicy::ModelDefault => ChatTemplateChoice::ModelDefault,
-                ChatTemplatePolicy::FrozenSource(template) => {
-                    ChatTemplateChoice::Override(template.clone())
-                }
-            },
+            messages: prepared.messages,
+            template: prepared.template,
         },
-        sampling,
+        sampling: prepared.sampling,
         media: Vec::new(),
         cached_prefix: None,
     }) {
@@ -471,6 +485,7 @@ pub fn composer_autocomplete_supervised(
                 selection_end_utf16: input.selection_end_utf16,
                 attachment_ids: input.attachment_ids,
                 model_fingerprint_sha256,
+                generation_input_sha256,
             },
             suffix,
             duration_ms: started.elapsed().as_millis(),
@@ -519,6 +534,67 @@ fn draft_anchor_blocker(input: &ComposerAutocompleteInput) -> Option<Blocker> {
         ));
     }
     None
+}
+
+fn prepare_composer_generation(
+    conversation: &Conversation,
+    settings: &Settings,
+    skill_db: &SkillDb,
+    draft: &str,
+) -> Result<std::result::Result<PreparedComposerGeneration, Blocker>> {
+    let active_messages = active_path_messages(conversation);
+    if let Some(blocker) = context_bound_blocker(&active_messages) {
+        return Ok(Err(blocker));
+    }
+    let skill_prompt = applied_skill_prompt_from_db(&conversation.current_skill_ids, skill_db);
+    let system_message = conversation
+        .execution_profile
+        .system_message
+        .clone()
+        .unwrap_or_else(|| upstream_setting_string(settings, "systemMessage").unwrap_or_default());
+    let prediction_prompt = prediction_prompt(draft);
+    let messages = build_native_messages(
+        &system_message,
+        &skill_prompt.prompt,
+        &active_messages,
+        &prediction_prompt,
+        upstream_setting_bool(settings, "excludeReasoningFromContext"),
+        &std::collections::HashMap::new(),
+        "",
+    );
+    if let Some(blocker) =
+        native_input_bound_blocker(&messages, &conversation.execution_profile.chat_template)
+    {
+        return Ok(Err(blocker));
+    }
+    let template = match &conversation.execution_profile.chat_template {
+        ChatTemplatePolicy::ModelDefault => ChatTemplateChoice::ModelDefault,
+        ChatTemplatePolicy::FrozenSource(template) => {
+            ChatTemplateChoice::Override(template.clone())
+        }
+    };
+    let mut sampling = conversation
+        .execution_profile
+        .sampling
+        .clone()
+        .unwrap_or_else(|| settings.sampling_config());
+    sampling.max_tokens = MAX_COMPLETION_TOKENS;
+    sampling.stop = vec!["\n".to_string(), "\r".to_string()];
+    let input_sha256 = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&ComposerGenerationBinding {
+            schema: "mom_llama.composer_generation_binding.v1",
+            messages: &messages,
+            template: &template,
+            sampling: &sampling,
+        })?)
+    );
+    Ok(Ok(PreparedComposerGeneration {
+        messages,
+        template,
+        sampling,
+        input_sha256,
+    }))
 }
 
 fn context_bound_blocker(messages: &[crate::conversation_store::Message]) -> Option<Blocker> {
@@ -679,8 +755,13 @@ fn blocked_with_engine(code: &str, message: &str) -> CommandResult<ComposerAutoc
 mod tests {
     use super::{
         ComposerAutocompleteInput, MAX_SUFFIX_BYTES, bounded_suffix, draft_anchor_blocker,
-        has_active_mention_token,
+        has_active_mention_token, prepare_composer_generation,
     };
+    use crate::config::{KvCachePolicy, Settings};
+    use crate::conversation_store::{Conversation, ConversationExecutionProfile, ConversationKind};
+    use crate::skill_store::{Skill, SkillDb};
+    use serde_json::Value;
+    use std::path::PathBuf;
 
     fn input(draft: &str) -> ComposerAutocompleteInput {
         let end = u32::try_from(draft.encode_utf16().count()).expect("small fixture");
@@ -725,5 +806,67 @@ mod tests {
         let suffix = bounded_suffix(&oversized, "draft").expect("bounded suffix");
         assert!(suffix.len() <= MAX_SUFFIX_BYTES);
         assert!(suffix.is_char_boundary(suffix.len()));
+    }
+
+    #[test]
+    fn generation_binding_changes_with_every_prompt_authority() {
+        let conversation = Conversation {
+            id: "conversation".to_string(),
+            title: "Conversation".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            kind: ConversationKind::Chat,
+            execution_profile: ConversationExecutionProfile::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: None,
+            current_skill_ids: vec!["skill".to_string()],
+            messages: Vec::new(),
+        };
+        let mut settings = Settings::defaults_for_data_dir(PathBuf::from("fixture"));
+        let mut skills = SkillDb {
+            skills: vec![Skill {
+                id: "skill".to_string(),
+                name: "Skill".to_string(),
+                description: String::new(),
+                prompt_template: "first prompt".to_string(),
+                usage_hint: String::new(),
+                tags: Vec::new(),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+                cache_policy: KvCachePolicy::None,
+            }],
+        };
+        let initial = prepare_composer_generation(&conversation, &settings, &skills, "draft")
+            .expect("prepare initial")
+            .expect("initial is bounded")
+            .input_sha256;
+
+        skills.skills[0].prompt_template = "changed prompt".to_string();
+        let changed_skill = prepare_composer_generation(&conversation, &settings, &skills, "draft")
+            .expect("prepare skill change")
+            .expect("skill change is bounded")
+            .input_sha256;
+        assert_ne!(initial, changed_skill);
+
+        settings.upstream_settings.insert(
+            "systemMessage".to_string(),
+            Value::String("changed system".to_string()),
+        );
+        let changed_setting =
+            prepare_composer_generation(&conversation, &settings, &skills, "draft")
+                .expect("prepare setting change")
+                .expect("setting change is bounded")
+                .input_sha256;
+        assert_ne!(changed_skill, changed_setting);
+
+        let changed_draft =
+            prepare_composer_generation(&conversation, &settings, &skills, "other draft")
+                .expect("prepare draft change")
+                .expect("draft change is bounded")
+                .input_sha256;
+        assert_ne!(changed_setting, changed_draft);
     }
 }

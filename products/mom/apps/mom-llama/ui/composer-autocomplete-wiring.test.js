@@ -60,7 +60,9 @@ test("Right Arrow atomically accepts the full anchor as one normal draft edit", 
   assert.equal(accept.match(/setRangeText/g)?.length, 1);
   assert.equal(accept.match(/new Event\("input"/g)?.length, 1);
   assert.match(accept, /model_fingerprint_sha256/);
+  assert.match(accept, /generation_input_sha256/);
   assert.match(accept, /autocompleteCommittedDraft/);
+  assert.match(accept, /if \(!responseIsExact \|\| !viewIsExact\)[\s\S]*await refreshChat\(\)/);
   assert.match(runtime, /mutate_documents\(/);
   assert.match(runtime, /selected_conversation_id\.as_deref\(\)/);
   assert.match(runtime, /draft\.message != anchor\.draft/);
@@ -77,4 +79,12 @@ test("composer markup preserves combobox and live suggestion semantics", () => {
 test("reducer cancellation effects reach the native speculative operation", () => {
   assert.match(ui, /keyEffect\.kind === "ai_cancel"[\s\S]*forceNative: true/);
   assert.match(ui, /mentionEffects\.some\(\(effect\) => effect\.kind === "ai_cancel"\)[\s\S]*forceNative: true/);
+});
+
+test("acceptance gates interaction and reconciles every committed backend result", () => {
+  assert.match(ui, /let autocompleteAccepting = false/);
+  assert.match(ui, /if \(autocompleteAccepting\) return;[\s\S]*form\.dataset\.busy/);
+  assert.match(ui, /if \(autocompleteAccepting\) \{[\s\S]*event\.preventDefault\(\);[\s\S]*return;/);
+  assert.match(ui, /acceptance\?\.status !== "passed"/);
+  assert.match(ui, /if \(!responseIsExact \|\| !viewIsExact\) \{[\s\S]*await refreshChat\(\);/);
 });
