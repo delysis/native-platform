@@ -381,7 +381,18 @@ test("PR workflow is always triggered and has one truthful aggregate", () => {
   assert.match(source, /^\s{4}if: always\(\)$/m);
   assert.match(source, /CI_NEEDS_JSON:\s*\$\{\{ toJSON\(needs\) \}\}/);
   assert.match(source, /node scripts\/ci\/ci-required\.mjs/);
-  assert.match(source, /node --test scripts\/ci\/test-ci-plan\.mjs scripts\/ci\/test-ci-required\.mjs scripts\/ci\/test-product-state-backup\.mjs scripts\/ci\/test-workflows\.mjs/);
+  assert.match(
+    source,
+    /node --test scripts\/ci\/test-ci-metadata-shadow\.mjs scripts\/ci\/test-ci-plan\.mjs scripts\/ci\/test-ci-required\.mjs scripts\/ci\/test-ignored-tests\.mjs scripts\/ci\/test-product-state-backup\.mjs scripts\/ci\/test-workflows\.mjs/,
+  );
+});
+
+test("full macOS CI reconciles ignored-test metadata without running ignored tests", () => {
+  const source = read(fullPath);
+  assert.match(source, /name: Reconcile ignored-test evidence registry/);
+  assert.match(source, /if: runner\.os == 'macOS'/);
+  assert.match(source, /node scripts\/ci\/validate-ignored-tests\.mjs --cargo-list/);
+  assert.doesNotMatch(source, /cargo test[^\n]*--ignored(?! --list)/);
 });
 
 test("PR workflow exposes every targeted partition and future product guards", () => {

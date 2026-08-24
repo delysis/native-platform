@@ -144,6 +144,36 @@ test("Speech Apple changes select Speech and platform coverage", () => {
   assert.deepEqual(result.macos_matrix, ["release", "speech"]);
 });
 
+test("contract-family changes conservatively include Mom while metadata stays shadow-only", () => {
+  const contractPaths = [
+    "crates/native/crates/llama-native-types/src/lib.rs",
+    "crates/services/attachment/crates/attachment-native-types/src/lib.rs",
+    "crates/services/information/crates/information-native-types/src/lib.rs",
+    "crates/services/speech/crates/speech-native-types/src/lib.rs",
+    "products/fte/crates/fte-types/src/lib.rs",
+  ];
+  for (const contractPath of contractPaths) {
+    const { result } = fixture(contractPath, {
+      present: ["products/mom/Cargo.toml"],
+    });
+    assert.equal(result.flags.mom, true, contractPath);
+    assert.ok(result.jobs.includes("mom-linux"), contractPath);
+    assert.equal(result.conservative_overlays.mom_contracts.applied, true);
+    assert.deepEqual(result.conservative_overlays.mom_contracts.paths, [contractPath]);
+    assert.equal(result.dependency_shadow.selection_applied, false);
+    assert.equal(result.dependency_shadow.promotion_allowed, false);
+  }
+});
+
+test("contract-family documentation does not trigger the temporary Mom overlay", () => {
+  const { result } = fixture("crates/services/speech/docs/ARCHITECTURE.md", {
+    present: ["products/mom/Cargo.toml"],
+  });
+  assert.equal(result.flags.speech, true);
+  assert.equal(result.flags.mom, false);
+  assert.equal(result.conservative_overlays.mom_contracts.applied, false);
+});
+
 test("Mom native source selects its product and macOS parity without root duplication", () => {
   const { result } = fixture("products/mom/apps/mom-llama/src-tauri/src/commands.rs", {
     present: ["products/mom/Cargo.toml"],

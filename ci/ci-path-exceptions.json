@@ -1,0 +1,91 @@
+{
+  "schema": "native-platform.ci-path-exceptions.v1",
+  "asset_groups": [
+    {
+      "prefix": "products/fte/src",
+      "primary_group": "product-fte"
+    },
+    {
+      "prefix": "products/fte/package.json",
+      "primary_group": "product-fte"
+    },
+    {
+      "prefix": "products/fte/tests/fixtures",
+      "primary_group": "product-fte"
+    },
+    {
+      "prefix": "products/mom/apps/mom-llama/ui",
+      "primary_group": "product-mom"
+    },
+    {
+      "prefix": "products/mom/apps/mom-llama/package.json",
+      "primary_group": "product-mom"
+    },
+    {
+      "prefix": "products/mom/contracts",
+      "primary_group": "product-mom"
+    },
+    {
+      "prefix": "products/loom/apps/loom/src",
+      "primary_group": "product-loom"
+    },
+    {
+      "prefix": "products/loom/apps/loom/tests",
+      "primary_group": "product-loom"
+    },
+    {
+      "prefix": "products/loom/apps/loom/index.html",
+      "primary_group": "product-loom"
+    },
+    {
+      "prefix": "products/loom/apps/loom/package.json",
+      "primary_group": "product-loom"
+    },
+    {
+      "prefix": "products/loom/apps/loom/tsconfig.json",
+      "primary_group": "product-loom"
+    },
+    {
+      "prefix": "products/loom/apps/loom/vite.config.ts",
+      "primary_group": "product-loom"
+    },
+    {
+      "prefix": "products/loom/apps/loom/vitest.browser.config.ts",
+      "primary_group": "product-loom"
+    },
+    {
+      "prefix": "products/loom/fixtures",
+      "primary_group": "product-loom"
+    },
+    {
+      "prefix": "products/loom/model-policies",
+      "primary_group": "product-loom"
+    }
+  ],
+  "authoritative_exceptions": [
+    { "prefix": ".github", "kind": "ci-platform-policy" },
+    { "prefix": "ci", "kind": "ci-policy" },
+    { "prefix": "scripts/ci", "kind": "ci-policy" },
+    { "prefix": "docs", "kind": "documentation" },
+    { "prefix": "migration", "kind": "historical-provenance" },
+    { "prefix": "products/fte/docs", "kind": "documentation" },
+    { "prefix": "products/fte/receipts", "kind": "historical-evidence" },
+    { "prefix": "products/fte/research", "kind": "research" },
+    { "prefix": "products/mom/docs", "kind": "documentation" },
+    { "prefix": "products/mom/receipts", "kind": "historical-evidence" },
+    { "prefix": "products/loom/docs", "kind": "documentation" },
+    { "prefix": "release", "kind": "platform-release" },
+    { "path": "README.md", "kind": "documentation" },
+    { "path": "AGENTS.md", "kind": "documentation" },
+    { "path": "CONTRIBUTING.md", "kind": "documentation" },
+    { "path": "SECURITY.md", "kind": "documentation" },
+    { "path": "package.json", "kind": "frontend-workspace" },
+    { "path": "pnpm-lock.yaml", "kind": "frontend-workspace" },
+    { "path": "pnpm-workspace.yaml", "kind": "frontend-workspace" },
+    { "path": "rust-toolchain.toml", "kind": "workspace-platform" },
+    { "path": "scripts/release-macos.sh", "kind": "platform-release" },
+    { "path": "scripts/smoke-macos-app.sh", "kind": "platform-release" },
+    { "path": "scripts/find-embedded-model.mjs", "kind": "platform-asset" },
+    { "path": "scripts/product-state-backup.mjs", "kind": "platform-asset" }
+  ]
+}

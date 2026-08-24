@@ -2,6 +2,11 @@
 
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import {
+  computeReverseDependencyShadow,
+  readCargoMetadata,
+  unavailableShadow,
+} from "./ci-metadata-shadow.mjs";
 
 function requiredEnv(name) {
   const value = process.env[name];
@@ -99,6 +104,32 @@ function forceFull(nextRisk = "dependency") {
 
 function under(candidate, prefix) {
   return candidate === prefix || candidate.startsWith(`${prefix}/`);
+}
+
+function isMomContractDependencyChange(changedPath) {
+  const contractRoots = [
+    "crates/native",
+    "crates/services/attachment",
+    "crates/services/information",
+    "crates/services/speech",
+    "products/fte",
+  ];
+  if (!contractRoots.some((prefix) => under(changedPath, prefix))) return false;
+  if (
+    changedPath.endsWith(".md") ||
+    changedPath.includes("/docs/") ||
+    changedPath.includes("/fixtures/") ||
+    changedPath.includes("/receipts/") ||
+    changedPath.includes("/research/") ||
+    changedPath.includes("/README") ||
+    changedPath.includes("/LICENSE")
+  ) {
+    return false;
+  }
+  return (
+    /(?:^|\/)(?:Cargo\.toml|Cargo\.lock|build\.rs)$/.test(changedPath) ||
+    /\.(?:rs|json|toml|proto|wit)$/.test(changedPath)
+  );
 }
 
 for (const changedPath of changed) {
@@ -276,6 +307,54 @@ for (const changedPath of changed) {
   if (!recognized) forceFull();
 }
 
+// This is an explicitly conservative bridge while metadata selection remains
+// observational. Mom already consumes Native, Attachment and FTE contracts,
+// and the staged architecture will consume Speech and Information contracts.
+// A contract-family change therefore exercises Mom even where today's Cargo
+// graph has not acquired the future edge yet.
+const momContractPaths = changed.filter(isMomContractDependencyChange);
+const momContractOverlay = {
+  applied: presence.mom && momContractPaths.length > 0,
+  paths: momContractPaths,
+  reason:
+    "temporary conservative Mom coverage for Native, Attachment, Speech, Information, and FTE contract changes",
+};
+if (momContractOverlay.applied) {
+  flags.mom = true;
+  markBehavior();
+}
+
+function selectedPrimaryGroups(primary) {
+  if (flags.full || flags.root) return Object.keys(primary);
+  const groups = [];
+  if (flags.native) groups.push("native");
+  if (flags.gateway) groups.push("gateway");
+  if (flags.attachment) groups.push("service-attachment");
+  if (flags.information) groups.push("service-information");
+  if (flags.speech) groups.push("service-speech");
+  if (flags.mom) groups.push("product-mom");
+  if (flags.loom) groups.push("product-loom");
+  return groups;
+}
+
+let dependencyShadow;
+try {
+  const packageGroups = JSON.parse(fs.readFileSync("ci/package-groups.json", "utf8"));
+  const pathExceptions = JSON.parse(
+    fs.readFileSync("ci/ci-path-exceptions.json", "utf8"),
+  );
+  dependencyShadow = computeReverseDependencyShadow({
+    metadata: readCargoMetadata(process.cwd()),
+    repoRoot: process.cwd(),
+    changed,
+    packageGroups,
+    pathExceptions,
+    authoritativePrimaryGroups: selectedPrimaryGroups(packageGroups.primary),
+  });
+} catch (error) {
+  dependencyShadow = unavailableShadow(String(error.message ?? error));
+}
+
 const jobs = ["policy"];
 if (flags.root || flags.full) jobs.push("root-linux");
 if (flags.native || flags.full) jobs.push("native-linux");
@@ -314,6 +393,10 @@ const plan = {
   changed,
   presence,
   flags,
+  conservative_overlays: {
+    mom_contracts: momContractOverlay,
+  },
+  dependency_shadow: dependencyShadow,
   macos_matrix: macosMatrix,
   jobs: [...new Set(jobs)],
 };

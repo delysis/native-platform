@@ -1,0 +1,376 @@
+{
+  "schema": "native-platform.ignored-tests.v1",
+  "expected_test_count": 37,
+  "entries": [
+    {
+      "test_id": "controlled_runtime::tests::real_small_gguf_controlled_generation_proves_baseline_cfg_constraints_and_samplers",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/controlled_runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and a real small local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "tests::real_completion_text_tokens_batch_and_capabilities",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "tests::real_in_process_prompt_smoke",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "tests::real_per_token_embeddings_preserve_generation_context",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "tests::real_strict_batch_retains_a_pre_cancelled_case_under_exact_model_binding",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH, MOM_LLAMA_MODEL_SHA256, and a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH", "MOM_LLAMA_MODEL_SHA256"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "tests::real_digest_assertions_reuse_one_resident_and_wrong_digest_cannot_mutate_slots",
+      "package": "llama-native-host",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-host/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH, MOM_LLAMA_MODEL_SHA256, and a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH", "MOM_LLAMA_MODEL_SHA256"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "tests::real_joined_shutdown_revokes_live_clients_then_joins_and_stops_admission",
+      "package": "llama-native-host",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-host/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH, MOM_LLAMA_MODEL_SHA256, and a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH", "MOM_LLAMA_MODEL_SHA256"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "tests::real_process_exit_shutdown_revokes_live_clients_then_joins_and_stops_admission",
+      "package": "llama-native-host",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-host/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH, MOM_LLAMA_MODEL_SHA256, and a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH", "MOM_LLAMA_MODEL_SHA256"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "tests::real_community_archive_smoke",
+      "package": "information-native-backend-community",
+      "target": "lib",
+      "source": "crates/services/information/crates/information-native-backend-community/src/lib.rs",
+      "prerequisite": "set COMMUNITY_ARCHIVE_SQLITE to run against a compatible v28 archive",
+      "required_environment": ["COMMUNITY_ARCHIVE_SQLITE"],
+      "evidence_class": "real-corpus-read-only",
+      "promotion_prohibition": "Passing this corpus smoke alone cannot promote product integration, corpus fitness, or model-use authority."
+    },
+    {
+      "test_id": "tests::real_database_read_only_smoke",
+      "package": "information-native-backend-encyclopedia",
+      "target": "lib",
+      "source": "crates/services/information/crates/information-native-backend-encyclopedia/src/lib.rs",
+      "prerequisite": "set INFORMATION_NATIVE_ENCYCLOPEDIA_DB to run against a compatible database",
+      "required_environment": ["INFORMATION_NATIVE_ENCYCLOPEDIA_DB"],
+      "evidence_class": "real-corpus-read-only",
+      "promotion_prohibition": "Passing this corpus smoke alone cannot promote product integration, corpus fitness, or model-use authority."
+    },
+    {
+      "test_id": "tests::real_scripture_index_read_only_smoke",
+      "package": "information-native-backend-scripture",
+      "target": "lib",
+      "source": "crates/services/information/crates/information-native-backend-scripture/src/lib.rs",
+      "prerequisite": "set INFORMATION_NATIVE_SCRIPTURE_DB to run against a compatible index",
+      "required_environment": ["INFORMATION_NATIVE_SCRIPTURE_DB"],
+      "evidence_class": "real-corpus-read-only",
+      "promotion_prohibition": "Passing this corpus smoke alone cannot promote product integration, corpus fitness, or model-use authority."
+    },
+    {
+      "test_id": "tests::real_alexandria_smoke",
+      "package": "information-native-backend-sqlite",
+      "target": "lib",
+      "source": "crates/services/information/crates/information-native-backend-sqlite/src/lib.rs",
+      "prerequisite": "set INFORMATION_NATIVE_ALEXANDRIA_DB to run against a real compatible corpus",
+      "required_environment": ["INFORMATION_NATIVE_ALEXANDRIA_DB"],
+      "evidence_class": "real-corpus-read-only",
+      "promotion_prohibition": "Passing this corpus smoke alone cannot promote product integration, corpus fitness, or model-use authority."
+    },
+    {
+      "test_id": "real_gateway_transcription_and_request_scoped_cancellation",
+      "package": "speech-native-backend-parakeet",
+      "target": "test:real_parakeet",
+      "source": "crates/services/speech/crates/speech-native-backend-parakeet/tests/real_parakeet.rs",
+      "prerequisite": "requires the exact Parakeet model bundle and exact English WAV fixture",
+      "required_environment": ["SPEECH_NATIVE_PARAKEET_MODEL_DIR", "SPEECH_NATIVE_TEST_WAV"],
+      "evidence_class": "real-model-audio-runtime",
+      "promotion_prohibition": "Passing this test cannot promote transcription accuracy, microphone capture, product integration, or cross-platform readiness."
+    },
+    {
+      "test_id": "apple_backend::tests::real_apple_tts_returns_silent_wav_bytes_without_permission",
+      "package": "speech-native-platform",
+      "target": "lib",
+      "source": "crates/services/speech/crates/speech-native-platform/src/apple_backend.rs",
+      "prerequisite": "requires macOS, a running AppKit event loop, and an installed Apple voice",
+      "required_environment": [],
+      "evidence_class": "real-platform-tts-runtime",
+      "promotion_prohibition": "Passing this test cannot promote launched-product playback, cancellation, packaging, or non-macOS readiness."
+    },
+    {
+      "test_id": "real_chat_completion_and_stable_prefix_hit_are_in_process",
+      "package": "fte-backend-llama",
+      "target": "test:real",
+      "source": "products/fte/crates/fte-backend-llama/tests/real.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote desktop, provider, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "gateway_runtime::tests::real_desktop_local_route_runs_in_process_and_joins_on_shutdown",
+      "package": "free-token-energy",
+      "target": "lib",
+      "source": "products/fte/src-tauri/src/gateway_runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote visible desktop, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "gateway_runtime::tests::real_os_credential_store_round_trips_and_cleans_up",
+      "package": "free-token-energy",
+      "target": "lib",
+      "source": "products/fte/src-tauri/src/gateway_runtime.rs",
+      "prerequisite": "requires a disposable FTE_W4_KEYCHAIN_ACCOUNT and access to the real OS credential store",
+      "required_environment": ["FTE_W4_KEYCHAIN_ACCOUNT"],
+      "evidence_class": "real-os-credential-store",
+      "promotion_prohibition": "Passing this disposable round trip cannot promote production credential migration, provider interoperability, or release readiness."
+    },
+    {
+      "test_id": "adapter::tests::real_gemma4_e2b_base_raw_family_acceptance",
+      "package": "loom-backend-llama",
+      "target": "lib",
+      "source": "products/loom/crates/loom-backend-llama/src/adapter.rs",
+      "prerequisite": "requires LOOM_GEMMA4_E2B_BASE_PATH and the pinned Gemma 4 E2B base Q8 GGUF",
+      "required_environment": ["LOOM_GEMMA4_E2B_BASE_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this backend test cannot promote editor UX, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "adapter::tests::real_gguf_cpu_cancellation_and_complete_release",
+      "package": "loom-backend-llama",
+      "target": "lib",
+      "source": "products/loom/crates/loom-backend-llama/src/adapter.rs",
+      "prerequisite": "requires LOOM_GGUF_MODEL_PATH and a real local GGUF",
+      "required_environment": ["LOOM_GGUF_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this backend test cannot promote editor UX, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "adapter::tests::real_gguf_four_way_writer_acceptance",
+      "package": "loom-backend-llama",
+      "target": "lib",
+      "source": "products/loom/crates/loom-backend-llama/src/adapter.rs",
+      "prerequisite": "requires LOOM_GGUF_MODEL_PATH, LOOM_GGUF_MODEL_SHA256, and a real local GGUF",
+      "required_environment": ["LOOM_GGUF_MODEL_PATH", "LOOM_GGUF_MODEL_SHA256"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this backend test cannot promote editor UX, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "adapter::tests::real_gguf_single_writer_acceptance",
+      "package": "loom-backend-llama",
+      "target": "lib",
+      "source": "products/loom/crates/loom-backend-llama/src/adapter.rs",
+      "prerequisite": "requires LOOM_GGUF_MODEL_PATH, LOOM_GGUF_MODEL_SHA256, and a real local GGUF",
+      "required_environment": ["LOOM_GGUF_MODEL_PATH", "LOOM_GGUF_MODEL_SHA256"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this backend test cannot promote editor UX, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "discovery::tests::real_default_cache_discovers_official_gemma_4_12b_qat",
+      "package": "loom-backend-llama",
+      "target": "lib",
+      "source": "products/loom/crates/loom-backend-llama/src/discovery.rs",
+      "prerequisite": "requires the official Gemma 4 12B QAT Q4_0 GGUF in the local Hugging Face cache",
+      "required_environment": [],
+      "evidence_class": "real-model-discovery",
+      "promotion_prohibition": "Discovery alone cannot promote executable inference, editor UX, packaged-app, or release readiness."
+    },
+    {
+      "test_id": "preserved_python_assemblies_reconstruct_or_fail_on_empty_spans",
+      "package": "loom-store",
+      "target": "test:legacy_python_fixture",
+      "source": "products/loom/crates/loom-store/tests/legacy_python_fixture.rs",
+      "prerequisite": "requires LOOM_LEGACY_FIXTURE_ROOT pointing at the preserved Python lab",
+      "required_environment": ["LOOM_LEGACY_FIXTURE_ROOT"],
+      "evidence_class": "historical-corpus-compatibility",
+      "promotion_prohibition": "Passing preserved-fixture reconstruction cannot promote current product migration, editor behavior, or release readiness."
+    },
+    {
+      "test_id": "real_native_cli_stream_preserves_inference_evidence_without_executable",
+      "package": "mom-llama-cli",
+      "target": "test:cli",
+      "source": "products/mom/crates/mom-llama-cli/tests/cli.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this CLI test cannot promote native GUI, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "real_four_persona_group_cancels_one_target_without_touching_sources",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote visible GUI, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote visible GUI, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "real_native_base_completion_invokes_no_fixture",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local base GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote visible GUI, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "real_native_chat_invokes_no_fixture_and_persists",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote visible GUI, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "real_native_kv_cache_save_restore_proves_equivalence",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote visible GUI, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_bytes",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires a real multimodal GGUF, matching mmproj, and local image",
+      "required_environment": ["MOM_LLAMA_MULTIMODAL_MODEL_PATH", "MOM_LLAMA_MM_PROJ_PATH", "MOM_LLAMA_TEST_IMAGE_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote visible multimodal UX, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "real_native_reasoning_stream_can_be_forced_to_the_answer",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_REASONING_MODEL_PATH pointing at a reasoning-capable GGUF",
+      "required_environment": ["MOM_LLAMA_REASONING_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote visible reasoning UX, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "real_native_tool_loop_cancels_an_active_model_request",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF and Unix MCP fixture execution",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote visible tool UX, arbitrary MCP safety, packaged-app, or release readiness."
+    },
+    {
+      "test_id": "real_native_tool_loop_invokes_model_and_persists_tool_lineage",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF and Unix MCP fixture execution",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote visible tool UX, arbitrary MCP safety, packaged-app, or release readiness."
+    },
+    {
+      "test_id": "real_persona_mentions_reuse_only_the_exact_versioned_prefix",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote visible persona UX, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_corruption",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote visible cache UX, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "repeated_profile_acquisition_reuses_the_same_resident_worker",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote visible model-management UX, packaged-app, cross-platform, or release readiness."
+    },
+    {
+      "test_id": "resident_model_profiles_fail_closed_before_memory_overcommit_without_eviction",
+      "package": "mom-llama-runtime",
+      "target": "test:runtime",
+      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF and a Unix filesystem",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-product-model-runtime",
+      "promotion_prohibition": "Passing this runtime test cannot promote device-wide memory safety, visible model UX, packaged-app, or release readiness."
+    }
+  ]
+}

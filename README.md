@@ -20,6 +20,8 @@ source: it is the separately reviewed unsafe upstream boundary.
   Loom applications. Each resolves the same pinned local Tauri CLI version.
 - `ci/package-groups.json` assigns every package to exactly one primary group
   and optional secondary gates.
+- `ci/ignored-tests.json` registers every opt-in test with its exact source,
+  prerequisite, evidence class, and prohibition on automatic promotion.
 - The Attachment fuzz target is the only deliberately excluded auxiliary
   Cargo workspace.
 
@@ -39,6 +41,13 @@ node scripts/ci/cargo-group.mjs clippy product-mom
 `./scripts/check-shell-policy.sh` remains the exhaustive local gate for broad
 workspace, lockfile, and release changes. `cargo xtask lean verify` is an
 explicit historical W8/W9 census check, not part of ordinary policy.
+
+PR selection still uses the authoritative path planner. Its Cargo-metadata
+reverse-dependency result is emitted only as `dependency_shadow`; mismatches
+cannot change required jobs. `ci/ci-path-exceptions.json` contains the small
+non-Cargo asset/platform exception set. Until shadow promotion, Native,
+Attachment, Information, Speech, and FTE contract changes conservatively add
+Mom coverage.
 
 Lifecycle, migration, and SQLite identity checks live with the product or
 service that owns the behavior. Product UI, real-model, and loaded-model
