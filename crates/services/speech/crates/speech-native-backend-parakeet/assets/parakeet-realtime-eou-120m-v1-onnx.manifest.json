@@ -1,0 +1,25 @@
+{
+  "schema": "delysis.speech.parakeet-model.v1",
+  "repository": "altunenes/parakeet-rs",
+  "revision": "a61d2818df4659c956b9661a9447f46e98c15126",
+  "subdirectory": "realtime_eou_120m-v1-onnx",
+  "combined_bytes": 480708981,
+  "combined_sha256": "c710ae82b52aa969f89874e7e7b35ad570fec50cc3d943a4fdde0bb874948756",
+  "files": [
+    {
+      "name": "encoder.onnx",
+      "bytes": 459341289,
+      "sha256": "d472887cc38a784a5bfc21c2dbe247639edc3b3f9992388d8ceceaec07256b5b"
+    },
+    {
+      "name": "decoder_joint.onnx",
+      "bytes": 21347639,
+      "sha256": "9d2553ac043c2fc5f69e970769b0fb8ab9103fbfdeb7d26a1ea9729d4bd2dddd"
+    },
+    {
+      "name": "tokenizer.json",
+      "bytes": 20053,
+      "sha256": "f6b0ad8690559351fa478116fe0985a203b76f7c040f3a9381f485c99c0325f8"
+    }
+  ]
+}

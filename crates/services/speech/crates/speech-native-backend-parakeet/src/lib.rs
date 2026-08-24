@@ -1,11 +1,13 @@
 //! Embedded, network-free Parakeet speech recognition.
 //!
-//! The backend loads one Parakeet Realtime EOU ONNX model from the shared
-//! Hugging Face cache and creates independent decoder state per request. Model
-//! weights are never copied into application storage. The first implementation
+//! The backend accepts one exact Parakeet Realtime EOU ONNX manifest, copies
+//! verified candidates out of mutable caches into private content-addressed
+//! application storage, and creates independent decoder state per request. It
 //! intentionally advertises only what the 120M model proves: English PCM/WAV
 //! transcription with partial streaming results, without timestamps,
 //! diarization, translation, or hotword biasing.
+
+mod model_artifact;
 
 use async_trait::async_trait;
 use parakeet_rs::{ParakeetEOU, ParakeetEOUHandle};
@@ -23,16 +25,18 @@ use speech_native_types::{
 };
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 pub const PARAKEET_BACKEND_ID: &str = "parakeet-rs.eou-120m";
 pub const PARAKEET_MODEL_ID: &str = "parakeet-realtime-eou-120m-v1-onnx";
 pub const PARAKEET_HF_REPOSITORY: &str = "altunenes/parakeet-rs";
 pub const PARAKEET_HF_SUBDIRECTORY: &str = "realtime_eou_120m-v1-onnx";
+pub const PARAKEET_HF_REVISION: &str = model_artifact::MODEL_SOURCE_REVISION;
+pub const PARAKEET_MODEL_CONTENT_SHA256: &str = model_artifact::MODEL_CONTENT_SHA256;
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const MODEL_CHUNK_SAMPLES: usize = 2_560;
@@ -41,7 +45,12 @@ const MAX_AUDIO_MS: u64 = 2 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct ParakeetBackendConfig {
+    /// Optional source candidate. Its bytes remain untrusted until copied and
+    /// verified against the checked-in model manifest.
     pub model_dir: Option<PathBuf>,
+    /// Optional injected root for private, content-addressed managed models.
+    /// Platform data storage is used when this is omitted.
+    pub managed_model_root: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -88,8 +97,36 @@ struct StreamAudioSink {
 }
 
 struct StreamControl {
-    sender: Mutex<Option<mpsc::Sender<AudioChunk>>>,
-    finished: AtomicBool,
+    pushes: mpsc::Sender<StreamPush>,
+    finishes: mpsc::Sender<oneshot::Sender<Result<(), SpeechError>>>,
+    cancel: watch::Sender<bool>,
+    phase: watch::Receiver<StreamPhase>,
+}
+
+struct StreamPush {
+    chunk: AudioChunk,
+    reply: oneshot::Sender<Result<(), SpeechError>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPhase {
+    Running,
+    FinishCommitted,
+    Terminal,
+}
+
+enum PendingStreamActorAction {
+    Cancel,
+    Finish(Option<oneshot::Sender<Result<(), SpeechError>>>),
+    Capacity,
+    DownstreamClosed,
+}
+
+enum IdleStreamActorAction {
+    Cancel,
+    Finish(Option<oneshot::Sender<Result<(), SpeechError>>>),
+    DownstreamClosed,
+    Push(Option<StreamPush>),
 }
 
 struct BackendOperationLease {
@@ -176,21 +213,33 @@ impl BackendState {
 }
 
 impl ParakeetSpeechBackend {
-    /// Discover and load the model from an explicit path or the standard
-    /// Hugging Face cache. Missing weights produce a registered but ineligible
+    /// Discover one exact manifest-bound source candidate, copy it into
+    /// content-addressed managed storage, reverify it, and load only that
+    /// managed path. Missing weights produce a registered but ineligible
     /// backend so status can explain the exact remediation.
     pub async fn discover(config: ParakeetBackendConfig) -> Self {
-        let model_dir = config.model_dir.or_else(discover_eou_model_dir);
-        let Some(model_dir) = model_dir else {
-            return Self::unavailable(asset_required_descriptor());
+        let model_dir = match model_artifact::prepare_model_dir(
+            config.model_dir.as_deref(),
+            config.managed_model_root.as_deref(),
+        ) {
+            Ok(Some(model_dir)) => model_dir,
+            Ok(None) => return Self::unavailable(asset_required_descriptor()),
+            Err(error) => {
+                return Self::unavailable(unavailable_descriptor(format!(
+                    "Parakeet model admission failed: {error}"
+                )));
+            }
         };
-        if !model_dir_is_complete(&model_dir) {
-            return Self::unavailable(asset_required_descriptor());
-        }
 
         let started = Instant::now();
-        let loaded = tokio::task::spawn_blocking(move || {
-            ParakeetEOUHandle::from_pretrained(model_dir, None)
+        let loaded = tokio::task::spawn_blocking(move || -> Result<_, String> {
+            model_artifact::verify_production_model_dir(&model_dir)
+                .map_err(|error| error.to_string())?;
+            let handle = ParakeetEOUHandle::from_pretrained(&model_dir, None)
+                .map_err(|error| error.to_string())?;
+            model_artifact::verify_production_model_dir(&model_dir)
+                .map_err(|error| error.to_string())?;
+            Ok(handle)
         })
         .await;
         let _initialization_ms = elapsed_ms(started);
@@ -239,7 +288,7 @@ impl SpeechBackend for ParakeetSpeechBackend {
                 "parakeet_model_unavailable",
                 SpeechErrorClass::AssetMissing,
                 true,
-                "The Parakeet EOU model is not loaded from the Hugging Face cache",
+                "The exact Parakeet EOU model is not loaded from managed storage",
             )
         })?;
         let request_id = request.context.request_id.clone();
@@ -249,11 +298,8 @@ impl SpeechBackend for ParakeetSpeechBackend {
         let (audio_receiver, audio_sink, stream_control) = match &request.input {
             TranscriptionInput::Complete { .. } => (None, None, None),
             TranscriptionInput::Stream { format, .. } => {
-                let (sender, receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
-                let control = Arc::new(StreamControl {
-                    sender: Mutex::new(Some(sender)),
-                    finished: AtomicBool::new(false),
-                });
+                let (audio_sender, receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
+                let control = spawn_stream_actor(&self.state, request_id.clone(), audio_sender)?;
                 let sink: Arc<dyn TranscriptionAudioSink> = Arc::new(StreamAudioSink {
                     request_id: request_id.clone(),
                     format: *format,
@@ -264,10 +310,10 @@ impl SpeechBackend for ParakeetSpeechBackend {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
-        self.state.spawn_operation(
+        if let Err(error) = self.state.spawn_operation(
             request_id.clone(),
             Arc::clone(&cancelled),
-            stream_control,
+            stream_control.clone(),
             move || {
                 run_transcription(
                     request,
@@ -278,7 +324,12 @@ impl SpeechBackend for ParakeetSpeechBackend {
                     final_sender,
                 );
             },
-        )?;
+        ) {
+            if let Some(stream) = &stream_control {
+                stream.cancel();
+            }
+            return Err(error);
+        }
 
         Ok(TranscriptionTicket::new(
             request_id,
@@ -341,14 +392,8 @@ impl SpeechCancellation for BackendCancellation {
 #[async_trait]
 impl TranscriptionAudioSink for StreamAudioSink {
     async fn push(&self, chunk: AudioChunk) -> Result<(), SpeechError> {
-        if self.control.finished.load(Ordering::Acquire) {
-            return Err(backend_error(
-                &self.request_id,
-                "audio_stream_finished",
-                SpeechErrorClass::InvalidRequest,
-                false,
-                "Audio cannot be pushed after the stream has finished",
-            ));
+        if *self.control.phase.borrow() != StreamPhase::Running {
+            return Err(stream_finished_error(&self.request_id));
         }
         chunk.validate(&self.request_id)?;
         if chunk.format != self.format {
@@ -360,33 +405,256 @@ impl TranscriptionAudioSink for StreamAudioSink {
                 "A transcription stream must keep one PCM format",
             ));
         }
-        let sender = self
+        let (reply, response) = oneshot::channel();
+        if self
             .control
-            .sender
-            .lock()
-            .map_err(|_| stream_closed_error(&self.request_id))?
-            .clone()
-            .ok_or_else(|| stream_closed_error(&self.request_id))?;
-        sender
-            .send(chunk)
+            .pushes
+            .send(StreamPush { chunk, reply })
             .await
-            .map_err(|_| stream_closed_error(&self.request_id))?;
-        if self.control.finished.load(Ordering::Acquire) {
-            return Err(stream_closed_error(&self.request_id));
+            .is_err()
+        {
+            return Err(if *self.control.phase.borrow() == StreamPhase::Running {
+                stream_closed_error(&self.request_id)
+            } else {
+                stream_finished_error(&self.request_id)
+            });
         }
-        Ok(())
+        response
+            .await
+            .unwrap_or_else(|_| Err(stream_closed_error(&self.request_id)))
     }
 
     async fn finish(&self) -> Result<(), SpeechError> {
-        if self.control.finished.swap(true, Ordering::AcqRel) {
+        if *self.control.phase.borrow() != StreamPhase::Running {
             return Ok(());
         }
-        self.control
-            .sender
-            .lock()
-            .map_err(|_| stream_closed_error(&self.request_id))?
-            .take();
-        Ok(())
+        let (reply, response) = oneshot::channel();
+        if self.control.finishes.send(reply).await.is_err() {
+            return if *self.control.phase.borrow() != StreamPhase::Running {
+                Ok(())
+            } else {
+                Err(stream_closed_error(&self.request_id))
+            };
+        }
+        response
+            .await
+            .unwrap_or_else(|_| Err(stream_closed_error(&self.request_id)))
+    }
+}
+
+impl StreamControl {
+    fn cancel(&self) {
+        let _ = self.cancel.send(true);
+    }
+}
+
+fn spawn_stream_actor(
+    state: &BackendState,
+    request_id: SpeechRequestId,
+    audio_sender: mpsc::Sender<AudioChunk>,
+) -> Result<Arc<StreamControl>, SpeechError> {
+    let (pushes, push_receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
+    let (finishes, finish_receiver) = mpsc::channel(1);
+    let (cancel, cancel_receiver) = watch::channel(false);
+    let (phase_sender, phase) = watch::channel(StreamPhase::Running);
+    let actor_request_id = request_id.clone();
+    state
+        .tasks
+        .spawn(format!("parakeet-stream:{request_id}"), async move {
+            run_stream_actor(
+                actor_request_id,
+                push_receiver,
+                finish_receiver,
+                cancel_receiver,
+                phase_sender,
+                audio_sender,
+            )
+            .await;
+            Ok(())
+        })
+        .map_err(|error| task_supervisor_error(&request_id, error))?;
+    Ok(Arc::new(StreamControl {
+        pushes,
+        finishes,
+        cancel,
+        phase,
+    }))
+}
+
+async fn run_stream_actor(
+    request_id: SpeechRequestId,
+    mut pushes: mpsc::Receiver<StreamPush>,
+    mut finishes: mpsc::Receiver<oneshot::Sender<Result<(), SpeechError>>>,
+    mut cancel: watch::Receiver<bool>,
+    phase: watch::Sender<StreamPhase>,
+    audio_sender: mpsc::Sender<AudioChunk>,
+) {
+    let mut pending = None;
+    loop {
+        if pending.is_some() {
+            match next_pending_stream_actor_action(&mut cancel, &mut finishes, &audio_sender).await
+            {
+                PendingStreamActorAction::Cancel | PendingStreamActorAction::DownstreamClosed => {
+                    drop(audio_sender);
+                    close_stream_actor(
+                        &request_id,
+                        pending.take(),
+                        &mut pushes,
+                        &mut finishes,
+                        &phase,
+                        StreamPhase::Terminal,
+                        None,
+                    );
+                    return;
+                }
+                PendingStreamActorAction::Finish(finish) => {
+                    drop(audio_sender);
+                    close_stream_actor(
+                        &request_id,
+                        pending.take(),
+                        &mut pushes,
+                        &mut finishes,
+                        &phase,
+                        StreamPhase::FinishCommitted,
+                        finish,
+                    );
+                    return;
+                }
+                PendingStreamActorAction::Capacity => {
+                    if let Some(push) = pending.take() {
+                        let StreamPush { chunk, reply } = push;
+                        match audio_sender.try_send(chunk) {
+                            Ok(()) => {
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(mpsc::error::TrySendError::Full(chunk)) => {
+                                pending = Some(StreamPush { chunk, reply });
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_chunk)) => {
+                                let _ = reply.send(Err(stream_closed_error(&request_id)));
+                                drop(audio_sender);
+                                close_stream_actor(
+                                    &request_id,
+                                    None,
+                                    &mut pushes,
+                                    &mut finishes,
+                                    &phase,
+                                    StreamPhase::Terminal,
+                                    None,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        match next_idle_stream_actor_action(&mut cancel, &mut pushes, &mut finishes, &audio_sender)
+            .await
+        {
+            IdleStreamActorAction::Cancel | IdleStreamActorAction::DownstreamClosed => {
+                drop(audio_sender);
+                close_stream_actor(
+                    &request_id,
+                    None,
+                    &mut pushes,
+                    &mut finishes,
+                    &phase,
+                    StreamPhase::Terminal,
+                    None,
+                );
+                return;
+            }
+            IdleStreamActorAction::Finish(finish) => {
+                drop(audio_sender);
+                close_stream_actor(
+                    &request_id,
+                    None,
+                    &mut pushes,
+                    &mut finishes,
+                    &phase,
+                    StreamPhase::FinishCommitted,
+                    finish,
+                );
+                return;
+            }
+            IdleStreamActorAction::Push(push) => {
+                let Some(push) = push else {
+                    return;
+                };
+                pending = Some(push);
+            }
+        }
+    }
+}
+
+async fn next_pending_stream_actor_action(
+    cancel: &mut watch::Receiver<bool>,
+    finishes: &mut mpsc::Receiver<oneshot::Sender<Result<(), SpeechError>>>,
+    audio_sender: &mpsc::Sender<AudioChunk>,
+) -> PendingStreamActorAction {
+    tokio::select! {
+        biased;
+        changed = cancel.changed() => {
+            let _ = changed;
+            PendingStreamActorAction::Cancel
+        }
+        finish = finishes.recv() => PendingStreamActorAction::Finish(finish),
+        permit = audio_sender.reserve() => {
+            match permit {
+                Ok(permit) => {
+                    drop(permit);
+                    PendingStreamActorAction::Capacity
+                }
+                Err(_) => PendingStreamActorAction::DownstreamClosed,
+            }
+        }
+    }
+}
+
+async fn next_idle_stream_actor_action(
+    cancel: &mut watch::Receiver<bool>,
+    pushes: &mut mpsc::Receiver<StreamPush>,
+    finishes: &mut mpsc::Receiver<oneshot::Sender<Result<(), SpeechError>>>,
+    audio_sender: &mpsc::Sender<AudioChunk>,
+) -> IdleStreamActorAction {
+    tokio::select! {
+        biased;
+        changed = cancel.changed() => {
+            let _ = changed;
+            IdleStreamActorAction::Cancel
+        }
+        finish = finishes.recv() => IdleStreamActorAction::Finish(finish),
+        () = audio_sender.closed() => IdleStreamActorAction::DownstreamClosed,
+        push = pushes.recv() => IdleStreamActorAction::Push(push),
+    }
+}
+
+fn close_stream_actor(
+    request_id: &SpeechRequestId,
+    pending: Option<StreamPush>,
+    pushes: &mut mpsc::Receiver<StreamPush>,
+    finishes: &mut mpsc::Receiver<oneshot::Sender<Result<(), SpeechError>>>,
+    phase: &watch::Sender<StreamPhase>,
+    terminal_phase: StreamPhase,
+    committed_finish: Option<oneshot::Sender<Result<(), SpeechError>>>,
+) {
+    pushes.close();
+    finishes.close();
+    phase.send_replace(terminal_phase);
+    if let Some(push) = pending {
+        let _ = push.reply.send(Err(stream_finished_error(request_id)));
+    }
+    while let Ok(push) = pushes.try_recv() {
+        let _ = push.reply.send(Err(stream_finished_error(request_id)));
+    }
+    while let Ok(finish) = finishes.try_recv() {
+        let _ = finish.send(Ok(()));
+    }
+    if let Some(finish) = committed_finish {
+        let _ = finish.send(Ok(()));
     }
 }
 
@@ -403,10 +671,7 @@ fn cancel_request(state: &BackendState, request_id: &SpeechRequestId) -> usize {
 fn cancel_operation(operation: &ActiveParakeetOperation) {
     operation.cancelled.store(true, Ordering::Release);
     if let Some(stream) = &operation.stream {
-        stream.finished.store(true, Ordering::Release);
-        if let Ok(mut sender) = stream.sender.lock() {
-            sender.take();
-        }
+        stream.cancel();
     }
 }
 
@@ -1153,63 +1418,12 @@ impl StreamingNormalizer {
     }
 }
 
-/// Resolve the EOU model without copying it out of Hugging Face's cache.
+/// Resolve and install the exact EOU model into content-addressed managed
+/// storage. Mutable cache references are discovery hints only; returned bytes
+/// have passed the checked-in revision/file/length/SHA-256 manifest.
 #[must_use]
 pub fn discover_eou_model_dir() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("SPEECH_NATIVE_PARAKEET_MODEL_DIR")
-        .or_else(|| std::env::var_os("FTE_PARAKEET_MODEL_DIR"))
-    {
-        let explicit = PathBuf::from(explicit);
-        if model_dir_is_complete(&explicit) {
-            return Some(explicit);
-        }
-    }
-    huggingface_cache_roots()
-        .into_iter()
-        .find_map(|root| discover_in_hf_root(&root))
-}
-
-fn huggingface_cache_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(root) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
-        roots.push(PathBuf::from(root));
-    }
-    if let Some(home) = std::env::var_os("HF_HOME") {
-        roots.push(PathBuf::from(home).join("hub"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".cache/huggingface/hub"));
-    }
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
-fn discover_in_hf_root(root: &Path) -> Option<PathBuf> {
-    let repository = root.join("models--altunenes--parakeet-rs");
-    if let Ok(reference) = std::fs::read_to_string(repository.join("refs/main")) {
-        let candidate = repository
-            .join("snapshots")
-            .join(reference.trim())
-            .join(PARAKEET_HF_SUBDIRECTORY);
-        if model_dir_is_complete(&candidate) {
-            return Some(candidate);
-        }
-    }
-    let mut snapshots = std::fs::read_dir(repository.join("snapshots"))
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join(PARAKEET_HF_SUBDIRECTORY))
-        .filter(|candidate| model_dir_is_complete(candidate))
-        .collect::<Vec<_>>();
-    snapshots.sort();
-    snapshots.pop()
-}
-
-fn model_dir_is_complete(path: &Path) -> bool {
-    ["encoder.onnx", "decoder_joint.onnx", "tokenizer.json"]
-        .iter()
-        .all(|file| path.join(file).is_file())
+    model_artifact::discover_default_model_dir()
 }
 
 fn ready_descriptor() -> SpeechBackendDescriptor {
@@ -1222,8 +1436,10 @@ fn ready_descriptor() -> SpeechBackendDescriptor {
             kind: EvidenceKind::RuntimeApi,
             outcome: EvidenceOutcome::Confirmed,
             observed_at_unix_ms: unix_time_ms(),
-            detail: "Parakeet EOU ONNX sessions and tokenizer loaded from the Hugging Face cache"
-                .to_string(),
+            detail: format!(
+                "Parakeet EOU ONNX sessions and tokenizer loaded from verified managed bytes at \
+                 altunenes/parakeet-rs@{PARAKEET_HF_REVISION}"
+            ),
         }],
         true,
     )
@@ -1236,7 +1452,7 @@ fn asset_required_descriptor() -> SpeechBackendDescriptor {
                 id: "hf.altunenes.parakeet-rs.realtime-eou-120m-v1-onnx".to_string(),
                 display_name: "Parakeet Realtime EOU 120M ONNX".to_string(),
                 bytes: Some(MODEL_ASSET_BYTES),
-                managed_by: AssetManager::HuggingFaceCache,
+                managed_by: AssetManager::Application,
             }],
         },
         CapabilityAvailability::AssetInstallRequired,
@@ -1298,7 +1514,7 @@ fn descriptor(
             languages: vec!["en".to_string()],
             resident,
             estimated_memory_bytes: Some(700_000_000),
-            content_hash: None,
+            content_hash: Some(PARAKEET_MODEL_CONTENT_SHA256.to_owned()),
         }],
         voices: Vec::new(),
     }
@@ -1368,6 +1584,16 @@ fn stream_closed_error(request_id: &SpeechRequestId) -> SpeechError {
     )
 }
 
+fn stream_finished_error(request_id: &SpeechRequestId) -> SpeechError {
+    backend_error(
+        request_id,
+        "audio_stream_finished",
+        SpeechErrorClass::InvalidRequest,
+        false,
+        "Audio cannot be pushed after the stream has finished",
+    )
+}
+
 fn invalid_audio_error(request_id: &SpeechRequestId, detail: String) -> SpeechError {
     backend_error(
         request_id,
@@ -1411,7 +1637,6 @@ fn unix_time_ms() -> u64 {
 mod tests {
     use super::*;
     use speech_native_types::{SpeechDeadlinePolicy, SpeechRequestContext, SpeechRoutingPolicy};
-    use std::sync::atomic::AtomicUsize;
 
     fn fixture_pcm_format() -> PcmFormat {
         PcmFormat {
@@ -1451,22 +1676,6 @@ mod tests {
         }
     }
 
-    fn temporary_fixture_root(label: &str) -> PathBuf {
-        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
-        std::env::temp_dir().join(format!(
-            "speech-native-{label}-{}-{}",
-            std::process::id(),
-            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-
-    fn write_named_model_files(path: &Path) {
-        std::fs::create_dir_all(path).expect("create model fixture directory");
-        for filename in ["encoder.onnx", "decoder_joint.onnx", "tokenizer.json"] {
-            std::fs::write(path.join(filename), []).expect("write named model fixture file");
-        }
-    }
-
     #[test]
     fn i24_sign_extension_is_correct() {
         assert_eq!(decode_sample(PcmSampleFormat::I24Le, &[0, 0, 0]), Ok(0.0));
@@ -1487,48 +1696,17 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_model_directory_never_looks_ready() {
-        let path = std::env::temp_dir().join(format!(
-            "fte-parakeet-missing-{}-{}",
-            std::process::id(),
-            unix_time_ms()
-        ));
-        std::fs::create_dir_all(&path).expect("create fixture directory");
-        assert!(!model_dir_is_complete(&path));
-        std::fs::remove_dir_all(path).expect("remove fixture directory");
-    }
-
-    #[test]
-    fn artifact_discovery_currently_trusts_mutable_ref_and_filenames_without_hash() {
-        let root = temporary_fixture_root("mutable-artifact-identity");
-        let repository = root.join("models--altunenes--parakeet-rs");
-        let first = repository
-            .join("snapshots")
-            .join("snapshot-a")
-            .join(PARAKEET_HF_SUBDIRECTORY);
-        let second = repository
-            .join("snapshots")
-            .join("snapshot-b")
-            .join(PARAKEET_HF_SUBDIRECTORY);
-        write_named_model_files(&first);
-        write_named_model_files(&second);
-        std::fs::create_dir_all(repository.join("refs")).expect("create fixture refs");
-
-        std::fs::write(repository.join("refs/main"), "snapshot-a\n")
-            .expect("point mutable ref at first snapshot");
-        assert_eq!(discover_in_hf_root(&root), Some(first.clone()));
-        std::fs::write(repository.join("refs/main"), "snapshot-b\n")
-            .expect("repoint mutable ref at second snapshot");
-        assert_eq!(discover_in_hf_root(&root), Some(second.clone()));
-        assert!(model_dir_is_complete(&first));
-        assert!(model_dir_is_complete(&second));
-        assert_eq!(
-            ready_descriptor().models[0].content_hash,
-            None,
-            "current ready identity records neither per-file nor combined content hash"
-        );
-
-        std::fs::remove_dir_all(root).expect("remove artifact identity fixture");
+    fn every_descriptor_binds_the_exact_model_content_hash() {
+        for descriptor in [
+            ready_descriptor(),
+            asset_required_descriptor(),
+            unavailable_descriptor("fixture unavailable".to_owned()),
+        ] {
+            assert_eq!(
+                descriptor.models[0].content_hash.as_deref(),
+                Some(PARAKEET_MODEL_CONTENT_SHA256)
+            );
+        }
     }
 
     #[test]
@@ -1558,12 +1736,16 @@ mod tests {
     }
 
     #[test]
-    fn asset_blocker_is_hugging_face_cache_managed() {
+    fn asset_blocker_requires_application_managed_verified_storage() {
         let descriptor = asset_required_descriptor();
         assert!(matches!(
-            descriptor.readiness,
+            &descriptor.readiness,
             SpeechBackendReadiness::AssetInstallRequired { .. }
         ));
+        let SpeechBackendReadiness::AssetInstallRequired { assets } = descriptor.readiness else {
+            panic!("asset blocker must retain exact asset facts");
+        };
+        assert_eq!(assets[0].managed_by, AssetManager::Application);
         assert!(!descriptor.capabilities[0].eligible_for_local_only());
         assert!(!descriptor.models[0].resident);
     }
@@ -1682,19 +1864,14 @@ mod tests {
     #[tokio::test]
     async fn stream_sink_rejects_push_after_finish() {
         let request_id = SpeechRequestId("finished-stream".to_string());
+        let state = BackendState::default();
         let (sender, _receiver) = mpsc::channel(1);
+        let control =
+            spawn_stream_actor(&state, request_id.clone(), sender).expect("spawn stream actor");
         let sink = StreamAudioSink {
             request_id: request_id.clone(),
-            format: PcmFormat {
-                sample_rate_hz: 16_000,
-                channels: 1,
-                sample_format: PcmSampleFormat::I16Le,
-                interleaved: true,
-            },
-            control: Arc::new(StreamControl {
-                sender: Mutex::new(Some(sender)),
-                finished: AtomicBool::new(false),
-            }),
+            format: fixture_pcm_format(),
+            control,
         };
         sink.finish().await.expect("finish stream");
         let error = sink
@@ -1708,19 +1885,24 @@ mod tests {
             .await
             .expect_err("push after finish must fail");
         assert_eq!(error.code, "audio_stream_finished");
+        state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("stream actor joins");
     }
 
     #[tokio::test]
-    async fn acknowledged_finish_currently_allows_a_waiting_push_to_deliver() {
+    async fn acknowledged_finish_rejects_a_blocked_push_without_delivery() {
         let request_id = SpeechRequestId("finish-push-race".to_owned());
+        let state = BackendState::default();
         let (sender, mut receiver) = mpsc::channel(1);
+        let control =
+            spawn_stream_actor(&state, request_id.clone(), sender).expect("spawn stream actor");
         let sink = StreamAudioSink {
             request_id: request_id.clone(),
             format: fixture_pcm_format(),
-            control: Arc::new(StreamControl {
-                sender: Mutex::new(Some(sender)),
-                finished: AtomicBool::new(false),
-            }),
+            control,
         };
         let chunk = |sequence| AudioChunk {
             sequence,
@@ -1738,7 +1920,10 @@ mod tests {
             result = &mut waiting_push => panic!("second push unexpectedly completed: {result:?}"),
             _ = std::future::ready(()) => {}
         }
-        sink.finish().await.expect("finish is acknowledged");
+        tokio::time::timeout(std::time::Duration::from_secs(1), sink.finish())
+            .await
+            .expect("finish overtakes the blocked push")
+            .expect("finish is acknowledged");
 
         assert_eq!(
             receiver.recv().await.expect("receive first chunk").sequence,
@@ -1746,26 +1931,26 @@ mod tests {
         );
         let error = waiting_push
             .await
-            .expect_err("waiting push reports the stream closed after sending");
-        assert_eq!(error.code, "audio_stream_closed");
-        assert_eq!(
-            receiver
-                .recv()
-                .await
-                .expect("current sink delivers the late chunk after finish")
-                .sequence,
-            1
+            .expect_err("waiting push is rejected by committed finish");
+        assert_eq!(error.code, "audio_stream_finished");
+        assert!(
+            receiver.recv().await.is_none(),
+            "no chunk may cross the acknowledged finish boundary"
         );
+        state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("stream actor joins");
     }
 
     #[tokio::test]
     async fn cancellation_closes_the_stream_input_sink() {
         let request_id = SpeechRequestId("cancelled-stream".to_string());
+        let state = BackendState::default();
         let (sender, _receiver) = mpsc::channel(1);
-        let control = Arc::new(StreamControl {
-            sender: Mutex::new(Some(sender)),
-            finished: AtomicBool::new(false),
-        });
+        let control =
+            spawn_stream_actor(&state, request_id.clone(), sender).expect("spawn stream actor");
         let sink = StreamAudioSink {
             request_id: request_id.clone(),
             format: PcmFormat {
@@ -1792,6 +1977,11 @@ mod tests {
             .await
             .expect_err("cancelled stream must reject input");
         assert_eq!(error.code, "audio_stream_finished");
+        state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("stream actor joins");
     }
 
     #[tokio::test]

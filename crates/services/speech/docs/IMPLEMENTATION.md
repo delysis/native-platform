@@ -29,8 +29,8 @@ This slice establishes five reusable crates:
   relays backend finals through host-owned monitor tasks.
 - `speech-native-backend-parakeet`: an executable, embedded Parakeet Realtime EOU 120M
   backend over `parakeet-rs` and ONNX Runtime. It loads one shared model handle
-  from the Hugging Face cache and creates independent decoder state per
-  request.
+  from exact manifest-verified content-addressed managed bytes and creates
+  independent decoder state per request.
 
 On macOS, `AppleCapabilitySource` now performs a real, noninteractive runtime
 inventory through safe Speech and AVSpeechSynthesizer bindings. It does not ask
@@ -76,7 +76,9 @@ A product edge must perform this joined shutdown during its native application
 exit event and surface failure rather than discarding it. If live
 transcription is exposed, the product edge must preserve both halves of the
 typed contract: bounded output events and the backpressured input audio sink.
-Closing either side cancels only that request.
+One bounded sink actor owns push admission and the irreversible finish commit;
+an acknowledged finish closes downstream delivery and makes every later or
+still-blocked push fail. Closing either side cancels only that request.
 
 Applications that do not use speech need no speech crate, permission, backend
 registration, or shutdown path.
@@ -133,18 +135,30 @@ capability.
 ## Embedded Parakeet Runtime
 
 `speech-native-backend-parakeet` is the first executable cross-platform fallback. Its
-current model is `parakeet-realtime-eou-120m-v1-onnx` from
-`altunenes/parakeet-rs`. Discovery checks, in order:
+current model is `parakeet-realtime-eou-120m-v1-onnx` from immutable revision
+`altunenes/parakeet-rs@a61d2818df4659c956b9661a9447f46e98c15126`.
+The checked-in manifest binds the ordered three-file bundle to 480,708,981
+bytes and combined SHA-256
+`c710ae82b52aa969f89874e7e7b35ad570fec50cc3d943a4fdde0bb874948756`.
+Discovery checks, in order:
 
 1. `SPEECH_NATIVE_PARAKEET_MODEL_DIR` (with the legacy
    `FTE_PARAKEET_MODEL_DIR` alias retained for the 0.1 line);
-2. `HUGGINGFACE_HUB_CACHE`;
-3. `HF_HOME/hub`;
-4. the standard `~/.cache/huggingface/hub` location.
+2. the exact immutable revision under `HUGGINGFACE_HUB_CACHE`;
+3. the exact immutable revision under `HF_HOME/hub`;
+4. the exact immutable revision under the standard
+   `~/.cache/huggingface/hub` location.
 
-It follows the cache snapshot/reference structure and never copies weights.
-When files are absent, the registered descriptor reports a Hugging Face-managed
-`asset_install_required` blocker; discovery does not download anything.
+Mutable refs and arbitrary snapshots are never admission authority. A candidate
+is streamed through the per-file length/SHA-256 manifest into private staging,
+reverified there, and atomically published under the combined content hash in
+application-managed storage. Cache data is copied, never hard-linked. The
+managed bundle is reverified immediately before and after model loading. The
+managed root may be injected in `ParakeetBackendConfig` or set with
+`SPEECH_NATIVE_PARAKEET_MANAGED_ROOT`; otherwise the platform application-data
+location is used. When exact files are absent, the descriptor reports an
+application-managed `asset_install_required` blocker; discovery does not
+download anything.
 
 The model is English-only and advertises PCM/WAV input, streaming, and partial
 results. It does not claim timestamps, diarization, translation, hotwords, or
