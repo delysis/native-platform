@@ -9,14 +9,14 @@ use fs4::TryLockError;
 use loom_document::DocumentContent;
 use loom_types::{
     ArtifactId, BlobId, CommandId, CommandKind, CommandReceipt, DocumentId, DocumentKind,
-    OperationId, OperationKind, ProjectManifest, RevisionId, now_unix_ms,
+    OperationId, OperationKind, ProjectId, ProjectManifest, RevisionId, now_unix_ms,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::file_io::{
-    atomic_install_if_absent, atomic_replace, atomic_replace_private,
+    BoundedNoFollowFile, atomic_install_if_absent, atomic_replace, atomic_replace_private,
     create_private_file_if_absent, hard_link_if_absent, read_bounded, read_bounded_no_follow,
     sync_parent,
 };
@@ -886,26 +886,47 @@ impl ProjectStore {
         relative_path: impl AsRef<Path>,
         destination: impl AsRef<Path>,
     ) -> Result<CommandReceipt> {
+        let mut source = self.open_document_file(relative_path)?;
+        self.export_document_file(&mut source, destination)
+    }
+
+    /// Exports the already-open, blob-verified descriptor authority without
+    /// resolving or reopening its mutable visible path.
+    pub fn export_document_file(
+        &mut self,
+        source: &mut DocumentFileAuthority,
+        destination: impl AsRef<Path>,
+    ) -> Result<CommandReceipt> {
         let started_at_ms = now_unix_ms();
-        let normalized = normalize_document_path(relative_path.as_ref())?;
-        let document = self
-            .document_by_path(&normalized)?
-            .ok_or_else(|| StoreError::NoActiveRevision(normalized.clone()))?;
-        let active = self
-            .active_revision(document.id)?
-            .ok_or_else(|| StoreError::NoActiveRevision(normalized.clone()))?;
-        let source = inspect_document_path(&self.root, &normalized)?;
-        let bytes = read_bounded(&source, MAX_DOCUMENT_BYTES)?;
-        if BlobId::digest(&bytes) != active.blob_id {
-            return Err(StoreError::UncheckpointedVisibleChange(normalized));
+        if source.project_id != self.manifest.project_id {
+            return Err(StoreError::DocumentFileAuthorityMismatch);
         }
+        let document = self
+            .registered_document(source.document.document_id)?
+            .ok_or(StoreError::DocumentFileAuthorityMismatch)?;
+        if document.relative_path != source.document.relative_path
+            || document.active_revision_id != Some(source.document.revision_id)
+        {
+            return Err(StoreError::DocumentFileAuthorityMismatch);
+        }
+        let active = self
+            .active_revision(source.document.document_id)?
+            .ok_or(StoreError::DocumentFileAuthorityMismatch)?;
+        if active.revision_id != source.document.revision_id
+            || active.artifact_id != source.document.artifact_id
+            || active.blob_id != source.document.blob_id
+        {
+            return Err(StoreError::DocumentFileAuthorityMismatch);
+        }
+        source.revalidate()?;
+        let bytes = source.document.text.as_bytes();
 
         if let Some(parent) = destination.as_ref().parent()
             && !parent.as_os_str().is_empty()
         {
             fs::create_dir_all(parent)?;
         }
-        atomic_replace(destination.as_ref(), &bytes)?;
+        atomic_replace(destination.as_ref(), bytes)?;
 
         let operation_id = OperationId::new();
         let created_at_ms = now_unix_ms();
@@ -919,7 +940,7 @@ impl ProjectStore {
         );
         let metadata = serde_json::to_string(&json!({
             "destination": destination.as_ref().to_string_lossy(),
-            "relative_path": normalized,
+            "relative_path": &source.document.relative_path,
         }))?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
@@ -1043,6 +1064,15 @@ impl ProjectStore {
     }
 
     pub fn read_document(&self, relative_path: impl AsRef<Path>) -> Result<LoadedDocument> {
+        self.open_document_file(relative_path)?.into_document()
+    }
+
+    /// Opens one no-follow descriptor and binds its exact UTF-8 bytes to the
+    /// store's current document, revision, artifact, and blob identity.
+    pub fn open_document_file(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<DocumentFileAuthority> {
         let normalized = normalize_document_path(relative_path.as_ref())?;
         let document = self
             .document_by_path(&normalized)?
@@ -1051,19 +1081,25 @@ impl ProjectStore {
             .active_revision(document.id)?
             .ok_or_else(|| StoreError::NoActiveRevision(normalized.clone()))?;
         let visible_path = inspect_document_path(&self.root, &normalized)?;
-        let bytes = read_bounded(&visible_path, MAX_DOCUMENT_BYTES)?;
+        let mut file = BoundedNoFollowFile::open(&visible_path, MAX_DOCUMENT_BYTES)?;
+        let bytes = file.read()?;
+        file.ensure_path_binding()?;
         if BlobId::digest(&bytes) != active.blob_id {
             return Err(StoreError::UncheckpointedVisibleChange(normalized));
         }
         let text = String::from_utf8(bytes).map_err(loom_document::DocumentError::from)?;
-        Ok(LoadedDocument {
-            document_id: document.id,
-            relative_path: normalized,
-            kind: document.kind,
-            revision_id: active.revision_id,
-            artifact_id: active.artifact_id,
-            blob_id: active.blob_id,
-            text,
+        Ok(DocumentFileAuthority {
+            project_id: self.manifest.project_id,
+            document: LoadedDocument {
+                document_id: document.id,
+                relative_path: normalized,
+                kind: document.kind,
+                revision_id: active.revision_id,
+                artifact_id: active.artifact_id,
+                blob_id: active.blob_id,
+                text,
+            },
+            file,
         })
     }
 
@@ -1660,6 +1696,53 @@ pub struct LoadedDocument {
     pub artifact_id: ArtifactId,
     pub blob_id: BlobId,
     pub text: String,
+}
+
+/// A store-derived visible document held through the exact descriptor whose
+/// bytes were checked against the active blob. Paths remain native-only and
+/// are never part of the renderer command contract.
+#[derive(Debug)]
+pub struct DocumentFileAuthority {
+    project_id: ProjectId,
+    document: LoadedDocument,
+    file: BoundedNoFollowFile,
+}
+
+impl DocumentFileAuthority {
+    pub const fn document(&self) -> &LoadedDocument {
+        &self.document
+    }
+
+    fn revalidate(&mut self) -> Result<()> {
+        let bytes = self.file.read()?;
+        self.file.ensure_path_binding()?;
+        if BlobId::digest(&bytes) != self.document.blob_id {
+            return Err(StoreError::UncheckpointedVisibleChange(
+                self.document.relative_path.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the reveal target resolved from the retained descriptor. The
+    /// stored path is used only as a binding expectation and is never reopened
+    /// to manufacture the returned target.
+    pub fn reveal_path(&mut self) -> Result<PathBuf> {
+        self.revalidate()?;
+        let descriptor_path = self.file.descriptor_path()?;
+        if descriptor_path != self.file.path() {
+            return Err(StoreError::VisibleFileIdentityChanged(
+                self.file.path().to_path_buf(),
+            ));
+        }
+        self.file.ensure_path_binding()?;
+        Ok(descriptor_path)
+    }
+
+    pub fn into_document(self) -> Result<LoadedDocument> {
+        self.file.ensure_path_binding()?;
+        Ok(self.document)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

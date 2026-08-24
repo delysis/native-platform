@@ -31,11 +31,11 @@ use loom_host::{
     GenerationTerminalRecord,
 };
 use loom_store::{
-    BranchPageCursor, DocumentReconciliationSnapshot, ExternalReconciliationOutcome,
-    ExternalReconciliationRequest, IdempotentSaveOutcome, LoadedDocument, MAX_BRANCH_BODY_BYTES,
-    MAX_DOCUMENT_BYTES, ProjectStore, StoredBranchBody, StoredBranchPage, StoredBranchRecord,
-    StoredBranchStatus, StoredBranchSummary, TerminalCandidateInput, TerminalEvidenceInput,
-    TerminalGenerationInput, TransientDraft, VisibleProjectionState,
+    BranchPageCursor, DocumentFileAuthority, DocumentReconciliationSnapshot,
+    ExternalReconciliationOutcome, ExternalReconciliationRequest, IdempotentSaveOutcome,
+    LoadedDocument, MAX_BRANCH_BODY_BYTES, ProjectStore, StoredBranchBody, StoredBranchPage,
+    StoredBranchRecord, StoredBranchStatus, StoredBranchSummary, TerminalCandidateInput,
+    TerminalEvidenceInput, TerminalGenerationInput, TransientDraft, VisibleProjectionState,
 };
 use loom_types::{
     AuthorityPolicy, BlobId, BranchId, BuildModelPolicy, BuildModelPolicyIdentity,
@@ -1922,6 +1922,8 @@ impl IpcFailure {
             StoreError::VisibleFileAlreadyExists(_) => "visible_file_already_exists",
             StoreError::DocumentAlreadyExists(_) => "document_already_exists",
             StoreError::UncheckpointedVisibleChange(_) => "external_file_change",
+            StoreError::VisibleFileIdentityChanged(_) => "document_path_changed",
+            StoreError::DocumentFileAuthorityMismatch => "stale_document_action",
             StoreError::ExternalVisibleFileDeleted(_) => "external_file_deleted",
             StoreError::ExternalVisibleBlobMismatch { .. } => "external_file_conflict",
             StoreError::ExternalVisibleInvalidUtf8(_) => "external_file_invalid_utf8",
@@ -3024,7 +3026,8 @@ async fn document_open(
         parse_document_action_identity(&document_id, &expected_revision_id, &expected_blob_id)?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    let document = resolve_document_action(store, identity)?;
+    let authority = resolve_document_action_file(store, identity)?;
+    let document = finish_document_open(authority)?;
     let mut draft = store
         .load_transient_draft(&document.relative_path)
         .map_err(IpcFailure::store)?;
@@ -3093,13 +3096,17 @@ async fn document_reveal(
     let _application_admission = lock_application_admission(&state, "a document reveal")?;
     let identity =
         parse_document_action_identity(&document_id, &expected_revision_id, &expected_blob_id)?;
-    let path = {
+    let mut authority = {
         let mut session = lock_session(&state)?;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;
-        let document = resolve_document_action(store, identity)?;
-        validated_document_reveal_path(store.root(), &document)?
+        resolve_document_action_file(store, identity)?
     };
-    tauri_plugin_opener::reveal_item_in_dir(&path).map_err(|error| match error {
+    let path = validated_document_reveal_path(&mut authority)?;
+    let reveal_result = tauri_plugin_opener::reveal_item_in_dir(&path);
+    authority
+        .reveal_path()
+        .map_err(document_reveal_store_failure)?;
+    reveal_result.map_err(|error| match error {
         tauri_plugin_opener::Error::UnsupportedPlatform => IpcFailure::new(
             "document_reveal_unsupported",
             "revealing a document is not available on this platform",
@@ -3158,21 +3165,26 @@ fn parse_document_action_identity(
     })
 }
 
-fn resolve_document_action(
+fn resolve_document_action_file(
     store: &ProjectStore,
     identity: DocumentActionIdentity,
-) -> Result<LoadedDocument, IpcFailure> {
+) -> Result<DocumentFileAuthority, IpcFailure> {
     let relative_path = registered_document_action_path(store, identity)?;
-    let loaded = store
-        .read_document(&relative_path)
+    let authority = store
+        .open_document_file(&relative_path)
         .map_err(IpcFailure::store)?;
+    let loaded = authority.document();
     if loaded.document_id != identity.document
         || loaded.revision_id != identity.revision
         || loaded.blob_id != identity.blob
     {
         return Err(stale_document_action_failure());
     }
-    Ok(loaded)
+    Ok(authority)
+}
+
+fn finish_document_open(authority: DocumentFileAuthority) -> Result<LoadedDocument, IpcFailure> {
+    authority.into_document().map_err(IpcFailure::store)
 }
 
 fn registered_document_action_path(
@@ -3204,157 +3216,29 @@ fn stale_document_action_failure() -> IpcFailure {
 }
 
 fn validated_document_reveal_path(
-    project_root: &Path,
-    document: &LoadedDocument,
+    authority: &mut DocumentFileAuthority,
 ) -> Result<PathBuf, IpcFailure> {
-    let canonical_root = project_root.canonicalize().map_err(|error| {
-        IpcFailure::new(
-            "document_reveal_path_unavailable",
-            format!("the project root could not be resolved for reveal: {error}"),
-            true,
-        )
-    })?;
-    let candidate = project_root.join(&document.relative_path);
-    let metadata = candidate.symlink_metadata().map_err(|error| {
-        IpcFailure::new(
-            "document_reveal_path_unavailable",
-            format!("the document path could not be inspected for reveal: {error}"),
-            true,
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(IpcFailure::new(
-            "document_reveal_path_refused",
-            "the registered document path is not a regular non-symbolic file",
-            false,
-        ));
-    }
-    let canonical_path = candidate.canonicalize().map_err(|error| {
-        IpcFailure::new(
-            "document_reveal_path_unavailable",
-            format!("the document path could not be resolved for reveal: {error}"),
-            true,
-        )
-    })?;
-    if !canonical_path.starts_with(&canonical_root) {
-        return Err(IpcFailure::new(
-            "document_reveal_path_refused",
-            "the registered document resolved outside its project root",
-            false,
-        ));
-    }
-    verify_reveal_file_identity(&canonical_path, document.blob_id)?;
-    Ok(canonical_path)
+    authority
+        .reveal_path()
+        .map_err(document_reveal_store_failure)
 }
 
-fn verify_reveal_file_identity(path: &Path, expected_blob_id: BlobId) -> Result<(), IpcFailure> {
-    let mut file = File::open(path).map_err(|error| {
-        IpcFailure::new(
-            "document_reveal_path_unavailable",
-            format!("the document could not be opened for reveal validation: {error}"),
-            true,
-        )
-    })?;
-    let metadata = file.metadata().map_err(|error| {
-        IpcFailure::new(
-            "document_reveal_path_unavailable",
-            format!("the document metadata could not be read for reveal: {error}"),
-            true,
-        )
-    })?;
-    if !metadata.is_file() || metadata.len() > MAX_DOCUMENT_BYTES {
-        return Err(IpcFailure::new(
-            "document_reveal_path_refused",
-            "the document reveal target is not a bounded regular file",
-            false,
-        ));
-    }
-    let opened_identity = FileIdentityHandle::from_file(file.try_clone().map_err(|error| {
-        IpcFailure::new(
-            "document_reveal_path_unavailable",
-            format!("the document identity could not be retained for reveal: {error}"),
-            true,
-        )
-    })?)
-    .map_err(|error| {
-        IpcFailure::new(
-            "document_reveal_path_unavailable",
-            format!("the open document identity could not be inspected: {error}"),
-            true,
-        )
-    })?;
-    let path_identity = FileIdentityHandle::from_path(path).map_err(|error| {
-        IpcFailure::new(
-            "document_reveal_path_unavailable",
-            format!("the resolved document identity could not be inspected: {error}"),
-            true,
-        )
-    })?;
-    if opened_identity != path_identity {
-        return Err(IpcFailure::new(
+fn document_reveal_store_failure(error: loom_store::StoreError) -> IpcFailure {
+    match error {
+        loom_store::StoreError::SymbolicLink(_) | loom_store::StoreError::NotRegularFile(_) => {
+            IpcFailure::new(
+                "document_reveal_path_refused",
+                "the registered document path is not a regular non-symbolic file",
+                false,
+            )
+        }
+        loom_store::StoreError::VisibleFileIdentityChanged(_) => IpcFailure::new(
             "document_reveal_path_changed",
             "the document path changed while Loom prepared the reveal",
             false,
-        ));
+        ),
+        error => IpcFailure::store(error),
     }
-
-    if hash_bounded_reveal_file(&mut file)? != expected_blob_id {
-        return Err(IpcFailure::new(
-            "external_file_change",
-            "the visible document bytes changed before reveal",
-            false,
-        ));
-    }
-    let final_path_identity = FileIdentityHandle::from_path(path).map_err(|error| {
-        IpcFailure::new(
-            "document_reveal_path_unavailable",
-            format!("the document identity could not be rechecked for reveal: {error}"),
-            true,
-        )
-    })?;
-    if opened_identity != final_path_identity {
-        return Err(IpcFailure::new(
-            "document_reveal_path_changed",
-            "the document path changed while Loom verified its bytes",
-            false,
-        ));
-    }
-    Ok(())
-}
-
-fn hash_bounded_reveal_file(file: &mut File) -> Result<BlobId, IpcFailure> {
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 8 * 1024];
-    let mut total = 0_u64;
-    loop {
-        let read = file.read(&mut buffer).map_err(|error| {
-            IpcFailure::new(
-                "document_reveal_path_unavailable",
-                format!("the document could not be verified for reveal: {error}"),
-                true,
-            )
-        })?;
-        if read == 0 {
-            break;
-        }
-        let read_bytes = u64::try_from(read).map_err(|_| {
-            IpcFailure::new(
-                "document_reveal_path_refused",
-                "the document read size exceeded Loom's addressable reveal limit",
-                false,
-            )
-        })?;
-        total = total.saturating_add(read_bytes);
-        if total > MAX_DOCUMENT_BYTES {
-            return Err(IpcFailure::new(
-                "document_reveal_path_refused",
-                "the document grew beyond Loom's bounded reveal limit",
-                false,
-            ));
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(BlobId::from_bytes(hasher.finalize().into()))
 }
 
 struct DocumentExportReservation<'a> {
@@ -3376,7 +3260,10 @@ fn reserve_document_export(
     let suggested_relative_path = {
         let mut session = lock_session_internal(state)?;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;
-        resolve_document_action(store, identity)?.relative_path
+        resolve_document_action_file(store, identity)?
+            .document()
+            .relative_path
+            .clone()
     };
     Ok(DocumentExportReservation {
         state,
@@ -3405,9 +3292,9 @@ fn export_registered_document(
     identity: DocumentActionIdentity,
     destination: &Path,
 ) -> Result<Receipt, IpcFailure> {
-    let document = resolve_document_action(store, identity)?;
+    let mut authority = resolve_document_action_file(store, identity)?;
     store
-        .export_document(&document.relative_path, destination)
+        .export_document_file(&mut authority, destination)
         .map(Receipt::from)
         .map_err(IpcFailure::store)
 }
@@ -10019,6 +9906,146 @@ mod tests {
         );
     }
 
+    struct DocumentActionFixture {
+        _temporary: tempfile::TempDir,
+        root: PathBuf,
+        store: ProjectStore,
+        identity: DocumentActionIdentity,
+    }
+
+    fn document_action_fixture() -> DocumentActionFixture {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("exact manuscript\n".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        DocumentActionFixture {
+            _temporary: temporary,
+            root,
+            store,
+            identity: DocumentActionIdentity {
+                document: document.document_id,
+                revision: document.revision_id,
+                blob: document.blob_id,
+            },
+        }
+    }
+
+    fn replace_visible_document_with_regular_file(root: &Path) {
+        let visible = root.join(INITIAL_DOCUMENT);
+        std::fs::rename(&visible, root.join("manuscript/original.md"))
+            .expect("retain opened original");
+        std::fs::write(&visible, "exact manuscript\n").expect("install same-byte replacement");
+    }
+
+    #[cfg(unix)]
+    fn replace_visible_document_with_symlink(root: &Path) {
+        use std::os::unix::fs::symlink;
+
+        let visible = root.join(INITIAL_DOCUMENT);
+        let outside = root
+            .parent()
+            .expect("project parent")
+            .join("outside-manuscript.md");
+        std::fs::write(&outside, "exact manuscript\n").expect("outside manuscript");
+        std::fs::rename(&visible, root.join("manuscript/original.md"))
+            .expect("retain opened original");
+        symlink(&outside, &visible).expect("install final-component symlink");
+    }
+
+    #[test]
+    fn open_action_refuses_a_same_byte_final_component_replacement() {
+        let fixture = document_action_fixture();
+        let authority = resolve_document_action_file(&fixture.store, fixture.identity)
+            .expect("capture document descriptor");
+        replace_visible_document_with_regular_file(&fixture.root);
+
+        let error = finish_document_open(authority).expect_err("replacement must fail closed");
+
+        assert_eq!(error.code, "document_path_changed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_action_refuses_a_final_component_symlink_after_descriptor_capture() {
+        let fixture = document_action_fixture();
+        let authority = resolve_document_action_file(&fixture.store, fixture.identity)
+            .expect("capture document descriptor");
+        replace_visible_document_with_symlink(&fixture.root);
+
+        let error = finish_document_open(authority).expect_err("symlink must fail closed");
+
+        assert_eq!(error.code, "symbolic_link_refused");
+    }
+
+    #[test]
+    fn export_action_refuses_a_same_byte_final_component_replacement() {
+        let mut fixture = document_action_fixture();
+        let mut authority = resolve_document_action_file(&fixture.store, fixture.identity)
+            .expect("capture document descriptor");
+        replace_visible_document_with_regular_file(&fixture.root);
+        let destination = fixture.root.join("replacement-export.md");
+
+        let error = fixture
+            .store
+            .export_document_file(&mut authority, &destination)
+            .expect_err("replacement must fail closed");
+
+        assert_eq!(IpcFailure::store(error).code, "document_path_changed");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_action_refuses_a_final_component_symlink_after_descriptor_capture() {
+        let mut fixture = document_action_fixture();
+        let mut authority = resolve_document_action_file(&fixture.store, fixture.identity)
+            .expect("capture document descriptor");
+        replace_visible_document_with_symlink(&fixture.root);
+        let destination = fixture.root.join("symlink-export.md");
+
+        let error = fixture
+            .store
+            .export_document_file(&mut authority, &destination)
+            .expect_err("symlink must fail closed");
+
+        assert_eq!(IpcFailure::store(error).code, "symbolic_link_refused");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn reveal_action_refuses_a_same_byte_final_component_replacement() {
+        let fixture = document_action_fixture();
+        let mut authority = resolve_document_action_file(&fixture.store, fixture.identity)
+            .expect("capture document descriptor");
+        replace_visible_document_with_regular_file(&fixture.root);
+
+        let error = validated_document_reveal_path(&mut authority)
+            .expect_err("replacement must fail closed");
+
+        assert_eq!(error.code, "document_reveal_path_changed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reveal_action_refuses_a_final_component_symlink_after_descriptor_capture() {
+        let fixture = document_action_fixture();
+        let mut authority = resolve_document_action_file(&fixture.store, fixture.identity)
+            .expect("capture document descriptor");
+        replace_visible_document_with_symlink(&fixture.root);
+
+        let error =
+            validated_document_reveal_path(&mut authority).expect_err("symlink must fail closed");
+
+        assert_eq!(error.code, "document_reveal_path_refused");
+    }
+
     #[test]
     fn export_copy_is_document_bound_and_refuses_uncheckpointed_visible_bytes() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
@@ -10120,7 +10147,7 @@ mod tests {
             .read_document("manuscript/second.md")
             .expect("other document");
         assert_ne!(captured.document_id, other.document_id);
-        let resolved = resolve_document_action(
+        let authority = resolve_document_action_file(
             &store,
             DocumentActionIdentity {
                 document: captured.document_id,
@@ -10129,6 +10156,7 @@ mod tests {
             },
         )
         .expect("resolve captured document");
+        let resolved = finish_document_open(authority).expect("finish captured document open");
 
         assert_eq!(resolved.document_id, captured.document_id);
         assert_eq!(resolved.relative_path, "manuscript/first.md");
@@ -10148,36 +10176,22 @@ mod tests {
             )
             .expect("initial document");
         let document = store.read_document(INITIAL_DOCUMENT).expect("document");
-        let path =
-            validated_document_reveal_path(store.root(), &document).expect("validated reveal path");
-        assert_eq!(
-            path,
-            root.join(INITIAL_DOCUMENT)
-                .canonicalize()
-                .expect("canonical document")
-        );
-
-        let outside = temporary.path().join("outside.md");
-        std::fs::write(&outside, "exact manuscript\n").expect("outside file");
-        let mut escaped = document.clone();
-        escaped.relative_path = "../outside.md".to_owned();
-        let escaped_error =
-            validated_document_reveal_path(store.root(), &escaped).expect_err("path escape");
-        assert_eq!(escaped_error.code, "document_reveal_path_refused");
+        let identity = DocumentActionIdentity {
+            document: document.document_id,
+            revision: document.revision_id,
+            blob: document.blob_id,
+        };
+        let mut authority =
+            resolve_document_action_file(&store, identity).expect("resolve reveal authority");
+        let path = validated_document_reveal_path(&mut authority).expect("validated reveal path");
+        assert_eq!(path, store.root().join(INITIAL_DOCUMENT));
 
         std::fs::write(root.join(INITIAL_DOCUMENT), "external edit\n").expect("external edit");
-        let reveal_external_error = validated_document_reveal_path(store.root(), &document)
-            .expect_err("external reveal bytes");
+        let reveal_external_error =
+            validated_document_reveal_path(&mut authority).expect_err("external reveal bytes");
         assert_eq!(reveal_external_error.code, "external_file_change");
-        let external_error = resolve_document_action(
-            &store,
-            DocumentActionIdentity {
-                document: document.document_id,
-                revision: document.revision_id,
-                blob: document.blob_id,
-            },
-        )
-        .expect_err("external bytes");
+        let external_error =
+            resolve_document_action_file(&store, identity).expect_err("external bytes");
         assert_eq!(external_error.code, "external_file_change");
     }
 
@@ -10197,15 +10211,21 @@ mod tests {
             )
             .expect("initial document");
         let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let identity = DocumentActionIdentity {
+            document: document.document_id,
+            revision: document.revision_id,
+            blob: document.blob_id,
+        };
+        let mut authority =
+            resolve_document_action_file(&store, identity).expect("resolve reveal authority");
         let outside = temporary.path().join("outside.md");
         std::fs::write(&outside, "exact manuscript\n").expect("outside file");
-        let link = root.join("manuscript/link.md");
-        symlink(&outside, &link).expect("symbolic document");
-        let mut symbolic = document;
-        symbolic.relative_path = "manuscript/link.md".to_owned();
+        let visible = root.join(INITIAL_DOCUMENT);
+        std::fs::remove_file(&visible).expect("remove captured visible file");
+        symlink(&outside, &visible).expect("symbolic document replacement");
 
-        let error = validated_document_reveal_path(store.root(), &symbolic)
-            .expect_err("symbolic reveal target");
+        let error =
+            validated_document_reveal_path(&mut authority).expect_err("symbolic reveal target");
         assert_eq!(error.code, "document_reveal_path_refused");
     }
 

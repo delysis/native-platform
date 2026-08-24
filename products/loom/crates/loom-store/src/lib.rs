@@ -28,7 +28,7 @@ pub use provenance::{
 pub use reconciliation::{ExternalReconciliationOutcome, ExternalReconciliationRequest};
 pub use schema::{CURRENT_SCHEMA_VERSION, CURRENT_STORE_SCHEMA_VERSION};
 pub use store::{
-    DocumentReconciliationSnapshot, DocumentSummary, LoadedDocument, MAX_DOCUMENT_BYTES,
-    ProjectStore, RecoveryConflict, RecoveryReport, SaveOutcome, StoreCounts,
+    DocumentFileAuthority, DocumentReconciliationSnapshot, DocumentSummary, LoadedDocument,
+    MAX_DOCUMENT_BYTES, ProjectStore, RecoveryConflict, RecoveryReport, SaveOutcome, StoreCounts,
     VisibleDocumentSnapshot, VisibleProjectionState,
 };

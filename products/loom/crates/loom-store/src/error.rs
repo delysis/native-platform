@@ -56,6 +56,10 @@ pub enum StoreError {
     DocumentAlreadyExists(String),
     #[error("visible file `{0}` has uncheckpointed changes")]
     UncheckpointedVisibleChange(String),
+    #[error("visible file path changed while it was held open: {0:?}")]
+    VisibleFileIdentityChanged(PathBuf),
+    #[error("the held document file authority no longer matches this project's active identity")]
+    DocumentFileAuthorityMismatch,
     #[error("visible file `{0}` was deleted; deletion reconciliation requires a distinct command")]
     ExternalVisibleFileDeleted(String),
     #[error("external visible file `{0}` is not valid UTF-8")]

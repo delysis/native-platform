@@ -1,9 +1,9 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
@@ -43,27 +43,168 @@ pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Reads a regular file without following a final-component symbolic link.
-/// Descriptor metadata is authoritative, closing the inspect-then-open race.
-pub(crate) fn read_bounded_no_follow(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    #[cfg(windows)]
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(unix)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
 
-    let file = match options.open(path) {
-        Ok(file) => file,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(windows)]
+struct FileIdentity {
+    volume: Option<u32>,
+    index: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(not(any(unix, windows)))]
+struct FileIdentity {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// One bounded, no-follow descriptor for a visible file. Its descriptor is
+/// retained so callers can read, hash, and validate one object instead of
+/// inspecting a path and then reopening whatever the path names later.
+#[derive(Debug)]
+pub(crate) struct BoundedNoFollowFile {
+    file: File,
+    path: PathBuf,
+    identity: FileIdentity,
+    max_bytes: u64,
+}
+
+impl BoundedNoFollowFile {
+    pub(crate) fn open(path: &Path, max_bytes: u64) -> Result<Self> {
+        let mut options = OpenOptions::new();
+        options.read(true);
         #[cfg(unix)]
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-            return Err(StoreError::SymbolicLink(path.to_path_buf()));
+        options.custom_flags(libc::O_NOFOLLOW);
+        #[cfg(windows)]
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+
+        let file = match options.open(path) {
+            Ok(file) => file,
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(StoreError::SymbolicLink(path.to_path_buf()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = file.metadata()?;
+        validate_bounded_regular_file(path, &metadata, max_bytes)?;
+        let identity = file_identity(&metadata);
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            identity,
+            max_bytes,
+        })
+    }
+
+    pub(crate) fn read(&mut self) -> Result<Vec<u8>> {
+        let metadata = self.file.metadata()?;
+        validate_bounded_regular_file(&self.path, &metadata, self.max_bytes)?;
+        if file_identity(&metadata) != self.identity {
+            return Err(StoreError::VisibleFileIdentityChanged(self.path.clone()));
         }
-        Err(error) => return Err(error.into()),
-    };
-    let metadata = file.metadata()?;
+
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+        Read::by_ref(&mut self.file)
+            .take(self.max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if actual_bytes > self.max_bytes {
+            return Err(StoreError::DocumentTooLarge {
+                actual_bytes,
+                max_bytes: self.max_bytes,
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// Confirms that the original store-derived path still names the opened
+    /// regular file without following a final-component symbolic link.
+    pub(crate) fn ensure_path_binding(&self) -> Result<()> {
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StoreError::VisibleFileIdentityChanged(self.path.clone()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        validate_bounded_regular_file(&self.path, &metadata, self.max_bytes)?;
+        if file_identity(&metadata) != self.identity {
+            return Err(StoreError::VisibleFileIdentityChanged(self.path.clone()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Resolves the current native path from the retained descriptor rather
+    /// than reopening the store path. Reveal uses this path only while the
+    /// descriptor remains alive and path-bound.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn descriptor_path(&self) -> Result<PathBuf> {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = rustix::fs::getpath(&self.file).map_err(std::io::Error::from)?;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(
+            path.into_bytes(),
+        )))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn descriptor_path(&self) -> Result<PathBuf> {
+        use std::os::fd::AsRawFd as _;
+
+        Ok(fs::read_link(format!(
+            "/proc/self/fd/{}",
+            self.file.as_raw_fd()
+        ))?)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn descriptor_path(&self) -> Result<PathBuf> {
+        Ok(winx::file::get_file_path(&self.file)?)
+    }
+
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        windows
+    )))]
+    pub(crate) fn descriptor_path(&self) -> Result<PathBuf> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "descriptor-derived reveal paths are unavailable on this platform",
+        )
+        .into())
+    }
+}
+
+fn validate_bounded_regular_file(
+    path: &Path,
+    metadata: &fs::Metadata,
+    max_bytes: u64,
+) -> Result<()> {
     #[cfg(windows)]
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(StoreError::SymbolicLink(path.to_path_buf()));
+    }
+    #[cfg(windows)]
+    if metadata.volume_serial_number().is_none() || metadata.file_index().is_none() {
+        return Err(
+            std::io::Error::other("the filesystem did not report a stable file identity").into(),
+        );
+    }
+    if metadata.file_type().is_symlink() {
         return Err(StoreError::SymbolicLink(path.to_path_buf()));
     }
     if !metadata.is_file() {
@@ -75,17 +216,39 @@ pub(crate) fn read_bounded_no_follow(path: &Path, max_bytes: u64) -> Result<Vec<
             max_bytes,
         });
     }
+    Ok(())
+}
 
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if actual_bytes > max_bytes {
-        return Err(StoreError::DocumentTooLarge {
-            actual_bytes,
-            max_bytes,
-        });
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
     }
+}
+
+#[cfg(windows)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        volume: metadata.volume_serial_number(),
+        index: metadata.file_index(),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+    }
+}
+
+/// Reads a regular file through one descriptor without following a
+/// final-component symbolic link and rejects replacement before return.
+pub(crate) fn read_bounded_no_follow(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    let mut opened = BoundedNoFollowFile::open(path, max_bytes)?;
+    let bytes = opened.read()?;
+    opened.ensure_path_binding()?;
     Ok(bytes)
 }
 
