@@ -35,6 +35,7 @@ const FORBIDDEN_HARNESS_ENVIRONMENT = new Set([
   "DYLD_FRAMEWORK_PATH",
   "DYLD_INSERT_LIBRARIES",
   "DYLD_LIBRARY_PATH",
+  "LD_AUDIT",
   "LD_LIBRARY_PATH",
   "LD_PRELOAD",
   "RUSTC",
@@ -46,6 +47,12 @@ const FORBIDDEN_HARNESS_ENVIRONMENT = new Set([
   "RUSTFLAGS",
 ]);
 const FORBIDDEN_CARGO_CONFIG_WORDS = [
+  "DYLD_FRAMEWORK_PATH",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "LD_AUDIT",
+  "LD_LIBRARY_PATH",
+  "LD_PRELOAD",
   "RUSTC",
   "RUSTC_BOOTSTRAP",
   "RUSTDOC",
@@ -228,6 +235,12 @@ export function assertSafeCargoConfig(configSource, label = ".cargo/config.toml"
   assert(
     !/\\(?:u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})/.test(configSource),
     `${label}: TOML Unicode escapes are prohibited by the standard-libtest policy`,
+  );
+  assert(
+    !/(^|[^A-Za-z0-9_-])DYLD_[A-Z0-9_]+(?=$|[^A-Za-z0-9_-])/.test(
+      configSource,
+    ),
+    `${label}: dynamic-loader environment configuration is prohibited (DYLD_*)`,
   );
   for (const word of FORBIDDEN_CARGO_CONFIG_WORDS) {
     const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -889,11 +902,69 @@ function workspaceRustFiles(packageRoots) {
   return sorted(rustFiles);
 }
 
-function ignoredTestsInSource(repoRoot, packageRoots) {
-  const rustFiles = workspaceRustFiles(packageRoots);
+function pathIsContained(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return (
+    relative === "" ||
+    (relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative))
+  );
+}
 
+function guardedTestTargetRoots(metadata, repoRoot, packageRoots) {
+  const roots = new Set();
+  const resolvedRepo = path.resolve(repoRoot);
+  const realRepo = fs.realpathSync(resolvedRepo);
+  for (const workspacePackage of workspacePackages(metadata).values()) {
+    const packageRoot = packageRoots.get(workspacePackage.name);
+    assert(packageRoot, `${workspacePackage.name}: workspace package root is missing`);
+    const resolvedPackage = path.resolve(packageRoot);
+    const realPackage = fs.realpathSync(resolvedPackage);
+    assert(
+      pathIsContained(realRepo, realPackage),
+      `${workspacePackage.name}: package root is outside the repository`,
+    );
+
+    for (const target of workspacePackage.targets) {
+      if (target.test !== true) continue;
+      const label = `${workspacePackage.name}:${target.name}`;
+      assert(
+        typeof target.src_path === "string" && path.isAbsolute(target.src_path),
+        `${label}: Cargo metadata test target root must be absolute`,
+      );
+      const source = path.resolve(target.src_path);
+      assert(
+        pathIsContained(resolvedRepo, source) && pathIsContained(resolvedPackage, source),
+        `${label}: test target root is outside its repository or package`,
+      );
+      assert(fs.existsSync(source), `${label}: test target root is missing`);
+      const direct = fs.lstatSync(source);
+      assert(!direct.isSymbolicLink(), `${label}: test target root must not be a symlink`);
+      assert(direct.isFile(), `${label}: test target root must be a regular file`);
+      const realSource = fs.realpathSync(source);
+      assert(
+        pathIsContained(realRepo, realSource) && pathIsContained(realPackage, realSource),
+        `${label}: real test target root is outside its repository or package`,
+      );
+      roots.add(source);
+    }
+  }
+  return sorted(roots);
+}
+
+function workspaceGuardedSources(metadata, repoRoot, packageRoots) {
+  const rustFiles = workspaceRustFiles(packageRoots);
+  const testTargetRoots = guardedTestTargetRoots(metadata, repoRoot, packageRoots);
+  return {
+    guardedSources: sorted(new Set([...rustFiles, ...testTargetRoots])),
+    testTargetRoots,
+  };
+}
+
+function ignoredTestsInSource(repoRoot, guardedSources) {
   const results = [];
-  for (const source of rustFiles) {
+  for (const source of guardedSources) {
     const sourceText = fs.readFileSync(source, "utf8");
     const relative = repoRelative(repoRoot, source);
     for (const functionName of discoverCanonicalIgnoredTests(sourceText, relative)) {
@@ -946,8 +1017,13 @@ export function createStandardLibtestGuard({
     repoRoot,
   );
   const workspaceProcMacroCount = validateNoWorkspaceProcMacros(metadata);
-  const rustFiles = workspaceRustFiles(workspacePackageRoots(metadata));
-  for (const source of rustFiles) {
+  const packageRoots = workspacePackageRoots(metadata);
+  const { guardedSources, testTargetRoots } = workspaceGuardedSources(
+    metadata,
+    repoRoot,
+    packageRoots,
+  );
+  for (const source of guardedSources) {
     assertStandardLibtestRustSource(
       fs.readFileSync(source, "utf8"),
       repoRelative(repoRoot, source),
@@ -956,7 +1032,7 @@ export function createStandardLibtestGuard({
   const snapshotPaths = standardLibtestSnapshotPaths(
     repoRoot,
     metadata,
-    rustFiles,
+    guardedSources,
     cargoConfigs,
   );
   return Object.freeze({
@@ -965,7 +1041,8 @@ export function createStandardLibtestGuard({
     cargo_config_count: cargoConfigs.length,
     default_libtest_manifest_count: manifestCount,
     reviewed_build_script_count: reviewedBuildScriptCount,
-    standard_libtest_source_count: rustFiles.length,
+    guarded_source_count: guardedSources.length,
+    guarded_test_target_root_count: testTargetRoots.length,
     workspace_proc_macro_count: workspaceProcMacroCount,
     snapshot: standardLibtestSnapshot(snapshotPaths),
     validated_after_cargo_build: false,
@@ -1108,7 +1185,12 @@ export function validateRegistry({
   );
   assert(unusedTargets.length === 0, `unreferenced Cargo targets: ${unusedTargets.join(", ")}`);
 
-  const sourceIgnored = ignoredTestsInSource(repoRoot, packageRoots);
+  const { guardedSources } = workspaceGuardedSources(
+    metadata,
+    repoRoot,
+    packageRoots,
+  );
+  const sourceIgnored = ignoredTestsInSource(repoRoot, guardedSources);
   const registeredSourceKeys = sorted(
     registry.entries.map((entry) => `${entry.source}:${entry.test_id.split("::").at(-1)}`),
   );
@@ -1138,8 +1220,9 @@ export function validateRegistry({
       standardLibtestGuard.default_libtest_manifest_count,
     reviewed_build_script_count:
       standardLibtestGuard.reviewed_build_script_count,
-    standard_libtest_source_count:
-      standardLibtestGuard.standard_libtest_source_count,
+    guarded_source_count: standardLibtestGuard.guarded_source_count,
+    guarded_test_target_root_count:
+      standardLibtestGuard.guarded_test_target_root_count,
     workspace_proc_macro_count:
       standardLibtestGuard.workspace_proc_macro_count,
     platform_counts: Object.fromEntries(

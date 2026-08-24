@@ -178,6 +178,107 @@ test("artifact selection requires an unchanged post-build standard-libtest guard
   );
 });
 
+test("metadata test target roots are guarded regardless of extension or symlinks", (context) => {
+  const fixture = fixtureWorkspace();
+  const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "outside-target-"));
+  context.after(() => {
+    fs.rmSync(fixture.repoRoot, { force: true, recursive: true });
+    fs.rmSync(outsideRoot, { force: true, recursive: true });
+  });
+  const target = fixture.metadata.packages[0].targets[0];
+  const nonRustRoot = path.join(fixture.repoRoot, "custom-root.data");
+  fs.writeFileSync(nonRustRoot, "#![no_main]\npub fn hidden() {}\n");
+  target.src_path = nonRustRoot;
+  assert.throws(
+    () => createStandardLibtestGuard(fixture),
+    /custom test-framework crate attributes/,
+  );
+  fs.writeFileSync(nonRustRoot, "pub fn guarded() {}\n");
+  assert.doesNotThrow(() => createStandardLibtestGuard(fixture));
+
+  fs.writeFileSync(
+    nonRustRoot,
+    [
+      '#[test]\n#[ignore = "registered"]\nfn registered() {}',
+      '#[test]\n#[ignore = "unregistered"]\nfn unregistered() {}',
+      "",
+    ].join("\n"),
+  );
+  const fixtureRegistry = {
+    schema: "native-platform.ignored-tests.v2",
+    expected_test_count: 1,
+    cargo_targets: [
+      {
+        package: "safe-package",
+        selector: "lib",
+        name: "safe_package",
+        kinds: ["lib"],
+        src_path: "custom-root.data",
+        manifest_path: "Cargo.toml",
+        platforms: ["linux", "macos", "windows"],
+        harness: "libtest",
+      },
+    ],
+    reviewed_build_scripts: [],
+    entries: [
+      {
+        test_id: "registered",
+        package: "safe-package",
+        target: "lib",
+        source: "custom-root.data",
+        prerequisite: "fixture prerequisite",
+        required_environment: [],
+        evidence_class: "fixture",
+        promotion_prohibition: "This fixture cannot promote any evidence.",
+        platforms: ["linux", "macos", "windows"],
+      },
+    ],
+  };
+  assert.throws(
+    () =>
+      validateRegistry({
+        registry: fixtureRegistry,
+        metadata: fixture.metadata,
+        repoRoot: fixture.repoRoot,
+        environment: fixture.environment,
+      }),
+    /ignored source registry drift.*unregistered: custom-root\.data:unregistered/s,
+  );
+  fs.writeFileSync(nonRustRoot, "pub fn guarded() {}\n");
+
+  if (process.platform !== "win32") {
+    const linkedRoot = path.join(fixture.repoRoot, "linked-root.data");
+    fs.symlinkSync(nonRustRoot, linkedRoot);
+    target.src_path = linkedRoot;
+    assert.throws(
+      () => createStandardLibtestGuard(fixture),
+      /test target root must not be a symlink/,
+    );
+  }
+
+  const outsideSource = path.join(outsideRoot, "outside-root.data");
+  fs.writeFileSync(outsideSource, "pub fn outside() {}\n");
+  target.src_path = outsideSource;
+  assert.throws(
+    () => createStandardLibtestGuard(fixture),
+    /outside its repository or package/,
+  );
+
+  target.src_path = path.dirname(fixture.repoRoot);
+  assert.throws(
+    () => createStandardLibtestGuard(fixture),
+    /outside its repository or package/,
+  );
+
+  const directoryRoot = path.join(fixture.repoRoot, "directory-root");
+  fs.mkdirSync(directoryRoot);
+  target.src_path = directoryRoot;
+  assert.throws(
+    () => createStandardLibtestGuard(fixture),
+    /test target root must be a regular file/,
+  );
+});
+
 test("guarded artifacts must be regular nonsymlink files inside Cargo target output", (context) => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "artifact-guard-"));
   context.after(() => fs.rmSync(fixtureRoot, { force: true, recursive: true }));
@@ -259,6 +360,10 @@ test("Cargo configuration and environment cannot inject compiler flags or runner
     '[target.x86_64-unknown-linux-gnu]\nlinker = "./injector"\n',
     '[target.x86_64-unknown-linux-gnu]\nrunner = "./injector"\n',
     '[env]\nRUSTC_BOOTSTRAP = "1"\n',
+    '[env]\nLD_PRELOAD = "./injector.so"\n',
+    '[env]\nLD_AUDIT = "./auditor.so"\n',
+    '[env]\nDYLD_INSERT_LIBRARIES = "./injector.dylib"\n',
+    'env.DYLD_PRINT_LIBRARIES = "1"\n',
     '[build]\ntarget = "./custom-target.json"\n',
     '[build]\ntarget-dir = "../untrusted-target"\n',
     '[source.crates-io]\nreplace-with = "fabricated"\n',
@@ -284,6 +389,8 @@ test("Cargo configuration and environment cannot inject compiler flags or runner
     { CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "./injector" },
     { CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Zcrate-attr=no_main" },
     { DYLD_INSERT_LIBRARIES: "./injector.dylib" },
+    { LD_AUDIT: "./auditor.so" },
+    { LD_LIBRARY_PATH: "./untrusted-libraries" },
     { LD_PRELOAD: "./injector.so" },
   ]) {
     assert.throws(
@@ -405,7 +512,8 @@ test("all ignored tests carry exact target, platform, evidence, and non-promotio
   assert.equal(report.cargo_target_count, 14);
   assert.equal(report.reviewed_build_script_count, 7);
   assert.equal(report.workspace_proc_macro_count, 0);
-  assert.ok(report.standard_libtest_source_count > 0);
+  assert.ok(report.guarded_source_count > 0);
+  assert.ok(report.guarded_test_target_root_count > 0);
   assert.ok(registry.cargo_targets.every((target) => target.harness === "libtest"));
   assert.deepEqual(report.platform_counts, { linux: 36, macos: 37, windows: 33 });
   assert.ok(report.evidence_classes.includes("real-model-runtime"));

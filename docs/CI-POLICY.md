@@ -33,17 +33,29 @@ test-runner, generated harness-main, `include!`, and workspace proc-macro paths
 are rejected, including raw-identifier and conditional forms. Every workspace
 build script is bound to an explicitly reviewed SHA-256.
 
+Every Cargo metadata target with `test = true` has its root guarded regardless
+of filename extension. The root must be an absolute regular nonsymlink file
+whose lexical and resolved paths remain inside both its workspace package and
+the repository; it is token-scanned and included in the pre/post-build source
+snapshot.
+
 Every Rust source, Cargo manifest or lock, build script, proc-macro source,
 toolchain file, and Cargo configuration change selects exact reconciliation.
 The blocking pull-request job is a Linux, macOS, and Windows matrix, and full CI
 also reconciles on all three operating systems. Each lane builds test harnesses
 with locked `cargo test --no-run --message-format=json-render-diagnostics`
 through `rustup run 1.92.0`, independent of the ambient `cargo` on `PATH`.
-Compiler identity is recorded. Effective Cargo configuration and environment
-overrides for compilers, wrappers, bootstrap, targets, linkers, loaders,
-Rustflags, and Rustdoc flags are rejected. Source, manifests, build scripts,
-lock, toolchain, registry, and Cargo configuration are hashed before the build
-and must remain unchanged afterward.
+Compiler identity is recorded. The guard rejects override keys for Cargo,
+rustc, rustdoc, Rust compiler wrappers, `RUSTC_BOOTSTRAP`, Cargo build targets,
+target runners and linkers, Rustflags, Rustdoc flags, and the named loader
+variables below. It does not sandbox native-toolchain discovery: `PATH`, `CC`,
+`CXX`, `CMAKE`, and `LDFLAGS` remain trusted inputs. The guarded source set,
+manifests, build scripts, lock, toolchain, registry, and Cargo configuration are
+hashed before the build and must remain unchanged afterward.
+
+Loader rejection covers ambient and Cargo-configured `LD_PRELOAD`, `LD_AUDIT`,
+`LD_LIBRARY_PATH`, and every `DYLD_*` variable. These checks run before Cargo
+metadata and again before compilation and guarded listing.
 
 Cargo test-profile artifacts must be regular nonsymlink files inside Cargo's
 metadata target directory. They are hashed, invoked from an empty temporary

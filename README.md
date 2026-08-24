@@ -38,9 +38,12 @@ node scripts/ci/cargo-group.mjs test product-mom
 node scripts/ci/cargo-group.mjs clippy product-mom
 ```
 
-`./scripts/check-shell-policy.sh` remains the exhaustive local gate for broad
-workspace, lockfile, and release changes. `cargo xtask lean verify` is an
-explicit historical W8/W9 census check, not part of ordinary policy.
+`./scripts/check-shell-policy.sh` remains the broad structural local gate for
+workspace, lockfile, and release changes. It does not run the guarded
+ignored-test inventory listing; when the planner selects `ignored-tests`, run
+`node scripts/ci/validate-ignored-tests.mjs --cargo-list` separately.
+`cargo xtask lean verify` is an explicit historical W8/W9 census check, not
+part of ordinary policy.
 
 PR selection still uses the authoritative path planner. Its Cargo-metadata
 reverse-dependency result is emitted only as `dependency_shadow`; mismatches
