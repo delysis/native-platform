@@ -16,10 +16,14 @@ represent these families even when a query backend is not yet present:
 - local managed or external read-only resources.
 
 Catalogue support does not imply query support. Each representation advertises
-what an installed backend can really do. Current content querying is limited to
-the four compiled SQLite profiles. Kiwix ZIM reading and OSM/Overture
-materialization or querying are not shipped; those backends can be added later
-without changing lifecycle, receipt, tool, or citation contracts.
+what an installed backend can really do. Current external-source querying is
+limited to the four compiled SQLite profiles. A bounded OpenZIM v6 producer can
+now convert exact local Kiwix archives into the separate Information-owned
+`managed.documents.v1` FTS representation using stable archive UUID,
+namespace/path, and entry-index locators. This is not a direct ZIM query
+backend or product UI. OSM/Overture materialization and querying are not
+shipped; those backends can be added later without changing lifecycle,
+receipt, tool, or citation contracts.
 
 ## OSM, Daylight, and Overture
 

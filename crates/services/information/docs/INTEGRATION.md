@@ -37,6 +37,14 @@ Materialization does not read the source URI: a source-specific adapter must
 already have verified and bounded the inert text and must retain exact artifact
 and record lineage in the contract.
 
+For Kiwix, `materialize_zim_documents` accepts a native-only
+`ZimMaterializationRequest` containing one already-authorized local archive
+path plus its expected size/SHA-256 and catalogue identities. The host invokes
+the bounded OpenZIM producer and then the same atomic managed-document staging
+path. The path type is not serializable and this method is not part of the
+model tool or renderer IPC surface. OPDS/Metalink discovery and acquisition
+remain separate; conversion never performs network fallback.
+
 Managed search is local-UI-only. It does not appear in the model tool surface,
 and the default use policy leaves model context unknown/fail-closed while
 forbidding export and redistribution. A product that later grants a specific

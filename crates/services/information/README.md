@@ -12,12 +12,13 @@ contract. It does not pretend that all formats support the same operations.
 Query support in this release is deliberately narrower: the compiled backends
 cover Alexandria blocks, Community Archive v28 messages, encyclopedia
 articles, and Scripture citation occurrences/passages in SQLite. Kiwix OPDS
-and Overture STAC are discovery surfaces. ZIM reading and OSM/Overture
-materialization or query backends remain future work. The source-neutral
-`managed.documents.v1` materializer is shipped: trusted native producers can
-activate bounded immutable documents and ordered inert-text segments into an
-Information-owned FTS5 representation without granting a source-specific
-reader or product integration.
+and exact Metalink discovery feed a bounded native OpenZIM v6 producer: it
+binds one exact local archive size/SHA-256, validates directory identities,
+decodes modern uncompressed or Zstandard clusters, strips article HTML to
+inert text, and activates `managed.documents.v1`. Overture STAC remains a
+discovery surface; OSM/Overture materialization and query backends remain
+future work. This Kiwix core is not Mom UI, a network fallback, or real-corpus
+product acceptance.
 
 ## Workspace
 
@@ -41,6 +42,8 @@ reader or product integration.
   and Wikipedia article adapter.
 - `information-native-backend-scripture`: normalized Scripture-passage and
   citation-occurrence adapter.
+- `information-native-backend-zim`: safe first-party bounded random-access
+  OpenZIM v6 parser and inert-text managed-document producer.
 - `information-native-host`: immutable composition root and agent-tool surface.
 - `information-native-cli`: an operator oracle for catalogues, installs,
   imports, queries, and receipts.
@@ -60,6 +63,11 @@ reader or product integration.
   with no pending WAL or rollback journal; immutable-read-only additionally
   pins full-file identity and SHA-256.
 - Managed state, indexes, and receipts are physically separate from sources.
+- OpenZIM parsing uses ordinary bounded file reads, checked offset/count
+  arithmetic, and a bounded pure-Rust Zstandard codec. It has no memory map,
+  libzim FFI, `xz2`, sidecar, subprocess, active archive HTML, or network
+  fallback. Historical OpenZIM v5, LZMA/zip/bzip2 clusters, split archives,
+  and non-UTF-8 article decoding are explicitly unsupported in this slice.
 - `managed.documents.v1` inputs bind exact immutable source artifacts,
   source-record hashes, typed locators, lineage, rights, and use policy. The
   default is private: local search allowed, model use unknown and therefore

@@ -2623,6 +2623,10 @@ pub enum EvidenceLocator {
     ZimArticle {
         archive_uuid: Option<String>,
         internal_path: String,
+        /// Zero-based URL pointer-table index. Older persisted locators omit
+        /// it; new OpenZIM materializations bind it for exact entry identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_index: Option<u32>,
     },
     Page {
         page: u32,
@@ -2926,6 +2930,24 @@ mod tests {
         assert!(ResourceId::parse("../../escape").is_err());
         assert!(validate_file_name("payload.zim").is_ok());
         assert!(validate_file_name("../payload.zim").is_err());
+    }
+
+    #[test]
+    fn legacy_zim_locator_deserializes_without_fabricating_an_entry_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let locator: EvidenceLocator = serde_json::from_str(
+            r#"{"kind":"zim_article","archive_uuid":"archive","internal_path":"C/A/Test"}"#,
+        )?;
+        assert!(matches!(
+            locator,
+            EvidenceLocator::ZimArticle {
+                entry_index: None,
+                ..
+            }
+        ));
+        let encoded = serde_json::to_value(locator)?;
+        assert!(encoded.get("entry_index").is_none());
+        Ok(())
     }
 
     #[test]

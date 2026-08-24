@@ -9,6 +9,9 @@ This file distinguishes implemented proof from architectural reach.
 - strict JSON catalogue validation and deterministic install planning;
 - Kiwix OPDS discovery, exact Metalink 4 resolution, and Overture STAC release
   discovery;
+- bounded native OpenZIM v6 reading for exact local archive size/SHA-256,
+  directory identity validation, uncompressed/Zstandard cluster decoding,
+  inert HTML/text extraction, and typed `managed.documents.v1` production;
 - policy-bounded HTTP/file acquisition, durable HTTP resume, and exact size and
   SHA-256 verification with source attestations;
 - managed staging, same-filesystem activation, receipts, and external read-only mounts;
@@ -24,10 +27,10 @@ This file distinguishes implemented proof from architectural reach.
 
 ## Next adapters, in order
 
-1. Supervised `kiwix-serve` integration on top of the shipped bounded OPDS and
-   Metalink resolution. Linking GPL C++ `libzim` through an unsafe FFI boundary
-   is not accepted as hidden “native Rust”; a mature audited pure-Rust reader
-   can replace the sidecar.
+1. Exercise the shipped safe first-party OpenZIM core against exact acquired
+   Kiwix archives, extend only with bounded audited pure-Rust codecs where real
+   evidence requires them, and add a typed article retrieval/conversation-grant
+   surface. A `kiwix-serve` sidecar or unsafe libzim FFI is not approved.
 2. Overture STAC traversal plus bounding-box/theme GeoParquet materialization,
    then DataFusion-style predicate pushdown and GERS locators.
 3. Raw OSM PBF regional installs and replication receipts; PMTiles is a
@@ -42,11 +45,13 @@ No item in the second list should be reported as shipped merely because the
 manifest format can describe it.
 
 The generic managed-document materializer is shipped infrastructure, not proof
-of any source adapter. Kiwix and other producers remain unimplemented until
-their exact reader/extraction contracts produce and verify real
-`managed.documents.v1` inputs.
+of every source adapter. The Kiwix core now produces exact hash-bound inputs in
+portable and hostile-fixture tests, but it has no real-corpus or launched-
+product acceptance yet. It supports OpenZIM v6 with uncompressed and
+Zstandard clusters; v5, historical LZMA/zip/bzip2, split archives, non-UTF-8
+article decoding, active HTML, and dictionary/skippable Zstandard extensions
+remain unsupported.
 
-Concretely, the current release has no Kiwix ZIM content reader, no OSM PBF
-query backend, and no Overture GeoParquet materializer or query backend. OPDS
-and STAC discovery results are catalogue evidence only until those adapters are
-implemented and verified.
+Concretely, the current release still has no OSM PBF query backend and no
+Overture GeoParquet materializer or query backend. STAC discovery results are
+catalogue evidence only until those adapters are implemented and verified.

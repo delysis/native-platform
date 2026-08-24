@@ -19,6 +19,9 @@ use information_native_backend_scripture::{
     SCRIPTURE_PROFILE_NAME, ScriptureBackend, ScriptureBackendConfig,
 };
 use information_native_backend_sqlite::{AlexandriaBackend, AlexandriaBackendConfig};
+use information_native_backend_zim::{
+    ZimError, ZimMaterializationRequest, ZimProductionReport, produce_managed_documents,
+};
 use information_native_catalog::{
     CatalogError, CatalogIndex, CatalogRepresentationMatch, CatalogSearchQuery, PlanRequest,
 };
@@ -61,6 +64,8 @@ pub enum HostError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
+    Zim(#[from] ZimError),
+    #[error(transparent)]
     Information(#[from] InformationError),
     #[error("information backend registry is unavailable")]
     BackendRegistryUnavailable,
@@ -82,6 +87,7 @@ impl HostError {
             ),
             Self::Acquire(error) => acquisition_information_error(error),
             Self::Store(error) => store_information_error(error),
+            Self::Zim(error) => zim_information_error(error),
             Self::BackendRegistryUnavailable => InformationError::new(
                 ErrorClass::ResourceBusy,
                 "information_backend_registry_unavailable",
@@ -125,6 +131,15 @@ pub struct CatalogHit {
     pub record: ResourceRecord,
     pub relevance: u32,
     pub matching_representations: Vec<CatalogRepresentationMatch>,
+}
+
+/// Receipt for the exact managed bytes activated by one native OpenZIM
+/// conversion. It exposes no source or caller-selected output path; the store
+/// receipt retains only its Information-derived managed relative path.
+#[derive(Debug, Clone, Serialize)]
+pub struct MaterializedZimDocuments {
+    pub receipt: ManagedDocumentsReceipt,
+    pub production: ZimProductionReport,
 }
 
 /// Safe policy knobs for binding one durable installation into the retrieval
@@ -916,6 +931,21 @@ impl InformationHost {
         Ok(self.store.materialize_documents(materialization)?)
     }
 
+    /// Parse one acquisition-bound local ZIM archive into inert source-neutral
+    /// documents, then atomically activate Information's managed SQLite/FTS5
+    /// representation. The source archive remains read-only and separate.
+    pub fn materialize_zim_documents(
+        &self,
+        request: &ZimMaterializationRequest,
+    ) -> Result<MaterializedZimDocuments, HostError> {
+        let produced = produce_managed_documents(request)?;
+        let receipt = self.store.materialize_documents(&produced.documents)?;
+        Ok(MaterializedZimDocuments {
+            receipt,
+            production: produced.report,
+        })
+    }
+
     /// Search one exact immutable managed-document representation for local UI
     /// use. Model-context and export grants remain separate policy decisions.
     pub fn search_managed_documents(
@@ -1380,6 +1410,46 @@ fn store_information_error(error: &StoreError) -> InformationError {
     InformationError::new(class, code, error.to_string()).retryable(retryable)
 }
 
+fn zim_information_error(error: &ZimError) -> InformationError {
+    let (class, code) = match error {
+        ZimError::UnsupportedVersion(_)
+        | ZimError::UnsupportedCompression(_)
+        | ZimError::SplitArchiveUnsupported => {
+            (ErrorClass::Unsupported, "information_zim_unsupported")
+        }
+        ZimError::Io { .. } => (ErrorClass::Io, "information_zim_io_failure"),
+        ZimError::InvalidLimits | ZimError::InvalidRequest(_) | ZimError::InvalidExpectedSha256 => {
+            (ErrorClass::InvalidInput, "information_zim_invalid_input")
+        }
+        ZimError::Contract(_) => (ErrorClass::InvalidInput, "information_zim_contract_failure"),
+        ZimError::ArchiveLimitExceeded
+        | ZimError::CountLimit(_)
+        | ZimError::ClusterLimitExceeded
+        | ZimError::ArticleLimitExceeded => {
+            (ErrorClass::ResourceBusy, "information_zim_limit_exceeded")
+        }
+        ZimError::SymlinkArchive
+        | ZimError::NotARegularFile
+        | ZimError::ArchiveSizeMismatch { .. }
+        | ZimError::ArchiveHashMismatch
+        | ZimError::ArchiveChanged
+        | ZimError::Truncated(_)
+        | ZimError::InvalidMagic
+        | ZimError::InvalidHeader(_)
+        | ZimError::IntegerOverflow
+        | ZimError::OutOfBounds(_)
+        | ZimError::OverlappingRegions
+        | ZimError::InvalidMimeList
+        | ZimError::InvalidDirectoryEntry { .. }
+        | ZimError::InvalidCluster { .. }
+        | ZimError::InvalidArticleUtf8
+        | ZimError::MalformedHtml
+        | ZimError::NoMaterializableArticles
+        | ZimError::Zstd(_) => (ErrorClass::Integrity, "information_zim_integrity_failure"),
+    };
+    InformationError::new(class, code, error.to_string())
+}
+
 fn staged_downloaded_bytes(prepared: &PreparedInstall) -> Result<u64, HostError> {
     prepared.artifacts.iter().try_fold(0_u64, |sum, target| {
         let metadata = match fs::symlink_metadata(&target.path) {
@@ -1513,6 +1583,7 @@ fn network_attempted_for_failure(
         )
         | HostError::Catalog(_)
         | HostError::Store(_)
+        | HostError::Zim(_)
         | HostError::Information(_)
         | HostError::BackendRegistryUnavailable
         | HostError::MissingArtifactTarget(_)

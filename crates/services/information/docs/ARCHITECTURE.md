@@ -140,8 +140,38 @@ while excerpt export and redistribution are explicitly forbidden.
 Removal planning reveals only an Information-derived relative path and exact
 content/database hashes. Commit accepts those identities rather than a path,
 atomically hides the active directory, and removes only the managed database,
-manifest, and receipt. Source archives are never opened by materialization and
-are outside the removal target by construction.
+manifest, and receipt. The store never opens a source archive during generic
+materialization, and source archives are outside the removal target by
+construction.
+
+## OpenZIM producer boundary
+
+`information-native-backend-zim` is a native-only producer, not a renderer or
+network backend. Its request contains a caller-authorized local path plus the
+exact acquisition-bound byte length and SHA-256. It rejects symlinks, split
+archives, non-regular files, identity changes during parsing, unchecked
+counts/offsets, overlapping structural regions, unordered namespace/path
+identities, invalid redirect/cluster references, and configured work or memory
+limit violations. The same file handle is hashed before and after bounded
+random-access parsing; canonical archive bytes are never modified.
+
+The initial parser deliberately supports modern OpenZIM major version 6 and
+cluster compression `none`/legacy-none and Zstandard. Zstandard window,
+compressed-cluster, decoded-cluster, cumulative decoded bytes, selected blob,
+candidate, document, per-article text, and total text bounds are all explicit.
+Historical LZMA, zip, and bzip2 compression, v5 headers, split archives,
+non-UTF-8 article decoding, dictionaries/skippable frames, and arbitrary
+binary MIME content fail or are omitted explicitly; there is no `xz2`, mmap,
+libzim FFI, sidecar, subprocess, or network fallback.
+
+Only `A`/`C` namespace `text/html`, `application/xhtml+xml`, and `text/plain`
+items become documents. HTML tags, comments, scripts, styles, templates, and
+noscript content are discarded; bounded normalized inert UTF-8 is the only
+content passed to `managed.documents.v1`. Each lineage record binds the raw
+blob SHA-256 and an exact `ZimArticle` locator containing archive UUID,
+namespace/path, and URL pointer-table entry index. The host composes this typed
+producer with the existing staged/atomic managed-document activation. It does
+not expose the local path or archive HTML to tool or renderer contracts.
 
 Managed installation is currently a synchronous host operation. The acquire
 layer accepts a cooperative progress callback, but a durable job identifier,
