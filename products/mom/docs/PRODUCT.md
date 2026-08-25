@@ -67,6 +67,15 @@ JavaScript bridge performs token insertion, targeted DOM swaps, focus,
 keyboard, clipboard, paste and drag/drop behavior. No frontend framework or
 browser networking is required for core behavior.
 
+The ordinary product surface follows the pinned upstream llama.cpp chat UI.
+Mom's deliberate additions are the Persona menu and contextual actions attached
+to the chat objects they operate on, such as Read Aloud, attachment
+transcription, preview and Add to Library. Engine diagnostics, resident model
+slots, legacy Skills and KV-cache policy/status/mutation remain typed backend
+and CLI capabilities; they do not authorize settings cards, dashboards or
+navigation in the ordinary UI. Model discovery and selection remain the single
+user-facing model setup path.
+
 ## Release meaning
 
 The app is not released until:

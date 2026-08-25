@@ -61,12 +61,14 @@ const unixMcpCommandIds = new Set([
   "mom_llama.tool_loop_status",
 ]);
 const lifecycleCommandIds = new Set(["mom_llama.persona_tool_approval_recover"]);
+const allowedCommandSurfaces = new Set(["native_view", "backend_only", "lifecycle"]);
 
 const commandsDocument = readJson("contracts/commands.json");
 const effectsDocument = readJson("contracts/effects.json");
 const parityDocument = readJson("contracts/upstream-parity.json");
 const settingsParityDocument = readJson("contracts/settings-parity.json");
 const viewSource = readText("apps/mom-llama/src-tauri/src/view.rs");
+const viewProductionSource = viewSource.split("#[cfg(test)]", 1)[0];
 const configSource = readText("crates/mom-llama-runtime/src/config.rs");
 const tauriSource = readText("apps/mom-llama/src-tauri/src/commands.rs");
 const tauriMain = readText("apps/mom-llama/src-tauri/src/main.rs");
@@ -147,7 +149,7 @@ for (const effect of effectsDocument.effects ?? []) {
 const controlPattern =
   /ControlSpec \{\s*affordance: "([^"]+)",\s*command: "([^"]+)",\s*tauri_command: "([^"]+)",\s*cli: "([^"]+)",\s*effect: "([^"]+)",\s*label: "([^"]+)"/g;
 const controls = [];
-for (const match of viewSource.matchAll(controlPattern)) {
+for (const match of viewProductionSource.matchAll(controlPattern)) {
   controls.push({
     affordance: match[1],
     command: match[2],
@@ -182,8 +184,8 @@ for (const command of commandsDocument.commands ?? []) {
   ]) {
     requiredText(command[key], `${command.command_id ?? "command"}.${key}`);
   }
-  if (!Array.isArray(command.affordances) || command.affordances.length === 0) {
-    fail(`${command.command_id}.affordances must be a non-empty array`);
+  if (!Array.isArray(command.affordances)) {
+    fail(`${command.command_id}.affordances must be an array`);
   }
   if (commandIds.has(command.command_id)) fail(`duplicate command ${command.command_id}`);
   commandIds.add(command.command_id);
@@ -202,8 +204,8 @@ for (const command of commandsDocument.commands ?? []) {
     );
   }
   const surface = command.surface ?? "native_view";
-  if (!lifecycleCommandIds.has(command.command_id) && surface !== "native_view") {
-    fail(`${command.command_id} has an unreviewed command surface ${surface}`);
+  if (!allowedCommandSurfaces.has(surface)) {
+    fail(`${command.command_id} has an invalid command surface ${surface}`);
   }
   if (lifecycleCommandIds.has(command.command_id) !== (surface === "lifecycle")) {
     fail(`${command.command_id} lifecycle classification disagrees`);
@@ -234,6 +236,18 @@ for (const command of commandsDocument.commands ?? []) {
     fail(`${command.command_id} Tauri handler is not registered`);
   }
   const actual = controls.filter((control) => control.command === command.command_id);
+  if (surface === "backend_only") {
+    if (command.affordances.length !== 0) {
+      fail(`${command.command_id} backend-only command must not claim visible affordances`);
+    }
+    if (actual.length !== 0) {
+      fail(`${command.command_id} backend-only command must not have a native view projection`);
+    }
+    continue;
+  }
+  if (command.affordances.length === 0) {
+    fail(`${command.command_id} native-view affordances must be non-empty`);
+  }
   if (actual.length === 0) fail(`${command.command_id} has no native view projection`);
   const actualAffordances = actual.map((control) => control.affordance);
   if (!sameSet(command.affordances, actualAffordances)) {
@@ -344,16 +358,16 @@ if (!sameSet(settingKeys, runtimeUpstreamKeys)) {
     `runtime upstream settings disagree with ledger: runtime=${runtimeUpstreamKeys.join(",")} ledger=${settingKeys.join(",")}`,
   );
 }
-const settingsFieldStart = viewSource.indexOf("const SETTINGS_FIELDS");
-const settingsFieldEnd = viewSource.indexOf("const NATIVE_SETTINGS_FIELDS", settingsFieldStart);
+const settingsFieldStart = viewProductionSource.indexOf("const SETTINGS_FIELDS");
+const settingsFieldEnd = viewProductionSource.indexOf("const NATIVE_SETTINGS_FIELDS", settingsFieldStart);
 if (settingsFieldStart < 0 || settingsFieldEnd < 0) fail("native settings field registry is missing");
 const visibleUpstreamKeys = [
-  ...viewSource
+  ...viewProductionSource
     .slice(settingsFieldStart, settingsFieldEnd)
     .matchAll(/key: "([A-Za-z][A-Za-z0-9_]*)"/g),
 ].map((match) => match[1]);
 const directlyRenderedSettingKeys = settingsParityDocument.settings
-  .filter((setting) => setting.ui_projection !== "derived")
+  .filter((setting) => !["derived", "backend_only"].includes(setting.ui_projection))
   .map((setting) => setting.key);
 if (!sameSet(directlyRenderedSettingKeys, visibleUpstreamKeys)) {
   fail(
@@ -366,8 +380,18 @@ for (const setting of settingsParityDocument.settings.filter(
   if (!setting.derived_by || !setting.evidence) {
     fail(`derived setting ${setting.key} must name its native control and evidence`);
   }
-  if (!viewSource.includes(`name="${setting.derived_by}"`)) {
+  if (!viewProductionSource.includes(`name="${setting.derived_by}"`)) {
     fail(`derived setting ${setting.key} references missing native control ${setting.derived_by}`);
+  }
+}
+for (const setting of settingsParityDocument.settings.filter(
+  (candidate) => candidate.ui_projection === "backend_only",
+)) {
+  if (!setting.runtime_policy || !setting.evidence) {
+    fail(`backend-only setting ${setting.key} must name its runtime policy and evidence`);
+  }
+  if (viewProductionSource.includes(`name="${setting.runtime_policy}"`)) {
+    fail(`backend-only setting ${setting.key} leaks native control ${setting.runtime_policy}`);
   }
 }
 const runtimeExtensionKeys = extractConstStringValues(

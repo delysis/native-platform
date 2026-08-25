@@ -69,6 +69,11 @@ if rg -q 'data-action="skills-open"|Body &amp; trauma lens|Safety &amp; recovery
   echo "obsolete primary navigation or abstract Persona seeds remain" >&2
   exit 1
 fi
+if rg -q 'data-settings-card="(skills|cache|engine)"|id="prompt-cache-card"|class="settings-card (cache-preferences|native-runtime)"|name="kv_cache_policy"|resident-fields|id="skill-form"|class="settings-subgrid"|Gentle explainer|Policy: disabled until verified|KV-cache persistence is surfaced' \
+  "$acceptance_dir/app.html"; then
+  echo "backend-only Skills, cache, engine, or resident diagnostics leaked into the product UI" >&2
+  exit 1
+fi
 if rg -q 'Edits version this template|class="persona-template-banner"' \
   "$acceptance_dir/app.html"; then
   echo "internal Persona-template state leaked into the normal chat surface" >&2

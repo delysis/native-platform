@@ -2,12 +2,8 @@ use anyhow::Result;
 use maud::{Markup, PreEscaped, html};
 use mom_llama_runtime::{
     AttachmentKind, AttachmentRecord, Blocker, CommandResult, Conversation, ConversationKind,
-    DraftMessage, KvCachePolicy, MentionToolApprovalState, MentionToolEffectOutcome, Message,
-    MessageRole, Settings,
-    engine::EngineCheckOutput,
-    kv_cache::{CacheEntryState, CacheTier, KvCacheStatus},
-    models::ModelInfo,
-    skill_store::Skill,
+    DraftMessage, MentionToolApprovalState, MentionToolEffectOutcome, Message, MessageRole,
+    Settings, engine::EngineCheckOutput, models::ModelInfo,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -53,22 +49,6 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         cli: "mom-llama settings get --json",
         effect: "mom_llama.effects.settings_store.v1",
         label: "Close settings",
-    },
-    ControlSpec {
-        affordance: "readiness.engine_check",
-        command: "mom_llama.engine_check",
-        tauri_command: "mom_llama_engine_check",
-        cli: "mom-llama engine check --json",
-        effect: "mom_llama.effects.engine_check.v1",
-        label: "Check",
-    },
-    ControlSpec {
-        affordance: "readiness.engine_configure",
-        command: "mom_llama.engine_configure",
-        tauri_command: "mom_llama_engine_configure",
-        cli: "mom-llama engine configure --model-path <path> --device <auto|cpu|metal> --json",
-        effect: "mom_llama.effects.engine_configure.v1",
-        label: "Save paths",
     },
     ControlSpec {
         affordance: "model.list",
@@ -711,70 +691,6 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         label: "Current chat instructions",
     },
     ControlSpec {
-        affordance: "skills.create",
-        command: "mom_llama.skill_create",
-        tauri_command: "mom_llama_skill_create",
-        cli: "mom-llama skill create --name <name> --prompt-template <text> --json",
-        effect: "mom_llama.effects.skill_store.v1",
-        label: "Save Skill",
-    },
-    ControlSpec {
-        affordance: "skills.list",
-        command: "mom_llama.skill_list",
-        tauri_command: "mom_llama_skill_list",
-        cli: "mom-llama skill list --json",
-        effect: "mom_llama.effects.skill_store.v1",
-        label: "Refresh Skills",
-    },
-    ControlSpec {
-        affordance: "skills.update",
-        command: "mom_llama.skill_update",
-        tauri_command: "mom_llama_skill_update",
-        cli: "mom-llama skill edit --skill <id> --name <name> --prompt-template <text> --json",
-        effect: "mom_llama.effects.skill_store.v1",
-        label: "Edit",
-    },
-    ControlSpec {
-        affordance: "skills.apply",
-        command: "mom_llama.skill_apply",
-        tauri_command: "mom_llama_skill_apply",
-        cli: "mom-llama skill apply --conversation <id> --skill <id-or-name> --json",
-        effect: "mom_llama.effects.skill_store.v1",
-        label: "Use",
-    },
-    ControlSpec {
-        affordance: "kv.status",
-        command: "mom_llama.kv_cache_status",
-        tauri_command: "mom_llama_kv_cache_status",
-        cli: "mom-llama kv-cache status --json",
-        effect: "mom_llama.effects.kv_cache_status.v1",
-        label: "Refresh",
-    },
-    ControlSpec {
-        affordance: "kv.save",
-        command: "mom_llama.kv_cache_save",
-        tauri_command: "mom_llama_kv_cache_save",
-        cli: "mom-llama kv-cache save --skill <id> --json",
-        effect: "mom_llama.effects.kv_cache_mutate.v1",
-        label: "Build assistant prefix",
-    },
-    ControlSpec {
-        affordance: "kv.restore",
-        command: "mom_llama.kv_cache_restore",
-        tauri_command: "mom_llama_kv_cache_restore",
-        cli: "mom-llama kv-cache restore --cache <id> --json",
-        effect: "mom_llama.effects.kv_cache_mutate.v1",
-        label: "Verify and warm cache",
-    },
-    ControlSpec {
-        affordance: "kv.clear",
-        command: "mom_llama.kv_cache_clear",
-        tauri_command: "mom_llama_kv_cache_clear",
-        cli: "mom-llama kv-cache clear --json",
-        effect: "mom_llama.effects.kv_cache_mutate.v1",
-        label: "Clear all",
-    },
-    ControlSpec {
         affordance: "mcp.status",
         command: "mom_llama.mcp_status",
         tauri_command: "mom_llama_mcp_status",
@@ -901,30 +817,6 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         cli: "mom-llama tool-loop permission-revoke --server <name> --tool <name> --json",
         effect: "mom_llama.effects.tool_permission_store.v1",
         label: "Revoke permission",
-    },
-    ControlSpec {
-        affordance: "resident.slots",
-        command: "mom_llama.model_slot_list",
-        tauri_command: "mom_llama_model_slot_list",
-        cli: "mom-llama model status --json",
-        effect: "mom_llama.effects.model_slot.v1",
-        label: "Resident models",
-    },
-    ControlSpec {
-        affordance: "resident.slot_load",
-        command: "mom_llama.model_slot_load",
-        tauri_command: "mom_llama_model_slot_load",
-        cli: "mom-llama model load --slot <n> --model-path <path> --json",
-        effect: "mom_llama.effects.model_slot.v1",
-        label: "Load model",
-    },
-    ControlSpec {
-        affordance: "resident.slot_unload",
-        command: "mom_llama.model_slot_unload",
-        tauri_command: "mom_llama_model_slot_unload",
-        cli: "mom-llama model unload --slot <n> --json",
-        effect: "mom_llama.effects.model_slot.v1",
-        label: "Unload model",
     },
 ];
 
@@ -1641,9 +1533,7 @@ pub fn render_app() -> Result<String> {
     let settings = mom_llama_runtime::settings_get()?;
     let engine = mom_llama_runtime::engine_status()?;
     let conversations = mom_llama_runtime::conversation_list()?;
-    let skills = mom_llama_runtime::skill_store::skill_list()?;
     let models = mom_llama_runtime::model_list()?;
-    let kv = mom_llama_runtime::kv_cache_status()?;
     let selected_conversation_id =
         mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
     let current_conversation_id =
@@ -1655,9 +1545,7 @@ pub fn render_app() -> Result<String> {
         settings: &settings,
         engine: &engine,
         conversations: &conversations,
-        skills: &skills,
         models: &models,
-        kv: &kv,
         selected_conversation_id: selected_conversation_id.as_deref(),
         draft: &draft,
     })
@@ -1686,23 +1574,18 @@ pub fn render_sidebar_fragment() -> Result<String> {
 
 pub fn render_settings_fragment() -> Result<String> {
     let settings = mom_llama_runtime::settings_get()?;
-    let engine = mom_llama_runtime::engine_status()?;
     let models = mom_llama_runtime::model_list()?;
-    let skills = mom_llama_runtime::skill_store::skill_list()?;
-    let kv = mom_llama_runtime::kv_cache_status()?;
     let conversations = mom_llama_runtime::conversation_list()?;
     let selected = mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
     let active = active_conversation(&conversations, selected.as_deref());
-    Ok(settings_modal(&settings, &engine, &models, &skills, &kv, active.as_ref()).into_string())
+    Ok(settings_modal(&settings, &models, active.as_ref()).into_string())
 }
 
 struct AppProjection<'a> {
     settings: &'a CommandResult<Settings>,
     engine: &'a CommandResult<EngineCheckOutput>,
     conversations: &'a CommandResult<Vec<Conversation>>,
-    skills: &'a CommandResult<Vec<Skill>>,
     models: &'a CommandResult<Vec<ModelInfo>>,
-    kv: &'a CommandResult<KvCacheStatus>,
     selected_conversation_id: Option<&'a str>,
     draft: &'a CommandResult<DraftMessage>,
 }
@@ -1712,9 +1595,7 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
         settings,
         engine,
         conversations,
-        skills,
         models,
-        kv,
         selected_conversation_id,
         draft,
     } = projection;
@@ -1743,7 +1624,7 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
                 (button("settings.open", Some("settings-open"), "icon-button settings-toggle", false))
             }
             (chat_view_with_draft(settings, engine, active.as_ref(), Some(draft)))
-            (settings_modal(settings, engine, models, skills, kv, active.as_ref()))
+            (settings_modal(settings, models, active.as_ref()))
             (persona_freeze_modal())
             (persona_context_menu())
             (persona_removal_modal())
@@ -2010,30 +1891,8 @@ fn latest_synthesizable_invocation(active: Option<&Conversation>) -> Option<Stri
 }
 
 fn sidebar(conversations: &CommandResult<Vec<Conversation>>, active_id: Option<&str>) -> Markup {
-    let StoreProjection {
-        value: mut personas,
-        blocker: persona_blocker,
-    } = store_projection(
-        mom_llama_runtime::persona_list(),
-        "persona_store_unavailable",
-        "Saved Personas could not be loaded from local storage.",
-    );
-    personas.sort_by(|left, right| left.title.cmp(&right.title));
-    let StoreProjection {
-        value: mut groups,
-        blocker: group_blocker,
-    } = store_projection(
-        mom_llama_runtime::persona_group_list(),
-        "persona_group_store_unavailable",
-        "Consult groups could not be loaded from local storage.",
-    );
-    groups.sort_by(|left, right| left.name.cmp(&right.name));
     let chats = conversations.result.as_deref().unwrap_or(&[]);
     let conversation_list = control("conversation.list");
-    let persona_list = control("persona.list");
-    let group_list = control("persona_group.list");
-    let persona_start = control("persona.instantiate");
-    let conversation_new = control("conversation.new");
     html! {
         aside class="sidebar" aria-label="Sidebar" {
             h2 { "llama.cpp" }
@@ -2106,90 +1965,6 @@ fn sidebar(conversations: &CommandResult<Vec<Conversation>>, active_id: Option<&
                                         span { (conversation.title.clone()) }
                                         small { (message_count(conversation)) }
                                     }
-                                }
-                            }
-                        }
-                    }
-                }
-                section class="sidebar-section" aria-label="Personas" data-sidebar-section="personas" {
-                    button type="button" class="nav-button sidebar-section-toggle"
-                        data-affordance=(persona_list.affordance)
-                        data-command=(persona_list.command)
-                        data-tauri-command=(persona_list.tauri_command)
-                        data-cli=(persona_list.cli)
-                        data-effect=(persona_list.effect)
-                        data-action="sidebar-section-toggle"
-                        data-sidebar-section="personas"
-                        data-sidebar-label="Personas"
-                        aria-label="Collapse Personas"
-                        aria-expanded="true"
-                        aria-controls="sidebar-persona-list" {
-                        span { "Personas" }
-                        span class="sidebar-section-chevron" aria-hidden="true" { (icon_markup("chevron-down")) }
-                    }
-                    ol id="sidebar-persona-list" class="conversation-list sidebar-section-list" {
-                        @if let Some(blocker) = &persona_blocker {
-                            li { (store_blocker(blocker)) }
-                        } @else if personas.is_empty() {
-                            li class="empty-line" { "No Personas yet" }
-                        }
-                        @for persona in personas {
-                            @let handle = persona.execution_profile.mention_handle.clone();
-                            li {
-                                button type="button" class="conversation-item sidebar-persona-item"
-                                    data-affordance=(persona_start.affordance)
-                                    data-command=(persona_start.command)
-                                    data-tauri-command=(persona_start.tauri_command)
-                                    data-cli=(persona_start.cli)
-                                    data-effect=(persona_start.effect)
-                                    data-action="sidebar-persona-start"
-                                    data-persona=(persona.id.clone())
-                                    aria-label=(format!("Start a new chat with {} (@{})", persona.title, handle)) {
-                                    span { (persona.title) }
-                                    small { "@" (handle) }
-                                }
-                            }
-                        }
-                    }
-                }
-                section class="sidebar-section" aria-label="Consult groups" data-sidebar-section="consult-groups" {
-                    button type="button" class="nav-button sidebar-section-toggle"
-                        data-affordance=(group_list.affordance)
-                        data-command=(group_list.command)
-                        data-tauri-command=(group_list.tauri_command)
-                        data-cli=(group_list.cli)
-                        data-effect=(group_list.effect)
-                        data-action="sidebar-section-toggle"
-                        data-sidebar-section="consult-groups"
-                        data-sidebar-label="Consult groups"
-                        aria-label="Collapse Consult groups"
-                        aria-expanded="true"
-                        aria-controls="sidebar-consult-group-list" {
-                        span { "Consult groups" }
-                        span class="sidebar-section-chevron" aria-hidden="true" { (icon_markup("chevron-down")) }
-                    }
-                    ol id="sidebar-consult-group-list" class="conversation-list sidebar-section-list" {
-                        @if let Some(blocker) = &group_blocker {
-                            li { (store_blocker(blocker)) }
-                        } @else if groups.is_empty() {
-                            li class="empty-line" { "No consult groups yet" }
-                        }
-                        @for group in groups {
-                            @let handle = group.mention_handle.clone();
-                            @let member_count = group.persona_ids.len();
-                            li {
-                                button type="button" class="conversation-item sidebar-consult-group-item"
-                                    data-affordance=(conversation_new.affordance)
-                                    data-command=(conversation_new.command)
-                                    data-tauri-command=(conversation_new.tauri_command)
-                                    data-cli=(conversation_new.cli)
-                                    data-effect=(conversation_new.effect)
-                                    data-action="sidebar-consult-group-start"
-                                    data-group=(group.id.clone())
-                                    data-handle=(handle.clone())
-                                    aria-label=(format!("Start a new chat with consult group {} (@{})", group.name, handle)) {
-                                    span { (group.name) }
-                                    small { "@" (handle) " · " (member_count) " members" }
                                 }
                             }
                         }
@@ -2726,10 +2501,7 @@ fn message_button(key: &str, action: &str, message: &Message) -> Markup {
 
 fn settings_modal(
     settings: &CommandResult<Settings>,
-    engine: &CommandResult<impl Serialize>,
     models: &CommandResult<Vec<ModelInfo>>,
-    skills: &CommandResult<Vec<Skill>>,
-    kv: &CommandResult<KvCacheStatus>,
     active: Option<&Conversation>,
 ) -> Markup {
     let current_conversation_id = active
@@ -2768,125 +2540,9 @@ fn settings_modal(
                         data-cli="mom-llama settings update"
                         data-effect="mom_llama.effects.settings_store.v1" {
                         @for section in SETTINGS_SECTIONS.iter().filter(|section| settings_section_visible(section)) {
-                            (settings_panel(section, settings, active))
+                            (settings_panel(section, settings, models, active))
                         }
                     }
-                    div class="settings-subgrid" {
-                            section class="settings-card" data-settings-card="models" {
-                            h3 { "Models" }
-                            (button("model.list", Some("model-list"), "small-button", false))
-                            @for model in models.result.as_deref().unwrap_or(&[]) {
-                                button type="button"
-                                    class=(format!("model-row {}", if model.selected { "active" } else { "" }))
-                                    data-affordance="readiness.model_select"
-                                    data-command="mom_llama.model_select"
-                                    data-tauri-command="mom_llama_model_select"
-                                    data-cli="mom-llama model select --model-path <path> --json"
-                                    data-effect="mom_llama.effects.model_select.v1"
-                                    data-action="model-select"
-                                    data-model-path=(model.path.clone())
-                                    disabled[model.selected] {
-                                    span { (model.id.clone()) }
-                                    small { (human_bytes(model.size_bytes)) }
-                                }
-                            }
-                        }
-                            section class="settings-card" data-settings-card="skills" {
-                            h3 { "Skills" }
-                            (button("skills.list", Some("refresh"), "small-button", false))
-                            @for skill in skills.result.as_deref().unwrap_or(&[]) {
-                                div class="skill-entry" {
-                                    button type="button"
-                                        class="skill-row"
-                                        data-affordance="skills.apply"
-                                        data-command="mom_llama.skill_apply"
-                                        data-tauri-command="mom_llama_skill_apply"
-                                        data-cli="mom-llama skill apply --conversation <id> --skill <id-or-name> --json"
-                                        data-effect="mom_llama.effects.skill_store.v1"
-                                        data-action="skill-apply"
-                                        data-skill=(skill.id.clone()) {
-                                        span { (skill.name.clone()) }
-                                        small { (skill.description.clone()) }
-                                    }
-                                    button type="button" class="icon-button skill-edit-button"
-                                        aria-label=(format!("Edit {}", skill.name))
-                                        data-affordance="skills.update"
-                                        data-command="mom_llama.skill_update"
-                                        data-tauri-command="mom_llama_skill_update"
-                                        data-cli="mom-llama skill edit --skill <id> --name <name> --prompt-template <text> --json"
-                                        data-effect="mom_llama.effects.skill_store.v1"
-                                        data-action="skill-edit"
-                                        data-skill=(skill.id.clone())
-                                        data-skill-name=(skill.name.clone())
-                                        data-skill-description=(skill.description.clone())
-                                        data-skill-prompt=(skill.prompt_template.clone())
-                                        data-skill-usage=(skill.usage_hint.clone())
-                                        data-skill-cache=(kv_policy_value(&skill.cache_policy)) {
-                                        (icon_markup("pencil"))
-                                    }
-                                }
-                            }
-                            form id="skill-form" class="skill-form"
-                                data-affordance="skills.create.form"
-                                data-command="mom_llama.skill_create"
-                                data-tauri-command="mom_llama_skill_create"
-                                data-cli="mom-llama skill create"
-                                data-effect="mom_llama.effects.skill_store.v1" {
-                                input type="hidden" name="skill_id"
-                                    data-affordance="skills.update"
-                                    data-command="mom_llama.skill_update"
-                                    data-tauri-command="mom_llama_skill_update"
-                                    data-cli="mom-llama skill edit --skill <id> --json"
-                                    data-effect="mom_llama.effects.skill_store.v1";
-                                input name="name" placeholder="Friendly explainer" aria-label="Skill name"
-                                    data-affordance="skills.create.name"
-                                    data-command="mom_llama.skill_create"
-                                    data-tauri-command="mom_llama_skill_create"
-                                    data-cli="mom-llama skill create"
-                                    data-effect="mom_llama.effects.skill_store.v1";
-                                input name="description" placeholder="Explain gently" aria-label="Skill description"
-                                    data-affordance="skills.create.description"
-                                    data-command="mom_llama.skill_create"
-                                    data-tauri-command="mom_llama_skill_create"
-                                    data-cli="mom-llama skill create"
-                                    data-effect="mom_llama.effects.skill_store.v1";
-                                textarea name="prompt_template" rows="3" placeholder="Explain this in simple, friendly language:" aria-label="Skill prompt template"
-                                    data-affordance="skills.create.prompt_template"
-                                    data-command="mom_llama.skill_create"
-                                    data-tauri-command="mom_llama_skill_create"
-                                    data-cli="mom-llama skill create"
-                                    data-effect="mom_llama.effects.skill_store.v1" {}
-                                select name="cache_policy" aria-label="Cache policy"
-                                    data-affordance="skills.create.cache_policy"
-                                    data-command="mom_llama.skill_create"
-                                    data-tauri-command="mom_llama_skill_create"
-                                    data-cli="mom-llama skill create"
-                                    data-effect="mom_llama.effects.skill_store.v1" {
-                                    option value="none" { "Do not reuse" }
-                                    option value="prompt_prefix" { "Reuse this prompt" }
-                                }
-                                (button("skills.create", Some("skill-create"), "small-button primary", false))
-                                button type="button" class="small-button is-hidden" data-action="skill-edit-cancel"
-                                    data-affordance="skills.list"
-                                    data-command="mom_llama.skill_list"
-                                    data-tauri-command="mom_llama_skill_list"
-                                    data-cli="mom-llama skill list --json"
-                                    data-effect="mom_llama.effects.skill_store.v1" { "Cancel edit" }
-                            }
-                        }
-                            (prompt_cache_card(kv))
-                            section class="settings-card" data-settings-card="engine" {
-                            h3 { "Engine" }
-                            p { (readiness_short_label(engine)) }
-                            div class="button-strip" {
-                                (button("readiness.engine_check", Some("engine-check"), "small-button", false))
-                                @if mcp_process_ui_supported() {
-                                    (button("mcp.status", Some("mcp-status"), "small-button", false))
-                                }
-                            }
-                        }
-                    }
-                        p class="receipt-panel" id="settings-receipt" { (readiness_short_label(engine)) }
                 }
                 footer class="settings-footer" {
                     (button("settings.reset", Some("settings-reset"), "small-button", false))
@@ -2915,6 +2571,7 @@ fn settings_modal(
 fn settings_panel(
     section: &SettingsSectionSpec,
     settings: &CommandResult<Settings>,
+    models: &CommandResult<Vec<ModelInfo>>,
     active: Option<&Conversation>,
 ) -> Markup {
     html! {
@@ -2933,8 +2590,8 @@ fn settings_panel(
             }
             @if section.slug == "general" {
                 (current_chat_instructions(active))
-                section class="settings-card native-runtime" {
-                    h3 { "Native runtime" }
+                section class="settings-card model-settings" data-settings-card="models" {
+                    h3 { "Model" }
                     (settings_path_input("Default model for new chats", "model_path", settings_value(settings, "model_path"), "model-browse"))
                     p class="field-help" { "New chats capture this default. Existing chats use their saved conversation model when available." }
                     @if let Some(cache) = mom_llama_runtime::hugging_face_hub_cache_dir() {
@@ -2944,25 +2601,26 @@ fn settings_panel(
                             "."
                         }
                     }
-                    (settings_path_input("Multimodal projector", "mmproj_path", settings_value(settings, "mmproj_path"), "mmproj-browse"))
-                    label class="field" { span { "Device" }
-                        select name="native_device" data-setting-core="native_device"
-                            data-affordance="settings.update" data-command="mom_llama.settings_update"
-                            data-tauri-command="mom_llama_settings_update"
-                            data-cli="mom-llama settings update --device <auto|cpu|metal> --json"
-                            data-effect="mom_llama.effects.settings_store.v1" {
-                            option value="auto" selected[settings_value(settings, "native_device") == "auto"] { "Automatic" }
-                            option value="metal" selected[settings_value(settings, "native_device") == "metal"] { "Metal" }
-                            option value="cpu" selected[settings_value(settings, "native_device") == "cpu"] { "CPU" }
+                    (settings_path_input("Vision projector (optional)", "mmproj_path", settings_value(settings, "mmproj_path"), "mmproj-browse"))
+                    div class="button-strip" {
+                        (button("model.list", Some("model-list"), "small-button", false))
+                    }
+                    @for model in models.result.as_deref().unwrap_or(&[]) {
+                        button type="button"
+                            class=(format!("model-row {}", if model.selected { "active" } else { "" }))
+                            data-affordance="readiness.model_select"
+                            data-command="mom_llama.model_select"
+                            data-tauri-command="mom_llama_model_select"
+                            data-cli="mom-llama model select --model-path <path> --json"
+                            data-effect="mom_llama.effects.model_select.v1"
+                            data-action="model-select"
+                            data-model-path=(model.path.clone())
+                            disabled[model.selected] {
+                            span { (model.id.clone()) }
+                            small { (human_bytes(model.size_bytes)) }
                         }
                     }
-                    div class="native-number-grid" {
-                        (settings_input("Context tokens", "context_tokens", settings_value(settings, "context_tokens")))
-                        (settings_input("Batch tokens", "batch_tokens", settings_value(settings, "batch_tokens")))
-                        (settings_input("Parallel sequences", "max_parallel_sequences", settings_value(settings, "max_parallel_sequences")))
-                        (settings_input("Memory budget (MiB)", "memory_budget_mib", settings_value(settings, "memory_budget_mib")))
-                    }
-                    p class="field-help" { "The GGUF model is loaded directly inside this app. No executable or local server is used." }
+                    p class="field-help" { "Models run locally inside Mom. Choosing a model does not start a server or another executable." }
                 }
             }
             @if section.slug == "consult" {
@@ -3026,52 +2684,6 @@ fn settings_panel(
             }
             @if section.slug == "mcp" {
                 (mcp_settings())
-            }
-            @if section.slug == "developer" {
-                section class="settings-card cache-preferences" {
-                    h3 { "Prompt caching" }
-                    label class="field" {
-                        span { "Mode" }
-                        select name="kv_cache_policy" data-setting-core="kv_cache_policy"
-                            data-affordance="settings.update"
-                            data-command="mom_llama.settings_update"
-                            data-tauri-command="mom_llama_settings_update"
-                            data-cli="mom-llama settings update --kv-cache-policy <automatic|prefixes-only|off> --json"
-                            data-effect="mom_llama.effects.settings_store.v1" {
-                            option value="kv_cache_candidate"
-                                selected[settings_value(settings, "kv_cache_policy") == "kv_cache_candidate"] {
-                                "Automatic (recommended)"
-                            }
-                            option value="prompt_prefix"
-                                selected[settings_value(settings, "kv_cache_policy") == "prompt_prefix"] {
-                                "Prefixes only"
-                            }
-                            option value="none"
-                                selected[settings_value(settings, "kv_cache_policy") == "none"] {
-                                "Off"
-                            }
-                        }
-                    }
-                    p class="field-help" {
-                        "Automatic keeps reusable Persona and Skill prefixes and an encrypted checkpoint for each active conversation. Prefixes only skips conversation checkpoints. Off neither creates nor reads cached prompt state."
-                    }
-                    p class="field-help" {
-                        "Safety limits remain fixed at 256 MiB in memory, 64 persistent entries, and 2 GiB on disk. Incompatible state is discarded and generation continues normally."
-                    }
-                }
-                section class="settings-card" {
-                    h3 { "Resident models" }
-                    p class="field-help" { "Model slots are native owner-thread workers governed by the app memory budget." }
-                    div class="native-number-grid resident-fields" {
-                        (command_input("Slot", "resident_slot", "0", "resident.slot_load"))
-                        (command_path_input("Model path", "resident_model_path", &settings_value(settings, "model_path"), "resident-model-browse", "resident.slot_load"))
-                    }
-                    div class="button-strip" {
-                        (button("resident.slots", Some("resident-slots"), "small-button", false))
-                        (button("resident.slot_load", Some("resident-slot-load"), "small-button", false))
-                        (button("resident.slot_unload", Some("resident-slot-unload"), "small-button", false))
-                    }
-                }
             }
         }
     }
@@ -3291,7 +2903,7 @@ fn persona_settings() -> Markup {
         section class="settings-card persona-library" {
             h3 { "Personas" }
             p class="field-help" {
-                "Manage each Persona's model, context profile, and saved template. Start chats from the main sidebar."
+                "Use a Persona's menu to start a conversation, edit its profile, or remove it from the library."
             }
             div id="persona-list" class="persona-list" {
                 @if let Some(blocker) = &blocker {
@@ -3866,20 +3478,6 @@ fn settings_field(field: &SettingsFieldSpec, settings: &CommandResult<Settings>)
     }
 }
 
-fn settings_input(label: &str, name: &str, value: String) -> Markup {
-    html! {
-        label class="field" { span { (label) }
-            input type="number" name=(name) value=(value)
-                data-setting-core=(name)
-                data-affordance=(format!("settings.{name}"))
-                data-command="mom_llama.settings_update"
-                data-tauri-command="mom_llama_settings_update"
-                data-cli="mom-llama settings update"
-                data-effect="mom_llama.effects.settings_store.v1";
-        }
-    }
-}
-
 fn settings_path_input(label: &str, name: &str, value: String, action: &str) -> Markup {
     let picker = control("path.select");
     html! {
@@ -4012,19 +3610,6 @@ fn icon_for_affordance(affordance: &str) -> Option<&'static str> {
         "settings.reset" => Some("rotate-ccw"),
         "settings.update" => Some("rotate-ccw"),
         "model.list" => Some("refresh-cw"),
-        "skills.list" => Some("refresh-cw"),
-        "skills.create" => Some("plus"),
-        "skills.update" => Some("pencil"),
-        "skills.apply" => Some("pencil-ruler"),
-        "kv.status" => Some("database"),
-        "kv.save" => Some("save"),
-        "kv.restore" => Some("rotate-ccw"),
-        "kv.clear" => Some("trash-2"),
-        "resident.slots" => Some("box"),
-        "resident.slot_load" => Some("download"),
-        "resident.slot_unload" => Some("trash-2"),
-        "readiness.engine_check" => Some("check"),
-        "readiness.engine_configure" => Some("settings"),
         "readiness.model_select" => Some("box"),
         _ => None,
     }
@@ -4291,20 +3876,6 @@ fn role_label(role: &MessageRole) -> &'static str {
     }
 }
 
-fn readiness_short_label(engine: &CommandResult<impl Serialize>) -> String {
-    if engine.status == "host_integrated" {
-        "Model loaded".to_string()
-    } else if engine.status == "configured" {
-        "Ready to load".to_string()
-    } else {
-        engine
-            .blocker
-            .as_ref()
-            .map(|blocker| blocker.message.clone())
-            .unwrap_or_else(|| "Needs setup".to_string())
-    }
-}
-
 fn effective_conversation_model_path<'a>(
     active: Option<&'a Conversation>,
     settings: &'a CommandResult<Settings>,
@@ -4459,11 +4030,6 @@ fn settings_value(settings: &CommandResult<Settings>, key: &str) -> String {
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_default(),
-        "native_device" => format!("{:?}", settings.native_device).to_lowercase(),
-        "context_tokens" => settings.context_tokens.to_string(),
-        "batch_tokens" => settings.batch_tokens.to_string(),
-        "max_parallel_sequences" => settings.max_parallel_sequences.to_string(),
-        "memory_budget_mib" => (settings.resident_memory_budget_bytes / (1024 * 1024)).to_string(),
         "model_path" => settings
             .model_path
             .as_ref()
@@ -4472,21 +4038,7 @@ fn settings_value(settings: &CommandResult<Settings>, key: &str) -> String {
         "default_temperature" => settings.default_temperature.to_string(),
         "default_top_p" => settings.default_top_p.to_string(),
         "default_max_tokens" => settings.default_max_tokens.to_string(),
-        "kv_cache_policy" => match settings.kv_cache_policy {
-            KvCachePolicy::None => "none",
-            KvCachePolicy::PromptPrefix => "prompt_prefix",
-            KvCachePolicy::KvCacheCandidate => "kv_cache_candidate",
-        }
-        .to_string(),
         _ => String::new(),
-    }
-}
-
-fn kv_policy_value(policy: &KvCachePolicy) -> &'static str {
-    match policy {
-        KvCachePolicy::None => "none",
-        KvCachePolicy::PromptPrefix => "prompt_prefix",
-        KvCachePolicy::KvCacheCandidate => "kv_cache_candidate",
     }
 }
 
@@ -4527,162 +4079,6 @@ fn json_value_to_form_value(value: &Value) -> String {
         Value::Bool(value) => value.to_string(),
         value => value.to_string(),
     }
-}
-
-fn prompt_cache_card(kv: &CommandResult<KvCacheStatus>) -> Markup {
-    let status = kv.result.as_ref();
-    let ready_entries = status
-        .map(|status| {
-            status
-                .entries
-                .iter()
-                .filter(|entry| entry.state == CacheEntryState::Ready)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let invalidated_entries = status.map_or(0, |status| {
-        status
-            .entries
-            .iter()
-            .filter(|entry| entry.state == CacheEntryState::Invalidated)
-            .count()
-    });
-    let memory_entries = status.map_or(0, |status| status.memory_entries);
-    let persistent_bytes = status.map_or(0, |status| status.persistent_bytes);
-    html! {
-        section id="prompt-cache-card" class="settings-card prompt-cache-card"
-            data-settings-card="cache"
-            data-cache-state=(status.map_or("unavailable", |status| kv_state_value(status.status))) {
-            div class="cache-card-heading" {
-                div {
-                    h3 { "Prompt cache" }
-                    p id="prompt-cache-summary" { (kv_label(kv)) }
-                }
-            }
-            p class="cache-explanation" {
-                "Conversation checkpoints and persona prefixes are encrypted on this Mac. "
-                "Compatible checkpoints restore automatically; integrity and the exact model fingerprint are checked before reuse."
-            }
-            dl class="cache-metrics" {
-                div {
-                    dt { "Stored" }
-                    dd { (ready_entries.len()) }
-                }
-                div {
-                    dt { "Encrypted state" }
-                    dd { (human_cache_bytes(persistent_bytes)) }
-                }
-                div {
-                    dt { "Warm now" }
-                    dd { (memory_entries) }
-                }
-            }
-            @if ready_entries.is_empty() {
-                p class="cache-empty" { "No persisted prompt checkpoints." }
-            } @else {
-                div class="cache-entry-list" aria-label="Persisted prompt checkpoints" {
-                    @for entry in ready_entries {
-                        div class="cache-entry" data-cache-id=(entry.id.clone()) {
-                            div {
-                                strong { (entry.label.clone()) }
-                                small { (cache_entry_detail(entry.tier, entry.token_ids.len(), entry.state_bytes)) }
-                            }
-                            span class="cache-entry-state" { "Stored" }
-                        }
-                    }
-                }
-            }
-            @if invalidated_entries > 0 {
-                p class="cache-invalidated" {
-                    (invalidated_entries) " invalidated "
-                    (if invalidated_entries == 1 { "record is" } else { "records are" })
-                    " retained for inspection until the cache is cleared."
-                }
-            }
-            @if let Some(blocker) = kv.blocker.as_ref() {
-                (store_blocker(blocker))
-            }
-            div class="button-strip cache-actions" {
-                (button("kv.status", Some("kv-status"), "small-button", false))
-                (button("kv.clear", Some("kv-clear"), "small-button danger", false))
-            }
-            p id="cache-action-status" class="cache-action-status" role="status" aria-live="polite" {}
-        }
-    }
-}
-
-fn kv_label(kv: &CommandResult<KvCacheStatus>) -> String {
-    let Some(status) = kv.result.as_ref() else {
-        return "Cache unavailable".to_string();
-    };
-    let ready = status
-        .entries
-        .iter()
-        .filter(|entry| entry.state == CacheEntryState::Ready)
-        .count();
-    match status.status {
-        mom_llama_runtime::kv_cache::KvCacheState::Disabled => {
-            format!("Caching is off · {ready} stored")
-        }
-        mom_llama_runtime::kv_cache::KvCacheState::UnsupportedByEngine => {
-            format!("Engine cache unsupported · {ready} stored")
-        }
-        mom_llama_runtime::kv_cache::KvCacheState::BlockedMissingModel => {
-            format!("No model selected · {ready} stored")
-        }
-        mom_llama_runtime::kv_cache::KvCacheState::BlockedMissingCacheDir => {
-            "Encrypted cache store unavailable".to_string()
-        }
-        mom_llama_runtime::kv_cache::KvCacheState::ConfiguredNotVerified => {
-            "Ready to create automatic checkpoints".to_string()
-        }
-        mom_llama_runtime::kv_cache::KvCacheState::PromptSmokeVerified => {
-            format!("Native restore verified · {ready} stored")
-        }
-        mom_llama_runtime::kv_cache::KvCacheState::Saved => {
-            format!(
-                "{ready} encrypted checkpoint{} stored",
-                if ready == 1 { "" } else { "s" }
-            )
-        }
-        mom_llama_runtime::kv_cache::KvCacheState::Restored => {
-            format!("Checkpoint restored · {ready} stored")
-        }
-        mom_llama_runtime::kv_cache::KvCacheState::Invalidated => {
-            "Prompt cache cleared".to_string()
-        }
-    }
-}
-
-const fn kv_state_value(state: mom_llama_runtime::kv_cache::KvCacheState) -> &'static str {
-    match state {
-        mom_llama_runtime::kv_cache::KvCacheState::Disabled => "disabled",
-        mom_llama_runtime::kv_cache::KvCacheState::UnsupportedByEngine => "unsupported_by_engine",
-        mom_llama_runtime::kv_cache::KvCacheState::BlockedMissingModel => "blocked_missing_model",
-        mom_llama_runtime::kv_cache::KvCacheState::BlockedMissingCacheDir => {
-            "blocked_missing_cache_dir"
-        }
-        mom_llama_runtime::kv_cache::KvCacheState::ConfiguredNotVerified => {
-            "configured_not_verified"
-        }
-        mom_llama_runtime::kv_cache::KvCacheState::PromptSmokeVerified => "prompt_smoke_verified",
-        mom_llama_runtime::kv_cache::KvCacheState::Saved => "saved",
-        mom_llama_runtime::kv_cache::KvCacheState::Restored => "restored",
-        mom_llama_runtime::kv_cache::KvCacheState::Invalidated => "invalidated",
-    }
-}
-
-fn cache_entry_detail(tier: CacheTier, tokens: usize, bytes: usize) -> String {
-    let tier = match tier {
-        CacheTier::MemoryLru => "Memory prefix",
-        CacheTier::SessionPersistent => "Conversation checkpoint",
-        CacheTier::PersonaPack => "Persona prefix",
-    };
-    format!("{tier} · {tokens} tokens · {}", human_cache_bytes(bytes))
-}
-
-fn human_cache_bytes(size: usize) -> String {
-    human_bytes(u64::try_from(size).ok())
 }
 
 fn message_count(conversation: &Conversation) -> String {
@@ -4730,18 +4126,6 @@ mod tests {
             mom_llama_runtime::now_ms()
         ));
         mom_llama_runtime::config::set_data_dir_override_for_tests(Some(data_dir));
-        let persona_ids = mom_llama_runtime::persona_list()?
-            .result
-            .unwrap_or_default()
-            .into_iter()
-            .take(2)
-            .map(|persona| persona.id)
-            .collect::<Vec<_>>();
-        mom_llama_runtime::persona_group_create(
-            "Care team".to_string(),
-            "care-team".to_string(),
-            persona_ids,
-        )?;
         let html = render_app()?;
         mom_llama_runtime::config::set_data_dir_override_for_tests(None);
         for forbidden in ["__sveltekit__", "React", "Vue", "fetch("] {
@@ -4785,11 +4169,42 @@ mod tests {
         assert!(html.contains(r#"class="settings-autosave" data-state="idle""#));
         assert!(html.contains("settings-save-glyph-saved"));
         assert!(html.contains("settings-save-glyph-saving"));
-        assert!(html.contains(r#"name="kv_cache_policy""#));
-        assert!(html.contains("Automatic (recommended)"));
-        assert!(html.contains("Prefixes only"));
-        assert!(html.contains(">Off</option>"));
-        assert!(html.contains("Off neither creates nor reads cached prompt state."));
+        assert_eq!(html.matches(r#"data-settings-card="models""#).count(), 1);
+        let general_panel = html
+            .find(r#"data-section-panel="general""#)
+            .expect("general settings panel");
+        let model_card = html
+            .find(r#"data-settings-card="models""#)
+            .expect("ordinary model card");
+        let display_panel = html
+            .find(r#"data-section-panel="display""#)
+            .expect("display settings panel");
+        assert!(
+            general_panel < model_card && model_card < display_panel,
+            "the one model chooser must live inside General rather than a global settings grid"
+        );
+        for forbidden_scaffold_surface in [
+            r#"class="settings-subgrid""#,
+            r#"data-settings-card="skills""#,
+            r#"data-settings-card="cache""#,
+            r#"data-settings-card="engine""#,
+            r#"name="kv_cache_policy""#,
+            "Native runtime",
+            "Memory budget (MiB)",
+            "Resident models",
+            "Gentle explainer",
+            "Warm, plain language",
+            "Explain simply and warmly.",
+            "Create Skill",
+            "No Skills yet.",
+            "Policy: disabled until verified",
+            "KV-cache persistence is surfaced",
+        ] {
+            assert!(
+                !html.contains(forbidden_scaffold_surface),
+                "scaffold-only product surface leaked into Mom: {forbidden_scaffold_surface}"
+            );
+        }
         assert!(!html.contains("Pre-fill KV cache after response"));
         assert!(
             html.contains(
@@ -4807,36 +4222,17 @@ mod tests {
         assert!(!html.contains(r#"id="persona-view""#));
         assert!(!html.contains(r#"data-action="personas-open""#));
         assert!(!html.contains(r#"data-action="consult-open""#));
-        for (section, list, label) in [
-            (
-                "conversations",
-                "conversation-section-panel",
-                "Conversations",
-            ),
-            ("personas", "sidebar-persona-list", "Personas"),
-            (
-                "consult-groups",
-                "sidebar-consult-group-list",
-                "Consult groups",
-            ),
-        ] {
-            assert!(html.contains(&format!(r#"data-sidebar-section="{section}""#)));
-            assert!(html.contains(&format!(r#"aria-controls="{list}""#)));
-            assert!(html.contains(&format!(r#"aria-label="Collapse {label}""#)));
-        }
-        assert!(html.contains(r#"data-action="sidebar-persona-start""#));
-        assert!(html.contains(
-            r#"aria-label="Start a new chat with Bessel van der Kolk (@bessel-van-der-kolk)""#
-        ));
-        assert!(html.contains(r#"data-action="sidebar-consult-group-start""#));
-        assert!(html.contains(
-            r#"aria-label="Start a new chat with consult group Care team (@care-team)""#
-        ));
+        assert!(html.contains(r#"data-sidebar-section="conversations""#));
+        assert!(html.contains(r#"aria-controls="conversation-section-panel""#));
+        assert!(html.contains(r#"aria-label="Collapse Conversations""#));
+        assert!(!html.contains(r#"data-sidebar-section="personas""#));
+        assert!(!html.contains(r#"id="sidebar-persona-list""#));
+        assert!(!html.contains(r#"data-sidebar-section="consult-groups""#));
+        assert!(!html.contains(r#"id="sidebar-consult-group-list""#));
         assert!(html.contains("Bessel van der Kolk"));
-        assert!(html.contains("@care-team · 2 members"));
         assert!(!html.contains(r#"data-action="skills-open""#));
         assert!(!html.contains(r#"data-action="persona-open""#));
-        assert!(html.contains("Start chats from the main sidebar."));
+        assert!(html.contains("Use a Persona's menu to start a conversation"));
         assert!(!html.contains("Edits version this template"));
         assert!(!html.contains(r#"class="persona-template-banner""#));
         assert!(html.contains(r#"id="mention-candidates" class="mention-candidates is-hidden""#));
@@ -4893,6 +4289,7 @@ mod tests {
             "display",
             "personas",
             "consult",
+            "library",
             "sampling",
             "penalties",
             "agentic",
@@ -4953,12 +4350,7 @@ mod tests {
                 && js.contains("conversation = created.result.id;"),
             "the landing composer must materialize a real conversation before dispatch"
         );
-        assert!(js.contains(r#""sidebar-persona-start": async (button)"#));
-        assert!(js.contains(r#""sidebar-consult-group-start": async (button)"#));
         assert!(js.contains("collapsedSidebarSections"));
-        assert!(js.contains("const seedNewChatDraft = async"));
-        assert!(js.contains(r#"draft.conversation === "default""#));
-        assert!(js.contains("await refreshConversationProjection().catch(reportError)"));
         assert!(js.contains("scheduleSettingsAutosave"));
         assert!(
             js.contains(r#"modelPath: formValue(form, "model_path")"#)
@@ -5113,81 +4505,6 @@ mod tests {
             "the packaged CSP must permit only local blob-backed attachment media"
         );
         Ok(())
-    }
-
-    #[test]
-    fn prompt_cache_inspector_reports_real_tiers_without_manual_session_restore_controls() {
-        use llama_native_types::{PromptForm, PromptTokenPolicy};
-        use mom_llama_runtime::kv_cache::{CacheFingerprint, KvCacheMetadata, KvCacheState};
-
-        let fingerprint = CacheFingerprint {
-            prompt_form: PromptForm::Chat,
-            prompt_token_policy: PromptTokenPolicy::ChatTemplate,
-            model_sha256: "model".to_string(),
-            binding_version: "binding".to_string(),
-            build_id: "build".to_string(),
-            tokenizer_sha256: "tokenizer".to_string(),
-            chat_template_sha256: "template".to_string(),
-            multimodal_projector_sha256: None,
-            lora_adapters_sha256: Vec::new(),
-            context_tokens: 2_048,
-            batch_tokens: 128,
-            max_sequences: 1,
-            device: "cpu".to_string(),
-            rope_config_sha256: "rope".to_string(),
-            kv_layout_sha256: "layout".to_string(),
-        };
-        let conversation = KvCacheMetadata::new(
-            "conversation-cache",
-            CacheTier::SessionPersistent,
-            fingerprint.clone(),
-            vec![1, 2, 3],
-            4_096,
-            1,
-        )
-        .with_owner("conversation-1")
-        .with_label("Conversation conversation-1");
-        let persona = KvCacheMetadata::new(
-            "persona-cache",
-            CacheTier::PersonaPack,
-            fingerprint,
-            vec![1, 2],
-            2_048,
-            2,
-        )
-        .with_owner("persona-1")
-        .with_label("Persona: Calm helper");
-        let cache = CommandResult::passed(
-            "mom_llama.kv_cache_status",
-            "contracted",
-            KvCacheStatus {
-                status: KvCacheState::Saved,
-                policy: KvCachePolicy::KvCacheCandidate,
-                cache_dir: "encrypted://runtime.sqlite3".to_string(),
-                entries: vec![conversation, persona],
-                memory_entries: 1,
-                memory_bytes: 2_048,
-                memory_capacity_bytes: 256 * 1024 * 1024,
-                persistent_bytes: 6_144,
-                persistent_capacity_bytes: 2 * 1024 * 1024 * 1024,
-                persistent_capacity_entries: 64,
-            },
-            Vec::new(),
-            Vec::new(),
-            false,
-            false,
-        );
-
-        let html = prompt_cache_card(&cache).into_string();
-        assert!(html.contains("2 encrypted checkpoints stored"));
-        assert!(html.contains("Conversation checkpoint · 3 tokens · 4096 bytes"));
-        assert!(html.contains("Persona prefix · 2 tokens · 2048 bytes"));
-        assert!(html.contains("Compatible checkpoints restore automatically"));
-        assert!(html.contains(r#"data-action="kv-status""#));
-        assert!(html.contains(r#"data-action="kv-clear""#));
-        assert!(!html.contains(r#"data-action="kv-save""#));
-        assert!(!html.contains(r#"data-action="kv-restore""#));
-        assert!(!html.contains("runtime.sqlite3"));
     }
 
     #[test]
@@ -5506,23 +4823,6 @@ mod tests {
             r#""mention-insert": async (button)"#,
             r#"invoke("mom_llama_mention_candidates"#,
             "insertMention(textarea, handle)",
-        );
-        assert_command_precedes_local_mutation(
-            js,
-            r#""sidebar-consult-group-start": async (button)"#,
-            r#"invoke("mom_llama_persona_group_list")"#,
-            r#"invoke("mom_llama_conversation_new"#,
-        );
-        assert_command_precedes_local_mutation(
-            js,
-            r#""sidebar-consult-group-start": async (button)"#,
-            r#"invoke("mom_llama_conversation_new"#,
-            r#"await seedNewChatDraft(created.result.id, draft, `@${group.mention_handle} `)"#,
-        );
-        assert!(
-            js.contains(r#""sidebar-persona-start": async (button)"#)
-                && js.contains("await instantiatePersona(button.dataset.persona)"),
-            "sidebar Personas must instantiate a new chat instead of selecting the template"
         );
         assert!(
             js.contains(r#"aria-label="Personas, chats, and consult groups""#)
@@ -6117,7 +5417,6 @@ mod tests {
             "consult-group-option",
             "persona-select",
             "model-row",
-            "skill-row",
         ];
         let mut rest = html;
         while let Some(index) = rest.find("<button") {

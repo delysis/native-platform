@@ -63,7 +63,7 @@
     {"key":"mcpRequestTimeoutSeconds","status":"implemented","evidence":"Bounds each isolated MCP stdio request."},
     {"key":"agenticMaxTurns","status":"implemented","evidence":"Bounds the native model/tool loop to the stricter one-to-eight range."},
     {"key":"alwaysShowToolCallContent","status":"implemented","evidence":"Controls expansion of tool arguments and technical details."},
-    {"key":"preEncodeConversation","status":"implemented","ui_projection":"derived","derived_by":"kv_cache_policy","evidence":"Derived from the single native Prompt caching mode: Automatic persists conversation checkpoints, Prefixes only does not, and Off disables all prompt-cache lookup, creation, and restore."},
+    {"key":"preEncodeConversation","status":"implemented","ui_projection":"backend_only","runtime_policy":"kv_cache_policy","evidence":"The Rust-owned cache policy implements the upstream behavior without exposing cache internals or a cache-policy control in the ordinary product UI."},
     {"key":"disableReasoningParsing","status":"implemented","evidence":"Preserves raw reasoning markers when enabled."},
     {"key":"excludeReasoningFromContext","status":"implemented","evidence":"Strips persisted reasoning from later native context when enabled."},
     {"key":"showRawOutputSwitch","status":"implemented","evidence":"Shows a command-backed formatted/raw assistant output toggle."},

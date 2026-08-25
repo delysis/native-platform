@@ -26,12 +26,13 @@ dependency graph and the exact present status of speech.
 
 ## Workspace
 
-- `crates/mom-llama-runtime`: conversations, Skills, editable/versioned
-  Personas, `@mention` dispatch, attachment lifecycle, storage, tools and
-  product cache policy.
+- `crates/mom-llama-runtime`: conversations, editable/versioned Personas,
+  `@mention` dispatch, attachment lifecycle, storage, tools, compatibility
+  Skill records and product cache policy. Skills and cache operations are
+  backend-only compatibility capabilities, not ordinary UI sections.
 - `crates/mom-llama-cli`: the complete machine-exercisable product boundary.
 - `apps/mom-llama`: the thin Maud/Tauri application.
-- `contracts`: visible command, effect, settings and upstream-parity ledgers.
+- `contracts`: command-surface, effect, settings and upstream-parity ledgers.
 - `receipts`: preserved historical product evidence. A receipt counts as
   current proof only when it is explicitly source-bound; older path/date-only
   receipts remain informative.
@@ -73,3 +74,5 @@ Keychain-backed store.
 Prompt caching remains a product runtime preference: `automatic` (conversation
 checkpoints plus stable Persona/Skill prefixes), `prefixes-only`, or `off`.
 Compatibility fingerprints and safety ceilings are enforced by native-kit.
+This policy is exercised through the typed backend and CLI; Mom does not expose
+cache internals, cache mutation or cache-policy controls in the ordinary UI.

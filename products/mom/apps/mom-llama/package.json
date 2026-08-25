@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "check:frontend": "node --check ui/cache-inspector.js && node --check ui/composer-key-policy.js && node --check ui/coop-hx.js",
-    "test:frontend": "node --test ui/cache-inspector.test.js ui/composer-key-policy.test.js ui/composer-autocomplete-wiring.test.js ui/attachment-preview-wiring.test.js ui/information-library-wiring.test.js",
+    "check:frontend": "node --check ui/composer-key-policy.js && node --check ui/coop-hx.js && node --check ui/product-surface-contract.test.js",
+    "test:frontend": "node --test ui/product-surface-contract.test.js ui/composer-key-policy.test.js ui/composer-autocomplete-wiring.test.js ui/attachment-preview-wiring.test.js ui/information-library-wiring.test.js",
     "tauri": "tauri"
   },
   "devDependencies": {

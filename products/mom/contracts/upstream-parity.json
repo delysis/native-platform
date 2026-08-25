@@ -111,7 +111,12 @@
       "id": "native_model_load_unload_slots",
       "classification": "p0_implemented",
       "commands": ["mom_llama.model_slot_list", "mom_llama.model_slot_load", "mom_llama.model_slot_unload"],
-      "evidence": ["owner-thread registry", "bounded resident memory budget", "no inference process or network authority"]
+      "evidence": [
+        "owner-thread registry",
+        "bounded resident memory budget",
+        "no inference process or network authority",
+        "resident-slot commands are backend-only and do not authorize a developer control panel in the ordinary chat UI"
+      ]
     },
     {
       "id": "model_metadata_search_progress",
@@ -173,7 +178,8 @@
       "evidence": [
         "scripts/prove-native-cache-restart.sh",
         "receipts/003-native-cache-restart-proof.json",
-        "real GGUF save and fresh-process encrypted restore returned prompt_smoke_verified with zero memory entries"
+        "real GGUF save and fresh-process encrypted restore returned prompt_smoke_verified with zero memory entries",
+        "cache commands and policy remain backend-only; no cache inspector, tier status, or cache-policy control is part of the ordinary UI"
       ]
     },
     {
@@ -284,7 +290,10 @@
       "id": "mom_skills",
       "classification": "p0_implemented",
       "commands": ["mom_llama.skill_create", "mom_llama.skill_list", "mom_llama.skill_update", "mom_llama.skill_apply"],
-      "evidence": ["encrypted persistent prompt presets and cache policy"]
+      "evidence": [
+        "encrypted persistent prompt presets and cache policy",
+        "legacy Skill commands remain backend-only and do not authorize a Skills editor or navigation surface"
+      ]
     },
     {
       "id": "chat_native_personas_and_groups",

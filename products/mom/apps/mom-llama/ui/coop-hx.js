@@ -697,17 +697,6 @@
     return modal;
   };
 
-  const refreshCacheInspector = async (action, result) => {
-    report(result);
-    await refreshSettings("developer");
-    const status = document.getElementById("cache-action-status");
-    const inspector = window.MomLlamaCacheInspector;
-    if (!status || !inspector) return result;
-    status.textContent = inspector.actionMessage(action, result);
-    status.dataset.state = inspector.actionState(result);
-    return result;
-  };
-
   const refreshConversationProjection = async () => {
     await Promise.all([refreshChat(), refreshSidebar()]);
   };
@@ -838,7 +827,6 @@
     temperature: numberOrNull(formValue(form, "temperature")),
     topP: numberOrNull(formValue(form, "top_p")),
     maxTokens: numberOrNull(formValue(form, "max_tokens")),
-    kvCachePolicy: formValue(form, "kv_cache_policy") || null,
     upstreamSettings: collectUpstreamSettings(form),
   });
 
@@ -1277,40 +1265,6 @@
       refreshConversationProjection(),
     ]);
     return result;
-  };
-
-  const persistCurrentDraftBeforeNavigation = async () => {
-    const conversation = selectedConversation();
-    const form = document.getElementById("chat-form");
-    const draft = {
-      conversation,
-      message: formValue(form, "message"),
-      attachmentIds: draftAttachmentIds(form),
-    };
-    const persisted = await persistDraftNow(draft.message, draft.attachmentIds, conversation);
-    report(persisted);
-    return persisted?.status === "blocked" ? null : draft;
-  };
-
-  const seedNewChatDraft = async (conversation, draft, prefix = "") => {
-    const transferLandingDraft = draft.conversation === "default";
-    if (!transferLandingDraft && !prefix) return true;
-    const seeded = await invoke("mom_llama_draft_update", {
-      conversation,
-      message: transferLandingDraft ? `${prefix}${draft.message}` : prefix,
-      attachmentIds: transferLandingDraft ? draft.attachmentIds : [],
-    });
-    report(seeded);
-    if (seeded?.status === "blocked") return false;
-    if (transferLandingDraft) {
-      const cleared = await invoke("mom_llama_draft_update", {
-        conversation: draft.conversation,
-        message: "",
-        attachmentIds: [],
-      });
-      report(cleared);
-    }
-    return true;
   };
 
   const focusComposer = () => {
@@ -2306,20 +2260,6 @@
     events.appendChild(row);
   };
 
-  const setSkillForm = (skill = null) => {
-    const form = document.getElementById("skill-form");
-    if (!form) return;
-    formField(form, "skill_id").value = skill?.id || "";
-    formField(form, "name").value = skill?.name || "";
-    formField(form, "description").value = skill?.description || "";
-    formField(form, "prompt_template").value = skill?.prompt || "";
-    formField(form, "cache_policy").value = skill?.cache || "none";
-    const submit = form.querySelector('[data-action="skill-create"]');
-    setButtonStateLabel(submit, skill ? "Save changes" : "Save Skill");
-    form.querySelector('[data-action="skill-edit-cancel"]')?.classList.toggle("is-hidden", !skill);
-    if (skill) formField(form, "name")?.focus();
-  };
-
   const armDestructiveAction = (button) => {
     if (button.dataset.confirmArmed === "true") return true;
     button.dataset.confirmArmed = "true";
@@ -2408,56 +2348,9 @@
       if (expanded) collapsedSidebarSections.delete(section);
       else collapsedSidebarSections.add(section);
     },
-    "sidebar-persona-start": async (button) => {
-      const draft = await persistCurrentDraftBeforeNavigation();
-      if (!draft) return;
-      const result = await instantiatePersona(button.dataset.persona);
-      if (result?.status === "blocked" || !result?.result?.id) return;
-      try {
-        await seedNewChatDraft(result.result.id, draft);
-      } catch (error) {
-        await refreshConversationProjection().catch(reportError);
-        throw error;
-      }
-      await refreshConversationProjection();
-      focusComposer();
-    },
-    "sidebar-consult-group-start": async (button) => {
-      const listed = await invoke("mom_llama_persona_group_list");
-      const group = (listed?.result || []).find((candidate) => (
-        candidate.id === button.dataset.group
-        && String(candidate.mention_handle || "").toLowerCase()
-          === String(button.dataset.handle || "").toLowerCase()
-      ));
-      if (listed?.status === "blocked" || !group) {
-        report(listed?.status === "blocked" ? listed : {
-          status: "blocked",
-          blocker: {
-            code: "persona_group_not_found",
-            message: "That consult group is no longer available.",
-          },
-        });
-        await refreshSidebar();
-        return;
-      }
-      const draft = await persistCurrentDraftBeforeNavigation();
-      if (!draft) return;
-      const created = await invoke("mom_llama_conversation_new", { title: group.name });
-      report(created);
-      if (created?.status === "blocked" || !created?.result?.id) return;
-      try {
-        await seedNewChatDraft(created.result.id, draft, `@${group.mention_handle} `);
-      } catch (error) {
-        await refreshConversationProjection().catch(reportError);
-        throw error;
-      }
-      await refreshConversationProjection();
-      focusComposer();
-    },
     "settings-open": async () => { await invoke("mom_llama_settings_get"); openSettings(); },
     "settings-close": async () => { await invoke("mom_llama_settings_get"); closeSettings(); },
     "settings-section": async (button) => switchSettingsSection(button.dataset.section || "general"),
-    "skills-open": async () => { await invoke("mom_llama_skill_list"); openSettings("general"); },
     "mention-insert": async (button) => {
       const textarea = document.querySelector("#chat-form textarea[name='message']");
       if (!textarea) return;
@@ -3037,7 +2930,6 @@
         .map(([key, queue]) => ({ key, failure: queue.failure }));
       failures.forEach(({ key, failure }) => queueAutosave(key, failure.job, 0));
     },
-    "engine-check": async () => { report(await invoke("mom_llama_engine_check")); await refreshSettings("general"); },
     "model-list": async () => report(await invoke("mom_llama_model_list")),
     "model-select": async (button) => {
       const form = document.getElementById("settings-form");
@@ -3068,27 +2960,6 @@
     "persona-mmproj-browse": async () => {
       const path = await pickFile("mmproj");
       if (path) formField(document.getElementById("persona-editor"), "persona_mmproj_path").value = path;
-    },
-    "skill-create": async () => document.getElementById("skill-form")?.requestSubmit(),
-    "skill-edit": async (button) => setSkillForm({
-      id: button.dataset.skill,
-      name: button.dataset.skillName,
-      description: button.dataset.skillDescription,
-      prompt: button.dataset.skillPrompt,
-      cache: button.dataset.skillCache,
-    }),
-    "skill-edit-cancel": async () => setSkillForm(),
-    "skill-apply": async (button) => {
-      report(await invoke("mom_llama_skill_apply", { conversation: selectedConversation(), skill: button.dataset.skill }));
-      await refreshSettings("general");
-    },
-    "kv-status": async () => refreshCacheInspector(
-      "refresh",
-      await invoke("mom_llama_kv_cache_status"),
-    ),
-    "kv-clear": async (button) => {
-      if (!armDestructiveAction(button)) return;
-      await refreshCacheInspector("clear", await invoke("mom_llama_kv_cache_clear"));
     },
     "mcp-status": async () => { report(await invoke("mom_llama_mcp_status")); openSettings("mcp"); },
     "mcp-command-browse": async () => {
@@ -3223,26 +3094,6 @@
         tool: formValue(form, "permission_tool"),
       }));
     },
-    "resident-model-browse": async () => {
-      const path = await pickFile("model");
-      if (path) formField(document.getElementById("settings-form"), "resident_model_path").value = path;
-    },
-    "resident-slots": async () => report(await invoke("mom_llama_model_slot_list")),
-    "resident-slot-load": async () => {
-      const form = document.getElementById("settings-form");
-      report(await invoke("mom_llama_model_slot_load", {
-        slot: numberOrNull(formValue(form, "resident_slot")) || 0,
-        modelPath: formValue(form, "resident_model_path"),
-      }));
-      await Promise.all([refreshChat(), refreshSettings("developer")]);
-    },
-    "resident-slot-unload": async () => {
-      const form = document.getElementById("settings-form");
-      report(await invoke("mom_llama_model_slot_unload", {
-        slot: numberOrNull(formValue(form, "resident_slot")) || 0,
-      }));
-      await Promise.all([refreshChat(), refreshSettings("developer")]);
-    },
   };
 
   document.addEventListener("click", async (event) => {
@@ -3347,22 +3198,6 @@
       }
       if (form.id === "settings-form") {
         scheduleSettingsAutosave(0);
-      }
-      if (form.id === "skill-form") {
-        const skill = formValue(form, "skill_id");
-        const payload = {
-          name: formValue(form, "name"),
-          description: formValue(form, "description"),
-          promptTemplate: formValue(form, "prompt_template"),
-          usageHint: "Use this perspective when it helps the current conversation.",
-          cachePolicy: formValue(form, "cache_policy") || "none",
-        };
-        const result = skill
-          ? await invoke("mom_llama_skill_update", { skill, ...payload })
-          : await invoke("mom_llama_skill_create", payload);
-        report(result);
-        setSkillForm();
-        await refreshSettings("general");
       }
       if (form.id === "conversation-search-form") await search();
     } catch (error) { reportError(error); }
