@@ -146,32 +146,47 @@ current model is `parakeet-realtime-eou-120m-v1-onnx` from immutable revision
 The checked-in manifest binds the ordered three-file bundle to 480,708,981
 bytes and combined SHA-256
 `c710ae82b52aa969f89874e7e7b35ad570fec50cc3d943a4fdde0bb874948756`.
-Discovery checks, in order:
+Discovery performs a bounded metadata-only presence/shape probe, in order:
 
-1. `SPEECH_NATIVE_PARAKEET_MODEL_DIR` (with the legacy
+1. the exact content-addressed bundle already in application-managed storage;
+2. `ParakeetBackendConfig::model_dir`, when explicitly injected;
+3. `SPEECH_NATIVE_PARAKEET_MODEL_DIR` (with the legacy
    `FTE_PARAKEET_MODEL_DIR` alias retained for the 0.1 line);
-2. the exact immutable revision under `HUGGINGFACE_HUB_CACHE`;
-3. the exact immutable revision under `HF_HOME/hub`;
-4. the exact immutable revision under the standard
+4. the exact immutable revision under `HUGGINGFACE_HUB_CACHE`;
+5. the exact immutable revision under `HF_HOME/hub`;
+6. the exact immutable revision under the standard
    `~/.cache/huggingface/hub` location.
 
-Mutable refs and arbitrary snapshots are never admission authority. A candidate
-is streamed through the per-file length/SHA-256 manifest into private staging,
-reverified there, and atomically published under the combined content hash in
+The startup probe checks only the exact names, regular-file/private-file shape,
+and manifest lengths; it does not read model bytes or construct ONNX sessions.
+A shape-admitted source is reported as a nonresident
+`CapabilityAvailability::DeferredLoad` with inconclusive system-inventory
+evidence, never runtime proof. The router admits that state only for an exact
+embedded-backend plus exact-model selector; automatic, fallback, hosted, and
+non-embedded routes cannot select it.
+
+Mutable refs and arbitrary snapshots are never admission authority. On the
+first exact dispatch, one supervised single-flight loader streams a candidate
+through the per-file length/SHA-256 manifest into private staging, reverifies
+it there, and atomically publishes it under the combined content hash in
 application-managed storage. Cache data is copied, never hard-linked. The
-managed bundle is reverified immediately before and after model loading. The
-managed root may be injected in `ParakeetBackendConfig` or set with
-`SPEECH_NATIVE_PARAKEET_MANAGED_ROOT`; otherwise the platform application-data
-location is used. When exact files are absent, the descriptor reports an
-application-managed `asset_install_required` blocker; discovery does not
-download anything.
+managed bundle is reverified immediately before and after session construction.
+Only then does the descriptor transition to resident `Available` with confirmed
+runtime evidence. Concurrent first-use requests share that publication;
+cancellation and quiesce wake waiters, and shutdown joins the non-preemptible
+loader before completing. The managed root may be injected in
+`ParakeetBackendConfig` or set with `SPEECH_NATIVE_PARAKEET_MANAGED_ROOT`;
+otherwise the platform application-data location is used. When exact files are
+absent, the descriptor reports an application-managed
+`asset_install_required` blocker. Neither discovery nor first use downloads
+anything.
 
 The model is English-only and advertises PCM/WAV input, streaming, and partial
 results. It does not claim timestamps, diarization, translation, hotwords, or
 generative transcription. Complete and live audio are downmixed and linearly
-resampled to the model's exact mono 16 kHz input. One ONNX handle remains
-resident, while each request has separate encoder/decoder state and an
-independent cancellation flag.
+resampled to the model's exact mono 16 kHz input. After the first successful
+exact dispatch, one verified ONNX handle remains resident, while each request
+has separate encoder/decoder state and an independent cancellation flag.
 
 The second embedded lane remains intentional rather than forgotten:
 

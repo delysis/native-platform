@@ -5,8 +5,8 @@ use mom_llama_runtime::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use speech_native_backend_parakeet::{
-    PARAKEET_BACKEND_ID, PARAKEET_MODEL_CONTENT_SHA256, PARAKEET_MODEL_ID, ParakeetBackendConfig,
-    ParakeetSpeechBackend,
+    PARAKEET_BACKEND_ID, PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID, PARAKEET_MODEL_CONTENT_SHA256,
+    PARAKEET_MODEL_ID, ParakeetBackendConfig, ParakeetSpeechBackend,
 };
 use speech_native_host::{SpeechHost, SpeechHostError};
 use speech_native_types::{
@@ -410,7 +410,7 @@ impl MomSpeech {
                     return Ok(blocked("mom_llama.speech_transcribe_attachment", blocker));
                 }
             };
-        let selection = match select_parakeet(&self.executor.descriptors()?) {
+        let _deferred_selection = match select_parakeet(&self.executor.descriptors()?) {
             Ok(selection) => selection,
             Err(blocker) => {
                 return Ok(blocked("mom_llama.speech_transcribe_attachment", blocker));
@@ -487,6 +487,13 @@ impl MomSpeech {
             self.finish_operation(operation, &request_id);
             return Ok(blocked("mom_llama.speech_transcribe_attachment", blocker));
         }
+        let selection = match select_resident_parakeet(&self.executor.descriptors()?) {
+            Ok(selection) => selection,
+            Err(blocker) => {
+                self.finish_operation(operation, &request_id);
+                return Ok(blocked("mom_llama.speech_transcribe_attachment", blocker));
+            }
+        };
         let provenance = transcription_provenance(conversation_id, &input, &selection, &response);
         if let Err(blocker) = self.complete_operation(operation, &request_id) {
             return Ok(blocked("mom_llama.speech_transcribe_attachment", blocker));
@@ -965,6 +972,19 @@ fn select_apple(
 }
 
 fn select_parakeet(descriptors: &[SpeechBackendDescriptor]) -> Result<ParakeetSelection, Blocker> {
+    select_parakeet_with_residency(descriptors, true)
+}
+
+fn select_resident_parakeet(
+    descriptors: &[SpeechBackendDescriptor],
+) -> Result<ParakeetSelection, Blocker> {
+    select_parakeet_with_residency(descriptors, false)
+}
+
+fn select_parakeet_with_residency(
+    descriptors: &[SpeechBackendDescriptor],
+    allow_deferred: bool,
+) -> Result<ParakeetSelection, Blocker> {
     let Some(descriptor) = descriptors
         .iter()
         .find(|descriptor| descriptor.id == PARAKEET_BACKEND_ID)
@@ -980,14 +1000,20 @@ fn select_parakeet(descriptors: &[SpeechBackendDescriptor]) -> Result<ParakeetSe
             vec!["Install the manifest-bound local Parakeet model, then restart Mom.".to_string()],
         ));
     }
+    let deferred_loader = allow_deferred
+        && descriptor
+            .capabilities
+            .iter()
+            .any(is_deferred_parakeet_capability);
     let exact_model = descriptor.models.iter().any(|model| {
         model.id == PARAKEET_MODEL_ID
             && model.content_hash.as_deref() == Some(PARAKEET_MODEL_CONTENT_SHA256)
-            && model.resident
+            && (model.resident || (allow_deferred && deferred_loader))
     });
     let executable = descriptor.capabilities.iter().any(|capability| {
         capability.model_id.as_deref() == Some(PARAKEET_MODEL_ID)
-            && capability.eligible_for_local_only()
+            && (capability.eligible_for_local_only()
+                || (allow_deferred && is_deferred_parakeet_capability(capability)))
             && matches!(
                 &capability.operation,
                 SpeechOperationCapability::Transcription(transcription)
@@ -1003,6 +1029,17 @@ fn select_parakeet(descriptors: &[SpeechBackendDescriptor]) -> Result<ParakeetSe
         descriptor_sha256: descriptor_sha256(descriptor)?,
         descriptor: descriptor.clone(),
     })
+}
+
+fn is_deferred_parakeet_capability(capability: &speech_native_types::SpeechCapability) -> bool {
+    capability.model_id.as_deref() == Some(PARAKEET_MODEL_ID)
+        && capability.deferred_load_admissible()
+        && capability.evidence.iter().any(|evidence| {
+            evidence.source_id == PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID
+                && evidence.kind == speech_native_types::EvidenceKind::SystemInventory
+                && evidence.outcome == speech_native_types::EvidenceOutcome::Inconclusive
+                && !evidence.proves_runtime()
+        })
 }
 
 fn request_context(
@@ -1296,6 +1333,21 @@ mod tests {
         }
     }
 
+    fn deferred_parakeet_descriptor() -> SpeechBackendDescriptor {
+        let mut descriptor = parakeet_descriptor();
+        descriptor.models[0].resident = false;
+        descriptor.capabilities[0].availability = CapabilityAvailability::DeferredLoad;
+        descriptor.capabilities[0].evidence = vec![CapabilityEvidence {
+            source_id: PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID.to_string(),
+            source_version: Some("1".to_string()),
+            kind: EvidenceKind::SystemInventory,
+            outcome: EvidenceOutcome::Inconclusive,
+            observed_at_unix_ms: 1,
+            detail: "fixture manifest-bound deferred loader".to_string(),
+        }];
+        descriptor
+    }
+
     #[test]
     fn routes_are_exact_never_network_and_complete_input_only() {
         let apple = select_apple(&[apple_descriptor()], 12).expect("Apple route");
@@ -1311,6 +1363,19 @@ mod tests {
         }));
         let parakeet = select_parakeet(&[parakeet_descriptor()]).expect("Parakeet route");
         assert_eq!(parakeet.descriptor.id, PARAKEET_BACKEND_ID);
+        let deferred = select_parakeet(&[deferred_parakeet_descriptor()])
+            .expect("manifest-bound deferred Parakeet route");
+        assert!(!deferred.descriptor.models[0].resident);
+        assert!(
+            deferred.descriptor.capabilities[0].deferred_load_admissible()
+                && !deferred.descriptor.capabilities[0].evidence[0].proves_runtime()
+        );
+        assert!(
+            select_resident_parakeet(&[deferred_parakeet_descriptor()]).is_err(),
+            "unverified deferred state must never be bound into response provenance"
+        );
+        select_resident_parakeet(&[parakeet_descriptor()])
+            .expect("resident verified Parakeet provenance route");
         let context = request_context(
             SpeechRequestId("request".to_string()),
             SpeechRouteSelector::ExactBackend {

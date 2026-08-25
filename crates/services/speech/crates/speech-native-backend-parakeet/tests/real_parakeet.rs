@@ -4,11 +4,11 @@ use speech_native_backend_parakeet::{
 };
 use speech_native_host::SpeechHost;
 use speech_native_types::{
-    AudioChunk, AudioInput, DiarizationPolicy, EncodedAudioFormat, PcmFormat, PcmSampleFormat,
-    SpeechBackend, SpeechBackendReadiness, SpeechDeadlinePolicy, SpeechRequestContext,
-    SpeechRequestId, SpeechRouteSelector, SpeechRoutingPolicy, TimestampGranularity,
-    TranscriptionEvent, TranscriptionInput, TranscriptionRequest, TranscriptionTask,
-    TranscriptionTicket,
+    AudioChunk, AudioInput, CapabilityAvailability, DiarizationPolicy, EncodedAudioFormat,
+    PcmFormat, PcmSampleFormat, SpeechBackend, SpeechBackendReadiness, SpeechDeadlinePolicy,
+    SpeechRequestContext, SpeechRequestId, SpeechRouteSelector, SpeechRoutingPolicy,
+    TimestampGranularity, TranscriptionEvent, TranscriptionInput, TranscriptionRequest,
+    TranscriptionTask, TranscriptionTicket,
 };
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -152,11 +152,30 @@ async fn real_gateway_transcription_and_request_scoped_cancellation() {
         .map(PathBuf::from)
         .expect("SPEECH_NATIVE_PARAKEET_MODEL_DIR must name the exact model directory");
     assert_exact_model_bundle(&model_dir);
-    let backend = ParakeetSpeechBackend::discover(ParakeetBackendConfig::default()).await;
-    assert_eq!(backend.readiness(), SpeechBackendReadiness::Ready);
+    let backend = Arc::new(
+        ParakeetSpeechBackend::discover(ParakeetBackendConfig {
+            model_dir: Some(model_dir),
+            managed_model_root: None,
+        })
+        .await,
+    );
+    let deferred = backend.descriptor();
+    assert_eq!(deferred.readiness, SpeechBackendReadiness::Ready);
+    assert_eq!(
+        deferred.capabilities[0].availability,
+        CapabilityAvailability::DeferredLoad
+    );
+    assert!(deferred.capabilities[0].deferred_load_admissible());
+    assert!(!deferred.models[0].resident);
+    assert!(
+        deferred.capabilities[0]
+            .evidence
+            .iter()
+            .all(|evidence| !evidence.proves_runtime())
+    );
     let gateway = Arc::new(SpeechHost::default());
     gateway
-        .register_backend(Arc::new(backend))
+        .register_backend(backend.clone())
         .expect("register Parakeet backend");
 
     let ticket = gateway
@@ -170,10 +189,25 @@ async fn real_gateway_transcription_and_request_scoped_cancellation() {
         events.first(),
         Some(TranscriptionEvent::Started { .. })
     ));
-    assert!(
-        matches!(events.last(), Some(TranscriptionEvent::Completed { response, .. }) if response.usage.real_local_inference && response.usage.model_load_ms == Some(0))
-    );
+    assert!(matches!(
+        events.last(),
+        Some(TranscriptionEvent::Completed { response, .. })
+            if response.usage.real_local_inference
+                && response.usage.model_load_ms.is_some_and(|milliseconds| milliseconds > 0)
+    ));
     assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
+    let resident = backend.descriptor();
+    assert_eq!(
+        resident.capabilities[0].availability,
+        CapabilityAvailability::Available
+    );
+    assert!(resident.models[0].resident);
+    assert!(
+        resident.capabilities[0]
+            .evidence
+            .iter()
+            .any(|evidence| evidence.proves_runtime())
+    );
     eprintln!("real Parakeet transcript: {transcript}");
 
     let mut reader = hound::WavReader::new(Cursor::new(wav.clone())).expect("decode smoke WAV");
@@ -226,7 +260,8 @@ async fn real_gateway_transcription_and_request_scoped_cancellation() {
     assert!(!stream_transcript.is_empty());
     assert!(matches!(
         stream_events.last(),
-        Some(TranscriptionEvent::Completed { .. })
+        Some(TranscriptionEvent::Completed { response, .. })
+            if response.usage.model_load_ms == Some(0)
     ));
     eprintln!("real streaming Parakeet transcript: {stream_transcript}");
 

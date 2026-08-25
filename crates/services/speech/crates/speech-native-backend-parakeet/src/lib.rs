@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
@@ -37,6 +37,8 @@ pub const PARAKEET_HF_REPOSITORY: &str = "altunenes/parakeet-rs";
 pub const PARAKEET_HF_SUBDIRECTORY: &str = "realtime_eou_120m-v1-onnx";
 pub const PARAKEET_HF_REVISION: &str = model_artifact::MODEL_SOURCE_REVISION;
 pub const PARAKEET_MODEL_CONTENT_SHA256: &str = model_artifact::MODEL_CONTENT_SHA256;
+pub const PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID: &str =
+    "parakeet-rs-manifest-bound-deferred-loader";
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const MODEL_CHUNK_SAMPLES: usize = 2_560;
@@ -55,13 +57,14 @@ pub struct ParakeetBackendConfig {
 
 #[derive(Clone)]
 pub struct ParakeetSpeechBackend {
-    descriptor: SpeechBackendDescriptor,
-    model: Option<Arc<ParakeetEOUHandle>>,
     state: Arc<BackendState>,
 }
 
 struct BackendState {
     data: Mutex<BackendStateData>,
+    model_changed: Condvar,
+    model_config: ParakeetBackendConfig,
+    model_loader: Arc<dyn ParakeetModelLoader>,
     tasks: Arc<TaskSupervisor>,
     changed: Notify,
 }
@@ -77,7 +80,71 @@ struct BackendStateData {
     phase: BackendPhase,
     next_nonce: u64,
     active: HashMap<SpeechRequestId, ActiveParakeetOperation>,
+    model: ParakeetModelState,
     shutdown_result: Option<Result<(), SpeechError>>,
+}
+
+enum ParakeetModelState {
+    Deferred(SpeechBackendDescriptor),
+    Loading(SpeechBackendDescriptor),
+    Ready {
+        descriptor: SpeechBackendDescriptor,
+        model: Arc<ParakeetEOUHandle>,
+        initialization_ms: u64,
+    },
+    Unavailable(SpeechBackendDescriptor),
+}
+
+struct ModelAcquisition {
+    model: Arc<ParakeetEOUHandle>,
+    initialization_ms: u64,
+}
+
+enum ModelLoadOutcome {
+    Ready(Arc<ParakeetEOUHandle>),
+    Unavailable(SpeechBackendDescriptor),
+}
+
+trait ParakeetModelLoader: Send + Sync {
+    fn load(&self, config: &ParakeetBackendConfig) -> ModelLoadOutcome;
+}
+
+struct ExactParakeetModelLoader;
+
+impl ParakeetModelLoader for ExactParakeetModelLoader {
+    fn load(&self, config: &ParakeetBackendConfig) -> ModelLoadOutcome {
+        let model_dir = match model_artifact::prepare_model_dir(
+            config.model_dir.as_deref(),
+            config.managed_model_root.as_deref(),
+        ) {
+            Ok(Some(model_dir)) => model_dir,
+            Ok(None) => {
+                return ModelLoadOutcome::Unavailable(asset_required_descriptor());
+            }
+            Err(error) => {
+                return ModelLoadOutcome::Unavailable(unavailable_descriptor(format!(
+                    "Parakeet model admission failed: {error}"
+                )));
+            }
+        };
+        let loaded = model_artifact::verify_production_model_dir(&model_dir)
+            .map_err(|error| error.to_string())
+            .and_then(|()| {
+                ParakeetEOUHandle::from_pretrained(&model_dir, None)
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|handle| {
+                model_artifact::verify_production_model_dir(&model_dir)
+                    .map_err(|error| error.to_string())?;
+                Ok(handle)
+            });
+        match loaded {
+            Ok(handle) => ModelLoadOutcome::Ready(Arc::new(handle)),
+            Err(error) => ModelLoadOutcome::Unavailable(unavailable_descriptor(format!(
+                "Parakeet model loading failed: {error}"
+            ))),
+        }
+    }
 }
 
 struct ActiveParakeetOperation {
@@ -243,22 +310,121 @@ struct BackendOperationLease {
     nonce: u64,
 }
 
+struct ModelLoadPublication {
+    state: Arc<BackendState>,
+    published: bool,
+}
+
 impl Default for BackendState {
     fn default() -> Self {
+        Self::unavailable(asset_required_descriptor())
+    }
+}
+
+impl BackendState {
+    fn deferred(
+        model_config: ParakeetBackendConfig,
+        model_loader: Arc<dyn ParakeetModelLoader>,
+    ) -> Self {
+        Self::new(
+            model_config,
+            model_loader,
+            ParakeetModelState::Deferred(shape_admitted_deferred_descriptor()),
+        )
+    }
+
+    fn unavailable(descriptor: SpeechBackendDescriptor) -> Self {
+        Self::new(
+            ParakeetBackendConfig::default(),
+            Arc::new(ExactParakeetModelLoader),
+            ParakeetModelState::Unavailable(descriptor),
+        )
+    }
+
+    fn new(
+        model_config: ParakeetBackendConfig,
+        model_loader: Arc<dyn ParakeetModelLoader>,
+        model: ParakeetModelState,
+    ) -> Self {
         Self {
             data: Mutex::new(BackendStateData {
                 phase: BackendPhase::Running,
                 next_nonce: 0,
                 active: HashMap::new(),
+                model,
                 shutdown_result: None,
             }),
+            model_changed: Condvar::new(),
+            model_config,
+            model_loader,
             tasks: Arc::new(TaskSupervisor::default()),
             changed: Notify::new(),
         }
     }
-}
 
-impl BackendState {
+    fn descriptor(&self) -> SpeechBackendDescriptor {
+        let Ok(data) = self.data.lock() else {
+            return unavailable_descriptor("Parakeet model state is unavailable".to_owned());
+        };
+        match &data.model {
+            ParakeetModelState::Deferred(descriptor)
+            | ParakeetModelState::Loading(descriptor)
+            | ParakeetModelState::Ready { descriptor, .. } => descriptor.clone(),
+            ParakeetModelState::Unavailable(descriptor) => descriptor.clone(),
+        }
+    }
+
+    fn acquire_model(
+        self: &Arc<Self>,
+        request_id: &SpeechRequestId,
+        cancelled: &AtomicBool,
+    ) -> Result<ModelAcquisition, SpeechError> {
+        let mut observed_initialization = false;
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(cancelled_error(request_id));
+            }
+            let mut data = self.data.lock().map_err(|_| state_error())?;
+            if data.phase != BackendPhase::Running {
+                return Err(shutting_down_error(request_id));
+            }
+            match &data.model {
+                ParakeetModelState::Ready {
+                    model,
+                    initialization_ms,
+                    ..
+                } => {
+                    return Ok(ModelAcquisition {
+                        model: Arc::clone(model),
+                        initialization_ms: if observed_initialization {
+                            *initialization_ms
+                        } else {
+                            0
+                        },
+                    });
+                }
+                ParakeetModelState::Unavailable(descriptor) => {
+                    return Err(model_unavailable_error(request_id, descriptor));
+                }
+                ParakeetModelState::Loading(_) => {
+                    observed_initialization = true;
+                    data = self.model_changed.wait(data).map_err(|_| state_error())?;
+                    drop(data);
+                }
+                ParakeetModelState::Deferred(descriptor) => {
+                    let descriptor = descriptor.clone();
+                    data.model = ParakeetModelState::Loading(descriptor);
+                    observed_initialization = true;
+                    drop(data);
+                    let started = Instant::now();
+                    let publication = ModelLoadPublication::new(Arc::clone(self));
+                    let outcome = self.model_loader.load(&self.model_config);
+                    publication.publish(outcome, elapsed_ms(started));
+                }
+            }
+        }
+    }
+
     fn spawn_operation(
         self: &Arc<Self>,
         request_id: SpeechRequestId,
@@ -316,61 +482,93 @@ impl BackendState {
                 nonce,
             },
         );
+        self.changed.notify_waiters();
         Ok(())
     }
 }
 
+impl ModelLoadPublication {
+    fn new(state: Arc<BackendState>) -> Self {
+        Self {
+            state,
+            published: false,
+        }
+    }
+
+    fn publish(mut self, outcome: ModelLoadOutcome, initialization_ms: u64) {
+        self.publish_state(match outcome {
+            ModelLoadOutcome::Ready(model) => ParakeetModelState::Ready {
+                descriptor: ready_descriptor(),
+                model,
+                initialization_ms,
+            },
+            ModelLoadOutcome::Unavailable(descriptor) => {
+                ParakeetModelState::Unavailable(descriptor)
+            }
+        });
+    }
+
+    fn publish_state(&mut self, model: ParakeetModelState) {
+        if let Ok(mut data) = self.state.data.lock()
+            && matches!(&data.model, ParakeetModelState::Loading(_))
+        {
+            data.model = model;
+        }
+        self.published = true;
+        self.state.model_changed.notify_all();
+        self.state.changed.notify_waiters();
+    }
+}
+
+impl Drop for ModelLoadPublication {
+    fn drop(&mut self) {
+        if !self.published {
+            self.publish_state(ParakeetModelState::Unavailable(unavailable_descriptor(
+                "Parakeet model loader panicked before publishing a verified result".to_owned(),
+            )));
+        }
+    }
+}
+
 impl ParakeetSpeechBackend {
-    /// Discover one exact manifest-bound source candidate, copy it into
-    /// content-addressed managed storage, reverify it, and load only that
-    /// managed path. Missing weights produce a registered but ineligible
-    /// backend so status can explain the exact remediation.
+    /// Register the exact manifest-bound loader without reading model bytes.
+    /// The first transcription performs managed admission, verification,
+    /// session construction, and post-load verification under the backend's
+    /// joined operation supervisor.
     pub async fn discover(config: ParakeetBackendConfig) -> Self {
-        let model_dir = match model_artifact::prepare_model_dir(
+        match model_artifact::probe_model_source(
             config.model_dir.as_deref(),
             config.managed_model_root.as_deref(),
         ) {
-            Ok(Some(model_dir)) => model_dir,
-            Ok(None) => return Self::unavailable(asset_required_descriptor()),
+            Ok(true) => {}
+            Ok(false) => return Self::unavailable(asset_required_descriptor()),
             Err(error) => {
                 return Self::unavailable(unavailable_descriptor(format!(
-                    "Parakeet model admission failed: {error}"
+                    "Parakeet model shape admission failed: {error}"
                 )));
             }
-        };
-
-        let started = Instant::now();
-        let loaded = tokio::task::spawn_blocking(move || -> Result<_, String> {
-            model_artifact::verify_production_model_dir(&model_dir)
-                .map_err(|error| error.to_string())?;
-            let handle = ParakeetEOUHandle::from_pretrained(&model_dir, None)
-                .map_err(|error| error.to_string())?;
-            model_artifact::verify_production_model_dir(&model_dir)
-                .map_err(|error| error.to_string())?;
-            Ok(handle)
-        })
-        .await;
-        let _initialization_ms = elapsed_ms(started);
-        match loaded {
-            Ok(Ok(handle)) => Self {
-                descriptor: ready_descriptor(),
-                model: Some(Arc::new(handle)),
-                state: Arc::new(BackendState::default()),
-            },
-            Ok(Err(error)) => Self::unavailable(unavailable_descriptor(format!(
-                "Parakeet model loading failed: {error}"
-            ))),
-            Err(error) => Self::unavailable(unavailable_descriptor(format!(
-                "Parakeet model task failed: {error}"
-            ))),
+        }
+        Self {
+            state: Arc::new(BackendState::deferred(
+                config,
+                Arc::new(ExactParakeetModelLoader),
+            )),
         }
     }
 
     fn unavailable(descriptor: SpeechBackendDescriptor) -> Self {
         Self {
-            descriptor,
-            model: None,
-            state: Arc::new(BackendState::default()),
+            state: Arc::new(BackendState::unavailable(descriptor)),
+        }
+    }
+
+    #[cfg(test)]
+    fn deferred_with_loader(loader: Arc<dyn ParakeetModelLoader>) -> Self {
+        Self {
+            state: Arc::new(BackendState::deferred(
+                ParakeetBackendConfig::default(),
+                loader,
+            )),
         }
     }
 }
@@ -378,11 +576,11 @@ impl ParakeetSpeechBackend {
 #[async_trait]
 impl SpeechBackend for ParakeetSpeechBackend {
     fn descriptor(&self) -> SpeechBackendDescriptor {
-        self.descriptor.clone()
+        self.state.descriptor()
     }
 
     fn readiness(&self) -> SpeechBackendReadiness {
-        self.descriptor.readiness.clone()
+        self.descriptor().readiness
     }
 
     async fn transcribe(
@@ -390,18 +588,10 @@ impl SpeechBackend for ParakeetSpeechBackend {
         request: TranscriptionRequest,
     ) -> Result<TranscriptionTicket, SpeechError> {
         validate_request(&request)?;
-        let model = self.model.clone().ok_or_else(|| {
-            backend_error(
-                &request.context.request_id,
-                "parakeet_model_unavailable",
-                SpeechErrorClass::AssetMissing,
-                true,
-                "The exact Parakeet EOU model is not loaded from managed storage",
-            )
-        })?;
         let request_id = request.context.request_id.clone();
         let (event_sender, event_receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
         let (final_sender, final_receiver) = oneshot::channel();
+        let (model_ready_sender, model_ready_receiver) = oneshot::channel();
 
         let (audio_receiver, audio_sink, stream_control) = match &request.input {
             TranscriptionInput::Complete { .. } => (None, None, None),
@@ -419,18 +609,36 @@ impl SpeechBackend for ParakeetSpeechBackend {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let worker_state = Arc::clone(&self.state);
+        let worker_request_id = request_id.clone();
         if let Err(error) = self.state.spawn_operation(
             request_id.clone(),
             Arc::clone(&cancelled),
             stream_control.clone(),
             move || {
+                let acquisition =
+                    worker_state.acquire_model(&worker_request_id, worker_cancelled.as_ref());
+                let acquisition = match acquisition {
+                    Ok(acquisition) => acquisition,
+                    Err(error) => {
+                        let _ = model_ready_sender.send(Err(error));
+                        return;
+                    }
+                };
+                if model_ready_sender
+                    .send(Ok(acquisition.initialization_ms))
+                    .is_err()
+                {
+                    return;
+                }
                 run_transcription(
                     request,
-                    model,
+                    acquisition.model,
                     audio_receiver,
                     worker_cancelled,
                     &event_sender,
                     final_sender,
+                    acquisition.initialization_ms,
                 );
             },
         ) {
@@ -438,6 +646,27 @@ impl SpeechBackend for ParakeetSpeechBackend {
                 stream.cancel();
             }
             return Err(error);
+        }
+        match model_ready_receiver.await {
+            Ok(Ok(_initialization_ms)) => {}
+            Ok(Err(error)) => {
+                if let Some(stream) = &stream_control {
+                    stream.cancel();
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                if let Some(stream) = &stream_control {
+                    stream.cancel();
+                }
+                return Err(backend_error(
+                    &request_id,
+                    "parakeet_model_loader_stopped",
+                    SpeechErrorClass::Internal,
+                    true,
+                    "The supervised Parakeet model loader stopped before publishing a result",
+                ));
+            }
         }
 
         Ok(TranscriptionTicket::new(
@@ -474,6 +703,7 @@ impl SpeechBackend for ParakeetSpeechBackend {
                     for operation in data.active.values() {
                         cancel_operation(operation);
                     }
+                    self.state.model_changed.notify_all();
                     true
                 }
                 BackendPhase::Quiescing => false,
@@ -486,6 +716,7 @@ impl SpeechBackend for ParakeetSpeechBackend {
             }
         };
         if start {
+            self.state.changed.notify_waiters();
             spawn_backend_shutdown(Arc::clone(&self.state));
         }
         wait_for_backend_shutdown(&self.state).await
@@ -792,10 +1023,16 @@ fn cancel_request(state: &BackendState, request_id: &SpeechRequestId) -> usize {
     let Ok(data) = state.data.lock() else {
         return 0;
     };
-    data.active.get(request_id).map_or(0, |operation| {
+    let cancelled = data.active.get(request_id).map_or(0, |operation| {
         cancel_operation(operation);
         1
-    })
+    });
+    drop(data);
+    if cancelled != 0 {
+        state.model_changed.notify_all();
+        state.changed.notify_waiters();
+    }
+    cancelled
 }
 
 fn cancel_operation(operation: &ActiveParakeetOperation) {
@@ -906,6 +1143,54 @@ fn state_error() -> SpeechError {
     )
 }
 
+fn shutting_down_error(request_id: &SpeechRequestId) -> SpeechError {
+    backend_error(
+        request_id,
+        "parakeet_shutting_down",
+        SpeechErrorClass::Unavailable,
+        true,
+        "The embedded Parakeet backend is shutting down",
+    )
+}
+
+fn model_unavailable_error(
+    request_id: &SpeechRequestId,
+    descriptor: &SpeechBackendDescriptor,
+) -> SpeechError {
+    match &descriptor.readiness {
+        SpeechBackendReadiness::AssetInstallRequired { .. } => backend_error(
+            request_id,
+            "parakeet_model_asset_required",
+            SpeechErrorClass::AssetMissing,
+            true,
+            "The exact manifest-bound Parakeet model is not installed in managed storage",
+        ),
+        SpeechBackendReadiness::Unavailable { reason }
+        | SpeechBackendReadiness::NotConfigured { reason }
+        | SpeechBackendReadiness::Unknown { reason } => backend_error(
+            request_id,
+            "parakeet_model_unavailable",
+            SpeechErrorClass::Unavailable,
+            true,
+            reason,
+        ),
+        SpeechBackendReadiness::PermissionRequired { .. } => backend_error(
+            request_id,
+            "parakeet_model_permission_required",
+            SpeechErrorClass::Permission,
+            true,
+            "The exact Parakeet model cannot be admitted without local file permission",
+        ),
+        SpeechBackendReadiness::Ready => backend_error(
+            request_id,
+            "parakeet_model_state_invalid",
+            SpeechErrorClass::Internal,
+            false,
+            "Parakeet reported a ready descriptor without a verified model handle",
+        ),
+    }
+}
+
 fn task_supervisor_error(request_id: &SpeechRequestId, error: TaskSupervisorError) -> SpeechError {
     backend_error(
         request_id,
@@ -1009,6 +1294,7 @@ fn run_transcription(
     cancelled: Arc<AtomicBool>,
     event_sender: &mpsc::Sender<TranscriptionEvent>,
     final_sender: oneshot::Sender<Result<TranscriptionResponse, SpeechError>>,
+    model_load_ms: u64,
 ) {
     let request_id = request.context.request_id.clone();
     let route = resolved_route();
@@ -1064,7 +1350,15 @@ fn run_transcription(
             true,
             "The streaming transcription input channel is unavailable",
         )),
-    };
+    }
+    .map(|mut response| {
+        response.usage.model_load_ms = Some(model_load_ms);
+        response.usage.total_ms = response
+            .usage
+            .total_ms
+            .map(|total_ms| total_ms.saturating_add(model_load_ms));
+        response
+    });
 
     match result {
         Ok(response) if cancelled.load(Ordering::Acquire) => {
@@ -1329,8 +1623,8 @@ fn build_response(
         segments,
         usage: SpeechUsage {
             input_audio_ms: Some(input_audio_ms),
-            // The handle was resident before request admission. The one-time
-            // application initialization cost is not charged to every request.
+            // The worker overwrites this with the exact single-flight load
+            // duration for callers that observed first-use initialization.
             model_load_ms: Some(0),
             time_to_first_result_ms: first_result_ms,
             total_ms: Some(elapsed_ms(started_at)),
@@ -1575,6 +1869,26 @@ fn ready_descriptor() -> SpeechBackendDescriptor {
     )
 }
 
+fn shape_admitted_deferred_descriptor() -> SpeechBackendDescriptor {
+    descriptor(
+        SpeechBackendReadiness::Ready,
+        CapabilityAvailability::DeferredLoad,
+        vec![CapabilityEvidence {
+            source_id: PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID.to_owned(),
+            source_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            kind: EvidenceKind::SystemInventory,
+            outcome: EvidenceOutcome::Inconclusive,
+            observed_at_unix_ms: unix_time_ms(),
+            detail: format!(
+                "A metadata-shape-admitted source is present. A joined, single-flight runtime \
+                 loader will verify the exact Parakeet manifest at \
+                 altunenes/parakeet-rs@{PARAKEET_HF_REVISION} before first inference"
+            ),
+        }],
+        false,
+    )
+}
+
 fn asset_required_descriptor() -> SpeechBackendDescriptor {
     descriptor(
         SpeechBackendReadiness::AssetInstallRequired {
@@ -1767,6 +2081,100 @@ fn unix_time_ms() -> u64 {
 mod tests {
     use super::*;
     use speech_native_types::{SpeechDeadlinePolicy, SpeechRequestContext, SpeechRoutingPolicy};
+    use std::sync::atomic::AtomicUsize;
+
+    struct BarrierUnavailableLoader {
+        calls: AtomicUsize,
+        started: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    struct BarrierPanickingLoader {
+        calls: AtomicUsize,
+        started: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl BarrierUnavailableLoader {
+        fn new() -> (
+            Arc<Self>,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::SyncSender<()>,
+        ) {
+            let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
+            let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+            (
+                Arc::new(Self {
+                    calls: AtomicUsize::new(0),
+                    started: Mutex::new(Some(started_sender)),
+                    release: Mutex::new(release_receiver),
+                }),
+                started_receiver,
+                release_sender,
+            )
+        }
+    }
+
+    impl ParakeetModelLoader for BarrierUnavailableLoader {
+        fn load(&self, _config: &ParakeetBackendConfig) -> ModelLoadOutcome {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if let Some(started) = self.started.lock().expect("lock start barrier").take() {
+                started.send(()).expect("publish model-load start");
+            }
+            self.release
+                .lock()
+                .expect("lock release barrier")
+                .recv()
+                .expect("release model loader");
+            ModelLoadOutcome::Unavailable(unavailable_descriptor(
+                "fixture model is unavailable after the deterministic barrier".to_owned(),
+            ))
+        }
+    }
+
+    impl BarrierPanickingLoader {
+        fn new() -> (
+            Arc<Self>,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::SyncSender<()>,
+        ) {
+            let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
+            let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+            (
+                Arc::new(Self {
+                    calls: AtomicUsize::new(0),
+                    started: Mutex::new(Some(started_sender)),
+                    release: Mutex::new(release_receiver),
+                }),
+                started_receiver,
+                release_sender,
+            )
+        }
+    }
+
+    impl ParakeetModelLoader for BarrierPanickingLoader {
+        fn load(&self, _config: &ParakeetBackendConfig) -> ModelLoadOutcome {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if let Some(started) = self.started.lock().expect("lock start barrier").take() {
+                started.send(()).expect("publish model-load start");
+            }
+            self.release
+                .lock()
+                .expect("lock release barrier")
+                .recv()
+                .expect("release model loader");
+            panic!("fixture model loader panic after deterministic release")
+        }
+    }
+
+    fn temporary_model_root(label: &str) -> PathBuf {
+        static NEXT_ROOT: AtomicUsize = AtomicUsize::new(1);
+        std::env::temp_dir().join(format!(
+            "parakeet-{label}-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     fn fixture_pcm_format() -> PcmFormat {
         PcmFormat {
@@ -1778,9 +2186,13 @@ mod tests {
     }
 
     fn complete_pcm_request(data: Vec<u8>) -> TranscriptionRequest {
+        complete_pcm_request_with_id("parakeet-characterization", data)
+    }
+
+    fn complete_pcm_request_with_id(id: &str, data: Vec<u8>) -> TranscriptionRequest {
         TranscriptionRequest {
             context: SpeechRequestContext {
-                request_id: SpeechRequestId("parakeet-characterization".to_owned()),
+                request_id: SpeechRequestId(id.to_owned()),
                 client_id: "test".to_owned(),
                 route: SpeechRouteSelector::ExactBackend {
                     backend_id: PARAKEET_BACKEND_ID.to_owned(),
@@ -1806,6 +2218,30 @@ mod tests {
         }
     }
 
+    async fn wait_for_active_count(state: &BackendState, expected: usize) {
+        loop {
+            let changed = state.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if state.data.lock().expect("lock backend state").active.len() == expected {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    async fn wait_for_phase(state: &BackendState, expected: BackendPhase) {
+        loop {
+            let changed = state.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if state.data.lock().expect("lock backend state").phase == expected {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     #[test]
     fn i24_sign_extension_is_correct() {
         assert_eq!(decode_sample(PcmSampleFormat::I24Le, &[0, 0, 0]), Ok(0.0));
@@ -1828,10 +2264,14 @@ mod tests {
     #[test]
     fn every_descriptor_binds_the_exact_model_content_hash() {
         for descriptor in [
+            shape_admitted_deferred_descriptor(),
             ready_descriptor(),
             asset_required_descriptor(),
             unavailable_descriptor("fixture unavailable".to_owned()),
         ] {
+            descriptor
+                .validate()
+                .expect("Parakeet descriptor state must remain schema-valid");
             assert_eq!(
                 descriptor.models[0].content_hash.as_deref(),
                 Some(PARAKEET_MODEL_CONTENT_SHA256)
@@ -1883,6 +2323,7 @@ mod tests {
     #[test]
     fn every_initial_parakeet_descriptor_advertises_one_request() {
         for descriptor in [
+            shape_admitted_deferred_descriptor(),
             ready_descriptor(),
             asset_required_descriptor(),
             unavailable_descriptor("fixture unavailable".to_owned()),
@@ -1892,6 +2333,301 @@ mod tests {
                 Some(1)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_reports_missing_assets_without_starting_a_model_load() {
+        let root = temporary_model_root("missing-shape");
+        let impossible_model = root.join("candidate");
+        let backend = ParakeetSpeechBackend::discover(ParakeetBackendConfig {
+            model_dir: Some(impossible_model),
+            managed_model_root: Some(root.join("managed")),
+        })
+        .await;
+
+        let descriptor = backend.descriptor();
+        assert!(matches!(
+            &descriptor.readiness,
+            SpeechBackendReadiness::AssetInstallRequired { .. }
+        ));
+        assert!(!descriptor.models[0].resident);
+        backend
+            .shutdown()
+            .await
+            .expect("missing-asset backend shuts down without loading");
+    }
+
+    #[tokio::test]
+    async fn discovery_admits_only_bounded_shape_and_defers_byte_verification() {
+        let root = temporary_model_root("deferred-shape");
+        let candidate = root.join("candidate");
+        let managed = root.join("managed");
+        std::fs::create_dir_all(&candidate).expect("create sparse model candidate");
+        for (name, bytes) in [
+            ("encoder.onnx", 459_341_289),
+            ("decoder_joint.onnx", 21_347_639),
+            ("tokenizer.json", 20_053),
+        ] {
+            let file = std::fs::File::create(candidate.join(name)).expect("create sparse artifact");
+            file.set_len(bytes).expect("set exact manifest length");
+        }
+        let backend = ParakeetSpeechBackend::discover(ParakeetBackendConfig {
+            model_dir: Some(candidate),
+            managed_model_root: Some(managed),
+        })
+        .await;
+
+        let descriptor = backend.descriptor();
+        assert_eq!(descriptor.readiness, SpeechBackendReadiness::Ready);
+        assert!(!descriptor.models[0].resident);
+        assert_eq!(
+            descriptor.capabilities[0].availability,
+            CapabilityAvailability::DeferredLoad
+        );
+        assert!(descriptor.capabilities[0].deferred_load_admissible());
+        assert!(descriptor.capabilities[0].evidence.iter().any(|evidence| {
+            evidence.source_id == PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID
+                && evidence.kind == EvidenceKind::SystemInventory
+                && evidence.outcome == EvidenceOutcome::Inconclusive
+                && !evidence.proves_runtime()
+        }));
+        backend
+            .shutdown()
+            .await
+            .expect("shape-admitted backend shuts down without loading bytes");
+        std::fs::remove_dir_all(root).expect("remove sparse model candidate");
+    }
+
+    #[tokio::test]
+    async fn discovery_reports_malformed_candidate_shape_as_unavailable() {
+        let root = temporary_model_root("malformed-shape");
+        let candidate = root.join("candidate");
+        std::fs::create_dir_all(&candidate).expect("create malformed candidate");
+        std::fs::write(candidate.join("encoder.onnx"), b"wrong length")
+            .expect("write malformed artifact");
+        let backend = ParakeetSpeechBackend::discover(ParakeetBackendConfig {
+            model_dir: Some(candidate),
+            managed_model_root: Some(root.join("managed")),
+        })
+        .await;
+
+        assert!(matches!(
+            &backend.descriptor().readiness,
+            SpeechBackendReadiness::Unavailable { .. }
+        ));
+        backend
+            .shutdown()
+            .await
+            .expect("malformed-shape backend shuts down without loading");
+        std::fs::remove_dir_all(root).expect("remove malformed candidate");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_first_transcriptions_share_one_model_load() {
+        let (loader, started, release) = BarrierUnavailableLoader::new();
+        let backend = ParakeetSpeechBackend::deferred_with_loader(loader.clone());
+        let first_backend = backend.clone();
+        let first = tokio::spawn(async move {
+            first_backend
+                .transcribe(complete_pcm_request_with_id("lazy-first-a", vec![0, 0]))
+                .await
+        });
+        started
+            .recv()
+            .expect("first request reaches loader barrier");
+
+        let second_backend = backend.clone();
+        let second = tokio::spawn(async move {
+            second_backend
+                .transcribe(complete_pcm_request_with_id("lazy-first-b", vec![0, 0]))
+                .await
+        });
+        wait_for_active_count(&backend.state, 2).await;
+        assert_eq!(loader.calls.load(Ordering::Acquire), 1);
+
+        release.send(()).expect("release exact model load");
+        for request in [first, second] {
+            let error = request
+                .await
+                .expect("transcription task joins")
+                .err()
+                .expect("fixture loader publishes one shared failure");
+            assert_eq!(error.code, "parakeet_model_unavailable");
+        }
+        assert_eq!(loader.calls.load(Ordering::Acquire), 1);
+        backend
+            .shutdown()
+            .await
+            .expect("failed lazy load remains join-safe");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicking_first_load_wakes_waiters_and_is_reported_at_shutdown() {
+        let (loader, started, release) = BarrierPanickingLoader::new();
+        let backend = ParakeetSpeechBackend::deferred_with_loader(loader.clone());
+        let first_backend = backend.clone();
+        let first = tokio::spawn(async move {
+            first_backend
+                .transcribe(complete_pcm_request_with_id("lazy-panic-a", vec![0, 0]))
+                .await
+        });
+        started.recv().expect("first request reaches panic barrier");
+
+        let second_backend = backend.clone();
+        let second = tokio::spawn(async move {
+            second_backend
+                .transcribe(complete_pcm_request_with_id("lazy-panic-b", vec![0, 0]))
+                .await
+        });
+        wait_for_active_count(&backend.state, 2).await;
+        release.send(()).expect("release panicking model loader");
+
+        let mut error_codes = Vec::new();
+        for request in [first, second] {
+            error_codes.push(
+                request
+                    .await
+                    .expect("transcription caller remains isolated from worker panic")
+                    .err()
+                    .expect("panicking load cannot return a ticket")
+                    .code,
+            );
+        }
+        error_codes.sort();
+        assert_eq!(
+            error_codes,
+            [
+                "parakeet_model_loader_stopped".to_owned(),
+                "parakeet_model_unavailable".to_owned(),
+            ]
+        );
+        assert_eq!(loader.calls.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            backend.descriptor().readiness,
+            SpeechBackendReadiness::Unavailable { .. }
+        ));
+
+        let shutdown_error = backend
+            .shutdown()
+            .await
+            .expect_err("supervised loader panic must remain shutdown evidence");
+        assert_eq!(shutdown_error.code, "parakeet_worker_failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_first_dispatch_drains_after_loader_release() {
+        let (loader, started, release) = BarrierUnavailableLoader::new();
+        let backend = ParakeetSpeechBackend::deferred_with_loader(loader);
+        let request_backend = backend.clone();
+        let request = tokio::spawn(async move {
+            request_backend
+                .transcribe(complete_pcm_request_with_id(
+                    "lazy-abandoned-dispatch",
+                    vec![0, 0],
+                ))
+                .await
+        });
+        started.recv().expect("request reaches loader barrier");
+        request.abort();
+        let join_error = request
+            .await
+            .err()
+            .expect("aborted dispatch caller must stop");
+        assert!(join_error.is_cancelled());
+        assert_eq!(
+            backend
+                .state
+                .tasks
+                .snapshot()
+                .expect("read supervised abandoned loader")
+                .active,
+            1
+        );
+
+        let shutdown_backend = backend.clone();
+        let shutdown = tokio::spawn(async move { shutdown_backend.shutdown().await });
+        wait_for_phase(&backend.state, BackendPhase::Quiescing).await;
+        assert!(!shutdown.is_finished());
+        release
+            .send(())
+            .expect("release abandoned non-preemptible loader");
+        shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect("abandoned dispatch loader drains without inference");
+        assert!(
+            backend
+                .state
+                .data
+                .lock()
+                .expect("lock drained backend")
+                .active
+                .is_empty()
+        );
+        assert_eq!(
+            backend
+                .state
+                .tasks
+                .snapshot()
+                .expect("read drained supervisor")
+                .active,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_suppresses_inference_and_shutdown_joins_model_load() {
+        let (loader, started, release) = BarrierUnavailableLoader::new();
+        let backend = ParakeetSpeechBackend::deferred_with_loader(loader);
+        let request_id = SpeechRequestId("lazy-cancel-before-inference".to_owned());
+        let request_backend = backend.clone();
+        let request = tokio::spawn({
+            let request_id = request_id.clone();
+            async move {
+                request_backend
+                    .transcribe(complete_pcm_request_with_id(&request_id.0, vec![0, 0]))
+                    .await
+            }
+        });
+        started.recv().expect("request reaches loader barrier");
+        assert_eq!(backend.cancel(&request_id), 1);
+
+        let shutdown_backend = backend.clone();
+        let shutdown = tokio::spawn(async move { shutdown_backend.shutdown().await });
+        wait_for_phase(&backend.state, BackendPhase::Quiescing).await;
+        assert!(!shutdown.is_finished());
+        assert_eq!(
+            backend
+                .state
+                .tasks
+                .snapshot()
+                .expect("read supervised loader state")
+                .active,
+            1
+        );
+
+        release
+            .send(())
+            .expect("release non-preemptible model load");
+        let error = request
+            .await
+            .expect("request task joins")
+            .err()
+            .expect("cancelled request never reaches inference");
+        assert_eq!(error.class, SpeechErrorClass::Cancelled);
+        shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect("shutdown joins the released model loader");
+        assert_eq!(
+            backend
+                .state
+                .tasks
+                .snapshot()
+                .expect("read terminal supervised state")
+                .active,
+            0
+        );
     }
 
     #[tokio::test]

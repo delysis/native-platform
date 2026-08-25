@@ -64,14 +64,91 @@ pub(crate) fn prepare_model_dir(
         return Ok(Some(managed_dir));
     }
 
-    let candidate = match explicit_candidate {
-        Some(path) => Some(path.to_path_buf()),
-        None => discover_exact_hugging_face_candidate(&manifest),
-    };
+    let candidate = source_candidate(explicit_candidate, &manifest);
     let Some(candidate) = candidate else {
         return Ok(None);
     };
     copy_verified_candidate(&candidate, &managed_root, &manifest).map(Some)
+}
+
+/// Cheap startup-only presence and shape probe.
+///
+/// This deliberately reads metadata only. It cannot confer model-byte
+/// authority: first use still runs the full copy/hash/load/hash admission in
+/// [`prepare_model_dir`] and [`verify_production_model_dir`].
+pub(crate) fn probe_model_source(
+    explicit_candidate: Option<&Path>,
+    explicit_managed_root: Option<&Path>,
+) -> Result<bool, ModelArtifactError> {
+    let manifest = production_manifest()?;
+    let managed_root = managed_model_root(explicit_managed_root).ok_or_else(|| {
+        artifact_error(
+            "Parakeet managed model storage is unavailable; configure \
+             SPEECH_NATIVE_PARAKEET_MANAGED_ROOT",
+        )
+    })?;
+    let managed_dir = managed_model_dir(&managed_root, &manifest);
+    if managed_dir.exists() {
+        probe_model_dir_shape(&managed_dir, &manifest, true)?;
+        return Ok(true);
+    }
+    let candidate = source_candidate(explicit_candidate, &manifest);
+    let Some(candidate) = candidate else {
+        return Ok(false);
+    };
+    if !candidate.exists() {
+        return Ok(false);
+    }
+    probe_model_dir_shape(&candidate, &manifest, false)?;
+    Ok(true)
+}
+
+fn probe_model_dir_shape(
+    path: &Path,
+    manifest: &ModelManifest,
+    managed: bool,
+) -> Result<(), ModelArtifactError> {
+    let directory = if managed {
+        fs::symlink_metadata(path)
+    } else {
+        fs::metadata(path)
+    }
+    .map_err(|error| {
+        artifact_error(format!(
+            "Could not inspect Parakeet model directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !directory.file_type().is_dir() {
+        return Err(artifact_error(format!(
+            "Parakeet model path is not a directory: {}",
+            path.display()
+        )));
+    }
+    for expected in &manifest.files {
+        let artifact_path = path.join(&expected.name);
+        let path_metadata = if managed {
+            fs::symlink_metadata(&artifact_path)
+        } else {
+            fs::metadata(&artifact_path)
+        }
+        .map_err(|error| {
+            artifact_error(format!(
+                "Could not inspect Parakeet model artifact {}: {error}",
+                artifact_path.display()
+            ))
+        })?;
+        if !path_metadata.is_file()
+            || path_metadata.len() != expected.bytes
+            || (managed && managed_file_has_peer_links(&path_metadata))
+        {
+            return Err(artifact_error(format!(
+                "Parakeet model artifact {} has the wrong type, length, or private-file shape",
+                expected.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn verify_production_model_dir(path: &Path) -> Result<(), ModelArtifactError> {
@@ -79,10 +156,7 @@ pub(crate) fn verify_production_model_dir(path: &Path) -> Result<(), ModelArtifa
 }
 
 pub(crate) fn discover_default_model_dir() -> Option<PathBuf> {
-    let explicit = std::env::var_os("SPEECH_NATIVE_PARAKEET_MODEL_DIR")
-        .or_else(|| std::env::var_os("FTE_PARAKEET_MODEL_DIR"))
-        .map(PathBuf::from);
-    prepare_model_dir(explicit.as_deref(), None).ok().flatten()
+    prepare_model_dir(None, None).ok().flatten()
 }
 
 fn production_manifest() -> Result<ModelManifest, ModelArtifactError> {
@@ -202,6 +276,17 @@ fn discover_exact_hugging_face_candidate(manifest: &ModelManifest) -> Option<Pat
     hugging_face_cache_roots()
         .into_iter()
         .find_map(|root| exact_hugging_face_candidate_in_root(&root, manifest))
+}
+
+fn source_candidate(explicit: Option<&Path>, manifest: &ModelManifest) -> Option<PathBuf> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var_os("SPEECH_NATIVE_PARAKEET_MODEL_DIR")
+                .or_else(|| std::env::var_os("FTE_PARAKEET_MODEL_DIR"))
+                .map(PathBuf::from)
+        })
+        .or_else(|| discover_exact_hugging_face_candidate(manifest))
 }
 
 fn exact_hugging_face_candidate_in_root(root: &Path, manifest: &ModelManifest) -> Option<PathBuf> {
@@ -823,6 +908,33 @@ mod tests {
         assert!(!managed_model_dir(&managed, &manifest).exists());
 
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn metadata_probe_never_substitutes_for_first_use_hash_verification() {
+        let root = temporary_root("shape-not-authority");
+        fs::create_dir_all(&root).expect("create candidate");
+        let expected = [
+            ("encoder.onnx", b"encoder".as_slice()),
+            ("decoder_joint.onnx", b"decoder".as_slice()),
+            ("tokenizer.json", b"tokenizer".as_slice()),
+        ];
+        let manifest = fixture_manifest(&expected);
+        for (name, bytes) in [
+            ("encoder.onnx", b"encodex".as_slice()),
+            ("decoder_joint.onnx", b"decoder".as_slice()),
+            ("tokenizer.json", b"tokenizer".as_slice()),
+        ] {
+            fs::write(root.join(name), bytes).expect("write candidate artifact");
+        }
+
+        probe_model_dir_shape(&root, &manifest, false)
+            .expect("bounded probe accepts exact names and lengths");
+        assert!(
+            verify_model_dir(&root, &manifest).is_err(),
+            "first-use SHA-256 admission must reject same-length tampering"
+        );
+        fs::remove_dir_all(root).expect("remove candidate");
     }
 
     #[test]

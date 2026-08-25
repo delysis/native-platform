@@ -241,7 +241,8 @@ fn evaluate_common(
             "backend is not ready".to_string(),
         ));
     }
-    if capability.availability != CapabilityAvailability::Available {
+    let exact_deferred_load = exact_deferred_load_selected(context, backend, capability);
+    if capability.availability != CapabilityAvailability::Available && !exact_deferred_load {
         return Err(rejection(
             backend,
             Some(capability),
@@ -259,7 +260,7 @@ fn evaluate_common(
                     "hosted backends are excluded from local-only routing".to_string(),
                 ));
             }
-            if !capability.eligible_for_local_only() {
+            if !capability.eligible_for_local_only() && !exact_deferred_load {
                 return Err(rejection(
                     backend,
                     Some(capability),
@@ -315,6 +316,24 @@ fn evaluate_common(
         SpeechRouteSelector::Auto => {}
     }
     Ok(())
+}
+
+fn exact_deferred_load_selected(
+    context: &SpeechRequestContext,
+    backend: &SpeechBackendDescriptor,
+    capability: &SpeechCapability,
+) -> bool {
+    backend.kind == SpeechBackendKind::EmbeddedModel
+        && capability.deferred_load_admissible()
+        && matches!(
+            &context.route,
+            SpeechRouteSelector::ExactBackend {
+                backend_id,
+                model_id: Some(model_id),
+                ..
+            } if backend_id == &backend.id
+                && capability.model_id.as_deref() == Some(model_id.as_str())
+        )
 }
 
 fn evaluate_transcription(
@@ -917,6 +936,119 @@ mod tests {
             .plan_transcription(&transcription(), &snapshot(vec![hosted]))
             .expect_err("hosted route must fail");
         assert!(matches!(error, SpeechRouteError::NoEligibleRoute { .. }));
+    }
+
+    #[test]
+    fn deferred_load_requires_an_exact_backend_and_model_route() {
+        let mut deferred = capability(
+            "embedded.parakeet",
+            SpeechOperationCapability::Transcription(TranscriptionCapabilities {
+                accepted_audio: vec![AcceptedAudio::Pcm],
+                ..TranscriptionCapabilities::default()
+            }),
+            NetworkBehavior::Never,
+        );
+        deferred.model_id = Some("parakeet.exact-model".to_owned());
+        deferred.availability = CapabilityAvailability::DeferredLoad;
+        deferred.evidence[0].kind = EvidenceKind::SystemInventory;
+        deferred.evidence[0].outcome = EvidenceOutcome::Inconclusive;
+        assert!(deferred.deferred_load_admissible());
+        assert!(!deferred.evidence[0].proves_runtime());
+        let backend = backend(
+            "embedded.parakeet",
+            SpeechBackendKind::EmbeddedModel,
+            deferred,
+        );
+
+        let mut exact = transcription();
+        exact.context.route = SpeechRouteSelector::ExactBackend {
+            backend_id: "embedded.parakeet".to_owned(),
+            model_id: Some("parakeet.exact-model".to_owned()),
+            voice_id: None,
+        };
+        let plan = SpeechRouter
+            .plan_transcription(&exact, &snapshot(vec![backend.clone()]))
+            .expect("exact model route may enter the joined deferred loader");
+        assert_eq!(plan.selected.route.backend_id, "embedded.parakeet");
+        assert_eq!(
+            plan.selected.route.model_id.as_deref(),
+            Some("parakeet.exact-model")
+        );
+
+        let automatic = SpeechRouter
+            .plan_transcription(&transcription(), &snapshot(vec![backend.clone()]))
+            .expect_err("automatic routing must never select deferred model loading");
+        let SpeechRouteError::NoEligibleRoute { rejections, .. } = automatic else {
+            panic!("expected no-route error");
+        };
+        assert!(
+            rejections
+                .iter()
+                .any(|rejection| { rejection.code == RouteRejectionCode::CapabilityUnavailable })
+        );
+
+        exact.context.route = SpeechRouteSelector::ExactBackend {
+            backend_id: "embedded.parakeet".to_owned(),
+            model_id: None,
+            voice_id: None,
+        };
+        assert!(matches!(
+            SpeechRouter.plan_transcription(&exact, &snapshot(vec![backend])),
+            Err(SpeechRouteError::NoEligibleRoute { .. })
+        ));
+    }
+
+    #[test]
+    fn only_embedded_backends_can_claim_deferred_local_loading() {
+        let mut deferred = capability(
+            "hosted.deferred",
+            SpeechOperationCapability::Transcription(TranscriptionCapabilities {
+                accepted_audio: vec![AcceptedAudio::Pcm],
+                ..TranscriptionCapabilities::default()
+            }),
+            NetworkBehavior::Never,
+        );
+        deferred.model_id = Some("hosted.exact-model".to_owned());
+        deferred.availability = CapabilityAvailability::DeferredLoad;
+        deferred.evidence[0].kind = EvidenceKind::SystemInventory;
+        deferred.evidence[0].outcome = EvidenceOutcome::Inconclusive;
+        let hosted = backend("hosted.deferred", SpeechBackendKind::Hosted, deferred);
+        let mut request = transcription();
+        request.context.route = SpeechRouteSelector::ExactBackend {
+            backend_id: "hosted.deferred".to_owned(),
+            model_id: Some("hosted.exact-model".to_owned()),
+            voice_id: None,
+        };
+
+        for privacy in [
+            SpeechPrivacyPolicy::HostedAllowed,
+            SpeechPrivacyPolicy::HostedOnly,
+        ] {
+            request.context.routing.privacy = privacy;
+            assert!(matches!(
+                SpeechRouter.plan_transcription(&request, &snapshot(vec![hosted.clone()])),
+                Err(SpeechRouteError::NoEligibleRoute { .. })
+            ));
+        }
+
+        let mut service_capability = hosted.capabilities[0].clone();
+        service_capability.id = "platform.deferred.capability".to_owned();
+        service_capability.backend_id = "platform.deferred".to_owned();
+        let service = backend(
+            "platform.deferred",
+            SpeechBackendKind::PlatformService,
+            service_capability,
+        );
+        request.context.route = SpeechRouteSelector::ExactBackend {
+            backend_id: "platform.deferred".to_owned(),
+            model_id: Some("hosted.exact-model".to_owned()),
+            voice_id: None,
+        };
+        request.context.routing.privacy = SpeechPrivacyPolicy::LocalOnly;
+        assert!(matches!(
+            SpeechRouter.plan_transcription(&request, &snapshot(vec![service])),
+            Err(SpeechRouteError::NoEligibleRoute { .. })
+        ));
     }
 
     #[test]
