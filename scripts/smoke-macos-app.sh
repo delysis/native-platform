@@ -2907,15 +2907,23 @@ state_identity() {
 
 quit_through_application_menu() {
   target_pid=$1
-  osascript - "$target_pid" "$APP_NAME" <<'APPLESCRIPT'
+  osascript - "$target_pid" <<'APPLESCRIPT'
 on run argv
   set targetPid to item 1 of argv as integer
-  set appName to item 2 of argv
   tell application "System Events"
     set matches to every application process whose unix id is targetPid
     if (count of matches) is not 1 then error "target application process did not appear"
     set targetProcess to item 1 of matches
-    set quitItem to menu item ("Quit " & appName) of menu 1 of menu bar item appName of menu bar 1 of targetProcess
+    set quitMatches to {}
+    repeat with topLevelItem in every menu bar item of menu bar 1 of targetProcess
+      try
+        repeat with candidate in every menu item of menu 1 of topLevelItem
+          if (name of candidate) starts with "Quit " then set end of quitMatches to candidate
+        end repeat
+      end try
+    end repeat
+    if (count of quitMatches) is not 1 then error "exactly one ordinary Quit menu item was not present"
+    set quitItem to item 1 of quitMatches
     perform action "AXPress" of quitItem
   end tell
 end run
