@@ -176,6 +176,13 @@
   };
 
   const releaseAttachmentPreview = (preview, restoreFallback = false) => {
+    const transcription = preview.querySelector("[data-action='attachment-transcribe']");
+    if (transcription?.dataset.operation) {
+      void invoke("mom_llama_speech_stop", { operation: transcription.dataset.operation })
+        .catch(() => {});
+    }
+    attachmentTranscripts.delete(preview);
+    preview.querySelector(".attachment-transcription")?.remove();
     const media = attachmentPreviewMedia.get(preview);
     const entry = media && attachmentObjectUrls.get(media);
     if (entry) URL.revokeObjectURL(entry.url);
@@ -217,6 +224,9 @@
     if (!current) return null;
     const replacement = parseFragment(await invokeMarkup(command));
     if (!replacement) throw new Error(`Renderer ${command} returned no element.`);
+    if (activeSpeechPlayback?.panel && current.contains(activeSpeechPlayback.panel)) {
+      await stopSpeechPlayback();
+    }
     releaseAttachmentObjectUrls(current);
     current.replaceWith(replacement);
     return replacement;
@@ -228,6 +238,144 @@
       return new Uint8Array(response.buffer, response.byteOffset, response.byteLength);
     }
     throw new Error("Attachment preview returned serialized JSON instead of raw IPC bytes.");
+  };
+
+  const speechOperationToken = () => {
+    const value = globalThis.crypto?.randomUUID?.();
+    if (!value) throw new Error("Secure opaque speech operation IDs are unavailable.");
+    return value;
+  };
+  const sha256Hex = async (bytes) => {
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+    return [...new Uint8Array(digest)]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  };
+  const attachmentTranscripts = new WeakMap();
+  let activeSpeechPlayback = null;
+
+  const restoreReadAloudButton = (button) => {
+    if (!button) return;
+    delete button.dataset.operation;
+    delete button.dataset.playback;
+    commandMetadata(button, DYNAMIC_CONTROL_SPECS.readAloud);
+    button.dataset.action = "message-read-aloud";
+    button.title = "Read aloud";
+    button.querySelector(".sr-only")?.replaceChildren("Read aloud");
+    button.removeAttribute("aria-pressed");
+  };
+
+  const stopSpeechPlayback = async ({ notifyNative = true } = {}) => {
+    const playback = activeSpeechPlayback;
+    activeSpeechPlayback = null;
+    if (!playback) return;
+    playback.audio.pause();
+    playback.audio.removeAttribute("src");
+    playback.audio.load();
+    URL.revokeObjectURL(playback.url);
+    playback.panel.remove();
+    restoreReadAloudButton(playback.button);
+    if (notifyNative) {
+      await invoke("mom_llama_speech_stop", { playback: playback.id }).catch(reportError);
+    }
+  };
+
+  const renderSpeechPlayback = async (button, result, bytes) => {
+    const binding = result.binding;
+    if (await sha256Hex(bytes) !== binding.wav_sha256) {
+      throw new Error("speech_provenance_mismatch: Complete WAV bytes changed at IPC.");
+    }
+    await stopSpeechPlayback();
+    const row = button.closest(".message-row");
+    if (
+      !row?.isConnected
+      || row.dataset.messageId !== binding.message_id
+      || selectedConversation() !== binding.conversation_id
+    ) {
+      await invoke("mom_llama_speech_stop", { playback: result.playback_id });
+      return;
+    }
+    const panel = document.createElement("section");
+    panel.className = "speech-playback";
+    panel.dataset.playback = result.playback_id;
+    const audio = createCommandElement("audio", DYNAMIC_CONTROL_SPECS.readAloudStop);
+    audio.controls = true;
+    audio.autoplay = false;
+    audio.preload = "auto";
+    const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+    audio.src = url;
+    const progress = document.createElement("output");
+    progress.className = "speech-playback-progress";
+    progress.textContent = "Ready";
+    const notice = document.createElement("small");
+    notice.textContent = "Stop suppresses playback immediately. Apple’s inner synthesis call is non-preemptive and Quit joins it before exit.";
+    panel.append(audio, progress, notice);
+    row.querySelector(".message-card")?.append(panel);
+    commandMetadata(button, DYNAMIC_CONTROL_SPECS.readAloudStop);
+    button.title = "Stop reading";
+    button.setAttribute("aria-pressed", "true");
+    button.querySelector(".sr-only")?.replaceChildren("Stop reading");
+    activeSpeechPlayback = {
+      id: result.playback_id,
+      audio,
+      url,
+      panel,
+      button,
+    };
+    audio.addEventListener("timeupdate", () => {
+      const current = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+      const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
+      progress.textContent = `${current.toFixed(1)} / ${duration.toFixed(1)} seconds`;
+    });
+    audio.addEventListener("ended", () => void stopSpeechPlayback());
+    await audio.play().catch(() => {});
+  };
+
+  const appendAttachmentTranscriptionControl = (preview, catalog, artifact) => {
+    if (artifact.kind !== "audio" || artifact.media_type !== "audio/wav") return;
+    preview.querySelector(".attachment-transcription")?.remove();
+    const panel = document.createElement("section");
+    panel.className = "attachment-transcription";
+    const button = createCommandElement("button", DYNAMIC_CONTROL_SPECS.attachmentTranscribe);
+    button.type = "button";
+    button.className = "small-button";
+    button.dataset.action = "attachment-transcribe";
+    button.dataset.attachment = catalog.attachment_id;
+    button.dataset.rootSha256 = catalog.root_sha256;
+    button.dataset.artifact = artifact.artifact_id;
+    button.dataset.policyFingerprint = catalog.policy_fingerprint;
+    button.textContent = "Transcribe audio";
+    const output = document.createElement("div");
+    output.className = "attachment-transcript";
+    output.setAttribute("aria-live", "polite");
+    panel.append(button, output);
+    preview.append(panel);
+  };
+
+  const renderAttachmentTranscript = (button, result) => {
+    const preview = button.closest("[data-attachment-preview]");
+    const output = preview?.querySelector(".attachment-transcript");
+    if (!preview?.isConnected || !output) return;
+    attachmentTranscripts.set(preview, result);
+    const transcript = document.createElement("p");
+    transcript.className = "attachment-transcript-text";
+    transcript.textContent = result.transcript || "No speech was detected.";
+    const provenance = document.createElement("small");
+    provenance.className = "attachment-transcript-provenance";
+    provenance.textContent = [
+      `artifact ${result.provenance.artifact_id}`,
+      `blob ${result.provenance.blob_object_id}`,
+      `root ${result.provenance.root_sha256}`,
+      `policy ${result.provenance.policy_fingerprint}`,
+      `model ${result.provenance.model_id}@${result.provenance.model_content_sha256}`,
+      "network never",
+    ].join(" · ");
+    const insert = createCommandElement("button", DYNAMIC_CONTROL_SPECS.draftUpdate);
+    insert.type = "button";
+    insert.className = "small-button";
+    insert.dataset.action = "speech-transcript-insert";
+    insert.textContent = "Insert into composer";
+    output.replaceChildren(transcript, provenance, insert);
   };
 
   const attachmentPreviewResult = (response) => {
@@ -381,6 +529,7 @@
       }
       body.replaceChildren(media);
       appendAttachmentPreviewNotices(body, catalog.notices);
+      appendAttachmentTranscriptionControl(preview, catalog, primary);
       attachmentPreviewMedia.set(preview, media);
       attachmentObjectUrls.set(media, { preview, url });
       preview.dataset.previewHydrated = "true";
@@ -446,6 +595,7 @@
   };
 
   window.addEventListener("beforeunload", () => {
+    void stopSpeechPlayback({ notifyNative: true });
     attachmentPreviewObserver?.disconnect();
     releaseAttachmentObjectUrls(document);
   });
@@ -1140,6 +1290,41 @@
       tauri: "mom_llama_attachment_preview",
       cli: "mom-llama attachment preview --attachment <id> --json",
       effect: "mom_llama.effects.attachment_preview.v1",
+    }),
+    attachmentTranscribe: Object.freeze({
+      affordance: "attachment.transcribe_audio",
+      command: "mom_llama.speech_transcribe_attachment",
+      tauri: "mom_llama_speech_transcribe_attachment",
+      cli: "app-only; exact Attachment authority belongs to the shared AppRuntime SpeechHost",
+      effect: "mom_llama.effects.speech_transcribe_attachment.v1",
+    }),
+    attachmentTranscriptionStop: Object.freeze({
+      affordance: "attachment.transcription_stop",
+      command: "mom_llama.speech_stop",
+      tauri: "mom_llama_speech_stop",
+      cli: "app-only; stops an opaque operation or playback owned by the running AppRuntime",
+      effect: "mom_llama.effects.speech_stop.v1",
+    }),
+    readAloud: Object.freeze({
+      affordance: "message.read_aloud",
+      command: "mom_llama.speech_read_aloud",
+      tauri: "mom_llama_speech_read_aloud",
+      cli: "app-only; exact playback belongs to the shared AppRuntime SpeechHost",
+      effect: "mom_llama.effects.speech_read_aloud.v1",
+    }),
+    readAloudStop: Object.freeze({
+      affordance: "message.read_aloud_stop",
+      command: "mom_llama.speech_stop",
+      tauri: "mom_llama_speech_stop",
+      cli: "app-only; stops an opaque operation or playback owned by the running AppRuntime",
+      effect: "mom_llama.effects.speech_stop.v1",
+    }),
+    draftUpdate: Object.freeze({
+      affordance: "conversation.draft_update",
+      command: "mom_llama.draft_update",
+      tauri: "mom_llama_draft_update",
+      cli: "mom-llama conversation draft-update --conversation <id> --message <text> --json",
+      effect: "mom_llama.effects.conversation_store.v1",
     }),
     conversationSelect: Object.freeze({
       affordance: "conversation.select",
@@ -2072,6 +2257,144 @@
       }
       report(result);
     },
+    "message-read-aloud": async (button) => {
+      if (activeSpeechPlayback?.button === button) {
+        await stopSpeechPlayback();
+        return;
+      }
+      if (button.dataset.playback) {
+        const playback = button.dataset.playback;
+        delete button.dataset.playback;
+        await invoke("mom_llama_speech_stop", { playback });
+        restoreReadAloudButton(button);
+        return;
+      }
+      if (button.dataset.operation) {
+        const operation = button.dataset.operation;
+        delete button.dataset.operation;
+        await invoke("mom_llama_speech_stop", { operation });
+        restoreReadAloudButton(button);
+        return;
+      }
+      await stopSpeechPlayback();
+      const conversation = selectedConversation();
+      const message = button.dataset.message;
+      const operation = speechOperationToken();
+      button.dataset.operation = operation;
+      commandMetadata(button, DYNAMIC_CONTROL_SPECS.readAloudStop);
+      button.title = "Stop reading";
+      button.setAttribute("aria-pressed", "true");
+      button.querySelector(".sr-only")?.replaceChildren("Stop reading");
+      let retainedPlayback = null;
+      try {
+        const response = await invoke("mom_llama_speech_read_aloud", {
+          conversation,
+          message,
+          operation,
+        });
+        report(response);
+        if (response?.status === "blocked" || !response?.result) return;
+        const result = response.result;
+        retainedPlayback = result.playback_id;
+        if (button.dataset.operation === operation) delete button.dataset.operation;
+        button.dataset.playback = result.playback_id;
+        if (
+          selectedConversation() !== conversation
+          || !button.isConnected
+          || button.closest(".message-row")?.dataset.messageId !== result.binding.message_id
+        ) {
+          await invoke("mom_llama_speech_stop", { playback: result.playback_id });
+          retainedPlayback = null;
+          return;
+        }
+        const bytes = rawAttachmentBytes(await invoke("mom_llama_speech_audio", {
+          playback: result.playback_id,
+          message: result.binding.message_id,
+          textSha256: result.binding.text_sha256,
+          backendDescriptorSha256: result.binding.backend_descriptor_sha256,
+        }));
+        if (button.dataset.playback !== result.playback_id) return;
+        await renderSpeechPlayback(button, result, bytes);
+        if (activeSpeechPlayback?.id === result.playback_id) retainedPlayback = null;
+      } finally {
+        if (retainedPlayback) {
+          await invoke("mom_llama_speech_stop", { playback: retainedPlayback }).catch(() => {});
+        }
+        if (button.dataset.operation === operation) delete button.dataset.operation;
+        if (activeSpeechPlayback?.button !== button) restoreReadAloudButton(button);
+      }
+    },
+    "attachment-transcribe": async (button) => {
+      if (button.dataset.operation) {
+        const operation = button.dataset.operation;
+        delete button.dataset.operation;
+        await invoke("mom_llama_speech_stop", { operation });
+        commandMetadata(button, DYNAMIC_CONTROL_SPECS.attachmentTranscribe);
+        button.textContent = "Transcribe audio";
+        return;
+      }
+      const preview = button.closest("[data-attachment-preview]");
+      const conversation = selectedConversation();
+      const operation = speechOperationToken();
+      button.dataset.operation = operation;
+      commandMetadata(button, DYNAMIC_CONTROL_SPECS.attachmentTranscriptionStop);
+      button.textContent = "Stop transcription";
+      try {
+        const response = await invoke("mom_llama_speech_transcribe_attachment", {
+          conversation,
+          attachment: button.dataset.attachment,
+          rootSha256: button.dataset.rootSha256,
+          artifact: button.dataset.artifact,
+          policyFingerprint: button.dataset.policyFingerprint,
+          operation,
+        });
+        report(response);
+        const result = response?.result;
+        if (response?.status === "blocked" || !result) return;
+        const provenance = result.provenance;
+        if (
+          !preview?.isConnected
+          || button.dataset.operation !== operation
+          || selectedConversation() !== conversation
+          || provenance.conversation_id !== conversation
+          || preview.dataset.attachmentPreview !== provenance.attachment_id
+          || button.dataset.rootSha256 !== provenance.root_sha256
+          || button.dataset.artifact !== provenance.artifact_id
+          || button.dataset.policyFingerprint !== provenance.policy_fingerprint
+        ) return;
+        renderAttachmentTranscript(button, result);
+      } finally {
+        if (button.dataset.operation === operation) delete button.dataset.operation;
+        commandMetadata(button, DYNAMIC_CONTROL_SPECS.attachmentTranscribe);
+        button.textContent = "Transcribe audio";
+      }
+    },
+    "speech-transcript-insert": async (button) => {
+      const preview = button.closest("[data-attachment-preview]");
+      const source = preview?.querySelector("[data-action='attachment-transcribe']");
+      const result = preview && attachmentTranscripts.get(preview);
+      const textarea = document.querySelector("#chat-form textarea[name='message']");
+      if (
+        !result
+        || !source
+        || !textarea
+        || selectedConversation() !== result.provenance.conversation_id
+        || preview.dataset.attachmentPreview !== result.provenance.attachment_id
+        || source.dataset.rootSha256 !== result.provenance.root_sha256
+        || source.dataset.artifact !== result.provenance.artifact_id
+        || source.dataset.policyFingerprint !== result.provenance.policy_fingerprint
+      ) {
+        throw new Error("speech_transcription_stale: The transcript target is no longer current.");
+      }
+      const transcript = result.transcript || "";
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+      const prefix = start > 0 && !/\s$/.test(textarea.value.slice(0, start)) ? " " : "";
+      const suffix = end < textarea.value.length && !/^\s/.test(textarea.value.slice(end)) ? " " : "";
+      textarea.setRangeText(`${prefix}${transcript}${suffix}`, start, end, "end");
+      textarea.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: transcript }));
+      textarea.focus();
+    },
     "message-raw-toggle": async (button) => {
       const result = await invoke("mom_llama_message_copy", {
         conversation: selectedConversation(),
@@ -2826,6 +3149,9 @@
     await events.listen("mom_llama_chat_stream", onChatEvent);
     await events.listen("mom_llama_chat_dispatch_stream", onDispatchEvent);
     await events.listen("mom_llama_tool_loop_stream", onToolLoopEvent);
+    await events.listen("mom_llama_speech_quiescing", () => {
+      void stopSpeechPlayback({ notifyNative: false });
+    });
   };
 
   const boot = async () => {

@@ -455,6 +455,22 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         label: "Copy",
     },
     ControlSpec {
+        affordance: "message.read_aloud",
+        command: "mom_llama.speech_read_aloud",
+        tauri_command: "mom_llama_speech_read_aloud",
+        cli: "app-only; exact playback belongs to the shared AppRuntime SpeechHost",
+        effect: "mom_llama.effects.speech_read_aloud.v1",
+        label: "Read aloud",
+    },
+    ControlSpec {
+        affordance: "message.read_aloud_stop",
+        command: "mom_llama.speech_stop",
+        tauri_command: "mom_llama_speech_stop",
+        cli: "app-only; stops an opaque operation or playback owned by the running AppRuntime",
+        effect: "mom_llama.effects.speech_stop.v1",
+        label: "Stop reading",
+    },
+    ControlSpec {
         affordance: "message.raw_toggle",
         command: "mom_llama.message_copy",
         tauri_command: "mom_llama_message_copy",
@@ -501,6 +517,22 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         cli: "mom-llama attachment preview --attachment <id> --json",
         effect: "mom_llama.effects.attachment_preview.v1",
         label: "Preview attachment",
+    },
+    ControlSpec {
+        affordance: "attachment.transcribe_audio",
+        command: "mom_llama.speech_transcribe_attachment",
+        tauri_command: "mom_llama_speech_transcribe_attachment",
+        cli: "app-only; exact Attachment authority belongs to the shared AppRuntime SpeechHost",
+        effect: "mom_llama.effects.speech_transcribe_attachment.v1",
+        label: "Transcribe audio",
+    },
+    ControlSpec {
+        affordance: "attachment.transcription_stop",
+        command: "mom_llama.speech_stop",
+        tauri_command: "mom_llama_speech_stop",
+        cli: "app-only; stops an opaque operation or playback owned by the running AppRuntime",
+        effect: "mom_llama.effects.speech_stop.v1",
+        label: "Stop transcription",
     },
     ControlSpec {
         affordance: "attachment.import",
@@ -2468,6 +2500,9 @@ fn message_actions(
     html! {
         div class="message-actions" aria-label="Message actions" {
             (message_button("message.copy", "message-copy", message))
+            @if message.role == MessageRole::Assistant {
+                (message_button("message.read_aloud", "message-read-aloud", message))
+            }
             @if message.role == MessageRole::Assistant && show_raw_output_switch {
                 (message_button("message.raw_toggle", "message-raw-toggle", message))
             }
@@ -2535,6 +2570,7 @@ fn message_button(key: &str, action: &str, message: &Message) -> Markup {
     let control = control(key);
     let icon = match action {
         "message-copy" => "copy",
+        "message-read-aloud" => "volume-2",
         "message-raw-toggle" => "code",
         "message-edit" => "pencil",
         "persona-freeze" => "snowflake",
@@ -3727,6 +3763,7 @@ fn icon_paths(name: &str) -> Markup {
         "folder-open" => r#"<path d="m6 14 1.5-2.9A2 2 0 0 1 9.2 10H20a2 2 0 0 1 1.8 2.9l-2 4A2 2 0 0 1 18 18H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.7.9l.8 1.2A2 2 0 0 0 13.1 6H19a2 2 0 0 1 2 2v2"/>"#,
         "code" => r#"<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/>"#,
         "square" => r#"<rect width="14" height="14" x="5" y="5" rx="2"/>"#,
+        "volume-2" => r#"<path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/>"#,
         "skip-forward" => r#"<path d="m13 19 9-7-9-7v14Z"/><path d="M2 19V5"/>"#,
         "users" => r#"<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>"#,
         "user-round" => r#"<circle cx="12" cy="8" r="5"/><path d="M20 21a8 8 0 0 0-16 0"/>"#,
@@ -5097,6 +5134,14 @@ mod tests {
 
         for (key, affordance) in [
             ("attachmentPreview", "attachment.preview"),
+            ("attachmentTranscribe", "attachment.transcribe_audio"),
+            (
+                "attachmentTranscriptionStop",
+                "attachment.transcription_stop",
+            ),
+            ("readAloud", "message.read_aloud"),
+            ("readAloudStop", "message.read_aloud_stop"),
+            ("draftUpdate", "conversation.draft_update"),
             ("conversationSelect", "conversation.select"),
             ("mentionCancel", "mention.cancel"),
             ("mentionCandidates", "mention.candidates"),
@@ -5107,6 +5152,9 @@ mod tests {
 
         for creation in [
             r#"createCommandElement("audio", DYNAMIC_CONTROL_SPECS.attachmentPreview)"#,
+            r#"createCommandElement("audio", DYNAMIC_CONTROL_SPECS.readAloudStop)"#,
+            r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.attachmentTranscribe)"#,
+            r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.draftUpdate)"#,
             r#"createCommandElement("video", DYNAMIC_CONTROL_SPECS.attachmentPreview)"#,
             r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.conversationSelect)"#,
             r#"createCommandElement("button", DYNAMIC_CONTROL_SPECS.mentionCancel)"#,
@@ -5158,6 +5206,51 @@ mod tests {
         assert!(
             js.contains(r#"if (settingEnabled("showThoughtInProgress")) reasoning?.classList.remove("is-hidden")"#),
             "live reasoning must honor the persisted display policy without an unmanaged disclosure"
+        );
+    }
+
+    #[test]
+    fn speech_projection_rebinds_targets_and_keeps_transcript_insertion_explicit() {
+        let js = include_str!("../../ui/coop-hx.js");
+        assert!(
+            js.contains("mom_llama_speech_read_aloud")
+                && js.contains("message: result.binding.message_id")
+                && js.contains("textSha256: result.binding.text_sha256")
+                && js.contains("backendDescriptorSha256: result.binding.backend_descriptor_sha256")
+                && js.contains("await sha256Hex(bytes) !== binding.wav_sha256")
+                && js.contains("button.dataset.playback !== result.playback_id"),
+            "Read Aloud must rebind the exact message, descriptor and complete WAV at raw IPC"
+        );
+        assert!(
+            js.contains("mom_llama_speech_transcribe_attachment")
+                && js.contains("rootSha256: button.dataset.rootSha256")
+                && js.contains("artifact: button.dataset.artifact")
+                && js.contains("policyFingerprint: button.dataset.policyFingerprint")
+                && js.contains("result.provenance.blob_object_id")
+                && js.contains("provenance.model_content_sha256")
+                && js.contains("button.dataset.operation !== operation"),
+            "attachment transcription must re-present exact artifact and model provenance"
+        );
+        let insert_start = js
+            .find(r#""speech-transcript-insert": async (button)"#)
+            .expect("explicit transcript insertion action");
+        let insert_end = js[insert_start..]
+            .find("\n    \"message-raw-toggle\"")
+            .map(|offset| insert_start + offset)
+            .expect("bounded transcript insertion action");
+        let insertion = &js[insert_start..insert_end];
+        assert!(
+            insertion.contains("textarea.setRangeText")
+                && insertion.contains("new InputEvent(\"input\"")
+                && !insertion.contains("mom_llama_chat_dispatch")
+                && !insertion.contains("requestSubmit"),
+            "transcription may become only one explicit ordinary composer edit, never a send"
+        );
+        assert!(
+            js.contains("Stop suppresses playback immediately")
+                && js.contains("Apple’s inner synthesis call is non-preemptive")
+                && js.contains("mom_llama_speech_quiescing"),
+            "playback Stop and Quit must state and enforce Apple's non-preemptive join boundary"
         );
     }
 

@@ -153,6 +153,9 @@ information-native-retrieval = { path = "crates/services/information/crates/info
 information-native-store = { path = "crates/services/information/crates/information-native-store" }
 information-native-types = { path = "crates/services/information/crates/information-native-types" }
 speech-native-host = { path = "crates/services/speech/crates/speech-native-host" }
+speech-native-types = { path = "crates/services/speech/crates/speech-native-types" }
+speech-native-platform = { path = "crates/services/speech/crates/speech-native-platform" }
+speech-native-backend-parakeet = { path = "crates/services/speech/crates/speech-native-backend-parakeet" }
 mom-llama-runtime = { path = "products/mom/crates/mom-llama-runtime" }
 
 [workspace.lints.rust]

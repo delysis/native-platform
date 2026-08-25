@@ -603,6 +603,29 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   font-size: 11px;
 }
 .attachment-document-preview > .attachment-preview-notices { padding: 8px 0 0 16px; }
+.attachment-transcription {
+  display: grid;
+  gap: 8px;
+  padding: 0 12px 12px;
+}
+.attachment-transcription > .small-button { justify-self: start; }
+.attachment-transcript { display: grid; gap: 7px; }
+.attachment-transcript-text { margin: 0; white-space: pre-wrap; }
+.attachment-transcript-provenance {
+  color: var(--faint);
+  overflow-wrap: anywhere;
+  font: 10px/1.45 var(--mono);
+}
+.speech-playback {
+  display: grid;
+  gap: 5px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.speech-playback audio { width: 100%; }
+.speech-playback-progress,
+.speech-playback small { color: var(--muted); font-size: 11px; }
 .tool-turn-stats { color: var(--faint); font-size: 12px; margin: 8px 0 0; }
 .build-version {
   position: fixed;

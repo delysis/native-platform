@@ -33,14 +33,16 @@ and no consult group is seeded on the user's behalf.
 Mom Llama consumes the accepted imported monorepo packages for:
 
 - `llama-native-kit` for in-process model execution and cache-safe native state;
-- `speech-native-kit` for local STT/TTS only after a deliberate, human-reviewed
-  microphone/read-aloud product surface exists.
+- `speech-native-kit` only for the deliberate Apple complete-WAV Read Aloud and
+  verified Parakeet attachment-transcription surfaces; microphone capture is
+  not composed.
 
 Free Token Energy remains a separate product for protocol routing, hosted
 providers, and optional loopback. Mom does not depend on its crates, install its
 Tauri plugin, grant its renderer permission, or drain its gateway. It also does
 not copy these implementations or retain their retired Git sources. The root
-workspace and lock establish one Native/Attachment/contracts identity for Mom.
+workspace and lock establish one Native/Attachment/Speech/contracts identity
+for Mom.
 
 ## Frontend boundary
 

@@ -35,6 +35,16 @@ key. `LLAMA_NATIVE_KIT_DATA_DIR` changes the storage location but does not, by
 itself, select the test-only key; a debug build still uses its documented
 development-key policy unless secure storage is explicitly enabled.
 
+## Speech authority
+
+Mom's speech edge grants no microphone, file-system, network, hosted-provider,
+loopback or generic speech-plugin permission. Renderer commands carry only
+opaque operation/playback IDs plus exact message or Attachment artifact hashes;
+Rust resolves encrypted content and verifies descriptor/model provenance. Apple
+TTS and Parakeet are admitted only through never-network routes. Complete WAV
+playback and transcript previews are bounded in memory and cleared when the
+shared `AppRuntime` begins Quit.
+
 ## What this does not claim
 
 Secure-mode encryption does not protect content from someone who controls the

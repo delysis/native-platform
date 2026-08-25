@@ -131,6 +131,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     read("mom_llama_conversation_export", true, false),
     mutation("mom_llama_conversation_import", true, false),
     read("mom_llama_message_copy", true, false),
+    long("mom_llama_speech_read_aloud", true, true),
     mutation("mom_llama_message_edit", true, false),
     mutation("mom_llama_message_delete", true, false),
     read("mom_llama_message_branches", true, false),
@@ -142,6 +143,9 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_attachment_preview", true, false),
     long("mom_llama_attachment_preview_content", true, false),
     long("mom_llama_attachment_preview_bytes", false, false),
+    long("mom_llama_speech_transcribe_attachment", true, true),
+    long("mom_llama_speech_audio", false, true),
+    mutation("mom_llama_speech_stop", true, true),
     read("mom_llama_settings_get", true, false),
     mutation("mom_llama_settings_reset", true, true),
     mutation("mom_llama_settings_update", true, true),
@@ -299,6 +303,10 @@ mod tests {
             "mom_llama_model_slot_list",
             "mom_llama_model_slot_load",
             "mom_llama_model_slot_unload",
+            "mom_llama_speech_read_aloud",
+            "mom_llama_speech_transcribe_attachment",
+            "mom_llama_speech_audio",
+            "mom_llama_speech_stop",
         ]);
         let command_source = include_str!("commands.rs");
 

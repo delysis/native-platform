@@ -256,6 +256,23 @@ pub struct AttachmentPreviewMedia {
     pub bytes: Vec<u8>,
 }
 
+/// Exact, path-free attachment authority admitted for one complete-input STT
+/// request. The caller must re-present the full preview anchor; a file name or
+/// attachment id alone is never enough to recover model input bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentTranscriptionInput {
+    pub anchor: AttachmentPreviewAnchor,
+    pub source_object_id: String,
+    pub blob_object_id: String,
+    pub media_type: String,
+    pub byte_len: u64,
+    pub bytes_sha256: String,
+    pub validation: BlobValidationGrade,
+    pub processor: String,
+    pub processor_version: String,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ChatAttachmentContext {
     pub staged_ids: Vec<String>,
@@ -711,6 +728,102 @@ pub fn attachment_preview_media(
     Ok(Ok(AttachmentPreviewMedia {
         anchor: anchor.clone(),
         media_type: blob.media_type.clone(),
+        bytes,
+    }))
+}
+
+pub fn attachment_transcription_input(
+    conversation_id: &str,
+    anchor: &AttachmentPreviewAnchor,
+) -> Result<std::result::Result<AttachmentTranscriptionInput, Blocker>> {
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let store = RuntimeStore::current()?;
+    let authority = match exact_preview_authority(&store, anchor)? {
+        Ok(authority) => authority,
+        Err(problem) => return Ok(Err(preview_blocker(&problem.code, problem.message))),
+    };
+    if authority.record.conversation_id != conversation_id {
+        return Ok(Err(preview_blocker(
+            "attachment_transcription_conversation_mismatch",
+            "The requested audio attachment does not belong to this conversation.".to_string(),
+        )));
+    }
+    if authority.record.kind != AttachmentKind::Audio {
+        return Ok(Err(preview_blocker(
+            "attachment_transcription_not_audio",
+            "Only an admitted audio attachment can be transcribed.".to_string(),
+        )));
+    }
+    if !matches!(authority.manifest.graph.coverage, Coverage::Complete) {
+        return Ok(Err(preview_blocker(
+            "attachment_transcription_incomplete",
+            "The attachment graph is incomplete, so its audio cannot be sent to complete-input transcription."
+                .to_string(),
+        )));
+    }
+    let Some(artifact) = authority
+        .manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id.0 == anchor.artifact_id)
+    else {
+        return Ok(Err(preview_blocker(
+            "attachment_preview_artifact_mismatch",
+            "The requested canonical audio artifact is no longer current.".to_string(),
+        )));
+    };
+    let ArtifactPayload::Media {
+        family,
+        blob,
+        validation,
+        ..
+    } = &artifact.payload
+    else {
+        return Ok(Err(preview_blocker(
+            "attachment_transcription_not_media",
+            "The requested canonical artifact is not an admitted media blob.".to_string(),
+        )));
+    };
+    if *family != MediaFamily::Audio || blob.media_type != "audio/wav" {
+        return Ok(Err(preview_blocker(
+            "attachment_transcription_wav_required",
+            "Initial local transcription accepts only a canonical WAV audio artifact.".to_string(),
+        )));
+    }
+    // Audio artifacts intentionally remain HeaderOrStructureOnly until an
+    // explicit transform decodes them. This complete-input STT call is that
+    // transform; direct multimodal model admission still requires the stronger
+    // PayloadDecoded grade elsewhere.
+    if let Err(problem) = media_preview_admission(*family, &blob.media_type, blob.byte_len) {
+        return Ok(Err(preview_blocker(&problem.code, problem.message)));
+    }
+    let bytes = match load_verified_object(&store, &authority.manifest.graph, &blob.object_id) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Ok(Err(preview_blocker(
+                "attachment_content_mismatch",
+                "The retained audio bytes no longer match the inspected attachment graph."
+                    .to_string(),
+            )));
+        }
+    };
+    let bytes_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if bytes_sha256 != blob.object_id.0 {
+        return Ok(Err(preview_blocker(
+            "attachment_content_mismatch",
+            "The retained audio bytes no longer match the selected canonical artifact.".to_string(),
+        )));
+    }
+    Ok(Ok(AttachmentTranscriptionInput {
+        anchor: anchor.clone(),
+        source_object_id: artifact.source.0.clone(),
+        blob_object_id: blob.object_id.0.clone(),
+        media_type: blob.media_type.clone(),
+        byte_len: blob.byte_len,
+        bytes_sha256,
+        validation: validation.grade,
+        processor: artifact.processor.name.clone(),
+        processor_version: artifact.processor.version.clone(),
         bytes,
     }))
 }
@@ -4218,6 +4331,51 @@ mod tests {
             blocked.blocker.code,
             "attachment_audio_transcription_required"
         );
+    }
+
+    #[test]
+    fn transcription_input_rebinds_exact_audio_authority_and_rejects_stale_targets() {
+        let _session = TestDataDir::new("speech-audio-authority");
+        let audio_path = resolve_settings()
+            .expect("settings")
+            .data_dir
+            .join("sample.wav");
+        std::fs::write(&audio_path, STRUCTURALLY_VALID_WAV).expect("write audio fixture");
+        let attachment = attachment_import("chat", &audio_path)
+            .expect("stage audio")
+            .result
+            .expect("audio import result")
+            .attachment;
+        let catalog = attachment_preview(&attachment.id)
+            .expect("catalog")
+            .result
+            .expect("catalog result");
+        let anchor = preview_anchor(&catalog);
+        let input = attachment_transcription_input("chat", &anchor)
+            .expect("transcription authority")
+            .expect("admitted transcription input");
+        assert_eq!(input.anchor, anchor);
+        assert_eq!(input.media_type, "audio/wav");
+        assert_eq!(input.bytes.as_slice(), STRUCTURALLY_VALID_WAV);
+        assert_eq!(input.bytes_sha256, input.blob_object_id);
+        assert!(matches!(
+            input.validation,
+            BlobValidationGrade::HeaderOrStructureOnly
+        ));
+
+        let wrong_conversation = attachment_transcription_input("other", &anchor)
+            .expect("typed conversation mismatch")
+            .expect_err("cross-conversation audio must fail closed");
+        assert_eq!(
+            wrong_conversation.code,
+            "attachment_transcription_conversation_mismatch"
+        );
+        let mut stale = anchor;
+        stale.policy_fingerprint = "sha256:stale".to_string();
+        let blocker = attachment_transcription_input("chat", &stale)
+            .expect("typed stale result")
+            .expect_err("stale audio authority must fail closed");
+        assert_eq!(blocker.code, "attachment_preview_stale");
     }
 
     #[test]

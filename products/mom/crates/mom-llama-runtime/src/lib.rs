@@ -26,8 +26,9 @@ pub use attachments::{
     AttachmentPreviewCatalog, AttachmentPreviewContent, AttachmentPreviewKind,
     AttachmentPreviewMedia, AttachmentPreviewNotice, AttachmentPreviewState,
     AttachmentPreviewTextSection, AttachmentPreviewTextStats, AttachmentPreviewTransform,
-    AttachmentRecord, AttachmentState, attachment_import, attachment_import_pasted_text,
-    attachment_list, attachment_preview, attachment_preview_content, attachment_preview_media,
+    AttachmentRecord, AttachmentState, AttachmentTranscriptionInput, attachment_import,
+    attachment_import_pasted_text, attachment_list, attachment_preview, attachment_preview_content,
+    attachment_preview_media, attachment_transcription_input,
 };
 pub use chat::{
     ChatCancelOutput, ChatRequestState, ChatSendInput, ChatSendOptions, ChatSendOutput,

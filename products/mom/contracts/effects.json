@@ -3,6 +3,45 @@
   "profile": "native_local",
   "effects": [
     {
+      "effect_id": "mom_llama.effects.speech_read_aloud.v1",
+      "reads": ["exact_assistant_message", "installed_apple_voice_descriptor"],
+      "writes": ["command_receipt"],
+      "network": [],
+      "process": [],
+      "secrets": [],
+      "model_calls": ["apple_complete_wav_synthesis"],
+      "persistence": ["encrypted_receipts"],
+      "memory": ["shared_speech_host", "bounded_complete_wav_playback"],
+      "external_apps": [],
+      "destructive": "reversible"
+    },
+    {
+      "effect_id": "mom_llama.effects.speech_transcribe_attachment.v1",
+      "reads": ["exact_attachment_artifact", "encrypted_content_addressed_audio_blob", "verified_parakeet_descriptor"],
+      "writes": ["command_receipt"],
+      "network": [],
+      "process": [],
+      "secrets": [],
+      "model_calls": ["verified_local_parakeet_complete_input"],
+      "persistence": ["encrypted_sqlite_read_only", "encrypted_receipts"],
+      "memory": ["shared_speech_host", "bounded_transcript_preview"],
+      "external_apps": [],
+      "destructive": "none"
+    },
+    {
+      "effect_id": "mom_llama.effects.speech_stop.v1",
+      "reads": ["active_speech_operation_or_playback"],
+      "writes": ["speech_cancellation_flag", "command_receipt"],
+      "network": [],
+      "process": [],
+      "secrets": [],
+      "model_calls": [],
+      "persistence": ["encrypted_receipts"],
+      "memory": ["shared_speech_host", "bounded_complete_wav_playback"],
+      "external_apps": [],
+      "destructive": "reversible"
+    },
+    {
       "effect_id": "mom_llama.effects.engine_check.v1",
       "reads": ["app_config", "selected_model_metadata"],
       "writes": ["command_receipt"],

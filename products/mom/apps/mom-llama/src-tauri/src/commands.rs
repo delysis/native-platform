@@ -800,6 +800,25 @@ pub fn mom_llama_message_copy(
 }
 
 #[tauri::command]
+pub async fn mom_llama_speech_read_aloud(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    message: String,
+    operation: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_speech_read_aloud"))?;
+    let speech = runtime.speech();
+    let result = speech
+        .read_aloud(&conversation, &message, &operation)
+        .await
+        .map_err(to_error)?;
+    let terminal = speech_terminal(&result);
+    let value = command_value(Ok(result));
+    lease.finish(terminal)?;
+    value
+}
+
+#[tauri::command]
 pub fn mom_llama_message_branches(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
@@ -924,6 +943,75 @@ pub async fn mom_llama_attachment_preview_bytes(
         },
     )
     .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn mom_llama_speech_transcribe_attachment(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    attachment: String,
+    root_sha256: String,
+    artifact: String,
+    policy_fingerprint: String,
+    operation: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_speech_transcribe_attachment"))?;
+    let speech = runtime.speech();
+    let result = speech
+        .transcribe_attachment(
+            &conversation,
+            &AttachmentPreviewAnchor {
+                attachment_id: attachment,
+                root_sha256,
+                artifact_id: artifact,
+                policy_fingerprint,
+            },
+            &operation,
+        )
+        .await
+        .map_err(to_error)?;
+    let terminal = speech_terminal(&result);
+    let value = command_value(Ok(result));
+    lease.finish(terminal)?;
+    value
+}
+
+#[tauri::command]
+pub async fn mom_llama_speech_audio(
+    runtime: State<'_, AppRuntimeHandle>,
+    playback: String,
+    message: String,
+    text_sha256: String,
+    backend_descriptor_sha256: String,
+) -> Result<Response, String> {
+    let lease = runtime.admit(command_spec("mom_llama_speech_audio"))?;
+    let speech = runtime.speech();
+    blocking_response(lease, move || {
+        speech
+            .playback_bytes(
+                &playback,
+                &message,
+                &text_sha256,
+                &backend_descriptor_sha256,
+            )
+            .map(Response::new)
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn mom_llama_speech_stop(
+    runtime: State<'_, AppRuntimeHandle>,
+    operation: Option<String>,
+    playback: Option<String>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_speech_stop"))?;
+    command_value(
+        runtime
+            .speech()
+            .stop(operation.as_deref(), playback.as_deref()),
+    )
 }
 
 fn attachment_preview_response(anchor: &AttachmentPreviewAnchor) -> Result<Response, String> {
@@ -1391,6 +1479,16 @@ fn command_value<T: serde::Serialize>(result: anyhow::Result<T>) -> Result<Value
     to_value(result).map_err(to_error)
 }
 
+fn speech_terminal<T: serde::Serialize>(
+    result: &mom_llama_runtime::CommandResult<T>,
+) -> crate::operation_supervisor::TerminalClass {
+    match result.blocker.as_ref().map(|blocker| blocker.code.as_str()) {
+        Some("speech_cancelled") => crate::operation_supervisor::TerminalClass::Cancelled,
+        Some(_) => crate::operation_supervisor::TerminalClass::Failed,
+        None => crate::operation_supervisor::TerminalClass::Completed,
+    }
+}
+
 async fn blocking_command<T, F>(lease: AppWorkLease, operation: F) -> Result<Value, String>
 where
     T: serde::Serialize + Send + 'static,
@@ -1487,6 +1585,34 @@ mod tests {
                 && command_body(source, "mom_llama_attachment_preview_bytes")
                     .contains("policy_fingerprint"),
             "raw attachment previews must read and decrypt outside the async dispatch thread"
+        );
+        assert!(
+            command_body(source, "mom_llama_speech_audio").contains("blocking_response("),
+            "bounded complete WAV cloning must stay off the async dispatch thread"
+        );
+    }
+
+    #[test]
+    fn speech_ipc_is_path_free_and_rebinds_exact_authority() {
+        let source = include_str!("commands.rs");
+        let read_aloud = command_body(source, "mom_llama_speech_read_aloud");
+        assert!(
+            read_aloud.contains("&conversation")
+                && read_aloud.contains("&message")
+                && read_aloud.contains("&operation")
+                && !read_aloud.contains("PathBuf")
+                && !read_aloud.contains("path:"),
+            "Read Aloud IPC must accept only opaque operation and message identity"
+        );
+        let transcribe = command_body(source, "mom_llama_speech_transcribe_attachment");
+        assert!(
+            transcribe.contains("AttachmentPreviewAnchor")
+                && transcribe.contains("root_sha256")
+                && transcribe.contains("artifact_id: artifact")
+                && transcribe.contains("policy_fingerprint")
+                && !transcribe.contains("PathBuf")
+                && !transcribe.contains("path:"),
+            "transcription IPC must re-present exact Attachment authority without a path"
         );
     }
 }

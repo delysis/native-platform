@@ -2,6 +2,7 @@ mod app_runtime;
 mod command_registry;
 mod commands;
 mod operation_supervisor;
+mod speech;
 mod view;
 use anyhow::Result;
 use app_runtime::AppRuntimeHandle;
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::menu::{
     AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID,
 };
-use tauri::{AppHandle, Manager, Runtime, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 const APPLICATION_QUIT_MENU_ID: &str = "mom-llama.application.quit";
 const APPLICATION_QUIT_ACCELERATOR: &str = "CmdOrCtrl+Q";
@@ -446,6 +447,7 @@ fn main() {
             commands::mom_llama_conversation_export,
             commands::mom_llama_conversation_import,
             commands::mom_llama_message_copy,
+            commands::mom_llama_speech_read_aloud,
             commands::mom_llama_message_edit,
             commands::mom_llama_message_delete,
             commands::mom_llama_message_branches,
@@ -457,6 +459,9 @@ fn main() {
             commands::mom_llama_attachment_preview,
             commands::mom_llama_attachment_preview_content,
             commands::mom_llama_attachment_preview_bytes,
+            commands::mom_llama_speech_transcribe_attachment,
+            commands::mom_llama_speech_audio,
+            commands::mom_llama_speech_stop,
             commands::mom_llama_settings_get,
             commands::mom_llama_settings_reset,
             commands::mom_llama_settings_update,
@@ -639,6 +644,7 @@ fn request_graceful_exit<R: Runtime>(
     exit_allowed: &Arc<AtomicBool>,
     exit_code: i32,
 ) {
+    let _ = app_handle.emit("mom_llama_speech_quiescing", ());
     if exit_allowed.load(Ordering::Acquire) || !runtime.begin_quiesce() {
         return;
     }
@@ -665,8 +671,10 @@ fn safe_to_exit_after_shutdown(
         Ok(_) => true,
         Err(error) => {
             error.summary.native_host_joined
+                && error.summary.speech_host_joined
                 && error.summary.persona_approval_recovery_complete
                 && error.approval_recovery_error.is_none()
+                && error.speech_error.is_none()
         }
     }
 }
@@ -750,6 +758,17 @@ fn log_shutdown_result(
 fn build_runtime(
     settings: mom_llama_runtime::config::Settings,
 ) -> std::result::Result<AppRuntimeHandle, RuntimeBuildError> {
+    let speech_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| RuntimeBuildError {
+            message: format!("speech runtime construction failed: {error}"),
+        })?;
+    let speech = speech_runtime
+        .block_on(crate::speech::MomSpeech::discover(&settings.data_dir))
+        .map_err(|error| RuntimeBuildError {
+            message: format!("speech host initialization failed: {error}"),
+        })?;
     let persona_approval_recovery =
         mom_llama_runtime::PersonaToolApprovalRecovery::bind(&settings.data_dir)
             .and_then(|recovery| {
@@ -768,6 +787,7 @@ fn build_runtime(
     Ok(AppRuntimeHandle::new(
         native_owner,
         persona_approval_recovery,
+        speech,
     ))
 }
 
@@ -905,6 +925,10 @@ mod tests {
             completed_at_unix_ms: 2,
             elapsed_ms: 1,
             native_host_joined: false,
+            speech_host_joined: true,
+            speech_active_operation_count: 0,
+            speech_retained_playback_count: 0,
+            apple_inner_call_non_preemptive: true,
             operation_supervisor_phase: crate::operation_supervisor::LifecyclePhase::Closed,
             active_operation_count: 0,
             retained_operation_task_count: 0,
@@ -923,6 +947,7 @@ mod tests {
             operation_error: None,
             approval_recovery_error: None,
             native_error: Some("native join failed".to_string()),
+            speech_error: None,
         });
         assert!(!safe_to_exit_after_shutdown(&failure));
 
@@ -930,13 +955,27 @@ mod tests {
             summary: AppShutdownSummary {
                 native_host_joined: true,
                 persona_approval_recovery_complete: false,
-                ..summary
+                ..summary.clone()
             },
             operation_error: None,
             approval_recovery_error: Some("final approval sweep failed".to_string()),
             native_error: None,
+            speech_error: None,
         });
         assert!(!safe_to_exit_after_shutdown(&recovery_failure));
+        let speech_failure = Err(AppShutdownError {
+            summary: AppShutdownSummary {
+                native_host_joined: true,
+                speech_host_joined: false,
+                persona_approval_recovery_complete: true,
+                ..summary
+            },
+            operation_error: None,
+            approval_recovery_error: None,
+            native_error: None,
+            speech_error: Some("non-preemptive Apple call did not join".to_string()),
+        });
+        assert!(!safe_to_exit_after_shutdown(&speech_failure));
         assert_eq!(
             final_exit_decision(false),
             FinalExitDecision::AbortWithoutRustTeardown

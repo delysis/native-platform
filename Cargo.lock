@@ -4145,6 +4145,7 @@ name = "mom-llama-app"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "llama-native-host",
  "llama-native-types",
  "maud",
@@ -4152,6 +4153,11 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "speech-native-backend-parakeet",
+ "speech-native-host",
+ "speech-native-platform",
+ "speech-native-types",
  "tauri",
  "tauri-build",
  "thiserror 2.0.20",

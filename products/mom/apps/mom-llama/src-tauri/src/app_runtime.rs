@@ -13,6 +13,7 @@ use crate::operation_supervisor::{
     LifecyclePhase as OperationLifecyclePhase, OperationReservation, OperationSupervisor,
     TerminalClass, validate_worker_sets,
 };
+use crate::speech::{APPLE_SYNTHESIS_IS_NON_PREEMPTIVE, MomSpeech};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppPhase {
@@ -45,6 +46,10 @@ pub struct AppShutdownSummary {
     pub completed_at_unix_ms: u64,
     pub elapsed_ms: u64,
     pub native_host_joined: bool,
+    pub speech_host_joined: bool,
+    pub speech_active_operation_count: usize,
+    pub speech_retained_playback_count: usize,
+    pub apple_inner_call_non_preemptive: bool,
     /// Product-owned operation-supervisor facts at the terminal boundary.
     pub operation_supervisor_phase: OperationLifecyclePhase,
     pub active_operation_count: usize,
@@ -71,6 +76,7 @@ pub struct AppShutdownError {
     pub operation_error: Option<String>,
     pub approval_recovery_error: Option<String>,
     pub native_error: Option<String>,
+    pub speech_error: Option<String>,
 }
 
 impl std::fmt::Display for AppShutdownError {
@@ -85,6 +91,9 @@ impl std::fmt::Display for AppShutdownError {
         if let Some(error) = &self.native_error {
             write!(formatter, "; native: {error}")?;
         }
+        if let Some(error) = &self.speech_error {
+            write!(formatter, "; speech: {error}")?;
+        }
         Ok(())
     }
 }
@@ -95,6 +104,7 @@ struct AppRuntime {
     lifecycle: Mutex<AppLifecycle>,
     work_drained: Notify,
     native_host: Arc<NativeHost>,
+    speech: Arc<MomSpeech>,
     _native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
     cancellation_sweeps: AtomicU64,
     operation_scope: mom_llama_runtime::OperationScope,
@@ -517,6 +527,7 @@ impl Drop for AppWorkLease {
 
 struct AppRuntimeConstruction {
     native_host: Arc<NativeHost>,
+    speech: Arc<MomSpeech>,
     native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
     operation_scope: mom_llama_runtime::OperationScope,
     native_finalizer: Arc<dyn NativeFinalizer>,
@@ -530,12 +541,14 @@ impl AppRuntimeHandle {
     pub fn new(
         native_owner: mom_llama_runtime::native_runtime::ProductRuntimeOwner,
         persona_approval_recovery: mom_llama_runtime::PersonaToolApprovalRecovery,
+        speech: Arc<MomSpeech>,
     ) -> Self {
         let native_host = native_owner.host();
         let persona_approval_authority = persona_approval_recovery.clone();
         Self::with_operation_supervisor(AppRuntimeConstruction {
             operation_scope: mom_llama_runtime::OperationScope::for_native_host(&native_host),
             native_host,
+            speech,
             native_owner: Some(native_owner),
             native_finalizer: Arc::new(ProductNativeFinalizer),
             operation_supervisor: OperationSupervisor::new(),
@@ -556,6 +569,7 @@ impl AppRuntimeHandle {
         Self::with_operation_supervisor(AppRuntimeConstruction {
             operation_scope: mom_llama_runtime::OperationScope::for_native_host(&native_host),
             native_host,
+            speech: MomSpeech::empty_for_tests(),
             native_owner,
             native_finalizer,
             operation_supervisor: OperationSupervisor::new(),
@@ -568,6 +582,7 @@ impl AppRuntimeHandle {
     fn with_operation_supervisor(construction: AppRuntimeConstruction) -> Self {
         let AppRuntimeConstruction {
             native_host,
+            speech,
             native_owner,
             operation_scope,
             native_finalizer,
@@ -588,6 +603,7 @@ impl AppRuntimeHandle {
             }),
             work_drained: Notify::new(),
             native_host,
+            speech,
             _native_owner: native_owner,
             cancellation_sweeps: AtomicU64::new(0),
             operation_scope,
@@ -684,6 +700,10 @@ impl AppRuntimeHandle {
         self.0.operation_scope.clone()
     }
 
+    pub fn speech(&self) -> Arc<MomSpeech> {
+        Arc::clone(&self.0.speech)
+    }
+
     pub fn cancel_speculative(&self) -> Result<usize, String> {
         let request_ids = self
             .0
@@ -744,6 +764,7 @@ impl AppRuntimeHandle {
             cancellation.store(true, Ordering::Release);
         }
         self.0.operation_supervisor.begin_quiesce();
+        self.0.speech.begin_quiesce();
         true
     }
 
@@ -803,6 +824,17 @@ impl AppRuntimeHandle {
                             ));
                         }
                         (!operation_errors.is_empty()).then(|| operation_errors.join("; "))
+                    };
+                let speech_shutdown = self.0.speech.shutdown().await;
+                let (speech_error, speech_host_joined, speech_active_operation_count, speech_retained_playback_count) =
+                    match speech_shutdown {
+                        Ok(receipt) => (
+                            None,
+                            receipt.host_joined,
+                            receipt.active_operation_count,
+                            receipt.retained_playback_count,
+                        ),
+                        Err(error) => (Some(error), false, 0, 0),
                     };
                 let approval_recovery_errors = persona_approval_recovery
                     .structural_error
@@ -864,6 +896,10 @@ impl AppRuntimeHandle {
                     completed_at_unix_ms: unix_time_ms(),
                     elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     native_host_joined: native_error.is_none(),
+                    speech_host_joined,
+                    speech_active_operation_count,
+                    speech_retained_playback_count,
+                    apple_inner_call_non_preemptive: APPLE_SYNTHESIS_IS_NON_PREEMPTIVE,
                     operation_supervisor_phase,
                     active_operation_count,
                     retained_operation_task_count,
@@ -880,6 +916,7 @@ impl AppRuntimeHandle {
                 if operation_error.is_none()
                     && approval_recovery_error.is_none()
                     && native_error.is_none()
+                    && speech_error.is_none()
                 {
                     Ok(summary)
                 } else {
@@ -888,6 +925,7 @@ impl AppRuntimeHandle {
                         operation_error,
                         approval_recovery_error,
                         native_error,
+                        speech_error,
                     })
                 }
             })
@@ -937,7 +975,7 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppRuntimeConstruction, AppRuntimeHandle, NativeFinalizer,
+        AppRuntimeConstruction, AppRuntimeHandle, MomSpeech, NativeFinalizer,
         PERSONA_APPROVAL_RECOVERY_WORKER_ID, PersonaApprovalReconciler,
         PersonaApprovalRecoveryWorker,
     };
@@ -1068,6 +1106,7 @@ mod tests {
         let runtime = AppRuntimeHandle::with_operation_supervisor(AppRuntimeConstruction {
             operation_scope: mom_llama_runtime::OperationScope::for_native_host(&host),
             native_host: host,
+            speech: MomSpeech::empty_for_tests(),
             native_owner: None,
             native_finalizer: Arc::new(ReconciliationOrderingFinalizer {
                 reconciled: Arc::clone(&reconciled),
@@ -1331,6 +1370,10 @@ mod tests {
             .expect_err("the injected native finalizer fails")
             .summary
             .clone();
+        assert!(summary.speech_host_joined);
+        assert_eq!(summary.speech_active_operation_count, 0);
+        assert_eq!(summary.speech_retained_playback_count, 0);
+        assert!(summary.apple_inner_call_non_preemptive);
         assert_eq!(summary.active_product_operation_count, 0);
         assert!(
             summary

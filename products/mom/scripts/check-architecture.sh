@@ -19,9 +19,9 @@ then
   exit 1
 fi
 
-if rg -n '(fte-speech-|speech-native-|tauri-plugin-(fte-speech|free-token-energy-speech|speech-native))' --glob 'Cargo.toml' .
+if rg -n '(fte-speech-|tauri-plugin-(fte-speech|free-token-energy-speech|speech-native))' --glob 'Cargo.toml' .
 then
-  echo "speech dependencies require deliberate product UX and a separate permission review" >&2
+  echo "Mom speech must use its product-owned IPC edge, not FTE or a generic Tauri plugin" >&2
   exit 1
 fi
 
@@ -31,7 +31,7 @@ then
   exit 1
 fi
 
-if rg -n '(llama|attachment)-native-[a-z-]+\s*=\s*\{\s*path\s*=\s*"\.\.' --glob 'Cargo.toml' .
+if rg -n '(llama|attachment|speech)-native-[a-z-]+\s*=\s*\{\s*path\s*=\s*"\.\.' --glob 'Cargo.toml' .
 then
   echo "Mom child manifests must inherit imported dependencies from the root workspace" >&2
   exit 1
@@ -48,7 +48,11 @@ for dependency in \
   'fte-store = { path = "products/fte/crates/fte-store" }' \
   'fte-types = { path = "products/fte/crates/fte-types" }' \
   'attachment-native-host = { path = "crates/services/attachment/crates/attachment-native-host" }' \
-  'attachment-native-types = { path = "crates/services/attachment/crates/attachment-native-types" }'
+  'attachment-native-types = { path = "crates/services/attachment/crates/attachment-native-types" }' \
+  'speech-native-host = { path = "crates/services/speech/crates/speech-native-host" }' \
+  'speech-native-types = { path = "crates/services/speech/crates/speech-native-types" }' \
+  'speech-native-platform = { path = "crates/services/speech/crates/speech-native-platform" }' \
+  'speech-native-backend-parakeet = { path = "crates/services/speech/crates/speech-native-backend-parakeet" }'
 do
   if ! grep -Fqx "$dependency" "$root_manifest"
   then
@@ -69,9 +73,9 @@ then
   echo "Mom Llama's resolved graph still contains the standalone FTE product" >&2
   exit 1
 fi
-if printf '%s\n' "$mom_tree" | rg -n '^(fte-speech-|speech-native-|tauri-plugin-(free-token-energy-speech|speech-native))'
+if printf '%s\n' "$mom_tree" | rg -n '^(fte-speech-|tauri-plugin-(free-token-energy-speech|speech-native))'
 then
-  echo "Mom Llama must not resolve speech packages without deliberate speech UX" >&2
+  echo "Mom Llama must not resolve FTE speech or a generic speech plugin" >&2
   exit 1
 fi
 
@@ -84,6 +88,19 @@ do
   if ! cargo tree --locked -p mom-llama-app -i "$native_package@0.1.0" >/dev/null
   then
     echo "the native package identity is missing or ambiguous: $native_package" >&2
+    exit 1
+  fi
+done
+
+for speech_package in \
+  speech-native-host \
+  speech-native-types \
+  speech-native-platform \
+  speech-native-backend-parakeet
+do
+  if ! cargo tree --locked -p mom-llama-app -i "$speech_package@0.1.0" >/dev/null
+  then
+    echo "the Mom speech package identity is missing or ambiguous: $speech_package" >&2
     exit 1
   fi
 done
@@ -118,4 +135,4 @@ then
   exit 1
 fi
 
-echo "architecture ok: Mom owns product code, resolves Native and Attachment, and does not compose standalone FTE"
+echo "architecture ok: Mom owns product code and narrow Speech IPC, resolves Native/Attachment/Speech, and does not compose standalone FTE or a generic speech plugin"

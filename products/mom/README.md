@@ -36,7 +36,7 @@ dependency graph and the exact present status of speech.
   current proof only when it is explicitly source-bound; older path/date-only
   receipts remain informative.
 
-Native, Attachment, and the shared platform contracts are resolved from their
+Native, Attachment, Speech, and the shared platform contracts are resolved from their
 imported monorepo paths and one root lock. FTE remains in the root workspace for
 its standalone product, but no FTE crate or permission is in Mom's dependency
 graph. No retired first-party Git source remains in Mom's dependency graph.

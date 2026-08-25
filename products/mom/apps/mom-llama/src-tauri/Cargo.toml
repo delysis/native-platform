@@ -14,9 +14,15 @@ anyhow = "1"
 mom-llama-runtime.workspace = true
 llama-native-types = { workspace = true }
 llama-native-host = { workspace = true }
+speech-native-host.workspace = true
+speech-native-types.workspace = true
+speech-native-platform.workspace = true
+speech-native-backend-parakeet.workspace = true
 maud = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2.workspace = true
+async-trait.workspace = true
 tauri = { version = "2", features = [] }
 tokio.workspace = true
 thiserror.workspace = true

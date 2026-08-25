@@ -4,7 +4,7 @@
 llama-native-kit ─────────────────────────────> mom-llama
        └──────────────> free-token-energy (standalone)
 
-speech-native-kit ────────────────────────────────> mom-llama (only when UX ships)
+speech-native-kit ────────────────────────────────> mom-llama (narrow product-owned UX)
 
 attachment-native-kit ────────────────────────────> mom-llama
 
@@ -36,12 +36,21 @@ this app or bundled into the provider gateway:
 - `speech-native-backend-parakeet`: resident local Parakeet STT using the Hugging Face
   cache.
 
-Mom Llama does not yet register a speech backend or expose microphone/read-aloud
-UX. It installs neither the FTE gateway plugin nor a speech plugin and grants no
-permissions for either. When speech UX ships, Mom Llama may consume the speech
-crates directly and own the narrow IPC/permission edge without inheriting
-hosted providers or loopback authority. Audio attachments for multimodal
-llama.cpp input are a separate product feature and are not STT.
+Mom Llama's shared `AppRuntime` owns one `SpeechHost` with two intentionally
+narrow operations. Read Aloud captures an exact assistant message ID and text
+hash, selects an installed never-network Apple voice from the bound descriptor,
+and accepts only one complete WAV. Mom owns the bounded WebView audio session,
+progress, Stop, byte revocation and Quit join. Apple's synchronous inner
+synthesis call is non-preemptive: Stop suppresses late publication/playback,
+while shutdown waits for that call rather than claiming to interrupt it.
+
+Audio-attachment transcription re-presents the exact Attachment ID, root hash,
+artifact ID and policy fingerprint, then sends the verified canonical WAV as a
+complete input to the exact manifest-bound Parakeet model. Mom displays the
+transcript and provenance. Insertion is a separate explicit ordinary composer
+edit; transcription never mutates a draft or sends a message. There is no
+microphone, streaming TTS, hosted route, FTE composition, loopback, generic
+speech Tauri plugin or speech permission.
 
 ## Attachment status
 
@@ -78,6 +87,6 @@ can execute at most one exact tool call.
 ## Enforced negative boundaries
 
 `scripts/check-architecture.sh` rejects copied native/attachment crates,
-FTE or undeclared speech dependencies, retired first-party Git sources in
+FTE/generic-plugin speech dependencies outside the reviewed set, retired first-party Git sources in
 Mom's locked graph, child-manifest path overrides, and product network/process
 authority outside the bounded MCP adapter.
