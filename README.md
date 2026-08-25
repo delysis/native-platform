@@ -45,12 +45,12 @@ ignored-test inventory listing; when the planner selects `ignored-tests`, run
 `cargo xtask lean verify` is an explicit historical W8/W9 census check, not
 part of ordinary policy.
 
-PR selection still uses the authoritative path planner. Its Cargo-metadata
-reverse-dependency result is emitted only as `dependency_shadow`; mismatches
-cannot change required jobs. `ci/ci-path-exceptions.json` contains the small
-non-Cargo asset/platform exception set. Until shadow promotion, Native,
-Attachment, Information, Speech, and FTE contract changes conservatively add
-Mom coverage.
+PR selection derives changed packages and local reverse consumers from locked
+Cargo metadata. `dependency_selection` is applied; unknown or unavailable
+metadata forces the full plan. `ci/ci-path-exceptions.json` contains only
+evidenced non-Cargo asset, platform, workspace, and workflow rules. The former
+path planner remains under `dependency_shadow` as an observational equivalence
+report, and any unexplained reduction against it also forces full coverage.
 
 Lifecycle, migration, and SQLite identity checks live with the product or
 service that owns the behavior. Product UI, real-model, and loaded-model

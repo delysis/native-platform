@@ -15,6 +15,7 @@ const releasePath = path.join(root, ".github/workflows/release-macos.yml");
 const releaseScriptPath = path.join(root, "scripts/release-macos.sh");
 const smokeScriptPath = path.join(root, "scripts/smoke-macos-app.sh");
 const embeddedModelScriptPath = path.join(root, "scripts/find-embedded-model.mjs");
+const workflowSnapshotPath = path.join(root, "ci/ci-workflow-snapshot.json");
 const momPackagePath = path.join(
   root,
   "products/mom/apps/mom-llama/package.json",
@@ -26,6 +27,11 @@ const momWindowsIconPath = path.join(
 
 function read(file) {
   return fs.readFileSync(file, "utf8");
+}
+
+function workflowJobIds(source) {
+  const jobs = source.slice(source.indexOf("\njobs:\n") + "\njobs:\n".length);
+  return [...jobs.matchAll(/^  ([a-z][a-z0-9-]+):$/gm)].map((match) => match[1]);
 }
 
 function sha256(file) {
@@ -385,6 +391,54 @@ test("PR workflow is always triggered and has one truthful aggregate", () => {
     source,
     /node --test scripts\/ci\/test-ci-metadata-shadow\.mjs scripts\/ci\/test-ci-plan\.mjs scripts\/ci\/test-ci-required\.mjs scripts\/ci\/test-ignored-tests\.mjs scripts\/ci\/test-product-state-backup\.mjs scripts\/ci\/test-workflows\.mjs/,
   );
+});
+
+test("required job names and workflow matrices match the checked-in R3 snapshot", () => {
+  const snapshot = JSON.parse(read(workflowSnapshotPath));
+  const pr = read(prPath);
+  const full = read(fullPath);
+  assert.equal(snapshot.schema, "native-platform.ci-workflow-snapshot.v1");
+  assert.match(pr, new RegExp(`^name: ${snapshot.pr.workflow_name}$`, "m"));
+  assert.match(full, new RegExp(`^name: ${snapshot.full.workflow_name}$`, "m"));
+  assert.deepEqual(workflowJobIds(pr), snapshot.pr.job_ids);
+  assert.deepEqual(workflowJobIds(full), snapshot.full.job_ids);
+  assert.match(
+    pr,
+    new RegExp(
+      `^  ${snapshot.pr.required_check}:\\n    name: ${snapshot.pr.required_check}$`,
+      "m",
+    ),
+  );
+
+  const commandMatrices = [...pr.matchAll(/^\s+command: \[([^\]]+)\]$/gm)].map(
+    (match) => match[1].split(",").map((value) => value.trim()),
+  );
+  assert.ok(commandMatrices.length > 0);
+  for (const matrix of commandMatrices) {
+    assert.deepEqual(matrix, snapshot.pr.command_matrix);
+  }
+
+  const ignoredBlock = pr.match(/^  ignored-tests:[\s\S]*?(?=^  fuzz-build:)/m)?.[0];
+  const ignoredMatrix = ignoredBlock
+    ?.match(/^\s+os: \[([^\]]+)\]$/m)?.[1]
+    .split(",")
+    .map((value) => value.trim());
+  assert.deepEqual(ignoredMatrix, snapshot.pr.ignored_test_os_matrix);
+
+  const macosComponents = [
+    ...new Set(
+      [...pr.matchAll(/matrix\.component (?:==|!=) '([^']+)'/g)].map(
+        (match) => match[1],
+      ),
+    ),
+  ].sort();
+  assert.deepEqual(macosComponents, [...snapshot.pr.macos_component_superset].sort());
+
+  const fullMatrices = [...full.matchAll(/^\s+os: \[([^\]]+)\]$/gm)].map(
+    (match) => match[1].split(",").map((value) => value.trim()),
+  );
+  assert.ok(fullMatrices.length > 0);
+  for (const matrix of fullMatrices) assert.deepEqual(matrix, snapshot.full.os_matrix);
 });
 
 test("full CI reconciles each current-platform ignored-test subset through guarded listing", () => {

@@ -9,6 +9,61 @@ import test from "node:test";
 
 const planner = path.resolve(import.meta.dirname, "ci-plan.mjs");
 
+const metadataPackages = [
+  ["llama-native-types", "crates/native/crates/llama-native-types", []],
+  ["llama-native-engine", "crates/native/crates/llama-native-engine", ["llama-native-types"]],
+  ["llama-native-host", "crates/native/crates/llama-native-host", ["llama-native-engine"]],
+  ["attachment-native-types", "crates/services/attachment/crates/attachment-native-types", []],
+  ["attachment-native-inspect", "crates/services/attachment/crates/attachment-native-inspect", ["attachment-native-types"]],
+  ["information-native-types", "crates/services/information/crates/information-native-types", []],
+  ["information-native-store", "crates/services/information/crates/information-native-store", ["information-native-types"]],
+  ["speech-native-types", "crates/services/speech/crates/speech-native-types", []],
+  ["speech-native-host", "crates/services/speech/crates/speech-native-host", ["speech-native-types"]],
+  ["speech-native-platform", "crates/services/speech/crates/speech-native-platform", ["speech-native-types"]],
+  ["fte-types", "products/fte/crates/fte-types", []],
+  ["fte-backend-llama", "products/fte/crates/fte-backend-llama", ["fte-types", "llama-native-host"]],
+  ["free-token-energy", "products/fte/src-tauri", ["fte-backend-llama"]],
+  ["mom-llama-runtime", "products/mom/crates/mom-llama-runtime", ["attachment-native-types", "fte-types", "llama-native-host"]],
+  ["mom-llama-cli", "products/mom/crates/mom-llama-cli", ["mom-llama-runtime"]],
+  ["mom-llama-app", "products/mom/apps/mom-llama/src-tauri", ["mom-llama-runtime", "speech-native-host", "speech-native-platform"]],
+  ["loom-types", "products/loom/crates/loom-types", []],
+  ["loom-backend-llama", "products/loom/crates/loom-backend-llama", ["llama-native-host", "loom-types"]],
+  ["loom-app", "products/loom/apps/loom/src-tauri", ["loom-backend-llama"]],
+  ["xtask", "xtask", []],
+];
+
+function writeMetadataFixture(repo) {
+  const canonicalRepo = fs.realpathSync(repo);
+  const ids = new Map(
+    metadataPackages.map(([name, packageRoot]) => [
+      name,
+      `path+file://${canonicalRepo}/${packageRoot}#${name}@0.0.0`,
+    ]),
+  );
+  const roots = new Map(metadataPackages.map(([name, packageRoot]) => [name, packageRoot]));
+  const metadata = {
+    packages: metadataPackages.map(([name, packageRoot, dependencies]) => ({
+      name,
+      id: ids.get(name),
+      manifest_path: path.join(canonicalRepo, packageRoot, "Cargo.toml"),
+      dependencies: dependencies.map((dependency) => ({
+        name: dependency,
+        path: path.join(canonicalRepo, roots.get(dependency)),
+      })),
+    })),
+    workspace_members: metadataPackages.map(([name]) => ids.get(name)),
+    resolve: {
+      nodes: metadataPackages.map(([name, , dependencies]) => ({
+        id: ids.get(name),
+        deps: dependencies.map((dependency) => ({ pkg: ids.get(dependency) })),
+      })),
+    },
+  };
+  const metadataPath = path.join(repo, ".ci-cargo-metadata.json");
+  fs.writeFileSync(metadataPath, `${JSON.stringify(metadata)}\n`);
+  return metadataPath;
+}
+
 function git(cwd, ...args) {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
@@ -35,7 +90,7 @@ function makeRepo() {
   return { repo, base };
 }
 
-function plan(repo, base, head, outputPath) {
+function plan(repo, base, head, outputPath, metadataPath = writeMetadataFixture(repo)) {
   const result = spawnSync(process.execPath, [planner], {
     cwd: repo,
     encoding: "utf8",
@@ -44,11 +99,21 @@ function plan(repo, base, head, outputPath) {
       CI_BASE_SHA: base,
       CI_HEAD_SHA: head,
       GITHUB_EVENT_NAME: "pull_request",
+      CI_CARGO_METADATA_PATH: metadataPath,
+      CARGO: "/fixture/cargo-must-not-be-probed",
       ...(outputPath ? { GITHUB_OUTPUT: outputPath } : {}),
     },
   });
   assert.equal(result.status, 0, result.stderr);
-  return JSON.parse(result.stdout);
+  const parsed = JSON.parse(result.stdout);
+  if (metadataPath === path.join(repo, ".ci-cargo-metadata.json")) {
+    assert.equal(
+      parsed.dependency_selection.metadata_status,
+      "available",
+      parsed.dependency_selection.reason,
+    );
+  }
+  return parsed;
 }
 
 function fixture(relativePath, { contents = "changed\n", present = [] } = {}) {
@@ -149,7 +214,7 @@ test("Speech Apple changes select Speech and platform coverage", () => {
   assert.deepEqual(result.macos_matrix, ["release", "speech"]);
 });
 
-test("contract-family changes conservatively include Mom while metadata stays shadow-only", () => {
+test("contract-family changes include metadata consumers while the Mom overlay stays shadow-only", () => {
   const contractPaths = [
     "crates/native/crates/llama-native-types/src/lib.rs",
     "crates/services/attachment/crates/attachment-native-types/src/lib.rs",
@@ -165,8 +230,10 @@ test("contract-family changes conservatively include Mom while metadata stays sh
     assert.ok(result.jobs.includes("mom-linux"), contractPath);
     assert.equal(result.conservative_overlays.mom_contracts.applied, true);
     assert.deepEqual(result.conservative_overlays.mom_contracts.paths, [contractPath]);
+    assert.equal(result.conservative_overlays.mom_contracts.applied_to_selection, false);
+    assert.equal(result.dependency_selection.selection_applied, true);
+    assert.equal(result.dependency_selection.metadata_status, "available");
     assert.equal(result.dependency_shadow.selection_applied, false);
-    assert.equal(result.dependency_shadow.promotion_allowed, false);
   }
 });
 
@@ -177,6 +244,38 @@ test("contract-family documentation does not trigger the temporary Mom overlay",
   assert.equal(result.flags.speech, true);
   assert.equal(result.flags.mom, false);
   assert.equal(result.conservative_overlays.mom_contracts.applied, false);
+});
+
+test("an unexplained legacy reduction forces full instead of narrowing generated selection", () => {
+  const { result } = fixture(
+    "crates/services/information/crates/information-native-types/src/lib.rs",
+    { present: ["products/mom/Cargo.toml"] },
+  );
+  assert.equal(result.dependency_selection.fallback, "full");
+  assert.ok(
+    result.dependency_selection.fallback_reasons.includes(
+      "legacy_reduction_without_evidence",
+    ),
+  );
+  assert.equal(result.flags.full, true);
+  assert.ok(result.dependency_shadow.missing_from_generated.includes("job:mom-linux"));
+  assert.ok(result.dependency_shadow.final_surface.includes("flag:full"));
+});
+
+test("an explicit non-graph evidence rule can authorize a reviewed legacy reduction", () => {
+  const { result } = fixture("products/mom/docs/PRODUCT.md", {
+    present: ["products/mom/Cargo.toml"],
+  });
+  assert.equal(result.flags.full, false);
+  assert.deepEqual(result.jobs, ["policy"]);
+  assert.deepEqual(result.dependency_shadow.missing_from_generated, ["job:mom-linux"]);
+  assert.deepEqual(result.dependency_shadow.reduction_evidence, [
+    {
+      path: "products/mom/docs/PRODUCT.md",
+      rule: "products/mom/docs",
+      evidence: "Mom documentation is policy-only",
+    },
+  ]);
 });
 
 test("Mom native source selects its product and macOS parity without root duplication", () => {
@@ -305,8 +404,8 @@ test("product package scripts select their owned frontend checks", () => {
 });
 
 test("Mom dependency metadata remains conservative", () => {
-  const { result } = fixture("products/mom/Cargo.toml", {
-    contents: "[workspace]\nmembers = []\n",
+  const { result } = fixture("products/mom/crates/mom-llama-runtime/Cargo.toml", {
+    contents: "[package]\nname = \"mom-llama-runtime\"\n",
     present: ["products/mom/Cargo.toml"],
   });
   assert.equal(result.flags.root, true);
@@ -378,6 +477,78 @@ test("unknown additions and deletions fail closed to full", () => {
   const deleted = commit(repo, "delete unknown");
   assert.equal(plan(repo, withUnknown, deleted).flags.full, true);
   assert.notEqual(base, withUnknown);
+});
+
+test("metadata unavailability forces the unchanged complete job and macOS matrices", () => {
+  const { repo, base } = makeRepo();
+  write(repo, "docs/note.md");
+  const head = commit(repo, "docs");
+  const result = plan(
+    repo,
+    base,
+    head,
+    undefined,
+    path.join(repo, "missing-cargo-metadata.json"),
+  );
+  assert.equal(result.dependency_selection.metadata_status, "unavailable");
+  assert.equal(result.dependency_selection.fallback, "full");
+  assert.equal(result.flags.full, true);
+  assert.deepEqual(result.macos_matrix, [
+    "release",
+    "root",
+    "attachment",
+    "information",
+    "speech",
+  ]);
+  assert.deepEqual(result.jobs, [
+    "policy",
+    "root-linux",
+    "native-linux",
+    "gateway-linux",
+    "attachment-linux",
+    "information-linux",
+    "speech-linux",
+    "frontend",
+    "platform-macos",
+    "ignored-tests",
+    "dependency-graph",
+    "fuzz-build",
+  ]);
+});
+
+test("planner applies metadata reverse consumers and retains a legacy shadow report", () => {
+  const { result } = fixture(
+    "crates/native/crates/llama-native-types/src/lib.rs",
+    {
+      present: [
+        "products/mom/Cargo.toml",
+        "products/loom/apps/loom/src-tauri/Cargo.toml",
+      ],
+    },
+  );
+  assert.deepEqual(result.dependency_selection.changed_packages, ["llama-native-types"]);
+  for (const packageName of [
+    "free-token-energy",
+    "fte-backend-llama",
+    "llama-native-engine",
+    "llama-native-host",
+    "loom-app",
+    "loom-backend-llama",
+    "mom-llama-app",
+    "mom-llama-cli",
+    "mom-llama-runtime",
+  ]) {
+    assert.ok(
+      result.dependency_selection.reverse_dependency_closure.includes(packageName),
+      packageName,
+    );
+  }
+  assert.equal(result.flags.full, false);
+  assert.equal(result.flags.gateway, true);
+  assert.equal(result.flags.mom, true);
+  assert.equal(result.flags.loom, true);
+  assert.equal(result.dependency_shadow.mode, "legacy-shadow");
+  assert.equal(result.dependency_shadow.generated_is_at_least_as_conservative, true);
 });
 
 test("renaming runtime source into docs retains the source-side coverage", () => {

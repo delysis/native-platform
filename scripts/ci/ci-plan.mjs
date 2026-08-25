@@ -4,9 +4,10 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  computeReverseDependencyShadow,
+  computeMetadataSelection,
+  legacyEquivalenceReport,
   readCargoMetadata,
-  unavailableShadow,
+  unavailableSelection,
 } from "./ci-metadata-shadow.mjs";
 
 function requiredEnv(name) {
@@ -92,22 +93,28 @@ function markPlatform() {
   flags.platform_macos = true;
 }
 
+function forceFullFlags(target) {
+  target.full = true;
+  target.root = true;
+  target.native = true;
+  target.gateway = true;
+  target.attachment = true;
+  target.information = true;
+  target.speech = true;
+  target.mom = presence.mom;
+  target.loom = presence.loom;
+  target.frontend_fte = true;
+  target.frontend_mom = presence.mom;
+  target.frontend_loom = presence.loom;
+  target.dependency_graph = true;
+  target.fuzz = true;
+  target.ignored_tests = true;
+  target.platform_linux = true;
+  target.platform_macos = true;
+}
+
 function forceFull(nextRisk = "dependency") {
-  flags.full = true;
-  flags.root = true;
-  flags.native = true;
-  flags.gateway = true;
-  flags.attachment = true;
-  flags.information = true;
-  flags.speech = true;
-  flags.mom = presence.mom;
-  flags.loom = presence.loom;
-  flags.frontend_fte = true;
-  flags.frontend_mom = presence.mom;
-  flags.frontend_loom = presence.loom;
-  flags.dependency_graph = true;
-  flags.fuzz = true;
-  flags.ignored_tests = true;
+  forceFullFlags(flags);
   markPlatform();
   risk = nextRisk;
 }
@@ -333,11 +340,8 @@ for (const changedPath of changed) {
   if (!recognized) forceFull();
 }
 
-// This is an explicitly conservative bridge while metadata selection remains
-// observational. Mom already consumes Native, Attachment and FTE contracts,
-// and the staged architecture will consume Speech and Information contracts.
-// A contract-family change therefore exercises Mom even where today's Cargo
-// graph has not acquired the future edge yet.
+// Preserve the former path planner as an observational baseline. It no longer
+// selects jobs; any unexplained reduction against it fails closed to full.
 const momContractPaths = changed.filter(isMomContractDependencyChange);
 const momContractOverlay = {
   applied: presence.mom && momContractPaths.length > 0,
@@ -350,66 +354,203 @@ if (momContractOverlay.applied) {
   markBehavior();
 }
 
-function selectedPrimaryGroups(primary) {
-  if (flags.full || flags.root) return Object.keys(primary);
-  const groups = [];
-  if (flags.native) groups.push("native");
-  if (flags.gateway) groups.push("gateway");
-  if (flags.attachment) groups.push("service-attachment");
-  if (flags.information) groups.push("service-information");
-  if (flags.speech) groups.push("service-speech");
-  if (flags.mom) groups.push("product-mom");
-  if (flags.loom) groups.push("product-loom");
-  return groups;
-}
+const legacyFlags = { ...flags };
+const legacyRisk = risk;
+const packageGroups = JSON.parse(
+  fs.readFileSync(path.join(plannerRoot, "ci/package-groups.json"), "utf8"),
+);
+const pathExceptions = JSON.parse(
+  fs.readFileSync(path.join(plannerRoot, "ci/ci-path-exceptions.json"), "utf8"),
+);
 
-let dependencyShadow;
+let dependencySelection;
 try {
-  const packageGroups = JSON.parse(fs.readFileSync("ci/package-groups.json", "utf8"));
-  const pathExceptions = JSON.parse(
-    fs.readFileSync("ci/ci-path-exceptions.json", "utf8"),
-  );
-  dependencyShadow = computeReverseDependencyShadow({
+  dependencySelection = computeMetadataSelection({
     metadata: readCargoMetadata(process.cwd()),
     repoRoot: process.cwd(),
     changed,
     packageGroups,
     pathExceptions,
-    authoritativePrimaryGroups: selectedPrimaryGroups(packageGroups.primary),
   });
 } catch (error) {
-  dependencyShadow = unavailableShadow(String(error.message ?? error));
+  dependencySelection = unavailableSelection(
+    String(error.message ?? error),
+    packageGroups,
+  );
 }
 
-const jobs = ["policy"];
-if (flags.root || flags.full) jobs.push("root-linux");
-if (flags.native || flags.full) jobs.push("native-linux");
-if (flags.gateway || flags.full) jobs.push("gateway-linux");
-if (flags.attachment || flags.full) jobs.push("attachment-linux");
-if (flags.information || flags.full) jobs.push("information-linux");
-if (flags.speech || flags.full) jobs.push("speech-linux");
-if (presence.mom && (flags.mom || flags.full)) jobs.push("mom-linux");
-if (presence.loom && (flags.loom || flags.full)) jobs.push("loom-linux");
-if (flags.frontend_fte || flags.frontend_mom || flags.frontend_loom || flags.full) {
-  jobs.push("frontend");
-}
-if (flags.platform_macos || flags.full) jobs.push("platform-macos");
-if (flags.ignored_tests || flags.full) jobs.push("ignored-tests");
-if (flags.dependency_graph || flags.full) jobs.push("dependency-graph");
-if (flags.fuzz || flags.full) jobs.push("fuzz-build");
+const generatedFlags = Object.fromEntries(
+  Object.keys(flags).map((name) => [name, name === "policy"]),
+);
 
-const macosMatrix = [];
-if (flags.platform_macos || flags.full) {
-  macosMatrix.push("release");
-  if (flags.root || flags.native || flags.gateway || flags.full) {
-    macosMatrix.push("root");
+function applyPrimaryGroup(group) {
+  switch (group) {
+    case "native":
+      generatedFlags.native = true;
+      generatedFlags.root = true;
+      generatedFlags.platform_macos = true;
+      break;
+    case "gateway":
+    case "product-fte":
+      generatedFlags.gateway = true;
+      generatedFlags.root = true;
+      break;
+    case "service-attachment":
+      generatedFlags.attachment = true;
+      break;
+    case "service-information":
+      generatedFlags.information = true;
+      break;
+    case "service-speech":
+      generatedFlags.speech = true;
+      generatedFlags.platform_macos = true;
+      break;
+    case "product-mom":
+      generatedFlags.mom = presence.mom;
+      break;
+    case "product-loom":
+      generatedFlags.loom = presence.loom;
+      break;
+    case "diagnostic":
+      break;
+    default:
+      throw new Error(`primary group has no CI lane mapping: ${group}`);
   }
-  if (presence.mom && (flags.mom || flags.full)) macosMatrix.push("mom");
-  if (flags.attachment || flags.full) macosMatrix.push("attachment");
-  if (flags.information || flags.full) macosMatrix.push("information");
-  if (flags.speech || flags.full) macosMatrix.push("speech");
-  if (presence.loom && (flags.loom || flags.full)) macosMatrix.push("loom");
 }
+
+for (const group of dependencySelection.primary_groups) applyPrimaryGroup(group);
+if (dependencySelection.primary_groups.length > 0) generatedFlags.platform_linux = true;
+
+const closure = new Set(dependencySelection.reverse_dependency_closure);
+const secondary = packageGroups.secondary ?? {};
+if ((secondary["platform-linux"] ?? []).some((name) => closure.has(name))) {
+  generatedFlags.platform_linux = true;
+}
+if ((secondary["platform-macos"] ?? []).some((name) => closure.has(name))) {
+  generatedFlags.platform_macos = true;
+}
+if ((secondary.fuzz ?? []).some((name) => closure.has(name))) {
+  generatedFlags.fuzz = true;
+}
+for (const packageName of (secondary.frontend ?? []).filter((name) => closure.has(name))) {
+  if (packageGroups.primary["product-fte"]?.includes(packageName)) {
+    generatedFlags.frontend_fte = true;
+  }
+  if (packageGroups.primary["product-mom"]?.includes(packageName) && presence.mom) {
+    generatedFlags.frontend_mom = true;
+  }
+  if (packageGroups.primary["product-loom"]?.includes(packageName) && presence.loom) {
+    generatedFlags.frontend_loom = true;
+  }
+}
+
+for (const effect of dependencySelection.effects) {
+  if (effect in generatedFlags) generatedFlags[effect] = true;
+}
+generatedFlags.frontend_mom &&= presence.mom;
+generatedFlags.frontend_loom &&= presence.loom;
+
+for (const changedPath of changed) {
+  const basename = path.posix.basename(changedPath);
+  if (isIgnoredInventoryChange(changedPath)) generatedFlags.ignored_tests = true;
+  if (["Cargo.toml", "Cargo.lock", "build.rs"].includes(basename)) {
+    generatedFlags.dependency_graph = true;
+    generatedFlags.root = true;
+    generatedFlags.platform_linux = true;
+    generatedFlags.platform_macos = true;
+  }
+}
+if (dependencySelection.fallback === "full") forceFullFlags(generatedFlags);
+
+function jobsFor(selectedFlags) {
+  const selected = ["policy"];
+  if (selectedFlags.root || selectedFlags.full) selected.push("root-linux");
+  if (selectedFlags.native || selectedFlags.full) selected.push("native-linux");
+  if (selectedFlags.gateway || selectedFlags.full) selected.push("gateway-linux");
+  if (selectedFlags.attachment || selectedFlags.full) selected.push("attachment-linux");
+  if (selectedFlags.information || selectedFlags.full) selected.push("information-linux");
+  if (selectedFlags.speech || selectedFlags.full) selected.push("speech-linux");
+  if (presence.mom && (selectedFlags.mom || selectedFlags.full)) selected.push("mom-linux");
+  if (presence.loom && (selectedFlags.loom || selectedFlags.full)) selected.push("loom-linux");
+  if (
+    selectedFlags.frontend_fte ||
+    selectedFlags.frontend_mom ||
+    selectedFlags.frontend_loom ||
+    selectedFlags.full
+  ) {
+    selected.push("frontend");
+  }
+  if (selectedFlags.platform_macos || selectedFlags.full) selected.push("platform-macos");
+  if (selectedFlags.ignored_tests || selectedFlags.full) selected.push("ignored-tests");
+  if (selectedFlags.dependency_graph || selectedFlags.full) selected.push("dependency-graph");
+  if (selectedFlags.fuzz || selectedFlags.full) selected.push("fuzz-build");
+  return [...new Set(selected)];
+}
+
+function macosMatrixFor(selectedFlags) {
+  const matrix = [];
+  if (selectedFlags.platform_macos || selectedFlags.full) {
+    matrix.push("release");
+    if (selectedFlags.root || selectedFlags.native || selectedFlags.gateway || selectedFlags.full) {
+      matrix.push("root");
+    }
+    if (presence.mom && (selectedFlags.mom || selectedFlags.full)) matrix.push("mom");
+    if (selectedFlags.attachment || selectedFlags.full) matrix.push("attachment");
+    if (selectedFlags.information || selectedFlags.full) matrix.push("information");
+    if (selectedFlags.speech || selectedFlags.full) matrix.push("speech");
+    if (presence.loom && (selectedFlags.loom || selectedFlags.full)) matrix.push("loom");
+  }
+  return matrix;
+}
+
+function selectionSurface(selectedFlags) {
+  return [
+    ...jobsFor(selectedFlags).map((name) => `job:${name}`),
+    ...macosMatrixFor(selectedFlags).map((name) => `macos:${name}`),
+    ...["frontend_fte", "frontend_mom", "frontend_loom"]
+      .filter((name) => selectedFlags[name])
+      .map((name) => `flag:${name}`),
+    ...(selectedFlags.full ? ["flag:full"] : []),
+  ].sort();
+}
+
+const legacySurface = selectionSurface(legacyFlags);
+const generatedSurface = selectionSurface(generatedFlags);
+const generatedSet = new Set(generatedSurface);
+const missingLegacy = legacySurface.filter((item) => !generatedSet.has(item));
+const reductionEvidence = dependencySelection.file_classifications
+  .filter((record) => record.authorizes_legacy_reduction)
+  .map((record) => ({ path: record.path, rule: record.rule, evidence: record.evidence }));
+const allChangesAuthorizeReduction =
+  dependencySelection.file_classifications.length > 0 &&
+  dependencySelection.file_classifications.every(
+    (record) => record.authorizes_legacy_reduction === true,
+  );
+if (missingLegacy.length > 0 && !allChangesAuthorizeReduction) {
+  forceFullFlags(generatedFlags);
+  dependencySelection = {
+    ...dependencySelection,
+    fallback: "full",
+    fallback_reasons: [
+      ...dependencySelection.fallback_reasons,
+      "legacy_reduction_without_evidence",
+    ],
+  };
+}
+
+Object.assign(flags, generatedFlags);
+if (flags.full && legacyRisk !== "release") risk = "dependency";
+else risk = legacyRisk;
+
+const jobs = jobsFor(flags);
+const macosMatrix = macosMatrixFor(flags);
+const dependencyShadow = legacyEquivalenceReport({
+  legacySurface,
+  generatedSurface,
+  finalSurface: selectionSurface(flags),
+  reductionEvidence,
+  fallbackReasons: dependencySelection.fallback_reasons,
+});
 
 const plan = {
   schema: "native-platform.ci-plan.v1",
@@ -421,11 +562,12 @@ const plan = {
   presence,
   flags,
   conservative_overlays: {
-    mom_contracts: momContractOverlay,
+    mom_contracts: { ...momContractOverlay, applied_to_selection: false },
   },
+  dependency_selection: dependencySelection,
   dependency_shadow: dependencyShadow,
   macos_matrix: macosMatrix,
-  jobs: [...new Set(jobs)],
+  jobs,
 };
 
 const compact = JSON.stringify(plan);

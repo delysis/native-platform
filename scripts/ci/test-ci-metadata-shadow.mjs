@@ -4,36 +4,52 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { computeReverseDependencyShadow } from "./ci-metadata-shadow.mjs";
+import {
+  computeMetadataSelection,
+  legacyEquivalenceReport,
+  unavailableSelection,
+} from "./ci-metadata-shadow.mjs";
 
 const repoRoot = "/workspace";
 
-function packageRecord(name, root, dependencies = []) {
+function packageId(name, root) {
+  return `path+file://${repoRoot}/${root}#${name}@0.1.0`;
+}
+
+function metadataFixture(records, edges = {}) {
+  const roots = new Map(records.map(({ name, root }) => [name, root]));
+  const ids = new Map(records.map(({ name, root }) => [name, packageId(name, root)]));
   return {
-    name,
-    id: `path+file://${repoRoot}/${root}#0.1.0`,
-    manifest_path: `${repoRoot}/${root}/Cargo.toml`,
-    dependencies: dependencies.map((dependencyRoot) => ({
-      name: dependencyRoot.split("/").at(-1),
-      path: `${repoRoot}/${dependencyRoot}`,
+    packages: records.map(({ name, root }) => ({
+      name,
+      id: ids.get(name),
+      manifest_path: `${repoRoot}/${root}/Cargo.toml`,
+      dependencies: (edges[name] ?? []).map((dependency) => ({
+        name: dependency,
+        path: `${repoRoot}/${roots.get(dependency)}`,
+      })),
     })),
+    workspace_members: records.map(({ name, root }) => packageId(name, root)),
+    resolve: {
+      nodes: records.map(({ name }) => ({
+        id: ids.get(name),
+        deps: (edges[name] ?? []).map((dependency) => ({ pkg: ids.get(dependency) })),
+      })),
+    },
   };
 }
 
-const metadata = {
-  packages: [
-    packageRecord("types", "crates/types"),
-    packageRecord("host", "crates/host", ["crates/types"]),
-    packageRecord("mom", "products/mom/src-tauri", ["crates/host"]),
-    packageRecord("unrelated", "crates/unrelated"),
-  ],
-  workspace_members: [
-    `path+file://${repoRoot}/crates/types#0.1.0`,
-    `path+file://${repoRoot}/crates/host#0.1.0`,
-    `path+file://${repoRoot}/products/mom/src-tauri#0.1.0`,
-    `path+file://${repoRoot}/crates/unrelated#0.1.0`,
-  ],
-};
+const records = [
+  { name: "types", root: "crates/types" },
+  { name: "host", root: "crates/host" },
+  { name: "mom", root: "products/mom/src-tauri" },
+  { name: "unrelated", root: "crates/unrelated" },
+];
+
+const metadata = metadataFixture(records, {
+  host: ["types"],
+  mom: ["host"],
+});
 
 const packageGroups = {
   primary: {
@@ -42,76 +58,165 @@ const packageGroups = {
     product: ["mom"],
     unrelated: ["unrelated"],
   },
+  secondary: {},
 };
 
 const pathExceptions = {
-  asset_groups: [{ prefix: "products/mom/ui", primary_group: "product" }],
-  authoritative_exceptions: [{ prefix: "docs", kind: "documentation" }],
+  schema: "native-platform.ci-path-exceptions.v2",
+  rules: [
+    {
+      prefix: "products/mom/ui",
+      kind: "asset",
+      primary_groups: ["product"],
+      effects: ["frontend_mom"],
+      evidence: "fixture asset",
+    },
+    {
+      prefix: ".github/workflows",
+      kind: "workflow",
+      effects: ["ignored_tests"],
+      evidence: "fixture workflow",
+    },
+    {
+      path: "scripts/release-macos.sh",
+      kind: "platform",
+      effects: ["platform_macos"],
+      evidence: "fixture platform helper",
+    },
+    {
+      prefix: "docs",
+      kind: "documentation",
+      effects: [],
+      authorizes_legacy_reduction: true,
+      evidence: "fixture documentation policy",
+    },
+  ],
 };
 
-function shadow(changed, authoritativePrimaryGroups = []) {
-  return computeReverseDependencyShadow({
-    metadata,
+function selection(changed, metadataOverride = metadata) {
+  return computeMetadataSelection({
+    metadata: metadataOverride,
     repoRoot,
     changed,
     packageGroups,
     pathExceptions,
-    authoritativePrimaryGroups,
   });
 }
 
-test("Cargo metadata supplies the complete local reverse-dependency closure", () => {
-  const result = shadow(["crates/types/src/lib.rs"], ["types", "host", "product"]);
+test("Cargo metadata supplies changed packages and the complete local reverse closure", () => {
+  const result = selection(["crates/types/src/lib.rs"]);
   assert.deepEqual(result.changed_packages, ["types"]);
   assert.deepEqual(result.reverse_dependency_closure, ["host", "mom", "types"]);
   assert.deepEqual(result.primary_groups, ["host", "product", "types"]);
-  assert.equal(result.matches_authoritative, true);
-  assert.equal(result.selection_applied, false);
-  assert.equal(result.promotion_allowed, false);
+  assert.equal(result.metadata_status, "available");
+  assert.equal(result.selection_applied, true);
+  assert.equal(result.fallback, "none");
 });
 
-test("a shadow mismatch is explicit and cannot alter authoritative selection", () => {
-  const result = shadow(["crates/types/src/lib.rs"], ["types"]);
-  assert.deepEqual(result.missing_from_authoritative, ["host", "product"]);
-  assert.deepEqual(result.extra_in_authoritative, []);
-  assert.equal(result.matches_authoritative, false);
-  assert.equal(result.selection_applied, false);
-  assert.match(result.promotion_prohibition, /observational only/);
-});
-
-test("explicit asset rules map non-Cargo product files", () => {
-  const result = shadow(["products/mom/ui/app.js"], ["product"]);
-  assert.deepEqual(result.changed_packages, []);
-  assert.deepEqual(result.primary_groups, ["product"]);
-  assert.deepEqual(result.explicit_path_exceptions, [
-    {
-      path: "products/mom/ui/app.js",
-      kind: "asset",
-      rule: "products/mom/ui",
-    },
-  ]);
-  assert.equal(result.matches_authoritative, true);
-});
-
-test("unknown paths fail closed to the complete metadata graph", () => {
-  const result = shadow(["unknown/input.bin"], [
-    "host",
-    "product",
-    "types",
-    "unrelated",
-  ]);
-  assert.equal(result.unknown_path_fallback, "full");
-  assert.deepEqual(result.unknown_paths, ["unknown/input.bin"]);
-  assert.deepEqual(result.reverse_dependency_closure, [
+test("a reverse-edge mutation deterministically changes the generated closure", () => {
+  const withoutHostEdge = metadataFixture(records, { mom: ["host"] });
+  assert.deepEqual(selection(["crates/types/src/lib.rs"]).reverse_dependency_closure, [
     "host",
     "mom",
     "types",
-    "unrelated",
   ]);
-  assert.equal(result.matches_authoritative, true);
+  assert.deepEqual(
+    selection(["crates/types/src/lib.rs"], withoutHostEdge).reverse_dependency_closure,
+    ["types"],
+  );
 });
 
-test("checked-in asset exceptions name existing primary groups and remain explicit", () => {
+test("resolved and declared local edges are conservatively unioned", () => {
+  const declaredOnly = structuredClone(metadata);
+  declaredOnly.resolve.nodes.find((node) => node.id.includes("host@" )).deps = [];
+  const result = selection(["crates/types/src/lib.rs"], declaredOnly);
+  assert.deepEqual(result.reverse_dependency_closure, ["host", "mom", "types"]);
+});
+
+test("explicit non-graph asset, workflow, platform, and documentation classes stay explicit", () => {
+  const result = selection([
+    ".github/workflows/ci-pr.yml",
+    "docs/architecture.md",
+    "products/mom/ui/app.js",
+    "scripts/release-macos.sh",
+  ]);
+  assert.deepEqual(
+    result.file_classifications.map((record) => record.class),
+    ["workflow", "documentation", "asset", "platform"],
+  );
+  assert.deepEqual(result.primary_groups, ["product"]);
+  assert.deepEqual(result.effects, ["frontend_mom", "ignored_tests", "platform_macos"]);
+  assert.equal(result.file_classifications[1].authorizes_legacy_reduction, true);
+});
+
+test("unknown additions and deletions fail closed to the complete workspace", () => {
+  const result = selection(["unknown/input.bin"]);
+  assert.equal(result.fallback, "full");
+  assert.equal(result.unknown_path_fallback, "full");
+  assert.deepEqual(result.unknown_paths, ["unknown/input.bin"]);
+  assert.deepEqual(result.reverse_dependency_closure, ["host", "mom", "types", "unrelated"]);
+  assert.deepEqual(result.primary_groups, ["host", "product", "types", "unrelated"]);
+});
+
+test("metadata unavailability is an unconditional full-selection result", () => {
+  const result = unavailableSelection("fixture metadata failure", packageGroups);
+  assert.equal(result.metadata_status, "unavailable");
+  assert.equal(result.fallback, "full");
+  assert.deepEqual(result.fallback_reasons, ["metadata_unavailable"]);
+  assert.deepEqual(result.primary_groups, ["host", "product", "types", "unrelated"]);
+});
+
+test("missing resolve evidence fails instead of silently dropping reverse edges", () => {
+  const incomplete = structuredClone(metadata);
+  delete incomplete.resolve;
+  assert.throws(
+    () => selection(["crates/types/src/lib.rs"], incomplete),
+    /resolve\.nodes must be an array/,
+  );
+});
+
+test("legacy equivalence records both reductions and conservative final fallback", () => {
+  const report = legacyEquivalenceReport({
+    legacySurface: ["job:policy", "job:mom-linux"],
+    generatedSurface: ["job:policy", "job:information-linux"],
+    finalSurface: ["job:policy", "job:mom-linux", "job:information-linux"],
+    fallbackReasons: ["legacy_reduction_without_evidence"],
+  });
+  assert.deepEqual(report.missing_from_generated, ["job:mom-linux"]);
+  assert.deepEqual(report.extra_in_generated, ["job:information-linux"]);
+  assert.equal(report.generated_is_at_least_as_conservative, false);
+  assert.deepEqual(report.conservative_fallback_reasons, [
+    "legacy_reduction_without_evidence",
+  ]);
+});
+
+test("every checked-in workspace package class is accepted by deterministic metadata", () => {
+  const root = path.resolve(import.meta.dirname, "../..");
+  const checkedInGroups = JSON.parse(
+    fs.readFileSync(path.join(root, "ci/package-groups.json"), "utf8"),
+  );
+  const syntheticRecords = Object.entries(checkedInGroups.primary).flatMap(
+    ([group, packages]) =>
+      packages.map((name) => ({ name, root: `fixture/${group}/${name}` })),
+  );
+  const syntheticMetadata = metadataFixture(syntheticRecords);
+  const changed = syntheticRecords.map(({ root: packageRoot }) => `${packageRoot}/src/lib.rs`);
+  const result = computeMetadataSelection({
+    metadata: syntheticMetadata,
+    repoRoot,
+    changed,
+    packageGroups: checkedInGroups,
+    pathExceptions: {
+      schema: "native-platform.ci-path-exceptions.v2",
+      rules: [],
+    },
+  });
+  assert.deepEqual(result.changed_packages, syntheticRecords.map(({ name }) => name).sort());
+  assert.deepEqual(result.primary_groups, Object.keys(checkedInGroups.primary).sort());
+  assert.equal(result.unknown_paths.length, 0);
+});
+
+test("checked-in exceptions are narrow, evidenced, deterministic, and group-valid", () => {
   const root = path.resolve(import.meta.dirname, "../..");
   const checkedInGroups = JSON.parse(
     fs.readFileSync(path.join(root, "ci/package-groups.json"), "utf8"),
@@ -119,23 +224,19 @@ test("checked-in asset exceptions name existing primary groups and remain explic
   const checkedInExceptions = JSON.parse(
     fs.readFileSync(path.join(root, "ci/ci-path-exceptions.json"), "utf8"),
   );
-  assert.equal(
-    checkedInExceptions.schema,
-    "native-platform.ci-path-exceptions.v1",
-  );
-  const prefixes = checkedInExceptions.asset_groups.map((entry) => entry.prefix);
-  assert.equal(new Set(prefixes).size, prefixes.length);
-  for (const entry of checkedInExceptions.asset_groups) {
-    assert.ok(
-      Object.hasOwn(checkedInGroups.primary, entry.primary_group),
-      `unknown primary group for ${entry.prefix}`,
-    );
+  assert.equal(checkedInExceptions.schema, "native-platform.ci-path-exceptions.v2");
+  const matches = checkedInExceptions.rules.map((entry) => entry.path ?? entry.prefix);
+  assert.equal(new Set(matches).size, matches.length);
+  for (const entry of checkedInExceptions.rules) {
+    assert.notEqual(Boolean(entry.path), Boolean(entry.prefix));
+    assert.ok(entry.kind);
+    assert.ok(entry.evidence);
+    assert.ok(Array.isArray(entry.effects));
+    for (const group of entry.primary_groups ?? []) {
+      assert.ok(Object.hasOwn(checkedInGroups.primary, group), `${group} is not primary`);
+    }
     assert.notEqual(entry.prefix, "products/fte");
     assert.notEqual(entry.prefix, "products/mom");
     assert.notEqual(entry.prefix, "products/loom");
-  }
-  for (const entry of checkedInExceptions.authoritative_exceptions) {
-    assert.notEqual(Boolean(entry.path), Boolean(entry.prefix));
-    assert.ok(entry.kind);
   }
 });

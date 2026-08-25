@@ -1,0 +1,54 @@
+{
+  "schema": "native-platform.ci-workflow-snapshot.v1",
+  "pr": {
+    "workflow_name": "ci-pr",
+    "required_check": "ci-required",
+    "job_ids": [
+      "plan",
+      "policy",
+      "root-linux",
+      "native-linux",
+      "gateway-linux",
+      "attachment-linux",
+      "information-linux",
+      "speech-linux",
+      "mom-linux",
+      "loom-linux",
+      "frontend",
+      "platform-macos",
+      "dependency-graph",
+      "ignored-tests",
+      "fuzz-build",
+      "ci-required"
+    ],
+    "command_matrix": ["test", "clippy"],
+    "ignored_test_os_matrix": ["ubuntu-latest", "macos-latest", "windows-latest"],
+    "macos_component_superset": [
+      "release",
+      "root",
+      "mom",
+      "attachment",
+      "information",
+      "speech",
+      "loom"
+    ]
+  },
+  "full": {
+    "workflow_name": "ci-full",
+    "job_ids": [
+      "inventory",
+      "root",
+      "attachment",
+      "information-portable",
+      "information-platform-linux",
+      "speech",
+      "mom",
+      "loom",
+      "frontend",
+      "policy-and-graphs",
+      "fuzz-build",
+      "full-summary"
+    ],
+    "os_matrix": ["ubuntu-latest", "macos-latest", "windows-latest"]
+  }
+}

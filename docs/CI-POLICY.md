@@ -68,17 +68,22 @@ it does not claim cryptographic proof of stock libtest or that trusted compiler,
 build-script, proc-macro, linker, or loader code cannot misbehave. It never
 requests an ignored test body and cannot promote runtime or product evidence.
 
-## Reverse-dependency shadow
+## Metadata reverse-dependency selection
 
-The PR plan computes local reverse dependencies from locked, no-dependency
-Cargo metadata. That result is observational under the
-`dependency_shadow` field: `selection_applied` and `promotion_allowed` remain
-false even when it matches the current planner. Unknown paths fail closed to
-the full metadata graph. The authoritative planner continues to own explicit
-frontend/platform assets in `ci/ci-path-exceptions.json` and required job
-selection until representative shadow results are reviewed and deliberately
-promoted. During this interval, changes to Native, Attachment, Information,
-Speech, or FTE contracts conservatively include Mom.
+The PR plan derives changed workspace packages and their complete local reverse
+closure from locked Cargo metadata. Resolved edges are conservatively unioned
+with declared local path edges so optional and target-specific consumers cannot
+silently disappear. Only evidenced non-graph asset, platform, workspace, and
+workflow rules remain in `ci/ci-path-exceptions.json`. Unknown paths, incomplete
+metadata, and Cargo metadata failure force the complete plan.
+
+`dependency_selection` records the applied graph, changed packages, closure,
+file classes, and fallback reasons. `dependency_shadow` retains the frozen
+legacy path planner as an observational equivalence report. If generated jobs,
+frontend sublanes, or macOS matrix entries are less conservative than that
+baseline without an explicit exception record, the applied plan becomes full.
+Required workflow job names and matrices are frozen by
+`ci/ci-workflow-snapshot.json`.
 
 There is one root Rust toolchain declaration, one Cargo workspace, one root
 Cargo lockfile, and one root pnpm workspace lockfile. CI uses locked dependency
