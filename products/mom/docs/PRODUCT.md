@@ -22,6 +22,19 @@ or live chat can be invited into an ordinary chat by its unique `@handle`.
 - Attachment previews are local and content-addressed: canonical text/PDF is
   escaped and bounded, admitted image/audio/video blobs use revocable object
   URLs, and stale root/artifact/policy identities fail closed.
+- Alexandria is the one compiled external Information profile. A native picker
+  yields only an opaque, one-time grant; registration preflights the exact
+  schema, records immutable-read-only identity, remounts durably, and exposes
+  only bounded local evidence and exact citation anchors to the renderer.
+- Model use requires a separate process-local grant bound to one conversation,
+  resource, release, representation, rights policy, and source SHA-256. Native
+  chat receives a length- and SHA-bound untrusted evidence packet; a UI search
+  alone is not described as model integration.
+- “Add to Library” re-presents the exact Attachment root, graph, canonical
+  artifact, processor policy, text bytes/hash, title, and explicit private-use
+  rights through the Attachment-to-Information bridge. Information's active
+  receipt and manifest are the sole discoverability authority; the managed copy
+  can be searched, cited, and removed independently without changing its source.
 - Product state, receipts and cache policy are Rust-owned.
 
 The exact user-supplied therapeutic Persona templates are documented in
@@ -35,7 +48,10 @@ Mom Llama consumes the accepted imported monorepo packages for:
 - `llama-native-kit` for in-process model execution and cache-safe native state;
 - `speech-native-kit` only for the deliberate Apple complete-WAV Read Aloud and
   verified Parakeet attachment-transcription surfaces; microphone capture is
-  not composed.
+  not composed;
+- `information-native-kit` for the exact Alexandria read-only profile and the
+  promoted Attachment canonical-text materializer. Mom does not gain generic
+  SQL, URL, directory, glob, archive-registration, or network authority.
 
 Free Token Energy remains a separate product for protocol routing, hosted
 providers, and optional loopback. Mom does not depend on its crates, install its

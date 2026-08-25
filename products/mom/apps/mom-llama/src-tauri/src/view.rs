@@ -95,6 +95,126 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         label: "Choose file",
     },
     ControlSpec {
+        affordance: "information.alexandria_pick",
+        command: "mom_llama.information_pick_alexandria",
+        tauri_command: "mom_llama_information_pick_alexandria",
+        cli: "app-only; the native picker returns one opaque path grant",
+        effect: "mom_llama.effects.information_path_grant.v1",
+        label: "Choose Alexandria database",
+    },
+    ControlSpec {
+        affordance: "information.alexandria_register",
+        command: "mom_llama.information_register_alexandria",
+        tauri_command: "mom_llama_information_register_alexandria",
+        cli: "app-only; immutable external registration is path-free at IPC",
+        effect: "mom_llama.effects.information_external_registration.v1",
+        label: "Register Alexandria",
+    },
+    ControlSpec {
+        affordance: "information.libraries",
+        command: "mom_llama.information_libraries",
+        tauri_command: "mom_llama_information_libraries",
+        cli: "app-only; returns path-free registered source identities",
+        effect: "mom_llama.effects.information_local_read.v1",
+        label: "Refresh libraries",
+    },
+    ControlSpec {
+        affordance: "information.search",
+        command: "mom_llama.information_search",
+        tauri_command: "mom_llama_information_search",
+        cli: "app-only; bounded local UI search of one exact registration",
+        effect: "mom_llama.effects.information_local_read.v1",
+        label: "Search library",
+    },
+    ControlSpec {
+        affordance: "information.open_citation",
+        command: "mom_llama.information_open_citation",
+        tauri_command: "mom_llama_information_open_citation",
+        cli: "app-only; reopens one exact path-free citation",
+        effect: "mom_llama.effects.information_local_read.v1",
+        label: "Open citation",
+    },
+    ControlSpec {
+        affordance: "information.model_grant",
+        command: "mom_llama.information_grant_model_context",
+        tauri_command: "mom_llama_information_grant_model_context",
+        cli: "app-only; process-local exact conversation and representation grant",
+        effect: "mom_llama.effects.information_model_grant.v1",
+        label: "Allow in this chat",
+    },
+    ControlSpec {
+        affordance: "information.chat_send",
+        command: "mom_llama.information_chat_send",
+        tauri_command: "mom_llama_information_chat_send",
+        cli: "app-only; grant-bound evidence is consumed by native chat",
+        effect: "mom_llama.effects.information_chat.v1",
+        label: "Ask with local evidence",
+    },
+    ControlSpec {
+        affordance: "attachment.library_open",
+        command: "mom_llama.attachment_library_preview",
+        tauri_command: "mom_llama_attachment_library_preview",
+        cli: "app-only; impact-hashed exact canonical Attachment preview",
+        effect: "mom_llama.effects.attachment_library_preview.v1",
+        label: "Add to Library",
+    },
+    ControlSpec {
+        affordance: "attachment.library_preview",
+        command: "mom_llama.attachment_library_preview",
+        tauri_command: "mom_llama_attachment_library_preview",
+        cli: "app-only; impact-hashed exact canonical Attachment preview",
+        effect: "mom_llama.effects.attachment_library_preview.v1",
+        label: "Review exact library item",
+    },
+    ControlSpec {
+        affordance: "attachment.library_commit",
+        command: "mom_llama.attachment_library_commit",
+        tauri_command: "mom_llama_attachment_library_commit",
+        cli: "app-only; atomic Information managed publish",
+        effect: "mom_llama.effects.attachment_library_publish.v1",
+        label: "Add exact text",
+    },
+    ControlSpec {
+        affordance: "information.managed_attachments",
+        command: "mom_llama.information_managed_attachments",
+        tauri_command: "mom_llama_information_managed_attachments",
+        cli: "app-only; bounded path-free active projection",
+        effect: "mom_llama.effects.information_managed_read.v1",
+        label: "Refresh attachment library",
+    },
+    ControlSpec {
+        affordance: "information.search_managed_attachment",
+        command: "mom_llama.information_search_managed_attachment",
+        tauri_command: "mom_llama_information_search_managed_attachment",
+        cli: "app-only; exact managed representation search",
+        effect: "mom_llama.effects.information_managed_read.v1",
+        label: "Search managed text",
+    },
+    ControlSpec {
+        affordance: "information.open_managed_citation",
+        command: "mom_llama.information_open_managed_citation",
+        tauri_command: "mom_llama_information_open_managed_citation",
+        cli: "app-only; reopens exact managed lineage",
+        effect: "mom_llama.effects.information_managed_read.v1",
+        label: "Open managed citation",
+    },
+    ControlSpec {
+        affordance: "information.managed_removal_preview",
+        command: "mom_llama.information_managed_removal_preview",
+        tauri_command: "mom_llama_information_managed_removal_preview",
+        cli: "app-only; opaque exact managed-only removal preview",
+        effect: "mom_llama.effects.information_managed_removal.v1",
+        label: "Review managed removal",
+    },
+    ControlSpec {
+        affordance: "information.managed_removal_commit",
+        command: "mom_llama.information_managed_removal_commit",
+        tauri_command: "mom_llama_information_managed_removal_commit",
+        cli: "app-only; removes only exact Information-owned bytes",
+        effect: "mom_llama.effects.information_managed_removal.v1",
+        label: "Remove managed representation",
+    },
+    ControlSpec {
         affordance: "chat.composer.send",
         command: "mom_llama.chat_dispatch",
         tauri_command: "mom_llama_chat_dispatch",
@@ -866,6 +986,12 @@ const SETTINGS_SECTIONS: &[SettingsSectionSpec] = &[
         blocker: None,
     },
     SettingsSectionSpec {
+        slug: "library",
+        title: "Library",
+        icon: "database",
+        blocker: None,
+    },
+    SettingsSectionSpec {
         slug: "sampling",
         title: "Sampling",
         icon: "funnel",
@@ -1621,6 +1747,7 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             (persona_freeze_modal())
             (persona_context_menu())
             (persona_removal_modal())
+            (attachment_library_modal())
             @if mcp_process_ui_supported() {
                 (tool_approval_modal())
             }
@@ -2844,6 +2971,9 @@ fn settings_panel(
             @if section.slug == "personas" {
                 (persona_settings())
             }
+            @if section.slug == "library" {
+                (information_library_settings(active))
+            }
             @if section.slug == "import-export" {
                 section class="settings-card" {
                     h3 { "Conversations" }
@@ -2983,6 +3113,122 @@ fn current_chat_instructions(active: Option<&Conversation>) -> Markup {
                     "Leave blank to inherit the default below. Changes apply to future replies in this conversation."
                 }
             }
+        }
+    }
+}
+
+fn information_library_settings(active: Option<&Conversation>) -> Markup {
+    let pick = control("information.alexandria_pick");
+    let register = control("information.alexandria_register");
+    let libraries = control("information.libraries");
+    let search = control("information.search");
+    let model_grant = control("information.model_grant");
+    let chat_send = control("information.chat_send");
+    let managed = control("information.managed_attachments");
+    let conversation_id = active
+        .map(|conversation| conversation.id.as_str())
+        .unwrap_or("");
+    html! {
+        section class="settings-card information-registration" {
+            h3 { "Alexandria" }
+            p class="field-help" {
+                "Register one caller-selected Alexandria SQLite database as immutable read-only. The renderer receives an opaque one-time grant, never its path. Non-empty WAL or rollback journals, wrong schema, and identity changes fail before registration."
+            }
+            input id="information-path-grant" type="hidden"
+                data-affordance=(register.affordance) data-command=(register.command)
+                data-tauri-command=(register.tauri_command) data-cli=(register.cli)
+                data-effect=(register.effect);
+            div class="button-strip" {
+                button type="button" class="small-button"
+                    data-affordance=(pick.affordance) data-command=(pick.command)
+                    data-tauri-command=(pick.tauri_command) data-cli=(pick.cli)
+                    data-effect=(pick.effect) data-action="information-alexandria-pick" {
+                    (icon_markup("folder-open")) "Choose database"
+                }
+            }
+            p id="information-path-grant-status" class="field-help" role="status" aria-live="polite" {
+                "No database selected."
+            }
+            label class="field checkbox-field" {
+                input id="information-rights-confirmed" type="checkbox"
+                    data-affordance=(register.affordance) data-command=(register.command)
+                    data-tauri-command=(register.tauri_command) data-cli=(register.cli)
+                    data-effect=(register.effect);
+                span { "I confirm authority for a private local searchable registration." }
+            }
+            label class="field checkbox-field" {
+                input id="information-model-context-allowed" type="checkbox"
+                    data-affordance=(register.affordance) data-command=(register.command)
+                    data-tauri-command=(register.tauri_command) data-cli=(register.cli)
+                    data-effect=(register.effect);
+                span { "Also permit bounded model-context retrieval after a separate per-chat grant." }
+            }
+            button type="button" class="primary-button" disabled[true]
+                data-affordance=(register.affordance) data-command=(register.command)
+                data-tauri-command=(register.tauri_command) data-cli=(register.cli)
+                data-effect=(register.effect) data-action="information-alexandria-register"
+                id="information-alexandria-register" { "Register immutable source" }
+        }
+        section class="settings-card information-search" data-active-conversation=(conversation_id) {
+            h3 { "Local library search" }
+            div class="button-strip" {
+                button type="button" class="small-button"
+                    data-affordance=(libraries.affordance) data-command=(libraries.command)
+                    data-tauri-command=(libraries.tauri_command) data-cli=(libraries.cli)
+                    data-effect=(libraries.effect) data-action="information-libraries-refresh" {
+                    "Refresh libraries"
+                }
+            }
+            label class="field" { span { "Registered library" }
+                select id="information-library-select" aria-label="Registered Alexandria library"
+                    data-affordance=(search.affordance) data-command=(search.command)
+                    data-tauri-command=(search.tauri_command) data-cli=(search.cli)
+                    data-effect=(search.effect) {}
+            }
+            label class="field" { span { "Search terms" }
+                input id="information-search-query" type="search" autocomplete="off"
+                    placeholder="contemplation prayer"
+                    data-affordance=(search.affordance) data-command=(search.command)
+                    data-tauri-command=(search.tauri_command) data-cli=(search.cli)
+                    data-effect=(search.effect);
+            }
+            div class="button-strip" {
+                button type="button" class="primary-button"
+                    data-affordance=(search.affordance) data-command=(search.command)
+                    data-tauri-command=(search.tauri_command) data-cli=(search.cli)
+                    data-effect=(search.effect) data-action="information-search" { "Search" }
+                button type="button" class="small-button"
+                    data-affordance=(model_grant.affordance) data-command=(model_grant.command)
+                    data-tauri-command=(model_grant.tauri_command) data-cli=(model_grant.cli)
+                    data-effect=(model_grant.effect) data-action="information-model-grant"
+                    disabled[conversation_id.is_empty()] { "Allow in this chat" }
+            }
+            div id="information-search-results" class="information-results" aria-live="polite" {}
+            label class="field" { span { "Ask Mom using this exact library" }
+                textarea id="information-chat-message" rows="3"
+                    placeholder="Synthesize the local evidence with exact citations."
+                    data-affordance=(chat_send.affordance) data-command=(chat_send.command)
+                    data-tauri-command=(chat_send.tauri_command) data-cli=(chat_send.cli)
+                    data-effect=(chat_send.effect) {}
+            }
+            button type="button" class="primary-button"
+                data-affordance=(chat_send.affordance) data-command=(chat_send.command)
+                data-tauri-command=(chat_send.tauri_command) data-cli=(chat_send.cli)
+                data-effect=(chat_send.effect) data-action="information-chat-send"
+                disabled[conversation_id.is_empty()] { "Ask with local evidence" }
+        }
+        section class="settings-card managed-attachment-library" {
+            h3 { "Attachment library" }
+            p class="field-help" {
+                "Canonical attachment text is copied into an independently removable, immutable Information representation. The original Attachment graph and source bytes are unchanged."
+            }
+            button type="button" class="small-button"
+                data-affordance=(managed.affordance) data-command=(managed.command)
+                data-tauri-command=(managed.tauri_command) data-cli=(managed.cli)
+                data-effect=(managed.effect) data-action="information-managed-refresh" {
+                "Refresh attachment library"
+            }
+            div id="information-managed-list" class="information-results" aria-live="polite" {}
         }
     }
 }
@@ -3391,6 +3637,74 @@ fn persona_removal_modal() -> Markup {
                         data-tauri-command=(commit.tauri_command) data-cli=(commit.cli)
                         data-effect=(commit.effect) data-action="persona-removal-commit" {
                         "Remove from Library"
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn attachment_library_modal() -> Markup {
+    let preview = control("attachment.library_preview");
+    let commit = control("attachment.library_commit");
+    html! {
+        div id="attachment-library-modal" class="modal-backdrop is-hidden" hidden[true]
+            aria-hidden="true" {
+            section class="compact-dialog attachment-library-dialog" role="dialog" aria-modal="true"
+                aria-labelledby="attachment-library-title" aria-describedby="attachment-library-description" {
+                header class="modal-title-row" {
+                    div {
+                        p class="eyebrow" { "ATTACHMENT LIBRARY" }
+                        h2 id="attachment-library-title" { "Add canonical text to Library" }
+                    }
+                    button type="button" class="icon-button" aria-label="Close attachment library preview"
+                        data-affordance=(preview.affordance) data-command=(preview.command)
+                        data-tauri-command=(preview.tauri_command) data-cli=(preview.cli)
+                        data-effect=(preview.effect) data-action="attachment-library-close" {
+                        (icon_markup("x"))
+                    }
+                }
+                p id="attachment-library-description" class="field-help" {
+                    "Review the exact canonical text identity before Information creates an independently removable private local representation. The original Attachment graph and source bytes are never changed."
+                }
+                label class="field" {
+                    span { "Library title" }
+                    input id="attachment-library-item-title" type="text" maxlength="240"
+                        data-affordance=(preview.affordance) data-command=(preview.command)
+                        data-tauri-command=(preview.tauri_command) data-cli=(preview.cli)
+                        data-effect=(preview.effect);
+                }
+                label class="field checkbox-field" {
+                    input id="attachment-library-rights" type="checkbox"
+                        data-affordance=(preview.affordance) data-command=(preview.command)
+                        data-tauri-command=(preview.tauri_command) data-cli=(preview.cli)
+                        data-effect=(preview.effect);
+                    span { "I confirm authority to create this private local searchable copy." }
+                }
+                dl class="attachment-library-impact" {
+                    div { dt { "Attachment root" } dd { code id="attachment-library-root" {} } }
+                    div { dt { "Graph" } dd { code id="attachment-library-graph" {} } }
+                    div { dt { "Artifact" } dd { code id="attachment-library-artifact" {} } }
+                    div { dt { "Processor policy" } dd { code id="attachment-library-policy" {} } }
+                    div { dt { "Canonical text" } dd id="attachment-library-text" {} }
+                    div { dt { "Rights" } dd { code id="attachment-library-rights-sha" {} } }
+                    div { dt { "Impact SHA-256" } dd { code id="attachment-library-impact-sha" {} } }
+                }
+                p id="attachment-library-status" class="field-help" role="status" aria-live="polite" {
+                    "Confirm rights, then review the exact publish impact."
+                }
+                div class="button-strip" {
+                    button type="button" class="small-button"
+                        data-affordance=(preview.affordance) data-command=(preview.command)
+                        data-tauri-command=(preview.tauri_command) data-cli=(preview.cli)
+                        data-effect=(preview.effect) data-action="attachment-library-preview" {
+                        "Review exact item"
+                    }
+                    button type="button" class="primary-button" disabled[true]
+                        data-affordance=(commit.affordance) data-command=(commit.command)
+                        data-tauri-command=(commit.tauri_command) data-cli=(commit.cli)
+                        data-effect=(commit.effect) data-action="attachment-library-commit" {
+                        "Add exact text"
                     }
                 }
             }
@@ -5120,6 +5434,7 @@ mod tests {
         let js = include_str!("../../ui/coop-hx.js");
         for unmanaged in [
             r#"document.createElement("button")"#,
+            r#"document.createElement("input")"#,
             r#"document.createElement("textarea")"#,
             r#"document.createElement("audio")"#,
             r#"document.createElement("video")"#,
@@ -5133,6 +5448,7 @@ mod tests {
         }
 
         for (key, affordance) in [
+            ("attachmentLibraryOpen", "attachment.library_open"),
             ("attachmentPreview", "attachment.preview"),
             ("attachmentTranscribe", "attachment.transcribe_audio"),
             (
@@ -5146,6 +5462,23 @@ mod tests {
             ("mentionCancel", "mention.cancel"),
             ("mentionCandidates", "mention.candidates"),
             ("messageEdit", "message.edit"),
+            ("informationOpenCitation", "information.open_citation"),
+            (
+                "informationManagedSearch",
+                "information.search_managed_attachment",
+            ),
+            (
+                "informationManagedCitation",
+                "information.open_managed_citation",
+            ),
+            (
+                "informationManagedRemovalPreview",
+                "information.managed_removal_preview",
+            ),
+            (
+                "informationManagedRemovalCommit",
+                "information.managed_removal_commit",
+            ),
         ] {
             assert_dynamic_js_contract(js, key, control(affordance));
         }

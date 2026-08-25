@@ -30,8 +30,9 @@ use information_native_retrieval::{
     ResourceBackend, RetrievalRouter,
 };
 use information_native_store::{
-    ExternalRegistrationRequest, ManagedStore, PreparedInstall, RegisteredInstallation,
-    RemovalPlan, StoreError, StoreSnapshot, TransferSummary,
+    ActiveManagedDocumentsProjection, ActiveManagedMaterialization, ExternalRegistrationRequest,
+    ManagedStore, PreparedInstall, RegisteredInstallation, RemovalPlan, StoreError, StoreSnapshot,
+    TransferSummary,
 };
 use information_native_types::{
     AcquisitionAttempt, AcquisitionRedirect, AcquisitionTransport, AgentToolDefinition,
@@ -953,6 +954,32 @@ impl InformationHost {
         request: &ManagedDocumentsSearchRequest,
     ) -> Result<ManagedDocumentsSearchResult, HostError> {
         Ok(self.store.search_managed_documents(request)?)
+    }
+
+    /// Return a caller-bounded, path-free discoverability projection of active
+    /// receipt identities. Exact actions must use `active_managed_document`.
+    pub fn list_active_managed_documents(
+        &self,
+        max_entries: usize,
+    ) -> Result<ActiveManagedDocumentsProjection, HostError> {
+        Ok(self.store.list_active_managed_documents(max_entries)?)
+    }
+
+    pub fn active_managed_document(
+        &self,
+        materialization_id: &ManagedMaterializationId,
+    ) -> Result<ActiveManagedMaterialization, HostError> {
+        Ok(self.store.active_managed_document(materialization_id)?)
+    }
+
+    pub fn project_active_managed_document(
+        &self,
+        materialization_id: &ManagedMaterializationId,
+        max_manifest_bytes: u64,
+    ) -> Result<ActiveManagedMaterialization, HostError> {
+        Ok(self
+            .store
+            .project_active_managed_document(materialization_id, max_manifest_bytes)?)
     }
 
     pub fn plan_managed_documents_removal(

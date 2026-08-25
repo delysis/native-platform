@@ -8,6 +8,8 @@ speech-native-kit ────────────────────�
 
 attachment-native-kit ────────────────────────────> mom-llama
 
+attachment-native-kit ──typed canonical text──> information-native-kit ──narrow host──> mom-llama
+
 mom-llama ──contracts/black-box CLI──> capability-system-compiler
 ```
 
@@ -21,6 +23,7 @@ graph.
 | `free-token-energy` | standalone text gateway, protocols, hosted providers and optional authenticated loopback; not composed by Mom |
 | `speech-native-kit` | STT/TTS contracts, routing, and local/platform backends |
 | `attachment-native-kit` | content-first bounded inspection, recursive container graph, canonical artifacts, provenance and capability-aware media/transform planning |
+| `information-native-kit` | immutable external registrations, exact Alexandria adapter, bounded retrieval/citation, and atomic managed-document staging/activation/removal |
 | `mom-llama` | product runtime, CLI, Personas, contracts, receipts and native interface |
 | `capability-system-compiler` | Loom compiler/specs and black-box acceptance |
 
@@ -73,6 +76,32 @@ only as inert text. PDF is text-first with page locators and honest partial/OCR
 warnings; video uses local native controls without autoplay. Preview does not
 execute OCR, rasterization, transcription, frame extraction, network or a
 subprocess.
+
+## Information status
+
+Mom's `AppRuntime` owns one `InformationHost`. The renderer can ask a native
+picker for an opaque single-use grant but never receives the selected path.
+Before a registration event is durable, the exact Alexandria adapter opens the
+selected database query-only and proves the compiled `alexandria.blocks.v1`
+schema. Information then binds the immutable file identity and SHA-256, rejects
+a non-empty WAL or rollback journal, remounts the registration on relaunch, and
+returns only path-free source identities, bounded evidence, and exact citation
+anchors. There is no generic SQL surface.
+
+Model-context retrieval is a second, explicit process-local capability bound to
+one conversation and one exact resource/release/representation/source hash. Its
+bounded evidence is serialized as untrusted JSON and length/SHA-bound before the
+ordinary native chat path invokes llama.cpp. Cross-conversation and disallowed
+rights use fail closed.
+
+The Attachment bridge is the sole materializer composed here. It verifies the
+retained Attachment receipt, root, graph, canonical artifact, processor/policy,
+text bytes/hash, title, and confirmed private-use rights, then activates a
+deterministic managed release through Information's staging protocol. Active
+Information receipts/manifests—not a second Mom ledger—own discovery. Listing is
+a bounded lightweight projection; every search, citation, or removal first does
+the exact manifest/database/provenance validation. Removal requires an opaque
+server-held preview and never removes Attachment or external source bytes.
 
 ## Persona tool authority
 

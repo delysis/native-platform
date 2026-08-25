@@ -22,13 +22,13 @@ pub mod tool_loop;
 pub mod upstream_status;
 
 pub use attachments::{
-    AttachmentImportOutput, AttachmentKind, AttachmentPreviewAnchor, AttachmentPreviewArtifact,
-    AttachmentPreviewCatalog, AttachmentPreviewContent, AttachmentPreviewKind,
-    AttachmentPreviewMedia, AttachmentPreviewNotice, AttachmentPreviewState,
+    AttachmentImportOutput, AttachmentKind, AttachmentLibraryInput, AttachmentPreviewAnchor,
+    AttachmentPreviewArtifact, AttachmentPreviewCatalog, AttachmentPreviewContent,
+    AttachmentPreviewKind, AttachmentPreviewMedia, AttachmentPreviewNotice, AttachmentPreviewState,
     AttachmentPreviewTextSection, AttachmentPreviewTextStats, AttachmentPreviewTransform,
     AttachmentRecord, AttachmentState, AttachmentTranscriptionInput, attachment_import,
-    attachment_import_pasted_text, attachment_list, attachment_preview, attachment_preview_content,
-    attachment_preview_media, attachment_transcription_input,
+    attachment_import_pasted_text, attachment_library_input, attachment_list, attachment_preview,
+    attachment_preview_content, attachment_preview_media, attachment_transcription_input,
 };
 pub use chat::{
     ChatCancelOutput, ChatRequestState, ChatSendInput, ChatSendOptions, ChatSendOutput,

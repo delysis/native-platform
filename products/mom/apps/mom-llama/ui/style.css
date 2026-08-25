@@ -492,6 +492,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .persona-removal-impact div { display: grid; grid-template-columns: minmax(130px, .35fr) minmax(0, 1fr); gap: 10px; }
 .persona-removal-impact dt { color: var(--muted); }
 .persona-removal-impact dd { margin: 0; overflow-wrap: anywhere; }
+.attachment-library-dialog { width: min(680px, calc(100vw - 32px)); max-height: 86vh; overflow-y: auto; }
+.attachment-library-impact { display: grid; gap: 8px; margin: 16px 0; }
+.attachment-library-impact div { display: grid; grid-template-columns: minmax(130px, .3fr) minmax(0, 1fr); gap: 10px; }
+.attachment-library-impact dt { color: var(--muted); }
+.attachment-library-impact dd { margin: 0; overflow-wrap: anywhere; }
 .danger-button { color: #fff; background: var(--danger); }
 .history-mode { display: grid; gap: 8px; margin: 14px 0; border: 0; padding: 0; }
 .history-mode label { display: flex; gap: 8px; align-items: center; }
@@ -603,6 +608,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   font-size: 11px;
 }
 .attachment-document-preview > .attachment-preview-notices { padding: 8px 0 0 16px; }
+.attachment-library-controls { display: flex; justify-content: flex-end; padding-top: 4px; }
 .attachment-transcription {
   display: grid;
   gap: 8px;
@@ -945,6 +951,16 @@ kbd { padding: 2px 6px; border-radius: 4px; color: #c5c5c5; background: #2a2a2a;
 .settings-subgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 20px; }
 .settings-card { padding: 16px; border: 1px solid var(--border); border-radius: 8px; }
 .settings-card h3 { margin: 0 0 12px; font-size: 15px; }
+.information-registration,
+.information-search,
+.managed-attachment-library { display: grid; gap: 12px; margin-bottom: 12px; }
+.information-results { display: grid; gap: 10px; }
+.information-result,
+.information-managed-item { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: 7px; }
+.information-result small,
+.information-managed-item small { color: var(--faint); overflow-wrap: anywhere; font: 10px/1.45 var(--mono); }
+.information-citation-context { max-height: 280px; margin: 0; overflow: auto; white-space: pre-wrap; font: 11px/1.5 var(--mono); }
+.information-managed-results { display: grid; gap: 8px; }
 .cache-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .cache-card-heading h3 { margin-bottom: 4px; }
 .cache-card-heading p { margin: 0; color: var(--text); font-size: 13px; }

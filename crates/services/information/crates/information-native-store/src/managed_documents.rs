@@ -5,21 +5,23 @@ use super::{
     enforce_private_directory, enforce_private_file, hash_file, path_exists, read_json,
     reject_symlink, sync_directory, write_new_json,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use information_native_types::{
-    MANAGED_DOCUMENTS_RECEIPT_SCHEMA, MANAGED_DOCUMENTS_REMOVAL_SCHEMA,
+    EvidenceLocator, MANAGED_DOCUMENTS_RECEIPT_SCHEMA, MANAGED_DOCUMENTS_REMOVAL_SCHEMA,
     MANAGED_DOCUMENTS_SEARCH_SCHEMA, ManagedDocumentId, ManagedDocumentLineage,
     ManagedDocumentsReceipt, ManagedDocumentsRemovalPlan, ManagedDocumentsRemovalReceipt,
     ManagedDocumentsRemovalRequest, ManagedDocumentsSearchHit, ManagedDocumentsSearchRequest,
     ManagedDocumentsSearchResult, ManagedDocumentsV1, ManagedMaterializationId, ManagedSegmentId,
-    ManagedSourceArtifact,
+    ManagedSourceArtifact, Provenance, ReleaseId, RepresentationId, ResourceId, RightsStatement,
+    UsePolicy,
 };
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const MANAGED_DOCUMENTS_DIRECTORY: &str = "managed-documents-v1";
@@ -29,6 +31,75 @@ const DATABASE_FILE: &str = "documents.sqlite3";
 const MANIFEST_FILE: &str = "manifest.json";
 const RECEIPT_FILE: &str = "receipt.json";
 const EXPECTED_ACTIVE_FILES: [&str; 3] = [DATABASE_FILE, MANIFEST_FILE, RECEIPT_FILE];
+const MAX_ACTIVE_PROJECTION_ENTRIES: usize = 256;
+const MAX_RECEIPT_PROJECTION_BYTES: u64 = 64 * 1024;
+const MAX_MANIFEST_PROJECTION_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Path-free projection for one active immutable managed representation.
+/// Canonical text remains inside the managed database. The producing method's
+/// contract determines whether this is a bounded manifest projection or a fully
+/// database-validated exact representation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveManagedMaterialization {
+    pub materialization_id: ManagedMaterializationId,
+    pub resource_id: ResourceId,
+    pub release_id: ReleaseId,
+    pub representation_id: RepresentationId,
+    pub content_sha256: String,
+    pub database_sha256: String,
+    pub document_count: u64,
+    pub segment_count: u64,
+    pub text_bytes: u64,
+    pub activated_at: DateTime<Utc>,
+    pub provenance: Provenance,
+    pub source_artifacts: Vec<ManagedSourceArtifact>,
+    pub documents: Vec<ActiveManagedDocument>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveManagedDocument {
+    pub document_id: ManagedDocumentId,
+    pub title: String,
+    pub creator: Option<String>,
+    pub locator: EvidenceLocator,
+    pub lineage: Vec<ManagedDocumentLineage>,
+    pub rights: Vec<RightsStatement>,
+    pub use_policy: UsePolicy,
+    pub segments: Vec<ActiveManagedSegment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveManagedSegment {
+    pub segment_id: ManagedSegmentId,
+    pub ordinal: u32,
+    pub text_sha256: String,
+    pub locator: EvidenceLocator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveManagedDocumentsProjection {
+    pub complete: bool,
+    pub entries: Vec<ActiveManagedReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveManagedReceipt {
+    pub materialization_id: ManagedMaterializationId,
+    pub resource_id: ResourceId,
+    pub release_id: ReleaseId,
+    pub representation_id: RepresentationId,
+    pub content_sha256: String,
+    pub database_sha256: String,
+    pub document_count: u64,
+    pub segment_count: u64,
+    pub text_bytes: u64,
+    pub activated_at: DateTime<Utc>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublishBoundary {
@@ -62,6 +133,97 @@ fn observe_publish_boundary(boundary: PublishBoundary) {
 fn observe_publish_boundary(_boundary: PublishBoundary) {}
 
 impl ManagedStore {
+    /// Enumerate a caller-bounded discoverability projection of active receipt
+    /// identities without exposing managed or source filesystem paths. This
+    /// validates directory shape plus a byte-capped receipt and path binding;
+    /// it intentionally does not deserialize manifests or hash databases.
+    /// Exact actions must call [`Self::active_managed_document`].
+    pub fn list_active_managed_documents(
+        &self,
+        max_entries: usize,
+    ) -> Result<ActiveManagedDocumentsProjection, StoreError> {
+        if max_entries == 0 || max_entries > MAX_ACTIVE_PROJECTION_ENTRIES {
+            return Err(StoreError::RegistryCorrupt(format!(
+                "managed documents projection cap must be between 1 and {MAX_ACTIVE_PROJECTION_ENTRIES}"
+            )));
+        }
+        let _lock = self.try_lock()?;
+        ensure_layout(self)?;
+        let root = active_root(self);
+        let directory = fs::read_dir(&root).map_err(|source| StoreError::Io {
+            operation: "list active managed documents",
+            path: root.clone(),
+            source,
+        })?;
+        let mut paths = Vec::with_capacity(max_entries.saturating_add(1));
+        for entry in directory.take(max_entries.saturating_add(1)) {
+            let entry = entry.map_err(|source| StoreError::Io {
+                operation: "read active managed documents entry",
+                path: root.clone(),
+                source,
+            })?;
+            paths.push(entry.path());
+        }
+        paths.sort();
+        if paths.len() > max_entries {
+            return Err(StoreError::RegistryCorrupt(format!(
+                "active managed documents count {} exceeds product projection cap {max_entries}",
+                paths.len()
+            )));
+        }
+        let entries = paths
+            .iter()
+            .map(|path| active_receipt_projection(self, path))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ActiveManagedDocumentsProjection {
+            complete: true,
+            entries,
+        })
+    }
+
+    /// Resolve one exact active representation through full receipt, manifest,
+    /// and database validation. Bounded enumeration intentionally does less and
+    /// cannot authorize an exact action.
+    pub fn active_managed_document(
+        &self,
+        materialization_id: &ManagedMaterializationId,
+    ) -> Result<ActiveManagedMaterialization, StoreError> {
+        let _lock = self.try_lock()?;
+        ensure_layout(self)?;
+        let active = active_path(self, materialization_id);
+        if !path_exists(&active)? {
+            return Err(StoreError::ManagedDocumentsNotFound(
+                materialization_id.clone(),
+            ));
+        }
+        active_projection(self, &active)
+    }
+
+    /// Read one exact active receipt and a caller-selected, byte-bounded
+    /// manifest projection without hashing the managed database. This is for
+    /// discoverability only. Search, citation, and removal must use
+    /// [`Self::active_managed_document`] first.
+    pub fn project_active_managed_document(
+        &self,
+        materialization_id: &ManagedMaterializationId,
+        max_manifest_bytes: u64,
+    ) -> Result<ActiveManagedMaterialization, StoreError> {
+        if max_manifest_bytes == 0 || max_manifest_bytes > MAX_MANIFEST_PROJECTION_BYTES {
+            return Err(StoreError::RegistryCorrupt(format!(
+                "managed documents manifest projection cap must be between 1 and {MAX_MANIFEST_PROJECTION_BYTES} bytes"
+            )));
+        }
+        let _lock = self.try_lock()?;
+        ensure_layout(self)?;
+        let active = active_path(self, materialization_id);
+        if !path_exists(&active)? {
+            return Err(StoreError::ManagedDocumentsNotFound(
+                materialization_id.clone(),
+            ));
+        }
+        active_projection_without_database(self, &active, max_manifest_bytes)
+    }
+
     /// Materialize one complete `managed.documents.v1` value into a private
     /// SQLite/FTS5 database and make it visible with one same-filesystem rename.
     /// Source paths are recorded as evidence only and are never opened here.
@@ -223,6 +385,180 @@ impl ManagedStore {
         removal.validate()?;
         Ok(removal)
     }
+}
+
+fn active_projection(
+    store: &ManagedStore,
+    active: &Path,
+) -> Result<ActiveManagedMaterialization, StoreError> {
+    let receipt = validate_active_materialization(store, active)?;
+    let manifest: ManagedDocumentsV1 =
+        read_json(&active.join(MANIFEST_FILE), "managed documents manifest")?;
+    projection_from_parts(receipt_projection_from_receipt(receipt), manifest)
+}
+
+fn projection_from_parts(
+    receipt: ActiveManagedReceipt,
+    manifest: ManagedDocumentsV1,
+) -> Result<ActiveManagedMaterialization, StoreError> {
+    let (document_count, segment_count, text_bytes) = materialization_counts(&manifest)?;
+    if document_count != receipt.document_count
+        || segment_count != receipt.segment_count
+        || text_bytes != receipt.text_bytes
+    {
+        return Err(StoreError::RegistryCorrupt(
+            "managed documents receipt accounting disagrees with its manifest".to_string(),
+        ));
+    }
+    let documents = manifest
+        .documents
+        .iter()
+        .map(|document| ActiveManagedDocument {
+            document_id: document.document_id.clone(),
+            title: document.title.clone(),
+            creator: document.creator.clone(),
+            locator: document.locator.clone(),
+            lineage: document.lineage.clone(),
+            rights: document.rights.clone(),
+            use_policy: document.use_policy,
+            segments: document
+                .segments
+                .iter()
+                .map(|segment| ActiveManagedSegment {
+                    segment_id: segment.segment_id.clone(),
+                    ordinal: segment.ordinal,
+                    text_sha256: segment.text_sha256.clone(),
+                    locator: segment.locator.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(ActiveManagedMaterialization {
+        materialization_id: receipt.materialization_id,
+        resource_id: receipt.resource_id,
+        release_id: receipt.release_id,
+        representation_id: receipt.representation_id,
+        content_sha256: receipt.content_sha256,
+        database_sha256: receipt.database_sha256,
+        document_count: receipt.document_count,
+        segment_count: receipt.segment_count,
+        text_bytes: receipt.text_bytes,
+        activated_at: receipt.activated_at,
+        provenance: manifest.provenance,
+        source_artifacts: manifest.source_artifacts,
+        documents,
+    })
+}
+
+fn active_receipt_projection(
+    store: &ManagedStore,
+    active: &Path,
+) -> Result<ActiveManagedReceipt, StoreError> {
+    validate_materialization_directory(active, true)?;
+    let receipt: ManagedDocumentsReceipt = read_json_bounded(
+        &active.join(RECEIPT_FILE),
+        "managed documents receipt projection",
+        MAX_RECEIPT_PROJECTION_BYTES,
+    )?;
+    receipt.validate()?;
+    let expected = store.root.join(&receipt.managed_relative_path);
+    if expected != active {
+        return Err(StoreError::RegistryCorrupt(
+            "managed documents receipt path disagrees with its active directory".to_string(),
+        ));
+    }
+    Ok(receipt_projection_from_receipt(receipt))
+}
+
+fn receipt_projection_from_receipt(receipt: ManagedDocumentsReceipt) -> ActiveManagedReceipt {
+    ActiveManagedReceipt {
+        materialization_id: receipt.materialization_id,
+        resource_id: receipt.resource_id,
+        release_id: receipt.release_id,
+        representation_id: receipt.representation_id,
+        content_sha256: receipt.content_sha256,
+        database_sha256: receipt.database_sha256,
+        document_count: receipt.document_count,
+        segment_count: receipt.segment_count,
+        text_bytes: receipt.text_bytes,
+        activated_at: receipt.activated_at,
+    }
+}
+
+fn active_projection_without_database(
+    store: &ManagedStore,
+    active: &Path,
+    max_manifest_bytes: u64,
+) -> Result<ActiveManagedMaterialization, StoreError> {
+    let receipt = active_receipt_projection(store, active)?;
+    let manifest: ManagedDocumentsV1 = read_json_bounded(
+        &active.join(MANIFEST_FILE),
+        "managed documents manifest projection",
+        max_manifest_bytes,
+    )?;
+    manifest.validate()?;
+    let synthetic_receipt = ManagedDocumentsReceipt {
+        schema: MANAGED_DOCUMENTS_RECEIPT_SCHEMA.to_string(),
+        materialization_id: receipt.materialization_id.clone(),
+        resource_id: receipt.resource_id.clone(),
+        release_id: receipt.release_id.clone(),
+        representation_id: receipt.representation_id.clone(),
+        content_sha256: receipt.content_sha256.clone(),
+        database_sha256: receipt.database_sha256.clone(),
+        document_count: receipt.document_count,
+        segment_count: receipt.segment_count,
+        text_bytes: receipt.text_bytes,
+        managed_relative_path: String::new(),
+        activated_at: receipt.activated_at,
+    };
+    if !receipt_matches_materialization(&synthetic_receipt, &manifest) {
+        return Err(StoreError::RegistryCorrupt(
+            "managed documents receipt disagrees with its immutable manifest".to_string(),
+        ));
+    }
+    projection_from_parts(receipt, manifest)
+}
+
+fn read_json_bounded<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    context: &'static str,
+    max_bytes: u64,
+) -> Result<T, StoreError> {
+    reject_symlink(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|source| StoreError::Io {
+            operation: "open bounded managed projection file",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata = file.metadata().map_err(|source| StoreError::Io {
+        operation: "inspect bounded managed projection file",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(StoreError::UnsafePath {
+            path: path.to_path_buf(),
+            reason: "managed projection file is not regular or exceeds its byte cap",
+        });
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| StoreError::Io {
+            operation: "read bounded managed projection file",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(StoreError::UnsafePath {
+            path: path.to_path_buf(),
+            reason: "managed projection file grew beyond its byte cap while being read",
+        });
+    }
+    serde_json::from_slice(&bytes).map_err(|source| StoreError::Json { context, source })
 }
 
 fn build_and_activate(
@@ -1048,6 +1384,75 @@ mod tests {
     }
 
     #[test]
+    fn active_receipt_enumeration_rejects_overflow_before_opening_entries()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let store = ManagedStore::open(temporary.path().join("managed"))?;
+        assert!(store.list_active_managed_documents(1)?.entries.is_empty());
+        let root = active_root(&store);
+        fs::create_dir(root.join("first"))?;
+        fs::create_dir(root.join("second"))?;
+        assert!(matches!(
+            store.list_active_managed_documents(1),
+            Err(StoreError::RegistryCorrupt(message)) if message.contains("projection cap")
+        ));
+        assert!(
+            store
+                .list_active_managed_documents(MAX_ACTIVE_PROJECTION_ENTRIES + 1)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_json_reader_accepts_exact_limit_and_rejects_one_byte_over()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let path = temporary.path().join("projection.json");
+        let mut exact = vec![b' '; 62];
+        exact.extend_from_slice(b"{}");
+        assert_eq!(exact.len(), 64);
+        fs::write(&path, exact)?;
+        let value: serde_json::Value = read_json_bounded(&path, "projection fixture", 64)?;
+        assert_eq!(value, serde_json::json!({}));
+
+        let mut oversized = vec![b' '; 63];
+        oversized.extend_from_slice(b"{}");
+        assert_eq!(oversized.len(), 65);
+        fs::write(&path, oversized)?;
+        assert!(matches!(
+            read_json_bounded::<serde_json::Value>(&path, "projection fixture", 64),
+            Err(StoreError::UnsafePath { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lightweight_receipt_projection_never_confers_database_authority()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempdir()?;
+        let store = ManagedStore::open(temporary.path().join("managed"))?;
+        let materialization = fixture_materialization()?;
+        store.materialize_documents(&materialization)?;
+        let database = active_path(&store, &materialization.materialization_id).join(DATABASE_FILE);
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o600))?;
+        fs::write(&database, b"corrupted after activation")?;
+
+        let listed = store.list_active_managed_documents(8)?;
+        assert_eq!(listed.entries.len(), 1);
+        assert!(
+            store
+                .active_managed_document(&materialization.materialization_id)
+                .is_err(),
+            "an exact action must reject the database that lightweight discovery did not hash"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn conflicting_content_and_stale_removal_confirmation_fail_closed() -> Result<(), Box<dyn Error>>
     {
         let temporary = tempdir()?;
@@ -1120,6 +1525,16 @@ mod tests {
                 assert!(path_exists(&stage)?);
             }
 
+            let immediately_visible = store.list_active_managed_documents(8)?;
+            assert!(immediately_visible.complete);
+            let expected_visible = usize::from(matches!(
+                boundary,
+                PublishBoundary::ActivationRenamed
+                    | PublishBoundary::ActivationHardened
+                    | PublishBoundary::ActivationSynced
+            ));
+            assert_eq!(immediately_visible.entries.len(), expected_visible);
+
             let receipt = store.materialize_documents(&materialization)?;
             assert_eq!(receipt.content_sha256, materialization.content_sha256);
             assert!(!path_exists(&stage)?);
@@ -1132,6 +1547,19 @@ mod tests {
                 max_snippet_chars: 256,
             };
             assert_eq!(store.search_managed_documents(&request)?.hits.len(), 1);
+            let reopened = ManagedStore::open(temporary.path().join("managed"))?;
+            let listed = reopened.list_active_managed_documents(8)?;
+            assert_eq!(listed.entries.len(), 1);
+            assert_eq!(
+                listed.entries[0].materialization_id,
+                materialization.materialization_id
+            );
+            let projected = reopened.project_active_managed_document(
+                &materialization.materialization_id,
+                MAX_MANIFEST_PROJECTION_BYTES,
+            )?;
+            assert_eq!(projected.content_sha256, materialization.content_sha256);
+            assert_eq!(projected.documents[0].title, "Fixture Document");
         }
         Ok(())
     }

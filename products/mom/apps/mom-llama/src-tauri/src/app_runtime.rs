@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, OnceCell};
 
 use crate::command_registry::{AdmissionClass, CommandClass, CommandSpec};
+use crate::information::MomInformation;
 use crate::operation_supervisor::{
     LifecyclePhase as OperationLifecyclePhase, OperationReservation, OperationSupervisor,
     TerminalClass, validate_worker_sets,
@@ -105,6 +106,7 @@ struct AppRuntime {
     work_drained: Notify,
     native_host: Arc<NativeHost>,
     speech: Arc<MomSpeech>,
+    information: Arc<MomInformation>,
     _native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
     cancellation_sweeps: AtomicU64,
     operation_scope: mom_llama_runtime::OperationScope,
@@ -528,6 +530,7 @@ impl Drop for AppWorkLease {
 struct AppRuntimeConstruction {
     native_host: Arc<NativeHost>,
     speech: Arc<MomSpeech>,
+    information: Arc<MomInformation>,
     native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
     operation_scope: mom_llama_runtime::OperationScope,
     native_finalizer: Arc<dyn NativeFinalizer>,
@@ -542,6 +545,7 @@ impl AppRuntimeHandle {
         native_owner: mom_llama_runtime::native_runtime::ProductRuntimeOwner,
         persona_approval_recovery: mom_llama_runtime::PersonaToolApprovalRecovery,
         speech: Arc<MomSpeech>,
+        information: Arc<MomInformation>,
     ) -> Self {
         let native_host = native_owner.host();
         let persona_approval_authority = persona_approval_recovery.clone();
@@ -549,6 +553,7 @@ impl AppRuntimeHandle {
             operation_scope: mom_llama_runtime::OperationScope::for_native_host(&native_host),
             native_host,
             speech,
+            information,
             native_owner: Some(native_owner),
             native_finalizer: Arc::new(ProductNativeFinalizer),
             operation_supervisor: OperationSupervisor::new(),
@@ -570,6 +575,7 @@ impl AppRuntimeHandle {
             operation_scope: mom_llama_runtime::OperationScope::for_native_host(&native_host),
             native_host,
             speech: MomSpeech::empty_for_tests(),
+            information: MomInformation::empty_for_tests(),
             native_owner,
             native_finalizer,
             operation_supervisor: OperationSupervisor::new(),
@@ -583,6 +589,7 @@ impl AppRuntimeHandle {
         let AppRuntimeConstruction {
             native_host,
             speech,
+            information,
             native_owner,
             operation_scope,
             native_finalizer,
@@ -604,6 +611,7 @@ impl AppRuntimeHandle {
             work_drained: Notify::new(),
             native_host,
             speech,
+            information,
             _native_owner: native_owner,
             cancellation_sweeps: AtomicU64::new(0),
             operation_scope,
@@ -702,6 +710,10 @@ impl AppRuntimeHandle {
 
     pub fn speech(&self) -> Arc<MomSpeech> {
         Arc::clone(&self.0.speech)
+    }
+
+    pub fn information(&self) -> Arc<MomInformation> {
+        Arc::clone(&self.0.information)
     }
 
     pub fn cancel_speculative(&self) -> Result<usize, String> {
@@ -980,6 +992,7 @@ mod tests {
         PersonaApprovalRecoveryWorker,
     };
     use crate::command_registry::command_spec;
+    use crate::information::MomInformation;
     use crate::operation_supervisor::OperationSupervisor;
     use llama_native_host::{NativeHost, NativeHostConfig, ProcessExitJoinedNativeHost};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1107,6 +1120,7 @@ mod tests {
             operation_scope: mom_llama_runtime::OperationScope::for_native_host(&host),
             native_host: host,
             speech: MomSpeech::empty_for_tests(),
+            information: MomInformation::empty_for_tests(),
             native_owner: None,
             native_finalizer: Arc::new(ReconciliationOrderingFinalizer {
                 reconciled: Arc::clone(&reconciled),

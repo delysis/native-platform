@@ -469,6 +469,24 @@
       documentPreview,
       [...(catalog.notices || []), ...(content.notices || [])],
     );
+    const libraryControls = document.createElement("div");
+    libraryControls.className = "attachment-library-controls";
+    const addToLibrary = createCommandElement(
+      "button",
+      DYNAMIC_CONTROL_SPECS.attachmentLibraryOpen,
+    );
+    addToLibrary.type = "button";
+    addToLibrary.className = "small-button";
+    addToLibrary.dataset.action = "attachment-library-open";
+    addToLibrary.dataset.attachment = content.anchor.attachment_id;
+    addToLibrary.dataset.rootSha256 = content.anchor.root_sha256;
+    addToLibrary.dataset.artifact = content.anchor.artifact_id;
+    addToLibrary.dataset.policyFingerprint = content.anchor.policy_fingerprint;
+    addToLibrary.dataset.title = preview.querySelector("figcaption strong")?.textContent
+      || "Attachment text";
+    addToLibrary.textContent = "Add to Library";
+    libraryControls.append(addToLibrary);
+    documentPreview.append(libraryControls);
     body.replaceChildren(documentPreview);
     preview.classList.add("hydrated-document");
   };
@@ -870,6 +888,221 @@
     modal.hidden = !visible;
     modal.classList.toggle("is-hidden", !visible);
     modal.setAttribute("aria-hidden", visible ? "false" : "true");
+  };
+
+  const setText = (id, value) => {
+    const element = document.getElementById(id);
+    if (element) element.textContent = value == null ? "" : String(value);
+  };
+
+  const clearAttachmentLibraryPreview = (modal) => {
+    delete modal.dataset.previewId;
+    delete modal.dataset.impactSha256;
+    modal.querySelector('[data-action="attachment-library-commit"]')?.setAttribute("disabled", "");
+    setText("attachment-library-graph", "Review required");
+    setText("attachment-library-text", "Review required");
+    setText("attachment-library-rights-sha", "Review required");
+    setText("attachment-library-impact-sha", "Review required");
+    setText("attachment-library-status", "Confirm rights, then review the exact publish impact.");
+  };
+
+  const openAttachmentLibrary = (button) => {
+    const modal = document.getElementById("attachment-library-modal");
+    if (!modal) return;
+    modal.dataset.attachment = button.dataset.attachment || "";
+    modal.dataset.rootSha256 = button.dataset.rootSha256 || "";
+    modal.dataset.artifact = button.dataset.artifact || "";
+    modal.dataset.policyFingerprint = button.dataset.policyFingerprint || "";
+    document.getElementById("attachment-library-item-title").value = button.dataset.title || "Attachment text";
+    document.getElementById("attachment-library-rights").checked = false;
+    setText("attachment-library-root", modal.dataset.rootSha256);
+    setText("attachment-library-artifact", modal.dataset.artifact);
+    setText("attachment-library-policy", modal.dataset.policyFingerprint);
+    clearAttachmentLibraryPreview(modal);
+    setModalVisibility("attachment-library-modal", true);
+    document.getElementById("attachment-library-rights")?.focus();
+  };
+
+  const previewAttachmentLibrary = async () => {
+    const modal = document.getElementById("attachment-library-modal");
+    if (!modal) return;
+    if (!document.getElementById("attachment-library-rights")?.checked) {
+      throw new Error("Confirm private local-use rights before reviewing this publish.");
+    }
+    const preview = await invoke("mom_llama_attachment_library_preview", {
+      anchor: {
+        attachment_id: modal.dataset.attachment || "",
+        root_sha256: modal.dataset.rootSha256 || "",
+        artifact_id: modal.dataset.artifact || "",
+        policy_fingerprint: modal.dataset.policyFingerprint || "",
+      },
+      title: document.getElementById("attachment-library-item-title")?.value || "Attachment text",
+      confirmedPrivateUse: true,
+    });
+    modal.dataset.previewId = preview.preview_id;
+    modal.dataset.impactSha256 = preview.impact_sha256;
+    setText("attachment-library-root", preview.root_sha256);
+    setText("attachment-library-graph", preview.graph_sha256);
+    setText("attachment-library-artifact", preview.artifact_id);
+    setText(
+      "attachment-library-policy",
+      `${preview.processor_name}@${preview.processor_version} · ${preview.policy_fingerprint}`,
+    );
+    setText(
+      "attachment-library-text",
+      `${preview.canonical_text_bytes} bytes · SHA-256 ${preview.canonical_text_sha256}`,
+    );
+    setText("attachment-library-rights-sha", preview.rights_sha256);
+    setText("attachment-library-impact-sha", preview.impact_sha256);
+    setText(
+      "attachment-library-status",
+      "Exact Attachment and rights bindings verified. Add exact text publishes an immutable managed copy.",
+    );
+    modal.querySelector('[data-action="attachment-library-commit"]')?.removeAttribute("disabled");
+  };
+
+  const commitAttachmentLibrary = async () => {
+    const modal = document.getElementById("attachment-library-modal");
+    if (!modal?.dataset.previewId || !modal.dataset.impactSha256) {
+      throw new Error("Review the exact attachment library item before publishing it.");
+    }
+    const result = await invoke("mom_llama_attachment_library_commit", {
+      previewId: modal.dataset.previewId,
+      impactSha256: modal.dataset.impactSha256,
+    });
+    report(result);
+    setModalVisibility("attachment-library-modal", false);
+    await refreshManagedAttachments();
+  };
+
+  const selectedInformationLibrary = () =>
+    document.getElementById("information-library-select")?.value || "";
+
+  const refreshInformationLibraries = async () => {
+    const libraries = await invoke("mom_llama_information_libraries");
+    const select = document.getElementById("information-library-select");
+    if (!select) return libraries;
+    const selected = select.value;
+    select.replaceChildren();
+    libraries.forEach((library) => {
+      const option = document.createElement("option");
+      option.value = library.installation_id;
+      option.textContent = `${library.label} · ${library.profile} · ${library.source_sha256.slice(0, 12)}`;
+      select.append(option);
+    });
+    if ([...select.options].some((option) => option.value === selected)) select.value = selected;
+    return libraries;
+  };
+
+  const renderInformationSearch = (result) => {
+    const container = document.getElementById("information-search-results");
+    if (!container) return;
+    container.replaceChildren();
+    if (!result.hits?.length) {
+      const empty = document.createElement("p");
+      empty.textContent = "No bounded local evidence matched.";
+      container.append(empty);
+      return;
+    }
+    result.hits.forEach((hit) => {
+      const article = document.createElement("article");
+      article.className = "information-result";
+      const title = document.createElement("strong");
+      title.textContent = hit.title;
+      const snippet = document.createElement("p");
+      snippet.textContent = hit.snippet;
+      const provenance = document.createElement("small");
+      provenance.textContent = `${hit.publisher} · excerpt SHA-256 ${hit.excerpt_sha256}`;
+      const open = createCommandElement("button", DYNAMIC_CONTROL_SPECS.informationOpenCitation);
+      open.type = "button";
+      open.className = "small-button";
+      open.dataset.action = "information-open-citation";
+      open.dataset.citation = JSON.stringify(hit.citation);
+      open.textContent = "Open exact citation";
+      article.append(title, snippet, provenance, open);
+      container.append(article);
+    });
+  };
+
+  const renderManagedEvidence = (container, hits) => {
+    container.replaceChildren();
+    if (!hits.length) {
+      const empty = document.createElement("p");
+      empty.textContent = "No canonical text segment matched.";
+      container.append(empty);
+      return;
+    }
+    hits.forEach((hit) => {
+      const result = document.createElement("div");
+      result.className = "information-managed-hit";
+      const snippet = document.createElement("p");
+      snippet.textContent = hit.snippet;
+      const open = createCommandElement(
+        "button",
+        DYNAMIC_CONTROL_SPECS.informationManagedCitation,
+      );
+      open.type = "button";
+      open.className = "small-button";
+      open.dataset.action = "information-open-managed-citation";
+      open.dataset.citation = JSON.stringify(hit.citation);
+      open.textContent = "Open exact lineage";
+      result.append(snippet, open);
+      container.append(result);
+    });
+  };
+
+  const refreshManagedAttachments = async () => {
+    const records = await invoke("mom_llama_information_managed_attachments");
+    const container = document.getElementById("information-managed-list");
+    if (!container) return records;
+    container.replaceChildren();
+    if (!records.length) {
+      const empty = document.createElement("p");
+      empty.textContent = "No active Attachment library representations.";
+      container.append(empty);
+      return records;
+    }
+    records.forEach((record) => {
+      const article = document.createElement("article");
+      article.className = "information-managed-item";
+      article.dataset.materialization = record.materialization_id;
+      const title = document.createElement("strong");
+      title.textContent = record.title;
+      const lineage = document.createElement("small");
+      lineage.textContent = `root ${record.root_sha256} · artifact ${record.artifact_id} · text ${record.canonical_text_sha256}`;
+      const query = createCommandElement(
+        "input",
+        DYNAMIC_CONTROL_SPECS.informationManagedSearch,
+      );
+      query.type = "search";
+      query.placeholder = "Search this managed text";
+      query.setAttribute("aria-label", `Search ${record.title}`);
+      const controls = document.createElement("div");
+      controls.className = "button-strip";
+      const search = createCommandElement(
+        "button",
+        DYNAMIC_CONTROL_SPECS.informationManagedSearch,
+      );
+      search.type = "button";
+      search.className = "small-button";
+      search.dataset.action = "information-search-managed";
+      search.textContent = "Search";
+      const remove = createCommandElement(
+        "button",
+        DYNAMIC_CONTROL_SPECS.informationManagedRemovalPreview,
+      );
+      remove.type = "button";
+      remove.className = "small-button danger";
+      remove.dataset.action = "information-managed-remove-preview";
+      remove.textContent = "Review removal";
+      const results = document.createElement("div");
+      results.className = "information-managed-results";
+      results.setAttribute("aria-live", "polite");
+      controls.append(search, remove);
+      article.append(title, lineage, query, controls, results);
+      container.append(article);
+    });
+    return records;
   };
 
   const slugHandle = (value) => String(value || "")
@@ -1284,6 +1517,13 @@
   };
 
   const DYNAMIC_CONTROL_SPECS = Object.freeze({
+    attachmentLibraryOpen: Object.freeze({
+      affordance: "attachment.library_open",
+      command: "mom_llama.attachment_library_preview",
+      tauri: "mom_llama_attachment_library_preview",
+      cli: "app-only; impact-hashed exact canonical Attachment preview",
+      effect: "mom_llama.effects.attachment_library_preview.v1",
+    }),
     attachmentPreview: Object.freeze({
       affordance: "attachment.preview",
       command: "mom_llama.attachment_preview",
@@ -1353,6 +1593,41 @@
       tauri: "mom_llama_message_edit",
       cli: "mom-llama message edit --conversation <id> --message <id> --content <text> --json",
       effect: "mom_llama.effects.conversation_store.v1",
+    }),
+    informationOpenCitation: Object.freeze({
+      affordance: "information.open_citation",
+      command: "mom_llama.information_open_citation",
+      tauri: "mom_llama_information_open_citation",
+      cli: "app-only; reopens one exact path-free citation",
+      effect: "mom_llama.effects.information_local_read.v1",
+    }),
+    informationManagedSearch: Object.freeze({
+      affordance: "information.search_managed_attachment",
+      command: "mom_llama.information_search_managed_attachment",
+      tauri: "mom_llama_information_search_managed_attachment",
+      cli: "app-only; exact managed representation search",
+      effect: "mom_llama.effects.information_managed_read.v1",
+    }),
+    informationManagedCitation: Object.freeze({
+      affordance: "information.open_managed_citation",
+      command: "mom_llama.information_open_managed_citation",
+      tauri: "mom_llama_information_open_managed_citation",
+      cli: "app-only; reopens exact managed lineage",
+      effect: "mom_llama.effects.information_managed_read.v1",
+    }),
+    informationManagedRemovalPreview: Object.freeze({
+      affordance: "information.managed_removal_preview",
+      command: "mom_llama.information_managed_removal_preview",
+      tauri: "mom_llama_information_managed_removal_preview",
+      cli: "app-only; opaque exact managed-only removal preview",
+      effect: "mom_llama.effects.information_managed_removal.v1",
+    }),
+    informationManagedRemovalCommit: Object.freeze({
+      affordance: "information.managed_removal_commit",
+      command: "mom_llama.information_managed_removal_commit",
+      tauri: "mom_llama_information_managed_removal_commit",
+      cli: "app-only; removes only exact Information-owned bytes",
+      effect: "mom_llama.effects.information_managed_removal.v1",
     }),
   });
 
@@ -2596,6 +2871,159 @@
       report(result);
       await refreshChat();
     },
+    "attachment-library-open": async (button) => openAttachmentLibrary(button),
+    "attachment-library-close": async () => setModalVisibility("attachment-library-modal", false),
+    "attachment-library-preview": async () => previewAttachmentLibrary(),
+    "attachment-library-commit": async () => commitAttachmentLibrary(),
+    "information-alexandria-pick": async () => {
+      const grant = await invoke("mom_llama_information_pick_alexandria");
+      const field = document.getElementById("information-path-grant");
+      if (field) field.value = grant.grant_id;
+      setText(
+        "information-path-grant-status",
+        `Opaque ${grant.profile} grant ready; the renderer has no source path.`,
+      );
+      const register = document.getElementById("information-alexandria-register");
+      if (register) {
+        register.disabled = !document.getElementById("information-rights-confirmed")?.checked;
+      }
+    },
+    "information-alexandria-register": async () => {
+      const grantId = document.getElementById("information-path-grant")?.value || "";
+      if (!grantId) throw new Error("Choose an Alexandria database first.");
+      const registration = await invoke("mom_llama_information_register_alexandria", {
+        grantId,
+        decision: {
+          confirmed: Boolean(document.getElementById("information-rights-confirmed")?.checked),
+          allow_model_context: Boolean(
+            document.getElementById("information-model-context-allowed")?.checked,
+          ),
+        },
+      });
+      document.getElementById("information-path-grant").value = "";
+      document.getElementById("information-alexandria-register").disabled = true;
+      setText(
+        "information-path-grant-status",
+        `Registered ${registration.profile} immutable read-only · ${registration.source_bytes} bytes · SHA-256 ${registration.source_sha256}.`,
+      );
+      await refreshInformationLibraries();
+    },
+    "information-libraries-refresh": async () => {
+      const libraries = await refreshInformationLibraries();
+      report({ libraries: libraries.length, path_free: true });
+    },
+    "information-search": async () => {
+      const installationId = selectedInformationLibrary();
+      if (!installationId) throw new Error("Register and select one Alexandria library first.");
+      const text = document.getElementById("information-search-query")?.value || "";
+      const result = await invoke("mom_llama_information_search", { installationId, text });
+      renderInformationSearch(result);
+    },
+    "information-open-citation": async (button) => {
+      const evidence = await invoke("mom_llama_information_open_citation", {
+        citation: JSON.parse(button.dataset.citation || "{}"),
+      });
+      const context = document.createElement("pre");
+      context.className = "information-citation-context";
+      context.textContent = evidence.context;
+      button.closest(".information-result")?.append(context);
+      button.disabled = true;
+    },
+    "information-model-grant": async (button) => {
+      const conversationId = selectedConversation();
+      const installationId = selectedInformationLibrary();
+      if (!installationId) throw new Error("Select an Alexandria library first.");
+      if (conversationId === "default") throw new Error("Start a chat before granting model context.");
+      const grant = await invoke("mom_llama_information_grant_model_context", {
+        conversationId,
+        installationId,
+        confirmed: true,
+      });
+      const section = button.closest(".information-search");
+      section.dataset.modelGrantId = grant.grant_id;
+      section.dataset.modelGrantConversation = grant.conversation_id;
+      section.dataset.modelGrantTarget = [
+        grant.resource_id,
+        grant.release_id,
+        grant.representation_id,
+        grant.source_sha256,
+      ].join("|");
+      setButtonStateLabel(button, "Allowed for this chat");
+    },
+    "information-chat-send": async (button) => {
+      const section = button.closest(".information-search");
+      const conversationId = selectedConversation();
+      if (
+        !section?.dataset.modelGrantId
+        || section.dataset.modelGrantConversation !== conversationId
+      ) {
+        throw new Error("Grant this exact library to the current chat first.");
+      }
+      const query = document.getElementById("information-search-query")?.value || "";
+      const message = document.getElementById("information-chat-message")?.value || "";
+      const result = await invoke("mom_llama_information_chat_send", {
+        conversationId,
+        grantId: section.dataset.modelGrantId,
+        query,
+        message,
+      });
+      report(result);
+      closeSettings();
+      await refreshConversationProjection();
+    },
+    "information-managed-refresh": async () => {
+      const records = await refreshManagedAttachments();
+      report({ managed_attachments: records.length, projection_only: true });
+    },
+    "information-search-managed": async (button) => {
+      const article = button.closest(".information-managed-item");
+      const text = article?.querySelector("input[type='search']")?.value || "";
+      const hits = await invoke("mom_llama_information_search_managed_attachment", {
+        materializationId: article?.dataset.materialization || "",
+        text,
+      });
+      renderManagedEvidence(article.querySelector(".information-managed-results"), hits);
+    },
+    "information-open-managed-citation": async (button) => {
+      const evidence = await invoke("mom_llama_information_open_managed_citation", {
+        citation: JSON.parse(button.dataset.citation || "{}"),
+      });
+      const exact = document.createElement("pre");
+      exact.className = "information-citation-context";
+      exact.textContent = evidence.snippet;
+      button.closest(".information-managed-hit")?.append(exact);
+      button.disabled = true;
+    },
+    "information-managed-remove-preview": async (button) => {
+      const article = button.closest(".information-managed-item");
+      const preview = await invoke("mom_llama_information_managed_removal_preview", {
+        materializationId: article?.dataset.materialization || "",
+      });
+      const output = article.querySelector(".information-managed-results");
+      output.replaceChildren();
+      const impact = document.createElement("p");
+      impact.textContent = `Remove ${preview.observed_managed_bytes} managed bytes only · content ${preview.content_sha256} · database ${preview.database_sha256} · external source removed: ${preview.external_source_bytes_removed}.`;
+      const commit = createCommandElement(
+        "button",
+        DYNAMIC_CONTROL_SPECS.informationManagedRemovalCommit,
+      );
+      commit.type = "button";
+      commit.className = "primary-button danger-button";
+      commit.dataset.action = "information-managed-remove-commit";
+      commit.dataset.preview = JSON.stringify(preview);
+      commit.textContent = "Remove exact managed representation";
+      output.append(impact, commit);
+    },
+    "information-managed-remove-commit": async (button) => {
+      const result = await invoke("mom_llama_information_managed_removal_commit", {
+        preview: JSON.parse(button.dataset.preview || "{}"),
+      });
+      if (result.external_source_bytes_removed) {
+        throw new Error("Information reported an invalid external-source removal.");
+      }
+      report(result);
+      await refreshManagedAttachments();
+    },
     "settings-get": async () => report(await invoke("mom_llama_settings_get")),
     "settings-reset": async () => { report(await invoke("mom_llama_settings_reset")); await refreshSettings("general"); },
     "settings-retry": async () => {
@@ -3133,6 +3561,24 @@
   });
 
   document.addEventListener("change", async (event) => {
+    if (event.target.matches("#information-rights-confirmed")) {
+      const register = document.getElementById("information-alexandria-register");
+      const hasGrant = Boolean(document.getElementById("information-path-grant")?.value);
+      if (register) register.disabled = !(hasGrant && event.target.checked);
+      return;
+    }
+    if (event.target.matches("#information-library-select")) {
+      const section = event.target.closest(".information-search");
+      delete section?.dataset.modelGrantId;
+      delete section?.dataset.modelGrantConversation;
+      delete section?.dataset.modelGrantTarget;
+      return;
+    }
+    if (event.target.matches("#attachment-library-item-title, #attachment-library-rights")) {
+      const modal = document.getElementById("attachment-library-modal");
+      if (modal) clearAttachmentLibraryPreview(modal);
+      return;
+    }
     if (event.target.matches("#settings-form [data-setting-core], #settings-form [data-setting-key]")) {
       scheduleSettingsAutosave(0);
       return;

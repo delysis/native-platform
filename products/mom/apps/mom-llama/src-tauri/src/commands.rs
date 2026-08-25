@@ -14,6 +14,9 @@ use tauri::{Emitter, State, Window};
 
 use crate::app_runtime::{AppRuntimeHandle, AppWorkLease};
 use crate::command_registry::command_spec;
+use crate::information::{
+    AlexandriaRightsDecision, CitationAnchor, ManagedCitationAnchor, ManagedRemovalPreview,
+};
 
 #[tauri::command]
 pub fn mom_llama_render_app(runtime: State<'_, AppRuntimeHandle>) -> Result<Response, String> {
@@ -96,6 +99,225 @@ pub async fn mom_llama_pick_file(
     };
     lease.finish(terminal)?;
     command_value(mom_llama_runtime::path_select(path_kind, path))
+}
+
+#[tauri::command]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+pub async fn mom_llama_information_pick_alexandria(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_pick_alexandria"))?;
+    let information = runtime.information();
+    let path = tokio::select! {
+        file = AsyncFileDialog::new()
+            .add_filter("Alexandria SQLite database", &["db", "sqlite", "sqlite3"])
+            .pick_file() => file.map(|file| file.path().to_path_buf()),
+        () = lease.cancelled() => None,
+    };
+    let terminal = if lease.cancellation_requested() {
+        crate::operation_supervisor::TerminalClass::Cancelled
+    } else {
+        crate::operation_supervisor::TerminalClass::Completed
+    };
+    lease.finish(terminal)?;
+    let path = path.ok_or_else(|| "No Alexandria database was selected.".to_string())?;
+    let grant = information.issue_alexandria_path_grant(path)?;
+    to_value(grant).map_err(to_error)
+}
+
+#[tauri::command]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+pub async fn mom_llama_information_pick_alexandria(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_pick_alexandria"))?;
+    lease.finish(crate::operation_supervisor::TerminalClass::Failed)?;
+    Err("The native Alexandria picker is unavailable on this platform.".to_string())
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_register_alexandria(
+    runtime: State<'_, AppRuntimeHandle>,
+    grant_id: String,
+    decision: AlexandriaRightsDecision,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_register_alexandria"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || {
+        information.register_alexandria(&grant_id, decision)
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn mom_llama_information_libraries(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_information_libraries"))?;
+    to_value(runtime.information().libraries()?).map_err(to_error)
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_search(
+    runtime: State<'_, AppRuntimeHandle>,
+    installation_id: String,
+    text: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_search"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || {
+        information.search_local(&installation_id, &text)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_open_citation(
+    runtime: State<'_, AppRuntimeHandle>,
+    citation: CitationAnchor,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_open_citation"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || information.open_citation(&citation)).await
+}
+
+#[tauri::command]
+pub fn mom_llama_information_grant_model_context(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation_id: String,
+    installation_id: String,
+    confirmed: bool,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_information_grant_model_context"))?;
+    to_value(runtime.information().grant_model_context(
+        &conversation_id,
+        &installation_id,
+        confirmed,
+    )?)
+    .map_err(to_error)
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_chat_send(
+    runtime: State<'_, AppRuntimeHandle>,
+    window: Window,
+    conversation_id: String,
+    grant_id: String,
+    query: String,
+    message: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_chat_send"))?;
+    let information = runtime.information();
+    let operations = runtime.operation_scope();
+    let events = window.clone();
+    blocking_command(lease, move || {
+        let message = information
+            .model_context_message(&conversation_id, &grant_id, &query, &message)
+            .map_err(anyhow::Error::msg)?;
+        mom_llama_runtime::chat_send_stream_in_scope(
+            &operations,
+            ChatSendInput {
+                conversation_id,
+                message,
+            },
+            ChatSendOptions::default(),
+            move |event| {
+                events
+                    .emit("mom_llama_chat_stream", &event)
+                    .map_err(anyhow::Error::new)?;
+                Ok(())
+            },
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_attachment_library_preview(
+    runtime: State<'_, AppRuntimeHandle>,
+    anchor: AttachmentPreviewAnchor,
+    title: String,
+    confirmed_private_use: bool,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_attachment_library_preview"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || {
+        information.preview_attachment(anchor, title, confirmed_private_use)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_attachment_library_commit(
+    runtime: State<'_, AppRuntimeHandle>,
+    preview_id: String,
+    impact_sha256: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_attachment_library_commit"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || {
+        information.commit_attachment(&preview_id, &impact_sha256)
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn mom_llama_information_managed_attachments(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_information_managed_attachments"))?;
+    to_value(runtime.information().managed_attachments()?).map_err(to_error)
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_search_managed_attachment(
+    runtime: State<'_, AppRuntimeHandle>,
+    materialization_id: String,
+    text: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec(
+        "mom_llama_information_search_managed_attachment",
+    ))?;
+    let information = runtime.information();
+    blocking_value(lease, move || {
+        information.search_managed_attachment(&materialization_id, &text)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_open_managed_citation(
+    runtime: State<'_, AppRuntimeHandle>,
+    citation: ManagedCitationAnchor,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_open_managed_citation"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || information.open_managed_citation(&citation)).await
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_managed_removal_preview(
+    runtime: State<'_, AppRuntimeHandle>,
+    materialization_id: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec(
+        "mom_llama_information_managed_removal_preview",
+    ))?;
+    let information = runtime.information();
+    blocking_value(lease, move || {
+        information.preview_managed_removal(&materialization_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_managed_removal_commit(
+    runtime: State<'_, AppRuntimeHandle>,
+    preview: ManagedRemovalPreview,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_managed_removal_commit"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || information.commit_managed_removal(&preview)).await
 }
 
 #[tauri::command]
@@ -1509,6 +1731,19 @@ where
     F: FnOnce() -> Result<Response, String> + Send + 'static,
 {
     lease.run_blocking(operation).await
+}
+
+async fn blocking_value<T, F>(lease: AppWorkLease, operation: F) -> Result<Value, String>
+where
+    T: serde::Serialize + Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    lease
+        .run_blocking(move || {
+            let value = operation()?;
+            to_value(value).map_err(to_error)
+        })
+        .await
 }
 
 fn to_error(error: impl std::fmt::Display) -> String {

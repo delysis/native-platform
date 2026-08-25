@@ -45,6 +45,33 @@ TTS and Parakeet are admitted only through never-network routes. Complete WAV
 playback and transcript previews are bounded in memory and cleared when the
 shared `AppRuntime` begins Quit.
 
+## Information authority
+
+The renderer has no filesystem path, SQLite, directory, glob, URL, or archive
+authority. Alexandria selection is a native dialog followed by a bounded,
+opaque, one-time process capability. Rust preflights the exact compiled profile
+before durable registration, then Information opens the caller-selected source
+immutable read-only, binds its identity and SHA-256, and rejects a non-empty WAL
+or rollback journal. Search results are untrusted local data; citation reopen
+must reproduce the exact resource, release, representation, locator, source
+fingerprint, and document/passage identity.
+
+Model-context access is separate from local UI search. A time-bounded grant is
+bound to one exact conversation and registered representation with an allowed
+rights policy and unchanged source SHA-256. The model receives only a bounded
+JSON evidence packet whose exact serialized byte length and SHA-256 are embedded
+in the stored chat input. No hosted or network fallback exists.
+
+Attachment-to-Library publication revalidates encrypted Attachment ownership and
+the exact root, graph, artifact, processor policy, canonical text hash/bytes,
+title, and confirmed private-use rights. Information owns atomic staging and
+activation; source Attachment records and external archives remain read-only.
+Discovery comes from bounded active Information receipts and bridge-qualified
+manifests. Exact actions fully validate the selected manifest and database.
+Managed removal requires a server-held opaque preview bound to exact hashes and
+caches the successful result for idempotent retry; it cannot remove source
+Attachment or external bytes.
+
 ## What this does not claim
 
 Secure-mode encryption does not protect content from someone who controls the

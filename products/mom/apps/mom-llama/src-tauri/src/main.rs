@@ -1,6 +1,7 @@
 mod app_runtime;
 mod command_registry;
 mod commands;
+mod information;
 mod operation_supervisor;
 mod speech;
 mod view;
@@ -402,6 +403,20 @@ fn main() {
             commands::mom_llama_render_sidebar_fragment,
             commands::mom_llama_render_settings_fragment,
             commands::mom_llama_pick_file,
+            commands::mom_llama_information_pick_alexandria,
+            commands::mom_llama_information_register_alexandria,
+            commands::mom_llama_information_libraries,
+            commands::mom_llama_information_search,
+            commands::mom_llama_information_open_citation,
+            commands::mom_llama_information_grant_model_context,
+            commands::mom_llama_information_chat_send,
+            commands::mom_llama_attachment_library_preview,
+            commands::mom_llama_attachment_library_commit,
+            commands::mom_llama_information_managed_attachments,
+            commands::mom_llama_information_search_managed_attachment,
+            commands::mom_llama_information_open_managed_citation,
+            commands::mom_llama_information_managed_removal_preview,
+            commands::mom_llama_information_managed_removal_commit,
             commands::mom_llama_engine_check,
             commands::mom_llama_engine_configure,
             commands::mom_llama_model_list,
@@ -784,10 +799,18 @@ fn build_runtime(
     .map_err(|error| RuntimeBuildError {
         message: format!("native runtime owner initialization failed: {error:#}"),
     })?;
+    let information = Arc::new(
+        crate::information::MomInformation::open(&settings.data_dir).map_err(|error| {
+            RuntimeBuildError {
+                message: format!("Information host initialization failed: {error}"),
+            }
+        })?,
+    );
     Ok(AppRuntimeHandle::new(
         native_owner,
         persona_approval_recovery,
         speech,
+        information,
     ))
 }
 

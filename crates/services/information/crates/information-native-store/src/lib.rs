@@ -13,6 +13,10 @@
 //! canonical implementation so planners and stores cannot drift.
 
 mod managed_documents;
+pub use managed_documents::{
+    ActiveManagedDocument, ActiveManagedDocumentsProjection, ActiveManagedMaterialization,
+    ActiveManagedReceipt, ActiveManagedSegment,
+};
 
 use chrono::{DateTime, Utc};
 use fs2::FileExt;

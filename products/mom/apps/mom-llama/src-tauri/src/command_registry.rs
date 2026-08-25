@@ -86,6 +86,28 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     read("mom_llama_render_sidebar_fragment", false, false),
     read("mom_llama_render_settings_fragment", false, true),
     long("mom_llama_pick_file", true, false),
+    long("mom_llama_information_pick_alexandria", false, false),
+    long("mom_llama_information_register_alexandria", true, false),
+    read("mom_llama_information_libraries", false, false),
+    long("mom_llama_information_search", false, false),
+    long("mom_llama_information_open_citation", false, false),
+    mutation("mom_llama_information_grant_model_context", false, false),
+    long("mom_llama_information_chat_send", true, true),
+    long("mom_llama_attachment_library_preview", false, false),
+    long("mom_llama_attachment_library_commit", true, false),
+    read("mom_llama_information_managed_attachments", false, false),
+    long(
+        "mom_llama_information_search_managed_attachment",
+        false,
+        false,
+    ),
+    long("mom_llama_information_open_managed_citation", false, false),
+    long(
+        "mom_llama_information_managed_removal_preview",
+        false,
+        false,
+    ),
+    long("mom_llama_information_managed_removal_commit", true, false),
     long("mom_llama_engine_check", true, true),
     mutation("mom_llama_engine_configure", true, true),
     read("mom_llama_model_list", true, false),
@@ -279,6 +301,7 @@ mod tests {
             "mom_llama_engine_configure",
             "mom_llama_model_select",
             "mom_llama_chat_send",
+            "mom_llama_information_chat_send",
             "mom_llama_composer_autocomplete",
             "mom_llama_composer_autocomplete_cancel",
             "mom_llama_composer_autocomplete_accept",
@@ -333,7 +356,10 @@ mod tests {
                 let expected_store_mutation = body.contains("command_value(")
                     || body.contains("blocking_command(")
                     || body.contains("picker_blocked(")
-                    || body.contains("composer_autocomplete_accept(");
+                    || body.contains("composer_autocomplete_accept(")
+                    || body.contains("register_alexandria(")
+                    || body.contains("commit_attachment(")
+                    || body.contains("commit_managed_removal(");
                 assert_eq!(
                     spec.mutates_store, expected_store_mutation,
                     "{} implementation {} store authority",
@@ -414,12 +440,14 @@ pub async fn sample(runtime: Runtime) {
                     implementation
                 );
                 let starts_long_work = body.contains("blocking_command(")
+                    || body.contains("blocking_value(")
                     || body.contains("blocking_response(")
                     || body.contains(".run_blocking(")
                     || body.contains("AsyncFileDialog::");
                 if starts_long_work {
                     assert!(
                         body.contains("blocking_command(")
+                            || body.contains("blocking_value(")
                             || body.contains("blocking_response(")
                             || body.contains(".run_blocking(")
                             || body.contains("lease.cancellation")

@@ -9,8 +9,8 @@ use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use anyhow::{Context, Result, anyhow};
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
 use attachment_native_types::{
-    ArtifactPayload, AttachmentGraph, BlobValidationGrade, CanonicalArtifact, Coverage,
-    DetectedFormat, MediaFamily, ObjectId, SegmentKind, TextFormat,
+    ArtifactPayload, AttachmentBundle, AttachmentGraph, AttachmentReceipt, BlobValidationGrade,
+    CanonicalArtifact, Coverage, DetectedFormat, MediaFamily, ObjectId, SegmentKind, TextFormat,
 };
 use llama_native_types::{MediaInput, MediaKind};
 use serde::de::DeserializeOwned;
@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use uuid::Uuid;
 
 const ATTACHMENTS_FILE: &str = "attachments.json";
@@ -124,6 +124,21 @@ struct AttachmentManifest {
     graph: AttachmentGraph,
     artifacts: Vec<CanonicalArtifact>,
     policy_fingerprint: String,
+    #[serde(default)]
+    receipt: Option<AttachmentReceipt>,
+}
+
+/// Host-only exact source authority for the Attachment -> Information bridge.
+///
+/// This capability deliberately has no serialization implementation. The
+/// renderer may name an [`AttachmentPreviewAnchor`], but only Mom's Rust host
+/// can reconstruct verified retained blobs and the matching Attachment receipt.
+#[derive(Clone)]
+pub struct AttachmentLibraryInput {
+    pub anchor: AttachmentPreviewAnchor,
+    pub bundle: AttachmentBundle,
+    pub receipt: AttachmentReceipt,
+    pub artifact_id: attachment_native_types::ArtifactId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -529,6 +544,7 @@ fn canonicalize_and_stage(
         graph: canonicalized.bundle.graph,
         artifacts: canonicalized.bundle.artifacts,
         policy_fingerprint: host.policy_fingerprint().to_string(),
+        receipt: Some(canonicalized.receipt),
     };
     let _lifecycle = lock_attachment_lifecycle()?;
     let mut attachment_db = load_attachment_db()?;
@@ -729,6 +745,75 @@ pub fn attachment_preview_media(
         anchor: anchor.clone(),
         media_type: blob.media_type.clone(),
         bytes,
+    }))
+}
+
+/// Reconstruct the exact canonical Attachment authority required by the
+/// Information materializer. Historical manifests pre-dating receipt
+/// persistence fail closed and must be re-imported; no receipt is fabricated.
+pub fn attachment_library_input(
+    anchor: &AttachmentPreviewAnchor,
+) -> Result<std::result::Result<AttachmentLibraryInput, Blocker>> {
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let store = RuntimeStore::current()?;
+    let authority = match exact_preview_authority(&store, anchor)? {
+        Ok(authority) => authority,
+        Err(problem) => return Ok(Err(preview_blocker(&problem.code, problem.message))),
+    };
+    let Some(artifact) = authority
+        .manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id.0 == anchor.artifact_id)
+    else {
+        return Ok(Err(preview_blocker(
+            "attachment_preview_artifact_mismatch",
+            "The requested canonical text artifact is no longer current.".to_string(),
+        )));
+    };
+    if !matches!(artifact.payload, ArtifactPayload::Text { .. }) {
+        return Ok(Err(preview_blocker(
+            "attachment_library_not_text",
+            "Only a canonical text artifact can be added to the Information library.".to_string(),
+        )));
+    }
+    let artifact_id = artifact.id.clone();
+    let Some(receipt) = authority.manifest.receipt.clone() else {
+        return Ok(Err(preview_blocker(
+            "attachment_library_receipt_missing",
+            "This historical attachment predates exact canonicalization receipts and must be re-imported before it can be added to the library."
+                .to_string(),
+        )));
+    };
+    let mut blobs = BTreeMap::new();
+    for object in &authority.manifest.graph.objects {
+        let bytes = match load_verified_object(&store, &authority.manifest.graph, &object.id) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Ok(Err(preview_blocker(
+                    "attachment_content_mismatch",
+                    "Retained attachment bytes no longer match the canonical graph.".to_string(),
+                )));
+            }
+        };
+        blobs.insert(object.id.clone(), Arc::<[u8]>::from(bytes));
+    }
+    let bundle = AttachmentBundle {
+        graph: authority.manifest.graph,
+        artifacts: authority.manifest.artifacts,
+        blobs,
+    };
+    if bundle.validate().is_err() || receipt.validate_against(&bundle, None).is_err() {
+        return Ok(Err(preview_blocker(
+            "attachment_library_authority_mismatch",
+            "The retained Attachment graph, blobs, and receipt no longer agree.".to_string(),
+        )));
+    }
+    Ok(Ok(AttachmentLibraryInput {
+        anchor: anchor.clone(),
+        artifact_id,
+        bundle,
+        receipt,
     }))
 }
 
@@ -3129,6 +3214,15 @@ mod tests {
         assert!(!rendered.contains("window.evil"));
         assert!(rendered.contains("# inert markdown"));
         assert!(!content.stats.truncated);
+        let library = attachment_library_input(&anchor)
+            .expect("library authority")
+            .expect("exact library input");
+        assert_eq!(library.anchor, anchor);
+        assert_eq!(library.artifact_id.0, anchor.artifact_id);
+        library
+            .receipt
+            .validate_against(&library.bundle, None)
+            .expect("persisted receipt must bind the reconstructed bundle");
 
         for field in ["root", "artifact", "policy"] {
             let mut stale = anchor.clone();
@@ -3148,6 +3242,11 @@ mod tests {
                     .map(|blocker| blocker.code.as_str()),
                 Some("attachment_preview_stale" | "attachment_preview_artifact_mismatch")
             ));
+            assert!(
+                attachment_library_input(&stale)
+                    .expect("stale library authority must return a blocker")
+                    .is_err()
+            );
         }
 
         crate::conversation_store::draft_update(Some("chat"), String::new(), Vec::new())
@@ -3160,6 +3259,11 @@ mod tests {
                 .as_ref()
                 .map(|blocker| blocker.code.as_str()),
             Some("attachment_not_found")
+        );
+        assert!(
+            attachment_library_input(&anchor)
+                .expect("removed library authority must return a blocker")
+                .is_err()
         );
     }
 
@@ -3357,6 +3461,7 @@ mod tests {
             .expect("fixture graph"),
             artifacts: vec![artifact],
             policy_fingerprint: "fixture".to_string(),
+            receipt: None,
         };
         let value = canonical_text(&record, &manifest);
         assert!(value.contains("BEGIN UNTRUSTED ATTACHMENT DATA id=attachment-1"));
