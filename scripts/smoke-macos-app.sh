@@ -7,6 +7,9 @@ SUPPLIED_ARTIFACT=${2:-}
 RECEIPT_DESTINATION=${3:-}
 LOOM_SMOKE_GGUF_MODEL_PATH=${LOOM_SMOKE_GGUF_MODEL_PATH:-}
 LOOM_SMOKE_REAL_COMPLETIONS=${LOOM_SMOKE_REAL_COMPLETIONS:-}
+MOM_ACCEPTANCE_PRODUCT_NAME=${MOM_ACCEPTANCE_PRODUCT_NAME:-}
+MOM_ACCEPTANCE_BUNDLE_ID=${MOM_ACCEPTANCE_BUNDLE_ID:-}
+MOM_ACCEPTANCE_SOURCE_SHA=${MOM_ACCEPTANCE_SOURCE_SHA:-}
 
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "smoke-macos-app.sh requires macOS" >&2
@@ -34,6 +37,58 @@ case "$COMPONENT" in
     exit 2
     ;;
 esac
+
+if [ -n "$MOM_ACCEPTANCE_PRODUCT_NAME" ] || [ -n "$MOM_ACCEPTANCE_BUNDLE_ID" ]; then
+  if [ "$COMPONENT" != mom ]; then
+    echo "Mom acceptance identity overrides are only valid for the Mom component" >&2
+    exit 2
+  fi
+  if [ -z "$MOM_ACCEPTANCE_PRODUCT_NAME" ] || [ -z "$MOM_ACCEPTANCE_BUNDLE_ID" ]; then
+    echo "Mom acceptance product name and bundle ID must be supplied together" >&2
+    exit 2
+  fi
+  if [ "${#MOM_ACCEPTANCE_SOURCE_SHA}" -ne 40 ]; then
+    echo "Mom acceptance source SHA must be a full 40-character Git object ID" >&2
+    exit 2
+  fi
+  case "$MOM_ACCEPTANCE_SOURCE_SHA" in
+    *[!0-9a-f]*)
+      echo "Mom acceptance source SHA must contain only lowercase hexadecimal digits" >&2
+      exit 2
+      ;;
+  esac
+  case "$MOM_ACCEPTANCE_PRODUCT_NAME" in
+    "Mom Llama Acceptance "*) ;;
+    *)
+      echo "Mom acceptance product name must begin with 'Mom Llama Acceptance '" >&2
+      exit 2
+      ;;
+  esac
+  case "$MOM_ACCEPTANCE_PRODUCT_NAME" in
+    *[!A-Za-z0-9._\ -]*)
+      echo "Mom acceptance product name contains an unsafe character" >&2
+      exit 2
+      ;;
+  esac
+  case "$MOM_ACCEPTANCE_BUNDLE_ID" in
+    com.delysis.mom-llama.acceptance.*) ;;
+    *)
+      echo "Mom acceptance bundle ID must begin with 'com.delysis.mom-llama.acceptance.'" >&2
+      exit 2
+      ;;
+  esac
+  case "$MOM_ACCEPTANCE_BUNDLE_ID" in
+    *[!A-Za-z0-9.-]*)
+      echo "Mom acceptance bundle ID contains an unsafe character" >&2
+      exit 2
+      ;;
+  esac
+  APP_NAME=$MOM_ACCEPTANCE_PRODUCT_NAME
+  BUNDLE_ID=$MOM_ACCEPTANCE_BUNDLE_ID
+elif [ -n "$MOM_ACCEPTANCE_SOURCE_SHA" ]; then
+  echo "Mom acceptance source SHA requires the unique product name and bundle ID" >&2
+  exit 2
+fi
 
 if [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ] && [ ! -f "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
   echo "LOOM_SMOKE_GGUF_MODEL_PATH is not a model file: $LOOM_SMOKE_GGUF_MODEL_PATH" >&2
@@ -131,6 +186,7 @@ if [ ! -x "$EXECUTABLE" ] || [ ! -f "$PLIST" ]; then
 fi
 
 EXECUTABLE_SHA256=$(shasum -a 256 "$EXECUTABLE" | awk '{print $1}')
+EXECUTABLE_FILE_ID=$(stat -Lf '%d:%i' "$EXECUTABLE")
 if [ -n "$INPUT_ARCHIVE" ]; then
   require_equal "release receipt executable SHA-256" "$EXECUTABLE_SHA256" "$RELEASE_RECEIPT_EXECUTABLE_SHA256"
 fi
@@ -152,6 +208,25 @@ if [ "$OBSERVED_EXECUTABLE" != "$BINARY_NAME" ]; then
   exit 1
 fi
 codesign --verify --deep --strict "$BUNDLE"
+
+reject_legacy_mom_bundle_ui() {
+  [ "$COMPONENT" = mom ] || return 0
+  for legacy_text in \
+    "Gentle explainer" \
+    "Warm, plain language" \
+    "Explain simply and warmly." \
+    "Create Skill" \
+    "No Skills yet." \
+    "Policy: disabled until verified" \
+    "KV-cache persistence is surfaced"; do
+    if LC_ALL=C grep -R -a -F -q -- "$legacy_text" "$BUNDLE/Contents"; then
+      echo "refusing legacy Mom bundle containing obsolete UI text: $legacy_text" >&2
+      exit 1
+    fi
+  done
+}
+
+reject_legacy_mom_bundle_ui
 
 PRODUCT_STATE="$SMOKE_ROOT/product"
 mkdir "$PRODUCT_STATE"
@@ -237,6 +312,92 @@ repeat {
     Thread.sleep(forTimeInterval: 0.1)
 } while Date() < deadline
 fputs("packaged application did not expose an on-screen window\n", stderr)
+exit(1)
+SWIFT
+}
+
+require_mom_ui_identity() {
+  target_pid=$1
+  xcrun swift - "$target_pid" <<'SWIFT'
+import ApplicationServices
+import Foundation
+
+let pid = Int32(CommandLine.arguments[1])!
+let application = AXUIElementCreateApplication(pid)
+let currentMarkers = [
+    "Mention a persona or chat",
+    "Personas, chats, and consult groups"
+]
+let legacyMarkers = [
+    "Gentle explainer",
+    "Warm, plain language",
+    "Explain simply and warmly.",
+    "Create Skill",
+    "No Skills yet.",
+    "Policy: disabled until verified",
+    "KV-cache persistence is surfaced"
+]
+let stringAttributes = [
+    kAXTitleAttribute as String,
+    kAXDescriptionAttribute as String,
+    kAXHelpAttribute as String,
+    kAXValueAttribute as String,
+    "AXPlaceholderValue"
+]
+
+func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else {
+        return nil
+    }
+    return value
+}
+
+func accessibilityStrings() -> [String] {
+    var queue = [application]
+    var cursor = 0
+    var observed: [String] = []
+    while cursor < queue.count && cursor < 8192 {
+        let element = queue[cursor]
+        cursor += 1
+        for name in stringAttributes {
+            if let value = attribute(element, name) as? String, !value.isEmpty {
+                observed.append(value)
+            }
+        }
+        if let children = attribute(element, kAXChildrenAttribute as String) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    return observed
+}
+
+let deadline = Date().addingTimeInterval(20)
+repeat {
+    let strings = accessibilityStrings()
+    if let legacy = legacyMarkers.first(where: { needle in
+        strings.contains(where: { $0.localizedCaseInsensitiveContains(needle) })
+    }) {
+        fputs("legacy Mom UI text is visible in the exact PID: \(legacy)\n", stderr)
+        exit(1)
+    }
+    if let current = currentMarkers.first(where: { needle in
+        strings.contains(where: { $0.localizedCaseInsensitiveContains(needle) })
+    }) {
+        let evidence: [String: Any] = [
+            "pid": pid,
+            "current_marker": current,
+            "legacy_markers_observed": 0,
+            "accessibility_strings_scanned": strings.count
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+        print(String(data: data, encoding: .utf8)!)
+        exit(0)
+    }
+    Thread.sleep(forTimeInterval: 0.1)
+} while Date() < deadline
+
+fputs("the exact Mom PID did not expose the current Persona-menu accessibility marker\n", stderr)
 exit(1)
 SWIFT
 }
@@ -2754,8 +2915,25 @@ run_once() {
     echo "LaunchServices did not expose a new exact-bundle process" >&2
     return 1
   fi
+  bound_command=$(ps -p "$ACTIVE_PID" -o command= | sed 's/^ *//')
+  require_equal "bound process executable path" "$EXECUTABLE" "$bound_command"
+  bound_executable_file_id=$(stat -Lf '%d:%i' "$EXECUTABLE")
+  bound_executable_sha256=$(shasum -a 256 "$EXECUTABLE" | awk '{print $1}')
+  require_equal "bound executable device/inode" "$EXECUTABLE_FILE_ID" "$bound_executable_file_id"
+  require_equal "bound executable SHA-256" "$EXECUTABLE_SHA256" "$bound_executable_sha256"
   echo "+ bound pid: $ACTIVE_PID"
-  eval "RUN_${run_number}_PID=$ACTIVE_PID"
+  case "$run_number" in
+    1)
+      RUN_1_PID=$ACTIVE_PID
+      RUN_1_EXECUTABLE_FILE_ID=$bound_executable_file_id
+      RUN_1_EXECUTABLE_SHA256=$bound_executable_sha256
+      ;;
+    2)
+      RUN_2_PID=$ACTIVE_PID
+      RUN_2_EXECUTABLE_FILE_ID=$bound_executable_file_id
+      RUN_2_EXECUTABLE_SHA256=$bound_executable_sha256
+      ;;
+  esac
 
   if ! wait_for_window "$ACTIVE_PID"; then
     echo "packaged app did not expose a window" >&2
@@ -2765,6 +2943,17 @@ run_once() {
   if ! wait_for_readiness "$run_number" "$ACTIVE_PID" "$stderr_log"; then
     echo "application logs: $stdout_log and $stderr_log" >&2
     return 1
+  fi
+  if [ "$COMPONENT" = mom ]; then
+    if ! mom_ui_identity=$(require_mom_ui_identity "$ACTIVE_PID"); then
+      echo "the exact Mom process failed UI identity verification" >&2
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    case "$run_number" in
+      1) RUN_1_MOM_UI_IDENTITY=$mom_ui_identity ;;
+      2) RUN_2_MOM_UI_IDENTITY=$mom_ui_identity ;;
+    esac
   fi
   if [ "$COMPONENT" = loom ] && [ "$run_number" -eq 1 ]; then
     loom_manuscript="$PRODUCT_STATE/writing/manuscript/Untitled.md"
@@ -3231,6 +3420,11 @@ if [ "$EXECUTABLE_SHA256_AFTER" != "$EXECUTABLE_SHA256" ]; then
   echo "packaged executable changed while the smoke test was running" >&2
   exit 1
 fi
+EXECUTABLE_FILE_ID_AFTER=$(stat -Lf '%d:%i' "$EXECUTABLE")
+if [ "$EXECUTABLE_FILE_ID_AFTER" != "$EXECUTABLE_FILE_ID" ]; then
+  echo "packaged executable inode changed while the smoke test was running" >&2
+  exit 1
+fi
 STATE_INVENTORY="$SMOKE_ROOT/state-inventory.txt"
 find "$PRODUCT_STATE" -mindepth 1 -print | LC_ALL=C sort > "$STATE_INVENTORY"
 RECEIPT="$SMOKE_ROOT/smoke-receipt.json"
@@ -3238,6 +3432,9 @@ RECEIPT="$SMOKE_ROOT/smoke-receipt.json"
 DELYSIS_SMOKE_COMPONENT="$COMPONENT" \
 DELYSIS_SMOKE_BUNDLE="$BUNDLE" \
 DELYSIS_SMOKE_BUNDLE_ID="$BUNDLE_ID" \
+DELYSIS_SMOKE_SOURCE_SHA="$MOM_ACCEPTANCE_SOURCE_SHA" \
+DELYSIS_SMOKE_EXECUTABLE_PATH="$EXECUTABLE" \
+DELYSIS_SMOKE_EXECUTABLE_FILE_ID="$EXECUTABLE_FILE_ID" \
 DELYSIS_SMOKE_EXECUTABLE_SHA="$EXECUTABLE_SHA256" \
 DELYSIS_SMOKE_INPUT_ARCHIVE="$INPUT_ARCHIVE" \
 DELYSIS_SMOKE_INPUT_ARCHIVE_SHA="$INPUT_ARCHIVE_SHA256" \
@@ -3246,6 +3443,12 @@ DELYSIS_SMOKE_INPUT_RELEASE_RECEIPT_SHA="$INPUT_RELEASE_RECEIPT_SHA256" \
 DELYSIS_SMOKE_STATE_ROOT="$PRODUCT_STATE" \
 DELYSIS_SMOKE_RUN_1_PID="$RUN_1_PID" \
 DELYSIS_SMOKE_RUN_2_PID="$RUN_2_PID" \
+DELYSIS_SMOKE_RUN_1_EXECUTABLE_FILE_ID="$RUN_1_EXECUTABLE_FILE_ID" \
+DELYSIS_SMOKE_RUN_2_EXECUTABLE_FILE_ID="$RUN_2_EXECUTABLE_FILE_ID" \
+DELYSIS_SMOKE_RUN_1_EXECUTABLE_SHA="$RUN_1_EXECUTABLE_SHA256" \
+DELYSIS_SMOKE_RUN_2_EXECUTABLE_SHA="$RUN_2_EXECUTABLE_SHA256" \
+DELYSIS_SMOKE_RUN_1_MOM_UI_IDENTITY="${RUN_1_MOM_UI_IDENTITY:-}" \
+DELYSIS_SMOKE_RUN_2_MOM_UI_IDENTITY="${RUN_2_MOM_UI_IDENTITY:-}" \
 DELYSIS_SMOKE_RUN_1_DRAG_EVIDENCE="${RUN_1_DRAG_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_BEFORE="${RUN_1_MANUSCRIPT_SHA256_BEFORE:-}" \
 DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER="${RUN_1_MANUSCRIPT_SHA256_AFTER:-}" \
@@ -3310,12 +3513,16 @@ const projectBusyRegression = e.DELYSIS_SMOKE_RUN_1_PROJECT_BUSY_MONITOR_EVIDENC
   accessibility_monitor: JSON.parse(e.DELYSIS_SMOKE_RUN_1_PROJECT_BUSY_MONITOR_EVIDENCE),
   launch_log_scan: JSON.parse(e.DELYSIS_SMOKE_RUN_1_PROJECT_BUSY_LOG_EVIDENCE),
 } : null;
+const momUiIdentity = (value) => value ? JSON.parse(value) : null;
 const receipt = {
   schema: "delysis.macos-packaged-app-smoke.v1",
   created_at: new Date().toISOString(),
   component: e.DELYSIS_SMOKE_COMPONENT,
   bundle: e.DELYSIS_SMOKE_BUNDLE,
   bundle_id: e.DELYSIS_SMOKE_BUNDLE_ID,
+  source_git_sha: e.DELYSIS_SMOKE_SOURCE_SHA || null,
+  executable_path: e.DELYSIS_SMOKE_EXECUTABLE_PATH,
+  executable_device_inode: e.DELYSIS_SMOKE_EXECUTABLE_FILE_ID,
   executable_sha256: e.DELYSIS_SMOKE_EXECUTABLE_SHA,
   input_archive: e.DELYSIS_SMOKE_INPUT_ARCHIVE || null,
   input_archive_sha256: e.DELYSIS_SMOKE_INPUT_ARCHIVE_SHA || null,
@@ -3325,6 +3532,10 @@ const receipt = {
   launches: [
     {
       pid: Number(e.DELYSIS_SMOKE_RUN_1_PID),
+      executable_path: e.DELYSIS_SMOKE_EXECUTABLE_PATH,
+      executable_device_inode: e.DELYSIS_SMOKE_RUN_1_EXECUTABLE_FILE_ID,
+      executable_sha256: e.DELYSIS_SMOKE_RUN_1_EXECUTABLE_SHA,
+      ui_identity: momUiIdentity(e.DELYSIS_SMOKE_RUN_1_MOM_UI_IDENTITY),
       window_observed: true,
       product_ready_at_state_root: true,
       titlebar_drag: titlebarDrag,
@@ -3365,6 +3576,10 @@ const receipt = {
     },
     {
       pid: Number(e.DELYSIS_SMOKE_RUN_2_PID),
+      executable_path: e.DELYSIS_SMOKE_EXECUTABLE_PATH,
+      executable_device_inode: e.DELYSIS_SMOKE_RUN_2_EXECUTABLE_FILE_ID,
+      executable_sha256: e.DELYSIS_SMOKE_RUN_2_EXECUTABLE_SHA,
+      ui_identity: momUiIdentity(e.DELYSIS_SMOKE_RUN_2_MOM_UI_IDENTITY),
       window_observed: true,
       product_ready_at_state_root: true,
       reopened_manuscript_sha256: e.DELYSIS_SMOKE_RUN_2_MANUSCRIPT_SHA || null,
