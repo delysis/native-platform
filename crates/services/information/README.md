@@ -34,6 +34,9 @@ real-partition acceptance is included yet.
 - `information-native-store`: private staging, same-filesystem activation,
   external read-only imports, full-byte verification, append-only receipts,
   and the strict source-neutral managed-document/FTS5 materializer.
+- `information-native-attachment-bridge`: path-free validation and deterministic
+  promotion of one exact canonical Attachment text artifact into managed
+  documents, downstream of both services.
 - `information-native-acquire`: the sole network-authority crate; bounded
   streaming fetch, durable HTTP resume, redirect/DNS attestations, and
   digest/length verification.
@@ -69,6 +72,12 @@ real-partition acceptance is included yet.
   with no pending WAL or rollback journal; immutable-read-only additionally
   pins full-file identity and SHA-256.
 - Managed state, indexes, and receipts are physically separate from sources.
+- Attachment promotion revalidates the root SHA, ordered graph locator and
+  hash, artifact, processor/policy fingerprint, canonical text bytes/hash,
+  title, and explicitly confirmed rights before Information stages anything.
+  The immutable managed release retains that lineage after its caller-owned
+  source disappears; the bridge never receives a source path or mutates the
+  Attachment bundle.
 - OpenZIM parsing uses ordinary bounded file reads, checked offset/count
   arithmetic, and a bounded pure-Rust Zstandard codec. It has no memory map,
   libzim FFI, `xz2`, sidecar, subprocess, active archive HTML, or network

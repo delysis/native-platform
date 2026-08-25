@@ -30,6 +30,37 @@ const MANIFEST_FILE: &str = "manifest.json";
 const RECEIPT_FILE: &str = "receipt.json";
 const EXPECTED_ACTIVE_FILES: [&str; 3] = [DATABASE_FILE, MANIFEST_FILE, RECEIPT_FILE];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishBoundary {
+    DatabaseSynced,
+    ManifestPublished,
+    ReceiptPublished,
+    StageSynced,
+    ActivationRenamed,
+    ActivationHardened,
+    ActivationSynced,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PUBLISH_FAULT: std::cell::Cell<Option<PublishBoundary>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn observe_publish_boundary(boundary: PublishBoundary) {
+    PUBLISH_FAULT.with(|fault| {
+        if fault.get() == Some(boundary) {
+            fault.set(None);
+            panic!("managed documents publish fault at {boundary:?}");
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn observe_publish_boundary(_boundary: PublishBoundary) {}
+
 impl ManagedStore {
     /// Materialize one complete `managed.documents.v1` value into a private
     /// SQLite/FTS5 database and make it visible with one same-filesystem rename.
@@ -46,6 +77,7 @@ impl ManagedStore {
         let active = active_root(self).join(&key);
         if path_exists(&active)? {
             let receipt = validate_active_materialization(self, &active)?;
+            make_materialization_directory_immutable(&active)?;
             if receipt_matches_materialization(&receipt, materialization) {
                 return Ok(receipt);
             }
@@ -202,6 +234,7 @@ fn build_and_activate(
     let database = stage.join(DATABASE_FILE);
     build_database(&database, materialization)?;
     sync_regular_file(&database, "sync managed documents database")?;
+    observe_publish_boundary(PublishBoundary::DatabaseSynced);
     let (_, database_sha256, _) = hash_file(&database)?;
 
     write_new_json(
@@ -209,6 +242,7 @@ fn build_and_activate(
         materialization,
         "managed documents manifest",
     )?;
+    observe_publish_boundary(PublishBoundary::ManifestPublished);
     let (document_count, segment_count, text_bytes) = materialization_counts(materialization)?;
     let key = materialization_key(&materialization.materialization_id);
     let receipt = ManagedDocumentsReceipt {
@@ -231,17 +265,22 @@ fn build_and_activate(
         &receipt,
         "managed documents receipt",
     )?;
-    sync_directory(stage)?;
+    observe_publish_boundary(PublishBoundary::ReceiptPublished);
     make_materialization_files_immutable(stage)?;
+    sync_directory(stage)?;
+    observe_publish_boundary(PublishBoundary::StageSynced);
 
     fs::rename(stage, active).map_err(|error| StoreError::Io {
         operation: "activate managed documents",
         path: active.to_path_buf(),
         source: error,
     })?;
+    observe_publish_boundary(PublishBoundary::ActivationRenamed);
     make_materialization_directory_immutable(active)?;
+    observe_publish_boundary(PublishBoundary::ActivationHardened);
     sync_directory(&active_root(store))?;
     sync_directory(&staging_root(store))?;
+    observe_publish_boundary(PublishBoundary::ActivationSynced);
     Ok(receipt)
 }
 
@@ -896,6 +935,7 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::error::Error;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use tempfile::tempdir;
 
     fn fixture_materialization() -> Result<ManagedDocumentsV1, Box<dyn Error>> {
@@ -1034,6 +1074,65 @@ mod tests {
             store.remove_managed_documents(&stale),
             Err(StoreError::ManagedDocumentsIdentityMismatch)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_publish_boundary_recovers_to_one_exact_searchable_release()
+    -> Result<(), Box<dyn Error>> {
+        let boundaries = [
+            PublishBoundary::DatabaseSynced,
+            PublishBoundary::ManifestPublished,
+            PublishBoundary::ReceiptPublished,
+            PublishBoundary::StageSynced,
+            PublishBoundary::ActivationRenamed,
+            PublishBoundary::ActivationHardened,
+            PublishBoundary::ActivationSynced,
+        ];
+
+        for boundary in boundaries {
+            let temporary = tempdir()?;
+            let store = ManagedStore::open(temporary.path().join("managed"))?;
+            let materialization = fixture_materialization()?;
+            PUBLISH_FAULT.with(|fault| fault.set(Some(boundary)));
+
+            let crashed = catch_unwind(AssertUnwindSafe(|| {
+                let _ = store.materialize_documents(&materialization);
+            }));
+            assert!(
+                crashed.is_err(),
+                "fault at {boundary:?} must interrupt publish"
+            );
+
+            let key = materialization_key(&materialization.materialization_id);
+            let active = active_root(&store).join(&key);
+            let stage = staging_root(&store).join(format!("building-{key}"));
+            if matches!(
+                boundary,
+                PublishBoundary::ActivationRenamed
+                    | PublishBoundary::ActivationHardened
+                    | PublishBoundary::ActivationSynced
+            ) {
+                assert!(path_exists(&active)?);
+                assert!(!path_exists(&stage)?);
+            } else {
+                assert!(!path_exists(&active)?);
+                assert!(path_exists(&stage)?);
+            }
+
+            let receipt = store.materialize_documents(&materialization)?;
+            assert_eq!(receipt.content_sha256, materialization.content_sha256);
+            assert!(!path_exists(&stage)?);
+            let request = ManagedDocumentsSearchRequest {
+                schema: MANAGED_DOCUMENTS_SEARCH_SCHEMA.to_string(),
+                materialization_id: materialization.materialization_id.clone(),
+                content_sha256: materialization.content_sha256.clone(),
+                query: "contemplative evidence".to_string(),
+                max_hits: 10,
+                max_snippet_chars: 256,
+            };
+            assert_eq!(store.search_managed_documents(&request)?.hits.len(), 1);
+        }
         Ok(())
     }
 }

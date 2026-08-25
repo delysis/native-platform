@@ -47,6 +47,15 @@ if [ -d "$overture_crate" ]; then
     fi
 fi
 
+attachment_bridge="$repo_dir/crates/information-native-attachment-bridge"
+if [ -d "$attachment_bridge" ]; then
+    if rg -n '\b(reqwest|rusqlite|tauri|std::fs|std::net|std::path|std::process|Command::new)\b' \
+        "$attachment_bridge/src"; then
+        echo "ambient path, network, process, SQLite, or renderer authority found in Attachment bridge" >&2
+        exit 1
+    fi
+fi
+
 if rg -n '(^|[^[:alnum:]_])unsafe([[:space:]]|\{|fn|trait|impl)' \
     "$repo_dir/crates" --glob '*.rs' --glob '!**/target/**'; then
     echo "unsafe Rust found in workspace" >&2

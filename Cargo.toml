@@ -11,6 +11,7 @@ members = [
     "crates/services/attachment/crates/attachment-native-plan",
     "crates/services/attachment/crates/attachment-native-types",
     "crates/services/information/crates/information-native-acquire",
+    "crates/services/information/crates/information-native-attachment-bridge",
     "crates/services/information/crates/information-native-backend-community",
     "crates/services/information/crates/information-native-backend-encyclopedia",
     "crates/services/information/crates/information-native-backend-overture",
@@ -140,6 +141,7 @@ fte-types = { path = "products/fte/crates/fte-types" }
 tauri-plugin-free-token-energy = { path = "products/fte/crates/tauri-plugin-free-token-energy" }
 information-native-host = { path = "crates/services/information/crates/information-native-host" }
 information-native-acquire = { path = "crates/services/information/crates/information-native-acquire" }
+information-native-attachment-bridge = { path = "crates/services/information/crates/information-native-attachment-bridge" }
 information-native-backend-community = { path = "crates/services/information/crates/information-native-backend-community" }
 information-native-backend-encyclopedia = { path = "crates/services/information/crates/information-native-backend-encyclopedia" }
 information-native-backend-overture = { path = "crates/services/information/crates/information-native-backend-overture" }

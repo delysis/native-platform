@@ -40,6 +40,17 @@ Materialization does not read the source URI: a source-specific adapter must
 already have verified and bounded the inert text and must retain exact artifact
 and record lineage in the contract.
 
+For Attachment canonical text,
+`information-native-attachment-bridge::materialize_attachment_text` accepts an
+in-memory `AttachmentBundle`, its exact `AttachmentReceipt`, and a path-free
+`AttachmentTextMaterializationRequest`. The request carries caller-confirmed
+rights and the complete root/graph/artifact/processor/policy/text/title binding.
+All mismatches and rights denials fail before the managed store is invoked.
+Activation uses the same verified staging path as other managed documents, and
+the resulting citation lineage remains reopenable without the original bundle
+or source bytes. This service API does not provide an app command, picker, or
+library UI.
+
 For Kiwix, `materialize_zim_documents` accepts a native-only
 `ZimMaterializationRequest` containing one already-authorized local archive
 path plus its expected size/SHA-256 and catalogue identities. The host invokes

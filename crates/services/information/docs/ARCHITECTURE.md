@@ -164,6 +164,26 @@ manifest, and receipt. The store never opens a source archive during generic
 materialization, and source archives are outside the removal target by
 construction.
 
+## Attachment canonical-text producer boundary
+
+`information-native-attachment-bridge` is a service adapter downstream of
+Attachment and Information. Its path-free request binds one Attachment root
+SHA-256, ordered graph locator and graph hash, canonical artifact ID,
+processor/version/policy fingerprint, exact inert text bytes and hash, title,
+and explicitly confirmed rights. The adapter revalidates those facts against
+the in-memory Attachment bundle and receipt before calling the existing
+managed-document store. A deterministic binding fingerprint supplies the
+managed resource, release, representation, document, and segment identities;
+an exact retry reopens the same immutable release.
+
+The source remains Attachment-owned and unchanged. Information copies only the
+bounded canonical text into its separately rooted staged database, manifest,
+and receipt, then publishes them with the existing atomic rename. Every search
+hit reproduces the root, graph, artifact, processor/policy, canonical-text, and
+rights lineage. The bridge has no picker, path, URL, network, renderer, Mom
+store, or transform-execution authority. Product `Add to Library` UX and native
+acceptance remain separate work.
+
 ## OpenZIM producer boundary
 
 `information-native-backend-zim` is a native-only producer, not a renderer or

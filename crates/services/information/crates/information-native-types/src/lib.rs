@@ -676,7 +676,7 @@ pub struct ManagedSourceArtifact {
 impl ManagedSourceArtifact {
     fn validate(&self) -> Result<(), ContractError> {
         validate_identifier("managed.source_artifact_id", self.artifact_id.as_str())?;
-        validate_durable_fetch_uri("managed.source_artifact_uri", &self.source_uri)?;
+        validate_managed_source_uri("managed.source_artifact_uri", &self.source_uri)?;
         validate_sha256(&self.sha256)?;
         if self.bytes == 0 || !self.immutable {
             return Err(ContractError::InvalidContract(
@@ -721,7 +721,7 @@ impl ManagedDocument {
             require_bounded_text("managed.document.creator", creator, 2_048)?;
         }
         if let Some(source_uri) = &self.source_uri {
-            validate_durable_fetch_uri("managed.document.source_uri", source_uri)?;
+            validate_managed_source_uri("managed.document.source_uri", source_uri)?;
         }
         validate_bounded_locator("managed.document.locator", &self.locator)?;
         if !self.immutable {
@@ -2892,6 +2892,22 @@ fn validate_durable_fetch_uri(field: &str, value: &str) -> Result<(), ContractEr
     Ok(())
 }
 
+fn validate_managed_source_uri(field: &str, value: &str) -> Result<(), ContractError> {
+    if let Some(digest) = value.strip_prefix("urn:sha256:") {
+        if digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Ok(());
+        }
+        return Err(ContractError::InvalidContract(format!(
+            "{field} has an invalid content-addressed SHA-256 URN"
+        )));
+    }
+    validate_durable_fetch_uri(field, value)
+}
+
 fn validate_file_name(value: &str) -> Result<(), ContractError> {
     let stem = value.split('.').next().unwrap_or(value);
     let windows_reserved = [
@@ -3565,5 +3581,38 @@ mod tests {
             "digest mismatch",
         ));
         assert!(forged.validate().is_err());
+    }
+
+    #[test]
+    fn managed_source_sha256_urn_is_exact_and_canonical() {
+        let digest = "a".repeat(64);
+        assert!(
+            validate_managed_source_uri(
+                "managed.source_artifact_uri",
+                &format!("urn:sha256:{digest}")
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_managed_source_uri(
+                "managed.source_artifact_uri",
+                &format!("urn:sha256:{}", "A".repeat(64))
+            )
+            .is_err()
+        );
+        assert!(
+            validate_managed_source_uri(
+                "managed.source_artifact_uri",
+                &format!("urn:sha256:sha256:{digest}")
+            )
+            .is_err()
+        );
+        assert!(
+            validate_managed_source_uri(
+                "managed.source_artifact_uri",
+                &format!("attachment:sha256:{digest}")
+            )
+            .is_err()
+        );
     }
 }
