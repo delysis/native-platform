@@ -389,7 +389,7 @@ impl MomInformation {
             .external
             .iter()
             .filter(|registration| is_alexandria(registration))
-            .map(|registration| external_summary(registration))
+            .map(external_summary)
             .collect()
     }
 
@@ -1577,7 +1577,12 @@ mod tests {
         let reopened = information
             .open_citation(&result.hits[0].citation)
             .expect("exact citation reopen");
-        assert_eq!(reopened.excerpt_sha256, result.hits[0].excerpt_sha256);
+        assert_eq!(reopened.citation, result.hits[0].citation);
+        assert_eq!(
+            reopened.excerpt_sha256,
+            information_native_types::evidence_text_sha256(&reopened.snippet, &reopened.context),
+            "citation reopen must hash its exact returned excerpt"
+        );
         drop(information);
 
         let relaunched = MomInformation::open(&data_dir).expect("relaunch Information app host");

@@ -434,7 +434,7 @@ pub async fn sample(runtime: Runtime) {
             for (implementation, body) in command_bodies(source, spec.name).into_iter().enumerate()
             {
                 assert!(
-                    body.contains(&format!("admit(command_spec(\"{}\"))", spec.name)),
+                    command_admission_offset(body, spec.name).is_some(),
                     "{} implementation {} must atomically acquire its classified app lease",
                     spec.name,
                     implementation
@@ -487,11 +487,29 @@ pub async fn sample(runtime: Runtime) {
         let Some((_, executable)) = body.split_once('{') else {
             return false;
         };
-        let admission = format!("admit(command_spec(\"{name}\"))");
-        let Some(admission_offset) = executable.find(&admission) else {
+        let executable = source_without_whitespace(executable);
+        let Some(admission_offset) = command_admission_offset(&executable, name) else {
             return false;
         };
-        effect_offsets(executable).all(|effect_offset| admission_offset < effect_offset)
+        effect_offsets(&executable).all(|effect_offset| admission_offset < effect_offset)
+    }
+
+    fn command_admission_offset(source: &str, name: &str) -> Option<usize> {
+        let compact = source_without_whitespace(source);
+        [
+            format!("admit(command_spec(\"{name}\"))"),
+            format!("admit(command_spec(\"{name}\",))"),
+        ]
+        .into_iter()
+        .filter_map(|admission| compact.find(&admission))
+        .min()
+    }
+
+    fn source_without_whitespace(source: &str) -> String {
+        source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
     }
 
     fn effect_offsets(body: &str) -> impl Iterator<Item = usize> + '_ {

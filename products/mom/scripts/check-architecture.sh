@@ -19,6 +19,12 @@ then
   exit 1
 fi
 
+if find crates -mindepth 1 -maxdepth 1 -type d -name 'information-native-*' | grep -q .
+then
+  echo "copied information-native crates are forbidden; use the pinned Information dependency" >&2
+  exit 1
+fi
+
 if rg -n '(fte-speech-|tauri-plugin-(fte-speech|free-token-energy-speech|speech-native))' --glob 'Cargo.toml' .
 then
   echo "Mom speech must use its product-owned IPC edge, not FTE or a generic Tauri plugin" >&2
@@ -31,9 +37,9 @@ then
   exit 1
 fi
 
-if rg -n '(llama|attachment|speech)-native-[a-z-]+\s*=\s*\{\s*path\s*=\s*"\.\.' --glob 'Cargo.toml' .
+if rg -n '(llama|attachment|speech|information)-native-[a-z-]+\s*=\s*\{\s*path\s*=\s*"\.\.' --glob 'Cargo.toml' .
 then
-  echo "Mom child manifests must inherit imported dependencies from the root workspace" >&2
+  echo "Mom child manifests must inherit imported Native, Attachment, Speech, and Information dependencies from the root workspace" >&2
   exit 1
 fi
 
@@ -52,7 +58,13 @@ for dependency in \
   'speech-native-host = { path = "crates/services/speech/crates/speech-native-host" }' \
   'speech-native-types = { path = "crates/services/speech/crates/speech-native-types" }' \
   'speech-native-platform = { path = "crates/services/speech/crates/speech-native-platform" }' \
-  'speech-native-backend-parakeet = { path = "crates/services/speech/crates/speech-native-backend-parakeet" }'
+  'speech-native-backend-parakeet = { path = "crates/services/speech/crates/speech-native-backend-parakeet" }' \
+  'information-native-host = { path = "crates/services/information/crates/information-native-host" }' \
+  'information-native-store = { path = "crates/services/information/crates/information-native-store" }' \
+  'information-native-types = { path = "crates/services/information/crates/information-native-types" }' \
+  'information-native-retrieval = { path = "crates/services/information/crates/information-native-retrieval" }' \
+  'information-native-attachment-bridge = { path = "crates/services/information/crates/information-native-attachment-bridge" }' \
+  'information-native-backend-sqlite = { path = "crates/services/information/crates/information-native-backend-sqlite" }'
 do
   if ! grep -Fqx "$dependency" "$root_manifest"
   then
@@ -105,6 +117,21 @@ do
   fi
 done
 
+for information_package in \
+  information-native-host \
+  information-native-store \
+  information-native-types \
+  information-native-retrieval \
+  information-native-attachment-bridge \
+  information-native-backend-sqlite
+do
+  if ! cargo tree --locked -p mom-llama-app -i "$information_package@0.1.0" >/dev/null
+  then
+    echo "the Mom Information package identity is missing or ambiguous: $information_package" >&2
+    exit 1
+  fi
+done
+
 for task_file in crates/mom-llama-runtime/src/*.rs
 do
   case "$task_file" in
@@ -135,4 +162,4 @@ then
   exit 1
 fi
 
-echo "architecture ok: Mom owns product code and narrow Speech IPC, resolves Native/Attachment/Speech, and does not compose standalone FTE or a generic speech plugin"
+echo "architecture ok: Mom owns product code plus narrow Speech and Information edges, resolves Native/Attachment/Speech/Information, and does not compose standalone FTE or a generic service plugin"
