@@ -81,6 +81,12 @@ if [ ! -x "$EXECUTABLE" ]; then
   exit 1
 fi
 
+# Tauri's custom per-run identity changes the bundle resources after its build
+# signature is created. Re-seal the isolated local artifact before the strict
+# smoke verifier binds it to the exact executable inode and hash.
+codesign --force --deep --sign - "$BUNDLE"
+codesign --verify --deep --strict "$BUNDLE"
+
 MOM_ACCEPTANCE_PRODUCT_NAME="$PRODUCT_NAME" \
 MOM_ACCEPTANCE_BUNDLE_ID="$BUNDLE_ID" \
 MOM_ACCEPTANCE_SOURCE_SHA="$SOURCE_SHA" \
