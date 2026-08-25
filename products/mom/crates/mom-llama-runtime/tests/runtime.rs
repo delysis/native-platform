@@ -240,14 +240,29 @@ fn settings_paths_can_be_replaced_and_explicitly_cleared() -> Result<()> {
     })?
     .result
     .ok_or_else(|| anyhow!("replacement settings missing"))?;
-    assert_eq!(replaced.model_path, Some(model));
-    assert_eq!(replaced.mmproj_path, Some(mmproj));
+    assert_eq!(replaced.model_path, Some(model.clone()));
+    assert_eq!(replaced.mmproj_path, Some(mmproj.clone()));
 
     let unchanged = mom_llama_runtime::settings_update(SettingsUpdate::default())?
         .result
         .ok_or_else(|| anyhow!("unchanged settings missing"))?;
     assert_eq!(unchanged.model_path, replaced.model_path);
     assert_eq!(unchanged.mmproj_path, replaced.mmproj_path);
+
+    let next_model = PathBuf::from("/models/next.gguf");
+    let model_changed = mom_llama_runtime::settings_update(SettingsUpdate {
+        model_path: Some(Some(next_model.clone())),
+        ..SettingsUpdate::default()
+    })?
+    .result
+    .ok_or_else(|| anyhow!("model-only settings missing"))?;
+    assert_eq!(model_changed.model_path, Some(next_model));
+    assert_eq!(model_changed.mmproj_path, None);
+    assert_eq!(
+        model_changed.upstream_settings.get("mmprojPath"),
+        Some(&json!("")),
+        "a model-only patch must never retain the previous model's projector"
+    );
 
     let cleared = mom_llama_runtime::settings_update(SettingsUpdate {
         model_path: Some(None),

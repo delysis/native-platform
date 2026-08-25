@@ -385,12 +385,29 @@ pub fn mom_llama_model_list(runtime: State<'_, AppRuntimeHandle>) -> Result<Valu
 }
 
 #[tauri::command]
-pub fn mom_llama_model_select(
+pub async fn mom_llama_model_select(
     runtime: State<'_, AppRuntimeHandle>,
     model_path: String,
+    conversation: Option<String>,
 ) -> Result<Value, String> {
-    let _lease = runtime.admit(command_spec("mom_llama_model_select"))?;
-    command_value(mom_llama_runtime::model_select(PathBuf::from(model_path)))
+    let conversation = conversation.filter(|value| !value.trim().is_empty());
+    let lease = runtime.admit(command_spec("mom_llama_model_select"))?;
+    let default_intent = conversation
+        .is_none()
+        .then(mom_llama_runtime::begin_model_selection)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    blocking_command(lease, move || match conversation.as_deref() {
+        Some(conversation) => mom_llama_runtime::conversation_model_select_and_load(
+            conversation,
+            PathBuf::from(model_path),
+        ),
+        None => mom_llama_runtime::model_select_with_intent(
+            PathBuf::from(model_path),
+            default_intent.expect("default model selection always has an intent"),
+        ),
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1674,7 +1691,10 @@ fn value_to_settings_map(value: Value) -> Option<std::collections::BTreeMap<Stri
 }
 
 fn path_setting_patch(value: Option<String>) -> Option<Option<PathBuf>> {
-    value.map(|value| (!value.is_empty()).then(|| PathBuf::from(value)))
+    value.map(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| PathBuf::from(value))
+    })
 }
 
 fn native_device_from_str(value: &str) -> NativeDevice {
@@ -1777,6 +1797,7 @@ mod tests {
     fn path_setting_patch_distinguishes_omitted_clear_and_replace() {
         assert_eq!(path_setting_patch(None), None);
         assert_eq!(path_setting_patch(Some(String::new())), Some(None));
+        assert_eq!(path_setting_patch(Some("   ".to_string())), Some(None));
         assert_eq!(
             path_setting_patch(Some("/models/local.gguf".to_string())),
             Some(Some(PathBuf::from("/models/local.gguf")))
@@ -1802,6 +1823,7 @@ mod tests {
             "mom_llama_mcp_read_resource",
             "mom_llama_mcp_list_prompts",
             "mom_llama_mcp_get_prompt",
+            "mom_llama_model_select",
             "mom_llama_model_slot_load",
             "mom_llama_model_slot_unload",
         ] {

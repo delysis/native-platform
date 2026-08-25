@@ -135,6 +135,14 @@ pub struct ValidationBlocker {
     pub blocker: Blocker,
 }
 
+impl std::fmt::Display for ValidationBlocker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.blocker.code, self.blocker.message)
+    }
+}
+
+impl std::error::Error for ValidationBlocker {}
+
 pub fn validate_engine_and_model(
     settings: &Settings,
 ) -> std::result::Result<(), ValidationBlocker> {
@@ -155,13 +163,23 @@ pub fn validate_engine_and_model(
 }
 
 pub fn validate_model_path(model: &Path) -> std::result::Result<(), ValidationBlocker> {
+    if model.as_os_str().is_empty() || model.to_str().is_some_and(|value| value.trim().is_empty()) {
+        return Err(ValidationBlocker {
+            readiness: "blocked_missing_model".to_string(),
+            blocker: Blocker::new(
+                "model_path_missing",
+                "No GGUF model is configured.",
+                vec!["Choose a local GGUF model.".to_string()],
+            ),
+        });
+    }
     if !model.exists() {
         return Err(ValidationBlocker {
             readiness: "blocked_missing_model".to_string(),
             blocker: Blocker::new(
                 "model_path_missing",
-                format!("Configured model path does not exist: {}.", model.display()),
-                vec!["Choose an existing .gguf model file.".to_string()],
+                "That model file is no longer available.",
+                vec!["Choose an available GGUF model file.".to_string()],
             ),
         });
     }
@@ -170,8 +188,8 @@ pub fn validate_model_path(model: &Path) -> std::result::Result<(), ValidationBl
             readiness: "blocked_invalid_model".to_string(),
             blocker: Blocker::new(
                 "model_path_not_file",
-                format!("Configured model path is not a file: {}.", model.display()),
-                vec!["Choose a .gguf model file.".to_string()],
+                "Choose a GGUF model file, not a folder.",
+                vec!["Choose a file ending in .gguf.".to_string()],
             ),
         });
     }
@@ -184,13 +202,54 @@ pub fn validate_model_path(model: &Path) -> std::result::Result<(), ValidationBl
             readiness: "blocked_invalid_model".to_string(),
             blocker: Blocker::new(
                 "model_path_not_gguf",
-                format!(
-                    "Configured model path is not a .gguf file: {}.",
-                    model.display()
-                ),
-                vec!["Choose a .gguf model file.".to_string()],
+                "Choose a GGUF model file.",
+                vec!["Choose a file ending in .gguf.".to_string()],
             ),
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_model_path;
+    use std::path::Path;
+
+    #[test]
+    fn model_path_blockers_are_friendly_and_never_echo_raw_paths() {
+        let empty = validate_model_path(Path::new("")).expect_err("empty model path");
+        assert_eq!(empty.blocker.message, "No GGUF model is configured.");
+        assert!(!empty.blocker.message.contains(": ."));
+
+        let missing_path = std::env::temp_dir().join(format!(
+            "mom-llama-missing-private-model-{}.gguf",
+            crate::now_ms()
+        ));
+        let missing = validate_model_path(&missing_path).expect_err("missing model path");
+        assert_eq!(
+            missing.blocker.message,
+            "That model file is no longer available."
+        );
+        assert!(
+            !missing
+                .blocker
+                .message
+                .contains(&missing_path.display().to_string())
+        );
+
+        let directory =
+            std::env::temp_dir().join(format!("mom-llama-invalid-model-kind-{}", crate::now_ms()));
+        std::fs::create_dir_all(&directory).expect("model test directory");
+        let not_file = validate_model_path(&directory).expect_err("directory is not a model");
+        assert_eq!(
+            not_file.blocker.message,
+            "Choose a GGUF model file, not a folder."
+        );
+        let text = directory.join("private-name.txt");
+        std::fs::write(&text, b"not a GGUF").expect("non-GGUF file");
+        let not_gguf = validate_model_path(&text).expect_err("wrong model extension");
+        assert_eq!(not_gguf.blocker.message, "Choose a GGUF model file.");
+        assert!(!not_gguf.blocker.message.contains("private-name"));
+        std::fs::remove_dir_all(directory).expect("remove model test directory");
+    }
 }

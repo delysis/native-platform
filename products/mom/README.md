@@ -56,11 +56,21 @@ products/mom/scripts/check-persona-product-ux.sh
 
 ## Run the app
 
-Set `MOM_LLAMA_MODEL_PATH` to a GGUF or select one in Settings, then:
+Choose a GGUF from the composer dropdown (or use its **Choose GGUF file…**
+action), then:
 
 ```sh
 cargo run --locked -p mom-llama-app
 ```
+
+`MOM_LLAMA_MODEL_PATH` remains an explicit runtime override. For a
+set-and-forget product build, set `MOM_LLAMA_DEFAULT_MODEL_PATH` while compiling
+and, only when automatic same-directory pairing is not unique, optionally set
+`MOM_LLAMA_DEFAULT_MMPROJ_PATH`. A persisted user choice wins over the compiled
+default; the explicit runtime override wins over both. Compile defaults must be
+absolute and all selected model/projector files are still validated at runtime.
+When no compile default is supplied, Mom embeds no developer model path and does
+not fall back to the build directory.
 
 The extraction deliberately retains the existing Tauri identifier, data paths,
 environment variables and Keychain service. That preserves current local data

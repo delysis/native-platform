@@ -159,6 +159,8 @@ enum ModelCommand {
         #[arg(long)]
         model_path: PathBuf,
         #[arg(long)]
+        conversation: Option<String>,
+        #[arg(long)]
         json: bool,
     },
     Status {
@@ -1002,9 +1004,23 @@ fn run() -> Result<()> {
         },
         Command::Model { command } => match command {
             ModelCommand::List { json } => print_result(mom_llama_runtime::model_list()?, json),
-            ModelCommand::Select { model_path, json } => {
-                print_result(mom_llama_runtime::model_select(model_path)?, json)
-            }
+            ModelCommand::Select {
+                model_path,
+                conversation,
+                json,
+            } => print_result(
+                match conversation
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    Some(conversation) => mom_llama_runtime::conversation_model_select_and_load(
+                        conversation,
+                        model_path,
+                    )?,
+                    None => mom_llama_runtime::model_select(model_path)?,
+                },
+                json,
+            ),
             ModelCommand::Status { json } => {
                 print_result(mom_llama_runtime::model_slot_list()?, json)
             }
@@ -1777,7 +1793,10 @@ fn command_uses_native(command: &Command) -> bool {
         Command::Engine { .. } | Command::Chat { .. } | Command::Server { .. } => true,
         Command::Model { command } => matches!(
             command,
-            ModelCommand::Status { .. } | ModelCommand::Load { .. } | ModelCommand::Unload { .. }
+            ModelCommand::Select { .. }
+                | ModelCommand::Status { .. }
+                | ModelCommand::Load { .. }
+                | ModelCommand::Unload { .. }
         ),
         Command::Persona { command } => matches!(
             command,

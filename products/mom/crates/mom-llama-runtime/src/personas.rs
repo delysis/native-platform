@@ -90,6 +90,8 @@ pub struct PersonaUpdateInput {
     pub mention_handle: String,
     pub model_path: Option<PathBuf>,
     pub mmproj_path: Option<PathBuf>,
+    #[serde(default)]
+    pub auto_discover_mmproj: bool,
     pub system_message: Option<String>,
     pub sampling: Option<llama_native_types::SamplingConfig>,
     pub chat_template: ChatTemplatePolicy,
@@ -412,7 +414,8 @@ pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Convers
         name,
         mention_handle,
         model_path,
-        mmproj_path,
+        mut mmproj_path,
+        auto_discover_mmproj,
         system_message,
         sampling,
         chat_template,
@@ -420,6 +423,31 @@ pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Convers
         source_history_tokens,
         host_context_tokens,
     } = input;
+    if auto_discover_mmproj {
+        if let Some(model_path) = model_path.as_deref()
+            && let Err(blocked) = crate::engine::validate_model_path(model_path)
+        {
+            return Ok(CommandResult::blocked(
+                "mom_llama.persona_update",
+                &blocked.readiness,
+                blocked.blocker,
+            ));
+        }
+        if mmproj_path.is_none()
+            && let Some(model_path) = model_path.as_deref()
+        {
+            mmproj_path = match crate::models::discover_projector_for_model(model_path) {
+                Ok(projector) => projector,
+                Err(blocked) => {
+                    return Ok(CommandResult::blocked(
+                        "mom_llama.persona_update",
+                        &blocked.readiness,
+                        blocked.blocker,
+                    ));
+                }
+            };
+        }
+    }
     let tool_bindings = match normalize_tools(tool_bindings) {
         Ok(tools) => tools,
         Err(blocker) => {
@@ -3016,6 +3044,7 @@ mod tests {
             mention_handle: "removed-persona".to_string(),
             model_path: None,
             mmproj_path: None,
+            auto_discover_mmproj: false,
             system_message: None,
             sampling: None,
             chat_template: crate::conversation_store::ChatTemplatePolicy::ModelDefault,

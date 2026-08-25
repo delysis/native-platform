@@ -111,7 +111,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_engine_check", true, true),
     mutation("mom_llama_engine_configure", true, true),
     read("mom_llama_model_list", true, false),
-    mutation("mom_llama_model_select", true, true),
+    long("mom_llama_model_select", true, true),
     long("mom_llama_chat_send", true, true),
     speculative("mom_llama_composer_autocomplete", true),
     mutation("mom_llama_composer_autocomplete_cancel", false, true),

@@ -1,7 +1,7 @@
 use crate::attachments::{
     ChatAttachmentContext, commit_generated_exchange, prepare_chat_attachments,
 };
-use crate::config::{resolve_settings, upstream_setting_string};
+use crate::config::{normalize_optional_path, resolve_settings, upstream_setting_string};
 use crate::conversation_store::{
     ChatTemplatePolicy, Message, MessageRole, active_leaf_id, active_path_messages,
     get_or_create_conversation, load_db, strip_reserved_attribution_prefix,
@@ -550,17 +550,12 @@ where
     let mut settings = resolve_settings()?;
     let (db, mut conversation) = get_or_create_conversation(&input.conversation_id)?;
     let expected_active_leaf = conversation.active_leaf_message_id.clone();
-    settings.model_path = conversation
-        .execution_profile
-        .model_path
-        .clone()
-        .or_else(|| conversation.selected_model_path.clone())
-        .or(settings.model_path);
-    settings.mmproj_path = conversation
-        .execution_profile
-        .mmproj_path
-        .clone()
-        .or(settings.mmproj_path);
+    apply_conversation_model_pair(
+        &mut settings,
+        conversation.execution_profile.model_path.clone(),
+        conversation.selected_model_path.clone(),
+        conversation.execution_profile.mmproj_path.clone(),
+    );
     let active_messages = active_path_messages(&conversation);
     let attachment_context = match prepare_chat_attachments(
         &input.conversation_id,
@@ -614,8 +609,11 @@ where
             "blocked_missing_mmproj",
             Blocker::new(
                 "mmproj_path_missing",
-                "This conversation contains image or audio attachments, but no native multimodal projector is configured.",
-                vec!["Choose the matching mmproj GGUF in Settings.".to_string()],
+                "This conversation contains image or audio attachments, but the selected model's vision support is unavailable.",
+                vec![
+                    "Reselect the model so Mom can pair and load its vision support automatically."
+                        .to_string(),
+                ],
             ),
         ));
     }
@@ -1001,6 +999,34 @@ where
         !options.fake_fixture,
         options.fake_fixture,
     ))
+}
+
+fn apply_conversation_model_pair(
+    settings: &mut crate::Settings,
+    profile_model: Option<PathBuf>,
+    legacy_selected_model: Option<PathBuf>,
+    profile_mmproj: Option<PathBuf>,
+) {
+    let conversation_model = normalize_optional_path(profile_model)
+        .or_else(|| normalize_optional_path(legacy_selected_model));
+    let Some(model) = conversation_model else {
+        // No conversation override means the global pair remains atomic.
+        return;
+    };
+    settings.model_path = Some(model);
+    // `None` is meaningful here: this exact conversation selected a text-only
+    // model. Never borrow the global model's projector.
+    settings.mmproj_path = normalize_optional_path(profile_mmproj);
+    settings.upstream_settings.insert(
+        "mmprojPath".to_string(),
+        Value::String(
+            settings
+                .mmproj_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        ),
+    );
 }
 
 fn chat_cancelled_result() -> CommandResult<ChatSendOutput> {
@@ -1509,9 +1535,9 @@ mod tests {
     use super::{
         ActiveChatRequest, ChatAttachmentContext, ChatRequestState, ChatSendOptions,
         ChatStreamLifecycle, Message, MessageRole, ReasoningStreamParser, ReasoningTarget,
-        build_native_messages, empty_native_response_result, load_active_requests,
-        native_context_messages, parse_reasoning_output, register_active_request,
-        user_turn_is_empty,
+        apply_conversation_model_pair, build_native_messages, empty_native_response_result,
+        load_active_requests, native_context_messages, parse_reasoning_output,
+        register_active_request, user_turn_is_empty,
     };
     use crate::OperationScope;
     use crate::conversation_store::{MessageAttribution, MessageSpeakerKind};
@@ -1582,6 +1608,31 @@ mod tests {
                 .collect::<String>(),
             "private plan"
         );
+    }
+
+    #[test]
+    fn conversation_model_and_projector_override_the_global_pair_atomically() {
+        let global_model = PathBuf::from("/models/global.gguf");
+        let global_projector = PathBuf::from("/models/global-mmproj.gguf");
+        let conversation_model = PathBuf::from("/models/conversation.gguf");
+        let mut settings = crate::Settings::defaults_for_data_dir(std::env::temp_dir());
+        settings.model_path = Some(global_model.clone());
+        settings.mmproj_path = Some(global_projector.clone());
+
+        apply_conversation_model_pair(&mut settings, Some(conversation_model.clone()), None, None);
+        assert_eq!(settings.model_path, Some(conversation_model));
+        assert_eq!(settings.mmproj_path, None);
+        assert_eq!(
+            settings.upstream_settings.get("mmprojPath"),
+            Some(&serde_json::json!(""))
+        );
+
+        let mut inherited = crate::Settings::defaults_for_data_dir(std::env::temp_dir());
+        inherited.model_path = Some(global_model.clone());
+        inherited.mmproj_path = Some(global_projector.clone());
+        apply_conversation_model_pair(&mut inherited, None, None, None);
+        assert_eq!(inherited.model_path, Some(global_model));
+        assert_eq!(inherited.mmproj_path, Some(global_projector));
     }
 
     #[test]

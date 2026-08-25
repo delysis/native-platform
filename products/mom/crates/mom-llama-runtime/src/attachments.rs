@@ -2953,8 +2953,11 @@ fn multimodal_readiness(
             false,
             Some(Blocker::new(
                 "mmproj_configured_not_verified",
-                "The multimodal projector is configured but has not been loaded with the selected model yet.",
-                vec!["Run a model check to verify the model and projector pair.".to_string()],
+                "The selected model's vision support has not been loaded yet.",
+                vec![
+                    "Reselect the model to load its automatically paired vision support."
+                        .to_string(),
+                ],
             )),
         );
     }
@@ -2962,8 +2965,11 @@ fn multimodal_readiness(
         false,
         Some(Blocker::new(
             "mmproj_path_missing",
-            "This attachment contains native image or audio media, but no matching multimodal projector is configured.",
-            vec!["Choose the matching mmproj GGUF in Settings.".to_string()],
+            "This image or audio attachment needs a vision-capable model.",
+            vec![
+                "Choose or reselect a model and Mom will pair its vision support automatically."
+                    .to_string(),
+            ],
         )),
     )
 }

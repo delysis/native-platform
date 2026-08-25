@@ -86,7 +86,11 @@ pub use mentions::{
     mention_tool_approval_decide_with_recovery_in_scope, mention_tool_approval_list,
     reconcile_persona_tool_approvals, reconcile_persona_tool_approvals_command,
 };
-pub use models::{hugging_face_hub_cache_dir, model_list, model_select};
+pub use models::{
+    ModelSelectionIntent, begin_model_selection, conversation_model_select_and_load,
+    discover_projector_for_model, hugging_face_hub_cache_dir, model_list, model_select,
+    model_select_with_intent,
+};
 pub use native_runtime::{
     ProductShutdownError, resident_model_for_profile, resident_status,
     shutdown_product_runtime_for_process_exit, unload_resident_model,

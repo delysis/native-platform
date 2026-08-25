@@ -1,3 +1,4 @@
+use crate::engine::ValidationBlocker;
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::{Context, Result};
@@ -8,10 +9,18 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 const SETTINGS_FILE: &str = "settings.json";
 pub(crate) const SETTINGS_NAMESPACE: &str = "settings.v2";
 const DEFAULT_MAX_TOKENS: u32 = 512;
+const GIB: u64 = 1024 * 1024 * 1024;
+const FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 8 * GIB;
+const MIN_AUTO_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 2 * GIB;
+const MAX_AUTO_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 64 * GIB;
+const MEMORY_BUDGET_MODE_KEY: &str = "nativeMemoryBudgetMode";
+const COMPILED_DEFAULT_MODEL_PATH: Option<&str> = option_env!("MOM_LLAMA_DEFAULT_MODEL_PATH");
+const COMPILED_DEFAULT_MMPROJ_PATH: Option<&str> = option_env!("MOM_LLAMA_DEFAULT_MMPROJ_PATH");
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +118,13 @@ impl LegacySettings {
 impl Settings {
     pub fn defaults_for_data_dir(data_dir: PathBuf) -> Self {
         let defaults = GenerationDefaults::default();
+        let resident_memory_budget_bytes = default_resident_memory_budget_bytes();
+        let mut upstream_settings = upstream_settings_defaults();
+        write_resident_memory_budget_projection(
+            &mut upstream_settings,
+            ResidentMemoryBudgetMode::Auto,
+            resident_memory_budget_bytes,
+        );
         Self {
             model_path: None,
             mmproj_path: None,
@@ -122,8 +138,8 @@ impl Settings {
             context_tokens: default_context_tokens(),
             batch_tokens: default_batch_tokens(),
             max_parallel_sequences: default_parallel_sequences(),
-            resident_memory_budget_bytes: default_resident_memory_budget_bytes(),
-            upstream_settings: upstream_settings_defaults(),
+            resident_memory_budget_bytes,
+            upstream_settings,
         }
     }
 
@@ -337,8 +353,86 @@ const fn default_parallel_sequences() -> u32 {
     4
 }
 
-const fn default_resident_memory_budget_bytes() -> u64 {
-    8 * 1024 * 1024 * 1024
+fn default_resident_memory_budget_bytes() -> u64 {
+    automatic_resident_memory_budget(physical_memory_bytes())
+}
+
+fn physical_memory_bytes() -> Option<u64> {
+    static PHYSICAL_MEMORY: OnceLock<Option<u64>> = OnceLock::new();
+    *PHYSICAL_MEMORY.get_or_init(|| {
+        let system = System::new_with_specifics(
+            RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+        );
+        let bytes = system.total_memory();
+        (bytes > 0).then_some(bytes)
+    })
+}
+
+fn automatic_resident_memory_budget(physical_memory_bytes: Option<u64>) -> u64 {
+    match physical_memory_bytes {
+        Some(bytes) => (bytes / 2).clamp(
+            MIN_AUTO_RESIDENT_MEMORY_BUDGET_BYTES,
+            MAX_AUTO_RESIDENT_MEMORY_BUDGET_BYTES,
+        ),
+        None => FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidentMemoryBudgetMode {
+    Auto,
+    Manual,
+}
+
+fn reconcile_resident_memory_budget(settings: &mut Settings, physical_memory: Option<u64>) {
+    let declared_mode = settings
+        .upstream_settings
+        .get(MEMORY_BUDGET_MODE_KEY)
+        .and_then(Value::as_str);
+    let legacy_budget_mib = upstream_setting_i64(settings, "nativeMemoryBudgetMiB")
+        .and_then(|value| u64::try_from(value).ok());
+    let mode = match declared_mode {
+        Some("manual") => ResidentMemoryBudgetMode::Manual,
+        Some("auto") => ResidentMemoryBudgetMode::Auto,
+        _ if legacy_budget_mib.is_some_and(|value| value != 8192) => {
+            ResidentMemoryBudgetMode::Manual
+        }
+        // The historical default and an explicit 8192 MiB choice are
+        // indistinguishable in documents written before mode provenance. The
+        // migration treats that exact legacy value as auto; every subsequent
+        // explicit update records `manual` and is preserved exactly.
+        _ => ResidentMemoryBudgetMode::Auto,
+    };
+    if mode == ResidentMemoryBudgetMode::Auto {
+        settings.resident_memory_budget_bytes = automatic_resident_memory_budget(physical_memory);
+    } else {
+        settings.resident_memory_budget_bytes =
+            settings.resident_memory_budget_bytes.max(256 * 1024 * 1024);
+    }
+    let bytes = settings.resident_memory_budget_bytes;
+    write_resident_memory_budget_projection(&mut settings.upstream_settings, mode, bytes);
+}
+
+pub(crate) fn reconcile_resident_memory_budget_for_runtime(settings: &mut Settings) {
+    reconcile_resident_memory_budget(settings, physical_memory_bytes());
+}
+
+fn write_resident_memory_budget_projection(
+    upstream_settings: &mut BTreeMap<String, Value>,
+    mode: ResidentMemoryBudgetMode,
+    bytes: u64,
+) {
+    upstream_settings.insert(
+        MEMORY_BUDGET_MODE_KEY.to_string(),
+        json!(match mode {
+            ResidentMemoryBudgetMode::Auto => "auto",
+            ResidentMemoryBudgetMode::Manual => "manual",
+        }),
+    );
+    upstream_settings.insert(
+        "nativeMemoryBudgetMiB".to_string(),
+        json!(bytes / (1024 * 1024)),
+    );
 }
 
 pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
@@ -413,6 +507,7 @@ pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
         ("mmprojPath".to_string(), json!("")),
         ("nativeModelSlots".to_string(), json!(1)),
         ("nativeMemoryBudgetMiB".to_string(), json!(8192)),
+        (MEMORY_BUDGET_MODE_KEY.to_string(), json!("auto")),
         ("nativeDevice".to_string(), json!("auto")),
         ("nativeContextTokens".to_string(), json!(8192)),
         ("nativeBatchTokens".to_string(), json!(512)),
@@ -474,21 +569,122 @@ pub fn resolve_settings() -> Result<Settings> {
     } else {
         Settings::defaults_for_data_dir(data_dir.clone())
     };
-    Ok(settings_from_document(data_dir, Some(settings)))
+    settings_from_document(data_dir, Some(settings)).map_err(anyhow::Error::new)
 }
 
-pub(crate) fn settings_from_document(data_dir: PathBuf, stored: Option<Settings>) -> Settings {
+pub(crate) fn settings_from_document(
+    data_dir: PathBuf,
+    stored: Option<Settings>,
+) -> std::result::Result<Settings, ValidationBlocker> {
+    settings_from_document_with_model_sources(
+        data_dir,
+        stored,
+        runtime_model_override(),
+        COMPILED_DEFAULT_MODEL_PATH,
+        COMPILED_DEFAULT_MMPROJ_PATH,
+    )
+}
+
+pub(crate) fn runtime_model_override() -> Option<PathBuf> {
+    std::env::var_os("MOM_LLAMA_MODEL_PATH")
+        .map(PathBuf::from)
+        .and_then(|path| normalize_optional_path(Some(path)))
+}
+
+fn settings_from_document_with_model_sources(
+    data_dir: PathBuf,
+    stored: Option<Settings>,
+    runtime_model: Option<PathBuf>,
+    compiled_model: Option<&str>,
+    compiled_mmproj: Option<&str>,
+) -> std::result::Result<Settings, ValidationBlocker> {
     let mut settings = stored.unwrap_or_else(|| Settings::defaults_for_data_dir(data_dir.clone()));
     settings.data_dir = data_dir;
+    settings.model_path = normalize_optional_path(settings.model_path);
+    settings.mmproj_path = normalize_optional_path(settings.mmproj_path);
+    reconcile_resident_memory_budget_for_runtime(&mut settings);
     merge_missing_setting_defaults(&mut settings);
     let cache_policy = settings.kv_cache_policy;
     set_cache_policy(&mut settings, cache_policy);
-    if let Ok(model) = std::env::var("MOM_LLAMA_MODEL_PATH")
-        && !model.is_empty()
+    if let Some(model) = normalize_optional_path(runtime_model) {
+        // The explicit runtime model remains the highest-precedence source,
+        // but it is still one atomic model/projector pair. Never inherit a
+        // persisted projector from a different model.
+        settings.mmproj_path = crate::models::discover_projector_for_model(&model)?;
+        settings.model_path = Some(model);
+    } else if settings.model_path.is_none()
+        && let Some(model) = compiled_default_path(compiled_model, CompiledPathKind::Model)?
     {
-        settings.model_path = Some(PathBuf::from(model));
+        settings.mmproj_path =
+            match compiled_default_path(compiled_mmproj, CompiledPathKind::Projector)? {
+                Some(projector) => Some(projector),
+                None => crate::models::discover_projector_for_model(&model)?,
+            };
+        settings.model_path = Some(model);
     }
-    settings
+    settings.upstream_settings.insert(
+        "mmprojPath".to_string(),
+        json!(
+            settings
+                .mmproj_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+        ),
+    );
+    Ok(settings)
+}
+
+pub(crate) fn normalize_optional_path(path: Option<PathBuf>) -> Option<PathBuf> {
+    path.filter(|path| {
+        !path.as_os_str().is_empty() && path.to_str().is_none_or(|value| !value.trim().is_empty())
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CompiledPathKind {
+    Model,
+    Projector,
+}
+
+fn compiled_default_path(
+    value: Option<&str>,
+    kind: CompiledPathKind,
+) -> std::result::Result<Option<PathBuf>, ValidationBlocker> {
+    let Some(path) = normalize_optional_path(value.map(PathBuf::from)) else {
+        return Ok(None);
+    };
+    // Relative compile-time paths depend on the launch working directory and
+    // can silently become `.`. A set-and-forget build default must be exact.
+    if path.is_absolute() {
+        return Ok(Some(path));
+    }
+    let (readiness, code, noun) = match kind {
+        CompiledPathKind::Model => (
+            "blocked_invalid_model",
+            "compiled_default_model_path_relative",
+            "model",
+        ),
+        CompiledPathKind::Projector => (
+            "blocked_invalid_mmproj",
+            "compiled_default_mmproj_path_relative",
+            "vision projector",
+        ),
+    };
+    Err(ValidationBlocker {
+        readiness: readiness.to_string(),
+        blocker: Blocker::new(
+            code,
+            format!("The compiled default {noun} path is not absolute."),
+            vec![format!(
+                "Rebuild with an absolute MOM_LLAMA_DEFAULT_{} path.",
+                match kind {
+                    CompiledPathKind::Model => "MODEL_PATH",
+                    CompiledPathKind::Projector => "MMPROJ_PATH",
+                }
+            )],
+        ),
+    })
 }
 
 fn read_settings_file(path: &Path, data_dir: PathBuf) -> Result<(Settings, Option<PathBuf>)> {
@@ -558,21 +754,33 @@ pub fn configure_engine(
 
 pub fn settings_update(update: SettingsUpdate) -> Result<CommandResult<Settings>> {
     let mut settings = resolve_settings()?;
+    let projector_path_explicit = update.mmproj_path.is_some();
     let requested_cache_policy = update.kv_cache_policy;
     let requested_preencode = update
         .upstream_settings
         .as_ref()
         .and_then(|values| values.get("preEncodeConversation"))
         .and_then(Value::as_bool);
+    let requested_memory_budget = update
+        .upstream_settings
+        .as_ref()
+        .is_some_and(|values| values.contains_key("nativeMemoryBudgetMiB"));
     if let Some(model_path) = update.model_path {
-        settings.model_path = model_path;
+        settings.model_path = normalize_optional_path(model_path);
+        if !projector_path_explicit {
+            settings.mmproj_path = None;
+            settings
+                .upstream_settings
+                .insert("mmprojPath".to_string(), json!(""));
+        }
     }
     if let Some(mmproj_path) = update.mmproj_path {
-        settings.mmproj_path = mmproj_path.clone();
+        settings.mmproj_path = normalize_optional_path(mmproj_path);
         settings.upstream_settings.insert(
             "mmprojPath".to_string(),
             json!(
-                mmproj_path
+                settings
+                    .mmproj_path
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_default()
@@ -627,9 +835,11 @@ pub fn settings_update(update: SettingsUpdate) -> Result<CommandResult<Settings>
     }
     if let Some(resident_memory_budget_bytes) = update.resident_memory_budget_bytes {
         settings.resident_memory_budget_bytes = resident_memory_budget_bytes.max(256 * 1024 * 1024);
-        settings.upstream_settings.insert(
-            "nativeMemoryBudgetMiB".to_string(),
-            json!(settings.resident_memory_budget_bytes / (1024 * 1024)),
+        let bytes = settings.resident_memory_budget_bytes;
+        write_resident_memory_budget_projection(
+            &mut settings.upstream_settings,
+            ResidentMemoryBudgetMode::Manual,
+            bytes,
         );
     }
     if let Some(upstream_settings) = update.upstream_settings {
@@ -645,6 +855,14 @@ pub fn settings_update(update: SettingsUpdate) -> Result<CommandResult<Settings>
         }
         sync_generation_defaults_from_upstream(&mut settings);
         sync_native_defaults_from_upstream(&mut settings);
+        if requested_memory_budget {
+            let bytes = settings.resident_memory_budget_bytes;
+            write_resident_memory_budget_projection(
+                &mut settings.upstream_settings,
+                ResidentMemoryBudgetMode::Manual,
+                bytes,
+            );
+        }
     }
     if let Some(policy) = requested_cache_policy.or_else(|| {
         requested_preencode.map(|enabled| {
@@ -1042,6 +1260,179 @@ mod tests {
         let settings = Settings::defaults_for_data_dir(std::env::temp_dir());
         assert_eq!(settings.default_max_tokens, DEFAULT_MAX_TOKENS);
         assert_eq!(settings.sampling_config().max_tokens, DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn automatic_memory_budget_is_half_of_ram_with_conservative_bounds() {
+        assert_eq!(
+            automatic_resident_memory_budget(None),
+            FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES
+        );
+        assert_eq!(automatic_resident_memory_budget(Some(GIB)), 2 * GIB);
+        assert_eq!(automatic_resident_memory_budget(Some(16 * GIB)), 8 * GIB);
+        assert_eq!(automatic_resident_memory_budget(Some(128 * GIB)), 64 * GIB);
+        assert_eq!(automatic_resident_memory_budget(Some(512 * GIB)), 64 * GIB);
+
+        let qwen_reservation = llama_native_host::memory_reservation(28_595_763_104, 927_607_040);
+        assert!(qwen_reservation > 8 * GIB);
+        assert!(qwen_reservation <= automatic_resident_memory_budget(Some(128 * GIB)));
+    }
+
+    #[test]
+    fn automatic_and_manual_memory_budget_provenance_survives_document_resolution() {
+        let mut manual = Settings::defaults_for_data_dir(std::env::temp_dir());
+        manual.resident_memory_budget_bytes = 12 * GIB;
+        write_resident_memory_budget_projection(
+            &mut manual.upstream_settings,
+            ResidentMemoryBudgetMode::Manual,
+            12 * GIB,
+        );
+        let resolved = settings_from_document_with_model_sources(
+            std::env::temp_dir(),
+            Some(manual),
+            None,
+            None,
+            None,
+        )
+        .expect("manual memory budget");
+        assert_eq!(resolved.resident_memory_budget_bytes, 12 * GIB);
+        assert_eq!(
+            resolved.upstream_settings.get(MEMORY_BUDGET_MODE_KEY),
+            Some(&json!("manual"))
+        );
+
+        let mut legacy_non_default = Settings::defaults_for_data_dir(std::env::temp_dir());
+        legacy_non_default.resident_memory_budget_bytes = 12 * GIB;
+        legacy_non_default
+            .upstream_settings
+            .remove(MEMORY_BUDGET_MODE_KEY);
+        legacy_non_default
+            .upstream_settings
+            .insert("nativeMemoryBudgetMiB".to_string(), json!(12 * 1024));
+        reconcile_resident_memory_budget(&mut legacy_non_default, Some(128 * GIB));
+        assert_eq!(legacy_non_default.resident_memory_budget_bytes, 12 * GIB);
+        assert_eq!(
+            legacy_non_default
+                .upstream_settings
+                .get(MEMORY_BUDGET_MODE_KEY),
+            Some(&json!("manual"))
+        );
+
+        let mut legacy_default = Settings::defaults_for_data_dir(std::env::temp_dir());
+        legacy_default.resident_memory_budget_bytes = 8 * GIB;
+        legacy_default
+            .upstream_settings
+            .remove(MEMORY_BUDGET_MODE_KEY);
+        legacy_default
+            .upstream_settings
+            .insert("nativeMemoryBudgetMiB".to_string(), json!(8192));
+        reconcile_resident_memory_budget(&mut legacy_default, Some(128 * GIB));
+        assert_eq!(legacy_default.resident_memory_budget_bytes, 64 * GIB);
+        assert_eq!(
+            legacy_default.upstream_settings.get(MEMORY_BUDGET_MODE_KEY),
+            Some(&json!("auto"))
+        );
+    }
+
+    #[test]
+    fn empty_paths_never_become_dot_and_compile_defaults_must_be_absolute() {
+        assert_eq!(normalize_optional_path(Some(PathBuf::new())), None);
+        assert_eq!(normalize_optional_path(Some(PathBuf::from("   "))), None);
+        assert_eq!(
+            compiled_default_path(None, CompiledPathKind::Model).expect("no compiled default"),
+            None
+        );
+        assert_eq!(
+            compiled_default_path(Some(""), CompiledPathKind::Model)
+                .expect("empty compiled default"),
+            None
+        );
+        let relative = compiled_default_path(Some("relative/model.gguf"), CompiledPathKind::Model)
+            .expect_err("relative compiled model must fail closed");
+        assert_eq!(
+            relative.blocker.code,
+            "compiled_default_model_path_relative"
+        );
+        assert_eq!(
+            compiled_default_path(Some("/models/default.gguf"), CompiledPathKind::Model,)
+                .expect("absolute compiled default"),
+            Some(PathBuf::from("/models/default.gguf"))
+        );
+    }
+
+    #[test]
+    fn runtime_and_compiled_models_resolve_one_projector_or_propagate_typed_ambiguity() {
+        let temporary = std::env::temp_dir().join(format!(
+            "mom-llama-config-model-pair-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temporary).expect("model pair directory");
+        let model = temporary.join("vision-model.gguf");
+        let projector = temporary.join("mmproj-F16.gguf");
+        std::fs::write(&model, b"GGUF").expect("model");
+        std::fs::write(&projector, b"GGUF").expect("projector");
+
+        let runtime = settings_from_document_with_model_sources(
+            temporary.join("runtime-data"),
+            None,
+            Some(model.clone()),
+            None,
+            None,
+        )
+        .expect("runtime model pair");
+        assert_eq!(runtime.model_path, Some(model.clone()));
+        assert_eq!(runtime.mmproj_path, Some(projector.clone()));
+
+        let model_text = model.to_str().expect("UTF-8 model path");
+        let compiled = settings_from_document_with_model_sources(
+            temporary.join("compiled-data"),
+            None,
+            None,
+            Some(model_text),
+            None,
+        )
+        .expect("compiled model pair");
+        assert_eq!(compiled.model_path, Some(model.clone()));
+        assert_eq!(compiled.mmproj_path, Some(projector));
+
+        std::fs::write(temporary.join("mmproj-BF16.gguf"), b"GGUF").expect("second projector");
+        for (runtime_model, compiled_model) in
+            [(Some(model.clone()), None), (None, Some(model_text))]
+        {
+            let blocked = settings_from_document_with_model_sources(
+                temporary.join("ambiguous-data"),
+                None,
+                runtime_model,
+                compiled_model,
+                None,
+            )
+            .expect_err("ambiguous automatic pairing must remain typed");
+            assert_eq!(blocked.readiness, "blocked_ambiguous_projector");
+            assert_eq!(blocked.blocker.code, "mmproj_path_ambiguous");
+        }
+
+        std::fs::remove_file(temporary.join("mmproj-F16.gguf")).expect("remove projector");
+        std::fs::remove_file(temporary.join("mmproj-BF16.gguf")).expect("remove second projector");
+        for index in 0..256 {
+            std::fs::write(temporary.join(format!("note-{index:03}.txt")), b"x")
+                .expect("bounded sibling");
+        }
+        for (runtime_model, compiled_model) in
+            [(Some(model.clone()), None), (None, Some(model_text))]
+        {
+            let blocked = settings_from_document_with_model_sources(
+                temporary.join("bounded-data"),
+                None,
+                runtime_model,
+                compiled_model,
+                None,
+            )
+            .expect_err("bounded automatic pairing must remain typed");
+            assert_eq!(blocked.readiness, "blocked_projector_scan_bound");
+            assert_eq!(blocked.blocker.code, "projector_directory_too_large");
+        }
+
+        std::fs::remove_dir_all(&temporary).expect("remove model pair directory");
     }
 
     #[test]

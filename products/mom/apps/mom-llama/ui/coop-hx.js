@@ -75,9 +75,13 @@
     return match ? match[1] : content;
   };
 
-  const report = (value) => {
+  const recordCommandResult = (value) => {
     const output = document.getElementById("command-output");
     if (output) output.value = JSON.stringify(value);
+  };
+
+  const report = (value) => {
+    recordCommandResult(value);
     const status = document.getElementById("command-status");
     if (status) {
       const blocker = value?.blocker?.message;
@@ -816,9 +820,8 @@
   };
 
   const settingsUpdatePayload = (form) => ({
-    // Empty strings are explicit clears; omitted or null values mean unchanged.
-    modelPath: formValue(form, "model_path"),
-    mmprojPath: formValue(form, "mmproj_path"),
+    // Model identity is owned by the explicit model-select command. Omitting
+    // both paths here prevents an unrelated autosave from clearing its pair.
     device: formValue(form, "native_device") || null,
     contextTokens: numberOrNull(formValue(form, "context_tokens")),
     batchTokens: numberOrNull(formValue(form, "batch_tokens")),
@@ -1127,8 +1130,19 @@
     formField(editor, "persona_id").value = persona.id || "";
     formField(editor, "persona_name").value = persona.title || "";
     formField(editor, "persona_handle").value = profile.mention_handle || "";
-    formField(editor, "persona_model_path").value = profile.model_path || "";
-    formField(editor, "persona_mmproj_path").value = profile.mmproj_path || "";
+    const modelChoice = formField(editor, "persona_model_choice");
+    const modelPath = profile.model_path || "";
+    if (modelChoice) {
+      modelChoice.querySelectorAll("[data-current-persona-model]").forEach((option) => option.remove());
+      if (modelPath && ![...modelChoice.options].some((option) => option.value === modelPath)) {
+        const option = document.createElement("option");
+        option.value = modelPath;
+        option.textContent = `Current: ${String(modelPath).split(/[\\/]/).pop() || "local model"}`;
+        option.dataset.currentPersonaModel = "true";
+        modelChoice.append(option);
+      }
+      modelChoice.value = modelPath;
+    }
     formField(editor, "persona_system_message").value = profile.system_message || "";
     formField(editor, "persona_source_tokens").value = profile.source_history_tokens ?? 4096;
     formField(editor, "persona_host_tokens").value = profile.host_context_tokens ?? 2048;
@@ -1278,6 +1292,7 @@
     const editor = document.getElementById("persona-editor");
     const current = JSON.parse(editor?.dataset.personaJson || "{}");
     const profile = current.execution_profile || {};
+    const modelPath = formValue(editor, "persona_model_choice") || null;
     const template = formValue(editor, "persona_chat_template_policy") === "frozen_source"
       ? { frozen_source: formValue(editor, "persona_chat_template") }
       : "model_default";
@@ -1285,8 +1300,13 @@
       persona_id: formValue(editor, "persona_id"),
       name: formValue(editor, "persona_name"),
       mention_handle: formValue(editor, "persona_handle"),
-      model_path: formValue(editor, "persona_model_path") || null,
-      mmproj_path: formValue(editor, "persona_mmproj_path") || null,
+      model_path: modelPath,
+      // Preserve an imported/advanced explicit projector only while its exact
+      // model remains unchanged. A new ordinary model resolves its own pair.
+      mmproj_path: modelPath === (profile.model_path || null)
+        ? (profile.mmproj_path || null)
+        : null,
+      auto_discover_mmproj: modelPath !== (profile.model_path || null),
       system_message: formValue(editor, "persona_system_message") || null,
       sampling: profile.sampling || null,
       chat_template: template,
@@ -2319,6 +2339,44 @@
     "mention-tool-deny",
   ]);
 
+  const selectAndLoadModel = async (button, path) => {
+    if (!path) return null;
+    const picker = button.closest("[data-model-picker]");
+    const previousState = picker?.dataset.state || "empty";
+    if (picker) {
+      const inlineError = picker.querySelector(".model-picker-error");
+      if (inlineError) {
+        inlineError.textContent = "";
+        inlineError.hidden = true;
+      }
+      picker.dataset.state = "loading";
+      picker.removeAttribute("open");
+    }
+    try {
+      const result = await invoke("mom_llama_model_select", {
+        modelPath: path,
+        conversation: button.dataset.conversation || null,
+      });
+      if (result?.status === "blocked") {
+        recordCommandResult(result);
+        const inlineError = picker?.querySelector(".model-picker-error");
+        if (inlineError) {
+          inlineError.textContent = result?.blocker?.message || "That model could not be loaded.";
+          inlineError.hidden = false;
+          picker.setAttribute("open", "");
+        }
+      } else {
+        report(result);
+        await Promise.all([refreshChat(), refreshSettings("general")]);
+      }
+      return result;
+    } finally {
+      if (picker?.isConnected && picker.dataset.state === "loading") {
+        picker.dataset.state = previousState;
+      }
+    }
+  };
+
   const actionHandlers = {
     "sidebar-toggle": async () => {
       await invoke("mom_llama_conversation_list");
@@ -2328,25 +2386,25 @@
       const section = button.dataset.sidebarSection;
       const list = document.getElementById(button.getAttribute("aria-controls"));
       if (!section || !list) return;
-      const command = {
-        conversations: "mom_llama_conversation_list",
-        personas: "mom_llama_persona_list",
-        "consult-groups": "mom_llama_persona_group_list",
-      }[section];
-      const listed = command ? await invoke(command) : null;
-      if (listed?.status === "blocked") {
-        report(listed);
+      const expanding = button.getAttribute("aria-expanded") !== "true";
+      if (!expanding) {
+        button.setAttribute("aria-expanded", "false");
+        button.setAttribute("aria-label", `Expand ${button.dataset.sidebarLabel || section}`);
+        list.hidden = true;
+        collapsedSidebarSections.add(section);
         return;
       }
-      const expanded = button.getAttribute("aria-expanded") !== "true";
-      button.setAttribute("aria-expanded", String(expanded));
-      button.setAttribute(
-        "aria-label",
-        `${expanded ? "Collapse" : "Expand"} ${button.dataset.sidebarLabel || section}`,
-      );
-      list.hidden = !expanded;
-      if (expanded) collapsedSidebarSections.delete(section);
-      else collapsedSidebarSections.add(section);
+      collapsedSidebarSections.delete(section);
+      try {
+        const replacement = await refreshSidebar();
+        replacement
+          ?.querySelector(`[data-action="sidebar-section-toggle"][data-sidebar-section="${CSS.escape(section)}"]`)
+          ?.focus();
+      } catch (error) {
+        collapsedSidebarSections.add(section);
+        applySidebarSectionState();
+        throw error;
+      }
     },
     "settings-open": async () => { await invoke("mom_llama_settings_get"); openSettings(); },
     "settings-close": async () => { await invoke("mom_llama_settings_get"); closeSettings(); },
@@ -2624,12 +2682,15 @@
       if (result?.status !== "blocked") {
         closeSettings();
         await refreshConversationProjection();
+        focusComposer();
       }
     },
     "persona-menu-edit": async () => {
       const persona = document.getElementById("persona-context-menu")?.dataset.persona;
       closePersonaMenu(false);
-      await openPersonaProfile(persona);
+      if (await openPersonaProfile(persona)) {
+        formField(document.getElementById("persona-editor"), "persona_name")?.focus();
+      }
     },
     "persona-menu-removal-preview": async () => {
       const persona = document.getElementById("persona-context-menu")?.dataset.persona;
@@ -2930,36 +2991,16 @@
         .map(([key, queue]) => ({ key, failure: queue.failure }));
       failures.forEach(({ key, failure }) => queueAutosave(key, failure.job, 0));
     },
-    "model-list": async () => report(await invoke("mom_llama_model_list")),
-    "model-select": async (button) => {
-      const form = document.getElementById("settings-form");
-      const path = button.dataset.modelPath || formValue(form, "model_path");
-      report(await invoke("mom_llama_model_select", { modelPath: path }));
+    "model-list": async () => {
+      report(await invoke("mom_llama_model_list"));
       await Promise.all([refreshChat(), refreshSettings("general")]);
     },
-    "model-browse": async () => {
+    "model-select": async (button) => {
+      await selectAndLoadModel(button, button.dataset.modelPath || "");
+    },
+    "model-browse": async (button) => {
       const path = await pickFile("model");
-      if (path) {
-        const field = formField(document.getElementById("settings-form"), "model_path");
-        field.value = path;
-        field.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-    },
-    "mmproj-browse": async () => {
-      const path = await pickFile("mmproj");
-      if (path) {
-        const field = formField(document.getElementById("settings-form"), "mmproj_path");
-        field.value = path;
-        field.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-    },
-    "persona-model-browse": async () => {
-      const path = await pickFile("model");
-      if (path) formField(document.getElementById("persona-editor"), "persona_model_path").value = path;
-    },
-    "persona-mmproj-browse": async () => {
-      const path = await pickFile("mmproj");
-      if (path) formField(document.getElementById("persona-editor"), "persona_mmproj_path").value = path;
+      if (path) await selectAndLoadModel(button, path);
     },
     "mcp-status": async () => { report(await invoke("mom_llama_mcp_status")); openSettings("mcp"); },
     "mcp-command-browse": async () => {
@@ -3097,6 +3138,9 @@
   };
 
   document.addEventListener("click", async (event) => {
+    document.querySelectorAll("details.model-picker[open]").forEach((picker) => {
+      if (!picker.contains(event.target)) picker.removeAttribute("open");
+    });
     if (!event.target.closest("#persona-context-menu, .persona-menu-trigger")) {
       closePersonaMenu(false);
     }
@@ -3220,6 +3264,15 @@
   });
 
   document.addEventListener("input", (event) => {
+    if (event.target.matches("[data-model-search]")) {
+      const query = event.target.value.trim().toLocaleLowerCase();
+      event.target.closest(".model-picker-popover")
+        ?.querySelectorAll("[data-model-search-value]")
+        .forEach((option) => {
+          option.hidden = Boolean(query)
+            && !option.dataset.modelSearchValue.includes(query);
+        });
+    }
     if (event.target.matches("#chat-form textarea[name='message']")) {
       if (autocompleteAccepting) return;
       if (event.isComposing || composerState.kind === "composing") return;
@@ -3281,6 +3334,19 @@
   });
 
   document.addEventListener("keydown", (event) => {
+    if (event.target.matches("[data-model-search]")) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        const picker = event.target.closest("details.model-picker");
+        picker?.removeAttribute("open");
+        picker?.querySelector("summary")?.focus();
+        return;
+      }
+    }
     const personaMenu = document.getElementById("persona-context-menu");
     if (event.target.matches(".persona-menu-trigger") && event.key === "ArrowDown") {
       event.preventDefault();

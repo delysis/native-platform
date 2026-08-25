@@ -414,7 +414,12 @@ pub(crate) fn model_configuration_for_profile(
     config.context_tokens = settings.context_tokens;
     config.batch_tokens = settings.batch_tokens;
     config.max_sequences = settings.max_parallel_sequences.clamp(1, 4);
-    config.mmproj_path = mmproj_path.map(Path::to_path_buf);
+    // This boundary consumes an exact profile. In particular, a frozen/imported
+    // `None` must remain `None` if a sibling projector appears later. Ordinary
+    // model selection resolves and persists its pair before reaching the host.
+    config.mmproj_path = mmproj_path
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf);
     Ok(config)
 }
 

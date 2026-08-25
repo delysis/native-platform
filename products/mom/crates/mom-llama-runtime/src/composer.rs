@@ -234,7 +234,7 @@ pub fn composer_autocomplete_accept(
             let transaction_settings = settings_from_document(
                 data_dir.clone(),
                 documents.get::<Settings>(SETTINGS_NAMESPACE)?,
-            );
+            )?;
             let skill_db = documents
                 .get::<SkillDb>(SKILLS_NAMESPACE)?
                 .unwrap_or_default();

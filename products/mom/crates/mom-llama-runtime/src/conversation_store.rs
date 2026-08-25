@@ -1218,6 +1218,7 @@ pub fn active_path_messages(conversation: &Conversation) -> Vec<Message> {
 
 pub fn project_conversation(conversation: &Conversation) -> Conversation {
     let mut projected = conversation.clone();
+    normalize_conversation_model_paths(&mut projected);
     projected.messages = active_path_messages(conversation);
     projected.active_leaf_message_id = projected.messages.last().map(|message| message.id.clone());
     projected
@@ -1447,7 +1448,9 @@ pub fn load_db() -> Result<ConversationDb> {
     let legacy_path = settings.data_dir.join(CONVERSATIONS_FILE);
     store.import_json_once::<ConversationDb>(CONVERSATIONS_NAMESPACE, &legacy_path)?;
     let mut db = store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default();
-    if !repair_inline_attribution_prefixes(&mut db) {
+    let repaired = repair_inline_attribution_prefixes(&mut db);
+    let normalized = normalize_db_model_paths(&mut db);
+    if !repaired && !normalized {
         return Ok(db);
     }
     store.mutate_documents(
@@ -1455,10 +1458,34 @@ pub fn load_db() -> Result<ConversationDb> {
         ConversationDb::default,
         |current, documents| {
             repair_inline_attribution_prefixes(current);
+            normalize_db_model_paths(current);
             crate::personas::reject_removed_conversation_writes_from_documents(current, documents)?;
             Ok(current.clone())
         },
     )
+}
+
+fn normalize_db_model_paths(db: &mut ConversationDb) -> bool {
+    let mut changed = false;
+    for conversation in &mut db.conversations {
+        changed |= normalize_conversation_model_paths(conversation);
+    }
+    changed
+}
+
+fn normalize_conversation_model_paths(conversation: &mut Conversation) -> bool {
+    let previous_selected = conversation.selected_model_path.take();
+    let previous_model = conversation.execution_profile.model_path.take();
+    let previous_mmproj = conversation.execution_profile.mmproj_path.take();
+    let selected = crate::config::normalize_optional_path(previous_selected.clone());
+    let model = crate::config::normalize_optional_path(previous_model.clone());
+    let mmproj = crate::config::normalize_optional_path(previous_mmproj.clone());
+    let changed =
+        previous_selected != selected || previous_model != model || previous_mmproj != mmproj;
+    conversation.selected_model_path = selected;
+    conversation.execution_profile.model_path = model;
+    conversation.execution_profile.mmproj_path = mmproj;
+    changed
 }
 
 pub fn save_db(db: &ConversationDb) -> Result<PathBuf> {
@@ -1637,9 +1664,10 @@ fn draft_key(conversation_id: Option<&str>) -> String {
 mod tests {
     use super::{
         Conversation, ConversationDb, ConversationExecutionProfile, ConversationKind, Message,
-        MessageAttribution, MessageRole, MessageSpeakerKind, repair_inline_attribution_prefixes,
-        strip_reserved_attribution_prefix,
+        MessageAttribution, MessageRole, MessageSpeakerKind, project_conversation,
+        repair_inline_attribution_prefixes, strip_reserved_attribution_prefix,
     };
+    use std::path::PathBuf;
 
     fn message(id: &str, parent_id: Option<&str>, role: MessageRole, content: &str) -> Message {
         Message {
@@ -1748,5 +1776,31 @@ mod tests {
             "Response from @unrelated-chat: Preserve this unverified literal"
         );
         assert!(!repair_inline_attribution_prefixes(&mut db));
+    }
+
+    #[test]
+    fn projected_legacy_blank_model_paths_do_not_mask_fallbacks() {
+        let mut conversation = Conversation {
+            id: "legacy-blank-model".to_string(),
+            title: "Legacy".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            kind: ConversationKind::Chat,
+            execution_profile: ConversationExecutionProfile::default(),
+            selected_model_path: Some(PathBuf::new()),
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: None,
+            current_skill_ids: Vec::new(),
+            messages: Vec::new(),
+        };
+        conversation.execution_profile.model_path = Some(PathBuf::from("   "));
+        conversation.execution_profile.mmproj_path = Some(PathBuf::new());
+
+        let projected = project_conversation(&conversation);
+        assert_eq!(projected.selected_model_path, None);
+        assert_eq!(projected.execution_profile.model_path, None);
+        assert_eq!(projected.execution_profile.mmproj_path, None);
     }
 }

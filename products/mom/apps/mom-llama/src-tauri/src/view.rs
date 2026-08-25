@@ -62,7 +62,7 @@ pub const CONTROL_SPECS: &[ControlSpec] = &[
         affordance: "readiness.model_select",
         command: "mom_llama.model_select",
         tauri_command: "mom_llama_model_select",
-        cli: "mom-llama model select --model-path <path> --json",
+        cli: "mom-llama model select --model-path <path> [--conversation <id>] --json",
         effect: "mom_llama.effects.model_select.v1",
         label: "Use model",
     },
@@ -1519,6 +1519,20 @@ where
     }
 }
 
+fn persona_projection() -> StoreProjection<Vec<Conversation>> {
+    let mut projection = store_projection(
+        mom_llama_runtime::persona_list(),
+        "persona_store_unavailable",
+        "Saved Personas could not be loaded from local storage.",
+    );
+    projection.value.sort_by(|left, right| {
+        left.title
+            .cmp(&right.title)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    projection
+}
+
 fn store_blocker(blocker: &Blocker) -> Markup {
     html! {
         p class="store-blocker" role="status" data-blocker-code=(blocker.code.clone())
@@ -1532,6 +1546,7 @@ fn store_blocker(blocker: &Blocker) -> Markup {
 pub fn render_app() -> Result<String> {
     let settings = mom_llama_runtime::settings_get()?;
     let engine = mom_llama_runtime::engine_status()?;
+    let personas = persona_projection();
     let conversations = mom_llama_runtime::conversation_list()?;
     let models = mom_llama_runtime::model_list()?;
     let selected_conversation_id =
@@ -1545,6 +1560,7 @@ pub fn render_app() -> Result<String> {
         settings: &settings,
         engine: &engine,
         conversations: &conversations,
+        personas: &personas,
         models: &models,
         selected_conversation_id: selected_conversation_id.as_deref(),
         draft: &draft,
@@ -1555,6 +1571,7 @@ pub fn render_app() -> Result<String> {
 pub fn render_chat_fragment() -> Result<String> {
     let settings = mom_llama_runtime::settings_get()?;
     let engine = mom_llama_runtime::engine_status()?;
+    let models = mom_llama_runtime::model_list()?;
     let conversations = mom_llama_runtime::conversation_list()?;
     let selected = mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
     let active = active_conversation(&conversations, selected.as_deref());
@@ -1563,28 +1580,34 @@ pub fn render_chat_fragment() -> Result<String> {
         .map(|conversation| conversation.id.as_str())
         .unwrap_or("default");
     let draft = mom_llama_runtime::draft_get(Some(current_id))?;
-    Ok(chat_view_with_draft(&settings, &engine, active.as_ref(), Some(&draft)).into_string())
+    Ok(
+        chat_view_with_draft(&settings, &engine, &models, active.as_ref(), Some(&draft))
+            .into_string(),
+    )
 }
 
 pub fn render_sidebar_fragment() -> Result<String> {
+    let personas = persona_projection();
     let conversations = mom_llama_runtime::conversation_list()?;
     let selected = mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
-    Ok(sidebar(&conversations, selected.as_deref()).into_string())
+    Ok(sidebar(&conversations, &personas, selected.as_deref()).into_string())
 }
 
 pub fn render_settings_fragment() -> Result<String> {
     let settings = mom_llama_runtime::settings_get()?;
     let models = mom_llama_runtime::model_list()?;
+    let personas = persona_projection();
     let conversations = mom_llama_runtime::conversation_list()?;
     let selected = mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
     let active = active_conversation(&conversations, selected.as_deref());
-    Ok(settings_modal(&settings, &models, active.as_ref()).into_string())
+    Ok(settings_modal(&settings, &models, &personas, active.as_ref()).into_string())
 }
 
 struct AppProjection<'a> {
     settings: &'a CommandResult<Settings>,
     engine: &'a CommandResult<EngineCheckOutput>,
     conversations: &'a CommandResult<Vec<Conversation>>,
+    personas: &'a StoreProjection<Vec<Conversation>>,
     models: &'a CommandResult<Vec<ModelInfo>>,
     selected_conversation_id: Option<&'a str>,
     draft: &'a CommandResult<DraftMessage>,
@@ -1595,6 +1618,7 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
         settings,
         engine,
         conversations,
+        personas,
         models,
         selected_conversation_id,
         draft,
@@ -1618,13 +1642,13 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             data-runtime="tauri-maud-htmx"
             data-native-core-only="true"
             data-mcp-process-ui-supported=(mcp_process_ui_supported()) {
-            (sidebar(conversations, active.as_ref().map(|conversation| conversation.id.as_str())))
+            (sidebar(conversations, personas, active.as_ref().map(|conversation| conversation.id.as_str())))
             header class="chrome" {
                 (button("layout.sidebar_toggle", Some("sidebar-toggle"), "icon-button sidebar-toggle", false))
                 (button("settings.open", Some("settings-open"), "icon-button settings-toggle", false))
             }
-            (chat_view_with_draft(settings, engine, active.as_ref(), Some(draft)))
-            (settings_modal(settings, models, active.as_ref()))
+            (chat_view_with_draft(settings, engine, models, active.as_ref(), Some(draft)))
+            (settings_modal(settings, models, personas, active.as_ref()))
             (persona_freeze_modal())
             (persona_context_menu())
             (persona_removal_modal())
@@ -1644,6 +1668,7 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
 fn chat_view_with_draft(
     settings: &CommandResult<Settings>,
     engine: &CommandResult<impl Serialize>,
+    models: &CommandResult<Vec<ModelInfo>>,
     active: Option<&Conversation>,
     draft: Option<&CommandResult<DraftMessage>>,
 ) -> Markup {
@@ -1805,7 +1830,7 @@ fn chat_view_with_draft(
                     }
                 }
             }
-            (composer(engine, settings, active, draft, &attachments))
+            (composer(engine, settings, models, active, draft, &attachments))
         }
     }
 }
@@ -1890,9 +1915,14 @@ fn latest_synthesizable_invocation(active: Option<&Conversation>) -> Option<Stri
         .find_map(|(invocation, count)| (count >= 2).then_some(invocation))
 }
 
-fn sidebar(conversations: &CommandResult<Vec<Conversation>>, active_id: Option<&str>) -> Markup {
+fn sidebar(
+    conversations: &CommandResult<Vec<Conversation>>,
+    personas: &StoreProjection<Vec<Conversation>>,
+    active_id: Option<&str>,
+) -> Markup {
     let chats = conversations.result.as_deref().unwrap_or(&[]);
     let conversation_list = control("conversation.list");
+    let persona_list = control("persona.list");
     html! {
         aside class="sidebar" aria-label="Sidebar" {
             h2 { "llama.cpp" }
@@ -1970,6 +2000,56 @@ fn sidebar(conversations: &CommandResult<Vec<Conversation>>, active_id: Option<&
                         }
                     }
                 }
+                section class="sidebar-section" aria-label="Personas" data-sidebar-section="personas" {
+                    button type="button" class="nav-button sidebar-section-toggle"
+                        data-affordance=(persona_list.affordance)
+                        data-command=(persona_list.command)
+                        data-tauri-command=(persona_list.tauri_command)
+                        data-cli=(persona_list.cli)
+                        data-effect=(persona_list.effect)
+                        data-action="sidebar-section-toggle"
+                        data-sidebar-section="personas"
+                        data-sidebar-label="Personas"
+                        aria-label="Collapse Personas"
+                        aria-expanded="true"
+                        aria-controls="sidebar-persona-list" {
+                        span { "Personas" }
+                        span class="sidebar-section-chevron" aria-hidden="true" { (icon_markup("chevron-down")) }
+                    }
+                    ol id="sidebar-persona-list" class="conversation-list sidebar-section-list" {
+                        @if let Some(blocker) = &personas.blocker {
+                            li { (store_blocker(blocker)) }
+                        } @else if personas.value.is_empty() {
+                            li class="empty-line" { "No Personas yet" }
+                        }
+                        @for persona in &personas.value {
+                            li class="sidebar-persona-row" data-persona-menu-target="true"
+                                data-persona=(persona.id.clone())
+                                data-persona-title=(persona.title.clone())
+                                data-persona-version=(persona.execution_profile.version) {
+                                div class="sidebar-persona-copy" {
+                                    span { (persona.title.clone()) }
+                                    small { "@" (persona.execution_profile.mention_handle.clone()) }
+                                }
+                                button type="button" class="icon-button persona-menu-trigger"
+                                    aria-label=(format!("Actions for {}", persona.title))
+                                    aria-haspopup="menu" aria-expanded="false"
+                                    aria-controls="persona-context-menu"
+                                    data-affordance=(persona_list.affordance)
+                                    data-command=(persona_list.command)
+                                    data-tauri-command=(persona_list.tauri_command)
+                                    data-cli=(persona_list.cli)
+                                    data-effect=(persona_list.effect)
+                                    data-action="persona-menu-open"
+                                    data-persona=(persona.id.clone())
+                                    data-persona-title=(persona.title.clone())
+                                    data-persona-version=(persona.execution_profile.version) {
+                                    (icon_markup("circle-ellipsis"))
+                                }
+                            }
+                        }
+                    }
+                }
             }
             div class="sidebar-actions hidden-contract" {
                 (button("conversation.rename", Some("conversation-rename"), "small-button", active_id.is_none()))
@@ -1983,6 +2063,7 @@ fn sidebar(conversations: &CommandResult<Vec<Conversation>>, active_id: Option<&
 fn composer(
     engine: &CommandResult<impl Serialize>,
     settings: &CommandResult<Settings>,
+    models: &CommandResult<Vec<ModelInfo>>,
     active: Option<&Conversation>,
     draft: Option<&CommandResult<DraftMessage>>,
     attachments: &[AttachmentRecord],
@@ -2108,9 +2189,18 @@ fn composer(
                     (button("attachment.import", Some("attachment-import"), "round-button", false))
                 }
                 div class="composer-right" {
-                    (conversation_model_chip(active, settings))
-                    span class=(format!("runtime-dot {}", readiness.class))
-                        title=(readiness.label) {}
+                    @if !active.is_some_and(|conversation| {
+                        conversation.kind == ConversationKind::PersonaTemplate
+                    }) {
+                        (model_picker(
+                            settings,
+                            models,
+                            effective_conversation_model_path(active, settings),
+                            active.map(|conversation| conversation.id.as_str()),
+                            "Model for this chat",
+                            "composer-model-picker",
+                        ))
+                    }
                     (button(
                         "chat.composer.skip_reasoning",
                         Some("chat-skip-reasoning"),
@@ -2120,6 +2210,7 @@ fn composer(
                     (button("chat.composer.cancel", Some("chat-cancel"), "send-button stop-button is-hidden", true))
                     button type="submit"
                         class="send-button"
+                        title=(readiness.label.clone())
                         data-affordance="chat.composer.send"
                         data-command="mom_llama.chat_dispatch"
                         data-tauri-command="mom_llama_chat_dispatch"
@@ -2502,6 +2593,7 @@ fn message_button(key: &str, action: &str, message: &Message) -> Markup {
 fn settings_modal(
     settings: &CommandResult<Settings>,
     models: &CommandResult<Vec<ModelInfo>>,
+    personas: &StoreProjection<Vec<Conversation>>,
     active: Option<&Conversation>,
 ) -> Markup {
     let current_conversation_id = active
@@ -2540,7 +2632,7 @@ fn settings_modal(
                         data-cli="mom-llama settings update"
                         data-effect="mom_llama.effects.settings_store.v1" {
                         @for section in SETTINGS_SECTIONS.iter().filter(|section| settings_section_visible(section)) {
-                            (settings_panel(section, settings, models, active))
+                            (settings_panel(section, settings, models, personas, active))
                         }
                     }
                 }
@@ -2572,6 +2664,7 @@ fn settings_panel(
     section: &SettingsSectionSpec,
     settings: &CommandResult<Settings>,
     models: &CommandResult<Vec<ModelInfo>>,
+    personas: &StoreProjection<Vec<Conversation>>,
     active: Option<&Conversation>,
 ) -> Markup {
     html! {
@@ -2592,7 +2685,14 @@ fn settings_panel(
                 (current_chat_instructions(active))
                 section class="settings-card model-settings" data-settings-card="models" {
                     h3 { "Model" }
-                    (settings_path_input("Default model for new chats", "model_path", settings_value(settings, "model_path"), "model-browse"))
+                    (model_picker(
+                        settings,
+                        models,
+                        settings.result.as_ref().and_then(|settings| settings.model_path.as_deref()),
+                        None,
+                        "Default model for new chats",
+                        "settings-model-picker",
+                    ))
                     p class="field-help" { "New chats capture this default. Existing chats use their saved conversation model when available." }
                     @if let Some(cache) = mom_llama_runtime::hugging_face_hub_cache_dir() {
                         p class="field-help model-cache-hint" {
@@ -2601,33 +2701,17 @@ fn settings_panel(
                             "."
                         }
                     }
-                    (settings_path_input("Vision projector (optional)", "mmproj_path", settings_value(settings, "mmproj_path"), "mmproj-browse"))
                     div class="button-strip" {
                         (button("model.list", Some("model-list"), "small-button", false))
                     }
-                    @for model in models.result.as_deref().unwrap_or(&[]) {
-                        button type="button"
-                            class=(format!("model-row {}", if model.selected { "active" } else { "" }))
-                            data-affordance="readiness.model_select"
-                            data-command="mom_llama.model_select"
-                            data-tauri-command="mom_llama_model_select"
-                            data-cli="mom-llama model select --model-path <path> --json"
-                            data-effect="mom_llama.effects.model_select.v1"
-                            data-action="model-select"
-                            data-model-path=(model.path.clone())
-                            disabled[model.selected] {
-                            span { (model.id.clone()) }
-                            small { (human_bytes(model.size_bytes)) }
-                        }
-                    }
-                    p class="field-help" { "Models run locally inside Mom. Choosing a model does not start a server or another executable." }
+                    p class="field-help" { "Models and a sole matching vision projector load together, locally inside Mom." }
                 }
             }
             @if section.slug == "consult" {
-                (consult_settings())
+                (consult_settings(personas))
             }
             @if section.slug == "personas" {
-                (persona_settings())
+                (persona_settings(personas, models))
             }
             @if section.slug == "library" {
                 (information_library_settings(active))
@@ -2888,15 +2972,10 @@ fn mcp_settings() -> Markup {
     }
 }
 
-fn persona_settings() -> Markup {
-    let StoreProjection {
-        value: personas,
-        blocker,
-    } = store_projection(
-        mom_llama_runtime::persona_list(),
-        "persona_store_unavailable",
-        "Saved Personas could not be loaded from local storage.",
-    );
+fn persona_settings(
+    personas: &StoreProjection<Vec<Conversation>>,
+    models: &CommandResult<Vec<ModelInfo>>,
+) -> Markup {
     let edit = control("persona.get");
     let list = control("persona.list");
     html! {
@@ -2906,12 +2985,12 @@ fn persona_settings() -> Markup {
                 "Use a Persona's menu to start a conversation, edit its profile, or remove it from the library."
             }
             div id="persona-list" class="persona-list" {
-                @if let Some(blocker) = &blocker {
+                @if let Some(blocker) = &personas.blocker {
                     (store_blocker(blocker))
-                } @else if personas.is_empty() {
+                } @else if personas.value.is_empty() {
                     p class="empty-line" { "Freeze any message from its context menu to create a persona." }
                 }
-                @for persona in &personas {
+                @for persona in &personas.value {
                     div class="persona-row" data-persona-menu-target="true"
                         data-persona=(persona.id.clone())
                         data-persona-title=(persona.title.clone())
@@ -2956,9 +3035,8 @@ fn persona_settings() -> Markup {
             div class="native-number-grid" {
                 (command_input("Name", "persona_name", "", "persona.update"))
                 (command_input("@handle", "persona_handle", "", "persona.update"))
-                (command_path_input("Model", "persona_model_path", "", "persona-model-browse", "persona.update"))
-                (command_path_input("Projector", "persona_mmproj_path", "", "persona-mmproj-browse", "persona.update"))
             }
+            (persona_model_selector(models))
             label class="field" { span { "System message (optional)" }
                 textarea name="persona_system_message" rows="4"
                     data-affordance="persona.update" data-command="mom_llama.persona_update"
@@ -3008,15 +3086,33 @@ fn persona_settings() -> Markup {
     }
 }
 
-fn consult_settings() -> Markup {
-    let StoreProjection {
-        value: personas,
-        blocker: persona_blocker,
-    } = store_projection(
-        mom_llama_runtime::persona_list(),
-        "persona_store_unavailable",
-        "Saved Personas could not be loaded from local storage.",
-    );
+fn persona_model_selector(models: &CommandResult<Vec<ModelInfo>>) -> Markup {
+    let update = control("persona.update");
+    let discovered = models.result.as_deref().unwrap_or(&[]);
+    html! {
+        label class="field persona-model-selector" {
+            span { "Model" }
+            select name="persona_model_choice"
+                data-persona-model-select="true"
+                data-affordance=(update.affordance)
+                data-command=(update.command)
+                data-tauri-command=(update.tauri_command)
+                data-cli=(update.cli)
+                data-effect=(update.effect) {
+                option value="" { "Use default model" }
+                @for model in discovered {
+                    option value=(model.path.clone()) {
+                        (model.id.clone())
+                        @if model.loaded { " (loaded)" }
+                    }
+                }
+            }
+            small { "Choose a discovered local model, or inherit the default for new chats." }
+        }
+    }
+}
+
+fn consult_settings(personas: &StoreProjection<Vec<Conversation>>) -> Markup {
     let StoreProjection {
         value: groups,
         blocker: group_blocker,
@@ -3071,7 +3167,7 @@ fn consult_settings() -> Markup {
         }
         section id="persona-group-editor" class="settings-card persona-group-editor is-hidden" {
             h3 { "Group pattern" }
-            @if let Some(blocker) = &persona_blocker {
+            @if let Some(blocker) = &personas.blocker {
                 (store_blocker(blocker))
             }
             input type="hidden" name="persona_group_id"
@@ -3092,7 +3188,7 @@ fn consult_settings() -> Markup {
                         data-cli="mom-llama persona-group create --persona <id> --json"
                         data-effect="mom_llama.effects.consult_store.v1" {
                         option value="" { @if index == 0 { "Choose a persona" } @else { "None" } }
-                        @for persona in &personas {
+                        @for persona in &personas.value {
                             option value=(persona.id.clone()) { (persona.title.clone()) " (@" (persona.execution_profile.mention_handle.clone()) ")" }
                         }
                     }
@@ -3478,26 +3574,135 @@ fn settings_field(field: &SettingsFieldSpec, settings: &CommandResult<Settings>)
     }
 }
 
-fn settings_path_input(label: &str, name: &str, value: String, action: &str) -> Markup {
+fn model_picker(
+    _settings: &CommandResult<Settings>,
+    models: &CommandResult<Vec<ModelInfo>>,
+    selected_path: Option<&Path>,
+    conversation_id: Option<&str>,
+    label: &str,
+    class_name: &str,
+) -> Markup {
     let picker = control("path.select");
+    let selected_label = selected_path
+        .map(file_name)
+        .unwrap_or_else(|| "Select model".to_string());
+    let discovered = models.result.as_deref().unwrap_or(&[]);
+    let has_loaded = discovered.iter().any(|model| model.loaded);
+    let selected_value = selected_path.map(|path| path.display().to_string());
+    let selected_discovered = selected_value
+        .as_deref()
+        .and_then(|selected| discovered.iter().find(|model| model.path == selected));
+    let selected_external = selected_path
+        .filter(|_| selected_discovered.is_none())
+        .map(|path| ModelInfo {
+            id: file_name(path),
+            path: path.display().to_string(),
+            selected: true,
+            loaded: false,
+            size_bytes: None,
+        });
+    let has_available = selected_external.is_some() || discovered.iter().any(|model| !model.loaded);
+    let picker_state = if selected_discovered.is_some_and(|model| model.loaded) {
+        "loaded"
+    } else if selected_path.is_some() {
+        "selected"
+    } else {
+        "empty"
+    };
+    let list_control = control("model.list");
+    let select_control = control("readiness.model_select");
     html! {
-        label class="field" { span { (label) }
-            div class="path-field" {
-                input name=(name) value=(value)
-                    data-setting-core=(name)
-                    data-affordance="settings.update"
-                    data-command="mom_llama.settings_update"
-                    data-tauri-command="mom_llama_settings_update"
-                    data-cli="mom-llama settings update --json"
-                    data-effect="mom_llama.effects.settings_store.v1";
-                button type="button" class="icon-button" aria-label=(format!("Choose {label}"))
-                    data-action=(action)
-                    data-affordance=(picker.affordance)
-                    data-command=(picker.command)
-                    data-tauri-command=(picker.tauri_command)
-                    data-cli=(picker.cli)
-                    data-effect=(picker.effect) {
-                    (icon_markup("folder-open"))
+        div class=(format!("model-picker-field {class_name}")) {
+            span class="model-picker-field-label" { (label) }
+            details class="model-picker" data-model-picker="true" data-state=(picker_state) {
+                summary class="model-picker-trigger" aria-label=(format!("{label}: {selected_label}")) {
+                    span class="model-picker-package" aria-hidden="true" { (icon_markup("box")) }
+                    strong { (selected_label) }
+                    span class="model-picker-state-label" {
+                        @if picker_state == "loaded" { "Loaded" }
+                        @else if picker_state == "selected" { "Ready to load" }
+                    }
+                    span class="model-picker-chevron" aria-hidden="true" { (icon_markup("chevron-down")) }
+                    span class="model-picker-spinner" aria-hidden="true" { (icon_markup("loader-circle")) }
+                }
+                div class="model-picker-popover" {
+                    label class="model-picker-search" {
+                        span class="sr-only" { "Search local models" }
+                        (icon_markup("search"))
+                        input type="search" placeholder="Search models" autocomplete="off"
+                            data-model-search="true"
+                            data-affordance=(list_control.affordance)
+                            data-command=(list_control.command)
+                            data-tauri-command=(list_control.tauri_command)
+                            data-cli=(list_control.cli)
+                            data-effect=(list_control.effect);
+                    }
+                    p class="model-picker-error" role="status" hidden {}
+                    div class="model-picker-options" {
+                        @if discovered.is_empty() {
+                            p class="empty-line model-picker-empty" { "No GGUF models discovered" }
+                        }
+                        @if has_loaded {
+                            p class="model-picker-group-label" { "Loaded" }
+                            @for model in discovered.iter().filter(|model| model.loaded) {
+                                (model_picker_option(model, selected_value.as_deref(), conversation_id, select_control))
+                            }
+                        }
+                        @if has_available {
+                            p class="model-picker-group-label" { "Available" }
+                            @if let Some(model) = &selected_external {
+                                (model_picker_option(model, selected_value.as_deref(), conversation_id, select_control))
+                            }
+                            @for model in discovered.iter().filter(|model| !model.loaded) {
+                                (model_picker_option(model, selected_value.as_deref(), conversation_id, select_control))
+                            }
+                        }
+                    }
+                    button type="button" class="model-picker-choose"
+                        data-action="model-browse"
+                        data-conversation=[conversation_id]
+                        data-affordance=(picker.affordance)
+                        data-command=(picker.command)
+                        data-tauri-command=(picker.tauri_command)
+                        data-cli=(picker.cli)
+                        data-effect=(picker.effect) {
+                        (icon_markup("folder-open"))
+                        span { "Choose GGUF file…" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn model_picker_option(
+    model: &ModelInfo,
+    selected_path: Option<&str>,
+    conversation_id: Option<&str>,
+    select_control: &ControlSpec,
+) -> Markup {
+    let selected = selected_path == Some(model.path.as_str());
+    html! {
+        button type="button" class=(format!("model-picker-option{}", if selected { " selected" } else { "" }))
+            data-affordance=(select_control.affordance)
+            data-command=(select_control.command)
+            data-tauri-command=(select_control.tauri_command)
+            data-cli=(select_control.cli)
+            data-effect=(select_control.effect)
+            data-action="model-select"
+            data-model-path=(model.path.clone())
+            data-model-search-value=(model.id.to_ascii_lowercase())
+            data-conversation=[conversation_id]
+            disabled[selected && model.loaded] {
+            span class="model-picker-option-copy" {
+                strong { (model.id.clone()) }
+                small { (human_bytes(model.size_bytes)) }
+            }
+            @if selected {
+                @if model.loaded {
+                    span class="model-picker-check" aria-hidden="true" { (icon_markup("check")) }
+                } @else {
+                    small class="model-picker-load-label" { "Load" }
                 }
             }
         }
@@ -3886,19 +4091,27 @@ fn effective_conversation_model_path<'a>(
                 .execution_profile
                 .model_path
                 .as_deref()
-                .or(conversation.selected_model_path.as_deref())
+                .filter(|path| usable_model_path(path))
+                .or(conversation
+                    .selected_model_path
+                    .as_deref()
+                    .filter(|path| usable_model_path(path)))
         })
         .or_else(|| {
             settings
                 .result
                 .as_ref()
                 .and_then(|settings| settings.model_path.as_deref())
+                .filter(|path| usable_model_path(path))
         })
+}
+
+fn usable_model_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty() && path.to_str().is_none_or(|value| !value.trim().is_empty())
 }
 
 struct ConversationModelReadiness {
     enabled: bool,
-    class: &'static str,
     label: String,
 }
 
@@ -3910,14 +4123,12 @@ fn conversation_model_readiness(
     let Some(path) = effective_conversation_model_path(active, settings) else {
         return ConversationModelReadiness {
             enabled: false,
-            class: "blocked",
-            label: "No GGUF model is configured for this conversation".to_string(),
+            label: "Choose a model before sending".to_string(),
         };
     };
     if let Err(blocked) = mom_llama_runtime::engine::validate_model_path(path) {
         return ConversationModelReadiness {
             enabled: false,
-            class: "blocked",
             label: blocked.blocker.message,
         };
     }
@@ -3929,34 +4140,12 @@ fn conversation_model_readiness(
     if engine.status == "host_integrated" && global_matches {
         ConversationModelReadiness {
             enabled: true,
-            class: "ready",
-            label: "Conversation model loaded".to_string(),
+            label: "Send".to_string(),
         }
     } else {
         ConversationModelReadiness {
             enabled: true,
-            class: "configured",
-            label: "Conversation model ready to load".to_string(),
-        }
-    }
-}
-
-fn conversation_model_chip(
-    active: Option<&Conversation>,
-    settings: &CommandResult<Settings>,
-) -> Markup {
-    let path = effective_conversation_model_path(active, settings);
-    let display = path
-        .map(file_name)
-        .map(|label| model_chip_label(settings, &label))
-        .unwrap_or_else(|| "No model".to_string());
-    let title = path
-        .map(|path| format!("Conversation model: {}", path.display()))
-        .unwrap_or_else(|| "Conversation model: no model configured".to_string());
-    html! {
-        span class="conversation-model-chip" aria-label=(title.clone()) title=(title) {
-            span class="conversation-model-chip-label" { "Conversation model" }
-            strong { (display) }
+            label: "Send; the selected model will load first".to_string(),
         }
     }
 }
@@ -4018,28 +4207,6 @@ fn model_tags(settings: &CommandResult<Settings>, label: &str) -> Vec<&'static s
         tags.push("reasoning");
     }
     tags
-}
-
-fn settings_value(settings: &CommandResult<Settings>, key: &str) -> String {
-    let Some(settings) = settings.result.as_ref() else {
-        return String::new();
-    };
-    match key {
-        "mmproj_path" => settings
-            .mmproj_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
-        "model_path" => settings
-            .model_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
-        "default_temperature" => settings.default_temperature.to_string(),
-        "default_top_p" => settings.default_top_p.to_string(),
-        "default_max_tokens" => settings.default_max_tokens.to_string(),
-        _ => String::new(),
-    }
 }
 
 fn upstream_settings_value(settings: &CommandResult<Settings>, key: &str) -> String {
@@ -4116,6 +4283,18 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn empty_models() -> CommandResult<Vec<ModelInfo>> {
+        CommandResult::passed(
+            "mom_llama.model_list",
+            "contracted",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        )
+    }
+
     #[test]
     fn rendered_app_controls_have_contract_metadata() -> Result<()> {
         let _guard = crate::APP_DATA_DIR_TEST_LOCK
@@ -4147,9 +4326,10 @@ mod tests {
             !html.contains("<a "),
             "native shell should not expose unmanaged anchors"
         );
-        assert!(
-            !html.contains("<summary"),
-            "native shell should not expose unmanaged disclosure controls"
+        assert_eq!(
+            html.matches("<summary").count(),
+            html.matches(r#"data-model-picker="true""#).count(),
+            "only the model pickers may use a native details disclosure"
         );
         assert!(
             html.contains(
@@ -4161,6 +4341,12 @@ mod tests {
         assert!(html.contains(r#"data-chat-setting="system_message""#));
         assert!(html.contains("Changes save automatically"));
         assert!(html.contains("Default model for new chats"));
+        assert!(html.contains(r#"data-model-picker="true""#));
+        assert!(html.contains(r#"data-model-search="true""#));
+        assert!(html.contains("Choose GGUF file…"));
+        assert!(!html.contains(r#"name="model_path""#));
+        assert!(!html.contains(r#"name="mmproj_path""#));
+        assert!(!html.contains("Vision projector"));
         assert!(html.contains(
             "New chats capture this default. Existing chats use their saved conversation model when available."
         ));
@@ -4225,8 +4411,12 @@ mod tests {
         assert!(html.contains(r#"data-sidebar-section="conversations""#));
         assert!(html.contains(r#"aria-controls="conversation-section-panel""#));
         assert!(html.contains(r#"aria-label="Collapse Conversations""#));
-        assert!(!html.contains(r#"data-sidebar-section="personas""#));
-        assert!(!html.contains(r#"id="sidebar-persona-list""#));
+        assert!(html.contains(r#"data-sidebar-section="personas""#));
+        assert!(html.contains(r#"id="sidebar-persona-list""#));
+        assert!(html.contains(r#"class="sidebar-persona-row""#));
+        assert!(html.contains(r#"data-persona-menu-target="true""#));
+        assert!(html.contains(r#"aria-label="Collapse Personas""#));
+        assert!(html.contains(r#"data-action="persona-menu-open""#));
         assert!(!html.contains(r#"data-sidebar-section="consult-groups""#));
         assert!(!html.contains(r#"id="sidebar-consult-group-list""#));
         assert!(html.contains("Bessel van der Kolk"));
@@ -4353,10 +4543,9 @@ mod tests {
         assert!(js.contains("collapsedSidebarSections"));
         assert!(js.contains("scheduleSettingsAutosave"));
         assert!(
-            js.contains(r#"modelPath: formValue(form, "model_path")"#)
-                && js.contains(r#"mmprojPath: formValue(form, "mmproj_path")"#)
-                && !js.contains(r#"mmprojPath: formValue(form, "mmproj_path") || null"#),
-            "empty native model paths must remain explicit clear patches"
+            !js.contains(r#"modelPath: formValue(form, "model_path")"#)
+                && !js.contains(r#"mmprojPath: formValue(form, "mmproj_path")"#),
+            "unrelated settings autosave must not mutate the exact model/projector pair"
         );
         assert!(js.contains("mom_llama_conversation_system_message_update"));
         assert!(js.contains("Couldn’t save changes"));
@@ -4975,7 +5164,16 @@ mod tests {
             attachment_record("notes", "", "notes.md", AttachmentKind::Text),
             attachment_record("image", "", "garden.png", AttachmentKind::Image),
         ];
-        let html = composer(&engine, &settings, None, Some(&draft), &attachments).into_string();
+        let models = empty_models();
+        let html = composer(
+            &engine,
+            &settings,
+            &models,
+            None,
+            Some(&draft),
+            &attachments,
+        )
+        .into_string();
         assert!(html.contains(r#"id="composer-attachments" class="composer-attachments""#));
         assert!(html.contains(r#"data-staged-attachment-id="image""#));
         assert!(html.contains(r#"data-staged-attachment-id="notes""#));
@@ -5021,14 +5219,16 @@ mod tests {
             effective_conversation_model_path(Some(&conversation), &settings),
             Some(Path::new("/models/frozen-profile-Q4_K_M.gguf"))
         );
+        let models = empty_models();
         let profile_html =
-            composer(&engine, &settings, Some(&conversation), None, &[]).into_string();
-        assert!(profile_html.contains("Conversation model"));
+            composer(&engine, &settings, &models, Some(&conversation), None, &[]).into_string();
+        assert!(!profile_html.contains("Conversation model"));
         assert!(profile_html.contains("frozen-profile-Q4_K_M"));
         assert!(!profile_html.contains("legacy-selected-Q5_K_M"));
         assert!(!profile_html.contains("global-default-Q8_0"));
-        assert!(!profile_html.contains(r#"name="model_picker""#));
-        assert!(!profile_html.contains("mom_llama_model_select"));
+        assert!(profile_html.contains(r#"data-model-picker="true""#));
+        assert!(profile_html.contains("mom_llama_model_select"));
+        assert!(profile_html.contains(r#"data-conversation="chat""#));
 
         conversation.execution_profile.model_path = None;
         assert_eq!(
@@ -5036,7 +5236,7 @@ mod tests {
             Some(Path::new("/models/legacy-selected-Q5_K_M.gguf"))
         );
         let selected_html =
-            composer(&engine, &settings, Some(&conversation), None, &[]).into_string();
+            composer(&engine, &settings, &models, Some(&conversation), None, &[]).into_string();
         assert!(selected_html.contains("legacy-selected-Q5_K_M"));
         assert!(!selected_html.contains("global-default-Q8_0"));
 
@@ -5046,8 +5246,16 @@ mod tests {
             Some(Path::new("/models/global-default-Q8_0.gguf"))
         );
         let default_html =
-            composer(&engine, &settings, Some(&conversation), None, &[]).into_string();
+            composer(&engine, &settings, &models, Some(&conversation), None, &[]).into_string();
         assert!(default_html.contains("global-default-Q8_0"));
+
+        conversation.execution_profile.model_path = Some(PathBuf::from("   "));
+        conversation.selected_model_path = Some(PathBuf::new());
+        assert_eq!(
+            effective_conversation_model_path(Some(&conversation), &settings),
+            Some(Path::new("/models/global-default-Q8_0.gguf")),
+            "legacy blank profile paths must not mask the configured fallback"
+        );
     }
 
     #[test]
@@ -5081,20 +5289,26 @@ mod tests {
         let configured =
             conversation_model_readiness(&blocked_global, Some(&conversation), &settings);
         assert!(configured.enabled);
-        assert_eq!(configured.class, "configured");
-        assert_eq!(configured.label, "Conversation model ready to load");
-        let html =
-            composer(&blocked_global, &settings, Some(&conversation), None, &[]).into_string();
-        assert!(html.contains(r#"class="runtime-dot configured""#));
-        assert!(html.contains("Conversation model ready to load"));
+        assert_eq!(configured.label, "Send; the selected model will load first");
+        let models = empty_models();
+        let html = composer(
+            &blocked_global,
+            &settings,
+            &models,
+            Some(&conversation),
+            None,
+            &[],
+        )
+        .into_string();
+        assert!(!html.contains("runtime-dot"));
+        assert!(html.contains("Send; the selected model will load first"));
         assert!(!html.contains(r#"type="submit" class="send-button" disabled"#));
 
         conversation.execution_profile.model_path =
             Some(directory.join("missing-conversation.gguf"));
         let missing = conversation_model_readiness(&blocked_global, Some(&conversation), &settings);
         assert!(!missing.enabled);
-        assert_eq!(missing.class, "blocked");
-        assert!(missing.label.contains("does not exist"));
+        assert_eq!(missing.label, "That model file is no longer available.");
 
         let mut loaded_settings_value = Settings::defaults_for_data_dir(directory.clone());
         loaded_settings_value.model_path = Some(conversation_model.clone());
@@ -5120,8 +5334,7 @@ mod tests {
         let loaded =
             conversation_model_readiness(&loaded_engine, Some(&conversation), &loaded_settings);
         assert!(loaded.enabled);
-        assert_eq!(loaded.class, "ready");
-        assert_eq!(loaded.label, "Conversation model loaded");
+        assert_eq!(loaded.label, "Send");
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }
@@ -5166,11 +5379,17 @@ mod tests {
     }
 
     #[test]
-    fn frontend_has_no_composer_model_mutation_path() {
+    fn frontend_model_picker_loads_the_chat_scoped_selection() {
         let js = include_str!("../../ui/coop-hx.js");
-        assert!(!js.contains("select[name='model_picker']"));
+        assert!(js.contains("const selectAndLoadModel"));
         assert!(js.contains(r#""model-select": async (button)"#));
-        assert!(js.contains(r#"invoke("mom_llama_model_select", { modelPath: path })"#));
+        assert!(js.contains(r#"invoke("mom_llama_model_select", {"#));
+        assert!(js.contains(r#"conversation: button.dataset.conversation || null"#));
+        assert!(js.contains(r#"picker.dataset.state = "loading""#));
+        assert!(js.contains(".model-picker-error"));
+        assert!(!js.contains("persona_mmproj_path"));
+        assert!(!js.contains("persona_model_path"));
+        assert!(js.contains("persona_model_choice"));
     }
 
     fn attachment_record(
@@ -5375,12 +5594,16 @@ mod tests {
         }
         assert_interactive_tags_have_metadata(&html, "button");
 
-        let editor = persona_settings().into_string();
+        let personas = persona_projection();
+        let editor = persona_settings(&personas, &empty_models()).into_string();
         assert_eq!(
             editor.contains(r#"name="persona_tools""#),
             mcp_process_ui_supported(),
             "Persona MCP bindings must be absent outside macOS and Linux"
         );
+        assert!(editor.contains(r#"name="persona_model_choice""#));
+        assert!(editor.contains("Use default model"));
+        assert!(!editor.contains(r#"name="persona_model_path""#));
 
         assert_eq!(
             control("mcp.list_tools").label,
@@ -5417,6 +5640,8 @@ mod tests {
             "consult-group-option",
             "persona-select",
             "model-row",
+            "model-picker-option",
+            "model-picker-choose",
         ];
         let mut rest = html;
         while let Some(index) = rest.find("<button") {
