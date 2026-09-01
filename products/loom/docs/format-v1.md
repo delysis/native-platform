@@ -1,6 +1,6 @@
 # Loom project format v1
 
-Status: initial versioned foundation. Project manifest schema version `1` is the stable on-disk compatibility boundary. The current branch reaches additive SQLite migration `11`; database migration numbers do not change the manifest version when they preserve the v1 contract. Migration 10 added immutable, content-addressed exact token-piece bytes and cumulative boundary vectors for verified native calls. Migration 11 adds receipts for ordinary foreground writing commands.
+Status: initial versioned foundation. Project manifest schema version `1` is the stable on-disk compatibility boundary. The current branch reaches additive SQLite migration `13`; database migration numbers do not change the manifest version when they preserve the v1 contract. Migration 10 added immutable, content-addressed exact token-piece bytes and cumulative boundary vectors for verified native calls. Migration 11 adds receipts for ordinary foreground writing commands. Migration 12 adds an optional bounded display title to registered documents; legacy documents continue to derive their title from the ordinary manuscript filename. Migration 13 normalizes each generation run's immutable weave-command family identity for indexed completion-family recovery.
 
 ## Authority split
 
@@ -8,6 +8,8 @@ Status: initial versioned foundation. Project manifest schema version `1` is the
 - `.loom/loom.sqlite3` is authoritative for revisions, causal occurrences, receipts, generation evidence, branch state, and pending visible-file projection.
 - `.loom/blobs/sha256/**` contains immutable payload bytes referenced by semantic history.
 - `.loom/drafts/**` contains at most two mutable crash-safe draft slots per document. Draft slots are explicitly not semantic history or immutable content-addressed artifacts.
+- Document display titles are mutable catalogue metadata. Changing one does not rename the ordinary manuscript file or rewrite immutable document revisions.
+- `generation_weave_commands` binds each run to at most one immutable weave command; cancellation command events cannot become completion-family authority.
 
 Visual prose uses Loom's byte-preserving Markdown dialect over the checked-in
 ProseMirror schema. It matches the admitted CommonMark subset except for raw

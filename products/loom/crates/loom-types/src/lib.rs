@@ -562,4 +562,9 @@ mod tests {
         assert!(ByteRange::new(9, 2).is_none());
         assert_eq!(ByteRange::new(2, 9).expect("valid range").len(), 7);
     }
+
+    #[test]
+    fn generation_text_delta_wire_ceiling_is_64_kibibytes() {
+        assert_eq!(MAX_GENERATION_TEXT_DELTA_BYTES, 65_536);
+    }
 }

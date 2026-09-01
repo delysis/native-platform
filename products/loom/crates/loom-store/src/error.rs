@@ -38,6 +38,8 @@ pub enum StoreError {
     UnsupportedSchema { found: u32, supported: u32 },
     #[error("project name must contain 1 to {max_bytes} UTF-8 bytes")]
     InvalidProjectName { max_bytes: usize },
+    #[error("document title must contain 1 to {max_bytes} UTF-8 bytes and no control characters")]
+    InvalidDocumentTitle { max_bytes: usize },
     #[error("reason must contain at most {max_bytes} UTF-8 bytes")]
     ReasonTooLong { max_bytes: usize },
     #[error("document has {actual_bytes} bytes; limit is {max_bytes} bytes")]
@@ -132,6 +134,18 @@ pub enum StoreError {
     CompletedGenerationRequiresCandidate,
     #[error("candidate-ready events are created only by terminal candidate recording")]
     CandidateReadyRequiresTerminalCandidate,
+    #[error("generation progress would contain {actual_events} text events; limit is {max_events}")]
+    GenerationProgressEventLimitExceeded {
+        actual_events: usize,
+        max_events: usize,
+    },
+    #[error(
+        "generation progress would contain {actual_bytes} UTF-8 text bytes; limit is {max_bytes} bytes"
+    )]
+    GenerationProgressTextLimitExceeded {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
     #[error("failed generation requires a non-empty error")]
     FailedGenerationRequiresError,
     #[error("model environment is a critic under the generation authority policy")]

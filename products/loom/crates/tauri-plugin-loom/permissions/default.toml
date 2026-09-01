@@ -10,6 +10,8 @@ permissions = [
   "allow-project-current",
   "allow-project-recover",
   "allow-document-create",
+  "allow-document-rename",
+  "allow-attachment-ingest",
   "allow-document-open",
   "allow-document-checkpoint",
   "allow-document-export-choose",

@@ -1,21 +1,22 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounded};
 use llama_native_types::{
     ChatMessage, ChatRole, ChatTemplateChoice, CompletionPrompt, GenerationBatchRequest,
     GenerationCase, GenerationEvent as NativeEvent, GenerationEventKind as NativeEventKind,
-    GenerationOutput, GenerationState, NativeError, NativeTransport, SamplingConfig,
-    SpecialTokenPolicy,
+    GenerationOutput, GenerationState, MAX_GENERATED_OUTPUT_BYTES, NativeError, NativeTransport,
+    SamplingConfig, SpecialTokenPolicy,
 };
 use loom_types::{
     ArtifactId, BlobId, BranchCandidate, BranchId, ByteRange, CandidateId, GeneratedSpan,
     GenerationEvent, GenerationEventKind, GenerationMetrics, GenerationProvenance, GenerationRunId,
     GenerationStart, GenerationTerminalEvent, GenerationTerminalStatus, InferenceEvidenceKind,
-    LoomEvent, ModelEnvironment, PromptMode, PromptRecipe, TokenTrace, now_unix_ms,
+    LoomEvent, MAX_GENERATION_TEXT_DELTA_BYTES, ModelEnvironment, PromptMode, PromptRecipe,
+    TokenTrace, now_unix_ms,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -30,6 +31,8 @@ use crate::runtime::{
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 256;
 pub const MAX_EVENT_CAPACITY: usize = 65_536;
+const MAX_RETAINED_NATIVE_EVENTS_PER_BRANCH: usize = 4_096;
+const MAX_RETAINED_NATIVE_EVENT_JSON_BYTES_PER_BRANCH: usize = MAX_GENERATED_OUTPUT_BYTES * 8;
 const _: () = assert!(DEFAULT_EVENT_CAPACITY > 0 && DEFAULT_EVENT_CAPACITY <= MAX_EVENT_CAPACITY);
 
 const WRITER_CHAT_INSTRUCTION: &str = "Write only the new prose that belongs after <cursor>. Never copy text from inside <manuscript>, and do not explain, label, quote, or describe your reasoning.\n\n<manuscript>\n";
@@ -307,6 +310,7 @@ impl LlamaBackend {
             execution,
             events,
             event_rx,
+            event_delivery: Mutex::new(EventDeliveryState::default()),
             result_rx,
         });
 
@@ -327,7 +331,13 @@ pub struct LlamaGenerationControl {
     execution: Arc<dyn BatchExecution>,
     events: Arc<EventStream>,
     event_rx: Receiver<LoomEvent>,
+    event_delivery: Mutex<EventDeliveryState>,
     result_rx: Receiver<Result<ExactContinuationResult, LlamaBackendError>>,
+}
+
+#[derive(Debug, Default)]
+struct EventDeliveryState {
+    deferred: VecDeque<LoomEvent>,
 }
 
 /// The sole owner of one Loom event-forwarder thread.
@@ -407,11 +417,59 @@ impl LlamaGenerationControl {
         &self,
         timeout: Duration,
     ) -> Result<Option<LoomEvent>, LlamaBackendError> {
-        match self.event_rx.recv_timeout(timeout) {
-            Ok(event) => Ok(Some(event)),
-            Err(RecvTimeoutError::Timeout) => Ok(None),
-            Err(RecvTimeoutError::Disconnected) => Err(LlamaBackendError::ResultDisconnected),
+        // Serialize consumers so a terminal deferred behind coalesced text
+        // cannot overtake those exact bytes through another control clone.
+        let mut delivery = self
+            .event_delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(event) = delivery.deferred.pop_front() {
+            return Ok(Some(event));
         }
+
+        match self.event_rx.try_recv() {
+            Ok(event) => return Ok(Some(self.order_event(event, &mut delivery))),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                return self
+                    .events
+                    .take_pending_text()
+                    .map(|event| Some(LoomEvent::Generation(event)))
+                    .ok_or(LlamaBackendError::ResultDisconnected);
+            }
+        }
+        if let Some(event) = self.events.take_pending_text() {
+            return Ok(Some(LoomEvent::Generation(event)));
+        }
+
+        match self.event_rx.recv_timeout(timeout) {
+            Ok(event) => Ok(Some(self.order_event(event, &mut delivery))),
+            Err(RecvTimeoutError::Timeout) => {
+                Ok(self.events.take_pending_text().map(LoomEvent::Generation))
+            }
+            Err(RecvTimeoutError::Disconnected) => self
+                .events
+                .take_pending_text()
+                .map(|event| Some(LoomEvent::Generation(event)))
+                .ok_or(LlamaBackendError::ResultDisconnected),
+        }
+    }
+
+    fn order_event(&self, event: LoomEvent, delivery: &mut EventDeliveryState) -> LoomEvent {
+        let LoomEvent::GenerationTerminal(terminal) = &event else {
+            return event;
+        };
+        let Some(mut pending) = self.events.take_pending_text_for(terminal.branch_id) else {
+            return event;
+        };
+        let first = pending
+            .pop_front()
+            .expect("pending-text branch queues are never empty");
+        delivery
+            .deferred
+            .extend(pending.into_iter().map(LoomEvent::Generation));
+        delivery.deferred.push_back(event);
+        LoomEvent::Generation(first)
     }
 
     /// Receives the backend result without joining the worker. Only the
@@ -565,11 +623,136 @@ struct CaseIdentity {
 }
 
 #[derive(Debug)]
+struct PendingTextState {
+    by_branch: BTreeMap<BranchId, VecDeque<GenerationEvent>>,
+    pending_branch_bytes: BTreeMap<BranchId, usize>,
+    total_pending_bytes: usize,
+    max_total_pending_bytes: usize,
+    accepted_branch_bytes: BTreeMap<BranchId, usize>,
+    failure: Option<String>,
+}
+
+impl PendingTextState {
+    fn new(branch_count: usize) -> Self {
+        Self {
+            by_branch: BTreeMap::new(),
+            pending_branch_bytes: BTreeMap::new(),
+            total_pending_bytes: 0,
+            max_total_pending_bytes: MAX_GENERATED_OUTPUT_BYTES.saturating_mul(branch_count),
+            accepted_branch_bytes: BTreeMap::new(),
+            failure: None,
+        }
+    }
+
+    fn admit_text(&mut self, branch_id: BranchId, text: &str) -> usize {
+        let accepted_bytes = self
+            .accepted_branch_bytes
+            .get(&branch_id)
+            .copied()
+            .unwrap_or(0);
+        let available = MAX_GENERATED_OUTPUT_BYTES.saturating_sub(accepted_bytes);
+        let accepted_len = utf8_prefix_len(text, available);
+        *self.accepted_branch_bytes.entry(branch_id).or_default() += accepted_len;
+        if accepted_len < text.len() {
+            self.record_overflow(branch_id);
+        }
+        accepted_len
+    }
+
+    fn record_overflow(&mut self, branch_id: BranchId) {
+        self.failure.get_or_insert_with(|| {
+            format!(
+                "loom_text_stream_output_overflow: branch {branch_id} exceeded the \
+                 {MAX_GENERATED_OUTPUT_BYTES}-byte native output ceiling"
+            )
+        });
+    }
+}
+
+#[derive(Debug, Default)]
+struct JsonByteCounter {
+    bytes: usize,
+}
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct RetainedNativeEventStream {
+    events: Vec<NativeEvent>,
+    serialized_bytes: usize,
+}
+
+impl Default for RetainedNativeEventStream {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            // The final provenance encoding is a JSON array, including these
+            // two bytes even when the native runtime emits no events.
+            serialized_bytes: 2,
+        }
+    }
+}
+
+impl RetainedNativeEventStream {
+    fn last(&self) -> Option<&NativeEvent> {
+        self.events.last()
+    }
+
+    fn as_slice(&self) -> &[NativeEvent] {
+        &self.events
+    }
+
+    fn push(&mut self, event: NativeEvent) -> Result<(), LlamaBackendError> {
+        if self.events.len() >= MAX_RETAINED_NATIVE_EVENTS_PER_BRANCH {
+            return Err(LlamaBackendError::OutputContract(format!(
+                "loom_native_event_count_overflow: branch {} exceeded the {}-event retained provenance ceiling",
+                event.branch_id, MAX_RETAINED_NATIVE_EVENTS_PER_BRANCH
+            )));
+        }
+        // Count through serde's writer path so rejecting one oversized event
+        // does not first allocate an equally oversized temporary JSON buffer.
+        let mut counter = JsonByteCounter::default();
+        serde_json::to_writer(&mut counter, &event)?;
+        let encoded_len = counter.bytes;
+        let separator_len = usize::from(!self.events.is_empty());
+        let projected_bytes = self
+            .serialized_bytes
+            .checked_add(separator_len)
+            .and_then(|bytes| bytes.checked_add(encoded_len))
+            .ok_or_else(|| {
+                LlamaBackendError::OutputContract(format!(
+                    "loom_native_event_bytes_overflow: branch {} exceeded the retained provenance byte ceiling",
+                    event.branch_id
+                ))
+            })?;
+        if projected_bytes > MAX_RETAINED_NATIVE_EVENT_JSON_BYTES_PER_BRANCH {
+            return Err(LlamaBackendError::OutputContract(format!(
+                "loom_native_event_bytes_overflow: branch {} exceeded the {}-byte retained provenance ceiling",
+                event.branch_id, MAX_RETAINED_NATIVE_EVENT_JSON_BYTES_PER_BRANCH
+            )));
+        }
+        self.events.push(event);
+        self.serialized_bytes = projected_bytes;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 struct EventStream {
     sender: Sender<LoomEvent>,
     capacity: usize,
     terminal_reserve: usize,
     emission: Mutex<()>,
+    pending_text: Mutex<PendingTextState>,
     sequences: Mutex<BTreeMap<BranchId, u64>>,
     terminals: Mutex<BTreeMap<BranchId, GenerationTerminalEvent>>,
 }
@@ -581,6 +764,7 @@ impl EventStream {
             capacity,
             terminal_reserve: identities.len(),
             emission: Mutex::new(()),
+            pending_text: Mutex::new(PendingTextState::new(identities.len())),
             sequences: Mutex::new(
                 identities
                     .iter()
@@ -596,20 +780,237 @@ impl EventStream {
             .emission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.is_terminated(identity.branch_id)
-            || self.sender.len() >= self.capacity.saturating_sub(self.terminal_reserve)
-        {
+        if self.is_terminated(identity.branch_id) {
+            return;
+        }
+        if let GenerationEventKind::TextDelta { text } = kind {
+            self.emit_text(identity, &text);
+            return;
+        }
+        let channel_under_pressure =
+            self.sender.len() >= self.capacity.saturating_sub(self.terminal_reserve);
+        let branch_has_pending_text = self.has_pending_text(identity.branch_id);
+        if channel_under_pressure || branch_has_pending_text {
+            // State, token, warning, and candidate-ready events are advisory
+            // under queue pressure. They are dropped before sequence
+            // allocation so exact text and the per-branch terminal reserve
+            // remain lossless and sequence-contiguous.
             return;
         }
         let sequence = self.next_sequence(identity.branch_id);
-        let _ = self.sender.try_send(LoomEvent::Generation(GenerationEvent {
+        let event = LoomEvent::Generation(GenerationEvent {
             event_id: loom_types::GenerationEventId::new(),
             run_id: identity.run_id,
             branch_id: identity.branch_id,
             sequence,
             kind,
             occurred_at_ms: now_unix_ms(),
-        }));
+        });
+        let _ = self.sender.try_send(event);
+    }
+
+    fn emit_text(&self, identity: &CaseIdentity, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let accepted_len = self
+            .pending_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admit_text(identity.branch_id, text);
+        let mut remaining = &text[..accepted_len];
+        while !remaining.is_empty() {
+            if self.has_pending_text(identity.branch_id)
+                || self.sender.len() >= self.capacity.saturating_sub(self.terminal_reserve)
+            {
+                self.merge_pending_text(identity, remaining);
+                return;
+            }
+            let chunk_len = utf8_prefix_len(remaining, MAX_GENERATION_TEXT_DELTA_BYTES);
+            debug_assert!(chunk_len > 0);
+            let (chunk, tail) = remaining.split_at(chunk_len);
+            let event = LoomEvent::Generation(GenerationEvent {
+                event_id: loom_types::GenerationEventId::new(),
+                run_id: identity.run_id,
+                branch_id: identity.branch_id,
+                sequence: self.next_sequence(identity.branch_id),
+                kind: GenerationEventKind::TextDelta {
+                    text: chunk.to_owned(),
+                },
+                occurred_at_ms: now_unix_ms(),
+            });
+            if let Err(error) = self.sender.try_send(event) {
+                let LoomEvent::Generation(event) = error.into_inner() else {
+                    unreachable!("emit_text only constructs generation events");
+                };
+                self.push_pending_text(event);
+                self.merge_pending_text(identity, tail);
+                return;
+            }
+            remaining = tail;
+        }
+    }
+
+    fn has_pending_text(&self, branch_id: BranchId) -> bool {
+        self.pending_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_branch
+            .contains_key(&branch_id)
+    }
+
+    fn merge_pending_text(&self, identity: &CaseIdentity, mut remaining: &str) {
+        if remaining.is_empty() {
+            return;
+        }
+        let mut pending = self
+            .pending_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !remaining.is_empty() {
+            let branch_bytes = pending
+                .pending_branch_bytes
+                .get(&identity.branch_id)
+                .copied()
+                .unwrap_or(0);
+            let available = MAX_GENERATED_OUTPUT_BYTES.saturating_sub(branch_bytes).min(
+                pending
+                    .max_total_pending_bytes
+                    .saturating_sub(pending.total_pending_bytes),
+            );
+            let accepted_len = utf8_prefix_len(remaining, available);
+            if accepted_len == 0 {
+                pending.record_overflow(identity.branch_id);
+                return;
+            }
+            let (accepted, tail) = remaining.split_at(accepted_len);
+            {
+                let branch = pending.by_branch.entry(identity.branch_id).or_default();
+                let mut accepted_remaining = accepted;
+                while !accepted_remaining.is_empty() {
+                    if let Some(last) = branch.back_mut() {
+                        debug_assert_eq!(last.run_id, identity.run_id);
+                        let GenerationEventKind::TextDelta { text } = &mut last.kind else {
+                            unreachable!("pending-text queues contain only text deltas");
+                        };
+                        let event_available =
+                            MAX_GENERATION_TEXT_DELTA_BYTES.saturating_sub(text.len());
+                        let merged_len = utf8_prefix_len(accepted_remaining, event_available);
+                        if merged_len > 0 {
+                            let (merged, accepted_tail) = accepted_remaining.split_at(merged_len);
+                            text.push_str(merged);
+                            accepted_remaining = accepted_tail;
+                            continue;
+                        }
+                    }
+                    let chunk_len =
+                        utf8_prefix_len(accepted_remaining, MAX_GENERATION_TEXT_DELTA_BYTES);
+                    debug_assert!(chunk_len > 0);
+                    let (chunk, accepted_tail) = accepted_remaining.split_at(chunk_len);
+                    branch.push_back(GenerationEvent {
+                        event_id: loom_types::GenerationEventId::new(),
+                        run_id: identity.run_id,
+                        branch_id: identity.branch_id,
+                        sequence: self.next_sequence(identity.branch_id),
+                        kind: GenerationEventKind::TextDelta {
+                            text: chunk.to_owned(),
+                        },
+                        occurred_at_ms: now_unix_ms(),
+                    });
+                    accepted_remaining = accepted_tail;
+                }
+            }
+            pending.total_pending_bytes = pending.total_pending_bytes.saturating_add(accepted_len);
+            *pending
+                .pending_branch_bytes
+                .entry(identity.branch_id)
+                .or_default() += accepted_len;
+            remaining = tail;
+        }
+    }
+
+    fn push_pending_text(&self, event: GenerationEvent) {
+        let GenerationEventKind::TextDelta { text } = &event.kind else {
+            return;
+        };
+        let branch_id = event.branch_id;
+        let event_bytes = text.len();
+        debug_assert!(event_bytes <= MAX_GENERATION_TEXT_DELTA_BYTES);
+        let mut pending = self
+            .pending_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let branch_bytes = pending
+            .pending_branch_bytes
+            .get(&branch_id)
+            .copied()
+            .unwrap_or(0);
+        if branch_bytes.saturating_add(event_bytes) > MAX_GENERATED_OUTPUT_BYTES
+            || pending.total_pending_bytes.saturating_add(event_bytes)
+                > pending.max_total_pending_bytes
+        {
+            pending.record_overflow(branch_id);
+            return;
+        }
+        pending
+            .by_branch
+            .entry(branch_id)
+            .or_default()
+            .push_back(event);
+        pending.total_pending_bytes += event_bytes;
+        *pending.pending_branch_bytes.entry(branch_id).or_default() += event_bytes;
+    }
+
+    fn take_pending_text_for(&self, branch_id: BranchId) -> Option<VecDeque<GenerationEvent>> {
+        let mut pending = self
+            .pending_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let branch = pending.by_branch.remove(&branch_id)?;
+        let removed_bytes = pending.pending_branch_bytes.remove(&branch_id).unwrap_or(0);
+        pending.total_pending_bytes = pending.total_pending_bytes.saturating_sub(removed_bytes);
+        Some(branch)
+    }
+
+    fn take_pending_text(&self) -> Option<GenerationEvent> {
+        let mut pending = self
+            .pending_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let branch_id = pending.by_branch.keys().next().copied()?;
+        let (event, event_bytes, branch_is_empty) = {
+            let branch = pending
+                .by_branch
+                .get_mut(&branch_id)
+                .expect("pending-text branch key was just selected");
+            let event = branch
+                .pop_front()
+                .expect("pending-text branch queues are never empty");
+            let event_bytes = match &event.kind {
+                GenerationEventKind::TextDelta { text } => text.len(),
+                _ => unreachable!("pending-text queues contain only text deltas"),
+            };
+            (event, event_bytes, branch.is_empty())
+        };
+        pending.total_pending_bytes = pending.total_pending_bytes.saturating_sub(event_bytes);
+        let branch_bytes = pending
+            .pending_branch_bytes
+            .get_mut(&branch_id)
+            .expect("pending-text byte count must follow its branch queue");
+        *branch_bytes = branch_bytes.saturating_sub(event_bytes);
+        if branch_is_empty {
+            pending.by_branch.remove(&branch_id);
+            pending.pending_branch_bytes.remove(&branch_id);
+        }
+        Some(event)
+    }
+
+    fn stream_failure(&self) -> Option<String> {
+        self.pending_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failure
+            .clone()
     }
 
     fn emit_terminal(
@@ -666,6 +1067,14 @@ impl EventStream {
     }
 }
 
+fn utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
+    let mut end = text.len().min(max_bytes);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_generation_worker(
     execution: &dyn BatchExecution,
@@ -684,7 +1093,12 @@ fn run_generation_worker(
         .collect::<BTreeMap<_, _>>();
     let mut raw_events = identities
         .iter()
-        .map(|identity| (identity.case_id.clone(), Vec::<NativeEvent>::new()))
+        .map(|identity| {
+            (
+                identity.case_id.clone(),
+                RetainedNativeEventStream::default(),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
 
     let result = 'worker: loop {
@@ -736,6 +1150,14 @@ fn run_generation_worker(
             Err(error) => break Err(LlamaBackendError::Native(error)),
         }
     };
+
+    let result = result.and_then(|materials| {
+        if let Some(error) = events.stream_failure() {
+            Err(LlamaBackendError::OutputContract(error))
+        } else {
+            Ok(materials)
+        }
+    });
 
     match result {
         Ok(materials) => {
@@ -794,7 +1216,7 @@ fn record_and_forward_native_event(
     events: &EventStream,
     request_id: &str,
     identities: &BTreeMap<String, CaseIdentity>,
-    raw_events: &mut BTreeMap<String, Vec<NativeEvent>>,
+    raw_events: &mut BTreeMap<String, RetainedNativeEventStream>,
     event: NativeEvent,
 ) -> Result<(), LlamaBackendError> {
     let identity = identities.get(&event.branch_id).ok_or_else(|| {
@@ -819,7 +1241,7 @@ fn record_and_forward_native_event(
             identity.case_id
         )));
     }
-    case_events.push(event.clone());
+    case_events.push(event.clone())?;
     match event.event {
         NativeEventKind::State {
             state:
@@ -959,7 +1381,7 @@ fn build_result(
     exact_prompt_blob_id: BlobId,
     model: &VerifiedModelDescriptor,
     outputs: Vec<GenerationOutput>,
-    mut raw_events: BTreeMap<String, Vec<NativeEvent>>,
+    mut raw_events: BTreeMap<String, RetainedNativeEventStream>,
 ) -> Result<Vec<CandidateMaterial>, LlamaBackendError> {
     if outputs.len() != identities.len() {
         return Err(LlamaBackendError::OutputContract(format!(
@@ -985,7 +1407,7 @@ fn build_result(
                 exact_prompt_blob_id,
                 model,
                 output,
-                &case_events,
+                case_events.as_slice(),
             )
         })
         .collect()
@@ -1915,6 +2337,150 @@ mod tests {
         }
     }
 
+    fn completed_native_delta_stream(
+        request: &ExactContinuationRequest,
+        deltas: &[String],
+    ) -> Vec<NativeEvent> {
+        let mut native_stream = Vec::new();
+        for (input_index, case) in request.cases.iter().enumerate() {
+            let mut kinds = vec![
+                NativeEventKind::State {
+                    state: GenerationState::Prefilling,
+                },
+                NativeEventKind::State {
+                    state: GenerationState::Generating,
+                },
+            ];
+            kinds.extend(
+                deltas
+                    .iter()
+                    .cloned()
+                    .map(|text| NativeEventKind::Delta { text }),
+            );
+            kinds.push(NativeEventKind::State {
+                state: GenerationState::Completed,
+            });
+            for (event_index, event) in kinds.into_iter().enumerate() {
+                native_stream.push(NativeEvent {
+                    request_id: request.request_id.clone(),
+                    branch_id: case.generation.branch_id.to_string(),
+                    sequence_id: i32::try_from(input_index).expect("fixture sequence fits i32"),
+                    input_index,
+                    event_index: u64::try_from(event_index).expect("fixture event index fits u64"),
+                    event,
+                });
+            }
+        }
+        native_stream
+    }
+
+    fn assert_bounded_text_delivery(
+        events: &[LoomEvent],
+        branch_id: BranchId,
+        expected_text: &str,
+    ) {
+        let branch_events = events
+            .iter()
+            .filter(|event| match event {
+                LoomEvent::Generation(event) => event.branch_id == branch_id,
+                LoomEvent::GenerationTerminal(event) => event.branch_id == branch_id,
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        let delivered_text_events = branch_events
+            .iter()
+            .filter_map(|event| match event {
+                LoomEvent::Generation(
+                    event @ GenerationEvent {
+                        kind: GenerationEventKind::TextDelta { .. },
+                        ..
+                    },
+                ) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let delivered_text = delivered_text_events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                GenerationEventKind::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(delivered_text, expected_text);
+        assert_eq!(delivered_text_events.len(), 3);
+        assert!(delivered_text_events.iter().all(|event| {
+            matches!(
+                &event.kind,
+                GenerationEventKind::TextDelta { text }
+                    if text.len() <= MAX_GENERATION_TEXT_DELTA_BYTES
+            )
+        }));
+        assert!(delivered_text_events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                GenerationEventKind::TextDelta { text }
+                    if text.len() == MAX_GENERATION_TEXT_DELTA_BYTES
+            )
+        }));
+        let sequences = branch_events
+            .iter()
+            .map(|event| match event {
+                LoomEvent::Generation(event) => event.sequence,
+                LoomEvent::GenerationTerminal(event) => event.sequence,
+                other => panic!("unexpected branch-scoped event: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            sequences.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "delivered branch sequences must remain contiguous: {sequences:?}"
+        );
+        assert!(matches!(
+            branch_events.last(),
+            Some(LoomEvent::GenerationTerminal(_))
+        ));
+        assert_eq!(
+            branch_events
+                .iter()
+                .filter(|event| matches!(event, LoomEvent::GenerationTerminal(_)))
+                .count(),
+            1
+        );
+    }
+
+    fn assert_failed_contiguous_text_delivery(events: &[LoomEvent], expected_bytes: usize) {
+        let text_bytes = events
+            .iter()
+            .filter_map(|event| match event {
+                LoomEvent::Generation(GenerationEvent {
+                    kind: GenerationEventKind::TextDelta { text },
+                    ..
+                }) => Some(text.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(text_bytes, expected_bytes);
+        let sequences = events
+            .iter()
+            .map(|event| match event {
+                LoomEvent::Generation(event) => event.sequence,
+                LoomEvent::GenerationTerminal(event) => event.sequence,
+                other => panic!("unexpected branch-scoped event: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            sequences.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "rejected overflow must not allocate a sequence: {sequences:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(LoomEvent::GenerationTerminal(GenerationTerminalEvent {
+                status: GenerationTerminalStatus::Failed,
+                candidate_id: None,
+                ..
+            }))
+        ));
+    }
+
     #[test]
     fn only_the_typed_native_constructor_retains_shutdown_authority() {
         let runtime = Arc::new(NativeHostRuntime::default());
@@ -1988,6 +2554,253 @@ mod tests {
         assert!(matches!(
             backend.shutdown_joined(),
             Err(LlamaBackendError::NativeShutdownAuthorityUnavailable)
+        ));
+    }
+
+    #[test]
+    fn queue_pressure_splits_unicode_deltas_and_delivers_every_chunk_before_terminal() {
+        let request = request_with_two_cases();
+        let exact_bound = "é".repeat(MAX_GENERATION_TEXT_DELTA_BYTES / 2);
+        let crosses_multibyte_boundary =
+            "雨".repeat((MAX_GENERATION_TEXT_DELTA_BYTES / "雨".len()) + 2);
+        let expected_text = format!("{exact_bound}{crosses_multibyte_boundary}");
+        let native_stream =
+            completed_native_delta_stream(&request, &[exact_bound, crosses_multibyte_boundary]);
+        let outputs = (0..request.cases.len())
+            .map(|index| native_output(&request, index, GenerationState::Completed, true))
+            .collect();
+        let runtime = fake_runtime(
+            &request,
+            outputs,
+            native_stream,
+            true,
+            RuntimeEvidenceClass::TestFixture,
+        );
+        let terminal_only_capacity = request.cases.len();
+        let backend =
+            LlamaBackend::with_runtime(runtime, terminal_only_capacity).expect("bounded backend");
+        let handle = backend
+            .start_exact_continuation(request.clone())
+            .expect("start pressure generation");
+
+        // Waiting before consuming events used to be the deadlock constraint
+        // that forced progress drops. Coalescing must leave terminal reserve
+        // available and let the worker publish its result without a receiver.
+        handle
+            .wait_timeout(Duration::from_secs(2))
+            .expect("pressure generation result");
+        let events = drain_events(&handle);
+
+        for case in &request.cases {
+            assert_bounded_text_delivery(&events, case.generation.branch_id, &expected_text);
+        }
+    }
+
+    #[test]
+    fn text_over_native_output_ceiling_fails_authority_without_candidate() {
+        let mut request = request_with_two_cases();
+        request.cases.truncate(1);
+        let case = &request.cases[0];
+        let native_stream = vec![
+            NativeEvent {
+                request_id: request.request_id.clone(),
+                branch_id: case.generation.branch_id.to_string(),
+                sequence_id: 0,
+                input_index: 0,
+                event_index: 0,
+                event: NativeEventKind::Delta {
+                    text: "x".repeat(MAX_GENERATED_OUTPUT_BYTES),
+                },
+            },
+            NativeEvent {
+                request_id: request.request_id.clone(),
+                branch_id: case.generation.branch_id.to_string(),
+                sequence_id: 0,
+                input_index: 0,
+                event_index: 1,
+                event: NativeEventKind::Delta { text: "!".into() },
+            },
+            NativeEvent {
+                request_id: request.request_id.clone(),
+                branch_id: case.generation.branch_id.to_string(),
+                sequence_id: 0,
+                input_index: 0,
+                event_index: 2,
+                event: NativeEventKind::State {
+                    state: GenerationState::Completed,
+                },
+            },
+        ];
+        let outputs = vec![native_output(&request, 0, GenerationState::Completed, true)];
+        let runtime = fake_runtime(
+            &request,
+            outputs,
+            native_stream,
+            true,
+            RuntimeEvidenceClass::TestFixture,
+        );
+        let backend = LlamaBackend::with_runtime(runtime, 1).expect("terminal-only backend");
+        let handle = backend
+            .start_exact_continuation(request)
+            .expect("start overflow fixture");
+
+        let error = handle
+            .wait_timeout(Duration::from_secs(5))
+            .expect_err("overflow cannot produce a completed candidate");
+        assert!(matches!(
+            error,
+            LlamaBackendError::OutputContract(message)
+                if message.starts_with("loom_text_stream_output_overflow:")
+        ));
+        let events = drain_events(&handle);
+        let delivered_bytes = events
+            .iter()
+            .filter_map(|event| match event {
+                LoomEvent::Generation(GenerationEvent {
+                    kind: GenerationEventKind::TextDelta { text },
+                    ..
+                }) => Some(text.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(delivered_bytes, MAX_GENERATED_OUTPUT_BYTES);
+        assert!(matches!(
+            events.last(),
+            Some(LoomEvent::GenerationTerminal(GenerationTerminalEvent {
+                status: GenerationTerminalStatus::Failed,
+                candidate_id: None,
+                error: Some(message),
+                ..
+            })) if message.contains("loom_text_stream_output_overflow:")
+        ));
+    }
+
+    #[test]
+    fn cumulative_text_ceiling_survives_concurrent_pending_drains() {
+        let mut request = request_with_two_cases();
+        request.cases.truncate(1);
+        let branch_id = request.cases[0].generation.branch_id.to_string();
+        let outputs = vec![native_output(&request, 0, GenerationState::Completed, true)];
+        let (event_tx, event_rx) = bounded(1);
+        let execution = Arc::new(FakeExecution {
+            event_rx,
+            result: Mutex::new(Some(outputs)),
+            ready: AtomicBool::new(false),
+            complete_on_cancel: AtomicBool::new(false),
+            panic_on_receive: AtomicBool::new(false),
+            cancelled: Mutex::new(Vec::new()),
+        });
+        let runtime = Arc::new(FakeRuntime {
+            class: RuntimeEvidenceClass::TestFixture,
+            inspection: model_inspection(&request.model),
+            execution: Arc::clone(&execution),
+            captured: Mutex::new(None),
+            released: AtomicBool::new(false),
+        });
+        let backend = LlamaBackend::with_runtime(runtime, 1).expect("terminal-only backend");
+        let handle = backend
+            .start_exact_continuation(request.clone())
+            .expect("start concurrently drained fixture");
+
+        let one_mibibyte = "x".repeat(1024 * 1024);
+        let chunks_per_delta = one_mibibyte.len() / MAX_GENERATION_TEXT_DELTA_BYTES;
+        let delta_count = MAX_GENERATED_OUTPUT_BYTES / one_mibibyte.len();
+        let mut delivered = Vec::with_capacity(delta_count * chunks_per_delta + 1);
+        for event_index in 0..delta_count {
+            event_tx
+                .send(NativeEvent {
+                    request_id: request.request_id.clone(),
+                    branch_id: branch_id.clone(),
+                    sequence_id: 0,
+                    input_index: 0,
+                    event_index: u64::try_from(event_index).expect("fixture event index"),
+                    event: NativeEventKind::Delta {
+                        text: one_mibibyte.clone(),
+                    },
+                })
+                .expect("send bounded native delta");
+            for _ in 0..chunks_per_delta {
+                delivered.push(
+                    handle
+                        .receive_event_timeout(Duration::from_millis(100))
+                        .expect("receive concurrently drained chunk")
+                        .expect("native delta must produce a chunk"),
+                );
+            }
+        }
+        event_tx
+            .send(NativeEvent {
+                request_id: request.request_id.clone(),
+                branch_id,
+                sequence_id: 0,
+                input_index: 0,
+                event_index: u64::try_from(delta_count).expect("overflow event index"),
+                event: NativeEventKind::Delta { text: "!".into() },
+            })
+            .expect("send overflow delta");
+        execution.set_ready();
+        drop(event_tx);
+
+        let error = handle
+            .wait_timeout(Duration::from_secs(5))
+            .expect_err("a drained stream cannot reuse its cumulative byte allowance");
+        assert!(matches!(
+            error,
+            LlamaBackendError::OutputContract(message)
+                if message.starts_with("loom_text_stream_output_overflow:")
+        ));
+        delivered.extend(drain_events(&handle));
+        assert_failed_contiguous_text_delivery(&delivered, MAX_GENERATED_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn retained_native_event_flood_fails_before_unbounded_provenance_growth() {
+        let mut request = request_with_two_cases();
+        request.cases.truncate(1);
+        let case = &request.cases[0];
+        let native_stream = (0..=MAX_RETAINED_NATIVE_EVENTS_PER_BRANCH)
+            .map(|event_index| NativeEvent {
+                request_id: request.request_id.clone(),
+                branch_id: case.generation.branch_id.to_string(),
+                sequence_id: 0,
+                input_index: 0,
+                event_index: u64::try_from(event_index).expect("fixture event index"),
+                event: NativeEventKind::State {
+                    state: GenerationState::Prefilling,
+                },
+            })
+            .collect::<Vec<_>>();
+        let outputs = vec![native_output(&request, 0, GenerationState::Completed, true)];
+        let runtime = fake_runtime(
+            &request,
+            outputs,
+            native_stream,
+            true,
+            RuntimeEvidenceClass::TestFixture,
+        );
+        let backend = LlamaBackend::with_runtime(runtime, 1).expect("terminal-only backend");
+        let handle = backend
+            .start_exact_continuation(request)
+            .expect("start event-flood fixture");
+
+        let error = handle
+            .wait_timeout(Duration::from_secs(5))
+            .expect_err("retained native event flood must fail deterministically");
+        assert!(matches!(
+            error,
+            LlamaBackendError::OutputContract(message)
+                if message.starts_with("loom_native_event_count_overflow:")
+        ));
+        let events = drain_events(&handle);
+        assert!(matches!(
+            events.as_slice(),
+            [LoomEvent::GenerationTerminal(GenerationTerminalEvent {
+                sequence: 0,
+                status: GenerationTerminalStatus::Failed,
+                candidate_id: None,
+                error: Some(message),
+                ..
+            })] if message.starts_with("native output violated the ordered batch contract: loom_native_event_count_overflow:")
         ));
     }
 

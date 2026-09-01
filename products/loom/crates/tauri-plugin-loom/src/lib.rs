@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod attachments;
 mod model_catalog;
 mod model_download;
 
@@ -35,8 +36,9 @@ use loom_store::{
     BranchPageCursor, DocumentFileAuthority, DocumentReconciliationSnapshot,
     ExternalReconciliationOutcome, ExternalReconciliationRequest, IdempotentSaveOutcome,
     LoadedDocument, MAX_BRANCH_BODY_BYTES, ProjectStore, StoredBranchBody, StoredBranchPage,
-    StoredBranchRecord, StoredBranchStatus, StoredBranchSummary, TerminalCandidateInput,
-    TerminalEvidenceInput, TerminalGenerationInput, TransientDraft, VisibleProjectionState,
+    StoredBranchRecord, StoredBranchStatus, StoredBranchSummary, StoredGenerationProgressText,
+    TerminalCandidateInput, TerminalEvidenceInput, TerminalGenerationInput, TransientDraft,
+    VisibleProjectionState,
 };
 use loom_types::{
     AuthorityPolicy, BlobId, BranchId, BuildModelPolicy, BuildModelPolicyIdentity,
@@ -52,6 +54,10 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 
+use crate::attachments::{
+    AttachmentStoreError, LoadedImageAsset, StoredImageAsset, is_canonical_image_asset_file_name,
+    read_image_asset, store_image_asset,
+};
 use crate::model_catalog::{ModelCatalogSnapshot, catalog_model_identity, embedded_model_catalog};
 use crate::model_download::{
     ModelDownloadRegistry, ModelDownloadRegistryError, ModelDownloadSnapshot, ModelDownloadSpec,
@@ -75,6 +81,8 @@ pub const FILE_OPEN_PROJECT_MENU_ID: &str = "loom.file.open-project";
 pub const FILE_SAVE_MENU_ID: &str = "loom.file.save";
 pub const FILE_EXPORT_COPY_MENU_ID: &str = "loom.file.export-copy";
 pub const FILE_COMMAND_EVENT: &str = "loom://file-command";
+const LOOM_ASSET_SCHEME: &str = "loom-asset";
+const LOOM_ASSET_TOKEN_VERSION: &str = "v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1767,6 +1775,12 @@ impl Builder {
         let app_local_data_root = self.app_local_data_root;
         let isolate_model_discovery = self.isolate_model_discovery;
         PluginBuilder::new("loom")
+            .register_uri_scheme_protocol(LOOM_ASSET_SCHEME, |context, request| {
+                let Some(state) = context.app_handle().try_state::<PluginState>() else {
+                    return empty_loom_asset_response(http::StatusCode::SERVICE_UNAVAILABLE);
+                };
+                loom_asset_protocol_response(&state, context.webview_label(), &request)
+            })
             .invoke_handler(tauri::generate_handler![
                 project_open_default,
                 project_choose_create,
@@ -1775,6 +1789,8 @@ impl Builder {
                 project_current,
                 project_recover,
                 document_create,
+                document_rename,
+                attachment_ingest,
                 document_open,
                 document_checkpoint,
                 document_export_choose,
@@ -1899,6 +1915,37 @@ impl IpcFailure {
         }
     }
 
+    fn attachment(error: &AttachmentStoreError) -> Self {
+        let code = match error {
+            AttachmentStoreError::Empty => "attachment_empty",
+            AttachmentStoreError::TooLarge => "attachment_too_large",
+            AttachmentStoreError::InvalidBase64 => "attachment_invalid_base64",
+            AttachmentStoreError::UnsupportedImage => "attachment_unsupported_image",
+            AttachmentStoreError::MediaTypeMismatch => "attachment_media_type_mismatch",
+            AttachmentStoreError::MalformedImage => "attachment_malformed_image",
+            AttachmentStoreError::ImageDimensionsExceeded { .. } => {
+                "attachment_dimensions_exceeded"
+            }
+            AttachmentStoreError::ImageDecodeLimit { .. } => "attachment_decode_limit_exceeded",
+            AttachmentStoreError::ProjectImageQuotaExceeded { .. } => {
+                "attachment_project_quota_exceeded"
+            }
+            AttachmentStoreError::AssetDirectoryEntryLimit { .. } => {
+                "attachment_asset_directory_too_large"
+            }
+            AttachmentStoreError::UnsafeAssetDirectory => "attachment_asset_directory_refused",
+            AttachmentStoreError::UnsafeAssetPath => "attachment_asset_path_refused",
+            AttachmentStoreError::DigestCollision => "attachment_digest_collision",
+            AttachmentStoreError::DirectoryDurability(_) => "attachment_durability_unconfirmed",
+            AttachmentStoreError::Io(_) => "attachment_storage_failed",
+        };
+        let retryable = matches!(
+            error,
+            AttachmentStoreError::DirectoryDurability(_) | AttachmentStoreError::Io(_)
+        );
+        Self::new(code, error.to_string(), retryable)
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     fn store(error: loom_store::StoreError) -> Self {
         use loom_store::StoreError;
@@ -1919,6 +1966,7 @@ impl IpcFailure {
             StoreError::UnsupportedFormat(_) => "unsupported_project_format",
             StoreError::UnsupportedSchema { .. } => "unsupported_project_schema",
             StoreError::InvalidProjectName { .. } => "invalid_project_name",
+            StoreError::InvalidDocumentTitle { .. } => "invalid_document_title",
             StoreError::ReasonTooLong { .. } => "checkpoint_reason_too_long",
             StoreError::DocumentTooLarge { .. } => "document_too_large",
             StoreError::DocumentKindMismatch { .. } => "document_kind_mismatch",
@@ -1959,6 +2007,10 @@ impl IpcFailure {
             }
             StoreError::CandidateReadyRequiresTerminalCandidate => {
                 "candidate_ready_requires_terminal"
+            }
+            StoreError::GenerationProgressEventLimitExceeded { .. }
+            | StoreError::GenerationProgressTextLimitExceeded { .. } => {
+                "generation_progress_limit_exceeded"
             }
             StoreError::FailedGenerationRequiresError => "failed_generation_requires_error",
             StoreError::CriticCannotPromote => "critic_cannot_promote",
@@ -2195,6 +2247,7 @@ pub struct ModelUnloadOutcome {
 pub struct BranchSnapshot {
     run_id: String,
     branch_id: String,
+    weave_command_id: Option<String>,
     document_id: String,
     candidate_id: Option<String>,
     source_revision_id: String,
@@ -2254,6 +2307,7 @@ impl From<BranchPageCursor> for BranchCursorSnapshot {
 pub struct BranchSummarySnapshot {
     run_id: String,
     branch_id: String,
+    weave_command_id: Option<String>,
     document_id: String,
     candidate_id: Option<String>,
     source_revision_id: String,
@@ -2281,6 +2335,16 @@ pub struct BranchPageSnapshot {
 pub struct CompletionOperationBranchSnapshot {
     run_id: String,
     branch_id: String,
+    partial_text: Option<CompletionPartialTextSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionPartialTextSnapshot {
+    /// Decimal u64, preserved as text across the JavaScript boundary.
+    sequence: String,
+    /// Decimal u64, preserved as text across the JavaScript boundary.
+    utf8_byte_len: String,
+    text: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2968,6 +3032,260 @@ async fn document_create(
     snapshot_for(store, active_session_id)
 }
 
+#[tauri::command]
+async fn document_rename(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    expected_revision_id: String,
+    expected_blob_id: String,
+    title: String,
+    state: State<'_, PluginState>,
+) -> Result<DocumentSummary, IpcFailure> {
+    let _application_admission = lock_application_admission(&state, "a document rename")?;
+    let identity =
+        parse_document_action_identity(&document_id, &expected_revision_id, &expected_blob_id)?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    rename_registered_document(store, identity, &title)
+}
+
+#[tauri::command]
+async fn attachment_ingest(
+    project_id: String,
+    session_id: String,
+    media_type: String,
+    encoded: String,
+    state: State<'_, PluginState>,
+) -> Result<StoredImageAsset, IpcFailure> {
+    ingest_image_attachment_for_session(&state, &project_id, &session_id, &media_type, &encoded)
+}
+
+fn ingest_image_attachment_for_session(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    media_type: &str,
+    encoded: &str,
+) -> Result<StoredImageAsset, IpcFailure> {
+    let _application_admission = lock_application_admission(state, "an image attachment")?;
+    let mut session = lock_session(state)?;
+    let store = require_bound_store(&mut session, project_id, session_id)?;
+    store_image_asset(store.root(), media_type, encoded)
+        .map_err(|error| IpcFailure::attachment(&error))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoomAssetRequest {
+    project_id: ProjectId,
+    session_id: CommandId,
+    file_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoomAssetAuthority {
+    project_id: ProjectId,
+    session_id: CommandId,
+    project_root: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoomAssetReadFailure {
+    NotFound,
+    Unavailable,
+}
+
+fn loom_asset_token(
+    project_id: ProjectId,
+    session_id: CommandId,
+    file_name: &str,
+) -> Option<String> {
+    if !is_canonical_image_asset_file_name(file_name) {
+        return None;
+    }
+    Some(format!(
+        "{LOOM_ASSET_TOKEN_VERSION}-{project_id}-{session_id}-{file_name}"
+    ))
+}
+
+fn parse_loom_asset_uri(uri: &http::Uri) -> Option<LoomAssetRequest> {
+    let canonical_origin = matches!(
+        (
+            uri.scheme_str(),
+            uri.authority().map(http::uri::Authority::as_str)
+        ),
+        (Some(LOOM_ASSET_SCHEME), Some("localhost")) | (Some("http"), Some("loom-asset.localhost"))
+    );
+    if !canonical_origin || uri.query().is_some() {
+        return None;
+    }
+    let token = uri.path().strip_prefix('/')?;
+    if token.is_empty() || token.contains('/') || !token.is_ascii() || token.contains('%') {
+        return None;
+    }
+    let identity = token.strip_prefix("v1-")?;
+    let (project_id_text, remainder) = identity.split_once('-')?;
+    let (session_id_text, file_name) = remainder.split_once('-')?;
+    if file_name.contains('-') {
+        return None;
+    }
+    let project_id = project_id_text.parse::<ProjectId>().ok()?;
+    let session_id = session_id_text.parse::<CommandId>().ok()?;
+    if project_id.to_string() != project_id_text || session_id.to_string() != session_id_text {
+        return None;
+    }
+    let canonical_token = loom_asset_token(project_id, session_id, file_name)?;
+    if canonical_token != token {
+        return None;
+    }
+    Some(LoomAssetRequest {
+        project_id,
+        session_id,
+        file_name: file_name.to_owned(),
+    })
+}
+
+fn read_authorized_loom_asset(
+    state: &PluginState,
+    request: &LoomAssetRequest,
+) -> Result<LoadedImageAsset, LoomAssetReadFailure> {
+    read_authorized_loom_asset_with(state, request, read_image_asset)
+}
+
+fn read_authorized_loom_asset_with(
+    state: &PluginState,
+    request: &LoomAssetRequest,
+    reader: impl FnOnce(&Path, &str) -> Result<LoadedImageAsset, AttachmentStoreError>,
+) -> Result<LoadedImageAsset, LoomAssetReadFailure> {
+    let authority = capture_loom_asset_authority(state, request)?;
+    // Hashing and structural image decode are bounded, but still substantially
+    // slower than an in-memory authority check. Never serialize unrelated
+    // session work behind that filesystem and decoder latency.
+    let asset = reader(&authority.project_root, &request.file_name)
+        .map_err(|_| LoomAssetReadFailure::NotFound)?;
+    if !loom_asset_authority_is_current(state, &authority)? {
+        return Err(LoomAssetReadFailure::NotFound);
+    }
+    Ok(asset)
+}
+
+fn capture_loom_asset_authority(
+    state: &PluginState,
+    request: &LoomAssetRequest,
+) -> Result<LoomAssetAuthority, LoomAssetReadFailure> {
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| LoomAssetReadFailure::Unavailable)?;
+    if session.phase != SessionPhase::Open || session.active_session_id != Some(request.session_id)
+    {
+        return Err(LoomAssetReadFailure::NotFound);
+    }
+    let store = session
+        .store
+        .as_ref()
+        .filter(|store| store.manifest().project_id == request.project_id)
+        .ok_or(LoomAssetReadFailure::NotFound)?;
+    Ok(LoomAssetAuthority {
+        project_id: request.project_id,
+        session_id: request.session_id,
+        project_root: store.root().to_path_buf(),
+    })
+}
+
+fn loom_asset_authority_is_current(
+    state: &PluginState,
+    authority: &LoomAssetAuthority,
+) -> Result<bool, LoomAssetReadFailure> {
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| LoomAssetReadFailure::Unavailable)?;
+    Ok(session.phase == SessionPhase::Open
+        && session.active_session_id == Some(authority.session_id)
+        && session.store.as_ref().is_some_and(|store| {
+            store.manifest().project_id == authority.project_id
+                && store.root() == authority.project_root
+        }))
+}
+
+fn loom_asset_protocol_response(
+    state: &PluginState,
+    webview_label: &str,
+    request: &http::Request<Vec<u8>>,
+) -> http::Response<Vec<u8>> {
+    if webview_label != "main" {
+        return empty_loom_asset_response(http::StatusCode::FORBIDDEN);
+    }
+    let is_head = request.method() == http::Method::HEAD;
+    if request.method() != http::Method::GET && !is_head {
+        return empty_loom_asset_response_with_header(
+            http::StatusCode::METHOD_NOT_ALLOWED,
+            http::header::ALLOW,
+            "GET, HEAD",
+        );
+    }
+    if !request.body().is_empty() {
+        return empty_loom_asset_response(http::StatusCode::BAD_REQUEST);
+    }
+    if request.headers().contains_key(http::header::RANGE) {
+        return empty_loom_asset_response(http::StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+    let Some(asset_request) = parse_loom_asset_uri(request.uri()) else {
+        return empty_loom_asset_response(http::StatusCode::BAD_REQUEST);
+    };
+    match read_authorized_loom_asset(state, &asset_request) {
+        Ok(asset) => successful_loom_asset_response(asset, is_head),
+        Err(LoomAssetReadFailure::NotFound) => {
+            empty_loom_asset_response(http::StatusCode::NOT_FOUND)
+        }
+        Err(LoomAssetReadFailure::Unavailable) => {
+            empty_loom_asset_response(http::StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
+}
+
+fn successful_loom_asset_response(
+    asset: LoadedImageAsset,
+    is_head: bool,
+) -> http::Response<Vec<u8>> {
+    let content_length = asset.bytes.len();
+    let body = if is_head { Vec::new() } else { asset.bytes };
+    http::Response::builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, asset.media_type)
+        .header(http::header::CONTENT_LENGTH, content_length.to_string())
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(body)
+        .expect("static Loom asset response headers are valid")
+}
+
+fn empty_loom_asset_response(status: http::StatusCode) -> http::Response<Vec<u8>> {
+    http::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_LENGTH, "0")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(Vec::new())
+        .expect("static Loom asset response headers are valid")
+}
+
+fn empty_loom_asset_response_with_header(
+    status: http::StatusCode,
+    header: http::header::HeaderName,
+    value: &'static str,
+) -> http::Response<Vec<u8>> {
+    http::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_LENGTH, "0")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .header(header, value)
+        .body(Vec::new())
+        .expect("static Loom asset response headers are valid")
+}
+
 fn create_untitled_document(store: &mut ProjectStore) -> Result<String, IpcFailure> {
     let registered_paths = store
         .list_documents()
@@ -3032,6 +3350,11 @@ async fn document_open(
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
     let authority = resolve_document_action_file(store, identity)?;
     let document = finish_document_open(authority)?;
+    let display_title = store
+        .registered_document(document.document_id)
+        .map_err(IpcFailure::store)?
+        .ok_or_else(stale_document_action_failure)?
+        .display_title;
     let mut draft = store
         .load_transient_draft(&document.relative_path)
         .map_err(IpcFailure::store)?;
@@ -3045,7 +3368,7 @@ async fn document_open(
             .map_err(IpcFailure::store)?;
         draft = None;
     }
-    Ok(open_document_from(document, draft))
+    Ok(open_document_from(document, draft, display_title))
 }
 
 #[tauri::command]
@@ -3189,6 +3512,29 @@ fn resolve_document_action_file(
 
 fn finish_document_open(authority: DocumentFileAuthority) -> Result<LoadedDocument, IpcFailure> {
     authority.into_document().map_err(IpcFailure::store)
+}
+
+fn rename_registered_document(
+    store: &mut ProjectStore,
+    identity: DocumentActionIdentity,
+    title: &str,
+) -> Result<DocumentSummary, IpcFailure> {
+    let mut authority = resolve_document_action_file(store, identity)?;
+    let renamed = store
+        .set_document_display_title(&mut authority, title)
+        .map_err(IpcFailure::store)?;
+    Ok(DocumentSummary {
+        document_id: renamed.document_id.to_string(),
+        relative_path: renamed.relative_path.clone(),
+        title: renamed
+            .display_title
+            .unwrap_or_else(|| title_for_path(&renamed.relative_path)),
+        kind: renamed.kind,
+        revision_id: renamed.active_revision_id.map(|id| id.to_string()),
+        active_blob_id: Some(identity.blob.to_string()),
+        word_count: count_words(&authority.document().text),
+        externally_modified: false,
+    })
 }
 
 fn registered_document_action_path(
@@ -5557,6 +5903,7 @@ fn completion_terminal_snapshot(terminal: GenerationTerminalRecord) -> Completio
 fn completion_operation_snapshots(
     state: &PluginState,
     routes: &[ActiveGenerationRoute],
+    progress_by_run: &BTreeMap<GenerationRunId, StoredGenerationProgressText>,
 ) -> Result<Option<Vec<CompletionOperationSnapshot>>, IpcFailure> {
     let mut families = BTreeMap::<
         String,
@@ -5577,9 +5924,47 @@ fn completion_operation_snapshots(
                 false,
             ));
         }
+        let progress = progress_by_run.get(&route.run_id).ok_or_else(|| {
+            IpcFailure::new(
+                "generation_provenance_missing",
+                "an active generation route has no durable progress projection",
+                false,
+            )
+        })?;
+        if progress.run_id != route.run_id || progress.branch_id != route.branch_id {
+            return Err(IpcFailure::new(
+                "generation_lifecycle_identity_mismatch",
+                "an active generation route disagrees with its durable progress identity",
+                false,
+            ));
+        }
+        let partial_text = match progress.last_text_delta_sequence {
+            Some(sequence) => Some(CompletionPartialTextSnapshot {
+                sequence: sequence.to_string(),
+                utf8_byte_len: u64::try_from(progress.text.len())
+                    .map_err(|_| {
+                        IpcFailure::new(
+                            "generation_progress_size_overflow",
+                            "the cumulative generation progress length does not fit u64",
+                            false,
+                        )
+                    })?
+                    .to_string(),
+                text: progress.text.clone(),
+            }),
+            None if progress.text.is_empty() => None,
+            None => {
+                return Err(IpcFailure::new(
+                    "generation_provenance_corrupt",
+                    "durable generation progress has text without a text-delta sequence",
+                    false,
+                ));
+            }
+        };
         family.1.push(CompletionOperationBranchSnapshot {
             run_id: route.run_id.to_string(),
             branch_id: route.branch_id.to_string(),
+            partial_text,
         });
     }
 
@@ -5690,6 +6075,7 @@ fn parse_observed_completion_runs(
 struct CompletionStoreProjection {
     page: StoredBranchPage,
     requested_summaries: Vec<StoredBranchSummary>,
+    progress_by_run: BTreeMap<GenerationRunId, StoredGenerationProgressText>,
 }
 
 fn read_completion_store_projection(
@@ -5710,6 +6096,22 @@ fn read_completion_store_projection(
         .iter()
         .map(|route| (route.run_id, route))
         .collect::<BTreeMap<_, _>>();
+    let progress_by_run = active_routes_by_run
+        .iter()
+        .map(|(&run_id, route)| {
+            let progress = store
+                .generation_progress_text(document_id, run_id)
+                .map_err(IpcFailure::store)?;
+            if progress.branch_id != route.branch_id {
+                return Err(IpcFailure::new(
+                    "generation_lifecycle_identity_mismatch",
+                    "an active generation route disagrees with its durable progress identity",
+                    false,
+                ));
+            }
+            Ok((run_id, progress))
+        })
+        .collect::<Result<BTreeMap<_, _>, IpcFailure>>()?;
     let requested_run_ids = active_routes_by_run
         .keys()
         .copied()
@@ -5744,6 +6146,7 @@ fn read_completion_store_projection(
     Ok(CompletionStoreProjection {
         page,
         requested_summaries,
+        progress_by_run,
     })
 }
 
@@ -5782,7 +6185,9 @@ fn completion_snapshot_for(
         if routes_before != routes_after {
             continue;
         }
-        let Some(active_operations) = completion_operation_snapshots(state, &routes_after)? else {
+        let Some(active_operations) =
+            completion_operation_snapshots(state, &routes_after, &projection.progress_by_run)?
+        else {
             let current_routes = state
                 .generations
                 .active_routes_for_document(project_identity, session_identity, document_id)
@@ -5971,6 +6376,7 @@ fn branch_snapshot(record: StoredBranchRecord, active: bool) -> BranchSnapshot {
     BranchSnapshot {
         run_id: record.run_id.to_string(),
         branch_id: record.branch_id.to_string(),
+        weave_command_id: record.weave_command_id.map(|id| id.to_string()),
         document_id: record.document_id.to_string(),
         candidate_id: record.candidate_id.map(|id| id.to_string()),
         source_revision_id: record.source_revision_id.to_string(),
@@ -5993,6 +6399,7 @@ fn branch_summary_snapshot(summary: StoredBranchSummary, active: bool) -> Branch
     BranchSummarySnapshot {
         run_id: summary.run_id.to_string(),
         branch_id: summary.branch_id.to_string(),
+        weave_command_id: summary.weave_command_id.map(|id| id.to_string()),
         document_id: summary.document_id.to_string(),
         candidate_id: summary.candidate_id.map(|id| id.to_string()),
         source_revision_id: summary.source_revision_id.to_string(),
@@ -6721,6 +7128,7 @@ async fn weave_start<R: Runtime>(
             .map(|started| BranchSnapshot {
                 run_id: started.generation.run_id.to_string(),
                 branch_id: started.generation.branch_id.to_string(),
+                weave_command_id: Some(started.receipt.command_id.to_string()),
                 document_id: started.generation.document_id.to_string(),
                 candidate_id: None,
                 source_revision_id: started.generation.source_revision_id.to_string(),
@@ -7253,7 +7661,12 @@ fn persist_backend_event<R: Runtime>(
                 false,
             )
         })?;
-    emit_desktop_event(app, identity, LoomEvent::Generation(canonical))
+    // The renderer event is only a wakeup hint. Persistence plus the scoped
+    // completion snapshot own recoverable state, so a suspended or closing
+    // WebView must never turn an observer-delivery failure into cancellation
+    // of otherwise healthy inference.
+    let _ = emit_desktop_event(app, identity, LoomEvent::Generation(canonical));
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8361,6 +8774,10 @@ fn snapshot_for(
         .map_err(IpcFailure::store)?
         .into_iter()
         .map(|summary| -> Result<DocumentSummary, IpcFailure> {
+            let title = summary
+                .display_title
+                .clone()
+                .unwrap_or_else(|| title_for_path(&summary.relative_path));
             let (active_blob_id, word_count, externally_modified) =
                 if summary.active_revision_id.is_some() {
                     let reconciliation = store
@@ -8380,7 +8797,7 @@ fn snapshot_for(
                 };
             Ok(DocumentSummary {
                 document_id: summary.document_id.to_string(),
-                title: title_for_path(&summary.relative_path),
+                title,
                 relative_path: summary.relative_path,
                 kind: summary.kind,
                 revision_id: summary.active_revision_id.map(|id| id.to_string()),
@@ -8412,13 +8829,18 @@ fn snapshot_for(
     })
 }
 
-fn open_document_from(document: LoadedDocument, draft: Option<TransientDraft>) -> OpenDocument {
+fn open_document_from(
+    document: LoadedDocument,
+    draft: Option<TransientDraft>,
+    display_title: Option<String>,
+) -> OpenDocument {
     let word_count = count_words(&document.text);
+    let title = display_title.unwrap_or_else(|| title_for_path(&document.relative_path));
     OpenDocument {
         visible_blob_id: document.blob_id.to_string(),
         summary: DocumentSummary {
             document_id: document.document_id.to_string(),
-            title: title_for_path(&document.relative_path),
+            title,
             relative_path: document.relative_path,
             kind: document.kind,
             revision_id: Some(document.revision_id.to_string()),
@@ -8686,11 +9108,28 @@ impl From<ExternalReconciliationOutcome> for Receipt {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::io::Cursor;
 
     use loom_backend_llama::{
         CapabilitySupport, NativeEvidenceCapabilities, VerifiedCapabilitySet,
     };
     use loom_types::ModelEnvironmentId;
+
+    fn png_attachment_fixture(seed: u8) -> Vec<u8> {
+        let image = image::RgbaImage::from_fn(2, 2, |x, y| {
+            image::Rgba([
+                seed.wrapping_add(u8::try_from(x).unwrap_or(u8::MAX)),
+                seed.wrapping_add(u8::try_from(y).unwrap_or(u8::MAX)),
+                seed,
+                u8::MAX,
+            ])
+        });
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode real PNG fixture");
+        encoded.into_inner()
+    }
 
     #[derive(Debug, Default)]
     struct RecordingCancellation {
@@ -10020,6 +10459,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rename_action_persists_a_display_title_without_changing_manuscript_path() {
+        let mut fixture = document_action_fixture();
+
+        let renamed =
+            rename_registered_document(&mut fixture.store, fixture.identity, "  A Better Name  ")
+                .expect("rename document");
+
+        assert_eq!(renamed.title, "A Better Name");
+        assert_eq!(renamed.relative_path, INITIAL_DOCUMENT);
+        assert_eq!(
+            renamed.revision_id,
+            Some(fixture.identity.revision.to_string())
+        );
+        assert_eq!(
+            renamed.active_blob_id,
+            Some(fixture.identity.blob.to_string())
+        );
+        assert_eq!(renamed.word_count, 2);
+        assert!(fixture.root.join(INITIAL_DOCUMENT).is_file());
+        assert!(!fixture.root.join("manuscript/A Better Name.md").exists());
+
+        let snapshot = snapshot_for(&fixture.store, CommandId::new()).expect("project snapshot");
+        assert_eq!(snapshot.documents.len(), 1);
+        assert_eq!(snapshot.documents[0].title, "A Better Name");
+        let loaded = fixture
+            .store
+            .read_document(INITIAL_DOCUMENT)
+            .expect("reopen renamed document");
+        let display_title = fixture
+            .store
+            .registered_document(loaded.document_id)
+            .expect("read renamed registration")
+            .expect("renamed document remains registered")
+            .display_title;
+        let opened = open_document_from(loaded, None, display_title);
+        assert_eq!(opened.summary.title, "A Better Name");
+    }
+
+    #[test]
+    fn rename_action_rejects_invalid_titles_without_mutating_the_fallback_name() {
+        let mut fixture = document_action_fixture();
+
+        let failure = rename_registered_document(&mut fixture.store, fixture.identity, "\n")
+            .expect_err("blank title must fail");
+
+        assert_eq!(failure.code, "invalid_document_title");
+        let snapshot = snapshot_for(&fixture.store, CommandId::new()).expect("project snapshot");
+        assert_eq!(
+            snapshot.documents[0].title,
+            title_for_path(INITIAL_DOCUMENT)
+        );
+    }
+
+    #[test]
+    fn rename_action_rejects_a_stale_source_revision() {
+        let mut fixture = document_action_fixture();
+        fixture
+            .store
+            .save_document(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("newer manuscript\n".to_owned()),
+                "newer edit",
+            )
+            .expect("advance source revision");
+
+        let failure =
+            rename_registered_document(&mut fixture.store, fixture.identity, "Stale Rename")
+                .expect_err("stale rename must fail");
+
+        assert_eq!(failure.code, "stale_document_action");
+        let snapshot = snapshot_for(&fixture.store, CommandId::new()).expect("project snapshot");
+        assert_eq!(
+            snapshot.documents[0].title,
+            title_for_path(INITIAL_DOCUMENT)
+        );
+    }
+
     fn replace_visible_document_with_regular_file(root: &Path) {
         let visible = root.join(INITIAL_DOCUMENT);
         std::fs::rename(&visible, root.join("manuscript/original.md"))
@@ -10700,6 +11217,7 @@ mod tests {
         let record = StoredBranchRecord {
             run_id: GenerationRunId::new(),
             branch_id: BranchId::new(),
+            weave_command_id: Some(CommandId::new()),
             document_id: DocumentId::new(),
             source_revision_id: RevisionId::new(),
             target_range: ByteRange::new(7, 7).expect("target range"),
@@ -10716,6 +11234,16 @@ mod tests {
         };
         let interrupted = branch_snapshot(record.clone(), false);
         assert_eq!(interrupted.status, "interrupted");
+        assert_eq!(
+            interrupted.weave_command_id.as_deref(),
+            Some(
+                record
+                    .weave_command_id
+                    .expect("weave command")
+                    .to_string()
+                    .as_str()
+            )
+        );
         let live = branch_snapshot(record, true);
         assert_eq!(live.status, "generating");
     }
@@ -10997,6 +11525,51 @@ mod tests {
         );
     }
 
+    fn append_completion_partial_text_fixture(
+        store: &mut ProjectStore,
+        document_id: DocumentId,
+        run_id: GenerationRunId,
+    ) -> u64 {
+        for text in [" world", " grows"] {
+            store
+                .append_generation_event(
+                    run_id,
+                    GenerationEventKind::TextDelta {
+                        text: text.to_owned(),
+                    },
+                )
+                .expect("persist partial text");
+        }
+        store
+            .generation_progress_text(document_id, run_id)
+            .expect("replay fixture partial text")
+            .last_text_delta_sequence
+            .expect("fixture has partial text")
+    }
+
+    fn assert_completion_partial_text(
+        branch: &CompletionOperationBranchSnapshot,
+        run_id: GenerationRunId,
+        branch_id: BranchId,
+        expected_sequence: u64,
+    ) {
+        assert_eq!(branch.run_id, run_id.to_string());
+        assert_eq!(branch.branch_id, branch_id.to_string());
+        let partial = branch
+            .partial_text
+            .as_ref()
+            .expect("active branch exposes durable partial text");
+        assert_eq!(partial.sequence, expected_sequence.to_string());
+        assert_eq!(partial.text, " world grows");
+        assert_eq!(partial.utf8_byte_len, partial.text.len().to_string());
+    }
+
+    fn assert_active_failed_completion(snapshot: &CompletionSnapshot, error: &str) {
+        assert_eq!(snapshot.active_operations.len(), 1);
+        assert_eq!(snapshot.branches[0].status, "failed");
+        assert_eq!(snapshot.branches[0].error.as_deref(), Some(error));
+    }
+
     #[test]
     fn completion_snapshot_joins_scoped_supervisor_and_durable_terminal_facts() {
         let temporary = tempfile::tempdir().expect("temporary parent");
@@ -11006,6 +11579,8 @@ mod tests {
         let project_id = store.manifest().project_id;
         let session_id = CommandId::new();
         let (run_id, branch_id, document_id) = start_persisted_test_generation(&mut store);
+        let last_text_delta_sequence =
+            append_completion_partial_text_fixture(&mut store, document_id, run_id);
         let state = PluginState::default();
         {
             let mut session = state.session.lock().expect("session lock");
@@ -11056,8 +11631,12 @@ mod tests {
         assert!(operation.cancellation_requested);
         assert_eq!(operation.progress_sequences, vec![u64::MAX.to_string()]);
         assert_eq!(operation.branches.len(), 1);
-        assert_eq!(operation.branches[0].run_id, run_id.to_string());
-        assert_eq!(operation.branches[0].branch_id, branch_id.to_string());
+        assert_completion_partial_text(
+            &operation.branches[0],
+            run_id,
+            branch_id,
+            last_text_delta_sequence,
+        );
         assert_eq!(active.branches.len(), 1);
         assert_eq!(active.branches[0].status, "generating");
 
@@ -11076,12 +11655,7 @@ mod tests {
             &[run_id.to_string()],
         )
         .expect("capture durable terminal completion snapshot");
-        assert_eq!(terminal.active_operations.len(), 1);
-        assert_eq!(terminal.branches[0].status, "failed");
-        assert_eq!(
-            terminal.branches[0].error.as_deref(),
-            Some("fixture terminal failure")
-        );
+        assert_active_failed_completion(&terminal, "fixture terminal failure");
 
         release_family_after_terminal_persistence(
             &state,
@@ -11497,6 +12071,343 @@ mod tests {
         )
         .expect_err("foreign project must fail");
         assert_eq!(foreign.code, "project_identity_mismatch");
+    }
+
+    #[test]
+    fn attachment_ingest_requires_exact_session_and_returns_only_bounded_paths() {
+        use base64::Engine as _;
+
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Attachment Novel");
+        let store = initialize_project(&root, "Attachment Novel".to_owned()).expect("initialize");
+        let project_id = store.manifest().project_id.to_string();
+        let session_id = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+        let png = png_attachment_fixture(7);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+
+        let stale_failure = ingest_image_attachment_for_session(
+            &state,
+            &project_id,
+            &CommandId::new().to_string(),
+            "image/png",
+            &encoded,
+        )
+        .expect_err("stale session must fail before storage");
+        assert_eq!(stale_failure.code, "stale_project_session");
+        assert_eq!(
+            std::fs::read_dir(root.join("assets"))
+                .expect("asset directory")
+                .count(),
+            0
+        );
+
+        let first = ingest_image_attachment_for_session(
+            &state,
+            &project_id,
+            &session_id.to_string(),
+            "image/png",
+            &encoded,
+        )
+        .expect("first ingest");
+        let second = ingest_image_attachment_for_session(
+            &state,
+            &project_id,
+            &session_id.to_string(),
+            "image/png",
+            &encoded,
+        )
+        .expect("idempotent ingest");
+        assert_eq!(first, second);
+        assert!(first.relative_path.starts_with("assets/"));
+        assert!(first.markdown_path.starts_with("../assets/"));
+        assert!(!first.relative_path.starts_with('/'));
+        assert!(
+            !first
+                .markdown_path
+                .contains(&root.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            std::fs::read(root.join(&first.relative_path)).expect("image"),
+            png
+        );
+
+        let foreign = ingest_image_attachment_for_session(
+            &state,
+            &ProjectId::new().to_string(),
+            &session_id.to_string(),
+            "image/png",
+            &encoded,
+        )
+        .expect_err("foreign project must fail");
+        assert_eq!(foreign.code, "project_identity_mismatch");
+    }
+
+    #[test]
+    fn asset_read_releases_session_lock_and_revalidates_authority() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Asset Read Authority");
+        let store =
+            initialize_project(&root, "Asset Read Authority".to_owned()).expect("initialize");
+        let project_id = store.manifest().project_id;
+        let expected_root = store.root().to_path_buf();
+        let session_id = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+        let request = LoomAssetRequest {
+            project_id,
+            session_id,
+            file_name: format!("{}.png", "a".repeat(64)),
+        };
+
+        let asset =
+            read_authorized_loom_asset_with(&state, &request, |observed_root, file_name| {
+                let session = state
+                    .session
+                    .try_lock()
+                    .expect("asset reader must not hold the session lock");
+                assert_eq!(session.phase, SessionPhase::Open);
+                assert_eq!(observed_root, expected_root);
+                assert_eq!(file_name, request.file_name);
+                drop(session);
+                Ok(LoadedImageAsset {
+                    bytes: vec![1, 2, 3],
+                    media_type: "image/png",
+                })
+            })
+            .expect("unchanged authority returns the loaded asset");
+        assert_eq!(asset.bytes, vec![1, 2, 3]);
+
+        let revoked = read_authorized_loom_asset_with(&state, &request, |_, _| {
+            let mut session = state
+                .session
+                .try_lock()
+                .expect("asset reader must be able to revoke session authority");
+            session.active_session_id = Some(CommandId::new());
+            drop(session);
+            Ok(LoadedImageAsset {
+                bytes: vec![4, 5, 6],
+                media_type: "image/png",
+            })
+        });
+        assert_eq!(revoked, Err(LoomAssetReadFailure::NotFound));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn asset_protocol_authority_is_exact_across_close_switch_and_reopen() {
+        use base64::Engine as _;
+
+        fn request(uri: &str, method: http::Method) -> http::Request<Vec<u8>> {
+            http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Vec::new())
+                .expect("asset protocol request")
+        }
+
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root_a = temporary.path().join("Project A");
+        let store_a = initialize_project(&root_a, "Project A".to_owned()).expect("project A");
+        let project_a = store_a.manifest().project_id;
+        let session_a = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store_a);
+            session.active_session_id = Some(session_a);
+        }
+
+        let png = png_attachment_fixture(9);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+        let stored = ingest_image_attachment_for_session(
+            &state,
+            &project_a.to_string(),
+            &session_a.to_string(),
+            "image/png",
+            &encoded,
+        )
+        .expect("store project A image");
+        let file_name = Path::new(&stored.relative_path)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("asset file name");
+        let token_a = loom_asset_token(project_a, session_a, file_name).expect("asset token");
+        let mac_uri_a = format!("loom-asset://localhost/{token_a}");
+        let windows_uri_a = format!("http://loom-asset.localhost/{token_a}");
+
+        let first =
+            loom_asset_protocol_response(&state, "main", &request(&mac_uri_a, http::Method::GET));
+        assert_eq!(first.status(), http::StatusCode::OK);
+        assert_eq!(first.body(), &png);
+        assert_eq!(first.headers()[http::header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            first.headers()[http::header::CONTENT_LENGTH],
+            png.len().to_string()
+        );
+        assert_eq!(first.headers()[http::header::CACHE_CONTROL], "no-store");
+        assert_eq!(first.headers()["x-content-type-options"], "nosniff");
+
+        let windows_head = loom_asset_protocol_response(
+            &state,
+            "main",
+            &request(&windows_uri_a, http::Method::HEAD),
+        );
+        assert_eq!(windows_head.status(), http::StatusCode::OK);
+        assert!(windows_head.body().is_empty());
+        assert_eq!(
+            windows_head.headers()[http::header::CONTENT_LENGTH],
+            png.len().to_string()
+        );
+
+        assert_eq!(
+            loom_asset_protocol_response(
+                &state,
+                "auxiliary",
+                &request(&mac_uri_a, http::Method::GET),
+            )
+            .status(),
+            http::StatusCode::FORBIDDEN
+        );
+        let ranged = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(&mac_uri_a)
+            .header(http::header::RANGE, "bytes=0-1")
+            .body(Vec::new())
+            .expect("range request");
+        assert_eq!(
+            loom_asset_protocol_response(&state, "main", &ranged).status(),
+            http::StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        assert_eq!(
+            loom_asset_protocol_response(&state, "main", &request(&mac_uri_a, http::Method::POST),)
+                .status(),
+            http::StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        close_project_with_wait(
+            &state,
+            project_a.to_string(),
+            session_a.to_string(),
+            CommandId::new(),
+            Duration::ZERO,
+        )
+        .expect("close project A");
+        assert_eq!(
+            loom_asset_protocol_response(&state, "main", &request(&mac_uri_a, http::Method::GET),)
+                .status(),
+            http::StatusCode::NOT_FOUND
+        );
+
+        let root_b = temporary.path().join("Project B");
+        let store_b = initialize_project(&root_b, "Project B".to_owned()).expect("project B");
+        let project_b = store_b.manifest().project_id;
+        let snapshot_b = reserve_project_choice(&state)
+            .expect("reserve project B open")
+            .finish(Ok(store_b))
+            .expect("open project B");
+        let session_b = snapshot_b
+            .session_id
+            .parse::<CommandId>()
+            .expect("project B session");
+        assert_eq!(
+            loom_asset_protocol_response(&state, "main", &request(&mac_uri_a, http::Method::GET),)
+                .status(),
+            http::StatusCode::NOT_FOUND,
+            "switching projects must not accumulate project A authority"
+        );
+        close_project_with_wait(
+            &state,
+            project_b.to_string(),
+            session_b.to_string(),
+            CommandId::new(),
+            Duration::ZERO,
+        )
+        .expect("close project B");
+
+        // A fresh plugin state models process relaunch: no prior filesystem
+        // scope or in-memory admission can help this read succeed.
+        let relaunched_state = PluginState::default();
+        let reopened_a = ProjectStore::open(&root_a).expect("reopen project A from disk");
+        let snapshot_a2 = reserve_project_choice(&relaunched_state)
+            .expect("reserve project A reopen")
+            .finish(Ok(reopened_a))
+            .expect("reopen project A");
+        let session_a2 = snapshot_a2
+            .session_id
+            .parse::<CommandId>()
+            .expect("new project A session");
+        assert_ne!(session_a2, session_a);
+        assert_eq!(
+            loom_asset_protocol_response(
+                &relaunched_state,
+                "main",
+                &request(&mac_uri_a, http::Method::GET),
+            )
+            .status(),
+            http::StatusCode::NOT_FOUND,
+            "the old project A session token stays revoked after reopen"
+        );
+        let token_a2 = loom_asset_token(project_a, session_a2, file_name).expect("reopen token");
+        let reopened_response = loom_asset_protocol_response(
+            &relaunched_state,
+            "main",
+            &request(
+                &format!("loom-asset://localhost/{token_a2}"),
+                http::Method::GET,
+            ),
+        );
+        assert_eq!(reopened_response.status(), http::StatusCode::OK);
+        assert_eq!(reopened_response.body(), &png);
+    }
+
+    #[test]
+    fn asset_protocol_parser_rejects_noncanonical_tokens_origins_and_paths() {
+        let project_id = ProjectId::new();
+        let session_id = CommandId::new();
+        let file_name = format!("{}.png", "a".repeat(64));
+        let token = loom_asset_token(project_id, session_id, &file_name).expect("canonical token");
+        let mac_uri = format!("loom-asset://localhost/{token}")
+            .parse::<http::Uri>()
+            .expect("mac URI");
+        let windows_uri = format!("http://loom-asset.localhost/{token}")
+            .parse::<http::Uri>()
+            .expect("Windows URI");
+        assert_eq!(
+            parse_loom_asset_uri(&mac_uri),
+            parse_loom_asset_uri(&windows_uri)
+        );
+        for rejected in [
+            format!("https://loom-asset.localhost/{token}"),
+            format!("loom-asset://not-localhost/{token}"),
+            format!("loom-asset://localhost/{token}?cache=1"),
+            format!("loom-asset://localhost/{token}/extra"),
+            format!("loom-asset://localhost/%25{token}"),
+            format!("loom-asset://localhost/{project_id}/{session_id}/{file_name}"),
+            format!("loom-asset://localhost/v1-{project_id}-{session_id}-../{file_name}"),
+            format!("loom-asset://localhost/V1-{project_id}-{session_id}-{file_name}"),
+            format!(
+                "loom-asset://localhost/v1-{}-{session_id}-{file_name}",
+                project_id.to_string().to_ascii_lowercase()
+            ),
+        ] {
+            let uri = rejected
+                .parse::<http::Uri>()
+                .expect("syntactically valid URI");
+            assert_eq!(parse_loom_asset_uri(&uri), None, "accepted {rejected}");
+        }
     }
 
     #[test]

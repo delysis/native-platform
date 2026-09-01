@@ -11,6 +11,8 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-project-current`
 - `allow-project-recover`
 - `allow-document-create`
+- `allow-document-rename`
+- `allow-attachment-ingest`
 - `allow-document-open`
 - `allow-document-checkpoint`
 - `allow-document-export-choose`
@@ -156,6 +158,32 @@ Enables the application_close_pending command without any pre-configured scope.
 <td>
 
 Denies the application_close_pending command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-attachment-ingest`
+
+</td>
+<td>
+
+Enables the attachment_ingest command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-attachment-ingest`
+
+</td>
+<td>
+
+Denies the attachment_ingest command without any pre-configured scope.
 
 </td>
 </tr>
@@ -546,6 +574,32 @@ Enables the document_reconciliation_preview command without any pre-configured s
 <td>
 
 Denies the document_reconciliation_preview command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-rename`
+
+</td>
+<td>
+
+Enables the document_rename command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-rename`
+
+</td>
+<td>
+
+Denies the document_rename command without any pre-configured scope.
 
 </td>
 </tr>

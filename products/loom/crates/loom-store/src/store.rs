@@ -32,6 +32,7 @@ pub(crate) const DATABASE_FILE: &str = "loom.sqlite3";
 const PROJECT_LEASE_FILE: &str = "session.lock";
 const MANIFEST_FILE: &str = "project.json";
 const MAX_PROJECT_NAME_BYTES: usize = 512;
+pub const MAX_DOCUMENT_TITLE_BYTES: usize = 256;
 const MAX_REASON_BYTES: usize = 4 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
@@ -1011,20 +1012,23 @@ impl ProjectStore {
     /// This is the bounded authority lookup for commands that capture a
     /// document ID and must derive its current path and revision natively.
     pub fn registered_document(&self, document_id: DocumentId) -> Result<Option<DocumentSummary>> {
-        let row: Option<(String, String)> = self
+        let row: Option<(String, String, Option<String>)> = self
             .connection
             .query_row(
-                "SELECT relative_path, document_kind FROM documents WHERE document_id = ?1",
+                "SELECT relative_path, document_kind, display_title
+                 FROM documents WHERE document_id = ?1",
                 [document_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((relative_path, kind)) = row else {
+        let Some((relative_path, kind, display_title)) = row else {
             return Ok(None);
         };
+        let display_title = validate_stored_document_display_title(display_title)?;
         Ok(Some(DocumentSummary {
             document_id,
             relative_path,
+            display_title,
             kind: DocumentKind::from_str(&kind)
                 .map_err(|error| StoreError::CorruptDatabase(error.to_string()))?,
             active_revision_id: self
@@ -1035,7 +1039,7 @@ impl ProjectStore {
 
     pub fn list_documents(&self) -> Result<Vec<DocumentSummary>> {
         let mut statement = self.connection.prepare(
-            "SELECT d.document_id, d.relative_path, d.document_kind,
+            "SELECT d.document_id, d.relative_path, d.display_title, d.document_kind,
                     (SELECT r.revision_id FROM revisions r WHERE r.document_id = d.document_id ORDER BY r.created_at_ms DESC, r.revision_id DESC LIMIT 1)
              FROM documents d ORDER BY d.relative_path",
         )?;
@@ -1043,16 +1047,19 @@ impl ProjectStore {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?;
         let mut documents = Vec::new();
         for row in rows {
-            let (document_id, relative_path, kind, revision_id) = row?;
+            let (document_id, relative_path, display_title, kind, revision_id) = row?;
+            let display_title = validate_stored_document_display_title(display_title)?;
             documents.push(DocumentSummary {
                 document_id: parse_id(&document_id, "document_id")?,
                 relative_path,
+                display_title,
                 kind: DocumentKind::from_str(&kind)
                     .map_err(|error| StoreError::CorruptDatabase(error.to_string()))?,
                 active_revision_id: revision_id
@@ -1061,6 +1068,74 @@ impl ProjectStore {
             });
         }
         Ok(documents)
+    }
+
+    /// Changes only the native display title for the exact source document.
+    ///
+    /// The ordinary UTF-8 manuscript path and every immutable revision remain
+    /// untouched. The retained no-follow descriptor proves that the caller's
+    /// document/revision/blob source is still the visible registered file at
+    /// the mutation boundary.
+    pub fn set_document_display_title(
+        &mut self,
+        authority: &mut DocumentFileAuthority,
+        requested_title: &str,
+    ) -> Result<DocumentSummary> {
+        if authority.project_id != self.manifest.project_id {
+            return Err(StoreError::DocumentFileAuthorityMismatch);
+        }
+        let display_title = normalize_document_display_title(requested_title)?;
+        authority.revalidate()?;
+        let source = authority.document().clone();
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT d.document_kind,
+                        (SELECT r.revision_id FROM revisions r
+                         WHERE r.document_id = d.document_id
+                         ORDER BY r.created_at_ms DESC, r.revision_id DESC LIMIT 1)
+                 FROM documents d
+                 WHERE d.document_id = ?1 AND d.relative_path = ?2",
+                params![source.document_id.to_string(), &source.relative_path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((kind, current_revision)) = current else {
+            return Err(StoreError::DocumentFileAuthorityMismatch);
+        };
+        let current_revision = current_revision
+            .ok_or_else(|| StoreError::NoActiveRevision(source.relative_path.clone()))
+            .and_then(|value| parse_id(&value, "revision_id"))?;
+        if current_revision != source.revision_id {
+            return Err(StoreError::SourceRevisionMismatch {
+                expected: source.revision_id,
+                actual: current_revision,
+            });
+        }
+        let kind = DocumentKind::from_str(&kind)
+            .map_err(|error| StoreError::CorruptDatabase(error.to_string()))?;
+        if kind != source.kind {
+            return Err(StoreError::DocumentFileAuthorityMismatch);
+        }
+        let changed = transaction.execute(
+            "UPDATE documents SET display_title = ?2 WHERE document_id = ?1",
+            params![source.document_id.to_string(), &display_title],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::DocumentFileAuthorityMismatch);
+        }
+        transaction.commit()?;
+
+        Ok(DocumentSummary {
+            document_id: source.document_id,
+            relative_path: source.relative_path,
+            display_title: Some(display_title),
+            kind: source.kind,
+            active_revision_id: Some(source.revision_id),
+        })
     }
 
     pub fn read_document(&self, relative_path: impl AsRef<Path>) -> Result<LoadedDocument> {
@@ -1683,8 +1758,34 @@ pub enum VisibleProjectionState {
 pub struct DocumentSummary {
     pub document_id: DocumentId,
     pub relative_path: String,
+    pub display_title: Option<String>,
     pub kind: DocumentKind,
     pub active_revision_id: Option<RevisionId>,
+}
+
+fn normalize_document_display_title(requested: &str) -> Result<String> {
+    let title = requested.trim();
+    if title.is_empty()
+        || title.len() > MAX_DOCUMENT_TITLE_BYTES
+        || title.chars().any(char::is_control)
+    {
+        return Err(StoreError::InvalidDocumentTitle {
+            max_bytes: MAX_DOCUMENT_TITLE_BYTES,
+        });
+    }
+    Ok(title.to_owned())
+}
+
+fn validate_stored_document_display_title(stored: Option<String>) -> Result<Option<String>> {
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    match normalize_document_display_title(&stored) {
+        Ok(canonical) if canonical == stored => Ok(Some(stored)),
+        _ => Err(StoreError::CorruptDatabase(
+            "document display_title is not canonical".into(),
+        )),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2256,6 +2357,7 @@ mod tests {
             DocumentSummary {
                 document_id: registered,
                 relative_path: "manuscript/001.md".to_owned(),
+                display_title: None,
                 kind: DocumentKind::Prose,
                 active_revision_id: Some(loaded.revision_id),
             }
@@ -2287,6 +2389,141 @@ mod tests {
                 .active_revision_id,
             Some(loaded.revision_id)
         );
+    }
+
+    #[test]
+    fn document_display_title_is_source_bound_trimmed_and_persists_without_renaming_file() {
+        let (directory, mut store) = new_store();
+        let root = store.root().to_path_buf();
+        store
+            .create_document_if_absent(
+                "manuscript/Untitled.md",
+                DocumentContent::Prose("ordinary manuscript\n".into()),
+                "new document",
+            )
+            .expect("create document");
+        let mut authority = store
+            .open_document_file("manuscript/Untitled.md")
+            .expect("capture exact source");
+
+        let renamed = store
+            .set_document_display_title(&mut authority, "  Éowyn's Choice  ")
+            .expect("set display title");
+
+        assert_eq!(renamed.display_title.as_deref(), Some("Éowyn's Choice"));
+        assert_eq!(renamed.relative_path, "manuscript/Untitled.md");
+        assert_eq!(
+            fs::read_to_string(root.join("manuscript/Untitled.md")).expect("read manuscript"),
+            "ordinary manuscript\n"
+        );
+        assert!(!root.join("manuscript/Éowyn's Choice.md").exists());
+
+        let document_id = renamed.document_id;
+        drop(store);
+        let reopened = ProjectStore::open(&root).expect("reopen titled project");
+        assert_eq!(
+            reopened
+                .registered_document(document_id)
+                .expect("read title after reopen")
+                .expect("registered document")
+                .display_title
+                .as_deref(),
+            Some("Éowyn's Choice")
+        );
+        drop(reopened);
+        drop(directory);
+    }
+
+    #[test]
+    fn document_display_title_rejects_blank_control_and_overlong_utf8_without_mutation() {
+        let (_directory, mut store) = new_store();
+        store
+            .create_document_if_absent(
+                "manuscript/Untitled.md",
+                DocumentContent::Prose("ordinary manuscript\n".into()),
+                "new document",
+            )
+            .expect("create document");
+        let document_id = store
+            .read_document("manuscript/Untitled.md")
+            .expect("read document")
+            .document_id;
+
+        for invalid in ["   ".to_owned(), "line\nbreak".to_owned(), "é".repeat(129)] {
+            let mut authority = store
+                .open_document_file("manuscript/Untitled.md")
+                .expect("capture exact source");
+            assert!(matches!(
+                store.set_document_display_title(&mut authority, &invalid),
+                Err(StoreError::InvalidDocumentTitle {
+                    max_bytes: MAX_DOCUMENT_TITLE_BYTES
+                })
+            ));
+        }
+        assert_eq!(
+            store
+                .registered_document(document_id)
+                .expect("read unchanged title")
+                .expect("registered document")
+                .display_title,
+            None
+        );
+
+        let exact_utf8_bound = "é".repeat(MAX_DOCUMENT_TITLE_BYTES / 2);
+        let mut authority = store
+            .open_document_file("manuscript/Untitled.md")
+            .expect("capture exact source at byte bound");
+        let renamed = store
+            .set_document_display_title(&mut authority, &exact_utf8_bound)
+            .expect("accept exact UTF-8 byte bound");
+        assert_eq!(
+            renamed.display_title.as_deref(),
+            Some(exact_utf8_bound.as_str())
+        );
+    }
+
+    #[test]
+    fn document_summary_reads_reject_noncanonical_stored_titles() {
+        let (_directory, mut store) = new_store();
+        store
+            .create_document_if_absent(
+                "manuscript/Untitled.md",
+                DocumentContent::Prose("ordinary manuscript\n".into()),
+                "new document",
+            )
+            .expect("create document");
+        let document_id = store
+            .read_document("manuscript/Untitled.md")
+            .expect("read document")
+            .document_id;
+
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", "ON")
+            .expect("enable corruption fixture");
+        store
+            .connection
+            .execute(
+                "UPDATE documents SET display_title = 'corrupt' || char(10) || 'title'
+                 WHERE document_id = ?1",
+                [document_id.to_string()],
+            )
+            .expect("inject corrupt display title");
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", "OFF")
+            .expect("restore check constraints");
+
+        assert!(matches!(
+            store.registered_document(document_id),
+            Err(StoreError::CorruptDatabase(message))
+                if message == "document display_title is not canonical"
+        ));
+        assert!(matches!(
+            store.list_documents(),
+            Err(StoreError::CorruptDatabase(message))
+                if message == "document display_title is not canonical"
+        ));
     }
 
     #[test]
@@ -3220,6 +3457,14 @@ mod tests {
         assert_eq!(migrated.revision_id, prior.revision_id);
         assert_eq!(migrated.blob_id, spec.document.sha256);
         assert_eq!(migrated.text, spec.document.text);
+        assert_eq!(
+            reopened
+                .registered_document(migrated.document_id)
+                .expect("read migrated document summary")
+                .expect("migrated document remains registered")
+                .display_title,
+            None
+        );
         assert_eq!(reopened.counts().expect("migrated counts"), prior.counts);
         assert_eq!(selection_count(&reopened), spec.expected.selection_count);
         assert_eq!(

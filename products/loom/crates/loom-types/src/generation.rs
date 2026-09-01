@@ -225,6 +225,13 @@ impl GenerationTerminalStatus {
     }
 }
 
+/// Maximum UTF-8 byte length of one text-delta protocol event.
+///
+/// Producers must split larger native deltas on character boundaries before
+/// delivery. Durable consumers reject larger events, keeping queue pressure,
+/// persistence, and bounded snapshot replay compositional.
+pub const MAX_GENERATION_TEXT_DELTA_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GenerationEventKind {
