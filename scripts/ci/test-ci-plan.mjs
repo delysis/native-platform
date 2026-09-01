@@ -423,15 +423,33 @@ test("Mom dependency metadata remains conservative", () => {
   assert.deepEqual(result.macos_matrix, ["release", "root", "mom"]);
 });
 
-test("Loom Svelte source selects Loom frontend when Loom is present", () => {
+test("Loom Svelte source selects the frontend and required macOS WebKit lane", () => {
   const { result } = fixture("products/loom/apps/loom/src/App.svelte", {
     present: ["products/loom/apps/loom/src-tauri/Cargo.toml"],
   });
   assert.equal(result.presence.loom, true);
   assert.equal(result.flags.loom, true);
   assert.equal(result.flags.frontend_loom, true);
+  assert.equal(result.flags.platform_macos, true);
+  assert.equal(result.flags.full, false);
   assert.ok(result.jobs.includes("loom-linux"));
   assert.ok(result.jobs.includes("frontend"));
+  assert.ok(result.jobs.includes("platform-macos"));
+  assert.deepEqual(result.macos_matrix, ["release", "loom"]);
+});
+
+test("root pnpm metadata cannot select Loom frontend without its WebKit lane", () => {
+  for (const relativePath of ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"]) {
+    const { result } = fixture(relativePath, {
+      present: ["products/loom/apps/loom/src-tauri/Cargo.toml"],
+    });
+    assert.equal(result.presence.loom, true, relativePath);
+    assert.equal(result.flags.frontend_loom, true, relativePath);
+    assert.equal(result.flags.platform_macos, true, relativePath);
+    assert.ok(result.jobs.includes("frontend"), relativePath);
+    assert.ok(result.jobs.includes("platform-macos"), relativePath);
+    assert.deepEqual(result.macos_matrix, ["release", "loom"], relativePath);
+  }
 });
 
 test("root Cargo metadata forces the complete present graph", () => {

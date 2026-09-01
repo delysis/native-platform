@@ -449,6 +449,10 @@ for (const effect of dependencySelection.effects) {
 }
 generatedFlags.frontend_mom &&= presence.mom;
 generatedFlags.frontend_loom &&= presence.loom;
+// Loom's WebKit interaction suite is a macOS product gate, not a Linux
+// frontend step. Any renderer change that selects the Loom frontend must also
+// schedule the macOS Loom matrix entry or the regression suite can be skipped.
+if (generatedFlags.frontend_loom) generatedFlags.platform_macos = true;
 
 for (const changedPath of changed) {
   const basename = path.posix.basename(changedPath);
@@ -498,7 +502,12 @@ function macosMatrixFor(selectedFlags) {
     if (selectedFlags.attachment || selectedFlags.full) matrix.push("attachment");
     if (selectedFlags.information || selectedFlags.full) matrix.push("information");
     if (selectedFlags.speech || selectedFlags.full) matrix.push("speech");
-    if (presence.loom && (selectedFlags.loom || selectedFlags.full)) matrix.push("loom");
+    if (
+      presence.loom &&
+      (selectedFlags.loom || selectedFlags.frontend_loom || selectedFlags.full)
+    ) {
+      matrix.push("loom");
+    }
   }
   return matrix;
 }

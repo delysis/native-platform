@@ -164,10 +164,13 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /stat -Lf '%d:%i' "\$LOOM_SMOKE_GGUF_MODEL_PATH"/);
   assert.doesNotMatch(smoke, /acceptance-writer/);
   assert.match(smoke, /exercise_loom_completion_word_reversal/);
-  assert.match(smoke, /characterDown\.postToPid\(pid\)/);
+  assert.match(smoke, /kAXValueAttribute as CFString/);
+  assert.match(smoke, /kAXSelectedTextRangeAttribute as CFString/);
+  assert.match(smoke, /virtualKey: 49/);
+  assert.match(smoke, /"terminal_space_key_event": terminalSpace/);
   assert.match(smoke, /event\.postToPid\(pid\)/);
-  assert.match(smoke, /native keyboard input never produced the exact observable editor value/);
-  assert.match(smoke, /native keyboard input did not leave one collapsed caret at the manuscript end/);
+  assert.match(smoke, /native Accessibility input did not stabilize at the exact value and collapsed end caret/);
+  assert.match(smoke, /"stable_seconds": 0\.4/);
   assert.match(smoke, /observed_editor_value/);
   assert.match(smoke, /observed_caret_utf16/);
   assert.match(smoke, /Option-Right did not persist one cached completion word/);
@@ -250,9 +253,121 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /start_loom_generation_guard/);
   assert.match(smoke, /fifth_run_observed/);
   assert.match(smoke, /generation_family_guard: generationGuard/);
+  assert.match(smoke, /start_loom_live_streaming_monitor/);
+  assert.match(smoke, /delysis\.loom-live-stream-witness\.v1/);
+  assert.match(smoke, /family_terminal_before_live_witness/);
+  assert.match(smoke, /event_kind = 'text_delta'/);
+  assert.match(smoke, /durableCumulativeText\.hasPrefix\(visibleSuffix\)/);
+  assert.match(smoke, /selectedPresentationKey == renderedPresentationKey/);
+  assert.match(smoke, /selectedPresentationKey == inlineVisibleKey/);
+  assert.match(smoke, /selectedRunIsTerminal\(selectedRunId\)/);
+  assert.match(smoke, /selected_run_terminal_after_accessibility": false/);
+  assert.match(smoke, /visible_suffix_is_durable_leading_projection": true/);
+  assert.match(smoke, /live_streaming_preterminal: liveStreaming/);
+  const liveObserverStart = smoke.indexOf("if ! start_loom_live_streaming_monitor");
+  const liveObserverWait = smoke.indexOf("if ! wait_for_loom_live_streaming_monitor");
+  const terminalFamilyWait = smoke.indexOf(
+    "RUN_1_REAL_GENERATION_EVIDENCE=$(wait_for_loom_generation_family",
+  );
+  assert.ok(
+    liveObserverStart >= 0 &&
+      liveObserverStart < autocompleteEnable &&
+      autocompleteEnable < liveObserverWait &&
+      liveObserverWait < terminalFamilyWait,
+    "the initialized AX/store observer must witness live text before terminal-family hydration",
+  );
+  assert.match(
+    smoke,
+    /RUN_1_LIVE_STREAMING_EVIDENCE=\$\(cat "\$LOOM_LIVE_STREAM_MONITOR_OUTPUT"\)/,
+  );
+
+  assert.match(smoke, /exercise_loom_idle_resume_ghost/);
+  assert.match(smoke, /delysis\.loom-idle-resume-ghost-witness\.v1/);
+  assert.match(smoke, /runningApplication\.hide\(\)/);
+  assert.match(smoke, /kAXHiddenAttribute as CFString/);
+  assert.match(smoke, /"PID-addressed AXHidden"/);
+  assert.match(smoke, /exact-PID System Events visible=false/);
+  assert.match(smoke, /exact-PID System Events visible=true/);
+  assert.match(smoke, /kCFBooleanFalse/);
+  assert.match(smoke, /"resume_dispatch": resumeDispatch/);
+  assert.match(smoke, /runningApplication\.isHidden/);
+  assert.match(smoke, /withBundleIdentifier: "com\.apple\.finder"/);
+  assert.match(smoke, /NSAppleScript\(/);
+  assert.match(smoke, /Finder Apple event/);
+  assert.match(smoke, /let minimumIdleSeconds: TimeInterval = 75/);
+  assert.match(smoke, /ProcessInfo\.processInfo\.systemUptime - idleStartedAtUptime/);
+  assert.match(smoke, /let deadlineUptime = ProcessInfo\.processInfo\.systemUptime \+ 120/);
+  assert.match(smoke, /Cross a full minute hidden/);
+  assert.match(
+    smoke,
+    /NSWorkspace\.shared\.frontmostApplication\?\.processIdentifier ==\s+backgroundApplication\.processIdentifier/,
+  );
+  assert.match(smoke, /generationCount\(\) == expectedGenerationCount/);
+  assert.match(smoke, /struct DurableCandidateIdentity: Equatable/);
+  assert.match(
+    smoke,
+    /SELECT f\.run_id, t\.candidate_id, c\.output_blob_id FROM family f/,
+  );
+  assert.match(smoke, /candidate\.candidateId == "run:\\[(]candidate\.runId[)]"/);
+  assert.match(smoke, /!candidate\.presentationKey\.hasPrefix\("stream:"\)/);
+  assert.match(smoke, /presentationMatchesDurableCandidate\(candidate, durable\)/);
+  assert.match(
+    smoke,
+    /waitForGhostIdentity\([\s\S]*?durableCandidates: durableFamilyCandidates,[\s\S]*?expected: before/,
+  );
+  assert.match(smoke, /"terminal_candidate_authority"/);
+  assert.match(smoke, /"before_identity"/);
+  assert.match(smoke, /"last_observed_identity"/);
+  assert.match(smoke, /"before_raw_observation"/);
+  assert.match(smoke, /"last_raw_observation"/);
+  assert.match(smoke, /"frontmost_matches_expected"/);
+  assert.match(smoke, /"application_hidden"/);
+  assert.match(smoke, /"application_active"/);
+  assert.match(smoke, /"writing_surface_present"/);
+  assert.match(smoke, /"selected_text_range"/);
+  assert.match(smoke, /"ax_value_utf8_bytes"/);
+  assert.match(smoke, /"ax_value_sha256"/);
+  assert.match(smoke, /"ax_value_suffix_sha256"/);
+  assert.match(smoke, /"completion_witness_text_found"/);
+  assert.match(smoke, /"completion_witness_parsed"/);
+  assert.match(smoke, /func completionWitnessCore/);
+  assert.match(smoke, /"rendered_presentation_key"/);
+  assert.match(smoke, /"inline_visible_key"/);
+  assert.doesNotMatch(smoke, /"ax_value":/);
+  assert.match(smoke, /launch-1-idle-resume-identity-diagnostics\.json/);
+  assert.match(smoke, /data\.write\(to: URL\(fileURLWithPath: identityFailurePath\), options: \.atomic\)/);
+  assert.match(smoke, /authority_frozen_before": before\.authorityFrozen/);
+  assert.match(smoke, /exact_ghost_identity_resynchronized": true/);
+  assert.match(smoke, /new_generation_started": false/);
+  assert.match(smoke, /ghost_stole_editor_focus": false/);
+  assert.match(smoke, /idle_resume_ghost: idleResumeGhost/);
+  const terminalGhostWait = smoke.indexOf(
+    "RUN_1_REAL_GHOST_EVIDENCE=$(wait_for_loom_accessibility_text",
+  );
+  const idleResumeWitness = smoke.indexOf(
+    "RUN_1_IDLE_RESUME_GHOST_EVIDENCE=$(exercise_loom_idle_resume_ghost",
+  );
+  const cachedInteractionWitness = smoke.indexOf(
+    "RUN_1_REAL_WORD_REVERSAL_EVIDENCE=$(exercise_loom_completion_word_reversal",
+  );
+  assert.ok(
+    terminalFamilyWait < terminalGhostWait &&
+      terminalGhostWait < idleResumeWitness &&
+      idleResumeWitness < cachedInteractionWitness,
+    "native hide/idle/resume must preserve the terminal ghost before cached interactions mutate it",
+  );
   assert.match(smoke, /launch-1-ghost-timeout-diagnostics\.json/);
   assert.match(smoke, /latest_generation_runs/);
   assert.match(smoke, /completion diagnostics:/);
+  assert.match(smoke, /restoreExactEditorFocus/);
+  assert.match(smoke, /NSWorkspace\.shared\.frontmostApplication\?\.processIdentifier == pid/);
+  assert.match(smoke, /observed\.hasPrefix\(expectedManuscript\)/);
+  assert.match(smoke, /selection\?\.location == expectedManuscript\.utf16\.count/);
+  assert.match(smoke, /did not restore exact foreground editor focus before visible completion proof/);
+  assert.match(
+    smoke,
+    /wait_for_loom_accessibility_text \\\n+\s+"\$ACTIVE_PID" "Suggestion available\." "\$RUN_1_EDITOR_SENTINEL"/,
+  );
 
   assert.match(smoke, /start_loom_project_busy_monitor/);
   assert.match(smoke, /another bounded project operation is still running/);
@@ -267,15 +382,45 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
     );
   }
   assert.match(smoke, /PID-targeted Command-A/);
-  assert.match(smoke, /if textField\(named: "Link destination"\) == nil/);
+  assert.match(smoke, /NSRunningApplication\.runningApplications/);
+  assert.match(smoke, /foreground_loom_process "\$ACTIVE_PID"/);
+  assert.match(smoke, /runningApplication\.unhide\(\)/);
+  assert.match(smoke, /Activation requested only once at that boundary is lost/);
+  assert.match(smoke, /System Events.*frontmost of first application process/s);
+  assert.match(smoke, /same-identifier macOS activation is not PID-addressable/);
+  assert.match(smoke, /DELYSIS_ACCEPTANCE_SOURCE_SHA/);
+  assert.match(smoke, /acceptance source SHA requires a clean repository worktree/);
+  assert.match(smoke, /DELYSIS_SMOKE_SOURCE_SHA="\$ACCEPTANCE_SOURCE_SHA"/);
+  assert.match(smoke, /attribute\(format, kAXExpandedAttribute as CFString\)/);
+  assert.match(smoke, /button\(named: "Title"\) != nil/);
+  assert.match(smoke, /sameSemanticSelection\(beforeSelectionWitness, current\)/);
+  assert.match(smoke, /sameAXSelectionSemantics\(beforeSelection, currentAX\)/);
+  assert.match(smoke, /caret_byte_offset/);
+  assert.match(smoke, /all_visible_text/);
+  assert.match(smoke, /integer\(witness, "epoch"\)/);
+  assert.match(smoke, /\.max \{ left, right in/);
+  assert.match(smoke, /selection\.canonical\.location == expected\.utf16\.count/);
+  assert.match(smoke, /terminal_line_break_utf16/);
+  assert.match(smoke, /delysis\.loom-completion-witness\.v1/);
+  assert.match(smoke, /editor_selection/);
+  assert.match(smoke, /internal_selection/);
+  assert.match(smoke, /bool\(witness, "caret_at_end"\)/);
+  assert.match(smoke, /bool\(observedSelectionWitness, "all_visible_text"\)/);
+  assert.match(smoke, /Date\(\)\.timeIntervalSince\(exactSelectionSince\) >= 0\.25/);
+  assert.match(smoke, /did not stably restore the exact manuscript selection/);
   assert.match(smoke, /editor_refocused/);
   assert.match(smoke, /observed_persisted_markdown/);
 });
 
 test("Loom's required macOS lane runs the headless WebKit editor interactions", () => {
   const workflow = read(".github/workflows/ci-pr.yml");
-  assert.match(workflow, /pnpm --filter @delysis\/loom exec playwright install webkit/);
-  assert.match(workflow, /pnpm --filter @delysis\/loom run test:browser/);
+  const macos = workflow.match(/^  platform-macos:[\s\S]*?(?=^  dependency-graph:)/m)?.[0];
+  assert.ok(macos, "platform-macos job block is missing");
+  assert.match(macos, /component: \$\{\{ fromJSON\(needs\.plan\.outputs\.macos_matrix\) \}\}/);
+  assert.match(macos, /if: \$\{\{ matrix\.component == 'loom' \}\}[\s\S]*pnpm --filter @delysis\/loom exec playwright install webkit/);
+  assert.match(macos, /name: Loom macOS[\s\S]*if: \$\{\{ matrix\.component == 'loom' \}\}[\s\S]*pnpm --filter @delysis\/loom run test:browser/);
+  const required = workflow.match(/^  ci-required:[\s\S]*$/m)?.[0];
+  assert.match(required, /^\s{6}- platform-macos$/m);
 });
 
 test("stable macOS packaging adds only the real distribution gates", () => {
@@ -560,6 +705,7 @@ test("PR frontend runs only selected product frontend commands", () => {
   );
   assert.match(prFrontend, /name: Mom frontend/);
   assert.match(prFrontend, /pnpm --filter @delysis\/mom-llama run check:frontend/);
+  assert.match(prFrontend, /pnpm --filter @delysis\/mom-llama run test:frontend/);
   assert.match(prFrontend, /name: Loom frontend/);
   assert.match(prFrontend, /pnpm --filter @delysis\/loom run test/);
   assert.match(prFrontend, /pnpm --filter @delysis\/loom run check/);
@@ -573,8 +719,9 @@ test("Mom exposes the frontend syntax check used by PR CI", () => {
   const scripts = JSON.parse(read(momPackagePath)).scripts;
   assert.equal(
     scripts["check:frontend"],
-    "node --check ui/cache-inspector.js && node --check ui/composer-key-policy.js && node --check ui/coop-hx.js",
+    "node --check ui/composer-key-policy.js && node --check ui/coop-hx.js && node --check ui/product-surface-contract.test.js",
   );
+  assert.match(scripts["test:frontend"], /(?:^|\s)ui\/persona-sidebar-wiring\.test\.js(?:\s|$)/);
 });
 
 test("PR and full CI enforce current service documentation paths", () => {

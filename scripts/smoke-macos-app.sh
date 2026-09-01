@@ -10,6 +10,14 @@ LOOM_SMOKE_REAL_COMPLETIONS=${LOOM_SMOKE_REAL_COMPLETIONS:-}
 MOM_ACCEPTANCE_PRODUCT_NAME=${MOM_ACCEPTANCE_PRODUCT_NAME:-}
 MOM_ACCEPTANCE_BUNDLE_ID=${MOM_ACCEPTANCE_BUNDLE_ID:-}
 MOM_ACCEPTANCE_SOURCE_SHA=${MOM_ACCEPTANCE_SOURCE_SHA:-}
+DELYSIS_ACCEPTANCE_SOURCE_SHA=${DELYSIS_ACCEPTANCE_SOURCE_SHA:-}
+if [ -n "$MOM_ACCEPTANCE_SOURCE_SHA" ] &&
+  [ -n "$DELYSIS_ACCEPTANCE_SOURCE_SHA" ] &&
+  [ "$MOM_ACCEPTANCE_SOURCE_SHA" != "$DELYSIS_ACCEPTANCE_SOURCE_SHA" ]; then
+  echo "conflicting Mom and product-neutral acceptance source SHAs" >&2
+  exit 2
+fi
+ACCEPTANCE_SOURCE_SHA=${DELYSIS_ACCEPTANCE_SOURCE_SHA:-$MOM_ACCEPTANCE_SOURCE_SHA}
 
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "smoke-macos-app.sh requires macOS" >&2
@@ -88,6 +96,28 @@ if [ -n "$MOM_ACCEPTANCE_PRODUCT_NAME" ] || [ -n "$MOM_ACCEPTANCE_BUNDLE_ID" ]; 
 elif [ -n "$MOM_ACCEPTANCE_SOURCE_SHA" ]; then
   echo "Mom acceptance source SHA requires the unique product name and bundle ID" >&2
   exit 2
+fi
+
+if [ -n "$DELYSIS_ACCEPTANCE_SOURCE_SHA" ]; then
+  if [ "${#DELYSIS_ACCEPTANCE_SOURCE_SHA}" -ne 40 ]; then
+    echo "acceptance source SHA must be a full 40-character Git object ID" >&2
+    exit 2
+  fi
+  case "$DELYSIS_ACCEPTANCE_SOURCE_SHA" in
+    *[!0-9a-f]*)
+      echo "acceptance source SHA must contain only lowercase hexadecimal digits" >&2
+      exit 2
+      ;;
+  esac
+  actual_source_sha=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)
+  if [ "$actual_source_sha" != "$DELYSIS_ACCEPTANCE_SOURCE_SHA" ]; then
+    echo "acceptance source SHA does not equal the current repository HEAD" >&2
+    exit 2
+  fi
+  if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+    echo "acceptance source SHA requires a clean repository worktree" >&2
+    exit 2
+  fi
 fi
 
 if [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ] && [ ! -f "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
@@ -238,6 +268,8 @@ LOOM_PROJECT_BUSY_MONITOR_PID=
 LOOM_PROJECT_BUSY_MONITOR_STOP=
 LOOM_GENERATION_GUARD_PID=
 LOOM_GENERATION_GUARD_STOP=
+LOOM_LIVE_STREAM_MONITOR_PID=
+LOOM_LIVE_STREAM_MONITOR_STOP=
 
 settle_background_monitor_for_cleanup() {
   monitor_pid=$1
@@ -261,6 +293,8 @@ cleanup_failed_process() {
     "$LOOM_PROJECT_BUSY_MONITOR_PID" "$LOOM_PROJECT_BUSY_MONITOR_STOP"
   settle_background_monitor_for_cleanup \
     "$LOOM_GENERATION_GUARD_PID" "$LOOM_GENERATION_GUARD_STOP"
+  settle_background_monitor_for_cleanup \
+    "$LOOM_LIVE_STREAM_MONITOR_PID" "$LOOM_LIVE_STREAM_MONITOR_STOP"
   if [ -n "$ACTIVE_PID" ] && kill -0 "$ACTIVE_PID" 2>/dev/null; then
     kill "$ACTIVE_PID" 2>/dev/null || true
   fi
@@ -287,6 +321,60 @@ if [ "$COMPONENT" = loom ] && [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
     "$(stat -Lf '%d:%i' "$LOOM_SMOKE_GGUF_MODEL_PATH")" \
     "$(stat -Lf '%d:%i' "$LOOM_SMOKE_MODEL_LINK")"
 fi
+
+foreground_loom_process() {
+  target_pid=$1
+  xcrun swift - "$target_pid" <<'SWIFT'
+import AppKit
+import ApplicationServices
+import Foundation
+
+let pid = Int32(CommandLine.arguments[1])!
+guard let runningApplication = NSRunningApplication(processIdentifier: pid) else {
+    fputs("Loom exited before exact foreground activation\n", stderr)
+    exit(1)
+}
+let application = AXUIElementCreateApplication(pid)
+let deadlineUptime = ProcessInfo.processInfo.systemUptime + 30
+var activationAttempts = 0
+while ProcessInfo.processInfo.systemUptime < deadlineUptime {
+    // LaunchServices can publish NSRunningApplication before the first native
+    // window exists. Activation requested only once at that boundary is lost;
+    // retry the exact PID until AppKit and Accessibility agree on ownership.
+    runningApplication.unhide()
+    _ = runningApplication.activate(options: [.activateAllWindows])
+    _ = AXUIElementSetAttributeValue(
+        application,
+        kAXFrontmostAttribute as CFString,
+        kCFBooleanTrue
+    )
+    activationAttempts += 1
+    if activationAttempts % 10 == 0 {
+        var frontmostError: NSDictionary?
+        let frontmostSource =
+            "tell application \"System Events\" to set frontmost of first application process " +
+            "whose unix id is \(pid) to true"
+        if let frontmostScript = NSAppleScript(source: frontmostSource) {
+            _ = frontmostScript.executeAndReturnError(&frontmostError)
+        }
+    }
+    if !runningApplication.isHidden,
+       NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+        exit(0)
+    }
+    Thread.sleep(forTimeInterval: 0.05)
+}
+let frontmostPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
+fputs(
+    "Loom's exact process did not become visible and frontmost " +
+    "(hidden=\(runningApplication.isHidden), active=\(runningApplication.isActive), " +
+    "terminated=\(runningApplication.isTerminated), frontmost=\(frontmostPid), " +
+    "attempts=\(activationAttempts))\n",
+    stderr
+)
+exit(1)
+SWIFT
+}
 
 wait_for_window() {
   target_pid=$1
@@ -689,48 +777,18 @@ guard !visibleEditorFrame.isNull,
     exit(1)
 }
 
-guard let selectAllDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-      let selectAllUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
-    fputs("could not construct manuscript keyboard events\n", stderr)
-    exit(1)
-}
-selectAllDown.flags = [.maskCommand]
-selectAllUp.flags = [.maskCommand]
-
-func typeString(_ value: String) -> Bool {
-    for character in value {
-        var utf16 = Array(String(character).utf16)
-        guard let characterDown = CGEvent(
-                keyboardEventSource: nil,
-                virtualKey: 0,
-                keyDown: true
-              ),
-              let characterUp = CGEvent(
-                keyboardEventSource: nil,
-                virtualKey: 0,
-                keyDown: false
-              ) else {
-            return false
-        }
-        characterDown.keyboardSetUnicodeString(
-            stringLength: utf16.count,
-            unicodeString: &utf16
-        )
-        characterUp.keyboardSetUnicodeString(
-            stringLength: utf16.count,
-            unicodeString: &utf16
-        )
-        characterDown.postToPid(pid)
-        characterUp.postToPid(pid)
-    }
-    return true
-}
-
 // Product-state readiness can precede the Svelte document-open transition,
 // especially while a large default writer is being inspected or loaded. A
-// dispatched key is not evidence. Retry an idempotent Select-All + type until
-// the exact AX value changes and remains observable in the bound editor.
+// successful setter is not evidence. Retry the exact PID-bound AX value and
+// range mutation until the visible value and collapsed end caret remain
+// jointly stable; this avoids contaminating the manuscript with a delayed
+// synthetic keyboard queue while still exercising WebKit's native edit path.
 var observedEditorValue = ""
+var observedSelection: CFRange?
+var stabilized = false
+var dispatchCount = 0
+let terminalSpace = sentinel.hasSuffix(" ")
+let seededValue = terminalSpace ? String(sentinel.dropLast()) : sentinel
 for _ in 0..<60 {
     guard AXUIElementSetAttributeValue(
         editor,
@@ -740,41 +798,80 @@ for _ in 0..<60 {
         fputs("could not focus Loom's accessible manuscript text area\n", stderr)
         exit(1)
     }
-    selectAllDown.postToPid(pid)
-    selectAllUp.postToPid(pid)
-    Thread.sleep(forTimeInterval: 0.05)
-    guard typeString(sentinel) else {
-        fputs("could not construct the complete manuscript keyboard sequence\n", stderr)
+    guard AXUIElementSetAttributeValue(
+        editor,
+        kAXValueAttribute as CFString,
+        seededValue as CFString
+    ) == .success else {
+        fputs("could not set Loom's exact accessible manuscript value\n", stderr)
         exit(1)
     }
-
-    for _ in 0..<20 {
-        observedEditorValue = stringAttribute(editor, kAXValueAttribute as CFString)
-        if observedEditorValue.trimmingCharacters(in: .newlines) == sentinel { break }
-        Thread.sleep(forTimeInterval: 0.05)
+    var endRange = CFRange(location: seededValue.utf16.count, length: 0)
+    guard let endRangeValue = AXValueCreate(.cfRange, &endRange),
+          AXUIElementSetAttributeValue(
+            editor,
+            kAXSelectedTextRangeAttribute as CFString,
+            endRangeValue
+          ) == .success else {
+        fputs("could not set Loom's exact accessible manuscript caret\n", stderr)
+        exit(1)
     }
-    if observedEditorValue.trimmingCharacters(in: .newlines) == sentinel { break }
+    if terminalSpace {
+        guard let spaceDown = CGEvent(
+                keyboardEventSource: nil,
+                virtualKey: 49,
+                keyDown: true
+              ),
+              let spaceUp = CGEvent(
+                keyboardEventSource: nil,
+                virtualKey: 49,
+                keyDown: false
+              ) else {
+            fputs("could not construct Loom's terminal Space key event\n", stderr)
+            exit(1)
+        }
+        spaceDown.postToPid(pid)
+        Thread.sleep(forTimeInterval: 0.03)
+        spaceUp.postToPid(pid)
+    }
+    dispatchCount += 1
+
+    let attemptDeadline = Date().addingTimeInterval(1.5)
+    var exactSince: Date?
+    repeat {
+        observedEditorValue = stringAttribute(editor, kAXValueAttribute as CFString)
+        observedSelection = rangeAttribute(editor, kAXSelectedTextRangeAttribute as CFString)
+        if observedEditorValue.trimmingCharacters(in: .newlines) == sentinel,
+           observedSelection?.location == sentinel.utf16.count,
+           observedSelection?.length == 0 {
+            exactSince = exactSince ?? Date()
+            if let exactSince,
+               Date().timeIntervalSince(exactSince) >= 0.4 {
+                stabilized = true
+                break
+            }
+        } else {
+            exactSince = nil
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    } while Date() < attemptDeadline
+    if stabilized { break }
     Thread.sleep(forTimeInterval: 0.25)
 }
 
-guard observedEditorValue.trimmingCharacters(in: .newlines) == sentinel else {
-    fputs("native keyboard input never produced the exact observable editor value\n", stderr)
-    exit(1)
-}
-var observedSelection: CFRange?
-for _ in 0..<20 {
-    observedSelection = rangeAttribute(editor, kAXSelectedTextRangeAttribute as CFString)
-    if observedSelection?.location == sentinel.utf16.count && observedSelection?.length == 0 { break }
-    Thread.sleep(forTimeInterval: 0.05)
-}
-guard let observedSelection,
+guard stabilized,
+      observedEditorValue.trimmingCharacters(in: .newlines) == sentinel,
+      let observedSelection,
       observedSelection.location == sentinel.utf16.count,
       observedSelection.length == 0 else {
-    fputs("native keyboard input did not leave one collapsed caret at the manuscript end\n", stderr)
+    fputs("native Accessibility input did not stabilize at the exact value and collapsed end caret\n", stderr)
     exit(1)
 }
 let evidence: [String: Any] = [
-    "dispatch": "PID-targeted Select-All and native keyboard input",
+    "dispatch": "PID-targeted AXValue and AXSelectedTextRange",
+    "dispatch_count": dispatchCount,
+    "terminal_space_key_event": terminalSpace,
+    "stable_seconds": 0.4,
     "observed_editor_value": true,
     "observed_editor_utf8_bytes": observedEditorValue.lengthOfBytes(using: .utf8),
     "observed_caret_utf16": observedSelection.location,
@@ -923,7 +1020,7 @@ func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
 }
 
 func strings(_ element: AXUIElement) -> [String] {
-    [kAXDescriptionAttribute, kAXTitleAttribute, kAXHelpAttribute]
+    [kAXValueAttribute, kAXDescriptionAttribute, kAXTitleAttribute, kAXHelpAttribute]
         .compactMap { attribute(element, $0 as CFString) as? String }
         .filter { !$0.isEmpty }
 }
@@ -943,6 +1040,112 @@ func rangeAttribute(_ element: AXUIElement, _ name: CFString) -> CFRange? {
     guard AXValueGetType(value) == .cfRange else { return nil }
     var range = CFRange()
     return AXValueGetValue(value, .cfRange, &range) ? range : nil
+}
+
+struct CanonicalSelection {
+    let raw: CFRange
+    let canonical: CFRange
+    let valueUtf16: Int
+    let terminalLineBreakUtf16: Int
+}
+
+// WebKit's AX text area may expose a structural trailing line break for a
+// heading/list wrapper even though that separator is absent from the exact
+// canonical manuscript value. Project the raw AX range into the canonical
+// value's coordinate space; never compare a stripped string to an unstripped
+// range.
+func canonicalSelection(_ element: AXUIElement) -> CanonicalSelection? {
+    guard let raw = rangeAttribute(element, kAXSelectedTextRangeAttribute as CFString),
+          var value = attribute(element, kAXValueAttribute as CFString) as? String else {
+        return nil
+    }
+    let rawValueUtf16 = value.utf16.count
+    while value.last == "\n" || value.last == "\r" { value.removeLast() }
+    let canonicalValueUtf16 = value.utf16.count
+    let canonicalLocation = min(max(raw.location, 0), canonicalValueUtf16)
+    let rawEnd = max(raw.location, 0) + max(raw.length, 0)
+    let canonicalEnd = min(max(rawEnd, canonicalLocation), canonicalValueUtf16)
+    return CanonicalSelection(
+        raw: raw,
+        canonical: CFRange(
+            location: canonicalLocation,
+            length: canonicalEnd - canonicalLocation
+        ),
+        valueUtf16: canonicalValueUtf16,
+        terminalLineBreakUtf16: rawValueUtf16 - canonicalValueUtf16
+    )
+}
+
+func jsonObject(in text: String, schema: String) -> [String: Any]? {
+    guard let schemaRange = text.range(of: "\"schema\":\"\(schema)\"") else { return nil }
+    let prefix = text[..<schemaRange.lowerBound]
+    guard let open = prefix.lastIndex(of: "{"),
+          let close = text.lastIndex(of: "}"),
+          open <= close,
+          let data = String(text[open...close]).data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          object["schema"] as? String == schema else { return nil }
+    return object
+}
+
+func editorSelectionWitness() -> [String: Any]? {
+    descendants().flatMap { element in
+        strings(element).compactMap { value in
+            jsonObject(in: value, schema: "delysis.loom-completion-witness.v1")
+        }
+    }.compactMap { $0["editor_selection"] as? [String: Any] }.max { left, right in
+        ((left["epoch"] as? NSNumber)?.intValue ?? -1) <
+            ((right["epoch"] as? NSNumber)?.intValue ?? -1)
+    }
+}
+
+func bool(_ object: [String: Any], _ key: String) -> Bool {
+    object[key] as? Bool ?? false
+}
+
+func integer(_ object: [String: Any], _ key: String) -> Int? {
+    (object[key] as? NSNumber)?.intValue
+}
+
+func string(_ object: [String: Any], _ key: String) -> String? {
+    object[key] as? String
+}
+
+// Compare selection semantics in the editor's canonical document model. Raw
+// AX offsets can move when a paragraph becomes a heading or list because
+// WebKit exposes structural line breaks that are not manuscript characters.
+func sameSemanticSelection(_ before: [String: Any], _ after: [String: Any]) -> Bool {
+    guard bool(before, "available"),
+          bool(after, "available"),
+          integer(before, "epoch") != nil,
+          integer(after, "epoch") != nil else { return false }
+    if bool(before, "empty") {
+        guard bool(after, "empty"),
+              integer(before, "caret_byte_offset") != nil,
+              integer(after, "caret_byte_offset") != nil else { return false }
+        if bool(before, "caret_at_end") { return bool(after, "caret_at_end") }
+        return string(before, "selection_kind") == string(after, "selection_kind") &&
+            integer(before, "from") == integer(after, "from") &&
+            integer(before, "to") == integer(after, "to")
+    }
+    if bool(before, "all_visible_text") {
+        return !bool(after, "empty") && bool(after, "all_visible_text")
+    }
+    return !bool(after, "empty") &&
+        string(before, "selection_kind") == string(after, "selection_kind") &&
+        integer(before, "from") == integer(after, "from") &&
+        integer(before, "to") == integer(after, "to")
+}
+
+func sameAXSelectionSemantics(_ before: CanonicalSelection, _ after: CanonicalSelection) -> Bool {
+    if before.canonical.length == 0 && before.canonical.location == before.valueUtf16 {
+        return after.canonical.length == 0 && after.canonical.location == after.valueUtf16
+    }
+    if before.canonical.location == 0 && before.canonical.length == before.valueUtf16 {
+        return after.canonical.location == 0 && after.canonical.length == after.valueUtf16
+    }
+    return before.canonical.location == after.canonical.location &&
+        before.canonical.length == after.canonical.length
 }
 
 func descendants() -> [AXUIElement] {
@@ -991,17 +1194,32 @@ func textField(named needle: String) -> AXUIElement? {
 guard let editor = descendants().first(where: {
     (attribute($0, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String
 }),
-      let beforeSelection = rangeAttribute(editor, kAXSelectedTextRangeAttribute as CFString) else {
+      let beforeSelection = canonicalSelection(editor),
+      let beforeSelectionWitness = editorSelectionWitness(),
+      bool(beforeSelectionWitness, "available"),
+      integer(beforeSelectionWitness, "epoch") != nil else {
     fputs("could not bind the formatting action to Loom's accessible manuscript selection\n", stderr)
     exit(1)
 }
 
 NSRunningApplication(processIdentifier: pid)?.activate(options: [])
-// Link is intentionally disabled until its destination is valid, so it
-// cannot witness whether the palette is open. Its stable text field can.
-if textField(named: "Link destination") == nil {
-    guard let format = waitForButton("Format text"), press(format) else {
+// Never infer a closed palette from one lagging AX descendant and accidentally
+// toggle an already-open lease closed. Prefer the owner's expanded state and
+// accept either stable palette child as corroboration.
+guard let format = waitForButton("Format text") else {
+    fputs("could not bind Loom's exact formatting palette owner\n", stderr)
+    exit(1)
+}
+let paletteIsOpen = (attribute(format, kAXExpandedAttribute as CFString) as? Bool) == true ||
+    button(named: "Title") != nil ||
+    textField(named: "Link destination") != nil
+if !paletteIsOpen {
+    guard press(format) else {
         fputs("could not open Loom's formatting palette through its exact titlebar control\n", stderr)
+        exit(1)
+    }
+    guard waitForButton("Title") != nil else {
+        fputs("Loom's formatting palette owner expanded without its stable controls\n", stderr)
         exit(1)
     }
 }
@@ -1037,9 +1255,9 @@ if actionName == "Link" {
             exit(1)
         }
         down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-        up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
         down.postToPid(pid)
         up.postToPid(pid)
+        Thread.sleep(forTimeInterval: 0.01)
     }
     let valueDeadline = Date().addingTimeInterval(5)
     while Date() < valueDeadline {
@@ -1060,16 +1278,52 @@ guard let action = waitForButton(actionName), press(action) else {
 }
 
 let focusDeadline = Date().addingTimeInterval(5)
-var afterSelection: CFRange?
+var afterSelection: CanonicalSelection?
+var afterSelectionWitness: [String: Any]?
 var editorFocused = false
+var exactSelectionSince: Date?
+var exactSelectionEpoch: Int?
 repeat {
     editorFocused = (attribute(editor, kAXFocusedAttribute as CFString) as? Bool) == true
-    afterSelection = rangeAttribute(editor, kAXSelectedTextRangeAttribute as CFString)
-    if editorFocused && afterSelection != nil { break }
+    afterSelection = canonicalSelection(editor)
+    afterSelectionWitness = editorSelectionWitness()
+    if editorFocused,
+       let currentAX = afterSelection,
+       let current = afterSelectionWitness,
+       sameAXSelectionSemantics(beforeSelection, currentAX),
+       sameSemanticSelection(beforeSelectionWitness, current),
+       let epoch = integer(current, "epoch") {
+        if exactSelectionEpoch != epoch {
+            exactSelectionEpoch = epoch
+            exactSelectionSince = Date()
+        }
+        if let exactSelectionSince,
+           Date().timeIntervalSince(exactSelectionSince) >= 0.25 { break }
+    } else {
+        exactSelectionSince = nil
+        exactSelectionEpoch = nil
+    }
     Thread.sleep(forTimeInterval: 0.05)
 } while Date() < focusDeadline
-guard editorFocused, let afterSelection else {
-    fputs("Loom's formatting palette did not restore focus and selection to the manuscript editor\n", stderr)
+guard editorFocused,
+      let afterSelection,
+      let afterSelectionWitness,
+      sameAXSelectionSemantics(beforeSelection, afterSelection),
+      sameSemanticSelection(beforeSelectionWitness, afterSelectionWitness),
+      let exactSelectionSince,
+      Date().timeIntervalSince(exactSelectionSince) >= 0.25,
+      exactSelectionEpoch == integer(afterSelectionWitness, "epoch") else {
+    let afterLocation = afterSelection?.canonical.location ?? -1
+    let afterLength = afterSelection?.canonical.length ?? -1
+    fputs(
+        "Loom's formatting palette did not stably restore the exact manuscript selection " +
+        "after \(actionName) (before=\(beforeSelection.canonical.location):" +
+        "\(beforeSelection.canonical.length), " +
+        "after=\(afterLocation):\(afterLength), focused=\(editorFocused), " +
+        "internal_before=\(beforeSelectionWitness), " +
+        "internal_after=\(String(describing: afterSelectionWitness)))\n",
+        stderr
+    )
     exit(1)
 }
 
@@ -1077,8 +1331,22 @@ let evidence: [String: Any] = [
     "control_path": "Format text -> \(actionName)",
     "dispatch": "AXPress on exact accessible controls bound to the target PID",
     "link_destination": linkDestination.isEmpty ? NSNull() : linkDestination,
-    "selection_before": ["location": beforeSelection.location, "length": beforeSelection.length],
-    "selection_after": ["location": afterSelection.location, "length": afterSelection.length],
+    "selection_before": [
+        "location": beforeSelection.canonical.location,
+        "length": beforeSelection.canonical.length,
+        "raw_location": beforeSelection.raw.location,
+        "raw_length": beforeSelection.raw.length,
+        "terminal_line_break_utf16": beforeSelection.terminalLineBreakUtf16
+    ],
+    "selection_after": [
+        "location": afterSelection.canonical.location,
+        "length": afterSelection.canonical.length,
+        "raw_location": afterSelection.raw.location,
+        "raw_length": afterSelection.raw.length,
+        "terminal_line_break_utf16": afterSelection.terminalLineBreakUtf16
+    ],
+    "internal_selection_before": beforeSelectionWitness,
+    "internal_selection_after": afterSelectionWitness,
     "editor_refocused": true
 ]
 let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
@@ -1112,52 +1380,180 @@ func rangeAttribute(_ element: AXUIElement, _ name: CFString) -> CFRange? {
     return AXValueGetValue(value, .cfRange, &range) ? range : nil
 }
 
-func editor() -> AXUIElement? {
+struct CanonicalSelection {
+    let value: String
+    let raw: CFRange
+    let canonical: CFRange
+    let terminalLineBreakUtf16: Int
+}
+
+func canonicalSelection(_ element: AXUIElement) -> CanonicalSelection? {
+    guard let raw = rangeAttribute(element, kAXSelectedTextRangeAttribute as CFString),
+          var value = attribute(element, kAXValueAttribute as CFString) as? String else {
+        return nil
+    }
+    let rawValueUtf16 = value.utf16.count
+    while value.last == "\n" || value.last == "\r" { value.removeLast() }
+    let canonicalValueUtf16 = value.utf16.count
+    let canonicalLocation = min(max(raw.location, 0), canonicalValueUtf16)
+    let rawEnd = max(raw.location, 0) + max(raw.length, 0)
+    let canonicalEnd = min(max(rawEnd, canonicalLocation), canonicalValueUtf16)
+    return CanonicalSelection(
+        value: value,
+        raw: raw,
+        canonical: CFRange(
+            location: canonicalLocation,
+            length: canonicalEnd - canonicalLocation
+        ),
+        terminalLineBreakUtf16: rawValueUtf16 - canonicalValueUtf16
+    )
+}
+
+func descendants() -> [AXUIElement] {
     var queue = [application]
     var cursor = 0
     while cursor < queue.count && cursor < 4096 {
         let element = queue[cursor]
         cursor += 1
-        if (attribute(element, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String {
-            return element
-        }
         if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
             queue.append(contentsOf: children)
         }
     }
-    return nil
+    return queue
 }
 
-guard let writingSurface = editor(),
-      AXUIElementSetAttributeValue(
-        writingSurface,
-        kAXFocusedAttribute as CFString,
-        kCFBooleanTrue
-      ) == .success,
-      let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-      let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
-    fputs("could not focus Loom's exact editor for Select-All\n", stderr)
+func editor() -> AXUIElement? {
+    descendants().first {
+        (attribute($0, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String
+    }
+}
+
+func strings(_ element: AXUIElement) -> [String] {
+    [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
+        .compactMap { attribute(element, $0 as CFString) as? String }
+}
+
+func jsonObject(in text: String, schema: String) -> [String: Any]? {
+    guard let schemaRange = text.range(of: "\"schema\":\"\(schema)\"") else { return nil }
+    let prefix = text[..<schemaRange.lowerBound]
+    guard let open = prefix.lastIndex(of: "{"),
+          let close = text.lastIndex(of: "}"),
+          open <= close,
+          let data = String(text[open...close]).data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          object["schema"] as? String == schema else { return nil }
+    return object
+}
+
+func editorSelectionWitness() -> [String: Any]? {
+    descendants().flatMap { element in
+        strings(element).compactMap { value in
+            jsonObject(in: value, schema: "delysis.loom-completion-witness.v1")
+        }
+    }.compactMap { $0["editor_selection"] as? [String: Any] }.max { left, right in
+        ((left["epoch"] as? NSNumber)?.intValue ?? -1) <
+            ((right["epoch"] as? NSNumber)?.intValue ?? -1)
+    }
+}
+
+func bool(_ object: [String: Any]?, _ key: String) -> Bool {
+    object?[key] as? Bool ?? false
+}
+
+guard let writingSurface = editor() else {
+    fputs("could not bind Loom's exact editor for Select-All\n", stderr)
     exit(1)
 }
-down.flags = [.maskCommand]
-up.flags = [.maskCommand]
-down.postToPid(pid)
-up.postToPid(pid)
+NSRunningApplication(processIdentifier: pid)?.activate(options: [])
 
 let deadline = Date().addingTimeInterval(5)
-var observed: CFRange?
+var observed: CanonicalSelection?
+var observedSelectionWitness: [String: Any]?
+var focused = false
+var exactSelectionSince: Date?
+var exactSelectionEpoch: Int?
+var nextDispatch = Date.distantPast
+var dispatchCount = 0
 repeat {
-    observed = rangeAttribute(writingSurface, kAXSelectedTextRangeAttribute as CFString)
-    if observed?.location == 0 && observed?.length == expected.utf16.count { break }
+    observed = canonicalSelection(writingSurface)
+    observedSelectionWitness = editorSelectionWitness()
+    focused = (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true
+    if let current = observed,
+       current.value == expected,
+       current.canonical.location == 0,
+       current.canonical.length == expected.utf16.count,
+       focused,
+       bool(observedSelectionWitness, "available"),
+       !bool(observedSelectionWitness, "empty"),
+       bool(observedSelectionWitness, "all_visible_text"),
+       let epoch = (observedSelectionWitness?["epoch"] as? NSNumber)?.intValue {
+        if exactSelectionEpoch != epoch {
+            exactSelectionEpoch = epoch
+            exactSelectionSince = Date()
+        }
+        if let exactSelectionSince,
+           Date().timeIntervalSince(exactSelectionSince) >= 0.25 { break }
+    } else {
+        exactSelectionSince = nil
+        exactSelectionEpoch = nil
+        if Date() >= nextDispatch {
+            guard AXUIElementSetAttributeValue(
+                writingSurface,
+                kAXFocusedAttribute as CFString,
+                kCFBooleanTrue
+            ) == .success,
+                  let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+                fputs("could not refocus Loom's exact editor for Select-All\n", stderr)
+                exit(1)
+            }
+            down.flags = [.maskCommand]
+            up.flags = [.maskCommand]
+            down.postToPid(pid)
+            Thread.sleep(forTimeInterval: 0.03)
+            up.postToPid(pid)
+            dispatchCount += 1
+            nextDispatch = Date().addingTimeInterval(0.4)
+        }
+    }
     Thread.sleep(forTimeInterval: 0.05)
 } while Date() < deadline
-guard let observed, observed.location == 0, observed.length == expected.utf16.count else {
-    fputs("Loom's exact editor did not retain the full manuscript selection\n", stderr)
+guard let observed,
+      observed.value == expected,
+      observed.canonical.location == 0,
+      observed.canonical.length == expected.utf16.count,
+      focused,
+      bool(observedSelectionWitness, "available"),
+      !bool(observedSelectionWitness, "empty"),
+      bool(observedSelectionWitness, "all_visible_text"),
+      let exactSelectionSince,
+      Date().timeIntervalSince(exactSelectionSince) >= 0.25,
+      exactSelectionEpoch == (observedSelectionWitness?["epoch"] as? NSNumber)?.intValue,
+      let observedSelectionWitness else {
+    let location = observed?.canonical.location ?? -1
+    let length = observed?.canonical.length ?? -1
+    let rawLocation = observed?.raw.location ?? -1
+    let rawLength = observed?.raw.length ?? -1
+    fputs(
+        "Loom's exact editor did not retain the full internal manuscript selection " +
+        "(focused=\(focused), selection=\(location):\(length), " +
+        "raw=\(rawLocation):\(rawLength), " +
+        "internal_selection=\(String(describing: observedSelectionWitness)))\n",
+        stderr
+    )
     exit(1)
 }
 let evidence: [String: Any] = [
     "dispatch": "PID-targeted Command-A",
-    "selection": ["location": observed.location, "length": observed.length]
+    "dispatch_count": dispatchCount,
+    "selection": [
+        "location": observed.canonical.location,
+        "length": observed.canonical.length,
+        "raw_location": observed.raw.location,
+        "raw_length": observed.raw.length,
+        "terminal_line_break_utf16": observed.terminalLineBreakUtf16
+    ],
+    "internal_selection": observedSelectionWitness
 ]
 let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
 print(String(data: data, encoding: .utf8)!)
@@ -1213,57 +1609,164 @@ func withoutTerminalLineBreaks(_ value: String) -> String {
     return normalized
 }
 
+struct CanonicalSelection {
+    let raw: CFRange
+    let canonical: CFRange
+    let terminalLineBreakUtf16: Int
+}
+
+func canonicalSelection(_ element: AXUIElement) -> CanonicalSelection? {
+    guard let raw = rangeAttribute(element, kAXSelectedTextRangeAttribute as CFString),
+          let rawValue = attribute(element, kAXValueAttribute as CFString) as? String else {
+        return nil
+    }
+    let canonicalValue = withoutTerminalLineBreaks(rawValue)
+    let canonicalValueUtf16 = canonicalValue.utf16.count
+    let canonicalLocation = min(max(raw.location, 0), canonicalValueUtf16)
+    let rawEnd = max(raw.location, 0) + max(raw.length, 0)
+    let canonicalEnd = min(max(rawEnd, canonicalLocation), canonicalValueUtf16)
+    return CanonicalSelection(
+        raw: raw,
+        canonical: CFRange(
+            location: canonicalLocation,
+            length: canonicalEnd - canonicalLocation
+        ),
+        terminalLineBreakUtf16: rawValue.utf16.count - canonicalValueUtf16
+    )
+}
+
+func descendants() -> [AXUIElement] {
+    var queue = [application]
+    var cursor = 0
+    while cursor < queue.count && cursor < 4096 {
+        let element = queue[cursor]
+        cursor += 1
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    return queue
+}
+
+func strings(_ element: AXUIElement) -> [String] {
+    [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
+        .compactMap { attribute(element, $0 as CFString) as? String }
+}
+
+func jsonObject(in text: String, schema: String) -> [String: Any]? {
+    guard let schemaRange = text.range(of: "\"schema\":\"\(schema)\"") else { return nil }
+    let prefix = text[..<schemaRange.lowerBound]
+    guard let open = prefix.lastIndex(of: "{"),
+          let close = text.lastIndex(of: "}"),
+          open <= close,
+          let data = String(text[open...close]).data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          object["schema"] as? String == schema else { return nil }
+    return object
+}
+
+func editorSelectionWitness() -> [String: Any]? {
+    descendants().flatMap { element in
+        strings(element).compactMap { value in
+            jsonObject(in: value, schema: "delysis.loom-completion-witness.v1")
+        }
+    }.compactMap { $0["editor_selection"] as? [String: Any] }.max { left, right in
+        ((left["epoch"] as? NSNumber)?.intValue ?? -1) <
+            ((right["epoch"] as? NSNumber)?.intValue ?? -1)
+    }
+}
+
+func bool(_ object: [String: Any]?, _ key: String) -> Bool {
+    object?[key] as? Bool ?? false
+}
+
+func integer(_ object: [String: Any]?, _ key: String) -> Int? {
+    (object?[key] as? NSNumber)?.intValue
+}
+
+func selectionMatches(
+    _ witness: [String: Any]?,
+    _ selection: CanonicalSelection?
+) -> Bool {
+    guard bool(witness, "available"),
+          integer(witness, "epoch") != nil,
+          let selection else { return false }
+    switch selectionMode {
+    case "caret-end":
+        return bool(witness, "empty") &&
+            bool(witness, "caret_at_end") &&
+            integer(witness, "caret_byte_offset") != nil &&
+            selection.canonical.location == expected.utf16.count &&
+            selection.canonical.length == 0
+    case "select-all":
+        return !bool(witness, "empty") &&
+            bool(witness, "all_visible_text") &&
+            selection.canonical.location == 0 &&
+            selection.canonical.length == expected.utf16.count
+    default:
+        return true
+    }
+}
+
 let deadline = Date().addingTimeInterval(12)
 var writingSurface: AXUIElement?
 var observedValue = ""
-var observedSelection: CFRange?
+var observedSelection: CanonicalSelection?
+var observedSelectionWitness: [String: Any]?
 var focused = false
+var exactSelectionSince: Date?
+var exactSelectionEpoch: Int?
 repeat {
     writingSurface = editor()
     if let current = writingSurface {
         observedValue = withoutTerminalLineBreaks(
             (attribute(current, kAXValueAttribute as CFString) as? String) ?? ""
         )
-        observedSelection = rangeAttribute(current, kAXSelectedTextRangeAttribute as CFString)
+        observedSelection = canonicalSelection(current)
+        observedSelectionWitness = editorSelectionWitness()
         focused = (attribute(current, kAXFocusedAttribute as CFString) as? Bool) == true
     } else {
         observedValue = ""
         observedSelection = nil
+        observedSelectionWitness = nil
         focused = false
     }
-    let selectionMatches: Bool
-    switch selectionMode {
-    case "caret-end":
-        selectionMatches = observedSelection?.location == expected.utf16.count && observedSelection?.length == 0
-    case "select-all":
-        selectionMatches = observedSelection?.location == 0 && observedSelection?.length == expected.utf16.count
-    default:
-        selectionMatches = observedSelection != nil
+    if observedValue == expected,
+       focused,
+       selectionMatches(observedSelectionWitness, observedSelection),
+       let epoch = integer(observedSelectionWitness, "epoch") {
+        if exactSelectionEpoch != epoch {
+            exactSelectionEpoch = epoch
+            exactSelectionSince = Date()
+        }
+        if let exactSelectionSince,
+           Date().timeIntervalSince(exactSelectionSince) >= 0.25 { break }
+    } else {
+        exactSelectionSince = nil
+        exactSelectionEpoch = nil
     }
-    if observedValue == expected && focused && selectionMatches { break }
     Thread.sleep(forTimeInterval: 0.05)
 } while Date() < deadline
 
-let selectionMatches: Bool
-switch selectionMode {
-case "caret-end":
-    selectionMatches = observedSelection?.location == expected.utf16.count && observedSelection?.length == 0
-case "select-all":
-    selectionMatches = observedSelection?.location == 0 && observedSelection?.length == expected.utf16.count
-default:
-    selectionMatches = observedSelection != nil
-}
 guard writingSurface != nil,
       observedValue == expected,
       focused,
-      selectionMatches,
-      let observedSelection else {
-    let location = observedSelection?.location ?? -1
-    let length = observedSelection?.length ?? -1
+      selectionMatches(observedSelectionWitness, observedSelection),
+      let exactSelectionSince,
+      Date().timeIntervalSince(exactSelectionSince) >= 0.25,
+      exactSelectionEpoch == integer(observedSelectionWitness, "epoch"),
+      let observedSelection,
+      let observedSelectionWitness else {
+    let location = observedSelection?.canonical.location ?? -1
+    let length = observedSelection?.canonical.length ?? -1
+    let rawLocation = observedSelection?.raw.location ?? -1
+    let rawLength = observedSelection?.raw.length ?? -1
     fputs(
         "Loom's live AX editor diverged from the exact canonical manuscript or lost focus/selection " +
         "(value=\(String(reflecting: observedValue)), expected=\(String(reflecting: expected)), " +
-        "focused=\(focused), selection=\(location):\(length), mode=\(selectionMode))\n",
+        "focused=\(focused), selection=\(location):\(length), " +
+        "raw_selection=\(rawLocation):\(rawLength), mode=\(selectionMode), " +
+        "internal_selection=\(String(describing: observedSelectionWitness)))\n",
         stderr
     )
     exit(1)
@@ -1272,7 +1775,14 @@ let evidence: [String: Any] = [
     "canonical_editor_value": observedValue,
     "focused": true,
     "selection_mode": selectionMode,
-    "selection": ["location": observedSelection.location, "length": observedSelection.length]
+    "selection": [
+        "location": observedSelection.canonical.location,
+        "length": observedSelection.canonical.length,
+        "raw_location": observedSelection.raw.location,
+        "raw_length": observedSelection.raw.length,
+        "terminal_line_break_utf16": observedSelection.terminalLineBreakUtf16
+    ],
+    "internal_selection": observedSelectionWitness
 ]
 let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
 print(String(data: data, encoding: .utf8)!)
@@ -1350,18 +1860,26 @@ SWIFT
 wait_for_loom_accessibility_text() {
   target_pid=$1
   expected=$2
-  generation_failure=${3:-}
-  project_busy_failure=${4:-}
+  expected_manuscript=$3
+  generation_failure=${4:-}
+  project_busy_failure=${5:-}
   xcrun swift - \
-    "$target_pid" "$expected" "$generation_failure" "$project_busy_failure" <<'SWIFT'
+    "$target_pid" "$expected" "$expected_manuscript" \
+    "$generation_failure" "$project_busy_failure" <<'SWIFT'
+import AppKit
 import ApplicationServices
 import Foundation
 
 let pid = Int32(CommandLine.arguments[1])!
 let expected = CommandLine.arguments[2]
-let asynchronousFailurePaths = [CommandLine.arguments[3], CommandLine.arguments[4]]
+let expectedManuscript = CommandLine.arguments[3]
+let asynchronousFailurePaths = [CommandLine.arguments[4], CommandLine.arguments[5]]
     .filter { !$0.isEmpty }
 let application = AXUIElementCreateApplication(pid)
+guard let runningApplication = NSRunningApplication(processIdentifier: pid) else {
+    fputs("Loom's exact completion process exited before visible-presentation focus\n", stderr)
+    exit(1)
+}
 
 func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
     var value: CFTypeRef?
@@ -1369,10 +1887,132 @@ func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
     return value
 }
 
+func rangeAttribute(_ element: AXUIElement, _ name: CFString) -> CFRange? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else {
+        return nil
+    }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cfRange else { return nil }
+    var range = CFRange()
+    return AXValueGetValue(value, .cfRange, &range) ? range : nil
+}
+
+func withoutTerminalLineBreaks(_ value: String) -> String {
+    var normalized = value
+    while normalized.last == "\n" || normalized.last == "\r" { normalized.removeLast() }
+    return normalized
+}
+
+func editor() -> AXUIElement? {
+    var queue = [application]
+    var cursor = 0
+    while cursor < queue.count && cursor < 4096 {
+        let element = queue[cursor]
+        cursor += 1
+        if (attribute(element, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String {
+            return element
+        }
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    return nil
+}
+
+func editorStateIsExact(_ writingSurface: AXUIElement) -> Bool {
+    let observed = withoutTerminalLineBreaks(
+        (attribute(writingSurface, kAXValueAttribute as CFString) as? String) ?? ""
+    )
+    let selection = rangeAttribute(
+        writingSurface,
+        kAXSelectedTextRangeAttribute as CFString
+    )
+    // WebKit may append a connected ProseMirror decoration to AXValue even
+    // when that widget is aria-hidden and absent from canonical manuscript
+    // bytes. The exact end-caret plus canonical prefix distinguishes that
+    // presentation-only suffix from an editor or persistence divergence.
+    return NSWorkspace.shared.frontmostApplication?.processIdentifier == pid &&
+        (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true &&
+        observed.hasPrefix(expectedManuscript) &&
+        selection?.location == expectedManuscript.utf16.count &&
+        selection?.length == 0
+}
+
+func exactEditorFocusIsCurrent() -> Bool {
+    guard let writingSurface = editor() else { return false }
+    return editorStateIsExact(writingSurface)
+}
+
+func exactEditorFocusDiagnostic() -> String {
+    guard let writingSurface = editor() else {
+        return "editor=missing,frontmost_pid=\(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1)"
+    }
+    let observed = withoutTerminalLineBreaks(
+        (attribute(writingSurface, kAXValueAttribute as CFString) as? String) ?? ""
+    )
+    let selection = rangeAttribute(
+        writingSurface,
+        kAXSelectedTextRangeAttribute as CFString
+    )
+    let focused = (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true
+    return [
+        "frontmost_pid=\(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1)",
+        "focused=\(focused)",
+        "value_has_canonical_prefix=\(observed.hasPrefix(expectedManuscript))",
+        "selection=\(selection?.location ?? -1):\(selection?.length ?? -1)",
+        "expected_selection=\(expectedManuscript.utf16.count):0"
+    ].joined(separator: ",")
+}
+
+func restoreExactEditorFocus() -> Bool {
+    // `activate` may report false when another running instance has the same
+    // bundle identifier even though the exact process can still become active.
+    // AXFrontmost is PID-bound and is the authoritative activation operation.
+    _ = runningApplication.activate(options: [.activateAllWindows])
+    guard AXUIElementSetAttributeValue(
+            application,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+          ) == .success,
+          let writingSurface = editor(),
+          AXUIElementSetAttributeValue(
+            writingSurface,
+            kAXFocusedAttribute as CFString,
+            kCFBooleanTrue
+          ) == .success else {
+        return false
+    }
+    Thread.sleep(forTimeInterval: 0.05)
+    return editorStateIsExact(writingSurface)
+}
+
+let focusDeadline = Date().addingTimeInterval(12)
+var exactEditorFocused = false
+repeat {
+    exactEditorFocused = restoreExactEditorFocus()
+    if exactEditorFocused { break }
+    Thread.sleep(forTimeInterval: 0.05)
+} while Date() < focusDeadline
+guard exactEditorFocused else {
+    fputs(
+        "Loom did not restore exact foreground editor focus before visible completion proof " +
+        "(\(exactEditorFocusDiagnostic()))\n",
+        stderr
+    )
+    exit(1)
+}
+
 for _ in 0..<1800 {
     if asynchronousFailurePaths.contains(where: { FileManager.default.fileExists(atPath: $0) }) {
         fputs("Loom failed an asynchronous generation or project_busy guard before the required accessible state\n", stderr)
         exit(1)
+    }
+    // Packaged smoke owns the visible interaction interval. Reassert the exact
+    // PID and canonical caret periodically so another same-bundle window cannot
+    // turn the focus-gated ghost requirement into a false negative.
+    if !exactEditorFocusIsCurrent() && !restoreExactEditorFocus() {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
     }
     var queue = [application]
     var cursor = 0
@@ -1692,6 +2332,1322 @@ stop_loom_generation_guard() {
   fi
 }
 
+start_loom_live_streaming_monitor() {
+  target_pid=$1
+  database=$2
+  baseline=$3
+  expected_manuscript=$4
+  monitor_name=$5
+  generation_failure=$6
+  project_busy_failure=$7
+  LOOM_LIVE_STREAM_MONITOR_STOP="$SMOKE_ROOT/$monitor_name.stop"
+  LOOM_LIVE_STREAM_MONITOR_READY="$SMOKE_ROOT/$monitor_name.ready"
+  LOOM_LIVE_STREAM_MONITOR_FAILURE="$SMOKE_ROOT/$monitor_name.failure.json"
+  LOOM_LIVE_STREAM_MONITOR_OUTPUT="$SMOKE_ROOT/$monitor_name.evidence.json"
+  LOOM_LIVE_STREAM_MONITOR_ERROR="$SMOKE_ROOT/$monitor_name.stderr.log"
+  rm -f \
+    "$LOOM_LIVE_STREAM_MONITOR_STOP" \
+    "$LOOM_LIVE_STREAM_MONITOR_READY" \
+    "$LOOM_LIVE_STREAM_MONITOR_FAILURE" \
+    "$LOOM_LIVE_STREAM_MONITOR_OUTPUT" \
+    "$LOOM_LIVE_STREAM_MONITOR_ERROR"
+  xcrun swift - \
+    "$target_pid" "$database" "$baseline" "$expected_manuscript" \
+    "$LOOM_LIVE_STREAM_MONITOR_STOP" "$LOOM_LIVE_STREAM_MONITOR_READY" \
+    "$LOOM_LIVE_STREAM_MONITOR_FAILURE" "$generation_failure" \
+    "$project_busy_failure" \
+    >"$LOOM_LIVE_STREAM_MONITOR_OUTPUT" \
+    2>"$LOOM_LIVE_STREAM_MONITOR_ERROR" <<'SWIFT' &
+import AppKit
+import ApplicationServices
+import CryptoKit
+import Foundation
+import SQLite3
+
+let pid = Int32(CommandLine.arguments[1])!
+let databasePath = CommandLine.arguments[2]
+let baseline = Int64(CommandLine.arguments[3])!
+let expectedManuscript = CommandLine.arguments[4]
+let stopPath = CommandLine.arguments[5]
+let readyPath = CommandLine.arguments[6]
+let failurePath = CommandLine.arguments[7]
+let asynchronousFailurePaths = [CommandLine.arguments[8], CommandLine.arguments[9]]
+    .filter { !$0.isEmpty }
+let manager = FileManager.default
+let application = AXUIElementCreateApplication(pid)
+guard let runningApplication = NSRunningApplication(processIdentifier: pid) else {
+    fputs("Loom's exact process exited before the live-stream observer initialized\n", stderr)
+    exit(1)
+}
+
+var database: OpaquePointer?
+guard sqlite3_open_v2(
+        databasePath,
+        &database,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+        nil
+      ) == SQLITE_OK,
+      let database else {
+    fputs("could not open Loom's isolated generation store read-only\n", stderr)
+    exit(1)
+}
+defer { sqlite3_close(database) }
+let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+func sha256(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
+    return value
+}
+
+func rangeAttribute(_ element: AXUIElement, _ name: CFString) -> CFRange? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else {
+        return nil
+    }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cfRange else { return nil }
+    var range = CFRange()
+    return AXValueGetValue(value, .cfRange, &range) ? range : nil
+}
+
+func strings(_ element: AXUIElement) -> [String] {
+    [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
+        .compactMap { attribute(element, $0 as CFString) as? String }
+}
+
+func descendants() -> [AXUIElement] {
+    var queue = [application]
+    var cursor = 0
+    while cursor < queue.count && cursor < 4096 {
+        let element = queue[cursor]
+        cursor += 1
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    return queue
+}
+
+func jsonObject(in text: String, schema: String) -> [String: Any]? {
+    guard let schemaRange = text.range(of: "\"schema\":\"\(schema)\"") else { return nil }
+    let prefix = text[..<schemaRange.lowerBound]
+    guard let open = prefix.lastIndex(of: "{"),
+          let close = text.lastIndex(of: "}"),
+          open <= close,
+          let data = String(text[open...close]).data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          object["schema"] as? String == schema else { return nil }
+    return object
+}
+
+func string(_ object: [String: Any], _ key: String) -> String {
+    object[key] as? String ?? ""
+}
+
+func integer(_ object: [String: Any], _ key: String) -> Int {
+    (object[key] as? NSNumber)?.intValue ?? -1
+}
+
+func bool(_ object: [String: Any], _ key: String) -> Bool {
+    object[key] as? Bool ?? false
+}
+
+func withoutTerminalLineBreaks(_ value: String) -> String {
+    var normalized = value
+    while normalized.last == "\n" || normalized.last == "\r" { normalized.removeLast() }
+    return normalized
+}
+
+func prepare(_ sql: String) -> OpaquePointer? {
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+        return nil
+    }
+    return statement
+}
+
+func scalarInt(_ sql: String, bindOffset: Bool = false) -> Int64? {
+    guard let statement = prepare(sql) else { return nil }
+    defer { sqlite3_finalize(statement) }
+    if bindOffset { sqlite3_bind_int64(statement, 1, baseline) }
+    guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+    return sqlite3_column_int64(statement, 0)
+}
+
+func generationCount() -> Int64? {
+    scalarInt("SELECT count(*) FROM generation_runs;")
+}
+
+func familyRunIds() -> [String]? {
+    guard let statement = prepare(
+        "SELECT run_id FROM generation_runs ORDER BY created_at_ms, run_id LIMIT 4 OFFSET ?1;"
+    ) else { return nil }
+    defer { sqlite3_finalize(statement) }
+    sqlite3_bind_int64(statement, 1, baseline)
+    var runIds: [String] = []
+    while sqlite3_step(statement) == SQLITE_ROW {
+        guard let raw = sqlite3_column_text(statement, 0) else { return nil }
+        runIds.append(String(cString: raw))
+    }
+    return runIds
+}
+
+func openFamilyRunIds() -> [String]? {
+    guard let statement = prepare(
+        "WITH family AS (SELECT run_id, created_at_ms FROM generation_runs " +
+        "ORDER BY created_at_ms, run_id LIMIT 4 OFFSET ?1) " +
+        "SELECT f.run_id FROM family f LEFT JOIN generation_terminals t ON t.run_id = f.run_id " +
+        "WHERE t.run_id IS NULL ORDER BY f.created_at_ms, f.run_id;"
+    ) else { return nil }
+    defer { sqlite3_finalize(statement) }
+    sqlite3_bind_int64(statement, 1, baseline)
+    var runIds: [String] = []
+    while sqlite3_step(statement) == SQLITE_ROW {
+        guard let raw = sqlite3_column_text(statement, 0) else { return nil }
+        runIds.append(String(cString: raw))
+    }
+    return runIds
+}
+
+func selectedRunIsTerminal(_ runId: String) -> Bool? {
+    guard let statement = prepare(
+        "SELECT count(*) FROM generation_terminals WHERE run_id = ?1;"
+    ) else { return nil }
+    defer { sqlite3_finalize(statement) }
+    sqlite3_bind_text(statement, 1, runId, -1, sqliteTransient)
+    guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+    return sqlite3_column_int64(statement, 0) != 0
+}
+
+func cumulativeText(_ runId: String, through sequence: Int64) -> String? {
+    guard let statement = prepare(
+        "SELECT sequence, payload_json FROM generation_events " +
+        "WHERE run_id = ?1 AND event_kind = 'text_delta' AND sequence <= ?2 " +
+        "ORDER BY sequence;"
+    ) else { return nil }
+    defer { sqlite3_finalize(statement) }
+    sqlite3_bind_text(statement, 1, runId, -1, sqliteTransient)
+    sqlite3_bind_int64(statement, 2, sequence)
+    var text = ""
+    var exactSequenceObserved = false
+    while sqlite3_step(statement) == SQLITE_ROW {
+        let observedSequence = sqlite3_column_int64(statement, 0)
+        guard let raw = sqlite3_column_text(statement, 1),
+              let data = String(cString: raw).data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              payload["kind"] as? String == "text_delta",
+              let delta = payload["text"] as? String else { return nil }
+        text += delta
+        if observedSequence == sequence { exactSequenceObserved = true }
+    }
+    return exactSequenceObserved ? text : nil
+}
+
+func fail(_ reason: String, _ detail: [String: Any] = [:]) -> Never {
+    var evidence = detail
+    evidence["schema"] = "delysis.loom-live-stream-failure.v1"
+    evidence["pid"] = pid
+    evidence["reason"] = reason
+    evidence["observed_at_ms"] = Int64(Date().timeIntervalSince1970 * 1_000)
+    if JSONSerialization.isValidJSONObject(evidence),
+       let data = try? JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys]) {
+        try? data.write(to: URL(fileURLWithPath: failurePath), options: [.atomic])
+    }
+    fputs("Loom live-stream witness failed: \(reason)\n", stderr)
+    exit(42)
+}
+
+let expectedCount = baseline + 4
+let expectedManuscriptUtf8Bytes = expectedManuscript.lengthOfBytes(using: .utf8)
+let deadlineUptime = ProcessInfo.processInfo.systemUptime + 120
+var polls = 0
+_ = manager.createFile(atPath: readyPath, contents: Data())
+
+while ProcessInfo.processInfo.systemUptime < deadlineUptime {
+    polls += 1
+    if manager.fileExists(atPath: stopPath) {
+        fail("observer_stopped_before_live_witness", ["polls": polls])
+    }
+    if asynchronousFailurePaths.contains(where: { manager.fileExists(atPath: $0) }) {
+        fail("asynchronous_guard_failed", ["polls": polls])
+    }
+    guard !runningApplication.isTerminated else {
+        fail("exact_process_exited", ["polls": polls])
+    }
+    guard let count = generationCount() else {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+    if count > expectedCount {
+        fail("unexpected_generation_run", ["generation_run_count": count, "polls": polls])
+    }
+    if count != expectedCount {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+    guard let durableFamilyRunIds = familyRunIds(), durableFamilyRunIds.count == 4,
+          Set(durableFamilyRunIds).count == 4,
+          let openBeforeAccessibility = openFamilyRunIds() else {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+    if openBeforeAccessibility.isEmpty {
+        fail("family_terminal_before_live_witness", [
+            "family_run_ids": durableFamilyRunIds,
+            "generation_run_count": count,
+            "polls": polls
+        ])
+    }
+
+    _ = runningApplication.activate(options: [.activateAllWindows])
+    _ = AXUIElementSetAttributeValue(
+        application,
+        kAXFrontmostAttribute as CFString,
+        kCFBooleanTrue
+    )
+    let elements = descendants()
+    guard let writingSurface = elements.first(where: {
+              (attribute($0, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String
+          }) else {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+    _ = AXUIElementSetAttributeValue(
+        writingSurface,
+        kAXFocusedAttribute as CFString,
+        kCFBooleanTrue
+    )
+    guard let witness = elements.lazy.compactMap({ element in
+              strings(element).lazy.compactMap({ value in
+                  jsonObject(in: value, schema: "delysis.loom-completion-witness.v1")
+              }).first
+          }).first,
+          string(witness, "mode") == "visual",
+          bool(witness, "session_cached"),
+          bool(witness, "autocomplete_enabled"),
+          !bool(witness, "shuttle_enabled"),
+          integer(witness, "accepted_chunk_count") == 0,
+          !bool(witness, "authority_frozen") else {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+    let selectedRunId = string(witness, "selected_run_id")
+    let selectedCandidateId = string(witness, "selected_candidate_id")
+    let selectedPresentationKey = string(witness, "selected_presentation_key")
+    let renderedPresentationKey = string(witness, "rendered_presentation_key")
+    let inlineVisibleKey = string(witness, "inline_visible_key")
+    let candidates = witness["candidates"] as? [[String: Any]] ?? []
+    let visual = witness["visual"] as? [String: Any] ?? [:]
+    guard !selectedRunId.isEmpty,
+          durableFamilyRunIds.contains(selectedRunId),
+          !selectedPresentationKey.isEmpty,
+          selectedPresentationKey == renderedPresentationKey,
+          selectedPresentationKey == inlineVisibleKey,
+          bool(visual, "available"),
+          !bool(visual, "inlineHidden"),
+          !bool(visual, "fanVisible"),
+          string(visual, "selectedCandidateId") == selectedCandidateId,
+          string(visual, "selectedPresentationKey") == selectedPresentationKey,
+          let selectedCandidate = candidates.first(where: {
+              string($0, "run_id") == selectedRunId &&
+                  string($0, "candidate_id") == selectedCandidateId
+          }) else {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+    let candidateUtf8Bytes = integer(selectedCandidate, "text_utf8_bytes")
+    let targetByte = integer(selectedCandidate, "target_byte")
+    guard candidateUtf8Bytes > 0,
+          targetByte == expectedManuscriptUtf8Bytes,
+          selectedPresentationKey.hasPrefix("stream:\(selectedRunId):") else {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+    let sequenceSuffix = selectedPresentationKey.dropFirst("stream:\(selectedRunId):".count)
+    guard let sequenceText = sequenceSuffix.split(separator: ":").first.map(String.init),
+          let streamSequence = Int64(sequenceText), streamSequence >= 0 else {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+    if let prosePrefixMarker = selectedPresentationKey.range(of: ":prose-prefix:"),
+       Int(selectedPresentationKey[prosePrefixMarker.upperBound...]) != candidateUtf8Bytes {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+
+    let observedEditorValue = withoutTerminalLineBreaks(
+        (attribute(writingSurface, kAXValueAttribute as CFString) as? String) ?? ""
+    )
+    let selection = rangeAttribute(writingSurface, kAXSelectedTextRangeAttribute as CFString)
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+          (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
+          observedEditorValue.hasPrefix(expectedManuscript),
+          selection?.location == expectedManuscript.utf16.count,
+          selection?.length == 0 else {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+    let visibleSuffix = String(observedEditorValue.dropFirst(expectedManuscript.count))
+    let visibleSuffixData = Data(visibleSuffix.utf8)
+    guard visibleSuffixData.count == candidateUtf8Bytes,
+          visibleSuffix.rangeOfCharacter(from: .whitespacesAndNewlines.inverted) != nil,
+          let durableCumulativeText = cumulativeText(selectedRunId, through: streamSequence),
+          durableCumulativeText.hasPrefix(visibleSuffix) else {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+
+    // generation_terminals is append-only. Observing no terminal only after
+    // the exact AX snapshot proves this visible text existed pre-terminal;
+    // sampling the table first would leave a race that could certify stale UI.
+    guard let selectedTerminalAfterAccessibility = selectedRunIsTerminal(selectedRunId),
+          let openAfterAccessibility = openFamilyRunIds() else {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+    guard !selectedTerminalAfterAccessibility,
+          openAfterAccessibility.contains(selectedRunId) else {
+        Thread.sleep(forTimeInterval: 0.05)
+        continue
+    }
+
+    let durableCumulativeData = Data(durableCumulativeText.utf8)
+    let evidence: [String: Any] = [
+        "schema": "delysis.loom-live-stream-witness.v1",
+        "pid": pid,
+        "database": databasePath,
+        "baseline_generation_runs": baseline,
+        "generation_run_count": count,
+        "family_run_ids": durableFamilyRunIds,
+        "open_run_ids_after_accessibility": openAfterAccessibility,
+        "terminal_count_after_accessibility": 4 - openAfterAccessibility.count,
+        "selected_run_id": selectedRunId,
+        "selected_candidate_id": selectedCandidateId,
+        "presentation_key": selectedPresentationKey,
+        "stream_sequence": sequenceText,
+        "candidate_utf8_bytes": candidateUtf8Bytes,
+        "durable_cumulative_utf8_bytes": durableCumulativeData.count,
+        "durable_cumulative_sha256": sha256(durableCumulativeData),
+        "visible_suffix_utf8_bytes": visibleSuffixData.count,
+        "visible_suffix_sha256": sha256(visibleSuffixData),
+        "visible_suffix_is_durable_leading_projection": true,
+        "selected_run_terminal_after_accessibility": false,
+        "mode": "visual",
+        "inline_visible_key": inlineVisibleKey,
+        "visual_editor_presentation_key": string(visual, "selectedPresentationKey"),
+        "frontmost_pid": pid,
+        "editor_focused": true,
+        "caret_utf16": selection!.location,
+        "expected_caret_utf16": expectedManuscript.utf16.count,
+        "polls": polls,
+        "observed_at_ms": Int64(Date().timeIntervalSince1970 * 1_000)
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+    exit(0)
+}
+
+let timeoutGenerationCount = generationCount()
+let timeoutOpenRunIds = openFamilyRunIds()
+fail("live_witness_timeout", [
+    "generation_run_count": timeoutGenerationCount ?? -1,
+    "open_run_ids": timeoutOpenRunIds ?? [],
+    "polls": polls
+])
+SWIFT
+  LOOM_LIVE_STREAM_MONITOR_PID=$!
+
+  live_monitor_attempt=0
+  while [ "$live_monitor_attempt" -lt 400 ]; do
+    if [ -f "$LOOM_LIVE_STREAM_MONITOR_READY" ]; then
+      return 0
+    fi
+    if [ -f "$LOOM_LIVE_STREAM_MONITOR_FAILURE" ] ||
+      ! kill -0 "$LOOM_LIVE_STREAM_MONITOR_PID" 2>/dev/null; then
+      cat "$LOOM_LIVE_STREAM_MONITOR_FAILURE" >&2 2>/dev/null || true
+      cat "$LOOM_LIVE_STREAM_MONITOR_ERROR" >&2 2>/dev/null || true
+      return 1
+    fi
+    live_monitor_attempt=$((live_monitor_attempt + 1))
+    sleep 0.05
+  done
+  echo "Loom live-stream observer did not become ready before generation" >&2
+  return 1
+}
+
+wait_for_loom_live_streaming_monitor() {
+  if wait "$LOOM_LIVE_STREAM_MONITOR_PID"; then
+    live_monitor_status=0
+  else
+    live_monitor_status=$?
+  fi
+  LOOM_LIVE_STREAM_MONITOR_PID=
+  if [ "$live_monitor_status" -ne 0 ] || [ -f "$LOOM_LIVE_STREAM_MONITOR_FAILURE" ]; then
+    cat "$LOOM_LIVE_STREAM_MONITOR_FAILURE" >&2 2>/dev/null || true
+    cat "$LOOM_LIVE_STREAM_MONITOR_ERROR" >&2 2>/dev/null || true
+    return 1
+  fi
+  if [ ! -s "$LOOM_LIVE_STREAM_MONITOR_OUTPUT" ]; then
+    echo "Loom live-stream observer produced no pre-terminal evidence" >&2
+    return 1
+  fi
+}
+
+exercise_loom_idle_resume_ghost() {
+  target_pid=$1
+  database=$2
+  baseline=$3
+  expected_manuscript=$4
+  generation_failure=$5
+  project_busy_failure=$6
+  identity_failure_path=$7
+  xcrun swift - \
+    "$target_pid" "$database" "$baseline" "$expected_manuscript" \
+    "$generation_failure" "$project_busy_failure" "$identity_failure_path" <<'SWIFT'
+import AppKit
+import ApplicationServices
+import CryptoKit
+import Foundation
+import SQLite3
+
+let pid = Int32(CommandLine.arguments[1])!
+let databasePath = CommandLine.arguments[2]
+let baseline = Int64(CommandLine.arguments[3])!
+let expectedManuscript = CommandLine.arguments[4]
+let asynchronousFailurePaths = [CommandLine.arguments[5], CommandLine.arguments[6]]
+    .filter { !$0.isEmpty }
+let identityFailurePath = CommandLine.arguments[7]
+let application = AXUIElementCreateApplication(pid)
+guard let runningApplication = NSRunningApplication(processIdentifier: pid) else {
+    fputs("Loom's exact process exited before the idle/resume witness\n", stderr)
+    exit(1)
+}
+guard let backgroundApplication = NSRunningApplication
+        .runningApplications(withBundleIdentifier: "com.apple.finder")
+        .first else {
+    fputs("Finder was unavailable as the native background-focus owner\n", stderr)
+    exit(1)
+}
+
+var database: OpaquePointer?
+guard sqlite3_open_v2(
+        databasePath,
+        &database,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+        nil
+      ) == SQLITE_OK,
+      let database else {
+    fputs("could not open Loom's isolated store for idle/resume evidence\n", stderr)
+    exit(1)
+}
+defer { sqlite3_close(database) }
+
+struct CandidateIdentity: Equatable {
+    let runId: String
+    let candidateId: String
+    let presentationKey: String
+    let targetByte: Int
+    let textUtf8Bytes: Int
+}
+
+struct DurableCandidateIdentity: Equatable {
+    let runId: String
+    let candidateId: String
+    let outputBlobId: String
+}
+
+struct GhostIdentity: Equatable {
+    let contextKey: String
+    let candidates: [CandidateIdentity]
+    let selectedRunId: String
+    let selectedCandidateId: String
+    let selectedPresentationKey: String
+    let inlineVisibleKey: String
+    let authorityFrozen: Bool
+    let visibleSuffixUtf8Bytes: Int
+    let visibleSuffixSha256: String
+}
+
+var lastObservedGhostIdentity: GhostIdentity?
+var lastRawGhostObservation: [String: Any]?
+
+func sha256(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
+    return value
+}
+
+func rangeAttribute(_ element: AXUIElement, _ name: CFString) -> CFRange? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else {
+        return nil
+    }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cfRange else { return nil }
+    var range = CFRange()
+    return AXValueGetValue(value, .cfRange, &range) ? range : nil
+}
+
+func strings(_ element: AXUIElement) -> [String] {
+    [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
+        .compactMap { attribute(element, $0 as CFString) as? String }
+}
+
+func descendants() -> [AXUIElement] {
+    var queue = [application]
+    var cursor = 0
+    while cursor < queue.count && cursor < 4096 {
+        let element = queue[cursor]
+        cursor += 1
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            queue.append(contentsOf: children)
+        }
+    }
+    return queue
+}
+
+func jsonObject(in text: String, schema: String) -> [String: Any]? {
+    guard let schemaRange = text.range(of: "\"schema\":\"\(schema)\"") else { return nil }
+    let prefix = text[..<schemaRange.lowerBound]
+    guard let open = prefix.lastIndex(of: "{"),
+          let close = text.lastIndex(of: "}"),
+          open <= close,
+          let data = String(text[open...close]).data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          object["schema"] as? String == schema else { return nil }
+    return object
+}
+
+func string(_ object: [String: Any], _ key: String) -> String {
+    object[key] as? String ?? ""
+}
+
+func integer(_ object: [String: Any], _ key: String) -> Int {
+    (object[key] as? NSNumber)?.intValue ?? -1
+}
+
+func bool(_ object: [String: Any], _ key: String) -> Bool {
+    object[key] as? Bool ?? false
+}
+
+func withoutTerminalLineBreaks(_ value: String) -> String {
+    var normalized = value
+    while normalized.last == "\n" || normalized.last == "\r" { normalized.removeLast() }
+    return normalized
+}
+
+func prepare(_ sql: String) -> OpaquePointer? {
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+        return nil
+    }
+    return statement
+}
+
+func generationCount() -> Int64? {
+    guard let statement = prepare("SELECT count(*) FROM generation_runs;") else { return nil }
+    defer { sqlite3_finalize(statement) }
+    guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+    return sqlite3_column_int64(statement, 0)
+}
+
+func familyRunIds() -> [String]? {
+    guard let statement = prepare(
+        "SELECT run_id FROM generation_runs ORDER BY created_at_ms, run_id LIMIT 4 OFFSET ?1;"
+    ) else { return nil }
+    defer { sqlite3_finalize(statement) }
+    sqlite3_bind_int64(statement, 1, baseline)
+    var runIds: [String] = []
+    while sqlite3_step(statement) == SQLITE_ROW {
+        guard let raw = sqlite3_column_text(statement, 0) else { return nil }
+        runIds.append(String(cString: raw))
+    }
+    return runIds
+}
+
+func familyTerminalCount() -> Int64? {
+    guard let statement = prepare(
+        "WITH family AS (SELECT run_id FROM generation_runs " +
+        "ORDER BY created_at_ms, run_id LIMIT 4 OFFSET ?1) " +
+        "SELECT count(*) FROM family JOIN generation_terminals USING (run_id);"
+    ) else { return nil }
+    defer { sqlite3_finalize(statement) }
+    sqlite3_bind_int64(statement, 1, baseline)
+    guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+    return sqlite3_column_int64(statement, 0)
+}
+
+func familyTerminalCandidates() -> [DurableCandidateIdentity]? {
+    guard let statement = prepare(
+        "WITH family AS (SELECT run_id FROM generation_runs " +
+        "ORDER BY created_at_ms, run_id LIMIT 4 OFFSET ?1) " +
+        "SELECT f.run_id, t.candidate_id, c.output_blob_id FROM family f " +
+        "JOIN generation_terminals t ON t.run_id = f.run_id AND t.status = 'completed' " +
+        "JOIN generation_candidates c ON c.run_id = f.run_id " +
+        "AND c.candidate_id = t.candidate_id ORDER BY f.run_id;"
+    ) else { return nil }
+    defer { sqlite3_finalize(statement) }
+    sqlite3_bind_int64(statement, 1, baseline)
+    var candidates: [DurableCandidateIdentity] = []
+    while sqlite3_step(statement) == SQLITE_ROW {
+        guard let rawRunId = sqlite3_column_text(statement, 0),
+              let rawCandidateId = sqlite3_column_text(statement, 1),
+              let rawOutputBlobId = sqlite3_column_text(statement, 2) else {
+            return nil
+        }
+        candidates.append(DurableCandidateIdentity(
+            runId: String(cString: rawRunId),
+            candidateId: String(cString: rawCandidateId),
+            outputBlobId: String(cString: rawOutputBlobId)
+        ))
+    }
+    return candidates
+}
+
+func presentationMatchesDurableCandidate(
+    _ candidate: CandidateIdentity,
+    _ durable: DurableCandidateIdentity
+) -> Bool {
+    let base = "\(durable.candidateId):\(durable.outputBlobId)"
+    return candidate.presentationKey == base ||
+        candidate.presentationKey == "\(base):prose-prefix:\(candidate.textUtf8Bytes)"
+}
+
+func ghostIdentityMatchesDurableFamily(
+    _ identity: GhostIdentity,
+    _ durableCandidates: [DurableCandidateIdentity]
+) -> Bool {
+    guard durableCandidates.count == 4,
+          Set(durableCandidates.map(\.runId)).count == 4,
+          Set(durableCandidates.map(\.candidateId)).count == 4,
+          identity.candidates.count == durableCandidates.count else {
+        return false
+    }
+    let durableByRun = Dictionary(
+        uniqueKeysWithValues: durableCandidates.map { ($0.runId, $0) }
+    )
+    return identity.candidates.allSatisfy { candidate in
+        guard let durable = durableByRun[candidate.runId] else { return false }
+        return candidate.candidateId == "run:\(candidate.runId)" &&
+            !candidate.presentationKey.hasPrefix("stream:") &&
+            presentationMatchesDurableCandidate(candidate, durable)
+    }
+}
+
+func candidateEvidence(_ candidates: [CandidateIdentity]) -> [[String: Any]] {
+    candidates.map {
+        [
+            "run_id": $0.runId,
+            "candidate_id": $0.candidateId,
+            "presentation_key": $0.presentationKey,
+            "target_byte": $0.targetByte,
+            "text_utf8_bytes": $0.textUtf8Bytes
+        ]
+    }
+}
+
+func durableCandidateEvidence(
+    _ candidates: [DurableCandidateIdentity]
+) -> [[String: Any]] {
+    candidates.map {
+        [
+            "run_id": $0.runId,
+            "terminal_candidate_id": $0.candidateId,
+            "output_blob_id": $0.outputBlobId
+        ]
+    }
+}
+
+func ghostIdentityEvidence(_ identity: GhostIdentity?) -> Any {
+    guard let identity else { return NSNull() }
+    return [
+        "context_key": identity.contextKey,
+        "candidates": candidateEvidence(identity.candidates),
+        "selected_run_id": identity.selectedRunId,
+        "selected_candidate_id": identity.selectedCandidateId,
+        "selected_presentation_key": identity.selectedPresentationKey,
+        "inline_visible_key": identity.inlineVisibleKey,
+        "authority_frozen": identity.authorityFrozen,
+        "visible_suffix_utf8_bytes": identity.visibleSuffixUtf8Bytes,
+        "visible_suffix_sha256": identity.visibleSuffixSha256
+    ] as [String: Any]
+}
+
+func jsonValue(_ value: Any?) -> Any {
+    value ?? NSNull()
+}
+
+func completionWitnessCore(_ witness: [String: Any]) -> [String: Any] {
+    let visual = witness["visual"] as? [String: Any] ?? [:]
+    let editorSelection = witness["editor_selection"] as? [String: Any] ?? [:]
+    let candidates = (witness["candidates"] as? [[String: Any]] ?? []).map {
+        [
+            "run_id": string($0, "run_id"),
+            "candidate_id": string($0, "candidate_id"),
+            "presentation_key": string($0, "presentation_key"),
+            "target_byte": integer($0, "target_byte"),
+            "text_utf8_bytes": integer($0, "text_utf8_bytes")
+        ] as [String: Any]
+    }
+    return [
+        "schema": string(witness, "schema"),
+        "mode": string(witness, "mode"),
+        "context_key": string(witness, "context_key"),
+        "session_cached": bool(witness, "session_cached"),
+        "family_count": integer(witness, "family_count"),
+        "candidates": candidates,
+        "selected_run_id": string(witness, "selected_run_id"),
+        "selected_candidate_id": string(witness, "selected_candidate_id"),
+        "selected_presentation_key": string(witness, "selected_presentation_key"),
+        "rendered_presentation_key": string(witness, "rendered_presentation_key"),
+        "inline_visible_key": string(witness, "inline_visible_key"),
+        "accepted_chunk_count": integer(witness, "accepted_chunk_count"),
+        "authority_frozen": bool(witness, "authority_frozen"),
+        "autocomplete_enabled": bool(witness, "autocomplete_enabled"),
+        "shuttle_enabled": bool(witness, "shuttle_enabled"),
+        "inline_hidden_requested": bool(witness, "inline_hidden_requested"),
+        "visual": [
+            "available": bool(visual, "available"),
+            "option_held": bool(visual, "optionHeld"),
+            "fan_visible": bool(visual, "fanVisible"),
+            "inline_hidden": bool(visual, "inlineHidden"),
+            "selected_candidate_id": string(visual, "selectedCandidateId"),
+            "selected_presentation_key": string(visual, "selectedPresentationKey"),
+            "alternative_candidate_ids": visual["alternativeCandidateIds"] as? [String] ?? [],
+            "alternative_presentation_keys": visual["alternativePresentationKeys"] as? [String] ?? [],
+            "alternative_run_ids": visual["alternativeRunIds"] as? [String] ?? []
+        ] as [String: Any],
+        "editor_selection": [
+            "available": bool(editorSelection, "available"),
+            "epoch": integer(editorSelection, "epoch"),
+            "selection_kind": string(editorSelection, "selection_kind"),
+            "from": integer(editorSelection, "from"),
+            "to": integer(editorSelection, "to"),
+            "empty": bool(editorSelection, "empty"),
+            "all_visible_text": bool(editorSelection, "all_visible_text"),
+            "caret_at_end": bool(editorSelection, "caret_at_end"),
+            "caret_byte_offset": integer(editorSelection, "caret_byte_offset")
+        ] as [String: Any]
+    ]
+}
+
+func rawGhostObservation() -> [String: Any] {
+    let elements = descendants()
+    let writingSurface = elements.first(where: {
+        (attribute($0, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String
+    })
+    let schema = "delysis.loom-completion-witness.v1"
+    let schemaBearingValues = elements.flatMap(strings).filter {
+        $0.contains("\"schema\":\"\(schema)\"")
+    }
+    let witness = schemaBearingValues.lazy.compactMap {
+        jsonObject(in: $0, schema: schema)
+    }.first
+    let frontmostPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    var observation: [String: Any] = [
+        "expected_pid": pid,
+        "frontmost_pid": jsonValue(frontmostPid),
+        "frontmost_matches_expected": frontmostPid == pid,
+        "application_hidden": runningApplication.isHidden,
+        "application_active": runningApplication.isActive,
+        "application_terminated": runningApplication.isTerminated,
+        "ax_application_frontmost": jsonValue(
+            attribute(application, kAXFrontmostAttribute as CFString) as? Bool
+        ),
+        "writing_surface_present": writingSurface != nil,
+        "completion_witness_text_found": !schemaBearingValues.isEmpty,
+        "completion_witness_parsed": witness != nil,
+        "completion_witness": witness.map(completionWitnessCore) ?? NSNull()
+    ]
+    guard let writingSurface else {
+        observation["writing_surface"] = NSNull()
+        return observation
+    }
+    let focused = attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool
+    let selectedRange = rangeAttribute(
+        writingSurface,
+        kAXSelectedTextRangeAttribute as CFString
+    )
+    let value = attribute(writingSurface, kAXValueAttribute as CFString) as? String
+    var writingSurfaceEvidence: [String: Any] = [
+        "focused": jsonValue(focused),
+        "selected_text_range": selectedRange.map {
+            ["location": $0.location, "length": $0.length] as [String: Any]
+        } ?? NSNull(),
+        "selection_matches_expected": selectedRange?.location == expectedManuscript.utf16.count &&
+            selectedRange?.length == 0,
+        "ax_value_available": value != nil
+    ]
+    if let value {
+        let valueData = Data(value.utf8)
+        writingSurfaceEvidence["ax_value_utf16_length"] = value.utf16.count
+        writingSurfaceEvidence["ax_value_utf8_bytes"] = valueData.count
+        writingSurfaceEvidence["ax_value_sha256"] = sha256(valueData)
+        writingSurfaceEvidence["ax_value_has_expected_manuscript_prefix"] =
+            value.hasPrefix(expectedManuscript)
+        if value.hasPrefix(expectedManuscript) {
+            let suffix = String(value.dropFirst(expectedManuscript.count))
+            let suffixData = Data(suffix.utf8)
+            writingSurfaceEvidence["ax_value_suffix_utf8_bytes"] = suffixData.count
+            writingSurfaceEvidence["ax_value_suffix_sha256"] = sha256(suffixData)
+            writingSurfaceEvidence["ax_value_suffix_nonblank"] =
+                suffix.rangeOfCharacter(from: .whitespacesAndNewlines.inverted) != nil
+        }
+    }
+    observation["writing_surface"] = writingSurfaceEvidence
+    return observation
+}
+
+func reportGhostIdentityFailure(
+    stage: String,
+    before: GhostIdentity?,
+    beforeRaw: [String: Any]?,
+    lastObserved: GhostIdentity?,
+    lastRaw: [String: Any]?,
+    durableCandidates: [DurableCandidateIdentity]
+) {
+    let diagnostic: [String: Any] = [
+        "schema": "delysis.loom-idle-resume-ghost-failure.v1",
+        "stage": stage,
+        "before_identity": ghostIdentityEvidence(before),
+        "before_raw_observation": beforeRaw ?? NSNull(),
+        "last_observed_identity": ghostIdentityEvidence(lastObserved),
+        "last_raw_observation": lastRaw ?? NSNull(),
+        "terminal_candidate_authority": durableCandidateEvidence(durableCandidates)
+    ]
+    if let data = try? JSONSerialization.data(withJSONObject: diagnostic, options: [.sortedKeys]),
+       let encoded = String(data: data, encoding: .utf8) {
+        if !identityFailurePath.isEmpty {
+            try? data.write(to: URL(fileURLWithPath: identityFailurePath), options: .atomic)
+        }
+        fputs("idle/resume ghost diagnostic: \(encoded)\n", stderr)
+    }
+}
+
+func asynchronousGuardFailed() -> Bool {
+    asynchronousFailurePaths.contains { FileManager.default.fileExists(atPath: $0) }
+}
+
+func restoreExactEditorFocus() -> Bool {
+    _ = runningApplication.activate(options: [.activateAllWindows])
+    guard AXUIElementSetAttributeValue(
+            application,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+          ) == .success else { return false }
+    guard let writingSurface = descendants().first(where: {
+              (attribute($0, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String
+          }),
+          AXUIElementSetAttributeValue(
+              writingSurface,
+              kAXFocusedAttribute as CFString,
+              kCFBooleanTrue
+          ) == .success else { return false }
+    return true
+}
+
+func resumeExactApplication() -> String? {
+    runningApplication.unhide()
+    var dispatch = "NSRunningApplication.unhide"
+    let accessibilityUnhide = AXUIElementSetAttributeValue(
+        application,
+        kAXHiddenAttribute as CFString,
+        kCFBooleanFalse
+    )
+    if accessibilityUnhide == .success {
+        dispatch += " then PID-addressed AXHidden=false"
+    }
+    let accessibilityDeadline = ProcessInfo.processInfo.systemUptime + 0.5
+    while runningApplication.isHidden &&
+        ProcessInfo.processInfo.systemUptime < accessibilityDeadline {
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    if runningApplication.isHidden {
+        var visibilityError: NSDictionary?
+        let visibilitySource =
+            "tell application \"System Events\" to set visible of first application process " +
+            "whose unix id is \(pid) to true"
+        guard let visibilityScript = NSAppleScript(source: visibilitySource) else { return nil }
+        _ = visibilityScript.executeAndReturnError(&visibilityError)
+        guard visibilityError == nil else { return nil }
+        dispatch += " then exact-PID System Events visible=true"
+    }
+
+    let foregroundDeadline = ProcessInfo.processInfo.systemUptime + 10
+    var attempts = 0
+    while ProcessInfo.processInfo.systemUptime < foregroundDeadline {
+        runningApplication.unhide()
+        _ = runningApplication.activate(options: [.activateAllWindows])
+        _ = AXUIElementSetAttributeValue(
+            application,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+        )
+        attempts += 1
+        if attempts % 10 == 0 {
+            var frontmostError: NSDictionary?
+            let frontmostSource =
+                "tell application \"System Events\" to set frontmost of first application process " +
+                "whose unix id is \(pid) to true"
+            if let frontmostScript = NSAppleScript(source: frontmostSource) {
+                _ = frontmostScript.executeAndReturnError(&frontmostError)
+            }
+        }
+        if !runningApplication.isHidden,
+           NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+           restoreExactEditorFocus() {
+            return dispatch
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    return nil
+}
+
+func currentGhostIdentity() -> GhostIdentity? {
+    let elements = descendants()
+    guard let writingSurface = elements.first(where: {
+              (attribute($0, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String
+          }),
+          NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+          (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
+          let selection = rangeAttribute(writingSurface, kAXSelectedTextRangeAttribute as CFString),
+          selection.location == expectedManuscript.utf16.count,
+          selection.length == 0,
+          let witness = elements.lazy.compactMap({ element in
+              strings(element).lazy.compactMap({ value in
+                  jsonObject(in: value, schema: "delysis.loom-completion-witness.v1")
+              }).first
+          }).first,
+          string(witness, "mode") == "visual",
+          bool(witness, "session_cached"),
+          integer(witness, "family_count") == 4,
+          integer(witness, "accepted_chunk_count") == 0,
+          bool(witness, "autocomplete_enabled"),
+          !bool(witness, "shuttle_enabled") else {
+        return nil
+    }
+    let selectedRunId = string(witness, "selected_run_id")
+    let selectedCandidateId = string(witness, "selected_candidate_id")
+    let selectedPresentationKey = string(witness, "selected_presentation_key")
+    let renderedPresentationKey = string(witness, "rendered_presentation_key")
+    let inlineVisibleKey = string(witness, "inline_visible_key")
+    let visual = witness["visual"] as? [String: Any] ?? [:]
+    let candidates = (witness["candidates"] as? [[String: Any]] ?? []).map {
+        CandidateIdentity(
+            runId: string($0, "run_id"),
+            candidateId: string($0, "candidate_id"),
+            presentationKey: string($0, "presentation_key"),
+            targetByte: integer($0, "target_byte"),
+            textUtf8Bytes: integer($0, "text_utf8_bytes")
+        )
+    }
+    guard candidates.count == 4,
+          Set(candidates.map(\.runId)).count == 4,
+          candidates.allSatisfy({ candidate in
+              !candidate.runId.isEmpty &&
+                  !candidate.candidateId.isEmpty &&
+                  !candidate.presentationKey.isEmpty &&
+                  candidate.targetByte == expectedManuscript.lengthOfBytes(using: .utf8) &&
+                  candidate.textUtf8Bytes > 0
+          }),
+          let selected = candidates.first(where: {
+              $0.runId == selectedRunId && $0.candidateId == selectedCandidateId
+          }),
+          selected.textUtf8Bytes > 0,
+          !selectedPresentationKey.isEmpty,
+          selected.presentationKey == selectedPresentationKey,
+          selectedPresentationKey == renderedPresentationKey,
+          selectedPresentationKey == inlineVisibleKey,
+          bool(visual, "available"),
+          !bool(visual, "inlineHidden"),
+          !bool(visual, "fanVisible"),
+          string(visual, "selectedCandidateId") == selectedCandidateId,
+          string(visual, "selectedPresentationKey") == selectedPresentationKey else {
+        return nil
+    }
+    let observed = withoutTerminalLineBreaks(
+        (attribute(writingSurface, kAXValueAttribute as CFString) as? String) ?? ""
+    )
+    guard observed.hasPrefix(expectedManuscript) else { return nil }
+    let visibleSuffix = String(observed.dropFirst(expectedManuscript.count))
+    let visibleSuffixData = Data(visibleSuffix.utf8)
+    guard visibleSuffixData.count == selected.textUtf8Bytes,
+          visibleSuffix.rangeOfCharacter(from: .whitespacesAndNewlines.inverted) != nil else {
+        return nil
+    }
+    return GhostIdentity(
+        contextKey: string(witness, "context_key"),
+        candidates: candidates,
+        selectedRunId: selectedRunId,
+        selectedCandidateId: selectedCandidateId,
+        selectedPresentationKey: selectedPresentationKey,
+        inlineVisibleKey: inlineVisibleKey,
+        authorityFrozen: bool(witness, "authority_frozen"),
+        visibleSuffixUtf8Bytes: visibleSuffixData.count,
+        visibleSuffixSha256: sha256(visibleSuffixData)
+    )
+}
+
+func waitForGhostIdentity(
+    timeout: TimeInterval,
+    durableCandidates: [DurableCandidateIdentity],
+    expected: GhostIdentity? = nil
+) -> GhostIdentity? {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if asynchronousGuardFailed() || runningApplication.isTerminated { return nil }
+        _ = restoreExactEditorFocus()
+        let observed = currentGhostIdentity()
+        lastRawGhostObservation = rawGhostObservation()
+        if let observed {
+            lastObservedGhostIdentity = observed
+            if ghostIdentityMatchesDurableFamily(observed, durableCandidates) &&
+               (expected == nil || observed == expected) {
+                return observed
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    } while Date() < deadline
+    return nil
+}
+
+let expectedGenerationCount = baseline + 4
+guard generationCount() == expectedGenerationCount,
+      familyTerminalCount() == 4,
+      let durableFamilyRunIds = familyRunIds(),
+      durableFamilyRunIds.count == 4,
+      Set(durableFamilyRunIds).count == 4 else {
+    fputs("Loom did not durably complete one exact family before native idle\n", stderr)
+    exit(1)
+}
+guard let durableFamilyCandidates = familyTerminalCandidates(),
+      durableFamilyCandidates.count == 4,
+      Set(durableFamilyCandidates.map(\.runId)) == Set(durableFamilyRunIds),
+      Set(durableFamilyCandidates.map(\.candidateId)).count == 4 else {
+    fputs("Loom did not expose four exact terminal candidate authorities before native idle\n", stderr)
+    exit(1)
+}
+lastObservedGhostIdentity = nil
+lastRawGhostObservation = nil
+guard let before = waitForGhostIdentity(
+        timeout: 15,
+        durableCandidates: durableFamilyCandidates
+      ),
+      !before.contextKey.isEmpty,
+      Set(before.candidates.map(\.runId)) == Set(durableFamilyRunIds) else {
+    reportGhostIdentityFailure(
+        stage: "before_idle",
+        before: nil,
+        beforeRaw: nil,
+        lastObserved: lastObservedGhostIdentity,
+        lastRaw: lastRawGhostObservation,
+        durableCandidates: durableFamilyCandidates
+    )
+    fputs("Loom did not expose one exact terminal cached ghost before native idle\n", stderr)
+    exit(1)
+}
+let beforeRawGhostObservation = lastRawGhostObservation
+
+var backgroundActivationError: NSDictionary?
+guard let backgroundActivation = NSAppleScript(
+        source: "tell application id \"com.apple.finder\" to activate"
+      ) else {
+    fputs("could not construct Finder activation for the native idle interval\n", stderr)
+    exit(1)
+}
+_ = backgroundActivation.executeAndReturnError(&backgroundActivationError)
+guard backgroundActivationError == nil else {
+    fputs("could not activate Finder as the native idle focus owner\n", stderr)
+    exit(1)
+}
+let backgroundActivationDeadlineUptime = ProcessInfo.processInfo.systemUptime + 10
+while NSWorkspace.shared.frontmostApplication?.processIdentifier !=
+    backgroundApplication.processIdentifier &&
+    ProcessInfo.processInfo.systemUptime < backgroundActivationDeadlineUptime {
+    Thread.sleep(forTimeInterval: 0.05)
+}
+guard NSWorkspace.shared.frontmostApplication?.processIdentifier ==
+        backgroundApplication.processIdentifier else {
+    fputs("Finder never became the exact native idle focus owner\n", stderr)
+    exit(1)
+}
+
+let nativeHideAccepted = runningApplication.hide()
+var hideDispatch = "NSRunningApplication.hide"
+let nativeHideDeadlineUptime = ProcessInfo.processInfo.systemUptime + 1
+while !runningApplication.isHidden &&
+    ProcessInfo.processInfo.systemUptime < nativeHideDeadlineUptime {
+    Thread.sleep(forTimeInterval: 0.05)
+}
+if !runningApplication.isHidden {
+    let hideResult = AXUIElementSetAttributeValue(
+        application,
+        kAXHiddenAttribute as CFString,
+        kCFBooleanTrue
+    )
+    guard hideResult == .success else {
+        fputs("could not hide Loom's exact process for the native idle interval\n", stderr)
+        exit(1)
+    }
+    hideDispatch = nativeHideAccepted
+        ? "NSRunningApplication.hide then PID-addressed AXHidden"
+        : "PID-addressed AXHidden"
+}
+let accessibilityHideDeadlineUptime = ProcessInfo.processInfo.systemUptime + 0.5
+while !runningApplication.isHidden &&
+    ProcessInfo.processInfo.systemUptime < accessibilityHideDeadlineUptime {
+    Thread.sleep(forTimeInterval: 0.05)
+}
+if !runningApplication.isHidden {
+    var visibilityError: NSDictionary?
+    let visibilitySource =
+        "tell application \"System Events\" to set visible of first application process " +
+        "whose unix id is \(pid) to false"
+    guard let visibilityScript = NSAppleScript(source: visibilitySource) else {
+        fputs("could not construct exact-PID Loom visibility mutation\n", stderr)
+        exit(1)
+    }
+    _ = visibilityScript.executeAndReturnError(&visibilityError)
+    guard visibilityError == nil else {
+        fputs("could not hide Loom through its exact System Events process\n", stderr)
+        exit(1)
+    }
+    hideDispatch += " then exact-PID System Events visible=false"
+}
+let backgroundDeadlineUptime = ProcessInfo.processInfo.systemUptime + 10
+while (
+    !runningApplication.isHidden ||
+    NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+) && ProcessInfo.processInfo.systemUptime < backgroundDeadlineUptime {
+    Thread.sleep(forTimeInterval: 0.05)
+}
+guard runningApplication.isHidden,
+      NSWorkspace.shared.frontmostApplication?.processIdentifier ==
+        backgroundApplication.processIdentifier else {
+    let frontmostPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
+    fputs(
+        "Loom's exact process never entered the hidden background state " +
+        "(hidden=\(runningApplication.isHidden), active=\(runningApplication.isActive), " +
+        "frontmost=\(frontmostPid), finder=\(backgroundApplication.processIdentifier), " +
+        "dispatch=\(hideDispatch))\n",
+        stderr
+    )
+    exit(1)
+}
+
+// Cross a full minute hidden so the witness covers WebKit's delayed
+// background throttling/suspension boundary, not merely an immediate
+// blur/visibility round trip.
+let minimumIdleSeconds: TimeInterval = 75
+let idleStartedAtUptime = ProcessInfo.processInfo.systemUptime
+var idlePolls = 0
+while ProcessInfo.processInfo.systemUptime - idleStartedAtUptime < minimumIdleSeconds {
+    idlePolls += 1
+    guard !asynchronousGuardFailed(),
+          !runningApplication.isTerminated,
+          runningApplication.isHidden,
+          NSWorkspace.shared.frontmostApplication?.processIdentifier ==
+            backgroundApplication.processIdentifier,
+          generationCount() == expectedGenerationCount,
+          familyTerminalCount() == 4,
+          familyTerminalCandidates() == durableFamilyCandidates else {
+        fputs("Loom stole focus, exited, or generated again during native idle\n", stderr)
+        exit(1)
+    }
+    Thread.sleep(forTimeInterval: 0.05)
+}
+let actualIdleSeconds = ProcessInfo.processInfo.systemUptime - idleStartedAtUptime
+
+guard let resumeDispatch = resumeExactApplication() else {
+    reportGhostIdentityFailure(
+        stage: "native_resume",
+        before: before,
+        beforeRaw: beforeRawGhostObservation,
+        lastObserved: nil,
+        lastRaw: rawGhostObservation(),
+        durableCandidates: durableFamilyCandidates
+    )
+    fputs("Loom's exact process never became visible and frontmost after native idle\n", stderr)
+    exit(1)
+}
+lastObservedGhostIdentity = nil
+lastRawGhostObservation = nil
+guard let after = waitForGhostIdentity(
+        timeout: 15,
+        durableCandidates: durableFamilyCandidates,
+        expected: before
+      ),
+      generationCount() == expectedGenerationCount,
+      familyTerminalCount() == 4,
+      familyTerminalCandidates() == durableFamilyCandidates else {
+    reportGhostIdentityFailure(
+        stage: "after_resume",
+        before: before,
+        beforeRaw: beforeRawGhostObservation,
+        lastObserved: lastObservedGhostIdentity,
+        lastRaw: lastRawGhostObservation,
+        durableCandidates: durableFamilyCandidates
+    )
+    fputs("the exact cached WYSIWYG ghost did not resynchronize after native idle\n", stderr)
+    exit(1)
+}
+
+let exactCandidateEvidence = candidateEvidence(after.candidates)
+let evidence: [String: Any] = [
+    "schema": "delysis.loom-idle-resume-ghost-witness.v1",
+    "pid": pid,
+    "database": databasePath,
+    "background_pid": backgroundApplication.processIdentifier,
+    "background_bundle_id": backgroundApplication.bundleIdentifier ?? "",
+    "background_frontmost_pid_during_idle": backgroundApplication.processIdentifier,
+    "background_activation_dispatch": "Finder Apple event",
+    "hide_dispatch": hideDispatch,
+    "resume_dispatch": resumeDispatch,
+    "application_hidden_during_idle": true,
+    "loom_frontmost_during_idle": false,
+    "minimum_idle_seconds": minimumIdleSeconds,
+    "actual_idle_seconds": actualIdleSeconds,
+    "idle_polls": idlePolls,
+    "explicit_resume": true,
+    "editor_focused_after_resume": true,
+    "caret_utf16_after_resume": expectedManuscript.utf16.count,
+    "generation_runs_before_idle": expectedGenerationCount,
+    "generation_runs_after_resume": expectedGenerationCount,
+    "family_terminal_count_before_idle": 4,
+    "family_terminal_count_after_resume": 4,
+    "family_run_ids": durableFamilyRunIds,
+    "context_key_before": before.contextKey,
+    "context_key_after": after.contextKey,
+    "selected_run_id_before": before.selectedRunId,
+    "selected_run_id_after": after.selectedRunId,
+    "presentation_key_before": before.selectedPresentationKey,
+    "presentation_key_after": after.selectedPresentationKey,
+    "inline_visible_key_before": before.inlineVisibleKey,
+    "inline_visible_key_after": after.inlineVisibleKey,
+    "authority_frozen_before": before.authorityFrozen,
+    "authority_frozen_after": after.authorityFrozen,
+    "visible_suffix_utf8_bytes_before": before.visibleSuffixUtf8Bytes,
+    "visible_suffix_utf8_bytes_after": after.visibleSuffixUtf8Bytes,
+    "visible_suffix_sha256_before": before.visibleSuffixSha256,
+    "visible_suffix_sha256_after": after.visibleSuffixSha256,
+    "candidate_identity_before_and_after": exactCandidateEvidence,
+    "terminal_candidate_authority": durableCandidateEvidence(durableFamilyCandidates),
+    "exact_ghost_identity_resynchronized": true,
+    "new_generation_started": false,
+    "ghost_stole_editor_focus": false
+]
+let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+print(String(data: data, encoding: .utf8)!)
+SWIFT
+}
+
 capture_loom_completion_diagnostics() {
   target_pid=$1
   database=$2
@@ -1711,6 +3667,7 @@ capture_loom_completion_diagnostics() {
   DELYSIS_DIAGNOSTIC_MANUSCRIPT_SHA="$diagnostic_manuscript_sha" \
   DELYSIS_DIAGNOSTIC_PROJECT_BUSY_FAILURE="${LOOM_PROJECT_BUSY_MONITOR_FAILURE:-}" \
   DELYSIS_DIAGNOSTIC_GENERATION_FAILURE="${LOOM_GENERATION_GUARD_FAILURE:-}" \
+  DELYSIS_DIAGNOSTIC_LIVE_STREAM_FAILURE="${LOOM_LIVE_STREAM_MONITOR_FAILURE:-}" \
   node <<'NODE' >"$destination"
 const fs = require('fs');
 const e = process.env;
@@ -1733,6 +3690,7 @@ process.stdout.write(`${JSON.stringify({
   manuscript_sha256: e.DELYSIS_DIAGNOSTIC_MANUSCRIPT_SHA || null,
   project_busy_monitor_failure: optionalFile(e.DELYSIS_DIAGNOSTIC_PROJECT_BUSY_FAILURE),
   generation_guard_failure: optionalFile(e.DELYSIS_DIAGNOSTIC_GENERATION_FAILURE),
+  live_stream_monitor_failure: optionalFile(e.DELYSIS_DIAGNOSTIC_LIVE_STREAM_FAILURE),
 }, null, 2)}\n`);
 NODE
 }
@@ -2914,6 +4872,15 @@ on run argv
     set matches to every application process whose unix id is targetPid
     if (count of matches) is not 1 then error "target application process did not appear"
     set targetProcess to item 1 of matches
+    set frontmost of targetProcess to true
+    repeat 100 times
+      if frontmost of targetProcess then exit repeat
+      delay 0.05
+    end repeat
+    if not frontmost of targetProcess then error "target application process did not become frontmost"
+    set frontmostMatches to every application process whose frontmost is true
+    if (count of frontmostMatches) is not 1 then error "frontmost application process was ambiguous"
+    if (unix id of item 1 of frontmostMatches) is not targetPid then error "a different process became frontmost"
     set quitMatches to {}
     repeat with topLevelItem in every menu bar item of menu bar 1 of targetProcess
       try
@@ -2958,10 +4925,32 @@ exact_bundle_pid() {
   done
 }
 
+running_bundle_pids() {
+  xcrun swift - "$BUNDLE_ID" <<'SWIFT'
+import AppKit
+import Foundation
+
+let bundleIdentifier = CommandLine.arguments[1]
+for application in NSRunningApplication.runningApplications(
+    withBundleIdentifier: bundleIdentifier
+).filter({ !$0.isTerminated }).sorted(by: {
+    $0.processIdentifier < $1.processIdentifier
+}) {
+    print(application.processIdentifier)
+}
+SWIFT
+}
+
 run_once() {
   run_number=$1
   stdout_log="$SMOKE_ROOT/launch-$run_number.stdout.log"
   stderr_log="$SMOKE_ROOT/launch-$run_number.stderr.log"
+  running_same_bundle_pids=$(running_bundle_pids)
+  if [ -n "$running_same_bundle_pids" ]; then
+    echo "refusing to run macOS UI smoke while another process owns bundle identifier $BUNDLE_ID (pid(s): $(printf '%s' "$running_same_bundle_pids" | tr '\n' ' '))" >&2
+    echo "same-identifier macOS activation is not PID-addressable; continuing could send Quit or keyboard input to the wrong manuscript" >&2
+    return 1
+  fi
   running_exact_pids=$(exact_bundle_pid)
   if [ -n "$running_exact_pids" ]; then
     echo "refusing to run macOS UI smoke while the exact application bundle is already running (pid(s): $(printf '%s' "$running_exact_pids" | tr '\n' ' '))" >&2
@@ -3018,6 +5007,11 @@ run_once() {
       RUN_2_EXECUTABLE_SHA256=$bound_executable_sha256
       ;;
   esac
+
+  if [ "$COMPONENT" = loom ] && ! foreground_loom_process "$ACTIVE_PID"; then
+    echo "the exact Loom process could not be foregrounded before window discovery" >&2
+    return 1
+  fi
 
   if ! wait_for_window "$ACTIVE_PID"; then
     echo "packaged app did not expose a window" >&2
@@ -3099,11 +5093,30 @@ run_once() {
         echo "could not start the one-family generation guard" >&2
         return 1
       fi
+      if ! start_loom_live_streaming_monitor \
+        "$ACTIVE_PID" "$loom_database" "$loom_generation_count_before_batch" \
+        "$RUN_1_EDITOR_SENTINEL" "launch-1-live-stream-monitor" \
+        "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"; then
+        echo "could not initialize the pre-terminal WYSIWYG live-stream observer" >&2
+        return 1
+      fi
       if ! RUN_1_AUTOCOMPLETE_ENABLE_EVIDENCE=$(set_loom_completion_toggle \
         "$ACTIVE_PID" "Turn autocomplete on" "Turn autocomplete off" "require-press"); then
         echo "could not enable autocomplete exactly once for the real-model presentation check" >&2
         return 1
       fi
+      if ! wait_for_loom_live_streaming_monitor; then
+        RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-live-stream-diagnostics.json"
+        capture_loom_completion_diagnostics \
+          "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
+          "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
+        echo "a real generation never exposed correlated pre-terminal WYSIWYG ghost text" >&2
+        echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
+        cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
+        echo "application logs: $stdout_log and $stderr_log" >&2
+        return 1
+      fi
+      RUN_1_LIVE_STREAMING_EVIDENCE=$(cat "$LOOM_LIVE_STREAM_MONITOR_OUTPUT")
       if ! RUN_1_REAL_GENERATION_EVIDENCE=$(wait_for_loom_generation_family \
         "$loom_database" \
         "$loom_generation_count_before_batch"); then
@@ -3122,7 +5135,7 @@ run_once() {
         return 1
       fi
       if ! RUN_1_REAL_GHOST_EVIDENCE=$(wait_for_loom_accessibility_text \
-        "$ACTIVE_PID" "Suggestion available." \
+        "$ACTIVE_PID" "Suggestion available." "$RUN_1_EDITOR_SENTINEL" \
         "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"); then
         RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-ghost-timeout-diagnostics.json"
         capture_loom_completion_diagnostics \
@@ -3137,6 +5150,31 @@ run_once() {
       fi
       if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
         echo "visible ghost presentation admitted an extra run or exposed project_busy" >&2
+        return 1
+      fi
+      RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC="$SMOKE_ROOT/launch-1-idle-resume-identity-diagnostics.json"
+      rm -f "$RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC"
+      if ! RUN_1_IDLE_RESUME_GHOST_EVIDENCE=$(exercise_loom_idle_resume_ghost \
+        "$ACTIVE_PID" "$loom_database" "$loom_generation_count_before_batch" \
+        "$RUN_1_EDITOR_SENTINEL" \
+        "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" \
+        "$RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC"); then
+        RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-idle-resume-diagnostics.json"
+        capture_loom_completion_diagnostics \
+          "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
+          "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
+        echo "the exact cached WYSIWYG ghost did not survive native hide/idle/resume" >&2
+        echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
+        cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
+        if [ -f "$RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC" ]; then
+          echo "idle/resume identity diagnostics: $RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC" >&2
+          cat "$RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC" >&2
+        fi
+        echo "application logs: $stdout_log and $stderr_log" >&2
+        return 1
+      fi
+      if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
+        echo "native idle/resume admitted an extra run or exposed project_busy" >&2
         return 1
       fi
       loom_generation_count_before_reversal=$(sqlite3 \
@@ -3168,19 +5206,33 @@ run_once() {
       require_equal "generation-run count across all cached completion interactions" \
         "$loom_generation_count_before_reversal" "$loom_generation_count_after_reversal"
       if ! DELYSIS_DATABASE_FAMILY="$RUN_1_REAL_GENERATION_EVIDENCE" \
+        DELYSIS_LIVE_STREAM_FAMILY="$RUN_1_LIVE_STREAMING_EVIDENCE" \
+        DELYSIS_IDLE_RESUME_FAMILY="$RUN_1_IDLE_RESUME_GHOST_EVIDENCE" \
         DELYSIS_ACCESSIBILITY_FAMILY="$RUN_1_REAL_WORD_REVERSAL_EVIDENCE" \
         node <<'NODE'
 const db = JSON.parse(process.env.DELYSIS_DATABASE_FAMILY);
+const live = JSON.parse(process.env.DELYSIS_LIVE_STREAM_FAMILY);
+const idle = JSON.parse(process.env.DELYSIS_IDLE_RESUME_FAMILY);
 const ax = JSON.parse(process.env.DELYSIS_ACCESSIBILITY_FAMILY);
 const normalizedRunIds = (runIds) => [...new Set(runIds)].sort();
 if (
   JSON.stringify(normalizedRunIds(db.run_ids)) !==
     JSON.stringify(normalizedRunIds(ax.family_run_ids)) ||
+  JSON.stringify(normalizedRunIds(db.run_ids)) !==
+    JSON.stringify(normalizedRunIds(live.family_run_ids)) ||
+  JSON.stringify(normalizedRunIds(db.run_ids)) !==
+    JSON.stringify(normalizedRunIds(idle.family_run_ids)) ||
   normalizedRunIds(db.run_ids).length !== 4 ||
   normalizedRunIds(ax.family_run_ids).length !== 4 ||
+  normalizedRunIds(live.family_run_ids).length !== 4 ||
+  normalizedRunIds(idle.family_run_ids).length !== 4 ||
+  !live.open_run_ids_after_accessibility.includes(live.selected_run_id) ||
+  live.selected_run_terminal_after_accessibility !== false ||
+  idle.exact_ghost_identity_resynchronized !== true ||
+  idle.new_generation_started !== false ||
   db.family_size !== ax.family_run_ids.length
 ) {
-  console.error('database family run IDs did not equal the exact AX cached family');
+  console.error('database family did not equal the live, resumed, and cached AX witnesses');
   process.exit(1);
 }
 NODE
@@ -3516,7 +5568,7 @@ RECEIPT="$SMOKE_ROOT/smoke-receipt.json"
 DELYSIS_SMOKE_COMPONENT="$COMPONENT" \
 DELYSIS_SMOKE_BUNDLE="$BUNDLE" \
 DELYSIS_SMOKE_BUNDLE_ID="$BUNDLE_ID" \
-DELYSIS_SMOKE_SOURCE_SHA="$MOM_ACCEPTANCE_SOURCE_SHA" \
+DELYSIS_SMOKE_SOURCE_SHA="$ACCEPTANCE_SOURCE_SHA" \
 DELYSIS_SMOKE_EXECUTABLE_PATH="$EXECUTABLE" \
 DELYSIS_SMOKE_EXECUTABLE_FILE_ID="$EXECUTABLE_FILE_ID" \
 DELYSIS_SMOKE_EXECUTABLE_SHA="$EXECUTABLE_SHA256" \
@@ -3545,7 +5597,9 @@ DELYSIS_SMOKE_RUN_1_FORMATTED_SENTINEL="${RUN_1_FORMATTED_SENTINEL:-}" \
 DELYSIS_SMOKE_RUN_1_FORMATTING_EVIDENCE="${RUN_1_FORMATTING_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_AUTOCOMPLETE_OFF_EVIDENCE="${RUN_1_AUTOCOMPLETE_OFF_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_AUTOCOMPLETE_ENABLE_EVIDENCE="${RUN_1_AUTOCOMPLETE_ENABLE_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_LIVE_STREAMING_EVIDENCE="${RUN_1_LIVE_STREAMING_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE="${RUN_1_REAL_GHOST_EVIDENCE:-}" \
+DELYSIS_SMOKE_RUN_1_IDLE_RESUME_GHOST_EVIDENCE="${RUN_1_IDLE_RESUME_GHOST_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_GENERATION_EVIDENCE="${RUN_1_REAL_GENERATION_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_GENERATION_GUARD_EVIDENCE="${RUN_1_REAL_GENERATION_GUARD_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_REAL_WORD_REVERSAL_EVIDENCE="${RUN_1_REAL_WORD_REVERSAL_EVIDENCE:-}" \
@@ -3588,6 +5642,12 @@ const generationFamily = e.DELYSIS_SMOKE_RUN_1_REAL_GENERATION_EVIDENCE
   : null;
 const generationGuard = e.DELYSIS_SMOKE_RUN_1_REAL_GENERATION_GUARD_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_REAL_GENERATION_GUARD_EVIDENCE)
+  : null;
+const liveStreaming = e.DELYSIS_SMOKE_RUN_1_LIVE_STREAMING_EVIDENCE
+  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_LIVE_STREAMING_EVIDENCE)
+  : null;
+const idleResumeGhost = e.DELYSIS_SMOKE_RUN_1_IDLE_RESUME_GHOST_EVIDENCE
+  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_IDLE_RESUME_GHOST_EVIDENCE)
   : null;
 const autocompleteActivation = e.DELYSIS_SMOKE_RUN_1_AUTOCOMPLETE_OFF_EVIDENCE ? {
   off_before_typing: JSON.parse(e.DELYSIS_SMOKE_RUN_1_AUTOCOMPLETE_OFF_EVIDENCE),
@@ -3643,7 +5703,9 @@ const receipt = {
         autocomplete_activation: autocompleteActivation,
         generation_family: generationFamily,
         generation_family_guard: generationGuard,
+        live_streaming_preterminal: liveStreaming,
         ghost_presentation: e.DELYSIS_SMOKE_RUN_1_REAL_GHOST_EVIDENCE,
+        idle_resume_ghost: idleResumeGhost,
         cached_completion_interactions: cachedCompletionInteractions ? {
           ...cachedCompletionInteractions,
           generation_runs_before: Number(e.DELYSIS_SMOKE_RUN_1_GENERATION_COUNT_BEFORE_REVERSAL),
