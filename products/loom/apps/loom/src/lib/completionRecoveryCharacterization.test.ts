@@ -156,6 +156,7 @@ function durableMetadata(): BranchCard[] {
   return fixture.family.map((item, index) => ({
     run_id: item.run_id,
     branch_id: item.branch_id,
+    weave_command_id: index < 4 ? '01K00000000000000000000001' : null,
     document_id: fixture.interaction.document_id,
     candidate_id: item.terminal.candidate_id,
     source_revision_id: fixture.source.revision_id,
@@ -351,6 +352,7 @@ function suggestionFamily(
     branches,
     verifiedBodyByRun,
     liveTextByRun,
+    liveTextSequenceByRun: {},
     currentModel,
     document: currentDocument,
     suggestionsEnabled: true,
@@ -392,7 +394,9 @@ describe('model-free completion recovery characterization', () => {
     const snapshot = durableCompletionSnapshot();
     expect(completionSnapshotFacts(snapshot, scope)).toEqual({
       activeRunIds: [],
-      cancellationRequestedRunIds: []
+      cancellationRequestedRunIds: [],
+      liveTextByRun: {},
+      liveTextSequenceByRun: {}
     });
     const metadata = snapshot.branches.map((branch) => ({ ...branch, text: '' }));
     const hydrated = await hydrateDurableProjection(metadata);
@@ -490,12 +494,15 @@ describe('model-free completion recovery characterization', () => {
       progress_sequences: ['0', '18446744073709551615'],
       branches: [{
         run_id: fixture.family[0].run_id,
-        branch_id: fixture.family[0].branch_id
+        branch_id: fixture.family[0].branch_id,
+        partial_text: null
       }]
     }];
     expect(completionSnapshotFacts(snapshot, scope)).toEqual({
       activeRunIds: [fixture.family[0].run_id],
-      cancellationRequestedRunIds: [fixture.family[0].run_id]
+      cancellationRequestedRunIds: [fixture.family[0].run_id],
+      liveTextByRun: {},
+      liveTextSequenceByRun: {}
     });
     expect(snapshot.branches[0]).toMatchObject({
       status: 'ready',
@@ -610,43 +617,52 @@ describe('model-free completion recovery characterization', () => {
       model(fixture.models.replacement)
     )).toEqual([]);
 
-    const replacementMetadata = {
+    const replacementMetadata = Array.from({ length: 4 }, (_, index): BranchCard => ({
       ...hydrated.branches[0],
-      run_id: 'run-replacement',
-      branch_id: 'branch-replacement',
-      candidate_id: 'candidate-replacement',
+      run_id: `run-replacement-${index + 1}`,
+      branch_id: `branch-replacement-${index + 1}`,
+      weave_command_id: '01K00000000000000000000002',
+      candidate_id: `candidate-replacement-${index + 1}`,
       model_id: fixture.models.replacement,
-      created_at_unix_ms: 100
-    };
+      created_at_unix_ms: 100 + index
+    }));
     const originalText = hydrated.branches[0].text;
-    const replacementBody = await verifyBranchBody({
-      run_id: replacementMetadata.run_id,
-      branch_id: replacementMetadata.branch_id,
-      document_id: replacementMetadata.document_id,
-      candidate_id: replacementMetadata.candidate_id!,
-      source_revision_id: replacementMetadata.source_revision_id,
-      target_start_byte: replacementMetadata.target_start_byte,
-      target_end_byte: replacementMetadata.target_end_byte,
-      seed: replacementMetadata.seed!,
-      model_id: replacementMetadata.model_id!,
-      created_at_unix_ms: replacementMetadata.created_at_unix_ms,
-      output_blob_id: replacementMetadata.output_blob_id!,
-      byte_len: replacementMetadata.output_byte_len!,
-      text: originalText
-    }, replacementMetadata);
-    expect(replacementBody).not.toBeNull();
+    const replacementBodies = await Promise.all(replacementMetadata.map(async (branch) => {
+      const body = await verifyBranchBody({
+        run_id: branch.run_id,
+        branch_id: branch.branch_id,
+        document_id: branch.document_id,
+        candidate_id: branch.candidate_id!,
+        source_revision_id: branch.source_revision_id,
+        target_start_byte: branch.target_start_byte,
+        target_end_byte: branch.target_end_byte,
+        seed: branch.seed!,
+        model_id: branch.model_id!,
+        created_at_unix_ms: branch.created_at_unix_ms,
+        output_blob_id: branch.output_blob_id!,
+        byte_len: branch.output_byte_len!,
+        text: originalText
+      }, branch);
+      expect(body).not.toBeNull();
+      return body!;
+    }));
     const replacementFamily = suggestionFamily(
-      [replacementMetadata],
-      { 'run-replacement': replacementBody! },
+      replacementMetadata,
+      Object.fromEntries(replacementBodies.map((body) => [body.runId, body])),
       openDocument(),
       model(fixture.models.replacement)
     );
     expect(replacementFamily.map((candidate) => candidate.runId))
-      .toEqual(['run-replacement']);
+      .toEqual([
+        'run-replacement-1',
+        'run-replacement-2',
+        'run-replacement-3',
+        'run-replacement-4'
+      ]);
 
     const unfrozen = startCompletionSession(contextKey, originalFamily, originalFamily[0].runId)!;
     expect(synchronizeCompletionCandidates(unfrozen, replacementFamily)?.selectedRunId)
-      .toBe('run-replacement');
+      .toBe('run-replacement-1');
     const frozen = consumeCompletionText(unfrozen, fixture.autosave.accepted_text)!.session;
     expect(synchronizeCompletionCandidates(frozen, replacementFamily)).toBe(frozen);
   });

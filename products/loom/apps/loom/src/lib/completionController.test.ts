@@ -142,6 +142,52 @@ describe('pure completion controller', () => {
     expect(reversed.state.session?.authorityFrozen).toBe(true);
   });
 
+  it('preserves the remainder across same-turn selection callbacks and repeated Option-Right', () => {
+    let state = readyController();
+    let currentText = manuscript;
+
+    const firstView = completionControllerView(state, contextKey, family);
+    const first = authorizeCompletionInsertion(state, {
+      contextKey,
+      family: firstView.activeFamily,
+      eligible: firstView.selected,
+      candidateId: firstView.selected!.candidateId,
+      presentationKey: firstView.selected!.presentationKey,
+      text: ' one ',
+      action: 'option_word',
+      manuscriptText: currentText,
+      promotionReady: true
+    });
+    expect(first.authorized).toBe(true);
+    state = first.state;
+
+    // Both editor surfaces synchronously report their new caret before Svelte
+    // can update any reactive projection of the controller. The controller is
+    // the only same-turn authority and must still identify this mutation.
+    expect(state.pendingText).toBe('Hello one ');
+    currentText = state.pendingText!;
+    const firstProjection = observeTextMutation(state, currentText, manuscript, false);
+    expect(firstProjection.completionOwned).toBe(true);
+    state = firstProjection.state;
+    const remainder = completionControllerView(state, contextKey, family);
+    expect(remainder.selected).toMatchObject({ text: 'two', targetByte: 10 });
+
+    const second = authorizeCompletionInsertion(state, {
+      contextKey,
+      family: remainder.activeFamily,
+      eligible: remainder.selected,
+      candidateId: remainder.selected!.candidateId,
+      presentationKey: remainder.selected!.presentationKey,
+      text: 'two',
+      action: 'option_word',
+      manuscriptText: currentText,
+      promotionReady: true
+    });
+    expect(second.authorized).toBe(true);
+    expect(second.state.pendingText).toBe('Hello one two');
+    expect(second.state.session?.acceptedChunks).toEqual([' one ', 'two']);
+  });
+
   it('edge-triggers exhaustion while preserving immediate rollback authority', () => {
     const inserted = insert('inline_tab');
     const projected = observeTextMutation(

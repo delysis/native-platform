@@ -38,6 +38,8 @@ describe('App ghost reactivity wiring', () => {
     const visualFamily = dependencyThunkFor(compiled, '$.set(visualSuggestionFamily');
     expect(visualFamily).toContain('branches');
     expect(visualFamily).toContain('verifiedBranchBodyByRun');
+    expect(visualFamily).toContain('liveBranchTextByRun');
+    expect(visualFamily).toContain('liveBranchTextSequenceByRun');
     expect(visualFamily).toContain('currentModel');
     expect(visualFamily).toContain('branchPromotionReady');
     expect(visualFamily).toContain('documentText');
@@ -76,6 +78,33 @@ describe('App ghost reactivity wiring', () => {
     expect(handler).not.toContain('text_delta');
     expect(refresh).toContain('getCompletionSnapshot');
     expect(refresh).toContain('completionSnapshotFacts');
+    expect(refresh).toContain('liveBranchTextByRun = completionFacts.liveTextByRun');
+    expect(refresh).toContain(
+      'liveBranchTextSequenceByRun = completionFacts.liveTextSequenceByRun'
+    );
+  });
+
+  it('forces authoritative completion recovery whenever the renderer resumes', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const recovery = source.slice(
+      source.indexOf('function resumeCompletionObservation'),
+      source.indexOf('function installGenerationEventListener')
+    );
+    const focus = source.slice(
+      source.indexOf('async function installWindowFocusHandler'),
+      source.indexOf('function handleRendererResume')
+    );
+
+    expect(source).toContain("window.addEventListener('pageshow', handleRendererResume)");
+    expect(source).toContain(
+      "window.document.addEventListener('visibilitychange', handleRendererResume)"
+    );
+    expect(focus).toContain("if (mode === 'visual') visualEditor?.refreshGhostPresentation()");
+    expect(focus).toContain('resumeCompletionObservation()');
+    expect(recovery).toContain('installGenerationEventListener()');
+    expect(recovery).toContain('window.clearTimeout(branchPollTimer)');
+    expect(recovery).toContain('branchPollAttempt = 0');
+    expect(recovery).toContain('scheduleBranchRefresh()');
   });
 
   it('keeps suggestion review and implementation evidence out of the quiet titlebar', () => {
@@ -88,7 +117,8 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('class="canvas-controls"');
     expect(source).toContain('on:mousedown={startTitlebarDrag}');
     expect(source).not.toContain('Autosave is always on');
-    expect(source).toContain('aria-label={autosaveLabel}');
+    expect(source).not.toContain('class="save-status');
+    expect(source).not.toContain('autosaveLabel');
     expect(source).toContain('New document (⌘N)');
   });
 
@@ -122,14 +152,15 @@ describe('App ghost reactivity wiring', () => {
     expect(modelMenu).toContain('AUTOCOMPLETE_MODEL_MENU_LONG_PRESS_MS');
     expect(source).toContain('on:contextmenu={openAutocompleteModelMenu}');
     expect(source).toContain('aria-keyshortcuts="Shift+F10"');
-    expect(source).toContain('class="titlebar-button gear-button"');
+    expect(source).not.toContain('class="titlebar-button gear-button"');
+    expect(source).not.toContain('class="project-menu"');
     expect(source).not.toContain('class="writer-onboarding"');
     expect(source).not.toContain('Set up private writing suggestions');
     expect(source).toContain('class="model-setup-callout"');
     expect(source).toContain('Private writing model');
   });
 
-  it('binds persisted tri-state appearance and curated downloads to typed boundaries', () => {
+  it('keeps system-aware appearance persistence behind one direct toggle and binds curated downloads', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const catalogLoad = source.slice(
       source.indexOf('async function refreshCuratedModels'),
@@ -158,23 +189,41 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('useCatalogSuggestionWriter(entry, installed)');
     expect(source).not.toContain('useDiscoveredSuggestionWriter(installed)');
     expect(appearance).toContain('persistAppearancePreference(window, next)');
-    expect(source).toContain("{#each ['system', 'light', 'dark'] as choice}");
+    expect(source).toContain('on:click={toggleAppearance}');
+    expect(source).not.toContain("{#each ['system', 'light', 'dark'] as choice}");
   });
 
-  it('makes an empty writing surface visibly writable in both editor modes', () => {
+  it('keeps both empty writing surfaces accessible without instructional placeholder copy', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const visual = readFileSync(new URL('./LoomEditor.svelte', import.meta.url), 'utf8');
     const markdown = readFileSync(new URL('./SourceEditor.svelte', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../app.css', import.meta.url), 'utf8');
-    expect(visual).toContain("export let placeholder = 'Start writing…'");
-    expect(visual).toContain("'aria-placeholder': placeholder");
-    expect(markdown).toContain("export let placeholder = 'Start writing…'");
-    expect(markdown).toContain('{placeholder}');
-    expect(visual).toContain('class="loom-editor-placeholder"');
-    expect(css).toContain('.loom-editor-placeholder');
-    expect(css).toMatch(/\.loom-editor-placeholder \{[^}]*z-index: 3/);
-    expect(css).toContain('.source-pane textarea::placeholder');
+    expect(visual).not.toContain('Start writing');
+    expect(markdown).not.toContain('Start writing');
+    expect(visual).toContain("'aria-label': currentLabel");
+    expect(visual).toContain('attributes: editorAttributes(snapshot.label)');
+    expect(markdown).toContain('aria-label={label}');
     expect(source).toContain('autofocus={true}');
+  });
+
+  it('announces image success only from an editor insertion acknowledgement', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const storage = source.slice(
+      source.indexOf('async function storeImageAttachments'),
+      source.indexOf('function resolveImageAssetUrl')
+    );
+    const committed = source.slice(
+      source.indexOf('function reportImageAttachmentsCommitted'),
+      source.indexOf('function updateSourceSelection')
+    );
+
+    expect(storage).not.toContain('Image attached');
+    expect(storage).not.toContain('images attached');
+    expect(storage).not.toContain('Promise.all');
+    expect(storage).toContain('for (const file of files)');
+    expect(committed).toContain("announce(count === 1 ? 'Image attached'");
+    expect(source.match(/onImageAttachmentsCommitted=\{reportImageAttachmentsCommitted\}/gu))
+      .toHaveLength(2);
+    expect(source).toContain("convertFileSrc(token, 'loom-asset')");
   });
 
   it('opens the writing surface before optional completion setup', () => {
@@ -239,6 +288,26 @@ describe('App ghost reactivity wiring', () => {
     expect(source).not.toContain('let scheduledSuggestion:');
     expect(source).toContain('authorizeCompletionInsertion(completionController');
     expect(source).toContain('completionExhausted(');
+    const immediateVisualMutation = source.slice(
+      source.indexOf('function invalidateVisualSuggestionImmediately'),
+      source.indexOf('function setSourceDocument')
+    );
+    const immediateSourceMutation = source.slice(
+      source.indexOf('function updateFromSource'),
+      source.indexOf('function scheduleSourceProjection')
+    );
+    expect(immediateVisualMutation).toContain('completionController.pendingText !== null');
+    expect(immediateVisualMutation).not.toContain('pendingCompletionText !== null');
+    expect(immediateSourceMutation).toContain('completionController.pendingText !== null');
+    expect(immediateSourceMutation).toContain('completionController.session');
+    expect(immediateSourceMutation).not.toContain('pendingCompletionText !== null');
+    expect(immediateSourceMutation).not.toMatch(/\bcompletionSession\b/u);
+    expect(source).toContain('authoritativeCompletionFamilyId = started.command_id;');
+    expect(source).toContain('authoritativeFamilyId: authoritativeCompletionFamilyId');
+    expect(source).toContain('authoritativeCompletionFamilyId = null;');
+    expect(source).toContain(
+      'started.branches.some((branch) => branch.weave_command_id !== started.command_id)'
+    );
     expect(controller).not.toContain('window.');
     expect(controller).not.toContain('invoke(');
     expect(controller).toContain('export type CompletionControllerEffect');
@@ -251,7 +320,7 @@ describe('App ghost reactivity wiring', () => {
       source.indexOf('function updateFromSource'),
       source.indexOf('function updateSourceSelection')
     );
-    expect(sourceMutation).toContain('if (pendingCompletionText !== null) commitSourceDraft();');
+    expect(sourceMutation).toContain('if (completionController.pendingText !== null) commitSourceDraft();');
     expect(source).toContain('surfaceKey={completionContextKey}');
     expect(source).not.toContain('surfaceKey={`${project.session_id}:${document.summary.document_id}:${document.summary.revision_id}');
     expect(sourceEditor).toContain('observedValue = element.value;');
@@ -328,6 +397,22 @@ describe('App ghost reactivity wiring', () => {
       ipc.indexOf('export function openDocument'),
       ipc.indexOf('export function checkpointDocument')
     );
+    const rename = source.slice(
+      source.indexOf('async function beginDocumentRename'),
+      source.indexOf('function cancelDocumentRename')
+    );
+    const cancelRename = source.slice(
+      source.indexOf('function cancelDocumentRename'),
+      source.indexOf('async function commitDocumentRename')
+    );
+    const commitRename = source.slice(
+      source.indexOf('async function commitDocumentRename'),
+      source.indexOf('function handleDocumentRenameKeydown')
+    );
+    const readonly = source.slice(
+      source.indexOf('$: editorReadonly ='),
+      source.indexOf('$: reconciliationResolutionLocked')
+    );
 
     expect(sidebar).toContain('aria-haspopup="menu"');
     expect(sidebar).toContain('on:contextmenu={(event) => handleDocumentContextPointer(event, candidate)}');
@@ -335,6 +420,7 @@ describe('App ghost reactivity wiring', () => {
     expect(sidebar).toContain('role="menu"');
     expect(sidebar).toContain('role="menuitem"');
     expect(sidebar).toContain('>Open</button>');
+    expect(sidebar).toContain('>Rename…</button>');
     expect(sidebar).toContain('>Export Text…</button>');
     expect(sidebar).toContain('{documentContextRevealLabel}</button>');
     expect(action).toContain('const target = documentContextTarget;');
@@ -344,6 +430,72 @@ describe('App ghost reactivity wiring', () => {
     expect(documentCalls).toContain('expectedRevisionId');
     expect(documentCalls).toContain('expectedBlobId');
     expect(documentCalls).not.toContain('relativePath');
+    expect(source).toContain('data-document-title');
+    expect(source).toContain('bind:value={renameDocumentTitle}');
+    expect(sidebar).toContain('on:compositionstart={handleDocumentRenameCompositionStart}');
+    expect(sidebar).toContain('on:compositionend={handleDocumentRenameCompositionEnd}');
+    expect(sidebar).toContain('on:blur={handleDocumentRenameBlur}');
+    expect(rename.indexOf('flushEditors()'))
+      .toBeLessThan(rename.indexOf('refreshDocumentRenameTarget('));
+    expect(rename.indexOf('renameDocumentEditorLocked = true'))
+      .toBeLessThan(rename.indexOf('flushEditors()'));
+    expect(rename).toContain('flushCurrentDocument');
+    expect(cancelRename).toContain('renameDocumentEditorLocked = false');
+    expect(readonly).toContain('renameDocumentEditorLocked');
+    expect(commitRename).toContain('capturedDocumentIdentityIsCurrent(target, project)');
+    expect(commitRename).toContain('renameDocumentComposition.active');
+    expect(source).toContain('boundedDocumentTitleInput(input.value)');
+    expect(action).toContain("case 'rename':");
+  });
+
+  it('does not let a handled rename or menu key escape into global Shuttle controls', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const renameKeydown = source.slice(
+      source.indexOf('function handleDocumentRenameKeydown'),
+      source.indexOf('function handleDocumentContextMenuKeydown')
+    );
+    const menuKeydown = source.slice(
+      source.indexOf('function handleDocumentContextMenuKeydown'),
+      source.indexOf('function recordDocumentContextFailure')
+    );
+    const globalKeydown = source.slice(
+      source.indexOf('function handleGlobalKeydown(event:'),
+      source.indexOf('function newDocumentShortcut')
+    );
+    const captureKeydown = source.slice(
+      source.indexOf('function handleGlobalKeydownCapture'),
+      source.indexOf('function handleGlobalKeydown(event:')
+    );
+
+    expect(renameKeydown).toContain("if (event.key === 'Escape')");
+    expect(renameKeydown).toContain('renameDocumentComposition.ownsCommandKey(event)');
+    expect(renameKeydown).toContain('event.stopPropagation()');
+    expect(renameKeydown).toContain('event.preventDefault()');
+    expect(menuKeydown).toContain("case 'dismiss':");
+    expect(menuKeydown).toContain('event.preventDefault()');
+    expect(globalKeydown.indexOf('if (event.defaultPrevented) return;'))
+      .toBeLessThan(globalKeydown.indexOf("if (event.key === 'Escape' && shuttleEnabled)"));
+    expect(source).toContain("window.addEventListener('keydown', handleGlobalKeydownCapture, true)");
+    expect(source).toContain("window.removeEventListener('keydown', handleGlobalKeydownCapture, true)");
+    expect(captureKeydown).toContain('shouldCaptureFormatMenuEscape');
+    expect(captureKeydown).toContain('compositionActive');
+    expect(captureKeydown).toContain('documentRenameOwnsEscape');
+    expect(captureKeydown).toContain('documentMenuOwnsEscape');
+    expect(captureKeydown).toContain('modelManagerOwnsEscape');
+    expect(captureKeydown).toContain('event.stopPropagation()');
+    expect(captureKeydown).toContain('closeFormatMenu()');
+  });
+
+  it('keeps the source-to-visual control available and checks exactness after flushing source edits', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const mode = source.slice(
+      source.indexOf('async function setMode'),
+      source.indexOf('function announce')
+    );
+    expect(source).toContain('disabled={editorReadonly}');
+    expect(source).not.toContain("disabled={editorReadonly || (mode === 'source' && !canUseVisual)}");
+    expect(mode.indexOf('flushEditors()')).toBeLessThan(mode.indexOf('canUseVisualMarkdown(documentText, false)'));
+    expect(mode).toContain("'visual_markdown_not_exact'");
   });
 
 });

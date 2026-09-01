@@ -234,6 +234,7 @@ export interface ModelDownloadSnapshot {
 export interface BranchCard {
   run_id: string;
   branch_id: string;
+  weave_command_id: string | null;
   document_id: string;
   candidate_id: string | null;
   source_revision_id: string;
@@ -283,9 +284,19 @@ export interface CompletionTerminalSnapshot {
   class: CompletionTerminalClass;
 }
 
+export interface CompletionPartialTextSnapshot {
+  /** Cumulative UTF-8 completion prefix owned by the scoped native snapshot. */
+  text: string;
+  /** Decimal u64 sequence of the last text-delta included in `text`. */
+  sequence: string;
+  /** Decimal u64 byte length of `text` after UTF-8 encoding. */
+  utf8_byte_len: string;
+}
+
 export interface CompletionOperationBranchSnapshot {
   run_id: string;
   branch_id: string;
+  partial_text: CompletionPartialTextSnapshot | null;
 }
 
 export interface CompletionOperationSnapshot {

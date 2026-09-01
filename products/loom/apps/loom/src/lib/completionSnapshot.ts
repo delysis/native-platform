@@ -13,10 +13,19 @@ export interface CompletionSnapshotScope {
 export interface CompletionSnapshotFacts {
   activeRunIds: string[];
   cancellationRequestedRunIds: string[];
+  /** Full replacement map for the partial text in this exact snapshot. */
+  liveTextByRun: Record<string, string>;
+  /** Full replacement map for sequence-based renderer presentation identity. */
+  liveTextSequenceByRun: Record<string, string>;
 }
 
+const U64_MAX_DECIMAL = '18446744073709551615';
+const MAX_COMPLETION_PARTIAL_TEXT_UTF8_BYTES = 256 * 1024;
+
 function isDecimalU64(value: string): boolean {
-  return /^(0|[1-9][0-9]*)$/.test(value);
+  if (!/^(0|[1-9][0-9]*)$/.test(value)) return false;
+  return value.length < U64_MAX_DECIMAL.length ||
+    (value.length === U64_MAX_DECIMAL.length && value <= U64_MAX_DECIMAL);
 }
 
 function isActiveOperationPhase(value: string): boolean {
@@ -86,6 +95,9 @@ export function completionSnapshotFacts(
   const activeRunIds = new Set<string>();
   const activeBranchIds = new Set<string>();
   const cancellationRequestedRunIds = new Set<string>();
+  const liveTextByRun: Record<string, string> = {};
+  const liveTextSequenceByRun: Record<string, string> = {};
+  const textEncoder = new TextEncoder();
   for (const operation of snapshot.active_operations) {
     if (
       !operation.request_id ||
@@ -116,6 +128,26 @@ export function completionSnapshotFacts(
       }
       activeRunIds.add(branch.run_id);
       activeBranchIds.add(branch.branch_id);
+      const partial = branch.partial_text;
+      if (partial !== null) {
+        const encodedByteLength = typeof partial === 'object' && typeof partial.text === 'string'
+          ? textEncoder.encode(partial.text).byteLength
+          : -1;
+        if (
+          typeof partial !== 'object' ||
+          typeof partial.text !== 'string' ||
+          typeof partial.sequence !== 'string' ||
+          typeof partial.utf8_byte_len !== 'string' ||
+          !isDecimalU64(partial.sequence) ||
+          !isDecimalU64(partial.utf8_byte_len) ||
+          encodedByteLength > MAX_COMPLETION_PARTIAL_TEXT_UTF8_BYTES ||
+          partial.utf8_byte_len !== String(encodedByteLength)
+        ) {
+          throw new Error('The desktop returned an invalid completion partial-text projection.');
+        }
+        liveTextByRun[branch.run_id] = partial.text;
+        liveTextSequenceByRun[branch.run_id] = partial.sequence;
+      }
       if (operation.cancellation_requested) {
         cancellationRequestedRunIds.add(branch.run_id);
       }
@@ -124,6 +156,8 @@ export function completionSnapshotFacts(
 
   return {
     activeRunIds: [...activeRunIds],
-    cancellationRequestedRunIds: [...cancellationRequestedRunIds]
+    cancellationRequestedRunIds: [...cancellationRequestedRunIds],
+    liveTextByRun,
+    liveTextSequenceByRun
   };
 }

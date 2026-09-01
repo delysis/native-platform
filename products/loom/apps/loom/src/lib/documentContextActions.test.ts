@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
+  MAX_DOCUMENT_TITLE_BYTES,
+  boundedDocumentTitleInput,
   captureDocumentTarget,
   capturedDocumentBelongsToSession,
+  capturedDocumentIdentityIsCurrent,
   clampDocumentMenuPoint,
+  createDocumentRenameCompositionGuard,
   documentMenuKeyAction,
   documentRevealLabel,
-  isDocumentContextTriggerKey
+  isDocumentContextTriggerKey,
+  refreshDocumentRenameTarget
 } from './documentContextActions';
 import type { DocumentSummary, ProjectSnapshot } from './types';
 
@@ -72,6 +77,103 @@ describe('captured document context target', () => {
       session_id: 'session-2'
     })).toBe(false);
     expect(capturedDocumentBelongsToSession(captured, null)).toBe(false);
+  });
+
+  it('requires the captured revision and blob to remain current before applying a receipt', () => {
+    const liveProject = project();
+    const captured = captureDocumentTarget(liveProject, liveProject.documents[0])!;
+    expect(capturedDocumentIdentityIsCurrent(captured, liveProject)).toBe(true);
+    expect(capturedDocumentIdentityIsCurrent(captured, project(document({
+      revision_id: 'revision-2',
+      active_blob_id: 'b'.repeat(64)
+    })))).toBe(false);
+    expect(capturedDocumentIdentityIsCurrent(captured, {
+      ...liveProject,
+      session_id: 'session-2'
+    })).toBe(false);
+    expect(capturedDocumentIdentityIsCurrent(captured, null)).toBe(false);
+  });
+
+  it('flushes a current manuscript and recaptures the post-save rename identity', async () => {
+    let liveProject = project();
+    const captured = captureDocumentTarget(liveProject, liveProject.documents[0])!;
+    let flushes = 0;
+
+    const refreshed = await refreshDocumentRenameTarget(
+      captured,
+      captured.documentId,
+      async () => {
+        flushes += 1;
+        liveProject = project(document({
+          revision_id: 'revision-2',
+          active_blob_id: 'b'.repeat(64)
+        }));
+        return true;
+      },
+      () => liveProject
+    );
+
+    expect(flushes).toBe(1);
+    expect(refreshed).toMatchObject({
+      expectedRevisionId: 'revision-2',
+      expectedBlobId: 'b'.repeat(64)
+    });
+  });
+
+  it('does not mint rename authority when a current save or project session changes', async () => {
+    let liveProject = project();
+    const captured = captureDocumentTarget(liveProject, liveProject.documents[0])!;
+    expect(await refreshDocumentRenameTarget(
+      captured,
+      captured.documentId,
+      async () => false,
+      () => liveProject
+    )).toBeNull();
+
+    liveProject = { ...liveProject, session_id: 'session-2' };
+    expect(await refreshDocumentRenameTarget(
+      captured,
+      'another-document',
+      async () => true,
+      () => liveProject
+    )).toBeNull();
+  });
+});
+
+describe('document title byte contract', () => {
+  it('keeps exact UTF-8 prefixes at the native 256-byte ceiling', () => {
+    expect(boundedDocumentTitleInput('a'.repeat(MAX_DOCUMENT_TITLE_BYTES)))
+      .toBe('a'.repeat(MAX_DOCUMENT_TITLE_BYTES));
+    expect(boundedDocumentTitleInput('😀'.repeat(65))).toBe('😀'.repeat(64));
+    expect(new TextEncoder().encode(boundedDocumentTitleInput(`a${'é'.repeat(200)}`)).byteLength)
+      .toBeLessThanOrEqual(MAX_DOCUMENT_TITLE_BYTES);
+  });
+});
+
+describe('document rename composition ownership', () => {
+  it('recognizes browser and legacy IME witnesses without consuming ordinary keys', () => {
+    const guard = createDocumentRenameCompositionGuard();
+    expect(guard.ownsCommandKey({ isComposing: false, keyCode: 13 })).toBe(false);
+    expect(guard.ownsCommandKey({ isComposing: true, keyCode: 13 })).toBe(true);
+    guard.reset();
+    expect(guard.ownsCommandKey({ isComposing: false, keyCode: 229 })).toBe(true);
+  });
+
+  it('defers blur through compositionend and clears every pending intent on reset', () => {
+    const guard = createDocumentRenameCompositionGuard();
+    guard.start();
+    expect(guard.active).toBe(true);
+    expect(guard.blurShouldCommit()).toBe(false);
+    expect(guard.finish()).toBe(true);
+    expect(guard.active).toBe(false);
+    expect(guard.finish()).toBe(false);
+
+    guard.start();
+    expect(guard.blurShouldCommit()).toBe(false);
+    guard.reset();
+    expect(guard.active).toBe(false);
+    expect(guard.finish()).toBe(false);
+    expect(guard.blurShouldCommit()).toBe(true);
   });
 });
 

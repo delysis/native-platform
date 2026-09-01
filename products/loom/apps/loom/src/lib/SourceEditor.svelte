@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
+  import { completionOptionAccessibleLabel } from './ghostText';
+  import { allocateCompletionPopupDomIds, placeCompletionPopup } from './completionPopup';
   import type { VerseNewlineKind } from './verseCodec';
   import {
     nextSuggestionWord,
@@ -16,11 +18,21 @@
     sourceGhostVisibilityWitnessMatches,
     sourceMirrorDirectionIsSupported,
     sourceMirrorGeometry,
+    sourceShiftTabEdit,
     sourceTextHasStrongRtl,
     type SourceGhostAnchor,
     type SourceGhostPlan,
     type SourceGhostPresentation
   } from './sourceGhostText';
+  import {
+    STALE_IMAGE_ATTACHMENT_ERROR,
+    UNREADABLE_TRANSFER_IMAGE_ERROR,
+    UNVERIFIED_DROP_FILE_ERROR,
+    imageAttachmentErrorMessage,
+    imageFilesFromTransfer,
+    transferContainsEphemeralImage,
+    transferMayContainImageFile
+  } from './attachments';
 
   export let element: HTMLTextAreaElement | undefined;
   export let value = '';
@@ -29,7 +41,6 @@
   export let verseNewline: VerseNewlineKind | null = null;
   export let surfaceKey = '';
   export let label = 'Markdown source editor';
-  export let placeholder = 'Start writing…';
   export let ghostText = '';
   export let ghostCandidateId = '';
   export let ghostPresentationKey = '';
@@ -37,6 +48,10 @@
   export let ghostAlternatives: readonly SuggestionAlternative[] = [];
   export let ghostHidden = false;
   export let ghostUnconsumeText = '';
+  export let onImageAttachments: (files: readonly File[]) => Promise<readonly string[]> =
+    async () => [];
+  export let onImageAttachmentsCommitted: (count: number) => void = () => {};
+  export let onImageAttachmentError: (message: string) => void = () => {};
   export let onValueInput: (textarea: HTMLTextAreaElement) => void = () => {};
   export let onSelectionChange: (textarea: HTMLTextAreaElement) => void = () => {};
   export let onCompositionStart: () => void = () => {};
@@ -73,6 +88,12 @@
   let plan: SourceGhostPlan | null = null;
   let presentationAnchor: SourceGhostAnchor | null = null;
   let optionFanVisible = false;
+  let suggestionFan: HTMLDivElement;
+  let fanPlacementFrame: number | undefined;
+  let selectedFanOptionIndex = -1;
+  let controlledFanId: string | undefined;
+  let activeFanOptionId: string | undefined;
+  const completionPopupDomIds = allocateCompletionPopupDomIds('source');
 
   const mirroredProperties = [
     'direction',
@@ -142,11 +163,55 @@
     onGhostVisibilityChange(presentationKey);
   }
 
-  function renderedGhostPresentationKey(candidate: SourceGhostPlan | null): string {
+  function placeSourceFan(): void {
+    fanPlacementFrame = undefined;
+    if (
+      !optionFanVisible ||
+      !plan ||
+      !ghostSpan?.isConnected ||
+      !suggestionFan?.isConnected
+    ) return;
+    if (!visibleSourceGhostPlan(plan, true)) {
+      // Viewport clamping cannot supply the missing insertion witness. Close
+      // the fixed fan when its mirrored caret has scrolled out of view.
+      setOptionFanVisible(false);
+      return;
+    }
+    const ghostRect = ghostSpan.getClientRects().item(0) ?? ghostSpan.getBoundingClientRect();
+    suggestionFan.style.maxHeight = '';
+    placeCompletionPopup(suggestionFan, {
+      left: ghostRect.left,
+      right: ghostRect.left,
+      top: ghostRect.top,
+      bottom: ghostRect.bottom,
+      width: 0,
+      height: ghostRect.height
+    });
+  }
+
+  function requestFanPlacement(): void {
+    if (fanPlacementFrame !== undefined || !optionFanVisible) return;
+    fanPlacementFrame = window.requestAnimationFrame(placeSourceFan);
+  }
+
+  function setOptionFanVisible(visible: boolean): void {
+    if (optionFanVisible === visible) {
+      if (visible) requestFanPlacement();
+      return;
+    }
+    optionFanVisible = visible;
+    if (visible) void tick().then(requestFanPlacement);
+  }
+
+  function renderedGhostPresentationKey(
+    candidate: SourceGhostPlan | null,
+    allowFanHiddenGhost = false
+  ): string {
     if (
       !candidate ||
       !viewport ||
       !ghostSpan ||
+      ghostHidden ||
       viewport.hidden ||
       ghostSpan.hidden ||
       !viewport.isConnected ||
@@ -155,14 +220,17 @@
 
     const viewportStyle = getComputedStyle(viewport);
     const ghostStyle = getComputedStyle(ghostSpan);
+    const ignoreFanVisibility = allowFanHiddenGhost && optionFanVisible;
     if (
       viewportStyle.display === 'none' ||
       viewportStyle.visibility === 'hidden' ||
       viewportStyle.visibility === 'collapse' ||
       Number.parseFloat(viewportStyle.opacity) === 0 ||
       ghostStyle.display === 'none' ||
-      ghostStyle.visibility === 'hidden' ||
-      ghostStyle.visibility === 'collapse' ||
+      (!ignoreFanVisibility && (
+        ghostStyle.visibility === 'hidden' ||
+        ghostStyle.visibility === 'collapse'
+      )) ||
       Number.parseFloat(ghostStyle.opacity) === 0
     ) return '';
 
@@ -175,6 +243,22 @@
       !sourceGhostRectIntersectsViewport(firstGhostRect, viewport.getBoundingClientRect())
     ) return '';
     return candidate.presentationKey;
+  }
+
+  function visibleSourceGhostPlan(
+    candidate: SourceGhostPlan | null,
+    allowFanHiddenGhost = false
+  ): SourceGhostPlan | null {
+    const livePresentationKey = renderedGhostPresentationKey(
+      candidate,
+      allowFanHiddenGhost
+    );
+    return candidate &&
+      renderedSourceGhostPresentationKey(candidate, viewport ? Boolean(viewport.hidden) : true) ===
+        candidate.presentationKey &&
+      sourceGhostVisibilityWitnessMatches(candidate.presentationKey, livePresentationKey)
+      ? candidate
+      : null;
   }
 
   function installPlan(next: SourceGhostPlan | null): void {
@@ -197,6 +281,7 @@
       if (!viewport || plan?.presentationKey !== expectedKey) return;
       viewport.hidden = false;
       reportVisiblePresentationKey(renderedGhostPresentationKey(plan));
+      requestFanPlacement();
     });
   }
 
@@ -280,6 +365,7 @@
     viewport.style.height = `${geometry.viewportHeight}px`;
     exactGeometry = true;
     installPlan(currentPlan());
+    requestFanPlacement();
   }
 
   function requestGeometrySync(): void {
@@ -303,7 +389,7 @@
 
   function handleBlur(): void {
     focused = false;
-    optionFanVisible = false;
+    setOptionFanVisible(false);
     hideCurrentGhost();
   }
 
@@ -315,6 +401,73 @@
     suppressCurrentGhost();
     readSelection(false, false);
     if (element) onValueInput(element);
+  }
+
+  function handleImageTransfer(event: DragEvent | ClipboardEvent): void {
+    const transfer = event instanceof ClipboardEvent ? event.clipboardData : event.dataTransfer;
+    const files = imageFilesFromTransfer(transfer);
+    const ephemeralImage = transferContainsEphemeralImage(transfer);
+    const claimedFileDrop = event instanceof DragEvent && transferMayContainImageFile(transfer);
+    if (files.length === 0 && !ephemeralImage && !claimedFileDrop) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (files.length === 0) {
+      onImageAttachmentError(
+        claimedFileDrop && !ephemeralImage
+          ? UNVERIFIED_DROP_FILE_ERROR
+          : UNREADABLE_TRANSFER_IMAGE_ERROR
+      );
+      return;
+    }
+    if (!element || readonly || composing) {
+      onImageAttachmentError('Images cannot be attached while this editor is unavailable.');
+      return;
+    }
+
+    const capturedElement = element;
+    const capturedValue = capturedElement.value;
+    const capturedSurfaceKey = surfaceKey;
+    const capturedStart = capturedElement.selectionStart;
+    const capturedEnd = capturedElement.selectionEnd;
+    void onImageAttachments(files).then((snippets) => {
+      const committedSnippets = snippets.filter((snippet) => snippet.length > 0);
+      if (
+        !element ||
+        element !== capturedElement ||
+        !capturedElement.isConnected ||
+        readonly ||
+        composing ||
+        surfaceKey !== capturedSurfaceKey ||
+        capturedElement.value !== capturedValue
+      ) {
+        if (committedSnippets.length > 0) {
+          onImageAttachmentError(STALE_IMAGE_ATTACHMENT_ERROR);
+        }
+        return;
+      }
+      const markdown = committedSnippets.join('\n\n');
+      if (!markdown) return;
+      const capturedSelectionIsCurrent =
+        capturedElement.selectionStart === capturedStart &&
+        capturedElement.selectionEnd === capturedEnd;
+      capturedElement.setRangeText(
+        markdown,
+        capturedStart,
+        capturedEnd,
+        capturedSelectionIsCurrent ? 'end' : 'preserve'
+      );
+      observedValue = capturedElement.value;
+      readSelection(false, false);
+      onValueInput(capturedElement);
+      onImageAttachmentsCommitted(committedSnippets.length);
+    }).catch((error: unknown) => onImageAttachmentError(imageAttachmentErrorMessage(error)));
+  }
+
+  function handleImageDragOver(event: DragEvent): void {
+    if (
+      transferMayContainImageFile(event.dataTransfer) ||
+      transferContainsEphemeralImage(event.dataTransfer)
+    ) event.preventDefault();
   }
 
   function handleSelection(): void {
@@ -336,12 +489,14 @@
 
   function handleKeydown(event: KeyboardEvent): void {
     const candidate = currentPlan();
+    const visible = visibleSourceGhostPlan(candidate, optionFanVisible);
+    if (optionFanVisible && !visible) setOptionFanVisible(false);
     if (
       (event.key === 'Alt' || event.altKey) &&
-      candidate &&
+      visible &&
       ghostAlternatives.length > 1
     ) {
-      optionFanVisible = true;
+      setOptionFanVisible(true);
       if (event.key === 'Alt') return;
     }
     if (
@@ -384,24 +539,14 @@
       onGhostDismiss(candidate.candidateId, candidate.presentationKey);
       return;
     }
-    const livePresentationKey = renderedGhostPresentationKey(candidate);
-    const visible = candidate &&
-      renderedSourceGhostPresentationKey(candidate, viewport ? Boolean(viewport.hidden) : true) ===
-        candidate.presentationKey &&
-      sourceGhostVisibilityWitnessMatches(
-        candidate.presentationKey,
-        livePresentationKey
-      )
-      ? candidate
-      : null;
     if (
-      candidate &&
+      visible &&
       optionFanVisible &&
       event.altKey &&
       (event.key === 'Enter' || event.key === 'Tab') &&
       insertVisibleGhostText(
-        candidate,
-        candidate.text,
+        visible,
+        visible.text,
         event.key === 'Enter' ? 'fan_return' : 'fan_tab'
       )
     ) {
@@ -410,9 +555,9 @@
       suppressCurrentGhost();
       return;
     }
-    const action = sourceGhostKeyAction(event, Boolean(visible), optionFanVisible && Boolean(candidate));
+    const action = sourceGhostKeyAction(event, Boolean(visible), optionFanVisible && Boolean(visible));
     if (!action) return;
-    if ((action === 'cycle_next' || action === 'cycle_previous') && candidate) {
+    if ((action === 'cycle_next' || action === 'cycle_previous') && visible) {
       event.preventDefault();
       event.stopPropagation();
       onGhostCycle(action === 'cycle_next' ? 1 : -1);
@@ -439,16 +584,33 @@
         return;
       }
     }
-    const wordCandidate = visible ?? (optionFanVisible ? candidate : null);
-    if (action === 'accept_word' && wordCandidate) {
-      const word = nextSuggestionWord(wordCandidate.text);
-      if (word && insertVisibleGhostText(wordCandidate, word, 'option_word')) {
+    if (action === 'accept_word' && visible) {
+      const word = nextSuggestionWord(visible.text);
+      if (word && insertVisibleGhostText(visible, word, 'option_word')) {
         event.preventDefault();
         event.stopPropagation();
       }
       return;
     }
     if (!element || readonly) return;
+    if (action === 'remove_tab_indent') {
+      const edit = sourceShiftTabEdit(
+        element.value,
+        element.selectionStart,
+        element.selectionEnd
+      );
+      // On an unindented line Shift-Tab remains ordinary keyboard navigation
+      // out of the textarea instead of becoming a focus trap.
+      if (!edit) return;
+      event.preventDefault();
+      event.stopPropagation();
+      suppressCurrentGhost();
+      element.value = edit.value;
+      element.setSelectionRange(edit.selectionStart, edit.selectionEnd);
+      readSelection(false, false);
+      onValueInput(element);
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     const edit = sourceTabEdit(
@@ -467,24 +629,34 @@
   }
 
   function handleKeyup(event: KeyboardEvent): void {
-    if (event.key === 'Alt' || !event.altKey) optionFanVisible = false;
+    if (event.key === 'Alt' || !event.altKey) setOptionFanVisible(false);
     handleSelection();
   }
 
   function handleWindowOptionDown(event: KeyboardEvent): void {
+    const candidate = currentPlan();
+    const visible = visibleSourceGhostPlan(candidate, optionFanVisible);
     if (
       (event.key === 'Alt' || (event.altKey && !event.metaKey && !event.ctrlKey)) &&
-      currentPlan() &&
+      visible &&
       ghostAlternatives.length > 1
-    ) optionFanVisible = true;
+    ) {
+      setOptionFanVisible(true);
+    } else if (optionFanVisible && !visible) {
+      setOptionFanVisible(false);
+    }
   }
 
   function handleWindowOptionUp(event: KeyboardEvent): void {
-    if (event.key === 'Alt' || !event.altKey) optionFanVisible = false;
+    if (event.key === 'Alt' || !event.altKey) setOptionFanVisible(false);
   }
 
   function handleWindowBlur(): void {
-    optionFanVisible = false;
+    setOptionFanVisible(false);
+  }
+
+  function handleWindowGeometryChange(): void {
+    requestFanPlacement();
   }
 
   function insertVisibleGhostText(
@@ -563,6 +735,8 @@
     window.addEventListener('keydown', handleWindowOptionDown, true);
     window.addEventListener('keyup', handleWindowOptionUp, true);
     window.addEventListener('blur', handleWindowBlur);
+    window.addEventListener('resize', handleWindowGeometryChange);
+    window.addEventListener('scroll', handleWindowGeometryChange, true);
     syncGeometry();
   });
 
@@ -580,6 +754,18 @@
       : null;
     installPlan(currentPlan());
   }
+
+  $: selectedFanOptionIndex = plan && optionFanVisible && ghostAlternatives.length > 1
+    ? ghostAlternatives.findIndex(
+        (alternative) => alternative.presentationKey === plan?.presentationKey
+      )
+    : -1;
+  $: controlledFanId = selectedFanOptionIndex >= 0
+    ? completionPopupDomIds.listboxId
+    : undefined;
+  $: activeFanOptionId = selectedFanOptionIndex >= 0
+    ? completionPopupDomIds.optionId(selectedFanOptionIndex)
+    : undefined;
 
   $: ltrContent = !sourceTextHasStrongRtl(value) && !sourceTextHasStrongRtl(ghostText);
 
@@ -613,11 +799,14 @@
   onDestroy(() => {
     resizeObserver?.disconnect();
     if (geometryFrame !== undefined) window.cancelAnimationFrame(geometryFrame);
+    if (fanPlacementFrame !== undefined) window.cancelAnimationFrame(fanPlacementFrame);
     reportVisiblePresentationKey('');
     document.removeEventListener('selectionchange', handleDocumentSelectionChange);
     window.removeEventListener('keydown', handleWindowOptionDown, true);
     window.removeEventListener('keyup', handleWindowOptionUp, true);
     window.removeEventListener('blur', handleWindowBlur);
+    window.removeEventListener('resize', handleWindowGeometryChange);
+    window.removeEventListener('scroll', handleWindowGeometryChange, true);
   });
 </script>
 
@@ -642,6 +831,9 @@
     on:focus={handleFocus}
     on:blur={handleBlur}
     on:beforeinput={handleBeforeInput}
+    on:paste={handleImageTransfer}
+    on:dragover={handleImageDragOver}
+    on:drop={handleImageTransfer}
     on:input={handleInput}
     on:select={handleSelection}
     on:click={handleSelection}
@@ -651,15 +843,33 @@
     on:compositionstart={handleCompositionStart}
     on:compositionend={handleCompositionEnd}
     aria-label={label}
-    aria-placeholder={placeholder}
-    {placeholder}
+    aria-controls={controlledFanId}
+    aria-activedescendant={activeFanOptionId}
     spellcheck="true"
     wrap={verse ? 'off' : 'soft'}
   ></textarea>
   {#if plan && optionFanVisible && ghostAlternatives.length > 1}
-    <div class="source-suggestion-fan" aria-hidden="true">
+    <div
+      class="source-suggestion-fan"
+      bind:this={suggestionFan}
+      id={completionPopupDomIds.listboxId}
+      role="listbox"
+      aria-label="Completion suggestions"
+      aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown Alt+Enter Alt+Tab"
+    >
       {#each ghostAlternatives as alternative, index (alternative.presentationKey)}
-        <div class:active={alternative.presentationKey === plan.presentationKey} class="loom-ghost-fan-row">
+        <div
+          class:active={alternative.presentationKey === plan.presentationKey}
+          class="loom-ghost-fan-row"
+          id={completionPopupDomIds.optionId(index)}
+          role="option"
+          aria-selected={alternative.presentationKey === plan.presentationKey}
+          aria-label={completionOptionAccessibleLabel(
+            index + 1,
+            ghostAlternatives.length,
+            alternative.text
+          )}
+        >
           <span class="loom-ghost-fan-index">{index + 1}</span><span>{alternative.text}</span>
         </div>
       {/each}

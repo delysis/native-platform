@@ -129,15 +129,33 @@ function unwrapWithFallback(primary: Command, nodeName: string): Command {
   };
 }
 
-function withTextSelection(command: Command): Command {
+function fullTextSelection(document: ProseMirrorNode): TextSelection | null {
+  const start = Selection.findFrom(document.resolve(0), 1, true);
+  const end = Selection.findFrom(document.resolve(document.content.size), -1, true);
+  if (!(start instanceof TextSelection) || !(end instanceof TextSelection)) return null;
+  // A text range cannot retain Select All semantics when a leaf block sits
+  // outside either endpoint. Keep AllSelection in that case so the next
+  // structural toggle still owns those nodes.
+  if (
+    !(Selection.atStart(document) instanceof TextSelection) ||
+    !(Selection.atEnd(document) instanceof TextSelection)
+  ) return null;
+  return TextSelection.create(document, start.from, end.to);
+}
+
+function withVisibleTextSelectionResult(command: Command): Command {
   return (state, dispatch, view) => {
-    if (!(state.selection instanceof AllSelection)) return command(state, dispatch, view);
-    const from = Selection.atStart(state.doc).from;
-    const to = Selection.atEnd(state.doc).to;
-    const selected = state.apply(state.tr
-      .setSelection(TextSelection.create(state.doc, from, to))
-      .setMeta('addToHistory', false));
-    return command(selected, dispatch, view);
+    const mapAllSelection = state.selection instanceof AllSelection && dispatch;
+    return command(state, mapAllSelection ? (transaction) => {
+      // A structural command may replace wrappers in descending order and map
+      // browser Select All to wrapper boundaries. Publish one atomic
+      // transaction whose final selection spans the writer-visible text, but
+      // retain AllSelection when leaf boundaries make a total text range
+      // impossible without dropping part of the selected document.
+      const mappedText = fullTextSelection(transaction.doc);
+      if (mappedText) transaction.setSelection(mappedText);
+      dispatch(transaction);
+    } : dispatch, view);
   };
 }
 
@@ -214,12 +232,13 @@ export function visualFormatState(state: EditorState): VisualFormatState {
 
 function listCommand(state: EditorState, ordered: boolean): Command {
   const activeName = ordered ? 'ordered_list' : 'bullet_list';
-  return structureIsActive(state, activeName)
-    ? unwrapWithFallback(withTextSelection(liftListItem(schema.nodes.list_item)), activeName)
+  const command = structureIsActive(state, activeName)
+    ? unwrapWithFallback(liftListItem(schema.nodes.list_item), activeName)
     : wrapInList(
         ordered ? schema.nodes.ordered_list : schema.nodes.bullet_list,
         ordered ? { order: 1, tight: true } : { tight: true }
       );
+  return withVisibleTextSelectionResult(command);
 }
 
 export function visualFormatCommand(
@@ -234,9 +253,11 @@ export function visualFormatCommand(
     case 'subheading': return setBlockType(schema.nodes.heading, { level: 3 });
     case 'bold': return withTrimmedInlineSelection(toggleMark(schema.marks.strong));
     case 'italic': return withTrimmedInlineSelection(toggleMark(schema.marks.em));
-    case 'blockquote': return structureIsActive(state, 'blockquote')
-      ? unwrapWithFallback(withTextSelection(lift), 'blockquote')
-      : wrapIn(schema.nodes.blockquote);
+    case 'blockquote': return withVisibleTextSelectionResult(
+      structureIsActive(state, 'blockquote')
+        ? unwrapWithFallback(lift, 'blockquote')
+        : wrapIn(schema.nodes.blockquote)
+    );
     case 'bullet_list': return listCommand(state, false);
     case 'ordered_list': return listCommand(state, true);
     case 'link': {

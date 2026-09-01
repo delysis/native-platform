@@ -8,6 +8,7 @@ import {
   sourceGhostPresentationCompatible,
   sourceGhostRectIntersectsViewport,
   sourceGhostVisibilityWitnessMatches,
+  sourceShiftTabEdit,
   sourceTabEdit,
   sourceTextHasStrongRtl,
   sourceGhostTextForTextarea,
@@ -246,7 +247,7 @@ describe('sourceGhostKeyAction', () => {
 
   it('accepts a visible ghost and otherwise inserts an ordinary tab', () => {
     expect(sourceGhostKeyAction(key(), true)).toBe('accept');
-    expect(sourceGhostKeyAction(key({ shiftKey: true }), true)).toBeNull();
+    expect(sourceGhostKeyAction(key({ shiftKey: true }), true)).toBe('remove_tab_indent');
     expect(sourceGhostKeyAction(key({ metaKey: true }), true)).toBeNull();
     expect(sourceGhostKeyAction(key(), false)).toBe('insert_tab');
     expect(sourceGhostKeyAction(key({ key: 'ArrowRight', altKey: true }), true)).toBe('accept_word');
@@ -267,6 +268,57 @@ describe('sourceGhostKeyAction', () => {
     expect(sourceGhostKeyAction(key({ key: 'Escape', keyCode: 27 }), true)).toBe('dismiss');
     expect(sourceGhostKeyAction(key({ isComposing: true }), true)).toBeNull();
     expect(sourceGhostKeyAction(key({ keyCode: 229 }), true)).toBeNull();
+  });
+});
+
+describe('sourceShiftTabEdit', () => {
+  it('removes a leading tab or up to four Markdown indentation spaces from the caret line', () => {
+    expect(sourceShiftTabEdit('before\n\tindented\nafter', 15, 15)).toEqual({
+      value: 'before\nindented\nafter',
+      selectionStart: 14,
+      selectionEnd: 14
+    });
+    expect(sourceShiftTabEdit('before\n    indented\nafter', 18, 18)).toEqual({
+      value: 'before\nindented\nafter',
+      selectionStart: 14,
+      selectionEnd: 14
+    });
+    expect(sourceShiftTabEdit('  shallow', 5, 5)).toEqual({
+      value: 'shallow',
+      selectionStart: 3,
+      selectionEnd: 3
+    });
+    expect(sourceShiftTabEdit('    indented', 2, 2)).toEqual({
+      value: 'indented',
+      selectionStart: 0,
+      selectionEnd: 0
+    });
+    expect(sourceShiftTabEdit('plain', 3, 3)).toBeNull();
+    expect(sourceShiftTabEdit('\n\tindented', 0, 0)).toBeNull();
+  });
+
+  it('deindents every selected line without including a trailing boundary line', () => {
+    expect(sourceShiftTabEdit('\tone\n\t\ttwo\n\tthree', 0, 11)).toEqual({
+      value: 'one\n\ttwo\n\tthree',
+      selectionStart: 0,
+      selectionEnd: 9
+    });
+    expect(sourceShiftTabEdit('\tone\n\ttwo', 0, 5)).toEqual({
+      value: 'one\n\ttwo',
+      selectionStart: 0,
+      selectionEnd: 4
+    });
+    expect(sourceShiftTabEdit('    one\n\ttwo\n  three', 0, 15)).toEqual({
+      value: 'one\ntwo\nthree',
+      selectionStart: 0,
+      selectionEnd: 8
+    });
+  });
+
+  it('rejects invalid textarea selections without changing bytes', () => {
+    expect(sourceShiftTabEdit('\ttext', -1, 2)).toBeNull();
+    expect(sourceShiftTabEdit('\ttext', 3, 2)).toBeNull();
+    expect(sourceShiftTabEdit('\ttext', 0, 6)).toBeNull();
   });
 });
 

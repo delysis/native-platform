@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
+  import { convertFileSrc } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
@@ -25,6 +26,7 @@
     getBuildModelPolicy,
     getModelDownloadStatus,
     getWeaveStatus,
+    ingestImageAttachment,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
     listenForFileCommands,
@@ -41,6 +43,7 @@
     previewDocumentReconciliation,
     promoteCandidate,
     recoverProject,
+    renameDocument,
     revealDocument,
     requestApplicationClose,
     setFocusMode,
@@ -51,6 +54,12 @@
     normalizeFailure,
     upsertTransientDraft
   } from './lib/ipc';
+  import {
+    attachmentMarkdown,
+    encodeImageAttachment,
+    imageAttachmentTransferError,
+    projectAssetProtocolToken
+  } from './lib/attachments';
   import {
     decodeVerseForEditor,
     encodeVerseFromEditor,
@@ -93,6 +102,7 @@
     mergeNewestPage
   } from './lib/branchPaging';
   import { completionSnapshotFacts } from './lib/completionSnapshot';
+  import { shouldCaptureFormatMenuEscape } from './lib/appKeyboardRouting';
   import { writeRebindsStaleDraft } from './lib/draftRecovery';
   import { documentProjectionDecision } from './lib/projectionState';
   import {
@@ -172,16 +182,23 @@
   } from './lib/completionModes';
   import {
     unavailableVisualCompletionWitness,
-    type VisualCompletionAccessibilityWitness
+    unavailableVisualSelectionWitness,
+    type VisualCompletionAccessibilityWitness,
+    type VisualSelectionAccessibilityWitness
   } from './lib/completionAccessibility';
   import { observeNativeFullscreen } from './lib/nativeFullscreen';
   import {
+    boundedDocumentTitleInput,
     captureDocumentTarget,
     capturedDocumentBelongsToSession,
+    capturedDocumentIdentityIsCurrent,
     clampDocumentMenuPoint,
+    createDocumentRenameCompositionGuard,
     documentMenuKeyAction,
     documentRevealLabel,
     isDocumentContextTriggerKey,
+    refreshDocumentRenameTarget,
+    releaseDocumentRenameAndRestoreFocus,
     type CapturedDocumentTarget,
     type DocumentContextAction,
     type MenuPoint
@@ -329,8 +346,8 @@
   let completionController = initialCompletionControllerState();
   let visualCompletionAccessibility: VisualCompletionAccessibilityWitness =
     unavailableVisualCompletionWitness();
-  let projectMenu: HTMLDetailsElement | undefined;
-  let projectMenuTrigger: HTMLElement | undefined;
+  let visualSelectionAccessibility: VisualSelectionAccessibilityWitness =
+    unavailableVisualSelectionWitness();
   let formatMenu: VisualFormatMenu | undefined;
   let visualFormatting: VisualFormatState = {
     block: 'body',
@@ -344,6 +361,14 @@
   };
   let unlistenFileCommands: (() => void) | undefined;
   let fileCommandInFlight = false;
+  let renamingDocumentId: string | null = null;
+  let renameDocumentTitle = '';
+  let renameDocumentInput: HTMLInputElement | undefined;
+  let renameDocumentTarget: CapturedDocumentTarget | null = null;
+  let renameDocumentTrigger: HTMLElement | null = null;
+  let renameDocumentInFlight = false;
+  let renameDocumentEditorLocked = false;
+  const renameDocumentComposition = createDocumentRenameCompositionGuard();
   let appliedNativeTitle = '';
   let suggestionsEnabled = false;
   let suggestionsChanging = false;
@@ -390,6 +415,8 @@
   let branchLoadedPastFirstPage = false;
   let branchBodyBlobByRun: Record<string, string> = {};
   let verifiedBranchBodyByRun: Record<string, VerifiedBranchBody> = {};
+  let liveBranchTextByRun: Record<string, string> = {};
+  let liveBranchTextSequenceByRun: Record<string, string> = {};
   let branchBodyErrorByRun: Record<string, string> = {};
   let branchRefreshSerial = 0;
   let branchRefreshInFlightCount = 0;
@@ -405,6 +432,7 @@
   let branchPollAttempt = 0;
   let branchPollEpoch = 0;
   let completionActiveRunIds: string[] = [];
+  let authoritativeCompletionFamilyId: string | null = null;
   let cancellingRunIds: string[] = [];
   let cancellationCommandByRun: Record<string, string> = {};
   let promotionArmedCandidateId: string | null = null;
@@ -416,6 +444,7 @@
   let uncertainPromotion: PromotionCapture | null = null;
   let unlistenGenerationEvents: (() => void) | undefined;
   let generationListenerDisposed = false;
+  let generationListenerPromise: Promise<void> | null = null;
   let saveTimer: number | undefined;
   let saveInFlight: Promise<void> | null = null;
   let saveQueued = false;
@@ -442,6 +471,7 @@
     focusPreservingSelection: () => boolean;
     captureFormattingSelection: () => boolean;
     clearFormattingSelection: () => void;
+    refreshGhostPresentation: () => boolean;
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
   } | null = null;
@@ -587,7 +617,6 @@
   const branchPollMaxMs = 4_000;
   const branchPageSize = 24;
   const branchShelfBodyMaxBytes = 1024 * 1024;
-  const noLiveBranchText: Record<string, string> = {};
   const applicationCloseRetry = new ApplicationCloseRetryScheduler({
     schedule: (callback, delayMs) => window.setTimeout(callback, delayMs),
     cancel: (handle) => window.clearTimeout(handle)
@@ -742,8 +771,10 @@
     : null;
   $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual', {
     branches,
+    authoritativeFamilyId: authoritativeCompletionFamilyId,
     verifiedBodyByRun: verifiedBranchBodyByRun,
-    liveTextByRun: noLiveBranchText,
+    liveTextByRun: liveBranchTextByRun,
+    liveTextSequenceByRun: liveBranchTextSequenceByRun,
     currentModel,
     document,
     suggestionsEnabled: completionAutomationEnabled(),
@@ -755,8 +786,10 @@
   });
   $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source', {
     branches,
+    authoritativeFamilyId: authoritativeCompletionFamilyId,
     verifiedBodyByRun: verifiedBranchBodyByRun,
-    liveTextByRun: noLiveBranchText,
+    liveTextByRun: liveBranchTextByRun,
+    liveTextSequenceByRun: liveBranchTextSequenceByRun,
     currentModel,
     document,
     suggestionsEnabled: completionAutomationEnabled(),
@@ -786,8 +819,11 @@
     const verified = selected && branch
       ? verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[selected.runId])
       : null;
+    const liveText = selected ? liveBranchTextByRun[selected.runId] : undefined;
+    const liveSequence = selected ? liveBranchTextSequenceByRun[selected.runId] : undefined;
+    const hasLiveProjection = liveText !== undefined && liveSequence !== undefined;
     const rawText = selected && branch
-      ? verified?.text ?? branch.text
+      ? verified?.text ?? (hasLiveProjection ? liveText : branch.text)
       : '';
     const text = selected
       ? projectInlineCandidateText(
@@ -800,7 +836,9 @@
       : null;
     if (selected && text && candidateTextIsSurfaceable(text)) {
       const rawPresentationKey = verified?.presentationKey ??
-        `branch:${selected.runId}:${new TextEncoder().encode(rawText).byteLength}`;
+        (hasLiveProjection
+          ? `stream:${selected.runId}:${liveSequence}`
+          : `branch:${branch?.branch_id ?? selected.runId}`);
       refreshVisibleCompletionCandidate(
         boundCompletionSession,
         selected.runId,
@@ -859,6 +897,17 @@
         ? visibleSourceGhostPresentationKey
         : '',
     visual: visualCompletionAccessibility,
+    editor_selection: {
+      available: visualSelectionAccessibility.available,
+      epoch: visualSelectionAccessibility.epoch,
+      selection_kind: visualSelectionAccessibility.selectionKind,
+      from: visualSelectionAccessibility.from,
+      to: visualSelectionAccessibility.to,
+      empty: visualSelectionAccessibility.empty,
+      all_visible_text: visualSelectionAccessibility.allVisibleText,
+      caret_at_end: visualSelectionAccessibility.caretAtEnd,
+      caret_byte_offset: visualSelectionAccessibility.caretByteOffset
+    },
     last_action: completionController.lastAction
   });
   $: completionExhaustionKey = boundCompletionSession && completionShouldRequestNextBatch(
@@ -899,15 +948,6 @@
           : 'Set up';
   $: nativeWindowTitle = document?.summary.title ?? project?.title ?? 'Loom';
   $: resolvedAppearance = resolveAppearance(appearance, systemDark);
-  $: autosaveLabel = saveState === 'saving'
-    ? 'Saving…'
-    : saveState === 'dirty'
-      ? 'Autosave pending'
-      : saveState === 'error' || saveState === 'uncertain'
-        ? saveMessage
-        : project
-          ? 'Autosaved'
-          : 'No document';
   $: if (desktop) void syncNativeWindowTitle(nativeWindowTitle);
   $: if (componentMounted) {
     window.document.documentElement.dataset.theme = resolvedAppearance;
@@ -1001,7 +1041,7 @@
   $: showVisual = mode === 'visual';
   $: showSource = mode === 'source';
   $: exactTextSurface = document?.summary.kind === 'verse';
-  $: editorReadonly = transition !== 'idle' || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
+  $: editorReadonly = transition !== 'idle' || renameDocumentEditorLocked || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
   $: reconciliationResolutionLocked = reconciliationApplying || pendingReconciliationApply !== null;
   $: reconciliationResolutionIsExact = Boolean(
     reconciliation && (
@@ -1055,8 +1095,11 @@
         }
       })();
     }
+    window.addEventListener('keydown', handleGlobalKeydownCapture, true);
     window.addEventListener('keydown', handleGlobalKeydown);
     window.addEventListener('pointerdown', handleGlobalPointerdown);
+    window.addEventListener('pageshow', handleRendererResume);
+    window.document.addEventListener('visibilitychange', handleRendererResume);
     return () => {
       componentMounted = false;
       startupHeldForApplicationClose = false;
@@ -1064,8 +1107,11 @@
       modelRefreshSerial += 1;
       modelLoadSerial += 1;
       clearPreferredWriterRequest();
+      window.removeEventListener('keydown', handleGlobalKeydownCapture, true);
       window.removeEventListener('keydown', handleGlobalKeydown);
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
+      window.removeEventListener('pageshow', handleRendererResume);
+      window.document.removeEventListener('visibilitychange', handleRendererResume);
       appearanceMedia?.removeEventListener('change', syncSystemAppearance);
       appearanceMedia = null;
       clearAutocompleteModelMenuLongPress();
@@ -1180,8 +1226,11 @@
     branchLoadedPastFirstPage = false;
     branchBodyBlobByRun = {};
     verifiedBranchBodyByRun = {};
+    liveBranchTextByRun = {};
+    liveBranchTextSequenceByRun = {};
     branchBodyErrorByRun = {};
     completionActiveRunIds = [];
+    authoritativeCompletionFamilyId = null;
     cancellingRunIds = [];
     cancellationCommandByRun = {};
     uncertainWeave = null;
@@ -1449,6 +1498,13 @@
     try {
       const unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
         windowFocused = focused;
+        if (focused) {
+          resumeCompletionObservation();
+          // A hidden WKWebView may stay DOM-focused and emit neither browser
+          // focus nor visibilitychange on native resume. Rebuild the exact
+          // cached visual decoration from the native window focus edge.
+          if (mode === 'visual') visualEditor?.refreshGhostPresentation();
+        }
         if (!focused && !compositionActive && !reconciliation) {
           flushEditors();
           void saveNow();
@@ -1465,21 +1521,45 @@
     }
   }
 
-  async function installGenerationEventListener(): Promise<void> {
-    try {
-      const unlisten = await listenForGenerationEvents(handleGenerationEnvelope);
-      if (generationListenerDisposed) {
-        unlisten();
-      } else {
-        unlistenGenerationEvents?.();
-        unlistenGenerationEvents = unlisten;
-      }
-    } catch (error) {
-      if (!generationListenerDisposed) {
-        recordFailure(error);
-        announce('Private strand events are unavailable');
-      }
+  function handleRendererResume(): void {
+    if (window.document.visibilityState === 'hidden') return;
+    resumeCompletionObservation();
+  }
+
+  function resumeCompletionObservation(): void {
+    if (!componentMounted || !desktop) return;
+    if (!unlistenGenerationEvents) void installGenerationEventListener();
+    if (branchPollTimer !== undefined) window.clearTimeout(branchPollTimer);
+    branchPollTimer = undefined;
+    branchPollAttempt = 0;
+    // A suspended WebView can miss every event and timer. The scoped native
+    // snapshot is authoritative, so foregrounding always forces a fresh pull;
+    // that pull rearms active polling without depending on an event replay.
+    scheduleBranchRefresh();
+  }
+
+  function installGenerationEventListener(): Promise<void> {
+    if (unlistenGenerationEvents || generationListenerDisposed) return Promise.resolve();
+    if (!generationListenerPromise) {
+      generationListenerPromise = (async () => {
+        try {
+          const unlisten = await listenForGenerationEvents(handleGenerationEnvelope);
+          if (generationListenerDisposed) {
+            unlisten();
+          } else {
+            unlistenGenerationEvents = unlisten;
+          }
+        } catch (error) {
+          if (!generationListenerDisposed) {
+            recordFailure(error);
+            announce('Private strand events are unavailable');
+          }
+        } finally {
+          generationListenerPromise = null;
+        }
+      })();
     }
+    return generationListenerPromise;
   }
 
   async function ensureModelDownloadEventListener(): Promise<void> {
@@ -1857,6 +1937,12 @@
         throw new Error('The desktop returned a branch for a different manuscript.');
       }
       if (
+        branch.weave_command_id !== null &&
+        !/^[0-9A-HJKMNP-TV-Z]{26}$/u.test(branch.weave_command_id)
+      ) {
+        throw new Error('The desktop returned an invalid weave-family identity.');
+      }
+      if (
         !Number.isSafeInteger(branch.target_start_byte) ||
         !Number.isSafeInteger(branch.target_end_byte) ||
         branch.target_start_byte < 0 ||
@@ -2101,11 +2187,22 @@
       if (snapshot.has_more !== (snapshot.next_cursor !== null)) {
         throw new Error('The desktop returned inconsistent branch page metadata.');
       }
-      completionActiveRunIds = completionFacts.activeRunIds;
+      const completingActivePresentation = completionActiveRunIds.length > 0 &&
+        completionFacts.activeRunIds.length === 0;
+      if (!completingActivePresentation) {
+        // Active partials are already bounded and scope-validated. Publish them
+        // before unrelated terminal-body I/O so streaming latency never depends
+        // on shelf hydration. The all-terminal transition is applied atomically
+        // with immutable candidate bodies below to avoid a blank frame.
+        liveBranchTextByRun = completionFacts.liveTextByRun;
+        liveBranchTextSequenceByRun = completionFacts.liveTextSequenceByRun;
+        completionActiveRunIds = completionFacts.activeRunIds;
+      }
       cancellingRunIds = [...new Set([
         ...cancellingRunIds,
         ...completionFacts.cancellationRequestedRunIds
       ])];
+      if (completionFacts.activeRunIds.length > 0) scheduleActiveBranchPoll();
       const firstPageCards = cardsFromSummaries(snapshot.branches);
       branches = mergeNewestPage(firstPageCards, branches);
       const firstPageCursorChanged =
@@ -2135,8 +2232,11 @@
       const hydratedByRun = new Map(hydration.cards.map((branch) => [branch.run_id, branch]));
       branchBodyBlobByRun = hydration.bodyBlobByRun;
       verifiedBranchBodyByRun = hydration.verifiedBodyByRun;
+      liveBranchTextByRun = completionFacts.liveTextByRun;
+      liveBranchTextSequenceByRun = completionFacts.liveTextSequenceByRun;
       branchBodyErrorByRun = hydration.bodyErrorByRun;
       branches = branches.map((branch) => hydratedByRun.get(branch.run_id) ?? branch);
+      completionActiveRunIds = completionFacts.activeRunIds;
       reconcileBranchActionState();
       if (completionActiveRunIds.length > 0) scheduleActiveBranchPoll();
       return true;
@@ -2168,6 +2268,8 @@
   function refreshCurrentBranches(reportFailure = true): Promise<boolean> {
     if (!project || !document) {
       branches = [];
+      liveBranchTextByRun = {};
+      liveBranchTextSequenceByRun = {};
       return Promise.resolve(false);
     }
     return refreshBranchesFor(
@@ -2551,10 +2653,6 @@
     return refreshed;
   }
 
-  function closeProjectMenu(): void {
-    if (projectMenu) projectMenu.open = false;
-  }
-
   function closeFormatMenu(refocus = true): void {
     formatMenu?.close(refocus);
   }
@@ -2582,7 +2680,6 @@
   }
 
   function openModelManager(trigger: HTMLElement): void {
-    closeProjectMenu();
     if (lastFailure?.code.startsWith('model_') || lastFailure?.code.startsWith('writing_model_')) {
       clearFailure();
     }
@@ -2626,7 +2723,6 @@
         return;
       }
       if (focusConnectedControl(trigger)) return;
-      if (focusConnectedControl(projectMenuTrigger)) return;
       focusCurrentWritingSurfaceAtEnd();
     });
   }
@@ -2703,7 +2799,6 @@
       applicationClosePhase !== 'running' ||
       transition !== 'idle'
     ) return;
-    closeProjectMenu();
     closeFormatMenu(false);
     closeDocumentContextMenu(false);
     documentContextTarget = target;
@@ -2822,7 +2917,210 @@
       event.preventDefault();
       return;
     }
+    if (
+      summary.document_id === document?.summary.document_id &&
+      event.target instanceof Element &&
+      event.target.closest('[data-document-title]')
+    ) {
+      event.preventDefault();
+      const target = captureDocumentContextTarget(summary);
+      if (target) void beginDocumentRename(target, event.currentTarget as HTMLElement);
+      return;
+    }
     void selectDocument(summary, true);
+  }
+
+  async function beginDocumentRename(
+    target: CapturedDocumentTarget,
+    trigger: HTMLElement | null
+  ): Promise<void> {
+    if (
+      renameDocumentInFlight ||
+      renameDocumentEditorLocked ||
+      fileCommandInFlight ||
+      editorReadonly ||
+      !capturedDocumentBelongsToSession(target, project)
+    ) return;
+    closeDocumentContextMenu(false);
+    const targetIsCurrent = document?.summary.document_id === target.documentId;
+    if (compositionActive) {
+      announce('Finish composing text before renaming a manuscript');
+      return;
+    }
+    // Freeze the manuscript before preparing rename authority and retain that
+    // lock until the rename is committed or explicitly cancelled. Otherwise a
+    // click back into the editor can start an autosave against the captured
+    // revision while the native rename command is still in flight.
+    renameDocumentEditorLocked = true;
+    if (targetIsCurrent && !flushEditors()) {
+      renameDocumentEditorLocked = false;
+      return;
+    }
+    fileCommandInFlight = true;
+    let refreshedTarget: CapturedDocumentTarget | null = null;
+    try {
+      refreshedTarget = await refreshDocumentRenameTarget(
+        target,
+        document?.summary.document_id ?? null,
+        flushCurrentDocument,
+        () => project
+      );
+    } catch (error) {
+      recordDocumentContextFailure(target, error);
+    } finally {
+      fileCommandInFlight = false;
+    }
+    if (!refreshedTarget) {
+      renameDocumentEditorLocked = false;
+      announce('The manuscript changed before its rename authority could be prepared');
+      return;
+    }
+    renameDocumentComposition.reset();
+    renamingDocumentId = refreshedTarget.documentId;
+    renameDocumentTitle = refreshedTarget.title;
+    renameDocumentTarget = refreshedTarget;
+    renameDocumentTrigger = trigger;
+    await tick();
+    renameDocumentInput?.focus();
+    renameDocumentInput?.select();
+  }
+
+  function synchronizeDocumentRenameTitle(input: HTMLInputElement): void {
+    const bounded = boundedDocumentTitleInput(input.value);
+    if (input.value !== bounded) input.value = bounded;
+    renameDocumentTitle = bounded;
+  }
+
+  function handleDocumentRenameInput(event: Event): void {
+    synchronizeDocumentRenameTitle(event.currentTarget as HTMLInputElement);
+  }
+
+  function handleDocumentRenameCompositionStart(): void {
+    renameDocumentComposition.start();
+  }
+
+  function handleDocumentRenameCompositionEnd(event: CompositionEvent): void {
+    const input = event.currentTarget as HTMLInputElement;
+    synchronizeDocumentRenameTitle(input);
+    const commitAfterBlur = renameDocumentComposition.finish();
+    if (
+      commitAfterBlur &&
+      input === renameDocumentInput &&
+      renamingDocumentId !== null &&
+      !renameDocumentInFlight
+    ) void commitDocumentRename(false);
+  }
+
+  function handleDocumentRenameBlur(): void {
+    if (renameDocumentInFlight || !renameDocumentComposition.blurShouldCommit()) return;
+    void commitDocumentRename(false);
+  }
+
+  function cancelDocumentRename(refocus = true): void {
+    const documentId = renamingDocumentId;
+    const trigger = renameDocumentTrigger;
+    renamingDocumentId = null;
+    renameDocumentTitle = '';
+    renameDocumentTarget = null;
+    renameDocumentTrigger = null;
+    renameDocumentEditorLocked = false;
+    renameDocumentComposition.reset();
+    if (refocus) void tick().then(() => {
+      const row = Array.from(
+        window.document.querySelectorAll<HTMLButtonElement>('[data-document-row]')
+      ).find((candidate) => candidate.dataset.documentRow === documentId);
+      if (focusConnectedControl(row)) return;
+      if (focusConnectedControl(trigger)) return;
+      if (focusConnectedControl(outlineToggle)) return;
+      focusCurrentWritingSurfaceAtEnd();
+    });
+  }
+
+  async function commitDocumentRename(refocus = true): Promise<void> {
+    const target = renameDocumentTarget;
+    if (!target || renameDocumentInFlight || renameDocumentComposition.active) return;
+    if (!capturedDocumentBelongsToSession(target, project)) {
+      cancelDocumentRename(false);
+      announce('The project session changed before the manuscript could be renamed');
+      return;
+    }
+    const title = renameDocumentTitle.trim();
+    if (title === target.title) {
+      cancelDocumentRename(refocus);
+      return;
+    }
+    renameDocumentInFlight = true;
+    fileCommandInFlight = true;
+    let restoreFailedRenameFocus = false;
+    try {
+      const renamed = await renameDocument(
+        target.projectId,
+        target.sessionId,
+        target.documentId,
+        target.expectedRevisionId,
+        target.expectedBlobId,
+        title
+      );
+      if (
+        !project ||
+        !capturedDocumentBelongsToSession(target, project) ||
+        !capturedDocumentIdentityIsCurrent(target, project) ||
+        renamed.document_id !== target.documentId ||
+        renamed.revision_id !== target.expectedRevisionId ||
+        renamed.active_blob_id !== target.expectedBlobId
+      ) throw new Error('The rename receipt did not match the captured manuscript.');
+      project = {
+        ...project,
+        documents: project.documents.map((candidate) =>
+          candidate.document_id === renamed.document_id ? renamed : candidate
+        )
+      };
+      if (document?.summary.document_id === renamed.document_id) {
+        document = { ...document, summary: renamed };
+      }
+      cancelDocumentRename(refocus);
+      announce(`Renamed manuscript to ${renamed.title}`);
+    } catch (error) {
+      recordDocumentContextFailure(target, error);
+      restoreFailedRenameFocus = true;
+    } finally {
+      if (restoreFailedRenameFocus) {
+        await releaseDocumentRenameAndRestoreFocus(
+          () => {
+            fileCommandInFlight = false;
+            renameDocumentInFlight = false;
+          },
+          tick,
+          () => renameDocumentInput
+        );
+      } else {
+        fileCommandInFlight = false;
+        renameDocumentInFlight = false;
+      }
+    }
+  }
+
+  function handleDocumentRenameKeydown(event: KeyboardEvent): void {
+    const compositionOwnsCommand = renameDocumentComposition.ownsCommandKey(event);
+    if (
+      compositionOwnsCommand &&
+      (event.key === 'Escape' || event.key === 'Enter')
+    ) {
+      // Keep the event's default behavior available to the IME, but prevent a
+      // rename-owned composition command from reaching global Shuttle/menu
+      // routing.
+      event.stopPropagation();
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      cancelDocumentRename();
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void commitDocumentRename(true);
+    }
   }
 
   function handleDocumentContextMenuKeydown(event: KeyboardEvent): void {
@@ -2925,6 +3223,10 @@
           restoreTrigger =
             document?.summary.document_id !== target.documentId &&
             reconciliation?.document_id !== target.documentId;
+          break;
+        case 'rename':
+          await beginDocumentRename(target, trigger);
+          restoreTrigger = false;
           break;
         case 'export_text': {
           fileCommandInFlight = true;
@@ -3926,6 +4228,9 @@
       applicationClosePhase !== 'running' ||
       !capturedDocumentBelongsToSession(target, project)
     ) return;
+    if (renamingDocumentId && renamingDocumentId !== target.documentId) {
+      cancelDocumentRename(false);
+    }
     const requestedScope: ProjectRestoreScope = {
       projectId: target.projectId,
       sessionId: target.sessionId,
@@ -4214,7 +4519,7 @@
 
   function invalidateVisualSuggestionImmediately(): void {
     if (transition !== 'idle' || visualMutationPending) return;
-    if (pendingCompletionText !== null) return;
+    if (completionController.pendingText !== null) return;
     visualMutationPending = true;
     const invalidated = invalidateVisualMutation(completionController);
     completionController = invalidated.state;
@@ -4277,9 +4582,81 @@
       // synchronously. Project them in the same event turn so the cached
       // remainder and reversal affordance never disappear behind the ordinary
       // source-edit debounce.
-      if (pendingCompletionText !== null) commitSourceDraft();
+      if (completionController.pendingText !== null) commitSourceDraft();
       else scheduleSourceProjection();
     }
+  }
+
+  async function storeImageAttachments(files: readonly File[]): Promise<readonly string[]> {
+    if (!project || !document || editorReadonly || files.length === 0) return [];
+    const transferError = imageAttachmentTransferError(files);
+    if (transferError) {
+      reportImageAttachmentError(transferError);
+      return [];
+    }
+    const captured = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id,
+      relativePath: document.summary.relative_path,
+      documentEpoch
+    };
+    const snippets: string[] = [];
+    try {
+      // Encode and transmit one image at a time. A single paste/drop therefore
+      // never retains every ArrayBuffer, binary string, and base64 payload at
+      // once, even at the explicit transfer ceiling.
+      for (const file of files) {
+        const encoded = await encodeImageAttachment(file);
+        const receipt = await ingestImageAttachment(
+          captured.projectId,
+          captured.sessionId,
+          encoded.mediaType,
+          encoded.base64
+        );
+        if (
+          project?.project_id !== captured.projectId ||
+          project.session_id !== captured.sessionId ||
+          document?.summary.document_id !== captured.documentId ||
+          documentEpoch !== captured.documentEpoch
+        ) {
+          const message =
+            'The image was stored in the original project, but the manuscript changed before insertion.';
+          recordLocalFailure('image_attachment_stale', message);
+          announce(message);
+          return [];
+        }
+        snippets.push(attachmentMarkdown(receipt, encoded.originalName, captured.relativePath));
+      }
+      return snippets;
+    } catch (error) {
+      recordFailure(error);
+      if (snippets.length > 0) {
+        return snippets;
+      }
+      announce('The image could not be attached; your manuscript is unchanged');
+      return [];
+    }
+  }
+
+  function resolveImageAssetUrl(markdownPath: string): string | null {
+    if (!project) return null;
+    const token = projectAssetProtocolToken(
+      project.project_id,
+      project.session_id,
+      markdownPath
+    );
+    return token ? convertFileSrc(token, 'loom-asset') : null;
+  }
+
+  function reportImageAttachmentError(message: string): void {
+    recordLocalFailure('image_attachment_unreadable', message);
+    announce(message);
+  }
+
+  function reportImageAttachmentsCommitted(count: number): void {
+    if (!Number.isSafeInteger(count) || count <= 0) return;
+    announce(count === 1 ? 'Image attached' : `${count} images attached`);
   }
 
   function updateSourceSelection(textarea: HTMLTextAreaElement): void {
@@ -4289,7 +4666,7 @@
     sourceSelectionStart = textarea.selectionStart;
     sourceSelectionEnd = textarea.selectionEnd;
     if (
-      pendingCompletionText !== null ||
+      completionController.pendingText !== null ||
       (previousStart === sourceSelectionStart && previousEnd === sourceSelectionEnd)
     ) return;
     const target = sourceGhostTargetByteFor(
@@ -4302,9 +4679,9 @@
       documentText,
       verseCodec
     );
-    const expected = completionSession
-      ? completionSessionPresentation(completionSession)?.targetByte ?? null
-      : selectedInlineSuggestion?.targetByte ?? completionGenerationIntent?.anchorByte ?? null;
+    const expected = completionController.session
+      ? completionSessionPresentation(completionController.session)?.targetByte ?? null
+      : selectedInlineSuggestion?.targetByte ?? completionController.generationIntent?.anchorByte ?? null;
     if (expected === null && target !== null) {
       if (completionWasActive) {
         completionController = bindCompletionAnchor(
@@ -4344,14 +4721,14 @@
       return;
     }
     if (
-      pendingCompletionText !== null ||
+      completionController.pendingText !== null ||
       markdownByteOffset === null ||
       markdownByteOffset === previous ||
       !completionWasActive
     ) return;
-    const expected = completionSession
-      ? completionSessionPresentation(completionSession)?.targetByte ?? null
-      : selectedInlineSuggestion?.targetByte ?? completionGenerationIntent?.anchorByte ?? null;
+    const expected = completionController.session
+      ? completionSessionPresentation(completionController.session)?.targetByte ?? null
+      : selectedInlineSuggestion?.targetByte ?? completionController.generationIntent?.anchorByte ?? null;
     if (expected === null) {
       completionController = bindCompletionAnchor(
         completionController,
@@ -5296,7 +5673,21 @@
     if (dismissed.authorized) announce('Suggestion dismissed');
   }
 
+  function handleGlobalKeydownCapture(event: KeyboardEvent): void {
+    if (!shouldCaptureFormatMenuEscape(event, {
+      formatMenuOpen: formatMenu?.isOpen() ?? false,
+      compositionActive,
+      documentRenameOwnsEscape: renameDocumentEditorLocked || renamingDocumentId !== null,
+      documentMenuOwnsEscape: documentContextTarget !== null,
+      modelManagerOwnsEscape: modelManagerOpen
+    })) return;
+    event.preventDefault();
+    event.stopPropagation();
+    closeFormatMenu();
+  }
+
   function handleGlobalKeydown(event: KeyboardEvent): void {
+    if (event.defaultPrevented) return;
     if (event.key === 'Escape' && documentContextTarget) {
       event.preventDefault();
       closeDocumentContextMenu();
@@ -5305,12 +5696,6 @@
     if (event.key === 'Escape' && modelManagerOpen) {
       event.preventDefault();
       closeModelManager();
-      return;
-    }
-    if (event.key === 'Escape' && projectMenu?.open) {
-      event.preventDefault();
-      closeProjectMenu();
-      projectMenuTrigger?.focus();
       return;
     }
     if (event.key === 'Escape' && formatMenu?.isOpen()) {
@@ -5347,11 +5732,6 @@
       event.target instanceof Node &&
       !documentContextMenu?.contains(event.target)
     ) closeDocumentContextMenu(false);
-    if (
-      projectMenu?.open &&
-      event.target instanceof Node &&
-      !projectMenu.contains(event.target)
-    ) closeProjectMenu();
     if (
       formatMenu?.isOpen() &&
       event.target instanceof Node &&
@@ -5391,7 +5771,9 @@
       started.document_id !== captured.documentId ||
       started.source_revision_id !== captured.sourceRevisionId ||
       !started.exact_prompt_blob_id ||
-      started.branches.length !== 4
+      started.branches.length !== 4 ||
+      new Set(started.branches.map((branch) => branch.run_id)).size !== 4 ||
+      started.branches.some((branch) => branch.weave_command_id !== started.command_id)
     ) {
       throw new Error('The desktop returned a branch family for different source identities.');
     }
@@ -5406,6 +5788,7 @@
     }
     if (!weaveCaptureStillCurrent(captured)) return false;
     const runIds = new Set(started.branches.map((branch) => branch.run_id));
+    authoritativeCompletionFamilyId = started.command_id;
     branches = [
       ...started.branches,
       ...branches.filter((branch) => !runIds.has(branch.run_id))
@@ -6291,9 +6674,20 @@
       announce('Finish composing text before changing editor modes');
       return;
     }
-    if (next === 'visual' && !canUseVisual) return;
     if (next === mode) return;
-    flushEditors();
+    if (!flushEditors()) return;
+    if (next === 'visual' && document?.summary.kind !== 'prose') {
+      announce('Visual editing is available for prose manuscripts');
+      return;
+    }
+    if (next === 'visual' && !canUseVisualMarkdown(documentText, false)) {
+      recordLocalFailure(
+        'visual_markdown_not_exact',
+        'This Markdown uses syntax the visual editor cannot preserve exactly yet. The Markdown editor remains available without changing your text.'
+      );
+      announce('Visual editor unavailable for this Markdown; your source text is unchanged');
+      return;
+    }
     invalidateCompletionForCaretNavigation();
     if (next === 'source' && document) setSourceDocument(documentText, document.summary.kind);
     if (document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')) {
@@ -6534,6 +6928,7 @@
     resetLiveGenerationView();
     saveState = 'clean';
     saveMessage = 'No project open';
+    cancelDocumentRename(false);
     closeDocumentContextMenu(false);
     outlineOpen = false;
     suggestionsEnabled = false;
@@ -6603,14 +6998,14 @@
             on:click={() => void newDocument()}
           ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
         {/if}
-        {#if document}
+        {#if document?.summary.kind === 'prose'}
           <button
             class="titlebar-button mode-toggle"
             type="button"
             aria-label={mode === 'visual' ? 'Switch to Markdown editor' : 'Switch to visual editor'}
             aria-pressed={mode === 'source'}
             title={mode === 'visual' ? 'Markdown source' : 'Visual writing'}
-            disabled={editorReadonly || (mode === 'source' && !canUseVisual)}
+            disabled={editorReadonly}
             on:click={() => void setMode(mode === 'visual' ? 'source' : 'visual')}
           >
             {#if mode === 'visual'}
@@ -6677,9 +7072,6 @@
         >
           <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M4 4.5 10.5 9 4 13.5v-9ZM13.5 4.5v9"/></svg>
         </button>
-        <div class="save-status state-{saveState}" role="status" aria-label={autosaveLabel}>
-          <span class="status-dot"></span>
-        </div>
         <button
           class="titlebar-button appearance-button"
           type="button"
@@ -6693,37 +7085,6 @@
             <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M14.7 11.7A6.4 6.4 0 0 1 6.3 3.3a6.4 6.4 0 1 0 8.4 8.4Z"/></svg>
           {/if}
         </button>
-      <details class="project-menu" bind:this={projectMenu}>
-        <summary class="titlebar-button gear-button" bind:this={projectMenuTrigger} title="Settings" aria-label="Settings">
-          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M9 6.4A2.6 2.6 0 1 0 9 11.6 2.6 2.6 0 0 0 9 6.4Z" /><path d="M15 9a6 6 0 0 0-.08-.96l1.35-1.05-1.5-2.6-1.58.65a6 6 0 0 0-1.65-.96L11.3 2.4h-3l-.24 1.68a6 6 0 0 0-1.65.96l-1.58-.65-1.5 2.6 1.35 1.05A6 6 0 0 0 4.6 9c0 .33.03.65.08.96l-1.35 1.05 1.5 2.6 1.58-.65c.5.4 1.06.72 1.65.96l.24 1.68h3l.24-1.68a6 6 0 0 0 1.65-.96l1.58.65 1.5-2.6-1.35-1.05c.05-.31.08-.63.08-.96Z" /></svg>
-        </summary>
-        <div class="project-menu-popover" aria-label="Editor and suggestion settings">
-          <div class="project-menu-label">Appearance</div>
-          {#each ['system', 'light', 'dark'] as choice}
-            <button
-              class:active={appearance === choice}
-              type="button"
-              aria-pressed={appearance === choice}
-              on:click={() => setAppearance(choice as AppearancePreference)}
-            >
-              <span>{choice === 'system' ? 'System' : choice === 'light' ? 'Light' : 'Dark'}</span>
-              <span aria-hidden="true">{appearance === choice ? '✓' : ''}</span>
-            </button>
-          {/each}
-          <div class="project-menu-separator"></div>
-          <button
-            class:active={suggestionsEnabled && Boolean(currentModel)}
-            type="button"
-            aria-haspopup="dialog"
-            on:click={(event) => openModelManager(projectMenuTrigger ?? event.currentTarget)}
-          >
-            <span>Suggestions</span>
-            <span class:ready={suggestionMenuState === 'Ready'} class="menu-state">
-              {suggestionMenuState}
-            </span>
-          </button>
-        </div>
-      </details>
       </div>
     </div>
   {/if}
@@ -6743,7 +7104,30 @@
         </label>
         <nav class="document-list" aria-label="Documents">
           {#each visibleDocuments as candidate (candidate.document_id)}
+            {#if renamingDocumentId === candidate.document_id}
+              <div class:active={candidate.document_id === document?.summary.document_id} class="document-row editing">
+                <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
+                <span class="document-label">
+                  <input
+                    bind:this={renameDocumentInput}
+                    bind:value={renameDocumentTitle}
+                    type="text"
+                    maxlength="256"
+                    aria-label={`Rename ${candidate.title}`}
+                    disabled={renameDocumentInFlight}
+                    on:input={handleDocumentRenameInput}
+                    on:compositionstart={handleDocumentRenameCompositionStart}
+                    on:compositionend={handleDocumentRenameCompositionEnd}
+                    on:keydown={handleDocumentRenameKeydown}
+                    on:blur={handleDocumentRenameBlur}
+                  />
+                  <small>{candidate.word_count.toLocaleString()} {candidate.word_count === 1 ? 'word' : 'words'}</small>
+                </span>
+              </div>
+            {:else}
             <button
+              class="document-row"
+              data-document-row={candidate.document_id}
               class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}
               type="button"
               disabled={editorReadonly}
@@ -6759,10 +7143,11 @@
             >
               <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
               <span class="document-label">
-                <strong>{candidate.title}</strong>
+                <strong data-document-title>{candidate.title}</strong>
                 <small>{candidate.word_count.toLocaleString()} {candidate.word_count === 1 ? 'word' : 'words'}</small>
               </span>
             </button>
+            {/if}
           {:else}
             <p class="empty-copy">No notes.</p>
           {/each}
@@ -6790,17 +7175,25 @@
               type="button"
               role="menuitem"
               tabindex={documentContextFocusIndex === 1 ? 0 : -1}
-              disabled={fileCommandInFlight || documentContextActionInFlight}
+              disabled={editorReadonly || fileCommandInFlight || documentContextActionInFlight}
               on:focus={() => documentContextFocusIndex = 1}
+              on:click={() => void runDocumentContextAction('rename')}
+            >Rename…</button>
+            <button
+              type="button"
+              role="menuitem"
+              tabindex={documentContextFocusIndex === 2 ? 0 : -1}
+              disabled={fileCommandInFlight || documentContextActionInFlight}
+              on:focus={() => documentContextFocusIndex = 2}
               on:click={() => void runDocumentContextAction('export_text')}
             >Export Text…</button>
             {#if documentContextRevealLabel}
               <button
                 type="button"
                 role="menuitem"
-                tabindex={documentContextFocusIndex === 2 ? 0 : -1}
+                tabindex={documentContextFocusIndex === 3 ? 0 : -1}
                 disabled={fileCommandInFlight || documentContextActionInFlight}
-                on:focus={() => documentContextFocusIndex = 2}
+                on:focus={() => documentContextFocusIndex = 3}
                 on:click={() => void runDocumentContextAction('reveal')}
               >{documentContextRevealLabel}</button>
             {/if}
@@ -6929,6 +7322,10 @@
                       {ghostUnconsumeText}
                       surfaceKey={visualGhostSurfaceKey}
                       onChange={updateText}
+                      onImageAttachments={storeImageAttachments}
+                      onImageAttachmentsCommitted={reportImageAttachmentsCommitted}
+                      onImageAttachmentError={reportImageAttachmentError}
+                      {resolveImageAssetUrl}
                       onCompositionChange={setVisualComposition}
                       onImmediateDocumentMutation={invalidateVisualSuggestionImmediately}
                       onGhostAccept={acceptActiveGhost}
@@ -6942,6 +7339,9 @@
                       }}
                       onCompletionAccessibilityChange={(witness) => {
                         visualCompletionAccessibility = witness;
+                      }}
+                      onSelectionAccessibilityChange={(witness) => {
+                        visualSelectionAccessibility = witness;
                       }}
                       onSelectionChange={updateVisualSelection}
                       onCaretNavigation={invalidateCompletionForCaretNavigation}
@@ -6986,6 +7386,9 @@
                     updateSourceSelection(textarea);
                     updateFromSource(textarea.value);
                   }}
+                  onImageAttachments={storeImageAttachments}
+                  onImageAttachmentsCommitted={reportImageAttachmentsCommitted}
+                  onImageAttachmentError={reportImageAttachmentError}
                   onSelectionChange={updateSourceSelection}
                   onGhostAccept={acceptActiveGhost}
                   onGhostInsert={authorizeGhostInsertion}

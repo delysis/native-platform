@@ -1,6 +1,7 @@
 import type { DocumentKind, DocumentSummary, ProjectSnapshot } from './types';
 
-export type DocumentContextAction = 'open' | 'export_text' | 'reveal';
+export type DocumentContextAction = 'open' | 'rename' | 'export_text' | 'reveal';
+export const MAX_DOCUMENT_TITLE_BYTES = 256;
 
 /**
  * Immutable renderer-side presentation target captured when the menu opens.
@@ -24,6 +25,57 @@ export interface CapturedDocumentTarget {
 export interface MenuPoint {
   readonly x: number;
   readonly y: number;
+}
+
+export interface DocumentRenameCompositionGuard {
+  readonly active: boolean;
+  reset(): void;
+  start(): void;
+  ownsCommandKey(
+    event: Pick<KeyboardEvent, 'isComposing' | 'keyCode'>
+  ): boolean;
+  blurShouldCommit(): boolean;
+  finish(): boolean;
+}
+
+/**
+ * Own the rename input's IME lifetime independently from manuscript editing.
+ *
+ * WebKit may report an active composition through either `isComposing` or the
+ * legacy 229 key code, and may deliver blur before compositionend. The guard
+ * keeps those cases from committing a partial title while preserving the
+ * explicit blur as a deferred commit request.
+ */
+export function createDocumentRenameCompositionGuard(): DocumentRenameCompositionGuard {
+  let active = false;
+  let commitAfterBlur = false;
+  return {
+    get active() {
+      return active;
+    },
+    reset() {
+      active = false;
+      commitAfterBlur = false;
+    },
+    start() {
+      active = true;
+    },
+    ownsCommandKey(event) {
+      if (event.isComposing || event.keyCode === 229) active = true;
+      return active;
+    },
+    blurShouldCommit() {
+      if (!active) return true;
+      commitAfterBlur = true;
+      return false;
+    },
+    finish() {
+      active = false;
+      const shouldCommit = commitAfterBlur;
+      commitAfterBlur = false;
+      return shouldCommit;
+    }
+  };
 }
 
 export type DocumentMenuKeyAction =
@@ -67,6 +119,73 @@ export function capturedDocumentBelongsToSession(
   project: Pick<ProjectSnapshot, 'project_id' | 'session_id'> | null
 ): boolean {
   return project?.project_id === target.projectId && project.session_id === target.sessionId;
+}
+
+/**
+ * Recheck the renderer's live store identity before applying a command receipt.
+ * Session equality alone is insufficient: a concurrent checkpoint may have
+ * advanced the document while the native command was in flight.
+ */
+export function capturedDocumentIdentityIsCurrent(
+  target: CapturedDocumentTarget,
+  project: Pick<ProjectSnapshot, 'project_id' | 'session_id' | 'documents'> | null
+): boolean {
+  if (!project || !capturedDocumentBelongsToSession(target, project)) return false;
+  const current = project.documents.find(
+    (candidate) => candidate.document_id === target.documentId
+  );
+  return current?.revision_id === target.expectedRevisionId &&
+    current.active_blob_id === target.expectedBlobId;
+}
+
+/**
+ * Flush a current manuscript before freezing rename authority, then recapture
+ * the revision/blob pair that is authoritative after that save.
+ */
+export async function refreshDocumentRenameTarget(
+  target: CapturedDocumentTarget,
+  currentDocumentId: string | null,
+  flushCurrentDocument: () => Promise<boolean>,
+  currentProject: () => ProjectSnapshot | null
+): Promise<CapturedDocumentTarget | null> {
+  const before = currentProject();
+  if (!capturedDocumentBelongsToSession(target, before)) return null;
+  if (target.documentId === currentDocumentId && !(await flushCurrentDocument())) return null;
+  const project = currentProject();
+  if (!project || !capturedDocumentBelongsToSession(target, project)) return null;
+  const summary = project.documents.find(
+    (candidate) => candidate.document_id === target.documentId
+  );
+  return summary ? captureDocumentTarget(project, summary) : null;
+}
+
+/** Match the native store's UTF-8 byte ceiling without splitting a code point. */
+export function boundedDocumentTitleInput(value: string): string {
+  let bytes = 0;
+  let codeUnits = 0;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    const characterBytes = codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    if (bytes + characterBytes > MAX_DOCUMENT_TITLE_BYTES) break;
+    bytes += characterBytes;
+    codeUnits += character.length;
+  }
+  return codeUnits === value.length ? value : value.slice(0, codeUnits);
+}
+
+/** Release Svelte's disabled state before restoring the failed rename editor. */
+export async function releaseDocumentRenameAndRestoreFocus(
+  releaseBusyState: () => void,
+  afterDomUpdate: () => Promise<void>,
+  currentInput: () => HTMLInputElement | null | undefined
+): Promise<boolean> {
+  releaseBusyState();
+  await afterDomUpdate();
+  const input = currentInput();
+  if (!input || input.disabled || !input.isConnected) return false;
+  input.focus();
+  input.select();
+  return input.ownerDocument.activeElement === input;
 }
 
 export function isDocumentContextTriggerKey(

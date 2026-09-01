@@ -10,6 +10,7 @@ function summary(overrides: Partial<BranchSummary> = {}): BranchSummary {
   return {
     run_id: 'run-1',
     branch_id: 'branch-1',
+    weave_command_id: null,
     document_id: 'document-1',
     candidate_id: 'candidate-1',
     source_revision_id: 'revision-1',

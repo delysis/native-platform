@@ -11,6 +11,7 @@ import type {
   CuratedModelCatalogSnapshot,
   DesktopGenerationEnvelope,
   DocumentKind,
+  DocumentSummary,
   ModelCapabilitySummary,
   ModelDownloadSnapshot,
   ModelUnloadOutcome,
@@ -25,6 +26,7 @@ import type {
   WeaveStarted
 } from './types';
 import { decodeBuildModelPolicy } from './buildModelPolicy';
+import type { ImageAttachmentReceipt } from './attachments';
 
 const PREFIX = 'plugin:loom|';
 
@@ -127,6 +129,38 @@ export function currentProjectSession(): Promise<ProjectSnapshot> {
 
 export function createDocument(projectId: string, sessionId: string): Promise<ProjectSnapshot> {
   return call('document_create', { projectId, sessionId });
+}
+
+export function renameDocument(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  expectedRevisionId: string,
+  expectedBlobId: string,
+  title: string
+): Promise<DocumentSummary> {
+  return call('document_rename', {
+    projectId,
+    sessionId,
+    documentId,
+    expectedRevisionId,
+    expectedBlobId,
+    title
+  });
+}
+
+export function ingestImageAttachment(
+  projectId: string,
+  sessionId: string,
+  mediaType: string,
+  base64: string
+): Promise<ImageAttachmentReceipt> {
+  return call('attachment_ingest', {
+    projectId,
+    sessionId,
+    mediaType,
+    encoded: base64
+  });
 }
 
 export async function getBuildModelPolicy(): Promise<BuildModelPolicySummary> {

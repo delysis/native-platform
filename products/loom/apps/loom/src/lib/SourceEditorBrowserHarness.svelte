@@ -16,6 +16,10 @@
 
   export let initialValue = 'hello';
   export let completionCandidates: CompletionCandidate[] = [];
+  export let onImageAttachments: (files: readonly File[]) => Promise<readonly string[]> =
+    async () => [];
+  export let onImageAttachmentsCommitted: (count: number) => void = () => {};
+  export let onImageAttachmentError: (message: string) => void = () => {};
 
   let markdown = initialValue;
   let pendingMarkdown: string | null = null;
@@ -31,6 +35,7 @@
   let ready = false;
   let generationRequests = 0;
   let rerenderSerial = 1;
+  let attachmentCommitWitness = 'none';
 
   $: presentation = ready && session
     ? session.acceptedChunks.length === 0
@@ -96,6 +101,11 @@
     if (session) session = cycleCompletionSession(session, offset);
   }
 
+  function acknowledgeImageAttachments(count: number): void {
+    attachmentCommitWitness = `${count}:${markdown}`;
+    onImageAttachmentsCommitted(count);
+  }
+
   onMount(async () => {
     await tick();
     editor.focusAtDocumentEnd();
@@ -116,6 +126,9 @@
       ghostInsertsOnAccept={true}
       ghostAlternatives={alternatives}
       ghostUnconsumeText={unconsumeText}
+      {onImageAttachments}
+      onImageAttachmentsCommitted={acknowledgeImageAttachments}
+      {onImageAttachmentError}
       onValueInput={input}
       onGhostInsert={insert}
       onGhostUnconsume={unconsume}
@@ -125,5 +138,6 @@
   <output aria-label="Source Markdown">{markdown}</output>
   <output aria-label="Source Generation Requests">{generationRequests}</output>
   <output aria-label="Source Rerender Serial">{rerenderSerial}</output>
+  <output aria-label="Source Attachment Commit Witness">{attachmentCommitWitness}</output>
   <button type="button" on:mousedown|preventDefault on:click={() => rerenderSerial += 1}>Stable rerender</button>
 </main>
