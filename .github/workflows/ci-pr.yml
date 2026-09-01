@@ -283,7 +283,9 @@ jobs:
           pnpm --filter free-token-energy run test:frontend
       - name: Mom frontend
         if: ${{ needs.plan.outputs.frontend_mom == 'true' }}
-        run: pnpm --filter @delysis/mom-llama run check:frontend
+        run: |
+          pnpm --filter @delysis/mom-llama run check:frontend
+          pnpm --filter @delysis/mom-llama run test:frontend
       - name: Loom frontend
         if: ${{ needs.plan.outputs.frontend_loom == 'true' }}
         run: |

@@ -4300,13 +4300,13 @@ mod tests {
         let _guard = crate::APP_DATA_DIR_TEST_LOCK
             .lock()
             .expect("lock app data-dir test state");
-        let data_dir = std::env::temp_dir().join(format!(
-            "mom-llama-view-test-{}",
-            mom_llama_runtime::now_ms()
+        let data_dir = tempfile::tempdir()?;
+        mom_llama_runtime::config::set_data_dir_override_for_tests(Some(
+            data_dir.path().to_path_buf(),
         ));
-        mom_llama_runtime::config::set_data_dir_override_for_tests(Some(data_dir));
-        let html = render_app()?;
+        let rendered = render_app();
         mom_llama_runtime::config::set_data_dir_override_for_tests(None);
+        let html = rendered?;
         for forbidden in ["__sveltekit__", "React", "Vue", "fetch("] {
             assert!(
                 !html.contains(forbidden),
@@ -5594,7 +5594,14 @@ mod tests {
         }
         assert_interactive_tags_have_metadata(&html, "button");
 
-        let personas = persona_projection();
+        // This markup contract does not need storage. Calling the live Persona
+        // projection here races the separate render test's process-global data
+        // directory override and can both contaminate that fixture and inspect
+        // the developer's real store.
+        let personas = StoreProjection {
+            value: Vec::new(),
+            blocker: None,
+        };
         let editor = persona_settings(&personas, &empty_models()).into_string();
         assert_eq!(
             editor.contains(r#"name="persona_tools""#),

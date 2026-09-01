@@ -10,6 +10,9 @@ import test from "node:test";
 
 const root = path.resolve(import.meta.dirname, "../..");
 const tool = path.join(root, "scripts/product-state-backup.mjs");
+const emptyProcessBin = fs.mkdtempSync(path.join(os.tmpdir(), "delysis-backup-empty-processes-"));
+fs.writeFileSync(path.join(emptyProcessBin, "ps"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+process.on("exit", () => fs.rmSync(emptyProcessBin, { recursive: true, force: true }));
 
 function fixture(t, product) {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), `delysis-${product}-backup-`));
@@ -32,7 +35,11 @@ function fixture(t, product) {
 function runWithEnvironment(environment, ...args) {
   return spawnSync(process.execPath, [tool, ...args], {
     encoding: "utf8",
-    env: { ...process.env, ...environment },
+    env: {
+      ...process.env,
+      PATH: `${emptyProcessBin}${path.delimiter}${process.env.PATH ?? ""}`,
+      ...environment,
+    },
   });
 }
 
