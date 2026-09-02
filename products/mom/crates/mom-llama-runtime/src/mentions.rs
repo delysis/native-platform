@@ -5289,8 +5289,10 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::{
         ACTIVE_APPROVALS_NAMESPACE, INVOCATIONS_NAMESPACE, MentionInvocationDb,
-        MentionToolEffectOutcome, PersonaToolApprovalRecovery, project_visible_tool_approvals,
-        upsert_invocation_with_continuations, write_active_approval_index,
+        MentionToolEffectOutcome, PersonaToolApprovalRecovery, PersonaToolResumeLease,
+        claim_stored_persona_tool_approval, persona_tool_resume_lease_is_live,
+        project_visible_tool_approvals, upsert_invocation_with_continuations,
+        write_active_approval_index,
     };
     use super::{
         ApprovalDeadlineTracker, BoundMentionTool, FrozenMentionToolContinuation,
@@ -5298,21 +5300,21 @@ mod tests {
         MentionInvocation, MentionInvocationState, MentionTargetKind, MentionTargetSnapshot,
         MentionToolApproval, MentionToolApprovalDecision, MentionToolApprovalResolution,
         MentionToolApprovalState, PersonaToolCallIdentity, PersonaToolDecision,
-        PersonaToolResumeLease, StoredMentionInvocation, active_approval_index,
-        ambiguous_resolution_blocker, authorize_bound_tool, claim_stored_persona_tool_approval,
-        finish_stored_mention_invocation, fit_handoff_to_context, mention_tool_instructions,
-        mention_tool_manifest, parse_handles, persona_tool_call_sha256,
-        persona_tool_decision_schema, persona_tool_resume_lease_is_live,
-        reconcile_stored_persona_tool_approvals, resolve_targets_from_registry, sha256_json_value,
-        unknown_persona_tool_effect_receipt, unregister_exact_mentions,
-        validate_resolved_mention_tools,
+        StoredMentionInvocation, active_approval_index, ambiguous_resolution_blocker,
+        authorize_bound_tool, finish_stored_mention_invocation, fit_handoff_to_context,
+        mention_tool_instructions, mention_tool_manifest, parse_handles, persona_tool_call_sha256,
+        persona_tool_decision_schema, reconcile_stored_persona_tool_approvals,
+        resolve_targets_from_registry, sha256_json_value, unknown_persona_tool_effect_receipt,
+        unregister_exact_mentions, validate_resolved_mention_tools,
     };
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::conversation_store::{CONVERSATIONS_NAMESPACE, Message, MessageRole};
     use crate::conversation_store::{
         Conversation, ConversationDb, ConversationExecutionProfile, ConversationKind,
     };
-    use crate::mcp::{McpServerConfig, McpTool, exact_mcp_server_config_sha256};
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use crate::mcp::exact_mcp_server_config_sha256;
+    use crate::mcp::{McpServerConfig, McpTool};
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::store::RuntimeStore;
     use crate::tool_loop::ToolPermissionPolicy;
@@ -5398,8 +5400,16 @@ mod tests {
             args: Vec::new(),
             enabled: true,
         };
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let server_config_sha256 =
             exact_mcp_server_config_sha256(&frozen_server_config).expect("test server config hash");
+        // Process-supervised MCP and its executable identity authority are
+        // deliberately unavailable on other platforms. State-only approval
+        // tests still need a stable opaque identity to bind into their call
+        // hashes; tests of the real executable validator are gated below.
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let server_config_sha256 =
+            super::sha256_json(&frozen_server_config).expect("opaque test server config hash");
         let frozen_server_config_sha256 = server_config_sha256.clone();
         let input_schema = json!({
             "type": "object",
@@ -5509,6 +5519,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn persona_tool_approval_is_exact_one_use_and_decision_bound() {
         let mut stored = frozen_approval_record(1_000);
@@ -5543,6 +5554,7 @@ mod tests {
         assert_eq!(blocker.code, "mention_tool_approval_consumed");
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn persona_tool_approval_rejects_tampering_and_expires_monotonically() {
         let mut tampered = frozen_approval_record(1_000);
@@ -5612,16 +5624,8 @@ mod tests {
         );
         assert_eq!(pending.approvals[0].resume_lease_id, None);
 
-        claim_stored_persona_tool_approval(
-            &mut stored,
-            "approval",
-            MentionToolApprovalDecision::Approve,
-            100,
-            "lease-1",
-            false,
-        )
-        .expect("claim validation")
-        .expect("claim");
+        stored.tool_approvals[0].state = MentionToolApprovalState::Resuming;
+        stored.frozen_tool_continuations[0].resume_lease_id = Some("lease-1".to_string());
         db.invocations[0] = stored;
         let resuming = active_approval_index(&db).expect("resuming active index");
         assert_eq!(resuming.approvals.len(), 1);
@@ -6253,6 +6257,7 @@ mod tests {
         assert!(!completed.request_cancel());
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn persona_resume_lease_keeps_a_stable_inode_and_binds_its_generation() {
         let data_dir =

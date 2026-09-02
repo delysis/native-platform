@@ -1358,10 +1358,24 @@ mod tests {
             relative.blocker.code,
             "compiled_default_model_path_relative"
         );
+        let absolute_model = std::env::temp_dir()
+            .join("mom-llama-compiled-defaults")
+            .join("default.gguf");
+        assert!(
+            absolute_model.is_absolute(),
+            "the host temporary directory must provide an absolute test path"
+        );
         assert_eq!(
-            compiled_default_path(Some("/models/default.gguf"), CompiledPathKind::Model,)
-                .expect("absolute compiled default"),
-            Some(PathBuf::from("/models/default.gguf"))
+            compiled_default_path(
+                Some(
+                    absolute_model
+                        .to_str()
+                        .expect("temporary path must be valid Unicode"),
+                ),
+                CompiledPathKind::Model,
+            )
+            .expect("absolute compiled default"),
+            Some(absolute_model)
         );
     }
 
